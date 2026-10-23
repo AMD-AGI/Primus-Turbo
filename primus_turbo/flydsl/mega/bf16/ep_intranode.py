@@ -123,8 +123,13 @@ def dispatch_bf16_tile(
     num_experts_per_rank: int,
     rank: int,
     block_threads: int = _BLOCK_THREADS,
+    experts_per_publish: int = 1,
 ):
-    """Push this block's chunk of every expert's task to one dst rank, in ascending expert order."""
+    """Push this block's chunk of every expert's task to one dst rank, in ascending expert order.
+
+    ``experts_per_publish`` experts share one store retire + barrier before their flags go out (in
+    ascending order, so the single-flag wait still holds); it must divide ``num_experts_per_rank``."""
+    assert num_experts_per_rank % experts_per_publish == 0, "publish groups tile the local experts"
     hidden_bytes = hidden_size * 2
     assert hidden_bytes % 16 == 0, "hidden*2 must be a multiple of 16 bytes -> hidden % 8 == 0"
     assert block_threads % _WARP == 0, "a block is a whole number of 64-lane copy warps"
@@ -142,46 +147,51 @@ def dispatch_bf16_tile(
     warp_id = chunk_index * fx.Int32(num_warps) + thread_index // fx.Int32(_WARP)
 
     # ascending expert order: flag[g] complete implies every expert <= g landed (single-flag wait)
-    for local_expert in range(fx.Int32(num_experts_per_rank)):
-        task_index = local_expert * fx.Int32(num_ranks) + block_dst_rank
-        dst_rank = buffer_load(expert_send_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32)
-        source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=fx.T.i32)
-        token_count = buffer_load(expert_send_count_res, task_index, vec_width=1, dtype=fx.T.i32)
-        token_buffer_address = sym.map(token_buffer_ptr, dst_rank)
-        dispatch_flag_address = sym.map(dispatch_flag_ptr, dst_rank)
+    for expert_group in range(fx.Int32(num_experts_per_rank // experts_per_publish)):
+        first_expert = expert_group * fx.Int32(experts_per_publish)
+        for local_expert in range(first_expert, first_expert + fx.Int32(experts_per_publish)):
+            task_index = local_expert * fx.Int32(num_ranks) + block_dst_rank
+            dst_rank = buffer_load(expert_send_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32)
+            source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=fx.T.i32)
+            token_count = buffer_load(expert_send_count_res, task_index, vec_width=1, dtype=fx.T.i32)
+            token_buffer_address = sym.map(token_buffer_ptr, dst_rank)
 
-        local_count = (token_count - warp_id + fx.Int32(row_stride - 1)) // fx.Int32(row_stride)
+            local_count = (token_count - warp_id + fx.Int32(row_stride - 1)) // fx.Int32(row_stride)
 
-        for i in range(local_count):
-            token_idx = buffer_load(
-                dispatched_token_idx_res,
-                source_offset + warp_id + i * fx.Int32(row_stride),
-                vec_width=1,
-                dtype=fx.T.i32,
-            )
-            # dst = peer dispatch_token_buffer row of this recv token, src = local input; offsets in i32 words
-            copy_warp(
-                token_buffer_address,
-                input_res,
-                hidden_bytes,
-                dst_off=(fx.Int32(recv_token_base) + token_idx) * fx.Int32(hidden_i32),
-                src_off=token_idx * fx.Int32(hidden_i32),
-                load_cache_modifier=cpol_device_stream(),  # read data produced by the same agent
-                store_cache_modifier=cpol_system_stream(),
-            )
+            for i in range(local_count):
+                token_idx = buffer_load(
+                    dispatched_token_idx_res,
+                    source_offset + warp_id + i * fx.Int32(row_stride),
+                    vec_width=1,
+                    dtype=fx.T.i32,
+                )
+                # dst = peer dispatch_token_buffer row of this recv token, src = local input; offsets in i32 words
+                copy_warp(
+                    token_buffer_address,
+                    input_res,
+                    hidden_bytes,
+                    dst_off=(fx.Int32(recv_token_base) + token_idx) * fx.Int32(hidden_i32),
+                    src_off=token_idx * fx.Int32(hidden_i32),
+                    load_cache_modifier=cpol_device_stream(),  # read data produced by the same agent
+                    store_cache_modifier=cpol_system_stream(),
+                )
 
         wait_mem_all()
         fx.gpu.barrier()
         if thread_index == fx.Int32(0):
-            # each chunk's stores retired before its counter add, so the last chunk's flag add publishes them all
-            chunk_count_before_add = atomic_add(
-                dispatch_chunk_counter_ptr, task_index, fx.Int64(1), scope="agent"
-            )
-            if chunk_count_before_add == fx.Int64(num_chunks - 1):
-                # the last chunk rearms the counter, so every launch starts from 0 whatever its chunk count
-                st(dispatch_chunk_counter_ptr, task_index, fx.Int64(0), scope="agent")
-                bank = dispatch_parity * fx.Int32(num_max_pool_blocks)
-                atomic_add(dispatch_flag_address, bank + local_expert, fx.Int64(1), scope="sys")
+            for local_expert in range(first_expert, first_expert + fx.Int32(experts_per_publish)):
+                task_index = local_expert * fx.Int32(num_ranks) + block_dst_rank
+                dst_rank = buffer_load(expert_send_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32)
+                dispatch_flag_address = sym.map(dispatch_flag_ptr, dst_rank)
+                # each chunk's stores retired before its counter add, so the last chunk's flag add publishes them all
+                chunk_count_before_add = atomic_add(
+                    dispatch_chunk_counter_ptr, task_index, fx.Int64(1), scope="agent"
+                )
+                if chunk_count_before_add == fx.Int64(num_chunks - 1):
+                    # the last chunk rearms the counter, so every launch starts from 0 whatever its chunk count
+                    st(dispatch_chunk_counter_ptr, task_index, fx.Int64(0), scope="agent")
+                    bank = dispatch_parity * fx.Int32(num_max_pool_blocks)
+                    atomic_add(dispatch_flag_address, bank + local_expert, fx.Int64(1), scope="sys")
 
 
 def _pool_row_resource(l2_ptr, pool_row, row_bytes, is_present=True):
