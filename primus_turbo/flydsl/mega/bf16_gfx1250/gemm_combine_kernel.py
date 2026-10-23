@@ -71,7 +71,7 @@ from primus_turbo.flydsl.utils.arch import cpol_device_stream
 from primus_turbo.flydsl.utils.buffer_ops import create_buffer_resource_from_addr
 from primus_turbo.flydsl.utils.prims import atomic_add, cast, ld, st, wait_mem_all
 
-# fold rows per combine work item: one _ROW_UNROLL group for each wave of a 4-wave workgroup
+# fold rows per combine work item: two rows for each wave of the default 8-wave workgroup
 _FOLD_CHUNK_ROWS = 16
 # reduce work item: this many workgroup-sized token groups per counter take
 _REDUCE_GROUPS_PER_TAKE = 4
@@ -493,7 +493,7 @@ def gemm_combine_nt_gfx1250(
     tile_m: int = 256,
     tile_n: int = 256,
     tile_k: int = 0,
-    m_warp: int = 2,
+    m_warp: int = 4,
     n_warp: int = 2,
     grad_gate: torch.Tensor | None = None,
     b_nn: bool = False,

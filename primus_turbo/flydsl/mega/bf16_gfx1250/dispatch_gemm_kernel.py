@@ -303,7 +303,7 @@ def dispatch_gemm_nt_gfx1250(
     tile_m: int = 256,
     tile_n: int = 256,
     tile_k: int = 0,
-    m_warp: int = 2,
+    m_warp: int = 4,
     n_warp: int = 2,
     group_m: int = 16,
     b_nn: bool = False,
@@ -324,7 +324,7 @@ def dispatch_only_gfx1250(x: torch.Tensor, handle: DispatchHandle, *, num_dispat
     G = handle.expert_send_dst_rank.numel() // int(symm.num_ranks)
     # only the GEMM's shape is read: the launch holds the comm workgroups alone
     shape_only = x.new_empty(x.shape[1]).as_strided((G, 256, x.shape[1]), (0, 0, 1))
-    _run(x, shape_only, handle, True, False, num_dispatch_cu, 256, 256, 0, 2, 2, 16)
+    _run(x, shape_only, handle, True, False, num_dispatch_cu, 256, 256, 0, 4, 2, 16)
     return pool_rows_of(symm.dispatch_token_buffer, handle)
 
 
