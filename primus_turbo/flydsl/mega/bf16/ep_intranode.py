@@ -33,6 +33,7 @@ from primus_turbo.flydsl.utils.buffer_ops import (
     create_buffer_resource_from_addr,
 )
 from primus_turbo.flydsl.utils.prims import (
+    _readfirstlane_i32,
     atomic_add,
     cast,
     ceildiv,
@@ -360,6 +361,12 @@ def combine_bf16_tile(
             ]
             for recv_token in recv_tokens
         ]
+        if const_expr(is_gfx1250_target()):
+            # a fold row is one wave's, so its pool rows are wave-uniform; left in VGPRs, the sum's
+            # row descriptors put each load behind a readfirstlane waterfall that drains loadcnt
+            pool_rows_per_row = [
+                [_readfirstlane_i32(row) for row in pool_rows] for pool_rows in pool_rows_per_row
+            ]
         # pool_rows[0] is the primary route's row; the sum lands in that route's combine row
         dst_routes = [
             buffer_load(pool_row_to_route_res, pool_rows[0], vec_width=1, dtype=fx.T.i32)
