@@ -150,8 +150,16 @@ template <> struct VecInt<16> {
     using vec_t       = native_int4;
 };
 
+// Trap where the timeout is detected. `abort()` is noreturn, so the compiler moves it out of the
+// spin loops into a block a wave only reaches once every lane has left them. A lane that times out
+// alone (the single-lane polls) then waits there while the rest of the wave keeps looping, and the
+// kernel hangs without printing. See kInlineTrap for the targets that get the inline trap, and
+// https://github.com/AMD-AGI/Primus-Turbo/issues/575.
 __device__ __forceinline__ void trap() {
-    abort();
+    if constexpr (kInlineTrap)
+        asm volatile("s_trap 2" ::: "memory");
+    else
+        abort();
 }
 
 __device__ __forceinline__ void memory_fence() {
@@ -455,9 +463,13 @@ __forceinline__ __device__ void barrier_block(int **barrier_signal_ptrs, int ran
         if (__all_sync(kFullWarpMask, value <= 0))
             break;
 
-        if (clock64() - start_time > NUM_TIMEOUT_CYCLES and thread_id < kNumRanks) {
-            printf("DeepEP timeout check failed: rank = %d, thread = %d, value = %d)\n", rank,
-                   thread_id, value);
+        // The whole wave must take the timeout: lanes leaving the loop on their own would keep
+        // the others spinning on `__all_sync` forever instead of reaching the trap. See
+        // https://github.com/AMD-AGI/Primus-Turbo/issues/575.
+        if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+            if (thread_id < kNumRanks)
+                printf("DeepEP timeout check failed: rank = %d, thread = %d, value = %d)\n",
+                       rank, thread_id, value);
             trap();
         }
     }
