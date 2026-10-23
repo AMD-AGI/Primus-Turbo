@@ -1744,6 +1744,10 @@ __global__ void __launch_bounds__(kBlockThreads, 1)
                     //     printf("rank %d dst_rdma_rank %d iter %d  warp_id %d  val %d\n", rank,
                     //     dst_rdma_rank, iter, warp_id,
                     //     sync_large_warp_counters[lds_dst_rdma_rank]);
+                    // TODO: on gfx1250 clock64() jumps when a wave moves to other hardware and
+                    // fires this timeout early. Use timeout_clock() once internode runs there
+                    // (deep_ep.cpp rejects it now). See
+                    // https://github.com/AMD-AGI/Primus-Turbo/issues/576.
                     auto start_time = clock64();
                     if (lane_id == 0) {
                         volatile int ret =

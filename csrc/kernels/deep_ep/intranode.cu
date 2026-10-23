@@ -287,7 +287,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         for (int64_t token_idx = token_start_idx; token_idx < token_end_idx;) {
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             // NOTES: the head index received by different warps may not be the same
-            auto start_time = clock64();
+            auto start_time = timeout_clock();
             bool has_free_slots =
                 kCheapFence and
                 num_recv_buffer_tokens - (cached_channel_tail_idx - prefetched_channel_head_idx) >=
@@ -301,7 +301,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     break;
 
                 // Rare cases to loop again
-                if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                if (timeout_clock() - start_time > NUM_TIMEOUT_CYCLES) {
                     printf(
                         "DeepEP timeout for dispatch senders, rank %d, responsible_channel = %d\n",
                         rank, responsible_channel);
@@ -420,7 +420,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         // Shared tail indices for different warps
         __shared__ volatile int shared_channel_tail_idx[kNumRanks];
 
-        auto start_time              = clock64();
+        auto start_time              = timeout_clock();
         int  cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
         while (num_tokens_to_recv > 0) {
             // NOTES: unlike the sender, the receiver must ensure that the tail indices hold by
@@ -436,7 +436,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 }
 
                 // Timeout check
-                if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                if (timeout_clock() - start_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP timeout for dispatch receivers, rank %d, responsible_channel = "
                            "%d, tokens remained: %d\n",
                            rank, responsible_channel, num_tokens_to_recv);
