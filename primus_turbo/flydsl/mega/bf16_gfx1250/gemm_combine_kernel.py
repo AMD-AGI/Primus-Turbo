@@ -107,6 +107,7 @@ def _launch_gemm_combine_nt(
     arg_bias_scale: fx.Pointer,
     sym_buffer,
     stream: fx.Stream,
+    grid_size: fx.Int32,
     N: Constexpr[int],
     K: Constexpr[int],
     MAX_TILES: Constexpr[int],
@@ -132,7 +133,6 @@ def _launch_gemm_combine_nt(
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
     if arena_bytes > GFX1250_LDS_BYTES:
         raise ValueError(f"LDS arena {arena_bytes} B exceeds {GFX1250_LDS_BYTES} B")
-    num_gemm_blocks = MAX_TILES * N_BLOCKS_N
     NUM_COMBINE = NUM_LEAD_COMBINE + NUM_TAIL_COMBINE
     num_experts_per_rank = NUM_EXPERTS // NUM_RANKS
 
@@ -221,7 +221,7 @@ def _launch_gemm_combine_nt(
 
         num_tiles_m = rocdl.readfirstlane(T.i32, _i32_table(arg_num_tile_blocks)[fx.Int32(0)])
         combine_start = num_tiles_m * fx.Int32(N_BLOCKS_N * LEAD_GEMM_PERCENT // 100)
-        tail_combine_start = fx.Int32(num_gemm_blocks + NUM_LEAD_COMBINE)
+        tail_combine_start = num_tiles_m * fx.Int32(N_BLOCKS_N) + fx.Int32(NUM_LEAD_COMBINE)
         is_lead_combine = (bid >= combine_start) & (bid < combine_start + fx.Int32(NUM_LEAD_COMBINE))
         is_combine = is_lead_combine | (bid >= tail_combine_start)
         # the combine workgroups also run the reduce, numbered lead first
@@ -463,9 +463,7 @@ def _launch_gemm_combine_nt(
         arg_bias,
         arg_bias_scale,
         sym_buffer,
-    ).launch(
-        grid=(num_gemm_blocks + NUM_COMBINE, 1, 1), block=(block, 1, 1), stream=stream
-    )
+    ).launch(grid=(grid_size, 1, 1), block=(block, 1, 1), stream=stream)
 
 
 _launch_gemm_combine_nt.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": True}
@@ -478,7 +476,7 @@ def _chunk_counter(device: torch.device) -> torch.Tensor:
     """The combine chunk and reduce token counters; the launch's epoch bump rearms them."""
     return torch.zeros(2, dtype=torch.int32, device=device)
 
-_CONSTEXPR0 = 24
+_CONSTEXPR0 = 25
 
 
 def gemm_combine_nt_gfx1250(
@@ -575,6 +573,9 @@ def gemm_combine_nt_gfx1250(
         _as_ptr(bias_scale if has_bias else out),
         symm.get_sym_buffer(),
         torch.cuda.current_stream(),
+        # GEMM tiles of this call's pool (the prologue's num_tile_blocks), then the combine
+        # workgroups: a worst-case grid would queue idle tiles ahead of the tail combine
+        rows // BLOCK_M * ((N + tile_n - 1) // tile_n) + num_lead_combine + num_tail_combine,
         N,
         K,
         int(symm.num_max_pool_tokens) // BLOCK_M,
