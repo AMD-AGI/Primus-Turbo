@@ -162,6 +162,20 @@ __device__ __forceinline__ void trap() {
         abort();
 }
 
+// The 100 MHz wall clock in the ~2 GHz cycles NUM_TIMEOUT_CYCLES is counted in.
+__device__ __forceinline__ long long wall_clock_cycles() {
+    return wall_clock64() * 20;
+}
+
+// Clock for the spin-loop timeouts. On the kTimeoutUsesWallClock targets clock64() cannot time a
+// wait, so use the wall clock there; see https://github.com/AMD-AGI/Primus-Turbo/issues/576.
+__device__ __forceinline__ long long timeout_clock() {
+    if constexpr (kTimeoutUsesWallClock)
+        return wall_clock_cycles();
+    else
+        return clock64();
+}
+
 __device__ __forceinline__ void memory_fence() {
 
     __threadfence_system();
@@ -456,7 +470,7 @@ __forceinline__ __device__ void barrier_block(int **barrier_signal_ptrs, int ran
     PRIMUS_TURBO_DEVICE_CHECK(kNumRanks <= blockDim.x);
 
     // Check timeout
-    auto start_time = clock64();
+    auto start_time = timeout_clock();
     while (true) {
         auto value =
             thread_id < kNumRanks ? ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) : 0;
@@ -466,7 +480,7 @@ __forceinline__ __device__ void barrier_block(int **barrier_signal_ptrs, int ran
         // The whole wave must take the timeout: lanes leaving the loop on their own would keep
         // the others spinning on `__all_sync` forever instead of reaching the trap. See
         // https://github.com/AMD-AGI/Primus-Turbo/issues/575.
-        if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+        if (timeout_clock() - start_time > NUM_TIMEOUT_CYCLES) {
             if (thread_id < kNumRanks)
                 printf("DeepEP timeout check failed: rank = %d, thread = %d, value = %d)\n",
                        rank, thread_id, value);

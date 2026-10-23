@@ -64,6 +64,15 @@ static constexpr bool kInlineTrap = true;
 static constexpr bool kInlineTrap = false;
 #endif
 
+// gfx1250's clock64() jumps when a wave is preempted and resumed on other hardware, so the
+// spin-loop timeouts there read the 100 MHz wall clock instead (timeout_clock() in the deep_ep
+// utils header). See https://github.com/AMD-AGI/Primus-Turbo/issues/576.
+#if defined(__gfx1250__)
+static constexpr bool kTimeoutUsesWallClock = true;
+#else
+static constexpr bool kTimeoutUsesWallClock = false;
+#endif
+
 // Remove Torch restrictions
 #ifdef __CUDA_NO_HALF_CONVERSIONS__
 #undef __CUDA_NO_HALF_CONVERSIONS__
