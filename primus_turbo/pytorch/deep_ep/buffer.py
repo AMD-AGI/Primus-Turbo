@@ -189,10 +189,6 @@ class Buffer:
         self.runtime.destroy()
         self.runtime = None
 
-    def _layout_runtime(self):
-        # the per-RDMA-rank counts of the internode layout come from the C++ kernel only
-        return self.runtime if self.runtime.get_num_rdma_ranks() > 1 else self.intranode_runtime
-
     @staticmethod
     def is_sm90_compiled():
         return deep_ep_cpp.is_sm90_compiled()
@@ -372,7 +368,7 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
         num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event = (
-            self._layout_runtime().get_dispatch_layout(
+            self.intranode_runtime.get_dispatch_layout(
                 topk_idx,
                 num_experts,
                 getattr(previous_event, "event", None),

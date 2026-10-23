@@ -14,13 +14,15 @@
 """Device helpers shared by the FlyDSL DeepEP intranode kernels."""
 
 import flydsl.expr as fx
+from flydsl.expr.primitive import get_dyn_shared
+from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
 from primus_turbo.flydsl.utils.buffer_ops import (
     _unwrap_value,
     buffer_load,
     extract_base_index,
 )
-from primus_turbo.flydsl.utils.prims import cast
+from primus_turbo.flydsl.utils.prims import cast, ld, st
 
 WARP_SIZE = 64
 
@@ -33,9 +35,8 @@ def load_index(res, elem_idx, element_type):
     return value
 
 
-def to_i64(value):
-    """Sign-extend an i32 to i64 (``cast`` follows the value's signedness flag, which a select drops)."""
-    return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64, _unwrap_value(value)), signed=True)
+def load_i32(res, idx):
+    return buffer_load(res, idx, vec_width=1, dtype=fx.T.i32)
 
 
 def tensor_addr(tensor):
@@ -43,27 +44,14 @@ def tensor_addr(tensor):
     return cast(fx.arith.ArithValue(extract_base_index(tensor, address_space=1)), fx.T.i64)
 
 
-_COMPILED_LAUNCHERS = {}
+def lds_base():
+    """Base address of the dynamic LDS allocation."""
+    return _unwrap_value(_fly_ptrtoint(get_dyn_shared()))
 
 
-def run_launcher(launcher, constexprs, *args):
-    """Run a ``@flyc.jit`` launcher through a ``flyc.compile``'d object, one per launcher, ``constexprs``
-    and tensor dtype / rank.
+def ld_lds(base, idx):
+    return ld(base, fx.Int32(idx) if isinstance(idx, int) else idx, scope="workgroup", space=3)
 
-    A compiled call skips ``@flyc.jit``'s per-call signature bind and cache-key build (~40 us -> ~5 us
-    of host time), which is most of a small launch. The kernels address tensors through their base
-    pointers only, so one compiled object serves every shape. ``args`` are all of the launcher's
-    arguments, positionally (stream last); ``constexprs`` must hold every ``fx.Constexpr`` among them.
-    Under CUDA-graph capture this takes the raw launcher, as a compiled object regresses there."""
-    import flydsl.compiler as flyc
-    import torch
 
-    if torch.cuda.is_current_stream_capturing():
-        return launcher(*args)
-    key = (id(launcher), constexprs) + tuple((a.dtype, a.dim()) for a in args if isinstance(a, torch.Tensor))
-    compiled = _COMPILED_LAUNCHERS.get(key)
-    if compiled is None:
-        # the compile runs the launch once
-        _COMPILED_LAUNCHERS[key] = flyc.compile(launcher, *args)
-    else:
-        compiled(*args)
+def st_lds(base, idx, value):
+    st(base, fx.Int32(idx) if isinstance(idx, int) else idx, value, scope="workgroup", space=3)
