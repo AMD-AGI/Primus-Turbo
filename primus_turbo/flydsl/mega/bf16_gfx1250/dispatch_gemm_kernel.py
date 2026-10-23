@@ -106,6 +106,7 @@ def _launch_dispatch_gemm_nt(
     idx_bits: Constexpr[int],
     DISPATCH_ONLY: Constexpr[bool],
     B_NN: Constexpr[bool],
+    EXPERTS_PER_PUBLISH: Constexpr[int],
 ):
     block = m_warp * n_warp * WAVE
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
@@ -185,6 +186,7 @@ def _launch_dispatch_gemm_nt(
                 num_experts_per_rank=num_experts_per_rank,
                 rank=RANK,
                 block_threads=block,
+                experts_per_publish=EXPERTS_PER_PUBLISH,
             )
 
         # ---- GEMM role: straight-line for every workgroup, masked by `live` ----
@@ -392,6 +394,9 @@ def _run(x, w1, handle, dispatch_only, b_nn, num_dispatch_cu, tile_m, tile_n, ti
         idx_bits,
         dispatch_only,
         b_nn,
+        # GEMM tiles start on their expert's flag; with no tile to wait, a comm block publishes
+        # once, sparing a remote store-retire round trip per expert
+        G if dispatch_only else 1,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)
