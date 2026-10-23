@@ -318,9 +318,9 @@ def dispatch_gemm_nt_gfx1250(
 def dispatch_only_gfx1250(
     x: torch.Tensor, handle: DispatchHandle, *, num_dispatch_cu: int | None = None
 ) -> torch.Tensor:
-    """Dispatch ``x`` by ``handle`` and return its rows in pool order (``[pool rows, hidden]``,
-    padding rows hold some received token). ``num_dispatch_cu`` defaults to every CU but the one
-    the launch's waiting workgroup holds: no GEMM shares the launch."""
+    """Dispatch ``x`` by ``handle`` and return the dispatch token buffer it lands in, in receive
+    order (``handle.pool_row_to_recv_token`` maps pool rows to it). ``num_dispatch_cu`` defaults
+    to every CU but the one the launch's waiting workgroup holds: no GEMM shares the launch."""
     if num_dispatch_cu is None:
         num_dispatch_cu = torch.cuda.get_device_properties(x.device).multi_processor_count - 1
     symm = get_symm_buffer_for_mega_moe()
@@ -328,13 +328,7 @@ def dispatch_only_gfx1250(
     # only the GEMM's shape is read: the launch holds the comm workgroups alone
     shape_only = x.new_empty(x.shape[1]).as_strided((G, 256, x.shape[1]), (0, 0, 1))
     _run(x, shape_only, handle, True, False, num_dispatch_cu, 256, 256, 0, 4, 2, 16)
-    return pool_rows_of(symm.dispatch_token_buffer, handle)
-
-
-def pool_rows_of(token_buffer: torch.Tensor, handle: DispatchHandle) -> torch.Tensor:
-    """The dispatch token buffer's rows gathered into pool order; padding rows read the last row."""
-    idx = handle.pool_row_to_recv_token[: handle.pool_row_to_route.numel()].long()
-    return token_buffer[idx.clamp_(max=token_buffer.shape[0] - 1)]
+    return symm.dispatch_token_buffer
 
 
 def _run(x, w1, handle, dispatch_only, b_nn, num_dispatch_cu, tile_m, tile_n, tile_k, m_warp, n_warp, group_m):

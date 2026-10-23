@@ -100,13 +100,16 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import arith as _std_arith
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import rocdl as _rocdl
+from flydsl._mlir.dialects import vector as _vector
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.utils.arith import ArithValue
 
 try:  # optional: only used for a friendlier LDS-overflow message
     from flydsl.runtime.device import get_rocm_arch as _get_arch
@@ -672,12 +675,75 @@ def _check_tdm_cache(value: int, table: dict, what: str) -> None:
         raise ValueError(f"{what}={value} selects SCOPE={scope}, which is not 0..3")
 
 
+# ---------------------------------------------------------------------------
+# Gathered operand (variable-K)
+# ---------------------------------------------------------------------------
+# One operand's reduction rows can come through a row-index table (reduction row -> source
+# row) as TDM gather loads, 16 rows per instruction with 16-bit indices or 8 with 32-bit
+# ones, so a caller whose rows live in another order (Mega MoE's pool order over the
+# dispatch buffer) need not materialize them. Built by hand rather than through
+# tdm_ops.make_tensor_gather_descriptor, which wants the LDS side as a memref and a constant
+# row stride; the field layout is CDNA5 ISA 4.10.3.2, the bits that builder packs.
+
+
+class _GatherDesc:
+    def __init__(self, dgroup0, dgroup1, dgroup2, dgroup3):
+        self.dgroup0, self.dgroup1, self.dgroup2, self.dgroup3 = dgroup0, dgroup1, dgroup2, dgroup3
+
+
+def _readlane_i32(v, lane: int):
+    """Lane ``lane`` of a per-lane i32, as a wave-uniform SGPR value."""
+    op = rocdl.readlane(res=T.i32, src=_raw(v), lane=_raw(fx.Int32(lane)))
+    return ArithValue(op.result if hasattr(op, "result") else op)
+
+
+def _vk_gather_desc(lds_addr, src_addr, rows, idx_bits, row_width, num_src_rows, row_stride, lds_pad):
+    """One gather load of ``rows`` (wave-uniform i32 indices < ``num_src_rows``), each
+    ``row_width`` bf16 elements from ``src_addr`` (i64 bytes) with ``row_stride`` (i32
+    elements), into LDS rows ``row_width * 2 + lds_pad`` bytes apart from ``lds_addr`` (i32 bytes)."""
+    eb = 2
+    i32 = ir.IntegerType.get_signless(32)
+
+    def c32(v):
+        return fx.Int32(v).ir_value()
+
+    interval_dw, amount_dw = row_width * eb // 4, lds_pad // 4
+    assert interval_dw & (interval_dw - 1) == 0, "TDM pad interval must be a power of two dwords"
+    g = _raw(src_addr)
+    lo = _std_arith.TruncIOp(i32, g).result
+    hi = _std_arith.TruncIOp(i32, _std_arith.ShRUIOp(g, _raw(fx.Int64(32))).result).result
+    hi = _std_arith.OrIOp(hi, c32(1 << 31)).result
+    pred = c32(1 | ((1 if idx_bits == 32 else 0) << 30) | (1 << 31))
+    dgroup0 = _vector.from_elements(T.vec(4, T.i32), [pred, _raw(lds_addr), lo, hi])
+    s0 = (eb.bit_length() - 1) << 16 | 1 << 20 | (interval_dw.bit_length() - 2) << 22 | (amount_dw - 1) << 25
+    words = [
+        s0,
+        (row_width & 0xFFFF) << 16,
+        (row_width >> 16) & 0xFFFF | (num_src_rows & 0xFFFF) << 16,
+        (num_src_rows >> 16) & 0xFFFF | row_width << 16,
+        len(rows),
+    ]
+    dgroup1 = _vector.from_elements(
+        T.vec(8, T.i32), [c32(w) for w in words] + [_raw(fx.Int32(row_stride)), c32(0), c32(0)]
+    )
+    if idx_bits == 32:
+        packed = [_raw(r) for r in rows]
+    else:
+        # indices are < num_src_rows < 2^16, so the high half needs no mask
+        packed = [_raw(rows[2 * w] | (rows[2 * w + 1] << fx.Int32(16))) for w in range(len(rows) // 2)]
+    packed += [c32(0)] * (8 - len(packed))
+    dgroup2 = _vector.from_elements(T.vec(4, T.i32), packed[:4])
+    dgroup3 = _vector.from_elements(T.vec(4, T.i32), packed[4:])
+    return _GatherDesc(dgroup0, dgroup1, dgroup2, dgroup3)
+
+
 @flyc.jit
 def _launch_grouped_bf16_variable_k(
     arg_c: fx.Pointer,
     arg_a: fx.Pointer,
     arg_b: fx.Pointer,
     arg_etab: fx.Pointer,
+    arg_ridx: fx.Pointer,
     stream: fx.Stream,
     i32_n: fx.Int32,
     i32_k: fx.Int32,
@@ -758,6 +824,10 @@ def _launch_grouped_bf16_variable_k(
     # and the correctness gate refuses to judge it. `const_expr` and defaulted to 0,
     # so the shipped trace is unchanged.
     wpath_only: Constexpr[int] = 0,
+    # 1 / 2 = A / B is gathered: its reduction row m is row `arg_ridx[m]` (i32) of a source
+    # matrix of `gather_rows` rows with the same row stride. 0 = both dense (`arg_ridx` unread).
+    gather: Constexpr[int] = 0,
+    gather_rows: Constexpr[int] = 0,
 ):
     """``out[g][n, k] = sum_{m in g} A[m, n] * B[m, k]``.
 
@@ -841,6 +911,21 @@ def _launch_grouped_bf16_variable_k(
     # garbage -- hence an assertion in code rather than a note. A tile that fails it
     # emits no prefetch, which is correct and merely no faster.
     PREFETCH_OK = bool(persist) and C_STORE_B <= PITCH
+    if gather not in (0, 1, 2):
+        raise ValueError(f"gather must be 0 (none), 1 (A) or 2 (B), got {gather}")
+    IDX_BITS = 16 if gather_rows < 0xFFFF else 32
+    GATHER_ROWS_PER_OP = 16 if IDX_BITS == 16 else 8
+    GATHER_ROWS_PER_WAVE = tile_k // num_waves
+    if gather:
+        # Every wave issues the same number of gather ops per k-tile, and with two buffers each
+        # fence drains them all, so the per-wave TDM budget (TDM_PW) never has to count them.
+        if num_buffers != 2 or persist:
+            raise ValueError("gather needs num_buffers == 2 and persist == 0")
+        if GATHER_ROWS_PER_WAVE % GATHER_ROWS_PER_OP or GATHER_ROWS_PER_WAVE > WAVE:
+            raise ValueError(
+                f"gather splits tile_k={tile_k} rows over {num_waves} waves into whole ops of "
+                f"{GATHER_ROWS_PER_OP}, at most one row per lane"
+            )
     if ARENA_B > _GFX1250_LDS_BYTES:
         raise ValueError(f"LDS arena {ARENA_B} B exceeds the gfx1250 budget {_GFX1250_LDS_BYTES} B")
     _check_smem(ARENA_B, str(_get_arch()))
@@ -851,6 +936,7 @@ def _launch_grouped_bf16_variable_k(
         arg_a: fx.Pointer,
         arg_b: fx.Pointer,
         arg_etab: fx.Pointer,
+        arg_ridx: fx.Pointer,
         i32_n: fx.Int32,
         i32_k: fx.Int32,
     ):
@@ -995,6 +1081,39 @@ def _launch_grouped_bf16_variable_k(
             gB_base = fx.recast_iter(fx.Int8, arg_b)  # B [M_total, OUT_N]
             gC_base = fx.recast_iter(fx.PointerType.get(elem_cls.ir_type, arg_c.address_space), arg_c)
 
+            if const_expr(gather):
+                ridx = _i32_table(arg_ridx)
+                has_rows = m_len > fx.Int32(0)
+                last_row = has_rows.select(m_len - fx.Int32(1), fx.Int32(0))
+                # an empty expert's m_start can be the table's end
+                first_row = has_rows.select(m_start, fx.Int32(0))
+                gather_row = wave * fx.Int32(GATHER_ROWS_PER_WAVE) + lane % fx.Int32(GATHER_ROWS_PER_WAVE)
+
+                def _gather_src_rows(kt):
+                    # rows past the expert re-read its last one, which is finite, against the
+                    # dense operand's zero-filled rows
+                    r = fx.Int32(kt) * fx.Int32(tile_k) + gather_row
+                    r = (r > last_row).select(last_row, r)
+                    return Vec.from_elements([ridx[first_row + r]], fx.Int32)
+
+                # this lane's source row for the next k-tile issued, loaded one k-tile ahead
+                gather_cell = fx.make_rmem_tensor(1, fx.Int32)
+                gather_cell.store(_gather_src_rows(0))
+
+                def _issue_gather(stage, src_base, col0, lds_row, width, row_stride, kt):
+                    src_rows = Vec(gather_cell.load())[0]
+                    gather_cell.store(_gather_src_rows(fx.Int32(kt) + fx.Int32(1)))
+                    lds0 = fx.Int32(_bidx(stage)) + wave * fx.Int32(GATHER_ROWS_PER_WAVE * lds_row)
+                    src = fx.Int64(fx.ptrtoint(src_base)) + fx.Int64(col0) * fx.Int64(EB)
+                    per_op = GATHER_ROWS_PER_OP
+                    for q in range_constexpr(GATHER_ROWS_PER_WAVE // per_op):
+                        rows = [_readlane_i32(src_rows, q * per_op + i) for i in range_constexpr(per_op)]
+                        lds_addr = lds0 + fx.Int32(q * per_op * lds_row)
+                        desc = _vk_gather_desc(
+                            lds_addr, src, rows, IDX_BITS, width, gather_rows, row_stride, LDS_PAD
+                        )
+                        tdm_ops.tensor_load_gather(desc)
+
             def issue(s, kt, dec=None):
                 pa = _buf_ptr(s)
                 # `dec` lets the caller name a DIFFERENT tile's decode than the one this
@@ -1006,26 +1125,33 @@ def _launch_grouped_bf16_variable_k(
                 rem = ml - fx.Int32(kt) * fx.Int32(tile_k)
                 rem = (rem < fx.Int32(0)).select(fx.Int32(0), rem)
                 m_off64 = fx.Int64(m_off)
-                if wave == 0 % num_waves:
-                    gt = _gv(
-                        gA_base,
-                        m_off64 * ldn_b + fx.Int64(bne) * fx.Int64(EB),
-                        (tile_k, tile_m * EB),
-                        (ldn_b, 1),
-                    )
-                    # Full width: the backed-off window is entirely valid columns, so
-                    # there is nothing left for a dim-1 extent to clamp.
-                    atom = _tdm(gt, rem, fx.Int32(tile_m * EB), ldn_b, tile_m * EB)
-                    fx.copy(atom, gt, _lv(pa, (tile_k, tile_m * EB), (LDS_A_ROW, 1)))
-                if wave == 1 % num_waves:
-                    gt = _gv(
-                        gB_base,
-                        m_off64 * ldk_b + fx.Int64(bke) * fx.Int64(EB),
-                        (tile_k, tile_n * EB),
-                        (ldk_b, 1),
-                    )
-                    atom = _tdm(gt, rem, fx.Int32(tile_n * EB), ldk_b, tile_n * EB)
-                    fx.copy(atom, gt, _lv(fx.add_offset(pa, STAGE_A), (tile_k, tile_n * EB), (LDS_B_ROW, 1)))
+                if const_expr(gather == 1):
+                    _issue_gather(pa, gA_base, bne, LDS_A_ROW, tile_m, i32_n, kt)
+                else:
+                    if wave == 0 % num_waves:
+                        gt = _gv(
+                            gA_base,
+                            m_off64 * ldn_b + fx.Int64(bne) * fx.Int64(EB),
+                            (tile_k, tile_m * EB),
+                            (ldn_b, 1),
+                        )
+                        # Full width: the backed-off window is entirely valid columns, so
+                        # there is nothing left for a dim-1 extent to clamp.
+                        atom = _tdm(gt, rem, fx.Int32(tile_m * EB), ldn_b, tile_m * EB)
+                        fx.copy(atom, gt, _lv(pa, (tile_k, tile_m * EB), (LDS_A_ROW, 1)))
+                if const_expr(gather == 2):
+                    _issue_gather(fx.add_offset(pa, STAGE_A), gB_base, bke, LDS_B_ROW, tile_n, i32_k, kt)
+                else:
+                    if wave == 1 % num_waves:
+                        gt = _gv(
+                            gB_base,
+                            m_off64 * ldk_b + fx.Int64(bke) * fx.Int64(EB),
+                            (tile_k, tile_n * EB),
+                            (ldk_b, 1),
+                        )
+                        atom = _tdm(gt, rem, fx.Int32(tile_n * EB), ldk_b, tile_n * EB)
+                        lds_b = _lv(fx.add_offset(pa, STAGE_A), (tile_k, tile_n * EB), (LDS_B_ROW, 1))
+                        fx.copy(atom, gt, lds_b)
 
             wmb = wave_m * warp_tile_m
             wnb = wave_n * warp_tile_n
@@ -1277,6 +1403,10 @@ def _launch_grouped_bf16_variable_k(
 
             # ---- epilogue: out[g] tile, both output axes clamped ------------------
             accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
+            if const_expr(gather):
+                # an empty expert has no row to re-read: its gathered LDS rows can be stale
+                zero_acc = Vec.filled(8, 0.0, fx.Float32)
+                accs = [Vec((m_len > fx.Int32(0)).select(acc, zero_acc)) for acc in accs]
             _fence(outstanding=0)
             if PREFETCH_OK:
                 # ---- fetch the NEXT tile's first stage, here -------------------------
@@ -1369,7 +1499,7 @@ def _launch_grouped_bf16_variable_k(
         else:
             _one_output_tile(pid)
 
-    kernel_grouped_variable_k(arg_c, arg_a, arg_b, arg_etab, i32_n, i32_k).launch(
+    kernel_grouped_variable_k(arg_c, arg_a, arg_b, arg_etab, arg_ridx, i32_n, i32_k).launch(
         grid=(PERSIST, 1, 1), block=(block, 1, 1), stream=stream
     )
 
@@ -1383,10 +1513,10 @@ _launch_grouped_bf16_variable_k.compile_hints["llvm_options"] = {
     "amdgpu-expert-scheduling-mode": True,
 }
 
-# Slots 0-6 (four pointers, the stream, i32_n, i32_k) are the only runtime
+# Slots 0-7 (five pointers, the stream, i32_n, i32_k) are the only runtime
 # arguments; the constexpr tail starts here. See `_nt_launch` for why the tail is
 # the right cache key.
-_VK_CONSTEXPR0 = 7
+_VK_CONSTEXPR0 = 8
 
 _VK_COMPILED: dict = {}
 
@@ -1540,6 +1670,10 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     # MEASUREMENT ONLY -- see the launcher's `wpath_only`. 1 emits the output write
     # path alone and RETURNS GARBAGE. Never set it on a correctness or delivery run.
     wpath_only: int = 0,
+    # [M_total] int32: reduction row m of `a` (or `b`) is row `a_index[m]` of the tensor
+    # passed, which may then hold any number of rows. At most one of the two.
+    a_index: torch.Tensor | None = None,
+    b_index: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Variable-K grouped wgrad: ``out[g] = a[rows_g].T @ b[rows_g]``.
 
@@ -1573,7 +1707,17 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     assert a.is_contiguous() and b.is_contiguous(), "operands must be contiguous"
     M_total, OUT_M = a.shape
     M2, OUT_N = b.shape
-    assert M2 == M_total, f"token counts differ: a M={M_total} vs b M={M2}"
+    assert a_index is None or b_index is None, "only one operand can be gathered"
+    gather, gather_rows, row_index = 0, 0, None
+    if a_index is not None:
+        gather, gather_rows, row_index, M_total = 1, a.shape[0], a_index, M2
+    elif b_index is not None:
+        gather, gather_rows, row_index = 2, b.shape[0], b_index
+    else:
+        assert M2 == M_total, f"token counts differ: a M={M_total} vs b M={M2}"
+    if row_index is not None:
+        assert row_index.dtype == torch.int32 and row_index.is_contiguous(), "row index: contiguous int32"
+        assert row_index.numel() >= M_total, f"row index covers {row_index.numel()} of {M_total} rows"
     G = group_k_offsets.numel() - 1
     _require_gfx1250(a.device)
     if trans_c:
@@ -1663,6 +1807,7 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
             _as_ptr(a),
             _as_ptr(b),
             _as_ptr(etab),
+            _as_ptr(etab if row_index is None else row_index),
             torch.cuda.current_stream(),
             OUT_M,
             OUT_N,
@@ -1691,6 +1836,8 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
             wave_grid,
             persist,
             wpath_only,
+            gather,
+            gather_rows,
         )
     )
     # The caller asked for [G, OUT_M, OUT_N]; the padding is this function's business.
