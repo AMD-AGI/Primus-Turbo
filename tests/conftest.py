@@ -40,6 +40,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_shapes.py",
     # FlyDSL attention at the DeepSeek-V3 MLA head dims (primus_turbo/flydsl/attention/gfx1250_mla).
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla.py",
+    # Dense FlyDSL attention (primus_turbo/flydsl/attention/gfx1250), bf16 head_dim 128.
+    "tests/pytorch/ops/test_attention_flydsl_gfx1250.py",
 )
 
 
