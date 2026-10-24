@@ -1429,7 +1429,7 @@ def test_attention_fake_kernel_strides(qkv_format):
 
 
 # ============================================================================
-# DeepSeek-V4 single-latent sparse-MLA attention (flydsl, gfx950/MI355X).
+# DeepSeek-V4 single-latent sparse-MLA attention (flydsl, gfx950/MI355X and gfx1250/MI455X).
 # ============================================================================
 
 # Fixed dims: kv_lora_rank (single latent, K == V) + rope pad; SWA local window.
@@ -1487,7 +1487,8 @@ def _build_sparse_mla(cr, num_heads, seqlen, pool, topk_pool, seed=0):
 
 
 @pytest.mark.skipif(
-    not (torch.cuda.is_available() and is_gfx950()), reason="sparse-MLA (flydsl) is gfx950-only"
+    not (torch.cuda.is_available() and (is_gfx950() or is_gfx1250())),
+    reason="sparse-MLA (flydsl) is gfx950 / gfx1250 only",
 )
 @pytest.mark.parametrize("seqlen", [512, 1024, 2048])
 @pytest.mark.parametrize("variant", ["flash", "pro"])
