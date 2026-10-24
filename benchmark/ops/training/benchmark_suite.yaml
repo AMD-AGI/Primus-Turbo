@@ -48,6 +48,12 @@ tasks:
     args: [--deterministic]
     output: attention_deterministic_benchmark.csv
 
+  # FlyDSL rows need gfx950 / gfx1250; Triton is the reference on every GPU.
+  - label: sparse_mla
+    group: attention
+    script: bench_sparse_mla_turbo.py
+    output: sparse_mla_benchmark.csv
+
   # ── GEMM BF16 ────────────────────────────────────────────
   - label: gemm_bf16_torch
     group: gemm_bf16
