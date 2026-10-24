@@ -16,6 +16,9 @@ is part of that identity (the code object is assembled from the saved ``.s``, wh
 from the integrated path), so its temporaries go to a scratch directory. A kernel with an ``asm_patch``
 (k_dkdv96ds) is assembled from that ``.s`` with the patch applied, and only from the ``.s`` whose
 sha256 is ``asm_input_sha256``; ``tools/regen_asm_patch.py`` regenerates the patch (see README.md).
+A kernel marked ``optional`` (k_delta, which replaces the FlyDSL k_delta) may be missing or foreign without taking
+the others down: ``unavailable_reason`` covers the required kernels only, and the backward runs the FlyDSL kernel
+in its place (``kernel_unavailable_reason``).
 
     python primus_turbo/hipkittens/gfx1250_mla_bwd/hsaco.py [--check] [--force] [--strict] [--cxx PATH]
 
@@ -34,7 +37,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 HIP_DIR = PACKAGE_DIR / "hip"
@@ -43,9 +46,9 @@ MANIFEST_PATH = PACKAGE_DIR / "manifest.json"
 CXX_ENV = "PRIMUS_TURBO_HK_CXX"
 
 _MANIFEST = None
-# binary dir -> None (every code object present with the manifest's sha256) or the reason it is not.
+# (binary dir, kernel) -> None (the code object is present with the manifest's sha256) or the reason it is not.
 # A plain dict, not functools.lru_cache: the gate runs inside torch.compile'd regions.
-_REASONS: Dict[str, Optional[str]] = {}
+_REASONS: Dict[Tuple[str, str], Optional[str]] = {}
 
 
 def load_manifest() -> dict:
@@ -63,27 +66,37 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def unavailable_reason(bin_dir: Path = BIN_DIR) -> Optional[str]:
-    """None when every code object is in ``bin_dir`` with the manifest's sha256, else why not.
-    Reads the files once per directory and process."""
-    key = str(bin_dir)
+def kernel_unavailable_reason(name: str, bin_dir: Path = BIN_DIR) -> Optional[str]:
+    """None when kernel ``name``'s code object is in ``bin_dir`` with the manifest's sha256, else why not.
+    Reads the file once per directory, kernel and process."""
+    key = (str(bin_dir), name)
     if key in _REASONS:
         return _REASONS[key]
+    k = load_manifest()["kernels"][name]
+    path = binary_path(name, bin_dir)
     reason = None
-    for name, k in load_manifest()["kernels"].items():
-        path = binary_path(name, bin_dir)
-        if not path.is_file():
-            reason = f"{path.name} is not built (build Primus-Turbo with GPU_ARCHS=gfx1250, or run hsaco.py)"
-            break
+    if not path.is_file():
+        reason = f"{path.name} is not built (build Primus-Turbo with GPU_ARCHS=gfx1250, or run hsaco.py)"
+    else:
         got = _sha256(path)
         if got != k["hsaco_sha256"]:
             reason = (
                 f"{path.name} sha256 {got[:16]} != {k['hsaco_sha256'][:16]}: built by another toolchain or "
                 f"from edited sources (validated with: {load_manifest()['toolchain']})"
             )
-            break
     _REASONS[key] = reason
     return reason
+
+
+def unavailable_reason(bin_dir: Path = BIN_DIR) -> Optional[str]:
+    """None when every required (not ``optional``) code object is in ``bin_dir`` with the manifest's sha256,
+    else why not."""
+    for name, k in load_manifest()["kernels"].items():
+        if not k.get("optional"):
+            reason = kernel_unavailable_reason(name, bin_dir)
+            if reason is not None:
+                return reason
+    return None
 
 
 def find_compiler(cxx: Optional[str] = None) -> Optional[str]:
@@ -188,7 +201,8 @@ def build(cxx: Optional[str] = None, bin_dir: Path = BIN_DIR, force: bool = Fals
 
     A code object already present with the manifest's sha256 is kept (unless ``force``). One that
     comes out with another sha256 is deleted, so it can never be loaded; the backward then falls
-    back to FlyDSL. No compiler, or one that cannot compile them: nothing is built (the same fallback)."""
+    back to FlyDSL (for an optional kernel: that kernel alone). No compiler, or one that cannot
+    compile them: nothing is built (the same fallback)."""
     bin_dir = Path(bin_dir)
     kernels = load_manifest()["kernels"]
     todo = [
@@ -198,7 +212,8 @@ def build(cxx: Optional[str] = None, bin_dir: Path = BIN_DIR, force: bool = Fals
         or not binary_path(n, bin_dir).is_file()
         or _sha256(binary_path(n, bin_dir)) != k["hsaco_sha256"]
     ]
-    _REASONS.pop(str(bin_dir), None)
+    for key in [key for key in _REASONS if key[0] == str(bin_dir)]:
+        del _REASONS[key]
     if not todo:
         log(f"[gfx1250_mla_bwd] code objects up to date in {bin_dir}")
         return True
@@ -240,6 +255,10 @@ def main(argv=None) -> int:
     if a.check:
         reason = unavailable_reason(Path(a.bin_dir))
         print(reason or "ok")
+        for name, k in load_manifest()["kernels"].items():
+            note = kernel_unavailable_reason(name, Path(a.bin_dir)) if k.get("optional") else None
+            if note is not None:
+                print(f"optional {name}: {note} (the FlyDSL kernel runs in its place)")
         return 1 if reason else 0
     ok = build(a.cxx, Path(a.bin_dir), a.force)
     return 0 if ok or not a.strict else 1

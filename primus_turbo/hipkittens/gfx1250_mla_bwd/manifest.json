@@ -263,6 +263,72 @@
           "size": 4
         }
       ]
+    },
+    "k_delta": {
+      "src": "src/k_delta.hip",
+      "extra_flags": [],
+      "optional": true,
+      "hsaco_sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f",
+      "block": 256,
+      "kernarg_size": 60,
+      "lds": 256,
+      "vgpr": 48,
+      "args": [
+        {
+          "name": "DO",
+          "kind": "ptr",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "O",
+          "kind": "ptr",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "DEL",
+          "kind": "ptr",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "LSE",
+          "kind": "ptr",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "NL",
+          "kind": "ptr",
+          "offset": 32,
+          "size": 8
+        },
+        {
+          "name": "ND",
+          "kind": "ptr",
+          "offset": 40,
+          "size": 8
+        },
+        {
+          "name": "scale",
+          "kind": "f32",
+          "offset": 48,
+          "size": 4
+        },
+        {
+          "name": "S",
+          "kind": "i32",
+          "offset": 52,
+          "size": 4
+        },
+        {
+          "name": "H",
+          "kind": "i32",
+          "offset": 56,
+          "size": 4
+        }
+      ]
     }
   }
 }

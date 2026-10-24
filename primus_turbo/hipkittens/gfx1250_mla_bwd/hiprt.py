@@ -258,12 +258,15 @@ def pack_args(args_meta, values):
 
 
 def load_kernels(bin_dir=hsaco.BIN_DIR):
-    """{name: Kernel} for every kernel of the manifest; raises HipError if a code object is missing or
-    is not the one the manifest pins. Reads files only (no GPU work until the first launch)."""
+    """{name: Kernel} for every required kernel of the manifest and every ``optional`` one whose code object is
+    the pinned one; raises HipError if a required code object is missing or is not the one the manifest pins.
+    Reads files only (no GPU work until the first launch)."""
     reason = hsaco.unavailable_reason(bin_dir)
     if reason is not None:
         raise HipError(f"gfx1250 MLA backward code objects unavailable: {reason}")
     out = {}
     for name, meta in hsaco.load_manifest()["kernels"].items():
+        if meta.get("optional") and hsaco.kernel_unavailable_reason(name, bin_dir) is not None:
+            continue
         out[name] = Kernel(Module(hsaco.binary_path(name, bin_dir), meta["hsaco_sha256"]), name, meta)
     return out

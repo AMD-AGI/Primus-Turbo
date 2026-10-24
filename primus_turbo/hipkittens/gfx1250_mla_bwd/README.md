@@ -1,6 +1,6 @@
 # gfx1250 MLA backward on HIP kernels
 
-The DeepSeek-V3 MLA attention backward on gfx1250 (MI455X) with two HIP kernels: head dims qk 192 /
+The DeepSeek-V3 MLA attention backward on gfx1250 (MI455X) with three HIP kernels: head dims qk 192 /
 v 128, bf16, MHA, bottom-right causal. The forward and the tensor layouts are the FlyDSL MLA ones
 (`primus_turbo/flydsl/attention/gfx1250_mla`); only the backward kernels change.
 
@@ -14,7 +14,7 @@ Each backward call makes three launches on the caller's current stream:
 
 | launch | kernel | work |
 |---|---|---|
-| `delta` | FlyDSL `k_delta` | delta, and the row constants NL = -LOG2E·lse, ND = -scale·delta |
+| `delta` | HIP `k_delta` | delta, and the row constants NL = -LOG2E·lse, ND = -scale·delta: 64-query workgroups of 16 rows × 16 lanes, bitwise equal to the FlyDSL `k_delta` (below) |
 | `dkdv` | HIP `k_dkdv96ds` | dK, dV over 96-row kv blocks (two 48-row waves on a 3-stage Q/dO TDM ring), then 64-row tail blocks; stores every bf16 dS^T tile it feeds the dK WMMA into the dS scratch |
 | `dq` | HIP `k_dqds_c` | dQ = dS·K from that scratch: 384-query workgroups (4 waves sharing one K ring) plus one merged 256-query head tile |
 
@@ -33,9 +33,20 @@ b2 s4096 h128. `PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES` (bytes, e.g. `2.2e9`,
 2. the HIP kernels' shape rules (`limits.shape_unsupported_reason`): seqlen_q % 384 in {0, 256},
    seqlen_kv % 96 in {0, 32, 64}, and batch·heads·max(seqlen) <= 512·4096 (the extent the index
    proofs replay);
-3. the code objects: built, and byte-identical to the ones `manifest.json` pins.
+3. the required code objects (`k_dkdv96ds`, `k_dqds_c`): built, and byte-identical to the ones
+   `manifest.json` pins.
 
-A call that fails any rule runs the FlyDSL backward, with one warning per reason.
+A call that fails any rule runs the FlyDSL backward, with one warning per reason. `k_delta` is the
+manifest's one `optional` kernel: when its code object is missing or not the pinned one, the `delta`
+launch runs the FlyDSL `k_delta` instead (one warning) and the HIP `k_dkdv96ds` / `k_dqds_c` still
+run; the results are the same bits.
+
+**k_delta.** Same arithmetic per row as the FlyDSL `k_delta`: per lane two chains over its 8
+elements (even, odd), their sum, then a 1/2/4/8 xor butterfly over the row's 16 lanes. It is built
+with fp contraction off (`#pragma clang fp contract(off)`): FlyDSL multiplies and adds separately,
+and a fused multiply-add rounds differently once a bf16 × bf16 product underflows into the fp32
+denormal range. fp32 denormals are preserved in both. The tests cover denormal inputs, underflowing
+products, signed zeros and an lse whose NL overflows.
 
 **Results.** Every output element is written by exactly one workgroup (no atomics), so dQ / dK /
 dV are deterministic. They are also bitwise equal to the FlyDSL backward's (same dS rounding, same
@@ -45,7 +56,7 @@ accumulation order), and independent of the head-group launch targets and of hea
 
 | path | content |
 |---|---|
-| `hip/src/k_dkdv96ds.hip`, `hip/src/k_dqds_c.hip` | the two kernels |
+| `hip/src/k_delta.hip`, `hip/src/k_dkdv96ds.hip`, `hip/src/k_dqds_c.hip` | the three kernels |
 | `hip/include/` | their headers; `cdna5/` vendors a subset of HipKittens (MIT, commit in the manifest) |
 | `hip/asm/k_dkdv96ds.s.patch` | assembly patch of k_dkdv96ds (below) |
 | `manifest.json` | compiler flags, toolchain, per-kernel sha256 pins, launch metadata (block, LDS, VGPRs, kernel arguments) |
@@ -72,8 +83,9 @@ The compiler is `--cxx`, `$PRIMUS_TURBO_HK_CXX`, `amdclang++` on `PATH`, or
 - **Fail-closed.** `manifest.json` pins the sha256 of every code object as validated with its
   `toolchain` (AMD clang 24.0.0git, ROCm/llvm-project 86230635). A build that produces other bytes
   is deleted. A missing or foreign code object is never loaded (`hsaco.unavailable_reason`,
-  checked again by `hiprt` before loading), so the backward runs on FlyDSL. A failed build never
-  fails the install.
+  checked again by `hiprt` before loading), so the backward runs on FlyDSL; for the optional
+  `k_delta` only that launch does (`hsaco.kernel_unavailable_reason`). A failed build never fails
+  the install.
 - **Assembly patch.** `k_dkdv96ds` also has `asm_patch` and `asm_input_sha256`. After compiling,
   `hsaco.py` checks the sha256 of the compiler's own `.s` (`-save-temps=obj`). It then applies
   `hip/asm/k_dkdv96ds.s.patch` (exact context, no fuzz) and re-runs the driver's own assembler and
@@ -124,9 +136,10 @@ register numbers and `s_wait_alu` lines change; the tool's docstring has the rul
    ```
 
    The HIP numeric tests skip when the code objects are unavailable, so check first that
-   `hsaco.py --check` prints `ok`. They cover the fp32 reference, bitwise equality with the FlyDSL
-   backward, determinism, a NaN-filled scratch at a production-like shape, and head chunking. The
-   static checks are not a proof; run the GPU gates after every patch regeneration.
+   `hsaco.py --check` prints `ok` and no `optional k_delta` line. They cover the fp32 reference,
+   bitwise equality with the FlyDSL backward and of `k_delta` with the FlyDSL `k_delta` (denormal
+   inputs included), determinism, a NaN-filled scratch at a production-like shape, and head
+   chunking. The static checks are not a proof; run the GPU gates after every patch regeneration.
 
 ## Performance
 

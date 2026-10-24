@@ -673,6 +673,39 @@ def test_hk_code_object_checks(tmp_path):
     assert "sha256" in hsaco.unavailable_reason(bad)
 
 
+def test_hk_optional_code_object(monkeypatch, tmp_path):
+    """k_delta is optional: with its code object missing or foreign the backward stays available
+    (unavailable_reason None) and hiprt loads the other kernels; a foreign required one is a reason.
+    A stand-in manifest pins placeholder bytes (no compiler, no GPU)."""
+    hsaco, hiprt = _hk_package("hsaco"), _hk_package("hiprt")
+    man = hsaco.load_manifest()
+    blobs = {n: f"code object {n}".encode() for n in man["kernels"]}
+    pins = {n: dict(k, hsaco_sha256=hashlib.sha256(blobs[n]).hexdigest()) for n, k in man["kernels"].items()}
+    monkeypatch.setattr(hsaco, "_MANIFEST", dict(man, kernels=pins))
+    monkeypatch.setattr(hsaco, "_REASONS", {})
+
+    def bin_dir(name, k_delta=None, k_dqds_c=None):
+        d = tmp_path / name
+        d.mkdir()
+        for n, data in blobs.items():
+            data = {"k_delta": k_delta, "k_dqds_c": k_dqds_c}.get(n) or data
+            if data != b"missing":
+                (d / f"{n}.hsaco").write_bytes(data)
+        return d
+
+    full = bin_dir("full")
+    assert hsaco.unavailable_reason(full) is None and hsaco.kernel_unavailable_reason("k_delta", full) is None
+    assert set(hiprt.load_kernels(full)) == set(blobs)
+    for name, data, why in (("foreign", b"other bytes", "sha256"), ("missing", b"missing", "not built")):
+        d = bin_dir(name, k_delta=data)
+        assert hsaco.unavailable_reason(d) is None and why in hsaco.kernel_unavailable_reason("k_delta", d)
+        assert set(hiprt.load_kernels(d)) == {"k_dkdv96ds", "k_dqds_c"}
+    d = bin_dir("required_foreign", k_dqds_c=b"other bytes")
+    assert "k_dqds_c.hsaco sha256" in hsaco.unavailable_reason(d)
+    with pytest.raises(hiprt.HipError, match="unavailable"):
+        hiprt.load_kernels(d)
+
+
 def test_hk_manifest():
     """Every kernel: its source is shipped, its arguments tile its kernarg segment in order, and the
     flags are the device-only gfx1250 build (no KITTENS_CDNA4)."""
@@ -684,10 +717,11 @@ def test_hk_manifest():
         and "--cuda-device-only" in m["flags"]
     )
     assert not any("KITTENS_CDNA4" in f for f in m["flags"])
-    assert set(m["kernels"]) == {"k_dkdv96ds", "k_dqds_c"}
+    assert set(m["kernels"]) == {"k_dkdv96ds", "k_dqds_c", "k_delta"}
+    assert [n for n, k in m["kernels"].items() if k.get("optional")] == ["k_delta"]
     for name, k in m["kernels"].items():
         assert (hsaco.HIP_DIR / k["src"]).is_file(), name
-        assert len(k["hsaco_sha256"]) == 64 and k["block"] in (64, 128)
+        assert len(k["hsaco_sha256"]) == 64 and k["block"] in (64, 128, 256)
         last = k["args"][-1]
         assert last["offset"] + last["size"] <= k["kernarg_size"], name
         values = [1 if a["kind"] == "ptr" else 0 for a in k["args"]]
@@ -787,6 +821,34 @@ def test_hk_plan_on_meta_tensors():
         impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None, head_group=48)
 
 
+def test_hk_plan_delta_launch(monkeypatch):
+    """The "delta" launch at DeepSeek-V3's shape: the HIP k_delta (64-query workgroups, the manifest's
+    argument list) or the FlyDSL k_delta (32-query workgroups); by default the HIP one exactly when its
+    code object is the pinned one. Both write the plan's delta / nl / nd (nl / nd feed dkdv)."""
+    impl, hsaco = _hk_package("impl"), _hk_package("hsaco")
+    args = hsaco.load_manifest()["kernels"]["k_delta"]["args"]
+    b, s, h = 2, 4096, 128
+    q, k, v = _meta(b, s, s, h)
+    o = torch.empty(b, s, h, D_V, dtype=torch.bfloat16, device="meta")
+    lse = torch.empty(b, h, s, dtype=torch.float32, device="meta")
+    hip = impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None, hk_delta=True)
+    name, fn, (grid, block, values) = hip["launches"][0]
+    assert (name, fn, grid, block) == ("delta", "k_delta", (64, 256, 1), 256) and hip["grids"][
+        "delta"
+    ] == grid
+    assert [a["name"] for a in args] == ["DO", "O", "DEL", "LSE", "NL", "ND", "scale", "S", "H"]
+    assert len(values) == len(args) and values[6:] == (MLA_SCALE, s, h)
+    assert (values[0], values[1], values[3]) == (o, o, lse)
+    assert (values[2], values[4], values[5]) == (hip["delta"], hip["nl"], hip["nd"])
+    assert hip["launches"][1][2][2][4:6] == (hip["nl"], hip["nd"])  # what dkdv reads
+    fly = impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None, hk_delta=False)
+    assert fly["launches"][0][1] is impl._k.launch_delta and fly["grids"]["delta"] == (128, 256, 1)
+    assert fly["launches"][0][2][4:6] == (fly["nl"], fly["nd"])
+    for reason, want in ((None, "k_delta"), ("k_delta.hsaco is not built", impl._k.launch_delta)):
+        monkeypatch.setattr(hsaco, "kernel_unavailable_reason", lambda name, *a, r=reason: r)
+        assert impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None)["launches"][0][1] == want
+
+
 @pytest.mark.parametrize(("s", "uses_hk"), [(256, True), (128, False)], ids=["hk", "falls_back"])
 def test_hk_routes_and_falls_back(monkeypatch, s, uses_hk):
     """PRIMUS_TURBO_MLA_BWD_IMPL=hk replaces only the backward kernels (same kernel-layout tensors);
@@ -883,6 +945,117 @@ def test_hk_production_shape_matches_reference():
         mp.setattr(impl, "POISON", True)
         got = _run(q, k, v, dout)
     _check(got, _reference_by_heads(q, k, v, dout, MLA_SCALE))
+
+
+needs_hk_delta = pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx1250())
+    or _hk_code_objects_reason() is not None
+    or _hk_package("hsaco").kernel_unavailable_reason("k_delta") is not None,
+    reason="needs a gfx1250 (MI455X) GPU and the HIP MLA backward code objects, k_delta included",
+)
+
+
+def _delta_inputs(b, s, h, special, seed=0):
+    """Kernel-layout dO / O [b, s, h, 128] bf16 and lse [b, h, s] fp32 on the card. special: every
+    (row, head) of dO and of O scaled by 2^-k, k in [0, 80), so the bf16 x bf16 products range from
+    normal to below the fp32 denormal range (where a fused multiply-add rounds differently from
+    FlyDSL's multiply then add); 5% bf16 denormals, 2% signed zeros; lse with 5% fp32 denormals,
+    1% signed zeros and 1% +-3e38 (NL overflows to +-inf)."""
+    g = torch.Generator().manual_seed(seed)
+    do, o = (torch.randn(b, s, h, D_V, generator=g) for _ in range(2))
+    lse = torch.randn(b, h, s, generator=g) * 4 + 6
+    if special:
+        do, o = (t * torch.exp2(-torch.randint(0, 80, (b, s, h, 1), generator=g).float()) for t in (do, o))
+    do, o = do.to(torch.bfloat16), o.to(torch.bfloat16)
+    if special:
+
+        def sign(shape, dtype, bit):
+            return torch.randint(0, 2, shape, generator=g, dtype=dtype) * torch.tensor(bit, dtype=dtype)
+
+        for t in (do, o):
+            bits = t.view(torch.int16)
+            den = torch.randint(1, 128, bits.shape, generator=g, dtype=torch.int16) | sign(
+                bits.shape, torch.int16, -32768
+            )
+            pick = torch.rand(bits.shape, generator=g)
+            bits[pick < 0.05] = den[pick < 0.05]
+            zero = (pick >= 0.05) & (pick < 0.07)
+            bits[zero] = sign(bits.shape, torch.int16, -32768)[zero]
+        bits = lse.view(torch.int32)
+        den = torch.randint(1, 1 << 23, bits.shape, generator=g, dtype=torch.int32) | sign(
+            bits.shape, torch.int32, -(2**31)
+        )
+        pick = torch.rand(bits.shape, generator=g)
+        bits[pick < 0.05] = den[pick < 0.05]
+        zero = (pick >= 0.05) & (pick < 0.06)
+        bits[zero] = sign(bits.shape, torch.int32, -(2**31))[zero]
+        huge = pick >= 0.99
+        lse[huge] = 3e38 * (1 - 2 * torch.randint(0, 2, lse.shape, generator=g).float())[huge]
+    return do.cuda(), o.cuda(), lse.cuda()
+
+
+def _delta_launches(do, o, lse, scale=MLA_SCALE):
+    """{"hk": ..., "flydsl": ...}: (delta, NL, ND) of the plan's "delta" launch on the HIP and on the
+    FlyDSL k_delta, the same inputs, outputs NaN-filled first."""
+    impl = _hk_package("impl")
+    b, s, h, _ = do.shape
+    q = torch.empty(b, s, h, D_QK, dtype=torch.bfloat16, device="cuda")
+    v = torch.empty(b, s, h, D_V, dtype=torch.bfloat16, device="cuda")
+    stream = torch.cuda.current_stream()
+    got = {}
+    for key, hk in (("hk", True), ("flydsl", False)):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(impl, "POISON", True)
+            plan = impl._plan(do, q, q, v, o, lse, scale, True, stream, hk_delta=hk)
+        _, fn, args = plan["launches"][0]
+        if hk:
+            grid, block, values = args
+            impl.kernels()[fn].call(grid, block, values, stream)
+        else:
+            impl._fly._launch(fn, args)
+        got[key] = (plan["delta"], plan["nl"], plan["nd"])
+    torch.cuda.synchronize()
+    return got
+
+
+@needs_hk_delta
+@pytest.mark.parametrize(
+    ("dims", "special"),
+    [
+        ((1, 256, 2), False),
+        ((2, 256, 4), False),
+        ((1, 640, 4), False),
+        ((1, 4096, 16), False),
+        ((2, 256, 4), True),
+        ((1, 640, 4), True),
+    ],
+    ids=["toy", "b2", "sq640", "sq4096", "b2_denormals", "sq640_denormals"],
+)
+def test_hk_delta_matches_flydsl(dims, special):
+    """The HIP k_delta writes delta, NL and ND bitwise equal to the FlyDSL k_delta, also for denormal
+    inputs, products that underflow fp32, signed zeros and an lse whose NL overflows."""
+    got = _delta_launches(*_delta_inputs(*dims, special))
+    for name, x, y in zip(("delta", "NL", "ND"), got["hk"], got["flydsl"]):
+        assert not torch.isnan(x).any(), name
+        assert torch.equal(x.view(torch.int32), y.view(torch.int32)), name
+    if special:
+        delta = got["hk"][0]
+        tiny = (delta != 0) & (delta.abs() < torch.finfo(torch.float32).tiny)
+        assert tiny.any(), "no denormal delta: the inputs do not reach the fp32 denormal range"
+
+
+@needs_hk_delta
+def test_hk_delta_falls_back_to_flydsl(monkeypatch):
+    """Without the k_delta code object hk_attn_bwd runs the FlyDSL k_delta, and the gradients are
+    bitwise the same."""
+    impl = _hk_package("impl")
+    q, k, v, dout = (t.cuda() for t in _inputs(1, 256, 256, 4, layout="bshd"))
+    out, lse = mla_impl._forward_op(q, k, v, MLA_SCALE, True)
+    hip = impl.hk_attn_bwd(dout, q, k, v, out, lse, MLA_SCALE, True)
+    monkeypatch.setattr(impl, "_KERNELS", {n: x for n, x in impl.kernels().items() if n != "k_delta"})
+    fly = impl.hk_attn_bwd(dout, q, k, v, out, lse, MLA_SCALE, True)
+    for a, b in zip(hip, fly):
+        assert torch.isfinite(a).all() and torch.equal(a, b)
 
 
 def test_hk_plan_head_chunks_under_a_scratch_budget():

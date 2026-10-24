@@ -7,8 +7,10 @@
 """hk_attn_bwd: the gfx1250 MLA backward with HIP dK/dV and dQ kernels.
 
 Three launches, all on the caller's current stream, in this order:
-  "delta"  FlyDSL k_delta of ``primus_turbo.flydsl.attention.gfx1250_mla`` (delta, and the per-row
-           constants NL = -LOG2E*lse, ND = -scale*delta the dK/dV kernel reads);
+  "delta"  HIP k_delta: delta, and the per-row constants NL = -LOG2E*lse, ND = -scale*delta the dK/dV
+           kernel reads (64-query workgroups, bitwise equal to the FlyDSL k_delta of
+           ``primus_turbo.flydsl.attention.gfx1250_mla``, which runs in its place when bin/k_delta.hsaco
+           is missing or not the pinned one: k_delta is the manifest's one ``optional`` kernel);
   "dkdv"   HIP k_dkdv96ds: dK and dV (96-row kv blocks of two 48-row waves on one 3-stage Q/dO TDM ring,
            then 64-row tail blocks), and every bf16 dS^T tile it feeds the dK WMMA (softmax scale
            included) stored into this call's scratch in dslayout.h v1;
@@ -43,7 +45,7 @@ import torch
 from primus_turbo.common.logger import logger
 from primus_turbo.flydsl.attention.gfx1250_mla import bwd as _fly
 
-from . import hiprt, limits
+from . import hiprt, hsaco, limits
 
 _k = _fly._k  # the FlyDSL backward's kernels module: k_delta and the head-dim constants
 
@@ -54,6 +56,8 @@ HEAD_GROUP_Q = 32  # k_dqds_c
 PROVEN_KV_TARGETS = (0, 8, 16, 24, 32, 64, 96, 128, 256)
 PROVEN_Q_TARGETS = (0, 8, 16, 32, 64, 128, 256)
 DS_MODE = 1  # k_dkdv96ds: store dS^T with num_records = the wave's true extent (0 drops every store)
+DELTA_ROWS = 64  # k_delta queries per workgroup (grid (Sq / DELTA_ROWS, B*Hq), block DELTA_BLOCK)
+DELTA_BLOCK = 256
 DS_GUARD_B = 65536  # bytes before and after the layout in the scratch
 MAX_SCRATCH_BYTES_ENV = "PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES"
 
@@ -169,6 +173,13 @@ def _alloc(shape, device, dtype):
     return torch.empty(shape, device=device, dtype=dtype)
 
 
+def _hk_delta_reason(sq):
+    """None when the HIP k_delta can take seqlen_q ``sq`` and its code object is the pinned one, else why not."""
+    if sq % DELTA_ROWS:
+        return f"seqlen_q {sq} is not a multiple of {DELTA_ROWS}"
+    return hsaco.kernel_unavailable_reason("k_delta")
+
+
 def _ds_scratch(nbytes, device):
     t = torch.empty(((2 * DS_GUARD_B + nbytes) // 2,), dtype=torch.bfloat16, device=device)
     if POISON and t.device.type != "meta":
@@ -176,11 +187,15 @@ def _ds_scratch(nbytes, device):
     return t, t[DS_GUARD_B // 2 : DS_GUARD_B // 2 + nbytes // 2]
 
 
-def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, head_group=None, max_scratch_bytes=None):
+def _plan(
+    do, q, k, v, o, lse, softmax_scale, causal, stream, head_group=None, max_scratch_bytes=None, hk_delta=None
+):
     """Every launch hk_attn_bwd makes for these inputs, in issue order, plus what it allocates.
 
-    launches: [(name, launcher, args)]: "delta" (FlyDSL launcher, its arguments), then "dkdv" / "dq"
-    (HIP kernel name, (grid, block, kernel argument values)) once, or once per head chunk. head_group:
+    launches: [(name, launcher, args)]: "delta", then "dkdv" / "dq" once, or once per head chunk; a HIP
+    launch is (kernel name, (grid, block, kernel argument values)), a FlyDSL one (launcher, its arguments).
+    hk_delta: "delta" on the HIP k_delta (True) or the FlyDSL k_delta (False); None: HIP when
+    _hk_delta_reason(sq) is None. head_group:
     target for both kernels (None: HEAD_GROUP_KV / HEAD_GROUP_Q); one the index proofs do not replay
     is refused (ValueError). max_scratch_bytes: dS scratch budget (None: MAX_SCRATCH_BYTES); over it
     the plan is head-chunked (module docstring), and ScratchBudgetError when no head group fits.
@@ -240,8 +255,32 @@ def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, head_group=None, m
         ds_bytes = limits.ds_layout_bytes(1, sq, skv, hc, c)
     ds_full, ds = _ds_scratch(ds_bytes, dev)
     q_off, nhead, ntile = limits.dq_split(sq)
-    delta_args = (do, o, delta, lse, nl, nd, scale, sq, hq, b * sq * hq, sq // _k.ROWS_DELTA, b * hq, stream)
-    launches = [("delta", _k.launch_delta, delta_args)]
+    if hk_delta is None:
+        hk_delta = _hk_delta_reason(sq) is None
+    elif hk_delta and sq % DELTA_ROWS:
+        raise ValueError(f"hk_attn_bwd: the HIP k_delta needs seqlen_q % {DELTA_ROWS} == 0, got {sq}")
+    if hk_delta:
+        delta_grid = (sq // DELTA_ROWS, b * hq, 1)
+        delta_values = (do, o, delta, lse, nl, nd, scale, sq, hq)
+        launches = [("delta", "k_delta", (delta_grid, DELTA_BLOCK, delta_values))]
+    else:
+        delta_grid = (sq // _k.ROWS_DELTA, b * hq, 1)
+        delta_args = (
+            do,
+            o,
+            delta,
+            lse,
+            nl,
+            nd,
+            scale,
+            sq,
+            hq,
+            b * sq * hq,
+            sq // _k.ROWS_DELTA,
+            b * hq,
+            stream,
+        )
+        launches = [("delta", _k.launch_delta, delta_args)]
     for (q_, k_, v_, do_, nl_, nd_, dv_, dk_, dq_), b_, gz_kv, gz_q in parts:
         dkdv_values = (
             q_,
@@ -273,8 +312,10 @@ def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, head_group=None, m
         "launches": launches,
         "outputs": (dq, dk, dv),
         "delta": delta,
+        "nl": nl,
+        "nd": nd,
         "grids": {
-            "delta": (sq // _k.ROWS_DELTA, b * hq, 1),
+            "delta": delta_grid,
             "dkdv": launches[1][2][0],
             "dq": launches[2][2][0],
         },
@@ -300,13 +341,19 @@ def hk_attn_bwd(
     _check_device_once(q.device)
     lse = lse.contiguous().float()
     stream = torch.cuda.current_stream()
+    table = kernels()
+    hk_delta = "k_delta" in table
+    if not hk_delta:
+        reason = hsaco.kernel_unavailable_reason("k_delta") or "k_delta is not loaded"
+        logger.warning(f"gfx1250 HIP MLA backward: {reason}: delta runs on the FlyDSL k_delta", once=True)
     try:
-        plan = _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, head_group, max_scratch_bytes)
+        plan = _plan(
+            do, q, k, v, o, lse, softmax_scale, causal, stream, head_group, max_scratch_bytes, hk_delta
+        )
     except ScratchBudgetError as e:
         logger.warning(f"{e}: this backward runs on FlyDSL", once=True)
         scale = 1.0 / math.sqrt(_k.D_QK) if softmax_scale is None else float(softmax_scale)
         return _fly.flash_attn_mla_bwd(do, q, k, v, o, lse, scale, causal)
-    table = kernels()
     for _, fn, args in plan["launches"]:
         if isinstance(fn, str):
             grid, block, values = args
