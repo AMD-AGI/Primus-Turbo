@@ -148,9 +148,9 @@ MI455X, b2 s4096 h128, SBHD, causal, bf16:
 | | time (ms) |
 |---|---|
 | forward (FlyDSL) | 0.742 |
-| backward, `hk` | 2.231 |
-| per kernel: k_delta / k_dkdv96ds / k_dqds_c | 0.057 / 1.700 / 0.484 |
+| backward, `hk` | 2.220 |
+| per kernel: k_delta / k_dkdv96ds / k_dqds_c | 0.054 / 1.685 / 0.483 |
 | backward, FlyDSL | 3.196 |
-| autograd fwd + bwd, `hk` / FlyDSL | 3.234 / 4.254 |
+| autograd fwd + bwd, `hk` / FlyDSL | 3.228 / 4.254 |
 
-The `hk` backward is 1.43x faster than the FlyDSL one, and forward + backward is 1.32x faster.
+The `hk` backward is 1.44x faster than the FlyDSL one, and forward + backward is 1.32x faster.

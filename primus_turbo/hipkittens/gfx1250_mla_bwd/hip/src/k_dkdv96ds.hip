@@ -267,7 +267,7 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
         float tt = __builtin_fmaf(s[si.value], c1, nl);
         if constexpr (decltype(do_mask)::value) {
           // causal, bottom-right: query q attends kv <= q + cshift; kv = this lane's row
-          tt = ((kvl > qb + si + cshift) & (causal != 0)) ? K1_NEG : tt;
+          tt = (kvl > qb + si + cshift) ? K1_NEG : tt;  // no causal test: n_mask = G * k3_nmaskp() is 0 unless causal
         }
         const float pf = exp2_raw(tt);
         ph[kh][hh * 8 + si] = to_bf16(pf);
