@@ -222,6 +222,16 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
       });
     });
 
+    // XCNT drain before the export's scalar math, 64-row tail body only (once per tail workgroup): the allocator gives
+    // that math r_k's SGPRs while the last K fragment loads may still be in address translation, and LLVM emits no
+    // s_wait_xcnt there (SIInsertWaitcnts at 862306352beb lets a younger VMEM whose vdst overlaps an older one's
+    // vaddr stand in for the XCNT wait, which also clears the older loads' SGPR sources). No builtin exists for
+    // s_wait_xcnt; the fence keeps the math below the wait.
+    if constexpr (!K3) {
+      asm volatile("s_wait_xcnt 0x0" ::: "memory");
+      sched_barrier<0>();
+    }
+
     // ---- dS^T export (k3ds_idx.h over k1ds_idx.h, dslayout.h v1): per-wave descriptor, row constants, voffset --
     const int kt0 = k3ds_kt0(kv0);
     const int64_t ds_base = k3ds_base(bat, Hq, hkv, G, kt0, Sq, Skv, causal);

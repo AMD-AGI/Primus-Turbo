@@ -30,9 +30,9 @@
         "-mllvm",
         "-greedy-regclass-priority-trumps-globalness"
       ],
-      "hsaco_sha256": "89068310a36c2d9a22da5ac9990abe3f12477f1bb76649c84a6c5afb02f6f40c",
+      "hsaco_sha256": "dda0e6e0f13ba5de19d1cdea5d32b1141193ee4ffe814225fd4bac6b34260650",
       "asm_patch": "asm/k_dkdv96ds.s.patch",
-      "asm_input_sha256": "85219fe5c261e670b4b1ffb2b4f66f302cab5548c93dbb140aaa76d9339a8777",
+      "asm_input_sha256": "47100516166f93af962518f4e6d36ec258d14d565ce809263b225a451f610683",
       "block": 64,
       "kernarg_size": 120,
       "lds": 64512,
