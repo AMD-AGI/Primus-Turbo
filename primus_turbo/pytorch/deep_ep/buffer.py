@@ -298,7 +298,11 @@ class Buffer:
         config_map = {
             # See get_dispatch_config: keep the existing setting on wave64 parts.
             2: Config(Buffer.num_sms, 64 if is_gfx1250() else 10, 256, 6, 128),
-            4: Config(Buffer.num_sms, 64 if is_gfx1250() else 9, 256, 6, 128),
+            # gfx1250, 4 ranks: chunk 128 is fastest from 128 SMs up, but at 32-64 SMs it was
+            # 16-30% slower than 64 on 32768-token batches, where 96 was never slower than 64.
+            4: Config(
+                Buffer.num_sms, (128 if Buffer.num_sms >= 128 else 96) if is_gfx1250() else 9, 256, 6, 128
+            ),
             8: Config(Buffer.num_sms, 4, 256, 6, 128),
             16: Config(Buffer.num_sms, 4, 288, 12, 128),
             24: Config(Buffer.num_sms, 1, 288, 8, 128),
