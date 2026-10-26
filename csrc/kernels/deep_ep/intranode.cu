@@ -21,6 +21,9 @@ namespace intranode {
 #ifndef PRIMUS_TURBO_DEEPEP_COPY_UNROLL
 #define PRIMUS_TURBO_DEEPEP_COPY_UNROLL 8
 #endif
+#ifndef PRIMUS_TURBO_DEEPEP_REDUCE_UNROLL
+#define PRIMUS_TURBO_DEEPEP_REDUCE_UNROLL 4
+#endif
 
 template <int kNumRanks>
 __global__ void
@@ -920,48 +923,68 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     }
                 }
 
-// Reduce data
-#pragma unroll 4
-                for (int i = lane_id; i < hidden_int4; i += kWarpSize) {
-                    // Read bias
-                    // TODO: make it as a template
-                    int4  bias_0_value_int4     = bias_0_int4 != nullptr
-                                                      ? __ldg(bias_0_int4 + token_idx * hidden_int4 + i)
-                                                      : make_int4(0, 0, 0, 0);
-                    int4  bias_1_value_int4     = bias_1_int4 != nullptr
-                                                      ? __ldg(bias_1_int4 + token_idx * hidden_int4 + i)
-                                                      : make_int4(0, 0, 0, 0);
-                    float values[kDtypePerInt4] = {0};
-                    auto  bias_0_values = reinterpret_cast<const dtype_t *>(&bias_0_value_int4);
-                    auto  bias_1_values = reinterpret_cast<const dtype_t *>(&bias_1_value_int4);
+// Reduce data, `kReduceUnroll` slots per lane at a time: all of a rank's loads for them are
+// issued before any accumulate or store, since the compiler cannot move a load across the
+// (possibly aliasing) output store itself
+                constexpr int kReduceUnroll = PRIMUS_TURBO_DEEPEP_REDUCE_UNROLL;
+                for (int i0 = lane_id; i0 < hidden_int4; i0 += kWarpSize * kReduceUnroll) {
+                    float values[kReduceUnroll][kDtypePerInt4];
 #pragma unroll
-                    for (int j = 0; j < kDtypePerInt4; ++j)
-                        values[j] = static_cast<float>(bias_0_values[j]) +
-                                    static_cast<float>(bias_1_values[j]);
-#pragma unroll 2
+                    for (int u = 0; u < kReduceUnroll; ++u) {
+                        const int i = i0 + u * kWarpSize;
+                        // TODO: make it as a template
+                        int4 bias_0_value_int4 = make_int4(0, 0, 0, 0);
+                        int4 bias_1_value_int4 = make_int4(0, 0, 0, 0);
+                        if (i < hidden_int4 and bias_0_int4 != nullptr)
+                            bias_0_value_int4 = __ldg(bias_0_int4 + token_idx * hidden_int4 + i);
+                        if (i < hidden_int4 and bias_1_int4 != nullptr)
+                            bias_1_value_int4 = __ldg(bias_1_int4 + token_idx * hidden_int4 + i);
+                        auto bias_0_values = reinterpret_cast<const dtype_t *>(&bias_0_value_int4);
+                        auto bias_1_values = reinterpret_cast<const dtype_t *>(&bias_1_value_int4);
+#pragma unroll
+                        for (int k = 0; k < kDtypePerInt4; ++k)
+                            values[u][k] = static_cast<float>(bias_0_values[k]) +
+                                           static_cast<float>(bias_1_values[k]);
+                    }
                     for (int j = 0; j < num_topk_ranks; ++j) {
                         auto recv_row = channel_x_buffers[topk_ranks[j]].buffer() +
                                         slot_indices[j] * hidden_int4;
-                        int4 recv_value;
-                        if constexpr (kCheapFence)
-                            recv_value = channel_x_payload.ld(recv_row + i);
-                        else
-                            recv_value = __ldg(recv_row + i);
-                        const dtype_t *recv_dtypes = reinterpret_cast<const dtype_t *>(&recv_value);
-
+                        int4 recv_values[kReduceUnroll];
 #pragma unroll
-                        for (int k = 0; k < kDtypePerInt4; ++k)
-                            values[k] += static_cast<float>(recv_dtypes[k]);
+                        for (int u = 0; u < kReduceUnroll; ++u) {
+                            const int i = i0 + u * kWarpSize;
+                            if (i < hidden_int4) {
+                                if constexpr (kCheapFence)
+                                    recv_values[u] = channel_x_payload.ld(recv_row + i);
+                                else
+                                    recv_values[u] = __ldg(recv_row + i);
+                            } else {
+                                recv_values[u] = make_int4(0, 0, 0, 0);
+                            }
+                        }
+#pragma unroll
+                        for (int u = 0; u < kReduceUnroll; ++u) {
+                            const dtype_t *recv_dtypes =
+                                reinterpret_cast<const dtype_t *>(&recv_values[u]);
+#pragma unroll
+                            for (int k = 0; k < kDtypePerInt4; ++k)
+                                values[u][k] += static_cast<float>(recv_dtypes[k]);
+                        }
                     }
 
                     // Cast back to `dtype_t`
-                    int4 out_int4;
-                    auto out_dtypes = reinterpret_cast<dtype_t *>(&out_int4);
 #pragma unroll
-                    for (int j = 0; j < kDtypePerInt4; ++j)
-                        out_dtypes[j] = static_cast<dtype_t>(values[j]);
-
-                    recv_int4[token_idx * hidden_int4 + i] = out_int4;
+                    for (int u = 0; u < kReduceUnroll; ++u) {
+                        const int i = i0 + u * kWarpSize;
+                        if (i < hidden_int4) {
+                            int4 out_int4;
+                            auto out_dtypes = reinterpret_cast<dtype_t *>(&out_int4);
+#pragma unroll
+                            for (int k = 0; k < kDtypePerInt4; ++k)
+                                out_dtypes[k] = static_cast<dtype_t>(values[u][k]);
+                            recv_int4[token_idx * hidden_int4 + i] = out_int4;
+                        }
+                    }
                 }
 
                 // Reduce `topk_weights`
