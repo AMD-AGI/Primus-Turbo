@@ -758,6 +758,27 @@ def _launch_grouped_bf16_variable_k(
     # and the correctness gate refuses to judge it. `const_expr` and defaulted to 0,
     # so the shipped trace is unchanged.
     wpath_only: Constexpr[int] = 0,
+    # 1 = issue a k-tile's prefetch at the top of its compute body (``frag_pipeline=1``
+    # only), so the ``sched_barrier`` pair around the issue no longer splits the body in
+    # two scheduling regions. Same knob as on the NT/NN launcher.
+    issue_first: Constexpr[int] = 0,
+    # Run the epilogue as an ``epi_chunk``-deep software pipeline over the output's row
+    # axis: stage chunk i into LDS, hand its TDM store to the engine, then convert and
+    # stage chunk i+1 while that store is in flight, and wait only once at the end. Same
+    # bytes, same LDS layout, same accumulation order, bit-identical output.
+    #   1 = shipped (one conversion pass, one store, one wait).
+    #   n = n chunks; n must divide ``wmma_m_rep``, so a chunk is a whole number of
+    #       16-row WMMA row groups per wave and a chunk boundary never cuts a fragment.
+    # A chunk's rows are ``m_warp`` disjoint bands (one per ``wave_m``), so it issues
+    # ``m_warp`` stores; that keeps all ``num_waves`` waves converting in every chunk,
+    # which is what makes the conversion time per chunk shrink rather than just move.
+    #
+    # ⚠️ ADDRESSING: a band's dim-0 extent is ``rows_left - band_start``, which goes
+    # NEGATIVE on a short tail tile or a dead tile, and the descriptor field is unsigned
+    # -- a negative value is the FULL window, not a clamp. Every band extent below is
+    # therefore clamped at zero, and extent 0 is the same complete no-op the shipped
+    # single store already relies on for a dead over-allocated tile.
+    epi_chunk: Constexpr[int] = 1,
 ):
     """``out[g][n, k] = sum_{m in g} A[m, n] * B[m, k]``.
 
@@ -790,6 +811,13 @@ def _launch_grouped_bf16_variable_k(
                 f"persist={persist} leaves {TILES_PER_WG} tile(s) per workgroup; with one "
                 f"tile 'the accumulator was not cleared between tiles' is unobservable"
             )
+    if epi_chunk < 1 or wmma_m_rep % epi_chunk:
+        raise ValueError(f"epi_chunk must divide wmma_m_rep={wmma_m_rep}, got {epi_chunk}")
+    if epi_chunk > 1 and persist:
+        # The chunked epilogue ends on `tensor_wait(0)` like the shipped one, but the
+        # seam barrier and the phase-2b prefetch below it were reasoned about for a
+        # single store.
+        raise ValueError("epi_chunk > 1 is not implemented on the persistent path")
     NB1 = num_buffers - 1
 
     if tile_k % WMMA_K or warp_tile_m % WMMA_M or warp_tile_n % WMMA_N:
@@ -1144,11 +1172,15 @@ def _launch_grouped_bf16_variable_k(
                             ]
                             rocdl.s_wait_dscnt(0)
                 elif const_expr(frag_pipeline):
+                    if const_expr(issue_first and prefetch_kt is not None):
+                        rocdl.sched_barrier(0)
+                        issue(_slot(prefetch_kt), prefetch_kt)
+                        rocdl.sched_barrier(0)
                     cur = _load_ks(addrs, 0)
                     for ks in range_constexpr(K_WS):
                         nxt = _load_ks(addrs, ks + 1) if const_expr(ks + 1 < K_WS) else None
                         rocdl.s_wait_dscnt(KS_DS if const_expr(nxt is not None) else 0)
-                        if const_expr(ks == 0 and prefetch_kt is not None):
+                        if const_expr(ks == 0 and prefetch_kt is not None and not issue_first):
                             rocdl.sched_barrier(0)
                             issue(_slot(prefetch_kt), prefetch_kt)
                             rocdl.sched_barrier(0)
@@ -1316,27 +1348,69 @@ def _launch_grouped_bf16_variable_k(
                 bne2 = (bn2 > (i32_n - fx.Int32(tile_m))).select(i32_n - fx.Int32(tile_m), bn2)
                 bke2 = (bk2 > (i32_k - fx.Int32(tile_n))).select(i32_k - fx.Int32(tile_n), bk2)
                 issue(_slot(0), 0, dec=(ms2, ml2, bne2, bke2))
-            for wm in range_constexpr(wmma_m_rep):
-                row_rel = wmb + wm * WMMA_M + lane16
-                for wn in range_constexpr(wmma_n_rep):
-                    col_rel = wnb + wn * WMMA_N + kgrp * 8
-                    h = accs[wm * wmma_n_rep + wn].to(elem_cls)
-                    fx.ptr_store(h.bitcast(fx.Int8), base_ptr + (row_rel * tile_n + col_rel) * EB)
-            gpu.barrier()
             c_off = fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS) + fx.Int64(blk_n) * ldc64 + fx.Int64(blk_k)
-            gtC = _gv(gC_base, c_off, (tile_m, tile_n), (tile_n, 1))
-            # Store side: dim-0 bounds addressing and dim-1 bounds a store's addressing
-            # too (sentinel-verified), so the backed-off rows written above are dropped
-            # here rather than reaching memory.
-            atomC = fx.rocdl.make_tdm_atom(
-                gtC,
-                [n_valid, k_valid],
-                strides=[ldc64, None],
-                num_warps=num_waves,
-                cache_modifier=tdm_store_cache,
-                early_timeout=False,
-            )
-            fx.copy(atomC, _lv(fx.recast_iter(elem_cls, base_ptr), (tile_m, tile_n), (tile_n, 1)), gtC)
+
+            def _epi_stage(wm_lo, wm_hi):
+                """Convert and stage the accumulator rows of WMMA row groups [lo, hi)."""
+                for wm in range_constexpr(wm_hi - wm_lo):
+                    wmg = wm_lo + wm
+                    row_rel = wmb + wmg * WMMA_M + lane16
+                    for wn in range_constexpr(wmma_n_rep):
+                        col_rel = wnb + wn * WMMA_N + kgrp * 8
+                        h = accs[wmg * wmma_n_rep + wn].to(elem_cls)
+                        fx.ptr_store(h.bitcast(fx.Int8), base_ptr + (row_rel * tile_n + col_rel) * EB)
+
+            def _epi_store(r0, rows):
+                """One TDM store of output rows [r0, r0+rows) of this tile. No wait."""
+                if const_expr(r0):
+                    ext0 = n_valid - fx.Int32(r0)
+                    ext0 = (ext0 > fx.Int32(0)).select(ext0, fx.Int32(0))
+                    off = c_off + fx.Int64(r0) * ldc64
+                else:
+                    ext0, off = n_valid, c_off
+                gts = _gv(gC_base, off, (rows, tile_n), (tile_n, 1))
+                atom = fx.rocdl.make_tdm_atom(
+                    gts,
+                    [ext0, k_valid],
+                    strides=[ldc64, None],
+                    num_warps=num_waves,
+                    cache_modifier=tdm_store_cache,
+                    early_timeout=False,
+                )
+                src = (
+                    fx.recast_iter(elem_cls, base_ptr)
+                    if const_expr(r0 == 0)
+                    else fx.recast_iter(elem_cls, fx.add_offset(base_ptr, r0 * tile_n * EB))
+                )
+                fx.copy(atom, _lv(src, (rows, tile_n), (tile_n, 1)), gts)
+
+            def _epi_whole():
+                gtC = _gv(gC_base, c_off, (tile_m, tile_n), (tile_n, 1))
+                # Store side: dim-0 bounds addressing and dim-1 bounds a store's addressing
+                # too (sentinel-verified), so the backed-off rows written above are dropped
+                # here rather than reaching memory.
+                atomC = fx.rocdl.make_tdm_atom(
+                    gtC,
+                    [n_valid, k_valid],
+                    strides=[ldc64, None],
+                    num_warps=num_waves,
+                    cache_modifier=tdm_store_cache,
+                    early_timeout=False,
+                )
+                fx.copy(atomC, _lv(fx.recast_iter(elem_cls, base_ptr), (tile_m, tile_n), (tile_n, 1)), gtC)
+
+            if const_expr(epi_chunk > 1):
+                EPI_REP = wmma_m_rep // epi_chunk
+                EPI_ROWS = EPI_REP * WMMA_M
+                for ch in range_constexpr(epi_chunk):
+                    _epi_stage(ch * EPI_REP, (ch + 1) * EPI_REP)
+                    gpu.barrier()
+                    for i in range_constexpr(m_warp):
+                        _epi_store(i * warp_tile_m + ch * EPI_ROWS, EPI_ROWS)
+            else:
+                _epi_stage(0, wmma_m_rep)
+                gpu.barrier()
+                _epi_whole()
             tdm_ops.tensor_wait(0)
             # ⛔⛔ THE SEAM BARRIER. Without it the persistent path is NOT REENTRANT,
             # and the cost of that is a device reset:
@@ -1403,6 +1477,124 @@ def _vk_launch(args: tuple):
     return fn(*args)
 
 
+# ---------------------------------------------------------------------------
+# Shape-keyed pipeline knobs
+# ---------------------------------------------------------------------------
+# The knobs below are not general rules. Each is an exact-key pick, fitted and
+# measured on one operator at one batch size, and every one of them measures
+# neutral or negative on at least one neighbouring delivery cell -- so widening a
+# key by a cell means re-measuring it. All of them are bit-identical to the
+# default path: they move scheduling, dealing or store granularity, never an
+# address, an extent or an accumulation order.
+#
+# A key is always ``(N, K, avg_m)`` in the consuming entry's own convention:
+#   ``"nt"``  the forward weight's ``(N, K)``
+#   ``"nn"``  ``(N_out, K_red)``
+#   ``"vk"``  ``(OUT_M, OUT_N)``, i.e. again the forward weight's ``(N, K)``
+# ``avg_m`` is part of every key because all of these are occupancy- and
+# fill-regime effects: the same pick at avg_m 512 reads flat to negative.
+#
+# Every entry point resolves these only when the caller left ``BLOCK_M`` and
+# ``BLOCK_N`` at their defaults. Naming a tile means naming a pipeline, so an
+# explicit tile silently drops the knobs rather than applying a pick fitted to a
+# geometry the caller just replaced.
+
+# Three-deep ring on the halved wgrad k-tile; see `_pick_variable_k_config`.
+_VK_DEEP_RING_KEYS = frozenset({(4096, 7168, 2048), (7168, 2048, 2048)})
+
+_ISSUE_FIRST_KEYS = {
+    "nt": frozenset({(4096, 7168, 2048), (7168, 2048, 2048)}),
+    "nn": frozenset({(7168, 4096, 2048), (2048, 7168, 2048)}),
+}
+
+_EPI_CHUNK_KEYS = {
+    "nt": {(7168, 2048, 2048): 4},
+    "nn": {},
+    "vk": {(4096, 7168, 2048): 4, (7168, 2048, 2048): 4},
+}
+
+_TDM_NN_KEYS = frozenset({(7168, 4096, 2048), (2048, 7168, 2048)})
+
+_TDM_ASSIGN_NN_KEYS = frozenset({(7168, 4096, 2048)})
+
+_WMMA_B2B_KEYS = {
+    "nn": frozenset({(2048, 7168, 2048)}),
+    "vk": frozenset({(4096, 7168, 2048), (7168, 2048, 2048)}),
+}
+
+
+def _pick_issue_first(kind: str, N: int, K: int, avg_m: int) -> int:
+    """Prefetch at the top of the k-tile body instead of after sub-step 0's LDS reads.
+
+    The default body issues the prefetch between two ``sched_barrier``s once sub-step
+    0's reads have landed, which cuts the body into two scheduling regions; at the top
+    the reads and matrix ops of every sub-step are one region, and the register
+    pressure falls on every key here.
+
+    ⛔ Not on the variable-K path. Its body needs the opposite order -- hoisting the
+    LDS reads is what keeps its register count down -- and forcing this there costs
+    8-11%.
+    """
+    return int((N, K, avg_m) in _ISSUE_FIRST_KEYS[kind])
+
+
+def _pick_epi_chunk(kind: str, N: int, K: int, avg_m: int) -> int:
+    """Depth of the software-pipelined epilogue; 1 = the single-store default.
+
+    The default epilogue is strictly serial: convert every accumulator fragment to
+    bf16, stage the whole C tile in LDS, issue one TDM store, wait for it. That block
+    is 10-16% of a tile on the keys here, of which waiting on the store is a third to
+    a half. Chunking along the output's row axis lets chunk i's store run while chunk
+    i+1 is converted and staged, so only the last chunk's store is exposed.
+
+    ⚠️ Four is the optimum wherever this helps: two leaves half the store exposed and
+    eight pays more barriers than it buys back. It is keyed and not a default because
+    it costs ``epi_chunk - 1`` extra workgroup barriers, which is a clear loss on the
+    dgrad path, whose waves are already skewed at the barrier -- and the loss there
+    grows monotonically with depth, the signature of a per-barrier cost.
+    """
+    return _EPI_CHUNK_KEYS[kind].get((N, K, avg_m), 1)
+
+
+def _pick_tdm_nn(N: int, K: int, avg_m: int) -> int:
+    """Split both NN operands in half so all four waves issue a TDM descriptor.
+
+    The NN path otherwise hands all of A to wave 0 and all of the transposed B to
+    wave 1, leaving waves 2 and 3 issuing nothing while they wait at the barrier for
+    the two that do. This is the ``tdm_balance`` dealing of the NT path, which is
+    rejected under ``b_lds_transpose`` only because of the half-WIDTH descriptor of
+    the non-transposed layout; splitting a data movement along the reduction axis is
+    harmless, since both halves land in the same LDS stage at different row offsets
+    and every WMMA k-step still reads the same bytes.
+    """
+    return int((N, K, avg_m) in _TDM_NN_KEYS)
+
+
+def _pick_tdm_assign_nn(N: int, K: int, avg_m: int) -> int:
+    """Cross ``tdm_nn``'s halves over the two wave parities: A -> (0, 3), B -> (1, 2).
+
+    TDM engines are picked by wave parity, and ``tdm_nn`` leaves both B halves on the
+    odd waves. On the one key here B is the slow stream -- transposed rows plus their
+    LDS pad -- so the odd engine carries both slow halves. The other dgrad shape is
+    not keyed: its A half carries 25% more bytes, which already makes the default
+    dealing close to time-balanced.
+    """
+    return int((N, K, avg_m) in _TDM_ASSIGN_NN_KEYS)
+
+
+def _pick_wmma_b2b(kind: str, N: int, K: int, avg_m: int) -> int:
+    """Relax the matrix-issue arbitration stall (``rocdl.disable_xdl_arb_stall``).
+
+    One instruction at the top of the kernel body; it changes no address, no extent,
+    no byte and no accumulation order.
+
+    ⚠️ Keyed, never a default. It has something to recover only where the waves are
+    not already level, which is why the forward path -- whose waves the 4-wave TDM
+    dealing already balances -- measures flat to negative and gets no key at all.
+    """
+    return int((N, K, avg_m) in _WMMA_B2B_KEYS[kind])
+
+
 @functools.lru_cache(maxsize=64)
 def _pick_variable_k_config(OUT_M: int, OUT_N: int, avg_m: int):
     """(tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) for the variable-K kernel.
@@ -1433,6 +1625,21 @@ def _pick_variable_k_config(OUT_M: int, OUT_N: int, avg_m: int):
     # only batch in the delivery matrix where avg_m == tile_k.
     if avg_m <= 128:
         return (256, 256, 64, 2, 2, 2)
+    # Same halved k-tile as the leg above, but with a THREE-deep ring instead of two
+    # and at the other end of the avg_m range. The wgrad grid does not move with avg_m
+    # -- the output is [G, OUT_M, OUT_N] and avg_m is only the reduction depth -- and an
+    # avg_m sweep on the wide tile fits `T_tile = F + n*P` with a fixed cost F that is
+    # 15-19% of T_tile here, while the write path is only 6% of the bytes. So the fixed
+    # cost is serial exposure, not bandwidth: tile_k=64 halves the bytes in flight per
+    # k-iteration so the prologue fill is half as long, and the third buffer keeps two
+    # atoms in flight across it.
+    #
+    # ⚠️ It is the RING DEPTH that pays, not the k-tile: `(256, 256, 64, 2, 2, 2)` is the
+    # avg_m <= 128 tile and it measures negative above avg_m=128. Four buffers is the
+    # same move one step deeper and reads consistently below three, so the ring is not
+    # simply "as deep as LDS allows". Exact-key scope for both reasons.
+    if (OUT_M, OUT_N, avg_m) in _VK_DEEP_RING_KEYS:
+        return (256, 256, 64, 2, 2, 3)
     # 2x2 instead of 4x2. ONLY `m_warp` moves -- tile area, `tile_k` and
     # `num_buffers` are untouched, so this is the warp grid on its own. 4x2 puts
     # eight waves in a workgroup, two per SIMD, and splits the accumulator; 2x2 is
@@ -1491,7 +1698,8 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     # unlike MI355X's 8. Correctness does not depend on the value.
     num_xcd: int = 1,
     xcd_band: int = 32,
-    wmma_b2b: int = 0,
+    # -1 = resolve from the shape (`_pick_wmma_b2b`), which is the recommended value.
+    wmma_b2b: int = -1,
     frag_pipeline: int = 1,
     # 1 = run the k-tile's last sub-step of WMMA inside the workgroup barrier's
     # signal-to-wait window. Same knob as on the NT/NN entry.
@@ -1540,6 +1748,10 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     # MEASUREMENT ONLY -- see the launcher's `wpath_only`. 1 emits the output write
     # path alone and RETURNS GARBAGE. Never set it on a correctness or delivery run.
     wpath_only: int = 0,
+    # 1 = issue each prefetch at the top of the k-tile body; see the launcher.
+    issue_first: int = 0,
+    # -1 = resolve from the shape (`_pick_epi_chunk`), which is the recommended value.
+    epi_chunk: int = -1,
 ) -> torch.Tensor:
     """Variable-K grouped wgrad: ``out[g] = a[rows_g].T @ b[rows_g]``.
 
@@ -1606,6 +1818,11 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
 
     _avg_m = max(1, M_total // max(G, 1))
     cfg = _pick_variable_k_config(OUT_M, OUT_N, _avg_m)
+    _keyed = not (BLOCK_M or BLOCK_N)
+    if epi_chunk < 0:
+        epi_chunk = _pick_epi_chunk("vk", OUT_M, OUT_N, _avg_m) if _keyed else 1
+    if wmma_b2b < 0:
+        wmma_b2b = _pick_wmma_b2b("vk", OUT_M, OUT_N, _avg_m) if _keyed else 0
     tile_m = BLOCK_M or cfg[0]
     tile_n = BLOCK_N or cfg[1]
     tile_k = BLOCK_K or cfg[2]
@@ -1691,6 +1908,8 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
             wave_grid,
             persist,
             wpath_only,
+            issue_first,
+            epi_chunk,
         )
     )
     # The caller asked for [G, OUT_M, OUT_N]; the padding is this function's business.
@@ -1854,6 +2073,36 @@ def _launch_grouped_gemm_bf16_nt(
     # ⛔ The default must stay 0 -- see the entry point: enabling it provokes an
     # intermittent device page fault.
     dead_tile_exit: Constexpr[int] = 0,
+    # Under `tdm_balance=1` (NT) or `tdm_nn=1` (NN): deal the two A halves to waves
+    # (0, 3) and the two B halves to waves (1, 2), instead of A on (0, 2) and B on
+    # (1, 3). A TDM engine is picked by wave parity, so the default dealing puts both
+    # B halves on one engine; where the two operands are not equal in bytes that
+    # engine carries the majority of the tile. See `_pick_tdm_assign_nn`.
+    tdm_assign: Constexpr[int] = 0,
+    # 1 = issue a k-tile's prefetch at the top of its compute body, before the primed
+    # LDS reads, instead of after sub-step 0's reads have landed. The `sched_barrier`
+    # pair around the issue then no longer cuts the body in two, so the reads and
+    # matrix ops of all sub-steps are scheduled as one region.
+    issue_first: Constexpr[int] = 0,
+    # Depth of the software-pipelined epilogue; 1 = one conversion pass, one store,
+    # one wait. See the variable-K launcher's parameter of the same name, including
+    # the reason every band extent below is clamped at zero.
+    epi_chunk: Constexpr[int] = 1,
+    # 1 = the NN counterpart of `tdm_balance`: split BOTH operands in half and give
+    # each half its own wave, so all four waves issue one descriptor instead of two
+    # waves issuing one whole operand each. A splits along its row axis, exactly as
+    # `tdm_balance` does on the NT path. B is transposed here, so its LDS row axis IS
+    # the reduction axis -- but splitting a DATA MOVEMENT along the reduction axis is
+    # harmless: the two halves land in the same LDS stage at different row offsets,
+    # every WMMA k-step still reads the same bytes, and the accumulation order does
+    # not change. (What `tdm_balance` is rejected for on this path is the half-WIDTH
+    # descriptor of the non-transposed layout, which really would straddle a k-step.)
+    #
+    # ⚠️ ADDRESSING: A's second half has dim-0 extent `m_rows - A_ROWS`, which goes
+    # negative on a dead or short tile, so `_ext`'s clamp gate covers this knob too.
+    # B's halves get a COMPILE-TIME `tile_k // 2` extent (`K % tile_k == 0` is
+    # asserted at the entry), so neither of those can go negative.
+    tdm_nn: Constexpr[int] = 0,
 ):
     """Grouped NT/NN: ``C[rows] = A[rows] @ B[g].T`` (or ``@ B[g]``). Requires ``K % tile_k == 0``.
 
@@ -1878,8 +2127,10 @@ def _launch_grouped_gemm_bf16_nt(
     n_acc = wmma_m_rep * wmma_n_rep
     num_waves = m_warp * n_warp
     block = num_waves * WAVE
-    tdm_parts = 2 if tdm_balance else 1
+    tdm_parts = 2 if (tdm_balance or tdm_nn) else 1
     A_ROWS, B_ROWS = tile_m // tdm_parts, tile_n // tdm_parts
+    # B under `b_lds_transpose` is split along its LDS row axis (the reduction rows).
+    BK_ROWS = tile_k // tdm_parts
     # See the variable-K kernel for the full story: the TDM outstanding budget is
     # per WAVE. Here it is derived rather than hardcoded -- `issue` fires on
     # `wave == w % num_waves`, so with `2 * tdm_parts` jobs spread over
@@ -1939,6 +2190,12 @@ def _launch_grouped_gemm_bf16_nt(
         # and the only state it would save over dead_tile_skip=1 is a k-loop that
         # dead_tile_skip=2 has already collapsed. Refusing rather than implying.
         raise ValueError(f"dead_tile_exit needs dead_tile_skip >= 2, got dead_tile_skip={dead_tile_skip}")
+    if issue_first not in (0, 1):
+        raise ValueError(f"issue_first must be 0 or 1, got {issue_first}")
+    if tdm_nn and not b_lds_transpose:
+        raise ValueError("tdm_nn is the NN (b_lds_transpose) dealing; use tdm_balance on NT")
+    if epi_chunk < 1 or wmma_m_rep % epi_chunk:
+        raise ValueError(f"epi_chunk must divide wmma_m_rep={wmma_m_rep}, got {epi_chunk}")
     if b_lds_transpose:
         # Each of these is a silent-wrong-answer risk rather than a crash, so they
         # are rejected rather than worked around.
@@ -1947,6 +2204,20 @@ def _launch_grouped_gemm_bf16_nt(
                 "tdm_balance splits B along its LDS row axis, which is the reduction axis "
                 "under b_lds_transpose; the split would straddle a WMMA k-step"
             )
+        if tdm_nn:
+            if b_imm_walk:
+                # The one fixed descriptor would need a per-half base, and a TDM extent
+                # is measured from the copy's imm_offset rather than the descriptor base,
+                # so folding the half offset into imm_offset is exactly the trap the
+                # per-k-tile rebuild below exists to avoid.
+                raise ValueError("tdm_nn needs b_imm_walk=0 (the per-k-tile descriptor rebuild)")
+            if tile_k % 2 or (tile_k // 2) % WMMA_K:
+                raise ValueError(
+                    f"tdm_nn halves tile_k={tile_k}; each half must stay a multiple of "
+                    f"WMMA_K={WMMA_K} so a half never cuts a k sub-step's LDS rows"
+                )
+        if tdm_assign and not tdm_nn:
+            raise ValueError("tdm_assign on the NN path deals tdm_nn's halves; it needs tdm_nn=1")
         if half_n_skip:
             # Its justification is "TDM never fetched the dead columns because
             # n_valid is B's dim-0 extent". Under b_lds_transpose the output axis
@@ -2158,28 +2429,38 @@ def _launch_grouped_gemm_bf16_nt(
         b_slab = fx.Int64(g_idx) * fx.Int64(B_GRP_ELEMS * EB)
 
         def _ext(v, p):
-            """dim-0 extent of TDM part ``p``. Under `dead_tile_skip` the second half of
-            a `tdm_balance` split is clamped at 0: ``m_rows - A_ROWS`` and
-            ``n_valid_b - B_ROWS`` go negative on a dead or short tile, and a negative
-            value in the unsigned descriptor field is no clamp at all. Identity else."""
+            """dim-0 extent of TDM part ``p``, clamped at 0 for every part but the first.
+
+            ``m_rows - A_ROWS`` and ``n_valid_b - B_ROWS`` go negative on a dead or short
+            tile, and a negative value in the unsigned descriptor field is no clamp at
+            all -- it is the full window, which on a dead over-allocated slot starts at
+            row ``M_total`` and reads past the end of the operand. At ``tdm_parts == 1``
+            ``p`` is only ever 0 and the clamp is not built at all."""
             return (
                 ((v > fx.Int32(0)).select(v, fx.Int32(0)) if const_expr(p) else v)
-                if const_expr(dead_tile_skip)
+                if const_expr(dead_tile_skip or tdm_balance or tdm_nn)
                 else v
             )
 
         a_jobs = [
-            (2 * p, p, _gv(gA_base, a_row0 + fx.Int64(p * A_ROWS) * lda_b, (A_ROWS, KB), (KB, 1)))
+            (
+                (3 * p) if const_expr(tdm_assign) else (2 * p),
+                p,
+                _gv(gA_base, a_row0 + fx.Int64(p * A_ROWS) * lda_b, (A_ROWS, KB), (KB, 1)),
+            )
             for p in range_constexpr(tdm_parts)
         ]
         tdm_jobs = [
             (w, _tdm(gt, _ext(m_rows - p * A_ROWS, p), lda_b), gt, p * A_ROWS * LDS_ROW, A_ROWS)
             for w, p, gt in a_jobs
         ]
+        # Wave that issues B part ``p``; the NN path reads it inside `issue` because its
+        # descriptor is rebuilt per k-tile rather than hoisted into `tdm_jobs`.
+        b_waves = [((1 + p) if const_expr(tdm_assign) else (2 * p + 1)) for p in range_constexpr(tdm_parts)]
         if const_expr(not b_lds_transpose):
             b_jobs = [
                 (
-                    2 * p + 1,
+                    b_waves[p],
                     p,
                     _gv(gB_base, b_slab + fx.Int64(blk_n + p * B_ROWS) * ldb_b, (B_ROWS, KB), (KB, 1)),
                 )
@@ -2199,7 +2480,7 @@ def _launch_grouped_gemm_bf16_nt(
         # NN: B's dim 0 is the reduction rows, and dim 0 is the axis that bounds
         # addressing, so a dead tile zeroes that one rather than the width.
         b_rows_ext = (
-            (live.select(fx.Int32(tile_k), fx.Int32(0)) if const_expr(dead_tile_skip) else tile_k)
+            (live.select(fx.Int32(BK_ROWS), fx.Int32(0)) if const_expr(dead_tile_skip) else BK_ROWS)
             if const_expr(b_lds_transpose)
             else tile_k
         )
@@ -2220,7 +2501,7 @@ def _launch_grouped_gemm_bf16_nt(
             gt_b_fixed = _gv(
                 gB_base,
                 b_slab + fx.Int64(blk_n_eff) * fx.Int64(EB),
-                (tile_k, tile_n * EB),
+                (BK_ROWS, tile_n * EB),
                 (ldb_b, 1),
             )
             atom_b_fixed = _b_tdm(gt_b_fixed)
@@ -2254,40 +2535,47 @@ def _launch_grouped_gemm_bf16_nt(
                 # the copy's imm_offset rather than from the descriptor base -- the
                 # same trap the variable-K kernel's `_tdm` documents. Folding the
                 # offset into the base sidesteps it; this is that `issue()` verbatim.
-                if wave == 1 % num_waves:
-                    dst_b = _lv(fx.add_offset(pa, STAGE_A), (tile_k, tile_n * EB), (LDS_B_ROW, 1))
-                    if const_expr(b_imm_walk):
-                        fx.copy(
-                            atom_b_fixed,
-                            gt_b_fixed,
-                            dst_b,
-                            imm_offset=fx.Int64(kt) * fx.Int64(tile_k) * ldb_b,
+                for h in range_constexpr(tdm_parts):
+                    if wave == b_waves[h] % num_waves:
+                        dst_b = _lv(
+                            fx.add_offset(pa, STAGE_A + h * BK_ROWS * LDS_B_ROW),
+                            (BK_ROWS, tile_n * EB),
+                            (LDS_B_ROW, 1),
                         )
-                    else:
-                        # k is B's ROW axis here, so a dim-0 extent could legally
-                        # clamp it -- but A's k is still dim 1, so both operands use
-                        # the same back-off and there is one k-offset rule.
-                        #
-                        # The k_tail=0 branch is the ORIGINAL expression verbatim,
-                        # including its int64 multiply: computing `kt * tile_k` in
-                        # int32 and widening is arithmetically fine at these sizes but
-                        # emits different code, and the contract here is that k_tail=0
-                        # stays byte-identical to what shipped.
-                        if const_expr(k_tail and is_tail):
-                            krow64 = fx.Int64(i32_k - fx.Int32(tile_k))
+                        if const_expr(b_imm_walk):
+                            fx.copy(
+                                atom_b_fixed,
+                                gt_b_fixed,
+                                dst_b,
+                                imm_offset=fx.Int64(kt) * fx.Int64(tile_k) * ldb_b,
+                            )
                         else:
-                            krow64 = fx.Int64(kt) * fx.Int64(tile_k)
-                        gt_b = _gv(
-                            gB_base,
-                            b_slab + krow64 * ldb_b + fx.Int64(blk_n_eff) * fx.Int64(EB),
-                            (tile_k, tile_n * EB),
-                            (ldb_b, 1),
-                        )
-                        # dim 0 = reduction rows. `K % tile_k == 0` is asserted at
-                        # the entry point, so a full tile_k rows is always in range
-                        # and the extent never has to clamp. dim 1 is full width:
-                        # the backed-off window is entirely valid columns.
-                        fx.copy(_b_tdm(gt_b), gt_b, dst_b)
+                            # k is B's ROW axis here, so a dim-0 extent could legally
+                            # clamp it -- but A's k is still dim 1, so both operands use
+                            # the same back-off and there is one k-offset rule.
+                            #
+                            # The k_tail=0 branch is the ORIGINAL expression verbatim,
+                            # including its int64 multiply: computing `kt * tile_k` in
+                            # int32 and widening is arithmetically fine at these sizes but
+                            # emits different code, and the contract here is that k_tail=0
+                            # stays byte-identical to what shipped.
+                            if const_expr(k_tail and is_tail):
+                                krow64 = fx.Int64(i32_k - fx.Int32(tile_k))
+                            else:
+                                krow64 = fx.Int64(kt) * fx.Int64(tile_k)
+                            if const_expr(h):
+                                krow64 = krow64 + fx.Int64(h * BK_ROWS)
+                            gt_b = _gv(
+                                gB_base,
+                                b_slab + krow64 * ldb_b + fx.Int64(blk_n_eff) * fx.Int64(EB),
+                                (BK_ROWS, tile_n * EB),
+                                (ldb_b, 1),
+                            )
+                            # dim 0 = reduction rows. `K % tile_k == 0` is asserted at
+                            # the entry point, so a full tile_k rows is always in range
+                            # and the extent never has to clamp. dim 1 is full width:
+                            # the backed-off window is entirely valid columns.
+                            fx.copy(_b_tdm(gt_b), gt_b, dst_b)
 
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
@@ -2431,6 +2719,11 @@ def _launch_grouped_gemm_bf16_nt(
             n_run = K_WS - ks_lo
             ring = [None] * R
             n_pr = min(R - 1, n_run)
+            pf_at0 = True if const_expr(prefetch_kt is not None and not issue_first) else False
+            if const_expr(prefetch_kt is not None and issue_first):
+                rocdl.sched_barrier(0)
+                issue(prefetch_kt % num_buffers, prefetch_kt, prefetch_tail)
+                rocdl.sched_barrier(0)
             for p in range_constexpr(n_pr):
                 ring[p] = _load_ks(buf, b_ref, ks_lo + p)
             # `split_bar_depth`: run the LAST `dc` sub-steps inside the barrier's
@@ -2463,7 +2756,7 @@ def _launch_grouped_gemm_bf16_nt(
                     # whole operand pipeline.
                     rocdl.sched_barrier(0)
                 rocdl.s_wait_dscnt(inflight * KS_DS)
-                if const_expr(ks == 0 and prefetch_kt is not None and wmma_m_rep > 1):
+                if const_expr(ks == 0 and pf_at0 and wmma_m_rep > 1):
                     rocdl.sched_barrier(0)
                     issue(prefetch_kt % num_buffers, prefetch_kt, prefetch_tail)
                     rocdl.sched_barrier(0)
@@ -2471,7 +2764,7 @@ def _launch_grouped_gemm_bf16_nt(
                     _mma_ks(ring[ks % R])
                 if const_expr(sched_style):
                     rocdl.sched_barrier(0)
-                if const_expr(ks == 0 and prefetch_kt is not None and wmma_m_rep == 1):
+                if const_expr(ks == 0 and pf_at0 and wmma_m_rep == 1):
                     rocdl.sched_barrier(0)
                     issue(prefetch_kt % num_buffers, prefetch_kt, prefetch_tail)
                     rocdl.sched_barrier(0)
@@ -2639,27 +2932,69 @@ def _launch_grouped_gemm_bf16_nt(
                 _pipeline_fence(outstanding=0)
             elif const_expr(epi_fence == 1):
                 _workgroup_barrier()
-            for wm in range_constexpr(wmma_m_rep):
-                row_rel = wmb + wm * WMMA_M + lane16
-                for wn in range_constexpr(wmma_n_rep):
-                    col_rel = wnb + wn * WMMA_N + kgrp * 8
-                    h = accs[wm * wmma_n_rep + wn].to(elem_cls)
-                    fx.ptr_store(h.bitcast(fx.Int8), base_ptr + (row_rel * tile_n + col_rel) * EB)
-            _workgroup_barrier()
-            gtC = _gv(gC_base, fx.Int64(m_row) * ldc64 + fx.Int64(blk_n), (tile_m, tile_n), (tile_n, 1))
-            # Both extents matter here: dim 0 drops the expert's short tail rows (and
-            # makes a dead over-allocated tile a complete no-op, since rows == 0), dim 1
-            # drops the ragged N tail. A dim-1 extent does bound addressing on a STORE,
-            # which is what makes this safe where the same reliance on a LOAD is not.
-            atomC = fx.rocdl.make_tdm_atom(
-                gtC,
-                [m_rows, n_valid],
-                strides=[ldc64, None],
-                num_warps=num_waves,
-                cache_modifier=tdm_store_cache,
-                early_timeout=False,
-            )
-            fx.copy(atomC, _lv(fx.recast_iter(elem_cls, base_ptr), (tile_m, tile_n), (tile_n, 1)), gtC)
+
+            def _epi_stage(wm_lo, wm_hi):
+                """Convert and stage the accumulator rows of WMMA row groups [lo, hi)."""
+                for wm in range_constexpr(wm_hi - wm_lo):
+                    wmg = wm_lo + wm
+                    row_rel = wmb + wmg * WMMA_M + lane16
+                    for wn in range_constexpr(wmma_n_rep):
+                        col_rel = wnb + wn * WMMA_N + kgrp * 8
+                        h = accs[wmg * wmma_n_rep + wn].to(elem_cls)
+                        fx.ptr_store(h.bitcast(fx.Int8), base_ptr + (row_rel * tile_n + col_rel) * EB)
+
+            def _epi_store(r0, rows):
+                """One TDM store of output rows [r0, r0+rows) of this tile. No wait."""
+                if const_expr(r0):
+                    ext0 = m_rows - fx.Int32(r0)
+                    ext0 = (ext0 > fx.Int32(0)).select(ext0, fx.Int32(0))
+                    row0 = fx.Int64(m_row) + fx.Int64(r0)
+                else:
+                    ext0, row0 = m_rows, fx.Int64(m_row)
+                gts = _gv(gC_base, row0 * ldc64 + fx.Int64(blk_n), (rows, tile_n), (tile_n, 1))
+                atom = fx.rocdl.make_tdm_atom(
+                    gts,
+                    [ext0, n_valid],
+                    strides=[ldc64, None],
+                    num_warps=num_waves,
+                    cache_modifier=tdm_store_cache,
+                    early_timeout=False,
+                )
+                src = (
+                    fx.recast_iter(elem_cls, base_ptr)
+                    if const_expr(r0 == 0)
+                    else fx.recast_iter(elem_cls, fx.add_offset(base_ptr, r0 * tile_n * EB))
+                )
+                fx.copy(atom, _lv(src, (rows, tile_n), (tile_n, 1)), gts)
+
+            def _epi_whole():
+                gtC = _gv(gC_base, fx.Int64(m_row) * ldc64 + fx.Int64(blk_n), (tile_m, tile_n), (tile_n, 1))
+                # Both extents matter here: dim 0 drops the expert's short tail rows (and
+                # makes a dead over-allocated tile a complete no-op, since rows == 0), dim 1
+                # drops the ragged N tail. A dim-1 extent does bound addressing on a STORE,
+                # which is what makes this safe where the same reliance on a LOAD is not.
+                atomC = fx.rocdl.make_tdm_atom(
+                    gtC,
+                    [m_rows, n_valid],
+                    strides=[ldc64, None],
+                    num_warps=num_waves,
+                    cache_modifier=tdm_store_cache,
+                    early_timeout=False,
+                )
+                fx.copy(atomC, _lv(fx.recast_iter(elem_cls, base_ptr), (tile_m, tile_n), (tile_n, 1)), gtC)
+
+            if const_expr(epi_chunk > 1):
+                EPI_REP = wmma_m_rep // epi_chunk
+                EPI_ROWS = EPI_REP * WMMA_M
+                for ch in range_constexpr(epi_chunk):
+                    _epi_stage(ch * EPI_REP, (ch + 1) * EPI_REP)
+                    _workgroup_barrier()
+                    for i in range_constexpr(m_warp):
+                        _epi_store(i * warp_tile_m + ch * EPI_ROWS, EPI_ROWS)
+            else:
+                _epi_stage(0, wmma_m_rep)
+                _workgroup_barrier()
+                _epi_whole()
             tdm_ops.tensor_wait(0)
 
         # The branch, and only the branch, is new. `live` is workgroup-uniform (see
@@ -3236,6 +3571,23 @@ def _wide_over_narrow_192(cfg, N: int, K: int, b_lds_transpose: int, a_ld: int =
 _M27_ENABLED = True  # the pin in `_pick_config_shape`
 _M28_ENABLED = True  # the pins in `_pick_config_nn`
 
+# (N, K) of the forward weight on which the 320-wide forward tile is taken; see
+# `_pick_config_shape`. No avg_m here -- the leg that reads it is already inside
+# the `avg_m == 2048` test, where the fill-bound argument holds.
+_FWD_WIDE_N_KEYS = frozenset({(4096, 7168), (7168, 2048)})
+
+# Band-cyclic XCD dealing with 8-row super-tiles, as (GROUP_M, num_xcd, xcd_band),
+# keyed on (N, K, avg_m) in each entry's own convention. One expert's eight m-tiles
+# then share near L2 instead of being spread across the device. Bit-identical --
+# the order of tiles changes, not the order of any accumulation -- and the
+# sustained clock rises with it, so it saves traffic and not merely cycles.
+_TILE_ORDER_NT = {(4096, 7168, 2048): (8, 8, 32)}
+_TILE_ORDER_NN = {(7168, 4096, 2048): (8, 8, 32), (2048, 7168, 2048): (8, 8, 32)}
+
+# (N, K) of the forward weight on which the NT entry splits both TDM loads in half
+# and deals the halves across both wave parities; see `grouped_gemm_bf16_nt_flydsl_kernel`.
+_FWD_TDM_DEAL_KEYS = frozenset({(4096, 7168)})
+
 
 def _pick_config_shape(N: int, K: int, avg_m: int, n_groups: int = 0, b_lds_transpose: int = 0):
     """The tile before any ragged-K upgrade -- the rules `_pick_config` documents.
@@ -3324,6 +3676,20 @@ def _pick_config_shape(N: int, K: int, avg_m: int, n_groups: int = 0, b_lds_tran
             return (128, 128, 128, 2, 2, 2)
         return (128, 128, 64, 2, 2, nb_narrow)
     if K % 128 == 0:
+        # At avg_m=2048 these keys are fill-bound -- the TDM engine, not the matrix
+        # engine, sets the k-loop's pace -- so the wider N tile's +11% FLOP per filled
+        # byte is what pays. Output is bit-identical: N is ragged against 320 on both
+        # keys, and the last block is clamped by B's dim-0 extent on the load and by C's
+        # dim-1 extent on the store, which is the path every ragged-N NT shape takes.
+        #
+        # ⚠️ NT ONLY. The transposed B stage of NN needs a power-of-two `pad_interval`
+        # (`tile_n * 2`), which 320 is not.
+        #
+        # ⛔ Exact-key scope, and it cannot be widened by inspection: the tile spends
+        # 95.6% of the LDS arena and ~994 of the 1024 VGPRs, so there is no margin left
+        # to absorb a shape it was not measured on.
+        if not b_lds_transpose and avg_m == 2048 and (N, K) in _FWD_WIDE_N_KEYS:
+            return (256, 320, 128, 2, 2, 2)
         return (256, 256, 128, 2, 2, 2)
     if avg_m >= 1536 and N % 192 == 0:
         # Fitted threshold, mechanism unknown; see the docstring.
@@ -3506,6 +3872,14 @@ def grouped_gemm_bf16_nt_flydsl_kernel(
     #
     # Being fast is not in question and is not enough.
     dead_tile_exit: int = 0,
+    # With `tdm_balance=1`: deal the A/B halves to waves (0, 3) / (1, 2) instead of
+    # (0, 2) / (1, 3). See the launcher parameter and the shape-keyed block below.
+    tdm_assign: int = 0,
+    # -1 = resolve from the shape (`_pick_issue_first`), which is the recommended
+    # value. 1 = issue each prefetch at the top of the k-tile body; see the launcher.
+    issue_first: int = -1,
+    # -1 = resolve from the shape (`_pick_epi_chunk`), which is the recommended value.
+    epi_chunk: int = -1,
 ) -> torch.Tensor:
     """Grouped NT forward: ``out[rows] = a[rows] @ b[g].T`` for the expert owning each run.
 
@@ -3548,9 +3922,24 @@ def grouped_gemm_bf16_nt_flydsl_kernel(
             f"output tile and has no persistent loop to bound. Pass cap_cu=0 (whole device)."
         )
 
-    cfg = _pick_config(
-        N, K, max(1, TOTAL_M // max(G, 1)), G, allow_ragged_k=allow_ragged_k != 0, a_ld=a_ld, b_ld=b_ld
-    )
+    avg_m = max(1, TOTAL_M // max(G, 1))
+    cfg = _pick_config(N, K, avg_m, G, allow_ragged_k=allow_ragged_k != 0, a_ld=a_ld, b_ld=b_ld)
+    _keyed = not (BLOCK_M or BLOCK_N)
+    if (GROUP_M, num_xcd, xcd_band) == (16, 1, 32):  # tile order left at its defaults
+        GROUP_M, num_xcd, xcd_band = _TILE_ORDER_NT.get((N, K, avg_m), (GROUP_M, num_xcd, xcd_band))
+    # Split both TDM loads in half and deal the halves across BOTH wave parities.
+    # `tdm_balance=1` alone only halves each descriptor; the dealing is what matters,
+    # because on the 320-wide tile the B half is 25% more bytes than the A half and the
+    # default (0, 2) / (1, 3) dealing leaves both B halves on the odd parity, i.e. one
+    # TDM engine carrying 55% of the tile's bytes. The other forward key is not listed:
+    # its tile is the same 320 wide but its K is a quarter as deep, so the per-tile byte
+    # imbalance is a quarter as large and the change measures flat.
+    if _keyed and tdm_balance == 0 and tdm_assign == 0 and (N, K) in _FWD_TDM_DEAL_KEYS and avg_m == 2048:
+        tdm_balance, tdm_assign = 1, 1
+    if issue_first < 0:
+        issue_first = _pick_issue_first("nt", N, K, avg_m) if _keyed else 0
+    if epi_chunk < 0:
+        epi_chunk = _pick_epi_chunk("nt", N, K, avg_m) if _keyed else 1
     tile_m = BLOCK_M or cfg[0]
     tile_n = BLOCK_N or cfg[1]
     tile_k = BLOCK_K or cfg[2]
@@ -3677,6 +4066,10 @@ def grouped_gemm_bf16_nt_flydsl_kernel(
             seg_split,
             dead_tile_skip,
             dead_tile_exit,
+            tdm_assign,
+            issue_first,
+            epi_chunk,
+            0,  # tdm_nn: the NN dealing; NT splits with tdm_balance + tdm_assign
         )
     )
     # The caller asked for width N; the padding is this function's business.
@@ -3791,6 +4184,19 @@ def _pick_config_nn(N: int, K: int, avg_m: int, n_groups: int = 0, allow_ragged_
             return _clamp_num_buffers((128, 512, 64, 2, 2, 3), K)
         if (N, K, avg_m) == (2048, 7168, 128):  # deepseek-v3 fc2 dgrad
             return _clamp_num_buffers((128, 256, 64, 2, 2, 4), K)
+        if (N, K, avg_m) == (2048, 7168, 2048):  # deepseek-v3 fc2 dgrad, long runs
+            # Widen tile_m, not tile_n. A 320-wide tile_n is unencodable here -- the
+            # transposed B stage's row width IS the TDM `pad_interval`, which the
+            # hardware requires to be a power of two -- while tile_m only widens the
+            # PLAIN A stage, whose row is `tile_k*2 + 16` and does not move. What it
+            # buys is fewer m-tiles: 7 per expert instead of 8, so B is read 12.5%
+            # fewer times while A stays extent-clamped.
+            #
+            # ⛔ The fc1 dgrad key is deliberately absent. The same change there is
+            # route-sensitive in the opposite direction -- negative on the balanced
+            # routing and positive on the skewed ones -- so it would be shipped on
+            # whichever routing it happens to like.
+            return _clamp_num_buffers((320, 256, 128, 2, 2, 2), K)
 
     # `b_lds_transpose=1` matters even though the ragged upgrade is asked for
     # separately below: `_pick_config_shape` reads it to keep the narrow leg's
@@ -3931,6 +4337,12 @@ def _nn_native_launch(
     wave_grid=-1,
     # Same meaning as on the NT entry; the NN grid uses the same m_tile_upper_bound.
     dead_tile_skip=0,
+    # Same meaning as on the NT entry, and threaded here for the same reason as the
+    # knobs above.
+    issue_first=0,
+    epi_chunk=1,
+    tdm_nn=0,
+    tdm_assign=0,
 ):
     """The native NN launch: ``b`` is consumed as ``[G, K, N]``, no copy made."""
     tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers = cfg
@@ -4022,6 +4434,11 @@ def _nn_native_launch(
             wave_grid,
             0,  # seg_split: NT only, rejected under b_lds_transpose
             dead_tile_skip,
+            0,  # dead_tile_exit: NT entry only; see its ⛔ note
+            tdm_assign,  # NN: crosses tdm_nn's halves over the two wave parities
+            issue_first,
+            epi_chunk,
+            tdm_nn,
         )
     )
     return out
@@ -4050,7 +4467,8 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
     m_warp: int = 0,
     n_warp: int = 0,
     num_buffers: int = 0,
-    wmma_b2b: int = 0,
+    # -1 = resolve from the shape (`_pick_wmma_b2b`), which is the recommended value.
+    wmma_b2b: int = -1,
     epi_fence: int = 2,
     m_tiles: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
@@ -4099,6 +4517,13 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
     wave_grid: int = -1,
     # Named for the same reason as the knobs above; see the NT entry.
     dead_tile_skip: int = 2,
+    # -1 = resolve from the shape, which is the recommended value for all four.
+    # `_pick_issue_first`, `_pick_epi_chunk`, `_pick_tdm_nn` and -- only where
+    # `tdm_nn` is on -- `_pick_tdm_assign_nn`. See the launcher parameters.
+    issue_first: int = -1,
+    epi_chunk: int = -1,
+    tdm_nn: int = -1,
+    tdm_assign: int = -1,
     **kw,
 ) -> torch.Tensor:
     """Grouped NN: ``out[rows] = a[rows] @ b[g]`` for the expert g owning each row run.
@@ -4152,7 +4577,8 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
                 f"output tile and has no persistent loop to bound. Pass cap_cu=0 (whole device)."
             )
         TOTAL_M = a.shape[0]
-        cfg = _pick_config_nn(N, Kb, max(1, TOTAL_M // max(G, 1)), G, allow_ragged_k=allow_ragged_k != 0)
+        avg_m = max(1, TOTAL_M // max(G, 1))
+        cfg = _pick_config_nn(N, Kb, avg_m, G, allow_ragged_k=allow_ragged_k != 0)
         cfg = (
             BLOCK_M or cfg[0],
             BLOCK_N or cfg[1],
@@ -4169,6 +4595,22 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
         # explicit num_buffers override, and the depth rule has to judge what will run.
         why = nn_native_unsupported_reason(N, Kb, cfg[1], cfg[2], cfg[5], allow_ragged_k=ragged_ok)
         if why is None:
+            # Resolved here and not at the top of the entry: every key below was fitted
+            # on THIS pipeline, and the fallback under `why is not None` lowers through
+            # the NT geometry instead.
+            keyed = not (BLOCK_M or BLOCK_N)
+            if (GROUP_M or 16, num_xcd, xcd_band) == (16, 1, 32):  # tile order left at its defaults
+                GROUP_M, num_xcd, xcd_band = _TILE_ORDER_NN.get((N, Kb, avg_m), (GROUP_M, num_xcd, xcd_band))
+            if issue_first < 0:
+                issue_first = _pick_issue_first("nn", N, Kb, avg_m) if keyed else 0
+            if epi_chunk < 0:
+                epi_chunk = _pick_epi_chunk("nn", N, Kb, avg_m) if keyed else 1
+            if tdm_nn < 0:
+                tdm_nn = _pick_tdm_nn(N, Kb, avg_m) if keyed else 0
+            if tdm_assign < 0:
+                tdm_assign = _pick_tdm_assign_nn(N, Kb, avg_m) if (keyed and tdm_nn) else 0
+            if wmma_b2b < 0:
+                wmma_b2b = _pick_wmma_b2b("nn", N, Kb, avg_m) if keyed else 0
             out, _ = _resolve_out_ldc(
                 out, TOTAL_M, N, out_ldc, a.device, out_dtype, "grouped_gemm_bf16_nn_flydsl_kernel"
             )
@@ -4199,6 +4641,10 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
                 tdm_store_cache,
                 wave_grid,
                 dead_tile_skip=dead_tile_skip,
+                issue_first=issue_first,
+                epi_chunk=epi_chunk,
+                tdm_nn=tdm_nn,
+                tdm_assign=tdm_assign,
             )
             # Same contract as the NT entry: the pad is internal.
             return out[:, :N] if out_ldc else out
@@ -4254,6 +4700,10 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
     # scaled-up slab threshold.
     if GROUP_M == 0:
         GROUP_M = 16
+    # The NN keys do not transfer to the materialised-transpose fallback, which is the
+    # NT pipeline; leave the NT entry to resolve its own.
+    if wmma_b2b < 0:
+        wmma_b2b = 0
 
     return grouped_gemm_bf16_nt_flydsl_kernel(
         a,
