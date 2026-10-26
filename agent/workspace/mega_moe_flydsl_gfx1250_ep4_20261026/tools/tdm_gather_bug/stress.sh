@@ -1,14 +1,28 @@
 #!/bin/bash
-# stress.sh COMMIT ITERS [EXTRA_ARGS]: stress_ep.py at EP4 on ep4val/src_COMMIT (repo for COMMIT=repo)
-# -> ep4c/logs/stress_COMMIT_ITERS.log; prints the summary and the first bad iterations.
-E=/home/xiaompen/mega_scratch/ep4c
-V=/home/xiaompen/mega_scratch/ep4val
+# stress.sh COMMIT|repo ITERS [EXTRA_ARGS]: run $SCRIPT (default stress_ep.py) under torchrun against the repo tree
+# (COMMIT=repo) or an overlay tree $V/src_COMMIT; log -> $E/logs/<script>_<COMMIT>_<ITERS>[_TAG].log, then print
+# the summary and the first bad iterations.
+# Overridable: E (scripts + logs, default this dir), TURBO (repo root), V (overlay trees), CACHE (FlyDSL cache),
+# CONTAINER (docker exec target; set it empty to run directly, e.g. inside the container), GPUS, NPROC, LIMIT (s).
+HERE=$(cd "$(dirname "$0")" && pwd)
+E=${E:-$HERE}
+TURBO=${TURBO:-$(cd "$HERE/../../../../.." && pwd)}
+V=${V:-/home/xiaompen/mega_scratch/ep4val}
+CONTAINER=${CONTAINER-xiaompen_mega_gfx1250_ep4}
 C=$1; N=$2; shift 2
-if [ "$C" = repo ]; then S=/home/xiaompen/Turbo; CACHE=${CACHE:-$E/cache}; else S=$V/src_$C; CACHE=$V/cache_$C; fi
+if [ "$C" = repo ]; then S=$TURBO; CACHE=${CACHE:-$E/cache}; else S=$V/src_$C; CACHE=${CACHE:-$V/cache_$C}; fi
 SCRIPT=${SCRIPT:-stress_ep.py}; LOG=$E/logs/${SCRIPT%.py}_${C}_${N}${TAG:+_$TAG}.log
-docker exec -w $S -e TURBO_ROOT=$S -e PYTHONPATH=$S -e TURBO_SRC=$S -e MEGA_IDX_BITS=${MEGA_IDX_BITS:-0} -e MEGA_B_WAVE=${MEGA_B_WAVE:-1} -e MEGA_ET=${MEGA_ET:-1} -e MEGA_SLEEP=${MEGA_SLEEP:-0} -e MEGA_HOLD=${MEGA_HOLD:-0} -e MEGA_TDM_GATHER=${MEGA_TDM_GATHER:-0} -e MEGA_A_SPREAD=${MEGA_A_SPREAD:-0} -e FLYDSL_DUMP_IR=${FLYDSL_DUMP_IR:-0} -e FLYDSL_DUMP_DIR=${FLYDSL_DUMP_DIR:-/tmp/fdump} -e FORCE_DUMP_IT=${FORCE_DUMP_IT:--1} -e FLYDSL_RUNTIME_CACHE_DIR=$CACHE \
-    -e TRITON_HIP_USE_EXPERT_SCHEDULING=0 -e HIP_VISIBLE_DEVICES=0,1,2,3 xiaompen_mega_gfx1250_ep4 bash -c \
-    "ulimit -c 0; /home/xiaompen/mega_scratch/capped.sh 1800 $LOG torchrun --nproc-per-node 4 $E/${SCRIPT:-stress_ep.py} --iters $N $*" \
-    >/dev/null
-echo "== $C: $(grep -E '^T=' $LOG)"
-grep -E "^max rel|^iterations with|BAD|KILLED|^  it |Error" $LOG | head -24
+mkdir -p "$E/logs"
+ENVS=(TURBO_ROOT=$S PYTHONPATH=$S TURBO_SRC=$S
+      MEGA_IDX_BITS=${MEGA_IDX_BITS:-0} MEGA_B_WAVE=${MEGA_B_WAVE:-1} MEGA_ET=${MEGA_ET:-1} MEGA_SLEEP=${MEGA_SLEEP:-0}
+      MEGA_HOLD=${MEGA_HOLD:-0} MEGA_TDM_GATHER=${MEGA_TDM_GATHER:-0} MEGA_A_SPREAD=${MEGA_A_SPREAD:-0}
+      FLYDSL_DUMP_IR=${FLYDSL_DUMP_IR:-0} FLYDSL_DUMP_DIR=${FLYDSL_DUMP_DIR:-/tmp/fdump} FORCE_DUMP_IT=${FORCE_DUMP_IT:--1}
+      FLYDSL_RUNTIME_CACHE_DIR=$CACHE TRITON_HIP_USE_EXPERT_SCHEDULING=0 HIP_VISIBLE_DEVICES=${GPUS:-0,1,2,3})
+RUN="ulimit -c 0; cd $S; $E/capped.sh ${LIMIT:-1800} $LOG torchrun --nproc-per-node ${NPROC:-4} $E/$SCRIPT --iters $N $*"
+if [ -n "$CONTAINER" ]; then
+    docker exec -w "$S" $(printf -- '-e %s ' "${ENVS[@]}") "$CONTAINER" bash -c "$RUN" >/dev/null
+else
+    env "${ENVS[@]}" bash -c "$RUN" >/dev/null
+fi
+echo "== $C: $(grep -E '^T=' "$LOG")"
+grep -E "^max rel|^iterations with|BAD|KILLED|^  it |Error" "$LOG" | head -24

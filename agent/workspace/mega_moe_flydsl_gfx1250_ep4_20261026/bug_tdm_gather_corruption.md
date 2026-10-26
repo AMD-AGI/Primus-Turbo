@@ -3,7 +3,7 @@
 - 状态：**暂停，未修复**（2026-10-26 决定先保留最优性能）。根因判断为 gfx1250 TDM gather 的硬件行为（见第 4 节）。规避方案（A 改用 per-lane async 加载）在复现器上 0 错误，但纯 GEMM 慢 6%、step 慢约 2%，没有合入；kernel 代码保持 `1149c02b`。
 - 分支：`feat/mega_moe/gfx1250-bf16`，kernel 基线 `1149c02b`（EP2 campaign round 9）
 - 机器 / 容器：MI455X（gfx1250）x4，`xiaompen_mega_gfx1250_ep4`
-- 复现和分析脚本：`tools/tdm_gather_bug/`（原始位置 `/home/xiaompen/mega_scratch/ep4c/`，`stress.sh` 里写死了这个路径）
+- 复现和分析脚本：`tools/tdm_gather_bug/`（原始位置 `/home/xiaompen/mega_scratch/ep4c/`）。`stress.sh` 默认用脚本所在目录和本仓库，路径、容器和 GPU 都可以用环境变量覆盖，见第 2 节"换机器继续"
 - 规避方案和实验开关：`tools/tdm_gather_bug/wip_async_a.patch`（基于 `1149c02b`，`git apply` 即可；没有合入）。开关：
   - `MEGA_TDM_GATHER=1`：A 走原来的 TDM gather，默认走 async 加载；
   - `MEGA_A_SPREAD=N`：async 加载分到 N 个 ks 子步发出，默认 0，即在 ks=0 一次发完；
@@ -53,6 +53,25 @@ TAG=x SCRIPT=stress_dg.py ./stress.sh repo 20000 --standalone --no_barrier --ske
 # 纯 GEMM，单卡、不需要通信（4 个进程各用一张卡）：随机索引，可以加填充行
 TAG=x SCRIPT=stress_gemm.py ./stress.sh repo 20000 --pad 70 [--pad_idx 0] [--zero_rows 16] [--sorted]
 ```
+
+### 换机器继续
+
+需要 4 张 gfx1250（纯 GEMM 复现每个进程只用一张卡），环境和 `amdprimus/amdprimus:tas-20261019` 镜像一致。
+
+```bash
+git clone -b feat/mega_moe/gfx1250-bf16 git@github.com:AMD-AGI/Primus-Turbo.git && cd Primus-Turbo   # 按常规方式 build
+T=agent/workspace/mega_moe_flydsl_gfx1250_ep4_20261026/tools/tdm_gather_bug
+git apply $T/wip_async_a.patch        # 可选：规避方案 + 实验开关；不打 patch 就是原始的 TDM gather（1149c02b）
+cd $T
+# 在容器里直接跑：CONTAINER= ；在宿主机上跑：CONTAINER=<容器名>。日志在 $T/logs/
+CONTAINER= TAG=tdm MEGA_TDM_GATHER=1 SCRIPT=stress_gemm.py ./stress.sh repo 20000 --pad 70   # 复现，预期 4 卡合计约 5 次出错
+CONTAINER= TAG=async SCRIPT=stress_gemm.py ./stress.sh repo 20000 --pad 70                   # 打了 patch 的 async 版本，预期 0 次
+CONTAINER= TAG=bench SCRIPT=stress_gemm.py ./stress.sh repo 1 --bench 200                    # 纯 GEMM 计时
+```
+
+- 其他可覆盖的变量：`TURBO`（仓库根目录）、`CACHE`（FlyDSL cache，换 kernel 变体时用独立目录）、`GPUS`、`NPROC`、`LIMIT`（超时秒数，由 `capped.sh` 强制）。
+- `stress.sh COMMIT ...`（不是 `repo`）要求 `$V/src_COMMIT` 下有对应 commit 的源码树。做法：把仓库的 `primus_turbo` 用 `cp -as` 做成符号链接副本，再把和 HEAD 不同的文件换成该 commit 的版本。
+- 整步压测是 `stress_ep.py`，也就是不设 `SCRIPT` 时的默认脚本。
 
 - `stress_dg.py --dump DIR`：保存出错 launch 的 `out/ref/valid/handle`（每个 rank 最多 2 个，每个 1-2 GB，文件属 root，要用 docker exec 删）。
 - 分析：
