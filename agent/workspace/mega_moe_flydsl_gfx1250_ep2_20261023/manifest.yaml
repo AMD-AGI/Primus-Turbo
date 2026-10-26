@@ -1,0 +1,26 @@
+target_op: mega_moe_bf16 (fused_mega_moe: dispatch + L1 GEMM + SwiGLU + L2 GEMM + combine, fwd+bwd)
+target_backend: FLYDSL
+target_lang: FLYDSL
+target_gpu: gfx1250
+execution_mode: repo
+project_skill: primus-turbo-develop
+performance_target: null
+primary_metric: "Combined Step TFLOPS (per rank, 3 * fwd_flops / fwd+bwd ms, geomean over shapes) at EP2 on GPUs 0,1"
+target_shapes: "EP2 DSV3 expert shape (H=7168, I=2048, 32 experts/rank, top-8): T=8192/rank random, T=8192/rank skew=1.0 on rank 0's experts, T=4096/rank random"
+kernel_source:
+  - primus_turbo/flydsl/mega/bf16_gfx1250/dispatch_gemm_kernel.py
+  - primus_turbo/flydsl/mega/bf16_gfx1250/gemm_combine_kernel.py
+  - primus_turbo/flydsl/mega/bf16/ep_intranode.py (shared with gfx950: gfx1250 changes go into gfx1250 copies)
+  - primus_turbo/pytorch/kernels/fused_mega_moe/fused_mega_moe_gfx1250_impl.py
+test_command: >-
+  HIP_VISIBLE_DEVICES=0,1 pytest tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe_ep.py -q;
+  HIP_VISIBLE_DEVICES=0 pytest tests/pytorch/ops/test_mega_bf16_gfx1250_gemm_combine.py
+  tests/pytorch/ops/test_mega_bf16_gfx1250_dispatch_gemm.py tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe.py -q
+benchmark_command: "HIP_VISIBLE_DEVICES=0,1 torchrun --nproc-per-node 2 quick_test_bench.py --csv <round>/artifacts/bench.csv"
+quick_command: "HIP_VISIBLE_DEVICES=0,1 torchrun --nproc-per-node 2 <campaign_dir>/quick_test_bench.py --csv <round>/artifacts/bench.csv"
+representative_shapes: same as target_shapes (3 shapes, includes the skewed routing)
+container: xiaompen_mega_gfx1250_ep4 (TRITON_HIP_USE_EXPERT_SCHEDULING=0, launcher patched)
+git_commit: true
+git_branch: none (local commits on feat/mega_moe/gfx1250-bf16, no push without asking)
+max_iterations: null
+created: 2026-10-23 04:57 (UTC)

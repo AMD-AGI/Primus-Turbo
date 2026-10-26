@@ -1,0 +1,14 @@
+exit 0
+exit 0
+==> /home/xiaompen/Turbo/agent/workspace/mega_moe_flydsl_gfx1250_ep2_20261023/rounds/round-2/artifacts/test_ep.log <==
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+5 passed, 1 warning in 58.61s
+
+==> /home/xiaompen/Turbo/agent/workspace/mega_moe_flydsl_gfx1250_ep2_20261023/rounds/round-2/artifacts/test_ep1.log <==
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+19 passed, 1 warning in 69.39s (0:01:09)
+exit 0
+dsv3_t8192_random    PASS snr(y,dx,dtw,dW1,dW2)=49.4,48.5,55.6,50.8,52.6  fwd 4.435 ms (1302 TF)  fwd+bwd 12.315 ms  bwd 1465 TF  step 1406.2 TF
+dsv3_t8192_skew1     PASS snr(y,dx,dtw,dW1,dW2)=49.8,48.8,55.5,50.8,52.6  fwd 6.397 ms (902 TF)  fwd+bwd 18.292 ms  bwd 971 TF  step 946.7 TF
+dsv3_t4096_random    PASS snr(y,dx,dtw,dW1,dW2)=49.4,48.5,55.6,50.8,52.6  fwd 2.306 ms (1252 TF)  fwd+bwd 7.036 ms  bwd 1220 TF  step 1230.5 TF
+AGGREGATE step 1178.823 TF  fwd 1137.045 TF  bwd 1201.630 TF  (3/3 PASS)

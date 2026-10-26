@@ -1,0 +1,100 @@
+W1026 02:04:05.980000 19098 torch/distributed/run.py:982] 
+W1026 02:04:05.980000 19098 torch/distributed/run.py:982] *****************************************
+W1026 02:04:05.980000 19098 torch/distributed/run.py:982] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1026 02:04:05.980000 19098 torch/distributed/run.py:982] *****************************************
+TURBO_ROOT /home/xiaompen/mega_scratch/ep4val/src_bbca1687
+[rank0]:W1026 02:04:08.649000 19268 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+[rank3]:W1026 02:04:08.649000 19271 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+[rank1]:W1026 02:04:08.649000 19269 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+[rank2]:W1026 02:04:08.650000 19270 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+[rank0]:W1026 02:04:08.651000 19268 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank0]:W1026 02:04:08.651000 19268 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank0]:W1026 02:04:08.651000 19268 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank0]:W1026 02:04:08.651000 19268 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank0]:W1026 02:04:08.651000 19268 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank0]:W1026 02:04:08.651000 19268 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank3]:W1026 02:04:08.651000 19271 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank3]:W1026 02:04:08.651000 19271 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank3]:W1026 02:04:08.651000 19271 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank3]:W1026 02:04:08.652000 19271 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank3]:W1026 02:04:08.652000 19271 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank3]:W1026 02:04:08.652000 19271 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank1]:W1026 02:04:08.652000 19269 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank1]:W1026 02:04:08.652000 19269 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank2]:W1026 02:04:08.652000 19270 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank1]:W1026 02:04:08.652000 19269 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank1]:W1026 02:04:08.652000 19269 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank1]:W1026 02:04:08.652000 19269 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank2]:W1026 02:04:08.652000 19270 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank1]:W1026 02:04:08.652000 19269 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank2]:W1026 02:04:08.652000 19270 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank2]:W1026 02:04:08.652000 19270 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank2]:W1026 02:04:08.652000 19270 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank2]:W1026 02:04:08.652000 19270 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+primus_turbo from /home/xiaompen/mega_scratch/ep4val/src_bbca1687/primus_turbo/__init__.py
+dsv3_t8192_skew1     PASS snr(y,dx,dtw,dW1,dW2)=49.7,48.7,55.6,50.8,52.6  fwd 10.171 ms (568 TF)  fwd+bwd 29.734 ms  bwd 590 TF  step 582.4 TF
+AGGREGATE step 582.412 TF  fwd 567.555 TF  bwd 590.136 TF  (1/1 PASS)
+W1026 02:04:17.120000 19098 torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 19268 closing signal SIGTERM
+W1026 02:04:17.121000 19098 torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 19270 closing signal SIGTERM
+W1026 02:04:17.121000 19098 torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 19271 closing signal SIGTERM
+E1026 02:04:17.385000 19098 torch/distributed/elastic/multiprocessing/api.py:1002] failed (exitcode: -11) local_rank: 1 (pid: 19269) of binary: /opt/venv/bin/python3
+Traceback (most recent call last):
+  File "/opt/venv/bin/torchrun", line 10, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 380, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/torch/distributed/run.py", line 1138, in main
+    run(args)
+  File "/opt/venv/lib/python3.12/site-packages/torch/distributed/run.py", line 1129, in run
+    elastic_launch(
+  File "/opt/venv/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 197, in __call__
+    return launch_agent(
+           ^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 386, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+=======================================================
+/home/xiaompen/mega_scratch/ep4val/bench_ep.py FAILED
+-------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-10-26_02:04:17
+  host      : ctheliosr-1b112-a08-1.mnb.dcgpu
+  rank      : 0 (local_rank: 0)
+  exitcode  : -15 (pid: 19268)  (SIGTERM)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 19268
+[2]:
+  time      : 2026-10-26_02:04:17
+  host      : ctheliosr-1b112-a08-1.mnb.dcgpu
+  rank      : 2 (local_rank: 2)
+  exitcode  : -15 (pid: 19270)  (SIGTERM)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 19270
+[3]:
+  time      : 2026-10-26_02:04:17
+  host      : ctheliosr-1b112-a08-1.mnb.dcgpu
+  rank      : 3 (local_rank: 3)
+  exitcode  : -11 (pid: 19271)  (SIGSEGV)
+  error_file: <N/A>
+  traceback : Signal 11 (SIGSEGV) received by PID 19271
+-------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-10-26_02:04:17
+  host      : ctheliosr-1b112-a08-1.mnb.dcgpu
+  rank      : 1 (local_rank: 1)
+  exitcode  : -11 (pid: 19269)  (SIGSEGV)
+  error_file: <N/A>
+  traceback : Signal 11 (SIGSEGV) received by PID 19269
+=======================================================
