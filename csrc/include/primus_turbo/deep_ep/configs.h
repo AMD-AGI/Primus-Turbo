@@ -121,7 +121,7 @@ static inline int get_num_cpu_timeout_secs() {
 // poll an acquire, which adds a GPU-wide L2 write-back per publish and a cache invalidate per
 // poll: on gfx950 (EP=8, DSv3 shapes, 32 CUs) that makes dispatch 23-30% and combine 35% slower,
 // and GEMMs running alongside 12% slower. Set PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE=1 for the
-// full fence; gfx1250 always uses it.
+// full fence (also on gfx1250, which now has the cheap fence).
 inline static bool is_enable_cheap_fence() {
     char const *v = std::getenv("PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE");
     if (!v || v[0] == '\0')

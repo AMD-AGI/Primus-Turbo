@@ -334,11 +334,13 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                         channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
                     auto shifted_x = x + token_idx * hidden_int4;
                     UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_channel_x_buffers,
-                                       shifted_x, __ldg, st_na_global);
+                                       shifted_x, __ldg, channel_x_payload.st);
 
                     // Copy source index
                     if (lane_id == 0)
-                        channel_src_idx_buffers[dst_slot_idx] = static_cast<int>(token_idx);
+                        st_payload<kCheapFence, int>(
+                            channel_src_idx_buffers.buffer() + dst_slot_idx,
+                            static_cast<int>(token_idx));
 
                     // Copy `topk_idx` and `topk_weights` with transformed index
                     if (lane_id < num_topk) {
@@ -349,21 +351,25 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                         idx_value = (idx_value >= recv_expert_begin and idx_value < recv_expert_end)
                                         ? idx_value - recv_expert_begin
                                         : -1;
-                        channel_topk_idx_buffers[dst_slot_idx * num_topk + lane_id] = idx_value;
+                        st_payload<kCheapFence, topk_idx_t>(
+                            channel_topk_idx_buffers.buffer() + dst_slot_idx * num_topk + lane_id,
+                            idx_value);
 
                         // Top-k weights
                         auto weight_value = __ldg(topk_weights + token_idx * num_topk + lane_id);
                         weight_value      = (idx_value >= 0) ? weight_value : 0.0f;
-                        channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] =
-                            weight_value;
+                        st_payload<kCheapFence, float>(channel_topk_weights_buffers.buffer() +
+                                                           dst_slot_idx * num_topk + lane_id,
+                                                       weight_value);
                     }
 
 // Copy `x_scales`
 #pragma unroll 2
                     for (int i = lane_id; i < num_scales; i += kWarpSize) {
                         auto offset = token_idx * scale_token_stride + i * scale_hidden_stride;
-                        channel_x_scales_buffers[dst_slot_idx * num_scales + i] =
-                            __ldg(x_scales + offset);
+                        st_payload<kCheapFence, float>(
+                            channel_x_scales_buffers.buffer() + dst_slot_idx * num_scales + i,
+                            __ldg(x_scales + offset));
                     }
                 }
 
@@ -698,6 +704,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         auto channel_topk_weights_buffers =
             Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk,
                           channel_rank_offset * num_recv_buffer_tokens * num_topk);
+        const ChannelPayload<kCheapFence> channel_x_payload(channel_x_buffers.buffer());
 
         // Get tasks
         // NOTES: `channel_offset` is already shifted
@@ -756,16 +763,18 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 auto shifted_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
                 auto shifted_x         = x_int4 + (token_idx + i) * hidden_int4;
                 UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_x_buffers, shifted_x,
-                                   ld_nc_global, st_na_global);
+                                   ld_nc_global, channel_x_payload.st);
 
                 // Send source index
                 if (lane_id == 0)
-                    channel_src_idx_buffers[dst_slot_idx] = __ldg(src_idx + token_idx + i);
+                    st_payload<kCheapFence, int>(channel_src_idx_buffers.buffer() + dst_slot_idx,
+                                                 __ldg(src_idx + token_idx + i));
 
                 // Send `topk_weights`
                 if (num_topk > 0 and lane_id < num_topk)
-                    channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] =
-                        __ldg(topk_weights + (token_idx + i) * num_topk + lane_id);
+                    st_payload<kCheapFence, float>(
+                        channel_topk_weights_buffers.buffer() + dst_slot_idx * num_topk + lane_id,
+                        __ldg(topk_weights + (token_idx + i) * num_topk + lane_id));
             }
             token_idx += num_round_tokens;
             current_channel_tail_idx += num_round_tokens;

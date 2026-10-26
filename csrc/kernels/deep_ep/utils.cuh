@@ -357,17 +357,21 @@ template <> __device__ __forceinline__ void st_na_global(const int4 *ptr, const 
 //      the publishing warp alone covers only its own stores.
 //   2. reads the payload with system-scope loads, which miss every GPU cache and so cannot return
 //      a slot's previous contents.
-// Other targets (gfx1250) encode cache policy and wait counters differently; they keep the full
-// fence.
-#if defined(__gfx942__) || defined(__gfx950__)
+// Other targets keep the full fence.
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__)
 constexpr bool kHasCheapFence = true;
 #else
 constexpr bool kHasCheapFence = false;
 #endif
 
-// Buffer-load cache policy on gfx942 / gfx950: SC0 (1) | SC1 (16) is system scope, NT (2) marks
-// the access as streaming.
+// Buffer-load cache policy for system scope, streaming.
+// gfx942 / gfx950: SC0 (1) | SC1 (16) is system scope, NT (2) marks the access as streaming.
+// gfx12: TH in bits 2:0 (TH_NT = 1), SCOPE in bits 4:3 (SCOPE_SYS = 3 << 3).
+#if defined(__gfx1250__)
+constexpr int32_t kSysScopeStreamCPol = (3 << 3) | 1;
+#else
 constexpr int32_t kSysScopeStreamCPol = 0x13;
+#endif
 
 // HIP makes every call convergent, which would keep loops around this from unrolling; the
 // intrinsic itself is not.
@@ -375,15 +379,32 @@ __device__ __attribute__((noconvergent)) device::int32x4_t
 llvm_amdgcn_raw_buffer_load_v4i32(device::int32x4_t rsrc, int32_t voffset, int32_t soffset,
                                   int32_t cpol) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
 
-// Reads of a channel's `int4` payload slots by whole warps. `base` must be the same in every
-// lane, and the element pointers handed to `ld` must lie less than 4 GiB past it.
-// `kSysScope = false` is the full fence's plain load. The system-scope variant is a buffer
+__device__ __attribute__((noconvergent)) void
+llvm_amdgcn_raw_buffer_store_v4i32(device::int32x4_t vdata, device::int32x4_t rsrc,
+                                   int32_t voffset, int32_t soffset,
+                                   int32_t cpol) __asm("llvm.amdgcn.raw.buffer.store.v4i32");
+
+// gfx12 reports a store complete at the first cache whose scope covers the store's SCOPE, so the
+// cheap fence's wait covers peer visibility only for SCOPE_SYS stores; the payload stores carry
+// it there. gfx942 / gfx950 acknowledge stores to uncached memory only from memory.
+#if defined(__gfx1250__)
+constexpr bool kSysScopePayloadStores = true;
+#else
+constexpr bool kSysScopePayloadStores = false;
+#endif
+
+// Reads and writes of a channel's `int4` payload slots by whole warps. `base` must be the same in
+// every lane, and the element pointers handed to `ld` / `st` must lie less than 4 GiB past it.
+// `kSysScope = false` is the full fence's plain access. The system-scope variant is a buffer
 // descriptor, built with a `readfirstlane`; that is convergent and keeps a loop with a runtime
 // trip count from unrolling, so construct it outside the token loops.
 template <bool kSysScope> struct ChannelPayload {
     __device__ __forceinline__ explicit ChannelPayload(const int4 *) {}
 
     __device__ __forceinline__ int4 ld(const int4 *ptr) const { return ld_nc_global(ptr); }
+    __device__ __forceinline__ void st(const int4 *ptr, const int4 &value) const {
+        st_na_global(ptr, value);
+    }
 };
 
 template <> struct ChannelPayload<true> {
@@ -396,6 +417,14 @@ template <> struct ChannelPayload<true> {
             srd.srd, static_cast<int32_t>((ptr - base) * sizeof(int4)), 0, kSysScopeStreamCPol);
         return *reinterpret_cast<int4 *>(&value);
     }
+    __device__ __forceinline__ void st(const int4 *ptr, const int4 &value) const {
+        if constexpr (kSysScopePayloadStores)
+            llvm_amdgcn_raw_buffer_store_v4i32(
+                *reinterpret_cast<const device::int32x4_t *>(&value), srd.srd,
+                static_cast<int32_t>((ptr - base) * sizeof(int4)), 0, kSysScopeStreamCPol);
+        else
+            st_na_global(ptr, value);
+    }
 };
 
 // Scalar payload reads (`src_idx`, `topk_idx`, `topk_weights`, `x_scales`). The system-scope
@@ -406,6 +435,15 @@ __device__ __forceinline__ dtype_t ld_payload(const dtype_t *ptr) {
         return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     else
         return ld_nc_global(ptr);
+}
+
+// Scalar payload writes; system scope only where `kSysScopePayloadStores`.
+template <bool kSysScope, typename dtype_t>
+__device__ __forceinline__ void st_payload(dtype_t *ptr, dtype_t value) {
+    if constexpr (kSysScope and kSysScopePayloadStores)
+        __hip_atomic_store(ptr, value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    else
+        *ptr = value;
 }
 
 template <bool kCheapFence> __device__ __forceinline__ void publish_barrier_fence() {
