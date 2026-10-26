@@ -46,3 +46,19 @@
   GEMM (~x^2); the post-GEMM backlog does not depend on the pusher count. Side probes: gfx1250 has no
   HW_REG_XCC_ID (HW_ID1 shows WGP/SA only); 256 spinning 8-wave workgroups are not all co-resident (221, the
   rest queue behind occupied slots while CUs idle); num_dispatch_cu 64 stays (32-192 screened)
+
+### round-3 — prologue publishes the pool rows to host memory after phase C
+- Time: 2026-10-26 03:25 (UTC)
+- Validation level: full + same-session A/B (3 alternating reps, T=8192 / T=4096 random)
+- Hypothesis: the host learns the rows only after the whole prologue (`.item()`), leaving ~100-130 us of GPU idle
+  before dispatch_gemm; a host-mapped rows notify at the end of phase C hides it under phases D-E
+- Changes: dispatch_prologue_kernel.py (gfx1250: block 0 stores total_rows at system scope into coherent pinned
+  host memory; host polls with a device-read fallback), pyhip_runtime_wrapper.py (hipHostMalloc,
+  hipHostGetDevicePointer)
+- Result: full run 1071.307 vs 1066.987 TF (+0.405%) but A/B median +0.14% (T=8192) / -0.09% (T=4096) ❌
+- Test: PASS (EP4 5 one per process, EP2 5, EP1 19)
+- Decision: rollback (back to 1149c02b); patch kept in rounds/round-3/artifacts
+- Detailed data: rounds/round-3/summary.md
+- Notes: rows seen before kernel end 25/25 with no fallback; steady-state GPU idle per iteration 101-124 -> 28-31 us,
+  prologue end -> dispatch_gemm 104-129 -> 18-20 us, yet gemm_combine and the prologue's barriers grow by
+  about as much (cross-rank waits)

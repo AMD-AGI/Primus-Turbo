@@ -42,3 +42,8 @@
 - Signal: 8-48 lead workgroups at 10-40% of the GEMM tiles all within -0.03..+0.4% fwd+bwd; per-workgroup stamps show the GEMM done at 1019 us, the tail push at 1294 us median, the reduce only ~70 us
 - Takeaway: a fold row is pushable only once its token's highest local expert's rows are done, so the push backlog piles up at the GEMM's end (~x^2 of the GEMM fraction x at ~2 local routes per token); adding pushers does not shorten it. Also: gfx1250 has no HW_REG_XCC_ID (HW_ID1 varies only in WGP_ID / SA_ID), and 8-wave workgroups can queue behind occupied slots while other CUs idle, so late-starting workgroups must take work from counters, not static shares
 - Applicability: any fold-then-push combine fused behind a GEMM; any gfx1250 kernel that assumes blockIdx -> XCD placement
+### 2026-10-26 03:25 EP4 round-3 — ROLLED BACK
+- Context: gfx1250 Mega dispatch prologue host sync, EP4, DSV3
+- Signal: a host-mapped rows notify (coherent hipHostMalloc, system-scope store at the end of phase C, host poll) cut steady-state GPU idle per step from ~110 to ~30 us, but same-session A/B fwd+bwd moved +0.14% / -0.09%
+- Takeaway: a GPU kernel can publish a value to coherent pinned host memory mid-kernel and the host sees it before the kernel ends (25/25, no fallback); but at EP4 a per-rank idle gap of ~1% of the step is not on the critical path — the freed time reappears as cross-rank waits in gemm_combine and the prologue's barriers. Gate idle-removal rounds on an alternating A/B of the full step, not on the trace's idle
+- Applicability: host-sync removal / launch-overlap work in cross-rank-coupled EP kernels
