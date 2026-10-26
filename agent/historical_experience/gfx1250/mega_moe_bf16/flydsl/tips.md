@@ -50,5 +50,15 @@
 ### 2026-10-26 03:31 EP4 round-4 — REJECTED
 - Context: MI455X DSV3 Mega step at EP4 (T=8192), power / clock telemetry; wgrad XCD band remap
 - Signal: amd-smi during the bench: socket power 2100-2430 W of the 2500 W PPT0 limit, GFX clock 2380 MHz idle -> 2000-2170 MHz loaded, 1650-1680 MHz at the peak sample, hotspot only 60-64 C; num_xcd=8 band remaps on the wgrads +0.1..+0.4%
-- Takeaway: the fused MoE step on MI455X runs at the power cap, so busy-time-only wins (idle removal, overlap) get absorbed by clocks; prefer changes that remove work or traffic (energy). Sample `amd-smi metric -p -c -t` during a bench before attributing a null result. A blockIdx-mod-8 XCD remap is not a safe default on MI455X until the real workgroup -> XCD / L2-cluster mapping is known
+- Takeaway: the fused MoE step on MI455X runs near the power cap with clocks well below idle, so sample `amd-smi metric -p -c -t` during a bench before attributing a null result (corrected in EP4 round 5: this does not absorb idle removal). A blockIdx-mod-8 XCD remap is not a safe default on MI455X until the real workgroup -> XCD / L2-cluster mapping is known
 - Applicability: any MI455X GEMM-heavy kernel campaign; any placement / swizzle remap on gfx1250
+### 2026-10-26 03:49 EP4 round-5 — REJECTED
+- Context: gfx1250 Mega gemm_combine tail push (ep_intranode push constants), EP4, DSV3 T=8192
+- Signal: ROW_UNROLL 2 / FOLD_CHUNK_ROWS 32 / MAX_LIF 128 all within ±0.2%; one remote chunk push takes 32 us in the lead phase and 35 us in the tail; a 100 / 200 / 400 us host delay after the prologue adds ~157 / 295 / 550 us to the step
+- Takeaway: with 8-wave WGs each wave gets 2 fold rows, so the `_ROW_UNROLL=4` grouped path is never taken and each row waits for its own store retire (~7 GB/s per WG); check which path a constant reaches at the target shape before screening it. Idle is on the EP4 critical path (it is not absorbed by the power cap, correcting round 4)
+- Applicability: any per-row CU push with a store-retire wait; any "the clock absorbs it" attribution
+### 2026-10-26 06:48 TDM gather intermittent corruption — OPEN
+- Context: gfx1250 TDM gather (`tensor_load_to_lds` gather mode, 16 rows per op) in the Mega dispatch_gemm nt tile, EP4
+- Signal: one 256x256 tile wrong per event in 16-row blocks (slot not written / data shifted +0x1100 into the next slot); ~1 / 500 fused fwd launches; standalone gather GEMM with 70 OOB padding rows per expert 10 / 160000, without padding 0 / 160000; the bad tiles are full tiles of the same expert as the padded one
+- Takeaway: gather ops that barely touch memory (OOB -1 rows, duplicate / hot rows, zero extent) can corrupt a neighbouring WG's TDM gather writes; waits, delays, descriptor holds and memory type only lower the rate. Per-lane `global_load_async_to_lds_b128` (ASYNCcnt, SADDR form) removes it at ~6% of the GEMM; spreading those loads over the ks sub-steps is slower. Validate any TDM-gather GEMM with a bitwise multi-launch stress that includes padding / duplicate indices
+- Applicability: every gfx1250 TDM gather user (Mega dispatch_gemm, variable-K wgrad gather)

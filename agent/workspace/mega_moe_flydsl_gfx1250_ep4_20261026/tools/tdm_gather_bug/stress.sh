@@ -6,7 +6,7 @@ V=/home/xiaompen/mega_scratch/ep4val
 C=$1; N=$2; shift 2
 if [ "$C" = repo ]; then S=/home/xiaompen/Turbo; CACHE=${CACHE:-$E/cache}; else S=$V/src_$C; CACHE=$V/cache_$C; fi
 SCRIPT=${SCRIPT:-stress_ep.py}; LOG=$E/logs/${SCRIPT%.py}_${C}_${N}${TAG:+_$TAG}.log
-docker exec -w $S -e TURBO_ROOT=$S -e PYTHONPATH=$S -e TURBO_SRC=$S -e MEGA_IDX_BITS=${MEGA_IDX_BITS:-0} -e MEGA_B_WAVE=${MEGA_B_WAVE:-1} -e MEGA_ET=${MEGA_ET:-1} -e MEGA_SLEEP=${MEGA_SLEEP:-0} -e MEGA_HOLD=${MEGA_HOLD:-0} -e FLYDSL_DUMP_IR=${FLYDSL_DUMP_IR:-0} -e FLYDSL_DUMP_DIR=${FLYDSL_DUMP_DIR:-/tmp/fdump} -e FORCE_DUMP_IT=${FORCE_DUMP_IT:--1} -e FLYDSL_RUNTIME_CACHE_DIR=$CACHE \
+docker exec -w $S -e TURBO_ROOT=$S -e PYTHONPATH=$S -e TURBO_SRC=$S -e MEGA_IDX_BITS=${MEGA_IDX_BITS:-0} -e MEGA_B_WAVE=${MEGA_B_WAVE:-1} -e MEGA_ET=${MEGA_ET:-1} -e MEGA_SLEEP=${MEGA_SLEEP:-0} -e MEGA_HOLD=${MEGA_HOLD:-0} -e MEGA_TDM_GATHER=${MEGA_TDM_GATHER:-0} -e MEGA_A_SPREAD=${MEGA_A_SPREAD:-0} -e FLYDSL_DUMP_IR=${FLYDSL_DUMP_IR:-0} -e FLYDSL_DUMP_DIR=${FLYDSL_DUMP_DIR:-/tmp/fdump} -e FORCE_DUMP_IT=${FORCE_DUMP_IT:--1} -e FLYDSL_RUNTIME_CACHE_DIR=$CACHE \
     -e TRITON_HIP_USE_EXPERT_SCHEDULING=0 -e HIP_VISIBLE_DEVICES=0,1,2,3 xiaompen_mega_gfx1250_ep4 bash -c \
     "ulimit -c 0; /home/xiaompen/mega_scratch/capped.sh 1800 $LOG torchrun --nproc-per-node 4 $E/${SCRIPT:-stress_ep.py} --iters $N $*" \
     >/dev/null

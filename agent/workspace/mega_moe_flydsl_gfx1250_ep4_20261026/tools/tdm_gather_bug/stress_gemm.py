@@ -20,6 +20,7 @@ ap.add_argument("--tiles", type=int, default=273)
 ap.add_argument("--pad", type=int, default=0, help="padding rows (index -1) at the end of every expert's last tile")
 ap.add_argument("--pad_idx", type=int, default=-1, help="index the padding rows gather (-1: out of bounds)")
 ap.add_argument("--sorted", action="store_true", help="sort the row indices within every tile (Mega's pools are ascending)")
+ap.add_argument("--bench", type=int, default=0, help="only time N launches (no compare)")
 ap.add_argument("--zero_rows", type=int, default=0, help="append Z zero rows to A; padding rows gather row rows + p %% Z")
 args = ap.parse_args()
 rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -76,6 +77,21 @@ for t in (0, tiles // 2, tiles - 1):
     want = (a[rows[keep]].float() @ bt.float()).to(torch.bfloat16)
     err = (ref[t * BM:(t + 1) * BM][keep].float() - want.float()).abs().max().item()
     assert err < 0.05 * want.float().abs().max().item(), f"rank {rank}: reference tile {t} off by {err}"
+if args.bench:
+    for _ in range(20):
+        run()
+    ts = []
+    for rep in range(5):
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
+        for _ in range(args.bench):
+            run()
+        e1.record()
+        torch.cuda.synchronize()
+        ts.append(e0.elapsed_time(e1) / args.bench)
+    ts.sort()
+    print(f"rank {rank}: bench median {ts[2] * 1e3:.1f} us  min {ts[0] * 1e3:.1f} us", flush=True)
+    sys.exit(0)
 bad = torch.zeros(args.iters, dtype=torch.int32, device=dev)
 slot_hits = torch.zeros(tiles, BM // 16, dtype=torch.int32, device=dev)
 t0 = time.time()

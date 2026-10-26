@@ -77,3 +77,31 @@
 - Detailed data: rounds/round-4/summary.md
 - Notes: the blockIdx -> XCD mapping on MI455X is still unverified (no HW_REG_XCC_ID); retry placement once the
   L2-cluster / AID reference is readable
+
+### round-5 — gemm_combine push constants
+- Time: 2026-10-26 03:49 (UTC)
+- Validation level: quick screen (dsv3_t8192_random, 2 alternating reps per config) + per-chunk timeline
+- Hypothesis: more fold rows in flight per pushing wave shortens the post-GEMM push tail (round 2)
+- Changes: none in source; monkeypatched `_ROW_UNROLL=2`, `FOLD_CHUNK_ROWS=32`, `_MAX_LOADS_IN_FLIGHT=128`
+- Result: fwd+bwd 11.525-11.585 ms vs default 11.568 / 11.535 ❌ (±0.2%); per-chunk push time unchanged (32-35 us)
+- Test: PASS (bench SNR, 8 runs)
+- Decision: rejected (constants stay at defaults)
+- Detailed data: rounds/round-5/summary.md
+- Notes: corrects round 4 (a 100 / 200 / 400 us host delay after the prologue adds ~157 / 295 / 550 us to the
+  step, so idle is on the critical path, not absorbed by the power cap) and round 2 (the push is limited by the
+  per-WG rate, ~7 GB/s; with 2 rows per wave the `_ROW_UNROLL=4` path is never taken)
+
+### campaign paused — intermittent corruption in the fused dispatch_gemm (TDM gather)
+- Time: 2026-10-26 06:48 (UTC)
+- Finding: the e2e check of 1149c02b hit an Inf gradient at step 6 of the uniform run (rerun passed). Root
+  cause traced to the gfx1250 TDM gather mode, most likely a hardware behavior: gather ops that barely touch
+  memory (OOB padding, duplicate / hot rows, zero extent) corrupt a neighbouring WG's gather writes. fused fwd
+  ~1 / 500 launches, full step ~6 / 26000
+- Workaround (not merged): A gathered by per-lane `global_load_async_to_lds_b128`, 0 errors, but GEMM +6.3%,
+  fwd +4-8%, step about -2% TF; spreading the loads over the ks sub-steps is slower (+9% / +20%)
+- Decision: keep 1149c02b (best performance) and pause the fix; patch in tools/tdm_gather_bug/wip_async_a.patch
+- Detailed data: bug_tdm_gather_corruption.md
+- Final best: 1149c02b, EP4 combined step 1066.987 TF (round 1 baseline, no EP4 round accepted). Same-session
+  kernel-level DSV3 EP4 T=8192: Mega fwd+bwd 11.504 ms vs 14.829 ms at ca0a9c2f, 1.53x over the tuned
+  unfused baseline; e2e DSV3 proxy EP4: even +12.1%, uniform steady +11.1%, real routing steady +12.3%
+  (summary html, tab 2026-10-26)

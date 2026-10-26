@@ -1,10 +1,14 @@
 # Mega MoE gfx1250：TDM gather 偶发数据损坏（排查记录）
 
-- 状态：**修复进行中**。根因已缩小到 TDM gather 的硬件行为；候选修复（A 改用 per-lane async 加载）在复现器上 0 错误，但 fwd 慢 4-8%，还在优化性能。
+- 状态：**暂停，未修复**（2026-10-26 决定先保留最优性能）。根因判断为 gfx1250 TDM gather 的硬件行为（见第 4 节）。规避方案（A 改用 per-lane async 加载）在复现器上 0 错误，但纯 GEMM 慢 6%、step 慢约 2%，没有合入；kernel 代码保持 `1149c02b`。
 - 分支：`feat/mega_moe/gfx1250-bf16`，kernel 基线 `1149c02b`（EP2 campaign round 9）
 - 机器 / 容器：MI455X（gfx1250）x4，`xiaompen_mega_gfx1250_ep4`
 - 复现和分析脚本：`tools/tdm_gather_bug/`（原始位置 `/home/xiaompen/mega_scratch/ep4c/`，`stress.sh` 里写死了这个路径）
-- 当前未提交的 kernel 改动：`tools/tdm_gather_bug/wip_async_a.patch`（带实验用环境变量开关，不是最终形态）
+- 规避方案和实验开关：`tools/tdm_gather_bug/wip_async_a.patch`（基于 `1149c02b`，`git apply` 即可；没有合入）。开关：
+  - `MEGA_TDM_GATHER=1`：A 走原来的 TDM gather，默认走 async 加载；
+  - `MEGA_A_SPREAD=N`：async 加载分到 N 个 ks 子步发出，默认 0，即在 ks=0 一次发完；
+  - 其余 `MEGA_IDX_BITS` / `MEGA_B_WAVE` / `MEGA_ET` / `MEGA_SLEEP` / `MEGA_HOLD` 对应第 3 节的 #2-#7。
+  - 实验 #2 的 `s_wait_xcnt` + 描述符 hold 也在这个 patch 里。
 
 ## 1. 问题
 
@@ -80,6 +84,7 @@ TAG=x SCRIPT=stress_gemm.py ./stress.sh repo 20000 --pad 70 [--pad_idx 0] [--zer
 | 15 | 在 12 里统计坏 tile 的位置 | 坏的大多是满 tile，和填充 tile 同 expert | **跨 WG 干扰**，WG 内部串行化救不了 |
 | 16 | 真实路由的独立 GEMM，填充改指向分散的合法行（另加去掉 dead tile） | 6 / 40000（9 / 40000） | 真实数据里的热点 token 也会触发 |
 | 17 | **A 的 gather 改用 per-lane `global_load_async_to_lds_b128`**（VMEM，ASYNCcnt），B 仍用 TDM 稠密加载 | 纯 GEMM 加填充 0 / 80000（和 torch 对拍通过），fused fwd 0 / 20000 | **候选修复** |
+| 18 | 17 的基础上，把 16 条 async 加载分到 2 / 4 个 ks 子步发出（`MEGA_A_SPREAD`），和 MMA 交错 | 纯 GEMM 单次 2166 / 2380 us（17 是 2112 us） | 更慢，开销来自加载指令和 MMA 抢发射槽 |
 
 ### 候选修复（#17）的性能，和 `1149c02b` 交替 A/B（`tools/ab.sh async`）
 
@@ -92,30 +97,60 @@ TAG=x SCRIPT=stress_gemm.py ./stress.sh repo 20000 --pad 70 [--pad_idx 0] [--zer
 
 fwd 稳定变慢 4-8%；bwd 的差异在噪声范围内。
 
+纯 GEMM 计时（`stress_gemm.py --bench 200`，每卡单次 launch 的中位数，4 卡）：
+
+| 版本 | us |
+|---|---|
+| TDM gather（`MEGA_TDM_GATHER=1`，有 bug） | 1966-2008，约 1987 |
+| #17 async，ks=0 一次发完 | 2095-2139，约 2112（+6.3%） |
+| #18 分到 2 个 ks 子步 | 约 2166 |
+| #18 分到 4 个 ks 子步 | 约 2380 |
+
 #17 的实现要点（见 patch）：
 - 每个 lane 负责 16 B 块，每轮覆盖 16 行，每个 k-tile 发 16 条 SADDR 形式的异步加载；
 - 行偏移用 32 位，K 不变，只算一次，多占 16 个 VGPR，总共 507 个，没有 spill；
 - 无效行（填充或 dead tile）读 A 的第 0 行，写到它自己的填充行位置；docstring 里说明过，填充行的输出下游不会读；
 - 本轮发出的加载在 `split_fence` 里用 `s_wait_asynccnt 0` 等待。
 
-## 4. 接下来的计划
+## 4. 结论（2026-10-26）
 
-1. **把 #17 的 fwd 性能拉回基线**，每次只改一个变量：
-   - 16 条异步加载不要集中在 ks=0 一次发完，分散到各个 ks 子步里，和 MMA 交错；
-   - 减少地址计算的 VALU；
-   - 试 cache policy（比如 NT 或 streaming）；
-   - 必要时调整 lane 和行的映射，比如一个 wave 连续读几行。
-2. **验证**（修复版）：
+**大概率是硬件问题**，出在 gfx1250 TDM 引擎的 gather 模式里，但还不能百分之百定论。
+
+支持硬件问题的证据：
+- 软件同步协议是对的。同一份代码、同样的同步，gather 分散的普通行时 16 万次 launch 0 错误（#11）。
+- 错误由**别的 WG 的数据**决定（#12-#15）。两个 WG 在不同 WGP 上，LDS 互相隔离，软件上没有路径能让一个 WG 的数据模式改写另一个 WG 的 LDS，能把它们连起来的只有共享的 TDM 引擎和返回路径。
+- 软件侧的改动只能降低概率（#1-#10）；只有把 A 的 TDM gather 换成 VMEM 加载才归零（#17），而 LDS 布局、同步方式、数据都不变。
+- 错误形态（某个 16 行块没写、数据落在 +0x1100 的相邻槽）像 DMA 写到了错误的 LDS 地址。
+
+还不能排除的：
+- gather 描述符是手工拼的（`_gather_static_groups` / `_gather_dgroup0`），没走 `tdm_ops` 的标准构造，某个字段（保留位、cluster / multicast 相关位）设错也可能造成跨 WG 写入。
+- 存在未公开的 TDM gather 使用约束或 errata，比如要求某个 wait、不允许越界或重复的索引。
+- 和这批芯片的 stepping、固件或驱动配置有关。
+
+决定：先保留 `1149c02b` 的最优性能，不合入规避方案。风险是 EP4 训练中偶发静默错误或 Inf；在问题解决前，正确性要求高的场景可以打上 `wip_async_a.patch`，代价是 step 慢约 2%。
+
+## 5. 恢复修复时的计划
+
+1. **确认是不是硬件问题**：
+   - 把单卡最小复现 `stress_gemm.py --pad 70`（10 / 160000 对 0 / 160000）交给硬件或编译器团队，问有没有已知的 TDM gather errata 和推荐的规避方式；
+   - 把手工拼的 gather 描述符和 `tdm_ops` 标准构造的结果逐位对比，排除字段设错。
+2. **低成本缓解**（只降概率，不根治）：#2 的 `s_wait_xcnt` + 描述符 hold 加 #3 的 32 位索引，fwd 出错率合计降约 60 倍（约 1 / 500 降到 2 / 60000）。性能影响没单独测过，要先 A/B。
+3. **如果要用 #17 根治，先把性能追回来**，每次只改一个变量：
+   - 去掉每条加载前算 LDS 地址的 VALU（用指令的立即数偏移，或预先算好）；
+   - 只让一部分 wave 发加载，减少和 MMA 抢发射槽；
+   - 试 cache policy（NT 或 streaming）；
+   - 调整 lane 和行的映射，比如一个 wave 连续读几行。
+   - 分散到 ks 子步已经试过，更慢（#18）。
+4. **验证**（修复版）：
    - `stress_dg` fwd 和 `--b_nn` 各至少 40000 次、0 次出错；
    - 纯 GEMM 加填充至少 160000 次、0 次出错；
    - 整步 `stress_ep` 20000 步；
    - pytest：EP1、EP2、EP4（`run_round.sh N full`）；
    - e2e：even、uniform、real 三种 routing。
-3. **清理代码**：
+5. **清理代码**：
    - 删掉 TDM gather 路径、实验开关（`MEGA_*`）和 hold 相关代码；
    - 更新 `gemm_nt_tile.py` 的 docstring；
    - launcher 加断言 `a_rows * lda * 2 < 2^31`（32 位行偏移的前提）。
-4. **排查其他 TDM 使用者**：
+6. **排查其他 TDM 使用者**：
    - grouped wgrad（variable_k，EP2 round 9 引入的 TDM gather）有没有同样的风险；
    - dead tile 发的 extent 为 0 的稠密 TDM（B 加载）是否也会成为触发源，必要时改成界内的正常加载。
-5. 验证通过后 commit + push 修复，并把这份文档更新为结论版。然后补记 EP4 campaign round 5，继续优化，每个 accept 都 commit + push。

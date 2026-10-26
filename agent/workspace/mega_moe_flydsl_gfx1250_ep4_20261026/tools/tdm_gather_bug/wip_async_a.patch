@@ -12,7 +12,7 @@ index 620c7342..3516fc65 100644
      n_blocks_n = (N + tile_n - 1) // tile_n
      args = (
 diff --git a/primus_turbo/flydsl/mega/bf16_gfx1250/gemm_nt_tile.py b/primus_turbo/flydsl/mega/bf16_gfx1250/gemm_nt_tile.py
-index df98758e..c27e741b 100644
+index df98758e..49036bbd 100644
 --- a/primus_turbo/flydsl/mega/bf16_gfx1250/gemm_nt_tile.py
 +++ b/primus_turbo/flydsl/mega/bf16_gfx1250/gemm_nt_tile.py
 @@ -155,6 +155,25 @@ class _GatherDesc:
@@ -76,13 +76,16 @@ index df98758e..c27e741b 100644
          a_addr = fx.Int64(fx.ptrtoint(gA_base))
          # descriptors for this wave's ops: indices are K-invariant, so groups 1-3 are built once
          a_dim1 = live.select(a_rows, zero32)
-@@ -288,19 +324,37 @@ def nt_gemm_tile(
+@@ -288,19 +324,39 @@ def nt_gemm_tile(
          gt_a = _gv(gA_base, fx.Int64(a_row0) * lda_b, (tile_m, KB), (KB, 1))
          atom_a = _tdm(gt_a, m_ext, lda_b)
  
+-    def issue(s, kt):
 +    _held = []
 +
-     def issue(s, kt):
++    A_SPREAD = int(__import__('os').environ.get('MEGA_A_SPREAD', 0)) if ASYNC_A else 0  # EXPERIMENT
++
++    def issue(s, kt, a_lo=0, a_hi=None, with_b=True):
          pa = _buf_ptr(s)
          koff = fx.Int64(kt) * fx.Int64(KB)
 -        if const_expr(gather):
@@ -90,7 +93,7 @@ index df98758e..c27e741b 100644
 +            g_base = _raw(a_addr + koff)
 +            l_base = fx.Int32(_bidx(pa)) + a_lane_lds
 +            i64t = ir.IntegerType.get_signless(64)
-+            for i in range_constexpr(N_LD):
++            for i in range_constexpr(a_lo, N_LD if a_hi is None else a_hi):
 +                g = std_arith.AddIOp(g_base, std_arith.ExtUIOp(i64t, _raw(a_off[i])).result).result
 +                gp = _llvm.inttoptr(ptr1, g)
 +                lp = _llvm.inttoptr(ptr3l, _raw(l_base + fx.Int32(i * RPI * LDS_ROW)))
@@ -111,12 +114,12 @@ index df98758e..c27e741b 100644
                  fx.copy(atom_a, gt_a, _lv(pa, (tile_m, KB), (LDS_ROW, 1)), imm_offset=koff)
 -        if wave == fx.Int32(1 % num_waves):
 +                _hold_tdm_descriptor()
-+        if wave == fx.Int32(int(__import__('os').environ.get('MEGA_B_WAVE', 1)) % num_waves):  # EXPERIMENT
++        if with_b and wave == fx.Int32(int(__import__('os').environ.get('MEGA_B_WAVE', 1)) % num_waves):  # EXPERIMENT
 +            rocdl.sched_barrier(0)
              if const_expr(b_nn):
                  # k is B's row axis: fold it into the base (a TDM extent counts from imm_offset)
                  gt_bk = _gv(
-@@ -317,13 +371,14 @@ def nt_gemm_tile(
+@@ -317,13 +373,14 @@ def nt_gemm_tile(
                      pad_interval=tile_n * EB,
                      pad_amount=LDS_B_ROW - tile_n * EB,
                      cache_modifier=0,
@@ -132,7 +135,24 @@ index df98758e..c27e741b 100644
  
      wmb = wave_m * warp_tile_m
      wnb = wave_n * warp_tile_n
-@@ -416,7 +471,15 @@ def nt_gemm_tile(
+@@ -402,7 +459,15 @@ def nt_gemm_tile(
+             rocdl.s_wait_dscnt(min(K_WS - 1 - ks, R - 1) * KS_DS)
+             if const_expr(ks == 0 and prefetch_kt is not None):
+                 rocdl.sched_barrier(0)
+-                issue(prefetch_kt % NUM_BUFFERS, prefetch_kt)
++                if const_expr(A_SPREAD):
++                    issue(prefetch_kt % NUM_BUFFERS, prefetch_kt, 0, N_LD // A_SPREAD)
++                else:
++                    issue(prefetch_kt % NUM_BUFFERS, prefetch_kt)
++                rocdl.sched_barrier(0)
++            elif const_expr(A_SPREAD and ks < A_SPREAD and prefetch_kt is not None):
++                rocdl.sched_barrier(0)
++                per = N_LD // A_SPREAD
++                issue(prefetch_kt % NUM_BUFFERS, prefetch_kt, ks * per, (ks + 1) * per, with_b=False)
+                 rocdl.sched_barrier(0)
+             if const_expr(ks < K_WS - 1):
+                 _mma_ks(ring[ks % R])
+@@ -416,7 +481,15 @@ def nt_gemm_tile(
  
      def split_fence(tail):
          tdm_ops.tensor_wait(0)
@@ -148,7 +168,7 @@ index df98758e..c27e741b 100644
          rocdl.s_barrier_signal(_WG_BARRIER)
          rocdl.sched_barrier(0)
          _mma_ks(tail)
-@@ -424,7 +487,10 @@ def nt_gemm_tile(
+@@ -424,7 +497,10 @@ def nt_gemm_tile(
          rocdl.s_barrier_wait(_WG_BARRIER)
  
      issue(0, 0)
