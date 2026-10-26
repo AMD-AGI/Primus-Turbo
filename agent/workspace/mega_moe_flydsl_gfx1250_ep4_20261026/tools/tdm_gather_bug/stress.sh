@@ -18,6 +18,7 @@ ENVS=(TURBO_ROOT=$S PYTHONPATH=$S TURBO_SRC=$S
       MEGA_HOLD=${MEGA_HOLD:-0} MEGA_TDM_GATHER=${MEGA_TDM_GATHER:-0} MEGA_A_SPREAD=${MEGA_A_SPREAD:-0}
       FLYDSL_DUMP_IR=${FLYDSL_DUMP_IR:-0} FLYDSL_DUMP_DIR=${FLYDSL_DUMP_DIR:-/tmp/fdump} FORCE_DUMP_IT=${FORCE_DUMP_IT:--1}
       FLYDSL_RUNTIME_CACHE_DIR=$CACHE TRITON_HIP_USE_EXPERT_SCHEDULING=0 HIP_VISIBLE_DEVICES=${GPUS:-0,1,2,3})
+for v in $(compgen -e | grep '^MEGA_'); do ENVS+=("$v=${!v}"); done
 RUN="ulimit -c 0; cd $S; $E/capped.sh ${LIMIT:-1800} $LOG torchrun --nproc-per-node ${NPROC:-4} $E/$SCRIPT --iters $N $*"
 if [ -n "$CONTAINER" ]; then
     docker exec -w "$S" $(printf -- '-e %s ' "${ENVS[@]}") "$CONTAINER" bash -c "$RUN" >/dev/null

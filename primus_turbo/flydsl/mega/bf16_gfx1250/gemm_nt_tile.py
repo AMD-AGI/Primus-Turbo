@@ -21,10 +21,15 @@ buffers, WMMA 16x16x32, ``split_bar`` with one deferred sub-step, a two-deep fra
 with two changes Mega needs:
 
 * **A can be gathered.** In ``gather`` mode the A rows come from a row-index table (pool row ->
-  dispatched token) through TDM gather loads, 16 rows per instruction with 16-bit indices or 8
-  with 32-bit ones. An index past ``a_rows`` -- the pool's padding rows carry -1 -- is out of
-  range for the TDM engine, which leaves that LDS row unwritten; the row's output is padding
-  that nothing downstream reads.
+  dispatched token). Every lane copies 16-byte chunks of them straight into LDS with
+  ``global_load_async_to_lds_b128`` (16 lanes per 256-byte row, 16 rows per instruction,
+  waited with ``s_wait_asynccnt``). An index outside ``[0, a_rows)`` -- the pool's padding rows
+  carry -1 -- reads some in-bounds row instead; the row's output is padding that nothing
+  downstream reads. TDM gather loads (``tensor_load_to_lds`` gather mode, 16 rows per
+  instruction) need no VMEM issue slots and are about 2.5% faster, but on gfx1250 they now and
+  then corrupt the LDS writes of neighbouring workgroups -- silently, about one fused launch in
+  500, triggered by gathers that barely touch memory (out-of-range, repeated or hot rows).
+  ``MEGA_TDM_GATHER=1`` at trace time brings them back to reproduce that.
 * **B can be NN.** With ``b_nn`` the B stage is ``[tile_k, tile_n]`` as stored and its fragments
   come out of the hardware LDS transpose read ``ds_load_tr16_b128``, the native NN path of the
   grouped kernel: no transposed copy of the weight.
@@ -34,12 +39,14 @@ with two changes Mega needs:
 
 A dead tile (past the device-side tile count) is not branched around -- a dynamic branch over the
 TDM pipeline is what the grouped kernel's ``dead_tile_exit`` found to fault intermittently.
-It runs with every extent at 0: no k-tile, no TDM traffic, a store with ``num_records`` 0.
+It runs with every extent at 0: no k-tile, no TDM traffic, a store with ``num_records`` 0. Only
+a gathered A's prologue loads still go out, from in-bounds rows.
 """
 
 from __future__ import annotations
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -78,6 +85,9 @@ EB = 2  # bf16
 LDS_PAD = 16  # bytes after every LDS row: keeps rows 4 dwords apart for conflict-free b128 reads
 NUM_BUFFERS = 2
 GFX1250_LDS_BYTES = 320 * 1024
+# the TDM gather repro switch (see the module docstring); a FlyDSL cache built without it keeps
+# serving the async kernels
+TDM_GATHER_A = os.environ.get("MEGA_TDM_GATHER", "0") == "1"
 
 
 def tile_geometry(tile_m: int, tile_n: int, tile_k: int, b_nn: bool = False):
@@ -91,6 +101,12 @@ def tile_geometry(tile_m: int, tile_n: int, tile_k: int, b_nn: bool = False):
     pitch = ((stage + stage_b + 1023) // 1024) * 1024
     arena = max(NUM_BUFFERS * pitch, tile_m * tile_n * EB)
     return lds_row, stage, pitch, arena
+
+
+def check_gather_rows(a_rows: int, lda: int, tile_m: int, tile_k: int):
+    """The async A gather's limits: some row to read, and 32-bit byte offsets into A."""
+    assert a_rows > 0, "a gathered A needs a row"
+    assert a_rows * lda * EB + tile_m * (tile_k * EB + LDS_PAD) < 2**32, "A too big for 32-bit row offsets"
 
 
 # ── TDM gather descriptors ───────────────────────────────────────────────────
@@ -271,7 +287,32 @@ def nt_gemm_tile(
     else:
         gt_b = _gv(gB_base, b_slab + fx.Int64(blk_n) * ldb_b, (tile_n, KB), (KB, 1))
         atom_b = _tdm(gt_b, n_ext, ldb_b)
-    if const_expr(gather):
+    async_a = gather and not TDM_GATHER_A
+    if const_expr(async_a):
+        # lane tid copies chunk tid % CH of row tid // CH, and RPI rows further per instruction
+        CH = KB // 16
+        RPI = block // CH
+        N_LD = tile_m // RPI
+        assert block % CH == 0 and tile_m % RPI == 0
+        A_BIAS = tile_m * LDS_ROW
+        c16 = tid % fx.Int32(CH)
+        rsub = tid // fx.Int32(CH)
+        a_addr = fx.Int64(fx.ptrtoint(gA_base))
+        a_lane_lds = rsub * fx.Int32(LDS_ROW) + c16 * fx.Int32(16)
+        # K-invariant 32-bit row offsets. An instruction offset moves the global and the LDS
+        # address alike, so load i's carries its LDS step, taken back out of its row offset here
+        # (A_BIAS keeps that unsigned). A padding or dead row reads row `pos` rather than one
+        # shared row: every workgroup hammering one row camps on one memory channel.
+        a_off = []
+        for i in range_constexpr(N_LD):
+            pos = fx.Int32(i * RPI) + rsub
+            idx = row_idx_table[row_idx_base + pos]
+            ok = live & (idx >= zero32) & (idx < a_rows)
+            row = ok.select(idx, (pos < a_rows).select(pos, zero32))
+            a_off.append(
+                row * fx.Int32(lda * EB) + c16 * fx.Int32(16) + fx.Int32(A_BIAS - i * RPI * LDS_ROW)
+            )
+    elif const_expr(gather):
         a_addr = fx.Int64(fx.ptrtoint(gA_base))
         # descriptors for this wave's ops: indices are K-invariant, so groups 1-3 are built once
         a_dim1 = live.select(a_rows, zero32)
@@ -291,7 +332,19 @@ def nt_gemm_tile(
     def issue(s, kt):
         pa = _buf_ptr(s)
         koff = fx.Int64(kt) * fx.Int64(KB)
-        if const_expr(gather):
+        if const_expr(async_a):
+            # k goes into the 32-bit offset so its zext stays in the loop and the loads keep the
+            # SADDR form; a hoisted 64-bit offset costs a v_add_u64 per load and twice the VGPRs.
+            # No per-row branch around a load either: that serializes them
+            i64 = ir.IntegerType.get_signless(64)
+            a_base = _raw(a_addr - fx.Int64(A_BIAS))
+            lds = _llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), _raw(fx.Int32(_bidx(pa)) + a_lane_lds))
+            koff32 = fx.Int32(kt) * fx.Int32(KB)
+            for i in range_constexpr(N_LD):
+                g = std_arith.AddIOp(a_base, std_arith.ExtUIOp(i64, _raw(a_off[i] + koff32)).result).result
+                gp = _llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), g)
+                _rocdl.global_load_async_to_lds_b128(gp, lds, i * RPI * LDS_ROW)
+        elif const_expr(gather):
             lds_base = fx.Int32(_bidx(pa))
             for q in range_constexpr(OPS_PER_WAVE):
                 lds_off, (dg1, dg2, dg3) = gather_groups[q]
@@ -416,6 +469,8 @@ def nt_gemm_tile(
 
     def split_fence(tail):
         tdm_ops.tensor_wait(0)
+        if const_expr(async_a):
+            _rocdl.s_wait_asynccnt(0)
         rocdl.sched_barrier(0)
         rocdl.s_barrier_signal(_WG_BARRIER)
         rocdl.sched_barrier(0)
@@ -424,6 +479,8 @@ def nt_gemm_tile(
         rocdl.s_barrier_wait(_WG_BARRIER)
 
     issue(0, 0)
+    if const_expr(async_a):
+        _rocdl.s_wait_asynccnt(0)
     _pipeline_fence(outstanding=0)
     for kt in range(n_steady):
         buf = _bidx(_buf_ptr(kt % NUM_BUFFERS))
@@ -613,6 +670,7 @@ def mega_grouped_gemm_nt_gfx1250(
     if gather:
         assert row_idx.dtype == torch.int32 and row_idx.numel() >= pool_rows
         assert idx_bits == 32 or a.shape[0] < 0xFFFF, "16-bit indices need A rows < 65535 (0xFFFF is padding)"
+        check_gather_rows(a.shape[0], K, tile_m, tile_k)
     else:
         row_idx = tile_to_expert  # unread
     args = (

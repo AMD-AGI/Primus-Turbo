@@ -57,6 +57,7 @@ from primus_turbo.flydsl.mega.bf16_gfx1250.gemm_nt_tile import (
     GFX1250_LDS_BYTES,
     NUM_BUFFERS,
     WAVE,
+    check_gather_rows,
     nt_gemm_tile,
     tile_geometry,
 )
@@ -349,7 +350,8 @@ def _run(x, w1, handle, dispatch_only, b_nn, num_dispatch_cu, tile_m, tile_n, ti
     assert num_comm % num_ranks == 0 and num_dispatch_cu >= num_ranks, "every dst rank needs a comm block"
     assert num_comm // num_ranks == G, "w1 holds this rank's experts"
     a_rows = int(symm.num_max_recv_tokens)
-    # the prologue marks padding rows with a_rows, out of range for the TDM gather
+    check_gather_rows(a_rows, K, tile_m, tile_k)
+    # the prologue marks padding rows with a_rows, out of range for the A gather
     idx_bits = 16 if a_rows < 0xFFFF else 32
     out = x.new_empty((0, N) if dispatch_only else (handle.pool_row_to_route.numel(), N))
     n_blocks_n = (N + tile_n - 1) // tile_n

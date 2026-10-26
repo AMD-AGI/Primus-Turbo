@@ -76,6 +76,8 @@ for t in (0, tiles // 2, tiles - 1):
     bt = b[e] if args.b_nn else b[e].t()
     want = (a[rows[keep]].float() @ bt.float()).to(torch.bfloat16)
     err = (ref[t * BM:(t + 1) * BM][keep].float() - want.float()).abs().max().item()
+    if os.environ.get("MEGA_A_DIAG"):  # diagnostic kernels compute garbage on purpose
+        break
     assert err < 0.05 * want.float().abs().max().item(), f"rank {rank}: reference tile {t} off by {err}"
 if args.bench:
     for _ in range(20):

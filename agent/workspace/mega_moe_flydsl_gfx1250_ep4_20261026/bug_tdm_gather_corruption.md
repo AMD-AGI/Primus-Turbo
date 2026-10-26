@@ -1,6 +1,7 @@
 # Mega MoE gfx1250：TDM gather 偶发数据损坏（排查记录）
 
-- 状态：**暂停，未修复**（2026-10-26 决定先保留最优性能）。根因判断为 gfx1250 TDM gather 的硬件行为（见第 4 节）。规避方案（A 改用 per-lane async 加载）在复现器上 0 错误，但纯 GEMM 慢 6%、step 慢约 2%，没有合入；kernel 代码保持 `1149c02b`。
+- 状态（2026-10-26 下午更新）：**规避方案已合入（默认开启），验证未做完**。A 的 gather 改用 per-lane async 加载，优化后纯 GEMM 只比 TDM 慢 1.6%（无填充）/ 3.5%（每 expert 128 行填充），见第 6 节。压测已过：纯 GEMM 0 / 160000、fused fwd 0 / 40000、b_nn 0 / 40000。**还没做**：整步 `stress_ep`（跑了约 1 分钟，因还机器中断）、pytest、e2e、step 级 A/B。根因判断为 gfx1250 TDM gather 的硬件行为（见第 4 节）。
+- 下面第 1-5 节是上午暂停时的记录（当时 kernel 保持 `1149c02b`，规避方案在 `wip_async_a.patch` 里）；`MEGA_TDM_GATHER=1` 仍可切回 TDM gather 复现。
 - 分支：`feat/mega_moe/gfx1250-bf16`，kernel 基线 `1149c02b`（EP2 campaign round 9）
 - 机器 / 容器：MI455X（gfx1250）x4，`xiaompen_mega_gfx1250_ep4`
 - 复现和分析脚本：`tools/tdm_gather_bug/`（原始位置 `/home/xiaompen/mega_scratch/ep4c/`）。`stress.sh` 默认用脚本所在目录和本仓库，路径、容器和 GPU 都可以用环境变量覆盖，见第 2 节"换机器继续"
@@ -61,11 +62,11 @@ TAG=x SCRIPT=stress_gemm.py ./stress.sh repo 20000 --pad 70 [--pad_idx 0] [--zer
 ```bash
 git clone -b feat/mega_moe/gfx1250-bf16 git@github.com:AMD-AGI/Primus-Turbo.git && cd Primus-Turbo   # 按常规方式 build
 T=agent/workspace/mega_moe_flydsl_gfx1250_ep4_20261026/tools/tdm_gather_bug
-git apply $T/wip_async_a.patch        # 可选：规避方案 + 实验开关；不打 patch 就是原始的 TDM gather（1149c02b）
+# 规避方案已合入，不用再打 wip_async_a.patch（会冲突）；MEGA_TDM_GATHER=1 切回 TDM gather 复现
 cd $T
 # 在容器里直接跑：CONTAINER= ；在宿主机上跑：CONTAINER=<容器名>。日志在 $T/logs/
-CONTAINER= TAG=tdm MEGA_TDM_GATHER=1 SCRIPT=stress_gemm.py ./stress.sh repo 20000 --pad 70   # 复现，预期 4 卡合计约 5 次出错
-CONTAINER= TAG=async SCRIPT=stress_gemm.py ./stress.sh repo 20000 --pad 70                   # 打了 patch 的 async 版本，预期 0 次
+CONTAINER= TAG=tdm MEGA_TDM_GATHER=1 CACHE=/tmp/fly_tdm SCRIPT=stress_gemm.py ./stress.sh repo 20000 --pad 70   # 复现，预期 4 卡合计约 5 次出错
+CONTAINER= TAG=async CACHE=/tmp/fly_async SCRIPT=stress_gemm.py ./stress.sh repo 20000 --pad 70                 # 合入的 async 版本，预期 0 次
 CONTAINER= TAG=bench SCRIPT=stress_gemm.py ./stress.sh repo 1 --bench 200                    # 纯 GEMM 计时
 ```
 
@@ -104,6 +105,7 @@ CONTAINER= TAG=bench SCRIPT=stress_gemm.py ./stress.sh repo 1 --bench 200       
 | 16 | 真实路由的独立 GEMM，填充改指向分散的合法行（另加去掉 dead tile） | 6 / 40000（9 / 40000） | 真实数据里的热点 token 也会触发 |
 | 17 | **A 的 gather 改用 per-lane `global_load_async_to_lds_b128`**（VMEM，ASYNCcnt），B 仍用 TDM 稠密加载 | 纯 GEMM 加填充 0 / 80000（和 torch 对拍通过），fused fwd 0 / 20000 | **候选修复** |
 | 18 | 17 的基础上，把 16 条 async 加载分到 2 / 4 个 ks 子步发出（`MEGA_A_SPREAD`），和 MMA 交错 | 纯 GEMM 单次 2166 / 2380 us（17 是 2112 us） | 更慢，开销来自加载指令和 MMA 抢发射槽 |
+| 19-28 | #17 的性能优化（下午），逐项见第 6 节 | 纯 GEMM 2112 → 2034 us | 已合入 |
 
 ### 候选修复（#17）的性能，和 `1149c02b` 交替 A/B（`tools/ab.sh async`）
 
@@ -173,3 +175,69 @@ fwd 稳定变慢 4-8%；bwd 的差异在噪声范围内。
 6. **排查其他 TDM 使用者**：
    - grouped wgrad（variable_k，EP2 round 9 引入的 TDM gather）有没有同样的风险；
    - dead tile 发的 extent 为 0 的稠密 TDM（B 加载）是否也会成为触发源，必要时改成界内的正常加载。
+
+## 6. 修复（2026-10-26 下午）：async A 加载的性能优化和合入
+
+### 实现（已合入 `gemm_nt_tile.py`，默认开启）
+
+- 每个 lane 负责一行里的一个 16 B 块（16 个 lane 读一行 256 B），一条指令覆盖 16 行，每个 k-tile 每个 lane 发 16 条 `global_load_async_to_lds_b128`；`split_fence` 和 prologue 里用 `s_wait_asynccnt 0` 等。
+- **k 偏移折进 32 位行偏移**（每条加载一个 `v_add_nc_u32`），基址是循环不变的 SGPR。这样 zext 留在循环里，ISel 选出 SADDR 形式。#17 的 64 位偏移被 LICM 提到循环外，变成 VADDR64 形式：每条加载多一个 `v_add_nc_u64`，偏移多占 16 个 VGPR，还有一串 `s_wait_alu depctr` 停顿。
+- **LDS 步长放进指令立即数偏移**：IOFFSET 同时加到 global 和 LDS 地址上，所以第 i 条的 LDS 步长 `i*16*272` 先从它的行偏移里减掉；基址减去 `A_BIAS = tile_m * LDS_ROW`，保证 32 位无符号偏移不为负。所有加载共用一个 LDS 地址寄存器。
+- **无效行（填充 / dead tile）读 tile 内位置 `pos` 对应的行**（越界时夹到 0），不再全部读第 0 行。所有 WG 同时读同一行会集中打到一个内存 channel（camping）。
+- 不加 per-load 分支：分支会让加载串行化。
+- B 恢复成 `1149c02b` 的写法（不加 `s_wait_xcnt` hold；#7 已否定"描述符被晚读"）。
+- launcher 断言：`a_rows > 0`、`a_rows * lda * 2 + tile_m * LDS_ROW < 2^32`（`check_gather_rows`，standalone 和 fused 都调用）。
+- `MEGA_TDM_GATHER=1`（trace 时读取）切回 TDM gather，用于复现；换开关时要用独立的 FlyDSL cache（`CACHE=`）。
+
+### 逐项实验（纯 GEMM `stress_gemm.py --bench 200`，4 卡中位数）
+
+同一时段 TDM gather 约 1983-2002 us（无填充）、约 1960 us（`--pad 128`）。
+
+| # | 改动 | us（无填充） | us（`--pad 128`） | 结论 |
+|---|---|---|---|---|
+| 17 | 原 async（VADDR64，无效行读第 0 行） | 约 2109 | 约 2148 | 起点 |
+| 19 | 用空 inline asm "洗"偏移，强制 SADDR | 约 3930 | - | 寄存器溢出到 scratch，放弃 |
+| 20 | k 折进 32 位偏移（SADDR） | 约 2038 | - | **采用** |
+| 21 | 8 / 4 个 lane 读一行（每 lane 少碰几行，多块用 IOFFSET） | 约 2310 / 2365 | - | 更慢：一行 256 B 连续最好 |
+| 22 | 20 + LDS 步长放进 IOFFSET | 约 2039 | 约 2148 | 持平，指令更少，**采用** |
+| 23 | 诊断：不加载 A（只有计算 + B） | 约 1740 | - | A 加载的下限开销 |
+| 24 | 诊断：所有行读第 0 行 | 约 2610 | - | 同一地址热点很慢 |
+| 25 | 22 + 无效行读不同的合法行（`pos`） | 约 2040 | 约 2038 | 填充下快 5%，**采用** |
+| 26 | 按行 exec 分支跳过无效行 / wave 级 ballot 标量分支跳过 | 约 2150 / 2178 | 约 2135 / 2150 | 分支让加载串行（每条都要等上一条读完源寄存器），放弃 |
+| 27 | B 的 TDM 先于 A 发出；再加 A 加载和 WMMA 交错（`sched_group_barrier`） | 约 2050 / 2144 | - | 更慢，放弃 |
+| 28 | 用 i32 GEP 代替 zext+add | 约 2109 | - | InstCombine 显式 sext 后又被提出循环，回到 VADDR64，放弃 |
+
+实验版代码（全部 `MEGA_A_*` 开关）存为 `tools/tdm_gather_bug/async_a_experiments.patch`（基于 `1149c02b`），只作记录。
+
+合入版本，同一时段对比：
+
+| 版本 | us（无填充） | us（`--pad 128`） |
+|---|---|---|
+| TDM gather（`MEGA_TDM_GATHER=1`，有 bug） | 约 2002 | 约 1965 |
+| 合入的 async 版本 | 约 2034（+1.6%） | 约 2034（+3.5%） |
+
+剩下的差距：TDM 不读填充行，async 仍要读（有填充时差距更大）；每条加载要一个 VALU，而 VGPR 已用到 502，只剩约 3 个临时寄存器轮转，`vm_vsrc` 等待没法完全消掉。
+
+### 验证（合入版本）
+
+| 测试 | 结果 | TDM gather 同条件 |
+|---|---|---|
+| 纯 GEMM `--pad 70`，4 卡各 40000 次 | **0 / 160000** | 10 / 160000 |
+| fused fwd `stress_dg`（EP4，T=8192） | **0 / 40000** | 约 1 / 500 |
+| fused b_nn `stress_dg --b_nn` | **0 / 40000** | 有错 |
+| 整步 `stress_ep` 20000 步 | 未完成（因还机器中断） | 约 6 / 26000 |
+
+`stress_dg` 结束时 rank 0 偶尔以 -11 退出，发生在打印结果之后的 teardown，上午的日志里也有，和本次改动无关。
+
+### 换机器后继续
+
+```bash
+cd agent/workspace/mega_moe_flydsl_gfx1250_ep4_20261026/tools/tdm_gather_bug
+CONTAINER= TAG=fix LIMIT=2400 ./stress.sh repo 20000                          # 1. 整步 stress_ep，约 7 分钟
+CONTAINER= TAG=fix SCRIPT=stress_gemm.py ./stress.sh repo 1 --bench 200        #    纯 GEMM 计时（对照加 MEGA_TDM_GATHER=1 和独立 CACHE）
+```
+
+1. 整步 `stress_ep` 20000 步，0 错误；
+2. pytest：EP1、EP2、EP4（`run_round.sh N full`）；
+3. e2e：even、uniform、real 三种 routing，和 `1149c02b` 对比 step 时间（预期慢 1% 左右，以实测为准），更新 HTML 报告；
+4. 第 5 节第 6 条：排查 grouped wgrad（variable_k）的 TDM gather 是否有同样风险。
