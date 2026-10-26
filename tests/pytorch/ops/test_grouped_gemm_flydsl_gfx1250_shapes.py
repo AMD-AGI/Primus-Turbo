@@ -48,8 +48,15 @@ needs_gfx1250 = pytest.mark.skipif(
 # starts below the smallest tile_k so ``K < tile_k`` is covered.
 _SCAN_KS = range(32, 4097, 8)
 _SCAN_NS = (768, 2048, 2880, 4096, 7168)
-_SCAN_AVG_MS = (32, 64, 96, 128, 256, 512, 1024)
+# 2048 covers the exact-key picks, which are all conditioned on it.
+_SCAN_AVG_MS = (32, 64, 96, 128, 256, 512, 1024, 2048)
 _SCAN_GS = (8, 32)
+
+# Cells the exact-key picks are fitted on: NT keys are the forward weight's (N, K), NN keys
+# are (N_out, K_red).
+_KEYED_NT = ((4096, 7168), (7168, 2048))
+_KEYED_NN = ((7168, 4096), (2048, 7168))
+_KEYED_AVG_M = 2048
 
 
 def _n_steady(K: int, cfg) -> int:
@@ -178,6 +185,24 @@ def test_k128_avgm128_picks_a_legal_pipeline():
     # And the gate has to admit them, because the shapes themselves are fine.
     assert grouped_gemm_bf16_nt_supported(2048, 128, 128, 8)
     assert grouped_gemm_bf16_nn_supported(2048, 128, 128, 8)
+
+
+def test_exact_key_picks_stay_inside_the_published_gate():
+    """Every shape-pinned tile must pass the published gate: a pin returns before the general rules."""
+    for N, K in _KEYED_NT:
+        for G in _SCAN_GS:
+            cfg = _pick_config(N, K, _KEYED_AVG_M, G)
+            assert grouped_gemm_bf16_nt_supported(N, K, _KEYED_AVG_M, G), f"NT N={N} K={K} G={G}: {cfg}"
+            assert _n_steady(K, cfg) >= 0, f"NT N={N} K={K} G={G} picked {cfg}"
+            assert K % cfg[2] % WMMA_K_ENTRY == 0, f"NT N={N} K={K}: tail of {K % cfg[2]} is not WMMA-aligned"
+    for N, K in _KEYED_NN:
+        for G in _SCAN_GS:
+            cfg = _pick_config_nn(N, K, _KEYED_AVG_M, G)
+            why = nn_native_unsupported_reason(N, K, cfg[1], cfg[2], cfg[5])
+            assert why is None, f"NN N={N} K={K} G={G} picked {cfg}, which the gate refuses: {why}"
+            assert grouped_gemm_bf16_nn_supported(N, K, _KEYED_AVG_M, G)
+            # The 4-wave TDM dealing halves tile_k; each half must stay a whole number of WMMA k-steps.
+            assert cfg[2] % (2 * WMMA_K_ENTRY) == 0, f"NN N={N} K={K}: tile_k={cfg[2]} is not split-safe"
 
 
 @pytest.mark.parametrize(
