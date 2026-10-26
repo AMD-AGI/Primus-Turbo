@@ -5,7 +5,7 @@ E=/home/xiaompen/mega_scratch
 TAG=$1; REPS=$2; shift 2
 BENCH=/home/xiaompen/Turbo/agent/workspace/mega_moe_flydsl_gfx1250_ep4_20261026/quick_test_bench.py
 declare -A TREE=([base]=$E/ep4val/src_1149c02b [new]=/home/xiaompen/Turbo)
-declare -A CACHE=([base]=$E/ep4val/cache_1149c02b [new]=$E/ep4c/cache)
+declare -A CACHE=([base]=$E/ep4val/cache_1149c02b [new]=${NEW_CACHE:-$E/ep4c/cache})
 for rep in $(seq 1 $REPS); do
     for s in "$@"; do
         for v in base new; do

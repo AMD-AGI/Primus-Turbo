@@ -1,0 +1,161 @@
+diff --git a/primus_turbo/flydsl/mega/bf16_gfx1250/dispatch_gemm_kernel.py b/primus_turbo/flydsl/mega/bf16_gfx1250/dispatch_gemm_kernel.py
+index 620c7342..3516fc65 100644
+--- a/primus_turbo/flydsl/mega/bf16_gfx1250/dispatch_gemm_kernel.py
++++ b/primus_turbo/flydsl/mega/bf16_gfx1250/dispatch_gemm_kernel.py
+@@ -350,7 +350,7 @@ def _run(x, w1, handle, dispatch_only, b_nn, num_dispatch_cu, tile_m, tile_n, ti
+     assert num_comm // num_ranks == G, "w1 holds this rank's experts"
+     a_rows = int(symm.num_max_recv_tokens)
+     # the prologue marks padding rows with a_rows, out of range for the TDM gather
+-    idx_bits = 16 if a_rows < 0xFFFF else 32
++    idx_bits = int(__import__('os').environ.get('MEGA_IDX_BITS', 0)) or (16 if a_rows < 0xFFFF else 32)  # EXPERIMENT
+     out = x.new_empty((0, N) if dispatch_only else (handle.pool_row_to_route.numel(), N))
+     n_blocks_n = (N + tile_n - 1) // tile_n
+     args = (
+diff --git a/primus_turbo/flydsl/mega/bf16_gfx1250/gemm_nt_tile.py b/primus_turbo/flydsl/mega/bf16_gfx1250/gemm_nt_tile.py
+index df98758e..c27e741b 100644
+--- a/primus_turbo/flydsl/mega/bf16_gfx1250/gemm_nt_tile.py
++++ b/primus_turbo/flydsl/mega/bf16_gfx1250/gemm_nt_tile.py
+@@ -155,6 +155,25 @@ class _GatherDesc:
+         self.dgroup0, self.dgroup1, self.dgroup2, self.dgroup3 = dgroup0, dgroup1, dgroup2, dgroup3
+ 
+ 
++def _hold_tdm_descriptor(*groups):
++    """Wait until the TDM op just issued has read its descriptor SGPRs (``s_wait_xcnt``).
++
++    The op can read them after issue (an XNACK replay re-reads them), but the compiler tracks no
++    XCNT for ``tensor_load_to_lds`` and reuses a descriptor SGPR right away; a late read sends a
++    gather to the wrong LDS rows and leaves its own rows stale for a k-tile. ``groups`` (the
++    descriptor vectors) are asm inputs, so their SGPRs stay unchanged until the wait."""
++    ops = [as_ir_value(_raw(g)) for g in groups]
++    rocdl.sched_barrier(0)
++    _llvm.inline_asm(
++        res=None,
++        operands_=ops,
++        asm_string="s_wait_xcnt 0x0",
++        constraints=",".join("s" for _ in ops),
++        has_side_effects=True,
++    )
++    rocdl.sched_barrier(0)
++
++
+ # ── the tile ─────────────────────────────────────────────────────────────────
+ 
+ 
+@@ -258,7 +277,7 @@ def nt_gemm_tile(
+             pad_interval=KB,
+             pad_amount=LDS_PAD,
+             cache_modifier=0,
+-            early_timeout=True,
++            early_timeout=bool(int(__import__('os').environ.get('MEGA_ET', 1))),  # EXPERIMENT
+         )
+ 
+     if const_expr(b_nn):
+@@ -271,7 +290,24 @@ def nt_gemm_tile(
+     else:
+         gt_b = _gv(gB_base, b_slab + fx.Int64(blk_n) * ldb_b, (tile_n, KB), (KB, 1))
+         atom_b = _tdm(gt_b, n_ext, ldb_b)
+-    if const_expr(gather):
++    ASYNC_A = gather and not int(__import__('os').environ.get('MEGA_TDM_GATHER', 0))  # EXPERIMENT
++    if const_expr(ASYNC_A):
++        CH = KB // 16
++        RPI = block // CH
++        N_LD = tile_m // RPI
++        assert block % CH == 0 and tile_m % RPI == 0
++        c16 = tid % fx.Int32(CH)
++        rsub = tid // fx.Int32(CH)
++        a_addr = fx.Int64(fx.ptrtoint(gA_base))
++        a_lane_lds = rsub * fx.Int32(LDS_ROW) + c16 * fx.Int32(16)
++        a_off = []
++        for i in range_constexpr(N_LD):
++            idx = row_idx_table[row_idx_base + fx.Int32(i * RPI) + rsub]
++            ok = live & (idx >= zero32) & (idx < a_rows)
++            a_off.append(ok.select(idx, zero32) * fx.Int32(lda * EB) + c16 * fx.Int32(16))
++        ptr1 = ir.Type.parse("!llvm.ptr<1>")
++        ptr3l = ir.Type.parse("!llvm.ptr<3>")
++    elif const_expr(gather):
+         a_addr = fx.Int64(fx.ptrtoint(gA_base))
+         # descriptors for this wave's ops: indices are K-invariant, so groups 1-3 are built once
+         a_dim1 = live.select(a_rows, zero32)
+@@ -288,19 +324,37 @@ def nt_gemm_tile(
+         gt_a = _gv(gA_base, fx.Int64(a_row0) * lda_b, (tile_m, KB), (KB, 1))
+         atom_a = _tdm(gt_a, m_ext, lda_b)
+ 
++    _held = []
++
+     def issue(s, kt):
+         pa = _buf_ptr(s)
+         koff = fx.Int64(kt) * fx.Int64(KB)
+-        if const_expr(gather):
++        if const_expr(ASYNC_A):
++            g_base = _raw(a_addr + koff)
++            l_base = fx.Int32(_bidx(pa)) + a_lane_lds
++            i64t = ir.IntegerType.get_signless(64)
++            for i in range_constexpr(N_LD):
++                g = std_arith.AddIOp(g_base, std_arith.ExtUIOp(i64t, _raw(a_off[i])).result).result
++                gp = _llvm.inttoptr(ptr1, g)
++                lp = _llvm.inttoptr(ptr3l, _raw(l_base + fx.Int32(i * RPI * LDS_ROW)))
++                _rocdl.global_load_async_to_lds_b128(gp, lp, 0)
++        elif const_expr(gather):
+             lds_base = fx.Int32(_bidx(pa))
+             for q in range_constexpr(OPS_PER_WAVE):
+                 lds_off, (dg1, dg2, dg3) = gather_groups[q]
+                 dg0 = _gather_dgroup0(lds_base + lds_off, a_addr + koff, idx_bits)
++                rocdl.sched_barrier(0)
+                 tdm_ops.tensor_load_gather(_GatherDesc(dg0, dg1, dg2, dg3))
++                _hold_tdm_descriptor(dg0, dg1, dg2, dg3)
++                if const_expr(int(__import__('os').environ.get('MEGA_HOLD', 0))):  # EXPERIMENT
++                    _held.extend([dg0, dg1, dg2, dg3])
+         else:
+             if wave == fx.Int32(0):
++                rocdl.sched_barrier(0)
+                 fx.copy(atom_a, gt_a, _lv(pa, (tile_m, KB), (LDS_ROW, 1)), imm_offset=koff)
+-        if wave == fx.Int32(1 % num_waves):
++                _hold_tdm_descriptor()
++        if wave == fx.Int32(int(__import__('os').environ.get('MEGA_B_WAVE', 1)) % num_waves):  # EXPERIMENT
++            rocdl.sched_barrier(0)
+             if const_expr(b_nn):
+                 # k is B's row axis: fold it into the base (a TDM extent counts from imm_offset)
+                 gt_bk = _gv(
+@@ -317,13 +371,14 @@ def nt_gemm_tile(
+                     pad_interval=tile_n * EB,
+                     pad_amount=LDS_B_ROW - tile_n * EB,
+                     cache_modifier=0,
+-                    early_timeout=True,
++                    early_timeout=bool(int(__import__('os').environ.get('MEGA_ET', 1))),  # EXPERIMENT
+                 )
+                 fx.copy(atom_bk, gt_bk, _lv(fx.add_offset(pa, B_DELTA), (tile_k, tile_n * EB), (LDS_B_ROW, 1)))
+             else:
+                 fx.copy(
+                     atom_b, gt_b, _lv(fx.add_offset(pa, B_DELTA), (tile_n, KB), (LDS_ROW, 1)), imm_offset=koff
+                 )
++            _hold_tdm_descriptor()
+ 
+     wmb = wave_m * warp_tile_m
+     wnb = wave_n * warp_tile_n
+@@ -416,7 +471,15 @@ def nt_gemm_tile(
+ 
+     def split_fence(tail):
+         tdm_ops.tensor_wait(0)
++        if const_expr(ASYNC_A):
++            _rocdl.s_wait_asynccnt(0)
+         rocdl.sched_barrier(0)
++        if const_expr(len(_held) > 0):  # EXPERIMENT
++            _hold_tdm_descriptor(*_held)
++            _held.clear()
++        if const_expr(int(__import__('os').environ.get('MEGA_SLEEP', 0))):  # EXPERIMENT
++            _llvm.inline_asm(res=None, operands_=[], asm_string=f"s_sleep {int(__import__('os').environ.get('MEGA_SLEEP', 0))}", constraints="", has_side_effects=True)
++            rocdl.sched_barrier(0)
+         rocdl.s_barrier_signal(_WG_BARRIER)
+         rocdl.sched_barrier(0)
+         _mma_ks(tail)
+@@ -424,7 +487,10 @@ def nt_gemm_tile(
+         rocdl.s_barrier_wait(_WG_BARRIER)
+ 
+     issue(0, 0)
++    if const_expr(ASYNC_A):
++        _rocdl.s_wait_asynccnt(0)
+     _pipeline_fence(outstanding=0)
++    _held.clear()  # EXPERIMENT
+     for kt in range(n_steady):
+         buf = _bidx(_buf_ptr(kt % NUM_BUFFERS))
+         split_fence(compute_ktile(buf, kt + 1))
