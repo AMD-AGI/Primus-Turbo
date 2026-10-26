@@ -47,3 +47,8 @@
 - Signal: a host-mapped rows notify (coherent hipHostMalloc, system-scope store at the end of phase C, host poll) cut steady-state GPU idle per step from ~110 to ~30 us, but same-session A/B fwd+bwd moved +0.14% / -0.09%
 - Takeaway: a GPU kernel can publish a value to coherent pinned host memory mid-kernel and the host sees it before the kernel ends (25/25, no fallback); but at EP4 a per-rank idle gap of ~1% of the step is not on the critical path — the freed time reappears as cross-rank waits in gemm_combine and the prologue's barriers. Gate idle-removal rounds on an alternating A/B of the full step, not on the trace's idle
 - Applicability: host-sync removal / launch-overlap work in cross-rank-coupled EP kernels
+### 2026-10-26 03:31 EP4 round-4 — REJECTED
+- Context: MI455X DSV3 Mega step at EP4 (T=8192), power / clock telemetry; wgrad XCD band remap
+- Signal: amd-smi during the bench: socket power 2100-2430 W of the 2500 W PPT0 limit, GFX clock 2380 MHz idle -> 2000-2170 MHz loaded, 1650-1680 MHz at the peak sample, hotspot only 60-64 C; num_xcd=8 band remaps on the wgrads +0.1..+0.4%
+- Takeaway: the fused MoE step on MI455X runs at the power cap, so busy-time-only wins (idle removal, overlap) get absorbed by clocks; prefer changes that remove work or traffic (energy). Sample `amd-smi metric -p -c -t` during a bench before attributing a null result. A blockIdx-mod-8 XCD remap is not a safe default on MI455X until the real workgroup -> XCD / L2-cluster mapping is known
+- Applicability: any MI455X GEMM-heavy kernel campaign; any placement / swizzle remap on gfx1250

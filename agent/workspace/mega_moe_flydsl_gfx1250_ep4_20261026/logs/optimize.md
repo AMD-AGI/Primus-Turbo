@@ -62,3 +62,18 @@
 - Notes: rows seen before kernel end 25/25 with no fallback; steady-state GPU idle per iteration 101-124 -> 28-31 us,
   prologue end -> dispatch_gemm 104-129 -> 18-20 us, yet gemm_combine and the prologue's barriers grow by
   about as much (cross-rank waits)
+
+### round-4 — wgrad XCD band remap
+- Time: 2026-10-26 03:31 (UTC)
+- Validation level: quick screen (dsv3_t8192_random, 2 alternating reps per config)
+- Hypothesis: the step is power-capped (bench: 2100-2430 W of the 2500 W PPT0, GFX clock 2380 -> 2000-2170 MHz,
+  1650 MHz at peak, hotspot 60-64 C), so energy per step sets the speed; dealing contiguous wgrad tile bands to
+  one XCD raises L2 reuse and cuts fabric / HBM energy
+- Changes: none in source; num_xcd 8 with xcd_band 16 / 32 / 64 / 128 on both variable-K wgrad calls via the
+  monkeypatched bench
+- Result: fwd+bwd 11.558-11.604 ms vs remap-off 11.547 / 11.554 ❌ (+0.1..+0.4%)
+- Test: PASS (bench SNR, 10 runs)
+- Decision: rejected (remap stays off)
+- Detailed data: rounds/round-4/summary.md
+- Notes: the blockIdx -> XCD mapping on MI455X is still unverified (no HW_REG_XCC_ID); retry placement once the
+  L2-cluster / AID reference is readable

@@ -31,6 +31,10 @@ _LEAD = {False: (int(os.environ.get("LEAD_N_FWD", 16)), int(os.environ.get("LEAD
 _orig_gc = _impl.gemm_combine_nt_gfx1250
 _impl.gemm_combine_nt_gfx1250 = lambda a, w, h, t, *, b_nn=False, **kw: _orig_gc(
     a, w, h, t, b_nn=b_nn, num_lead_combine=_LEAD[b_nn][0], lead_gemm_percent=_LEAD[b_nn][1], **kw)
+if os.environ.get("XCD_WGRAD"):
+    _XCD, _BAND = (int(v) for v in os.environ["XCD_WGRAD"].split(":"))
+    _orig_vk = _impl._variable_k
+    _impl._variable_k = lambda *a, **kw: _orig_vk(*a, num_xcd=_XCD, xcd_band=_BAND, **kw)
 
 SHAPES = [  # label, tokens/rank, hidden, inter, experts/rank, topk, skew
     ("dsv3_t8192_random", 8192, 7168, 2048, 32, 8, 0.0),
