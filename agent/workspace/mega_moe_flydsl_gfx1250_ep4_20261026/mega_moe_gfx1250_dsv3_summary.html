@@ -90,16 +90,16 @@
 
 <div class="stats">
   <div class="stat"><div class="v">1.53x</div><div class="l">MoE 层 fwd+bwd，对比调优基线（EP4 kernel 级；<code>ca0a9c2f</code> 同次复测 1.18x）</div></div>
-  <div class="stat"><div class="v">12.1%</div><div class="l">端到端训练加速，even 路由（10-23：5.6%）</div></div>
-  <div class="stat"><div class="v">11.1%</div><div class="l">端到端稳态加速，uniform 路由（10-23：0.8%）</div></div>
-  <div class="stat"><div class="v">12.3%</div><div class="l">端到端稳态加速，真实路由（10-23：2.5%）</div></div>
+  <div class="stat"><div class="v">−12.1%</div><div class="l">端到端单步耗时，even 路由（10-23：−5.6%）</div></div>
+  <div class="stat"><div class="v">−13.2%</div><div class="l">端到端单步耗时，uniform 路由（10-23：−3.2%）</div></div>
+  <div class="stat"><div class="v">−17.0%</div><div class="l">端到端单步耗时，真实路由（Primus 日志的平均 ms/iter）</div></div>
   <div class="stat"><div class="v warn">≈ 1/500</div><div class="l">fused fwd 偶发数据错误的 launch 比例（TDM gather，未修复）</div></div>
 </div>
 
 <div class="callout">
   <b>结论</b>
   EP2 campaign 接受的 8 个改动（round 2–9）让 Mega 的 MoE 层 fwd+bwd 从 14.83 ms 降到 11.50 ms（同次复测，−22.4%），
-  对调优基线的加速从 1.18x 提到 1.53x；端到端训练加速从 0.8%–5.6% 提到 11%–12%，loss 和 grad norm 仍然跟住基线。
+  对调优基线的加速从 1.18x 提到 1.53x；端到端单步耗时减少 12.1%–17.0%（上一版 even / uniform 是 5.6% / 3.2%），loss 和 grad norm 仍然跟住基线。
   10-26 的 EP4 campaign（round 2–5）没有新的被接受的改动，最优版本仍是 <code>1149c02b</code>。
   这个版本有一个<b style="display: inline; margin: 0">未修复的偶发数据错误</b>：uniform 路由的第一次端到端在第 6 步出现 Inf 梯度，复跑通过，详见下面的「已知问题」。
 </div>
@@ -113,39 +113,40 @@
   <thead>
     <tr>
       <th>路由方式</th><th class="num">步数</th><th class="num">基线 ms/iter</th><th class="num">Mega ms/iter</th>
-      <th class="num">Mega 加速</th><th class="num">10-23 加速</th><th class="num">TFLOP/s/GPU 基线 / Mega</th>
+      <th class="num">单步耗时变化</th><th class="num">10-23 单步耗时变化</th><th class="num">TFLOP/s/GPU 基线 / Mega</th>
       <th class="num">峰值显存 基线 / Mega</th><th class="num">最后一步 loss 基线 / Mega</th><th class="num">loss 最大相对偏差</th>
     </tr>
   </thead>
   <tbody>
     <tr>
       <td>even（Primus 默认）</td><td class="num">10</td><td class="num">1201.2</td><td class="num">1055.7</td>
-      <td class="num good">12.1%</td><td class="num">5.6%</td><td class="num">1184 / 1342</td><td class="num">170.8 / 154.4 GB</td>
+      <td class="num good">−12.1%</td><td class="num">−5.6%</td><td class="num">1177.5 / 1339.8（+13.8%）</td><td class="num">170.8 / 154.4 GB</td>
       <td class="num">5.562744 / 5.563191</td><td class="num">8.0e-5</td>
     </tr>
     <tr>
-      <td>uniform</td><td class="num">10</td><td class="num">1250.9（第 6–10 步 1218.9）</td><td class="num">1085.8（1083.9）</td>
-      <td class="num good">13.2%（稳态 11.1%）</td><td class="num">3.2%（稳态 0.8%）</td><td class="num">1169 / 1301</td>
+      <td>uniform</td><td class="num">10</td><td class="num">1250.9</td><td class="num">1085.8</td>
+      <td class="num good">−13.2%</td><td class="num">−3.2%</td><td class="num">1132.0 / 1302.8（+15.1%）</td>
       <td class="num">179.6 / 154.8 GB</td><td class="num">8.791613 / 8.791598</td><td class="num">3.2e-6</td>
     </tr>
     <tr>
-      <td>真实路由，不强制均衡</td><td class="num">50</td><td class="num">1319.1（第 8–50 步 1249.1）</td><td class="num">1095.1</td>
-      <td class="num good">17.0%（稳态 12.3%）</td><td class="num">3.2x（稳态 2.5%）</td><td class="num">1147 / 1286</td>
+      <td>真实路由，不强制均衡</td><td class="num">50</td><td class="num">1319.1</td><td class="num">1095.1</td>
+      <td class="num good">−17.0%</td><td class="num">不可比 *</td><td class="num">1092.9 / 1291.8（+18.2%）</td>
       <td class="num">179.5 / 154.9 GB</td><td class="num">0.101169 / 0.101165</td><td class="num">1.0e-3</td>
     </tr>
   </tbody>
 </table>
 <div class="caption">
-  ms/iter 是 Primus 从第 3 步起的平均值。稳态口径和 10-23 相同：uniform 取第 6–10 步；真实路由的基线去掉第 3–7 步的 5 个慢步
-  （1.6–2.3 s），即取第 8–50 步，Mega 取第 3–50 步。这次基线没有出现 10-23 那种约 8 s 的周期性慢步。uniform 的 Mega 数据来自复跑：
-  第一次在第 6 步因 rank 3 的 Inf 梯度中断（第 3–5 步 1091.2 ms/iter）。
+  ms/iter 和 TFLOP/s/GPU 都取 Primus 日志最后一步打印的平均值（从第 3 步起算）。这个平均值包含基线前几步的慢步：uniform 第 3–5 步约 1300 ms，
+  真实路由第 3–7 步 1.6–2.3 s。如果去掉这些慢步，uniform 是 1218.9 → 1083.9 ms（−11.1%），真实路由是 1249.1 → 1095.1 ms（−12.3%）。
+  * 10-23 的真实路由基线有约 8 s 的周期性慢步，平均值 3851.5 ms，和这次没有可比性。uniform 的 Mega 数据来自复跑：第一次在第 6 步因
+  rank 3 的 Inf 梯度中断（第 3–5 步 1091.2 ms/iter）。
 </div>
 
 <div class="grid2">
   <div class="chart">
-    <h3>端到端稳态单步耗时</h3>
+    <h3>端到端单步耗时</h3>
     <div id="chart-e2e-1026"></div>
-    <div class="caption">纵轴：ms/iter。even 取第 3–10 步均值；uniform 取第 6–10 步均值；真实路由基线取第 8–50 步、Mega 取第 3–50 步。</div>
+    <div class="caption">纵轴：ms/iter，Primus 日志最后一步打印的平均值（从第 3 步起算）。</div>
   </div>
   <div class="chart">
     <h3>真实路由每步耗时（第 8–50 步）</h3>
@@ -687,10 +688,10 @@ const realMegaMs1026 = [1094.5, 1094.0, 1110.5, 1097.2, 1092.8, 1099.1, 1097.9, 
 const C_MEGA_OLD = "#8fd19e";
 
 barChart("chart-e2e-1026", {
-  categories: ["even", "uniform（稳态）", "真实路由（稳态）"],
+  categories: ["even", "uniform", "真实路由"],
   series: [
-    { name: "基线（all-to-all + FlyDSL grouped GEMM）", data: [1201.2, 1218.9, 1249.1], color: C.base },
-    { name: "Mega MoE @ 1149c02b", data: [1055.7, 1083.9, 1095.1], color: C.mega },
+    { name: "基线（all-to-all + FlyDSL grouped GEMM）", data: [1201.2, 1250.9, 1319.1], color: C.base },
+    { name: "Mega MoE @ 1149c02b", data: [1055.7, 1085.8, 1095.1], color: C.mega },
   ],
   fmt: v => v.toFixed(0), xLabel: "路由方式", yLabel: "ms/iter",
 });
