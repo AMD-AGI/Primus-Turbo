@@ -18,6 +18,10 @@ namespace primus_turbo::deep_ep {
 
 namespace intranode {
 
+#ifndef PRIMUS_TURBO_DEEPEP_COPY_UNROLL
+#define PRIMUS_TURBO_DEEPEP_COPY_UNROLL 8
+#endif
+
 template <int kNumRanks>
 __global__ void
 notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped,
@@ -333,8 +337,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     auto shifted_channel_x_buffers =
                         channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
                     auto shifted_x = x + token_idx * hidden_int4;
-                    UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_channel_x_buffers,
-                                       shifted_x, __ldg, channel_x_payload.st);
+                    UNROLLED_WARP_COPY(PRIMUS_TURBO_DEEPEP_COPY_UNROLL, lane_id, hidden_int4,
+                                       shifted_channel_x_buffers, shifted_x, __ldg,
+                                       channel_x_payload.st);
 
                     // Copy source index
                     if (lane_id == 0)
@@ -464,8 +469,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     channel_x_buffers.buffer() + token_idx_in_buffer * hidden_int4;
                 auto shifted_recv_x_int4 =
                     recv_x + static_cast<int64_t>(total_offset + chunk_idx) * hidden_int4;
-                UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_recv_x_int4,
-                                   shifted_buffer_x_int4, channel_x_payload.ld, st_na_global);
+                UNROLLED_WARP_COPY(PRIMUS_TURBO_DEEPEP_COPY_UNROLL, lane_id, hidden_int4,
+                                   shifted_recv_x_int4, shifted_buffer_x_int4, channel_x_payload.ld,
+                                   st_na_global);
             }
 
 // Copy `src_idx`
@@ -762,8 +768,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 // Copy data
                 auto shifted_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
                 auto shifted_x         = x_int4 + (token_idx + i) * hidden_int4;
-                UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_x_buffers, shifted_x,
-                                   ld_nc_global, channel_x_payload.st);
+                UNROLLED_WARP_COPY(PRIMUS_TURBO_DEEPEP_COPY_UNROLL, lane_id, hidden_int4,
+                                   shifted_x_buffers, shifted_x, ld_nc_global, channel_x_payload.st);
 
                 // Send source index
                 if (lane_id == 0)
