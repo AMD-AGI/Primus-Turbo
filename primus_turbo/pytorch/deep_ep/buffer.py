@@ -16,15 +16,32 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-import primus_turbo.pytorch._C.deep_ep as deep_ep_cpp
-from primus_turbo.pytorch._C.deep_ep import Config, EventHandle
-
+from ._compat import Config, EventHandle, deep_ep_cpp
 from .flydsl_intranode import (
     SUPPORTED_NUM_RANKS,
     FlyDSLIntranodeRuntime,
     get_intranode_backend,
 )
 from .utils import EventOverlap, check_nvlink_connections
+
+
+def _require_deep_ep_cpp(what: str):
+    if deep_ep_cpp is None:
+        raise RuntimeError(
+            f"{what} needs the C++ DeepEP, which this build of primus_turbo does not include; "
+            "only the FlyDSL intranode backend (intranode_backend='flydsl') runs without it"
+        )
+    return deep_ep_cpp
+
+
+class _NoCppRuntime:
+    """``Buffer.runtime`` of the FlyDSL intranode backend: no C++ runtime behind it."""
+
+    def __getattr__(self, name):
+        raise RuntimeError(
+            f"Buffer.runtime.{name}: the FlyDSL intranode backend has no C++ runtime "
+            "(internode and low-latency need intranode_backend='cpp')"
+        )
 
 
 class Buffer:
@@ -104,11 +121,21 @@ class Buffer:
         )
         if self.intranode_backend == "flydsl" and not use_flydsl:
             self.intranode_backend = "cpp"
-        self.runtime = deep_ep_cpp.Buffer(
+
+        if use_flydsl:
+            # intranode only: the FlyDSL runtime owns the NVL heap, and nothing needs the C++ one
+            assert num_rdma_bytes == 0, "the FlyDSL intranode backend has no RDMA buffer"
+            self.runtime = _NoCppRuntime()
+            self.num_rdma_ranks = 1
+            # like the C++ runtime's comm stream, a high-priority one from the pool
+            self._comm_stream = torch.cuda.Stream(priority=-1)
+            self.intranode_runtime = FlyDSLIntranodeRuntime(group, num_nvl_bytes, self._comm_stream)
+            return
+
+        self.runtime = _require_deep_ep_cpp("the 'cpp' DeepEP backend").Buffer(
             self.rank,
             self.group_size,
-            # the FlyDSL runtime owns the NVL heap, the C++ one keeps only its stream / counters
-            0 if use_flydsl else num_nvl_bytes,
+            num_nvl_bytes,
             num_rdma_bytes,
             low_latency_mode,
             explicitly_destroy,
@@ -167,13 +194,8 @@ class Buffer:
         # Make CPP runtime available
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
         assert self.runtime.is_available()
-
-        # Intranode kernels: the C++ runtime itself, or the FlyDSL one on its own heap
-        self.intranode_runtime = (
-            FlyDSLIntranodeRuntime(group, num_nvl_bytes, self.get_comm_stream())
-            if use_flydsl
-            else self.runtime
-        )
+        self.num_rdma_ranks = self.runtime.get_num_rdma_ranks()
+        self.intranode_runtime = self.runtime
 
     def destroy(self):
         """
@@ -185,13 +207,14 @@ class Buffer:
 
         if self.intranode_runtime is not self.runtime:
             self.intranode_runtime.destroy()
+        else:
+            self.runtime.destroy()
         self.intranode_runtime = None
-        self.runtime.destroy()
         self.runtime = None
 
     @staticmethod
     def is_sm90_compiled():
-        return deep_ep_cpp.is_sm90_compiled()
+        return deep_ep_cpp is not None and deep_ep_cpp.is_sm90_compiled()
 
     @staticmethod
     def set_num_sms(new_num_sms: int) -> None:
@@ -231,7 +254,7 @@ class Buffer:
         Returns:
             size: the RDMA buffer size recommended.
         """
-        return deep_ep_cpp.get_low_latency_rdma_size_hint(
+        return _require_deep_ep_cpp("the low-latency mode").get_low_latency_rdma_size_hint(
             num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts
         )
 
@@ -242,6 +265,8 @@ class Buffer:
         Returns:
             stream: the communication stream.
         """
+        if self.intranode_runtime is not self.runtime:
+            return self._comm_stream
         ts: torch.Stream = self.runtime.get_comm_stream()
         return torch.cuda.Stream(
             stream_id=ts.stream_id, device_index=ts.device_index, device_type=ts.device_type
@@ -452,7 +477,7 @@ class Buffer:
         config = self.get_dispatch_config(self.group_size) if config is None else config
 
         # Internode
-        if self.runtime.get_num_rdma_ranks() > 1:
+        if self.num_rdma_ranks > 1:
             return self.internode_dispatch(
                 x,
                 handle,
@@ -599,7 +624,7 @@ class Buffer:
         config = self.get_combine_config(self.group_size) if config is None else config
 
         # Internode
-        if self.runtime.get_num_rdma_ranks() > 1:
+        if self.num_rdma_ranks > 1:
             return self.internode_combine(
                 x, handle, topk_weights, bias, config, previous_event, async_finish, allocate_on_comm_stream
             )

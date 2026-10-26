@@ -21,10 +21,15 @@ Within a block the threads split into one group per peer rank, and each group ru
 its own ring buffer on the receiver's heap: the sender bumps the tail, the receiver
 the head.
 
-Ordering follows the HIP path's cheap fence (gfx942 / gfx950): the heap is uncached,
-so a sender that waits for its own stores (``s_waitcnt``) before the tail store has
-put the payload in memory, and the receiver reads it with system-scope loads that
-miss every cache.
+Ordering, per ``ArchTraits.cheap_fence``:
+
+- gfx942 / gfx950, the HIP path's cheap fence: the heap is uncached, so a sender that
+  waits for its own stores (``s_waitcnt``) before a relaxed tail store has put the payload
+  in memory, and the receiver reads it with system-scope loads that miss every cache.
+- gfx1250, the HIP path's full fence: every sending warp still drains its stores
+  (``s_wait_storecnt``) before the group barrier, then the tail goes out as a
+  system-scope release and is polled with system-scope acquires; heads likewise.
+  The payload reads keep the system-scope cache policy.
 """
 
 import functools
@@ -33,9 +38,17 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, range_constexpr
+from flydsl.expr.utils.arith import ArithValue
+from flydsl.expr.utils.arith import _to_raw as _raw
 
+from primus_turbo.flydsl.deep_ep.arch import (
+    ArchTraits,
+    get_arch_traits,
+    spin_timeout_hit,
+    wait_all,
+    wait_stores,
+)
 from primus_turbo.flydsl.deep_ep.common import (
-    WARP_SIZE,
     ld_lds,
     lds_base,
     load_i32,
@@ -43,7 +56,6 @@ from primus_turbo.flydsl.deep_ep.common import (
     st_lds,
     tensor_addr,
 )
-from primus_turbo.flydsl.utils.attn_helper import _wave_any
 from primus_turbo.flydsl.utils.buffer_ops import (
     _unwrap_value,
     buffer_load,
@@ -66,30 +78,13 @@ from primus_turbo.flydsl.utils.prims import (
 )
 
 NUM_THREADS = 1024
-NUM_WARPS = NUM_THREADS // WARP_SIZE
 FINISHED_SUM_TAG = 1024
 NOTIFY_THREADS = 256
-# sc0 | sc1 | nt: a system-scope streaming load, which misses every GPU cache
-SYS_LOAD = 0x13
 _INT_MAX = 0x7FFFFFFF
 
 
-def dispatch_copy_piece_bytes(num_channels):
-    """Bytes of a row one ``copy_warp`` call loads before it stores them (1 KiB a warp step).
-
-    gfx9's vmcnt counts stores too, so the loads of the next piece wait for this piece's (remote)
-    stores; the more channels push at once, the smaller the piece that keeps a sender streaming.
-    Measured on MI355X, 8 ranks, hidden 7168, a DeepEP forward + backward per step
-    (num_sms -> best dispatch / combine): 20 -> 2 KiB / 8 KiB, 40 -> 1 KiB / 2 KiB,
-    64 and 80 -> 1 KiB / 1 KiB."""
-    return 2 * 1024 if num_channels <= 10 else 1024
-
-
-def combine_copy_piece_bytes(num_channels):
-    """The combine sender's ``dispatch_copy_piece_bytes``."""
-    if num_channels <= 10:
-        return 8 * 1024
-    return 2 * 1024 if num_channels <= 20 else 1024
+def _timed_out(spin_start):
+    return spin_timed_out(spin_start, get_arch_traits().spin_timeout_cycles)
 
 
 # ── Heap layout (byte offsets from a rank's buffer base) ─────────────────────
@@ -165,6 +160,23 @@ def _st_sys(addr, idx, value):
     st(addr, fx.Int32(idx) if isinstance(idx, int) else idx, value, scope="sys")
 
 
+def _publish(traits: ArchTraits, addr, value):
+    """Store a ring tail / head the peer polls; ``group_barrier(publish=True)`` comes first."""
+    st(addr, fx.Int32(0), value, scope="sys", order="relaxed" if traits.cheap_fence else "release")
+
+
+def _ld_flag(traits: ArchTraits, addr):
+    """Read a ring tail / head the peer publishes with ``_publish``."""
+    return ld(addr, fx.Int32(0), scope="sys", order="relaxed" if traits.cheap_fence else "acquire")
+
+
+def _wave_any(traits: ArchTraits, cond):
+    """Wave-uniform "some lane satisfies cond", as one ballot and one compare."""
+    mask_type = fx.Int64 if traits.wave_size == 64 else fx.Int32
+    mask = fx.rocdl.ballot(mask_type.ir_type, _raw(cond))
+    return ArithValue(mask_type(mask) != mask_type(0))
+
+
 def _sum_lds(lds, first, count: int):
     """Sum of ``count`` consecutive i32 LDS words from ``first``."""
     total = fx.Int32(0)
@@ -220,7 +232,7 @@ def _region_res(base, layout, name, slot):
     )
 
 
-def _copy_row(dst_addr, src_addr, num_bytes, piece_bytes, load_cache_modifier=0):
+def _copy_row(traits: ArchTraits, dst_addr, src_addr, num_bytes, piece_bytes, load_cache_modifier=0):
     """Warp copy of one row between two warp-uniform i64 addresses."""
     # a row base the compiler cannot prove uniform turns every load / store into a waterfall
     dst_addr, src_addr = _uniform_i64(dst_addr), _uniform_i64(src_addr)
@@ -230,6 +242,7 @@ def _copy_row(dst_addr, src_addr, num_bytes, piece_bytes, load_cache_modifier=0)
             src_addr + fx.Int64(piece),
             min(piece_bytes, num_bytes - piece),
             load_cache_modifier=load_cache_modifier,
+            wave_size=traits.wave_size,
         )
 
 
@@ -243,14 +256,25 @@ def _uniform_i64(value):
     return (_i64(high) << fx.Int64(32)) | (_i64(low) & fx.Int64(0xFFFFFFFF))
 
 
+def _publish_fence(traits: ArchTraits):
+    """Every sending warp's part of a publish: its payload stores must have landed before the
+    one warp that stores the tail does. The release of that store covers only its own warp."""
+    if traits.cheap_fence:
+        wait_all(traits)
+    else:
+        wait_stores(traits)
+
+
 @ASTRewriter.transform
-def group_barrier(lds, bar_id, num_arrived, num_warps_per_group: int, publish: bool = False):
+def group_barrier(
+    traits: ArchTraits, lds, bar_id, num_arrived, num_warps_per_group: int, publish: bool = False
+):
     """Barrier over the warps of one rank group (``sync_barrier``), on an LDS arrival counter.
 
     ``num_arrived`` is the count this warp expects before this barrier; returns the next one.
-    ``publish`` first waits for the warp's own stores, the cheap fence in front of a tail store."""
+    ``publish`` first waits for the warp's own stores (``_publish_fence``), in front of a tail store."""
     if publish:
-        fx.rocdl.s_waitcnt(0)
+        _publish_fence(traits)
     memory_fence(order="release", scope="workgroup")
     num_arrived = num_arrived + fx.Int32(num_warps_per_group)
     if fx.lane_id() == fx.Int32(0):
@@ -276,13 +300,14 @@ def barrier_block(barrier_ptrs_res, rank, num_ranks: int, sync_only: bool, tag: 
         spin_start = read_clock()
         value = _ld_sys(own_signal, thread_id)
         while value > fx.Int32(0):
-            if spin_timed_out(spin_start):
+            if _timed_out(spin_start):
                 fx.printf(
                     "[DeepEP FlyDSL " + tag + "] barrier timeout: rank={} thread={} value={}\n",
                     rank,
                     thread_id,
                     value,
                 )
+                spin_timeout_hit(get_arch_traits())
                 spin_start = read_clock()
             value = _ld_sys(own_signal, thread_id)
     fx.gpu.barrier()
@@ -295,38 +320,43 @@ def wait_nonzero_sys(addr, rank, channel, tag: str):
     spin_start = read_clock()
     value = _ld_sys(addr)
     while value == fx.Int32(0):
-        if spin_timed_out(spin_start):
+        if _timed_out(spin_start):
             fx.printf("[DeepEP FlyDSL " + tag + "] timeout: rank={} channel={}\n", rank, channel)
+            spin_timeout_hit(get_arch_traits())
             spin_start = read_clock()
         value = _ld_sys(addr)
     return value
 
 
 @ASTRewriter.transform
-def wait_free_slots(head_addr, tail, num_needed, num_recv_buffer_tokens: int, rank, channel, tag: str):
+def wait_free_slots(
+    traits: ArchTraits, head_addr, tail, num_needed, num_recv_buffer_tokens: int, rank, channel, tag: str
+):
     """Whole-warp poll of a remote queue head until ``num_needed`` slots are free; returns the head."""
     spin_start = read_clock()
-    head = _ld_sys(head_addr)
+    head = _ld_flag(traits, head_addr)
     while fx.Int32(num_recv_buffer_tokens) - (tail - head) < num_needed:
-        if spin_timed_out(spin_start):
+        if _timed_out(spin_start):
             fx.printf("[DeepEP FlyDSL " + tag + "] sender timeout: rank={} channel={}\n", rank, channel)
+            spin_timeout_hit(get_arch_traits())
             spin_start = read_clock()
-        head = _ld_sys(head_addr)
+        head = _ld_flag(traits, head_addr)
     return head
 
 
 @ASTRewriter.transform
-def wait_new_tail(tail_addr, head, rank, channel, tag: str):
+def wait_new_tail(traits: ArchTraits, tail_addr, head, rank, channel, tag: str):
     """Whole-warp poll of a local queue tail until it moves past ``head``; returns it."""
     spin_start = read_clock()
-    fx.rocdl.s_waitcnt(0)
-    tail = _ld_sys(tail_addr)
+    wait_all(traits)
+    tail = _ld_flag(traits, tail_addr)
     while tail == head:
-        if spin_timed_out(spin_start):
+        if _timed_out(spin_start):
             fx.printf("[DeepEP FlyDSL " + tag + "] receiver timeout: rank={} channel={}\n", rank, channel)
+            spin_timeout_hit(get_arch_traits())
             spin_start = read_clock()
-        fx.rocdl.s_waitcnt(0)
-        tail = _ld_sys(tail_addr)
+        wait_all(traits)
+        tail = _ld_flag(traits, tail_addr)
     return tail
 
 
@@ -335,6 +365,10 @@ def wait_new_tail(tail_addr, head, rank, channel, tag: str):
 
 def _make_notify_dispatch(num_ranks, num_experts, num_channels, num_memset_int, expert_alignment):
     num_experts_per_rank = num_experts // num_ranks
+    traits = get_arch_traits()
+    wave_size = traits.wave_size
+    # xor butterfly of a warp: wave_size / 2, ..., 1
+    shuffle_offsets = tuple(wave_size >> s for s in range(1, wave_size.bit_length()))
 
     @flyc.kernel(known_block_size=[NOTIFY_THREADS, 1, 1])
     def notify_dispatch_kernel(
@@ -351,8 +385,8 @@ def _make_notify_dispatch(num_ranks, num_experts, num_channels, num_memset_int, 
     ):
         thread_id = fx.thread_idx.x
         block_id = fx.block_idx.x
-        lane_id = thread_id % fx.Int32(WARP_SIZE)
-        warp_id = thread_id // fx.Int32(WARP_SIZE)
+        lane_id = thread_id % fx.Int32(wave_size)
+        warp_id = thread_id // fx.Int32(wave_size)
         buffer_ptrs_res = create_buffer_resource(BUFFER_PTRS, max_size=True)
         barrier_ptrs_res = create_buffer_resource(BARRIER_PTRS, max_size=True)
         lds = lds_base()
@@ -427,12 +461,12 @@ def _make_notify_dispatch(num_ranks, num_experts, num_channels, num_memset_int, 
                 token = token_start + lane_id
                 while token < token_end:
                     count = count + _load_u8(in_rank_res, token * fx.Int32(num_ranks) + dst_rank)
-                    token = token + fx.Int32(WARP_SIZE)
-                for offset in (32, 16, 8, 4, 2, 1):
-                    count = count + fx.shuffle_xor(count, offset, WARP_SIZE)
+                    token = token + fx.Int32(wave_size)
+                for offset in shuffle_offsets:
+                    count = count + fx.shuffle_xor(count, offset, wave_size)
                 if lane_id == fx.Int32(0):
                     st_lds(lds, channel, count)
-                channel = channel + fx.Int32(NOTIFY_THREADS // WARP_SIZE)
+                channel = channel + fx.Int32(NOTIFY_THREADS // wave_size)
             fx.gpu.barrier()
             if thread_id == fx.Int32(0):
                 prefix_res = create_buffer_resource(CHANNEL_PREFIX_MATRIX, max_size=True)
@@ -535,12 +569,14 @@ def _make_dispatch(
     num_recv_buffer_tokens,
     topk_idx_bytes,
 ):
-    assert NUM_WARPS % num_ranks == 0, "every rank group needs whole warps"
+    traits = get_arch_traits()
+    wave_size = traits.wave_size
+    assert (NUM_THREADS // wave_size) % num_ranks == 0, "every rank group needs whole warps"
     threads_per_rank = NUM_THREADS // num_ranks
-    warps_per_rank = threads_per_rank // WARP_SIZE
+    warps_per_rank = threads_per_rank // wave_size
     num_experts_per_rank = num_experts // num_ranks if num_topk > 0 else 0
-    assert num_topk <= WARP_SIZE
-    copy_piece_bytes = dispatch_copy_piece_bytes(num_channels)
+    assert num_topk <= wave_size
+    copy_piece_bytes = traits.copy_piece_bytes("dispatch", num_channels)
     layout, _ = dispatch_buffer_layout(
         num_ranks, num_channels, num_recv_buffer_tokens, hidden_bytes, num_topk, topk_idx_bytes, num_scales
     )
@@ -571,10 +607,10 @@ def _make_dispatch(
     ):
         thread_id = fx.thread_idx.x
         block_id = fx.block_idx.x
-        lane_id = thread_id % fx.Int32(WARP_SIZE)
+        lane_id = thread_id % fx.Int32(wave_size)
         group = thread_id // fx.Int32(threads_per_rank)
         thread_in_group = thread_id % fx.Int32(threads_per_rank)
-        warp_in_group = thread_in_group // fx.Int32(WARP_SIZE)
+        warp_in_group = thread_in_group // fx.Int32(wave_size)
         channel = block_id // fx.Int32(2)
         lds = lds_base()
         buffer_ptrs_res = create_buffer_resource(BUFFER_PTRS, max_size=True)
@@ -621,6 +657,7 @@ def _make_dispatch(
                 ):
                     prefetched_head = _readfirstlane_i32(
                         wait_free_slots(
+                            traits,
                             head_addr,
                             tail,
                             fx.Int32(num_max_send_tokens),
@@ -644,6 +681,7 @@ def _make_dispatch(
                         tail = tail + fx.Int32(1)
                         if tail % fx.Int32(warps_per_rank) == warp_in_group:
                             _copy_row(
+                                traits,
                                 _addr(x_ring, 0, dst_slot, hidden_bytes),
                                 _addr(x_base, 0, token, hidden_bytes),
                                 hidden_bytes,
@@ -679,8 +717,8 @@ def _make_dispatch(
                             if fx.const_expr(num_scales > 0):
                                 x_scales_res = create_buffer_resource(X_SCALES, max_size=True)
                                 x_scales_ring = _region_res(peer, layout, "x_scales", slot)
-                                for u in range_constexpr((num_scales + WARP_SIZE - 1) // WARP_SIZE):
-                                    scale_idx = lane_id + fx.Int32(u * WARP_SIZE)
+                                for u in range_constexpr((num_scales + wave_size - 1) // wave_size):
+                                    scale_idx = lane_id + fx.Int32(u * wave_size)
                                     if scale_idx < fx.Int32(num_scales):
                                         value = load_i32(
                                             x_scales_res,
@@ -693,10 +731,10 @@ def _make_dispatch(
                     token = token + fx.Int32(1)
 
                 # read the next round's head here, so the publish wait covers it too
-                prefetched_head = _readfirstlane_i32(_ld_sys(head_addr))
-                num_arrived = group_barrier(lds, group, num_arrived, warps_per_rank, True)
+                prefetched_head = _readfirstlane_i32(_ld_flag(traits, head_addr))
+                num_arrived = group_barrier(traits, lds, group, num_arrived, warps_per_rank, True)
                 if (warp_in_group == fx.Int32(0)) & (lane_id == fx.Int32(0)):
-                    _st_sys(tail_addr, 0, tail)
+                    _publish(traits, tail_addr, tail)
         else:
             # ---- receiver: this group drains the ring `group` fills for (channel, us) ----
             slot = channel * fx.Int32(num_ranks) + group
@@ -731,10 +769,10 @@ def _make_dispatch(
             while num_tokens_to_recv > fx.Int32(0):
                 # one warp reads the tail so every warp of the group copies the same tokens
                 if warp_in_group == fx.Int32(0):
-                    new_tail = wait_new_tail(tail_addr, head, rank, channel, "dispatch")
+                    new_tail = wait_new_tail(traits, tail_addr, head, rank, channel, "dispatch")
                     if lane_id == fx.Int32(0):
                         st_lds(lds, fx.Int32(lds_shared_tail) + group, new_tail)
-                num_arrived = group_barrier(lds, group, num_arrived, warps_per_rank)
+                num_arrived = group_barrier(traits, lds, group, num_arrived, warps_per_rank)
                 tail = _readfirstlane_i32(ld_lds(lds, fx.Int32(lds_shared_tail) + group))
                 num_recv = tail - head
 
@@ -742,11 +780,12 @@ def _make_dispatch(
                 while chunk < num_recv:
                     ring_slot = (head + chunk) % fx.Int32(num_recv_buffer_tokens)
                     _copy_row(
+                        traits,
                         _addr(recv_x_base, 0, total_offset + chunk, hidden_bytes),
                         _addr(x_ring, 0, ring_slot, hidden_bytes),
                         hidden_bytes,
                         copy_piece_bytes,
-                        load_cache_modifier=SYS_LOAD,
+                        load_cache_modifier=traits.cpol_sys_load,
                     )
                     chunk = chunk + fx.Int32(warps_per_rank)
                 i = thread_in_group
@@ -794,9 +833,9 @@ def _make_dispatch(
 
                 head = head + num_recv
                 total_offset = total_offset + num_recv
-                num_arrived = group_barrier(lds, group, num_arrived, warps_per_rank)
+                num_arrived = group_barrier(traits, lds, group, num_arrived, warps_per_rank)
                 if (warp_in_group == fx.Int32(warps_per_rank - 1)) & (lane_id == fx.Int32(0)):
-                    _st_sys(head_addr, 0, head)
+                    _publish(traits, head_addr, head)
                 num_tokens_to_recv = num_tokens_to_recv - num_recv
 
         # with a worst-case allocation, the rows past the received ones read as unrouted
@@ -887,6 +926,9 @@ def launch_dispatch(
 def _make_cached_notify_combine(num_ranks, num_channels, num_memset_int, num_threads):
     # far past any queue position: what a token with no later route to a rank waits for
     num_heuristic_head = 1 << 25
+    # one warp per destination rank
+    wave_size = get_arch_traits().wave_size
+    assert num_threads >= wave_size * num_ranks
 
     @flyc.kernel(known_block_size=[num_threads, 1, 1])
     def cached_notify_combine_kernel(
@@ -898,7 +940,7 @@ def _make_cached_notify_combine(num_ranks, num_channels, num_memset_int, num_thr
     ):
         thread_id = fx.thread_idx.x
         block_id = fx.block_idx.x
-        lane_id = thread_id % fx.Int32(WARP_SIZE)
+        lane_id = thread_id % fx.Int32(wave_size)
         if block_id == fx.Int32(0):
             buffer_ptrs_res = create_buffer_resource(BUFFER_PTRS, max_size=True)
             barrier_ptrs_res = create_buffer_resource(BARRIER_PTRS, max_size=True)
@@ -913,7 +955,7 @@ def _make_cached_notify_combine(num_ranks, num_channels, num_memset_int, num_thr
             # a token not sent to a rank gets -(the next sent token's head) - 1, so the combine
             # receiver can still move that rank's queue head past it
             channel = block_id - fx.Int32(1)
-            dst_rank = thread_id // fx.Int32(WARP_SIZE)
+            dst_rank = thread_id // fx.Int32(wave_size)
             if dst_rank < fx.Int32(num_ranks):
                 send_head_res = create_buffer_resource(SEND_HEAD, max_size=True)
                 token_start, token_end = _channel_task_range(num_recv_tokens, num_channels, channel)
@@ -927,7 +969,7 @@ def _make_cached_notify_combine(num_ranks, num_channels, num_memset_int, num_thr
                     head = arith.select(is_valid, head, fx.Int32(-1))
                     expected_head = fx.Int32(0)
                     # lane i holds token_tail - i, so walking lanes upward walks tokens backward
-                    for i in range_constexpr(WARP_SIZE):
+                    for i in range_constexpr(wave_size):
                         lane_head = _readlane_i32(head, i)
                         expected_head = arith.select(
                             (lane_head < fx.Int32(0)) & (lane_id == fx.Int32(i)),
@@ -937,7 +979,7 @@ def _make_cached_notify_combine(num_ranks, num_channels, num_memset_int, num_thr
                         last_head = arith.select(lane_head >= fx.Int32(0), lane_head, last_head)
                     if (head < fx.Int32(0)) & is_valid:
                         buffer_store(expected_head, send_head_res, elem)
-                    token_tail = token_tail - fx.Int32(WARP_SIZE)
+                    token_tail = token_tail - fx.Int32(wave_size)
 
     return cached_notify_combine_kernel
 
@@ -954,7 +996,7 @@ def launch_cached_notify_combine(
     num_memset_int: fx.Constexpr[int],
     stream: fx.Stream,
 ):
-    num_threads = max(128, WARP_SIZE * num_ranks)
+    num_threads = max(128, get_arch_traits().wave_size * num_ranks)
     kernel = _make_cached_notify_combine(num_ranks, num_channels, num_memset_int, num_threads)
     kernel(send_head, buffer_ptrs, barrier_ptrs, num_recv_tokens, rank).launch(
         grid=(1 + num_channels, 1, 1), block=(num_threads, 1, 1), stream=stream
@@ -962,6 +1004,14 @@ def launch_cached_notify_combine(
 
 
 # ── combine ──────────────────────────────────────────────────────────────────
+
+
+def combine_min_recv_buffer_tokens(num_max_send_tokens: int) -> int:
+    """Smallest combine ring that cannot deadlock. A reducer warp moves its queue head only once
+    its token is summed, so the published head trails the oldest pending token by up to one
+    token per reducer warp, and the sender still needs a whole chunk free past that."""
+    num_reduce_warps = NUM_THREADS // get_arch_traits().wave_size - 1
+    return num_reduce_warps + num_max_send_tokens - 1
 
 
 def _make_combine(
@@ -975,24 +1025,27 @@ def _make_combine(
     has_bias_0,
     has_bias_1,
 ):
-    assert NUM_WARPS % num_ranks == 0 and num_ranks <= WARP_SIZE and num_topk <= WARP_SIZE
+    traits = get_arch_traits()
+    wave_size = traits.wave_size
+    num_warps = NUM_THREADS // wave_size
+    assert num_warps % num_ranks == 0 and num_ranks <= wave_size and num_topk <= wave_size
     hidden_bytes = hidden * elem_bytes
     assert hidden_bytes % 16 == 0
-    warps_per_rank = NUM_WARPS // num_ranks
-    num_reduce_warps = NUM_WARPS - 1
+    warps_per_rank = num_warps // num_ranks
+    num_reduce_warps = num_warps - 1
     layout, _ = combine_buffer_layout(num_ranks, num_channels, num_recv_buffer_tokens, hidden_bytes, num_topk)
-    copy_piece_bytes = combine_copy_piece_bytes(num_channels)
-    # LDS: [num_ranks] group barrier counters, [NUM_WARPS][num_ranks] per-warp heads,
-    # [num_ranks] queue tails, [NUM_WARPS] retired flags
+    copy_piece_bytes = traits.copy_piece_bytes("combine", num_channels)
+    # LDS: [num_ranks] group barrier counters, [num_warps][num_ranks] per-warp heads,
+    # [num_ranks] queue tails, [num_warps] retired flags
     lds_warp_head = num_ranks
-    lds_tail = lds_warp_head + NUM_WARPS * num_ranks
+    lds_tail = lds_warp_head + num_warps * num_ranks
     lds_retired = lds_tail + num_ranks
-    lds_words = lds_retired + NUM_WARPS
+    lds_words = lds_retired + num_warps
     # one 16-byte vector per lane per step; passes bound the row loads in flight
     vec_elems = 16 // elem_bytes
     num_vecs = hidden_bytes // 16
-    num_steps = (num_vecs + WARP_SIZE - 1) // WARP_SIZE
-    steps_per_pass = max(1, 32 // (num_ranks + int(has_bias_0) + int(has_bias_1)))
+    num_steps = (num_vecs + wave_size - 1) // wave_size
+    steps_per_pass = max(1, traits.combine_loads_in_flight // (num_ranks + int(has_bias_0) + int(has_bias_1)))
 
     @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
     def combine_kernel(
@@ -1012,8 +1065,8 @@ def _make_combine(
     ):
         thread_id = fx.thread_idx.x
         block_id = fx.block_idx.x
-        lane_id = thread_id % fx.Int32(WARP_SIZE)
-        warp_id = thread_id // fx.Int32(WARP_SIZE)
+        lane_id = thread_id % fx.Int32(wave_size)
+        warp_id = thread_id // fx.Int32(wave_size)
         channel = block_id // fx.Int32(2)
         lds = lds_base()
         buffer_ptrs_res = create_buffer_resource(BUFFER_PTRS, max_size=True)
@@ -1071,6 +1124,7 @@ def _make_combine(
                 if fx.Int32(num_recv_buffer_tokens) - (tail - prefetched_head) < num_round_tokens:
                     prefetched_head = _readfirstlane_i32(
                         wait_free_slots(
+                            traits,
                             head_addr,
                             tail,
                             num_round_tokens,
@@ -1084,6 +1138,7 @@ def _make_combine(
                 while i < num_round_tokens:
                     dst_slot = (tail + i) % fx.Int32(num_recv_buffer_tokens)
                     _copy_row(
+                        traits,
                         _addr(x_ring, 0, dst_slot, hidden_bytes),
                         _addr(x_base, 0, token + i, hidden_bytes),
                         hidden_bytes,
@@ -1110,10 +1165,10 @@ def _make_combine(
                 token = token + num_round_tokens
                 tail = tail + num_round_tokens
 
-                prefetched_head = _readfirstlane_i32(_ld_sys(head_addr))
-                num_arrived = group_barrier(lds, send_rank, num_arrived, warps_per_rank, True)
+                prefetched_head = _readfirstlane_i32(_ld_flag(traits, head_addr))
+                num_arrived = group_barrier(traits, lds, send_rank, num_arrived, warps_per_rank, True)
                 if (warp_in_rank == fx.Int32(0)) & (lane_id == fx.Int32(0)):
-                    _st_sys(tail_addr, 0, tail)
+                    _publish(traits, tail_addr, tail)
         else:
             local = _load_ptr(buffer_ptrs_res, rank)
             if warp_id == fx.Int32(0):
@@ -1124,16 +1179,16 @@ def _make_combine(
                     last_head = fx.Int32(0)
                     num_retired = _sum_lds(lds, lds_retired + 1, num_reduce_warps)
                     while num_retired < fx.Int32(num_reduce_warps):
-                        fx.rocdl.s_waitcnt(0)
-                        st_lds(lds, fx.Int32(lds_tail) + lane_id, _ld_sys(tail_addr))
+                        wait_all(traits)
+                        st_lds(lds, fx.Int32(lds_tail) + lane_id, _ld_flag(traits, tail_addr))
                         min_head = fx.Int32(_INT_MAX)
-                        for w in range_constexpr(1, NUM_WARPS):
+                        for w in range_constexpr(1, num_warps):
                             warp_head = ld_lds(lds, fx.Int32(lds_warp_head + w * num_ranks) + lane_id)
                             is_live = ld_lds(lds, lds_retired + w) == fx.Int32(0)
                             min_head = arith.select(is_live & (warp_head < min_head), warp_head, min_head)
                         if (min_head != fx.Int32(_INT_MAX)) & (min_head > last_head):
                             last_head = min_head
-                            _st_sys(head_addr, 0, min_head)
+                            _publish(traits, head_addr, min_head)
                         num_retired = _sum_lds(lds, lds_retired + 1, num_reduce_warps)
             else:
                 # ---- reducers: one token per warp, summed over the ranks it went to ----
@@ -1155,8 +1210,8 @@ def _make_combine(
                     expected_head = arith.select(lane_id < fx.Int32(num_ranks), expected_head, fx.Int32(-1))
                     spin_start = read_clock()
                     pending = _waits_on_tail(lds, lds_tail, lane_rank, expected_head)
-                    while _wave_any(pending):
-                        if spin_timed_out(spin_start):
+                    while _wave_any(traits, pending):
+                        if _timed_out(spin_start):
                             if lane_id == fx.Int32(0):
                                 fx.printf(
                                     "[DeepEP FlyDSL combine] receiver timeout: rank={} channel={} token={}\n",
@@ -1164,10 +1219,12 @@ def _make_combine(
                                     channel,
                                     token,
                                 )
+                            spin_timeout_hit(get_arch_traits())
                             spin_start = read_clock()
                         pending = _waits_on_tail(lds, lds_tail, lane_rank, expected_head)
 
                     # rank r's copy of the token, or an empty resource whose loads read 0
+                    # (where that does not hold, slot 0 read and masked out below)
                     row_resources = []
                     is_routed = []
                     ring_slots = []
@@ -1177,10 +1234,13 @@ def _make_combine(
                         ring_slot = arith.select(routed, head_r, fx.Int32(0)) % fx.Int32(
                             num_recv_buffer_tokens
                         )
+                        row_bytes = fx.Int32(hidden_bytes)
+                        if fx.const_expr(traits.oob_load_reads_zero):
+                            row_bytes = arith.select(routed, row_bytes, fx.Int32(0))
                         row_resources.append(
                             create_buffer_resource_from_addr(
                                 _addr(x_rings[r], 0, ring_slot, hidden_bytes),
-                                num_records_bytes=arith.select(routed, fx.Int32(hidden_bytes), fx.Int32(0)),
+                                num_records_bytes=row_bytes,
                             )
                         )
                         is_routed.append(routed)
@@ -1202,13 +1262,20 @@ def _make_combine(
                         steps = range(first_step, min(first_step + steps_per_pass, num_steps))
                         # element offsets; lanes past the row read 0 and store nothing
                         cols = [
-                            (lane_id + fx.Int32(step * WARP_SIZE)) * fx.Int32(vec_elems) for step in steps
+                            (lane_id + fx.Int32(step * wave_size)) * fx.Int32(vec_elems) for step in steps
                         ]
                         sums = [None] * len(cols)
                         # bias_0 + bias_1 first, then the ranks in ascending order, as the HIP kernel adds them
-                        sources = [(res, 0) for res in bias_resources]
-                        sources += [(row_resources[r], SYS_LOAD) for r in range(num_ranks)]
-                        for res, cache_modifier in sources:
+                        sources = [(res, 0, None) for res in bias_resources]
+                        sources += [
+                            (
+                                row_resources[r],
+                                traits.cpol_sys_load,
+                                None if traits.oob_load_reads_zero else is_routed[r],
+                            )
+                            for r in range(num_ranks)
+                        ]
+                        for res, cache_modifier, routed in sources:
                             values = [
                                 buffer_load(
                                     res,
@@ -1223,6 +1290,8 @@ def _make_combine(
                                 term = (
                                     value if fx.const_expr(elem_bytes == 4) else fx.arith.extf(f32_vec, value)
                                 )
+                                if fx.const_expr(routed is not None):
+                                    term = arith.select(routed, term, fx.arith.constant_vector(0.0, f32_vec))
                                 sums[k] = term if sums[k] is None else fx.arith.addf(sums[k], term)
                         for k, col in enumerate(cols):
                             out = (

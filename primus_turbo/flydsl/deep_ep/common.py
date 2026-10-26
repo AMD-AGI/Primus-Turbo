@@ -24,8 +24,6 @@ from primus_turbo.flydsl.utils.buffer_ops import (
 )
 from primus_turbo.flydsl.utils.prims import cast, ld, st
 
-WARP_SIZE = 64
-
 
 def load_index(res, elem_idx, element_type):
     """Load one i32 / i64 index element as i32."""

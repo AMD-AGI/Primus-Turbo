@@ -28,6 +28,7 @@ from primus_turbo.common.constants import ENV_EP_FORCE_CURRENT_STREAM
 from primus_turbo.flydsl.deep_ep.intranode_kernel import (
     combine_buffer_layout,
     dispatch_buffer_layout,
+    combine_min_recv_buffer_tokens,
     launch_cached_notify_combine,
     launch_cached_notify_dispatch,
     launch_combine,
@@ -36,17 +37,19 @@ from primus_turbo.flydsl.deep_ep.intranode_kernel import (
 )
 from primus_turbo.flydsl.deep_ep.layout_kernel import get_dispatch_layout_flydsl
 from primus_turbo.flydsl.utils.launch_cache import run_launcher
-from primus_turbo.pytorch._C.deep_ep import EventHandle
 from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
 
-NUM_MAX_NVL_PEERS = 8
+from ._compat import NUM_MAX_NVL_PEERS, EventHandle, deep_ep_cpp
+
 NUM_MAX_LOCAL_EXPERTS = 1024
 SUPPORTED_NUM_RANKS = (2, 4, 8)
 
 
 def get_intranode_backend(backend: Optional[str] = None) -> str:
-    """``backend``, else ``PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`` (``cpp`` | ``flydsl``, default ``cpp``)."""
-    backend = (backend or os.environ.get("PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND", "cpp")).strip().lower()
+    """``backend``, else ``PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`` (``cpp`` | ``flydsl``), else ``cpp``
+    where the C++ DeepEP is built and ``flydsl`` where it is not."""
+    default = "cpp" if deep_ep_cpp is not None else "flydsl"
+    backend = (backend or os.environ.get("PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND", default)).strip().lower()
     if backend not in ("cpp", "flydsl"):
         raise ValueError(f"Unknown DeepEP intranode backend {backend!r}; expected 'cpp' or 'flydsl'")
     return backend
@@ -441,6 +444,12 @@ class FlyDSLIntranodeRuntime:
         _check(tuple(channel_prefix_matrix.shape) == (num_ranks, num_channels))
         hidden_bytes = hidden * x.element_size()
         _check(hidden_bytes % 16 == 0, "hidden bytes must be a multiple of 16")
+        min_recv_tokens = combine_min_recv_buffer_tokens(config.num_max_nvl_chunked_send_tokens)
+        _check(
+            config.num_max_nvl_chunked_recv_tokens >= min_recv_tokens,
+            f"combine needs num_max_nvl_chunked_recv_tokens >= {min_recv_tokens} "
+            f"for {config.num_max_nvl_chunked_send_tokens} send tokens, or it can deadlock",
+        )
 
         compute_stream, launch_stream, cross = self._fork(
             previous_event, async_finish, allocate_on_comm_stream
