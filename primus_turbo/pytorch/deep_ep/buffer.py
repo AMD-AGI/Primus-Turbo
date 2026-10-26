@@ -269,7 +269,12 @@ class Buffer:
             # gfx1250 was measured across representative MoE shapes at 32 SMs. The larger
             # chunk raises 2- and 4-rank dispatch bandwidth while preserving SMs for overlap.
             2: Config(Buffer.num_sms, 128 if is_gfx1250() else 24, 256, 6, 128),
-            4: Config(Buffer.num_sms, 128 if is_gfx1250() else 6, 256, 6, 128),
+            # gfx1250, 4 ranks, with the cheap fence: 48 at <128 SMs (96/128 up to 2x slower
+            # at 32-64 SMs); 96 from 128 SMs up (within ~3% of 48 on microbench; 120B uniform
+            # e2e preferred larger than fixed 48).
+            4: Config(
+                Buffer.num_sms, (96 if Buffer.num_sms >= 128 else 48) if is_gfx1250() else 6, 256, 6, 128
+            ),
             8: Config(Buffer.num_sms, 6, 256, 6, 128),
             16: Config(Buffer.num_sms, 36, 288, 20, 128),
             24: Config(Buffer.num_sms, 8, 288, 32, 128),
@@ -298,10 +303,10 @@ class Buffer:
         config_map = {
             # See get_dispatch_config: keep the existing setting on wave64 parts.
             2: Config(Buffer.num_sms, 64 if is_gfx1250() else 10, 256, 6, 128),
-            # gfx1250, 4 ranks: chunk 128 is fastest from 128 SMs up, but at 32-64 SMs it was
-            # 16-30% slower than 64 on 32768-token batches, where 96 was never slower than 64.
+            # gfx1250, 4 ranks, with the cheap fence: same tier as get_dispatch_config
+            # (48 below 128 SMs, 96 from 128 SMs up).
             4: Config(
-                Buffer.num_sms, (128 if Buffer.num_sms >= 128 else 96) if is_gfx1250() else 9, 256, 6, 128
+                Buffer.num_sms, (96 if Buffer.num_sms >= 128 else 48) if is_gfx1250() else 9, 256, 6, 128
             ),
             8: Config(Buffer.num_sms, 4, 256, 6, 128),
             16: Config(Buffer.num_sms, 4, 288, 12, 128),
