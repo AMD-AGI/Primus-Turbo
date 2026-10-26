@@ -24,9 +24,6 @@ from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import ArithValue
 
 from primus_turbo.flydsl.utils.buffer_ops import (
-    _create_i32_constant,
-    _create_i64_constant,
-    _unwrap_value,
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
@@ -128,10 +125,8 @@ def _unwrap_order(order: Optional[str]) -> llvm.AtomicOrdering:
 def _as_value(v: Union[int, ArithValue]) -> ir.Value:
     # Coerce python int / ArithValue / raw ir value to a raw ir value (bare int -> i32; pass typed for i64).
     if isinstance(v, int):
-        v = _create_i32_constant(v)
-    elif hasattr(v, "ir_value"):
-        v = v.ir_value()
-    return _unwrap_value(v)
+        return std_arith.constant(fx.T.i32, v)
+    return fx.as_ir_value(v)
 
 
 def memory_fence(order: Optional[str] = None, scope: Optional[str] = None) -> None:
@@ -149,13 +144,13 @@ def elem_ptr(
     space: Union[int, str],
     elem_bytes: int = 4,
 ) -> ir.Value:
-    ptr = create_llvm_ptr(_unwrap_value(base), _unwrap_space(space))
-    idx_val = _unwrap_value(idx)
+    ptr = create_llvm_ptr(base, _unwrap_space(space))
+    idx_val = fx.as_ir_value(idx)
     if isinstance(idx_val.type, ir.IndexType):
-        idx_val = _unwrap_value(std_arith.IndexCastOp(fx.T.i64, idx_val).result)
+        idx_val = std_arith.IndexCastOp(fx.T.i64, idx_val).result
     elif isinstance(idx_val.type, ir.IntegerType) and idx_val.type.width < 64:
-        idx_val = _unwrap_value(std_arith.ExtSIOp(fx.T.i64, idx_val).result)
-    byte_off = _unwrap_value(std_arith.MulIOp(idx_val, _create_i64_constant(elem_bytes)).result)
+        idx_val = std_arith.ExtSIOp(fx.T.i64, idx_val).result
+    byte_off = std_arith.MulIOp(idx_val, std_arith.constant(fx.T.i64, elem_bytes)).result
     return get_element_ptr(ptr, byte_offset=byte_off, elem_type=fx.T.i8)
 
 
@@ -235,7 +230,7 @@ def copy_warp(
     def _addr_i64(addr: Union[int, ArithValue]) -> ArithValue:
         if isinstance(addr, int):
             return fx.Int64(addr)
-        v = _unwrap_value(addr)
+        v = fx.as_ir_value(addr)
         if isinstance(v.type, ir.IndexType):
             v = std_arith.IndexCastOp(fx.T.i64, v).result
         elif isinstance(v.type, ir.IntegerType) and v.type.width < 64:
@@ -245,7 +240,7 @@ def copy_warp(
     def _copy_operand(
         operand: Union[int, ArithValue], word_off: Union[int, ArithValue], nbytes: int
     ) -> Tuple[ArithValue, ArithValue]:
-        if "ptr" in str(_unwrap_value(operand).type):
+        if "ptr" in str(fx.as_ir_value(operand).type):
             return operand, fx.Int32(word_off) if isinstance(word_off, int) else word_off
         base = _addr_i64(operand) + _addr_i64(word_off) * fx.Int64(_I32_BYTES)
         return create_buffer_resource_from_addr(base, num_records_bytes=nbytes), fx.Int32(0)
@@ -256,7 +251,7 @@ def copy_warp(
     tail_words = nbytes // _I32_BYTES - num_full_chunks * cols
     # A ragged tail parks its idle lanes' stores one row past the end, which only the
     # num_records of an address-built dst resource turns into a dropped store.
-    assert not tail_words or "ptr" not in str(_unwrap_value(dst).type), (
+    assert not tail_words or "ptr" not in str(fx.as_ir_value(dst).type), (
         "a ragged copy needs dst as an address"
     )
     src, src_off = _copy_operand(src, src_off, nbytes)
@@ -330,7 +325,7 @@ def _as_index(v):
 
 def _i64(v):
     # widen an i32 runtime value to i64 (avoids overflow in worst-case base offsets)
-    return ArithValue(arith.extsi(T.i64, _unwrap_value(v)), signed=True)
+    return ArithValue(arith.extsi(T.i64, fx.as_ir_value(v)), signed=True)
 
 
 # ── Wave and lane primitives ─────────────────────────────────────────────────

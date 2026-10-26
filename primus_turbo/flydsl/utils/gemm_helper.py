@@ -127,13 +127,9 @@ def make_fp8_buffer_tensor_rebased(arg_i8, fp8_ir_t, base_elems, num_records_byt
     base = _readfirstlane_i32(base + arith.index_cast(T.i64, base_elems))
     nr = arith.minui(arith.index_cast(T.index, num_records_bytes), arith.index(0xFFFFFFFF))
     nrec = fx.Int64(_readfirstlane_i32(arith.index_cast(T.i64, nr)))
-    flags = _buffer_ops._get_buffer_flags()
     # global int8 ptr at the shifted addr -> int8 BufferDesc fat ptr -> recast fp8.
     base_ptr = fx.inttoptr(fx.PointerType.get(elem_ty=T.i8, address_space=1, alignment=16), base)
-    i8_buf_ty = fx.PointerType.get(elem_ty=T.i8, address_space=TargetAddressSpace.BufferDesc, alignment=16)
-    buf_ptr = fx.make_ptr(
-        i8_buf_ty, [base_ptr, fx.Int16(0).ir_value(), nrec.ir_value(), fx.Int32(flags).ir_value()]
-    )
+    buf_ptr = fx.rocdl.make_buffer_ptr(base_ptr, num_records_bytes=nrec)
     lay = fx.make_layout(0x40000000, 1)  # 1D flat; HW bounds via num_records
     iter_i8 = fx.get_iter(fx.make_view(buf_ptr, lay))
     f8_buf_ptr_ty = fx.PointerType.get(
@@ -169,12 +165,8 @@ def make_bf16_buffer_tensor_rebased(arg, bf16_ir_t, base_bytes, num_records_byte
     base = _readfirstlane_i32(base + base_off)
     nr = arith.minui(arith.index_cast(T.index, num_records_bytes), arith.index(0xFFFFFFFF))
     nrec = fx.Int64(_readfirstlane_i32(arith.index_cast(T.i64, nr)))
-    flags = _buffer_ops._get_buffer_flags()
     base_ptr = fx.inttoptr(fx.PointerType.get(elem_ty=T.i8, address_space=1, alignment=16), base)
-    i8_buf_ty = fx.PointerType.get(elem_ty=T.i8, address_space=TargetAddressSpace.BufferDesc, alignment=16)
-    buf_ptr = fx.make_ptr(
-        i8_buf_ty, [base_ptr, fx.Int16(0).ir_value(), nrec.ir_value(), fx.Int32(flags).ir_value()]
-    )
+    buf_ptr = fx.rocdl.make_buffer_ptr(base_ptr, num_records_bytes=nrec)
     lay = fx.make_layout(0x40000000, 1)
     iter_i8 = fx.get_iter(fx.make_view(buf_ptr, lay))
     bf_buf_ptr_ty = fx.PointerType.get(
@@ -200,21 +192,12 @@ def make_bf16_rebased_rsrc(arg, base_elems, num_records_bytes):
     """Return a raw !llvm.ptr<8> buffer SRD whose base = arg's base advanced by
     ``base_elems`` bf16 elements (2 bytes), in 64-bit, bounded by ``num_records_bytes``.
     For buffers > 4GB (e.g. pro-cr4 interm 4.8GB) where a flat entry*D_V element offset
-    overflows the 32-bit voffset. Mirrors BufferResourceDescriptor.from_memref's
-    MakeBufferRsrcOp construction but with a rebased base. Pass directly to
-    buffer_load/buffer_store as `rsrc` (with dtype=bf16)."""
+    overflows the 32-bit voffset. Pass directly to buffer_load/buffer_store as `rsrc`
+    (with dtype=bf16)."""
     base = arith.index_cast(T.i64, _buffer_ops.extract_base_index(arg))
     base = base + arith.index_cast(T.i64, base_elems) * fx.Int64(2)
     nr = arith.minui(arith.index_cast(T.index, num_records_bytes), arith.index(0xFFFFFFFF))
-    nrec = _raw(fx.Int64(arith.index_cast(T.i64, nr)))
-    flags = _buffer_ops._get_buffer_flags()
-    llvm_ptr_ty = ir.Type.parse("!llvm.ptr")
-    base_ptr = _llvm.IntToPtrOp(llvm_ptr_ty, _raw(base)).result
-    rsrc_ty = ir.Type.parse("!llvm.ptr<8>")
-    stride_val = _buffer_ops._create_i16_constant(0)
-    flags_val = _buffer_ops._create_i32_constant(flags)
-    rsrc = rocdl.MakeBufferRsrcOp(rsrc_ty, base_ptr, stride_val, nrec, flags_val).result
-    return rsrc
+    return _buffer_ops.create_buffer_resource_from_addr(base, num_records_bytes=arith.index_cast(T.i64, nr))
 
 
 def lds_row_swizzle(row, chunks):
