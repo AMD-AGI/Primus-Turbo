@@ -11,7 +11,7 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""Per-architecture choices of the FlyDSL DeepEP intranode kernels.
+"""Per-architecture choices of the FlyDSL DeepEP intranode kernels (V1 and V2).
 
 ``TRAITS`` holds the choices for the target FlyDSL compiles for (``FLYDSL_GPU_ARCH`` or the
 device), read once at import time: a process builds for one architecture, and FlyDSL keys its

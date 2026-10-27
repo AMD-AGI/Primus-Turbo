@@ -94,9 +94,11 @@ class Buffer:
                 otherwise, the resources will be released by the destructor.
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
             intranode_backend: the kernels of the intranode path (`num_ranks <= 8`, no low-latency mode),
-                `"cpp"` (HIP) or `"flydsl"`; defaults to `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`, else `"cpp"`
-                (`"flydsl"` where the C++ DeepEP is not loaded, as on gfx1250). Both return interchangeable
-                handles. The internode and low-latency paths always use `"cpp"`.
+                `"cpp"` (HIP), `"flydsl"` or `"flydsl_v2"`; defaults to `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`,
+                else `"cpp"` (`"flydsl"` where the C++ DeepEP is not loaded, as on gfx1250). `"cpp"` and
+                `"flydsl"` return interchangeable handles; `"flydsl_v2"` (direct slot writes, no channel rings,
+                gfx1250 only) returns the same outputs with handles of its own. The internode and low-latency paths always
+                use `"cpp"`.
 
         Note:
             Controlled by ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM`` (default ``0``).
@@ -115,12 +117,12 @@ class Buffer:
         self.explicitly_destroy = explicitly_destroy
         self.intranode_backend = get_intranode_backend(intranode_backend)
         use_flydsl = (
-            self.intranode_backend == "flydsl"
+            self.intranode_backend in ("flydsl", "flydsl_v2")
             and num_nvl_bytes > 0
             and not low_latency_mode
             and self.group_size in SUPPORTED_NUM_RANKS
         )
-        if self.intranode_backend == "flydsl" and not use_flydsl:
+        if self.intranode_backend in ("flydsl", "flydsl_v2") and not use_flydsl:
             self.intranode_backend = "cpp"
 
         if use_flydsl:
@@ -130,7 +132,12 @@ class Buffer:
             self.num_rdma_ranks = 1
             # like the C++ runtime's comm stream, a high-priority one from the pool
             self._comm_stream = torch.cuda.Stream(priority=-1)
-            self.intranode_runtime = FlyDSLIntranodeRuntime(group, num_nvl_bytes, self._comm_stream)
+            self.intranode_runtime = FlyDSLIntranodeRuntime(
+                group,
+                num_nvl_bytes,
+                self._comm_stream,
+                version=2 if self.intranode_backend == "flydsl_v2" else 1,
+            )
             return
 
         self.runtime = _require_deep_ep_cpp("the 'cpp' DeepEP backend").Buffer(

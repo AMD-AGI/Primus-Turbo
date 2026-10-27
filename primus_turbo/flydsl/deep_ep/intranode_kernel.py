@@ -343,7 +343,11 @@ def wait_new_tail(tail_addr, head, rank, channel, tag: str):
 # ── notify_dispatch / cached_notify_dispatch ─────────────────────────────────
 
 
-def _make_notify_dispatch(num_ranks, num_experts, num_channels, num_memset_int, expert_alignment):
+def _make_notify_dispatch(
+    num_ranks, num_experts, num_channels, num_memset_int, expert_alignment, full_rank_matrix
+):
+    """``full_rank_matrix`` fills every column of the rank prefix matrix (V2 needs where it sits in
+    every rank's receive order); otherwise only this rank's column is valid, as in the HIP kernel."""
     num_experts_per_rank = num_experts // num_ranks
 
     @flyc.kernel(known_block_size=[NOTIFY_THREADS, 1, 1])
@@ -375,11 +379,17 @@ def _make_notify_dispatch(num_ranks, num_experts, num_channels, num_memset_int, 
                 tokens_res = create_buffer_resource(NUM_TOKENS_PER_RANK, max_size=True)
                 experts_res = create_buffer_resource(NUM_TOKENS_PER_EXPERT, max_size=True)
                 peer = _load_lane_ptr(buffer_ptrs_res, thread_id)
-                _st_sys(
-                    peer,
-                    rank * fx.Int32(num_ranks) + thread_id,
-                    load_i32(tokens_res, thread_id),
-                )
+                if fx.const_expr(full_rank_matrix):
+                    for t in range_constexpr(num_ranks):
+                        _st_sys(
+                            peer, rank * fx.Int32(num_ranks) + fx.Int32(t), load_i32(tokens_res, fx.Int32(t))
+                        )
+                else:
+                    _st_sys(
+                        peer,
+                        rank * fx.Int32(num_ranks) + thread_id,
+                        load_i32(tokens_res, thread_id),
+                    )
                 for i in range(num_experts_per_rank):
                     count = load_i32(experts_res, thread_id * fx.Int32(num_experts_per_rank) + fx.Int32(i))
                     _st_sys(
@@ -471,9 +481,12 @@ def launch_notify_dispatch(
     num_channels: fx.Constexpr[int],
     num_memset_int: fx.Constexpr[int],
     expert_alignment: fx.Constexpr[int],
+    full_rank_matrix: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
-    kernel = _make_notify_dispatch(num_ranks, num_experts, num_channels, num_memset_int, expert_alignment)
+    kernel = _make_notify_dispatch(
+        num_ranks, num_experts, num_channels, num_memset_int, expert_alignment, full_rank_matrix
+    )
     kernel(
         num_tokens_per_rank,
         num_tokens_per_expert,
