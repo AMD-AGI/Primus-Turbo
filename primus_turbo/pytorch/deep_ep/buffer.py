@@ -23,6 +23,7 @@ from .flydsl_intranode import (
     SUPPORTED_NUM_RANKS,
     FlyDSLIntranodeRuntime,
     get_intranode_backend,
+    v2_heap_bytes,
 )
 from .utils import EventOverlap, check_nvlink_connections
 
@@ -382,6 +383,38 @@ class Buffer:
         }
         assert num_ranks in config_map, f"Unsupported number of EP ranks: {num_ranks}"
         return config_map[num_ranks]
+
+    @staticmethod
+    def get_token_buffer_size_hint(
+        num_max_tokens_per_rank: int,
+        hidden_bytes: int,
+        num_ranks: int,
+        num_topk: int,
+        backend: Optional[str] = None,
+    ) -> int:
+        """
+        Get the NVL buffer size of an intranode backend whose heap holds whole batches (`flydsl_v2`),
+        like DeepEP V2's `ElasticBuffer.get_buffer_size_hint`; 0 for the backends sized by their channel
+        rings (`Config.get_nvl_buffer_size_hint`).
+
+        Arguments:
+            num_max_tokens_per_rank: the most tokens a rank dispatches; every rank must use the same value.
+            hidden_bytes: the bytes of a bf16 hidden row.
+            num_ranks: the number of ranks.
+            num_topk: the number of top-k experts per token.
+            backend: the intranode backend, else `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND` or the default one.
+
+        Returns:
+            size: the NVL buffer size in bytes, or 0.
+        """
+        if get_intranode_backend(backend) != "flydsl_v2" or num_ranks not in SUPPORTED_NUM_RANKS:
+            return 0
+        if num_max_tokens_per_rank <= 0:
+            raise ValueError(
+                "the flydsl_v2 intranode backend sizes its buffer from the number of tokens per rank: "
+                "dispatch once before combine, or set num_max_tokens_per_rank in set_buffer_global_config"
+            )
+        return v2_heap_bytes(num_max_tokens_per_rank, num_ranks, hidden_bytes, num_topk)
 
     # noinspection PyTypeChecker
     def get_dispatch_layout(
