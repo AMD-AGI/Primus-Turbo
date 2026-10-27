@@ -41,10 +41,12 @@ from primus_turbo.flydsl.deep_ep.intranode_kernel import (
     launch_notify_dispatch,
 )
 from primus_turbo.flydsl.deep_ep.intranode_v2_kernel import (
+    COMBINE_FLAGS_BYTES,
     DATA_OFFSET,
     MAX_EPOCH,
     META_BYTES,
     TAIL_DONE_BIT,
+    combine_v2_grabs,
     combine_v2_layout,
     dispatch_v2_layout,
     launch_barrier,
@@ -122,15 +124,16 @@ class FlyDSLIntranodeRuntime:
         self.counters_ready = torch.cuda.Event()
         if version == 2:
             _check(num_nvl_bytes > DATA_OFFSET, f"the V2 heap needs more than {DATA_OFFSET} bytes")
-            # the arrival counters only ever grow; the kernels wait for the running totals here
+            # the combine's row flags hold epochs, which start at 1
             self.symm.get_buffer(
                 self.rank, ((DATA_OFFSET - META_BYTES) // 4,), torch.int32, META_BYTES // 4
             ).zero_()
             self.dispatch_epoch = 0
-            self.combine_arrivals = 0
-            # where the combine's blocks meet before signalling the peers
-            self.block_counter = torch.zeros(1, dtype=torch.int32, device="cuda")
-            self.combine_blocks = 0
+            self.combine_epoch = 0
+            # the combine's reduce queue; it only ever grows, each combine claims from where the
+            # previous one left it
+            self.reduce_counter = torch.zeros(1, dtype=torch.int32, device="cuda")
+            self.reduce_grabs = 0
             # a combine may push into a peer's combine region only once that peer is done reducing
             # the previous combine: the notify of a dispatch in between is a barrier that ensures it
             self.combine_needs_barrier = False
@@ -652,8 +655,13 @@ class FlyDSLIntranodeRuntime:
                 f"V2 combine may receive {num_recv_tokens * num_ranks} rows > the heap's {capacity}; "
                 "raise num_nvl_bytes",
             )
-            self.combine_arrivals += num_ranks
-            self.combine_blocks += num_channels
+            _check(
+                num_recv_tokens * num_ranks * 4 <= COMBINE_FLAGS_BYTES,
+                f"V2 combine of {num_recv_tokens} tokens needs more than {COMBINE_FLAGS_BYTES} flag bytes",
+            )
+            self.combine_epoch = self.combine_epoch % (2**31 - 1) + 1
+            grab_base = self.reduce_grabs
+            self.reduce_grabs += combine_v2_grabs(num_recv_tokens, num_channels)
             if self.combine_needs_barrier:
                 run_launcher(launch_barrier, self.barrier_ptrs, rank, num_ranks, launch_stream)
             self.combine_needs_barrier = True
@@ -669,12 +677,12 @@ class FlyDSLIntranodeRuntime:
                 rank_prefix_matrix,
                 send_head,
                 self.buffer_ptrs,
-                self.block_counter,
+                self.reduce_counter,
                 num_tokens,
                 num_recv_tokens,
                 rank,
-                _as_i32(self.combine_arrivals),
-                _as_i32(self.combine_blocks),
+                self.combine_epoch,
+                _as_i32(grab_base),
                 num_ranks,
                 num_channels,
                 hidden,

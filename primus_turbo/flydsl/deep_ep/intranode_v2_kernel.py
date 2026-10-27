@@ -27,21 +27,24 @@ heap. When its rows are visible, the block tells each rank how many rows its cha
 then it copies, from our heap into the outputs, the rows the same channel of every other rank sent
 us, as soon as that rank's count is in.
 
-Combine. The rows ``x`` of the dispatch's receive order go back to their source rank, into a
-compact region laid out as [destination rank][index in the source's stream to it], so the slot of
-(rank ``r``, token ``t``) on the source is ``base_r + send_head[t, r]``; our own rows stay in ``x``.
-After an arrival counter, each rank sums the rows of its own tokens (bias first, then ranks in
-ascending order, as the HIP and V1 kernels add them).
+Combine. The rows ``x`` of the dispatch's receive order go back to their source rank, each with
+its top-k weights, into a compact region laid out as [destination rank][index in the source's
+stream to it], so the slot of (rank ``r``, token ``t``) on the source is
+``base_r + send_head[t, r]``; our own rows stay in ``x``. Once a row has landed its pusher raises
+the slot's flag to this combine's epoch. Each rank sums the rows of its own tokens (bias first,
+then ranks in ascending order, as the HIP and V1 kernels add them) as soon as their flags are up:
+warps claim tokens in order from a queue, some from the start of the kernel and the pushers once
+they are done, so the reduce overlaps the push and no rank waits for all the others.
 
 On gfx1250 the rows move through LDS with the Tensor Data Mover (one load, a store per
 destination); elsewhere a warp copies them through VGPRs.
 
 Ordering is the V1 cheap fence: the heap is uncached, payload stores carry SCOPE_SYS
-(``SYS_STORE``), and every warp waits for its own stores before the block publishes a count or
-bumps a counter; the readers load with ``SYS_LOAD``.
+(``SYS_STORE``), and a warp waits for its own stores before it publishes a count or raises a flag;
+the readers load with ``SYS_LOAD``.
 
 Heap layout (byte offsets, the same on every rank): ``[0, META_BYTES)`` the notify's scratch, then
-the arrival counter, the received channel offsets and the dispatch row counts, then from
+the received channel offsets, the dispatch row counts and the combine's row flags, then from
 ``DATA_OFFSET`` the dispatch region in the first half of the rest and the combine region in the
 second half.
 """
@@ -103,13 +106,15 @@ from primus_turbo.flydsl.utils.prims import (
 )
 
 META_BYTES = 64 * 1024
-COMBINE_ARRIVALS_OFFSET = META_BYTES + 256
 # int32 [num_ranks][num_channels]: where each source's channel starts in its receive block
 RECV_CHANNEL_OFFSET_OFFSET = META_BYTES + 4096
 MAX_CHANNELS = 1024
 # int32 [num_ranks][num_channels]: how far each source's channel has sent its rows here
 TAILS_OFFSET = 128 * 1024
-DATA_OFFSET = 256 * 1024
+# int32 per combine slot: the epoch of the combine whose row has landed there
+COMBINE_FLAGS_OFFSET = 256 * 1024
+COMBINE_FLAGS_BYTES = 4 << 20
+DATA_OFFSET = COMBINE_FLAGS_OFFSET + COMBINE_FLAGS_BYTES
 assert RECV_CHANNEL_OFFSET_OFFSET + 8 * MAX_CHANNELS * 4 <= TAILS_OFFSET
 assert TAILS_OFFSET + 8 * MAX_CHANNELS * 4 <= 192 * 1024
 
@@ -118,6 +123,8 @@ FANOUT_PIECE_BYTES = 8 * 1024
 # rows move global -> LDS -> global through the Tensor Data Mover: a warp copy of the row
 # through VGPRs caps how much each CU keeps in flight, and with it the bandwidth per CU
 USE_TDM = IS_GFX1250
+# combine: tokens a warp claims from the reduce queue at a time
+REDUCE_GRAB_TOKENS = 4
 
 
 def _tdm_row(lds_addr, global_addr, num_bytes):
@@ -182,11 +189,17 @@ def dispatch_v2_layout(num_nvl_bytes, hidden_bytes, num_topk, topk_idx_bytes, nu
     return layout, capacity
 
 
+def combine_v2_slot_bytes(hidden_bytes, num_topk):
+    """A combine slot: the row, then its top-k weights, so one TDM store moves both; slots start on
+    128-byte boundaries, as TDM stores want."""
+    return _align(hidden_bytes + num_topk * 4, 128)
+
+
 @functools.lru_cache(maxsize=None)
 def combine_v2_layout(num_nvl_bytes, hidden_bytes, num_topk):
     """``({region: offset}, capacity in rows)`` of the combine receive region."""
     half = _half_bytes(num_nvl_bytes)
-    regions = (("x", hidden_bytes), ("topk_weights", num_topk * 4))
+    regions = (("x", combine_v2_slot_bytes(hidden_bytes, num_topk)),)
     capacity = max(0, (half - 16 * len(regions)) // sum(b for _, b in regions))
     layout, end = _regions(DATA_OFFSET + half, capacity, regions)
     assert end <= DATA_OFFSET + 2 * half
@@ -258,54 +271,6 @@ def _fanout_row(dst_resources, src_res, num_bytes):
         for dst in dst_resources:
             for o, v in zip(offsets, values):
                 buffer_store(v, dst, o, cache_modifier=SYS_STORE)
-
-
-@ASTRewriter.transform
-def wait_arrivals(addr, expected, rank, tag: str):
-    """Poll an arrival counter until it reaches ``expected`` (wrap-safe)."""
-    spin_start = read_clock()
-    value = _ld_sys(addr)
-    while _signed(value - expected) < fx.Int32(0):
-        if timed_out(spin_start):
-            fx.printf(
-                "[DeepEP FlyDSL V2 " + tag + "] arrival timeout: rank={} value={} expected={}\n",
-                rank,
-                value,
-                expected,
-            )
-            timeout_hit()
-            spin_start = read_clock()
-        value = _ld_sys(addr)
-
-
-@ASTRewriter.transform
-def signal_and_wait(
-    buffer_ptrs_res,
-    local,
-    rank,
-    num_ranks: int,
-    arrivals_offset: int,
-    expected,
-    block_counter,
-    expected_blocks,
-    tag: str,
-):
-    """Once every block of this rank has its stores visible, bump the arrival counter of every
-    rank; then wait for every rank to have bumped ours.
-
-    The blocks meet on a local L2 counter and the last one signals the peers: one remote atomic per
-    rank pair, where a remote atomic per block serializes hundreds of them on each counter."""
-    thread_id = fx.thread_idx.x
-    wait_mem_all()
-    fx.gpu.barrier()
-    if thread_id == fx.Int32(0):
-        arrived = atomic_add(block_counter, fx.Int32(0), fx.Int32(1)) + fx.Int32(1)
-        if arrived == expected_blocks:
-            for r in range_constexpr(num_ranks):
-                peer = _load_ptr(buffer_ptrs_res, fx.Int32(r))
-                atomic_add(peer + fx.Int64(arrivals_offset), fx.Int32(0), fx.Int32(1), scope="sys")
-        wait_arrivals(local + fx.Int64(arrivals_offset), expected, rank, tag)
-    fx.gpu.barrier()
 
 
 # ── dispatch ─────────────────────────────────────────────────────────────────
@@ -866,6 +831,54 @@ def launch_barrier(barrier_ptrs, rank: fx.Int32, num_ranks: fx.Constexpr[int], s
 # ── combine ──────────────────────────────────────────────────────────────────
 
 
+def _wait_lds():
+    """Wait for this wave's LDS accesses, e.g. before a TDM store reads what it wrote."""
+    llvm.inline_asm(
+        res=None, operands_=[], asm_string="s_wait_dscnt 0x0", constraints="~{memory}", has_side_effects=True
+    )
+
+
+@ASTRewriter.transform
+def _grab_tokens(counter, lds, lds_slot, base):
+    """First of the warp's next ``REDUCE_GRAB_TOKENS`` tokens from the reduce queue."""
+    lane_id = fx.thread_idx.x % fx.Int32(WARP_SIZE)
+    if lane_id == fx.Int32(0):
+        st_lds(lds, lds_slot, atomic_add(counter, fx.Int32(0), fx.Int32(1)))
+    return (_readfirstlane_i32(ld_lds(lds, lds_slot)) - base) * fx.Int32(REDUCE_GRAB_TOKENS)
+
+
+@ASTRewriter.transform
+def _wait_rows(flags, flag_idx, waits, epoch, rank, token):
+    """Spin until every lane in ``waits`` reads ``epoch`` from its row's flag."""
+    spin_start = read_clock()
+    value = _ld_sys(flags, flag_idx)
+    while _popc(_ballot(waits & (value != epoch))) > fx.Int32(0):
+        if timed_out(spin_start):
+            fx.printf(
+                "[DeepEP FlyDSL V2 combine] row timeout: rank={} token={} flag={} epoch={}\n",
+                rank,
+                token,
+                value,
+                epoch,
+            )
+            timeout_hit()
+            spin_start = read_clock()
+        value = _ld_sys(flags, flag_idx)
+
+
+def combine_v2_push_warps(num_channels):
+    """Warps of each block that push before they reduce; the others reduce from the start. A grid
+    of 96+ blocks saturates the links with about 2/3 of its warps pushing, and the rest overlap
+    the reduce with the push; a narrower one is bound by how fast each CU sends, so all push."""
+    return NUM_WARPS * 11 // 16 if num_channels >= 96 else NUM_WARPS
+
+
+def combine_v2_grabs(num_recv_tokens, num_channels):
+    """How far one combine advances the reduce queue counter: every claim of tokens, plus the one
+    claim per warp that finds the queue empty."""
+    return (num_recv_tokens + REDUCE_GRAB_TOKENS - 1) // REDUCE_GRAB_TOKENS + num_channels * NUM_WARPS
+
+
 def _make_combine_v2(
     num_ranks, num_channels, hidden, elem_bytes, num_topk, has_bias_0, has_bias_1, num_nvl_bytes
 ):
@@ -873,14 +886,20 @@ def _make_combine_v2(
     hidden_bytes = hidden * elem_bytes
     assert hidden_bytes % 16 == 0
     layout, _ = combine_v2_layout(num_nvl_bytes, hidden_bytes, num_topk)
-    grid_warps = num_channels * NUM_WARPS
-    assert grid_warps >= num_ranks
+    slot_bytes = combine_v2_slot_bytes(hidden_bytes, num_topk)
+    weights_offset = layout["x"] + hidden_bytes
+    # the row and its weights, in whole 8-byte TDM elements
+    push_bytes = _align(hidden_bytes + num_topk * 4, 8)
+    push_warps = combine_v2_push_warps(num_channels)
+    grid_push_warps = num_channels * push_warps
+    assert grid_push_warps >= num_ranks and REDUCE_GRAB_TOKENS * num_ranks <= WARP_SIZE
     vec_elems = 16 // elem_bytes
     num_vecs = hidden_bytes // 16
     num_steps = (num_vecs + WARP_SIZE - 1) // WARP_SIZE
     steps_per_pass = max(1, TRAITS.combine_loads_in_flight // (num_ranks + int(has_bias_0) + int(has_bias_1)))
-    row_buffer_bytes = _align(hidden_bytes, 128)
-    smem_bytes = NUM_WARPS * row_buffer_bytes if USE_TDM else 0
+    row_buffer_bytes = slot_bytes
+    lds_grab = (push_warps * row_buffer_bytes if USE_TDM else 0) // 4
+    smem_bytes = lds_grab * 4 + NUM_WARPS * 4
 
     @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
     def combine_v2_kernel(
@@ -893,12 +912,12 @@ def _make_combine_v2(
         RANK_PREFIX_MATRIX: fx.Tensor,
         SEND_HEAD: fx.Tensor,
         BUFFER_PTRS: fx.Tensor,
-        BLOCK_COUNTER: fx.Tensor,
+        REDUCE_COUNTER: fx.Tensor,
         num_rows: fx.Int32,
         num_recv_tokens: fx.Int32,
         rank: fx.Int32,
-        expected_arrivals: fx.Int32,
-        expected_blocks: fx.Int32,
+        epoch: fx.Int32,
+        grab_base: fx.Int32,
     ):
         thread_id = fx.thread_idx.x
         block_id = fx.block_idx.x
@@ -907,6 +926,7 @@ def _make_combine_v2(
         buffer_ptrs_res = create_buffer_resource(BUFFER_PTRS, max_size=True)
         local = _load_ptr(buffer_ptrs_res, rank)
         rank_prefix_res = create_buffer_resource(RANK_PREFIX_MATRIX, max_size=True)
+        lds = fx.arith.ArithValue(lds_base(), signed=True)
 
         # per source rank s: where its rows of x begin, and where our rank's rows start
         # in s's region (the tokens s sends to the ranks before ours)
@@ -924,14 +944,15 @@ def _make_combine_v2(
                 base = base + arith.select(fx.Int32(r) < rank, count, fx.Int32(0))
             bases.append(base)
 
-        # ---- push: each row of x back to its source rank, but for our own rows, which the reduce
-        # reads from x ----
+        # ---- push (the first push_warps warps of each block): each row of x back to its source
+        # rank, but for our own rows, which the reduce reads from x; a row's flag goes up once
+        # the row is visible ----
         # rows are grouped by source, so a warp sticks to one source: walking them in order would
         # have the whole GPU writing to one peer, over one link, at a time
         x_base = tensor_addr(X)
-        global_warp = block_id * fx.Int32(NUM_WARPS) + warp_id
+        global_warp = block_id * fx.Int32(push_warps) + warp_id
         num_peers = num_ranks - 1
-        warps_per_peer = grid_warps // num_peers
+        warps_per_peer = grid_push_warps // num_peers
         warp_source = global_warp % fx.Int32(num_peers)
         warp_source = warp_source + arith.select(warp_source >= rank, fx.Int32(1), fx.Int32(0))
         peer = peers[0]
@@ -945,62 +966,69 @@ def _make_combine_v2(
             row_end = arith.select(is_s, row_begins[s + 1] if s + 1 < num_ranks else num_rows, row_end)
             base = arith.select(is_s, bases[s], base)
         row = row_begin + global_warp // fx.Int32(num_peers)
-        if global_warp >= fx.Int32(warps_per_peer * num_peers):
-            row = row_end
+        is_pusher = (warp_id < fx.Int32(push_warps)) & (global_warp < fx.Int32(warps_per_peer * num_peers))
+        row = arith.select(is_pusher, row, row_end)
+        peer_flags = peer + fx.Int64(COMBINE_FLAGS_OFFSET)
         row_lds = None
         if fx.const_expr(USE_TDM):
-            row_lds = fx.arith.ArithValue(lds_base(), signed=True) + _readfirstlane_i32(warp_id) * fx.Int32(
-                row_buffer_bytes
-            )
+            row_lds = lds + _readfirstlane_i32(warp_id) * fx.Int32(row_buffer_bytes)
+        pushed = fx.Int32(-1)
+        topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
         while row < row_end:
             slot = row - row_begin + base
+            # the previous row has landed, and is done with the LDS buffer
             if fx.const_expr(USE_TDM):
-                # the previous row's store is done with the buffer
                 tdm_ops.tensor_wait(0)
+            else:
+                wait_mem_all()
+            weight = fx.Float32(0.0)
+            if fx.const_expr(num_topk > 0):
+                weight = buffer_load(
+                    topk_weights_res,
+                    row * fx.Int32(num_topk)
+                    + arith.select(lane_id < fx.Int32(num_topk), lane_id, fx.Int32(0)),
+                    vec_width=1,
+                    dtype=fx.T.f32,
+                )
+            if fx.const_expr(USE_TDM):
                 tdm_ops.tensor_load_2d(
                     _tdm_row(row_lds, _uniform_i64(_addr(x_base, 0, row, hidden_bytes)), hidden_bytes)
                 )
+                if fx.const_expr(num_topk > 0):
+                    if lane_id < fx.Int32(num_topk):
+                        st_lds(row_lds, fx.Int32(hidden_bytes // 4) + lane_id, weight)
+                    _wait_lds()
                 tdm_ops.tensor_wait(0)
                 tdm_ops.tensor_store_2d(
-                    _tdm_row(
-                        row_lds, _uniform_i64(_addr(peer, layout["x"], slot, hidden_bytes)), hidden_bytes
-                    ),
+                    _tdm_row(row_lds, _uniform_i64(_addr(peer, layout["x"], slot, slot_bytes)), push_bytes),
                     cache_policy=SYS_STORE,
                 )
             else:
                 _copy_row(
-                    _addr(peer, layout["x"], slot, hidden_bytes),
+                    _addr(peer, layout["x"], slot, slot_bytes),
                     _addr(x_base, 0, row, hidden_bytes),
                     hidden_bytes,
                     FANOUT_PIECE_BYTES,
                     store_cache_modifier=SYS_STORE,
                 )
-            if fx.const_expr(num_topk > 0):
-                if lane_id < fx.Int32(num_topk):
-                    topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
-                    weight = buffer_load(
-                        topk_weights_res, row * fx.Int32(num_topk) + lane_id, vec_width=1, dtype=fx.T.f32
-                    )
-                    _st_sys(
-                        peer + fx.Int64(layout["topk_weights"]), slot * fx.Int32(num_topk) + lane_id, weight
-                    )
+                if fx.const_expr(num_topk > 0):
+                    if lane_id < fx.Int32(num_topk):
+                        _st_sys(_addr(peer, weights_offset, slot, slot_bytes), lane_id, weight)
+            # raise the previous row's flag only now: the store waits to be sent before the warp
+            # goes on, which this row's transfer hides
+            if (pushed >= fx.Int32(0)) & (lane_id == fx.Int32(0)):
+                _st_sys(peer_flags, pushed, epoch)
+            pushed = slot
             row = row + fx.Int32(warps_per_peer)
-
         if fx.const_expr(USE_TDM):
             tdm_ops.tensor_wait(0)
-        signal_and_wait(
-            buffer_ptrs_res,
-            local,
-            rank,
-            num_ranks,
-            COMBINE_ARRIVALS_OFFSET,
-            expected_arrivals,
-            tensor_addr(BLOCK_COUNTER),
-            expected_blocks,
-            "combine",
-        )
+        else:
+            wait_mem_all()
+        if (pushed >= fx.Int32(0)) & (lane_id == fx.Int32(0)):
+            _st_sys(peer_flags, pushed, epoch)
 
-        # ---- reduce: each of our tokens over the ranks it went to ----
+        # ---- reduce: each of our tokens over the ranks it went to, as soon as its rows are in;
+        # warps claim tokens in order from a queue, the pushers once they are done ----
         # where rank r's rows start in our region: the tokens we sent to the ranks before r
         own_bases = []
         running = fx.Int32(0)
@@ -1017,87 +1045,116 @@ def _make_combine_v2(
                 + _uniform_load_i32(rank_prefix_res, rank * fx.Int32(num_ranks) + fx.Int32(r))
                 - own_prev
             )
+        # lane l looks after rank l % num_ranks of the claim's token l / num_ranks
+        lane_r = lane_id % fx.Int32(num_ranks)
+        lane_base = own_bases[0]
+        for r in range_constexpr(1, num_ranks):
+            lane_base = arith.select(lane_r == fx.Int32(r), own_bases[r], lane_base)
 
         send_head_res = create_buffer_resource(SEND_HEAD, max_size=True)
         recv_x_base = tensor_addr(RECV_X)
+        local_flags = local + fx.Int64(COMBINE_FLAGS_OFFSET)
+        counter = tensor_addr(REDUCE_COUNTER)
+        lds_slot = fx.Int32(lds_grab) + warp_id
         in_dtype = X.element_type
         f32_vec = fx.T.vec(vec_elems, fx.T.f32)
         in_vec = fx.T.vec(vec_elems, in_dtype.ir_type)
-        lane_rank = arith.select(lane_id < fx.Int32(num_ranks), lane_id, fx.Int32(0))
-        token = block_id * fx.Int32(NUM_WARPS) + warp_id
-        while token < num_recv_tokens:
-            index = load_i32(send_head_res, token * fx.Int32(num_ranks) + lane_rank)
-            row_resources = []
-            is_routed = []
-            slots = []
-            weight_addrs = []
-            for r in range_constexpr(num_ranks):
-                index_r = _readlane_i32(index, r)
-                routed = index_r >= fx.Int32(0)
-                index_r = arith.select(routed, index_r, fx.Int32(0))
-                # our own rows were not pushed: they are in x
-                is_own = rank == fx.Int32(r)
-                slot = arith.select(is_own, row_begins[r], own_bases[r]) + index_r
-                row_resources.append(
-                    create_buffer_resource_from_addr(
-                        _uniform_i64(
-                            arith.select(
-                                is_own,
-                                _addr(x_base, 0, slot, hidden_bytes),
-                                _addr(local, layout["x"], slot, hidden_bytes),
-                            )
-                        ),
-                        num_records_bytes=arith.select(routed, fx.Int32(hidden_bytes), fx.Int32(0)),
-                    )
-                )
-                weight_addrs.append(
-                    arith.select(is_own, tensor_addr(TOPK_WEIGHTS), local + fx.Int64(layout["topk_weights"]))
-                )
-                is_routed.append(routed)
-                slots.append(slot)
-            bias_resources = []
-            for has_bias, bias in ((has_bias_0, BIAS_0), (has_bias_1, BIAS_1)):
-                if fx.const_expr(has_bias):
-                    bias_resources.append(
-                        create_buffer_resource_from_addr(
-                            _addr(tensor_addr(bias), 0, token, hidden_bytes), num_records_bytes=hidden_bytes
-                        )
-                    )
-            out_res = create_buffer_resource_from_addr(
-                _addr(recv_x_base, 0, token, hidden_bytes), num_records_bytes=hidden_bytes
+        first = _grab_tokens(counter, lds, lds_slot, grab_base)
+        while first < num_recv_tokens:
+            token_end = arith.select(
+                first + fx.Int32(REDUCE_GRAB_TOKENS) < num_recv_tokens,
+                first + fx.Int32(REDUCE_GRAB_TOKENS),
+                num_recv_tokens,
             )
-            for first_step in range_constexpr(0, num_steps, steps_per_pass):
-                steps = range(first_step, min(first_step + steps_per_pass, num_steps))
-                cols = [(lane_id + fx.Int32(step * WARP_SIZE)) * fx.Int32(vec_elems) for step in steps]
-                sums = [None] * len(cols)
-                sources = [(res, 0) for res in bias_resources]
-                sources += [(row_resources[r], SYS_LOAD) for r in range(num_ranks)]
-                for res, cache_modifier in sources:
-                    values = [
-                        buffer_load(
-                            res, col, vec_width=vec_elems, dtype=in_dtype, cache_modifier=cache_modifier
+            # the claim's send_head entries in one load, and its rows' flags in one wait
+            in_claim = lane_id < (token_end - first) * fx.Int32(num_ranks)
+            index = load_i32(
+                send_head_res, arith.select(in_claim, first * fx.Int32(num_ranks) + lane_id, fx.Int32(0))
+            )
+            index = arith.select(in_claim, index, fx.Int32(-1))
+            waits = (lane_r != rank) & (index >= fx.Int32(0))
+            _wait_rows(
+                local_flags,
+                arith.select(waits, lane_base + index, fx.Int32(0)),
+                waits,
+                epoch,
+                rank,
+                first,
+            )
+            token = first
+            while token < token_end:
+                claim_lane = (token - first) * fx.Int32(num_ranks)
+                row_resources = []
+                is_routed = []
+                weight_addrs = []
+                for r in range_constexpr(num_ranks):
+                    index_r = _readlane_i32(index, claim_lane + fx.Int32(r))
+                    routed = index_r >= fx.Int32(0)
+                    index_r = arith.select(routed, index_r, fx.Int32(0))
+                    # our own rows were not pushed: they are in x
+                    is_own = rank == fx.Int32(r)
+                    slot = arith.select(is_own, row_begins[r], own_bases[r]) + index_r
+                    row_resources.append(
+                        create_buffer_resource_from_addr(
+                            _uniform_i64(
+                                arith.select(
+                                    is_own,
+                                    _addr(x_base, 0, slot, hidden_bytes),
+                                    _addr(local, layout["x"], slot, slot_bytes),
+                                )
+                            ),
+                            num_records_bytes=arith.select(routed, fx.Int32(hidden_bytes), fx.Int32(0)),
                         )
-                        for col in cols
-                    ]
-                    for k, value in enumerate(values):
-                        term = value if fx.const_expr(elem_bytes == 4) else fx.arith.extf(f32_vec, value)
-                        sums[k] = term if sums[k] is None else fx.arith.addf(sums[k], term)
-                for k, col in enumerate(cols):
-                    out = sums[k] if fx.const_expr(elem_bytes == 4) else fx.arith.trunc_f(in_vec, sums[k])
-                    buffer_store(out, out_res, col)
-            if fx.const_expr(num_topk > 0):
-                if lane_id < fx.Int32(num_topk):
-                    weight = fx.Float32(0.0)
-                    for r in range_constexpr(num_ranks):
-                        value = _ld_sys(
-                            weight_addrs[r],
-                            slots[r] * fx.Int32(num_topk) + lane_id,
-                            dtype=fx.T.f32,
+                    )
+                    weight_addrs.append(
+                        arith.select(
+                            is_own,
+                            _addr(tensor_addr(TOPK_WEIGHTS), 0, slot, num_topk * 4),
+                            _addr(local, weights_offset, slot, slot_bytes),
                         )
-                        weight = weight + arith.select(is_routed[r], value, fx.Float32(0.0))
-                    recv_topk_weights_res = create_buffer_resource(RECV_TOPK_WEIGHTS, max_size=True)
-                    buffer_store(weight, recv_topk_weights_res, token * fx.Int32(num_topk) + lane_id)
-            token = token + fx.Int32(grid_warps)
+                    )
+                    is_routed.append(routed)
+                bias_resources = []
+                for has_bias, bias in ((has_bias_0, BIAS_0), (has_bias_1, BIAS_1)):
+                    if fx.const_expr(has_bias):
+                        bias_resources.append(
+                            create_buffer_resource_from_addr(
+                                _addr(tensor_addr(bias), 0, token, hidden_bytes),
+                                num_records_bytes=hidden_bytes,
+                            )
+                        )
+                out_res = create_buffer_resource_from_addr(
+                    _addr(recv_x_base, 0, token, hidden_bytes), num_records_bytes=hidden_bytes
+                )
+                for first_step in range_constexpr(0, num_steps, steps_per_pass):
+                    steps = range(first_step, min(first_step + steps_per_pass, num_steps))
+                    cols = [(lane_id + fx.Int32(step * WARP_SIZE)) * fx.Int32(vec_elems) for step in steps]
+                    sums = [None] * len(cols)
+                    sources = [(res, 0) for res in bias_resources]
+                    sources += [(row_resources[r], SYS_LOAD) for r in range(num_ranks)]
+                    for res, cache_modifier in sources:
+                        values = [
+                            buffer_load(
+                                res, col, vec_width=vec_elems, dtype=in_dtype, cache_modifier=cache_modifier
+                            )
+                            for col in cols
+                        ]
+                        for k, value in enumerate(values):
+                            term = value if fx.const_expr(elem_bytes == 4) else fx.arith.extf(f32_vec, value)
+                            sums[k] = term if sums[k] is None else fx.arith.addf(sums[k], term)
+                    for k, col in enumerate(cols):
+                        out = sums[k] if fx.const_expr(elem_bytes == 4) else fx.arith.trunc_f(in_vec, sums[k])
+                        buffer_store(out, out_res, col)
+                if fx.const_expr(num_topk > 0):
+                    if lane_id < fx.Int32(num_topk):
+                        weight = fx.Float32(0.0)
+                        for r in range_constexpr(num_ranks):
+                            value = _ld_sys(weight_addrs[r], lane_id, dtype=fx.T.f32)
+                            weight = weight + arith.select(is_routed[r], value, fx.Float32(0.0))
+                        recv_topk_weights_res = create_buffer_resource(RECV_TOPK_WEIGHTS, max_size=True)
+                        buffer_store(weight, recv_topk_weights_res, token * fx.Int32(num_topk) + lane_id)
+                token = token + fx.Int32(1)
+            first = _grab_tokens(counter, lds, lds_slot, grab_base)
 
     return combine_v2_kernel, smem_bytes
 
@@ -1113,12 +1170,12 @@ def launch_combine_v2(
     rank_prefix_matrix,
     send_head,
     buffer_ptrs,
-    block_counter,
+    reduce_counter,
     num_rows: fx.Int32,
     num_recv_tokens: fx.Int32,
     rank: fx.Int32,
-    expected_arrivals: fx.Int32,
-    expected_blocks: fx.Int32,
+    epoch: fx.Int32,
+    grab_base: fx.Int32,
     num_ranks: fx.Constexpr[int],
     num_channels: fx.Constexpr[int],
     hidden: fx.Constexpr[int],
@@ -1142,10 +1199,10 @@ def launch_combine_v2(
         rank_prefix_matrix,
         send_head,
         buffer_ptrs,
-        block_counter,
+        reduce_counter,
         num_rows,
         num_recv_tokens,
         rank,
-        expected_arrivals,
-        expected_blocks,
+        epoch,
+        grab_base,
     ).launch(grid=(num_channels, 1, 1), block=(NUM_THREADS, 1, 1), stream=stream, smem=smem_bytes)
