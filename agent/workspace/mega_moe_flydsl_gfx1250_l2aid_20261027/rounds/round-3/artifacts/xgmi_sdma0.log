@@ -1,0 +1,16 @@
+W1027 06:33:29.540000 70289 torch/distributed/run.py:982] 
+W1027 06:33:29.540000 70289 torch/distributed/run.py:982] *****************************************
+W1027 06:33:29.540000 70289 torch/distributed/run.py:982] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1027 06:33:29.540000 70289 torch/distributed/run.py:982] *****************************************
+HSA_ENABLE_SDMA=0
+A. RCCL all_to_all_single, per-rank egress (bytes to the 3 peers / time), max-over-ranks time
+     32 MiB/rank:    0.157 ms  egress    160.3 GB/s per rank
+    128 MiB/rank:    0.249 ms  egress    404.2 GB/s per rank
+    320 MiB/rank:    0.379 ms  egress    664.6 GB/s per rank
+   1024 MiB/rank:    1.064 ms  egress    756.8 GB/s per rank
+B. peer copies issued by one process (others idle), 1 GiB per copy, concurrent streams
+  one link, one way (0->1)          0.828 ms  per copy  1296.8 GB/s  GPU0 egress  1296.8  GPU0 ingress     0.0  total  1296.8 GB/s
+  one link, both ways (0<->1)       2.379 ms  per copy   451.4 GB/s  GPU0 egress   451.4  GPU0 ingress   451.4  total   902.9 GB/s
+  GPU 0 -> its 3 peers              2.399 ms  per copy   447.5 GB/s  GPU0 egress  1342.6  GPU0 ingress     0.0  total  1342.6 GB/s
+  3 peers -> GPU 0                  3.369 ms  per copy   318.7 GB/s  GPU0 egress     0.0  GPU0 ingress   956.2  total   956.2 GB/s
+  all 12 pairs (all-to-all)         8.456 ms  per copy   127.0 GB/s  GPU0 egress   381.0  GPU0 ingress   381.0  total  1523.8 GB/s

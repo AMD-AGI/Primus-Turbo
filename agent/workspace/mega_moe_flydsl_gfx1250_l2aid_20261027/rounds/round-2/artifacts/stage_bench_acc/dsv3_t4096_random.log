@@ -1,0 +1,130 @@
+W1027 06:22:20.866000 51747 torch/distributed/run.py:982] 
+W1027 06:22:20.866000 51747 torch/distributed/run.py:982] *****************************************
+W1027 06:22:20.866000 51747 torch/distributed/run.py:982] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1027 06:22:20.866000 51747 torch/distributed/run.py:982] *****************************************
+[rank2]:W1027 06:22:23.348000 51919 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+[rank0]:W1027 06:22:23.349000 51917 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+[rank3]:W1027 06:22:23.349000 51920 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+[rank1]:W1027 06:22:23.350000 51918 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+[rank2]:W1027 06:22:23.350000 51919 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank2]:W1027 06:22:23.351000 51919 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank2]:W1027 06:22:23.351000 51919 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank2]:W1027 06:22:23.351000 51919 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank2]:W1027 06:22:23.351000 51919 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank2]:W1027 06:22:23.351000 51919 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank0]:W1027 06:22:23.351000 51917 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank0]:W1027 06:22:23.352000 51917 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank0]:W1027 06:22:23.352000 51917 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank0]:W1027 06:22:23.352000 51917 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank0]:W1027 06:22:23.352000 51917 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank0]:W1027 06:22:23.352000 51917 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank1]:W1027 06:22:23.352000 51918 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank3]:W1027 06:22:23.352000 51920 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank1]:W1027 06:22:23.352000 51918 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank1]:W1027 06:22:23.352000 51918 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank3]:W1027 06:22:23.352000 51920 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank1]:W1027 06:22:23.352000 51918 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank1]:W1027 06:22:23.352000 51918 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank1]:W1027 06:22:23.352000 51918 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank3]:W1027 06:22:23.352000 51920 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank3]:W1027 06:22:23.352000 51920 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank3]:W1027 06:22:23.352000 51920 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank3]:W1027 06:22:23.352000 51920 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+
+====================================================================================================
+[dsv3_t4096_random] EP4 T=4096 H=7168 I=2048 experts/rank=32 topk=8 routing=0.0 pool tiles=142 (rank 0)  max over ranks
+====================================================================================================
+  -- L1 fwd dispatch_gemm (NT)  [1.00000/PASS]
+     dense_gemm :    0.925 ms |  2337.0 TF (single-weight roofline)
+     gemm_only  :    0.971 ms |  2225.5 TF | grouped/dense = 95.2%
+     comm_only  :    0.352 ms |   455.0 GB/s (XGMI) | all-CU 0.197 ms
+     fused      :    1.154 ms |  1872.2 TF | serial 1.323 ms, hidden 0.169 ms (48% of comm) | roofline 84.1% | fused/gemm_only 118.9%
+  -- L2 fwd gemm_combine (NT)  [1.00000/PASS]
+     dense_gemm :    0.490 ms |  2202.9 TF (single-weight roofline)
+     gemm_only  :    0.537 ms |  2011.2 TF | grouped/dense = 91.3%
+     comm_only  :    0.593 ms |   269.3 GB/s (XGMI)
+     fused      :    0.783 ms |  1380.6 TF | serial 1.131 ms, hidden 0.348 ms (59% of comm) | roofline 75.8% | fused/gemm_only 145.7%
+  -- L2 dgrad dispatch_gemm (NN)  [1.00000/PASS]
+     dense_gemm :    0.480 ms |  2252.3 TF (single-weight roofline)
+     gemm_only  :    0.498 ms |  2169.4 TF | grouped/dense = 96.3%
+     comm_only  :    0.355 ms |   451.4 GB/s (XGMI) | all-CU 0.198 ms
+     fused      :    0.670 ms |  1613.6 TF | serial 0.853 ms, hidden 0.183 ms (52% of comm) | roofline 74.4% | fused/gemm_only 134.4%
+  -- dW2 variable-K  [1.00000/PASS]
+     dense_gemm :    0.480 ms |  2251.0 TF (single-weight roofline)
+     gemm_only  :    0.658 ms |  1641.8 TF | grouped/dense = 72.9%
+     fused      :    0.658 ms |  1641.8 TF | serial 0.658 ms, hidden 0.000 ms (nan% of comm) | roofline 100.0% | fused/gemm_only 100.0%
+  -- L1 dgrad gemm_combine (NN)  [1.00000/PASS]
+     dense_gemm :    0.892 ms |  2423.9 TF (single-weight roofline)
+     gemm_only  :    0.995 ms |  2171.4 TF | grouped/dense = 89.6%
+     comm_only  :    0.609 ms |   262.3 GB/s (XGMI)
+     fused      :    1.280 ms |  1688.8 TF | serial 1.604 ms, hidden 0.325 ms (53% of comm) | roofline 77.8% | fused/gemm_only 128.6%
+  -- dW1 x re-dispatch + variable-K  [1.00000/PASS]
+     dense_gemm :    0.902 ms |  2395.1 TF (single-weight roofline)
+     gemm_only  :    1.263 ms |  1710.9 TF | grouped/dense = 71.4%
+     comm_only  :    0.195 ms |   819.0 GB/s (XGMI)
+     fused      :    1.463 ms |  1477.4 TF | serial 1.458 ms, hidden -0.004 ms (-2% of comm) | roofline 86.4% | fused/gemm_only 115.8%
+  == SUM 6 GEMM stages: gemm_only 4.923 ms + comm_only 2.105 ms = serial 7.027 ms -> fused 6.007 ms, hidden 1.020 ms (48% of comm), fused/gemm_only 122.0%
+  == fused_mega_moe fwd+bwd step 6.686 ms (1295.0 TF); outside the 6 GEMM stages (prologue, swiglu fwd/bwd, small ops, gaps): 0.679 ms
+W1027 06:23:13.800000 51747 torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 51917 closing signal SIGTERM
+W1027 06:23:13.801000 51747 torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 51918 closing signal SIGTERM
+E1027 06:23:14.014000 51747 torch/distributed/elastic/multiprocessing/api.py:1002] failed (exitcode: -11) local_rank: 2 (pid: 51919) of binary: /opt/venv/bin/python3
+Traceback (most recent call last):
+  File "/opt/venv/bin/torchrun", line 10, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 380, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/torch/distributed/run.py", line 1138, in main
+    run(args)
+  File "/opt/venv/lib/python3.12/site-packages/torch/distributed/run.py", line 1129, in run
+    elastic_launch(
+  File "/opt/venv/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 197, in __call__
+    return launch_agent(
+           ^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 386, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+/home/xiaompen/Turbo/agent/workspace/mega_moe_flydsl_gfx1250_l2aid_20261027/tools/bench_mega_gfx1250.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-10-27_06:23:13
+  host      : ctheliosr-rck-g02-e15-02.rck.dcgpu
+  rank      : 3 (local_rank: 3)
+  exitcode  : -6 (pid: 51920)  (SIGABRT)
+  error_file: <N/A>
+  traceback : Signal 6 (SIGABRT) received by PID 51920
+[2]:
+  time      : 2026-10-27_06:23:14
+  host      : ctheliosr-rck-g02-e15-02.rck.dcgpu
+  rank      : 0 (local_rank: 0)
+  exitcode  : -15 (pid: 51917)  (SIGTERM)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 51917
+[3]:
+  time      : 2026-10-27_06:23:14
+  host      : ctheliosr-rck-g02-e15-02.rck.dcgpu
+  rank      : 1 (local_rank: 1)
+  exitcode  : -15 (pid: 51918)  (SIGTERM)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 51918
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-10-27_06:23:13
+  host      : ctheliosr-rck-g02-e15-02.rck.dcgpu
+  rank      : 2 (local_rank: 2)
+  exitcode  : -11 (pid: 51919)  (SIGSEGV)
+  error_file: <N/A>
+  traceback : Signal 11 (SIGSEGV) received by PID 51919
+============================================================

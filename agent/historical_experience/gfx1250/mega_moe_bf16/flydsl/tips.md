@@ -62,3 +62,35 @@
 - Signal: one 256x256 tile wrong per event in 16-row blocks (slot not written / data shifted +0x1100 into the next slot); ~1 / 500 fused fwd launches; standalone gather GEMM with 70 OOB padding rows per expert 10 / 160000, without padding 0 / 160000; the bad tiles are full tiles of the same expert as the padded one
 - Takeaway: gather ops that barely touch memory (OOB -1 rows, duplicate / hot rows, zero extent) can corrupt a neighbouring WG's TDM gather writes; waits, delays, descriptor holds and memory type only lower the rate. Per-lane `global_load_async_to_lds_b128` (ASYNCcnt, SADDR form) removes it at ~6% of the GEMM; spreading those loads over the ks sub-steps is slower. Validate any TDM-gather GEMM with a bitwise multi-launch stress that includes padding / duplicate indices
 - Applicability: every gfx1250 TDM gather user (Mega dispatch_gemm, variable-K wgrad gather)
+### 2026-10-27 05:51 L2/AID campaign round-1 — BASELINE (probe)
+- Context: MI455X (gfx1250, SPX + NPS1) workgroup placement, launches shaped like the Mega GEMMs (256 threads, 280 KB LDS, 1 WG per WGP)
+- Signal: `s_sendmsg_rtn_b32 sendmsg(MSG_RTN_GET_SE_AID_ID)` bits [18:16] = XCC; every WG of every launch on XCC `(bid + 7) % 8` (grids 7..4163, GPUs 0-3, across a reboot); with every 8th WG 4x slower the launch takes 1373 instead of 355 us while 7 XCCs idle from ~330 us
+- Takeaway: dispatch is strict round robin from XCC 7, no rebalancing; AID 0 (XCC 0-3) gets `bid % 8` in {1,2,3,4}. A bid-only remap is a fixed bijection (no -2 style hardware read needed). Per-XCC work must be even: a heavy role on one bid residue mod 8 serializes on one XCC. HW_ID1 has no XCC field, this message does
+- Applicability: any gfx1250 tile-order / L2-affinity remap; any kernel mixing roles by bid
+- Context: rocprofv3 `--pmc` (FETCH_SIZE, GL2C_HIT/MISS) on the EP4 Mega step
+- Signal: a rank SIGSEGV, then `SMU: No response` on 3 GPUs, amdgpu sensor reads blocked in D state, reboot needed
+- Takeaway: do not collect PMC counters on this node / ROCm (10.2.0a20261011) with multi-rank Mega runs; use kernel trace + A/B
+- Applicability: gfx1250 profiling on the e15 node
+### 2026-10-27 06:40 L2/AID campaign round-2 — ROLLBACK
+- Context: gemm_combine AID N-half split (each AID takes half the N blocks of 2 / 4 pool blocks), EP4 DSV3
+- Signal: step +0.005% / +0.09% (noise); trace: AID_GROUP_M=2 L2 fwd NT +12.6%, L1 dgrad NN -3.9%. Stage bench (bench_mega_moe view): standalone grouped GEMMs 94-97% of dense, fused stages 1.19-1.49x gemm_only, 48% of comm hidden (t8192 random), 28% (256 experts balanced)
+- Takeaway: halving the weight each GL2 holds does nothing for these GEMMs alone (already at the dense roofline); the Mega slack is the comm/GEMM overlap inside the fused launches. Measure gemm_only / comm_only / fused per stage before placement work. `benchmark/ops/training/bench_mega_moe.py` drives the gfx950 kernels (fails on gfx1250: `buffer.load.lds` LLVM ERROR); the campaign's `tools/bench_mega_gfx1250.py` is its gfx1250 port
+- Applicability: Mega MoE gfx1250 fused dispatch/combine GEMMs
+### 2026-10-27 06:55 L2/AID campaign round-3 — ROLLBACK (+ XGMI ceiling)
+- Context: dispatch_gemm AID N-half split of the 16-row super-tiles (always / only when pool blocks < weight blocks); 4x MI455X node, all pairs one XGMI hop (KFD io_link type 11, no bandwidth in sysfs)
+- Signal: -0.54% / -0.28% step, slower on all 3 shapes. torch peer copies (SDMA): one GPU egress 1558 GB/s to 1 peer, 1581 to 3 peers, ingress 1654, full duplex; all-to-all SDMA 793, RCCL all_to_all_single 657 (320 MiB) / 755 (1 GiB), Mega dispatch_only 255 CUs 1129 GB/s per GPU. Blit-kernel copies (HSA_ENABLE_SDMA=0) are slower in every concurrent pattern
+- Takeaway: the per-GPU injection (~1.6 TB/s) is the XGMI cap, not the link; Mega's in-kernel comm runs at 18-33% of it (combine push 290, dispatch at 64 CUs 519 GB/s) -- CU-issue bound, not link bound. GL2/AID placement does not pay for the Mega GEMMs
+- Applicability: Mega dispatch/combine on MI455X EP4; any XGMI roofline estimate on this node
+
+## Round 4 (2026-10-27): a comm leg that needs no routing goes to the copy engines
+
+- dW1's x re-dispatch was fully exposed (0.30 ms at T=8192). Every rank copying all of x into a second symmetric
+  buffer at rows `src_rank * T_max` (the recv_token index the pool table already uses) with hipMemcpy on IPC peer
+  pointers (SDMA, no CU) on a side stream during the L1 dgrad gemm_combine: +1.16% step. ~10% more bytes than the
+  routed dispatch do not matter when the transfer is hidden.
+- Remote SDMA writes into hipMalloc'd symmetric memory were read correctly by the next kernel after a system-scope
+  flag wait (bitwise stress, 110 iterations, new data every iteration): no stale GL2 line on gfx1250 here.
+- The copies share XGMI with the combine push: the overlapped gemm_combine got +2.75% (~65 us). Hidden comm is not
+  free when it runs beside another comm leg.
+- WAR on a reused receive buffer can ride an existing all-rank dependency: the stage-2 backward dispatch waits on
+  every peer's dy, so every peer finished its previous dW1.

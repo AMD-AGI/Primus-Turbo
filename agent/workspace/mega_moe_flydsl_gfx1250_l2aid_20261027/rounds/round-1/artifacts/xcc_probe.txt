@@ -1,0 +1,96 @@
+grid 4160, busy 20 us (wall clock 100000 kHz), slow_every 0 x4, lds 286720
+launch 0: s hist 0 0 0 0 0 0 0 4160 | s=7, 0 off round-robin (first at bid -1) | per xcc 520 520 520 520 520 520 520 520 | span 355.3 us
+  bid: xcc (start us) for bids 0-15, 256-271, 4144-4159:
+  0:7(7) 1:0(2) 2:1(0) 3:2(4) 4:3(5) 5:4(6) 6:5(5) 7:6(6) 8:7(7) 9:0(2) 10:1(0) 11:2(4) 12:3(5) 13:4(6) 14:5(5) 15:6(6) 
+  256:7(27) 257:0(22) 258:1(20) 259:2(25) 260:3(26) 261:4(26) 262:5(25) 263:6(26) 264:7(27) 265:0(22) 266:1(21) 267:2(25) 268:3(26) 269:4(26) 270:5(25) 271:6(26) 
+  4144:7(335) 4145:0(329) 4146:1(329) 4147:2(331) 4148:3(335) 4149:4(335) 4150:5(334) 4151:6(334) 4152:7(335) 4153:0(329) 4154:1(329) 4155:2(331) 4156:3(335) 4157:4(335) 4158:5(334) 4159:6(335) 
+  raw[0..3] = 00070001 00000001 00010001 00020001
+launch 1: s hist 0 0 0 0 0 0 0 4160 | s=7, 0 off round-robin (first at bid -1) | per xcc 520 520 520 520 520 520 520 520 | span 350.8 us
+launch 2: s hist 0 0 0 0 0 0 0 4160 | s=7, 0 off round-robin (first at bid -1) | per xcc 520 520 520 520 520 520 520 520 | span 350.9 us
+launch 3: s hist 0 0 0 0 0 0 0 4160 | s=7, 0 off round-robin (first at bid -1) | per xcc 520 520 520 520 520 520 520 520 | span 350.6 us
+launch 4: s hist 0 0 0 0 0 0 0 4160 | s=7, 0 off round-robin (first at bid -1) | per xcc 520 520 520 520 520 520 520 520 | span 350.8 us
+launch 5: s hist 0 0 0 0 0 0 0 4160 | s=7, 0 off round-robin (first at bid -1) | per xcc 520 520 520 520 520 520 520 520 | span 350.6 us
+====
+grid 4160, busy 20 us (wall clock 100000 kHz), slow_every 8 x4, lds 286720
+launch 0: s hist 0 0 0 0 0 0 0 4160 | s=7, 0 off round-robin (first at bid -1) | per xcc 520 520 520 520 520 520 520 520 | span 1373.0 us
+  bid: xcc (start us) for bids 0-15, 256-271, 4144-4159:
+  0:7(6) 1:0(0) 2:1(0) 3:2(3) 4:3(6) 5:4(5) 6:5(3) 7:6(6) 8:7(6) 9:0(1) 10:1(0) 11:2(3) 12:3(6) 13:4(5) 14:5(3) 15:6(6) 
+  256:7(87) 257:0(21) 258:1(21) 259:2(23) 260:3(26) 261:4(25) 262:5(24) 263:6(27) 264:7(87) 265:0(21) 266:1(21) 267:2(23) 268:3(26) 269:4(25) 270:5(24) 271:6(27) 
+  4144:7(1293) 4145:0(329) 4146:1(329) 4147:2(329) 4148:3(335) 4149:4(333) 4150:5(333) 4151:6(336) 4152:7(1293) 4153:0(329) 4154:1(329) 4155:2(329) 4156:3(335) 4157:4(333) 4158:5(333) 4159:6(336) 
+  raw[0..3] = 00070001 00000001 00010001 00020001
+launch 1: s hist 0 0 0 0 0 0 0 4160 | s=7, 0 off round-robin (first at bid -1) | per xcc 520 520 520 520 520 520 520 520 | span 1369.1 us
+launch 2: s hist 0 0 0 0 0 0 0 4160 | s=7, 0 off round-robin (first at bid -1) | per xcc 520 520 520 520 520 520 520 520 | span 1368.4 us
+====
+grid 4160, busy 20 us (wall clock 100000 kHz), slow_every 3 x6, lds 286720
+launch 0: s hist 0 0 0 0 0 0 0 4160 | s=7, 0 off round-robin (first at bid -1) | per xcc 520 520 520 520 520 520 520 520 | span 1007.5 us
+  bid: xcc (start us) for bids 0-15, 256-271, 4144-4159:
+  0:7(6) 1:0(0) 2:1(0) 3:2(2) 4:3(5) 5:4(6) 6:5(4) 7:6(5) 8:7(6) 9:0(0) 10:1(0) 11:2(1) 12:3(5) 13:4(6) 14:5(4) 15:6(5) 
+  256:7(26) 257:0(21) 258:1(21) 259:2(22) 260:3(26) 261:4(26) 262:5(24) 263:6(25) 264:7(26) 265:0(21) 266:1(21) 267:2(22) 268:3(26) 269:4(27) 270:5(24) 271:6(25) 
+  4144:7(853) 4145:0(839) 4146:1(887) 4147:2(829) 4148:3(838) 4149:4(834) 4150:5(851) 4151:6(856) 4152:7(853) 4153:0(846) 4154:1(888) 4155:2(848) 4156:3(838) 4157:4(835) 4158:5(853) 4159:6(872) 
+  raw[0..3] = 00070001 00000001 00010001 00020001
+launch 1: s hist 0 0 0 0 0 0 0 4160 | s=7, 0 off round-robin (first at bid -1) | per xcc 520 520 520 520 520 520 520 520 | span 1008.6 us
+launch 2: s hist 0 0 0 0 0 0 0 4160 | s=7, 0 off round-robin (first at bid -1) | per xcc 520 520 520 520 520 520 520 520 | span 1008.6 us
+====
+grid 256, busy 20 us (wall clock 100000 kHz), slow_every 0 x4, lds 286720
+launch 0: s hist 0 0 0 0 0 0 0 256 | s=7, 0 off round-robin (first at bid -1) | per xcc 32 32 32 32 32 32 32 32 | span 45.3 us
+  bid: xcc (start us) for bids 0-15, 256-271, 240-255:
+  0:7(7) 1:0(0) 2:1(0) 3:2(7) 4:3(6) 5:4(6) 6:5(5) 7:6(5) 8:7(7) 9:0(0) 10:1(0) 11:2(7) 12:3(6) 13:4(6) 14:5(5) 15:6(5) 
+  
+  240:7(7) 241:0(0) 242:1(0) 243:2(7) 244:3(6) 245:4(6) 246:5(5) 247:6(5) 248:7(7) 249:0(0) 250:1(0) 251:2(7) 252:3(6) 253:4(6) 254:5(5) 255:6(5) 
+  raw[0..3] = 00070001 00000001 00010001 00020001
+launch 1: s hist 0 0 0 0 0 0 0 256 | s=7, 0 off round-robin (first at bid -1) | per xcc 32 32 32 32 32 32 32 32 | span 41.2 us
+launch 2: s hist 0 0 0 0 0 0 0 256 | s=7, 0 off round-robin (first at bid -1) | per xcc 32 32 32 32 32 32 32 32 | span 41.0 us
+launch 3: s hist 0 0 0 0 0 0 0 256 | s=7, 0 off round-robin (first at bid -1) | per xcc 32 32 32 32 32 32 32 32 | span 41.2 us
+grid 1000, busy 5 us (wall clock 100000 kHz), slow_every 0 x4, lds 286720
+launch 0: s hist 0 0 0 0 0 0 0 1000 | s=7, 0 off round-robin (first at bid -1) | per xcc 125 125 125 125 125 125 125 125 | span 30.3 us
+  bid: xcc (start us) for bids 0-15, 256-271, 984-999:
+  0:7(5) 1:0(0) 2:1(0) 3:2(2) 4:3(4) 5:4(5) 6:5(4) 7:6(3) 8:7(5) 9:0(0) 10:1(0) 11:2(2) 12:3(4) 13:4(5) 14:5(4) 15:6(3) 
+  256:7(10) 257:0(6) 258:1(6) 259:2(7) 260:3(10) 261:4(10) 262:5(9) 263:6(9) 264:7(10) 265:0(6) 266:1(6) 267:2(7) 268:3(10) 269:4(10) 270:5(9) 271:6(9) 
+  984:7(22) 985:0(17) 986:1(22) 987:2(23) 988:3(21) 989:4(22) 990:5(20) 991:6(20) 992:7(22) 993:0(17) 994:1(17) 995:2(18) 996:3(21) 997:4(22) 998:5(25) 999:6(25) 
+  raw[0..3] = 00070001 00000001 00010001 00020001
+launch 1: s hist 0 0 0 0 0 0 0 1000 | s=7, 0 off round-robin (first at bid -1) | per xcc 125 125 125 125 125 125 125 125 | span 27.5 us
+launch 2: s hist 0 0 0 0 0 0 0 1000 | s=7, 0 off round-robin (first at bid -1) | per xcc 125 125 125 125 125 125 125 125 | span 27.5 us
+GPU 0
+launch 0: s hist 0 0 0 0 0 0 0 4163 | s=7, 0 off round-robin (first at bid -1)
+launch 1: s hist 0 0 0 0 0 0 0 4163 | s=7, 0 off round-robin (first at bid -1)
+launch 2: s hist 0 0 0 0 0 0 0 4163 | s=7, 0 off round-robin (first at bid -1)
+launch 3: s hist 0 0 0 0 0 0 0 4163 | s=7, 0 off round-robin (first at bid -1)
+launch 0: s hist 0 0 0 0 0 0 0 1001 | s=7, 0 off round-robin (first at bid -1)
+launch 1: s hist 0 0 0 0 0 0 0 1001 | s=7, 0 off round-robin (first at bid -1)
+launch 2: s hist 0 0 0 0 0 0 0 1001 | s=7, 0 off round-robin (first at bid -1)
+launch 0: s hist 0 0 0 0 0 0 0 7 | s=7, 0 off round-robin (first at bid -1)
+launch 1: s hist 0 0 0 0 0 0 0 7 | s=7, 0 off round-robin (first at bid -1)
+launch 2: s hist 0 0 0 0 0 0 0 7 | s=7, 0 off round-robin (first at bid -1)
+GPU 1
+launch 0: s hist 0 0 0 0 0 0 0 4163 | s=7, 0 off round-robin (first at bid -1)
+launch 1: s hist 0 0 0 0 0 0 0 4163 | s=7, 0 off round-robin (first at bid -1)
+launch 2: s hist 0 0 0 0 0 0 0 4163 | s=7, 0 off round-robin (first at bid -1)
+launch 3: s hist 0 0 0 0 0 0 0 4163 | s=7, 0 off round-robin (first at bid -1)
+launch 0: s hist 0 0 0 0 0 0 0 1001 | s=7, 0 off round-robin (first at bid -1)
+launch 1: s hist 0 0 0 0 0 0 0 1001 | s=7, 0 off round-robin (first at bid -1)
+launch 2: s hist 0 0 0 0 0 0 0 1001 | s=7, 0 off round-robin (first at bid -1)
+launch 0: s hist 0 0 0 0 0 0 0 7 | s=7, 0 off round-robin (first at bid -1)
+launch 1: s hist 0 0 0 0 0 0 0 7 | s=7, 0 off round-robin (first at bid -1)
+launch 2: s hist 0 0 0 0 0 0 0 7 | s=7, 0 off round-robin (first at bid -1)
+GPU 2
+launch 0: s hist 0 0 0 0 0 0 0 4163 | s=7, 0 off round-robin (first at bid -1)
+launch 1: s hist 0 0 0 0 0 0 0 4163 | s=7, 0 off round-robin (first at bid -1)
+launch 2: s hist 0 0 0 0 0 0 0 4163 | s=7, 0 off round-robin (first at bid -1)
+launch 3: s hist 0 0 0 0 0 0 0 4163 | s=7, 0 off round-robin (first at bid -1)
+launch 0: s hist 0 0 0 0 0 0 0 1001 | s=7, 0 off round-robin (first at bid -1)
+launch 1: s hist 0 0 0 0 0 0 0 1001 | s=7, 0 off round-robin (first at bid -1)
+launch 2: s hist 0 0 0 0 0 0 0 1001 | s=7, 0 off round-robin (first at bid -1)
+launch 0: s hist 0 0 0 0 0 0 0 7 | s=7, 0 off round-robin (first at bid -1)
+launch 1: s hist 0 0 0 0 0 0 0 7 | s=7, 0 off round-robin (first at bid -1)
+launch 2: s hist 0 0 0 0 0 0 0 7 | s=7, 0 off round-robin (first at bid -1)
+GPU 3
+launch 0: s hist 0 0 0 0 0 0 0 4163 | s=7, 0 off round-robin (first at bid -1)
+launch 1: s hist 0 0 0 0 0 0 0 4163 | s=7, 0 off round-robin (first at bid -1)
+launch 2: s hist 0 0 0 0 0 0 0 4163 | s=7, 0 off round-robin (first at bid -1)
+launch 3: s hist 0 0 0 0 0 0 0 4163 | s=7, 0 off round-robin (first at bid -1)
+launch 0: s hist 0 0 0 0 0 0 0 1001 | s=7, 0 off round-robin (first at bid -1)
+launch 1: s hist 0 0 0 0 0 0 0 1001 | s=7, 0 off round-robin (first at bid -1)
+launch 2: s hist 0 0 0 0 0 0 0 1001 | s=7, 0 off round-robin (first at bid -1)
+launch 0: s hist 0 0 0 0 0 0 0 7 | s=7, 0 off round-robin (first at bid -1)
+launch 1: s hist 0 0 0 0 0 0 0 7 | s=7, 0 off round-robin (first at bid -1)
+launch 2: s hist 0 0 0 0 0 0 0 7 | s=7, 0 off round-robin (first at bid -1)

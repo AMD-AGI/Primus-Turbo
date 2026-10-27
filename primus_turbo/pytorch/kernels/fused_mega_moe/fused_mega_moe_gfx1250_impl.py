@@ -8,8 +8,9 @@
 
 Same contracts as the gfx950 stage1 / stage2 compositions. The GEMMs read the weights as stored:
 NT for the forward, NN (``b_nn``) for the dgrads. The wgrads run the gfx1250 variable-K kernel in
-pool order, the dispatched operand read from the dispatch token buffer through the pool's row
-table, ordered so the result lands in the weight's own layout.
+pool order, the dispatched operand (dy in the dispatch token buffer, x in the second receive buffer
+of ``x_redispatch_kernel``) read through the pool's row table, ordered so the result lands in the
+weight's own layout.
 """
 
 from typing import Optional
@@ -26,11 +27,11 @@ from primus_turbo.flydsl.mega.bf16.dispatch_prologue_kernel import (
 from primus_turbo.flydsl.mega.bf16.symm_buffer import get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.mega.bf16_gfx1250.dispatch_gemm_kernel import (
     dispatch_gemm_nt_gfx1250,
-    dispatch_only_gfx1250,
 )
 from primus_turbo.flydsl.mega.bf16_gfx1250.gemm_combine_kernel import (
     gemm_combine_nt_gfx1250,
 )
+from primus_turbo.flydsl.mega.bf16_gfx1250.x_redispatch_kernel import get_x_redispatch
 from primus_turbo.flydsl.utils.swiglu_kernel import (
     swiglu_backward_flydsl_kernel,
     swiglu_flydsl_kernel,
@@ -104,7 +105,7 @@ def stage2_backward(
         bias=fc1_bias,
         tile_to_expert=handle.tile_to_expert,
     )
-    # the dispatched dy lives in the symm buffer until stage1's backward dispatches x into it
+    # the dispatched dy lives in the symm buffer until the next dispatch into it
     token_buffer = get_symm_buffer_for_mega_moe().dispatch_token_buffer
     prefix, counts = handle.num_tokens_per_expert_prefix, handle.num_tokens_per_expert
     # dW2[e] = dy_pool[e].T @ act_w[e] -> [E, hidden, inter]
@@ -122,9 +123,13 @@ def stage1_backward(grad_l1, saved_x, w1, handle, topk_idx, grad_gate):
     """L1 dgrad + combine + reduce with the routing-weight gradient, then dW1.
 
     Returns ``(dx, grad_topk_weights [tokens, topk], dW1)``."""
+    # dW1 reads x again, at every rank: peer copies on a side stream land it in a second receive
+    # buffer while the L1 dgrad + combine below runs, instead of a dispatch exposed after it
+    x_redispatch = get_x_redispatch(get_symm_buffer_for_mega_moe())
+    x_redispatch.push(saved_x.contiguous())
     dx, grad_topk_weights = gemm_combine_nt_gfx1250(grad_l1, w1, handle, topk_idx, grad_gate=grad_gate, b_nn=True)
-    # dW1[e] = grad_l1[e].T @ x_pool[e] -> [E, 2 * inter, hidden]; x is dispatched again
-    x_recv = dispatch_only_gfx1250(saved_x.contiguous(), handle)
+    # dW1[e] = grad_l1[e].T @ x_pool[e] -> [E, 2 * inter, hidden]
+    x_recv = x_redispatch.wait()
     prefix, counts = handle.num_tokens_per_expert_prefix, handle.num_tokens_per_expert
     dW1 = _variable_k(grad_l1, x_recv, prefix, masked_k=counts, b_index=handle.pool_row_to_recv_token)
     return dx, grad_topk_weights, dW1.to(w1.dtype)

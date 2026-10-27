@@ -1,0 +1,7 @@
+8bbd8c8967f28e8d1ce3553a6b3fa2eb2dd51453
+ M agent/historical_experience/gfx1250/mega_moe_bf16/flydsl/tips.md
+ M primus_turbo/flydsl/mega/bf16_gfx1250/dispatch_gemm_kernel.py
+ M primus_turbo/flydsl/mega/bf16_gfx1250/gemm_combine_kernel.py
+ M primus_turbo/flydsl/mega/bf16_gfx1250/gemm_nt_tile.py
+?? .rocprofv3/
+?? opt.md

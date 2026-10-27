@@ -1,0 +1,4 @@
+acc            dsv3_t4096_random: 6.896 / 6.845 -> 6.870 | dsv3_t8192_random: 11.984 / 12.016 -> 12.000 | dsv3_t8192_skew1: 28.099 / 28.098 -> 28.099
+sdma           dsv3_t4096_random: 6.764 / 6.723 -> 6.744 | dsv3_t8192_random: 11.836 / 11.887 -> 11.861 | dsv3_t8192_skew1: 27.980 / 27.971 -> 27.976
+acc            step geomean 1038.774 TF
+sdma           step geomean 1050.843 TF  vs acc: +1.162%  (t4096_random +1.88%, t8192_random +1.17%, t8192_skew1 +0.44%)

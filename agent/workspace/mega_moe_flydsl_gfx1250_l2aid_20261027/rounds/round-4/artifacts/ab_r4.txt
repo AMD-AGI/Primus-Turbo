@@ -1,0 +1,12 @@
+r1 acc dsv3_t4096_random    PASS  fwd 2.307 ms (1251 TF)  fwd+bwd 6.896 ms  bwd 1258 TF  step 1255.7 TF
+r1 sdma dsv3_t4096_random    PASS  fwd 2.334 ms (1237 TF)  fwd+bwd 6.764 ms  bwd 1303 TF  step 1280.2 TF
+r1 acc dsv3_t8192_random    PASS  fwd 4.219 ms (1368 TF)  fwd+bwd 11.984 ms  bwd 1487 TF  step 1445.0 TF
+r1 sdma dsv3_t8192_random    PASS  fwd 4.257 ms (1356 TF)  fwd+bwd 11.836 ms  bwd 1523 TF  step 1463.1 TF
+r1 acc dsv3_t8192_skew1     PASS  fwd 9.709 ms (595 TF)  fwd+bwd 28.099 ms  bwd 628 TF  step 616.3 TF
+r1 sdma dsv3_t8192_skew1     PASS  fwd 9.710 ms (594 TF)  fwd+bwd 27.980 ms  bwd 632 TF  step 618.9 TF
+r2 sdma dsv3_t4096_random    PASS  fwd 2.289 ms (1261 TF)  fwd+bwd 6.723 ms  bwd 1302 TF  step 1287.8 TF
+r2 acc dsv3_t4096_random    PASS  fwd 2.290 ms (1261 TF)  fwd+bwd 6.845 ms  bwd 1267 TF  step 1265.0 TF
+r2 sdma dsv3_t8192_random    PASS  fwd 6.330 ms (912 TF)  fwd+bwd 11.887 ms  bwd 2077 TF  step 1456.8 TF
+r2 acc dsv3_t8192_random    PASS  fwd 4.013 ms (1438 TF)  fwd+bwd 12.016 ms  bwd 1443 TF  step 1441.2 TF
+r2 sdma dsv3_t8192_skew1     PASS  fwd 9.732 ms (593 TF)  fwd+bwd 27.971 ms  bwd 633 TF  step 619.1 TF
+r2 acc dsv3_t8192_skew1     PASS  fwd 9.739 ms (593 TF)  fwd+bwd 28.098 ms  bwd 629 TF  step 616.3 TF

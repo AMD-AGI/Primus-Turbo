@@ -1,0 +1,11 @@
+EP4 test_deepseek_v3: 2 passed, 3 deselected, 1 warning in 36.26s
+EP4 test_ragged_skewed: 1 passed, 4 deselected, 1 warning in 29.37s
+EP4 test_one_token: 1 passed, 4 deselected, 1 warning in 23.57s
+EP4 test_staged_bias_gpt_oss: 1 passed, 4 deselected, 1 warning in 23.33s
+EP2: 5 passed, 1 warning in 75.17s (0:01:15)
+EP1: 19 passed, 1 warning in 89.39s (0:01:29)
+grouped GEMM gfx1250: 31 passed, 1 warning in 16.45s
+dsv3_t8192_random    PASS  fwd 4.239 ms (1362 TF)  fwd+bwd 11.973 ms  bwd 1493 TF  step 1446.4 TF
+dsv3_t8192_skew1     PASS  fwd 9.763 ms (591 TF)  fwd+bwd 28.114 ms  bwd 629 TF  step 616.0 TF
+dsv3_t4096_random    PASS  fwd 2.312 ms (1248 TF)  fwd+bwd 6.865 ms  bwd 1268 TF  step 1261.3 TF
+AGGREGATE step 1039.651 TF  fwd 1001.774 TF  bwd 1059.866 TF  (3/3 PASS)
