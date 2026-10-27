@@ -198,11 +198,11 @@ def main(argv=None):
     torch.cuda.empty_cache()
 
     flush = torch.empty(a.flush_mb * (1 << 20) // 4, dtype=torch.float32, device=dev)
-    for arm in arms:  # pre-warm
-        t_end = time.time() + a.warmup_s
+    for arm in arms:  # pre-warm; synchronize every call: launches are asynchronous, and an unsynchronized
+        t_end = time.time() + a.warmup_s  # loop queues thousands of calls in seconds (minutes of GPU work)
         while time.time() < t_end:
             calls[arm.id]()
-        torch.cuda.synchronize()
+            torch.cuda.synchronize()
 
     sclk = Sclk().start()
     ids = [arm.id for arm in arms]
