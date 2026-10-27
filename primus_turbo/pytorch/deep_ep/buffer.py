@@ -87,7 +87,11 @@ class Buffer:
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
             intranode_backend: the intranode dispatch / combine kernels: ``cpp`` (default) or ``cpp_v2``
                 (gfx1250: direct writes into fixed slots instead of channel rings; its handles are its own).
-                ``None`` reads ``PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND``.
+                ``None`` reads ``PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND``. ``cpp_v2`` keeps every received
+                row in the NVL buffer: past its first 4.25 MiB, half of ``num_nvl_bytes`` must hold the most
+                rows any rank receives (each its hidden bytes plus 4 + 12 * top-k bytes), and the other half
+                the most rows any rank gets back in a combine (each its hidden bytes plus 4 * top-k, rounded
+                up to 128 bytes).
 
         Note:
             Controlled by ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM`` (default ``0``).

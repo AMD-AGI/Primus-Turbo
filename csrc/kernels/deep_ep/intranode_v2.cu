@@ -172,6 +172,20 @@ __device__ __forceinline__ void wait_all_memory() {
 
 // System-scope accesses as global (not flat) instructions: a flat access also counts on the LDS
 // counter, so a wait for this wave's LDS accesses would wait for it to reach the peer as well.
+// The reports that end a kernel are out of line: a printf expands to a lot of code, which inline
+// would share the instruction cache with the hot loops.
+__device__ __noinline__ void trap_capacity(const char *op, const char *what, int rank, int count,
+                                           long long capacity) {
+    printf("DeepEP V2 %s: rank %d %s %d, the NVL buffer holds %lld; raise num_nvl_bytes\n", op,
+           rank, what, count, capacity);
+    trap();
+}
+
+__device__ __noinline__ void trap_timeout(const char *what, int rank, int index, int value) {
+    printf("DeepEP V2 %s timeout: rank %d, %d, %d\n", what, rank, index, value);
+    trap();
+}
+
 template <typename T> __device__ __forceinline__ T ld_sys(const T *ptr) {
     return __hip_atomic_load((const __attribute__((address_space(1))) T *) ptr, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_SYSTEM);
@@ -251,7 +265,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     void **buffer_ptrs, DispatchLayout layout, int num_tokens, int num_worst_tokens,
                     int hidden_bytes, int num_topk, int num_experts, int num_scales,
                     int scale_token_stride, int scale_hidden_stride, int rank, int epoch,
-                    int lds_rows, int row_buffer_bytes) {
+                    int lds_rows, int row_buffer_bytes, int64_t capacity) {
 #if defined(__gfx1250__)
     extern __shared__ __align__(128) int smem[];
     constexpr int                        kLdsRunning   = 0;
@@ -271,6 +285,23 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     auto     *local                = static_cast<uint8_t *>(buffer_ptrs[rank]);
     int       token_start, token_end;
     get_channel_task_range(num_tokens, num_channels, channel, token_start, token_end);
+
+    // every rank's heap holds what every rank receives, checked the same way on every rank so that
+    // they all stop rather than wait for one that did
+    {
+        int max_rank = 0, max_recv = rank_prefix_matrix[(kNumRanks - 1) * kNumRanks];
+#pragma unroll
+        for (int r = 1; r < kNumRanks; ++r) {
+            const int recv = rank_prefix_matrix[(kNumRanks - 1) * kNumRanks + r];
+            max_rank       = recv > max_recv ? r : max_rank;
+            max_recv       = recv > max_recv ? recv : max_recv;
+        }
+        if (max_recv > capacity) {
+            if (channel == 0 and thread_id == 0)
+                trap_capacity("dispatch", "receives tokens:", max_rank, max_recv, capacity);
+            trap();
+        }
+    }
 
     // the channel's first index in our stream to each rank, published to that rank before any of
     // its rows; and nothing received yet (our own rows go to the outputs directly)
@@ -492,9 +523,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         if (remaining == 0)
             break;
         if (timeout_clock() - start_time > NUM_TIMEOUT_CYCLES) {
+            // rank, channel, sources not done
             if (thread_id == 0)
-                printf("DeepEP V2 dispatch receive timeout: rank %d, channel %d, sources left %d\n",
-                       rank, channel, remaining);
+                trap_timeout("dispatch receive", rank, channel, remaining);
             trap();
         }
     }
@@ -521,7 +552,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                    const int *rank_prefix_matrix, const int *send_head, void **buffer_ptrs,
                    int *reduce_counter, int num_rows, int num_recv_tokens, int hidden_bytes,
                    int num_topk, int rank, int epoch, uint32_t grab_base, int push_warps,
-                   int64_t region_offset, int slot_bytes) {
+                   int64_t region_offset, int slot_bytes, int64_t capacity) {
 #if defined(__gfx1250__)
     extern __shared__ __align__(128) int smem[];
     constexpr int kVecElems = static_cast<int>(sizeof(int4) / sizeof(dtype_t));
@@ -550,6 +581,26 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         bases[s] = base;
     }
     row_begins[kNumRanks] = num_rows;
+
+    // every rank's region holds the rows that come back to it (one per token and rank it went to),
+    // checked the same way on every rank so that none pushes past a peer's heap
+    {
+        int max_rank = 0, max_rows = 0;
+#pragma unroll
+        for (int s = 0; s < kNumRanks; ++s) {
+            int rows = 0;
+#pragma unroll
+            for (int r = 0; r < kNumRanks; ++r)
+                rows += rank_prefix(s, r) - rank_prefix(s - 1, r);
+            max_rank = rows > max_rows ? s : max_rank;
+            max_rows = rows > max_rows ? rows : max_rows;
+        }
+        if (max_rows > capacity) {
+            if (block_id == 0 and thread_id == 0)
+                trap_capacity("combine", "gets rows back:", max_rank, max_rows, capacity);
+            trap();
+        }
+    }
 
     // ---- push (the first push_warps warps of each block): each row of x back to its source rank,
     // but for our own rows, which the reduce reads from x; a row's flag goes up once the row is
@@ -642,9 +693,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         auto       spin_start = timeout_clock();
         while (ballot(waits and ld_sys(flag) != epoch) != 0) {
             if (timeout_clock() - spin_start > NUM_TIMEOUT_CYCLES) {
+                // rank, first token of the claim, lane
                 if (waits)
-                    printf("DeepEP V2 combine row timeout: rank %d, token %d, lane %d\n", rank,
-                           first, lane_id);
+                    trap_timeout("combine row", rank, first, lane_id);
                 trap();
             }
         }
@@ -754,7 +805,8 @@ void dispatch(void *recv_x, float *recv_x_scales, int *recv_src_idx, int64_t *re
     PRIMUS_TURBO_CHECK(DIVUP(num_tokens, num_channels) < kTailDoneBit,
                        "DeepEP V2 dispatch takes fewer than 2^19 tokens per channel");
     const auto layout = dispatch_layout(num_nvl_bytes, hidden_bytes, num_topk, num_scales);
-    PRIMUS_TURBO_CHECK(num_recv_tokens <= layout.capacity,
+    // the kernel checks every rank's count the same way; with a worst-case allocation only it knows
+    PRIMUS_TURBO_CHECK(num_worst_tokens > 0 or num_recv_tokens <= layout.capacity,
                        "DeepEP V2 dispatch receives more tokens than the NVL buffer holds; raise "
                        "num_nvl_bytes");
 
@@ -772,7 +824,7 @@ void dispatch(void *recv_x, float *recv_x_scales, int *recv_src_idx, int64_t *re
             topk_weights, is_token_in_rank, channel_prefix_matrix, rank_prefix_matrix,             \
             buffer_ptrs, layout, num_tokens, num_worst_tokens, hidden_bytes, num_topk,             \
             num_experts, num_scales, scale_token_stride, scale_hidden_stride, rank, epoch,         \
-            lds_rows, row_buffer);                                                                 \
+            lds_rows, row_buffer, layout.capacity);                                                \
     }                                                                                              \
     break
 
@@ -800,14 +852,9 @@ void combine(hipDataType type, void *recv_x, float *recv_topk_weights, const voi
     const int     slot_bytes    = combine_slot_bytes(hidden_bytes, num_topk);
     const int64_t half          = half_bytes(num_nvl_bytes);
     const int64_t region_offset = kDataOffset + half;
-    // a token comes back from at most every rank
-    PRIMUS_TURBO_CHECK(static_cast<int64_t>(num_recv_tokens) * num_ranks <=
-                           (half - 16) / slot_bytes,
-                       "DeepEP V2 combine receives more rows than the NVL buffer holds; raise "
-                       "num_nvl_bytes");
-    PRIMUS_TURBO_CHECK(static_cast<int64_t>(num_recv_tokens) * num_ranks * 4 <= kCombineFlagsBytes,
-                       "DeepEP V2 combine has more rows than row flags");
-    const int push_warps = combine_push_warps(num_channels, slot_bytes);
+    // rows of the combine region, each with a flag; the kernel checks every rank's count
+    const int64_t capacity   = std::min<int64_t>((half - 16) / slot_bytes, kCombineFlagsBytes / 4);
+    const int     push_warps = combine_push_warps(num_channels, slot_bytes);
     PRIMUS_TURBO_CHECK(push_warps > 0 and num_channels * push_warps >= num_ranks - 1);
     const int  smem_bytes = push_warps * slot_bytes;
     const bool has_bias   = bias_0 != nullptr or bias_1 != nullptr;
@@ -822,7 +869,7 @@ void combine(hipDataType type, void *recv_x, float *recv_topk_weights, const voi
             topk_weights, static_cast<const dtype *>(bias_0), static_cast<const dtype *>(bias_1),  \
             rank_prefix_matrix, send_head, buffer_ptrs, reduce_counter, num_tokens,                \
             num_recv_tokens, hidden_bytes, num_topk, rank, epoch, grab_base, push_warps,           \
-            region_offset, slot_bytes);                                                            \
+            region_offset, slot_bytes, capacity);                                                  \
     }                                                                                              \
     break
 
