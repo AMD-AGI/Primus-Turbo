@@ -2,7 +2,7 @@
 # campaign.sh <stage> -- the measurement campaign of the HK attention ladders, in the order it must run.
 # Every GPU step goes through tools/run_gpu.sh (HKL_GPU = gpu index; container from start_gpu_container.sh).
 #   A  CPU only: build every rung of the three ladders (sha256 pins must match) + self-check (no GPU)
-#   B  smoke: every rung that never ran on a GPU (f00..f08, b00..b07, the rebuilt MLA sub-rungs r1a..r2f),
+#   B  smoke: every rung that never ran on a GPU (f00..f08, b00..b07, m00..m02, the rebuilt MLA sub-rungs r1a..r2f),
 #      ONE rung per job, toy shape only, stop at the first failure
 #   C  correctness: every rung + baseline, every shape of its problem kind (toy first; prod last)
 #   D  timing: the main line of each ladder (+ side rungs), -r 10, JSON + Markdown tables in logs/
@@ -27,6 +27,9 @@ B)
   for r in b00 b01 b02 b03 b04 b05 b06 b07; do
     $RUN "smoke_bwd_$r" 600 -- python3 -m hkl.test llama/ladder_bwd.json --rung "$r" --baseline --shapes toy toy_full
   done
+  for r in m00 m01 m02; do
+    $RUN "smoke_mla_$r" 600 -- python3 -m hkl.test mla/ladder_bwd.json --rung "$r" --baseline --shapes toy
+  done
   for r in r1a r1b r1c r1d r1e r1f r1g r1h r1i r1j r1k r1l r2a r2b r2c r2d r2e; do  # never ran in this form
     $RUN "smoke_mla_$r" 600 -- python3 -m hkl.test mla/ladder_bwd.json --rung hk_v0 "$r" --baseline --shapes toy
   done
@@ -47,6 +50,7 @@ E)
   for r in v0 p1 v1_lsum0 v11_best; do tools/att.sh llama/ladder_fwd.json "$r" 'k_attn_fwd_v'; done
   for r in b00 b01 b02 b03 b04 b05 b06 b07; do tools/att.sh llama/ladder_bwd.json "$r" "k_bwd_${r}_dkdv"; done
   for r in v0 p1 v1_atom2 v11_best; do tools/att.sh llama/ladder_bwd.json "$r" 'k_hk_bwd1?_g4'; done
+  for r in m00 m01 m02; do tools/att.sh mla/ladder_bwd.json "$r" "k_mla_${r}_d"; done
   for r in hk_v0 r1 r2 r3 r4 r7; do tools/att.sh mla/ladder_bwd.json "$r" 'k_dkdv96ds|k_dqds_c'; done
   ;;
 *) echo "unknown stage $STAGE" >&2; exit 2 ;;

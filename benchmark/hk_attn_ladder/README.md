@@ -9,7 +9,7 @@ checks and times them all in one process on one GPU.
 |---|---|---|---|---|
 | `llama/ladder_fwd.json` | Llama-3.1-8B attention forward: bf16, d 128, GQA 32 / 8, causal, BSHD (b4 s8192) | `f00` naive | `v11_best` (v1.1) | Primus-Turbo FlyDSL |
 | `llama/ladder_bwd.json` | the same backward | `b00` naive 3-kernel FA2 | `v11_best` (v1.1) | Primus-Turbo FlyDSL |
-| `mla/ladder_bwd.json` | DeepSeek-V3 MLA backward: bf16, qk 192 / v 128, MHA 128 heads, causal, SBHD (b2 s4096) | `hk_v0` | `r7` (71bd0329) | Primus-Turbo FlyDSL |
+| `mla/ladder_bwd.json` | DeepSeek-V3 MLA backward: bf16, qk 192 / v 128, MHA 128 heads, causal, SBHD (b2 s4096) | `m00` naive 3-kernel FA2 | `r7` (71bd0329) | Primus-Turbo FlyDSL |
 
 Nothing in this directory has run on a GPU yet (prepared CPU-only, 2026-10-27). The `ref` / `ref_ms`
 values in the ladder files are a08-1 measurements from when a rung was first written (GPU2 / GPU3 of
@@ -27,7 +27,10 @@ another node, other sessions): orientation only, every rung is re-measured by `t
 * **New rungs** (`src/ladder/*.hip`, written for this ladder, no pin) fill the bottom the history does
   not have: nothing below Llama v0 / MLA d3590be4 survived. Llama forward `f00`..`f08` climb from a naive
   kernel to v0 minus software pipelining; Llama backward `b00`..`b07` from FlashAttention-2's three-kernel
-  backward to v0 minus its step pipeline. They are reviewed on the CPU (an independent review of
+  backward to v0 minus its step pipeline; MLA backward `m00`..`m02` from the same three-kernel backward with
+  the MLA head dims, through TDM fills, to the dS-export idea of hk_v0 (dQ read back from a dS^T scratch
+  instead of recomputing S and dP). The MLA bottom rungs live in the Llama tree (`"tree": "../llama/hip"`,
+  they use its hk_attn primitives) and launch through `mla/lab/bwd_mladder.py`. They are reviewed on the CPU (an independent review of
   `f00`..`f08` found no correctness issue) but only a GPU run can validate them: stage B of the campaign
   runs each one alone at a toy shape first.
 * **Side rungs** (`"side": true`) are measured dead ends that make good "what did not work" notes (v0 flags
@@ -101,13 +104,16 @@ barriers; asm-patched kernels only from their verified patch (`hkl.build` refuse
 * The HK MLA forward reached parity with FlyDSL but was never integrated (a08-1 `fwd_summary.md`): a
   sidebar, not a ladder. The MLA forward is FlyDSL.
 * `v11_best` of the Llama forward never ran on a GPU (it was blocked by a halted card on a08-1).
-* MLA naive bottom rungs (below `hk_v0`) are not written yet.
+* `m02` -> `hk_v0` is still a large step (96-row kv blocks on a 3-stage ring, packed dS layout, 384-query dQ
+  workgroups, lock_simd): the pre-squash kernels between them (k1, k1ds, q1 / q2, k3) were lost with the
+  host they were written on.
 
 ## Rungs
 
 Generated with `python3 -m hkl.table <ladder> --build` (VGPRs / static LDS of the main kernel).
 
 ### Llama forward
+
 | Rung | Parent | Source / flags | Pin | a08-1 ms | Feature | VGPR / LDS |
 |---|---|---|---|---|---|---|
 | f00 |  | `f00_naive.hip` | new |  | naive: 64 queries x 1 head per WG, register-mediated single-buffer K/V fill, 2 barriers per block, eager rescale | 238/35K |
@@ -170,7 +176,10 @@ Generated with `python3 -m hkl.table <ladder> --build` (VGPRs / static LDS of th
 
 | Rung | Parent | Source / flags | Pin | a08-1 ms | Feature | VGPR / LDS |
 |---|---|---|---|---|---|---|
-| hk_v0 |  | `k_dkdv96ds.hip`; `k_dqds_c.hip` | yes | 2.529 | first HK backward: dK/dV on 96-row kv blocks exporting dS^T to a scratch, dQ = dS K from it (no S/dP recompute) | 1012/63K, 887/270K |
+| m00 |  | `m00_naive.hip` | new |  | naive FA2 backward with MLA dims (qk 192 / v 128, MHA): prep + dK/dV kernel + separate dQ kernel recomputing S and dP | 424/42K, 319/42K |
+| m01 | m00 | `m01_tdm_dbuf.hip` | new |  | double-buffered TDM fills (the Llama ladder's b01 + b02): 192-wide tiles as 128- and 64-column ops | 387/84K, 277/84K |
+| m02 | m01 | `m02_ds_export.hip` | new |  | dS^T exported by the dK/dV kernel to a scratch, dQ = dS K read back from it: no S/dP recompute, no atomics | 364/84K, 134/70K |
+| hk_v0 | m02 | `k_dkdv96ds.hip`; `k_dqds_c.hip` | yes | 2.529 | first HK backward (d3590be4): m02 + 96-row kv blocks (two 48-row waves on a 3-stage Q/dO TDM ring, 1 wave/SIMD), causal-packed dS layout (4.33 GB), 384-query dQ workgroups on a K ring, lock_simd | 1012/63K, 887/270K |
 | r1a | hk_v0 | `01a_dkdv_dsexport_pin.patch`; `k_dkdv96ds.hip`; `k_dqds_c.hip` | part |  | dK/dV: the dS^T export (6 buffer stores) is pinned by a sched_barrier right after the dO^T tr16 burst, ahead of the first dV WMMA: without expert scheduling a store issued inside the WMMA run waits for every earlier WMMA, under the tr16 latency it is free. | 1016/63K, 887/270K |
 | r1b | r1a | `01b_dkdv_split_barrier.patch`; `k_dkdv96ds.hip`; `k_dqds_c.hip` | part |  | dK/dV: split ring barrier (hk1.h lds_arrive = release fence + s_barrier_signal, lds_wait = s_barrier_wait + acquire) with the 24 register-only dK kh1/kh2 WMMAs between arrive and wait, so the other wave's late arrival overlaps matrix work instead of an idle s_barrier. | 1012/63K, 887/270K |
 | r1c | r1b | `01c_dkdv_mha_loop_top.patch`; `k_dkdv96ds.hip`; `k_dqds_c.hip` | part |  | dK/dV: the full loop specialised for G == 1 (MHA: the q-pair counter is ii, the q head 0), so the clamped prefetch tiles are min(ii + k, n - 1) instead of the k1_nx_* / k1_pf_* select chains: loop-top SALU 156 -> 57 per 2 iterations (the G != 1 loop stays as a second copy). | 1008/63K, 887/270K |

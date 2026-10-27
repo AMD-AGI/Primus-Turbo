@@ -25,6 +25,62 @@
  ],
  "rungs": [
   {
+   "id": "m00",
+   "tree": "../llama/hip",
+   "kernels": {
+    "k_mla_m00": {
+     "src": "src/ladder/m00_naive.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_mladder",
+    "opts": {
+     "prefix": "k_mla_m00",
+     "plan": "split"
+    }
+   },
+   "feature": "naive FA2 backward with MLA dims (qk 192 / v 128, MHA): prep + dK/dV kernel + separate dQ kernel recomputing S and dP"
+  },
+  {
+   "id": "m01",
+   "parent": "m00",
+   "tree": "../llama/hip",
+   "kernels": {
+    "k_mla_m01": {
+     "src": "src/ladder/m01_tdm_dbuf.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_mladder",
+    "opts": {
+     "prefix": "k_mla_m01",
+     "plan": "split"
+    }
+   },
+   "feature": "double-buffered TDM fills (the Llama ladder's b01 + b02): 192-wide tiles as 128- and 64-column ops"
+  },
+  {
+   "id": "m02",
+   "parent": "m01",
+   "tree": "../llama/hip",
+   "kernels": {
+    "k_mla_m02": {
+     "src": "src/ladder/m02_ds_export.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_mladder",
+    "opts": {
+     "prefix": "k_mla_m02",
+     "plan": "export"
+    }
+   },
+   "feature": "dS^T exported by the dK/dV kernel to a scratch, dQ = dS K read back from it: no S/dP recompute, no atomics"
+  },
+  {
    "id": "hk_v0",
    "commit": "d3590be4",
    "kernels": {
@@ -45,9 +101,10 @@
    "launch": {
     "module": "bwd_hk"
    },
-   "feature": "first HK backward: dK/dV on 96-row kv blocks exporting dS^T to a scratch, dQ = dS K from it (no S/dP recompute)",
+   "feature": "first HK backward (d3590be4): m02 + 96-row kv blocks (two 48-row waves on a 3-stage Q/dO TDM ring, 1 wave/SIMD), causal-packed dS layout (4.33 GB), 384-query dQ workgroups on a K ring, lock_simd",
    "ref_ms": 2.529,
-   "bitwise_with": "flydsl"
+   "bitwise_with": "flydsl",
+   "parent": "m02"
   },
   {
    "id": "r1a",

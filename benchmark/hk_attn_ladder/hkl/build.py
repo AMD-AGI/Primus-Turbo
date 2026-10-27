@@ -90,7 +90,7 @@ def ladder_name(spec):
 def patch_chain(spec, rung):
     """Patches from the ladder's base tree up to ``rung``, oldest first."""
     chain, r = [], rung
-    while r is not None:
+    while r is not None and not r.get("tree"):
         if r.get("patch"):
             chain.append(spec["_dir"] / r["patch"])
         r = spec["_by_id"].get(r.get("parent")) if r.get("parent") else None
@@ -98,7 +98,13 @@ def patch_chain(spec, rung):
 
 
 def materialize(spec, rung, out_root):
-    """The rung's source tree: the ladder's tree itself when no patch applies, else a patched copy."""
+    """The rung's source tree: the ladder's tree itself when no patch applies, else a patched copy. A rung with
+    its own ``tree`` (relative to the ladder file, e.g. the MLA ladder's new bottom rungs built from the Llama
+    tree's hk_attn primitives) builds from that directory as is."""
+    if rung.get("tree"):
+        if rung.get("patch"):
+            raise BuildError(f"rung {rung['id']}: a rung with its own tree takes no patch")
+        return (spec["_dir"] / rung["tree"]).resolve()
     base = spec["_dir"] / spec["tree"]
     chain = patch_chain(spec, rung)
     if not chain:
