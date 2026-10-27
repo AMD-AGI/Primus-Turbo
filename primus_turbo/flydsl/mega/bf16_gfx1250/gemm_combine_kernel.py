@@ -25,10 +25,10 @@ The three roles of the gfx950 ``grouped_gemm_combine_bf16_kernel``, in one launc
   second counter, waits for each token's primary-route rows to land and sums them into ``out``
   (``topk_reduce_bf16_tile``); it also tops up the flags of the pool blocks this call left empty.
 
-Workgroup order: a lead share of the GEMM tiles, a few lead combine workgroups that push while the
-GEMM runs, the remaining GEMM tiles, then the tail combine workgroups (together with the lead ones,
-one per CU; they start as the GEMM drains and take the chunks left), so nothing that spins can keep
-a GEMM tile from a CU. The GEMM tile is reached by every workgroup in straight-line code before the
+Workgroup order: the GEMM tiles, then the tail combine workgroups (one per CU; they start as the
+GEMM drains), so nothing that spins can keep a GEMM tile from a CU. ``num_lead_combine`` > 0 moves
+that many combine workgroups to after ``lead_gemm_percent`` of the tiles, to push while the GEMM
+runs; on MI455X they slow the GEMM by more than their early push saves, so the default has none. The GEMM tile is reached by every workgroup in straight-line code before the
 role branches and is masked with ``live`` elsewhere -- no dynamic branch covers the TDM pipeline.
 """
 
@@ -280,9 +280,9 @@ def _launch_gemm_combine_nt(
         if is_combine:
             # Work items are _FOLD_CHUNK_ROWS-row chunks of the fold rows of all segments, in pool
             # order, taken from one counter: a segment can hold most of the fold rows (a token's
-            # fold row sits in its highest local expert's segment), and the lead workgroups that
-            # follow the GEMM get the early chunks while the tail ones, which start once the GEMM
-            # has drained, take what is left. LDS: [0] the taken chunk, [2 + s] segment s's first
+            # fold row sits in its highest local expert's segment), and the lead workgroups, if
+            # any, get the early chunks while the tail ones, which start once the GEMM has drained,
+            # take what is left. LDS: [0] the taken chunk, [2 + s] segment s's first
             # chunk, [2 + NUM_EXPERTS] the chunk count.
             lds = _addr(base_ptr)
             seg = fx.Int32(tid)
@@ -485,7 +485,7 @@ def gemm_combine_nt_gfx1250(
     handle: DispatchHandle,
     topk_idx: torch.Tensor,
     *,
-    num_lead_combine: int = 16,
+    num_lead_combine: int = 0,
     num_tail_combine: int = 0,
     lead_gemm_percent: int = 25,
     tile_m: int = 256,
@@ -532,7 +532,7 @@ def gemm_combine_nt_gfx1250(
     assert int(symm.num_experts) // num_ranks == G, "w2 holds this rank's experts"
     num_cu = torch.cuda.get_device_properties(act.device).multi_processor_count
     # lead combine workgroups spin on GEMM tiles, so they must leave CUs for the GEMM to finish
-    assert 0 < num_lead_combine < num_cu
+    assert 0 <= num_lead_combine < num_cu
     num_tail_combine = num_tail_combine or num_cu - num_lead_combine
     out = torch.empty(int(symm.num_max_tokens_per_rank), N, dtype=torch.bfloat16, device=act.device)
     has_grad_gate = grad_gate is not None

@@ -33,3 +33,16 @@ Rounds are judged by same-session alternating A/B against the accepted-tree copy
 - A/B x2: +1.16% step geomean (t4096 +1.88%, t8192 +1.17%, skew1 +0.44%); full tests pass; bitwise stress
   T=256 x 60, T=8192 x 50, 0 mismatches.
 - Trace: dispatch_only 304 us gone; L1 dgrad gemm_combine +65 us (XGMI shared with the copies); wait 1.8 us.
+
+### round-5 — ROLLBACK (2026-10-27 15:45)
+- gemm_combine `_FOLD_CHUNK_ROWS` 16 -> 32 / 64 (each wave pushes 4-row groups): -0.47% / -1.15%, slower on
+  every shape, worst at t4096 (L2 fwd combine). Coarser chunks delay the first push and starve the tail.
+- Stage bench of the round-4 tree: combine stages still the largest gaps (t8192 L2 fwd 0.45, L1 dgrad 0.49 ms;
+  bench_dsv3 L2 fwd 0.73 ms). Next: a clock-stamp timeline of gemm_combine before another combine change.
+
+### round-6 — ACCEPT (2026-10-27 15:48), EP2 on GPUs 2,3 from here on
+- gemm_combine lead combine workgroups 16 @ 25% -> 0 (all combine workgroups after the GEMM tiles).
+- Motivation: clock-stamp timeline (`tools/gc_trace.py`, EP4, round-4 tree): leads push 72-121 of ~320 MB before
+  the GEMM ends but slow it ~89 us (L2 fwd) / ~144 us (L1 dgrad); no lead ends both launches ~100 us earlier.
+- A/B x2 at EP2: l0 +0.687% (every shape, every rep), l4 +0.450%, l8 +0.045%. Full tests pass (EP4 skipped).
+  Bench: 1285.765 TF step at EP2.

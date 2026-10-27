@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mega MoE BF16 gfx1250：GEMM / 通信 overlap 数据</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --faint: #8c959f; --border: #d1d9e0; --panel: #f6f8fa;
+    --good: #1a7f37; --warn: #9a6700; --bad: #cf222e; --info: #0969da;
+    --gemm: #0969da; --comm: #8c959f; --fused: #bf8700; --tail: #d4a72c; --reduce: #8250df;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; color: var(--fg); background: #fff;
+         font: 14px/1.65 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; }
+  main { max-width: 1180px; margin: 0 auto; padding: 32px 24px 56px; }
+  h1 { font-size: 24px; margin: 0 0 6px; }
+  h2 { font-size: 18px; margin: 40px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 15px; margin: 0 0 4px; }
+  p { margin: 0 0 10px; }
+  .meta { color: var(--muted); font-size: 13px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em;
+         background: var(--panel); padding: 1px 5px; border-radius: 4px; }
+  .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 22px 0; }
+  .stat { border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+  .stat .v { font-size: 22px; font-weight: 600; line-height: 1.3; }
+  .stat .l { font-size: 12px; color: var(--muted); }
+  .v.warn { color: var(--warn); } .v.bad { color: var(--bad); } .v.good { color: var(--good); }
+  .callout { border-left: 3px solid var(--info); background: var(--panel); padding: 10px 14px; border-radius: 4px; margin-bottom: 12px; }
+  .callout.warn { border-left-color: var(--warn); }
+  .callout b { display: block; margin-bottom: 2px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 6px; }
+  th, td { border-bottom: 1px solid var(--border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--panel); font-weight: 600; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr.sum td { font-weight: 600; background: #fbfcfd; }
+  .good { color: var(--good); font-weight: 600; }
+  .warn { color: var(--warn); font-weight: 600; }
+  .caption { font-size: 12px; color: var(--faint); margin-top: 6px; }
+  .grid32 { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 28px; margin-top: 12px; }
+  .chart svg { width: 100%; height: auto; display: block; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin: 2px 0 4px; }
+  .legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+                         margin-right: 5px; background: var(--c); vertical-align: -1px; }
+  .tabs { display: flex; gap: 6px; margin: 4px 0 10px; flex-wrap: wrap; }
+  .tabs button { font: inherit; font-size: 13px; padding: 3px 12px; border: 1px solid var(--border); border-radius: 999px;
+                 background: #fff; color: var(--fg); cursor: pointer; }
+  .tabs button.on { background: var(--fg); color: #fff; border-color: var(--fg); }
+  ul.notes { margin: 6px 0 0; padding-left: 20px; color: var(--muted); font-size: 13px; }
+  @media (max-width: 860px) { .grid32, .stats { grid-template-columns: minmax(0, 1fr); } }
+</style>
+</head>
+<body>
+<main>
+<h1>Mega MoE BF16 gfx1250：GEMM / 通信 overlap 数据</h1>
+<p class="meta">MI455X，EP4（GPU 0-3），round 4 之后的 accepted tree（3ef91841）。数据来源：bench_mega_moe 的 stage 视图移植到 gfx1250 kernel（<code>tools/bench_mega_gfx1250.py</code>），以及 <code>gemm_combine</code> 内部的时钟打点 timeline（<code>tools/gc_trace.py</code>）。测于 2026-10-27，切到 GPU 2、3 跑 EP2 之前。</p>
+
+<div class="stats">
+  <div class="stat"><div class="v warn">121.7%</div><div class="l">fused / gemm_only（t8192 random，六个 stage 合计）</div></div>
+  <div class="stat"><div class="v">50%</div><div class="l">通信被藏住的比例（t8192 random）</div></div>
+  <div class="stat"><div class="v bad">0.45 / 0.49 ms</div><div class="l">L2 fwd / L1 dgrad 超出各自 GEMM 的时间</div></div>
+  <div class="stat"><div class="v good">+1.16%</div><div class="l">round 4：dW1 的 x 重发改用 SDMA 并 overlap</div></div>
+</div>
+
+<h2>各 stage 分解</h2>
+<div class="tabs" id="tabs"></div>
+<p class="meta" id="shape-note"></p>
+<div class="grid32">
+  <div>
+    <h3>各 stage 时延：GEMM 单独 / 通信单独 / fused（ms）</h3>
+    <div class="chart" id="stage-chart"></div>
+    <p class="caption">横轴：stage；纵轴：时延（ms，取各 rank 最大值）。EP4 GPU 0-3，tree 3ef91841。</p>
+  </div>
+  <div>
+    <h3>fused 减去 GEMM 单独（ms）</h3>
+    <div class="chart" id="gap-chart"></div>
+    <p class="caption">每个 stage 在 GEMM 之外多花的时间 = 没藏住的通信 + GEMM 在 fused kernel 里自身变慢的部分。</p>
+  </div>
+</div>
+<table id="stage-table"></table>
+<ul class="notes">
+  <li>hidden = gemm_only + comm_only − fused。</li>
+  <li>两个 combine stage 的 comm_only 用的是 bench_mega_moe 原版 <code>combine_only</code> baseline：每个 recv segment 只用一个 WG，负载不均，只有 96-529 GB/s，所以这两个 stage 的“藏住比例”偏乐观。</li>
+  <li>dW1 那一行是 bench 的串行 <code>dispatch_only</code> + wgrad。round 4 之后实际 step 里 x 在 L1 dgrad 期间用 SDMA 拷贝，只体现在 step 时间里。</li>
+  <li>hidden 超过 100% 的格子（t4096 的 L1 fwd、L2 dgrad）：该 M 下 fused tile 比单独的 grouped GEMM 还快。</li>
+</ul>
+
+<h2><code>gemm_combine</code> 内部：combine 的时间花在哪</h2>
+<p>每个 WG 和每个 16 行 combine chunk 都打 realtime 时钟（100 MHz）。一次 launch 分三段：GEMM 到最后一个 tile 算完、GEMM 之后的 tail push、最后的 reduce。对比现在的 16 个 lead combine WG 和不用 lead WG。</p>
+<div class="grid32">
+  <div>
+    <h3><code>gemm_combine</code> 各阶段，t8192 random（µs，4 个 rank 平均）</h3>
+    <div class="chart" id="timeline-chart"></div>
+    <p class="caption">横轴：从 launch 第一个 WG 进入算起的时间（µs）。同样的 GEMM 单独跑：L2 fwd 950 µs，L1 dgrad 1862 µs。来源：<code>tools/gc_trace.py</code> + <code>tools/gc_trace.patch</code>，单个插桩 step，EP4。</p>
+  </div>
+  <div>
+    <div class="callout warn"><b>lead WG 得不偿失</b>16 个 lead combine WG 只占 6% 的 CU，却让 GEMM 平均慢 89 µs（L2 fwd）和 144 µs（L1 dgrad）；GEMM 结束前只推出约 320 MB 远端数据中的 72-121 MB。去掉后 launch 平均早结束约 100 µs（最慢的 rank 上 112 / 116 µs），两个 stage、4 个 rank 都如此。</div>
+    <div class="callout"><b>tail 卡在延迟，不是带宽</b>一个 16 行 chunk 推送要 34-40 µs，链路空闲时（lead）和 256 个 WG 同时推时（tail）一样。tail 只有 0.6-0.96 TB/s，单 GPU XGMI 注入上限是 1.58 TB/s。</div>
+    <div class="callout"><b>GEMM 在 fused 里本身也偏慢</b>不用 lead WG 时，L2 fwd 的 GEMM 仍要 1075-1137 µs，单独跑是 950 µs（慢 13-20%）。</div>
+  </div>
+</div>
+<table id="rank-table"></table>
+<p class="caption">每格：最后一个 GEMM tile / 最后一个 chunk 推完 / reduce 完成，单位 µs，从各 rank 第一个 WG 进入算起。16 个 lead 时 GEMM 结束前推出的远端数据：L2 fwd 72 / 74 / 74 / 76 MB，L1 dgrad 102 / 112 / 121 / 105 MB（共约 320 MB）。</p>
+
+<h2>通信速率与 XGMI 上限</h2>
+<div class="grid32">
+  <div>
+    <div class="chart" id="bw-chart"></div>
+    <p class="caption">横轴：每 GPU 发出带宽（GB/s）；tail push 为 4 个 rank 平均。来源：<code>tools/xgmi_peak.py</code>（SDMA、RCCL，每 rank 320 MB-1 GiB），stage bench（t8192 random 每 rank 320 MB dispatch），<code>gemm_combine</code> trace（tail）。</p>
+  </div>
+  <div>
+    <h3>到目前为止的 round</h3>
+    <table>
+      <tr><th>Round</th><th>改动</th><th>结果</th></tr>
+      <tr><td>1</td><td>baseline 8bbd8c89</td><td class="num">1039.7 TF</td></tr>
+      <tr><td>2</td><td>gemm_combine AID N 方向切分</td><td>rollback，+0.09%</td></tr>
+      <tr><td>3</td><td>dispatch_gemm AID N 方向切分</td><td>rollback，−0.28%</td></tr>
+      <tr><td>4</td><td>dW1 的 x 重发改 SDMA，overlap</td><td class="good">accept，+1.16%</td></tr>
+      <tr><td>5</td><td>combine chunk 32 / 64 行</td><td>rollback，−0.47%</td></tr>
+      <tr><td>6</td><td>lead combine 16 / 8 / 4 / 0</td><td class="warn">进行中（EP2，GPU 2、3）</td></tr>
+    </table>
+    <p class="caption">从 round 6 起 A/B 在 GPU 2、3 上跑 EP2（GPU 0、1 已让出），上面的 EP4 数据不能直接和之后的 EP2 数据比较。</p>
+  </div>
+</div>
+
+</main>
+<script>
+const NS = "http://www.w3.org/2000/svg";
+const AXIS = "#59636e", GRID = "#e6eaef";
+const COL = { gemm: "#0969da", comm: "#8c959f", fused: "#bf8700", gap: "#9a6700", tail: "#d4a72c", reduce: "#8250df", bw: "#0969da", ref: "#cf222e" };
+
+function el(tag, attrs, parent, text) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (text !== undefined) e.textContent = text;
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function niceTicks(min, max, n) {
+  const raw = (max - min) / n, p = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / p;
+  const step = (f < 1.5 ? 1 : f < 3 ? 2 : f < 7 ? 5 : 10) * p;
+  const out = [];
+  for (let v = Math.floor(min / step) * step; v <= Math.ceil(max / step) * step + step * 1e-9; v += step) out.push(+v.toFixed(10));
+  return out;
+}
+function legend(container, series) {
+  const d = document.createElement("div");
+  d.className = "legend";
+  for (const s of series) {
+    const sp = document.createElement("span");
+    sp.style.setProperty("--c", s.color);
+    sp.textContent = s.name;
+    d.appendChild(sp);
+  }
+  container.appendChild(d);
+}
+function axisLabel(svg, x, y, text, rotate) {
+  el("text", { x, y, transform: rotate ? `rotate(-90 ${x} ${y})` : "", "text-anchor": "middle", "font-size": 12, fill: AXIS }, svg, text);
+}
+
+// vertical grouped bars
+function groupedBar(c, o) {
+  c.innerHTML = "";
+  legend(c, o.series);
+  const W = 600, H = 300, m = { l: 56, r: 10, t: 16, b: 46 };
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}` }, c);
+  const yt = niceTicks(0, Math.max(...o.series.flatMap(s => s.data)), 5), y1 = yt[yt.length - 1];
+  const Y = v => m.t + (H - m.t - m.b) * (1 - v / y1);
+  for (const v of yt) {
+    el("line", { x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v), stroke: GRID }, svg);
+    el("text", { x: m.l - 6, y: Y(v) + 4, "text-anchor": "end", "font-size": 11, fill: AXIS }, svg, v);
+  }
+  const gw = (W - m.l - m.r) / o.categories.length, bw = gw * 0.78 / o.series.length;
+  o.categories.forEach((cat, i) => {
+    el("text", { x: m.l + gw * (i + 0.5), y: H - m.b + 16, "text-anchor": "middle", "font-size": 11, fill: AXIS }, svg, cat);
+    o.series.forEach((s, j) => {
+      const v = s.data[i];
+      if (v === null) return;
+      const x = m.l + gw * i + gw * 0.11 + bw * j;
+      const r = el("rect", { x, y: Y(v), width: bw - 2, height: Y(0) - Y(v), fill: s.color, rx: 1.5 }, svg);
+      el("title", {}, r, `${s.name} · ${cat}：${v.toFixed(3)} ms`);
+    });
+  });
+  axisLabel(svg, (m.l + W - m.r) / 2, H - 6, o.xLabel);
+  axisLabel(svg, 14, (m.t + H - m.b) / 2, o.yLabel, true);
+}
+
+// horizontal bars, single series, optional reference line
+function hBar(c, o) {
+  c.innerHTML = "";
+  const W = 600, rowH = o.rowH || 30, m = { l: o.left || 120, r: 60, t: 8, b: 40 };
+  const H = m.t + m.b + rowH * o.categories.length;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}` }, c);
+  const xt = niceTicks(Math.min(0, ...o.data), Math.max(...o.data, o.ref ? o.ref.value : 0), 6);
+  const x0 = xt[0], x1 = xt[xt.length - 1];
+  const X = v => m.l + (W - m.l - m.r) * (v - x0) / (x1 - x0);
+  for (const v of xt) {
+    el("line", { x1: X(v), x2: X(v), y1: m.t, y2: H - m.b, stroke: GRID }, svg);
+    el("text", { x: X(v), y: H - m.b + 15, "text-anchor": "middle", "font-size": 11, fill: AXIS }, svg, v);
+  }
+  o.categories.forEach((cat, i) => {
+    const v = o.data[i], y = m.t + rowH * i + 5, h = rowH - 10;
+    el("text", { x: m.l - 8, y: y + h / 2 + 4, "text-anchor": "end", "font-size": 11, fill: AXIS }, svg, cat);
+    const xa = X(Math.min(0, v)), xb = X(Math.max(0, v));
+    const r = el("rect", { x: xa, y, width: Math.max(xb - xa, 1), height: h, fill: o.color, rx: 1.5 }, svg);
+    el("title", {}, r, `${cat}：${o.fmt(v)}`);
+    el("text", { x: xb + 5, y: y + h / 2 + 4, "font-size": 11, fill: "#1f2328" }, svg, o.fmt(v));
+  });
+  if (o.ref) {
+    el("line", { x1: X(o.ref.value), x2: X(o.ref.value), y1: m.t, y2: H - m.b, stroke: COL.ref, "stroke-dasharray": "4 3", "stroke-width": 1.4 }, svg);
+    el("text", { x: X(o.ref.value) - 4, y: H - m.b - 4, "text-anchor": "end", "font-size": 11, fill: COL.ref }, svg, o.ref.label);
+  }
+  axisLabel(svg, (m.l + W - m.r) / 2, H - 4, o.xLabel);
+}
+
+// horizontal stacked bars
+function stackedH(c, o) {
+  c.innerHTML = "";
+  legend(c, o.series);
+  const W = 600, rowH = 50, m = { l: 170, r: 70, t: 6, b: 40 };
+  const H = m.t + m.b + rowH * o.categories.length;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}` }, c);
+  const totals = o.categories.map((_, i) => o.series.reduce((a, s) => a + s.data[i], 0));
+  const xt = niceTicks(0, Math.max(...totals), 6), x1 = xt[xt.length - 1];
+  const X = v => m.l + (W - m.l - m.r) * v / x1;
+  for (const v of xt) {
+    el("line", { x1: X(v), x2: X(v), y1: m.t, y2: H - m.b, stroke: GRID }, svg);
+    el("text", { x: X(v), y: H - m.b + 15, "text-anchor": "middle", "font-size": 11, fill: AXIS }, svg, v);
+  }
+  o.categories.forEach((cat, i) => {
+    const y = m.t + rowH * i + 9, h = rowH - 18;
+    el("text", { x: m.l - 8, y: y + h / 2 + 4, "text-anchor": "end", "font-size": 12, fill: AXIS }, svg, cat);
+    let acc = 0;
+    for (const s of o.series) {
+      const v = s.data[i];
+      const r = el("rect", { x: X(acc), y, width: X(acc + v) - X(acc) - 1, height: h, fill: s.color }, svg);
+      el("title", {}, r, `${cat} · ${s.name}：${v} µs`);
+      if (X(acc + v) - X(acc) > 30)
+        el("text", { x: (X(acc) + X(acc + v)) / 2, y: y + h / 2 + 4, "text-anchor": "middle", "font-size": 11, fill: "#fff" }, svg, v);
+      acc += v;
+    }
+    el("text", { x: X(acc) + 6, y: y + h / 2 + 4, "font-size": 12, fill: "#1f2328" }, svg, `${acc} µs`);
+  });
+  axisLabel(svg, (m.l + W - m.r) / 2, H - 4, o.xLabel);
+}
+
+// ---------------- data ----------------
+const STAGES = ["L1 fwd", "L2 fwd", "L2 dgrad", "dW2", "L1 dgrad", "dW1+重发"];
+const STAGE_LONG = ["L1 fwd（dispatch + GEMM）", "L2 fwd（GEMM + combine）", "L2 dgrad（dispatch dy + GEMM）", "dW2",
+                    "L1 dgrad（GEMM + combine）", "dW1 + x 重发"];
+// [gemm_ms, gemm_TF, of_dense, comm_ms, comm_GBs, fused_ms, hidden_ms, hidden/comm, fused/gemm]
+const SHAPES = [
+  { label: "t8192 random", note: "T=8192/rank，每 rank 32 个 expert，topk 8，随机路由", step: 11.919, nonGemm: 1.384,
+    rows: [[1.708, 2407, "99.4%", 0.620, 516, 2.078, 0.251, "40%", "121.6%"],
+           [0.950, 2164, "93.6%", 1.100, 291, 1.402, 0.648, "59%", "147.6%"],
+           [0.877, 2344, "99.5%", 0.619, 517, 1.178, 0.319, "51%", "134.3%"],
+           [1.069, 1923, "81.6%", null, null, 1.069, null, "-", "100.0%"],
+           [1.862, 2208, "97.3%", 1.122, 285, 2.349, 0.635, "57%", "126.1%"],
+           [2.189, 1879, "83.2%", 0.286, 1121, 2.459, 0.015, "5%", "112.4%"]],
+    sum: [8.655, 3.747, 10.535, 1.868, "50%", "121.7%"] },
+  { label: "bench_dsv3", note: "T=8192/rank，每 rank 64 个 expert，topk 8，均衡路由（bench_mega_moe generate_routing）", step: 13.097, nonGemm: 0.930,
+    rows: [[2.144, 2021, "96.8%", 0.677, 469, 2.259, 0.563, "83%", "105.3%"],
+           [1.048, 2068, "90.0%", 0.602, 529, 1.773, -0.123, "-20%", "169.2%"],
+           [0.977, 2218, "96.6%", 0.675, 471, 1.266, 0.386, "57%", "129.6%"],
+           [1.316, 1646, "69.8%", null, null, 1.316, null, "-", "100.0%"],
+           [2.040, 2124, "92.5%", 0.611, 521, 2.538, 0.113, "19%", "124.4%"],
+           [2.686, 1613, "71.4%", 0.366, 868, 3.015, 0.037, "10%", "112.3%"]],
+    sum: [10.211, 2.932, 12.167, 0.976, "33%", "119.2%"] },
+  { label: "t8192 skew1", note: "T=8192/rank，每 rank 32 个 expert，rank 0 的 expert logits +1（rank 0 偏热）", step: 27.838, nonGemm: 1.836,
+    rows: [[4.724, 877, "99.6%", 0.653, 322, 5.471, -0.094, "-14%", "115.8%"],
+           [2.546, 814, "94.0%", 3.622, 97, 3.109, 3.059, "84%", "122.1%"],
+           [2.436, 851, "96.3%", 0.650, 323, 2.675, 0.411, "63%", "109.8%"],
+           [2.840, 730, "80.9%", null, null, 2.840, null, "-", "100.0%"],
+           [5.294, 783, "94.3%", 3.652, 96, 5.953, 2.992, "82%", "112.5%"],
+           [5.630, 736, "91.5%", 0.304, 691, 5.953, -0.019, "-6%", "105.7%"]],
+    sum: [23.470, 8.882, 26.002, 6.349, "71%", "110.8%"] },
+  { label: "t4096 random", note: "T=4096/rank，每 rank 32 个 expert，topk 8，随机路由", step: 6.679, nonGemm: 0.624,
+    rows: [[1.369, 1578, "98.6%", 0.356, 450, 1.150, 0.576, "162%", "83.9%"],
+           [0.540, 2001, "91.8%", 0.578, 276, 0.784, 0.334, "58%", "145.2%"],
+           [0.814, 1328, "59.4%", 0.356, 450, 0.668, 0.501, "141%", "82.1%"],
+           [0.662, 1632, "72.7%", null, null, 0.662, null, "-", "100.0%"],
+           [0.997, 2167, "91.6%", 0.866, 184, 1.294, 0.570, "66%", "129.8%"],
+           [1.286, 1681, "72.1%", 0.196, 816, 1.497, -0.015, "-8%", "116.4%"]],
+    sum: [5.668, 2.352, 6.055, 1.966, "84%", "106.8%"] },
+];
+
+function f3(v) { return v === null ? "-" : v.toFixed(3); }
+
+function showShape(i) {
+  const s = SHAPES[i];
+  document.querySelectorAll("#tabs button").forEach((b, j) => b.classList.toggle("on", j === i));
+  document.getElementById("shape-note").textContent =
+    `${s.note}。整个 step（fused_mega_moe fwd+bwd）${s.step.toFixed(3)} ms，六个 GEMM stage 之外的时间 ${s.nonGemm.toFixed(3)} ms。`;
+  groupedBar(document.getElementById("stage-chart"), {
+    categories: STAGES,
+    series: [
+      { name: "gemm_only", color: COL.gemm, data: s.rows.map(r => r[0]) },
+      { name: "comm_only", color: COL.comm, data: s.rows.map(r => r[3]) },
+      { name: "fused", color: COL.fused, data: s.rows.map(r => r[5]) },
+    ],
+    xLabel: "stage", yLabel: "时延（ms）",
+  });
+  hBar(document.getElementById("gap-chart"), {
+    categories: STAGES, data: s.rows.map(r => +(r[5] - r[0]).toFixed(3)), color: COL.gap,
+    fmt: v => `${v.toFixed(3)} ms`, xLabel: "fused − gemm_only（ms）", left: 76, rowH: 40,
+  });
+  const head = "<tr><th>Stage</th><th class=num>gemm_only ms</th><th class=num>GEMM TF</th><th class=num>占 dense</th>" +
+    "<th class=num>comm_only ms</th><th class=num>comm GB/s</th><th class=num>fused ms</th><th class=num>hidden ms</th>" +
+    "<th class=num>hidden / comm</th><th class=num>fused / gemm</th></tr>";
+  const body = s.rows.map((r, k) => `<tr><td>${STAGE_LONG[k]}</td><td class=num>${f3(r[0])}</td><td class=num>${r[1]}</td>` +
+    `<td class=num>${r[2]}</td><td class=num>${f3(r[3])}</td><td class=num>${r[4] === null ? "-" : r[4]}</td>` +
+    `<td class=num>${f3(r[5])}</td><td class=num>${f3(r[6])}</td><td class=num>${r[7]}</td><td class=num>${r[8]}</td></tr>`).join("");
+  const u = s.sum;
+  const sum = `<tr class=sum><td>六个 stage 合计</td><td class=num>${u[0].toFixed(3)}</td><td></td><td></td>` +
+    `<td class=num>${u[1].toFixed(3)}</td><td></td><td class=num>${u[2].toFixed(3)}</td><td class=num>${u[3].toFixed(3)}</td>` +
+    `<td class=num>${u[4]}</td><td class=num>${u[5]}</td></tr>`;
+  document.getElementById("stage-table").innerHTML = head + body + sum;
+}
+
+const tabs = document.getElementById("tabs");
+SHAPES.forEach((s, i) => {
+  const b = document.createElement("button");
+  b.textContent = s.label;
+  b.onclick = () => showShape(i);
+  tabs.appendChild(b);
+});
+showShape(0);
+
+// gemm_combine timeline, EP4 t8192 random, mean of 4 ranks (us)
+stackedH(document.getElementById("timeline-chart"), {
+  categories: ["L2 fwd，16 个 lead（现状）", "L2 fwd，无 lead", "L1 dgrad，16 个 lead（现状）", "L1 dgrad，无 lead"],
+  series: [
+    { name: "GEMM（到最后一个 tile）", color: COL.gemm, data: [1205, 1116, 1920, 1777] },
+    { name: "tail push", color: COL.tail, data: [357, 356, 327, 378] },
+    { name: "reduce", color: COL.reduce, data: [108, 95, 112, 105] },
+  ],
+  xLabel: "从 launch 第一个 WG 进入算起（µs）",
+});
+
+const RANKS = [
+  ["L2 fwd，16 个 lead", "1170 / 1567 / 1671", "1255 / 1541 / 1642", "1173 / 1581 / 1689", "1223 / 1558 / 1678"],
+  ["L2 fwd，无 lead", "1075 / 1464 / 1567", "1137 / 1486 / 1577", "1118 / 1473 / 1554", "1133 / 1464 / 1567"],
+  ["L1 dgrad，16 个 lead", "1871 / 2225 / 2351", "1955 / 2227 / 2334", "1898 / 2271 / 2388", "1957 / 2266 / 2365"],
+  ["L1 dgrad，无 lead", "1717 / 2162 / 2264", "1785 / 2149 / 2238", "1751 / 2117 / 2260", "1853 / 2188 / 2272"],
+];
+document.getElementById("rank-table").innerHTML =
+  "<tr><th>配置</th><th class=num>rank 0</th><th class=num>rank 1</th><th class=num>rank 2</th><th class=num>rank 3</th></tr>" +
+  RANKS.map(r => `<tr><td>${r[0]}</td>${r.slice(1).map(c => `<td class=num>${c}</td>`).join("")}</tr>`).join("");
+
+hBar(document.getElementById("bw-chart"), {
+  categories: ["XGMI 注入，单 GPU（SDMA）", "all-to-all，Mega dispatch_only 255 CU", "L2 fwd combine tail，无 lead",
+               "all-to-all，SDMA 拷贝", "all-to-all，RCCL 1 GiB", "L2 fwd combine tail，16 lead",
+               "fused dispatch，64 CU", "combine_only bench baseline"],
+  data: [1580, 1121, 897, 793, 755, 704, 516, 291], color: COL.bw,
+  fmt: v => `${v} GB/s`, xLabel: "每 GPU 发出带宽（GB/s）", left: 230, rowH: 30,
+  ref: { value: 1580, label: "单 GPU 注入上限" },
+});
+</script>
+</body>
+</html>

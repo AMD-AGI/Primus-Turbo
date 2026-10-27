@@ -1,0 +1,189 @@
+diff --git a/primus_turbo/flydsl/mega/bf16_gfx1250/gemm_combine_kernel.py b/primus_turbo/flydsl/mega/bf16_gfx1250/gemm_combine_kernel.py
+index 57288a31..5f68362e 100644
+--- a/primus_turbo/flydsl/mega/bf16_gfx1250/gemm_combine_kernel.py
++++ b/primus_turbo/flydsl/mega/bf16_gfx1250/gemm_combine_kernel.py
+@@ -69,7 +69,12 @@ from primus_turbo.flydsl.mega.bf16_gfx1250.gemm_nt_tile import (
+ )
+ from primus_turbo.flydsl.utils.arch import cpol_device_stream
+ from primus_turbo.flydsl.utils.buffer_ops import create_buffer_resource_from_addr
+-from primus_turbo.flydsl.utils.prims import atomic_add, cast, ld, st, wait_mem_all
++from primus_turbo.flydsl.utils.prims import atomic_add, cast, ld, read_clock, st, wait_mem_all
++from flydsl.expr import const_expr
++import os
++
++_TRACE = os.environ.get("MEGA_GC_TRACE") == "1"
++TRACES: list = []  # (meta dict, i64 tensor) per traced launch
+ 
+ # fold rows per combine work item: two rows for each wave of the default 8-wave workgroup
+ _FOLD_CHUNK_ROWS = 16
+@@ -105,6 +110,7 @@ def _launch_gemm_combine_nt(
+     arg_grad_topk_weights: fx.Pointer,
+     arg_bias: fx.Pointer,
+     arg_bias_scale: fx.Pointer,
++    arg_trace: fx.Pointer,
+     sym_buffer,
+     stream: fx.Stream,
+     grid_size: fx.Int32,
+@@ -128,8 +134,10 @@ def _launch_gemm_combine_nt(
+     HAS_GRAD_GATE: Constexpr[bool],
+     B_NN: Constexpr[bool],
+     HAS_BIAS: Constexpr[bool],
++    TRACE: Constexpr[bool],
+ ):
+     block = m_warp * n_warp * WAVE
++    TRACE_CHUNK_BASE = (MAX_TILES * N_BLOCKS_N + NUM_LEAD_COMBINE + NUM_TAIL_COMBINE) * 4
+     arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
+     if arena_bytes > GFX1250_LDS_BYTES:
+         raise ValueError(f"LDS arena {arena_bytes} B exceeds {GFX1250_LDS_BYTES} B")
+@@ -181,6 +189,7 @@ def _launch_gemm_combine_nt(
+         arg_grad_topk_weights: fx.Pointer,
+         arg_bias: fx.Pointer,
+         arg_bias_scale: fx.Pointer,
++        arg_trace: fx.Pointer,
+         sym_buffer,
+     ):
+         arena = fx.SharedAllocator(static=False)
+@@ -188,6 +197,8 @@ def _launch_gemm_combine_nt(
+         base_ptr = arena.base_ptr
+         tid = fx.thread_idx.x
+         bid = fx.Int32(fx.block_idx.x)
++        trace = _addr(arg_trace)
++        t_entry = read_clock()
+ 
+         # token pools are N wide (the model hidden); hoist everything workspace-derived above
+         # the branches (the rewriter can't carry Workspace)
+@@ -276,6 +287,10 @@ def _launch_gemm_combine_nt(
+         if live:
+             if fx.Int32(tid) == fx.Int32(0):
+                 atomic_add(combine_flag_base, combine_bank + block_m, fx.Int64(1))
++                if const_expr(TRACE):
++                    st(trace, bid * fx.Int32(4), t_entry)
++                    st(trace, bid * fx.Int32(4) + fx.Int32(1), read_clock())
++                    st(trace, bid * fx.Int32(4) + fx.Int32(3), fx.Int64(1))
+ 
+         if is_combine:
+             # Work items are _FOLD_CHUNK_ROWS-row chunks of the fold rows of all segments, in pool
+@@ -337,6 +352,16 @@ def _launch_gemm_combine_nt(
+                             "combine",
+                         )
+                         polled_tile_m = polled_tile_m + fx.Int32(1)
++                    if const_expr(TRACE):
++                        rec = fx.Int32(TRACE_CHUNK_BASE) + chunk * fx.Int32(4)
++                        dst = _i32_table(arg_recv_dst_rank)[segment_idx]
++                        st(trace, rec, cast(bid, fx.T.i64))
++                        st(trace, rec + fx.Int32(1), read_clock())
++                        st(
++                            trace,
++                            rec + fx.Int32(3),
++                            cast(num_part_rows, fx.T.i64) | (cast(dst, fx.T.i64) << fx.Int64(32)),
++                        )
+                     # take the next chunk now, so its counter round trip overlaps this one's push
+                     taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(0), fx.Int32(1))
+                     st(lds, fx.Int32(1), taken, scope="workgroup", space=3)
+@@ -376,8 +401,21 @@ def _launch_gemm_combine_nt(
+                     ),
+                     block_threads=block,
+                 )
++                if const_expr(TRACE):
++                    fx.gpu.barrier()
++                    if fx.Int32(tid) == fx.Int32(0):
++                        st(trace, fx.Int32(TRACE_CHUNK_BASE) + chunk * fx.Int32(4) + fx.Int32(2), read_clock())
+                 chunk = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(1), scope="workgroup", space=3))
+                 fx.gpu.barrier()  # every wave has the chunk before thread 0 takes the next one
++            if const_expr(TRACE):
++                if fx.Int32(tid) == fx.Int32(0):
++                    st(trace, bid * fx.Int32(4), t_entry)
++                    st(trace, bid * fx.Int32(4) + fx.Int32(1), read_clock())
++                    st(
++                        trace,
++                        bid * fx.Int32(4) + fx.Int32(3),
++                        cast(arith.select(is_lead_combine, fx.Int32(2), fx.Int32(3)), fx.T.i64),
++                    )
+ 
+             # ---- reduce: every chunk is taken by a running workgroup, so the flags waited on come ----
+             # pool blocks this call left empty still have to reach the never-reset expected
+@@ -435,6 +473,9 @@ def _launch_gemm_combine_nt(
+                 fx.gpu.barrier()
+                 take = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(1), scope="workgroup", space=3))
+                 fx.gpu.barrier()  # every wave has the take before thread 0 takes the next one
++            if const_expr(TRACE):
++                if fx.Int32(tid) == fx.Int32(0):
++                    st(trace, bid * fx.Int32(4) + fx.Int32(2), read_clock())
+ 
+     epoch_bump(arg_parity, arg_combine_expected, arg_reduce_expected, arg_chunk_counter).launch(
+         grid=(1, 1, 1), block=(64, 1, 1), stream=stream
+@@ -462,6 +503,7 @@ def _launch_gemm_combine_nt(
+         arg_grad_topk_weights,
+         arg_bias,
+         arg_bias_scale,
++        arg_trace,
+         sym_buffer,
+     ).launch(grid=(grid_size, 1, 1), block=(block, 1, 1), stream=stream)
+ 
+@@ -476,7 +518,7 @@ def _chunk_counter(device: torch.device) -> torch.Tensor:
+     """The combine chunk and reduce token counters; the launch's epoch bump rearms them."""
+     return torch.zeros(2, dtype=torch.int32, device=device)
+ 
+-_CONSTEXPR0 = 25
++_CONSTEXPR0 = 26
+ 
+ 
+ def gemm_combine_nt_gfx1250(
+@@ -531,6 +573,8 @@ def gemm_combine_nt_gfx1250(
+     num_ranks = int(symm.num_ranks)
+     assert int(symm.num_experts) // num_ranks == G, "w2 holds this rank's experts"
+     num_cu = torch.cuda.get_device_properties(act.device).multi_processor_count
++    num_lead_combine = int(os.environ.get("MEGA_GC_LEAD", num_lead_combine))
++    lead_gemm_percent = int(os.environ.get("MEGA_GC_LEAD_PCT", lead_gemm_percent))
+     # lead combine workgroups spin on GEMM tiles, so they must leave CUs for the GEMM to finish
+     assert 0 < num_lead_combine < num_cu
+     num_tail_combine = num_tail_combine or num_cu - num_lead_combine
+@@ -547,6 +591,32 @@ def gemm_combine_nt_gfx1250(
+         bias, bias_scale = bias.contiguous(), bias_scale.contiguous()
+     # local stage of the L2 output: only this rank's combine workgroups read it
+     l2 = torch.empty(rows, N, dtype=torch.bfloat16, device=act.device)
++    max_tiles = int(symm.num_max_pool_tokens) // BLOCK_M
++    n_blocks_n = (N + tile_n - 1) // tile_n
++    trace_chunk_base = (max_tiles * n_blocks_n + num_lead_combine + num_tail_combine) * 4
++    trace = torch.zeros(
++        trace_chunk_base + (int(symm.num_max_routes) // _FOLD_CHUNK_ROWS + int(symm.num_experts) + 1) * 4
++        if _TRACE
++        else 4,
++        dtype=torch.int64,
++        device=act.device,
++    )
++    if _TRACE:
++        TRACES.append(
++            (
++                dict(
++                    b_nn=b_nn,
++                    grad_gate=has_grad_gate,
++                    grid=rows // BLOCK_M * n_blocks_n + num_lead_combine + num_tail_combine,
++                    num_gemm=rows // BLOCK_M * n_blocks_n,
++                    chunk_base=trace_chunk_base,
++                    hidden=N,
++                    rank=int(symm.rank),
++                ),
++                trace,
++            )
++        )
++        del TRACES[:-4]
+     args = (
+         _as_ptr(out),
+         _as_ptr(act),
+@@ -571,6 +641,7 @@ def gemm_combine_nt_gfx1250(
+         _as_ptr(grad_topk_weights if has_grad_gate else out),
+         _as_ptr(bias if has_bias else out),
+         _as_ptr(bias_scale if has_bias else out),
++        _as_ptr(trace),
+         symm.get_sym_buffer(),
+         torch.cuda.current_stream(),
+         # GEMM tiles of this call's pool (the prologue's num_tile_blocks), then the combine
+@@ -596,6 +667,7 @@ def gemm_combine_nt_gfx1250(
+         has_grad_gate,
+         b_nn,
+         has_bias,
++        _TRACE,
+     )
+     key = args[_CONSTEXPR0:]
+     fn = _COMPILED.get(key)

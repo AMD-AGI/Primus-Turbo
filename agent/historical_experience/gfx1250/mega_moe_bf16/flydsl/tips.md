@@ -94,3 +94,14 @@
   free when it runs beside another comm leg.
 - WAR on a reused receive buffer can ride an existing all-rank dependency: the stage-2 backward dispatch waits on
   every peer's dy, so every peer finished its previous dW1.
+
+## Rounds 5-6 (2026-10-27): the fused combine push is latency-bound; lead combine workgroups do not pay
+
+- Larger fold chunks (16 -> 32 / 64 rows, 4-row push groups per wave) were slower on every shape (-0.47% / -1.15%):
+  coarser chunks delay the first push and starve the tail; per-row index/retire cost is not the bound.
+- Clock-stamp the roles before tuning a fused kernel: a `read_clock()` (100 MHz realtime) start/end per workgroup
+  and per chunk, written to a side buffer behind a constexpr, showed the lead combine workgroups pushing a quarter
+  of the bytes while stretching the GEMM by 90-140 us.
+- gemm_combine with 0 lead combine workgroups (all after the GEMM tiles) beat 16 / 8 / 4 leads at 25% of the
+  tiles, monotonically (+0.69% / +0.05% / +0.45% step at EP2): CUs that spin on tile flags and remote stores
+  beside the GEMM cost more than the early push saves when the tail push is latency-bound.
