@@ -58,7 +58,7 @@ void notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mappe
                      int num_experts, int num_tokens, const bool *is_token_in_rank,
                      int *channel_prefix_matrix, int *rank_prefix_matrix_copy, int num_memset_int,
                      int expert_alignment, void **buffer_ptrs, int **barrier_signal_ptrs, int rank,
-                     hipStream_t stream, int num_sms);
+                     hipStream_t stream, int num_sms, bool full_rank_matrix = false);
 
 void cached_notify_dispatch(const int *rank_prefix_matrix, int num_memset_int, void **buffer_ptrs,
                             int **barrier_signal_ptrs, int rank, int num_ranks, hipStream_t stream);
@@ -85,6 +85,48 @@ void combine(hipDataType type, void *recv_x, float *recv_topk_weights, const voi
              int num_recv_buffer_tokens);
 
 } // namespace intranode
+
+// Intranode V2 kernels (gfx1250): every token has a fixed slot on each rank it goes to, written
+// directly instead of streamed through channel rings. A channel is one block.
+namespace intranode_v2 {
+
+// Heap layout, byte offsets into every rank's NVL buffer. [0, kMetaBytes) is the notify's scratch.
+// int32 [num_ranks][num_channels]: where each source's channel starts in its receive block
+constexpr int64_t kRecvChannelOffsetOffset = 64 * 1024 + 4096;
+constexpr int     kMaxChannels             = 1024;
+// int32 [num_ranks][num_channels]: how far each source's channel has sent its rows here
+constexpr int64_t kTailsOffset = 128 * 1024;
+// int32 per combine slot: the epoch of the combine whose row has landed there
+constexpr int64_t kCombineFlagsOffset = 256 * 1024;
+constexpr int64_t kCombineFlagsBytes  = 4 << 20;
+// then the dispatch receive region in the first half of the rest, the combine's in the second
+constexpr int64_t kDataOffset = kCombineFlagsOffset + kCombineFlagsBytes;
+// the region from kMetaBytes to kDataOffset must be zero before the first dispatch
+constexpr int64_t kMetaBytes = 64 * 1024;
+// dispatch epochs fit 11 bits; combine epochs any positive int
+constexpr int kMaxDispatchEpoch = (1 << 11) - 1;
+
+void dispatch(void *recv_x, float *recv_x_scales, int *recv_src_idx, int64_t *recv_topk_idx,
+              float *recv_topk_weights, int *recv_channel_offset, int *send_head, const void *x,
+              const float *x_scales, const int64_t *topk_idx, const float *topk_weights,
+              const bool *is_token_in_rank, const int *channel_prefix_matrix,
+              const int *rank_prefix_matrix, int num_tokens, int num_recv_tokens,
+              int num_worst_tokens, int hidden_bytes, int num_topk, int num_experts, int num_scales,
+              int scale_token_stride, int scale_hidden_stride, void **buffer_ptrs,
+              int64_t num_nvl_bytes, int rank, int num_ranks, int epoch, hipStream_t stream,
+              int num_channels);
+
+// How far one combine advances the reduce queue counter.
+uint32_t combine_grabs(int num_recv_tokens, int num_channels);
+
+void combine(hipDataType type, void *recv_x, float *recv_topk_weights, const void *x,
+             const float *topk_weights, const void *bias_0, const void *bias_1,
+             const int *rank_prefix_matrix, const int *send_head, int *reduce_counter,
+             int num_tokens, int num_recv_tokens, int hidden, int num_topk, void **buffer_ptrs,
+             int64_t num_nvl_bytes, int rank, int num_ranks, int epoch, uint32_t grab_base,
+             hipStream_t stream, int num_channels);
+
+} // namespace intranode_v2
 
 // Internode kernels
 namespace internode {

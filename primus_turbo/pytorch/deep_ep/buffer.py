@@ -22,6 +22,19 @@ from primus_turbo.pytorch.core.utils import is_gfx1250
 
 from .utils import EventOverlap, check_nvlink_connections
 
+INTRANODE_BACKENDS = ("cpp", "cpp_v2")
+
+
+def get_intranode_backend(backend: Optional[str] = None) -> str:
+    """``backend``, else ``PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`` (``cpp`` | ``cpp_v2``, default
+    ``cpp``)."""
+    backend = (backend or os.environ.get("PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND", "cpp")).strip().lower()
+    if backend not in INTRANODE_BACKENDS:
+        raise ValueError(
+            f"Unknown DeepEP intranode backend {backend!r}; expected one of {INTRANODE_BACKENDS}"
+        )
+    return backend
+
 
 class Buffer:
     """
@@ -52,6 +65,7 @@ class Buffer:
         allow_nvlink_for_low_latency_mode: bool = True,
         allow_mnnvl: bool = False,
         explicitly_destroy: bool = False,
+        intranode_backend: Optional[str] = None,
     ) -> None:
         """
         Initialize the communication buffer.
@@ -71,6 +85,9 @@ class Buffer:
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
                 otherwise, the resources will be released by the destructor.
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
+            intranode_backend: the intranode dispatch / combine kernels: ``cpp`` (default) or ``cpp_v2``
+                (gfx1250: direct writes into fixed slots instead of channel rings; its handles are its own).
+                ``None`` reads ``PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND``.
 
         Note:
             Controlled by ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM`` (default ``0``).
@@ -149,6 +166,11 @@ class Buffer:
         # Make CPP runtime available
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
         assert self.runtime.is_available()
+
+        self.intranode_backend = get_intranode_backend(intranode_backend)
+        if self.intranode_backend == "cpp_v2":
+            self.runtime.enable_intranode_v2()
+            dist.barrier(group)
 
     def destroy(self):
         """

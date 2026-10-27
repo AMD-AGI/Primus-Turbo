@@ -75,6 +75,19 @@ private:
     volatile int *moe_recv_rdma_counter        = nullptr;
     int          *moe_recv_rdma_counter_mapped = nullptr;
 
+    // Intranode V2 (``enable_intranode_v2``): epochs tag what this op's kernels leave in the heap,
+    // so stale counts and flags from an earlier op never match.
+    bool intranode_v2      = false;
+    int  v2_dispatch_epoch = 0;
+    int  v2_combine_epoch  = 0;
+    // The combine's reduce queue: it only ever grows, each combine claims from where the previous
+    // one left it.
+    int     *v2_reduce_counter = nullptr;
+    uint32_t v2_reduce_grabs   = 0;
+    // A combine may push into a peer's combine region only once that peer is done reducing the
+    // previous combine; the notify of a dispatch in between is a barrier that ensures it.
+    bool v2_combine_needs_barrier = false;
+
     // Controlled by ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM`` (default ``0``).
     // When true, all dispatch/combine kernels run on the caller's current CUDA
     // stream instead of ``comm_stream``.
@@ -124,6 +137,11 @@ public:
               const std::optional<pybind11::bytearray>              &root_unique_id_opt);
 
     void destroy();
+
+    // Route the intranode dispatch / combine to the V2 kernels (gfx1250). Call on every rank after
+    // ``sync`` and before any intranode op, then barrier the ranks.
+    void enable_intranode_v2();
+    bool is_intranode_v2() const;
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor,
                std::optional<EventHandle>>

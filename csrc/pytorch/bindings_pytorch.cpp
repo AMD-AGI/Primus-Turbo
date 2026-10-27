@@ -340,6 +340,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_comm_stream", &deep_ep::Buffer::get_comm_stream)
         .def("sync", &deep_ep::Buffer::sync)
         .def("destroy", &deep_ep::Buffer::destroy)
+        .def("enable_intranode_v2", &deep_ep::Buffer::enable_intranode_v2)
+        .def("is_intranode_v2", &deep_ep::Buffer::is_intranode_v2)
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)

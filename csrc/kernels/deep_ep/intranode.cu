@@ -31,7 +31,8 @@ notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped,
                 const int *num_tokens_per_expert, int *moe_recv_expert_counter_mapped,
                 int num_experts, int num_tokens, int num_channels, const bool *is_token_in_rank,
                 int *channel_prefix_matrix, int *rank_prefix_matrix_copy, int num_memset_int,
-                int expert_alignment, void **buffer_ptrs, int **barrier_signal_ptrs, int rank) {
+                int expert_alignment, void **buffer_ptrs, int **barrier_signal_ptrs, int rank,
+                bool full_rank_matrix) {
     auto sm_id     = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
     auto lane_id = thread_id % kWarpSize, warp_id = thread_id / kWarpSize,
@@ -51,9 +52,17 @@ notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mapped,
         //  - `per_rank_buffer[rank][i, j]` means the number of tokens from rank i to rank j
         //  - `per_expert_buffer[rank][i, j]` means the number of tokens from rank i to local expert
         //  j
+        // Only column `rank` of `rank_prefix_matrix_copy` comes out valid unless
+        // `full_rank_matrix`, which sends every rank our whole row (V2 needs every column).
         int num_experts_per_rank = num_experts / kNumRanks;
         if (thread_id < kNumRanks) {
-            per_rank_buffer[rank * kNumRanks + thread_id] = num_tokens_per_rank[thread_id];
+            if (full_rank_matrix) {
+#pragma unroll
+                for (int i = 0; i < kNumRanks; ++i)
+                    per_rank_buffer[rank * kNumRanks + i] = num_tokens_per_rank[i];
+            } else {
+                per_rank_buffer[rank * kNumRanks + thread_id] = num_tokens_per_rank[thread_id];
+            }
 #pragma unroll 2
             for (int i = 0; i < num_experts_per_rank; ++i)
                 per_expert_buffer[rank * num_experts_per_rank + i] =
@@ -132,13 +141,14 @@ void notify_dispatch(const int *num_tokens_per_rank, int *moe_recv_counter_mappe
                      int num_experts, int num_tokens, const bool *is_token_in_rank,
                      int *channel_prefix_matrix, int *rank_prefix_matrix_copy, int num_memset_int,
                      int expert_alignment, void **buffer_ptrs, int **barrier_signal_ptrs, int rank,
-                     hipStream_t stream, int num_channels) {
+                     hipStream_t stream, int num_channels, bool full_rank_matrix) {
 #define NOTIFY_DISPATCH_LAUNCH_CASE(ranks)                                                         \
     LAUNCH_KERNEL_NON_COOPERATIVE(                                                                 \
         &cfg, notify_dispatch<ranks>, num_tokens_per_rank, moe_recv_counter_mapped,                \
         num_tokens_per_expert, moe_recv_expert_counter_mapped, num_experts, num_tokens,            \
         num_channels, is_token_in_rank, channel_prefix_matrix, rank_prefix_matrix_copy,            \
-        num_memset_int, expert_alignment, buffer_ptrs, barrier_signal_ptrs, rank);                 \
+        num_memset_int, expert_alignment, buffer_ptrs, barrier_signal_ptrs, rank,                  \
+        full_rank_matrix);                                                                         \
     break
 
     constexpr int kNumThreads = 128;
