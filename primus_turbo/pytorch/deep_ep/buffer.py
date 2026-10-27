@@ -16,6 +16,8 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
+from primus_turbo.pytorch.core.utils import is_gfx1250
+
 from ._compat import Config, EventHandle, deep_ep_cpp
 from .flydsl_intranode import (
     SUPPORTED_NUM_RANKS,
@@ -317,12 +319,14 @@ class Buffer:
         return bias_0, bias_1
 
     @staticmethod
-    def get_dispatch_config(num_ranks: int) -> Config:
+    def get_dispatch_config(num_ranks: int, backend: Optional[str] = None) -> Config:
         """
         Get a recommended dispatch config.
 
         Argument:
             num_ranks: the number of ranks.
+            backend: the intranode backend the config is for, else `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND` or the
+                default one (see `Buffer`). The backends share the dispatch values so far.
 
         Returns:
             config: the recommended config.
@@ -345,16 +349,23 @@ class Buffer:
         return config_map[num_ranks]
 
     @staticmethod
-    def get_combine_config(num_ranks: int) -> Config:
+    def get_combine_config(num_ranks: int, backend: Optional[str] = None) -> Config:
         """
         Get a recommended combine config.
 
         Argument:
             num_ranks: the number of ranks.
+            backend: the intranode backend the config is for, else `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND` or the
+                default one (see `Buffer`).
 
         Returns:
             config: the recommended config.
         """
+
+        # FlyDSL V1 on gfx1250 (8 KiB copy pieces): a larger send chunk halves the combine at 2 ranks and
+        # cuts it by up to 60% at 4, DSv3 shape at 32-160 SMs
+        if num_ranks in (2, 4) and is_gfx1250() and get_intranode_backend(backend) == "flydsl":
+            return Config(Buffer.num_sms, 48 if num_ranks == 2 else 24, 256, 6, 128)
 
         # TODO: automatically tune
         config_map = {
@@ -482,7 +493,9 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
         # Default config
-        config = self.get_dispatch_config(self.group_size) if config is None else config
+        config = (
+            self.get_dispatch_config(self.group_size, self.intranode_backend) if config is None else config
+        )
 
         # Internode
         if self.num_rdma_ranks > 1:
@@ -629,7 +642,9 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
         # Default config
-        config = self.get_combine_config(self.group_size) if config is None else config
+        config = (
+            self.get_combine_config(self.group_size, self.intranode_backend) if config is None else config
+        )
 
         # Internode
         if self.num_rdma_ranks > 1:
