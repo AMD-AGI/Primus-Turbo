@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (c) 2026 FlyDSL Project Contributors
 #
 # Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
 # Modified by the Primus-Turbo team.
@@ -25,6 +25,7 @@ from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
 from primus_turbo.flydsl.mega.gfx1250.barrier import grid_sync, xgmi_barrier
 from primus_turbo.flydsl.mega.gfx1250.ep_intranode import same_rank_order
+from primus_turbo.flydsl.mega.gfx1250.prims import atomic_add, ld, st
 from primus_turbo.flydsl.mega.gfx1250.symm_buffer import (
     BLOCK_M,
     TOKEN_DTYPE,
@@ -44,7 +45,6 @@ from primus_turbo.flydsl.utils.buffer_ops import (
     create_buffer_resource_from_addr,
     extract_base_index,
 )
-from primus_turbo.flydsl.mega.gfx1250.prims import atomic_add, ld, st
 
 
 class DispatchHandle(NamedTuple):

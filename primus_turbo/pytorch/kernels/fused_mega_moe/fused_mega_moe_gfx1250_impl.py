@@ -17,25 +17,25 @@ from typing import Optional
 
 import torch
 
-from primus_turbo.flydsl.mega.gfx1250.bf16.variable_k import (
-    grouped_gemm_bf16_variable_k_flydsl_kernel as _variable_k,
-)
-from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
-    DispatchHandle,
-    run_dispatch_prologue,
-)
-from primus_turbo.flydsl.mega.gfx1250.symm_buffer import get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.mega.gfx1250.bf16.dispatch_gemm_kernel import (
     dispatch_gemm_nt_gfx1250,
 )
 from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_combine_kernel import (
     gemm_combine_nt_gfx1250,
 )
+from primus_turbo.flydsl.mega.gfx1250.bf16.variable_k import (
+    grouped_gemm_bf16_variable_k_flydsl_kernel as _variable_k,
+)
 from primus_turbo.flydsl.mega.gfx1250.bf16.x_redispatch_kernel import get_x_redispatch
+from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
+    DispatchHandle,
+    run_dispatch_prologue,
+)
 from primus_turbo.flydsl.mega.gfx1250.swiglu_kernel import (
     swiglu_backward_flydsl_kernel,
     swiglu_flydsl_kernel,
 )
+from primus_turbo.flydsl.mega.gfx1250.symm_buffer import get_symm_buffer_for_mega_moe
 from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_bias_impl import (
     fc1_bias_backward,
     fc2_bias_backward,
@@ -113,7 +113,9 @@ def stage2_backward(
         token_buffer, act_weighted, prefix, masked_k=counts, a_index=handle.pool_row_to_recv_token
     )
     d_fc2_bias = (
-        None if fc2_bias is None else fc2_bias_backward(token_buffer, handle, dispatch_weights, fc2_bias, grad_gate)
+        None
+        if fc2_bias is None
+        else fc2_bias_backward(token_buffer, handle, dispatch_weights, fc2_bias, grad_gate)
     )
     d_fc1_bias = None if fc1_bias is None else fc1_bias_backward(grad_l1, handle, fc1_bias.dtype)
     return grad_l1, grad_gate, dW2.to(w2.dtype), d_fc1_bias, d_fc2_bias
@@ -127,7 +129,9 @@ def stage1_backward(grad_l1, saved_x, w1, handle, topk_idx, grad_gate):
     # buffer while the L1 dgrad + combine below runs, instead of a dispatch exposed after it
     x_redispatch = get_x_redispatch(get_symm_buffer_for_mega_moe())
     x_redispatch.push(saved_x.contiguous())
-    dx, grad_topk_weights = gemm_combine_nt_gfx1250(grad_l1, w1, handle, topk_idx, grad_gate=grad_gate, b_nn=True)
+    dx, grad_topk_weights = gemm_combine_nt_gfx1250(
+        grad_l1, w1, handle, topk_idx, grad_gate=grad_gate, b_nn=True
+    )
     # dW1[e] = grad_l1[e].T @ x_pool[e] -> [E, 2 * inter, hidden]
     x_recv = x_redispatch.wait()
     prefix, counts = handle.num_tokens_per_expert_prefix, handle.num_tokens_per_expert

@@ -1,7 +1,14 @@
 ###############################################################################
-# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-# See LICENSE for license information.
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 FlyDSL Project Contributors
+#
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
+# Modified by the Primus-Turbo team.
+#
+# This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
+# not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
 """Gathered-operand variable-K grouped GEMM for gfx1250 Mega MoE wgrads.
@@ -23,22 +30,21 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import arith as std_arith
 from flydsl._mlir.dialects import arith as _std_arith
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import rocdl as _rocdl
 from flydsl._mlir.dialects import vector as _vector
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.arith import _to_raw as _raw
-from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.rocdl import tdm_ops
-from flydsl.expr.typing import Constexpr, T, Vector as Vec
+from flydsl.expr.typing import Constexpr, T
+from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.utils.arith import ArithValue
 
 # Shared helpers / constants from the gfx1250 grouped GEMM (non-gather).
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
     _F16,
     _GFX1250_LDS_BYTES,
-    _TDM_SCOPE,
     _TDM_TH_LOAD,
     _TDM_TH_STORE,
     _WG_BARRIER,
@@ -48,14 +54,10 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
     _get_arch,
     _group_m_tile_decode,
     _i32_table,
-    _make_lds_copy_ops,
-    _nn_b_pad,
-    _pipeline_fence,
     _require_gfx1250,
     _vk_auto_split_bar,
     _vk_lds_pad,
     _vk_wave_grid,
-    _workgroup_barrier,
     _xcd_band_remap,
     build_expert_table,
     check_prebuilt,

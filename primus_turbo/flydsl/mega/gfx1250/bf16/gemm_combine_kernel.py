@@ -47,18 +47,6 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
     _i32_table,
     _require_gfx1250,
 )
-from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
-from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (
-    combine_bf16_tile,
-    spin_until_flag_reaches,
-    topk_reduce_bf16_tile,
-)
-from primus_turbo.flydsl.mega.gfx1250.symm_buffer import (
-    BLOCK_M,
-    TOKEN_DTYPE,
-    Workspace,
-    get_symm_buffer_for_mega_moe,
-)
 from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     EB,
     GFX1250_LDS_BYTES,
@@ -67,7 +55,12 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     nt_gemm_tile,
     tile_geometry,
 )
-from primus_turbo.flydsl.utils.buffer_ops import create_buffer_resource_from_addr
+from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
+from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (
+    combine_bf16_tile,
+    spin_until_flag_reaches,
+    topk_reduce_bf16_tile,
+)
 from primus_turbo.flydsl.mega.gfx1250.prims import (
     CPOL_DEVICE_STREAM,
     atomic_add,
@@ -76,6 +69,13 @@ from primus_turbo.flydsl.mega.gfx1250.prims import (
     st,
     wait_mem_all,
 )
+from primus_turbo.flydsl.mega.gfx1250.symm_buffer import (
+    BLOCK_M,
+    TOKEN_DTYPE,
+    Workspace,
+    get_symm_buffer_for_mega_moe,
+)
+from primus_turbo.flydsl.utils.buffer_ops import create_buffer_resource_from_addr
 
 # fold rows per combine work item: two rows for each wave of the default 8-wave workgroup
 _FOLD_CHUNK_ROWS = 16
@@ -213,7 +213,9 @@ def _launch_gemm_combine_nt(
             workspace.get_combine_token_buffer_ptr(), num_records_bytes=num_max_routes * N * EB
         )
         combine_gate_res = (
-            create_buffer_resource_from_addr(workspace.get_combine_gate_ptr(), num_records_bytes=num_max_routes * 4)
+            create_buffer_resource_from_addr(
+                workspace.get_combine_gate_ptr(), num_records_bytes=num_max_routes * 4
+            )
             if HAS_GRAD_GATE
             else None
         )
@@ -482,6 +484,7 @@ def _chunk_counter(device: torch.device) -> torch.Tensor:
     """The combine chunk and reduce token counters; the launch's epoch bump rearms them."""
     return torch.zeros(2, dtype=torch.int32, device=device)
 
+
 _CONSTEXPR0 = 25
 
 
@@ -543,7 +546,9 @@ def gemm_combine_nt_gfx1250(
     out = torch.empty(int(symm.num_max_tokens_per_rank), N, dtype=torch.bfloat16, device=act.device)
     has_grad_gate = grad_gate is not None
     if has_grad_gate:
-        assert grad_gate.dtype == torch.float32 and grad_gate.numel() == rows, "one f32 gate grad per pool row"
+        assert grad_gate.dtype == torch.float32 and grad_gate.numel() == rows, (
+            "one f32 gate grad per pool row"
+        )
         grad_gate = grad_gate.contiguous()
         grad_topk_weights = torch.empty(int(symm.num_max_routes), dtype=torch.float32, device=act.device)
     has_bias = bias is not None

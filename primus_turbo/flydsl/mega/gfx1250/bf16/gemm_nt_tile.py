@@ -53,12 +53,12 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as std_arith
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import rocdl as _rocdl
 from flydsl._mlir.dialects import vector
+from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import tdm_ops
@@ -127,7 +127,9 @@ def _pad_encoding(row_bytes: int, pad_bytes: int):
     return interval_dw.bit_length() - 2, amount_dw - 1
 
 
-def _gather_static_groups(row_indices, idx_bits: int, row_width: int, tensor_dim0: int, tensor_dim1, stride: int):
+def _gather_static_groups(
+    row_indices, idx_bits: int, row_width: int, tensor_dim0: int, tensor_dim1, stride: int
+):
     """dgroup1..3: element size, padding, OOB dims, row width, row stride and the row indices."""
     enc_interval, enc_amount = _pad_encoding(row_width * EB, LDS_PAD)
     data_size_code = EB.bit_length() - 1
@@ -139,7 +141,9 @@ def _gather_static_groups(row_indices, idx_bits: int, row_width: int, tensor_dim
     s4 = _c32(len(row_indices))
     s5 = _c32(stride)
     zero = _c32(0)
-    dgroup1 = vector.from_elements(T.vec(8, T.i32), [as_ir_value(v) for v in (s0, s1, s2, s3, s4, s5, zero, zero)])
+    dgroup1 = vector.from_elements(
+        T.vec(8, T.i32), [as_ir_value(v) for v in (s0, s1, s2, s3, s4, s5, zero, zero)]
+    )
     if idx_bits == 32:
         words = list(row_indices)
     else:
@@ -163,9 +167,7 @@ def _gather_dgroup0(lds_addr_i32, global_addr_i64, idx_bits: int):
     hi = std_arith.TruncIOp(i32, std_arith.ShRUIOp(g, _raw(fx.Int64(32))).result).result
     hi = arith.ori(hi, _c32(1 << 31))
     pred = _c32(1 | ((1 if idx_bits == 32 else 0) << 30) | (1 << 31))
-    return vector.from_elements(
-        T.vec(4, T.i32), [as_ir_value(v) for v in (pred, _raw(lds_addr_i32), lo, hi)]
-    )
+    return vector.from_elements(T.vec(4, T.i32), [as_ir_value(v) for v in (pred, _raw(lds_addr_i32), lo, hi)])
 
 
 class _GatherDesc:
@@ -320,9 +322,7 @@ def nt_gemm_tile(
             row = ok.select(idx, fallback)
             if const_expr(i == 0):
                 fallback = row
-            a_off.append(
-                row * fx.Int32(lda * EB) + c16 * fx.Int32(16) + fx.Int32(A_BIAS - i * RPI * LDS_ROW)
-            )
+            a_off.append(row * fx.Int32(lda * EB) + c16 * fx.Int32(16) + fx.Int32(A_BIAS - i * RPI * LDS_ROW))
     elif const_expr(gather):
         a_addr = fx.Int64(fx.ptrtoint(gA_base))
         # descriptors for this wave's ops: indices are K-invariant, so groups 1-3 are built once
@@ -354,7 +354,9 @@ def nt_gemm_tile(
 
             def _a_loads():
                 for i in range_constexpr(N_LD):
-                    g = std_arith.AddIOp(a_base, std_arith.ExtUIOp(i64, _raw(a_off[i] + koff32)).result).result
+                    g = std_arith.AddIOp(
+                        a_base, std_arith.ExtUIOp(i64, _raw(a_off[i] + koff32)).result
+                    ).result
                     gp = _llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), g)
                     _rocdl.global_load_async_to_lds_b128(gp, lds, i * RPI * LDS_ROW)
 
@@ -393,7 +395,9 @@ def nt_gemm_tile(
                     cache_modifier=0,
                     early_timeout=True,
                 )
-                fx.copy(atom_bk, gt_bk, _lv(fx.add_offset(pa, B_DELTA), (tile_k, tile_n * EB), (LDS_B_ROW, 1)))
+                fx.copy(
+                    atom_bk, gt_bk, _lv(fx.add_offset(pa, B_DELTA), (tile_k, tile_n * EB), (LDS_B_ROW, 1))
+                )
             else:
                 fx.copy(
                     atom_b, gt_b, _lv(fx.add_offset(pa, B_DELTA), (tile_n, KB), (LDS_ROW, 1)), imm_offset=koff
@@ -433,7 +437,9 @@ def nt_gemm_tile(
         def load_b(buf, wn, ks):
             addr = fx.Int32(buf) + b_lane
             base = ks * WMMA_K * LDS_B_ROW + wn * WMMA_N * EB
-            return _tr(addr, base).shuffle(_tr(addr, base + 16 * LDS_B_ROW), list(range(16))).bitcast(fx.Int32)
+            return (
+                _tr(addr, base).shuffle(_tr(addr, base + 16 * LDS_B_ROW), list(range(16))).bitcast(fx.Int32)
+            )
 
     else:
 
@@ -605,10 +611,9 @@ def _launch_mega_nt(
         m_row = block_m * fx.Int32(tile_m)
         gA = fx.recast_iter(fx.Int8, arg_a)
         gB = fx.recast_iter(fx.Int8, arg_b)
-        c_addr = (
-            fx.Int64(fx.ptrtoint(fx.recast_iter(fx.Int8, arg_c)))
-            + (fx.Int64(m_row) * fx.Int64(LDC) + fx.Int64(blk_n)) * fx.Int64(EB)
-        )
+        c_addr = fx.Int64(fx.ptrtoint(fx.recast_iter(fx.Int8, arg_c))) + (
+            fx.Int64(m_row) * fx.Int64(LDC) + fx.Int64(blk_n)
+        ) * fx.Int64(EB)
         nt_gemm_tile(
             base_ptr,
             gA_base=gA,

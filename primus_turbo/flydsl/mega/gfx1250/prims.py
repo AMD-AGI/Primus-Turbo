@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (c) 2026 FlyDSL Project Contributors
 #
 # Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
 # Modified by the Primus-Turbo team.

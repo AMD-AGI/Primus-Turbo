@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (c) 2026 FlyDSL Project Contributors
 #
 # Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
 # Modified by the Primus-Turbo team.
@@ -30,6 +30,7 @@ from flydsl._mlir.dialects import vector as _vector
 from flydsl.expr.primitive import get_dyn_shared
 from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
+from primus_turbo.flydsl.mega.gfx1250.prims import WAVE, ld, st
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
@@ -44,7 +45,6 @@ from primus_turbo.flydsl.utils.glu_activation import (
     GLUActivation,
     activation_constexpr,
 )
-from primus_turbo.flydsl.mega.gfx1250.prims import WAVE, ld, st
 
 _VEC = 8
 _POOL_BLOCK_M = 256  # pool-block granularity (fixed policy; matches symm_buffer.BLOCK_M)

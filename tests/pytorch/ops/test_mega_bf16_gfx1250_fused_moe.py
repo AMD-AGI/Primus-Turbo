@@ -104,7 +104,9 @@ def test_fused_mega_moe_forward_ep1(ep1_group, num_tokens, hidden, inter, num_ex
     w2 = (torch.randn(num_experts, hidden, inter, device="cuda") * 2 / inter**0.5).to(torch.bfloat16)
     for _ in range(_CALLS):
         x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
-        topk_w, topk_idx = torch.randn(num_tokens, num_experts, device="cuda").softmax(-1).topk(num_topk, dim=-1)
+        topk_w, topk_idx = (
+            torch.randn(num_tokens, num_experts, device="cuda").softmax(-1).topk(num_topk, dim=-1)
+        )
         with torch.no_grad():
             y = fused_mega_moe(ep1_group, x, topk_idx, topk_w, w1, w2, activation=activation)
         ref = _reference(x.float(), topk_idx, topk_w, w1.float(), w2.float(), activation)
@@ -138,7 +140,9 @@ def test_fused_mega_moe_backward_ep1(
     w2 = (torch.randn(num_experts, hidden, inter, device="cuda") * 2 / inter**0.5).to(torch.bfloat16)
     for _ in range(2):
         x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
-        topk_w, topk_idx = torch.randn(num_tokens, num_experts, device="cuda").softmax(-1).topk(num_topk, dim=-1)
+        topk_w, topk_idx = (
+            torch.randn(num_tokens, num_experts, device="cuda").softmax(-1).topk(num_topk, dim=-1)
+        )
         dy = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
         leaves = [t.clone().requires_grad_() for t in (x, topk_w, w1, w2)]
         run(leaves[0], topk_idx, *leaves[1:]).backward(dy)
@@ -170,7 +174,9 @@ def test_fused_mega_moe_staged_bias_ep1(ep1_group, num_tokens, hidden, inter, nu
     b2 = torch.randn(num_experts, hidden, device="cuda").to(torch.bfloat16)
     for _ in range(2):
         x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
-        topk_w, topk_idx = torch.randn(num_tokens, num_experts, device="cuda").softmax(-1).topk(num_topk, dim=-1)
+        topk_w, topk_idx = (
+            torch.randn(num_tokens, num_experts, device="cuda").softmax(-1).topk(num_topk, dim=-1)
+        )
         dy = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
         leaves = [t.clone().requires_grad_() for t in (x, topk_w, w1, w2, b1, b2)]
         lx, ltw, lw1, lw2, lb1, lb2 = leaves
@@ -184,5 +190,7 @@ def test_fused_mega_moe_staged_bias_ep1(ep1_group, num_tokens, hidden, inter, nu
         yr = _reference(rx, topk_idx, rtw, rw1, rw2, activation, rb1, rb2)
         yr.backward(dy.float())
         assert (snr := _snr(y, yr.detach())) > 40, f"y SNR {snr:.1f} dB"
-        for name, got, want in zip(("dx", "d topk_w", "dW1", "dW2", "d fc1_bias", "d fc2_bias"), leaves, refs):
+        for name, got, want in zip(
+            ("dx", "d topk_w", "dW1", "dW2", "d fc1_bias", "d fc2_bias"), leaves, refs
+        ):
             assert (snr := _snr(got.grad, want.grad)) > 40, f"{name} SNR {snr:.1f} dB"

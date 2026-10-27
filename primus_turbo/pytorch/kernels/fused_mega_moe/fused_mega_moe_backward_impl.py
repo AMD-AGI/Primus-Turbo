@@ -72,7 +72,9 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
         handle = DispatchHandle(*handle)
         dy = grad_y.contiguous().to(torch.bfloat16)
         if is_gfx1250():
-            return _backward_gfx1250(dy, saved_x, l1_out, dispatch_weights, w1, w2, topk_idx, handle, activation)
+            return _backward_gfx1250(
+                dy, saved_x, l1_out, dispatch_weights, w1, w2, topk_idx, handle, activation
+            )
 
         # L2 dgrad: cross-rank dispatch PUSH + grouped GEMM (nn)
         grad_swiglu, dispatch_l2_grad, _ = dispatch_grouped_gemm_bf16_flydsl_kernel(
@@ -134,7 +136,9 @@ def _backward_gfx1250(dy, saved_x, l1_out, dispatch_weights, w1, w2, topk_idx, h
         fused_mega_moe_gfx1250_impl as gfx1250,
     )
 
-    grad_l1, grad_gate, dW2, _, _ = gfx1250.stage2_backward(dy, l1_out, dispatch_weights, w2, handle, activation)
+    grad_l1, grad_gate, dW2, _, _ = gfx1250.stage2_backward(
+        dy, l1_out, dispatch_weights, w2, handle, activation
+    )
     dx, grad_topk_weights, dW1 = gfx1250.stage1_backward(grad_l1, saved_x, w1, handle, topk_idx, grad_gate)
     return dx, grad_topk_weights, dW1, dW2
 

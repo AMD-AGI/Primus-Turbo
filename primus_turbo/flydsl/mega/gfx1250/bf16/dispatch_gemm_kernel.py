@@ -41,17 +41,6 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
     _i32_table,
     _require_gfx1250,
 )
-from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
-from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (
-    dispatch_bf16_tile,
-    spin_until_flag_reaches,
-)
-from primus_turbo.flydsl.mega.gfx1250.symm_buffer import (
-    BLOCK_M,
-    TOKEN_DTYPE,
-    Workspace,
-    get_symm_buffer_for_mega_moe,
-)
 from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     EB,
     GFX1250_LDS_BYTES,
@@ -61,8 +50,19 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     nt_gemm_tile,
     tile_geometry,
 )
-from primus_turbo.flydsl.utils.buffer_ops import create_buffer_resource_from_addr
+from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
+from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (
+    dispatch_bf16_tile,
+    spin_until_flag_reaches,
+)
 from primus_turbo.flydsl.mega.gfx1250.prims import cast, ld, st
+from primus_turbo.flydsl.mega.gfx1250.symm_buffer import (
+    BLOCK_M,
+    TOKEN_DTYPE,
+    Workspace,
+    get_symm_buffer_for_mega_moe,
+)
+from primus_turbo.flydsl.utils.buffer_ops import create_buffer_resource_from_addr
 
 
 def _addr(p):
@@ -115,7 +115,9 @@ def _launch_dispatch_gemm_nt(
         raise ValueError(f"LDS arena {arena_bytes} B exceeds {GFX1250_LDS_BYTES} B")
     num_experts_per_rank = NUM_EXPERTS // NUM_RANKS
     if DISPATCH_ONLY and num_experts_per_rank > block:
-        raise ValueError(f"the dispatch-only wait gives each of {num_experts_per_rank} experts a lane of {block}")
+        raise ValueError(
+            f"the dispatch-only wait gives each of {num_experts_per_rank} experts a lane of {block}"
+        )
 
     @flyc.kernel(known_block_size=[64, 1, 1])
     def epoch_bump(arg_parity: fx.Pointer, arg_expected: fx.Pointer):
@@ -215,7 +217,9 @@ def _launch_dispatch_gemm_nt(
         group_size_m = (remaining_m < fx.Int32(group_m)).select(remaining_m, fx.Int32(group_m))
         group_size_m = (group_size_m > fx.Int32(0)).select(group_size_m, fx.Int32(1))
         pid_in_group = pid % num_pid_in_group
-        block_m = rocdl.readfirstlane(T.i32, live.select(first_pid_m + pid_in_group % group_size_m, fx.Int32(0)))
+        block_m = rocdl.readfirstlane(
+            T.i32, live.select(first_pid_m + pid_in_group % group_size_m, fx.Int32(0))
+        )
         block_n = rocdl.readfirstlane(T.i32, live.select(pid_in_group // group_size_m, fx.Int32(0)))
         expert = rocdl.readfirstlane(T.i32, _i32_table(arg_tile_to_expert)[block_m])
         expert = live.select(expert, fx.Int32(0))
@@ -332,7 +336,9 @@ def dispatch_only_gfx1250(
     return symm.dispatch_token_buffer
 
 
-def _run(x, w1, handle, dispatch_only, b_nn, num_dispatch_cu, tile_m, tile_n, tile_k, m_warp, n_warp, group_m):
+def _run(
+    x, w1, handle, dispatch_only, b_nn, num_dispatch_cu, tile_m, tile_n, tile_k, m_warp, n_warp, group_m
+):
     _require_gfx1250(x.device)
     symm = get_symm_buffer_for_mega_moe()
     G, N, K = w1.shape

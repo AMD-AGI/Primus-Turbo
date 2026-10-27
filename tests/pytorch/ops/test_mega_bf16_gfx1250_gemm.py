@@ -91,7 +91,9 @@ def test_mega_nt_tile(N, K, group_lens, mode, b_layout):
     torch.cuda.synchronize()
 
     ref = _reference(a_rows, b, tile_to_expert, live)
-    valid = row_idx[: live * _BLOCK_M] >= 0 if mode != "dense" else torch.ones(live * _BLOCK_M, dtype=torch.bool)
+    valid = (
+        row_idx[: live * _BLOCK_M] >= 0 if mode != "dense" else torch.ones(live * _BLOCK_M, dtype=torch.bool)
+    )
     valid = valid.cuda()
     got = out[: live * _BLOCK_M].float()
     torch.testing.assert_close(got[valid], ref[valid], rtol=1.6e-2, atol=1e-2)

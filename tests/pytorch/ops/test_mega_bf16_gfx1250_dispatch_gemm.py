@@ -53,11 +53,11 @@ def ep1_group():
     ],
 )
 def test_dispatch_gemm_nt_ep1(ep1_group, num_tokens, hidden, inter, num_experts, num_topk, num_empty):
-    from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
-        run_dispatch_prologue,
-    )
     from primus_turbo.flydsl.mega.gfx1250.bf16.dispatch_gemm_kernel import (
         dispatch_gemm_nt_gfx1250,
+    )
+    from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
+        run_dispatch_prologue,
     )
 
     torch.manual_seed(num_tokens + num_empty)

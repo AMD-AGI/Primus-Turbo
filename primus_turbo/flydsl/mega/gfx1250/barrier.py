@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (c) 2026 FlyDSL Project Contributors
 #
 # Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
 # Modified by the Primus-Turbo team.
@@ -14,7 +14,6 @@
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
-from primus_turbo.flydsl.mega.gfx1250.symm_buffer import SymBuffer, Workspace
 from primus_turbo.flydsl.mega.gfx1250.prims import (
     atomic_add,
     ld,
@@ -22,6 +21,7 @@ from primus_turbo.flydsl.mega.gfx1250.prims import (
     read_clock,
     spin_timed_out,
 )
+from primus_turbo.flydsl.mega.gfx1250.symm_buffer import SymBuffer, Workspace
 
 # grid_sync counter: low bits count per-block arrivals, bit 25 is the phase flag. Requires num_blocks < 2^25.
 _PHASE_BIT = 25

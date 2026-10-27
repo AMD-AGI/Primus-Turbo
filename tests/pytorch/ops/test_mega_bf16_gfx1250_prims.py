@@ -34,22 +34,20 @@ from flydsl.expr import arith, range_constexpr  # noqa: E402
 from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (  # noqa: E402
     spin_until_flag_reaches,
 )
-from primus_turbo.flydsl.mega.gfx1250.symm_buffer import SymBuffer  # noqa: E402
-from primus_turbo.flydsl.mega.gfx1250.prims import (  # noqa: E402
+from primus_turbo.flydsl.mega.gfx1250.prims import (  # noqa: E402  # noqa: E402
     CPOL_DEVICE_STREAM,
     CPOL_SYSTEM_STREAM,
-)
-from primus_turbo.flydsl.utils.buffer_ops import (  # noqa: E402
-    buffer_load,
-    buffer_store,
-    create_buffer_resource_from_addr,
-)
-from primus_turbo.flydsl.mega.gfx1250.prims import (  # noqa: E402
     atomic_add,
     cast,
     copy_warp,
     read_clock,
     wait_mem_all,
+)
+from primus_turbo.flydsl.mega.gfx1250.symm_buffer import SymBuffer  # noqa: E402
+from primus_turbo.flydsl.utils.buffer_ops import (  # noqa: E402
+    buffer_load,
+    buffer_store,
+    create_buffer_resource_from_addr,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -105,7 +103,9 @@ def _oob_launcher(cpol_name: str):
 
         # b128, the width copy_warp moves
         w = t * fx.Int32(4)
-        v4 = buffer_load(res(_OOB_SRC4, _OOB_VALID4 * 16), w, vec_width=4, dtype=fx.T.i32, cache_modifier=cpol)
+        v4 = buffer_load(
+            res(_OOB_SRC4, _OOB_VALID4 * 16), w, vec_width=4, dtype=fx.T.i32, cache_modifier=cpol
+        )
         buffer_store(v4, res(_OOB_LOAD4, full), w)
         src4 = buffer_load(res(_OOB_SRC4, full), w, vec_width=4, dtype=fx.T.i32)
         buffer_store(src4, res(_OOB_STORE4, _OOB_VALID4 * 16), w, cache_modifier=cpol)
@@ -184,9 +184,13 @@ def test_copy_warp_rows(hidden):
     _copy_launcher(hidden)(sym, torch.cuda.current_stream())
     torch.cuda.synchronize()
 
-    dst = buf[_HALF_WORDS + _COPY_DST : _HALF_WORDS + _COPY_DST + src.numel()].view(_COPY_ROWS, _COPY_ROW_WORDS)
+    dst = buf[_HALF_WORDS + _COPY_DST : _HALF_WORDS + _COPY_DST + src.numel()].view(
+        _COPY_ROWS, _COPY_ROW_WORDS
+    )
     torch.testing.assert_close(dst[:, :words], src[:, :words], rtol=0, atol=0)
-    assert bool((dst[:, words:] == _SENTINEL).all()), "copy_warp wrote past the row (a parked tail store landed)"
+    assert bool((dst[:, words:] == _SENTINEL).all()), (
+        "copy_warp wrote past the row (a parked tail store landed)"
+    )
 
 
 # ── flag handoff across XCDs ─────────────────────────────────────────────────
@@ -232,7 +236,9 @@ def _flag_launcher(rounds: int):
                 spin_until_flag_reaches(ack, pair, cast(r, fx.T.i64), "sys", 0, "ack")
                 for k in range_constexpr(_FLAG_WORDS_PER_THREAD):
                     value = (r + fx.Int32(1)) * fx.Int32(1 << 20) + tag + fx.Int32(k)
-                    buffer_store(value, payload_res, first_word + fx.Int32(k), cache_modifier=CPOL_SYSTEM_STREAM)
+                    buffer_store(
+                        value, payload_res, first_word + fx.Int32(k), cache_modifier=CPOL_SYSTEM_STREAM
+                    )
                 wait_mem_all()
                 fx.gpu.barrier()
                 if t == fx.Int32(0):

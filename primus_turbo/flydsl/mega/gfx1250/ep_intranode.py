@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (c) 2026 FlyDSL Project Contributors
 #
 # Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
 # Modified by the Primus-Turbo team.
@@ -19,13 +19,6 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.utils.arith import ArithValue
 
-from primus_turbo.flydsl.mega.gfx1250.symm_buffer import BLOCK_M as POOL_BLOCK_M
-from primus_turbo.flydsl.mega.gfx1250.symm_buffer import SymBuffer, Workspace
-from primus_turbo.flydsl.utils.buffer_ops import (
-    buffer_load,
-    buffer_store,
-    create_buffer_resource_from_addr,
-)
 from primus_turbo.flydsl.mega.gfx1250.prims import (
     CPOL_DEVICE_STREAM,
     CPOL_SYSTEM_STREAM,
@@ -40,6 +33,13 @@ from primus_turbo.flydsl.mega.gfx1250.prims import (
     spin_timed_out,
     st,
     wait_mem_all,
+)
+from primus_turbo.flydsl.mega.gfx1250.symm_buffer import BLOCK_M as POOL_BLOCK_M
+from primus_turbo.flydsl.mega.gfx1250.symm_buffer import SymBuffer, Workspace
+from primus_turbo.flydsl.utils.buffer_ops import (
+    buffer_load,
+    buffer_store,
+    create_buffer_resource_from_addr,
 )
 
 _WARP = 64
@@ -244,7 +244,8 @@ def _sum_pool_rows(
             # read the same-agent GEMM stage
             cpol = CPOL_DEVICE_STREAM
             values = [
-                buffer_load(row_res, col, vec_width=_PVEC, dtype=fx.T.bf16, cache_modifier=cpol) for col in cols
+                buffer_load(row_res, col, vec_width=_PVEC, dtype=fx.T.bf16, cache_modifier=cpol)
+                for col in cols
             ]
             for i, value in enumerate(values):
                 term = fx.arith.extf(f32_vec, value)
@@ -510,10 +511,13 @@ def topk_reduce_bf16_tile(
         if const_expr(vec_unroll > 1):
             num_steps = ceildiv(num_vec_chunks, _WARP)
             for first_step in range_constexpr(0, num_steps, vec_unroll):
-                vec_ids = [lane_id + fx.Int32(step * _WARP) for step in _steps(first_step, vec_unroll, num_steps)]
+                vec_ids = [
+                    lane_id + fx.Int32(step * _WARP) for step in _steps(first_step, vec_unroll, num_steps)
+                ]
                 # a lane past the row's last chunk reads chunk 0 and skips its store
                 cols = [
-                    arith.select(v < fx.Int32(num_vec_chunks), v * fx.Int32(_PVEC), fx.Int32(0)) for v in vec_ids
+                    arith.select(v < fx.Int32(num_vec_chunks), v * fx.Int32(_PVEC), fx.Int32(0))
+                    for v in vec_ids
                 ]
                 values = [
                     [
@@ -534,7 +538,9 @@ def topk_reduce_bf16_tile(
                         row_sum = fx.arith.addf(row_sum, fx.arith.extf(f32_vec, values[u][j]))
                     if vec_ids[u] < fx.Int32(num_vec_chunks):
                         buffer_store(
-                            fx.arith.trunc_f(bf16_vec, row_sum), output_res, token * fx.Int32(hidden) + cols[u]
+                            fx.arith.trunc_f(bf16_vec, row_sum),
+                            output_res,
+                            token * fx.Int32(hidden) + cols[u],
                         )
         else:
             vec_idx = lane_id

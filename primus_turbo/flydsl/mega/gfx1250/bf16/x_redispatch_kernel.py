@@ -1,7 +1,14 @@
 ###############################################################################
-# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-# See LICENSE for license information.
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 FlyDSL Project Contributors
+#
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
+# Modified by the Primus-Turbo team.
+#
+# This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
+# not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
 """Cross-rank completion flags for the copy-engine x re-dispatch of the stage-1 backward.
@@ -82,7 +89,9 @@ def _run(launcher, args, num_ranks: int, rank: int) -> None:
     fn(*args)
 
 
-def x_copy_signal(peer_flag_table: torch.Tensor, local_flags: torch.Tensor, num_ranks: int, rank: int) -> None:
+def x_copy_signal(
+    peer_flag_table: torch.Tensor, local_flags: torch.Tensor, num_ranks: int, rank: int
+) -> None:
     """Publish this call's epoch to every rank; ``peer_flag_table[d]`` is rank d's flags address."""
     args = (_as_ptr(peer_flag_table), _as_ptr(local_flags), torch.cuda.current_stream(), num_ranks, rank)
     _run(_launch_x_copy_signal, args, num_ranks, rank)
@@ -109,7 +118,9 @@ class XRedispatch:
         rows = self.num_ranks * self.rows_per_rank
         flags_offset = -(-rows * symm.hidden * 2 // _FLAGS_ALIGN) * _FLAGS_ALIGN
         self.mem = SymmetricMemory(symm.group, flags_offset + _FLAGS_ALIGN, signal_pad_size=0)
-        self.buffers = [self.mem.get_buffer(r, (rows, symm.hidden), torch.bfloat16) for r in range(self.num_ranks)]
+        self.buffers = [
+            self.mem.get_buffer(r, (rows, symm.hidden), torch.bfloat16) for r in range(self.num_ranks)
+        ]
         self.local_flags = self.mem.get_buffer(
             self.rank, (self.num_ranks + 1,), torch.int64, storage_offset=flags_offset // 8
         )

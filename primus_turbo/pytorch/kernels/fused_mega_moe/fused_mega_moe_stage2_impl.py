@@ -19,11 +19,11 @@ from primus_turbo.flydsl.mega.bf16.grouped_gemm_bf16_kernel import (
     grouped_gemm_bf16_variable_k_flydsl_kernel,
 )
 from primus_turbo.flydsl.utils.glu_activation import GLUActivation
-from primus_turbo.pytorch.core.utils import is_gfx1250
 from primus_turbo.flydsl.utils.swiglu_kernel import (
     swiglu_backward_flydsl_kernel,
     swiglu_flydsl_kernel,
 )
+from primus_turbo.pytorch.core.utils import is_gfx1250
 from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_bias_impl import (
     fc1_bias_backward,
     fc2_bias_backward,
@@ -49,7 +49,9 @@ def fused_mega_moe_stage2_forward_impl(
             fused_mega_moe_gfx1250_impl as gfx1250,
         )
 
-        return gfx1250.stage2_forward(l1_out, w2, handle, topk_idx, dispatch_weights, activation, fc1_bias, fc2_bias)
+        return gfx1250.stage2_forward(
+            l1_out, w2, handle, topk_idx, dispatch_weights, activation, fc1_bias, fc2_bias
+        )
     # bound swiglu by THIS handle's tile count (per-forward, not shared symm)
     act = swiglu_flydsl_kernel(
         l1_out,

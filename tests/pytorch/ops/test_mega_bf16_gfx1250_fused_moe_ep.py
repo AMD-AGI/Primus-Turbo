@@ -105,7 +105,9 @@ class FusedMegaMoEGfx1250EPTest(MultiProcContinuousTest):
 
         w1 = randn(experts_per_rank, 2 * inter, hidden, scale=l1_gain / hidden**0.5)
         w2 = randn(experts_per_rank, hidden, inter, scale=2 / inter**0.5)
-        b1, b2 = (randn(experts_per_rank, 2 * inter), randn(experts_per_rank, hidden)) if bias else (None, None)
+        b1, b2 = (
+            (randn(experts_per_rank, 2 * inter), randn(experts_per_rank, hidden)) if bias else (None, None)
+        )
 
         def run(x, topk_idx, topk_w, w1, w2, b1, b2):
             if staged:
@@ -132,7 +134,9 @@ class FusedMegaMoEGfx1250EPTest(MultiProcContinuousTest):
             y.backward(dy)
 
             gx, row0 = self._gather_rows(x)
-            refs = [t.detach().float().requires_grad_() for t in [gx, self._gather_rows(topk_w)[0]] + full_weights]
+            refs = [
+                t.detach().float().requires_grad_() for t in [gx, self._gather_rows(topk_w)[0]] + full_weights
+            ]
             rb1, rb2 = (refs[4], refs[5]) if bias else (None, None)
             yr = _reference(refs[0], self._gather_rows(topk_idx)[0], *refs[1:4], activation, rb1, rb2)
             yr.backward(self._gather_rows(dy)[0].float())
