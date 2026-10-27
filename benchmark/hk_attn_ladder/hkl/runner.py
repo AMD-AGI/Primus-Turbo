@@ -31,7 +31,7 @@ from pathlib import Path
 
 from .build import DEFAULT_OUT, ladder_name, load_ladder
 
-__all__ = ["Rung", "load", "rung_ids"]
+__all__ = ["Baseline", "Rung", "baseline_ids", "load", "load_baseline", "rung_ids"]
 
 
 class Rung:
@@ -79,6 +79,45 @@ def _fresh_package(lab_dir):
     sys.modules[name] = pkg
     spec.loader.exec_module(pkg)
     return name
+
+
+class Baseline:
+    """An external arm (e.g. Primus-Turbo's FlyDSL kernels) with the rung call signature."""
+
+    def __init__(self, spec, b):
+        self.spec, self.b = spec, b
+        self.id = b["id"]
+        self.ladder = ladder_name(spec)
+        root = os.environ.get("HKL_TURBO_DIR") or str(Path(__file__).resolve().parents[3])
+        if root not in sys.path:
+            sys.path.insert(0, root)  # the Primus-Turbo checkout this ladder lives in (or HKL_TURBO_DIR)
+        self.module = importlib.import_module(b["module"])
+        self._fwd = getattr(self.module, b["fwd"]) if b.get("fwd") else None
+        self._bwd = getattr(self.module, b["bwd"]) if b.get("bwd") else None
+        self.kwargs = dict(b.get("kwargs", {}))
+
+    def __repr__(self):
+        return f"Baseline({self.ladder}:{self.id})"
+
+    def fwd(self, q, k, v, softmax_scale=None, causal=True):
+        scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+        return self._fwd(q, k, v, softmax_scale=scale, causal=causal, **self.kwargs)
+
+    def bwd(self, do, q, k, v, o, lse, softmax_scale=None, causal=True):
+        scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+        return self._bwd(do, q, k, v, o, lse, softmax_scale=scale, causal=causal, **self.kwargs)
+
+
+def load_baseline(ladder, bid):
+    spec = load_ladder(ladder)
+    for b in spec.get("baselines", []):
+        if b["id"] == bid:
+            return Baseline(spec, b)
+    raise KeyError(f"{ladder}: no baseline {bid!r}")
+
+
+def baseline_ids(ladder):
+    return [b["id"] for b in load_ladder(ladder).get("baselines", [])]
 
 
 def rung_ids(ladder, include_side=True):

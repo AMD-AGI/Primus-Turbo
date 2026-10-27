@@ -476,5 +476,26 @@
    "feature": "negative: 8-wave ping-pong (HK's CDNA4 attention schedule)",
    "ref_ms": 1.2211
   }
- ]
+ ],
+ "baselines": [
+  {
+   "id": "flydsl",
+   "module": "primus_turbo.flydsl.attention.gfx1250.interface",
+   "fwd": "flash_attn_fwd",
+   "note": "Primus-Turbo's FlyDSL gfx1250 d128 forward (main since #580)"
+  }
+ ],
+ "problem": {
+  "kind": "gqa",
+  "b": 4,
+  "sq": 8192,
+  "skv": 8192,
+  "hq": 32,
+  "hkv": 8,
+  "d": 128,
+  "dv": 128,
+  "causal": true,
+  "layout": "bshd"
+ },
+ "direction": "fwd"
 }
