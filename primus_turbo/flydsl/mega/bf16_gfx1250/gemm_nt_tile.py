@@ -24,9 +24,11 @@ with two changes Mega needs:
   dispatched token). Every lane copies 16-byte chunks of them straight into LDS with
   ``global_load_async_to_lds_b128`` (16 lanes per 256-byte row, 16 rows per instruction,
   waited with ``s_wait_asynccnt``). An index outside ``[0, a_rows)`` -- the pool's padding rows
-  carry -1 -- reads some in-bounds row instead; the row's output is padding that nothing
-  downstream reads. TDM gather loads (``tensor_load_to_lds`` gather mode, 16 rows per
-  instruction) need no VMEM issue slots and are about 2.5% faster, but on gfx1250 they now and
+  carry -1 -- reads one of the tile's own rows instead; the row's output is padding that
+  nothing downstream reads. No other row may be read: one the dispatch is still writing leaves
+  stale lines in the WGP's vector cache, which the tile owning that row then reads. TDM gather
+  loads (``tensor_load_to_lds`` gather mode, 16 rows per instruction) need no VMEM issue slots
+  and are about 2.5% faster, but on gfx1250 they now and
   then corrupt the LDS writes of neighbouring workgroups -- silently, about one fused launch in
   500, triggered by gathers that barely touch memory (out-of-range, repeated or hot rows).
   ``MEGA_TDM_GATHER=1`` at trace time brings them back to reproduce that.
@@ -39,8 +41,8 @@ with two changes Mega needs:
 
 A dead tile (past the device-side tile count) is not branched around -- a dynamic branch over the
 TDM pipeline is what the grouped kernel's ``dead_tile_exit`` found to fault intermittently.
-It runs with every extent at 0: no k-tile, no TDM traffic, a store with ``num_records`` 0. Only
-a gathered A's prologue loads still go out, from in-bounds rows.
+It runs with every extent at 0: no k-tile, no TDM traffic, a store with ``num_records`` 0. A
+gathered A's prologue loads sit behind a uniform ``live`` branch, the one branch in the tile.
 """
 
 from __future__ import annotations
@@ -301,14 +303,21 @@ def nt_gemm_tile(
         a_lane_lds = rsub * fx.Int32(LDS_ROW) + c16 * fx.Int32(16)
         # K-invariant 32-bit row offsets. An instruction offset moves the global and the LDS
         # address alike, so load i's carries its LDS step, taken back out of its row offset here
-        # (A_BIAS keeps that unsigned). A padding or dead row reads row `pos` rather than one
-        # shared row: every workgroup hammering one row camps on one memory channel.
+        # (A_BIAS keeps that unsigned). A padding row reads the lane's row of load 0, or the
+        # tile's first row if that is padding too: only this tile's rows are known written
+        # (before its expert's flag), and reading a row the dispatch is still writing can leave
+        # stale lines in the WGP's vector cache that the workgroup owning the row then hits.
+        # One shared fallback row would put every padding row's loads on one address.
+        first = rocdl.readfirstlane(T.i32, row_idx_table[row_idx_base])
+        fallback = ((first >= zero32) & (first < a_rows)).select(first, zero32)
         a_off = []
         for i in range_constexpr(N_LD):
             pos = fx.Int32(i * RPI) + rsub
             idx = row_idx_table[row_idx_base + pos]
-            ok = live & (idx >= zero32) & (idx < a_rows)
-            row = ok.select(idx, (pos < a_rows).select(pos, zero32))
+            ok = (idx >= zero32) & (idx < a_rows)
+            row = ok.select(idx, fallback)
+            if const_expr(i == 0):
+                fallback = row
             a_off.append(
                 row * fx.Int32(lda * EB) + c16 * fx.Int32(16) + fx.Int32(A_BIAS - i * RPI * LDS_ROW)
             )
@@ -329,7 +338,7 @@ def nt_gemm_tile(
         gt_a = _gv(gA_base, fx.Int64(a_row0) * lda_b, (tile_m, KB), (KB, 1))
         atom_a = _tdm(gt_a, m_ext, lda_b)
 
-    def issue(s, kt):
+    def issue(s, kt, prologue=False):
         pa = _buf_ptr(s)
         koff = fx.Int64(kt) * fx.Int64(KB)
         if const_expr(async_a):
@@ -340,10 +349,20 @@ def nt_gemm_tile(
             a_base = _raw(a_addr - fx.Int64(A_BIAS))
             lds = _llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), _raw(fx.Int32(_bidx(pa)) + a_lane_lds))
             koff32 = fx.Int32(kt) * fx.Int32(KB)
-            for i in range_constexpr(N_LD):
-                g = std_arith.AddIOp(a_base, std_arith.ExtUIOp(i64, _raw(a_off[i] + koff32)).result).result
-                gp = _llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), g)
-                _rocdl.global_load_async_to_lds_b128(gp, lds, i * RPI * LDS_ROW)
+
+            def _a_loads():
+                for i in range_constexpr(N_LD):
+                    g = std_arith.AddIOp(a_base, std_arith.ExtUIOp(i64, _raw(a_off[i] + koff32)).result).result
+                    gp = _llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), g)
+                    _rocdl.global_load_async_to_lds_b128(gp, lds, i * RPI * LDS_ROW)
+
+            if const_expr(prologue):
+                # a dead tile waits on no flag, so it reads no A at all (only the prologue runs
+                # for it); its LDS stays garbage and its store is dropped
+                if live:
+                    _a_loads()
+            else:
+                _a_loads()
         elif const_expr(gather):
             lds_base = fx.Int32(_bidx(pa))
             for q in range_constexpr(OPS_PER_WAVE):
@@ -478,7 +497,7 @@ def nt_gemm_tile(
         rocdl.sched_barrier(0)
         rocdl.s_barrier_wait(_WG_BARRIER)
 
-    issue(0, 0)
+    issue(0, 0, prologue=True)
     if const_expr(async_a):
         _rocdl.s_wait_asynccnt(0)
     _pipeline_fence(outstanding=0)
