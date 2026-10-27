@@ -35,6 +35,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -105,10 +107,12 @@ def materialize(spec, rung, out_root):
         shutil.rmtree(dst)
     shutil.copytree(base, dst)
     for p in chain:
-        r = subprocess.run(["git", "apply", "--whitespace=nowarn", "-p1", str(p)], cwd=dst,
-                           capture_output=True, text=True)  # fmt: skip
+        # GNU patch, not git apply: inside a git work tree (build/ is one) git apply silently skips every path
+        # outside the current directory. Exact application only: no fuzz, rejects fail the build.
+        r = subprocess.run(["patch", "-p1", "-s", "--batch", "--forward", "--fuzz=0", "--no-backup-if-mismatch",
+                            "-r", "-", "-i", str(p)], cwd=dst, capture_output=True, text=True)  # fmt: skip
         if r.returncode:
-            raise BuildError(f"rung {rung['id']}: patch {p.name} does not apply: {r.stderr.strip()[:2000]}")
+            raise BuildError(f"rung {rung['id']}: patch {p.name} does not apply: {(r.stdout + r.stderr).strip()[:2000]}")
     return dst
 
 
@@ -141,6 +145,54 @@ def toolchain(runner):
     return r.stdout.splitlines()[0].strip()
 
 
+def apply_unified_diff(text, patch):
+    """Apply a one-file unified diff with exact context (no fuzz); BuildError on any mismatch.
+    (The applier of primus_turbo/hipkittens/gfx1250_mla_bwd/hsaco.py.)"""
+    src, out, pos = text.split("\n"), [], 0
+    lines, i = patch.split("\n"), 0
+    while i < len(lines) and not lines[i].startswith("@@"):
+        i += 1
+    while i < len(lines):
+        m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", lines[i])
+        i += 1
+        if not m:
+            continue
+        start = int(m.group(1)) - 1 if int(m.group(2) or 1) > 0 else int(m.group(1))
+        out.extend(src[pos:start])
+        pos = start
+        while i < len(lines) and not lines[i].startswith("@@"):
+            line = lines[i]
+            if line[:1] in (" ", "-"):
+                if pos >= len(src) or src[pos] != line[1:]:
+                    raise BuildError(f"asm patch does not apply at line {pos + 1}")
+                if line[0] == " ":
+                    out.append(src[pos])
+                pos += 1
+            elif line[:1] == "+":
+                out.append(line[1:])
+            i += 1
+    out.extend(src[pos:])
+    return "\n".join(out)
+
+
+def _patch_and_reassemble(name, kspec, cmd, tree, tmp, runner):
+    """A kernel with ``asm_patch``: the compile left the compiler's own .s in ``tmp`` (-save-temps=obj). It must
+    have ``asm_input_sha256``; the patched .s is assembled and linked with the driver's own commands (-###)."""
+    s_files = sorted(tmp.glob(f"{name}-hip-*.s"))
+    if len(s_files) != 1:
+        raise BuildError(f"{name}: expected one saved .s, found {[p.name for p in s_files]}")
+    got = hashlib.sha256(s_files[0].read_bytes()).hexdigest()
+    if got != kspec["asm_input_sha256"]:
+        raise BuildError(f"{name}: compiler .s sha256 {got[:16]} != asm_input_sha256 {kspec['asm_input_sha256'][:16]}")
+    s_files[0].write_text(apply_unified_diff(s_files[0].read_text(), (Path(tree) / kspec["asm_patch"]).read_text()))
+    dry = _run(runner, cmd + ["-###"], tree)
+    steps = [shlex.split(line) for line in dry.stderr.splitlines() if line.startswith(' "')]
+    for step in (next(s for s in steps if "-cc1as" in s), next(s for s in steps if s[0].endswith("lld"))):
+        r = _run(runner, step, tree)
+        if r.returncode:
+            raise BuildError(f"{name}: {step[0]} failed ({r.returncode}): {r.stderr[-2000:]}")
+
+
 def build_kernel(spec, rung, name, kspec, tree, out_dir, runner, tc):
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp = out_dir / f".tmp_{name}"
@@ -166,6 +218,13 @@ def build_kernel(spec, rung, name, kspec, tree, out_dir, runner, tc):
         errors.append(f"{len(ub)} UB-class warning(s): {ub[0][:200]}")
     meta = {"name": name, "rung": rung["id"], "ladder": ladder_name(spec), "toolchain": tc, "flags": cmd,
             "tree": str(tree), "ok": False, "errors": errors, "kernels": {}}  # fmt: skip
+    if not r.returncode and kspec.get("asm_patch"):
+        try:
+            meta["asm_patch"] = kspec["asm_patch"]
+            _patch_and_reassemble(name, kspec, cmd, tree, tmp, runner)
+        except BuildError as e:
+            errors.append(str(e))
+            r = subprocess.CompletedProcess(cmd, 1, r.stdout, r.stderr)
     if not r.returncode:
         shutil.copy2(tmp / f"{name}.hsaco", hsaco)
         s = sorted(tmp.glob("*.s"))
@@ -178,9 +237,11 @@ def build_kernel(spec, rung, name, kspec, tree, out_dir, runner, tc):
         meta["hsaco_sha256"] = hashlib.sha256(hsaco.read_bytes()).hexdigest()
         meta["kernels"] = codeobj.kernels(str(hsaco))
         for kn, k in meta["kernels"].items():
-            if k["scratch"] or k["vgpr_spill"] or k["sgpr_spill"] or k["dynamic_stack"]:
+            # SGPR spills go to VGPR lanes (no memory traffic) and are tolerated, as in the shipped MLA dK/dV
+            # kernel; anything that reaches scratch memory fails the build.
+            if k["scratch"] or k["vgpr_spill"] or k["dynamic_stack"]:
                 errors.append(f"{kn}: scratch {k['scratch']} vgpr_spill {k['vgpr_spill']} "
-                              f"sgpr_spill {k['sgpr_spill']} dynamic_stack {k['dynamic_stack']}")  # fmt: skip
+                              f"dynamic_stack {k['dynamic_stack']}")  # fmt: skip
     if TOOLCHAIN not in tc:
         errors.append(f"toolchain is not {TOOLCHAIN[:12]}: {tc}")
     want = kspec.get("sha256")  # full sha256, or a prefix of >= 12 hex digits where only that was recorded

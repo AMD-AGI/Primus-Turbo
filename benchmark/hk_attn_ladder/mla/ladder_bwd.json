@@ -1,0 +1,334 @@
+{
+ "name": "mla_bwd",
+ "title": "DeepSeek-V3 MLA attention backward (bf16, qk 192 / v 128, MHA 128 heads, causal, SBHD) on gfx1250",
+ "tree": "hip",
+ "flags": [
+  "-x",
+  "hip",
+  "--offload-arch=gfx1250",
+  "--cuda-device-only",
+  "--no-gpu-bundle-output",
+  "-O3",
+  "-std=c++20",
+  "-DNDEBUG",
+  "-DKITTENS_CDNA5",
+  "-Iinclude",
+  "-I.",
+  "-save-temps=obj"
+ ],
+ "notes": [
+  "hip/ is primus_turbo/hipkittens/gfx1250_mla_bwd/hip at Primus-Turbo d3590be4 (dev/lhz/dsv3-attn-hk-b0); patches/NN_<commit>.patch is that commit's change to hip/, so rung N's tree is the branch's hip/ at that commit.",
+  "sha256 / asm_input_sha256 / extra_flags: the commit's manifest.json; FlyDSL bwd (baseline) = 3.194 ms on the same ruler.",
+  "ref_ms: a08-1 GPU3 full backward at b2 s4096 h128 SBHD (scripts/hk/mla_ab.py), orientation only."
+ ],
+ "rungs": [
+  {
+   "id": "hk_v0",
+   "commit": "d3590be4",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions"
+     ],
+     "sha256": "5698407882321aca92a5baaad8074d7cbb86a5e45218f3c448b5d04f0af30084"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [],
+     "sha256": "8e778af52399414892bac164b0e47ffd2b9cee46ed4da9bcffaa4e26cebd9b63"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "delta": "flydsl"
+    }
+   },
+   "feature": "first HK backward: dK/dV on 96-row kv blocks exporting dS^T to a scratch, dQ = dS K from it (no S/dP recompute)",
+   "ref_ms": 2.529
+  },
+  {
+   "id": "r1",
+   "commit": "d18ab9fc",
+   "parent": "hk_v0",
+   "patch": "patches/01_d18ab9fc.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "401937739b4fc949cc57b160be284f1d8a2d6f78d404d18fd036f22b00884e50"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "af5fe0f87242a0e44974f9101efa1412dccec073f932855902d457b6c45add28"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "delta": "flydsl"
+    }
+   },
+   "feature": "round 1: dK/dV scheduling (dS export placement, split barrier, MHA loop top, NL/ND voffsets), masked tiles on the TDM ring, dQ split barrier / tr16 interleave / branch-free masks; expert scheduling for both",
+   "ref_ms": 2.299
+  },
+  {
+   "id": "r2",
+   "commit": "5c20de7e",
+   "parent": "r1",
+   "patch": "patches/02_5c20de7e.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "401937739b4fc949cc57b160be284f1d8a2d6f78d404d18fd036f22b00884e50"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "5e3782d65b17dfed8abfa1a1227d42fd5bf825ae52d2df55b6c20c5ce88dda2a"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "delta": "flydsl"
+    }
+   },
+   "feature": "dQ round 2: snake q pairs, masked-pair skip, steady loop unrolled by the ring depth, per-sub-tile epilogue image",
+   "ref_ms": 2.274
+  },
+  {
+   "id": "r3",
+   "commit": "4469dab5",
+   "parent": "r2",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-misched-prera-direction=bottomup",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-disable-machine-sink"
+     ],
+     "sha256": "de541125d4c4dd56ff790493205ea5f2cd19f9c0f0e4d59c4c8f14417209035f"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "5e3782d65b17dfed8abfa1a1227d42fd5bf825ae52d2df55b6c20c5ce88dda2a"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "delta": "flydsl"
+    }
+   },
+   "feature": "dK/dV compiler knobs: bottom-up pre-RA scheduling, delay-alu off, no machine sink",
+   "ref_ms": 2.255
+  },
+  {
+   "id": "r4",
+   "commit": "2f3d60c6",
+   "parent": "r3",
+   "patch": "patches/04_2f3d60c6.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness"
+     ],
+     "sha256": "89068310a36c2d9a22da5ac9990abe3f12477f1bb76649c84a6c5afb02f6f40c",
+     "asm_patch": "asm/k_dkdv96ds.s.patch",
+     "asm_input_sha256": "85219fe5c261e670b4b1ffb2b4f66f302cab5548c93dbb140aaa76d9339a8777"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "5e3782d65b17dfed8abfa1a1227d42fd5bf825ae52d2df55b6c20c5ce88dda2a"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "delta": "flydsl"
+    }
+   },
+   "feature": "dK/dV: Q^T loads interleaved into the dV run + asm register retarget (va_vdst(0) drains 15 -> 9 per 2 iterations)",
+   "ref_ms": 2.231
+  },
+  {
+   "id": "r5",
+   "commit": "5b19697f",
+   "parent": "r4",
+   "patch": "patches/05_5b19697f.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness"
+     ],
+     "sha256": "89068310a36c2d9a22da5ac9990abe3f12477f1bb76649c84a6c5afb02f6f40c",
+     "asm_patch": "asm/k_dkdv96ds.s.patch",
+     "asm_input_sha256": "85219fe5c261e670b4b1ffb2b4f66f302cab5548c93dbb140aaa76d9339a8777"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "5e3782d65b17dfed8abfa1a1227d42fd5bf825ae52d2df55b6c20c5ce88dda2a"
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "delta": "hk"
+    }
+   },
+   "feature": "HIP k_delta (several b128 loads in flight per lane)",
+   "ref_ms": 2.218
+  },
+  {
+   "id": "r6",
+   "commit": "7ccfba3b",
+   "parent": "r5",
+   "patch": "patches/06_7ccfba3b.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness"
+     ],
+     "sha256": "dda0e6e0f13ba5de19d1cdea5d32b1141193ee4ffe814225fd4bac6b34260650",
+     "asm_patch": "asm/k_dkdv96ds.s.patch",
+     "asm_input_sha256": "47100516166f93af962518f4e6d36ec258d14d565ce809263b225a451f610683"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "5e3782d65b17dfed8abfa1a1227d42fd5bf825ae52d2df55b6c20c5ce88dda2a"
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "delta": "hk"
+    }
+   },
+   "feature": "hardening: s_wait_xcnt before the tail block reuses its K/V descriptor SGPRs (perf-neutral)"
+  },
+  {
+   "id": "r7",
+   "commit": "71bd0329",
+   "parent": "r6",
+   "patch": "patches/07_71bd0329.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness"
+     ],
+     "sha256": "853798b9a06588a3c8d82c5de3fcbd963f8946f2e2be548b1c0ea82bb6585673",
+     "asm_patch": "asm/k_dkdv96ds.s.patch",
+     "asm_input_sha256": "386bfa6733d3c5b5c057ab3d4f20c7ab8fa491a314abb7a4d41fd4c56643e076"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "5e3782d65b17dfed8abfa1a1227d42fd5bf825ae52d2df55b6c20c5ce88dda2a"
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "delta": "hk"
+    }
+   },
+   "feature": "redundant causal test dropped from the masked dK/dV loop",
+   "ref_ms": 2.22
+  }
+ ]
+}
