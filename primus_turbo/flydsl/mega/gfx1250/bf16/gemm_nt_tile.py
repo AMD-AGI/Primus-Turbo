@@ -217,7 +217,7 @@ def nt_gemm_tile(
     block reads its columns ``blk_n ..``, and ``i32_n`` (N, at least ``tile_n``) bounds that
     read. C is written at byte address ``c_addr`` with row stride
     ``ldc``, ``m_rows`` rows and ``n_valid`` columns kept. ``live`` (wave-uniform i1) turns the
-    tile into a no-op. ``c_cache_modifier`` is the C stores' cache policy (``cpol_device_stream()``
+    tile into a no-op. ``c_cache_modifier`` is the C stores' cache policy (``CPOL_DEVICE_STREAM``
     when another workgroup consumes C in the same launch).
     """
     KB = tile_k * EB

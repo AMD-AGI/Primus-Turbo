@@ -54,22 +54,22 @@ os.environ["FLYDSL_RUNTIME_ENABLE_CACHE"] = "0"
 import flydsl.compiler as flyc  # noqa: E402
 import flydsl.expr as fx  # noqa: E402
 
-from primus_turbo.flydsl.mega.bf16.ep_intranode import (  # noqa: E402
+from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (  # noqa: E402
     combine_bf16_tile,
     dispatch_bf16_tile,
     topk_reduce_bf16_tile,
 )
-from primus_turbo.flydsl.mega.bf16.symm_buffer import SymBuffer, Workspace  # noqa: E402
-from primus_turbo.flydsl.utils.arch import (  # noqa: E402
-    cpol_device_stream,
-    cpol_system_stream,
+from primus_turbo.flydsl.mega.gfx1250.symm_buffer import SymBuffer, Workspace  # noqa: E402
+from primus_turbo.flydsl.mega.gfx1250.prims import (  # noqa: E402
+    CPOL_DEVICE_STREAM,
+    CPOL_SYSTEM_STREAM,
 )
 from primus_turbo.flydsl.utils.buffer_ops import (  # noqa: E402
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
 )
-from primus_turbo.flydsl.utils.prims import (  # noqa: E402
+from primus_turbo.flydsl.mega.gfx1250.prims import (  # noqa: E402
     atomic_add,
     cast,
     ld,
@@ -97,7 +97,7 @@ def mega_prims_probe(sym: SymBuffer, dst_rank: fx.Int32):
     local_res = create_buffer_resource_from_addr(base, num_records_bytes=_BLOCK * 16)
     peer_res = create_buffer_resource_from_addr(peer, num_records_bytes=_BLOCK * 16)
     start = read_clock()
-    device_cpol, system_cpol = cpol_device_stream(), cpol_system_stream()
+    device_cpol, system_cpol = CPOL_DEVICE_STREAM, CPOL_SYSTEM_STREAM
     payload = buffer_load(local_res, lane_word, vec_width=4, dtype=fx.T.i32, cache_modifier=device_cpol)
     buffer_store(payload, peer_res, lane_word, cache_modifier=system_cpol)
     wait_mem_all()

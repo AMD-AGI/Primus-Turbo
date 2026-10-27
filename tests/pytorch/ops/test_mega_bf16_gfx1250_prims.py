@@ -31,20 +31,20 @@ flyc = pytest.importorskip("flydsl.compiler")
 fx = pytest.importorskip("flydsl.expr")
 from flydsl.expr import arith, range_constexpr  # noqa: E402
 
-from primus_turbo.flydsl.mega.bf16.ep_intranode import (  # noqa: E402
+from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (  # noqa: E402
     spin_until_flag_reaches,
 )
-from primus_turbo.flydsl.mega.bf16.symm_buffer import SymBuffer  # noqa: E402
-from primus_turbo.flydsl.utils.arch import (  # noqa: E402
-    cpol_device_stream,
-    cpol_system_stream,
+from primus_turbo.flydsl.mega.gfx1250.symm_buffer import SymBuffer  # noqa: E402
+from primus_turbo.flydsl.mega.gfx1250.prims import (  # noqa: E402
+    CPOL_DEVICE_STREAM,
+    CPOL_SYSTEM_STREAM,
 )
 from primus_turbo.flydsl.utils.buffer_ops import (  # noqa: E402
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
 )
-from primus_turbo.flydsl.utils.prims import (  # noqa: E402
+from primus_turbo.flydsl.mega.gfx1250.prims import (  # noqa: E402
     atomic_add,
     cast,
     copy_warp,
@@ -59,7 +59,11 @@ _HALF_WORDS = 1 << 22
 _HALF_BYTES = _HALF_WORDS * 4
 _SENTINEL = 0x7EADBEEF
 
-_CPOLS = {"none": lambda: 0, "device": cpol_device_stream, "system": cpol_system_stream}
+_CPOLS = {
+    "none": lambda: 0,
+    "device": lambda: CPOL_DEVICE_STREAM,
+    "system": lambda: CPOL_SYSTEM_STREAM,
+}
 
 
 def _scratch():
@@ -160,8 +164,8 @@ def _copy_launcher(hidden: int):
             dst,
             src,
             nbytes,
-            load_cache_modifier=cpol_device_stream(),
-            store_cache_modifier=cpol_system_stream(),
+            load_cache_modifier=CPOL_DEVICE_STREAM,
+            store_cache_modifier=CPOL_SYSTEM_STREAM,
         )
 
     @flyc.jit
@@ -228,7 +232,7 @@ def _flag_launcher(rounds: int):
                 spin_until_flag_reaches(ack, pair, cast(r, fx.T.i64), "sys", 0, "ack")
                 for k in range_constexpr(_FLAG_WORDS_PER_THREAD):
                     value = (r + fx.Int32(1)) * fx.Int32(1 << 20) + tag + fx.Int32(k)
-                    buffer_store(value, payload_res, first_word + fx.Int32(k), cache_modifier=cpol_system_stream())
+                    buffer_store(value, payload_res, first_word + fx.Int32(k), cache_modifier=CPOL_SYSTEM_STREAM)
                 wait_mem_all()
                 fx.gpu.barrier()
                 if t == fx.Int32(0):
@@ -244,7 +248,7 @@ def _flag_launcher(rounds: int):
                         first_word + fx.Int32(k),
                         vec_width=1,
                         dtype=fx.T.i32,
-                        cache_modifier=cpol_system_stream(),
+                        cache_modifier=CPOL_SYSTEM_STREAM,
                     )
                     want = (r + fx.Int32(1)) * fx.Int32(1 << 20) + tag + fx.Int32(k)
                     errors = errors + arith.select(got != want, fx.Int32(1), fx.Int32(0))

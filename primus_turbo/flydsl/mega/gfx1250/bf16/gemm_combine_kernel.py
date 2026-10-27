@@ -47,19 +47,19 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
     _i32_table,
     _require_gfx1250,
 )
-from primus_turbo.flydsl.mega.bf16.dispatch_prologue_kernel import DispatchHandle
-from primus_turbo.flydsl.mega.bf16.ep_intranode import (
+from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
+from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (
     combine_bf16_tile,
     spin_until_flag_reaches,
     topk_reduce_bf16_tile,
 )
-from primus_turbo.flydsl.mega.bf16.symm_buffer import (
+from primus_turbo.flydsl.mega.gfx1250.symm_buffer import (
     BLOCK_M,
     TOKEN_DTYPE,
     Workspace,
     get_symm_buffer_for_mega_moe,
 )
-from primus_turbo.flydsl.mega.bf16_gfx1250.gemm_nt_tile import (
+from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     EB,
     GFX1250_LDS_BYTES,
     NUM_BUFFERS,
@@ -67,9 +67,15 @@ from primus_turbo.flydsl.mega.bf16_gfx1250.gemm_nt_tile import (
     nt_gemm_tile,
     tile_geometry,
 )
-from primus_turbo.flydsl.utils.arch import cpol_device_stream
 from primus_turbo.flydsl.utils.buffer_ops import create_buffer_resource_from_addr
-from primus_turbo.flydsl.utils.prims import atomic_add, cast, ld, st, wait_mem_all
+from primus_turbo.flydsl.mega.gfx1250.prims import (
+    CPOL_DEVICE_STREAM,
+    atomic_add,
+    cast,
+    ld,
+    st,
+    wait_mem_all,
+)
 
 # fold rows per combine work item: two rows for each wave of the default 8-wave workgroup
 _FOLD_CHUNK_ROWS = 16
@@ -264,7 +270,7 @@ def _launch_gemm_combine_nt(
             m_warp=m_warp,
             n_warp=n_warp,
             gather=False,
-            c_cache_modifier=cpol_device_stream(),  # read by combine workgroups on other CUs
+            c_cache_modifier=CPOL_DEVICE_STREAM,  # read by combine workgroups on other CUs
             b_nn=B_NN,
             i32_n=fx.Int32(N),
         )

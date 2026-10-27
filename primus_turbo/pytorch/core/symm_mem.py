@@ -11,6 +11,8 @@ from typing import Optional, Sequence
 
 import torch
 import torch.distributed as dist
+import triton
+import triton.language as tl
 from torch._tensor import _dtype_to_typestr
 
 from primus_turbo.pytorch.core.pyhip_runtime_wrapper import (
@@ -19,28 +21,19 @@ from primus_turbo.pytorch.core.pyhip_runtime_wrapper import (
 )
 
 
-try:
-    import triton
-    import triton.language as tl
-except ImportError:  # gfx1250 builds ship without Triton; only barrier() needs it
-    triton = None
+@triton.jit
+def _barrier_all_ipc_kernel(rank, num_ranks, comm_buf_base_ptrs):
+    for i in range(num_ranks):
+        remote_base_ptr = tl.load(comm_buf_base_ptrs + i).to(tl.pointer_type(tl.int32))
+        while tl.atomic_cas(remote_base_ptr + rank, 0, 1, scope="sys", sem="release") != 0:
+            pass
 
+    for i in range(num_ranks):
+        local_base_ptr = tl.load(comm_buf_base_ptrs + rank).to(tl.pointer_type(tl.int32))
+        while tl.atomic_cas(local_base_ptr + i, 1, 0, scope="sys", sem="acquire") != 1:
+            pass
 
-if triton is not None:
-
-    @triton.jit
-    def _barrier_all_ipc_kernel(rank, num_ranks, comm_buf_base_ptrs):
-        for i in range(num_ranks):
-            remote_base_ptr = tl.load(comm_buf_base_ptrs + i).to(tl.pointer_type(tl.int32))
-            while tl.atomic_cas(remote_base_ptr + rank, 0, 1, scope="sys", sem="release") != 0:
-                pass
-
-        for i in range(num_ranks):
-            local_base_ptr = tl.load(comm_buf_base_ptrs + rank).to(tl.pointer_type(tl.int32))
-            while tl.atomic_cas(local_base_ptr + i, 1, 0, scope="sys", sem="acquire") != 1:
-                pass
-
-        tl.debug_barrier()
+    tl.debug_barrier()
 
 
 _group_name_to_workspace_tensor = {}
@@ -294,8 +287,6 @@ class SymmetricMemory:
         """GPU-side IPC barrier across all ranks on the given stream via the signal-pad memory."""
         if self.signal_pad_size <= 0:
             raise RuntimeError("barrier() requires signal_pad_size > 0")
-        if triton is None:
-            raise RuntimeError("barrier() needs Triton, which this build does not ship")
         if stream is None:
             stream = torch.cuda.current_stream()
         with torch.cuda.stream(stream):

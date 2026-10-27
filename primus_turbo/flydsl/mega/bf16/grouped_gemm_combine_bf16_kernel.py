@@ -33,7 +33,6 @@ from primus_turbo.flydsl.mega.bf16.symm_buffer import (
     Workspace,
     get_symm_buffer_for_mega_moe,
 )
-from primus_turbo.flydsl.utils.arch import cpol_device_stream
 from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_load,
     buffer_store,
@@ -49,7 +48,6 @@ from primus_turbo.flydsl.utils.prims import (
     atomic_add,
     cast,
     ceildiv,
-    wait_mem_all,
 )
 
 _WARP = 64
@@ -254,7 +252,7 @@ def _make_grouped_gemm_combine(
                     next_tile_m = arith.select(
                         last_tile_m < next_tile_m, next_tile_m, last_tile_m + fx.Int32(1)
                     )
-                    wait_mem_all()
+                    fx.rocdl.s_waitcnt(0)
                     fx.gpu.barrier()
                     combine_bf16_tile(
                         sym_buffer,
@@ -340,12 +338,12 @@ def _make_grouped_gemm_combine(
                     out_fp16=out_fp16,
                     nt_vmcnt=nt_vmcnt,
                     n_tail=out_features % BLOCK_N,
-                    c_cache_modifier=cpol_device_stream(),  # agent-visible non-temporal local stage
+                    c_cache_modifier=18,  # sc1|nt: agent-visible non-temporal local stage.
                 )
-                wait_mem_all()
+                fx.rocdl.s_waitcnt(0)
                 fx.gpu.barrier()
                 # Keep a separator: LLVM folds adjacent barriers, but two rendezvous are required.
-                wait_mem_all()
+                fx.rocdl.s_waitcnt(0)
                 fx.gpu.barrier()
                 if thread_index == fx.Int32(0):
                     atomic_add(combine_flag_base, combine_bank + tile_m, fx.Int64(1))

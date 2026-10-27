@@ -23,7 +23,6 @@ from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import ArithValue
 
-from primus_turbo.flydsl.utils.arch import is_gfx1250_target
 from primus_turbo.flydsl.utils.buffer_ops import (
     _create_i32_constant,
     _create_i64_constant,
@@ -47,31 +46,10 @@ SPIN_TIMEOUT_CYCLES = 3_000_000_000
 
 def read_clock() -> ArithValue:
     # Realtime counter for spin-wait watchdogs; unsigned so deltas compare right.
-    # gfx12 dropped s_memrealtime; the realtime counter is read through a returning sendmsg.
-    if is_gfx1250_target():
-        asm = "s_sendmsg_rtn_b64 $0, sendmsg(MSG_RTN_GET_REALTIME)\n\ts_wait_kmcnt 0"
-    else:
-        asm = "s_memrealtime $0\n\ts_waitcnt lgkmcnt(0)"
-    op = llvm.inline_asm(fx.T.i64, [], asm, "=s", has_side_effects=True)
+    op = llvm.inline_asm(
+        fx.T.i64, [], "s_memrealtime $0\n\ts_waitcnt lgkmcnt(0)", "=s", has_side_effects=True
+    )
     return fx.arith.ArithValue(op, signed=False)
-
-
-# gfx12 split the unified counter; stores retire on storecnt, which vmcnt no longer covers.
-_GFX1250_WAIT_ALL = "s_wait_dscnt 0\n\ts_wait_kmcnt 0\n\ts_wait_loadcnt 0\n\ts_wait_storecnt 0"
-
-
-def wait_mem_all() -> None:
-    """Retire every outstanding memory op of this wave, stores included (e.g. before a flag publish)."""
-    if is_gfx1250_target():
-        llvm.inline_asm(
-            res=None,
-            operands_=[],
-            asm_string=_GFX1250_WAIT_ALL,
-            constraints="~{memory}",
-            has_side_effects=True,
-        )
-    else:
-        rocdl.s_waitcnt(0)
 
 
 def spin_timed_out(spin_start: ArithValue, timeout: int = SPIN_TIMEOUT_CYCLES) -> ArithValue:
@@ -253,7 +231,6 @@ def copy_warp(
     src_off: Union[int, ArithValue] = 0,
     load_cache_modifier: int = 0,
     store_cache_modifier: int = 0,
-    warp: int = _WARP,
 ) -> None:
     def _addr_i64(addr: Union[int, ArithValue]) -> ArithValue:
         if isinstance(addr, int):
@@ -274,7 +251,7 @@ def copy_warp(
         return create_buffer_resource_from_addr(base, num_records_bytes=nbytes), fx.Int32(0)
 
     assert nbytes % (_COPY_VEC_I32 * _I32_BYTES) == 0, "copy_warp nbytes must be a multiple of 16"
-    cols = warp * _COPY_VEC_I32
+    cols = _WARP * _COPY_VEC_I32
     num_full_chunks = nbytes // _I32_BYTES // cols
     tail_words = nbytes // _I32_BYTES - num_full_chunks * cols
     # A ragged tail parks its idle lanes' stores one row past the end, which only the
@@ -284,7 +261,7 @@ def copy_warp(
     )
     src, src_off = _copy_operand(src, src_off, nbytes)
     dst, dst_off = _copy_operand(dst, dst_off, nbytes)
-    lane_off = (fx.thread_idx.x % fx.Int32(warp)) * fx.Int32(_COPY_VEC_I32)
+    lane_off = (fx.thread_idx.x % fx.Int32(_WARP)) * fx.Int32(_COPY_VEC_I32)
     offs = [fx.Int32(c * cols) + lane_off for c in range_constexpr(num_full_chunks)]
     load_offs = list(offs)
     if tail_words:

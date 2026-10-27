@@ -61,7 +61,7 @@ def _reference(a_rows, b, tile_to_expert, live):
 @pytest.mark.parametrize("mode", ["gather16", "gather32", "dense"])
 @pytest.mark.parametrize("b_layout", ["nt", "nn"])
 def test_mega_nt_tile(N, K, group_lens, mode, b_layout):
-    from primus_turbo.flydsl.mega.bf16_gfx1250.gemm_nt_tile import mega_grouped_gemm_nt_gfx1250
+    from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import mega_grouped_gemm_nt_gfx1250
 
     torch.manual_seed(0)
     G = len(group_lens)

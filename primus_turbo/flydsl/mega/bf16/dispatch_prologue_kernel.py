@@ -593,15 +593,13 @@ def get_dispatch_prologue_scratch(num_experts, device="cuda"):
         for num_cu, num_threads in itertools.product((32, 64, 96), (256, 512, 1024))
     ],
     rep=5,
-    # Retune per shape; topk_idx dtype auto-joins the key via the tensor arg. A tuning run launches
-    # the kernel, whose barriers wait for every rank, so all ranks must tune together: the key holds
-    # only values every rank shares -- the symmetric buffer's token capacity, not this rank's tokens
-    # or its rank -- or one rank tunes while another hits its cache and the two deadlock.
+    # Retune per shape; topk_idx dtype auto-joins the key via the tensor arg.
     key=[
-        "num_max_tokens_per_rank",
+        "num_tokens",
         "num_topk",
         "num_experts",
         "num_ranks",
+        "rank",
         "num_experts_per_rank",
         "block_m",
         "num_max_pool_tokens",
