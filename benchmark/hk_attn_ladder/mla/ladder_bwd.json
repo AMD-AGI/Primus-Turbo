@@ -21,7 +21,8 @@
   "sha256 / asm_input_sha256 / extra_flags: the commit's manifest.json; FlyDSL bwd (baseline) = 3.194 ms on the same ruler.",
   "ref_ms: a08-1 GPU3 full backward at b2 s4096 h128 SBHD (scripts/hk/mla_ab.py), orientation only.",
   "Rounds 1 / 2 are split into one-feature sub-rungs r1a..r1m (hk_v0 -> d18ab9fc) and r2a..r2f (d18ab9fc -> 5c20de7e), reconstructed from the scratch variants of the dsv3 hk_b0 study (x1_dkdv_sched, x2_dkdv_expert, x3_dkdv_mask, x4_dq, r2_z3_dq; reports results/hk_b0/p2_*.md, p3_z3.md). r1 = r1m byte for byte (no leftover patch); r2 = r2f + patches/02z_5c20de7e_leftover.patch (renames, comment moves, code motion of desc(), dead last-unit code; codegen neutral: r2f already builds r2's pinned sha). patches/01_d18ab9fc.patch / 02_5c20de7e.patch are the whole-commit diffs, kept for reference (applying a round's sub-patches in order gives the same tree); no rung uses them.",
-  "Sub-rung refs: dkdv numbers are paired speedups vs hk_v0 from multi_ab / pair_ab (same process, rotating order, 60 x 8192^3 GEMM prefill, GPU3 of a08-1); dq-only numbers (x4_ab / z3_ab) time k_dqds_c after the shipped delta + dkdv of that time (hk_v0 for round 1, r1 for round 2), so behind a faster dkdv they shrink (power coupling). A ref says when it was measured standalone or in another order; rungs without a matching measurement say so."
+  "Sub-rung refs: dkdv numbers are paired speedups vs hk_v0 from multi_ab / pair_ab (same process, rotating order, 60 x 8192^3 GEMM prefill, GPU3 of a08-1); dq-only numbers (x4_ab / z3_ab) time k_dqds_c after the shipped delta + dkdv of that time (hk_v0 for round 1, r1 for round 2), so behind a faster dkdv they shrink (power coupling). A ref says when it was measured standalone or in another order; rungs without a matching measurement say so.",
+  "main line m02 -> m07q (written 2026-10-27, e15-02): a wider dQ wave (K^T reuse), bursts, 32 kv rows per dK / dV wave with 32-query steps, longest-first order, 64-query dQ waves. The Llama backward ladder's later steps (LD rows by TDM, pipelined softmax, barrier + readback, a deeper ring, wave kinds) measured flat on MLA at this geometry and are side rungs; hk_v0 remains a 1.4-1.5x step (48-row waves on 2-wave workgroups, export in whole lines, causal-packed dS, 384-query dQ on a K ring)."
  ],
  "rungs": [
   {
@@ -81,6 +82,109 @@
    "feature": "dS^T exported by the dK/dV kernel to a scratch, dQ = dS K read back from it: no S/dP recompute, no atomics"
   },
   {
+   "id": "m03q",
+   "parent": "m02",
+   "tree": "../llama/hip",
+   "kernels": {
+    "k_mla_m03q": {
+     "src": "src/ladder/m03q_dq_wide.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_mladder",
+    "opts": {
+     "prefix": "k_mla_m03q",
+     "plan": "export",
+     "q_per_wg": 128
+    }
+   },
+   "feature": "dQ kernel: 32 queries per wave (128 per WG), each K^T operand feeds 2 WMMAs, a chunk's operands as one burst"
+  },
+  {
+   "id": "m04b",
+   "parent": "m03q",
+   "tree": "../llama/hip",
+   "kernels": {
+    "k_mla_m04b": {
+     "src": "src/ladder/m04b_bursts.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_mladder",
+    "opts": {
+     "prefix": "k_mla_m04b",
+     "plan": "export",
+     "q_per_wg": 128
+    }
+   },
+   "feature": "dK/dV kernel: operand bursts per q tile, tr16 operands of dV / dK during the softmax, NL / delta requested a run ahead"
+  },
+  {
+   "id": "m05w",
+   "parent": "m04b",
+   "tree": "../llama/hip",
+   "kernels": {
+    "k_mla_m05w": {
+     "src": "src/ladder/m05w_kv32.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_mladder",
+    "opts": {
+     "prefix": "k_mla_m05w",
+     "plan": "export",
+     "q_per_wg": 128,
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "dK/dV kernel: 32 kv rows per wave (128 per WG), 32-query steps: every Q / dO operand feeds 2 WMMAs"
+  },
+  {
+   "id": "m06g",
+   "parent": "m05w",
+   "tree": "../llama/hip",
+   "kernels": {
+    "k_mla_m06g": {
+     "src": "src/ladder/m06g_longest_first.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_mladder",
+    "opts": {
+     "prefix": "k_mla_m06g",
+     "plan": "export",
+     "q_per_wg": 128,
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "longest-first workgroup order in both kernels (heads fastest; kv blocks ascending, q blocks descending)"
+  },
+  {
+   "id": "m07q",
+   "parent": "m06g",
+   "tree": "../llama/hip",
+   "kernels": {
+    "k_mla_m07q": {
+     "src": "src/ladder/m07q_dq64.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_mladder",
+    "opts": {
+     "prefix": "k_mla_m07q",
+     "plan": "export",
+     "q_per_wg": 256,
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "dQ kernel: 64 queries per wave (256 per WG): each K^T operand feeds 4 WMMAs, a K tile serves 256 queries"
+  },
+  {
    "id": "hk_v0",
    "commit": "d3590be4",
    "kernels": {
@@ -101,10 +205,10 @@
    "launch": {
     "module": "bwd_hk"
    },
-   "feature": "first HK backward (d3590be4): m02 + 96-row kv blocks (two 48-row waves on a 3-stage Q/dO TDM ring, 1 wave/SIMD), causal-packed dS layout (4.33 GB), 384-query dQ workgroups on a K ring, lock_simd",
+   "feature": "first HK backward (d3590be4): 48 kv rows per wave on 2-wave workgroups (each Q / dO operand feeds 3 WMMAs), a 3-stage Q / dO ring with per-q-tile readback, dS^T exported in whole 128-B lines (DPP regroup) to a causal-packed layout (4.33 GB), 384-query dQ workgroups on a K ring, lock_simd",
    "ref_ms": 2.529,
    "bitwise_with": "flydsl",
-   "parent": "m02"
+   "parent": "m07q"
   },
   {
    "id": "r1a",
@@ -929,6 +1033,166 @@
    "feature": "redundant causal test dropped from the masked dK/dV loop",
    "ref_ms": 2.22,
    "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "m07k",
+   "parent": "m06g",
+   "tree": "../llama/hip",
+   "kernels": {
+    "k_mla_m07k": {
+     "src": "src/ladder/m07k_wave_kinds.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_mladder",
+    "opts": {
+     "prefix": "k_mla_m07k",
+     "plan": "export",
+     "q_per_wg": 128,
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "flat on MLA (1.00x): q steps descending, FULL steps without the mask, wave kinds on the diagonal -- the mask is a smaller share of a 6-k-step S tile, at 966 VGPRs",
+   "side": true
+  },
+  {
+   "id": "m07l",
+   "parent": "m06g",
+   "tree": "../llama/hip",
+   "kernels": {
+    "k_mla_m07l": {
+     "src": "src/ladder/m07l_ld_tdm.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_mladder",
+    "opts": {
+     "prefix": "k_mla_m07l",
+     "plan": "export",
+     "q_per_wg": 128,
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "flat on MLA (side): NL / delta rows by TDM with the step's Q / dO tiles (the Llama ladder's b07l; 1.00x)",
+   "side": true
+  },
+  {
+   "id": "m08p",
+   "parent": "m06g",
+   "tree": "../llama/hip",
+   "kernels": {
+    "k_mla_m08p": {
+     "src": "src/ladder/m08p_pipeline.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_mladder",
+    "opts": {
+     "prefix": "k_mla_m08p",
+     "plan": "export",
+     "q_per_wg": 128,
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "flat on MLA (side): q tile 1's S / dP WMMAs || q tile 0's softmax, co-execution scheduler (0.99x; by kv tile: 0.98x)",
+   "side": true
+  },
+  {
+   "id": "m08q",
+   "parent": "m07l",
+   "tree": "../llama/hip",
+   "kernels": {
+    "k_mla_m08q": {
+     "src": "src/ladder/m08q_dq64.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_mladder",
+    "opts": {
+     "prefix": "k_mla_m08q",
+     "plan": "export",
+     "q_per_wg": 256,
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "m07l + the 64-query dQ waves of m07q",
+   "side": true
+  },
+  {
+   "id": "m08h",
+   "parent": "m07q",
+   "tree": "../llama/hip",
+   "kernels": {
+    "k_mla_m08h": {
+     "src": "src/ladder/m08h_two_waves.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_mladder",
+    "opts": {
+     "prefix": "k_mla_m08h",
+     "plan": "export",
+     "q_per_wg": 256,
+     "kv_per_wg": 64,
+     "dkdv_block": 64
+    }
+   },
+   "feature": "negative on MLA (side): 2-wave dK / dV workgroups (64 kv rows; 0.97x: twice the Q / dO staging per kv row)",
+   "side": true
+  },
+  {
+   "id": "m09r",
+   "parent": "m08q",
+   "tree": "../llama/hip",
+   "kernels": {
+    "k_mla_m09r": {
+     "src": "src/ladder/m09r_readback.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_mladder",
+    "opts": {
+     "prefix": "k_mla_m09r",
+     "plan": "export",
+     "q_per_wg": 256,
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "flat on MLA (side): step barrier between the dV and dK runs, the next step's first operands + NL / delta read back under the dK WMMAs (1.00x)",
+   "side": true
+  },
+  {
+   "id": "m10t",
+   "parent": "m09r",
+   "tree": "../llama/hip",
+   "kernels": {
+    "k_mla_m10t": {
+     "src": "src/ladder/m10t_ring3.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_mladder",
+    "opts": {
+     "prefix": "k_mla_m10t",
+     "plan": "export",
+     "q_per_wg": 256,
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "flat on MLA (side): 3-slot Q / dO ring, TDM ops two steps ahead (1.00x)",
+   "side": true
   }
  ],
  "baselines": [
