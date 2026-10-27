@@ -965,6 +965,17 @@ def _pick_wmma_b2b(kind: str, N: int, K: int, avg_m: int) -> int:
     return int((N, K, avg_m) in _WMMA_B2B_KEYS[kind])
 
 
+# `lds_cosched` level per (N, K, avg_m); see the NT launcher.
+_LDS_COSCHED_KEYS = {
+    "nt": {(4096, 7168, 2048): 3, (7168, 2048, 2048): 3},
+    "nn": {(7168, 4096, 2048): 3},
+}
+
+
+def _pick_lds_cosched(kind: str, N: int, K: int, avg_m: int) -> int:
+    return _LDS_COSCHED_KEYS[kind].get((N, K, avg_m), 0)
+
+
 @functools.lru_cache(maxsize=64)
 def _pick_variable_k_config(OUT_M: int, OUT_N: int, avg_m: int):
     if OUT_M < 256 or OUT_N < 256:
@@ -1216,6 +1227,17 @@ def _launch_grouped_gemm_bf16_nt(
     # A's second half has dim-0 extent `m_rows - A_ROWS`, which goes negative on a dead or short
     # tile, so `_ext`'s clamp gate covers this knob too.
     tdm_nn: Constexpr[int] = 0,
+    # 1: the waits of the sub-steps deferred into the barrier window are emitted after the body's
+    #    closing fence, so the scheduler cannot hoist the stage-closing LDS drain above the last
+    #    in-body sub-step's matrix ops.
+    # 2: 1, and each sub-step's fragment reads are issued one per matrix op at the head of the
+    #    previous sub-step's run, one scheduling region per sub-step. The running sub-step's
+    #    fragments are held live to the end of its run: otherwise the allocator hands the reads
+    #    registers that an in-flight WMMA still reads, and expert scheduling covers each such
+    #    overwrite with a full `s_wait_alu depctr_va_vdst(0)`.
+    # 3: 2 with SCHED_MODE bit 2 set (no arbitration stall after a WMMA), without which a read
+    #    placed between two WMMAs cannot issue until the first has executed.
+    lds_cosched: Constexpr[int] = 0,
 ):
     WMMA_M = WMMA_N = 16
     WMMA_K = 32
@@ -1280,6 +1302,16 @@ def _launch_grouped_gemm_bf16_nt(
         raise ValueError("tdm_nn is the NN (b_lds_transpose) dealing; use tdm_balance on NT")
     if epi_chunk < 1 or wmma_m_rep % epi_chunk:
         raise ValueError(f"epi_chunk must divide wmma_m_rep={wmma_m_rep}, got {epi_chunk}")
+    if lds_cosched not in (0, 1, 2, 3):
+        raise ValueError(f"lds_cosched must be 0, 1, 2 or 3, got {lds_cosched}")
+    if lds_cosched >= 2 and (
+        frag_ring != 2 or sched_style or not issue_first or 2 * (wmma_m_rep + wmma_n_rep) >= n_acc
+    ):
+        raise ValueError(
+            f"lds_cosched={lds_cosched} needs frag_ring=2, sched_style=0, issue_first=1 and fewer "
+            f"fragment reads per sub-step ({2 * (wmma_m_rep + wmma_n_rep)}) than matrix ops ({n_acc}); "
+            f"got frag_ring={frag_ring}, sched_style={sched_style}, issue_first={issue_first}"
+        )
     if b_lds_transpose:
         # Each combination rejected below would give a silently wrong answer rather than a crash.
         if tdm_balance:
@@ -1395,6 +1427,10 @@ def _launch_grouped_gemm_bf16_nt(
 
         _dec = _decode_m_tile_scan if const_expr(inkernel_scan) else _decode_m_tile
         g_idx, m_row, m_rows = _dec(_i32_table(arg_mtiles), blk_m_idx, N_GROUPS, tile_m)
+        if const_expr(lds_cosched == 3 and not wmma_b2b):
+            # After the table reads: emitted ahead of them, it turns their scalar loads into
+            # vector loads. Still ahead of every matrix op.
+            rocdl.disable_xdl_arb_stall()
         # Wave-uniform by construction -- m_rows comes back readfirstlane'd -- so whatever it
         # gates, all waves take the same path.
         live = (m_rows > fx.Int32(0)) if const_expr(dead_tile_skip) else None
@@ -1630,6 +1666,13 @@ def _launch_grouped_gemm_bf16_nt(
                     idx = wm * wmma_n_rep + wn
                     fx.gemm(wmma_atom, c_frags[idx], wt[wn], act[wm], c_frags[idx])
 
+        def _hold_live(state):
+            # `llvm.fake.use` emits nothing. An empty inline asm would do the same job but pins
+            # its operands to v0-v255, which two sub-steps of fragments do not fit.
+            act, wt = state
+            for t in act + wt:
+                _llvm.call_intrinsic(None, "llvm.fake.use", [_raw(t.load())], [], [])
+
         def _prefetch_only(prefetch_kt, prefetch_tail=False):
             if const_expr(prefetch_kt is not None):
                 rocdl.sched_barrier(0)
@@ -1652,6 +1695,32 @@ def _launch_grouped_gemm_bf16_nt(
                 ring[p] = _load_ks(buf, b_ref, ks_lo + p)
             dc = min(defer_count, n_run, R)
             n_mma = n_run - dc
+            if const_expr(lds_cosched >= 2):
+                rocdl.sched_dsrd(n_pr * KS_DS)
+                rocdl.sched_barrier(0)
+                for i in range_constexpr(n_run):
+                    ks = i
+                    load_ks = i + R - 1
+                    # Only this sub-step's reads are in flight here (R = 2).
+                    rocdl.s_wait_dscnt(0)
+                    if const_expr(load_ks < n_run):
+                        ring[load_ks % R] = _load_ks(buf, b_ref, ks_lo + load_ks)
+                    if const_expr(ks < n_mma):
+                        _mma_ks(ring[ks % R])
+                        if const_expr(load_ks < n_run):
+                            for _j in range_constexpr(KS_DS):
+                                rocdl.sched_dsrd(1)
+                                rocdl.sched_mfma(1)
+                            rocdl.sched_mfma(n_acc - KS_DS)
+                            # Must follow the group hints; placed before them, the hints are ignored.
+                            _hold_live(ring[ks % R])
+                        else:
+                            rocdl.sched_mfma(n_acc)
+                    elif const_expr(load_ks < n_run):
+                        rocdl.sched_dsrd(KS_DS)
+                    rocdl.sched_barrier(0)
+                return [ring[(n_run - dc + t) % R] for t in range_constexpr(dc)]
+            late_waits = []
             for i in range_constexpr(n_run):
                 ks = i
                 load_ks = i + R - 1
@@ -1660,7 +1729,10 @@ def _launch_grouped_gemm_bf16_nt(
                 inflight = min(n_run - 1 - i, R - 1)
                 if const_expr(sched_style):
                     rocdl.sched_barrier(0)
-                rocdl.s_wait_dscnt(inflight * KS_DS)
+                if const_expr(lds_cosched == 1 and ks >= n_mma):
+                    late_waits.append(inflight * KS_DS)
+                else:
+                    rocdl.s_wait_dscnt(inflight * KS_DS)
                 if const_expr(ks == 0 and pf_at0 and wmma_m_rep > 1):
                     rocdl.sched_barrier(0)
                     issue(prefetch_kt % num_buffers, prefetch_kt, prefetch_tail)
@@ -1680,6 +1752,8 @@ def _launch_grouped_gemm_bf16_nt(
                         rocdl.sched_dsrd(KS_DS)
                     rocdl.sched_mfma(n_acc)
             rocdl.sched_barrier(0)
+            for w in late_waits:
+                rocdl.s_wait_dscnt(w)
             tails = []
             for t in range_constexpr(dc):
                 tails.append(ring[(n_run - dc + t) % R])
@@ -2216,6 +2290,8 @@ def grouped_gemm_bf16_nt_flydsl_kernel(
     tdm_assign: int = 0,
     issue_first: int = -1,
     epi_chunk: int = -1,
+    # -1 = auto (`_LDS_COSCHED_KEYS`); see the launcher's `lds_cosched`.
+    lds_cosched: int = -1,
 ) -> torch.Tensor:
     """Grouped NT forward: ``out[rows] = a[rows] @ b[g].T`` for the expert owning each run."""
     assert a.dim() == 2 and b.dim() == 3, f"a must be 2-D and b 3-D, got {a.dim()}/{b.dim()}"
@@ -2245,6 +2321,8 @@ def grouped_gemm_bf16_nt_flydsl_kernel(
         issue_first = _pick_issue_first("nt", N, K, avg_m) if _keyed else 0
     if epi_chunk < 0:
         epi_chunk = _pick_epi_chunk("nt", N, K, avg_m) if _keyed else 1
+    if lds_cosched < 0:
+        lds_cosched = _pick_lds_cosched("nt", N, K, avg_m) if _keyed else 0
     tile_m = BLOCK_M or cfg[0]
     tile_n = BLOCK_N or cfg[1]
     tile_k = BLOCK_K or cfg[2]
@@ -2348,6 +2426,7 @@ def grouped_gemm_bf16_nt_flydsl_kernel(
             issue_first,
             epi_chunk,
             0,
+            lds_cosched,
         )
     )
     return out[:, :N] if out_ldc else out
@@ -2465,6 +2544,7 @@ def _nn_native_launch(
     epi_chunk=1,
     tdm_nn=0,
     tdm_assign=0,
+    lds_cosched=0,
 ):
     tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers = cfg
     if wave_grid < 0:
@@ -2534,6 +2614,7 @@ def _nn_native_launch(
             issue_first,
             epi_chunk,
             tdm_nn,
+            lds_cosched,
         )
     )
     return out
@@ -2581,6 +2662,8 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
     epi_chunk: int = -1,
     tdm_nn: int = -1,
     tdm_assign: int = -1,
+    # -1 = auto (`_LDS_COSCHED_KEYS`); see the launcher's `lds_cosched`.
+    lds_cosched: int = -1,
     **kw,
 ) -> torch.Tensor:
     """Grouped NN: ``out[rows] = a[rows] @ b[g]`` for the expert g owning each row run."""
@@ -2626,6 +2709,8 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
                 tdm_assign = _pick_tdm_assign_nn(N, Kb, avg_m) if (keyed and tdm_nn) else 0
             if wmma_b2b < 0:
                 wmma_b2b = _pick_wmma_b2b("nn", N, Kb, avg_m) if keyed else 0
+            if lds_cosched < 0:
+                lds_cosched = _pick_lds_cosched("nn", N, Kb, avg_m) if keyed else 0
             out, _ = _resolve_out_ldc(
                 out, TOTAL_M, N, out_ldc, a.device, out_dtype, "grouped_gemm_bf16_nn_flydsl_kernel"
             )
@@ -2660,6 +2745,7 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
                 epi_chunk=epi_chunk,
                 tdm_nn=tdm_nn,
                 tdm_assign=tdm_assign,
+                lds_cosched=lds_cosched,
             )
             return out[:, :N] if out_ldc else out
         if out_ldc:
