@@ -88,10 +88,13 @@ class Baseline:
         self.spec, self.b = spec, b
         self.id = b["id"]
         self.ladder = ladder_name(spec)
-        root = os.environ.get("HKL_TURBO_DIR") or str(Path(__file__).resolve().parents[3])
-        if root not in sys.path:
-            sys.path.insert(0, root)  # the Primus-Turbo checkout this ladder lives in (or HKL_TURBO_DIR)
-        self.module = importlib.import_module(b["module"])
+        if b.get("lab_module"):  # a module of the family's lab package (e.g. a layout-folding wrapper)
+            self.module = importlib.import_module(f"{_fresh_package(spec['_dir'] / 'lab')}.{b['lab_module']}")
+        else:
+            root = os.environ.get("HKL_TURBO_DIR") or str(Path(__file__).resolve().parents[3])
+            if root not in sys.path:
+                sys.path.insert(0, root)  # the Primus-Turbo checkout this ladder lives in (or HKL_TURBO_DIR)
+            self.module = importlib.import_module(b["module"])
         self._fwd = getattr(self.module, b["fwd"]) if b.get("fwd") else None
         self._bwd = getattr(self.module, b["bwd"]) if b.get("bwd") else None
         self.kwargs = dict(b.get("kwargs", {}))

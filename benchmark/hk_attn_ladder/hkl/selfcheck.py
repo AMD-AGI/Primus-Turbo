@@ -23,16 +23,23 @@ import torch
 
 from . import runner
 
-PROD = {"llama": dict(b=4, sq=8192, skv=8192, hq=32, hkv=8, d=128)}
+PROD = {"llama": dict(b=4, sq=8192, skv=8192, hq=32, hkv=8, d=128), "mla": dict(b=2, sq=4096, hq=128)}
 
 
 def check(ladder, rid):
     r = runner.load(ladder, rid)
     mod = r.module
-    loader = getattr(mod, "_kernel", None) or getattr(mod, "_kernels")
+    loader = getattr(mod, "_kernel", None) or getattr(mod, "_kernels", None) or getattr(mod, "kernels")
     k = loader()
     n = len(k) if isinstance(k, dict) else 1
     msg = f"{n} kernel(s) loaded"
+    if hasattr(mod, "hk_attn_bwd"):  # MLA: plan the production call on meta tensors (folded SBHD)
+        p = PROD["mla"]
+        S, B, H = p["sq"], p["b"], p["hq"]
+        t = lambda d: torch.empty((1, S, B * H, d), dtype=torch.bfloat16, device="meta")  # noqa: E731
+        lse = torch.empty((1, B * H, S), dtype=torch.float32, device="meta")
+        pl = mod._plan(t(128), t(192), t(192), t(128), t(128), lse, None, True, None, hk_delta="k_delta" in k)
+        msg += f", prod plan grids {pl['grids']} delta {'hk' if 'k_delta' in k else 'flydsl'} ds {pl['ds_layout_bytes'] / 1e9:.2f} GB"
     if hasattr(mod, "flash_attn_fwd") and "llama" in str(ladder):
         p = PROD["llama"]
         q = torch.empty((p["b"], p["sq"], p["hq"], p["d"]), dtype=torch.bfloat16, device="meta")
