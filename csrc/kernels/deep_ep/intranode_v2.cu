@@ -170,12 +170,16 @@ __device__ __forceinline__ void wait_all_memory() {
     asm volatile(PRIMUS_TURBO_WAIT_ALL_STR ::: "memory");
 }
 
+// System-scope accesses as global (not flat) instructions: a flat access also counts on the LDS
+// counter, so a wait for this wave's LDS accesses would wait for it to reach the peer as well.
 template <typename T> __device__ __forceinline__ T ld_sys(const T *ptr) {
-    return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    return __hip_atomic_load((const __attribute__((address_space(1))) T *) ptr, __ATOMIC_RELAXED,
+                             __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 template <typename T> __device__ __forceinline__ void st_sys(T *ptr, T value) {
-    __hip_atomic_store(ptr, value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    __hip_atomic_store((__attribute__((address_space(1))) T *) ptr, value, __ATOMIC_RELAXED,
+                       __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 __device__ __forceinline__ uint32_t ballot(bool pred) {
@@ -228,7 +232,7 @@ template <typename Kernel> void set_dynamic_lds(Kernel kernel, int bytes) {
 
 } // namespace
 
-// ── dispatch ────────────────────────────────────────────────────────────────────────────────────
+// Dispatch
 
 template <int kNumRanks> constexpr int dispatch_lds_words() {
     // [kNumRanks] running stream indices, [kNumRanks] the channel's first stream indices,
@@ -508,9 +512,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 #endif // __gfx1250__
 }
 
-// ── combine ─────────────────────────────────────────────────────────────────────────────────────
+// Combine
 
-template <int kNumRanks, typename dtype_t>
+template <int kNumRanks, typename dtype_t, bool kHasBias>
 __global__ void __launch_bounds__(kNumThreads, 1)
     combine_kernel(dtype_t *recv_x, float *recv_topk_weights, const dtype_t *x,
                    const float *topk_weights, const dtype_t *bias_0, const dtype_t *bias_1,
@@ -696,16 +700,22 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 }
 #pragma unroll
                 for (int u = 0; u < kReduceUnroll; ++u) {
-                    const int i      = i0 + u * kV2WarpSize;
-                    int4      bias_a = make_int4(0, 0, 0, 0), bias_b = make_int4(0, 0, 0, 0);
-                    if (i < num_vecs and bias_0_row != nullptr)
-                        bias_a = bias_0_row[i];
-                    if (i < num_vecs and bias_1_row != nullptr)
-                        bias_b = bias_1_row[i];
+                    const int i = i0 + u * kV2WarpSize;
+                    // V1 starts from the biases' sum, zero for a missing one
                     float values[kVecElems];
 #pragma unroll
                     for (int k = 0; k < kVecElems; ++k)
-                        values[k] = vec_elem<dtype_t>(bias_a, k) + vec_elem<dtype_t>(bias_b, k);
+                        values[k] = 0.0f;
+                    if constexpr (kHasBias) {
+                        int4 bias_a = make_int4(0, 0, 0, 0), bias_b = make_int4(0, 0, 0, 0);
+                        if (i < num_vecs and bias_0_row != nullptr)
+                            bias_a = bias_0_row[i];
+                        if (i < num_vecs and bias_1_row != nullptr)
+                            bias_b = bias_1_row[i];
+#pragma unroll
+                        for (int k = 0; k < kVecElems; ++k)
+                            values[k] = vec_elem<dtype_t>(bias_a, k) + vec_elem<dtype_t>(bias_b, k);
+                    }
 #pragma unroll
                     for (int r = 0; r < kNumRanks; ++r) {
                         if (not routed[r])
@@ -802,11 +812,13 @@ void combine(hipDataType type, void *recv_x, float *recv_topk_weights, const voi
                        "DeepEP V2 combine has more rows than row flags");
     const int push_warps = combine_push_warps(num_channels, slot_bytes);
     PRIMUS_TURBO_CHECK(push_warps > 0 and num_channels * push_warps >= num_ranks - 1);
-    const int smem_bytes = push_warps * slot_bytes;
+    const int  smem_bytes = push_warps * slot_bytes;
+    const bool has_bias   = bias_0 != nullptr or bias_1 != nullptr;
 
 #define COMBINE_V2_LAUNCH_CASE(dtype, ranks)                                                       \
     {                                                                                              \
-        auto kernel = combine_kernel<ranks, dtype>;                                                \
+        auto kernel =                                                                              \
+            has_bias ? combine_kernel<ranks, dtype, true> : combine_kernel<ranks, dtype, false>;   \
         set_dynamic_lds(kernel, smem_bytes);                                                       \
         kernel<<<num_channels, kNumThreads, smem_bytes, stream>>>(                                 \
             static_cast<dtype *>(recv_x), recv_topk_weights, static_cast<const dtype *>(x),        \
