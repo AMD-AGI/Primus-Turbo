@@ -1,8 +1,0 @@
-EP4 tests: skipped (GPUS=2,3)
-EP2: 5 passed, 1 warning in 70.37s (0:01:10)
-EP1: 19 passed, 1 warning in 83.87s (0:01:23)
-grouped GEMM gfx1250: 31 passed, 1 warning in 16.43s
-dsv3_t8192_random    PASS  fwd 3.864 ms (1494 TF)  fwd+bwd 11.027 ms  bwd 1612 TF  step 1570.4 TF
-dsv3_t8192_skew1     PASS  fwd 5.948 ms (970 TF)  fwd+bwd 17.229 ms  bwd 1023 TF  step 1005.1 TF
-dsv3_t4096_random    PASS  fwd 2.187 ms (1319 TF)  fwd+bwd 6.430 ms  bwd 1361 TF  step 1346.6 TF
-AGGREGATE step 1285.765 TF  fwd 1241.340 TF  bwd 1309.268 TF  (3/3 PASS)

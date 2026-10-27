@@ -1,6 +1,0 @@
-r1 acc 3 traces 0 killed
-r1 gc2 4 traces 0 killed
-r1 gc4 4 traces 0 killed
-r2 gc4 3 traces 1 killed
-r2 gc2 4 traces 0 killed
-r2 acc 4 traces 0 killed

@@ -1,8 +1,0 @@
-acc            dsv3_t4096_random: 6.467 / 6.454 -> 6.460 | dsv3_t8192_random: 11.151 / 11.162 -> 11.157 | dsv3_t8192_skew1: 17.467 / 17.359 -> 17.413
-l0             dsv3_t4096_random: 6.426 / 6.420 -> 6.423 | dsv3_t8192_random: 11.060 / 11.090 -> 11.075 | dsv3_t8192_skew1: 17.267 / 17.303 -> 17.285
-l4             dsv3_t4096_random: 6.442 / 6.420 -> 6.431 | dsv3_t8192_random: 11.101 / 11.057 -> 11.079 | dsv3_t8192_skew1: 17.356 / 17.403 -> 17.380
-l8             dsv3_t4096_random: 6.424 / 6.439 -> 6.431 | dsv3_t8192_random: 11.180 / 11.187 -> 11.183 | dsv3_t8192_skew1: 17.430 / 17.422 -> 17.426
-acc            step geomean 1274.214 TF
-l0             step geomean 1282.964 TF  vs acc: +0.687%  (t4096_random +0.58%, t8192_random +0.74%, t8192_skew1 +0.74%)
-l4             step geomean 1279.949 TF  vs acc: +0.450%  (t4096_random +0.46%, t8192_random +0.70%, t8192_skew1 +0.19%)
-l8             step geomean 1274.781 TF  vs acc: +0.045%  (t4096_random +0.45%, t8192_random -0.24%, t8192_skew1 -0.07%)
