@@ -88,9 +88,10 @@ _TRAITS = {
         wave_size=32,
         cpol_sys_load=_GFX12_SYS_STREAM,
         cpol_sys_store=_GFX12_SYS_STREAM,
-        # gfx12 counts loads and stores apart, so a piece only bounds the VGPRs of a copy (a wave32
-        # step is 512 B); not scanned on MI455X yet
-        copy_piece_table=_GFX9_COPY_PIECES,
+        # gfx12 counts loads and stores apart, so a piece only bounds the VGPRs of a copy: 8 KiB is 16
+        # wave32 steps, 64 VGPRs. Fastest of the MI355X table and 2 / 4 / 8 KiB at 32-160 SMs on
+        # MI455X (DSv3 shape, 2 and 4 ranks)
+        copy_piece_table=(("dispatch", ((_INF, 8 * 1024),)), ("combine", ((_INF, 8 * 1024),))),
         combine_loads_in_flight=32,
         # 5 s, under the driver's 9 s queue preemption timeout: a queue still spinning when it is
         # evicted or torn down has left MES unrecoverable on MI455X, a trapped one has no waves left
