@@ -2,3 +2,4 @@
 !*.hip
 build/
 __pycache__/
+logs/
