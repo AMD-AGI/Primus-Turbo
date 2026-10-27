@@ -7,6 +7,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import os
 import unittest
 
 import torch
@@ -16,6 +17,7 @@ from torch.testing._internal.common_distributed import (
     skip_if_lt_x_gpu,
 )
 from torch.testing._internal.common_utils import (
+    TestCase,
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
@@ -23,7 +25,14 @@ from torch.testing._internal.common_utils import (
 
 import primus_turbo.pytorch as pt
 from primus_turbo.flydsl.deep_ep.common import IS_GFX1250
+from primus_turbo.flydsl.deep_ep.intranode_v2_kernel import combine_v2_layout, dispatch_v2_layout
 from primus_turbo.pytorch.deep_ep._compat import deep_ep_cpp
+from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
+    _get_backend_instance,
+    _resolve_backend_name,
+    clear_backend_instances,
+    set_buffer_global_config,
+)
 from tests.pytorch.ref.deep_ep_ref import (
     get_dispatch_layout_ref,
     per_token_cast_to_fp8,
@@ -236,6 +245,67 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
                     assert_same(cpp.combine(**combine_args)[:2], fly.combine(**combine_args)[:2], "combine")
         torch.cuda.synchronize()
         dist.barrier()
+
+    @unittest.skipUnless(IS_GFX1250, "flydsl_v2 runs on gfx1250 only")
+    @skip_if_lt_x_gpu(2)
+    def test_moe_ops_size_the_v2_buffer(self):
+        """moe_dispatch / moe_combine on flydsl_v2 through init_buffer: the buffer is sized from the
+        dispatched tokens and grows for a larger dispatch."""
+        os.environ["PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND"] = "flydsl_v2"
+        torch.cuda.set_device(self.device)
+        store = dist.FileStore(self.file_name, self.world_size)
+        dist.init_process_group(backend="nccl", world_size=self.world_size, rank=self.rank, store=store)
+        group = dist.group.WORLD
+        num_ranks = group.size()
+        clear_backend_instances()
+        set_buffer_global_config(num_use_cu=24)
+        backend = _get_backend_instance(_resolve_backend_name())
+        hidden, num_topk, num_experts = 4096, 4, 64
+        torch.manual_seed(42 + self.rank)
+        sizes = []
+        for num_tokens in (4096, 12288):
+            x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+            topk_idx = torch.topk(torch.rand((num_tokens, num_experts), device="cuda"), num_topk, dim=-1)[1]
+            topk_weights = torch.rand((num_tokens, num_topk), dtype=torch.float32, device="cuda")
+            recv_x, _, _, _, handle = pt.ops.moe_dispatch(x, topk_idx, topk_weights, num_experts, group)
+            combined_x = pt.ops.moe_combine(recv_x, group, handle)
+            torch.cuda.synchronize()
+            in_rank = torch.zeros((num_tokens, num_ranks), dtype=torch.bool, device="cuda")
+            in_rank.scatter_(1, topk_idx // (num_experts // num_ranks), True)
+            ref_x = x.float() * in_rank.sum(dim=1, keepdim=True)
+            assert torch.allclose(combined_x.float(), ref_x, rtol=2e-2, atol=2e-2)
+            buffer = backend._buffer
+            assert buffer.intranode_backend == "flydsl_v2"
+            hint = pt.deep_ep.Buffer.get_token_buffer_size_hint(num_tokens, 2 * hidden, num_ranks, num_topk)
+            assert buffer.num_nvl_bytes >= hint, (buffer.num_nvl_bytes, hint)
+            sizes.append(buffer.num_nvl_bytes)
+        assert sizes[1] > sizes[0], sizes
+        dist.barrier()
+
+
+class TokenBufferSizeHintTestCase(TestCase):
+    """``Buffer.get_token_buffer_size_hint``, host only."""
+
+    def test_flydsl_v2_heap_holds_the_batch(self):
+        for num_tokens, num_ranks, hidden, num_topk in (
+            (4096, 2, 7168, 8),
+            (32768, 4, 2880, 4),
+            (1, 8, 256, 1),
+        ):
+            hidden_bytes, rows = 2 * hidden, num_tokens * num_ranks
+            num_bytes = pt.deep_ep.Buffer.get_token_buffer_size_hint(
+                num_tokens, hidden_bytes, num_ranks, num_topk, backend="flydsl_v2"
+            )
+            # bf16 rows, fp8 rows with per-32 scales, and the combine slots
+            assert dispatch_v2_layout(num_bytes, hidden_bytes, num_topk, 8, 0)[1] >= rows
+            assert dispatch_v2_layout(num_bytes, hidden, num_topk, 8, hidden // 32)[1] >= rows
+            assert combine_v2_layout(num_bytes, hidden_bytes, num_topk)[1] >= rows
+
+    def test_ring_backends_take_no_token_hint(self):
+        for backend in ("cpp", "flydsl"):
+            assert pt.deep_ep.Buffer.get_token_buffer_size_hint(4096, 8192, 2, 8, backend=backend) == 0
+        with self.assertRaises(ValueError):
+            pt.deep_ep.Buffer.get_token_buffer_size_hint(0, 8192, 2, 8, backend="flydsl_v2")
 
 
 if __name__ == "__main__":
