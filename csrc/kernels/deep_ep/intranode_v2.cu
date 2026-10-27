@@ -582,15 +582,12 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         const int slot = row - row_begin + base;
         // the previous row has landed, and is done with the LDS buffer
         wait_tensor();
-        float weight = 0.0f;
-        if (num_topk > 0)
-            weight = topk_weights[static_cast<int64_t>(row) * num_topk +
-                                  (lane_id < num_topk ? lane_id : 0)];
         tdm_row<false, 0>(row_lds, uniform_addr(x_bytes + static_cast<int64_t>(row) * hidden_bytes),
                           hidden_bytes);
         if (num_topk > 0) {
             if (lane_id < num_topk)
-                reinterpret_cast<float *>(row_buffer + hidden_bytes)[lane_id] = weight;
+                reinterpret_cast<float *>(row_buffer + hidden_bytes)[lane_id] =
+                    topk_weights[static_cast<int64_t>(row) * num_topk + lane_id];
             wait_lds();
         }
         wait_tensor();
