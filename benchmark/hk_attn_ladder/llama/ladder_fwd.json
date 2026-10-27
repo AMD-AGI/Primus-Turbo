@@ -220,7 +220,8 @@
     "module": "fwd_v0"
    },
    "feature": "lazy-rescale test as one max + one VCC branch",
-   "ref_ms": 1.1009
+   "ref_ms": 1.1009,
+   "bitwise_with": "v0"
   },
   {
    "id": "v0_resc_desc",
@@ -241,7 +242,8 @@
    "launch": {
     "module": "fwd_v0"
    },
-   "feature": "TDM descriptor math inside the QK WMMA run, burst LDS bases one stage ahead"
+   "feature": "TDM descriptor math inside the QK WMMA run, burst LDS bases one stage ahead",
+   "bitwise_with": "v0"
   },
   {
    "id": "p1",
@@ -264,7 +266,8 @@
     "module": "fwd_v0"
    },
    "feature": "K(c+2) and V(c+1) loads as one burst per chunk (Primus-Turbo cade7db6 pin)",
-   "ref_ms": 1.0446
+   "ref_ms": 1.0446,
+   "bitwise_with": "v0"
   },
   {
    "id": "v1_v0body",
@@ -389,7 +392,8 @@
     "module": "fwd_v0"
    },
    "feature": "DESC alone on v0",
-   "ref_ms": 1.1108
+   "ref_ms": 1.1108,
+   "bitwise_with": "v0"
   },
   {
    "id": "x_merge",
@@ -412,7 +416,8 @@
     "module": "fwd_v0"
    },
    "feature": "MERGE alone on v0",
-   "ref_ms": 1.1129
+   "ref_ms": 1.1129,
+   "bitwise_with": "v0"
   },
   {
    "id": "x_p1_tail",
@@ -435,7 +440,8 @@
     "module": "fwd_v0"
    },
    "feature": "negative: row sums moved into the PV run (TAIL)",
-   "ref_ms": 1.0649
+   "ref_ms": 1.0649,
+   "bitwise_with": "v0"
   },
   {
    "id": "x_v1_lsum1",
@@ -497,5 +503,9 @@
   "causal": true,
   "layout": "bshd"
  },
- "direction": "fwd"
+ "direction": "fwd",
+ "exact_outputs": [
+  "o",
+  "lse"
+ ]
 }

@@ -26,7 +26,7 @@
 //   PV        O^T += V^T P^T: 64 WMMA per block; every V^T operand (ds_load_tr16_b128) feeds 4
 //
 // What changes from f06: one instruction in the prologue, lock_simd (s_setreg SCHED_MODE
-// DISABLE_XDL_ARB_STALL = 1, HK's kittens::sched::lock_simd). With 657 VGPRs the kernel already runs
+// DISABLE_XDL_ARB_STALL = 1, HK's kittens::sched::lock_simd). With 659 VGPRs the kernel already runs
 // one wave per SIMD, so there is nobody to yield the matrix pipe to; without the lock a wave still
 // pauses between WMMAs for the arbitration (HK GEMM ladder rung 10; p1_research: 8.13 -> 8.00
 // cycles per WMMA).

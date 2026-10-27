@@ -56,19 +56,22 @@ BLOCKS = {"prep": 256, "dkdv": 128, "dq": 128, "cvt": 256}
 PREFIX = None
 PLAN = "split"
 HEADS_PER_WG = 1
+KV_PER_WG = 64
 HSACO_DIR = None
 _KERNELS = None
 _LOCK = threading.Lock()
 
 
-def configure(prefix, plan="split", heads_per_wg=1):
-    global PREFIX, PLAN, HEADS_PER_WG, _KERNELS
+def configure(prefix, plan="split", heads_per_wg=1, kv_per_wg=64):
+    global PREFIX, PLAN, HEADS_PER_WG, KV_PER_WG, _KERNELS
     if plan not in ("split", "fused"):
         raise ValueError(f"unknown plan {plan!r}")
     if heads_per_wg not in (1, 4):
         raise ValueError(f"heads_per_wg must be 1 or 4, got {heads_per_wg!r}")
+    if kv_per_wg not in (64, 128):
+        raise ValueError(f"kv_per_wg must be 64 or 128, got {kv_per_wg!r}")
     with _LOCK:
-        PREFIX, PLAN, HEADS_PER_WG, _KERNELS = str(prefix), plan, int(heads_per_wg), None
+        PREFIX, PLAN, HEADS_PER_WG, KV_PER_WG, _KERNELS = str(prefix), plan, int(heads_per_wg), int(kv_per_wg), None
 
 
 def set_hsaco_dir(path):
@@ -121,8 +124,8 @@ def unsupported_reason(b, sq, skv, hq, hkv, causal, d=D):
         return f"bad heads / sizes: b {b} sq {sq} skv {skv} hq {hq} hkv {hkv}"
     if HEADS_PER_WG == 4 and (hq // hkv) % 4:
         return f"G = {hq // hkv} is not a multiple of 4"
-    if sq % 64 or skv % 64:
-        return f"sq {sq} and skv {skv} must be multiples of 64"
+    if sq % 64 or skv % KV_PER_WG:
+        return f"sq {sq} must be a multiple of 64 and skv {skv} of {KV_PER_WG}"
     if causal and sq > skv:
         return f"causal needs sq <= skv (bottom-right), got {sq} > {skv}"
     if max(2 * b * sq * hq * D, 2 * b * skv * hkv * D, 4 * b * hq * sq) >= I32_LIMIT:
@@ -165,7 +168,7 @@ def plan(do, q, k, v, o, lse, softmax_scale=None, causal=True):
         launches = [
             ("zero", None, (dqa,)),
             ("prep", (sq // 64, hq, b), (do, o, lse, dl, nl, qb, rb, b, sq, hq)),
-            ("dkdv", (skv // 64, hkv, b), common + (dk, dv, dqa, qb, kvb, rb, 4 * dqa.numel()) + tail),
+            ("dkdv", (skv // KV_PER_WG, hkv, b), common + (dk, dv, dqa, qb, kvb, rb, 4 * dqa.numel()) + tail),
             ("cvt", (-(-n8 // 256), 1, 1), (dqa, dq, 4 * dqa.numel(), qb, scale)),
         ]
     return {"launches": launches, "outputs": (dq, dk, dv)}

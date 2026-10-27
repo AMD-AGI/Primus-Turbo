@@ -112,6 +112,63 @@
    "feature": "dQ fused into the dK/dV kernel: dS^T through LDS, dQ = dS K, fp32 atomics (5 GEMMs per pair instead of 7)"
   },
   {
+   "id": "b05",
+   "parent": "b04",
+   "kernels": {
+    "k_bwd_b05": {
+     "src": "src/ladder/b05_kv32.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b05",
+     "plan": "fused",
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "32 kv rows per wave (128 per WG): every Q / dO LDS operand feeds 2 WMMAs, half the Q / dO traffic per kv row"
+  },
+  {
+   "id": "b06",
+   "parent": "b05",
+   "kernels": {
+    "k_bwd_b06": {
+     "src": "src/ladder/b06_deferred_dq.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b06",
+     "plan": "fused",
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "dQ one iteration late from a double-buffered dS^T: 1 barrier per iteration instead of 2"
+  },
+  {
+   "id": "b07",
+   "parent": "b06",
+   "kernels": {
+    "k_bwd_b07": {
+     "src": "src/ladder/b07_lock_simd.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b07",
+     "plan": "fused",
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "lock_simd in the dK/dV kernel (one wave per SIMD)"
+  },
+  {
    "id": "v0",
    "kernels": {
     "k_attn_bwd_v0": {
@@ -123,8 +180,9 @@
    "launch": {
     "module": "bwd_v0"
    },
-   "feature": "first HK backward (Primus-Turbo fd4a1bd0)",
-   "ref_ms": 3.491
+   "feature": "first HK backward (Primus-Turbo fd4a1bd0): b07 + 32-query steps (q pairs, heads inner, unmasked steps first) on a 4-deep TDM ring of Q / dO / LD records with one split-barrier phase per step, dQ_acc in C-fragment order (one 128-B line per atomic), and the 9-phase software pipeline (softmax interleaved into the WMMA runs, dQ(s-1) under step s)",
+   "ref_ms": 3.491,
+   "parent": "b07"
   },
   {
    "id": "v0_regs",
@@ -142,7 +200,8 @@
     "module": "bwd_v0"
    },
    "feature": "holds on the S / dP WMMA source registers (no WAR v_nops)",
-   "ref_ms": 3.4331
+   "ref_ms": 3.4331,
+   "bitwise_with": "v0"
   },
   {
    "id": "v0_regs_masked",
@@ -159,7 +218,8 @@
    "launch": {
     "module": "bwd_v0"
    },
-   "feature": "diagonal steps use the full step's operand layout"
+   "feature": "diagonal steps use the full step's operand layout",
+   "bitwise_with": "v0"
   },
   {
    "id": "v0_regs_masked_atom4",
@@ -177,7 +237,8 @@
    "launch": {
     "module": "bwd_v0"
    },
-   "feature": "the 32 dQ atomics of a step as 4 sub-bursts of 8"
+   "feature": "the 32 dQ atomics of a step as 4 sub-bursts of 8",
+   "bitwise_with": "v0"
   },
   {
    "id": "v0_rma_tdm3",
@@ -196,7 +257,8 @@
    "launch": {
     "module": "bwd_v0"
    },
-   "feature": "wave 3 issues a real 16-byte dummy TDM op instead of a role branch"
+   "feature": "wave 3 issues a real 16-byte dummy TDM op instead of a role branch",
+   "bitwise_with": "v0"
   },
   {
    "id": "p1",
@@ -219,7 +281,8 @@
     "module": "bwd_v0"
    },
    "feature": "loop-entry DS wait + early LDS base math (Primus-Turbo cade7db6 pin)",
-   "ref_ms": 3.3371
+   "ref_ms": 3.3371,
+   "bitwise_with": "v0"
   },
   {
    "id": "v1_sched0",
@@ -369,7 +432,8 @@
     "module": "bwd_v0"
    },
    "feature": "MASKED alone on v0",
-   "ref_ms": 3.4479
+   "ref_ms": 3.4479,
+   "bitwise_with": "v0"
   },
   {
    "id": "x_atom4",
@@ -388,7 +452,8 @@
     "module": "bwd_v0"
    },
    "feature": "ATOM=4 alone on v0",
-   "ref_ms": 3.4638
+   "ref_ms": 3.4638,
+   "bitwise_with": "v0"
   },
   {
    "id": "x_tdm3",
@@ -407,7 +472,8 @@
     "module": "bwd_v0"
    },
    "feature": "TDM3 alone on v0",
-   "ref_ms": 3.4727
+   "ref_ms": 3.4727,
+   "bitwise_with": "v0"
   },
   {
    "id": "x_addr",
@@ -426,7 +492,8 @@
     "module": "bwd_v0"
    },
    "feature": "ADDR alone on v0",
-   "ref_ms": 3.471
+   "ref_ms": 3.471,
+   "bitwise_with": "v0"
   },
   {
    "id": "x_entry",
@@ -445,7 +512,8 @@
     "module": "bwd_v0"
    },
    "feature": "ENTRY alone on v0",
-   "ref_ms": 3.4928
+   "ref_ms": 3.4928,
+   "bitwise_with": "v0"
   },
   {
    "id": "x_onephase",
@@ -530,5 +598,9 @@
  "fwd_for_bwd": {
   "ladder": "ladder_fwd.json",
   "rung": "p1"
- }
+ },
+ "exact_outputs": [
+  "dk",
+  "dv"
+ ]
 }
