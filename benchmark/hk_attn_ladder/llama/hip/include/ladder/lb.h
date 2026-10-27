@@ -20,8 +20,11 @@
 //   prep (DO, O, LSE, DEL, NL, o_bytes, row_bytes, B, Sq, Hq)                  grid (Sq/64, Hq, B), block 256
 //   dkdv (Q, K, V, DO, DEL, NL, DK, DV, q_bytes, kv_bytes, row_bytes, B, Sq, Skv, Hq, Hkv, causal, c2, scale)
 //   dq   (Q, K, V, DO, DEL, NL, DQ, q_bytes, kv_bytes, row_bytes, B, Sq, Skv, Hq, Hkv, causal, c2, scale)
-// row_bytes = byte extent of DEL / NL. Host gate: d = 128, Sq % 64 == 0, Skv % 64 == 0, causal -> Sq <= Skv,
-// Hq % Hkv == 0, every byte extent < 2^31.
+// fused rungs (b04 on): dkdv (Q, K, V, DO, DEL, NL, DK, DV, DQA, q_bytes, kv_bytes, row_bytes, dqa_bytes, B, Sq, Skv,
+//   Hq, Hkv, causal, c2, scale) adds dQ_acc (fp32 [B, Sq, Hq, 128], zeroed by the host); cvt (DQA, DQ, dqa_bytes,
+//   q_bytes, scale) replaces dq.
+// row_bytes = byte extent of DEL / NL. Host gate (lab/bwd_ladder.py): d = 128, Sq % 64 == 0, Skv % 64 (b05 on: 128)
+// == 0, causal -> Sq <= Skv, Hq % Hkv == 0 (b03: G % 4 == 0), every byte extent incl. dQ_acc < 2^31.
 #pragma once
 #include "ladder/lf.h"
 

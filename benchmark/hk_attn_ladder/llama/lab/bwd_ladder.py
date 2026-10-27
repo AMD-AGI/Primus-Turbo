@@ -16,7 +16,7 @@ Plans (every launch on torch's current stream, in this order; ABIs in include/la
          <prefix>_dkdv (dK, dV)           grid (Skv/64, Hkv, B), block 128
          <prefix>_dq   (dQ, recomputing S and dP)  grid (Sq/64, Hq / heads_per_wg, B), block 128
   fused  dQ_acc.zero_() (torch), <prefix>_prep,
-         <prefix>_dkdv (dK, dV, dQ_acc += dS K by fp32 atomics)    grid (Skv/64, Hkv, B), block 128
+         <prefix>_dkdv (dK, dV, dQ_acc += dS K by fp32 atomics)    grid (Skv/kv_per_wg, Hkv, B), block 128
          <prefix>_cvt  (dq = bf16(scale dQ_acc))                    grid (B Sq Hq 128 / 2048), block 256
 Anything outside the range the kernels are written for raises (no fallback).
 """
@@ -128,7 +128,8 @@ def unsupported_reason(b, sq, skv, hq, hkv, causal, d=D):
         return f"sq {sq} must be a multiple of 64 and skv {skv} of {KV_PER_WG}"
     if causal and sq > skv:
         return f"causal needs sq <= skv (bottom-right), got {sq} > {skv}"
-    if max(2 * b * sq * hq * D, 2 * b * skv * hkv * D, 4 * b * hq * sq) >= I32_LIMIT:
+    dqa = 4 * b * sq * hq * D if PLAN == "fused" else 0  # fp32 dQ_acc: its atomic / cvt offsets are int32 too
+    if max(2 * b * sq * hq * D, 2 * b * skv * hkv * D, 4 * b * hq * sq, dqa) >= I32_LIMIT:
         return "byte extents must be < 2^31 (int32 buffer offsets)"
     return None
 

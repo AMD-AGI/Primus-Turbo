@@ -32,7 +32,7 @@ namespace {
 
 constexpr int P_B    = 2 * lf::D + 16; // 272: Q / dO tiles (rows and tr16 reads)
 constexpr int KT_P   = 2 * lf::D + 32; // 288: the K tile of dQ (tr16 reads)
-constexpr int DS_P   = 2 * 64 + 32;    // 160: dS^T tile [64 kv][64 q] (C^T stores, tr16 reads)
+constexpr int DS_P   = 2 * 64 + 32;    // 160: dS^T tile [128 kv][64 q] (C^T stores, tr16 reads)
 constexpr int TILE   = 64 * P_B;       // 17408
 constexpr int BUF_B  = 2 * TILE;       // one buffer: Q tile, then dO tile
 constexpr int KVB    = 128;            // kv rows per workgroup

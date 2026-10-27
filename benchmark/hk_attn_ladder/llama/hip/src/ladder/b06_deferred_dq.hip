@@ -12,7 +12,6 @@
 //         (B operands) and the WG's K tile also in LDS (pitch 288, for dQ); loop over every visible 64-query
 //         block x every q head of the group:
 //           Q / dO tiles by TDM (pitch 272, two buffers, next iteration's ops in flight),
-//           S = Q K^T, dP = dO V^T (lane = kv), P, dS,
 //           dQ of the PREVIOUS iteration (16 queries of wave w) = dS K over 128 kv from its dS^T tile (A by tr16,
 //           B = K by tr16), fp32 device-scope atomics into dQ_acc [B, Sq, Hq, 128] (zeroed by the host),
 //           S = Q K^T, dP = dO V^T, P, dS of this iteration; dS^T -> LDS buffer it & 1 (no barrier here),
@@ -34,7 +33,7 @@ namespace {
 
 constexpr int P_B    = 2 * lf::D + 16; // 272: Q / dO tiles (rows and tr16 reads)
 constexpr int KT_P   = 2 * lf::D + 32; // 288: the K tile of dQ (tr16 reads)
-constexpr int DS_P   = 2 * 64 + 32;    // 160: dS^T tile [64 kv][64 q] (C^T stores, tr16 reads)
+constexpr int DS_P   = 2 * 64 + 32;    // 160: dS^T tile [128 kv][64 q] (C^T stores, tr16 reads)
 constexpr int TILE   = 64 * P_B;       // 17408
 constexpr int BUF_B  = 2 * TILE;       // one buffer: Q tile, then dO tile
 constexpr int KVB    = 128;            // kv rows per workgroup
