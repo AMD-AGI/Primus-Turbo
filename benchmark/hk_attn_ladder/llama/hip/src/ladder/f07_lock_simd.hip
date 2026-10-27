@@ -4,7 +4,7 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
-// f07_lock_simd -- rung 07 of the Llama forward ladder: f06 with the WMMA pipe locked to its wave.
+// f07_lock_simd -- Llama forward ladder, side chain (GQA before pipelining): f06 with the WMMA pipe locked to its wave.
 //
 // Kernel Specification
 //   work      workgroup = 64 query positions x FOUR q heads (a head quad, G % 4 == 0, so one kv head);

@@ -4,7 +4,7 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
-// f08_lazy_rescale -- rung 08 of the Llama forward ladder: f07 with a lazy online-softmax rescale.
+// f08_lazy_rescale -- Llama forward ladder, side chain (GQA before pipelining): f07 with a lazy online-softmax rescale.
 //
 // Kernel Specification
 //   work      workgroup = 64 query positions x FOUR q heads (a head quad, G % 4 == 0, so one kv head);

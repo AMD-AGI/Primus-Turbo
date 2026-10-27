@@ -25,7 +25,7 @@ Protocol (the HK GEMM ladder's, plus what the a08-1 attention work learned on th
   * sclk: a host thread samples the GPU's hwmon freq1_input every ~2 ms; each cell reports its median
     (on this card time follows clock: cycles are stable, sustained clocks are not).
 Results: per arm the median over rounds of the cell medians (ms), TFLOP/s on the useful FLOPs, the step
-over the previous rung of the main line (per-round ratio, median and 95% CI) in time and in cycles
+over the rung's parent when it was timed, else over the previous rung of the main line (per-round ratio, median and 95% CI) in time and in cycles
 (ms x the cell's median sclk), sclk. --json keeps every
 sample; --md writes the table.
 """
@@ -250,11 +250,13 @@ def main(argv=None):
             r = by_id[base_id]
             row["feature"] = r.get("feature", "")
             row["ref_ms_a08"] = r.get("ref_ms")
-            if not i.endswith("#null") and base_id in main_line and prev is not None:
-                ratios = [p / c for p, c in zip(samples[prev], samples[i])]
+            # step over the rung's parent when it was timed, else over the previous main-line rung
+            over = r.get("parent") if r.get("parent") in samples else (prev if base_id in main_line else None)
+            if not i.endswith("#null") and over is not None:
+                ratios = [p / c for p, c in zip(samples[over], samples[i])]
                 sm, sci = summarize(ratios)
-                row["step"] = {"over": prev, "median": statistics.median(ratios), "mean": sm, "ci95": sci}
-                cr = [p / c for p, c in zip(cycles[prev], cycles[i]) if p and c]
+                row["step"] = {"over": over, "median": statistics.median(ratios), "mean": sm, "ci95": sci}
+                cr = [p / c for p, c in zip(cycles[over], cycles[i]) if p and c]
                 if cr:
                     row["step_cyc"] = {"median": statistics.median(cr), "ci95": summarize(cr)[1]}
             if not i.endswith("#null") and base_id in main_line:
@@ -268,7 +270,7 @@ def main(argv=None):
     else:
         null_ctl = None
 
-    hdr = f"{'arm':<20} {'ms':>8} {'TFLOP/s':>8} {'step':>16} {'step cyc':>9} {'sclk':>6} {'Mcyc':>7} {'a08 ms':>7}  feature"
+    hdr = f"{'arm':<20} {'ms':>8} {'TFLOP/s':>8} {'over':>8} {'step':>16} {'step cyc':>9} {'sclk':>6} {'Mcyc':>7} {'a08 ms':>7}  feature"
     lines = [hdr, "-" * len(hdr)]
     for row in rows:
         st = row.get("step")
@@ -277,7 +279,8 @@ def main(argv=None):
         ra = f"{row['ref_ms_a08']:.3f}" if row.get("ref_ms_a08") else ""
         sy = f"{row['step_cyc']['median']:.3f}x" if row.get("step_cyc") else ""
         mc = f"{row['mcyc']:.3f}" if row.get("mcyc") else "-"
-        lines.append(f"{row['arm']:<20} {row['ms']:8.4f} {row['tflops']:8.1f} {s:>16} {sy:>9} {sc:>6} {mc:>7} {ra:>7}  "
+        ov = st["over"] if st else ""
+        lines.append(f"{row['arm']:<20} {row['ms']:8.4f} {row['tflops']:8.1f} {ov:>8} {s:>16} {sy:>9} {sc:>6} {mc:>7} {ra:>7}  "
                      f"{row.get('feature', '')[:60]}")  # fmt: skip
     if null_ctl:
         lines.append(f"null control {rungs[-1]} vs #null: {null_ctl['median']:.4f}x ± {null_ctl['ci95']:.4f}")
@@ -291,15 +294,16 @@ def main(argv=None):
             json.dump({"meta": meta, "rows": rows, "null_control": null_ctl}, f, indent=1)
     if a.md:
         md = [f"{spec.get('title', spec['name'])}, {sh}, {meta['host']} GPU {meta['hip_visible_devices']}, {meta['time']}",
-              "", "| Rung | ms | TFLOP/s | Step | Step (cycles) | sclk MHz | Mcycles | Feature |",
-              "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"]  # fmt: skip
+              "", "| Rung | ms | TFLOP/s | Over | Step | Step (cycles) | sclk MHz | Mcycles | Feature |",
+              "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- |"]  # fmt: skip
         for row in rows:
             st = row.get("step")
             step = f"{st['median']:.3f}x" if st else ""
             sc = f"{row['sclk']:.0f}" if row["sclk"] else "-"
             sy = f"{row['step_cyc']['median']:.3f}x" if row.get("step_cyc") else ""
             mc = f"{row['mcyc']:.3f}" if row.get("mcyc") else "-"
-            md.append(f"| {row['arm']} | {row['ms']:.4f} | {row['tflops']:.0f} | {step} | {sy} | {sc} | {mc} | "
+            ov = st["over"] if st else ""
+            md.append(f"| {row['arm']} | {row['ms']:.4f} | {row['tflops']:.0f} | {ov} | {step} | {sy} | {sc} | {mc} | "
                       f"{row.get('feature', '')} |")  # fmt: skip
         with open(a.md, "w") as f:
             f.write("\n".join(md) + "\n")

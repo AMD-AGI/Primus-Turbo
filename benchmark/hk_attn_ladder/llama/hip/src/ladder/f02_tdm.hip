@@ -4,7 +4,8 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
-// f02_tdm -- rung 02 of the Llama forward ladder: f01 with the fill on the Tensor Data Mover.
+// f02_tdm -- rung 02 of the Llama forward ladder (main line): f01t double-buffered (equivalently f01 with the
+// fill on the Tensor Data Mover).
 //
 // Kernel Specification
 //   work      workgroup = 64 query positions x ONE q head; wave w = positions [16 w, +16)
@@ -20,7 +21,9 @@
 //   softmax   online, eager: every block rescales O and l; causal mask on every block
 //   PV        O^T += V^T P^T: 16 WMMA per block, V^T operands by ds_load_tr16_b128
 //
-// What changes from f01: the copy engine moves the tiles, so the fill costs no VGPRs (f01 held 64
+// What changes from f01t: two buffers -- block j + 1's ops fly during block j's compute, one barrier per block
+// instead of two.
+// What changes from f01 (side rung): the copy engine moves the tiles, so the fill costs no VGPRs (f01 held 64
 // for the next block), no VALU address math and no ds_store; a wave only builds one descriptor
 // (SALU) and waits for its own op before the barrier.
 #include "ladder/lf.h"

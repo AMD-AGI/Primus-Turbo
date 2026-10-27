@@ -18,7 +18,8 @@
  ],
  "notes": [
   "sha256 pins: the code objects measured on ctheliosr-1b112-a08-1 (hk/lab/review_tmp/**/*.meta.json of the a08-1 backup) or pinned in Primus-Turbo cade7db6 (manifest.json); a rung without a pin was never built before.",
-  "ref_ms: the a08-1 measurement (b4 s8192 hq32 hkv8, lab.py ruler, L2 flush, median), for orientation only; every rung is re-measured in one session on one GPU."
+  "ref_ms: the a08-1 measurement (b4 s8192 hq32 hkv8, lab.py ruler, L2 flush, median), for orientation only; every rung is re-measured in one session on one GPU.",
+  "main line f00 -> f10z (written 2026-10-27, e15-02): the order follows what each step needs -- TDM, then double buffering, operand bursts, a 3-slot ring (enabler), software pipelining, then GQA packing on the pipelined kernel; the first-draft order (GQA right after TDM, f03..f08) is kept as a side chain: without a pipeline nothing hides the softmax and every later step stays flat. Steps are over the parent rung."
  ],
  "rungs": [
   {
@@ -38,25 +39,25 @@
    "feature": "naive: 64 queries x 1 head per WG, register-mediated single-buffer K/V fill, 2 barriers per block, eager rescale"
   },
   {
-   "id": "f01",
+   "id": "f01t",
    "parent": "f00",
    "kernels": {
-    "k_fwd_f01": {
-     "src": "src/ladder/f01_double_buf.hip",
+    "k_fwd_f01t": {
+     "src": "src/ladder/f01t_tdm.hip",
      "extra_flags": []
     }
    },
    "launch": {
     "module": "fwd_ladder",
     "opts": {
-     "kernel": "k_fwd_f01"
+     "kernel": "k_fwd_f01t"
     }
    },
-   "feature": "double-buffered LDS: block j+1's global loads in flight during block j's compute, 1 barrier per block"
+   "feature": "TDM fill (one buffer, 2 barriers per block): no VGPRs, VALU or buffer-load waits for the fill"
   },
   {
    "id": "f02",
-   "parent": "f01",
+   "parent": "f01t",
    "kernels": {
     "k_fwd_f02": {
      "src": "src/ladder/f02_tdm.hip",
@@ -69,115 +70,178 @@
      "kernel": "k_fwd_f02"
     }
    },
-   "feature": "TDM fill: one 32-row tensor_load_to_lds per wave per block instead of the register path"
+   "feature": "double-buffered TDM fill: block j+1's tensor_load_to_lds ops in flight during block j's compute, 1 barrier per block"
   },
   {
-   "id": "f03",
+   "id": "f03b",
    "parent": "f02",
    "kernels": {
-    "k_fwd_f03": {
-     "src": "src/ladder/f03_gqa4.hip",
+    "k_fwd_f03b": {
+     "src": "src/ladder/f03b_bursts.hip",
      "extra_flags": []
     }
    },
    "launch": {
     "module": "fwd_ladder",
     "opts": {
-     "kernel": "k_fwd_f03",
+     "kernel": "k_fwd_f03b"
+    }
+   },
+   "feature": "operand bursts: a phase's LDS operands loaded at once (V before the softmax), not one load before each WMMA"
+  },
+  {
+   "id": "f04r",
+   "parent": "f03b",
+   "kernels": {
+    "k_fwd_f04r": {
+     "src": "src/ladder/f04r_ring3.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f04r"
+    }
+   },
+   "feature": "3-slot TDM ring, prefetch distance 2 (enabler of the pipelined rung)"
+  },
+  {
+   "id": "f05p",
+   "parent": "f04r",
+   "kernels": {
+    "k_fwd_f05p": {
+     "src": "src/ladder/f05p_pipeline.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec"
+     ]
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f05p"
+    }
+   },
+   "feature": "software pipelining: S^T(j+1) WMMAs under the softmax of block j (one branch-free region)"
+  },
+  {
+   "id": "f06g",
+   "parent": "f05p",
+   "kernels": {
+    "k_fwd_f06g": {
+     "src": "src/ladder/f06g_gqa4.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec"
+     ]
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f06g",
      "heads_per_wg": 4
     }
    },
-   "feature": "GQA packing: the 4 q heads of one kv head per WG share every K / V tile and LDS operand"
+   "feature": "GQA packing on the pipelined kernel: each K / V operand feeds the 4 q heads of its kv head"
   },
   {
-   "id": "f04",
-   "parent": "f03",
+   "id": "f07l",
+   "parent": "f06g",
    "kernels": {
-    "k_fwd_f04": {
-     "src": "src/ladder/f04_longest_first.hip",
-     "extra_flags": []
+    "k_fwd_f07l": {
+     "src": "src/ladder/f07l_longest_first.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec"
+     ]
     }
    },
    "launch": {
     "module": "fwd_ladder",
     "opts": {
-     "kernel": "k_fwd_f04",
+     "kernel": "k_fwd_f07l",
      "heads_per_wg": 4
     }
    },
    "feature": "longest-first workgroup order (causal load balance)"
   },
   {
-   "id": "f05",
-   "parent": "f04",
+   "id": "f08s",
+   "parent": "f07l",
    "kernels": {
-    "k_fwd_f05": {
-     "src": "src/ladder/f05_ring4.hip",
-     "extra_flags": []
+    "k_fwd_f08s": {
+     "src": "src/ladder/f08s_lock_simd.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec"
+     ]
     }
    },
    "launch": {
     "module": "fwd_ladder",
     "opts": {
-     "kernel": "k_fwd_f05",
-     "heads_per_wg": 4
-    }
-   },
-   "feature": "4-slot TDM ring with prefetch distance 2 (two blocks of compute cover each block's TDM latency)"
-  },
-  {
-   "id": "f06",
-   "parent": "f05",
-   "kernels": {
-    "k_fwd_f06": {
-     "src": "src/ladder/f06_split_barrier.hip",
-     "extra_flags": []
-    }
-   },
-   "launch": {
-    "module": "fwd_ladder",
-    "opts": {
-     "kernel": "k_fwd_f06",
-     "heads_per_wg": 4
-    }
-   },
-   "feature": "split barrier: signal after S^T(j), wait at the top of block j+1 (softmax + PV absorb wave skew)"
-  },
-  {
-   "id": "f07",
-   "parent": "f06",
-   "kernels": {
-    "k_fwd_f07": {
-     "src": "src/ladder/f07_lock_simd.hip",
-     "extra_flags": []
-    }
-   },
-   "launch": {
-    "module": "fwd_ladder",
-    "opts": {
-     "kernel": "k_fwd_f07",
+     "kernel": "k_fwd_f08s",
      "heads_per_wg": 4
     }
    },
    "feature": "lock_simd: no WMMA arbitration pause at one wave per SIMD"
   },
   {
-   "id": "f08",
-   "parent": "f07",
+   "id": "f09m",
+   "parent": "f08s",
    "kernels": {
-    "k_fwd_f08": {
-     "src": "src/ladder/f08_lazy_rescale.hip",
-     "extra_flags": []
+    "k_fwd_f09m": {
+     "src": "src/ladder/f09m_diag_mask.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec"
+     ]
     }
    },
    "launch": {
     "module": "fwd_ladder",
     "opts": {
-     "kernel": "k_fwd_f08",
+     "kernel": "k_fwd_f09m",
      "heads_per_wg": 4
     }
    },
-   "feature": "lazy rescale: O / l rescaled only when a query's max grew by > 8 nat (uniform branch)"
+   "feature": "causal mask on the diagonal block only (peeled loop, no branch in the hot loop)"
+  },
+  {
+   "id": "f10z",
+   "parent": "f09m",
+   "kernels": {
+    "k_fwd_f10z": {
+     "src": "src/ladder/f10z_lazy_rescale.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec"
+     ]
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f10z",
+     "heads_per_wg": 4
+    }
+   },
+   "feature": "lazy rescale behind one unlikely branch per chunk (v0's RESC form), max taken a phase ahead"
   },
   {
    "id": "v0",
@@ -196,9 +260,9 @@
    "launch": {
     "module": "fwd_v0"
    },
-   "feature": "first HK forward (Primus-Turbo fd4a1bd0): f08 + software pipelining (QK(c+1) || softmax(c) on 32-row chunks, double-buffered S^T), mask on the last stage only, Q through TDM, O through LDS, 320 KB LDS",
+   "feature": "first HK forward (Primus-Turbo fd4a1bd0), the shipped form of f10z: 4-slot ring with split barriers, Q by TDM, O through LDS, a finer QK || softmax interleave (same speed as f10z)",
    "ref_ms": 1.123,
-   "parent": "f08"
+   "parent": "f10z"
   },
   {
    "id": "v0_resc",
@@ -370,6 +434,162 @@
     "module": "fwd_v1"
    },
    "feature": "v1.1: RESC + one burst per stage (MDS3) + 2-stage unroll (never run on a GPU)"
+  },
+  {
+   "id": "f01",
+   "parent": "f00",
+   "kernels": {
+    "k_fwd_f01": {
+     "src": "src/ladder/f01_double_buf.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f01"
+    }
+   },
+   "feature": "negative: register-path double buffer -- 64 more VGPRs hold block j+1's loads, occupancy 4 -> 3 waves/SIMD (ATT); the TDM path (f01t, f02) double-buffers without VGPRs",
+   "side": true
+  },
+  {
+   "id": "f03",
+   "parent": "f02",
+   "kernels": {
+    "k_fwd_f03": {
+     "src": "src/ladder/f03_gqa4.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f03",
+     "heads_per_wg": 4
+    }
+   },
+   "feature": "side chain (GQA before pipelining; one S^T -> softmax -> PV dependency chain per block): GQA packing on f02 -- 4x the work per WG at 1 wave/SIMD, nothing to hide the softmax under",
+   "side": true
+  },
+  {
+   "id": "f04",
+   "parent": "f03",
+   "kernels": {
+    "k_fwd_f04": {
+     "src": "src/ladder/f04_longest_first.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f04",
+     "heads_per_wg": 4
+    }
+   },
+   "feature": "side chain (GQA before pipelining; one S^T -> softmax -> PV dependency chain per block): longest-first workgroup order (causal load balance)",
+   "side": true
+  },
+  {
+   "id": "f05",
+   "parent": "f04",
+   "kernels": {
+    "k_fwd_f05": {
+     "src": "src/ladder/f05_ring4.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f05",
+     "heads_per_wg": 4
+    }
+   },
+   "feature": "side chain (GQA before pipelining; one S^T -> softmax -> PV dependency chain per block): 4-slot TDM ring with prefetch distance 2 (two blocks of compute cover each block's TDM latency)",
+   "side": true
+  },
+  {
+   "id": "f06",
+   "parent": "f05",
+   "kernels": {
+    "k_fwd_f06": {
+     "src": "src/ladder/f06_split_barrier.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f06",
+     "heads_per_wg": 4
+    }
+   },
+   "feature": "side chain (GQA before pipelining; one S^T -> softmax -> PV dependency chain per block): split barrier: signal after S^T(j), wait at the top of block j+1 (softmax + PV absorb wave skew)",
+   "side": true
+  },
+  {
+   "id": "f07",
+   "parent": "f06",
+   "kernels": {
+    "k_fwd_f07": {
+     "src": "src/ladder/f07_lock_simd.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f07",
+     "heads_per_wg": 4
+    }
+   },
+   "feature": "side chain (GQA before pipelining; one S^T -> softmax -> PV dependency chain per block): lock_simd: no WMMA arbitration pause at one wave per SIMD",
+   "side": true
+  },
+  {
+   "id": "f08",
+   "parent": "f07",
+   "kernels": {
+    "k_fwd_f08": {
+     "src": "src/ladder/f08_lazy_rescale.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f08",
+     "heads_per_wg": 4
+    }
+   },
+   "feature": "side chain (GQA before pipelining; one S^T -> softmax -> PV dependency chain per block): lazy rescale: O / l rescaled only when a query's max grew by > 8 nat (uniform branch)",
+   "side": true
+  },
+  {
+   "id": "f09z",
+   "parent": "f08s",
+   "kernels": {
+    "k_fwd_f09z": {
+     "src": "src/ladder/f09z_lazy_rescale.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec"
+     ]
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f09z",
+     "heads_per_wg": 4
+    }
+   },
+   "feature": "negative: lazy rescale with a per-head branch at every chunk end (the branches cut the interleaved schedule)",
+   "side": true
   },
   {
    "id": "x_desc",

@@ -4,7 +4,7 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
-// f04_longest_first -- rung 04 of the Llama forward ladder: f03 with the heaviest workgroups dispatched first.
+// f04_longest_first -- Llama forward ladder, side chain (GQA before pipelining): f03 with the heaviest workgroups dispatched first.
 //
 // Kernel Specification
 //   work      workgroup = 64 query positions x FOUR q heads (a head quad, G % 4 == 0, so one kv head);

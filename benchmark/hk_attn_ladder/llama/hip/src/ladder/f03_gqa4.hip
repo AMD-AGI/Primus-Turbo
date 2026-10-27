@@ -4,7 +4,7 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
-// f03_gqa4 -- rung 03 of the Llama forward ladder: f02 with four q heads of one kv head per workgroup.
+// f03_gqa4 -- Llama forward ladder, side chain (GQA before pipelining): f02 with four q heads of one kv head per workgroup.
 //
 // Kernel Specification
 //   work      workgroup = 64 query positions x FOUR q heads (a head quad, G % 4 == 0, so one kv head);

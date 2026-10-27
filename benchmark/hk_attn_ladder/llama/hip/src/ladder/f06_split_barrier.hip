@@ -4,7 +4,7 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
-// f06_split_barrier -- rung 06 of the Llama forward ladder: f05 with the per-block barrier split.
+// f06_split_barrier -- Llama forward ladder, side chain (GQA before pipelining): f05 with the per-block barrier split.
 //
 // Kernel Specification
 //   work      workgroup = 64 query positions x FOUR q heads (a head quad, G % 4 == 0, so one kv head);

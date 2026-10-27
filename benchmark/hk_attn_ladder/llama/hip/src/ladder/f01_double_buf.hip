@@ -4,7 +4,7 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
-// f01_double_buf -- rung 01 of the Llama forward ladder: f00 + a double-buffered LDS fill.
+// f01_double_buf -- Llama forward ladder, side rung (negative): f00 + a double-buffered LDS fill.
 //
 // Kernel Specification
 //   work      workgroup = 64 query positions x ONE q head; wave w = positions [16 w, +16)
