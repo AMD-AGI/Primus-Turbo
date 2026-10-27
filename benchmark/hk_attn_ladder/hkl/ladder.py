@@ -55,11 +55,15 @@ def t95(dof):
 
 
 class Sclk:
-    """Background sampler of the device's current shader clock (MHz) from hwmon; inert if not found."""
+    """Background sampler of the device's current shader clock (MHz) and, when its hwmon has power1_input,
+    socket power (W); inert if not found."""
 
     def __init__(self, dev_index=0):
         self.path = os.environ.get("HKL_HWMON_FREQ") or self._find(dev_index)
-        self.samples, self._stop = [], threading.Event()
+        pw = os.environ.get("HKL_HWMON_POWER") or (os.path.join(os.path.dirname(self.path), "power1_input")
+                                                   if self.path else None)  # fmt: skip
+        self.ppath = pw if pw and os.path.exists(pw) else None
+        self.samples, self.psamples, self._stop = [], [], threading.Event()
         self._t = None
 
     @staticmethod
@@ -80,12 +84,17 @@ class Sclk:
         return self
 
     def _run(self):
-        while not self._stop.is_set():
-            try:
-                with open(self.path) as f:
-                    self.samples.append((time.monotonic(), int(f.read()) / 1e6))
-            except OSError:
-                return
+        fails = 0  # hwmon reads fail transiently (firmware busy); give up only on a long run of failures
+        while not self._stop.is_set() and fails < 1000:
+            for path, out in ((self.path, self.samples), (self.ppath, self.psamples)):
+                if not path:
+                    continue
+                try:
+                    with open(path) as f:
+                        out.append((time.monotonic(), int(f.read()) / 1e6))
+                    fails = 0
+                except (OSError, ValueError):
+                    fails += 1
             time.sleep(0.002)
 
     def stop(self):
@@ -95,6 +104,10 @@ class Sclk:
 
     def median(self, t0, t1):
         v = [m for t, m in self.samples if t0 <= t <= t1]
+        return statistics.median(v) if v else None
+
+    def power(self, t0, t1):
+        v = [w for t, w in self.psamples if t0 <= t <= t1]
         return statistics.median(v) if v else None
 
 
@@ -168,6 +181,8 @@ def main(argv=None):
     ap.add_argument("--no-null", action="store_true", help="skip the null-control arm")
     ap.add_argument("--verify", choices=("ref", "none"), default="ref")
     ap.add_argument("--min-snr", type=float, default=40.0)
+    ap.add_argument("--data", choices=("randn", "zeros"), default=os.environ.get("HKL_DATA", "randn"),
+                    help="input data; zeros (no verification) shows the clock without the power cap's pull")
     ap.add_argument("--json")
     ap.add_argument("--md")
     a = ap.parse_args(argv)
@@ -189,7 +204,9 @@ def main(argv=None):
         null.id = f"{rungs[-1]}#null"
         arms.append(null)
 
-    inp = R.make_inputs(sh, dev, seed=0)
+    if a.data == "zeros":
+        a.verify = "none"  # an all-zero reference has no SNR
+    inp = R.make_inputs(sh, dev, seed=0, data=a.data)
     refs = None
     if direction == "bwd" or a.verify == "ref":
         t0 = time.time()
@@ -218,6 +235,7 @@ def main(argv=None):
     samples = {i: [] for i in ids}  # per round: cell median ms
     clocks = {i: [] for i in ids}
     cycles = {i: [] for i in ids}  # per round: cell median ms x sclk (Mcycles)
+    watts = {i: [] for i in ids}  # per round: cell median socket power (W)
     for rnd in range(a.rounds):
         order = ids[rnd % len(ids):] + ids[:rnd % len(ids)]
         if rnd % 2:
@@ -230,6 +248,7 @@ def main(argv=None):
             samples[i].append(statistics.median(ms))
             clocks[i].append(sclk.median(t0, t1))
             cycles[i].append(samples[i][-1] * clocks[i][-1] / 1e3 if clocks[i][-1] else None)
+            watts[i].append(sclk.power(t0, t1))
         print(f"  round {rnd + 1}/{a.rounds}: " + " ".join(f"{i}={samples[i][-1]:.4f}" for i in ids), flush=True)
     sclk.stop()
 
@@ -242,9 +261,12 @@ def main(argv=None):
         mean, ci = summarize(samples[i])
         c = [x for x in clocks[i] if x is not None]
         cy = [x for x in cycles[i] if x is not None]
+        w = [x for x in watts[i] if x is not None]
+        mj = [x * ms for x, ms in zip(watts[i], samples[i]) if x is not None]  # W x ms = mJ per call
         row = {"arm": i, "ms": m, "mean": mean, "ci95": ci, "tflops": flops / (m * 1e-3) / 1e12,
                "sclk": statistics.median(c) if c else None, "mcyc": statistics.median(cy) if cy else None,
-               "rounds": samples[i], "sclk_rounds": clocks[i]}  # fmt: skip
+               "watts": statistics.median(w) if w else None, "mj": statistics.median(mj) if mj else None,
+               "rounds": samples[i], "sclk_rounds": clocks[i], "watt_rounds": watts[i]}  # fmt: skip
         base_id = i.split("#")[0]
         if base_id in by_id:
             r = by_id[base_id]
@@ -270,7 +292,7 @@ def main(argv=None):
     else:
         null_ctl = None
 
-    hdr = f"{'arm':<20} {'ms':>8} {'TFLOP/s':>8} {'over':>8} {'step':>16} {'step cyc':>9} {'sclk':>6} {'Mcyc':>7} {'a08 ms':>7}  feature"
+    hdr = f"{'arm':<20} {'ms':>8} {'TFLOP/s':>8} {'over':>8} {'step':>16} {'step cyc':>9} {'sclk':>6} {'Mcyc':>7} {'W':>6} {'mJ':>6} {'a08 ms':>7}  feature"
     lines = [hdr, "-" * len(hdr)]
     for row in rows:
         st = row.get("step")
@@ -280,7 +302,9 @@ def main(argv=None):
         sy = f"{row['step_cyc']['median']:.3f}x" if row.get("step_cyc") else ""
         mc = f"{row['mcyc']:.3f}" if row.get("mcyc") else "-"
         ov = st["over"] if st else ""
-        lines.append(f"{row['arm']:<20} {row['ms']:8.4f} {row['tflops']:8.1f} {ov:>8} {s:>16} {sy:>9} {sc:>6} {mc:>7} {ra:>7}  "
+        wt = f"{row['watts']:.0f}" if row.get("watts") else "-"
+        mj = f"{row['mj']:.2f}" if row.get("mj") else "-"
+        lines.append(f"{row['arm']:<20} {row['ms']:8.4f} {row['tflops']:8.1f} {ov:>8} {s:>16} {sy:>9} {sc:>6} {mc:>7} {wt:>6} {mj:>6} {ra:>7}  "
                      f"{row.get('feature', '')[:60]}")  # fmt: skip
     if null_ctl:
         lines.append(f"null control {rungs[-1]} vs #null: {null_ctl['median']:.4f}x ± {null_ctl['ci95']:.4f}")
@@ -288,14 +312,14 @@ def main(argv=None):
     meta = {"ladder": spec["name"], "shape": repr(sh), "device": props.gcnArchName, "cus": props.multi_processor_count,
             "torch": torch.__version__, "rounds": a.rounds, "iters": a.iters, "settle_s": a.settle_s, "flush_mb": a.flush_mb,
             "hip_visible_devices": os.environ.get("HIP_VISIBLE_DEVICES"), "host": os.uname().nodename,
-            "time": time.strftime("%Y-%m-%d %H:%M:%S"), "useful_flops": flops}  # fmt: skip
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"), "useful_flops": flops, "data": a.data}  # fmt: skip
     if a.json:
         with open(a.json, "w") as f:
             json.dump({"meta": meta, "rows": rows, "null_control": null_ctl}, f, indent=1)
     if a.md:
-        md = [f"{spec.get('title', spec['name'])}, {sh}, {meta['host']} GPU {meta['hip_visible_devices']}, {meta['time']}",
-              "", "| Rung | ms | TFLOP/s | Over | Step | Step (cycles) | sclk MHz | Mcycles | Feature |",
-              "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- |"]  # fmt: skip
+        md = [f"{spec.get('title', spec['name'])}, {sh}, {a.data} inputs, {meta['host']} GPU {meta['hip_visible_devices']}, {meta['time']}",
+              "", "| Rung | ms | TFLOP/s | Over | Step | Step (cycles) | sclk MHz | Mcycles | W | mJ/call | Feature |",
+              "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"]  # fmt: skip
         for row in rows:
             st = row.get("step")
             step = f"{st['median']:.3f}x" if st else ""
@@ -303,7 +327,9 @@ def main(argv=None):
             sy = f"{row['step_cyc']['median']:.3f}x" if row.get("step_cyc") else ""
             mc = f"{row['mcyc']:.3f}" if row.get("mcyc") else "-"
             ov = st["over"] if st else ""
-            md.append(f"| {row['arm']} | {row['ms']:.4f} | {row['tflops']:.0f} | {ov} | {step} | {sy} | {sc} | {mc} | "
+            wt = f"{row['watts']:.0f}" if row.get("watts") else "-"
+            mj = f"{row['mj']:.2f}" if row.get("mj") else "-"
+            md.append(f"| {row['arm']} | {row['ms']:.4f} | {row['tflops']:.0f} | {ov} | {step} | {sy} | {sc} | {mc} | {wt} | {mj} | "
                       f"{row.get('feature', '')} |")  # fmt: skip
         with open(a.md, "w") as f:
             f.write("\n".join(md) + "\n")

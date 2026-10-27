@@ -1,0 +1,78 @@
+diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
+--- a/include/dqds/dqds_impl.h	2026-10-27 15:09:49.417129037 +0000
++++ b/include/dqds/dqds_impl.h	2026-10-27 15:09:49.425347909 +0000
+@@ -243,7 +243,11 @@
+     const int       mshift = cshift / 32;
+     const long long nblk   = dsl_nblk_bh(Sq, Skv, causal);
+     auto            c_desc = [&](int u, auto REAL) DQ_INL -> TdmDesc {
++#if HKL_ABL_DQ_NOK  // ablation (timing only, wrong results): every K op is the 16-B dummy (stale K ring)
++        const bool live = false;
++#else
+         const bool live = decltype(REAL)::value != 0 || u < nu;
++#endif
+         // K role: rows [64u + 32 hh, +32), all 192 columns
+         const int       kv0 = c_kop_kv0(u, hh);
+         const long long gel = k_el(bat, Skv, kv0, Hkv, hkv, 0);
+@@ -255,7 +259,12 @@
+         const int       r    = 2 * u + hh;
+         const int       slot = c_dsslot(u, NQW, hh);
+         const int       nv   = dsop_nv_hot(qp0g, NB_G, r, mshift, causal);
++#if HKL_ABL_DQ_NODS  // ablation (timing only, wrong results): every dS op is the 16-B dummy (stale dS ring)
++        const bool      go   = false;
++        (void) nv;
++#else
+         const bool      go   = decltype(REAL)::value != 0 || (live && nv >= 1);
++#endif
+         const long long src = dsop_src_el_hot((long long) hb, nblk, r, qp0g, nqp, mshift, causal);
+         const long long str = dsop_stride_el_hot(r, nqp, mshift, causal);
+         const TdmDesc   dd  = desc(go ? dsop_lds(slot, NB_G, nv) : slot,
+diff -ruN a/src/k_dkdv96ds.hip b/src/k_dkdv96ds.hip
+--- a/src/k_dkdv96ds.hip	2026-10-27 15:09:49.417386578 +0000
++++ b/src/k_dkdv96ds.hip	2026-10-27 15:09:49.425294428 +0000
+@@ -269,9 +269,19 @@
+           // causal, bottom-right: query q attends kv <= q + cshift; kv = this lane's row
+           tt = (kvl > qb + si + cshift) ? K1_NEG : tt;  // no causal test: n_mask = G * k3_nmaskp() is 0 unless causal
+         }
++#if HKL_ABL_NOSMX  // ablation (timing only, wrong results): no softmax / dS VALU, P = S, dS = dP
++        (void)tt;
++        ph[kh][hh * 8 + si] = to_bf16(s[si.value]);
++        dh[kh][hh * 8 + si] = to_bf16(p[si.value]);
++#else
++#if HKL_ABL_NOEXP  // ablation (timing only, wrong results): no v_exp
++        const float pf = tt;
++#else
+         const float pf = exp2_raw(tt);
++#endif
+         ph[kh][hh * 8 + si] = to_bf16(pf);
+         dh[kh][hh * 8 + si] = to_bf16(pf * __builtin_fmaf(p[si.value], scale, nd));
++#endif
+       });
+     };
+     auto frags = [&](const bf16x8* ops, bf16x16 (&qfr)[NDT_QK], bf16x16 (&dfr)[NDT_V]) {
+@@ -519,7 +529,11 @@
+       if constexpr (K3) {
+         // (1) hh1 of stage cur is read back here, under hh0's S/dP WMMAs; right behind it the pending prefetch
+         // TDM: tile min(ii+2, n-1) -> stage (ii+2)%3, whose last reads were before BARRIER(ii-1)
++#if HKL_ABL_NOTDM  // ablation (timing only, wrong results): the full loop streams no Q / dO tiles (stale ring)
++        sdp3(std::false_type{}, qd, rd_base(cur), pre, (qt0 + qi) * 32, a_pk, a_dsk, [&] {});
++#else
+         sdp3(std::false_type{}, qd, rd_base(cur), pre, (qt0 + qi) * 32, a_pk, a_dsk, [&] { tdm_issue(tdp_pend); });
++#endif
+         const lds_u8* tv = tr_base(cur, 0);
+         const lds_u8* tk = tr_base(cur, 1);
+         const RdBase rbb = rd_base(ncur);
+@@ -541,10 +555,14 @@
+                           dpp_ror8<0x3>(w[7], w[3])};
+         });
+         sched_barrier<0>();
++#if !HKL_ABL_NODS  // ablation (timing only, wrong results): the full loop exports no dS^T
+         static_for<NKV>([&](auto kh) {
+           buf_store_u32x4(dsx[kh], r_ds, vds, so_c + ds_rc[kh]);
+           buf_store_u32x4(dsy[kh], r_ds, vds + K1DS_ST_B, so_c + ds_rc[kh]);
+         });
++#else
++        (void)dsx; (void)dsy;
++#endif
+         // X1b1: the export is pinned here, under the dO^T tr16 latency, ahead of the first dV WMMA (in the
+         // non-expert mode a store issued inside the WMMA run waits for every earlier WMMA)
+         sched_barrier<0>();

@@ -7,7 +7,7 @@ set -euo pipefail
 [ $# -ge 2 ] || { sed -n '2,5p' "$0"; exit 2; }
 LADDER=$1; ARM=$2; shift 2
 HERE=$(readlink -f "$(dirname "$0")/..")
-NAME=$(dirname "$LADDER")_$(basename "$LADDER" .json)_$ARM
+NAME=$(dirname "$LADDER")_$(basename "$LADDER" .json)_$ARM${HKL_DATA:+_$HKL_DATA}  # HKL_DATA=zeros: one dir per input kind
 OUT=$HERE/logs/ktrace/$NAME
 rm -rf "$OUT"; mkdir -p "$OUT"
 exec "$HERE/tools/run_gpu.sh" "ktrace_$NAME" 900 -- \

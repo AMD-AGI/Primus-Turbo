@@ -47,12 +47,18 @@ def _bshd(t, layout):
     return t if layout == "bshd" else t.permute(1, 0, 2, 3)
 
 
-def make_inputs(sh, device, seed=0, scale=1.0):
-    """q, k, v, do (bf16, the problem's layout, contiguous), N(0, scale^2)."""
+def make_inputs(sh, device, seed=0, scale=1.0, data="randn"):
+    """q, k, v, do (bf16, the problem's layout, contiguous), N(0, scale^2); data="zeros": all zero (same
+    instruction stream, almost no bit toggling: the clock under the power cap goes up, which separates the
+    cycle-bound part of a time from the power-bound part)."""
+    if data not in ("randn", "zeros"):
+        raise ValueError(f"data {data!r}: expected randn or zeros")
     g = torch.Generator(device=device).manual_seed(seed)
 
     def rnd(s, h, d):
         t = sh.tensor(s, h, d, device)
+        if data == "zeros":
+            return t.zero_()
         t.copy_(torch.randn(t.shape, generator=g, device=device, dtype=torch.float32) * scale)
         return t
 

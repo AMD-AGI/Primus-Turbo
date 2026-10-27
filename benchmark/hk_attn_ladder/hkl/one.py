@@ -6,13 +6,14 @@
 
 """Run one arm (rung or baseline) a few times at one shape: the workload for rocprofv3 (ATT, kernel trace).
 
-    python3 -m hkl.one llama/ladder_fwd.json f03 [-n 3] [--warm 2] [--shape b=1 sq=4096 skv=4096]
+    python3 -m hkl.one llama/ladder_fwd.json f03 [-n 3] [--warm 2] [--shape b=1 sq=4096 skv=4096] [--data zeros]
 
 Warm calls first (JIT, caches, clocks), then -n calls with a device sync after each, so a profiler that
 selects dispatches by index (--att-consecutive-kernels, kernel-include regex + skip) sees whole calls.
 """
 
 import argparse
+import os
 import sys
 
 import torch
@@ -29,6 +30,7 @@ def main(argv=None):
     ap.add_argument("-n", type=int, default=3)
     ap.add_argument("--warm", type=int, default=2)
     ap.add_argument("--shape", nargs="*")
+    ap.add_argument("--data", choices=("randn", "zeros"), default=os.environ.get("HKL_DATA", "randn"))
     a = ap.parse_args(argv)
     spec = runner.load_ladder(a.ladder)
     direction = spec["direction"]
@@ -36,7 +38,7 @@ def main(argv=None):
     arm = (runner.load_baseline(a.ladder, a.arm) if a.arm in runner.baseline_ids(a.ladder)
            else runner.load(a.ladder, a.arm))  # fmt: skip
     dev = torch.device("cuda")
-    inp = R.make_inputs(sh, dev, seed=0)
+    inp = R.make_inputs(sh, dev, seed=0, data=a.data)
     if direction == "bwd":
         o, lse = R.ref_fwd(sh, inp["q"], inp["k"], inp["v"])
         inp["o"], inp["lse"] = o.to(torch.bfloat16), lse
@@ -47,7 +49,7 @@ def main(argv=None):
     for i in range(a.n):
         call()
         torch.cuda.synchronize()
-    print(f"{arm} {sh}: {a.warm} warm + {a.n} calls done", flush=True)
+    print(f"{arm} {sh} {a.data}: {a.warm} warm + {a.n} calls done", flush=True)
     return 0
 
 
