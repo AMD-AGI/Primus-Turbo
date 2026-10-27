@@ -48,6 +48,7 @@ from primus_turbo.flydsl.deep_ep.intranode_v2_kernel import (
     TAIL_DONE_BIT,
     combine_v2_grabs,
     combine_v2_layout,
+    combine_v2_slot_bytes,
     dispatch_v2_layout,
     launch_barrier,
     launch_combine_v2,
@@ -85,6 +86,31 @@ def get_intranode_backend(backend: Optional[str] = None) -> str:
 def _check(cond: bool, msg: str = "") -> None:
     if not cond:
         raise RuntimeError(f"DeepEP FlyDSL intranode check failed: {msg}")
+
+
+# the widest top-k index the dispatch takes (int64)
+_V2_TOPK_IDX_BYTES = 8
+
+
+def v2_heap_bytes(num_max_tokens_per_rank: int, num_ranks: int, hidden_bytes: int, num_topk: int) -> int:
+    """Heap bytes the V2 backend needs when no rank sends more than ``num_max_tokens_per_rank`` tokens:
+    the dispatch region of a rank may receive every rank's tokens, and the combine region holds each of
+    its own tokens coming back from every rank. ``hidden_bytes`` is the bf16 row; an fp8 row with its
+    scales is smaller."""
+    _check(num_max_tokens_per_rank > 0, "the V2 heap is sized from the maximum number of tokens per rank")
+    rows = num_max_tokens_per_rank * num_ranks
+    _check(
+        rows * 4 <= COMBINE_FLAGS_BYTES,
+        f"V2 takes at most {COMBINE_FLAGS_BYTES // 4} tokens x ranks, got {rows}",
+    )
+    dispatch_row = hidden_bytes + 4 + num_topk * (_V2_TOPK_IDX_BYTES + 4)
+    row = max(dispatch_row, combine_v2_slot_bytes(hidden_bytes, num_topk))
+    # every region starts 16-byte aligned (dispatch_v2_layout has 5); halves are whole 4 KiB pages
+    half = -(-(rows * row + 16 * 5) // 4096) * 4096
+    num_bytes = DATA_OFFSET + 2 * half
+    assert dispatch_v2_layout(num_bytes, hidden_bytes, num_topk, _V2_TOPK_IDX_BYTES, 0)[1] >= rows
+    assert combine_v2_layout(num_bytes, hidden_bytes, num_topk)[1] >= rows
+    return num_bytes
 
 
 class FlyDSLIntranodeRuntime:

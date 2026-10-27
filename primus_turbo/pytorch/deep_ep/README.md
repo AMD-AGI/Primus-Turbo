@@ -39,8 +39,9 @@ backends with the same `Buffer` API:
   On gfx1250 the C++ DeepEP is not loaded and `flydsl` is the default.
 - `flydsl_v2` (gfx1250 only): FlyDSL kernels in `primus_turbo/flydsl/deep_ep/intranode_v2_kernel.py`
   that write every token straight into a fixed slot on each destination rank instead of streaming it
-  through channel rings. Same outputs as `flydsl`, with handles of its own; the heap it needs grows
-  with the token count.
+  through channel rings. Same outputs as `flydsl`, with handles of its own. Its heap grows with the
+  token count: `moe_dispatch` sizes it from the dispatched tokens, which must be the same on every
+  rank, or `set_buffer_global_config(num_max_tokens_per_rank=...)` sets it up front.
 
 Pick one per `Buffer` with `intranode_backend="cpp" | "flydsl" | "flydsl_v2"`, or globally with
 `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND=cpp|flydsl|flydsl_v2`. `cpp` and `flydsl` use the same
