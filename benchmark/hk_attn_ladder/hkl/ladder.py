@@ -14,17 +14,19 @@ Protocol (the HK GEMM ladder's, plus what the a08-1 attention work learned on th
   * every arm is checked once against the fp32 reference at the timing shape before any timing starts
     (--verify none skips it); a failure aborts the campaign there;
   * each arm is pre-warmed for --warmup-s seconds (clocks settle under the power cap);
-  * R rounds; each round runs every arm once, in an order rotated by one per round (cyclic shift), so a
-    step's delta is formed between neighbouring cells of the same round and drift cancels;
-  * a cell = W unmeasured calls (block alternation: never one call per arm) then I measured calls, each
-    timed by its own event pair with a --flush-mb fill enqueued before it (no call sees the previous
-    one's L2);
+  * R rounds; each round runs every arm once, rotated by one per round and in reverse order every other
+    round, so an arm's predecessor alternates (a cyclic shift alone keeps every arm behind the same arm,
+    and its power state carries over: the first e15-02 run measured a 3% null-control bias that way);
+  * a cell = --settle-s seconds of synchronized calls (the shader clock settles to THIS arm's power draw;
+    a cell of ~50 ms of work inherits the previous arm's clock), then I measured calls, each timed by its
+    own event pair with a --flush-mb fill enqueued before it (no call sees the previous one's L2);
   * the top rung is also loaded a second time as a separate arm ("<id>#null", its own module instance):
     the spread between the two bounds how small a delta can be and still mean something;
   * sclk: a host thread samples the GPU's hwmon freq1_input every ~2 ms; each cell reports its median
     (on this card time follows clock: cycles are stable, sustained clocks are not).
 Results: per arm the median over rounds of the cell medians (ms), TFLOP/s on the useful FLOPs, the step
-over the previous rung of the main line (per-round ratio, median and 95% CI), sclk. --json keeps every
+over the previous rung of the main line (per-round ratio, median and 95% CI) in time and in cycles
+(ms x the cell's median sclk), sclk. --json keeps every
 sample; --md writes the table.
 """
 
@@ -114,10 +116,17 @@ def verify(arms, calls, direction, refs, min_snr):
             sys.exit(f"{arm.id} failed verification ({s} dB < {min_snr}); campaign aborted before timing")
 
 
-def cell(call, flush, warm, iters):
-    for _ in range(warm):
+def settle(call, flush, seconds, minimum=2):
+    """Synchronized calls for `seconds` (at least `minimum`): the clock settles to this arm's own power draw."""
+    t_end, n = time.time() + seconds, 0
+    while n < minimum or time.time() < t_end:
         flush.fill_(0)
         call()
+        torch.cuda.synchronize()
+        n += 1
+
+
+def cell(call, flush, iters):
     beg = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     end = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     for i in range(iters):
@@ -153,7 +162,7 @@ def main(argv=None):
     ap.add_argument("--shape", nargs="*", help="overrides of the ladder's problem, e.g. b=1 sq=4096")
     ap.add_argument("-r", "--rounds", type=int, default=10)
     ap.add_argument("-i", "--iters", type=int, default=20)
-    ap.add_argument("-w", "--warm", type=int, default=3, help="unmeasured calls per cell")
+    ap.add_argument("--settle-s", type=float, default=1.0, help="synchronized unmeasured calls per cell (seconds)")
     ap.add_argument("--warmup-s", type=float, default=2.0, help="pre-warm seconds per arm")
     ap.add_argument("--flush-mb", type=int, default=512)
     ap.add_argument("--no-null", action="store_true", help="skip the null-control arm")
@@ -208,14 +217,19 @@ def main(argv=None):
     ids = [arm.id for arm in arms]
     samples = {i: [] for i in ids}  # per round: cell median ms
     clocks = {i: [] for i in ids}
+    cycles = {i: [] for i in ids}  # per round: cell median ms x sclk (Mcycles)
     for rnd in range(a.rounds):
         order = ids[rnd % len(ids):] + ids[:rnd % len(ids)]
+        if rnd % 2:
+            order = order[::-1]
         for i in order:
+            settle(calls[i], flush, a.settle_s)
             t0 = time.monotonic()
-            ms = cell(calls[i], flush, a.warm, a.iters)
+            ms = cell(calls[i], flush, a.iters)
             t1 = time.monotonic()
             samples[i].append(statistics.median(ms))
             clocks[i].append(sclk.median(t0, t1))
+            cycles[i].append(samples[i][-1] * clocks[i][-1] / 1e3 if clocks[i][-1] else None)
         print(f"  round {rnd + 1}/{a.rounds}: " + " ".join(f"{i}={samples[i][-1]:.4f}" for i in ids), flush=True)
     sclk.stop()
 
@@ -227,8 +241,10 @@ def main(argv=None):
         m = statistics.median(samples[i])
         mean, ci = summarize(samples[i])
         c = [x for x in clocks[i] if x is not None]
+        cy = [x for x in cycles[i] if x is not None]
         row = {"arm": i, "ms": m, "mean": mean, "ci95": ci, "tflops": flops / (m * 1e-3) / 1e12,
-               "sclk": statistics.median(c) if c else None, "rounds": samples[i]}  # fmt: skip
+               "sclk": statistics.median(c) if c else None, "mcyc": statistics.median(cy) if cy else None,
+               "rounds": samples[i], "sclk_rounds": clocks[i]}  # fmt: skip
         base_id = i.split("#")[0]
         if base_id in by_id:
             r = by_id[base_id]
@@ -238,6 +254,9 @@ def main(argv=None):
                 ratios = [p / c for p, c in zip(samples[prev], samples[i])]
                 sm, sci = summarize(ratios)
                 row["step"] = {"over": prev, "median": statistics.median(ratios), "mean": sm, "ci95": sci}
+                cr = [p / c for p, c in zip(cycles[prev], cycles[i]) if p and c]
+                if cr:
+                    row["step_cyc"] = {"median": statistics.median(cr), "ci95": summarize(cr)[1]}
             if not i.endswith("#null") and base_id in main_line:
                 prev = i
         rows.append(row)
@@ -249,20 +268,22 @@ def main(argv=None):
     else:
         null_ctl = None
 
-    hdr = f"{'arm':<20} {'ms':>8} {'TFLOP/s':>8} {'step':>16} {'sclk':>6} {'a08 ms':>7}  feature"
+    hdr = f"{'arm':<20} {'ms':>8} {'TFLOP/s':>8} {'step':>16} {'step cyc':>9} {'sclk':>6} {'Mcyc':>7} {'a08 ms':>7}  feature"
     lines = [hdr, "-" * len(hdr)]
     for row in rows:
         st = row.get("step")
         s = f"{st['median']:.3f}x±{st['ci95']:.3f}" if st else ""
         sc = f"{row['sclk']:.0f}" if row["sclk"] else "-"
         ra = f"{row['ref_ms_a08']:.3f}" if row.get("ref_ms_a08") else ""
-        lines.append(f"{row['arm']:<20} {row['ms']:8.4f} {row['tflops']:8.1f} {s:>16} {sc:>6} {ra:>7}  "
-                     f"{row.get('feature', '')[:70]}")  # fmt: skip
+        sy = f"{row['step_cyc']['median']:.3f}x" if row.get("step_cyc") else ""
+        mc = f"{row['mcyc']:.3f}" if row.get("mcyc") else "-"
+        lines.append(f"{row['arm']:<20} {row['ms']:8.4f} {row['tflops']:8.1f} {s:>16} {sy:>9} {sc:>6} {mc:>7} {ra:>7}  "
+                     f"{row.get('feature', '')[:60]}")  # fmt: skip
     if null_ctl:
         lines.append(f"null control {rungs[-1]} vs #null: {null_ctl['median']:.4f}x ± {null_ctl['ci95']:.4f}")
     print("\n".join(lines))
     meta = {"ladder": spec["name"], "shape": repr(sh), "device": props.gcnArchName, "cus": props.multi_processor_count,
-            "torch": torch.__version__, "rounds": a.rounds, "iters": a.iters, "warm": a.warm, "flush_mb": a.flush_mb,
+            "torch": torch.__version__, "rounds": a.rounds, "iters": a.iters, "settle_s": a.settle_s, "flush_mb": a.flush_mb,
             "hip_visible_devices": os.environ.get("HIP_VISIBLE_DEVICES"), "host": os.uname().nodename,
             "time": time.strftime("%Y-%m-%d %H:%M:%S"), "useful_flops": flops}  # fmt: skip
     if a.json:
@@ -270,12 +291,15 @@ def main(argv=None):
             json.dump({"meta": meta, "rows": rows, "null_control": null_ctl}, f, indent=1)
     if a.md:
         md = [f"{spec.get('title', spec['name'])}, {sh}, {meta['host']} GPU {meta['hip_visible_devices']}, {meta['time']}",
-              "", "| Rung | ms | TFLOP/s | Step | sclk MHz | Feature |", "| --- | ---: | ---: | ---: | ---: | --- |"]  # fmt: skip
+              "", "| Rung | ms | TFLOP/s | Step | Step (cycles) | sclk MHz | Mcycles | Feature |",
+              "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"]  # fmt: skip
         for row in rows:
             st = row.get("step")
             step = f"{st['median']:.3f}x" if st else ""
             sc = f"{row['sclk']:.0f}" if row["sclk"] else "-"
-            md.append(f"| {row['arm']} | {row['ms']:.4f} | {row['tflops']:.0f} | {step} | {sc} | "
+            sy = f"{row['step_cyc']['median']:.3f}x" if row.get("step_cyc") else ""
+            mc = f"{row['mcyc']:.3f}" if row.get("mcyc") else "-"
+            md.append(f"| {row['arm']} | {row['ms']:.4f} | {row['tflops']:.0f} | {step} | {sy} | {sc} | {mc} | "
                       f"{row.get('feature', '')} |")  # fmt: skip
         with open(a.md, "w") as f:
             f.write("\n".join(md) + "\n")
