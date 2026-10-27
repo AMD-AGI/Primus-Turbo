@@ -4,7 +4,8 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
-// b02_tdm -- rung 02 of the Llama backward ladder: b01 with the tile fills on the Tensor Data Mover.
+// b02_tdm -- rung 02 of the Llama backward ladder (main line): b01t double-buffered (equivalently b01 with the tile
+// fills on the Tensor Data Mover).
 //
 // Kernel Specification
 //   prep  delta = rowsum(dO o O), NL = -LSE log2 e                          grid (Sq/64, Hq, B), block 256
@@ -21,7 +22,9 @@
 //           S^T = K Q^T, dP^T = V dO^T (lane = q), P^T, dS^T, dQ^T += K^T dS^T
 //         dQ = scale dQ^T                                                   grid (Sq/64, Hq, B), block 128
 // S and dP are computed twice (once per kernel): 7 GEMMs of 128-wide operands per (q, kv) pair instead of 5.
-// What changes from b01: as in the forward ladder's f02, the copy engine moves the tiles: no VGPRs held for
+// What changes from b01t: two buffers -- the next iteration's ops fly during this one's compute, one barrier per
+// iteration instead of two.
+// What changes from b01 (side rung): as in the forward ladder's f02, the copy engine moves the tiles: no VGPRs held for
 // the next tiles (b01: 64), no VALU address math, no ds_store; one SALU descriptor and one op per wave.
 #include "ladder/lb.h"
 

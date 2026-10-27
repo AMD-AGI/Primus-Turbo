@@ -4,7 +4,7 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
-// b06_deferred_dq -- rung 06 of the Llama backward ladder: b05 with dQ computed one iteration late.
+// b06_deferred_dq -- Llama backward ladder, side chain (first draft): b05 with dQ computed one iteration late.
 //
 // Kernel Specification
 //   prep  delta = rowsum(dO o O), NL = -LSE log2 e                          grid (Sq/64, Hq, B), block 256

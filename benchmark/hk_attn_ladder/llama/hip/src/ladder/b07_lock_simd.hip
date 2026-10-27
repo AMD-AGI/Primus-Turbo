@@ -4,7 +4,7 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
-// b07_lock_simd -- rung 07 of the Llama backward ladder: b06 with the WMMA pipe locked to its wave.
+// b07_lock_simd -- Llama backward ladder, side chain (first draft): b06 with the WMMA pipe locked to its wave.
 //
 // Kernel Specification
 //   prep  delta = rowsum(dO o O), NL = -LSE log2 e                          grid (Sq/64, Hq, B), block 256

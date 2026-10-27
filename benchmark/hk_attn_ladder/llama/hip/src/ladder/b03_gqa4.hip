@@ -4,7 +4,7 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
-// b03_gqa4 -- rung 03 of the Llama backward ladder: b02 with four q heads per dQ workgroup.
+// b03_gqa4 -- Llama backward ladder, side chain (first draft): b02 with four q heads per dQ workgroup.
 //
 // Kernel Specification
 //   prep  delta = rowsum(dO o O), NL = -LSE log2 e                          grid (Sq/64, Hq, B), block 256

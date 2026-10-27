@@ -18,6 +18,8 @@ Plans (every launch on torch's current stream, in this order; ABIs in include/la
   fused  dQ_acc.zero_() (torch), <prefix>_prep,
          <prefix>_dkdv (dK, dV, dQ_acc += dS K by fp32 atomics)    grid (Skv/kv_per_wg, Hkv, B), block 128
          <prefix>_cvt  (dq = bf16(scale dQ_acc))                    grid (B Sq Hq 128 / 2048), block 256
+  fused_c  as fused, dQ_acc in C-fragment order (1 KB per 16 x 16 tile, b04f on); cvt de-swizzles it and takes
+         (..., scale, Sq, Hq)
 Anything outside the range the kernels are written for raises (no fallback).
 """
 
@@ -51,6 +53,7 @@ ARGS_FUSED = {
     "dkdv": ARGS["dkdv"][:8] + [("DQA", _P)] + ARGS["dkdv"][8:11] + [("dqa_bytes", _L)] + ARGS["dkdv"][11:],
     "cvt": [("DQA", _P), ("DQ", _P), ("dqa_bytes", _L), ("q_bytes", _L), ("scale", _F)],
 }
+ARGS_FUSED_C = dict(ARGS_FUSED, cvt=ARGS_FUSED["cvt"] + [("Sq", _I), ("Hq", _I)])
 BLOCKS = {"prep": 256, "dkdv": 128, "dq": 128, "cvt": 256}
 
 PREFIX = None
@@ -64,7 +67,7 @@ _LOCK = threading.Lock()
 
 def configure(prefix, plan="split", heads_per_wg=1, kv_per_wg=64):
     global PREFIX, PLAN, HEADS_PER_WG, KV_PER_WG, _KERNELS
-    if plan not in ("split", "fused"):
+    if plan not in ("split", "fused", "fused_c"):
         raise ValueError(f"unknown plan {plan!r}")
     if heads_per_wg not in (1, 4):
         raise ValueError(f"heads_per_wg must be 1 or 4, got {heads_per_wg!r}")
@@ -98,7 +101,7 @@ def _kernels():
             raise hiprt.HipError(f"{path}: stale or failed build ({mj})")
         table = codeobj.kernels(path)
         specs = {}
-        roles = ARGS if PLAN == "split" else ARGS_FUSED
+        roles = {"split": ARGS, "fused": ARGS_FUSED, "fused_c": ARGS_FUSED_C}[PLAN]
         for role, args in roles.items():
             name = f"{PREFIX}_{role}"
             t = table.get(name)
@@ -128,7 +131,7 @@ def unsupported_reason(b, sq, skv, hq, hkv, causal, d=D):
         return f"sq {sq} must be a multiple of 64 and skv {skv} of {KV_PER_WG}"
     if causal and sq > skv:
         return f"causal needs sq <= skv (bottom-right), got {sq} > {skv}"
-    dqa = 4 * b * sq * hq * D if PLAN == "fused" else 0  # fp32 dQ_acc: its atomic / cvt offsets are int32 too
+    dqa = 4 * b * sq * hq * D if PLAN != "split" else 0  # fp32 dQ_acc: its atomic / cvt offsets are int32 too
     if max(2 * b * sq * hq * D, 2 * b * skv * hkv * D, 4 * b * hq * sq, dqa) >= I32_LIMIT:
         return "byte extents must be < 2^31 (int32 buffer offsets)"
     return None
@@ -170,7 +173,7 @@ def plan(do, q, k, v, o, lse, softmax_scale=None, causal=True):
             ("zero", None, (dqa,)),
             ("prep", (sq // 64, hq, b), (do, o, lse, dl, nl, qb, rb, b, sq, hq)),
             ("dkdv", (skv // KV_PER_WG, hkv, b), common + (dk, dv, dqa, qb, kvb, rb, 4 * dqa.numel()) + tail),
-            ("cvt", (-(-n8 // 256), 1, 1), (dqa, dq, 4 * dqa.numel(), qb, scale)),
+            ("cvt", (-(-n8 // 256), 1, 1), (dqa, dq, 4 * dqa.numel(), qb, scale) + ((sq, hq) if PLAN == "fused_c" else ())),
         ]
     return {"launches": launches, "outputs": (dq, dk, dv)}
 

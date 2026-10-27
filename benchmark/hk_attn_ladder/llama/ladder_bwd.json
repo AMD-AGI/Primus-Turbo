@@ -18,7 +18,8 @@
  ],
  "notes": [
   "sha256 pins: the code objects measured on ctheliosr-1b112-a08-1 (meta.json files, or the 12-hex prefix printed in runs_hk/hkb1_prod.log where no meta.json survived) or pinned in Primus-Turbo cade7db6.",
-  "ref_ms: a08-1 GPU2 measurement (b4 s8192 hq32 hkv8, lab.py ruler, L2 flush, median), orientation only. Single-feature refs are v0 + that one flag."
+  "ref_ms: a08-1 GPU2 measurement (b4 s8192 hq32 hkv8, lab.py ruler, L2 flush, median), orientation only. Single-feature refs are v0 + that one flag.",
+  "main line b00 -> b12l (written 2026-10-27, e15-02): TDM, double buffering, operand bursts, then dQ fused in v0's decomposition (128 kv / WG, 32-query steps, dS^T exchanged through LDS, each wave's K slice of dQ resident), longest-first order, wave kinds with FULL steps first, LD rows by TDM, deferred dQ, the softmax pipelined under the WMMAs (co-execution scheduler), v0's split barrier, lock_simd. The first-draft order (b03..b07: GQA dQ kernel, fusion with 16 queries x 128 d per wave and K read from LDS) is kept as a side chain. Steps are over the parent rung."
  ],
  "rungs": [
   {
@@ -39,26 +40,26 @@
    "feature": "naive FA2 backward: prep + dK/dV kernel + separate dQ kernel (S, dP recomputed), register-mediated single-buffer fills"
   },
   {
-   "id": "b01",
+   "id": "b01t",
    "parent": "b00",
    "kernels": {
-    "k_bwd_b01": {
-     "src": "src/ladder/b01_double_buf.hip",
+    "k_bwd_b01t": {
+     "src": "src/ladder/b01t_tdm.hip",
      "extra_flags": []
     }
    },
    "launch": {
     "module": "bwd_ladder",
     "opts": {
-     "prefix": "k_bwd_b01",
+     "prefix": "k_bwd_b01t",
      "plan": "split"
     }
    },
-   "feature": "double-buffered fills: the next tiles' global loads in flight during this iteration, 1 barrier per iteration"
+   "feature": "TDM fills (one buffer, 2 barriers per iteration): no VGPRs, VALU or buffer-load waits for the fill"
   },
   {
    "id": "b02",
-   "parent": "b01",
+   "parent": "b01t",
    "kernels": {
     "k_bwd_b02": {
      "src": "src/ladder/b02_tdm.hip",
@@ -72,101 +73,211 @@
      "plan": "split"
     }
    },
-   "feature": "TDM fills: one 32-row tensor_load_to_lds per wave per tile pair instead of the register path"
+   "feature": "double-buffered TDM fills: the next iteration's tiles in flight during this one's compute, 1 barrier per iteration"
   },
   {
-   "id": "b03",
+   "id": "b03b",
    "parent": "b02",
    "kernels": {
-    "k_bwd_b03": {
-     "src": "src/ladder/b03_gqa4.hip",
+    "k_bwd_b03b": {
+     "src": "src/ladder/b03b_bursts.hip",
      "extra_flags": []
     }
    },
    "launch": {
     "module": "bwd_ladder",
     "opts": {
-     "prefix": "k_bwd_b03",
-     "plan": "split",
-     "heads_per_wg": 4
+     "prefix": "k_bwd_b03b",
+     "plan": "split"
     }
    },
-   "feature": "dQ kernel takes the 4 q heads of one kv head per WG (K / V tiles shared)"
+   "feature": "operand bursts (next group's burst during this group's WMMAs, tr16 operands during the softmax), NL / delta requested a run ahead"
   },
   {
-   "id": "b04",
-   "parent": "b03",
+   "id": "b04f",
+   "parent": "b03b",
    "kernels": {
-    "k_bwd_b04": {
-     "src": "src/ladder/b04_fused_dq.hip",
+    "k_bwd_b04f": {
+     "src": "src/ladder/b04f_fused.hip",
      "extra_flags": []
     }
    },
    "launch": {
     "module": "bwd_ladder",
     "opts": {
-     "prefix": "k_bwd_b04",
-     "plan": "fused"
-    }
-   },
-   "feature": "dQ fused into the dK/dV kernel: dS^T through LDS, dQ = dS K, fp32 atomics (5 GEMMs per pair instead of 7)"
-  },
-  {
-   "id": "b05",
-   "parent": "b04",
-   "kernels": {
-    "k_bwd_b05": {
-     "src": "src/ladder/b05_kv32.hip",
-     "extra_flags": []
-    }
-   },
-   "launch": {
-    "module": "bwd_ladder",
-    "opts": {
-     "prefix": "k_bwd_b05",
-     "plan": "fused",
+     "prefix": "k_bwd_b04f",
+     "plan": "fused_c",
      "kv_per_wg": 128
     }
    },
-   "feature": "32 kv rows per wave (128 per WG): every Q / dO LDS operand feeds 2 WMMAs, half the Q / dO traffic per kv row"
+   "feature": "dQ fused in v0's split: 128 kv / WG, 32-query steps, dS^T exchanged through LDS, each wave's K slice of dQ resident, 128-B-line fp32 atomics (5 GEMMs instead of 7)"
   },
   {
-   "id": "b06",
-   "parent": "b05",
+   "id": "b05g",
+   "parent": "b04f",
    "kernels": {
-    "k_bwd_b06": {
-     "src": "src/ladder/b06_deferred_dq.hip",
+    "k_bwd_b05g": {
+     "src": "src/ladder/b05g_longest_first.hip",
      "extra_flags": []
     }
    },
    "launch": {
     "module": "bwd_ladder",
     "opts": {
-     "prefix": "k_bwd_b06",
-     "plan": "fused",
+     "prefix": "k_bwd_b05g",
+     "plan": "fused_c",
      "kv_per_wg": 128
     }
    },
-   "feature": "dQ one iteration late from a double-buffered dS^T: 1 barrier per iteration instead of 2"
+   "feature": "longest-first workgroup order: kv heads fastest, kv blocks ascending (v0's grid order)"
   },
   {
-   "id": "b07",
-   "parent": "b06",
+   "id": "b06k",
+   "parent": "b05g",
    "kernels": {
-    "k_bwd_b07": {
-     "src": "src/ladder/b07_lock_simd.hip",
+    "k_bwd_b06k": {
+     "src": "src/ladder/b06k_wave_kinds.hip",
      "extra_flags": []
     }
    },
    "launch": {
     "module": "bwd_ladder",
     "opts": {
-     "prefix": "k_bwd_b07",
-     "plan": "fused",
+     "prefix": "k_bwd_b06k",
+     "plan": "fused_c",
      "kv_per_wg": 128
     }
    },
-   "feature": "lock_simd in the dK/dV kernel (one wave per SIMD)"
+   "feature": "wave kinds per step (v0's FULL / DIAG / DEAD): the mask only on diagonal squares, fully masked squares skipped"
+  },
+  {
+   "id": "b07l",
+   "parent": "b06k",
+   "kernels": {
+    "k_bwd_b07l": {
+     "src": "src/ladder/b07l_ld_tdm.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b07l",
+     "plan": "fused_c",
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "NL / delta rows by TDM with the step's Q / dO tiles, read from LDS (v0's LD records): no global loads in the loop (flat alone; the enabler of b08d)"
+  },
+  {
+   "id": "b08d",
+   "parent": "b07l",
+   "kernels": {
+    "k_bwd_b08d": {
+     "src": "src/ladder/b08d_deferred_dq.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b08d",
+     "plan": "fused_c",
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "deferred dQ: dS operands requested right after the barrier, dQ(s) WMMAs + atomics in step s+1 after its S / dP run"
+  },
+  {
+   "id": "b09i",
+   "parent": "b08d",
+   "kernels": {
+    "k_bwd_b09i": {
+     "src": "src/ladder/b09i_dq_softmax.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b09i",
+     "plan": "fused_c",
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "dQ(s-1) WMMAs and step s's softmax in one scheduling region (no branch, no sched_barrier), atomics after the dS^T stores"
+  },
+  {
+   "id": "b10p",
+   "parent": "b09i",
+   "kernels": {
+    "k_bwd_b10p": {
+     "src": "src/ladder/b10p_pipeline.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b10p",
+     "plan": "fused_c",
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "two pipelined regions per step (co-execution scheduler): S / dP(q tile 1) || softmax(q tile 0), dQ(s-1) || softmax(q tile 1)"
+  },
+  {
+   "id": "b11s",
+   "parent": "b10p",
+   "kernels": {
+    "k_bwd_b11s": {
+     "src": "src/ladder/b11s_split_barrier.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b11s",
+     "plan": "fused_c",
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "v0's split step barrier: tr16 of dV / dK in flight past the signal, dV / dK WMMAs in the window, 3-slot ring with ops after the wait"
+  },
+  {
+   "id": "b12l",
+   "parent": "b11s",
+   "kernels": {
+    "k_bwd_b12l": {
+     "src": "src/ladder/b12l_lock_simd.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b12l",
+     "plan": "fused_c",
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "lock_simd: no WMMA arbitration pause at one wave per SIMD"
   },
   {
    "id": "v0",
@@ -180,9 +291,9 @@
    "launch": {
     "module": "bwd_v0"
    },
-   "feature": "first HK backward (Primus-Turbo fd4a1bd0): b07 + 32-query steps (q pairs, heads inner, unmasked steps first) on a 4-deep TDM ring of Q / dO / LD records with one split-barrier phase per step, dQ_acc in C-fragment order (one 128-B line per atomic), and the 9-phase software pipeline (softmax interleaved into the WMMA runs, dQ(s-1) under step s)",
+   "feature": "first HK backward (Primus-Turbo fd4a1bd0), the shipped form of b12l: next step's operand sets double-buffered in registers (x2-unrolled parity steps, readback a phase ahead), a 4-slot ring with TDM roles (wave 3 moves K / V), LD records per 4 queries, S / dP by kv tile with the softmax interleaved by sched_group_barrier",
    "ref_ms": 3.491,
-   "parent": "b07"
+   "parent": "b12l"
   },
   {
    "id": "v0_regs",
@@ -416,6 +527,224 @@
    "ref_ms": 3.1936
   },
   {
+   "id": "b01",
+   "parent": "b00",
+   "kernels": {
+    "k_bwd_b01": {
+     "src": "src/ladder/b01_double_buf.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b01",
+     "plan": "split"
+    }
+   },
+   "feature": "negative: register-path double buffer -- 64 more VGPRs for the in-flight loads cost a wave per SIMD (ATT); the TDM path (b01t, b02) double-buffers without VGPRs",
+   "side": true
+  },
+  {
+   "id": "b05r",
+   "parent": "b04f",
+   "kernels": {
+    "k_bwd_b05r": {
+     "src": "src/ladder/b05r_ring3.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b05r",
+     "plan": "fused_c",
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "negative: 3-slot ring + split step barrier on b04f -- the signal's DS drain right after the dS^T stores costs more than the skew it absorbs",
+   "side": true
+  },
+  {
+   "id": "b05s",
+   "parent": "b04f",
+   "kernels": {
+    "k_bwd_b05s": {
+     "src": "src/ladder/b05s_split_barrier.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b05s",
+     "plan": "fused_c",
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "negative: split step barrier with two Q / dO buffers -- the early signal waits for step s+1's TDM op",
+   "side": true
+  },
+  {
+   "id": "b05n",
+   "parent": "b04f",
+   "kernels": {
+    "k_bwd_b05n": {
+     "src": "src/ladder/b05n_prefetch.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b05n",
+     "plan": "fused_c",
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "negative: the same prefetch on b04f (before the work order and the wave kinds)",
+   "side": true
+  },
+  {
+   "id": "b07n",
+   "parent": "b06k",
+   "kernels": {
+    "k_bwd_b07n": {
+     "src": "src/ladder/b07n_prefetch.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b07n",
+     "plan": "fused_c",
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "negative: next step's operands a step ahead in registers (NL / delta, Q / dO readback) -- 990 VGPRs",
+   "side": true
+  },
+  {
+   "id": "x_b10p_nocoexec",
+   "parent": "b10p",
+   "side": true,
+   "kernels": {
+    "k_bwd_b10p": {
+     "src": "src/ladder/b10p_pipeline.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b10p",
+     "plan": "fused_c",
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "b10p in the default scheduler (no co-execution strategy)"
+  },
+  {
+   "id": "b03",
+   "parent": "b02",
+   "kernels": {
+    "k_bwd_b03": {
+     "src": "src/ladder/b03_gqa4.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b03",
+     "plan": "split",
+     "heads_per_wg": 4
+    }
+   },
+   "feature": "side chain (first draft: GQA / fusion before the v0 decomposition): dQ kernel takes the 4 q heads of one kv head per WG (K / V tiles shared)",
+   "side": true
+  },
+  {
+   "id": "b04",
+   "parent": "b03",
+   "kernels": {
+    "k_bwd_b04": {
+     "src": "src/ladder/b04_fused_dq.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b04",
+     "plan": "fused"
+    }
+   },
+   "feature": "side chain (first draft: GQA / fusion before the v0 decomposition): dQ fused into the dK/dV kernel: dS^T through LDS, dQ = dS K, fp32 atomics (5 GEMMs per pair instead of 7)",
+   "side": true
+  },
+  {
+   "id": "b05",
+   "parent": "b04",
+   "kernels": {
+    "k_bwd_b05": {
+     "src": "src/ladder/b05_kv32.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b05",
+     "plan": "fused",
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "side chain (first draft: GQA / fusion before the v0 decomposition): 32 kv rows per wave (128 per WG): every Q / dO LDS operand feeds 2 WMMAs, half the Q / dO traffic per kv row",
+   "side": true
+  },
+  {
+   "id": "b06",
+   "parent": "b05",
+   "kernels": {
+    "k_bwd_b06": {
+     "src": "src/ladder/b06_deferred_dq.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b06",
+     "plan": "fused",
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "side chain (first draft: GQA / fusion before the v0 decomposition): dQ one iteration late from a double-buffered dS^T: 1 barrier per iteration instead of 2",
+   "side": true
+  },
+  {
+   "id": "b07",
+   "parent": "b06",
+   "kernels": {
+    "k_bwd_b07": {
+     "src": "src/ladder/b07_lock_simd.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b07",
+     "plan": "fused",
+     "kv_per_wg": 128
+    }
+   },
+   "feature": "side chain (first draft: GQA / fusion before the v0 decomposition): lock_simd in the dK/dV kernel (one wave per SIMD)",
+   "side": true
+  },
+  {
    "id": "x_masked",
    "parent": "v0",
    "side": true,
@@ -572,6 +901,40 @@
    },
    "feature": "negative: all 32 atomics as one burst",
    "ref_ms": 3.4004
+  },
+  {
+   "id": "x_v0_noint",
+   "kernels": {
+    "k_attn_bwd_v0": {
+     "src": "src/k_attn_bwd_v0.hip",
+     "extra_flags": [
+      "-DBWD_INTERLEAVE=0"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v0"
+   },
+   "feature": "v0 without the sched_group_barrier interleave of the softmax into the S / dP and dQ WMMA runs",
+   "parent": "v0",
+   "side": true
+  },
+  {
+   "id": "x_v0_nodead",
+   "kernels": {
+    "k_attn_bwd_v0": {
+     "src": "src/k_attn_bwd_v0.hip",
+     "extra_flags": [
+      "-DBWD_SKIP_DEAD=0"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v0"
+   },
+   "feature": "v0 with DEAD waves running the masked diagonal path",
+   "parent": "v0",
+   "side": true
   }
  ],
  "baselines": [

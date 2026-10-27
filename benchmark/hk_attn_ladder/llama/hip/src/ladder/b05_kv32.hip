@@ -4,7 +4,7 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
-// b05_kv32 -- rung 05 of the Llama backward ladder: b04 with 32 kv rows per wave (128 per workgroup).
+// b05_kv32 -- Llama backward ladder, side chain (first draft): b04 with 32 kv rows per wave (128 per workgroup).
 //
 // Kernel Specification
 //   prep  delta = rowsum(dO o O), NL = -LSE log2 e                          grid (Sq/64, Hq, B), block 256

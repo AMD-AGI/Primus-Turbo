@@ -22,7 +22,8 @@
 //   dq   (Q, K, V, DO, DEL, NL, DQ, q_bytes, kv_bytes, row_bytes, B, Sq, Skv, Hq, Hkv, causal, c2, scale)
 // fused rungs (b04 on): dkdv (Q, K, V, DO, DEL, NL, DK, DV, DQA, q_bytes, kv_bytes, row_bytes, dqa_bytes, B, Sq, Skv,
 //   Hq, Hkv, causal, c2, scale) adds dQ_acc (fp32 [B, Sq, Hq, 128], zeroed by the host); cvt (DQA, DQ, dqa_bytes,
-//   q_bytes, scale) replaces dq.
+//   q_bytes, scale) replaces dq. fused_c rungs (b04f on, 128 kv per WG): the same dkdv ABI, dQ_acc in C-fragment order
+//   (1 KB per 16 x 16 tile), cvt (DQA, DQ, dqa_bytes, q_bytes, scale, Sq, Hq) de-swizzles it.
 // row_bytes = byte extent of DEL / NL. Host gate (lab/bwd_ladder.py): d = 128, Sq % 64 == 0, Skv % 64 (b05 on: 128)
 // == 0, causal -> Sq <= Skv, Hq % Hkv == 0 (b03: G % 4 == 0), every byte extent incl. dQ_acc < 2^31.
 #pragma once

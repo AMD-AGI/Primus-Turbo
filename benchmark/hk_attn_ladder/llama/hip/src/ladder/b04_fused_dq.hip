@@ -4,7 +4,7 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
-// b04_fused_dq -- rung 04 of the Llama backward ladder: b03 with dQ computed inside the dK / dV kernel.
+// b04_fused_dq -- Llama backward ladder, side chain (first draft): b03 with dQ computed inside the dK / dV kernel.
 //
 // Kernel Specification
 //   prep  delta = rowsum(dO o O), NL = -LSE log2 e                          grid (Sq/64, Hq, B), block 256

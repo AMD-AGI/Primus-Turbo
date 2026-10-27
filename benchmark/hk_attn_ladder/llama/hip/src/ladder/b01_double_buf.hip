@@ -4,7 +4,7 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
-// b01_double_buf -- rung 01 of the Llama backward ladder: b00 with double-buffered, prefetched LDS fills.
+// b01_double_buf -- Llama backward ladder, side rung (negative): b00 with double-buffered, prefetched LDS fills.
 //
 // Kernel Specification
 //   prep  delta = rowsum(dO o O), NL = -LSE log2 e                          grid (Sq/64, Hq, B), block 256
