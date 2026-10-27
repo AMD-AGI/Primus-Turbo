@@ -1,0 +1,57 @@
+W1027 07:47:49.903000 145513 torch/distributed/run.py:982] 
+W1027 07:47:49.903000 145513 torch/distributed/run.py:982] *****************************************
+W1027 07:47:49.903000 145513 torch/distributed/run.py:982] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1027 07:47:49.903000 145513 torch/distributed/run.py:982] *****************************************
+[rank0]:W1027 07:47:52.027000 145681 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+[rank1]:W1027 07:47:52.028000 145682 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+[rank0]:W1027 07:47:52.029000 145681 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank0]:W1027 07:47:52.029000 145681 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank0]:W1027 07:47:52.029000 145681 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank0]:W1027 07:47:52.029000 145681 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank0]:W1027 07:47:52.030000 145681 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank0]:W1027 07:47:52.030000 145681 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank1]:W1027 07:47:52.030000 145682 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank1]:W1027 07:47:52.030000 145682 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank1]:W1027 07:47:52.030000 145682 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank1]:W1027 07:47:52.030000 145682 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+[rank1]:W1027 07:47:52.030000 145682 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+[rank1]:W1027 07:47:52.030000 145682 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+
+====================================================================================================
+[dsv3_t8192_skew1] EP2 T=8192 H=7168 I=2048 experts/rank=32 topk=8 routing=1.0 pool tiles=450 (rank 0)  max over ranks
+====================================================================================================
+  -- L1 fwd dispatch_gemm (NT)  [1.00000/PASS]
+     dense_gemm :    2.715 ms |  1511.4 TF (single-weight roofline)
+     gemm_only  :    2.798 ms |  1466.9 TF | grouped/dense = 97.1%
+     comm_only  :    0.357 ms |   240.4 GB/s (XGMI) | all-CU 0.183 ms
+     fused      :    3.257 ms |  1260.1 TF | serial 3.155 ms, hidden -0.102 ms (-29% of comm) | roofline 85.9% | fused/gemm_only 116.4%
+  -- L2 fwd gemm_combine (NT)  [1.00000/PASS]
+     dense_gemm :    1.420 ms |  1445.4 TF (single-weight roofline)
+     gemm_only  :    1.479 ms |  1387.5 TF | grouped/dense = 96.0%
+     comm_only  :    4.723 ms |    24.9 GB/s (XGMI)
+     fused      :    1.855 ms |  1106.3 TF | serial 6.202 ms, hidden 4.347 ms (92% of comm) | roofline 254.6% | fused/gemm_only 125.4%
+  -- L2 dgrad dispatch_gemm (NN)  [1.00000/PASS]
+     dense_gemm :    1.370 ms |  1498.2 TF (single-weight roofline)
+     gemm_only  :    1.384 ms |  1482.2 TF | grouped/dense = 98.9%
+     comm_only  :    0.358 ms |   239.9 GB/s (XGMI) | all-CU 0.182 ms
+     fused      :    1.572 ms |  1305.6 TF | serial 1.742 ms, hidden 0.170 ms (48% of comm) | roofline 88.1% | fused/gemm_only 113.5%
+  -- dW2 variable-K  [1.00000/PASS]
+     dense_gemm :    1.380 ms |  1486.5 TF (single-weight roofline)
+     gemm_only  :    1.647 ms |  1246.0 TF | grouped/dense = 83.8%
+     fused      :    1.647 ms |  1246.0 TF | serial 1.647 ms, hidden 0.000 ms (nan% of comm) | roofline 100.0% | fused/gemm_only 100.0%
+  -- L1 dgrad gemm_combine (NN)  [1.00000/PASS]
+     dense_gemm :    2.695 ms |  1522.9 TF (single-weight roofline)
+     gemm_only  :    2.869 ms |  1430.3 TF | grouped/dense = 93.9%
+     comm_only  :    4.876 ms |    24.1 GB/s (XGMI)
+     fused      :    3.330 ms |  1232.5 TF | serial 7.745 ms, hidden 4.416 ms (91% of comm) | roofline 146.4% | fused/gemm_only 116.0%
+  -- dW1 x re-dispatch + variable-K  [1.00000/PASS]
+     dense_gemm :    2.804 ms |  1463.8 TF (single-weight roofline)
+     gemm_only  :    3.441 ms |  1192.6 TF | grouped/dense = 81.5%
+     comm_only  :    0.181 ms |   474.8 GB/s (XGMI)
+     fused      :    3.598 ms |  1140.6 TF | serial 3.622 ms, hidden 0.024 ms (13% of comm) | roofline 95.6% | fused/gemm_only 104.6%
+  == SUM 6 GEMM stages: gemm_only 13.618 ms + comm_only 10.495 ms = serial 24.113 ms -> fused 15.258 ms, hidden 8.855 ms (84% of comm), fused/gemm_only 112.0%
+  == fused_mega_moe fwd+bwd step 17.272 ms (1002.6 TF); outside the 6 GEMM stages (prologue, swiglu fwd/bwd, small ops, gaps): 2.014 ms

@@ -1,0 +1,8 @@
+d97bd80ce9198226f74140f24bc185713ffb355a
+ M agent/historical_experience/gfx1250/mega_moe_bf16/flydsl/tips.md
+ M agent/workspace/mega_moe_flydsl_gfx1250_l2aid_20261027/logs/optimize.md
+ M agent/workspace/mega_moe_flydsl_gfx1250_l2aid_20261027/logs/performance_trend.md
+ M agent/workspace/mega_moe_flydsl_gfx1250_l2aid_20261027/rounds/round-6/summary.md
+ M primus_turbo/flydsl/mega/bf16_gfx1250/gemm_combine_kernel.py
+?? .rocprofv3/
+?? opt.md

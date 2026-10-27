@@ -1,0 +1,10 @@
+mega22: max abs diff vs gg 0.000e+00
+mega42: max abs diff vs gg 0.000e+00
+mega42rm: max abs diff vs gg 0.000e+00
+mega22rm: max abs diff vs gg 0.000e+00
+nn G=128 N=7168 K=4096 pool blocks 271
+  gg        2.286 ms   1782.3 TF  vs gg +0.0%
+  mega22    2.187 ms   1862.4 TF  vs gg -4.3%
+  mega42    2.233 ms   1824.6 TF  vs gg -2.3%
+  mega42rm  2.302 ms   1769.4 TF  vs gg +0.7%
+  mega22rm  2.374 ms   1716.1 TF  vs gg +3.9%

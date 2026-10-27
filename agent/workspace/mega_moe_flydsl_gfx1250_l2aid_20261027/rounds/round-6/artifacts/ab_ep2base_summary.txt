@@ -1,0 +1,6 @@
+base           dsv3_t4096_random: 6.547 / 6.570 -> 6.559 | dsv3_t8192_random: 11.227 / 11.300 -> 11.264 | dsv3_t8192_skew1: 17.608 / 17.520 -> 17.564
+r4             dsv3_t4096_random: 6.460 / 6.466 -> 6.463 | dsv3_t8192_random: 11.122 / 11.221 -> 11.171 | dsv3_t8192_skew1: 17.390 / 17.535 -> 17.462
+r6             dsv3_t4096_random: 6.422 / 6.433 -> 6.428 | dsv3_t8192_random: 11.050 / 11.129 -> 11.090 | dsv3_t8192_skew1: 17.304 / 17.220 -> 17.262
+base           step geomean 1260.143 TF
+r4             step geomean 1272.241 TF  vs base: +0.960%  (t4096_random +1.48%, t8192_random +0.82%, t8192_skew1 +0.58%)
+r6             step geomean 1282.641 TF  vs base: +1.785%  (t4096_random +2.04%, t8192_random +1.57%, t8192_skew1 +1.75%)

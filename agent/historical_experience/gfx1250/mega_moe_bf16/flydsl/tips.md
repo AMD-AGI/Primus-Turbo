@@ -102,6 +102,16 @@
 - Clock-stamp the roles before tuning a fused kernel: a `read_clock()` (100 MHz realtime) start/end per workgroup
   and per chunk, written to a side buffer behind a constexpr, showed the lead combine workgroups pushing a quarter
   of the bytes while stretching the GEMM by 90-140 us.
-- gemm_combine with 0 lead combine workgroups (all after the GEMM tiles) beat 16 / 8 / 4 leads at 25% of the
-  tiles, monotonically (+0.69% / +0.05% / +0.45% step at EP2): CUs that spin on tile flags and remote stores
-  beside the GEMM cost more than the early push saves when the tail push is latency-bound.
+- gemm_combine lead combine workgroups at 25% of the tiles, step vs 16 leads at EP2: 8 leads +0.05%, 4 leads
+  +0.45%, 0 leads (all combine workgroups after the GEMM tiles) +0.69%: CUs that spin on tile flags and push
+  remote stores beside the GEMM cost more than the early push saves when the tail push is latency-bound.
+
+## Round 7 (2026-10-27, stopped before validation): tile order inside a fused GEMM + combine
+
+- A standalone GEMM's best super-tile size is not the fused kernel's: Mega's tile alone is fastest at GROUP_M 16
+  (row-major 3-5% slower), but inside gemm_combine GROUP_M 2 > 4 > 8 > 16 > row-major (+0.81% / +0.45..0.54% /
+  +0.36% / +0.10% step at EP2). Re-sweep the order in the fused launch; a consumer that waits on blocks in pool
+  order wants them to finish nearly in order.
+- With N_BLOCKS_N = 28 (= 4 mod 8) row-major puts the two pool blocks of one expert's N column on XCCs 4 apart,
+  i.e. on different AIDs, so every weight block is fetched once per AID. Check `N_BLOCKS_N mod 8` against the
+  `(bid + 7) % 8` XCC map before trusting row-major order for weight reuse.

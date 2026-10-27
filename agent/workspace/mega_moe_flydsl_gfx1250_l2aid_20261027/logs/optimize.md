@@ -46,3 +46,13 @@ Rounds are judged by same-session alternating A/B against the accepted-tree copy
   the GEMM ends but slow it ~89 us (L2 fwd) / ~144 us (L1 dgrad); no lead ends both launches ~100 us earlier.
 - A/B x2 at EP2: l0 +0.687% (every shape, every rep), l4 +0.450%, l8 +0.045%. Full tests pass (EP4 skipped).
   Bench: 1285.765 TF step at EP2.
+- EP2 baseline (16:00): same-session A/B x2, 8bbd8c89 / 3ef91841 / d97bd80c at EP2: 1260.143 / 1272.241 (+0.960%) /
+  1282.641 TF (+1.785%), faster than base on every shape. Later EP2 rounds report vs this baseline.
+- EP2 stage bench of the round-6 tree (`rounds/round-6/artifacts/stage_bench_ep2/`): fused/gemm_only at t8192 random
+  L2 fwd 132.5% (+0.30 ms), L1 dgrad 123.9% (+0.41 ms), L2 dgrad 122.0%, L1 fwd 113.0%; step 10.921 ms.
+
+### round-7 — STOPPED (2026-10-27 16:15)
+- gemm_combine GROUP_M super-tile order of the GEMM tiles. One GPU: Mega's tile row-major is 5.0% (NT L2 fwd) /
+  3.0% (NN L1 dgrad) slower than GROUP_M 16. EP2 A/B vs round 6: GROUP_M 16 +0.104%, 8 +0.356%, 4 +0.544% /
+  +0.446%, 2 +0.813% (every shape). Tests pass at GROUP_M 16; GROUP_M 2 not fully validated.
+- Stopped for submission: kernel reverted to round 6, change kept as `rounds/round-7/gemm_combine_group_m.patch`.

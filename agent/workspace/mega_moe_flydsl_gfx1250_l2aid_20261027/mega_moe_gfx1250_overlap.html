@@ -117,9 +117,36 @@
       <tr><td>3</td><td>dispatch_gemm AID N 方向切分</td><td>rollback，−0.28%</td></tr>
       <tr><td>4</td><td>dW1 的 x 重发改 SDMA，overlap</td><td class="good">accept，+1.16%</td></tr>
       <tr><td>5</td><td>combine chunk 32 / 64 行</td><td>rollback，−0.47%</td></tr>
-      <tr><td>6</td><td>lead combine 16 / 8 / 4 / 0</td><td class="warn">进行中（EP2，GPU 2、3）</td></tr>
+      <tr><td>6</td><td>去掉 lead combine WG（16 → 0），EP2</td><td class="good">accept，+0.69%</td></tr>
+      <tr><td>7</td><td>gemm_combine GEMM tile 用 GROUP_M 顺序，EP2</td><td class="warn">停在 A/B：GROUP_M 2 +0.81%，未合入</td></tr>
     </table>
-    <p class="caption">从 round 6 起 A/B 在 GPU 2、3 上跑 EP2（GPU 0、1 已让出），上面的 EP4 数据不能直接和之后的 EP2 数据比较。</p>
+    <p class="caption">round 1-5 是 EP4（GPU 0-3）相对上一个 accepted tree；round 6、7 是 EP2（GPU 2、3）。</p>
+  </div>
+</div>
+
+<h2>EP2 结果（GPU 2、3，同一 session 对比 baseline）</h2>
+<div class="grid32">
+  <div>
+    <table>
+      <tr><th>Tree</th><th>t4096 random</th><th>t8192 random</th><th>t8192 skew1</th><th>step geomean</th><th>vs baseline</th></tr>
+      <tr><td>baseline 8bbd8c89（round 1）</td><td class="num">6.559</td><td class="num">11.264</td><td class="num">17.564</td><td class="num">1260.1 TF</td><td class="num">—</td></tr>
+      <tr><td>round 4 3ef91841</td><td class="num">6.463</td><td class="num">11.171</td><td class="num">17.462</td><td class="num">1272.2 TF</td><td class="num good">+0.96%</td></tr>
+      <tr><td>round 6 d97bd80c（提交版本）</td><td class="num">6.428</td><td class="num">11.090</td><td class="num">17.262</td><td class="num">1282.6 TF</td><td class="num good">+1.79%</td></tr>
+    </table>
+    <p class="caption">fwd+bwd ms，2 次重复的均值，<code>tools/ab.sh ep2base 2</code>。三个 shape 都比 baseline 快。round 7 的 GROUP_M 2 在另一个 session 里比 round 6 再快 0.81%（未做完整验证）。</p>
+  </div>
+  <div>
+    <table>
+      <tr><th>Stage（t8192 random）</th><th>gemm_only</th><th>fused</th><th>fused / gemm</th></tr>
+      <tr><td>L1 fwd dispatch_gemm</td><td class="num">1.690</td><td class="num">1.909</td><td class="num">113.0%</td></tr>
+      <tr><td>L2 fwd gemm_combine</td><td class="num">0.931</td><td class="num">1.233</td><td class="num bad">132.5%</td></tr>
+      <tr><td>L2 dgrad dispatch_gemm</td><td class="num">0.859</td><td class="num">1.049</td><td class="num">122.0%</td></tr>
+      <tr><td>dW2 variable-K</td><td class="num">1.032</td><td class="num">1.032</td><td class="num">100.0%</td></tr>
+      <tr><td>L1 dgrad gemm_combine</td><td class="num">1.717</td><td class="num">2.128</td><td class="num bad">123.9%</td></tr>
+      <tr><td>dW1 variable-K</td><td class="num">1.961</td><td class="num">2.235</td><td class="num">113.9%</td></tr>
+      <tr class="sum"><td>合计</td><td class="num">8.190</td><td class="num">9.585</td><td class="num">117.0%</td></tr>
+    </table>
+    <p class="caption">ms，round 6 tree 的 EP2 stage bench（<code>rounds/round-6/artifacts/stage_bench_ep2/</code>）。dW1 一行仍是 bench 的串行 dispatch_only + wgrad，实际 step 里 x 由 SDMA 在 L1 dgrad 期间拷完。step 10.921 ms。</p>
   </div>
 </div>
 

@@ -39,6 +39,16 @@ EP4 tests are skipped and the step numbers are not comparable with rounds 1-5 (E
 `l0` is faster than acc on every shape in both reps (6 of 6 pairs). Full-validation bench of the committed tree
 (0 leads): 11.027 / 17.229 / 6.430 ms, step geomean 1285.765 TF (fwd 1241.340, bwd 1309.268).
 
+### vs the EP2 baseline (`tools/ab.sh ep2base 2`, same session, fwd+bwd ms, mean of 2 reps)
+
+| Tree | t4096 random | t8192 random | t8192 skew1 | Step geomean TF | vs base |
+|---|---|---|---|---|---|
+| base (8bbd8c89, round 1) | 6.559 | 11.264 | 17.564 | 1260.143 | — |
+| round 4 (3ef91841) | 6.463 (+1.48%) | 11.171 (+0.82%) | 17.462 (+0.58%) | 1272.241 | +0.960% |
+| round 6 (d97bd80c) | 6.428 (+2.04%) | 11.090 (+1.57%) | 17.262 (+1.75%) | 1282.641 | +1.785% |
+
+Artifacts: `artifacts/ab_ep2base.txt`, `artifacts/ab_ep2base_summary.txt`. Later EP2 rounds report vs this base.
+
 ## Decision
 
 `ACCEPT`. Default 0 lead combine workgroups; committed locally, accepted tree synced.
