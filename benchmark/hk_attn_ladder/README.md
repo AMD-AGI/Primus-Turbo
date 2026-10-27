@@ -96,11 +96,14 @@ barriers; asm-patched kernels only from their verified patch (`hkl.build` refuse
 
 ## Known issues
 
-* **Suspected dQ read error in the shipped MLA dQ kernel (r2d onward: 5c20de7e .. 71bd0329, `k_dqds_c`
-  sha 5e3782d6)**: a CPU replay of its idx.h shows the last steady unit's region-C read of row 2 nf using
-  the wrong half-block when causal and (Skv - Sq) % 64 == 32 (e.g. Sq 4096 / Skv 4128; 656 of 2772 replayed
-  shape x causal cases). The production shape (Skv == Sq) is not affected. Not confirmed on a GPU:
-  `hkl.test mla/ladder_bwd.json --shapes rect32` compares every rung bitwise against `hk_v0` there.
+* **dQ read error in the shipped MLA dQ kernel from r2d on (5c20de7e .. 71bd0329, `k_dqds_c` sha 5e3782d6),
+  confirmed on MI455X (e15-02 GPU1, 2026-10-27)**: with causal and (Skv - Sq) % 64 == 32 the last steady
+  unit's region-C read of row 2 nf takes the wrong half-block (found by a CPU replay of its idx.h). At b1
+  Sq 4096 Skv 4128 h4 (`hkl.test --shapes rect32`) dq drops to 17.7 dB from r2d on while r2c and every
+  rung before it are bitwise equal to hk_v0 (52.5 dB); dk / dv are unaffected. Production cannot reach it:
+  the Primus-Turbo adapter's gate (`hk_mla_bwd_unsupported_reason`) applies the FlyDSL rules first, which
+  require Sq and Skv to be multiples of 64, so Skv - Sq is too; only `limits.shape_unsupported_reason`
+  alone (as the ladder's bwd_hk uses it) admits such shapes.
 * The HK MLA forward reached parity with FlyDSL but was never integrated (a08-1 `fwd_summary.md`): a
   sidebar, not a ladder. The MLA forward is FlyDSL.
 * `v11_best` of the Llama forward never ran on a GPU (it was blocked by a halted card on a08-1).

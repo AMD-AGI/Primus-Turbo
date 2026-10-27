@@ -20,7 +20,7 @@ done
 if docker inspect "$NAME" >/dev/null 2>&1; then
   docker start "$NAME" >/dev/null
 else
-  docker run -d --name "$NAME" --device /dev/kfd --device "/dev/dri/$NODE" --group-add video --group-add render \
+  docker run -d --name "$NAME" --device /dev/kfd --device "/dev/dri/$NODE" --group-add "$(stat -c %g /dev/kfd)" --group-add "$(stat -c %g "/dev/dri/$NODE")" \
     --shm-size 16g --ipc private -v "$ROOT:$ROOT" -w "$ROOT" --entrypoint sleep "$IMAGE" infinity >/dev/null
 fi
 echo "$NAME up: gpu $GPU = $PCI /dev/dri/$NODE"
