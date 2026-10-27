@@ -296,6 +296,8 @@ def nt_gemm_tile(
         RPI = block // CH
         N_LD = tile_m // RPI
         assert block % CH == 0 and tile_m % RPI == 0
+        # an instruction offset of 64 KiB or more makes the async loads read the wrong rows
+        assert (N_LD - 1) * RPI * LDS_ROW < 1 << 16, "the async A gather needs more waves at this tile_k"
         A_BIAS = tile_m * LDS_ROW
         c16 = tid % fx.Int32(CH)
         rsub = tid // fx.Int32(CH)
@@ -658,7 +660,7 @@ def mega_grouped_gemm_nt_gfx1250(
     tile_m: int = 256,
     tile_n: int = 256,
     tile_k: int = 0,
-    m_warp: int = 2,
+    m_warp: int = 4,
     n_warp: int = 2,
     group_m: int = 16,
     idx_bits: int = 0,
