@@ -1,0 +1,26 @@
+diff --git a/src/k_dkdv96ds.hip b/src/k_dkdv96ds.hip
+index eb995f2ac19fda3b4a760f3303636f948f3ad77c..b2917ff2ae982deb5c8b636284106f5f72118953 100644
+--- a/src/k_dkdv96ds.hip
++++ b/src/k_dkdv96ds.hip
+@@ -484,7 +484,20 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
+         // k3ds: this iteration's dS^T (all NKV blocks) at the head of the DS-free dV WMMA run, 24 WMMAs before the
+         // Q^T burst; the soffset from this iteration's counters (they advance only at the end of full_iter)
+         const int so_c = k3ds_sq(qt0 + qi, gh, Sq, Skv, causal);
+-        static_for<NKV>([&](auto kh) { ds_store(a_dsk[kh], so_c + ds_rc[kh]); });
++        // X1b1s: regroup all NKV blocks first (distinct staging registers), then the 2*NKV stores
++        u32x4 dsx[NKV], dsy[NKV];
++        static_for<NKV>([&](auto kh) {
++          const u32x8 w = __builtin_bit_cast(u32x8, a_dsk[kh]);
++          dsx[kh] = u32x4{dpp_ror8<0xC>(w[0], w[4]), dpp_ror8<0xC>(w[1], w[5]), dpp_ror8<0xC>(w[2], w[6]),
++                          dpp_ror8<0xC>(w[3], w[7])};
++          dsy[kh] = u32x4{dpp_ror8<0x3>(w[4], w[0]), dpp_ror8<0x3>(w[5], w[1]), dpp_ror8<0x3>(w[6], w[2]),
++                          dpp_ror8<0x3>(w[7], w[3])};
++        });
++        sched_barrier<0>();
++        static_for<NKV>([&](auto kh) {
++          buf_store_u32x4(dsx[kh], r_ds, vds, so_c + ds_rc[kh]);
++          buf_store_u32x4(dsy[kh], r_ds, vds + K1DS_ST_B, so_c + ds_rc[kh]);
++        });
+         // X1b1: the export is pinned here, under the dO^T tr16 latency, ahead of the first dV WMMA (in the
+         // non-expert mode a store issued inside the WMMA run waits for every earlier WMMA)
+         sched_barrier<0>();

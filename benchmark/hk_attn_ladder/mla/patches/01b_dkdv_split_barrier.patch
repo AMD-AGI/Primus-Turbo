@@ -1,0 +1,74 @@
+diff --git a/include/hk1.h b/include/hk1.h
+index 553823df2388ea1e97b53432ba5f88704c5e2db5..7135d3cb18c8c1662d54b125569b26e7c88d4dc6 100644
+--- a/include/hk1.h
++++ b/include/hk1.h
+@@ -139,6 +139,17 @@ HK1_INLINE void      lds_barrier() {
+     __builtin_amdgcn_s_barrier_wait(-1);
+     __builtin_amdgcn_fence(MO_ACQUIRE, "workgroup", "local");
+ }
++// split form of lds_barrier() (HipKittens cdna5 barrier.cuh arrive()/wait(), rung 08 split barrier): arrive =
++// release fence (s_wait_dscnt 0: this wave's DS ops retired) + s_barrier_signal -1; wait = s_barrier_wait -1 +
++// acquire fence. Work placed between the two (pinned with sched_barrier<0>) overlaps the other wave's arrival.
++HK1_INLINE void lds_arrive() {
++    __builtin_amdgcn_fence(MO_RELEASE, "workgroup", "local");
++    __builtin_amdgcn_s_barrier_signal(-1);
++}
++HK1_INLINE void lds_wait() {
++    __builtin_amdgcn_s_barrier_wait(-1);
++    __builtin_amdgcn_fence(MO_ACQUIRE, "workgroup", "local");
++}
+ // lock_simd: SCHED_MODE.DISABLE_XDL_ARB_STALL (hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1) = 1), FlyDSL
+ // rocdl.disable_xdl_arb_stall() == llvm.amdgcn.s.setreg(i32 154, i32 1); the one s_setreg the
+ // HK-line lint and isa_static S2 allow.
+diff --git a/src/k_dkdv96ds.hip b/src/k_dkdv96ds.hip
+index 7a4ad2d1980ebc67ce84d6d401c61a72797030cb..d3b1672c755c7918452f693a06712f8e03a65ab8 100644
+--- a/src/k_dkdv96ds.hip
++++ b/src/k_dkdv96ds.hip
+@@ -325,6 +325,14 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
+         acc[DK0 + kh * NDO_QK + d] = wmma<false, (d > 0)>(b_q[d], a_dsk[kh], acc[DK0 + kh * NDO_QK + d]);
+       });
+     };
++    // dK^T of kv sub-tile kh, d tiles [D0, D1) (the split-barrier window takes a prefix of dK kh1/kh2)
++    auto dk_rng = [&](auto kh, auto d0, auto d1, f32x8 (&acc)[NST], const bf16x16 (&b_q)[NDO_QK],
++                      const bf16x16 (&a_dsk)[NKV]) {
++      static_for<decltype(d1)::value - decltype(d0)::value>([&](auto i) {
++        constexpr int d = decltype(d0)::value + decltype(i)::value;
++        acc[DK0 + kh * NDO_QK + d] = wmma<false, (d > 0)>(b_q[d], a_dsk[kh], acc[DK0 + kh * NDO_QK + d]);
++      });
++    };
+     auto dvdk = [&](auto kh, f32x8 (&acc)[NST], const bf16x16 (&b_do)[NDO_V], const bf16x16 (&b_q)[NDO_QK],
+                     const bf16x16 (&a_pk)[NKV], const bf16x16 (&a_dsk)[NKV]) {
+       dv_kh(kh, acc, b_do, a_pk);
+@@ -487,11 +495,30 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
+         sched_barrier<0>();
+         tensor_wait<K1_TW>();
+         sched_barrier<0>();
+-        lds_barrier();
++        // X1c: split ring barrier. arrive (s_wait_dscnt 0 + release + signal) -> the first XS of the 24 pure-register
++        // dK kh1/kh2 WMMAs -> wait (+ acquire) -> hh0 readback of ncur -> the rest of dK kh1/kh2. WAR/RAW as before:
++        // every wave signals only after its own tensorcnt 3 and its last DS read of stage cur.
++        constexpr int XS = 24;
++        lds_arrive();
++        sched_barrier<0>();
++        // window: global WMMA index j = (kh - 1) * NDO_QK + d over kh 1..NKV-1
++        static_for<NKV - 1>([&](auto k) {
++          constexpr int lo = k * NDO_QK, hi = lo + NDO_QK;
++          constexpr int e = XS < lo ? 0 : (XS > hi ? NDO_QK : XS - lo);
++          dk_rng(std::integral_constant<int, k + 1>{}, std::integral_constant<int, 0>{}, std::integral_constant<int, e>{},
++                 acc, b_q, a_dsk);
++        });
++        sched_barrier<0>();
++        lds_wait();
+         sched_barrier<0>();
+         rdqd_hh(rbb, std::integral_constant<int, 0>{}, qd);   // (1) hh0 of ncur; qd died in hh0's S/dP
+         sched_barrier<0>();
+-        static_for<NKV - 1>([&](auto k) { dk_kh(std::integral_constant<int, k + 1>{}, acc, b_q, a_dsk); });
++        static_for<NKV - 1>([&](auto k) {
++          constexpr int lo = k * NDO_QK, hi = lo + NDO_QK;
++          constexpr int e = XS < lo ? 0 : (XS > hi ? NDO_QK : XS - lo);
++          dk_rng(std::integral_constant<int, k + 1>{}, std::integral_constant<int, e>{}, std::integral_constant<int, NDO_QK>{},
++                 acc, b_q, a_dsk);
++        });
+         sched_barrier<0>();
+       } else {
+         // the k1 body + k1ds's export: the previous iteration's payload in this S/dP window (no DS op there), the

@@ -1,0 +1,149 @@
+diff --git a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
+index 5c8246f36d87c674855acd7a2e0807dff3c71fbb..bd1619b4a854652153be8aafd9518c2b1f2565cb 100644
+--- a/include/dqds/dqds_impl.h
++++ b/include/dqds/dqds_impl.h
+@@ -13,8 +13,10 @@
+ // bwd_hk_dqds's k_dqds_b with the workgroup doubled to 4 waves (block 128, 1 wave per SIMD, one
+ // workgroup per CU), so one K ring feeds 384 queries, and role-split TDM issue (idx.h has the
+ // layouts and the arithmetic):
+-//   NQW 6 -> the 384-query tiles of [q_off, Sq): 4 waves x 96 queries, longest first
+-//   NQW 4 -> the head [0, 256) (q_off == 256): 4 waves x 64 queries, the same ring protocol
++//   NQW 6 -> the 384-query tiles of [q_off, Sq): 4 waves x 96 queries (3 q pairs each), longest first
++//   NQW 4 -> the head [0, 256) (q_off == 256): 4 waves x 64 queries (2 q pairs each), the same ring protocol
++// q pairs are dealt to the waves in snake order (wave w: pairs w, 7 - w, 8 + w of the workgroup's 12; head
++// tile w, 7 - w; idx.h wave_pair), so the fully masked pairs of the diagonal units spread over all waves.
+ // Per kv32 row r (block rows 2r, 2r + 1) every wave runs NQW x 12 WMMA (dQ^T += K^T dS^T), operands
+ // burst-loaded one row ahead into the other register set (X / Y: 12 K^T + NQW dS^T v16 operands
+ // each):
+@@ -129,9 +131,7 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
+     const int  bat  = head_bat(hb, Hq);
+     const int  qh   = head_qh(hb, bat, Hq);
+     const int  hkv  = head_kv(qh, G);
+-    const int  q0   = wave_q0(q0g, wv, NQW);
+     const int  qp0g = tile_qp0(q0g);
+-    const int  qp0w = qp0g + wv * nbw(NQW);
+     const int  n32  = kv_n32(q0g, NQW, cshift, nkvt, causal);
+     const int  nu   = n_units(n32);
+     const int  nfu  = n_full_units(qp0g, cshift, nu, causal);
+@@ -173,14 +173,14 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
+             S.kt[dt] = cat16(tr16(lds, kb + c_k_imm(dt, 0)), tr16(lds, kb + c_k_imm(dt, 1)));
+         });
+     };
+-    // dS^T of the wave's sub-tiles: row-0 image block 0 of the reader at r0, row-1 image block 0 at
+-    // r1
++    // dS^T of the wave's sub-tiles: row-0 image of the workgroup's pair 0 at r0, row-1 image at r1
+     auto burst_ds = [&](OpSet<NQW> &S, int r0, int r1) DQ_INL {
+         const int d0 = r0 + ds_lane(lane);
+         const int d1 = r1 + ds_lane(lane);
+         sfor<0, NQW>([&](auto Q) DQ_INL {
+-            constexpr int h = decltype(Q)::value;
+-            S.ds[h]         = cat16(tr16(lds, d0 + ds_imm(h)), tr16(lds, d1 + ds_imm(h)));
++            constexpr int h  = decltype(Q)::value;
++            const int     po = wave_pair(wv, h / 2, NQW) * DSI_BLK_B + (h % 2) * 32;
++            S.ds[h]          = cat16(tr16(lds, d0 + po), tr16(lds, d1 + po));
+         });
+     };
+     // the whole burst of kv32 row r (its stages hold landed, published data)
+@@ -188,9 +188,8 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
+         const int u = r / 2, h = r % 2;
+         const int slot = c_dsslot(u, NQW, h); // the op of dS wave h holds kv32 row 2u + h
+         const int sh   = dsop_sh(NB_G, dsop_nv(qp0g, NB_G, r, cshift, causal));
+-        const int rb   = ds_wave_off(wv, NQW); // this wave's first q pair in the slot
+         burst_k(S, c_kstage(u) + h * C_KHALF_B);
+-        burst_ds(S, slot + rb, ds_row1(slot, NB_G, sh) + rb);
++        burst_ds(S, slot, ds_row1(slot, NB_G, sh));
+     };
+ 
+     // ---- the NQW x 12 WMMA run of one kv32 row
+@@ -198,7 +197,7 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
+     sfor<0, NACC>([&](auto I) DQ_INL { acc[decltype(I)::value] = zero8(); });
+     // the wave's k-th q pair holds no attended entry at kv32 row r (wave-uniform)
+     auto pair_zero = [&](int k, int r) DQ_INL {
+-        return x4_ds_zero(qp0w + k, r, n32, cshift, causal);
++        return x4_ds_zero(qp0g + wave_pair(wv, k, NQW), r, n32, cshift, causal);
+     };
+     // the WMMAs [LO, HI) of a run; MASK (masked units): a uniform branch per q pair skips the pair's WMMAs when
+     // it is fully masked (its operands were never loaded)
+@@ -378,15 +377,17 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
+     int       u     = 0;
+     if constexpr (NQW == MAIN_NQW) {
+         // steady units, unrolled by the ring depth: precomputed burst bases, K stages 0 / 1 off kb01
+-        // (immediates <= 54176), stage 2 off kb2; dS stage s off db[s] (the wave's first pair; its pair k = pair 0
+-        // + k blocks)
++        // (immediates <= 54176), stage 2 off kb2; dS stage s off db[s] (the wave's pair 0; pair 2 = pair 0 + 8
++        // blocks) and db1[s] (pair 1)
+         const int kb01 = c_k_lane(lane);
+         const int kb2  = kb01 + 2 * C_KSTG_B;
+-        const int dl   = ds_lane(lane) + ds_wave_off(wv, NQW);
+-        int       db[3];
++        const int dl   = ds_lane(lane) + wave_pair(wv, 0, NQW) * DSI_BLK_B;
++        const int d1o  = (wave_pair(wv, 1, NQW) - wave_pair(wv, 0, NQW)) * DSI_BLK_B;
++        int       db[3], db1[3];
+         sfor<0, 3>([&](auto Sg) DQ_INL {
+             constexpr int s = decltype(Sg)::value;
+             db[s]           = dl + C_DS_OFF + s * c_dsstg_b(NQW);
++            db1[s]          = db[s] + d1o;
+         });
+         // the burst of kv32 row 2u + H of a steady unit u with u % 3 == s (all NB_G pairs stored: sh = 0)
+         auto burst_stage = [&](OpSet<NQW> &Sx, auto Sg, auto Hg) DQ_INL {
+@@ -401,8 +402,9 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
+             constexpr int r1 = NB_G * DSI_BLK_B;
+             sfor<0, NQW>([&](auto Q) DQ_INL {
+                 constexpr int h = decltype(Q)::value, k = h / 2;
+-                const int     base = db[s];
+-                constexpr int po   = k * DSI_BLK_B + (h % 2) * 32;
++                static_assert(wave_pair(0, 2, MAIN_NQW) - wave_pair(0, 0, MAIN_NQW) == 8, "pair 2 = pair 0 + 8");
++                const int     base = k == 1 ? db1[s] : db[s];
++                constexpr int po   = (k == 2 ? 8 * DSI_BLK_B : 0) + (h % 2) * 32;
+                 Sx.ds[h] = cat16(tr16(lds, base + so + po), tr16(lds, base + so + r1 + po));
+             });
+         };
+@@ -447,7 +449,7 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
+             constexpr int dt = decltype(D)::value;
+             lds_st(lds, img + epi_w_lane(lane) + epi_w_imm(dt), cvt_bf16x8(acc[h * NDT + dt]));
+         });
+-        const int qs = q0 + 16 * h;
++        const int qs = subtile_q0(q0g, wv, h, NQW);
+         sfor<0, 4>([&](auto RB) DQ_INL {
+             constexpr int rb = decltype(RB)::value;
+             sfor<0, D_QK / DQ_LINE_EL>([&](auto LI) DQ_INL {
+diff --git a/include/dqds/idx.h b/include/dqds/idx.h
+index b539bb0d1721d44bc25998db575417b4aa99b07b..55bb91ce6088f74dd09cb387b5b7bff0fa99f963 100644
+--- a/include/dqds/idx.h
++++ b/include/dqds/idx.h
+@@ -225,13 +225,19 @@ DQ_HD constexpr int tile_q0g(int q_off, int ntile, int gy) {
+ DQ_HD constexpr int head_q0g(int q_off) {
+     return q_off - bqwg(HEAD_NQW);
+ }
+-DQ_HD constexpr int wave_q0(int q0g, int wv, int nqw) {
++// q pair (0-based in the workgroup's nbg) of the k-th pair of wave wv: snake order over the waves (main tile
++// w, 7 - w, 8 + w; head tile w, 7 - w), so the diagonal units' fully masked pairs spread over all waves
++DQ_HD constexpr int wave_pair(int wv, int k, int nqw) {
+ #if DQ_MUT == 3
+-    return q0g + wv * bqw(nqw) / 2; // MUTATION: waves overlap
++    return 4 * k + wv; // MUTATION: two waves share pairs
+ #else
+-    return q0g + wv * bqw(nqw);
++    return 4 * k + ((k & 1) ? 3 - wv : wv);
+ #endif
+ }
++// first query of the wave's 16-query sub-tile h (q pair h / 2, half h % 2)
++DQ_HD constexpr int subtile_q0(int q0g, int wv, int h, int nqw) {
++    return q0g + 32 * wave_pair(wv, h / 2, nqw) + 16 * (h % 2);
++}
+ DQ_HD constexpr int tile_qp0(int q0g) {
+     return q0g / 32;
+ } // first q pair of the workgroup (q0g % 32 == 0)
+@@ -437,11 +443,7 @@ DQ_HD constexpr int ds_row1(int slot, int nbs, int sh) {
+     return slot + (nbs - sh) * DSI_BLK_B;
+ #endif
+ }
+-// this wave's first q pair inside a slot (bytes): the workgroup's NB_G pairs land in q order, wave
+-// w owns [w nbw, +nbw)
+-DQ_HD constexpr int ds_wave_off(int wv, int nqw) {
+-    return wv * nbw(nqw) * DSI_BLK_B;
+-}
++// the workgroup's NB_G pairs land in q order in a slot; the wave's sub-tile h reads pair wave_pair(wv, h / 2)
+ 
+ // ---- dQ epilogue (bwd_hk_q1's, one 16-row sub-tile at a time): per-wave row-major image [16][400 B] after the
+ // rings, whole-line readback ----

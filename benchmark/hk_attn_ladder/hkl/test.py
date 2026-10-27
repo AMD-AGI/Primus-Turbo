@@ -16,9 +16,9 @@ a broken new rung shows up on the toy shape, before it ever runs at the producti
 
 Per (arm, shape): SNR in dB of every output against the fp32 reference (fwd: o, lse; bwd: dq, dk, dv),
 all finite (the allocator is NaN-poisoned before every call, so an unwritten output element is NaN),
-determinism (a second call: fwd o / lse and bwd dk / dv bitwise, dq to >= 90 dB, since dQ may be summed
-with atomics), and, where the ladder file says ``"bitwise_with": <arm>``, bitwise equality with that
-arm's outputs on the same inputs. PASS = finite, every SNR >= --min-snr, determinism, bitwise.
+determinism (a second call: the ladder's ``exact_outputs`` bitwise -- default fwd o / lse, bwd dk / dv --
+the others to >= 90 dB, e.g. a dQ summed with atomics), and, where the ladder file says
+``"bitwise_with": <arm>``, bitwise equality of the exact outputs with that arm's on the same inputs. PASS = finite, every SNR >= --min-snr, determinism, bitwise.
 """
 
 import argparse
@@ -43,6 +43,9 @@ SHAPES = {
         ("toy", dict(b=1, sq=384, skv=384, hq=16, hkv=16)),
         ("s640", dict(b=1, sq=640, skv=640, hq=16, hkv=16)),
         ("b1_s4096", dict(b=1, sq=4096, skv=4096, hq=16, hkv=16)),
+        # causal with (Skv - Sq) % 64 == 32: the steady-loop region-C read of the dQ kernel from 5c20de7e (r2d) on
+        # is suspected to take the wrong half-block for row 2 nf here (CPU replay of its idx.h); FlyDSL skips it
+        ("rect32", dict(b=1, sq=4096, skv=4128, hq=4, hkv=4)),
         ("prod", dict()),
     ],
 }
@@ -64,7 +67,7 @@ def call(arm, direction, inp, sh):
     return {"dq": dq, "dk": dk, "dv": dv}
 
 
-def run_shape(arms, direction, sh, name, a, results):
+def run_shape(arms, direction, sh, name, a, results, exact):
     dev = torch.device("cuda")
     inp = R.make_inputs(sh, dev, seed=a.seed)
     t0 = time.time()
@@ -94,16 +97,13 @@ def run_shape(arms, direction, sh, name, a, results):
             continue
         snr = {k: R.snr_db(v, refs[k]) for k, v in out1.items()}
         finite = all(torch.isfinite(v.float()).all().item() for v in out1.values())
-        det = {}
+        det = {}  # exact outputs bitwise across calls; the others (e.g. an atomically summed dQ) to >= 90 dB
         for k in out1:
-            if direction == "bwd" and k == "dq":
-                det[k] = R.snr_db(out2[k], out1[k]) >= 90.0
-            else:
-                det[k] = torch.equal(out1[k], out2[k])
+            det[k] = torch.equal(out1[k], out2[k]) if k in exact else R.snr_db(out2[k], out1[k]) >= 90.0
         bw = None
         want = getattr(arm, "rung", {}).get("bitwise_with") if hasattr(arm, "rung") else None
         if want is not None and want in outs:
-            bw = all(torch.equal(out1[k], outs[want][k]) for k in out1 if not (direction == "bwd" and k == "dq"))
+            bw = all(torch.equal(out1[k], outs[want][k]) for k in out1 if k in exact)
         ok = finite and all(v >= a.min_snr for v in snr.values()) and all(det.values()) and bw is not False
         outs[arm.id] = out1
         rec.update(status="PASS" if ok else "FAIL", snr={k: round(v, 2) for k, v in snr.items()}, finite=finite,
@@ -143,7 +143,8 @@ def main(argv=None):
     results, ok = [], True
     for name in names:
         sh = R.Shape.from_problem(prob, **over[name])
-        ok &= run_shape(arms, direction, sh, name, a, results)
+        exact = spec.get("exact_outputs") or (["o", "lse"] if direction == "fwd" else ["dk", "dv"])
+        ok &= run_shape(arms, direction, sh, name, a, results, exact)
         if not ok and not a.keep_going:
             print(f"stopping after shape {name}: a rung failed (use --keep-going to continue)")
             break

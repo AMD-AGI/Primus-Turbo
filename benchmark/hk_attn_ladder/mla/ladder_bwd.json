@@ -19,7 +19,9 @@
  "notes": [
   "hip/ is primus_turbo/hipkittens/gfx1250_mla_bwd/hip at Primus-Turbo d3590be4 (dev/lhz/dsv3-attn-hk-b0); patches/NN_<commit>.patch is that commit's change to hip/, so rung N's tree is the branch's hip/ at that commit.",
   "sha256 / asm_input_sha256 / extra_flags: the commit's manifest.json; FlyDSL bwd (baseline) = 3.194 ms on the same ruler.",
-  "ref_ms: a08-1 GPU3 full backward at b2 s4096 h128 SBHD (scripts/hk/mla_ab.py), orientation only."
+  "ref_ms: a08-1 GPU3 full backward at b2 s4096 h128 SBHD (scripts/hk/mla_ab.py), orientation only.",
+  "Rounds 1 / 2 are split into one-feature sub-rungs r1a..r1m (hk_v0 -> d18ab9fc) and r2a..r2f (d18ab9fc -> 5c20de7e), reconstructed from the scratch variants of the dsv3 hk_b0 study (x1_dkdv_sched, x2_dkdv_expert, x3_dkdv_mask, x4_dq, r2_z3_dq; reports results/hk_b0/p2_*.md, p3_z3.md). r1 = r1m byte for byte (no leftover patch); r2 = r2f + patches/02z_5c20de7e_leftover.patch (renames, comment moves, code motion of desc(), dead last-unit code; codegen neutral: r2f already builds r2's pinned sha). patches/01_d18ab9fc.patch / 02_5c20de7e.patch are the whole-commit diffs, kept for reference (applying a round's sub-patches in order gives the same tree); no rung uses them.",
+  "Sub-rung refs: dkdv numbers are paired speedups vs hk_v0 from multi_ab / pair_ab (same process, rotating order, 60 x 8192^3 GEMM prefill, GPU3 of a08-1); dq-only numbers (x4_ab / z3_ab) time k_dqds_c after the shipped delta + dkdv of that time (hk_v0 for round 1, r1 for round 2), so behind a faster dkdv they shrink (power coupling). A ref says when it was measured standalone or in another order; rungs without a matching measurement say so."
  ],
  "rungs": [
   {
@@ -41,19 +43,355 @@
     }
    },
    "launch": {
-    "module": "bwd_hk",
-    "opts": {
-     "delta": "flydsl"
-    }
+    "module": "bwd_hk"
    },
    "feature": "first HK backward: dK/dV on 96-row kv blocks exporting dS^T to a scratch, dQ = dS K from it (no S/dP recompute)",
-   "ref_ms": 2.529
+   "ref_ms": 2.529,
+   "bitwise_with": "flydsl"
   },
   {
-   "id": "r1",
-   "commit": "d18ab9fc",
+   "id": "r1a",
    "parent": "hk_v0",
-   "patch": "patches/01_d18ab9fc.patch",
+   "patch": "patches/01a_dkdv_dsexport_pin.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions"
+     ]
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [],
+     "sha256": "8e778af52399414892bac164b0e47ffd2b9cee46ed4da9bcffaa4e26cebd9b63"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "touches": "k_dkdv96ds",
+   "feature": "dK/dV: the dS^T export (6 buffer stores) is pinned by a sched_barrier right after the dO^T tr16 burst, ahead of the first dV WMMA: without expert scheduling a store issued inside the WMMA run waits for every earlier WMMA, under the tr16 latency it is free.",
+   "ref": "x12_m3 b1: paired dkdv 1.0213x (20/20), bwd 1.0152x vs hk_v0; GPU3, multi_ab 20 rounds x 50, GEMM prefill; p2_x12_dkdv_sched.md \u00a72",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r1b",
+   "parent": "r1a",
+   "patch": "patches/01b_dkdv_split_barrier.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions"
+     ]
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [],
+     "sha256": "8e778af52399414892bac164b0e47ffd2b9cee46ed4da9bcffaa4e26cebd9b63"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "touches": "k_dkdv96ds, hk1.h",
+   "feature": "dK/dV: split ring barrier (hk1.h lds_arrive = release fence + s_barrier_signal, lds_wait = s_barrier_wait + acquire) with the 24 register-only dK kh1/kh2 WMMAs between arrive and wait, so the other wave's late arrival overlaps matrix work instead of an idle s_barrier.",
+   "ref": "b1 + c24 not measured; c24 alone on hk_v0: x12_m4 paired dkdv 1.0190x (19/20), bwd 1.0143x; GPU3 multi_ab 20x50; p2_x12_dkdv_sched.md \u00a72",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r1c",
+   "parent": "r1b",
+   "patch": "patches/01c_dkdv_mha_loop_top.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions"
+     ]
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [],
+     "sha256": "8e778af52399414892bac164b0e47ffd2b9cee46ed4da9bcffaa4e26cebd9b63"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "touches": "k_dkdv96ds",
+   "feature": "dK/dV: the full loop specialised for G == 1 (MHA: the q-pair counter is ii, the q head 0), so the clamped prefetch tiles are min(ii + k, n - 1) instead of the k1_nx_* / k1_pf_* select chains: loop-top SALU 156 -> 57 per 2 iterations (the G != 1 loop stays as a second copy).",
+   "ref": "x12_m6 comb_noa (= b1 + c24 + d, this rung's source): paired dkdv 1.0319x (20/20), bwd 1.0239x vs hk_v0; GPU3 multi_ab 20x50; p2_x12_dkdv_sched.md \u00a72",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r1d",
+   "parent": "r1c",
+   "patch": "patches/01d_dkdv_nlnd_voffset.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions"
+     ]
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [],
+     "sha256": "8e778af52399414892bac164b0e47ffd2b9cee46ed4da9bcffaa4e26cebd9b63"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "touches": "k_dkdv96ds",
+   "feature": "dK/dV: the 8 NL/ND loads put their constant on the VGPR offset (3 loop-invariant VGPRs) and share one SGPR soffset, so no SALU rewrites an address register that an in-flight buffer load still reads (the s_wait_xcnt 0 WAR stalls go).",
+   "ref": "x12_m7 comb_a (= this rung's source): paired dkdv 1.0752x (16/16), bwd 1.0534x vs hk_v0; GPU3 multi_ab 16x40; p2_x12_dkdv_sched.md \u00a72",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r1e",
+   "parent": "r1d",
+   "patch": "patches/01e_dkdv_dsexport_staging.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions"
+     ],
+     "sha256": "90fe5a6489198f449092f97d82ace67f365a7f899c17a7ee8f247b5c9a67de84"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [],
+     "sha256": "8e778af52399414892bac164b0e47ffd2b9cee46ed4da9bcffaa4e26cebd9b63"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "touches": "k_dkdv96ds",
+   "feature": "dK/dV: the dS^T export first regroups all 3 blocks into distinct staging VGPRs (24 DPP ops), then issues the 6 stores, so no store-data register is rewritten while an earlier store still reads it (the ~82-cyc store-data s_wait_xcnt goes; with r1d the full loop has no s_wait_xcnt left).",
+   "ref": "x12_m8 x1s (= this rung; sha pinned from x1_dkdv_sched/best/manifest.json): paired dkdv 1.0860x (16/16), bwd 1.0604x vs hk_v0 (x12_m7: 1.0860x / 1.0608x); GPU3 multi_ab 16x40; p2_x12_dkdv_sched.md \u00a70, \u00a72",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r1f",
+   "parent": "r1e",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "957b9e855b82f3a2a726471f52bd93c1c1cba6a428c6c57c060a39bf4b53efc8"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [],
+     "sha256": "8e778af52399414892bac164b0e47ffd2b9cee46ed4da9bcffaa4e26cebd9b63"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "touches": "k_dkdv96ds (flags only)",
+   "feature": "dK/dV compiled with -amdgpu-expert-scheduling-mode: the compiler places explicit s_wait_alu va_vdst / vm_vsrc counts instead of relying on the hardware interlock, so DS / VMEM issue no longer waits for every earlier WMMA.",
+   "ref": "x12_m8 x2s (= this rung; sha pinned from x2_dkdv_expert/best/manifest.json): paired dkdv 1.1192x (14/16), bwd 1.0807x vs hk_v0; merge_pairs1 'x12': dkdv 1.1239x, bwd 1.0848x (10/10, pair_ab 10x40); p2_x12_dkdv_sched.md \u00a74.1, p2_merge_r1.md \u00a74.2",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r1g",
+   "parent": "r1f",
+   "patch": "patches/01g_dkdv_masked_ring.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "401937739b4fc949cc57b160be284f1d8a2d6f78d404d18fd036f22b00884e50"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [],
+     "sha256": "8e778af52399414892bac164b0e47ffd2b9cee46ed4da9bcffaa4e26cebd9b63"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "touches": "k_dkdv96ds, new k3m_idx.h",
+   "feature": "dK/dV: the masked (diagonal) iterations ride the full loop's 3-stage Q/dO TDM ring with prefetch distance 2 (tile j in stage (j - n_mask) mod 3, k3m_idx.h) instead of an own-tile TDM + tensorcnt 0 + 2 barriers each: ~3 exposed HBM round trips (~1.2k cyc) per 96-row workgroup and 4 barriers per wave go.",
+   "ref": "merge_pairs1 'mdk' (= this rung: r1 dkdv + hk_v0 dq): paired dkdv 1.1331x, bwd 1.0912x vs hk_v0 (10/10); x12 -> x12+x3 paired dkdv 1.0082x (10/10); GPU3 pair_ab 10x40 GEMM prefill; p2_merge_r1.md \u00a74.2. On hk_v0 alone: x3_m_v1_v1a_r20 v1a dkdv 1.0191x (18/20), p2_x3_dkdv_mask.md \u00a73.2",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r1h",
+   "parent": "r1g",
+   "patch": "patches/01h_dq_split_barrier.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "401937739b4fc949cc57b160be284f1d8a2d6f78d404d18fd036f22b00884e50"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "touches": "k_dqds_c",
+   "feature": "dQ: split barrier P_{u+1} in every steady unit but the last: arrive (tensorcnt 1, dscnt 0, release, s_barrier_signal) after WMMA 48 of run(X) (32 on the head tile), wait after run(X), so the remaining WMMAs absorb the ~90-cyc lag of the dS-issuing waves 0 / 3.",
+   "ref": "dq only, measured on hk_v0 dkdv: x4_ab_il1 s48 dq 0.5298 -> 0.5096 ms, 1.0396x (5/5); x4_ab_split_sweep 1.040x; GPU3 x4_ab (dq event time after shipped delta + dkdv, 5 rounds); p2_x4_dq.md \u00a73, \u00a73.1",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r1i",
+   "parent": "r1h",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "401937739b4fc949cc57b160be284f1d8a2d6f78d404d18fd036f22b00884e50"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "touches": "k_dqds_c (flags only)",
+   "feature": "dQ compiled with -amdgpu-expert-scheduling-mode: a DS read no longer waits for earlier WMMAs (the prerequisite of r1j's interleave).",
+   "ref": "dq only: x4_ab_il1 exs48 1.0507x (5/5) vs hk_v0 dq; p2_x4_dq.md \u00a73",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r1j",
+   "parent": "r1i",
+   "patch": "patches/01j_dq_burst_interleave.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "401937739b4fc949cc57b160be284f1d8a2d6f78d404d18fd036f22b00884e50"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "touches": "k_dqds_c",
+   "feature": "dQ: in main-tile steady units the 36-tr16 operand bursts are interleaved into the WMMA runs with sched_group_barrier ({8 WMMA} then {1 tr16, 1 WMMA} x 36 before the arrive, {4 WMMA} then the same under run(Y)), hiding the 130-180-cyc bursts under matrix work.",
+   "ref": "dq only: x4_ab_il1 il48 1.0669x (5/5) vs hk_v0 dq; p2_x4_dq.md \u00a73, \u00a73.4",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r1k",
+   "parent": "r1j",
+   "patch": "patches/01k_dq_split_at_66.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "401937739b4fc949cc57b160be284f1d8a2d6f78d404d18fd036f22b00884e50"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "touches": "k_dqds_c",
+   "feature": "dQ: the split-barrier arrive moves from WMMA 48 to 66 (44 on the head tile): region A now carries the whole interleaved Y burst, and the later arrive lets its 36 tr16 retire before the s_wait_dscnt 0 that precedes the signal.",
+   "ref": "dq only: x4_ab_fin1 il66 1.0783x (8/8) (x4_ab_il2 1.072x, x4_ab_me 1.082x) vs hk_v0 dq; the rebuilt sha starts with c8856d2e, the 8-hex prefix recorded for x4_dq/best_il66 (p2_x4_dq.md \u00a76; too short to pin)",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r1l",
+   "parent": "r1k",
+   "patch": "patches/01l_dq_masked_branchfree.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "401937739b4fc949cc57b160be284f1d8a2d6f78d404d18fd036f22b00884e50"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "touches": "k_dqds_c",
+   "feature": "dQ: the masked units' zero-select predicate in branch-free form (x4_ds_zero: | instead of ||), so the selects compile to in-place v_cndmask instead of 17 scalar branches + v_dual_mov operand copies that split the scheduling region (VGPR 887 -> 871).",
+   "ref": "dq only: x4_ab_fin1 il66ms 1.0847x (8/8) vs hk_v0 dq; p2_x4_dq.md \u00a73.5",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r1m",
+   "parent": "r1l",
+   "patch": "patches/01m_dq_masked_split.patch",
    "kernels": {
     "k_dkdv96ds": {
      "src": "src/k_dkdv96ds.hip",
@@ -75,19 +413,203 @@
     }
    },
    "launch": {
-    "module": "bwd_hk",
-    "opts": {
-     "delta": "flydsl"
-    }
+    "module": "bwd_hk"
    },
-   "feature": "round 1: dK/dV scheduling (dS export placement, split barrier, MHA loop top, NL/ND voffsets), masked tiles on the TDM ring, dQ split barrier / tr16 interleave / branch-free masks; expert scheduling for both",
-   "ref_ms": 2.299
+   "touches": "k_dqds_c",
+   "feature": "dQ: the masked units (all but the last) take the split barrier too, with the select pattern carried in the first part of run(X).",
+   "ref": "dq only: x4_ab_fin1 il66mms (= x4 best, sha pinned) 1.0876x (8/8) vs hk_v0 dq; x4_g_best_b2 variant_ab 5x30: bwd 1.013x, dq 0.5249 -> 0.4796 ms; behind the r1 dkdv (power coupling) merge_pairs1 'merged': dq 1.0512x, bwd 1.1023x vs hk_v0; p2_x4_dq.md \u00a73, \u00a74, p2_merge_r1.md \u00a74.2",
+   "bitwise_with": "hk_v0"
   },
   {
-   "id": "r2",
-   "commit": "5c20de7e",
+   "id": "r1",
+   "commit": "d18ab9fc",
+   "parent": "r1m",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "401937739b4fc949cc57b160be284f1d8a2d6f78d404d18fd036f22b00884e50"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "af5fe0f87242a0e44974f9101efa1412dccec073f932855902d457b6c45add28"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "round 1: dK/dV scheduling (dS export placement, split barrier, MHA loop top, NL/ND voffsets), masked tiles on the TDM ring, dQ split barrier / tr16 interleave / branch-free masks; expert scheduling for both",
+   "ref_ms": 2.299,
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r2a",
    "parent": "r1",
-   "patch": "patches/02_5c20de7e.patch",
+   "patch": "patches/02a_dq_masked_pair_skip.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "401937739b4fc949cc57b160be284f1d8a2d6f78d404d18fd036f22b00884e50"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "touches": "k_dqds_c",
+   "feature": "dQ: in masked units a wave-uniform branch per q pair skips a fully masked pair's WMMAs instead of selecting its B operand to zero (bitwise identical: those WMMAs only add +-0), so the selects and the masked pairs' WMMA issue (and energy) go.",
+   "ref": "dq only vs r1 dq: z3_ab1 skip 1.029x (5/5); GPU3 z3_ab (dq event time after shipped delta + dkdv, 5 rounds, blocks of 2); p3_z3.md \u00a73, \u00a73.2",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r2b",
+   "parent": "r2a",
+   "patch": "patches/02b_dq_subtile_epilogue.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "401937739b4fc949cc57b160be284f1d8a2d6f78d404d18fd036f22b00884e50"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "touches": "k_dqds_c, dqds/idx.h",
+   "feature": "dQ: the epilogue runs per 16-row sub-tile through a private 16 x 400 B per-wave LDS image after the rings (LDS 276480 -> 302080, still 1 WG/CU) instead of the whole-wave image in the dead ring: shorter store / load chains, epilogue 3.1 -> 2.4 us per WG.",
+   "ref": "z3_ab2 se (= r2a + this): 1.026x (5/5) vs r1 dq (epilogue alone: z3_ab1 1.014x, z3_ab2 1.005x); p3_z3.md \u00a73, \u00a73.4",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r2c",
+   "parent": "r2b",
+   "patch": "patches/02c_dq_real_desc_nocheck.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "401937739b4fc949cc57b160be284f1d8a2d6f78d404d18fd036f22b00884e50"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "touches": "k_dqds_c",
+   "feature": "dQ: the steady loop's (REAL) TDM descriptors drop the runtime nv >= 1 check (a real unit's rows always hold a stored pair), so the descriptor SALU inside the WMMA run needs no select / branch that would split burst Y and run X into different basic blocks.",
+   "ref": "not measured on its own (z3_ab2 rgk = this + keep_ds without the unroll: 0.995x); p3_z3.md \u00a73.3",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r2d",
+   "parent": "r2c",
+   "patch": "patches/02d_dq_steady_unroll3.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "401937739b4fc949cc57b160be284f1d8a2d6f78d404d18fd036f22b00884e50"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "touches": "k_dqds_c",
+   "feature": "dQ: main-tile steady loop unrolled by the ring depth (3), so every stage index is a compile-time constant: the burst addresses become precomputed base VGPRs + immediates and the loop carries no VALU, which lets expert mode count va_vdst(k) waits instead of va_vdst(0) drains.",
+   "ref": "not measured in this order; the unroll without keep_ds on r1: z3_ab1 u3 0.992x / u3b 0.995x (0/5) -- it regresses (register reuse, 11 va_vdst(0) per 3 units) until r2e; p3_z3.md \u00a73.3",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r2e",
+   "parent": "r2d",
+   "patch": "patches/02e_dq_keep_ds.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "401937739b4fc949cc57b160be284f1d8a2d6f78d404d18fd036f22b00884e50"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "touches": "k_dqds_c",
+   "feature": "dQ: keep_ds() (an empty asm volatile taking the 6 dS operands) keeps each region's dS operands live to its end, so the next burst cannot be allocated to a register the newest WMMA just read (that WAR forced va_vdst(0)).",
+   "ref": "z3_ab2 u3kse (= this rung) 1.0406x (5/5) vs r1 dq; p3_z3.md \u00a73",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r2f",
+   "parent": "r2e",
+   "patch": "patches/02f_dq_snake_pairs.patch",
    "kernels": {
     "k_dkdv96ds": {
      "src": "src/k_dkdv96ds.hip",
@@ -109,13 +631,44 @@
     }
    },
    "launch": {
-    "module": "bwd_hk",
-    "opts": {
-     "delta": "flydsl"
+    "module": "bwd_hk"
+   },
+   "touches": "k_dqds_c, dqds/idx.h",
+   "feature": "dQ: q pairs dealt to the waves in snake order {w, 7 - w, 8 + w} (head {w, 7 - w}) instead of contiguous blocks, so the fully masked pairs of the diagonal units spread over all 4 waves (skippable share per wave 83% / 8% -> 42-50%) and the barrier-bound masked critical path drops by a third.",
+   "ref": "z3_ab2 u3ksse (= this rung) 1.053x (5/5), z3_ab3 1.0658x (5/5); delivered source (sha pinned from r2_z3_dq/best/manifest.json) z3_ab10 1.064x (8/8); z3_gc_b2 variant_ab 7x30: bwd 1.0098x (7/7), dq 0.4995 -> 0.4693 ms; p3_z3.md \u00a70, \u00a73",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r2",
+   "commit": "5c20de7e",
+   "parent": "r2f",
+   "patch": "patches/02z_5c20de7e_leftover.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "401937739b4fc949cc57b160be284f1d8a2d6f78d404d18fd036f22b00884e50"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "5e3782d65b17dfed8abfa1a1227d42fd5bf825ae52d2df55b6c20c5ce88dda2a"
     }
    },
+   "launch": {
+    "module": "bwd_hk"
+   },
    "feature": "dQ round 2: snake q pairs, masked-pair skip, steady loop unrolled by the ring depth, per-sub-tile epilogue image",
-   "ref_ms": 2.274
+   "ref_ms": 2.274,
+   "bitwise_with": "hk_v0"
   },
   {
    "id": "r3",
@@ -148,13 +701,11 @@
     }
    },
    "launch": {
-    "module": "bwd_hk",
-    "opts": {
-     "delta": "flydsl"
-    }
+    "module": "bwd_hk"
    },
    "feature": "dK/dV compiler knobs: bottom-up pre-RA scheduling, delay-alu off, no machine sink",
-   "ref_ms": 2.255
+   "ref_ms": 2.255,
+   "bitwise_with": "hk_v0"
   },
   {
    "id": "r4",
@@ -188,13 +739,11 @@
     }
    },
    "launch": {
-    "module": "bwd_hk",
-    "opts": {
-     "delta": "flydsl"
-    }
+    "module": "bwd_hk"
    },
    "feature": "dK/dV: Q^T loads interleaved into the dV run + asm register retarget (va_vdst(0) drains 15 -> 9 per 2 iterations)",
-   "ref_ms": 2.231
+   "ref_ms": 2.231,
+   "bitwise_with": "hk_v0"
   },
   {
    "id": "r5",
@@ -233,13 +782,11 @@
     }
    },
    "launch": {
-    "module": "bwd_hk",
-    "opts": {
-     "delta": "hk"
-    }
+    "module": "bwd_hk"
    },
    "feature": "HIP k_delta (several b128 loads in flight per lane)",
-   "ref_ms": 2.218
+   "ref_ms": 2.218,
+   "bitwise_with": "hk_v0"
   },
   {
    "id": "r6",
@@ -278,12 +825,10 @@
     }
    },
    "launch": {
-    "module": "bwd_hk",
-    "opts": {
-     "delta": "hk"
-    }
+    "module": "bwd_hk"
    },
-   "feature": "hardening: s_wait_xcnt before the tail block reuses its K/V descriptor SGPRs (perf-neutral)"
+   "feature": "hardening: s_wait_xcnt before the tail block reuses its K/V descriptor SGPRs (perf-neutral)",
+   "bitwise_with": "hk_v0"
   },
   {
    "id": "r7",
@@ -322,13 +867,37 @@
     }
    },
    "launch": {
-    "module": "bwd_hk",
-    "opts": {
-     "delta": "hk"
-    }
+    "module": "bwd_hk"
    },
    "feature": "redundant causal test dropped from the masked dK/dV loop",
-   "ref_ms": 2.22
+   "ref_ms": 2.22,
+   "bitwise_with": "hk_v0"
   }
+ ],
+ "baselines": [
+  {
+   "id": "flydsl",
+   "lab_module": "flydsl_bwd",
+   "bwd": "flash_attn_bwd",
+   "note": "Primus-Turbo's FlyDSL gfx1250 MLA backward (primus_turbo.flydsl.attention.gfx1250_mla.bwd) behind bwd_hk's SBHD folding"
+  }
+ ],
+ "problem": {
+  "kind": "mla",
+  "b": 2,
+  "sq": 4096,
+  "skv": 4096,
+  "hq": 128,
+  "hkv": 128,
+  "d": 192,
+  "dv": 128,
+  "causal": true,
+  "layout": "sbhd"
+ },
+ "direction": "bwd",
+ "exact_outputs": [
+  "dq",
+  "dk",
+  "dv"
  ]
 }

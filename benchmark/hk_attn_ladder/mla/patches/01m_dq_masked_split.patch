@@ -1,0 +1,72 @@
+diff --git a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
+index 9baa4af31a95b976ad8bf8a1a29447300aa83ce3..04103035ad54259c870c9f9f5146ebe4ed6b61a1 100644
+--- a/include/dqds/dqds_impl.h
++++ b/include/dqds/dqds_impl.h
+@@ -55,7 +55,7 @@ using namespace q1;
+ // * every unit but the last: split barrier P_{u+1}: arrive after the first X4_NS (x NACC / 72 on the head tile)
+ //   WMMAs of run(X), wait after run(X). The ring protocol is unchanged: before the arrive the wave's op(u + 1)
+ //   landed (tensorcnt 1) and its ring reads (burst(Y)) retired (dscnt 0); between arrive and wait only WMMAs;
+-//   op(u + 3) and burst(X) after the wait. Masked units: not yet (full barrier, wg_sync).
++//   op(u + 3) and burst(X) after the wait.
+ // * main-tile steady units: the operand bursts interleaved into the WMMA runs (expert scheduling: a DS read
+ //   no longer waits for earlier WMMAs):
+ //     region A: burst(Y, 2u + 1) under run(X) WMMAs [0, X4_NS): {X4_LA WMMA} then {1 tr16, 1 WMMA} x 36
+@@ -217,6 +217,32 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
+         Q1_SCHED_BARRIER();
+     };
+ 
++    // X4: the WMMAs [LO, HI) of a run (the masked form selects its operands and carries the selects' pattern
++    // in the first part only)
++    auto run_rng = [&](const OpSet<NQW> &S, auto MASK, int r, auto LO, auto HI) DQ_INL {
++        constexpr int lo = decltype(LO)::value, hi = decltype(HI)::value;
++        bf16x16 b[NQW];
++        sfor<0, NQW>([&](auto Q) DQ_INL {
++            constexpr int h = decltype(Q)::value;
++            if constexpr (decltype(MASK)::value != 0) {
++                b[h] = x4_ds_zero(qp0w + h / 2, r, n32, cshift, causal) ? zero16 : S.ds[h];
++            } else {
++                b[h] = S.ds[h];
++            }
++        });
++        sfor<lo, hi>([&](auto I) DQ_INL {
++            constexpr int i = decltype(I)::value, h = i / NDT, dt = i % NDT;
++            acc[i] = wmma_bf16(S.kt[dt], b[h], acc[i]);
++        });
++        if constexpr (decltype(MASK)::value != 0 && lo == 0) {
++            Q1_SGB(0x002, 8);
++            sfor<0, hi>([&](auto I) DQ_INL {
++                Q1_SGB(0x008, 1);
++                if constexpr (decltype(I)::value < 8 * (NQW - 1)) Q1_SGB(0x002, 1);
++            });
++        }
++        Q1_SCHED_BARRIER();
++    };
+     // X4: the WMMAs [LO, HI) of a steady run (no selects, no trailing sched_barrier: interleaved regions)
+     auto run_raw = [&](const OpSet<NQW> &S, auto LO, auto HI) DQ_INL {
+         constexpr int lo = decltype(LO)::value, hi = decltype(HI)::value;
+@@ -293,21 +319,19 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
+             Q1_SCHED_BARRIER();
+             return;
+         }
+-        if constexpr (!last && decltype(MASK)::value == 0) {
+-            // head-tile steady units: split barrier only (bursts as in the shipped
++        if constexpr (!last) {
++            // head-tile steady units and all masked units: split barrier only (bursts as in the shipped
+             // kernel), arrive after X4_NS * NACC / 72 WMMAs
+             constexpr int NS = X4_NS * NACC / (MAIN_NQW * NDT);
+             burst(Y, r1);
+             Q1_SCHED_BARRIER();
+             const TdmDesc dn = c_desc(u + 3, REAL);
+-            run_raw(X, ic<0>{}, ic<NS>{});
+-            Q1_SCHED_BARRIER();
++            run_rng(X, MASK, r0, ic<0>{}, ic<NS>{});
+             Q1_WAIT_TENSORCNT(C_TW);
+             Q1_WAIT_DSCNT(0);
+             x4_bar_signal();
+             Q1_SCHED_BARRIER();
+-            run_raw(X, ic<NS>{}, ic<NACC>{});
+-            Q1_SCHED_BARRIER();
++            run_rng(X, MASK, r0, ic<NS>{}, ic<NACC>{});
+             x4_bar_wait();
+             Q1_SCHED_BARRIER();
+             issue(dn);

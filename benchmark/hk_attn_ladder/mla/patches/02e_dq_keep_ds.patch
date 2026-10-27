@@ -1,0 +1,52 @@
+diff --git a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
+index 4ec70717bf93e9efcfc396f1c47b2b46e619fd8e..5c8246f36d87c674855acd7a2e0807dff3c71fbb 100644
+--- a/include/dqds/dqds_impl.h
++++ b/include/dqds/dqds_impl.h
+@@ -28,7 +28,8 @@
+ // units a wave-uniform branch skips their WMMAs (they would add +-0 to a non -0 accumulator); full units
+ // carry no branch. Epilogue: per 16-row sub-tile, dQ^T fragments -> this wave's row-major 16-row image
+ // after the rings -> whole-line b128 stores. Every index formula: ../../idx.h (replayed on the host
+-// by bounds_proof.py). No inline asm, no atomics, no named barriers, no clusters (prims.h).
++// by bounds_proof.py). No atomics, no named barriers, no clusters (prims.h); the only inline asm is an
++// empty statement that keeps operands allocated (keep_ds).
+ #pragma once
+ #pragma clang fp contract(off)
+ 
+@@ -64,7 +65,8 @@ using namespace q1;
+ //   The steady loop is unrolled by the ring depth (3 units: the ring stage is a compile-time constant), so
+ //   every burst address is a precomputed base VGPR + immediate and the loop carries no VALU: with only WMMAs
+ //   in flight the compiler's expert-mode waits before the bursts are counted (va_vdst(k)) instead of full
+-//   drains (a VALU mixed with in-flight WMMAs forces va_vdst(0)).
++//   drains (a VALU mixed with in-flight WMMAs forces va_vdst(0)). keep_ds() holds each run's dS operands to
++//   the end of its region so the burst loads cannot be allocated to a register the newest WMMA just read.
+ // * masked units: a uniform branch per q pair skips the fully masked pairs (no operand selects).
+ constexpr int X4_NS = 66, X4_LA = 8, X4_LC = 4;
+ Q1_DEV void x4_bar_signal() {
+@@ -104,6 +106,11 @@ template <int NQW> struct OpSet {
+     bf16x16 kt[NDT]; // A operands: K^T of the 12 d tiles
+     bf16x16 ds[NQW]; // B operands: dS^T of the wave's 16-query sub-tiles
+ };
++// emits no instruction: the dS operands of S stay allocated (live) up to this point
++template <int NQW> Q1_DEV void keep_ds(const OpSet<NQW> &S) {
++    static_assert(NQW == 6, "main tile only");
++    asm volatile("" ::"v"(S.ds[0]), "v"(S.ds[1]), "v"(S.ds[2]), "v"(S.ds[3]), "v"(S.ds[4]), "v"(S.ds[5]));
++}
+ 
+ template <int NQW>
+ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int Skv, int Hq,
+@@ -279,6 +286,7 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
+         run_raw(X, ic<0>{}, ic<NS>{});
+         x4_sgb_il<X4_LA, 1, 24 + 2 * NQW, NS>();
+         Q1_SCHED_BARRIER();
++        keep_ds(X);
+         Q1_WAIT_TENSORCNT(C_TW);
+         Q1_WAIT_DSCNT(0);
+         x4_bar_signal(); // P_{u+1} arrive: op(u+1) landed, unit u's ring reads retired
+@@ -294,6 +302,7 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
+         run_raw(Y, ic<0>{}, ic<NACC>{});
+         x4_sgb_il<X4_LC, 1, 24 + 2 * NQW, NACC>();
+         Q1_SCHED_BARRIER();
++        keep_ds(Y);
+     };
+ 
+     auto unit = [&](int u, auto MASK, auto LAST, auto REAL) DQ_INL {

@@ -1,0 +1,37 @@
+diff --git a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
+index 5b340ef468a61cb1e6ed2902e7d6929366bf6f86..9baa4af31a95b976ad8bf8a1a29447300aa83ce3 100644
+--- a/include/dqds/dqds_impl.h
++++ b/include/dqds/dqds_impl.h
+@@ -60,6 +60,8 @@ using namespace q1;
+ //   no longer waits for earlier WMMAs):
+ //     region A: burst(Y, 2u + 1) under run(X) WMMAs [0, X4_NS): {X4_LA WMMA} then {1 tr16, 1 WMMA} x 36
+ //     region C: burst(X, 2u + 2) under run(Y):                  {X4_LC WMMA} then {1 tr16, 1 WMMA} x 36
++// * masked units: the zero-select predicate in branch-free form (x4_ds_zero, same value as idx.h ds_zero), so
++//   the selects stay in-place v_cndmask (no scalar branches / operand copies inside the run).
+ constexpr int X4_NS = 66, X4_LA = 8, X4_LC = 4;
+ Q1_DEV void x4_bar_signal() {
+     __builtin_amdgcn_fence(3, "workgroup", "local"); // release
+@@ -80,6 +82,14 @@ template <int L, int R, int NT, int NW> Q1_DEV void x4_sgb_il() {
+     if constexpr (NW - L - NT * R > 0) Q1_SGB(0x008, NW - L - NT * R);
+ }
+ 
++// idx.h ds_zero without the short circuit (cshift >= 0, as the plan requires): r >= n32 || qp <
++// dsl_qp_first(2r) with dsl_qp_first(2r) = causal ? max(0, r - cshift / 32) : 0
++Q1_DEV bool x4_ds_zero(int qp, int r, int n32, int cshift, int causal) {
++    const int f   = r - cshift / 32;
++    const int qpf = (causal != 0) & (f > 0) ? f : 0;
++    return (bool) ((int) (r >= n32) | (int) (qp < qpf));
++}
++
+ struct TdmDesc { // one TDM op's descriptor groups 0 / 1 (prepared before the barrier, issued after
+                  // it)
+     u32x4 g0;
+@@ -182,7 +192,7 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
+         sfor<0, NQW>([&](auto Q) DQ_INL {
+             constexpr int h = decltype(Q)::value;
+             if constexpr (decltype(MASK)::value != 0) {
+-                b[h] = ds_zero(qp0w + h / 2, r, n32, cshift, causal) ? zero16 : S.ds[h];
++                b[h] = x4_ds_zero(qp0w + h / 2, r, n32, cshift, causal) ? zero16 : S.ds[h];
+             } else {
+                 b[h] = S.ds[h];
+             }

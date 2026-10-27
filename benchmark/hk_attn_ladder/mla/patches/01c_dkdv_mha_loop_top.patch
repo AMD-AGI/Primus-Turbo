@@ -1,0 +1,100 @@
+diff --git a/src/k_dkdv96ds.hip b/src/k_dkdv96ds.hip
+index d3b1672c755c7918452f693a06712f8e03a65ab8..162fc535c5850848b44d57220306fafbf5605c34 100644
+--- a/src/k_dkdv96ds.hip
++++ b/src/k_dkdv96ds.hip
+@@ -443,19 +443,29 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
+       }
+       sched_barrier<0>();
+     }
+-    int cur = 0, qi = 0, gh = 0;
++    int cur = 0, qi_c = 0, gh_c = 0;
+     // k1ds (64-row tail body): the dS^T payload of the previous full iteration (its a_dsk) and the q-pair / q-head
+     // part of its soffset, stored in the S/dP window of the next iteration (no DS op there) or after the loop
+     bf16x16 pend[NKV];
+     int pso = 0;
+     // one full iteration ii: S/dP of the carried B operands (stage ii%3's tile, read back in ii-1) and NL/ND
+     // `pre`; prefetch NL/ND of ii+1 into `nxt`; EXP (tail body): store iteration ii-1's dS^T in this S/dP window
+-    auto full_iter = [&](auto exp, int ii, const f32x4 (&pre)[NLD], f32x4 (&nxt)[NLD]) {
++    // X1d: g1 = true_type is the MHA (G == 1) specialization of the 96-row body's loop: the (query pair, q head)
++    // counters are (ii, 0) there, so the clamped prefetch tiles min(ii+1, n-1) / min(ii+3, n-1) replace the
++    // k1_nx_* / k1_pf_* select chains (same values: qi == ii, gh == 0 for G == 1) and no counter is carried.
++    auto full_iter = [&](auto exp, auto g1, int ii, const f32x4 (&pre)[NLD], f32x4 (&nxt)[NLD]) {
++      constexpr bool G1 = decltype(g1)::value;
++      const int qi = G1 ? ii : qi_c;
++      const int gh = G1 ? 0 : gh_c;
+       const int qn = k1_wrap_q(qi, gh, G), gn = k1_wrap_g(qi, gh, G);
+       const int ncur = k1_ncur(cur);         // (ii+1)%3: next iteration's stage == this one's readback stage
+       // NL/ND prefetch for ii+1 (clamped) at the top
+       sched_barrier<0>();
+-      ldl(qt0 + k1_nx_q(ii, n_full, qi, gh, G), k1_nx_g(ii, n_full, qi, gh, G), nxt);
++      if constexpr (G1) {
++        ldl(qt0 + (ii + 1 < n_full ? ii + 1 : n_full - 1), 0, nxt);
++      } else {
++        ldl(qt0 + k1_nx_q(ii, n_full, qi, gh, G), k1_nx_g(ii, n_full, qi, gh, G), nxt);
++      }
+       bf16x16 a_pk[NKV], a_dsk[NKV];
+       if constexpr (K3) {
+         // (1) hh1 of stage cur is read back here, under hh0's S/dP WMMAs; right behind it the pending prefetch
+@@ -478,7 +488,11 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
+         sched_barrier<0>();
+         // the prefetch tile min(ii+3, n-1) -> stage cur: its scalar math rides the dV WMMA run ({1 WMMA,
+         // KH0_SALU SALU} groups); the 3 ops issue at the top of iteration ii+1 (never, after the last iteration)
+-        tdp_pend = tdm_prep(qt0 + k1_pf_q(ii, n_full, qi, gh, G), k1_pf_g(ii, n_full, qi, gh, G), cur);
++        if constexpr (G1) {
++          tdp_pend = tdm_prep(qt0 + (ii + 3 < n_full ? ii + 3 : n_full - 1), 0, cur);
++        } else {
++          tdp_pend = tdm_prep(qt0 + k1_pf_q(ii, n_full, qi, gh, G), k1_pf_g(ii, n_full, qi, gh, G), cur);
++        }
+         static_for<NKV>([&](auto kh) { dv_kh(kh, acc, b_do, a_pk); });
+         static_for<NKV * NDO_V>([&](auto) {
+           sched_group_barrier<0x008, 1, 0>();
+@@ -563,27 +577,36 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
+         pso = k3ds_sq(qt0 + qi, gh, Sq, Skv, causal);
+       }
+       cur = ncur;
+-      qi = qn;
+-      gh = gn;
++      if constexpr (!G1) {
++        qi_c = qn;
++        gh_c = gn;
++      }
+     };
+     if constexpr (K3) {
+-      int ii = 0;
+-      for (; ii + 1 < n_full; ii += 2) {
+-        full_iter(std::false_type{}, ii, preA, preB);
+-        full_iter(std::false_type{}, ii + 1, preB, preA);
++      auto loop = [&](auto g1) {
++        int ii = 0;
++        for (; ii + 1 < n_full; ii += 2) {
++          full_iter(std::false_type{}, g1, ii, preA, preB);
++          full_iter(std::false_type{}, g1, ii + 1, preB, preA);
++        }
++        if (ii < n_full) full_iter(std::false_type{}, g1, ii, preA, preB);
++      };
++      if (G == 1) {
++        loop(std::true_type{});
++      } else {
++        loop(std::false_type{});
+       }
+-      if (ii < n_full) full_iter(std::false_type{}, ii, preA, preB);
+     } else if (n_full > 0) {
+       // k1ds: iteration 0 is peeled (nothing pending), then k1's x2 unrolled body and odd tail from iteration 1
+-      full_iter(std::false_type{}, 0, preA, preB);
+-      qi = k1ds_q1(G);                       // == k1_wrap_q(0, 0, G) (bounds_proof DL3), integer form
+-      gh = k1ds_g1(G);                       // == k1_wrap_g(0, 0, G)
++      full_iter(std::false_type{}, std::false_type{}, 0, preA, preB);
++      qi_c = k1ds_q1(G);                     // == k1_wrap_q(0, 0, G) (bounds_proof DL3), integer form
++      gh_c = k1ds_g1(G);                     // == k1_wrap_g(0, 0, G)
+       int ii = 1;
+       for (; ii + 1 < n_full; ii += 2) {
+-        full_iter(std::true_type{}, ii, preB, preA);
+-        full_iter(std::true_type{}, ii + 1, preA, preB);
++        full_iter(std::true_type{}, std::false_type{}, ii, preB, preA);
++        full_iter(std::true_type{}, std::false_type{}, ii + 1, preA, preB);
+       }
+-      if (ii < n_full) full_iter(std::true_type{}, ii, preB, preA);
++      if (ii < n_full) full_iter(std::true_type{}, std::false_type{}, ii, preB, preA);
+       // the last full iteration's payload
+       sched_barrier<0>();
+       static_for<NKV>([&](auto kh) { ds_store(pend[kh], pso + ds_rc[kh]); });

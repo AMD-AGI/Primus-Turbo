@@ -1,0 +1,260 @@
+diff --git a/include/k3m_idx.h b/include/k3m_idx.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e94a653582b92cd8fecab35f2face049d19a11e
+--- /dev/null
++++ b/include/k3m_idx.h
+@@ -0,0 +1,25 @@
++/***************************************************************************************************
++ * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
++ *
++ * See LICENSE for license information.
++ **************************************************************************************************/
++
++// k3m_idx.h -- the masked-ring index math of k_dkdv96ds (X3: the diagonal (masked) iterations go
++// through the same 3-stage Q/dO TDM ring as the full loop, prefetch distance 2). constexpr
++// __host__ __device__ functions of scalars; the kernel calls exactly these and the CPU replay
++// (scratch x3 tools/ring_replay.py) compiles this file for the host.
++//
++// One flat tile sequence per workgroup: j = 0 .. N-1, N = n_mask + n_full = G * nqp_eff, tile T_j =
++// (query pair qp_start + j / G, q head j % G); j < n_mask are the masked tiles (they straddle the
++// diagonal), the rest are the full loop's. Tile j lives in stage sigma(j) = (j - n_mask) mod 3, so
++// the full loop's first tile (j = n_mask) lands in stage 0 as the full loop's code assumes.
++#pragma once
++#include "idx.h"
++
++#define K3M_FN static inline constexpr __host__ __device__
++
++// byte offset of stage sigma(0) = ((-n_mask) mod 3) * K1_QDO_B (n_mask >= 0)
++K3M_FN int k3m_st0(int n_mask) {
++    const int r = n_mask % K1_DEPTH;
++    return r == 0 ? 0 : (K1_DEPTH - r) * K1_QDO_B;
++}
+diff --git a/src/k_dkdv96ds.hip b/src/k_dkdv96ds.hip
+index b2917ff2ae982deb5c8b636284106f5f72118953..38ade0597579ac62aaa35d6548da70b0d1a84184 100644
+--- a/src/k_dkdv96ds.hip
++++ b/src/k_dkdv96ds.hip
+@@ -53,12 +53,14 @@
+ //   The ring protocol is k1's: the ring barrier sits after the Q^T burst and dK kh0, so every DS read of stage
+ //   cur precedes BARRIER(ii) and the prefetch TDM into cur follows it.
+ //
+-// Ring protocol (k1's = FlyDSL's; bounds_proof.py K2 replays both bodies): both waves run one program, the wave index
+-// only offsets addresses, so per wave #barriers = 2*G*nmaskp + 2 + n_full + 1.
+-//   masked iteration: BARRIER (WAR) -> TDM own half of the tile -> stage 0 -> tensorcnt 0 -> BARRIER (RAW)
+-//     -> readback + tr16 of stage 0.
+-//   prologue: BARRIER -> TDM stages 0, 1 -> tensorcnt 3 -> BARRIER -> readback (k3: hh0) of stage 0
+-//     -> k1: TDM stage 2 | k3: tile min(2, n-1) -> stage 2 becomes the pending prefetch.
++// Ring protocol (k1's = FlyDSL's full loop; X3: the masked iterations ride the same ring; the CPU replay
++// scratch/hk_opt/x3_dkdv_mask/tools/ring_replay.py checks both bodies): both waves run one program, the wave index
++// only offsets addresses, so per wave #barriers = 1 + G*nmaskp + n_full + 1.
++//   one tile sequence T_0 .. T_{N-1} (masked tiles first), tile j in stage sigma(j) = (j - G*nmaskp) mod 3.
++//   prologue: TDM T_0, T_1 -> sigma(0), sigma(1) -> tensorcnt 3 -> BARRIER -> readback (k3: hh0) of sigma(0)
++//     -> k1: TDM T_2 -> sigma(2) | k3: T_2 -> sigma(2) becomes the pending prefetch.
++//   masked iteration j: the full iteration below with the causal mask on, stage sigma(j), tiles min(j+k, N-1),
++//     dS^T export (put blocks only) at its end.
+ //   k1 full iteration ii (stage cur = ii%3): tr16 of cur; WMMAs; tensorcnt 3 (own half of (ii+1)%3); BARRIER(ii);
+ //     readback of (ii+1)%3; TDM of tile min(ii+3, n-1) into cur; WMMAs.
+ //   k3 full iteration ii: readback hh1 of cur; the pending prefetch TDM (tile min(ii+2, n-1) -> stage (ii+2)%3, whose
+@@ -73,6 +75,7 @@
+ #include "dslayout.h"
+ #include "k1ds_idx.h"
+ #include "k3ds_idx.h"
++#include "k3m_idx.h"
+ 
+ using namespace hk1;
+ 
+@@ -351,52 +354,119 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
+     f32x8 acc[NST];
+     static_for<NST>([&](auto i) { acc[i] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; });
+ 
+-    // ---- masked loop: the query pairs that straddle this workgroup's diagonal; own tile, no prefetch -----
++    // ---- X3: the masked (diagonal) iterations ride the full loop's 3-stage Q/dO ring (k3m_idx.h) ----------
++    // Flat tile sequence j < N = n_mask + n_full, T_j = (qp_start + j / G, j % G) in stage sigma(j) = (j - n_mask)
++    // mod 3 (the full loop's first tile lands in stage 0); every prefetch is clamped to T_{N-1}.
++    //   prologue (the ring is empty): TDM T_0 -> sigma(0), T_1 -> sigma(1); NL/ND of T_0; tensorcnt 3; BARRIER;
++    //     readback of sigma(0) (k3: hh0 | k1: both halves); k3: T_2 -> sigma(2) pending | k1: TDM T_2 -> sigma(2).
++    //   masked iteration j = the full iteration's ring protocol with the causal mask on:
++    //     k3: NL/ND of T_{j+1}; hh1 readback of sigma(j), pending TDM T_{j+2} -> sigma(j+2); S/dP; tr16 dO^T; dV
++    //         (+ prep of T_{j+3} -> sigma(j)); tr16 Q^T; dK kh0; tensorcnt 3; BARRIER(j); readback hh0 of
++    //         sigma(j+1); dK kh1, kh2; export.
++    //     k1: NL/ND of T_{j+1}; S/dP; tr16 dO^T, Q^T; dvdk kh0; tensorcnt 3; BARRIER(j); readback of sigma(j+1);
++    //         TDM T_{j+3} -> sigma(j); dvdk kh1; export.
++    //   (A fully masked wave-iteration, e.g. wave 1 at qp_start, still runs its WMMAs: skipping them behind a uniform
++    //   branch measured no gain -- wave 0 bounds that iteration -- and raised SGPR pressure: X3b, p2_x3_dkdv_mask.md.)
++    // After the last masked iteration the state is the full loop's entry state: qd = readback of stage 0 =
++    // T_{n_mask}, T_{n_mask+1} in flight to stage 1, T_{n_mask+2} -> stage 2 (k3 pending | k1 issued), preA = NL/ND
++    // of T_{n_mask}. Barriers per wave: 1 + n_mask + n_full + 1 (was 2 n_mask + 2 + n_full + 1).
++    const int qt0 = qp_start + nmaskp;
++    const int n_seq = n_mask + n_full;
++    // NL/ND live in two register sets (k1): iteration ii reads one and prefetches ii+1 into the other, the loop
++    // body is unrolled by 2 to alternate them (the masked loop copies preB -> preA instead).
++    f32x4 preA[NLD], preB[NLD];
++    // carried readback: k1 both hh halves (40 entries); k3 hh0 only (20)
++    constexpr int NCAR = K3 ? NHB : NRB;
++    bf16x8 qd[NCAR];
++    TdmG0 tdp_pend;                          // k3: the prefetch TDM prepped in iteration ii-1 (or the prologue)
++    {
++      const int s0 = k3m_st0(n_mask);
++      const int s1 = k1_ncur(s0), s2 = k1_ncur(s1);
++      sched_barrier<0>();
++      tdm_tile(k1_clampqt(qp_start, nqt2), 0, s0);
++      tdm_tile(k1_clampqt(qp_start + k1_pro_q(1, n_seq, G), nqt2), k1_pro_g(1, n_seq, G), s1);
++      ldl(k1_clampqt(qp_start, nqt2), 0, preA);
++      sched_barrier<0>();
++      tensor_wait<K1_TW>();
++      sched_barrier<0>();
++      lds_barrier();                         // RAW: every wave's half of sigma(0) landed
++      sched_barrier<0>();
++      if constexpr (K3) {
++        rdqd_hh(rd_base(s0), std::integral_constant<int, 0>{}, qd);
++        sched_barrier<0>();
++        // T_2 -> sigma(2) is issued at the top of iteration 0, after its hh1 readback
++        tdp_pend = tdm_prep(k1_clampqt(qp_start + k1_pro_q(2, n_seq, G), nqt2), k1_pro_g(2, n_seq, G), s2);
++      } else {
++        rdqd(rd_base(s0), qd);
++        sched_barrier<0>();                  // readback before the TDM (one barrier region, R4 order)
++        tdm_tile(k1_clampqt(qp_start + k1_pro_q(2, n_seq, G), nqt2), k1_pro_g(2, n_seq, G), s2);
++      }
++      sched_barrier<0>();
++    }
+     {
+-      int qi = 0, gh = 0;
++      int qi = 0, gh = 0, mst = k3m_st0(n_mask);
+       for (int it = 0; it < n_mask; ++it) {
+         const int qt = qp_start + qi;
+-        f32x4 pre[NLD];
+-        ldl(qt, gh, pre);
+-        sched_barrier<0>();
+-        lds_barrier();                       // WAR: every wave's reads of stage 0 retired
+-        sched_barrier<0>();
+-        tdm_tile(qt, gh, 0);
+-        sched_barrier<0>();
+-        tensor_wait<0>();
+-        sched_barrier<0>();
+-        lds_barrier();                       // RAW: every wave's half of the tile landed
++        const int mnx = k1_ncur(mst);        // sigma(j+1)
+         sched_barrier<0>();
++        ldl(qp_start + k1_nx_q(it, n_seq, qi, gh, G), k1_nx_g(it, n_seq, qi, gh, G), preB);
++        const int pfq = qp_start + k1_pf_q(it, n_seq, qi, gh, G), pfg = k1_pf_g(it, n_seq, qi, gh, G);
+         bf16x16 a_pk[NKV], a_dsk[NKV];
+-        const lds_u8* tv = tr_base(0, 0);
+-        const lds_u8* tk = tr_base(0, 1);
+         if constexpr (K3) {
+-          const RdBase rb = rd_base(0);
+-          bf16x8 op0[NHB];
+-          rdqd_hh(rb, std::integral_constant<int, 0>{}, op0);
+-          sdp3(std::true_type{}, op0, rb, pre, qt * 32, a_pk, a_dsk, [] {});
+-          sched_barrier<0>();
++          sdp3(std::true_type{}, qd, rd_base(mst), preA, qt * 32, a_pk, a_dsk, [&] { tdm_issue(tdp_pend); });
++          const lds_u8* tv = tr_base(mst, 0);
++          const lds_u8* tk = tr_base(mst, 1);
++          const RdBase rbb = rd_base(mnx);
++          sched_barrier<SB_ALU>();
+           bf16x16 b_do[NDO_V];
+           static_for<NDO_V>([&](auto d) { b_do[d] = tr(tv, 0, d); });
+           sched_barrier<0>();
++          tdp_pend = tdm_prep(pfq, pfg, mst);
+           static_for<NKV>([&](auto kh) { dv_kh(kh, acc, b_do, a_pk); });
++          static_for<NKV * NDO_V>([&](auto) {
++            sched_group_barrier<0x008, 1, 0>();
++            sched_group_barrier<0x004, KH0_SALU, 0>();
++          });
+           sched_barrier<0>();
+           bf16x16 b_q[NDO_QK];
+           static_for<NDO_QK>([&](auto d) { b_q[d] = tr(tk, 1, d); });
+           sched_barrier<0>();
+-          static_for<NKV>([&](auto kh) { dk_kh(kh, acc, b_q, a_dsk); });
++          dk_kh(std::integral_constant<int, 0>{}, acc, b_q, a_dsk);
++          sched_barrier<0>();
++          tensor_wait<K1_TW>();
++          sched_barrier<0>();
++          lds_barrier();
++          sched_barrier<0>();
++          rdqd_hh(rbb, std::integral_constant<int, 0>{}, qd);
++          sched_barrier<0>();
++          static_for<NKV - 1>([&](auto k) { dk_kh(std::integral_constant<int, k + 1>{}, acc, b_q, a_dsk); });
+         } else {
+-          bf16x8 ops[NRB];
+-          rdqd(rd_base(0), ops);
+-          sdp(std::true_type{}, ops, pre, qt * 32, a_pk, a_dsk);
++          sdp(std::true_type{}, qd, preA, qt * 32, a_pk, a_dsk);
++          const lds_u8* tv = tr_base(mst, 0);
++          const lds_u8* tk = tr_base(mst, 1);
++          const RdBase rbb = rd_base(mnx);
+           sched_barrier<0>();
+           bf16x16 b_do[NDO_V], b_q[NDO_QK];
+-          static_for<NDO_QK>([&](auto d) {
+-            if constexpr (d < NDO_V) b_do[d] = tr(tv, 0, d);
+-            b_q[d] = tr(tk, 1, d);
++          static_for<NDO_V>([&](auto d) { b_do[d] = tr(tv, 0, d); });
++          sched_barrier<0>();
++          static_for<NDO_QK>([&](auto d) { b_q[d] = tr(tk, 1, d); });
++          sched_barrier<0>();
++          const TdmG0 tdp = tdm_prep(pfq, pfg, mst);
++          dvdk(std::integral_constant<int, 0>{}, acc, b_do, b_q, a_pk, a_dsk);
++          static_for<NDO_V + NDO_QK>([&](auto) {
++            sched_group_barrier<0x008, 1, 0>();
++            sched_group_barrier<0x004, KH0_SALU, 0>();
+           });
+           sched_barrier<0>();
+-          static_for<NKV>([&](auto kh) { dvdk(kh, acc, b_do, b_q, a_pk, a_dsk); });
++          tensor_wait<K1_TW>();
++          sched_barrier<0>();
++          lds_barrier();
++          sched_barrier<0>();
++          rdqd(rbb, qd);
++          sched_barrier<0x004>();            // readback before the TDM; SALU may cross
++          tdm_issue(tdp);
++          sched_barrier<0>();
++          dvdk(std::integral_constant<int, 1>{}, acc, b_do, b_q, a_pk, a_dsk);
+         }
+         // export of this masked iteration's dS^T: a block only if its kv16 row has an attended entry in pair qt
+         sched_barrier<0>();
+@@ -405,46 +475,13 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
+           if (k3ds_put(kh, qt, kt0, Sq, Skv, causal)) ds_store(a_dsk[kh], so_m + ds_rc[kh]);
+         });
+         sched_barrier<0>();
++        static_for<NLD>([&](auto e) { preA[e] = preB[e]; });
+         const int qn = k1_wrap_q(qi, gh, G), gn = k1_wrap_g(qi, gh, G);
+         qi = qn;
+         gh = gn;
++        mst = mnx;
+       }
+     }
+-
+-    // ---- full loop: unmasked pairs through the 3-stage ring, B operands and NL/ND carried ---------------
+-    const int qt0 = qp_start + nmaskp;
+-    // NL/ND live in two register sets (k1): iteration ii reads one and prefetches ii+1 into the other, the loop
+-    // body is unrolled by 2 to alternate them.
+-    f32x4 preA[NLD], preB[NLD];
+-    ldl(k1_clampqt(qt0, nqt2), 0, preA);
+-    // carried readback: k1 both hh halves (40 entries); k3 hh0 only (20)
+-    constexpr int NCAR = K3 ? NHB : NRB;
+-    bf16x8 qd[NCAR];
+-    TdmG0 tdp_pend;                          // k3: the prefetch TDM prepped in iteration ii-1 (or the prologue)
+-    {
+-      // prologue: stages 0, 1 <- tiles min(0|1, n-1); RAW; readback of stage 0; stage 2 <- min(2, n-1)
+-      sched_barrier<0>();
+-      lds_barrier();                         // WAR vs the masked loop's reads of stage 0
+-      sched_barrier<0>();
+-      tdm_tile(k1_clampqt(qt0, nqt2), 0, 0);
+-      tdm_tile(k1_clampqt(qt0 + k1_pro_q(1, n_full, G), nqt2), k1_pro_g(1, n_full, G), K1_QDO_B);
+-      sched_barrier<0>();
+-      tensor_wait<K1_TW>();
+-      sched_barrier<0>();
+-      lds_barrier();                         // RAW: every wave's half of stage 0 landed
+-      sched_barrier<0>();
+-      if constexpr (K3) {
+-        rdqd_hh(rd_base(0), std::integral_constant<int, 0>{}, qd);
+-        sched_barrier<0>();
+-        // tile min(2, n-1) -> stage 2 is issued at the top of iteration 0, after its hh1 readback
+-        tdp_pend = tdm_prep(k1_clampqt(qt0 + k1_pro_q(2, n_full, G), nqt2), k1_pro_g(2, n_full, G), 2 * K1_QDO_B);
+-      } else {
+-        rdqd(rd_base(0), qd);
+-        sched_barrier<0>();                  // readback before the TDM (one barrier region, R4 order)
+-        tdm_tile(k1_clampqt(qt0 + k1_pro_q(2, n_full, G), nqt2), k1_pro_g(2, n_full, G), 2 * K1_QDO_B);
+-      }
+-      sched_barrier<0>();
+-    }
+     int cur = 0, qi_c = 0, gh_c = 0;
+     // k1ds (64-row tail body): the dS^T payload of the previous full iteration (its a_dsk) and the q-pair / q-head
+     // part of its soffset, stored in the S/dP window of the next iteration (no DS op there) or after the loop

@@ -1,0 +1,139 @@
+diff --git a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
+index 57bb8d7c46b90955752928be6a87653dc754c4c7..4ec70717bf93e9efcfc396f1c47b2b46e619fd8e 100644
+--- a/include/dqds/dqds_impl.h
++++ b/include/dqds/dqds_impl.h
+@@ -61,6 +61,10 @@ using namespace q1;
+ //   no longer waits for earlier WMMAs):
+ //     region A: burst(Y, 2u + 1) under run(X) WMMAs [0, X4_NS): {X4_LA WMMA} then {1 tr16, 1 WMMA} x 36
+ //     region C: burst(X, 2u + 2) under run(Y):                  {X4_LC WMMA} then {1 tr16, 1 WMMA} x 36
++//   The steady loop is unrolled by the ring depth (3 units: the ring stage is a compile-time constant), so
++//   every burst address is a precomputed base VGPR + immediate and the loop carries no VALU: with only WMMAs
++//   in flight the compiler's expert-mode waits before the bursts are counted (va_vdst(k)) instead of full
++//   drains (a VALU mixed with in-flight WMMAs forces va_vdst(0)).
+ // * masked units: a uniform branch per q pair skips the fully masked pairs (no operand selects).
+ constexpr int X4_NS = 66, X4_LA = 8, X4_LC = 4;
+ Q1_DEV void x4_bar_signal() {
+@@ -266,32 +270,37 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
+     // ---- one 64-kv unit: rows 2u (set X, burst into Y) and 2u + 1 (set Y, burst into X unless
+     // LAST) --------------
+     OpSet<NQW> X, Y;
+-    auto       unit = [&](int u, auto MASK, auto LAST, auto REAL) DQ_INL {
++    // main-tile steady unit u (interleaved regions A / C); BY / BX issue the bursts of rows 2u + 1 / 2u + 2
++    auto steady_unit = [&](int u, auto BY, auto BX) DQ_INL {
++        constexpr int NS = X4_NS < NACC ? X4_NS : NACC;
++        // region A: burst Y (row 2u + 1, unit u's stages) under run X part 1, the descriptor SALU too
++        BY();
++        const TdmDesc dn = c_desc(u + 3, ic<1>{});
++        run_raw(X, ic<0>{}, ic<NS>{});
++        x4_sgb_il<X4_LA, 1, 24 + 2 * NQW, NS>();
++        Q1_SCHED_BARRIER();
++        Q1_WAIT_TENSORCNT(C_TW);
++        Q1_WAIT_DSCNT(0);
++        x4_bar_signal(); // P_{u+1} arrive: op(u+1) landed, unit u's ring reads retired
++        Q1_SCHED_BARRIER();
++        run_raw(X, ic<NS>{}, ic<NACC>{});
++        Q1_SCHED_BARRIER();
++        x4_bar_wait(); // P_{u+1}: unit u+1 published, unit u's stages free
++        Q1_SCHED_BARRIER();
++        issue(dn); // op(u + 3) into unit u's stages
++        Q1_SCHED_BARRIER();
++        // region C: burst X (row 2u + 2, unit u + 1's stages) under run Y
++        BX();
++        run_raw(Y, ic<0>{}, ic<NACC>{});
++        x4_sgb_il<X4_LC, 1, 24 + 2 * NQW, NACC>();
++        Q1_SCHED_BARRIER();
++    };
++
++    auto unit = [&](int u, auto MASK, auto LAST, auto REAL) DQ_INL {
+         constexpr bool last = decltype(LAST)::value != 0;
+         const int      r0 = 2 * u, r1 = 2 * u + 1;
+         if constexpr (!last && decltype(MASK)::value == 0 && NQW == MAIN_NQW) {
+-            constexpr int NS = X4_NS < NACC ? X4_NS : NACC;
+-            // region A: burst Y (row 2u + 1, unit u's stages) under run X part 1, the descriptor SALU too
+-            burst(Y, r1);
+-            const TdmDesc dn = c_desc(u + 3, REAL);
+-            run_raw(X, ic<0>{}, ic<NS>{});
+-            x4_sgb_il<X4_LA, 1, 24 + 2 * NQW, NS>();
+-            Q1_SCHED_BARRIER();
+-            Q1_WAIT_TENSORCNT(C_TW);
+-            Q1_WAIT_DSCNT(0);
+-            x4_bar_signal(); // P_{u+1} arrive: op(u+1) landed, unit u's ring reads retired
+-            Q1_SCHED_BARRIER();
+-            run_raw(X, ic<NS>{}, ic<NACC>{});
+-            Q1_SCHED_BARRIER();
+-            x4_bar_wait(); // P_{u+1}: unit u+1 published, unit u's stages free
+-            Q1_SCHED_BARRIER();
+-            issue(dn); // op(u + 3) into unit u's stages
+-            Q1_SCHED_BARRIER();
+-            // region C: burst X (row 2u + 2, unit u + 1's stages) under run Y
+-            burst(X, r1 + 1);
+-            run_raw(Y, ic<0>{}, ic<NACC>{});
+-            x4_sgb_il<X4_LC, 1, 24 + 2 * NQW, NACC>();
+-            Q1_SCHED_BARRIER();
++            steady_unit(u, [&]() DQ_INL { burst(Y, r1); }, [&]() DQ_INL { burst(X, r1 + 1); });
+             return;
+         }
+         if constexpr (!last) {
+@@ -357,9 +366,60 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
+     // loop itself; the generic body (skips + dummies) runs the rest.
+     const int nloop = nu - 1;
+     const int nf    = steady_units(nfu, nu);
+-    for (int u = 0; u < nf; ++u)
++    int       u     = 0;
++    if constexpr (NQW == MAIN_NQW) {
++        // steady units, unrolled by the ring depth: precomputed burst bases, K stages 0 / 1 off kb01
++        // (immediates <= 54176), stage 2 off kb2; dS stage s off db[s] (the wave's first pair; its pair k = pair 0
++        // + k blocks)
++        const int kb01 = c_k_lane(lane);
++        const int kb2  = kb01 + 2 * C_KSTG_B;
++        const int dl   = ds_lane(lane) + ds_wave_off(wv, NQW);
++        int       db[3];
++        sfor<0, 3>([&](auto Sg) DQ_INL {
++            constexpr int s = decltype(Sg)::value;
++            db[s]           = dl + C_DS_OFF + s * c_dsstg_b(NQW);
++        });
++        // the burst of kv32 row 2u + H of a steady unit u with u % 3 == s (all NB_G pairs stored: sh = 0)
++        auto burst_stage = [&](OpSet<NQW> &Sx, auto Sg, auto Hg) DQ_INL {
++            constexpr int s = decltype(Sg)::value, H = decltype(Hg)::value;
++            constexpr int ko = (s == 2 ? 0 : s * C_KSTG_B) + H * C_KHALF_B;
++            const int     kb = s == 2 ? kb2 : kb01;
++            sfor<0, NDT>([&](auto D) DQ_INL {
++                constexpr int dt = decltype(D)::value;
++                Sx.kt[dt] = cat16(tr16(lds, kb + ko + c_k_imm(dt, 0)), tr16(lds, kb + ko + c_k_imm(dt, 1)));
++            });
++            constexpr int so = H * c_slot_b(NQW);
++            constexpr int r1 = NB_G * DSI_BLK_B;
++            sfor<0, NQW>([&](auto Q) DQ_INL {
++                constexpr int h = decltype(Q)::value, k = h / 2;
++                const int     base = db[s];
++                constexpr int po   = k * DSI_BLK_B + (h % 2) * 32;
++                Sx.ds[h] = cat16(tr16(lds, base + so + po), tr16(lds, base + so + r1 + po));
++            });
++        };
++        auto unit_stage = [&](int uu, auto Sg) DQ_INL {
++            constexpr int s  = decltype(Sg)::value;
++            constexpr int s1 = (s + 1) % 3;
++            steady_unit(uu, [&]() DQ_INL { burst_stage(Y, ic<s>{}, ic<1>{}); },
++                        [&]() DQ_INL { burst_stage(X, ic<s1>{}, ic<0>{}); });
++        };
++        for (; u + 3 <= nf; u += 3) {
++            unit_stage(u, ic<0>{});
++            unit_stage(u + 1, ic<1>{});
++            unit_stage(u + 2, ic<2>{});
++        }
++        if (u < nf) { // nf % 3 == 1 or 2 (u % 3 == 0 here)
++            unit_stage(u, ic<0>{});
++            ++u;
++            if (u < nf) {
++                unit_stage(u, ic<1>{});
++                ++u;
++            }
++        }
++    }
++    for (; u < nf; ++u) // head tile (no main-tile steady unit is left)
+         unit(u, ic<0>{}, ic<0>{}, ic<1>{});
+-    for (int u = nf; u < nloop; ++u)
++    for (u = nf; u < nloop; ++u)
+         unit(u, ic<1>{}, ic<0>{}, ic<0>{});
+     unit(nloop, ic<1>{}, ic<1>{}, ic<0>{});
+ 

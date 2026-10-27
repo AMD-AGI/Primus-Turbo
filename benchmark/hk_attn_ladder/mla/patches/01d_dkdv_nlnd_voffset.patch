@@ -1,0 +1,15 @@
+diff --git a/src/k_dkdv96ds.hip b/src/k_dkdv96ds.hip
+index 162fc535c5850848b44d57220306fafbf5605c34..eb995f2ac19fda3b4a760f3303636f948f3ad77c 100644
+--- a/src/k_dkdv96ds.hip
++++ b/src/k_dkdv96ds.hip
+@@ -158,7 +158,9 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
+   auto ldl = [&](int qt, int gh, f32x4 (&out)[NLD]) {
+     const int sb = uniform(k1_nl_soff(bat, Hq, k1_qh(hkv, G, gh), Sq, qt * 32));
+     static_for<NLD>([&](auto e) {
+-      out[e] = buf_load_f32x4(((e % 4) / 2) == 0 ? r_nl : r_nd, voff_l, sb + k1_nl_sconst(e));
++      // X1a: the constant goes on the VGPR offset (3 loop-invariant VGPRs voff + 16 / 64 / 80), so all 8 loads share
++      // one SGPR soffset and no address register is rewritten while earlier loads still read it (s_wait_xcnt WAR)
++      out[e] = buf_load_f32x4(((e % 4) / 2) == 0 ? r_nl : r_nd, voff_l + k1_nl_sconst(e), sb);
+     });
+   };
+ 

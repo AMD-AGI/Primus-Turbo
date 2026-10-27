@@ -1,0 +1,137 @@
+diff --git a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
+index 04103035ad54259c870c9f9f5146ebe4ed6b61a1..cdc001978dabd8a4042859ba05847b30461b35f3 100644
+--- a/include/dqds/dqds_impl.h
++++ b/include/dqds/dqds_impl.h
+@@ -24,9 +24,9 @@
+ // (waves 0 / 3: the dS of kv32 row 2u + (w >> 1) for all NB_G q pairs of the workgroup, waves 1 /
+ // 2: K rows [64u + 32 (w >> 1), +32)); wait 1 -> barrier P_{u+1} -> op(u + 3) at the odd row of
+ // every unit only; <= 2 TDM ops in flight per wave; ops past the last unit are 16-B dummies. Fully
+-// masked q pairs are never loaded (the dS op starts at the first stored pair, dslayout) and their B
+-// operand is selected to zero (uniform condition, v_cndmask; never a multiply) in the masked units;
+-// full units carry no select. Epilogue: bwd_hk_q1's (dQ^T fragments -> per-wave row-major image in
++// masked q pairs are never loaded (the dS op starts at the first stored pair, dslayout); in the masked
++// units a wave-uniform branch skips their WMMAs (they would add +-0 to a non -0 accumulator); full units
++// carry no branch. Epilogue: bwd_hk_q1's (dQ^T fragments -> per-wave row-major image in
+ // the dead ring -> whole-line b128 stores). Every index formula: ../../idx.h (replayed on the host
+ // by bounds_proof.py). No inline asm, no atomics, no named barriers, no clusters (prims.h).
+ #pragma once
+@@ -60,8 +60,7 @@ using namespace q1;
+ //   no longer waits for earlier WMMAs):
+ //     region A: burst(Y, 2u + 1) under run(X) WMMAs [0, X4_NS): {X4_LA WMMA} then {1 tr16, 1 WMMA} x 36
+ //     region C: burst(X, 2u + 2) under run(Y):                  {X4_LC WMMA} then {1 tr16, 1 WMMA} x 36
+-// * masked units: the zero-select predicate in branch-free form (x4_ds_zero, same value as idx.h ds_zero), so
+-//   the selects stay in-place v_cndmask (no scalar branches / operand copies inside the run).
++// * masked units: a uniform branch per q pair skips the fully masked pairs (no operand selects).
+ constexpr int X4_NS = 66, X4_LA = 8, X4_LC = 4;
+ Q1_DEV void x4_bar_signal() {
+     __builtin_amdgcn_fence(3, "workgroup", "local"); // release
+@@ -182,68 +181,44 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
+         burst_ds(S, slot + rb, ds_row1(slot, NB_G, sh) + rb);
+     };
+ 
+-    // ---- the NQW x 12 WMMA run of one kv32 row (MASK: masked units select fully masked q pairs'
+-    // operands to zero) -
++    // ---- the NQW x 12 WMMA run of one kv32 row
+     f32x8 acc[NACC];
+     sfor<0, NACC>([&](auto I) DQ_INL { acc[decltype(I)::value] = zero8(); });
+-    const bf16x16 zero16 = {};
+-    auto          run    = [&](const OpSet<NQW> &S, auto MASK, int r) DQ_INL {
+-        bf16x16 b[NQW];
+-        sfor<0, NQW>([&](auto Q) DQ_INL {
+-            constexpr int h = decltype(Q)::value;
+-            if constexpr (decltype(MASK)::value != 0) {
+-                b[h] = x4_ds_zero(qp0w + h / 2, r, n32, cshift, causal) ? zero16 : S.ds[h];
+-            } else {
+-                b[h] = S.ds[h];
+-            }
+-        });
+-        sfor<0, NQW>([&](auto Q) DQ_INL {
+-            constexpr int h = decltype(Q)::value;
+-            sfor<0, NDT>([&](auto D) DQ_INL {
+-                constexpr int dt  = decltype(D)::value;
+-                acc[h * NDT + dt] = wmma_bf16(S.kt[dt], b[h], acc[h * NDT + dt]);
+-            });
+-        });
+-        if constexpr (decltype(MASK)::value != 0) {
+-            // the selects ride the run: sub-tile 0's 8 first, then {1 WMMA, 1 VALU} (bwd_r6_a's
+-            // k_dqds192 pattern)
+-            Q1_SGB(0x002, 8);
+-            sfor<0, 8 * (NQW - 1)>([&](auto) DQ_INL {
+-                Q1_SGB(0x008, 1);
+-                Q1_SGB(0x002, 1);
+-            });
+-            Q1_SGB(0x008, NACC - 8 * (NQW - 1));
+-        }
+-        Q1_SCHED_BARRIER();
++    // the wave's k-th q pair holds no attended entry at kv32 row r (wave-uniform)
++    auto pair_zero = [&](int k, int r) DQ_INL {
++        return x4_ds_zero(qp0w + k, r, n32, cshift, causal);
+     };
+-
+-    // X4: the WMMAs [LO, HI) of a run (the masked form selects its operands and carries the selects' pattern
+-    // in the first part only)
++    // the WMMAs [LO, HI) of a run; MASK (masked units): a uniform branch per q pair skips the pair's WMMAs when
++    // it is fully masked (its operands were never loaded)
+     auto run_rng = [&](const OpSet<NQW> &S, auto MASK, int r, auto LO, auto HI) DQ_INL {
+         constexpr int lo = decltype(LO)::value, hi = decltype(HI)::value;
+-        bf16x16 b[NQW];
+-        sfor<0, NQW>([&](auto Q) DQ_INL {
+-            constexpr int h = decltype(Q)::value;
+-            if constexpr (decltype(MASK)::value != 0) {
+-                b[h] = x4_ds_zero(qp0w + h / 2, r, n32, cshift, causal) ? zero16 : S.ds[h];
+-            } else {
+-                b[h] = S.ds[h];
+-            }
+-        });
++        if constexpr (decltype(MASK)::value != 0) {
++            sfor<0, NQW / 2>([&](auto Kp) DQ_INL {
++                constexpr int k  = decltype(Kp)::value;
++                constexpr int a  = 2 * k * NDT > lo ? 2 * k * NDT : lo;
++                constexpr int bb = 2 * (k + 1) * NDT < hi ? 2 * (k + 1) * NDT : hi;
++                if constexpr (a < bb) {
++                    if (!pair_zero(k, r)) {
++                        sfor<a, bb>([&](auto I) DQ_INL {
++                            constexpr int i = decltype(I)::value, h = i / NDT, dt = i % NDT;
++                            acc[i] = wmma_bf16(S.kt[dt], S.ds[h], acc[i]);
++                        });
++                    }
++                }
++            });
++            Q1_SCHED_BARRIER();
++            return;
++        }
+         sfor<lo, hi>([&](auto I) DQ_INL {
+             constexpr int i = decltype(I)::value, h = i / NDT, dt = i % NDT;
+-            acc[i] = wmma_bf16(S.kt[dt], b[h], acc[i]);
++            acc[i] = wmma_bf16(S.kt[dt], S.ds[h], acc[i]);
+         });
+-        if constexpr (decltype(MASK)::value != 0 && lo == 0) {
+-            Q1_SGB(0x002, 8);
+-            sfor<0, hi>([&](auto I) DQ_INL {
+-                Q1_SGB(0x008, 1);
+-                if constexpr (decltype(I)::value < 8 * (NQW - 1)) Q1_SGB(0x002, 1);
+-            });
+-        }
+         Q1_SCHED_BARRIER();
+     };
+-    // X4: the WMMAs [LO, HI) of a steady run (no selects, no trailing sched_barrier: interleaved regions)
++    auto run = [&](const OpSet<NQW> &S, auto MASK, int r) DQ_INL {
++        run_rng(S, MASK, r, ic<0>{}, ic<NACC>{});
++    };
++    // X4: the WMMAs [LO, HI) of a steady run (no trailing sched_barrier: interleaved regions)
+     auto run_raw = [&](const OpSet<NQW> &S, auto LO, auto HI) DQ_INL {
+         constexpr int lo = decltype(LO)::value, hi = decltype(HI)::value;
+         sfor<lo, hi>([&](auto I) DQ_INL {
+@@ -376,10 +351,10 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
+     burst(X, 0);
+     Q1_SCHED_BARRIER();
+ 
+-    // ---- units: full ones (no selects), masked ones, then the last unit (masked form, no burst
++    // ---- units: full ones (no branches), masked ones, then the last unit (masked form, no burst
+     // past the end) ------ The steady-state loop also requires every op it issues to be real (u + 3
+     // < nu): causal main tiles have exactly 6 masked units, the head 4, so this is the full-unit
+-    // loop itself; the generic body (selects + dummies) runs the rest.
++    // loop itself; the generic body (skips + dummies) runs the rest.
+     const int nloop = nu - 1;
+     const int nf    = steady_units(nfu, nu);
+     for (int u = 0; u < nf; ++u)

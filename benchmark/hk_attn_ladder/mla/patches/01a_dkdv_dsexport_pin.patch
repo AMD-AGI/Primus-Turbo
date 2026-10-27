@@ -1,0 +1,14 @@
+diff --git a/src/k_dkdv96ds.hip b/src/k_dkdv96ds.hip
+index aa3e3de8805194d126c7b91535f65509c7e12be8..7a4ad2d1980ebc67ce84d6d401c61a72797030cb 100644
+--- a/src/k_dkdv96ds.hip
++++ b/src/k_dkdv96ds.hip
+@@ -465,6 +465,9 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
+         // Q^T burst; the soffset from this iteration's counters (they advance only at the end of full_iter)
+         const int so_c = k3ds_sq(qt0 + qi, gh, Sq, Skv, causal);
+         static_for<NKV>([&](auto kh) { ds_store(a_dsk[kh], so_c + ds_rc[kh]); });
++        // X1b1: the export is pinned here, under the dO^T tr16 latency, ahead of the first dV WMMA (in the
++        // non-expert mode a store issued inside the WMMA run waits for every earlier WMMA)
++        sched_barrier<0>();
+         // the prefetch tile min(ii+3, n-1) -> stage cur: its scalar math rides the dV WMMA run ({1 WMMA,
+         // KH0_SALU SALU} groups); the 3 ops issue at the top of iteration ii+1 (never, after the last iteration)
+         tdp_pend = tdm_prep(qt0 + k1_pf_q(ii, n_full, qi, gh, G), k1_pf_g(ii, n_full, qi, gh, G), cur);

@@ -1,0 +1,13 @@
+diff --git a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
+index f428dd299951fb2a8d340cb44c7e611e8061bb0d..5b340ef468a61cb1e6ed2902e7d6929366bf6f86 100644
+--- a/include/dqds/dqds_impl.h
++++ b/include/dqds/dqds_impl.h
+@@ -60,7 +60,7 @@ using namespace q1;
+ //   no longer waits for earlier WMMAs):
+ //     region A: burst(Y, 2u + 1) under run(X) WMMAs [0, X4_NS): {X4_LA WMMA} then {1 tr16, 1 WMMA} x 36
+ //     region C: burst(X, 2u + 2) under run(Y):                  {X4_LC WMMA} then {1 tr16, 1 WMMA} x 36
+-constexpr int X4_NS = 48, X4_LA = 8, X4_LC = 4;
++constexpr int X4_NS = 66, X4_LA = 8, X4_LC = 4;
+ Q1_DEV void x4_bar_signal() {
+     __builtin_amdgcn_fence(3, "workgroup", "local"); // release
+     __builtin_amdgcn_s_barrier_signal(-1);
