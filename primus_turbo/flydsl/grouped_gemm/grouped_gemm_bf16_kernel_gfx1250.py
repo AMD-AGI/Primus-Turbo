@@ -2377,11 +2377,6 @@ def _pick_config_nn(N: int, K: int, avg_m: int, n_groups: int = 0, allow_ragged_
             return _clamp_num_buffers((128, 512, 64, 2, 2, 3), K)
         if (N, K, avg_m) == (2048, 7168, 128):
             return _clamp_num_buffers((128, 256, 64, 2, 2, 4), K)
-        if (N, K, avg_m) == (2048, 7168, 2048):
-            # A 320-wide tile_n is unencodable here -- the transposed B stage's row width IS the
-            # TDM `pad_interval`, which the hardware requires to be a power of two -- while
-            # tile_m only widens the plain A stage.
-            return _clamp_num_buffers((320, 256, 128, 2, 2, 2), K)
 
     cfg = _pick_config(N, K, avg_m, n_groups, allow_ragged_k=False, b_lds_transpose=1)
     cfg = _pick_config_nn_shape(cfg, K, avg_m)
