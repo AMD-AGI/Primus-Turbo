@@ -94,6 +94,24 @@
    "feature": "dQ kernel takes the 4 q heads of one kv head per WG (K / V tiles shared)"
   },
   {
+   "id": "b04",
+   "parent": "b03",
+   "kernels": {
+    "k_bwd_b04": {
+     "src": "src/ladder/b04_fused_dq.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b04",
+     "plan": "fused"
+    }
+   },
+   "feature": "dQ fused into the dK/dV kernel: dS^T through LDS, dQ = dS K, fp32 atomics (5 GEMMs per pair instead of 7)"
+  },
+  {
    "id": "v0",
    "kernels": {
     "k_attn_bwd_v0": {

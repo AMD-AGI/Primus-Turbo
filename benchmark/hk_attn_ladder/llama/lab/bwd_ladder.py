@@ -15,6 +15,9 @@ Plans (every launch on torch's current stream, in this order; ABIs in include/la
   split  <prefix>_prep (DEL, NL)          grid (Sq/64, Hq, B), block 256
          <prefix>_dkdv (dK, dV)           grid (Skv/64, Hkv, B), block 128
          <prefix>_dq   (dQ, recomputing S and dP)  grid (Sq/64, Hq / heads_per_wg, B), block 128
+  fused  dQ_acc.zero_() (torch), <prefix>_prep,
+         <prefix>_dkdv (dK, dV, dQ_acc += dS K by fp32 atomics)    grid (Skv/64, Hkv, B), block 128
+         <prefix>_cvt  (dq = bf16(scale dQ_acc))                    grid (B Sq Hq 128 / 2048), block 256
 Anything outside the range the kernels are written for raises (no fallback).
 """
 
@@ -43,7 +46,12 @@ ARGS = {
            ("kv_bytes", _L), ("row_bytes", _L), ("B", _I), ("Sq", _I), ("Skv", _I), ("Hq", _I), ("Hkv", _I),
            ("causal", _I), ("c2", _F), ("scale", _F)],
 }  # fmt: skip
-BLOCKS = {"prep": 256, "dkdv": 128, "dq": 128}
+ARGS_FUSED = {
+    "prep": ARGS["prep"],
+    "dkdv": ARGS["dkdv"][:8] + [("DQA", _P)] + ARGS["dkdv"][8:11] + [("dqa_bytes", _L)] + ARGS["dkdv"][11:],
+    "cvt": [("DQA", _P), ("DQ", _P), ("dqa_bytes", _L), ("q_bytes", _L), ("scale", _F)],
+}
+BLOCKS = {"prep": 256, "dkdv": 128, "dq": 128, "cvt": 256}
 
 PREFIX = None
 PLAN = "split"
@@ -55,7 +63,7 @@ _LOCK = threading.Lock()
 
 def configure(prefix, plan="split", heads_per_wg=1):
     global PREFIX, PLAN, HEADS_PER_WG, _KERNELS
-    if plan not in ("split",):
+    if plan not in ("split", "fused"):
         raise ValueError(f"unknown plan {plan!r}")
     if heads_per_wg not in (1, 4):
         raise ValueError(f"heads_per_wg must be 1 or 4, got {heads_per_wg!r}")
@@ -87,7 +95,8 @@ def _kernels():
             raise hiprt.HipError(f"{path}: stale or failed build ({mj})")
         table = codeobj.kernels(path)
         specs = {}
-        for role, args in ARGS.items():
+        roles = ARGS if PLAN == "split" else ARGS_FUSED
+        for role, args in roles.items():
             name = f"{PREFIX}_{role}"
             t = table.get(name)
             if t is None:
@@ -96,7 +105,7 @@ def _kernels():
                 raise hiprt.HipError(f"{path}: {name} scratch {t['scratch']} vgpr_spill {t['vgpr_spill']}")
             specs[name] = {"block": BLOCKS[role], "args": args}
         loaded = hiprt.load_hsaco(path, specs, sha256=sha)
-        _KERNELS = {role: loaded[f"{PREFIX}_{role}"] for role in ARGS}
+        _KERNELS = {role: loaded[f"{PREFIX}_{role}"] for role in roles}
         return _KERNELS
 
 
@@ -144,11 +153,21 @@ def plan(do, q, k, v, o, lse, softmax_scale=None, causal=True):
     c2 = scale * math.log2(math.e)
     common = (q, k, v, do, dl, nl)
     tail = (b, sq, skv, hq, hkv, c, c2, scale)
-    launches = [
-        ("prep", (sq // 64, hq, b), (do, o, lse, dl, nl, qb, rb, b, sq, hq)),
-        ("dkdv", (skv // 64, hkv, b), common + (dk, dv, qb, kvb, rb) + tail),
-        ("dq", (sq // 64, hq // HEADS_PER_WG, b), common + (dq, qb, kvb, rb) + tail),
-    ]
+    if PLAN == "split":
+        launches = [
+            ("prep", (sq // 64, hq, b), (do, o, lse, dl, nl, qb, rb, b, sq, hq)),
+            ("dkdv", (skv // 64, hkv, b), common + (dk, dv, qb, kvb, rb) + tail),
+            ("dq", (sq // 64, hq // HEADS_PER_WG, b), common + (dq, qb, kvb, rb) + tail),
+        ]
+    else:
+        dqa = torch.empty((b, sq, hq, d), dtype=torch.float32, device=dev)
+        n8 = dqa.numel() // 8
+        launches = [
+            ("zero", None, (dqa,)),
+            ("prep", (sq // 64, hq, b), (do, o, lse, dl, nl, qb, rb, b, sq, hq)),
+            ("dkdv", (skv // 64, hkv, b), common + (dk, dv, dqa, qb, kvb, rb, 4 * dqa.numel()) + tail),
+            ("cvt", (-(-n8 // 256), 1, 1), (dqa, dq, 4 * dqa.numel(), qb, scale)),
+        ]
     return {"launches": launches, "outputs": (dq, dk, dv)}
 
 
@@ -158,5 +177,8 @@ def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True):
     kern = _kernels()
     stream = torch.cuda.current_stream(q.device)
     for role, grid, values in p["launches"]:
-        _launch(role, kern[role].call, (grid, (BLOCKS[role], 1, 1), values, stream))
+        if grid is None:  # dQ_acc memset
+            _launch(role, torch.Tensor.zero_, values)
+        else:
+            _launch(role, kern[role].call, (grid, (BLOCKS[role], 1, 1), values, stream))
     return p["outputs"]
