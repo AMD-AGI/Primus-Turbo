@@ -22,6 +22,7 @@ from torch.testing._internal.common_utils import (
 )
 
 import primus_turbo.pytorch as pt
+from primus_turbo.flydsl.deep_ep.common import IS_GFX1250
 from primus_turbo.pytorch.deep_ep._compat import deep_ep_cpp
 from tests.pytorch.ref.deep_ep_ref import (
     get_dispatch_layout_ref,
@@ -29,9 +30,9 @@ from tests.pytorch.ref.deep_ep_ref import (
     tune_and_verify_intranode,
 )
 
-# builds without the C++ DeepEP (gfx1250) have the FlyDSL backend only
+# builds without the C++ DeepEP (gfx1250) have the FlyDSL backends only; flydsl_v2 runs on gfx1250 only
 HAS_CPP = deep_ep_cpp is not None
-BACKENDS = ["cpp", "flydsl"] if HAS_CPP else ["flydsl"]
+BACKENDS = (["cpp"] if HAS_CPP else []) + ["flydsl"] + (["flydsl_v2"] if IS_GFX1250 else [])
 
 
 @instantiate_parametrized_tests
