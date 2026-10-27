@@ -1,0 +1,4 @@
+A subset of HipKittens (https://github.com/HazyResearch/HipKittens) include/cdna5 at commit
+be1c91841b817c9690aa3af22ea771f8e3624bf4 (identical to 8cde3dd1 for these files), vendored unmodified for
+the gfx1250 attention kernels of this package. HipKittens is distributed under the MIT license in LICENSE
+(this directory).

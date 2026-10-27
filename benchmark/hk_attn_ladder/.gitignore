@@ -1,0 +1,4 @@
+# kernel sources are HIP files here, not hipify output (the top-level .gitignore drops *.hip)
+!*.hip
+build/
+__pycache__/
