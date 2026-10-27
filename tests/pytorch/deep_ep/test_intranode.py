@@ -121,6 +121,39 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
             assert torch.equal(num_tokens_per_expert, ref_per_expert), case
             assert torch.equal(is_token_in_rank, ref_in_rank), case
 
+    @skip_if_lt_x_gpu(2)
+    @parametrize("backend", BACKENDS)
+    def test_rank_receives_nothing(self, backend: str):
+        """No token goes to rank 0: its dispatch receives nothing and its combine pushes nothing."""
+        buffer = self._init_process(backend)
+        num_ranks = dist.group.WORLD.size()
+        num_tokens, hidden, num_topk, num_experts = 64, 4096, 4, 64
+        torch.manual_seed(42 + self.rank)
+        x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+        scores = torch.rand((num_tokens, num_experts), device="cuda")
+        scores[:, : num_experts // num_ranks] = -1
+        topk_idx = torch.topk(scores, num_topk, dim=-1)[1]
+        topk_weights = torch.rand((num_tokens, num_topk), dtype=torch.float32, device="cuda")
+
+        num_tokens_per_rank, _, num_tokens_per_expert, is_token_in_rank, _ = buffer.get_dispatch_layout(
+            topk_idx, num_experts
+        )
+        recv_x, _, recv_topk_weights, _, handle, _ = buffer.dispatch(
+            x,
+            num_tokens_per_rank=num_tokens_per_rank,
+            is_token_in_rank=is_token_in_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+        )
+        if self.rank == 0:
+            assert recv_x.size(0) == 0, recv_x.shape
+        combined_x, combined_topk_weights, _ = buffer.combine(recv_x, handle, topk_weights=recv_topk_weights)
+        torch.cuda.synchronize()
+        ref_x = x.float() * is_token_in_rank.sum(dim=1, keepdim=True)
+        assert torch.allclose(combined_x.float(), ref_x, rtol=2e-2, atol=2e-2)
+        assert torch.allclose(combined_topk_weights, topk_weights)
+
     @unittest.skipUnless(HAS_CPP, "needs the C++ DeepEP")
     @skip_if_lt_x_gpu(2)
     @parametrize("num_sms", [8, 24])

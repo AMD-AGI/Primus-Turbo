@@ -1117,11 +1117,17 @@ def _make_combine_v2(
                             num_records_bytes=arith.select(routed, fx.Int32(hidden_bytes), fx.Int32(0)),
                         )
                     )
+                    # an unrouted rank's weight is masked out below: read it from our own region,
+                    # since x and its weights are empty on a rank that received no tokens
                     weight_addrs.append(
                         arith.select(
-                            is_own,
-                            _addr(tensor_addr(TOPK_WEIGHTS), 0, slot, num_topk * 4),
-                            _addr(local, weights_offset, slot, slot_bytes),
+                            routed,
+                            arith.select(
+                                is_own,
+                                _addr(tensor_addr(TOPK_WEIGHTS), 0, slot, num_topk * 4),
+                                _addr(local, weights_offset, slot, slot_bytes),
+                            ),
+                            _addr(local, weights_offset, fx.Int32(0), slot_bytes),
                         )
                     )
                     is_routed.append(routed)
