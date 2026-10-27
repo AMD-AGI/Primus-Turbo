@@ -1,75 +1,480 @@
 {
-  "name": "llama_fwd",
-  "title": "Llama-3.1-8B attention forward (bf16, d128, GQA 32/8, causal, BSHD) on gfx1250",
-  "tree": "hip",
-  "flags": ["-x", "hip", "--offload-arch=gfx1250", "--cuda-device-only", "--no-gpu-bundle-output", "-O3",
-            "-std=c++20", "-DNDEBUG", "-DKITTENS_CDNA5", "-Iinclude", "-I.", "-save-temps=obj"],
-  "notes": [
-    "sha256 pins: the code objects measured on ctheliosr-1b112-a08-1 (hk/lab/review_tmp/**/*.meta.json of the a08-1 backup) or pinned in Primus-Turbo cade7db6 (manifest.json); a rung without a pin was never built before.",
-    "ref_ms: the a08-1 measurement (b4 s8192 hq32 hkv8, lab.py ruler, L2 flush, median), for orientation only; every rung is re-measured in one session on one GPU."
-  ],
-  "rungs": [
-    {"id": "v0", "kernels": {"k_attn_fwd_v0": {"src": "src/k_attn_fwd_v0.hip",
-      "extra_flags": ["-mllvm", "-structurizecfg-skip-uniform-regions", "-mllvm", "-amdgpu-sched-strategy=coexec"],
-      "sha256": "7e9be7f1e6395c4089320272549446cdf061219d4023fc04161316821b600e9b"}},
-     "launch": {"module": "fwd_v0"}, "feature": "first HK forward (Primus-Turbo fd4a1bd0)", "ref_ms": 1.123},
-    {"id": "v0_resc", "parent": "v0", "kernels": {"k_attn_fwd_v0": {"src": "src/k_attn_fwd_v0.hip",
-      "extra_flags": ["-mllvm", "-structurizecfg-skip-uniform-regions", "-mllvm", "-amdgpu-sched-strategy=coexec",
-                      "-DHK_FWD_OPT_RESC=1"],
-      "sha256": "e3e7ce1ef890f46ec4d0fd627a66dc3cbd1bbe6592872f0840e66fe4991b8592"}},
-     "launch": {"module": "fwd_v0"}, "feature": "lazy-rescale test as one max + one VCC branch", "ref_ms": 1.1009},
-    {"id": "v0_resc_desc", "parent": "v0_resc", "kernels": {"k_attn_fwd_v0": {"src": "src/k_attn_fwd_v0.hip",
-      "extra_flags": ["-mllvm", "-structurizecfg-skip-uniform-regions", "-mllvm", "-amdgpu-sched-strategy=coexec",
-                      "-DHK_FWD_OPT_RESC=1", "-DHK_FWD_OPT_DESC=1"]}},
-     "launch": {"module": "fwd_v0"}, "feature": "TDM descriptor math inside the QK WMMA run, burst LDS bases one stage ahead"},
-    {"id": "p1", "parent": "v0_resc_desc", "kernels": {"k_attn_fwd_v0": {"src": "src/k_attn_fwd_v0.hip",
-      "extra_flags": ["-mllvm", "-structurizecfg-skip-uniform-regions", "-mllvm", "-amdgpu-sched-strategy=coexec",
-                      "-DHK_FWD_OPT_ALL=1", "-DHK_FWD_OPT_TAIL=0"],
-      "sha256": "71d2684a4809df31d8919ff26184ee84dbaaefca71c6d6fe0ff89b63dde45401"}},
-     "launch": {"module": "fwd_v0"}, "feature": "K(c+2) and V(c+1) loads as one burst per chunk (Primus-Turbo cade7db6 pin)", "ref_ms": 1.0446},
-
-    {"id": "v1_v0body", "parent": "v0", "kernels": {"k_attn_fwd_v1": {"src": "src/k_attn_fwd_v1.hip",
-      "extra_flags": ["-mllvm", "-structurizecfg-skip-uniform-regions", "-mllvm", "-amdgpu-sched-strategy=coexec",
-                      "-DFWD1_MDS=0", "-DFWD1_LSUM=0", "-DFWD1_SM1L=0", "-DFWD1_FSPLIT=0"],
-      "sha256": "d722184df758fc3d3246353d936b179cb0c34401143a303bf633885584c9839a"}},
-     "launch": {"module": "fwd_v1", "opts": {"launch": "items"}}, "feature": "v1 source with the v0 body (v0 grid)", "ref_ms": 1.1199},
-    {"id": "v1_v0body_pairs", "parent": "v1_v0body", "kernels": {"k_attn_fwd_v1": {"src": "src/k_attn_fwd_v1.hip",
-      "extra_flags": ["-mllvm", "-structurizecfg-skip-uniform-regions", "-mllvm", "-amdgpu-sched-strategy=coexec",
-                      "-DFWD1_MDS=0", "-DFWD1_LSUM=0", "-DFWD1_SM1L=0", "-DFWD1_FSPLIT=0"],
-      "sha256": "d722184df758fc3d3246353d936b179cb0c34401143a303bf633885584c9839a"}},
-     "launch": {"module": "fwd_v1", "opts": {"launch": "pairs"}}, "feature": "persistent grid: zig-zag causal pairs, XCD-major", "ref_ms": 1.0991},
-    {"id": "v1_lsum0", "parent": "v1_v0body_pairs", "kernels": {"k_attn_fwd_v1": {"src": "src/k_attn_fwd_v1.hip",
-      "extra_flags": ["-mllvm", "-structurizecfg-skip-uniform-regions", "-mllvm", "-amdgpu-sched-strategy=coexec",
-                      "-DFWD1_LSUM=0"],
-      "sha256": "1d7bb24aed91e979780d82d2c0ca5d0bd4dbf03c8c829d3a49b4f19e03e25ed6"}},
-     "launch": {"module": "fwd_v1"}, "feature": "lean SM1 / FSPLIT, F1 interleave, MDS2 (v1 as validated)", "ref_ms": 1.0409},
-    {"id": "v11_best", "parent": "v1_lsum0", "kernels": {"k_attn_fwd_v1": {"src": "src/k_attn_fwd_v1.hip",
-      "extra_flags": ["-mllvm", "-structurizecfg-skip-uniform-regions", "-mllvm", "-amdgpu-sched-strategy=coexec",
-                      "-DFWD1_LSUM=0", "-DFWD1_OPT_RESC=1", "-DFWD1_MDS=3", "-DFWD1_OPT_UNROLL=1"],
-      "sha256": "c7ae5b8e16f556d7744e2998479a7a7c501beb7c610a1df279aed63ea1cc6f55"}},
-     "launch": {"module": "fwd_v1"}, "feature": "v1.1: RESC + one burst per stage (MDS3) + 2-stage unroll (never run on a GPU)"},
-
-    {"id": "x_desc", "parent": "v0", "side": true, "kernels": {"k_attn_fwd_v0": {"src": "src/k_attn_fwd_v0.hip",
-      "extra_flags": ["-mllvm", "-structurizecfg-skip-uniform-regions", "-mllvm", "-amdgpu-sched-strategy=coexec",
-                      "-DHK_FWD_OPT_DESC=1"],
-      "sha256": "e3a77b0c50866e26996955edc7e8b20022c9abd35e998b00bd919f4ba267c88e"}},
-     "launch": {"module": "fwd_v0"}, "feature": "DESC alone on v0", "ref_ms": 1.1108},
-    {"id": "x_merge", "parent": "v0", "side": true, "kernels": {"k_attn_fwd_v0": {"src": "src/k_attn_fwd_v0.hip",
-      "extra_flags": ["-mllvm", "-structurizecfg-skip-uniform-regions", "-mllvm", "-amdgpu-sched-strategy=coexec",
-                      "-DHK_FWD_OPT_MERGE=1"],
-      "sha256": "806e9cc2f2bc170bd7c6b09154139d5d354537fb5d781b252447d984218f1b45"}},
-     "launch": {"module": "fwd_v0"}, "feature": "MERGE alone on v0", "ref_ms": 1.1129},
-    {"id": "x_p1_tail", "parent": "p1", "side": true, "kernels": {"k_attn_fwd_v0": {"src": "src/k_attn_fwd_v0.hip",
-      "extra_flags": ["-mllvm", "-structurizecfg-skip-uniform-regions", "-mllvm", "-amdgpu-sched-strategy=coexec",
-                      "-DHK_FWD_OPT_ALL=1"],
-      "sha256": "b9f3eda6b3188a756c385b19d9560c22b6d42ca012945fba92468054cba3ff25"}},
-     "launch": {"module": "fwd_v0"}, "feature": "negative: row sums moved into the PV run (TAIL)", "ref_ms": 1.0649},
-    {"id": "x_v1_lsum1", "parent": "v1_lsum0", "side": true, "kernels": {"k_attn_fwd_v1": {"src": "src/k_attn_fwd_v1.hip",
-      "extra_flags": ["-mllvm", "-structurizecfg-skip-uniform-regions", "-mllvm", "-amdgpu-sched-strategy=coexec"],
-      "sha256": "5faa062373dcfd95b127c43824ad749bc9bfbe7ac4de141bf6b6447657f4be8e"}},
-     "launch": {"module": "fwd_v1"}, "feature": "negative: row sums by a WMMA with an all-ones operand (LSUM=1)", "ref_ms": 1.0518},
-    {"id": "x_pp", "parent": "v0", "side": true, "kernels": {"k_attn_fwd_pp": {"src": "src/k_attn_fwd_pp.hip",
-      "extra_flags": [], "sha256": "ad2e96429ad1e9d444207b88828ad7fc76978b1134e058ac2db87c88fae7ff15"}},
-     "launch": {"module": "fwd_pp"}, "feature": "negative: 8-wave ping-pong (HK's CDNA4 attention schedule)", "ref_ms": 1.2211}
-  ]
+ "name": "llama_fwd",
+ "title": "Llama-3.1-8B attention forward (bf16, d128, GQA 32/8, causal, BSHD) on gfx1250",
+ "tree": "hip",
+ "flags": [
+  "-x",
+  "hip",
+  "--offload-arch=gfx1250",
+  "--cuda-device-only",
+  "--no-gpu-bundle-output",
+  "-O3",
+  "-std=c++20",
+  "-DNDEBUG",
+  "-DKITTENS_CDNA5",
+  "-Iinclude",
+  "-I.",
+  "-save-temps=obj"
+ ],
+ "notes": [
+  "sha256 pins: the code objects measured on ctheliosr-1b112-a08-1 (hk/lab/review_tmp/**/*.meta.json of the a08-1 backup) or pinned in Primus-Turbo cade7db6 (manifest.json); a rung without a pin was never built before.",
+  "ref_ms: the a08-1 measurement (b4 s8192 hq32 hkv8, lab.py ruler, L2 flush, median), for orientation only; every rung is re-measured in one session on one GPU."
+ ],
+ "rungs": [
+  {
+   "id": "f00",
+   "kernels": {
+    "k_fwd_f00": {
+     "src": "src/ladder/f00_naive.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f00"
+    }
+   },
+   "feature": "naive: 64 queries x 1 head per WG, register-mediated single-buffer K/V fill, 2 barriers per block, eager rescale"
+  },
+  {
+   "id": "f01",
+   "parent": "f00",
+   "kernels": {
+    "k_fwd_f01": {
+     "src": "src/ladder/f01_double_buf.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f01"
+    }
+   },
+   "feature": "double-buffered LDS: block j+1's global loads in flight during block j's compute, 1 barrier per block"
+  },
+  {
+   "id": "f02",
+   "parent": "f01",
+   "kernels": {
+    "k_fwd_f02": {
+     "src": "src/ladder/f02_tdm.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f02"
+    }
+   },
+   "feature": "TDM fill: one 32-row tensor_load_to_lds per wave per block instead of the register path"
+  },
+  {
+   "id": "f03",
+   "parent": "f02",
+   "kernels": {
+    "k_fwd_f03": {
+     "src": "src/ladder/f03_gqa4.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f03",
+     "heads_per_wg": 4
+    }
+   },
+   "feature": "GQA packing: the 4 q heads of one kv head per WG share every K / V tile and LDS operand"
+  },
+  {
+   "id": "f04",
+   "parent": "f03",
+   "kernels": {
+    "k_fwd_f04": {
+     "src": "src/ladder/f04_longest_first.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f04",
+     "heads_per_wg": 4
+    }
+   },
+   "feature": "longest-first workgroup order (causal load balance)"
+  },
+  {
+   "id": "f05",
+   "parent": "f04",
+   "kernels": {
+    "k_fwd_f05": {
+     "src": "src/ladder/f05_ring4.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f05",
+     "heads_per_wg": 4
+    }
+   },
+   "feature": "4-slot TDM ring with prefetch distance 2 (two blocks of compute cover each block's TDM latency)"
+  },
+  {
+   "id": "f06",
+   "parent": "f05",
+   "kernels": {
+    "k_fwd_f06": {
+     "src": "src/ladder/f06_split_barrier.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f06",
+     "heads_per_wg": 4
+    }
+   },
+   "feature": "split barrier: signal after S^T(j), wait at the top of block j+1 (softmax + PV absorb wave skew)"
+  },
+  {
+   "id": "f07",
+   "parent": "f06",
+   "kernels": {
+    "k_fwd_f07": {
+     "src": "src/ladder/f07_lock_simd.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f07",
+     "heads_per_wg": 4
+    }
+   },
+   "feature": "lock_simd: no WMMA arbitration pause at one wave per SIMD"
+  },
+  {
+   "id": "f08",
+   "parent": "f07",
+   "kernels": {
+    "k_fwd_f08": {
+     "src": "src/ladder/f08_lazy_rescale.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "fwd_ladder",
+    "opts": {
+     "kernel": "k_fwd_f08",
+     "heads_per_wg": 4
+    }
+   },
+   "feature": "lazy rescale: O / l rescaled only when a query's max grew by > 8 nat (uniform branch)"
+  },
+  {
+   "id": "v0",
+   "kernels": {
+    "k_attn_fwd_v0": {
+     "src": "src/k_attn_fwd_v0.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec"
+     ],
+     "sha256": "7e9be7f1e6395c4089320272549446cdf061219d4023fc04161316821b600e9b"
+    }
+   },
+   "launch": {
+    "module": "fwd_v0"
+   },
+   "feature": "first HK forward (Primus-Turbo fd4a1bd0): f08 + software pipelining (QK(c+1) || softmax(c) on 32-row chunks, double-buffered S^T), mask on the last stage only, Q through TDM, O through LDS, 320 KB LDS",
+   "ref_ms": 1.123,
+   "parent": "f08"
+  },
+  {
+   "id": "v0_resc",
+   "parent": "v0",
+   "kernels": {
+    "k_attn_fwd_v0": {
+     "src": "src/k_attn_fwd_v0.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DHK_FWD_OPT_RESC=1"
+     ],
+     "sha256": "e3e7ce1ef890f46ec4d0fd627a66dc3cbd1bbe6592872f0840e66fe4991b8592"
+    }
+   },
+   "launch": {
+    "module": "fwd_v0"
+   },
+   "feature": "lazy-rescale test as one max + one VCC branch",
+   "ref_ms": 1.1009
+  },
+  {
+   "id": "v0_resc_desc",
+   "parent": "v0_resc",
+   "kernels": {
+    "k_attn_fwd_v0": {
+     "src": "src/k_attn_fwd_v0.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DHK_FWD_OPT_RESC=1",
+      "-DHK_FWD_OPT_DESC=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "fwd_v0"
+   },
+   "feature": "TDM descriptor math inside the QK WMMA run, burst LDS bases one stage ahead"
+  },
+  {
+   "id": "p1",
+   "parent": "v0_resc_desc",
+   "kernels": {
+    "k_attn_fwd_v0": {
+     "src": "src/k_attn_fwd_v0.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DHK_FWD_OPT_ALL=1",
+      "-DHK_FWD_OPT_TAIL=0"
+     ],
+     "sha256": "71d2684a4809df31d8919ff26184ee84dbaaefca71c6d6fe0ff89b63dde45401"
+    }
+   },
+   "launch": {
+    "module": "fwd_v0"
+   },
+   "feature": "K(c+2) and V(c+1) loads as one burst per chunk (Primus-Turbo cade7db6 pin)",
+   "ref_ms": 1.0446
+  },
+  {
+   "id": "v1_v0body",
+   "parent": "v0",
+   "kernels": {
+    "k_attn_fwd_v1": {
+     "src": "src/k_attn_fwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DFWD1_MDS=0",
+      "-DFWD1_LSUM=0",
+      "-DFWD1_SM1L=0",
+      "-DFWD1_FSPLIT=0"
+     ],
+     "sha256": "d722184df758fc3d3246353d936b179cb0c34401143a303bf633885584c9839a"
+    }
+   },
+   "launch": {
+    "module": "fwd_v1",
+    "launch_json": {
+     "mode": "items"
+    }
+   },
+   "feature": "v1 source with the v0 body (v0 grid)",
+   "ref_ms": 1.1199
+  },
+  {
+   "id": "v1_v0body_pairs",
+   "parent": "v1_v0body",
+   "kernels": {
+    "k_attn_fwd_v1": {
+     "src": "src/k_attn_fwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DFWD1_MDS=0",
+      "-DFWD1_LSUM=0",
+      "-DFWD1_SM1L=0",
+      "-DFWD1_FSPLIT=0"
+     ],
+     "sha256": "d722184df758fc3d3246353d936b179cb0c34401143a303bf633885584c9839a"
+    }
+   },
+   "launch": {
+    "module": "fwd_v1",
+    "launch_json": {
+     "mode": "pairs"
+    }
+   },
+   "feature": "persistent grid: zig-zag causal pairs, XCD-major",
+   "ref_ms": 1.0991
+  },
+  {
+   "id": "v1_lsum0",
+   "parent": "v1_v0body_pairs",
+   "kernels": {
+    "k_attn_fwd_v1": {
+     "src": "src/k_attn_fwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DFWD1_LSUM=0"
+     ],
+     "sha256": "1d7bb24aed91e979780d82d2c0ca5d0bd4dbf03c8c829d3a49b4f19e03e25ed6"
+    }
+   },
+   "launch": {
+    "module": "fwd_v1"
+   },
+   "feature": "lean SM1 / FSPLIT, F1 interleave, MDS2 (v1 as validated)",
+   "ref_ms": 1.0409
+  },
+  {
+   "id": "v11_best",
+   "parent": "v1_lsum0",
+   "kernels": {
+    "k_attn_fwd_v1": {
+     "src": "src/k_attn_fwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DFWD1_LSUM=0",
+      "-DFWD1_OPT_RESC=1",
+      "-DFWD1_MDS=3",
+      "-DFWD1_OPT_UNROLL=1"
+     ],
+     "sha256": "c7ae5b8e16f556d7744e2998479a7a7c501beb7c610a1df279aed63ea1cc6f55"
+    }
+   },
+   "launch": {
+    "module": "fwd_v1"
+   },
+   "feature": "v1.1: RESC + one burst per stage (MDS3) + 2-stage unroll (never run on a GPU)"
+  },
+  {
+   "id": "x_desc",
+   "parent": "v0",
+   "side": true,
+   "kernels": {
+    "k_attn_fwd_v0": {
+     "src": "src/k_attn_fwd_v0.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DHK_FWD_OPT_DESC=1"
+     ],
+     "sha256": "e3a77b0c50866e26996955edc7e8b20022c9abd35e998b00bd919f4ba267c88e"
+    }
+   },
+   "launch": {
+    "module": "fwd_v0"
+   },
+   "feature": "DESC alone on v0",
+   "ref_ms": 1.1108
+  },
+  {
+   "id": "x_merge",
+   "parent": "v0",
+   "side": true,
+   "kernels": {
+    "k_attn_fwd_v0": {
+     "src": "src/k_attn_fwd_v0.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DHK_FWD_OPT_MERGE=1"
+     ],
+     "sha256": "806e9cc2f2bc170bd7c6b09154139d5d354537fb5d781b252447d984218f1b45"
+    }
+   },
+   "launch": {
+    "module": "fwd_v0"
+   },
+   "feature": "MERGE alone on v0",
+   "ref_ms": 1.1129
+  },
+  {
+   "id": "x_p1_tail",
+   "parent": "p1",
+   "side": true,
+   "kernels": {
+    "k_attn_fwd_v0": {
+     "src": "src/k_attn_fwd_v0.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DHK_FWD_OPT_ALL=1"
+     ],
+     "sha256": "b9f3eda6b3188a756c385b19d9560c22b6d42ca012945fba92468054cba3ff25"
+    }
+   },
+   "launch": {
+    "module": "fwd_v0"
+   },
+   "feature": "negative: row sums moved into the PV run (TAIL)",
+   "ref_ms": 1.0649
+  },
+  {
+   "id": "x_v1_lsum1",
+   "parent": "v1_lsum0",
+   "side": true,
+   "kernels": {
+    "k_attn_fwd_v1": {
+     "src": "src/k_attn_fwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec"
+     ],
+     "sha256": "5faa062373dcfd95b127c43824ad749bc9bfbe7ac4de141bf6b6447657f4be8e"
+    }
+   },
+   "launch": {
+    "module": "fwd_v1"
+   },
+   "feature": "negative: row sums by a WMMA with an all-ones operand (LSUM=1)",
+   "ref_ms": 1.0518
+  },
+  {
+   "id": "x_pp",
+   "parent": "v0",
+   "side": true,
+   "kernels": {
+    "k_attn_fwd_pp": {
+     "src": "src/k_attn_fwd_pp.hip",
+     "extra_flags": [],
+     "sha256": "ad2e96429ad1e9d444207b88828ad7fc76978b1134e058ac2db87c88fae7ff15"
+    }
+   },
+   "launch": {
+    "module": "fwd_pp"
+   },
+   "feature": "negative: 8-wave ping-pong (HK's CDNA4 attention schedule)",
+   "ref_ms": 1.2211
+  }
+ ]
 }

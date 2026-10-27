@@ -20,7 +20,8 @@ root).
 
 Each kernel is compiled once per rung into ``<out>/<ladder>/<rung>/``:
 ``<kernel>.hsaco``, ``.s`` (the compiler's own assembly, from -save-temps), ``.dis`` (llvm-objdump),
-``.flags`` (the exact command) and ``.meta.json`` (sha256, toolchain, per-kernel resources, ok). The
+``.flags`` (the exact command), ``.meta.json`` (sha256, toolchain, per-kernel resources, ok) and, when the
+rung's ``launch`` has a ``launch_json``, ``<kernel>.launch.json`` (fwd_v1's schedule mode). The
 lab launchers (``llama/lab``, ``mla/lab``) refuse a code object whose meta.json is not ok or whose
 bytes are not the recorded ones. ``-cuid=<kernel>`` pins the ``__hip_cuid_*`` symbol, so the bytes do
 not depend on the build directory, and a ``sha256`` in the ladder file proves a rung rebuilt the
@@ -280,8 +281,11 @@ def main(argv=None):
             print(f"  {rung['id']:<6} FAIL {e}")
             bad += 1
             continue
+        lj = rung.get("launch", {}).get("launch_json")
         for name, kspec in rung["kernels"].items():
             meta, secs = build_kernel(spec, rung, name, kspec, tree, out_root / rung["id"], runner, tc)
+            if lj is not None:  # launch configuration the rung's lab module reads next to the code object
+                (out_root / rung["id"] / f"{name}.launch.json").write_text(json.dumps(lj) + "\n")
             res = " ".join(f"{kn}:v{k['vgpr']}/s{k['sgpr']}/lds{k['lds']}" for kn, k in meta["kernels"].items())
             sha = meta.get("hsaco_sha256", "")[:8]
             state = "ok" if meta["ok"] else "FAIL " + "; ".join(meta["errors"])

@@ -63,7 +63,10 @@ import threading
 
 import torch
 
-from . import codeobj, hiprt, hsaco
+from . import codeobj, hiprt
+
+# (ladder copy: no production bin/ next to these lab modules, so no launch.json is ever ignored)
+_PROD_BIN_DIR = None
 
 __all__ = ["flash_attn_fwd", "unsupported_reason", "set_hsaco_dir", "plan", "fdiv_of", "MODES", "layout_of",
            "supports_strides"]
@@ -161,7 +164,7 @@ def read_launch_cfg(dirpath):
 def launch_cfg(dirpath):
     """The launch configuration used with the code object in ``dirpath``: {} (the host default) for the package's
     pinned ``bin/`` (``hsaco.BIN_DIR``), else ``read_launch_cfg``."""
-    if os.path.realpath(dirpath) == os.path.realpath(hsaco.BIN_DIR):
+    if _PROD_BIN_DIR is not None and os.path.realpath(dirpath) == os.path.realpath(_PROD_BIN_DIR):
         return {}
     return read_launch_cfg(dirpath)
 
