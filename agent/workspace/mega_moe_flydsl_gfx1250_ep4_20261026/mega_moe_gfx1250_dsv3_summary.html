@@ -85,63 +85,123 @@
 <section class="tabpanel" id="d20261027">
 <div class="meta">
   4x MI455X (gfx1250)，和 10-26 不是同一台机器 · 镜像 <code>amdprimus/amdprimus:tas-20261019</code> ·
-  Primus-Turbo <code>feat/mega_moe/gfx1250-bf16</code> @ <code>0cff79c9</code>（本地 commit，未 push），对照 <code>1149c02b</code> ·
+  Primus-Turbo <code>feat/mega_moe/gfx1250-bf16</code> @ <code>0cff79c9</code>（已 push） ·
   Primus <code>dev/mi455x_v2</code> @ <code>a8abb804</code> · 2026-10-27
 </div>
 
 <div class="stats">
-  <div class="stat"><div class="v">0</div><div class="l">修复后压测出错次数（纯 GEMM 160000 次、fused 60000 次、整步 20000 步）；TDM gather 同条件 3/80000</div></div>
-  <div class="stat"><div class="v warn">+1.0%</div><div class="l">端到端单步耗时，even 路由，对比 <code>1149c02b</code></div></div>
-  <div class="stat"><div class="v warn">+1.0%</div><div class="l">端到端单步耗时，uniform 路由</div></div>
-  <div class="stat"><div class="v warn">+0.8%</div><div class="l">端到端单步耗时，真实路由（50 步）</div></div>
-  <div class="stat"><div class="v warn">−1.9%</div><div class="l">MoE 层 step TFLOPS（EP4 kernel 级，3 个 shape x 2 轮平均）</div></div>
+  <div class="stat"><div class="v">+9.8%</div><div class="l">端到端训练吞吐，even 路由，对比基线（Primus avg TFLOP/s/GPU 1218.8 → 1337.8）</div></div>
+  <div class="stat"><div class="v">+9.3%</div><div class="l">端到端训练吞吐，uniform 路由（1175.1 → 1284.1）</div></div>
+  <div class="stat"><div class="v">+32.9%</div><div class="l">端到端训练吞吐，真实路由（964.6 → 1281.7；基线有 15–26 s 和约 8 s 的慢步，Mega 没有）</div></div>
+  <div class="stat"><div class="v">1.38x</div><div class="l">MoE 层 fwd+bwd，对比调优基线（EP4 kernel 级，3 个 shape 都是 1.37–1.38x）</div></div>
+  <div class="stat"><div class="v">0</div><div class="l">TDM gather 偶发数据错误修复后，压测出错次数（纯 GEMM 160000 次、fused 60000 次、整步 20000 步）</div></div>
 </div>
 
 <div class="callout">
   <b>结论</b>
-  10-26 的偶发数据错误已修复：fused <code>dispatch_gemm</code> 里 A 的 gather 不再用 TDM gather，改用 per-lane
-  <code>global_load_async_to_lds_b128</code>，并且只读确定已经写完的行。修复后 pytest EP1 / EP2 / EP4 全过，所有压测 0 次出错，
-  端到端 loss 和 grad norm 跟住 <code>1149c02b</code>。代价是端到端单步慢 0.8%–1.0%，kernel 级 step TFLOPS 低约 1.9%。
-  这一页的数字只和同页的 <code>1149c02b</code> 对比。换了机器，<code>1149c02b</code> 的端到端和 10-26 tab 相差 1% 以内、有快有慢
-  （ms/iter：even 1050.5 / 1055.7，uniform 1093.0 / 1085.8，真实路由 1098.6 / 1095.1）。
+  10-26 的 TDM gather 偶发数据错误已修复（<code>0cff79c9</code>），修复后的 Mega 对比基线：端到端训练吞吐（Primus avg TFLOP/s/GPU）提升 9.8%（even）、
+  9.3%（uniform）、32.9%（真实路由，基线有慢步），峰值显存少 16–25 GB，loss 和 grad norm 跟住基线；MoE 层 fwd+bwd 比调优基线快 1.37–1.38x，
+  前向快 1.62–1.69x。修复本身的代价：和修复前的 <code>1149c02b</code> 比，端到端吞吐低 0.8%–1.0%，kernel 级 step TFLOPS 低约 1.9%（见下面「修复的代价」）。
+  基线是这台机器上同一时段重测的，比 10-26 那台快（even avg 1160.5 / 1201.2 ms/iter），所以对基线的收益比 10-26 tab 小，跨 tab 不要直接比。
 </div>
 
-<h2>端到端训练：DSV3 proxy，EP4，修复版对比 <code>1149c02b</code></h2>
+<h2>端到端训练：DSV3 proxy，EP4，修复版 Mega 对比基线</h2>
 <p class="lead">
-  配置和 10-26 相同，两边都开 <code>--use_turbo_mega_moe True</code>，每种路由两边交替运行，各用独立的 FlyDSL cache。
+  配置和 10-26 相同（4 层 MoE，128 个 expert，top-8，seq 4096，MBS 2，GBS 64，mock data）。基线是脚本默认的 MoE 路径（all-to-all +
+  FlyDSL grouped GEMM），Mega 只多加 <code>--use_turbo_mega_moe True</code>；两边用同一份源码树，每种路由两边交替运行。
 </p>
 <table>
   <thead>
     <tr>
-      <th>路由方式</th><th class="num">步数</th><th class="num"><code>1149c02b</code> ms/iter</th><th class="num">修复版 ms/iter</th>
-      <th class="num">单步耗时变化</th><th class="num">TFLOP/s/GPU</th><th class="num">最后一步 loss</th>
-      <th class="num">逐步 loss 最大相对偏差</th><th class="num">nan iteration</th>
+      <th>路由方式</th><th class="num">步数</th><th class="num">avg ms/iter 基线 / Mega</th><th class="num">avg TFLOP/s/GPU 基线 / Mega</th>
+      <th class="num">吞吐变化</th><th class="num">峰值显存 基线 / Mega</th><th class="num">最后一步 loss 基线 / Mega</th><th class="num">loss 最大相对偏差</th>
     </tr>
   </thead>
   <tbody>
-    <tr><td>even（Primus 默认）</td><td class="num">10</td><td class="num">1050.5</td><td class="num">1061.2</td><td class="num warn">+1.0%</td>
-      <td class="num">1346.4 / 1332.8</td><td class="num">5.563013 / 5.562970</td><td class="num">9.4e-6</td><td class="num">0 / 0</td></tr>
-    <tr><td>uniform</td><td class="num">10</td><td class="num">1093.0</td><td class="num">1103.8</td><td class="num warn">+1.0%</td>
-      <td class="num">1294.1 / 1281.5</td><td class="num">8.791574 / 8.791613</td><td class="num">1.5e-5</td><td class="num">0 / 0</td></tr>
-    <tr><td>真实路由，不强制均衡</td><td class="num">50</td><td class="num">1098.6</td><td class="num">1107.8</td><td class="num warn">+0.8%</td>
-      <td class="num">1287.5 / 1276.8</td><td class="num">0.101170 / 0.101233</td><td class="num">1.8e-3</td><td class="num">0 / 0</td></tr>
+    <tr><td>even（Primus 默认）</td><td class="num">10</td><td class="num">1160.5 / 1057.3</td><td class="num">1218.8 / 1337.8</td>
+      <td class="num good">+9.8%</td><td class="num">170.8 / 154.5 GB</td><td class="num">5.562941 / 5.563068</td><td class="num">3.6e-5</td></tr>
+    <tr><td>uniform</td><td class="num">10</td><td class="num">1204.4 / 1101.5</td><td class="num">1175.1 / 1284.1</td>
+      <td class="num good">+9.3%</td><td class="num">179.6 / 154.8 GB</td><td class="num">8.791600 / 8.791594</td><td class="num">5.5e-6</td></tr>
+    <tr><td>真实路由，不强制均衡</td><td class="num">50</td><td class="num">3785.0 / 1103.5</td><td class="num">964.6 / 1281.7</td>
+      <td class="num good">+32.9% *</td><td class="num">179.6 / 155.0 GB</td><td class="num">0.101235 / 0.101194</td><td class="num">1.5e-3</td></tr>
   </tbody>
 </table>
 <div class="caption">
-  ms/iter 和 TFLOP/s/GPU 取 Primus 日志最后一步打印的平均值（从第 3 步起算）。真实路由的 loss 偏差正负交替、没有趋势，
-  loss 降到 0.1 左右后相对值才变大（10-26 基线和 Mega 之间是 1.0e-3）。峰值显存两边相同，154.5–155.0 GB。
+  avg ms/iter 和 avg TFLOP/s/GPU 都是 Primus 日志最后一步打印的平均值（第 3 步起各步的算术平均）；吞吐变化按 avg TFLOP/s/GPU 计算。
+  * 基线真实路由第 3–7 步每步 1.7–26.5 s，第 10、23–25、28、34 步各 8.1–8.3 s（10-23 也见过约 8 s 的慢步），Mega 50 步里没有慢步。
+  步间差别这么大时，按耗时平均和按 TFLOP/s 平均的比值不同：avg ms/iter 是 3.43x。所有运行 0 个 nan iteration。
 </div>
 
 <div class="grid2">
   <div class="chart">
-    <h3>端到端单步耗时</h3>
+    <h3>端到端训练吞吐</h3>
     <div id="chart-e2e-1027"></div>
-    <div class="caption">纵轴：ms/iter，Primus 日志最后一步打印的平均值（从第 3 步起算）。</div>
+    <div class="caption">纵轴：TFLOP/s/GPU，Primus 日志最后一步打印的平均值（从第 3 步起算）。</div>
+  </div>
+  <div class="chart">
+    <h3>真实路由每步耗时（第 8–50 步）</h3>
+    <div id="chart-real-ms-1027"></div>
+    <div class="caption">横轴：训练步。纵轴：单步耗时（ms）。Mega 在 1095–1114 ms；基线多数在 1154–1251 ms，另有 6 个 8.1–8.3 s 的慢步。</div>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2>MoE 层 kernel 级对比：DSV3 EP4（同次运行）</h2>
+<p class="lead">
+  每卡 32 个 expert，top-8，H=7168，I=2048，4 卡取最大值。基线和 Mega 在同一个进程里跑同一份输入（<code>tools/bench_ep_baseline.py</code>，
+  按 10-26 的描述重写：permute、RCCL all-to-all、FlyDSL grouped GEMM、SwiGLU 乘 prob、grouped GEMM、all-to-all、unpermute，反向走 autograd；
+  eager 胶水用 PyTorch，调优胶水用 Turbo 的 <code>moe_permute</code> / <code>moe_unpermute</code>（TURBO 后端）和 <code>swiglu_with_probs</code>）。
+</p>
+<div class="grid32">
+  <div>
+    <table>
+      <thead><tr><th>shape</th><th>实现</th><th class="num">前向 ms</th><th class="num">前向+反向 ms</th><th class="num">step TF/GPU</th><th class="num">Mega 加速（前向 / 前向+反向）</th></tr></thead>
+      <tbody>
+        <tr><td rowspan="3">T=8192 random</td><td>基线（eager 胶水）</td><td class="num">9.094</td><td class="num">22.036</td><td class="num">786</td><td class="num">2.18x / 1.83x</td></tr>
+        <tr><td>基线（调优胶水）</td><td class="num">6.992</td><td class="num">16.571</td><td class="num">1045</td><td class="num">1.68x / 1.38x</td></tr>
+        <tr><td><b>Mega</b></td><td class="num good">4.172</td><td class="num good">12.026</td><td class="num good">1440</td><td class="num">—</td></tr>
+        <tr><td rowspan="3">T=8192 skew1</td><td>基线（eager 胶水）</td><td class="num">18.078</td><td class="num">46.905</td><td class="num">369</td><td class="num">1.86x / 1.66x</td></tr>
+        <tr><td>基线（调优胶水）</td><td class="num">15.696</td><td class="num">38.852</td><td class="num">446</td><td class="num">1.62x / 1.38x</td></tr>
+        <tr><td><b>Mega</b></td><td class="num good">9.694</td><td class="num good">28.232</td><td class="num good">613</td><td class="num">—</td></tr>
+        <tr><td rowspan="3">T=4096 random</td><td>基线（eager 胶水）</td><td class="num">4.718</td><td class="num">12.222</td><td class="num">708</td><td class="num">1.98x / 1.78x</td></tr>
+        <tr><td>基线（调优胶水）</td><td class="num">4.021</td><td class="num">9.424</td><td class="num">919</td><td class="num">1.69x / 1.37x</td></tr>
+        <tr><td><b>Mega</b></td><td class="num good">2.378</td><td class="num good">6.882</td><td class="num good">1258</td><td class="num">—</td></tr>
+      </tbody>
+    </table>
+    <div class="caption">
+      CUDA event 计时，每项 10 次取平均、3 次取中位数。T=8192 random 复跑一次：eager 8.569 / 22.090 ms，调优 7.059 / 16.606 ms，
+      Mega 4.192 / 12.015 ms，加速倍数 2.04x / 1.84x 和 1.68x / 1.38x。三者的输出和全部梯度互相对得上：对 Mega，eager 基线 y / dx 47.4 dB，
+      调优基线 51.5 dB，d topk_w / dW1 / dW2 ≥ 60.8 dB。基线脚本是重写的，和 10-26 tab 的基线数字不完全一样
+      （10-26 的调优基线是 6.457 / 17.560 ms）。
+    </div>
+  </div>
+  <div class="chart">
+    <h3>MoE 层耗时（T=8192 random）</h3>
+    <div id="chart-kernel-1027"></div>
+    <div class="caption">纵轴：每次调用耗时（ms），4 卡取最大值。</div>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2>修复的代价：对比修复前的 <code>1149c02b</code></h2>
+<div class="grid2" style="margin-top: 0">
+  <div>
+    <table>
+      <thead><tr><th>端到端</th><th class="num">avg ms/iter <code>1149c02b</code> / 修复版</th><th class="num">avg TFLOP/s/GPU <code>1149c02b</code> / 修复版</th><th class="num">吞吐变化</th><th class="num">loss 最大相对偏差</th></tr></thead>
+      <tbody>
+        <tr><td>even</td><td class="num">1050.5 / 1061.2</td><td class="num">1346.4 / 1332.8</td><td class="num warn">−1.0%</td><td class="num">9.4e-6</td></tr>
+        <tr><td>uniform</td><td class="num">1093.0 / 1103.8</td><td class="num">1294.1 / 1281.5</td><td class="num warn">−1.0%</td><td class="num">1.5e-5</td></tr>
+        <tr><td>真实路由</td><td class="num">1098.6 / 1107.8</td><td class="num">1287.5 / 1276.8</td><td class="num warn">−0.8%</td><td class="num">1.8e-3</td></tr>
+      </tbody>
+    </table>
+    <div class="caption">
+      两边都开 Mega，交替运行，各用独立的 FlyDSL cache；Primus 日志最后一步打印的平均值，吞吐变化按 avg TFLOP/s/GPU。和上面对比基线的那次运行是两个时段，
+      修复版两次的 avg TFLOP/s/GPU 相差 0.5% 以内（1332.8 / 1337.8，1281.5 / 1284.1，1276.8 / 1281.7）。
+    </div>
   </div>
   <div>
-    <h3>MoE 层 kernel 级 A/B（EP4，<code>quick_test_bench.py</code>）</h3>
     <table>
-      <thead><tr><th>shape</th><th class="num">前向</th><th class="num">前向+反向</th><th class="num">step TFLOPS</th></tr></thead>
+      <thead><tr><th>kernel 级（<code>quick_test_bench.py</code>）</th><th class="num">前向</th><th class="num">前向+反向</th><th class="num">step TFLOPS</th></tr></thead>
       <tbody>
         <tr><td>T=8192 random</td><td class="num">+4.1% / +2.5%</td><td class="num">+2.1% / +1.2%</td><td class="num">−2.0% / −1.2%</td></tr>
         <tr><td>T=8192 skew1</td><td class="num">+2.5% / +2.4%</td><td class="num">+2.9% / +1.2%</td><td class="num">−2.8% / −1.2%</td></tr>
@@ -149,8 +209,7 @@
       </tbody>
     </table>
     <div class="caption">
-      修复版相对 <code>1149c02b</code> 的变化，两轮交替（r1 / r2）。T=8192 random 的绝对值：前向 4.072 → 4.237 ms、3.928 → 4.028 ms，
-      前向+反向 11.775 → 12.018 ms、11.812 → 11.956 ms。纯 GEMM 的差距只有 0.8%，fused kernel 里更大，原因还没查。
+      修复版相对 <code>1149c02b</code> 的变化，两轮交替（r1 / r2）。纯 GEMM 的差距只有 0.8%，fused kernel 里更大，原因还没查。
     </div>
   </div>
 </div>
@@ -188,10 +247,14 @@
     <tr><td>硬件和镜像</td><td>4x MI455X（gfx1250）；镜像 <code>amdprimus/amdprimus:tas-20261019</code>，容器 <code>xiaompen_mega_gfx1250_ep4</code>。开机时 <code>amdgpu</code> 在黑名单里，要先 <code>sudo modprobe amdgpu</code>。</td></tr>
     <tr><td>Primus-Turbo</td><td>修复版是仓库 <code>/home/xiaompen/Turbo</code> @ <code>0cff79c9</code>；<code>1149c02b</code> 是 <code>/home/xiaompen/mega_scratch/ep4val/src_1149c02b</code>（符号链接副本，Python 源码换回 <code>1149c02b</code>）。
       两边的 <code>_C</code> 和 <code>libprimus_turbo_kernels.so</code> 都是 <code>/home/xiaompen/mega_scratch/turbo_build</code> 里 in-place 编译的。</td></tr>
-    <tr><td>端到端</td><td>容器内以 root 运行 <code>tools/tdm_gather_bug/e2e_suite.sh fix3</code>（Primus 在 <code>/home/xiaompen/mega_scratch/primus_a8abb804</code>），
-      日志 <code>/home/xiaompen/mega_scratch/e2e_fix3_{tdm,async}_{even,uniform,real}.log</code>。</td></tr>
-    <tr><td>kernel 级</td><td><code>NEW_CACHE=&lt;新目录&gt; bash tools/ab.sh fix3 2 dsv3_t8192_random dsv3_t8192_skew1 dsv3_t4096_random</code>，
-      日志 <code>/home/xiaompen/mega_scratch/ep4c/logs/ab_fix3_*</code>。</td></tr>
+    <tr><td>端到端</td><td>容器内以 root 运行 <code>tools/tdm_gather_bug/e2e_suite.sh</code>（Primus 在 <code>/home/xiaompen/mega_scratch/primus_a8abb804</code>）。
+      对比基线：<code>e2e_suite.sh base27 "base=/home/xiaompen/Turbo mega=/home/xiaompen/Turbo"</code>（名字以 base 开头的 arm 不加 Mega 参数），
+      日志 <code>/home/xiaompen/mega_scratch/e2e_base27_{base,mega}_{even,uniform,real}.log</code>；
+      对比 <code>1149c02b</code>：<code>e2e_suite.sh fix3</code>，日志 <code>e2e_fix3_{tdm,async}_*.log</code>。</td></tr>
+    <tr><td>kernel 级</td><td>对比基线：<code>ONLY_SHAPE=&lt;shape&gt; torchrun --nproc-per-node 4 tools/bench_ep_baseline.py</code>（每个 shape 一个进程），
+      日志 <code>/home/xiaompen/mega_scratch/ep4c/logs/base27_*.log</code>。
+      对比 <code>1149c02b</code>：<code>NEW_CACHE=&lt;新目录&gt; bash tools/ab.sh fix3 2 dsv3_t8192_random dsv3_t8192_skew1 dsv3_t4096_random</code>，
+      日志 <code>ep4c/logs/ab_fix3_*</code>。</td></tr>
     <tr><td>正确性</td><td><code>tools/tdm_gather_bug/run_tests.sh TAG</code>（pytest）和 <code>stress.sh</code>（压测），命令和全部结果见
       <code>bug_tdm_gather_corruption.md</code> 第 7 节。</td></tr>
   </tbody>
@@ -843,10 +906,33 @@ lineChart("chart-trend-1026", {
 barChart("chart-e2e-1027", {
   categories: ["even", "uniform", "真实路由"],
   series: [
-    { name: "Mega MoE @ 1149c02b（TDM gather）", data: [1050.5, 1093.0, 1098.6], color: C_MEGA_OLD },
-    { name: "Mega MoE @ 0cff79c9（修复版）", data: [1061.2, 1103.8, 1107.8], color: C.mega },
+    { name: "基线（all-to-all + FlyDSL grouped GEMM）", data: [1218.8, 1175.1, 964.6], color: C.base },
+    { name: "Mega MoE @ 0cff79c9", data: [1337.8, 1284.1, 1281.7], color: C.mega },
   ],
-  fmt: v => v.toFixed(0), xLabel: "路由方式", yLabel: "ms/iter",
+  fmt: v => v.toFixed(0), xLabel: "路由方式", yLabel: "TFLOP/s/GPU",
+});
+lineChart("chart-real-ms-1027", {
+  categories: iters,
+  series: [
+    { name: "基线（all-to-all + FlyDSL grouped GEMM）", data: [1167.3, 1218.2, 8119.0, 1174.8, 1169.8, 1173.8, 1219.3, 1177.1, 1175.4,
+      1181.9, 1181.3, 1245.9, 1251.4, 1184.2, 1177.0, 8119.3, 8136.9, 8088.8, 1166.3, 1173.7, 8260.8, 1154.0, 1169.3, 1174.5, 1236.3,
+      1179.7, 8168.3, 1169.7, 1174.6, 1178.4, 1182.9, 1181.4, 1184.5, 1184.3, 1186.2, 1180.4, 1185.7, 1190.7, 1186.7, 1182.8, 1184.0,
+      1188.7, 1185.6], color: C.base },
+    { name: "Mega MoE @ 0cff79c9", data: [1104.7, 1108.5, 1114.2, 1101.3, 1094.6, 1096.7, 1102.8, 1099.4, 1101.5, 1100.7, 1099.2,
+      1106.5, 1104.1, 1106.2, 1097.3, 1109.1, 1101.7, 1104.0, 1101.0, 1104.3, 1101.1, 1105.2, 1100.7, 1096.9, 1103.3, 1110.0, 1103.7,
+      1107.8, 1104.0, 1105.9, 1105.2, 1108.9, 1105.4, 1104.0, 1103.3, 1102.7, 1097.2, 1104.6, 1103.8, 1101.6, 1104.1, 1104.5,
+      1104.9], color: C.mega },
+  ],
+  fmt: v => v.toFixed(0), xLabel: "训练步", yLabel: "单步耗时（ms）",
+});
+barChart("chart-kernel-1027", {
+  categories: ["前向", "前向+反向"],
+  series: [
+    { name: "基线（eager 胶水）", data: [9.094, 22.036], color: C.base },
+    { name: "基线（调优胶水）", data: [6.992, 16.571], color: C.tuned },
+    { name: "Mega @ 0cff79c9", data: [4.172, 12.026], color: C.mega },
+  ],
+  fmt: v => v.toFixed(2), xLabel: null, yLabel: "每次调用耗时（ms）",
 });
 
 // ---- tabs ----
