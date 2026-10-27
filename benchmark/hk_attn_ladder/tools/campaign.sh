@@ -48,6 +48,9 @@ D)
 E)
   # per-kernel times (rocprofv3 kernel trace) of the multi-kernel rungs, then one thread trace per hot kernel
   for r in b00 b01 b02 b03 b04 b05 b06 b07 v0 p1 v1_atom2 v11_best; do tools/ktrace.sh llama/ladder_bwd.json "$r"; done
+  # hk_v0 .. r4 run FlyDSL's k_delta, whose JIT launch deadlocks under rocprofv3 (e15-02, 2026-10-27): profile them
+  # with r7's HIP k_delta (bitwise equal); their dK/dV and dQ kernels are unchanged
+  export HKL_MLA_DELTA_DIR=$HERE/build/mla_bwd/r7
   for r in m00 m01 m02 hk_v0 r1 r2 r3 r4 r7; do tools/ktrace.sh mla/ladder_bwd.json "$r"; done
   for r in f00 f01 f02 f03 f04 f05 f06 f07 f08; do tools/att.sh llama/ladder_fwd.json "$r" "k_fwd_$r"; done
   for r in v0 p1 v1_lsum0 v11_best; do tools/att.sh llama/ladder_fwd.json "$r" 'k_attn_fwd_v'; done

@@ -1,0 +1,22 @@
+per-kernel mean time (ms) under rocprofv3 --kernel-trace (hkl.one, 7 calls, no flush; hk_v0..r4 with r7's HIP k_delta)
+llama_ladder_bwd_b00         total   9.372  k_bwd_b00_dkdv=6.013  k_bwd_b00_dq=3.304  k_bwd_b00_prep=0.055
+llama_ladder_bwd_b01         total   9.528  k_bwd_b01_dkdv=6.368  k_bwd_b01_dq=3.108  k_bwd_b01_prep=0.053
+llama_ladder_bwd_b02         total   6.637  k_bwd_b02_dkdv=4.220  k_bwd_b02_dq=2.361  k_bwd_b02_prep=0.056
+llama_ladder_bwd_b03         total   7.863  k_bwd_b03_dkdv=4.246  k_bwd_b03_dq=3.565  k_bwd_b03_prep=0.052
+llama_ladder_bwd_b04         total  11.810  k_bwd_b04_dkdv=11.698  k_bwd_b04_cvt=0.062  k_bwd_b04_prep=0.050
+llama_ladder_bwd_b05         total  10.549  k_bwd_b05_dkdv=10.440  k_bwd_b05_cvt=0.060  k_bwd_b05_prep=0.050
+llama_ladder_bwd_b06         total  14.891  k_bwd_b06_dkdv=14.780  k_bwd_b06_cvt=0.062  k_bwd_b06_prep=0.049
+llama_ladder_bwd_b07         total  15.321  k_bwd_b07_dkdv=15.211  k_bwd_b07_cvt=0.061  k_bwd_b07_prep=0.049
+llama_ladder_bwd_p1          total   3.378  k_hk_bwd_g4=3.288  k_hk_bwd_dqcvt=0.053  k_hk_bwd_prep=0.037
+llama_ladder_bwd_v0          total   3.141  k_hk_bwd_g4=3.051  k_hk_bwd_dqcvt=0.053  k_hk_bwd_prep=0.036
+llama_ladder_bwd_v11_best    total   2.825  k_hk_bwd1_g4=2.699  k_hk_bwd1_prep_z=0.073  k_hk_bwd1_dqcvt=0.053
+llama_ladder_bwd_v1_atom2    total   2.843  k_hk_bwd1_g4=2.717  k_hk_bwd1_prep_z=0.073  k_hk_bwd1_dqcvt=0.053
+mla_ladder_bwd_hk_v0         total   2.372  k_dkdv96ds=1.816  k_dqds_c=0.514  k_delta=0.042
+mla_ladder_bwd_m00           total   6.592  k_mla_m00_dkdv=4.004  k_mla_m00_dq=2.543  k_mla_m00_prep=0.046
+mla_ladder_bwd_m01           total   5.846  k_mla_m01_dkdv=3.621  k_mla_m01_dq=2.179  k_mla_m01_prep=0.047
+mla_ladder_bwd_m02           total   5.292  k_mla_m02_dkdv=3.793  k_mla_m02_dq=1.453  k_mla_m02_prep=0.045
+mla_ladder_bwd_r1            total   2.109  k_dkdv96ds=1.577  k_dqds_c=0.491  k_delta=0.041
+mla_ladder_bwd_r2            total   2.095  k_dkdv96ds=1.570  k_dqds_c=0.484  k_delta=0.042
+mla_ladder_bwd_r3            total   2.041  k_dkdv96ds=1.517  k_dqds_c=0.482  k_delta=0.043
+mla_ladder_bwd_r4            total   2.032  k_dkdv96ds=1.516  k_dqds_c=0.472  k_delta=0.044
+mla_ladder_bwd_r7            total   2.023  k_dkdv96ds=1.499  k_dqds_c=0.481  k_delta=0.043

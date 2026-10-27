@@ -45,7 +45,9 @@ T0=$(date -u +%Y-%m-%dT%H:%M:%S)
 echo "[$T0 UTC] gpu $GPU ($PCI) $CT: $*" | tee "$LOG"
 # primary group = the host group owning /dev/kfd (render): docker exec -u does not apply the container's
 # --group-add, and the image's own render group has another gid
-timeout -k 30 "$TMO" docker exec -u "$(id -u):$(stat -c %g /dev/kfd)" -e HOME=/tmp -w "$HERE" "$CT" "$@" >>"$LOG" 2>&1
+ENVS=()  # HKL_* settings of the caller reach the job (docker exec does not inherit the host environment)
+while IFS= read -r v; do ENVS+=(-e "$v"); done < <(env | grep '^HKL_' | grep -v '^HKL_GPU=')
+timeout -k 30 "$TMO" docker exec -u "$(id -u):$(stat -c %g /dev/kfd)" -e HOME=/tmp "${ENVS[@]}" -w "$HERE" "$CT" "$@" >>"$LOG" 2>&1
 RC=$?
 sleep 2
 klog | awk -v t0="$T0" '$1 >= t0' > "$LOGS/${STAMP}_$TAG.dmesg"

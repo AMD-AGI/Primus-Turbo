@@ -10,3 +10,10 @@ dev/lhz/hk_attn_ladder 53a2d33b, container lhz-hkl-g1 (this GPU only). Kernel lo
 * `ladder_*.md / .json`: stage D timing (`hkl.ladder --side -r 10`, settle 1 s per cell, alternating order,
   flush 512 MB per call). Null controls: fwd 1.0011x +- 0.0030, bwd 0.9985x +- 0.0020, MLA 1.0016x +- 0.0045.
   Sustained sclk 1.2-1.5 GHz for the dense kernels (absolute times ~10% above a08-1's; ratios match).
+* `att_*.txt / .json`: stage E thread traces (`tools/att.sh`, one CU, prod shape; summarized with `hkl.att`): waves per
+  SIMD, wave lifetime, WMMA-pipe busy fraction and a time attribution per instruction category. `ktrace_bwd.txt`:
+  per-kernel times of the backward rungs. Finding: every new bottom rung (f*, b*, m*) spends 22-41% of its time in
+  `s_wait_dscnt` (each WMMA waits for the LDS operand it loads right before it) and reaches 9-42% WMMA-pipe use; the
+  production kernels batch their operand loads a phase ahead and overlap softmax with WMMA runs (wait_ds 2-10%,
+  WMMA 43-71%). Packing more work per wave (f03 GQA, b03 dq GQA, b05) drops occupancy to one wave per SIMD, which
+  exposes that latency fully; the fused dQ of b04-b07 adds a dS barrier and 4x v0's dQ atomic traffic per kv row.

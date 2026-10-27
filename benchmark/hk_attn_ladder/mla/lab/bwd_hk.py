@@ -143,9 +143,10 @@ def set_hsaco_dir(path):
         _KERNELS = None
 
 
-def _load(name):
-    path = os.path.join(HSACO_DIR, f"{name}.hsaco")
-    mj = os.path.join(HSACO_DIR, f"{name}.meta.json")
+def _load(name, d=None):
+    d = d or HSACO_DIR
+    path = os.path.join(d, f"{name}.hsaco")
+    mj = os.path.join(d, f"{name}.meta.json")
     with open(mj) as f:
         m = json.load(f)
     with open(path, "rb") as f:
@@ -232,6 +233,10 @@ def kernels():
                     raise RuntimeError(f"{HSACO_DIR}: no k_delta code object")
                 if has_delta and DELTA != "flydsl":
                     table["k_delta"] = _load("k_delta")
+                elif os.environ.get("HKL_MLA_DELTA_DIR") and DELTA != "flydsl":
+                    # profiling aid: a rung without k_delta takes the HIP k_delta of another build dir (bitwise equal
+                    # to FlyDSL's), because FlyDSL's JIT launch deadlocks under rocprofv3's queue interposition
+                    table["k_delta"] = _load("k_delta", os.environ["HKL_MLA_DELTA_DIR"])
                 _KERNELS = table
     return _KERNELS
 
