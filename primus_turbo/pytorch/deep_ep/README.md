@@ -28,7 +28,7 @@ Please following [Primus-Turbo Install from Source](../../../README.md#3-install
 
 ### Intranode backend: HIP (C++) or FlyDSL
 
-The intranode path (a single node, `num_ranks` in {2, 4, 8}, no low-latency mode) has two kernel
+The intranode path (a single node, `num_ranks` in {2, 4, 8}, no low-latency mode) has these kernel
 backends with the same `Buffer` API:
 
 - `cpp` (default where the C++ DeepEP is loaded): the HIP kernels in
@@ -37,12 +37,16 @@ backends with the same `Buffer` API:
   (`get_dispatch_layout`, `notify_dispatch`, `dispatch`, `cached_notify_combine`, `combine`).
   It runs on gfx942 / gfx950 / gfx1250 and owns its own uncached HIP-IPC heap of `num_nvl_bytes`.
   On gfx1250 the C++ DeepEP is not loaded and `flydsl` is the default.
+- `flydsl_v2` (gfx1250 only): FlyDSL kernels in `primus_turbo/flydsl/deep_ep/intranode_v2_kernel.py`
+  that write every token straight into a fixed slot on each destination rank instead of streaming it
+  through channel rings. Same outputs as `flydsl`, with handles of its own; the heap it needs grows
+  with the token count.
 
-Pick one per `Buffer` with `intranode_backend="cpp" | "flydsl"`, or globally with
-`PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND=cpp|flydsl`. The two backends use the same channel
-protocol, so the returned tensors and handles are bit-identical: a handle from one backend can drive
-the other's cached dispatch or combine. Internode (rocSHMEM) and low-latency kernels stay on the C++
-path whatever the setting.
+Pick one per `Buffer` with `intranode_backend="cpp" | "flydsl" | "flydsl_v2"`, or globally with
+`PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND=cpp|flydsl|flydsl_v2`. `cpp` and `flydsl` use the same
+channel protocol, so the returned tensors and handles are bit-identical: a handle from one backend can
+drive the other's cached dispatch or combine. Internode (rocSHMEM) and low-latency kernels stay on the
+C++ path whatever the setting.
 
 ### Example
 
