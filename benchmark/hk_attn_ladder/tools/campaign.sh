@@ -46,12 +46,22 @@ D)
   done
   ;;
 E)
+  # per-kernel times (rocprofv3 kernel trace) of the multi-kernel rungs, then one thread trace per hot kernel
+  for r in b00 b01 b02 b03 b04 b05 b06 b07 v0 p1 v1_atom2 v11_best; do tools/ktrace.sh llama/ladder_bwd.json "$r"; done
+  for r in m00 m01 m02 hk_v0 r1 r2 r3 r4 r7; do tools/ktrace.sh mla/ladder_bwd.json "$r"; done
   for r in f00 f01 f02 f03 f04 f05 f06 f07 f08; do tools/att.sh llama/ladder_fwd.json "$r" "k_fwd_$r"; done
   for r in v0 p1 v1_lsum0 v11_best; do tools/att.sh llama/ladder_fwd.json "$r" 'k_attn_fwd_v'; done
-  for r in b00 b01 b02 b03 b04 b05 b06 b07; do tools/att.sh llama/ladder_bwd.json "$r" "k_bwd_${r}_dkdv"; done
-  for r in v0 p1 v1_atom2 v11_best; do tools/att.sh llama/ladder_bwd.json "$r" 'k_hk_bwd1?_g4'; done
-  for r in m00 m01 m02; do tools/att.sh mla/ladder_bwd.json "$r" "k_mla_${r}_d"; done
-  for r in hk_v0 r1 r2 r3 r4 r7; do tools/att.sh mla/ladder_bwd.json "$r" 'k_dkdv96ds|k_dqds_c'; done
+  for r in b00 b01 b02 b03 b04 b05 b06 b07; do HKL_ATT_TAG=dkdv tools/att.sh llama/ladder_bwd.json "$r" "k_bwd_${r}_dkdv"; done
+  for r in b00 b01 b02 b03; do HKL_ATT_TAG=dq tools/att.sh llama/ladder_bwd.json "$r" "k_bwd_${r}_dq"; done
+  for r in v0 p1 v1_atom2 v11_best; do HKL_ATT_TAG=g4 tools/att.sh llama/ladder_bwd.json "$r" 'k_hk_bwd1?_g4'; done
+  for r in m00 m01 m02; do
+    HKL_ATT_TAG=dkdv tools/att.sh mla/ladder_bwd.json "$r" "k_mla_${r}_dkdv"
+    HKL_ATT_TAG=dq tools/att.sh mla/ladder_bwd.json "$r" "k_mla_${r}_dq"
+  done
+  for r in hk_v0 r1 r2 r3 r4 r7; do
+    HKL_ATT_TAG=dkdv tools/att.sh mla/ladder_bwd.json "$r" 'k_dkdv96ds'
+    HKL_ATT_TAG=dq tools/att.sh mla/ladder_bwd.json "$r" 'k_dqds_c'
+  done
   ;;
 *) echo "unknown stage $STAGE" >&2; exit 2 ;;
 esac

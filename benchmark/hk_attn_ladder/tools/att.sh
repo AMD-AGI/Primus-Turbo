@@ -9,9 +9,9 @@ set -euo pipefail
 [ $# -ge 3 ] || { sed -n '2,8p' "$0"; exit 2; }
 LADDER=$1; ARM=$2; RE=$3; shift 3
 HERE=$(readlink -f "$(dirname "$0")/..")
-NAME=$(basename "$LADDER" .json)_$ARM
+NAME=$(basename "$LADDER" .json)_$ARM${HKL_ATT_TAG:+_$HKL_ATT_TAG}  # HKL_ATT_TAG: one dir per kernel of an arm
 OUT=$HERE/logs/att/$(dirname "$LADDER")_$NAME
-mkdir -p "$OUT"
+rm -rf "$OUT"; mkdir -p "$OUT"
 exec "$HERE/tools/run_gpu.sh" "att_$(dirname "$LADDER")_$NAME" 900 -- \
   rocprofv3 --att --att-target-cu "${HKL_ATT_CU:-1}" --kernel-include-regex "$RE" -d "$OUT" "$@" -- \
   python3 -m hkl.one "$LADDER" "$ARM" -n 1 --warm 2
