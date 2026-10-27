@@ -123,6 +123,8 @@ FANOUT_PIECE_BYTES = 8 * 1024
 # rows move global -> LDS -> global through the Tensor Data Mover: a warp copy of the row
 # through VGPRs caps how much each CU keeps in flight, and with it the bandwidth per CU
 USE_TDM = IS_GFX1250
+# LDS a block can allocate on gfx1250
+MAX_LDS_BYTES = 320 * 1024
 # combine: tokens a warp claims from the reduce queue at a time
 REDUCE_GRAB_TOKENS = 4
 
@@ -335,6 +337,7 @@ def _copy_received(
     num_scales: int,
     idx_dtype,
     row_lds,
+    row_buffer_bytes: int,
 ):
     """The block copies the rows that have arrived and it has not copied yet, with their metadata,
     from the heap into the outputs."""
@@ -360,15 +363,17 @@ def _copy_received(
         for s in range_constexpr(1, num_ranks):
             row = arith.select(j >= cums[s], starts[s] + j - cums[s], row)
         if fx.const_expr(row_lds is not None):
-            tdm_ops.tensor_wait(0)
-            tdm_ops.tensor_load_2d(
-                _tdm_row(row_lds, _uniform_i64(_addr(local, layout["x"], row, hidden_bytes)), hidden_bytes),
-                cache_policy=SYS_LOAD,
-            )
-            tdm_ops.tensor_wait(0)
-            tdm_ops.tensor_store_2d(
-                _tdm_row(row_lds, _uniform_i64(_addr(outputs["x"], 0, row, hidden_bytes)), hidden_bytes)
-            )
+            for p in range_constexpr(0, hidden_bytes, row_buffer_bytes):
+                piece = min(row_buffer_bytes, hidden_bytes - p)
+                tdm_ops.tensor_wait(0)
+                tdm_ops.tensor_load_2d(
+                    _tdm_row(row_lds, _uniform_i64(_addr(local, layout["x"] + p, row, hidden_bytes)), piece),
+                    cache_policy=SYS_LOAD,
+                )
+                tdm_ops.tensor_wait(0)
+                tdm_ops.tensor_store_2d(
+                    _tdm_row(row_lds, _uniform_i64(_addr(outputs["x"], p, row, hidden_bytes)), piece)
+                )
         else:
             _copy_row(
                 _addr(outputs["x"], 0, row, hidden_bytes),
@@ -432,9 +437,9 @@ def _make_dispatch_v2(
     lds_slot = lds_warp + NUM_WARPS * num_ranks
     lds_recv = lds_slot + tile * num_ranks
     lds_words = lds_recv + 4 * num_ranks
-    # with TDM, a row buffer per warp
-    row_buffer_bytes = _align(hidden_bytes, 128)
+    # with TDM, a row buffer per warp; a row that does not fit moves through it in pieces
     lds_rows = _align(lds_words * 4, 128)
+    row_buffer_bytes = min(_align(hidden_bytes, 128), (MAX_LDS_BYTES - lds_rows) // NUM_WARPS // 128 * 128)
     if USE_TDM:
         lds_words = (lds_rows + NUM_WARPS * row_buffer_bytes) // 4
     grid_threads = num_channels * NUM_THREADS
@@ -586,22 +591,24 @@ def _make_dispatch_v2(
                     rows.append(rank_offsets[d] + arith.select(is_routed, slot, fx.Int32(0)))
                     routed.append(is_routed)
                 if fx.const_expr(USE_TDM):
-                    # the previous token's stores are done with the buffer
-                    tdm_ops.tensor_wait(0)
-                    tdm_ops.tensor_load_2d(
-                        _tdm_row(row_lds, _uniform_i64(_addr(x_base, 0, t, hidden_bytes)), hidden_bytes)
-                    )
-                    tdm_ops.tensor_wait(0)
-                    for d in range_constexpr(num_ranks):
-                        if routed[d]:
-                            tdm_ops.tensor_store_2d(
-                                _tdm_row(
-                                    row_lds,
-                                    _uniform_i64(_addr(dst_bases["x"][d], 0, rows[d], hidden_bytes)),
-                                    hidden_bytes,
-                                ),
-                                cache_policy=SYS_STORE,
-                            )
+                    for p in range_constexpr(0, hidden_bytes, row_buffer_bytes):
+                        piece = min(row_buffer_bytes, hidden_bytes - p)
+                        # the previous stores are done with the buffer
+                        tdm_ops.tensor_wait(0)
+                        tdm_ops.tensor_load_2d(
+                            _tdm_row(row_lds, _uniform_i64(_addr(x_base, p, t, hidden_bytes)), piece)
+                        )
+                        tdm_ops.tensor_wait(0)
+                        for d in range_constexpr(num_ranks):
+                            if routed[d]:
+                                tdm_ops.tensor_store_2d(
+                                    _tdm_row(
+                                        row_lds,
+                                        _uniform_i64(_addr(dst_bases["x"][d], p, rows[d], hidden_bytes)),
+                                        piece,
+                                    ),
+                                    cache_policy=SYS_STORE,
+                                )
                 else:
                     dst_resources = [
                         create_buffer_resource_from_addr(
@@ -699,6 +706,7 @@ def _make_dispatch_v2(
                 num_scales,
                 idx_dtype,
                 row_lds,
+                row_buffer_bytes,
             )
             remaining = fx.Int32(0)
             for s in range_constexpr(num_ranks):
@@ -891,6 +899,9 @@ def _make_combine_v2(
     # the row and its weights, in whole 8-byte TDM elements
     push_bytes = _align(hidden_bytes + num_topk * 4, 8)
     push_warps = combine_v2_push_warps(num_channels)
+    if USE_TDM:
+        # each pusher holds a whole slot in LDS: the weights go with the row's store
+        push_warps = min(push_warps, (MAX_LDS_BYTES - NUM_WARPS * 4) // slot_bytes)
     grid_push_warps = num_channels * push_warps
     assert grid_push_warps >= num_ranks and REDUCE_GRAB_TOKENS * num_ranks <= WARP_SIZE
     vec_elems = 16 // elem_bytes
