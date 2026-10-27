@@ -1,6 +1,6 @@
 # Mega MoE gfx1250：TDM gather 偶发数据损坏（排查记录）
 
-- 状态（2026-10-26 下午更新）：**规避方案已合入（默认开启），验证未做完**。A 的 gather 改用 per-lane async 加载，优化后纯 GEMM 只比 TDM 慢 1.6%（无填充）/ 3.5%（每 expert 128 行填充），见第 6 节。压测已过：纯 GEMM 0 / 160000、fused fwd 0 / 40000、b_nn 0 / 40000。**还没做**：整步 `stress_ep`（跑了约 1 分钟，因还机器中断）、pytest、e2e、step 级 A/B。根因判断为 gfx1250 TDM gather 的硬件行为（见第 4 节）。
+- 状态（2026-10-27 更新）：**规避方案已合入（默认开启）**。A 的 gather 改用 per-lane async 加载。第 6 节合入版本的"无效行读 `pos` 行"在 GPT-OSS staged-bias 测试上回归（读到 dispatch 还没写完的行，WGP 缓存里留下旧数据），已修复，见第 7 节。修复后 pytest EP1 / EP2 / EP4 全过，纯 GEMM、fused fwd / b_nn / churn、整步 `stress_ep` 压测全 0 错误；纯 GEMM 比 TDM 慢约 0.8%（无填充）/ 2.7%（每 expert 128 行填充）。对比 `1149c02b`：kernel 级 step TF 慢约 1.9%，e2e 单步慢 0.8-1.0%，loss 跟住。**还没做**：第 5 节第 5 条的清理（删 TDM gather 路径和 `MEGA_*` 开关）。根因判断为 gfx1250 TDM gather 的硬件行为（见第 4 节）。
 - 下面第 1-5 节是上午暂停时的记录（当时 kernel 保持 `1149c02b`，规避方案在 `wip_async_a.patch` 里）；`MEGA_TDM_GATHER=1` 仍可切回 TDM gather 复现。
 - 分支：`feat/mega_moe/gfx1250-bf16`，kernel 基线 `1149c02b`（EP2 campaign round 9）
 - 机器 / 容器：MI455X（gfx1250）x4，`xiaompen_mega_gfx1250_ep4`
@@ -183,7 +183,7 @@ fwd 稳定变慢 4-8%；bwd 的差异在噪声范围内。
 - 每个 lane 负责一行里的一个 16 B 块（16 个 lane 读一行 256 B），一条指令覆盖 16 行，每个 k-tile 每个 lane 发 16 条 `global_load_async_to_lds_b128`；`split_fence` 和 prologue 里用 `s_wait_asynccnt 0` 等。
 - **k 偏移折进 32 位行偏移**（每条加载一个 `v_add_nc_u32`），基址是循环不变的 SGPR。这样 zext 留在循环里，ISel 选出 SADDR 形式。#17 的 64 位偏移被 LICM 提到循环外，变成 VADDR64 形式：每条加载多一个 `v_add_nc_u64`，偏移多占 16 个 VGPR，还有一串 `s_wait_alu depctr` 停顿。
 - **LDS 步长放进指令立即数偏移**：IOFFSET 同时加到 global 和 LDS 地址上，所以第 i 条的 LDS 步长 `i*16*272` 先从它的行偏移里减掉；基址减去 `A_BIAS = tile_m * LDS_ROW`，保证 32 位无符号偏移不为负。所有加载共用一个 LDS 地址寄存器。
-- **无效行（填充 / dead tile）读 tile 内位置 `pos` 对应的行**（越界时夹到 0），不再全部读第 0 行。所有 WG 同时读同一行会集中打到一个内存 channel（camping）。
+- ~~**无效行（填充 / dead tile）读 tile 内位置 `pos` 对应的行**（越界时夹到 0），不再全部读第 0 行。所有 WG 同时读同一行会集中打到一个内存 channel（camping）。~~ 这会读到 dispatch 还没写完的行，造成回归，第 7 节已改掉。
 - 不加 per-load 分支：分支会让加载串行化。
 - B 恢复成 `1149c02b` 的写法（不加 `s_wait_xcnt` hold；#7 已否定"描述符被晚读"）。
 - launcher 断言：`a_rows > 0`、`a_rows * lda * 2 + tile_m * LDS_ROW < 2^32`（`check_gather_rows`，standalone 和 fused 都调用）。
@@ -241,3 +241,103 @@ CONTAINER= TAG=fix SCRIPT=stress_gemm.py ./stress.sh repo 1 --bench 200        #
 2. pytest：EP1、EP2、EP4（`run_round.sh N full`）；
 3. e2e：even、uniform、real 三种 routing，和 `1149c02b` 对比 step 时间（预期慢 1% 左右，以实测为准），更新 HTML 报告；
 4. 第 5 节第 6 条：排查 grouped wgrad（variable_k）的 TDM gather 是否有同样风险。
+
+## 7. 新机器上的验证和 staged-bias 回归的修复（2026-10-27）
+
+新机器同样是 MI455X x4，容器用 `amdprimus/amdprimus:tas-20261019`，名字沿用 `xiaompen_mega_gfx1250_ep4`。开机时 `amdgpu` 在 kernel cmdline 里被列进黑名单，要先 `sudo modprobe amdgpu`。仓库没编译，压测和 pytest 用的 `_C` 先用符号链接指到镜像里预编译的 `.so`；Mega 路径不调 C++ op。e2e 要用 C++ rmsnorm，所以在 `/home/xiaompen/mega_scratch/turbo_build` 里另做了 in-place 编译。
+
+这台机器的绝对时间比上一台慢约 7%（TDM 纯 GEMM 约 2150 us，上一台约 2002 us），下面的对比都是同一时段交替跑的。
+
+### 新机器上复现和第 6 节合入版本的压测
+
+| 测试 | async（第 6 节合入版本） | TDM gather（`MEGA_TDM_GATHER=1`） |
+|---|---|---|
+| 纯 GEMM `--pad 70` | 0 / 160000 | 3 / 80000，错误特征和之前一致 |
+| 整步 `stress_ep` 20000 步 | 0（y、dx、dtw bitwise 一致；dW 有 1 ulp 量级的差，来自 pool 顺序） | 之前约 6 / 26000 |
+
+### grouped wgrad（variable_k）的 TDM gather（第 5 节第 6 条）
+
+新脚本 `stress_wgrad.py`：直接调 `grouped_gemm_bf16_variable_k` 做 dW1（`b_index` gather）和 dW2（`--dw2`，`a_index` gather），pool 按 256 行补齐、`masked_k` 给真实行数，每次和第一次的结果 bitwise 比较。
+
+| 测试 | 结果 |
+|---|---|
+| dW1，4 卡各 40000 次 | 0 / 160000 |
+| dW2，4 卡各 40000 次 | 0 / 160000 |
+| dW1，大量重复行（`--tokens` 小，热点行），4 卡各 100000 次 | 0 / 400000 |
+
+wgrad 的 gather 没有越界行（`masked_k` 截掉了填充），每个 expert 尾部 k-tile 重复读最后一行。压测没出错，风险低，但不能证明没有（grouped kernel 头部注释记录的已知缺陷约 1 / 130000 次调用）。暂不改。
+
+### 回归：GPT-OSS staged-bias 测试失败
+
+第 6 节合入版本跑 pytest 时，`test_staged_bias_gpt_oss`（EP4）、EP2 的 1 个和 EP1 的 1 个（`test_fused_mega_moe_staged_bias_ep1[1024-2880-2880-32-4]`）失败，其余通过。三个失败都是 GPT-OSS shape（H=2880，`tile_k=64`）。`1149c02b` 和 `MEGA_TDM_GATHER=1` 都通过。
+
+排查（`probe_staged.py` 打印每轮 SNR，`probe_l1.py` 逐个 pool 行对照 `token_buffer[idx] @ w1[e].T`）：
+- 只在第 2 轮及以后出错，第 1 轮总是对的；
+- 坏行的源行号全部 < 256；
+- 只有部分 WG 错（N-block 12-14、tile 9-15）；
+- 部分 k-tile 的数据能用同一行上一轮的数据解释。
+
+原因：第 6 节的"无效行读 `pos` 行"让 dead tile（不等任何 expert 的 flag）和填充行去读 token buffer 的第 0-255 行，这些行可能正在被 dispatch 写入。读到的旧数据留在 WGP 的 vector cache 里，之后同一个 WGP 上负责这些行的 live tile 过了 flag 再读，命中了旧数据。TDM gather 从不读这些行（越界行不访存，dead tile 的 extent 为 0），所以没有这个问题。
+
+修复（`gemm_nt_tile.py`）：只读确定已经写完的行。
+- dead tile 完全不发 A 的加载：只在 prologue 里加一个 wave 一致的 `live` 分支，主循环不变（dead tile 本来就只跑 prologue）。
+- 填充行读本 tile 自己的行（这个 expert 的 token，在它的 flag 之前已写完）：先取这个 lane 第 0 条加载的行，那一行也是填充时再取 tile 的第一行。如果所有填充行都读 tile 的第一行，最多 128 行的加载会打到同一个地址，`--pad 128` 下慢 6%。
+
+纯 GEMM 计时（`stress_gemm.py --bench 200`，4 卡平均，两轮交替）：
+
+| 版本 | us（无填充） | us（`--pad 128`） |
+|---|---|---|
+| TDM gather（有 bug） | 约 2150 | 约 2107 |
+| 填充行全读 tile 第一行 | 约 2169（+0.9%） | 约 2243（+6.4%） |
+| **采用：填充行读本 lane 第 0 条加载的行** | 约 2167（+0.8%） | 约 2163（+2.7%） |
+
+（第 6 节合入版本在这台机器上没有和 TDM 同时段计时；上一台机器上它比 TDM 慢 1.6% / 3.5%。）
+
+### 修复后的验证
+
+| 测试 | 结果 |
+|---|---|
+| `probe_l1.py --reps 6`（staged-bias GPT-OSS 的 L1 fwd，逐行对照） | 每轮 0 坏行 |
+| `probe_staged.py --reps 4` | y 50.8、dx 49.4、d topk_w 55.6、dW1 50.6、dW2 52.6 dB，每轮一致，和 TDM 路径相同 |
+| pytest EP4 / EP2 / EP1 | EP4 4 / 4、EP2 5 / 5、EP1 19 / 19，全过 |
+| 纯 GEMM `--pad 70`，4 卡各 40000 次 | 0 / 160000 |
+| fused fwd `stress_dg`，20000 次 | 0 / 20000 |
+| fused b_nn `stress_dg --b_nn`，20000 次 | 0 / 20000 |
+| fused fwd 加 churn `stress_dg --churn`，20000 次 | 0 / 20000 |
+| 整步 `stress_ep` 20000 步 | 0 / 20000（y、dx、dtw bitwise 一致；dW 1 ulp 量级，同上） |
+
+（"填充行全读 tile 第一行"的版本也跑完了同一套：pytest 全过，纯 GEMM 0 / 160000，fused fwd / b_nn / churn 各 0 / 20000，`stress_ep` 0 / 20000。）
+
+### step 级 A/B 和 e2e（修复后，对比 `1149c02b`）
+
+kernel 级：`tools/ab.sh fix3 2 <3 个 shape>`（`NEW_CACHE` 用新目录），campaign bench `quick_test_bench.py`，两边交替各跑 2 轮，日志在 `/home/xiaompen/mega_scratch/ep4c/logs/ab_fix3_*`。`ab.sh` 加了 `TURBO_SRC`，保证每边导入自己的源码树（日志第一行 `primus_turbo from ...` 可确认）。
+
+| shape | 轮 | base fwd ms | 修复版 fwd ms | base fwd+bwd ms | 修复版 fwd+bwd ms | base step TF | 修复版 step TF |
+|---|---|---|---|---|---|---|---|
+| dsv3_t8192_random | r1 | 4.072 | 4.237（+4.1%） | 11.775 | 12.018（+2.1%） | 1470.6 | 1440.9（−2.0%） |
+| dsv3_t8192_random | r2 | 3.928 | 4.028（+2.5%） | 11.812 | 11.956（+1.2%） | 1466.0 | 1448.4（−1.2%） |
+| dsv3_t8192_skew1 | r1 | 9.470 | 9.706（+2.5%） | 27.635 | 28.442（+2.9%） | 626.6 | 608.9（−2.8%） |
+| dsv3_t8192_skew1 | r2 | 9.512 | 9.737（+2.4%） | 27.695 | 28.025（+1.2%） | 625.3 | 617.9（−1.2%） |
+| dsv3_t4096_random | r1 | 2.235 | 2.288（+2.4%） | 6.750 | 6.900（+2.2%） | 1282.7 | 1255.0（−2.2%） |
+| dsv3_t4096_random | r2 | 2.198 | 2.263（+3.0%） | 6.738 | 6.867（+1.9%） | 1285.0 | 1260.9（−1.9%） |
+
+step TF 平均慢约 1.9%，和第 3 节 #17 的 A/B 一样；第 6 节把纯 GEMM 的差距从 6% 降到 1% 以内，但没有传到 fused kernel 上。原因还没查（候选：fused kernel 里 dispatch 和 GEMM 共用 VMEM 发射，async 加载要占 VMEM，TDM 不占）。
+
+e2e：DSV3 proxy EP4（`e2e_suite.sh fix3`，容器内 root 运行），`tdm` = `1149c02b` 源码树，`async` = 本仓库，每个 routing 两边交替，各用独立的 FlyDSL cache。两份源码树的 `_C` / `libprimus_turbo_kernels.so` 已换成 `turbo_build` 里编译的版本（rmsnorm 是 C++ op）。日志 `/home/xiaompen/mega_scratch/e2e_fix3_{tdm,async}_{even,uniform,real}.log`。
+
+| routing | 步数 | `1149c02b` ms/iter | 修复版 ms/iter | 变化 | TFLOP/s/GPU | 最后一步 loss | 逐步 loss 最大相对偏差 |
+|---|---|---|---|---|---|---|---|
+| even | 10 | 1050.5 | 1061.2 | +1.0% | 1346.4 / 1332.8 | 5.563013 / 5.562970 | 9.4e-6 |
+| uniform | 10 | 1093.0 | 1103.8 | +1.0% | 1294.1 / 1281.5 | 8.791574 / 8.791613 | 1.5e-5 |
+| 真实路由 | 50 | 1098.6 | 1107.8 | +0.8% | 1287.5 / 1276.8 | 0.1011702 / 0.1012327 | 1.8e-3 |
+
+ms/iter 和 TFLOP/s 是 Primus 日志最后一步打印的平均值（从第 3 步起算）。所有项 0 个 nan iteration，loss 没有 nan / inf，grad norm 一致。真实路由的偏差正负交替、没有趋势，loss 降到 0.1 左右后相对值才变大，10-26 基线和 Mega 之间也有 1.0e-3。峰值显存两边相同（154.5-155.0 GB）。
+
+bitwise 压测（`stress_ep`、`stress_dg`，都是 DSv3 shape，H=7168、`tile_k=128`）在第 6 节合入版本上都是 0 错误，没抓到这个回归；只有 GPT-OSS shape（H=2880、`tile_k=64`）的测试暴露出来。DSv3 shape 为什么不出错还没确认，所以压测之外 pytest 也必须跑。
+
+### 新脚本（`tools/tdm_gather_bug/`）
+
+- `run_tests.sh TAG`：`run_round.sh` 的 pytest（EP4 每个测试一个进程，EP2 用 GPU 0,1，EP1 用 GPU 0），每次用新的 FlyDSL cache，日志在 `logs/test_TAG_*.log`。
+- `stress_wgrad.py`：见上。
+- `probe_staged.py` / `probe_l1.py`：见上。`probe_tilek.py`：单独的 gather GEMM 按 (K, tile_k) 和 torch 对拍。
+- `e2e_suite.sh TAG [ARMS] [ROUTINGS]`：在容器里以 root 跑 Primus 的 DeepSeek-V3 proxy（`--use_turbo_mega_moe True`），默认对比 `tdm=1149c02b` 和 `async=本仓库`，routing 为 even、uniform（10 步）和 real（50 步）。

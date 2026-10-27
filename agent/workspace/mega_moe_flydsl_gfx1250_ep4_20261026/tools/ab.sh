@@ -10,7 +10,7 @@ for rep in $(seq 1 $REPS); do
     for s in "$@"; do
         for v in base new; do
             L=$E/ep4c/logs/ab_${TAG}_${v}_${s}_r$rep.log
-            docker exec -w ${TREE[$v]} -e PYTHONPATH=${TREE[$v]} -e TRITON_HIP_USE_EXPERT_SCHEDULING=0 \
+            docker exec -w ${TREE[$v]} -e PYTHONPATH=${TREE[$v]} -e TURBO_SRC=${TREE[$v]} -e TRITON_HIP_USE_EXPERT_SCHEDULING=0 \
                 -e FLYDSL_RUNTIME_CACHE_DIR=${CACHE[$v]} -e ONLY_SHAPE=$s -e HIP_VISIBLE_DEVICES=0,1,2,3 \
                 xiaompen_mega_gfx1250_ep4 bash -c "ulimit -c 0; $E/capped.sh 600 $L torchrun --nproc-per-node 4 $BENCH" \
                 > /dev/null

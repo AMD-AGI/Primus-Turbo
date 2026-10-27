@@ -74,9 +74,129 @@
 <p class="meta">按测试日期分 tab，每个 tab 记录当天测的代码版本和复现方式。</p>
 
 <nav class="tabs" role="tablist">
+  <button class="tab" role="tab" data-tab="d20261027">2026-10-27 · <code>0cff79c9</code>（TDM gather 修复）</button>
   <button class="tab" role="tab" data-tab="d20261026">2026-10-26 · <code>1149c02b</code></button>
   <button class="tab" role="tab" data-tab="d20261023">2026-10-23 · <code>ca0a9c2f</code></button>
 </nav>
+
+<!-- ===================================================================== -->
+<!-- 2026-10-27 -->
+<!-- ===================================================================== -->
+<section class="tabpanel" id="d20261027">
+<div class="meta">
+  4x MI455X (gfx1250)，和 10-26 不是同一台机器 · 镜像 <code>amdprimus/amdprimus:tas-20261019</code> ·
+  Primus-Turbo <code>feat/mega_moe/gfx1250-bf16</code> @ <code>0cff79c9</code>（本地 commit，未 push），对照 <code>1149c02b</code> ·
+  Primus <code>dev/mi455x_v2</code> @ <code>a8abb804</code> · 2026-10-27
+</div>
+
+<div class="stats">
+  <div class="stat"><div class="v">0</div><div class="l">修复后压测出错次数（纯 GEMM 160000 次、fused 60000 次、整步 20000 步）；TDM gather 同条件 3/80000</div></div>
+  <div class="stat"><div class="v warn">+1.0%</div><div class="l">端到端单步耗时，even 路由，对比 <code>1149c02b</code></div></div>
+  <div class="stat"><div class="v warn">+1.0%</div><div class="l">端到端单步耗时，uniform 路由</div></div>
+  <div class="stat"><div class="v warn">+0.8%</div><div class="l">端到端单步耗时，真实路由（50 步）</div></div>
+  <div class="stat"><div class="v warn">−1.9%</div><div class="l">MoE 层 step TFLOPS（EP4 kernel 级，3 个 shape x 2 轮平均）</div></div>
+</div>
+
+<div class="callout">
+  <b>结论</b>
+  10-26 的偶发数据错误已修复：fused <code>dispatch_gemm</code> 里 A 的 gather 不再用 TDM gather，改用 per-lane
+  <code>global_load_async_to_lds_b128</code>，并且只读确定已经写完的行。修复后 pytest EP1 / EP2 / EP4 全过，所有压测 0 次出错，
+  端到端 loss 和 grad norm 跟住 <code>1149c02b</code>。代价是端到端单步慢 0.8%–1.0%，kernel 级 step TFLOPS 低约 1.9%。
+  这一页的数字只和同页的 <code>1149c02b</code> 对比。换了机器，<code>1149c02b</code> 的端到端和 10-26 tab 相差 1% 以内、有快有慢
+  （ms/iter：even 1050.5 / 1055.7，uniform 1093.0 / 1085.8，真实路由 1098.6 / 1095.1）。
+</div>
+
+<h2>端到端训练：DSV3 proxy，EP4，修复版对比 <code>1149c02b</code></h2>
+<p class="lead">
+  配置和 10-26 相同，两边都开 <code>--use_turbo_mega_moe True</code>，每种路由两边交替运行，各用独立的 FlyDSL cache。
+</p>
+<table>
+  <thead>
+    <tr>
+      <th>路由方式</th><th class="num">步数</th><th class="num"><code>1149c02b</code> ms/iter</th><th class="num">修复版 ms/iter</th>
+      <th class="num">单步耗时变化</th><th class="num">TFLOP/s/GPU</th><th class="num">最后一步 loss</th>
+      <th class="num">逐步 loss 最大相对偏差</th><th class="num">nan iteration</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>even（Primus 默认）</td><td class="num">10</td><td class="num">1050.5</td><td class="num">1061.2</td><td class="num warn">+1.0%</td>
+      <td class="num">1346.4 / 1332.8</td><td class="num">5.563013 / 5.562970</td><td class="num">9.4e-6</td><td class="num">0 / 0</td></tr>
+    <tr><td>uniform</td><td class="num">10</td><td class="num">1093.0</td><td class="num">1103.8</td><td class="num warn">+1.0%</td>
+      <td class="num">1294.1 / 1281.5</td><td class="num">8.791574 / 8.791613</td><td class="num">1.5e-5</td><td class="num">0 / 0</td></tr>
+    <tr><td>真实路由，不强制均衡</td><td class="num">50</td><td class="num">1098.6</td><td class="num">1107.8</td><td class="num warn">+0.8%</td>
+      <td class="num">1287.5 / 1276.8</td><td class="num">0.101170 / 0.101233</td><td class="num">1.8e-3</td><td class="num">0 / 0</td></tr>
+  </tbody>
+</table>
+<div class="caption">
+  ms/iter 和 TFLOP/s/GPU 取 Primus 日志最后一步打印的平均值（从第 3 步起算）。真实路由的 loss 偏差正负交替、没有趋势，
+  loss 降到 0.1 左右后相对值才变大（10-26 基线和 Mega 之间是 1.0e-3）。峰值显存两边相同，154.5–155.0 GB。
+</div>
+
+<div class="grid2">
+  <div class="chart">
+    <h3>端到端单步耗时</h3>
+    <div id="chart-e2e-1027"></div>
+    <div class="caption">纵轴：ms/iter，Primus 日志最后一步打印的平均值（从第 3 步起算）。</div>
+  </div>
+  <div>
+    <h3>MoE 层 kernel 级 A/B（EP4，<code>quick_test_bench.py</code>）</h3>
+    <table>
+      <thead><tr><th>shape</th><th class="num">前向</th><th class="num">前向+反向</th><th class="num">step TFLOPS</th></tr></thead>
+      <tbody>
+        <tr><td>T=8192 random</td><td class="num">+4.1% / +2.5%</td><td class="num">+2.1% / +1.2%</td><td class="num">−2.0% / −1.2%</td></tr>
+        <tr><td>T=8192 skew1</td><td class="num">+2.5% / +2.4%</td><td class="num">+2.9% / +1.2%</td><td class="num">−2.8% / −1.2%</td></tr>
+        <tr><td>T=4096 random</td><td class="num">+2.4% / +3.0%</td><td class="num">+2.2% / +1.9%</td><td class="num">−2.2% / −1.9%</td></tr>
+      </tbody>
+    </table>
+    <div class="caption">
+      修复版相对 <code>1149c02b</code> 的变化，两轮交替（r1 / r2）。T=8192 random 的绝对值：前向 4.072 → 4.237 ms、3.928 → 4.028 ms，
+      前向+反向 11.775 → 12.018 ms、11.812 → 11.956 ms。纯 GEMM 的差距只有 0.8%，fused kernel 里更大，原因还没查。
+    </div>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2>修复和验证</h2>
+<div class="grid2" style="margin-top: 0">
+  <ul>
+    <li><b>A 的 gather 改用 async 加载（<code>915c3ad2</code>，10-26 下午）。</b>每个 lane 用 <code>global_load_async_to_lds_b128</code>
+      把 16 B 块直接拷进 LDS，不再经过 TDM gather。<code>MEGA_TDM_GATHER=1</code> 可以切回 TDM gather 复现。</li>
+    <li><b>回归（10-27 发现）。</b>GPT-OSS shape（H=2880）的 staged-bias 测试在第 2 次调用起出错，EP4 / EP2 / EP1 各 1 个。
+      原因是 dead tile 和填充行去读 token buffer 的第 0–255 行，而 dispatch 可能还在写这些行；旧数据留在 WGP 的 vector cache 里，
+      负责这些行的 tile 过了 flag 以后读到了旧数据。TDM gather 从不读这些行，所以 <code>1149c02b</code> 没有这个问题。</li>
+    <li><b>修复（<code>0cff79c9</code>）。</b>只读确定已经写完的行：dead tile 不发 A 的加载；填充行读本 tile 自己的行（本 lane 第 0 条加载的行）。
+      如果所有填充行都读 tile 的第一行，最多 128 行打到同一个地址，填充多时纯 GEMM 慢 6.4%；现在是 2.7%。</li>
+    <li><b>grouped wgrad 的 TDM gather。</b>dW1、dW2 各 160000 次、热点重复行 400000 次压测，0 次出错，暂不改。</li>
+  </ul>
+  <table>
+    <thead><tr><th>验证（<code>0cff79c9</code>）</th><th>结果</th></tr></thead>
+    <tbody>
+      <tr><td>pytest EP4 / EP2 / EP1</td><td class="good">4/4、5/5、19/19</td></tr>
+      <tr><td>纯 GEMM <code>--pad 70</code>，4 卡各 40000 次</td><td class="good">0 / 160000（TDM gather 3 / 80000）</td></tr>
+      <tr><td>fused 前向 / b_nn / 前向加 churn</td><td class="good">各 0 / 20000</td></tr>
+      <tr><td>整步 <code>stress_ep</code>（fwd+bwd，bitwise）</td><td class="good">0 / 20000</td></tr>
+      <tr><td>staged-bias GPT-OSS 逐行对照，6 轮</td><td class="good">每轮 0 坏行，SNR 和 TDM 路径相同</td></tr>
+      <tr><td>纯 GEMM 对 TDM gather（无填充 / 128 行填充）</td><td class="num">+0.8% / +2.7%</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ===================================================================== -->
+<h2>复现信息</h2>
+<table class="repro">
+  <tbody>
+    <tr><td>硬件和镜像</td><td>4x MI455X（gfx1250）；镜像 <code>amdprimus/amdprimus:tas-20261019</code>，容器 <code>xiaompen_mega_gfx1250_ep4</code>。开机时 <code>amdgpu</code> 在黑名单里，要先 <code>sudo modprobe amdgpu</code>。</td></tr>
+    <tr><td>Primus-Turbo</td><td>修复版是仓库 <code>/home/xiaompen/Turbo</code> @ <code>0cff79c9</code>；<code>1149c02b</code> 是 <code>/home/xiaompen/mega_scratch/ep4val/src_1149c02b</code>（符号链接副本，Python 源码换回 <code>1149c02b</code>）。
+      两边的 <code>_C</code> 和 <code>libprimus_turbo_kernels.so</code> 都是 <code>/home/xiaompen/mega_scratch/turbo_build</code> 里 in-place 编译的。</td></tr>
+    <tr><td>端到端</td><td>容器内以 root 运行 <code>tools/tdm_gather_bug/e2e_suite.sh fix3</code>（Primus 在 <code>/home/xiaompen/mega_scratch/primus_a8abb804</code>），
+      日志 <code>/home/xiaompen/mega_scratch/e2e_fix3_{tdm,async}_{even,uniform,real}.log</code>。</td></tr>
+    <tr><td>kernel 级</td><td><code>NEW_CACHE=&lt;新目录&gt; bash tools/ab.sh fix3 2 dsv3_t8192_random dsv3_t8192_skew1 dsv3_t4096_random</code>，
+      日志 <code>/home/xiaompen/mega_scratch/ep4c/logs/ab_fix3_*</code>。</td></tr>
+    <tr><td>正确性</td><td><code>tools/tdm_gather_bug/run_tests.sh TAG</code>（pytest）和 <code>stress.sh</code>（压测），命令和全部结果见
+      <code>bug_tdm_gather_corruption.md</code> 第 7 节。</td></tr>
+  </tbody>
+</table>
+</section>
 
 <!-- ===================================================================== -->
 <!-- 2026-10-26 -->
@@ -228,7 +348,7 @@
 </div>
 
 <!-- ===================================================================== -->
-<h2>已知问题：TDM gather 偶发数据错误（未修复）</h2>
+<h2>已知问题：TDM gather 偶发数据错误（10-27 已修复，见 2026-10-27 tab）</h2>
 <div class="grid2" style="margin-top: 0">
   <ul>
     <li><b>现象。</b>fused <code>dispatch_gemm</code>（L1 前向和 L2 dgrad）偶发静默错误：每次坏一个 256x256 tile，以 16 行为单位。
@@ -719,6 +839,16 @@ lineChart("chart-trend-1026", {
   tip: (s, cat, v) => `${cat}：${v} ms`,
 });
 
+// ---- 2026-10-27 (0cff79c9) ----
+barChart("chart-e2e-1027", {
+  categories: ["even", "uniform", "真实路由"],
+  series: [
+    { name: "Mega MoE @ 1149c02b（TDM gather）", data: [1050.5, 1093.0, 1098.6], color: C_MEGA_OLD },
+    { name: "Mega MoE @ 0cff79c9（修复版）", data: [1061.2, 1103.8, 1107.8], color: C.mega },
+  ],
+  fmt: v => v.toFixed(0), xLabel: "路由方式", yLabel: "ms/iter",
+});
+
 // ---- tabs ----
 function showTab(id) {
   document.querySelectorAll(".tabpanel").forEach(p => { p.hidden = p.id !== id; });
@@ -727,7 +857,7 @@ function showTab(id) {
 }
 document.querySelectorAll(".tab").forEach(b => b.addEventListener("click", () => showTab(b.dataset.tab)));
 const hashTab = location.hash.slice(1);
-showTab(document.getElementById(hashTab) && document.getElementById(hashTab).classList.contains("tabpanel") ? hashTab : "d20261026");
+showTab(document.getElementById(hashTab) && document.getElementById(hashTab).classList.contains("tabpanel") ? hashTab : "d20261027");
 </script>
 </body>
 </html>

@@ -14,10 +14,13 @@ import argparse, csv, os, statistics, sys, torch, torch.distributed as dist
 rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
 torch.cuda.set_device(rank)
 dist.init_process_group("nccl", rank=rank, world_size=world, device_id=torch.device("cuda", rank))
-sys.path.insert(0, "/home/xiaompen/Turbo")
+sys.path.insert(0, os.environ.get("TURBO_SRC", "/home/xiaompen/Turbo"))
 import primus_turbo.pytorch  # noqa
 from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe
 from tests.pytorch.ops.test_mega_bf16_gfx1250_fused_moe import _reference, _snr
+
+if rank == 0:
+    print(f"primus_turbo from {os.path.dirname(primus_turbo.__file__)}", flush=True)
 
 SHAPES = [  # label, tokens/rank, hidden, inter, experts/rank, topk, skew
     ("dsv3_t8192_random", 8192, 7168, 2048, 32, 8, 0.0),
