@@ -1,0 +1,463 @@
+--- a/gfx1250_mla_fwd/gen/build.py
++++ b/gfx1250_mla_fwd/gen/build.py
+@@ -22,7 +22,10 @@
+     global / buffer / flat / scratch / SMEM store / TDM in generated code), VGPR defs only in the generated range or
+     the marker outputs, SGPR defs only in the clobbered set, no exec / m0 writes, LDS read bases and offsets, one
+     s_barrier_signal per TILE, MSB mode 0 at every region end, no WMMA / TRANS in the shell's code;
+- 7. --ref: also build the HIP reference variant (HKGEN_REF=1) as DIR/ref/k_mla_fwd.hsaco.
++ 7. the shell's store phase (edev1, `writeback_check`): straight-line from the first global store to s_endpgm, no
++    rewrite of an in-flight store's address / scalar operands, data registers reloaded only behind XCNT waits, the
++    LDS staging stores ahead of the read-back;
++ 8. --ref: also build the HIP reference variant (HKGEN_REF=1) as DIR/ref/k_mla_fwd.hsaco.
+ Writes DIR/build.json (recipe, tool versions, sha256s, register map, check results). Exit 1 on any failed check."""
+ 
+ import argparse
+@@ -298,6 +301,8 @@
+     ap.add_argument("--pipe-tree", default="body", choices=("body", "prefix"), help="fwdgen.CFG['pipe_tree']")
+     ap.add_argument("--pipe-vafter", default="pv", choices=("pv", "qk0"), help="fwdgen.CFG['pipe_vafter']")
+     ap.add_argument("--pipe-dsentry", action="store_true", help="fwdgen.CFG['pipe_dsentry']")
++    ap.add_argument("--pipe-q3after", action="store_true", help="fwdgen.CFG['pipe_q3after'] (A')")
++    ap.add_argument("--arrive-lat", type=int, default=None, help="fwdgen.CFG['arrivelat'] (scheduler model)")
+     a = ap.parse_args()
+     if a.pipe and a.worder == G.CFG["worder"]:
+         a.worder = G.PIPE_WORDER
+@@ -315,6 +320,8 @@
+         pipe_tree=a.pipe_tree,
+         pipe_vafter=a.pipe_vafter,
+         pipe_dsentry=a.pipe_dsentry,
++        pipe_q3after=a.pipe_q3after,
++        arrivelat=a.arrive_lat,
+         seed=a.seed,
+     )
+     G.LAT["DS"] = G.CFG["dslat"]
+@@ -452,7 +459,10 @@
+         lines, open_ = emit_region(texts, fmap, M, E, walk_check)
+         if open_:
+             fail.append(f"{name}: {len(open_)} hazards / coverage errors after emission, e.g. {open_[:3]}")
+-        regions[name] = pre + lines
++        # edev1: a FINAL region hands VALU-written outputs to the shell, whose compiler does not see the asm's VALU
++        # writes (expert mode: no interlock, and LLVM inserts no va_vdst wait for an inline-asm def): drain them here
++        post = ["\ts_wait_alu depctr_va_vdst(0)"] if name.startswith("FINAL") else []
++        regions[name] = pre + lines + post
+         log(
+             f"{name}: {len(texts)} instructions -> {len(pre) + len(lines)} lines"
+             + (f", modelled {models[name]} cycles" if name in models else "")
+@@ -488,6 +498,8 @@
+ 
+     # 6. contract checks on the listing (regions by instruction ordinal)
+     rec["checks"]["contract"] = contract_checks(spl, out / f"{KERNEL}.objdump.s", markers, L, fail)
++    # 7. the shell's writeback (edev1): straight-line store phase
++    rec["checks"]["writeback"] = writeback_check(out / f"{KERNEL}.objdump.s", fail)
+ 
+     for f in fail:
+         log("FAIL:", f)
+@@ -497,6 +509,83 @@
+     return 0 if not fail else 1
+ 
+ 
++def writeback_check(objdump, fail):
++    """The epilogue's global stores (edev1): from the first VMEM store to s_endpgm the code is straight-line and never
++    rewrites an operand of an in-flight store except through LLVM's XCNT waits on the staged data quads:
++      no branch, no EXEC / M0 write, no s_set_vgpr_msb (each one drains XCNT), no SGPR write at all (soffsets and
++      descriptors are computed before the first store), no write of a VGPR that an earlier store used as its ADDRESS;
++      a write of an earlier store's DATA VGPR only from a ds_load right after an s_wait_xcnt that retires that store
++      (in-order XCNT: the store has at most N younger stores);
++    and the store phase is the only VMEM in the kernel after the last TILE (the O / LSE writes of every q tile)."""
++    from asmkit.isa import load_any, regs_of, sgpr_defs_uses
++
++    _, ins, _ = load_any(objdump)
++    seq = [x for x in ins if x.mn and x.cls not in ("LABEL", "DIR")]
++    first = next((k for k, x in enumerate(seq) if x.mn.startswith(("buffer_store", "global_store"))), None)
++    end = next((k for k, x in enumerate(seq) if x.mn == "s_endpgm"), None)
++    res = {"stores": 0, "xcnt_waits": [], "first": first, "end": end}
++    if first is None or end is None or end < first:
++        fail.append("writeback: no store phase before s_endpgm")
++        return res
++    stores = []  # (data regs, addr regs) of the stores issued so far, oldest first
++    pend = None  # an s_wait_xcnt N seen and not yet consumed
++    for k in range(first, end + 1):
++        x = seq[k]
++        t = x.text.strip()
++        mn = x.mn
++        if mn == "s_endpgm":
++            break
++        if mn.startswith(("s_branch", "s_cbranch", "s_set_vgpr_msb", "s_setpc", "s_getpc", "s_swappc")):
++            fail.append(f"writeback: {t} inside the store phase")
++        sd, _ = sgpr_defs_uses(x)
++        if mn == "s_sendmsg" and "MSG_DEALLOC_VGPRS" in t:
++            continue  # LLVM's VGPR release right before s_endpgm (the HIP reference has it)
++        if sd and mn not in ("s_wait_xcnt", "s_wait_dscnt", "s_wait_alu", "s_nop"):
++            fail.append(f"writeback: scalar write {sd} inside the store phase: {t}")
++        if mn == "s_wait_xcnt":
++            pend = int(x.ops[0], 0)
++            res["xcnt_waits"].append(pend)
++            continue
++        if mn.startswith(("buffer_store", "global_store")):
++            ops = [o.strip() for o in x.ops]
++            dregs = set(regs_of(ops[0]))
++            aregs = set(regs_of(ops[1])) if len(ops) > 1 else set()
++            stores.append((dregs, aregs))
++            res["stores"] += 1
++            pend = None
++            continue
++        if mn.startswith(("buffer_", "global_", "flat_", "scratch_", "tensor_")):
++            fail.append(f"writeback: other memory op inside the store phase: {t}")
++            continue
++        for r in x.defs:
++            if any(r in a for _, a in stores):
++                fail.append(f"writeback: rewrites the address VGPR v{r} of an in-flight store: {t}")
++            hit = [j for j, (d, _) in enumerate(stores) if r in d]
++            if hit:
++                j = max(hit)
++                younger = len(stores) - 1 - j
++                if not mn.startswith("ds_load") or pend is None or pend > younger:
++                    fail.append(
++                        f"writeback: rewrites data VGPR v{r} of store #{j} ({younger} younger) without an "
++                        f"s_wait_xcnt <= {younger}: {t}"
++                    )
++        if not mn.startswith("s_wait"):
++            pend = pend if mn.startswith("ds_load") else None
++    vm_after = [x.text.strip() for x in seq[end + 1 :] if x.mn.startswith(("buffer_", "global_store"))]
++    res["vmem_after_endpgm"] = len(vm_after)
++    # the LDS staging: from the last TILE marker's barrier wait to s_endpgm, every ds_store precedes every ds_load
++    # (the compiler kept the stores of all four q tiles ahead of the reads: cross-lane data of one wave, in-order LDS)
++    lastbar = max(k for k, x in enumerate(seq[:end]) if x.mn == "s_barrier_wait")
++    dss = [k for k in range(lastbar, end) if seq[k].mn.startswith("ds_store")]
++    dsl = [k for k in range(lastbar, end) if seq[k].mn.startswith("ds_load")]
++    res["staging"] = {"ds_store": len(dss), "ds_load": len(dsl)}
++    if dss and dsl and max(dss) > min(dsl):
++        fail.append("writeback: an epilogue ds_load precedes a ds_store (staging order)")
++    if any(k >= first for k in dss):
++        fail.append("writeback: a ds_store inside the store phase")
++    return res
++
++
+ def contract_checks(spl, objdump, markers, L, fail):
+     """Check the generated regions in the code object's listing."""
+     from asmkit.isa import load_any, parse_line, sgpr_defs_uses
+--- a/gfx1250_mla_fwd/gen/fwdgen.py
++++ b/gfx1250_mla_fwd/gen/fwdgen.py
+@@ -104,6 +104,12 @@
+ #                the same va_vdst(0) drain as the Q(3) reads)
+ #   pipe_dsentry the K / Q(0) reads first in program order and the first one before the first prefix WMMA (the
+ #                region-entry drain then covers them; else the first read after a WMMA pays its own drain)
++#   pipe_q3after (fwddev2, A') the arrive sits before Q(3)'s reads in program order, with order edges arrive -> Q(3)
++#                reads: the arrive retires only the stage's K / V reads and Q(0) (the Q staging area is not in the
++#                ring; S1a2 read 24 Q fragments after its arrive). Moves the arrive from after WMMA #132 to about one
++#                LDS latency after the last V read (fgate1: test whether the late arrive is the per-tile loss)
++#   arrivelat    (fwddev2) the slot scheduler's load -> arrive latency (model only; None = dslat): the arrive's
++#                s_wait_dscnt 0 retires the loads in hardware anyway, so this only places the arrive
+ CFG = {
+     "csgpr": False,
+     "qgroup": "none",
+@@ -118,6 +124,8 @@
+     "pipe_tree": "body",
+     "pipe_vafter": "pv",
+     "pipe_dsentry": False,
++    "pipe_q3after": False,
++    "arrivelat": None,
+     "seed": None,
+     "slotpar": True,
+ }
+@@ -603,7 +611,12 @@
+         if k == "PERM":
+             return o >= 8 and t != trans_at + 1 and t > perm_busy
+         if k == "DS":
+-            return o != 0 and t >= ds_next and ds_room()
++            # no room: (q3after) wait for the oldest outstanding load (the re-walk below inserts the s_wait_dscnt).
++            # Needed by the TILE_D bodies (their only consumers of the K loads need Q(3), which waits for the arrive,
++            # which waits for every V load: deadlock otherwise); also taken in TILE_C / TILE_D0 (the K reads issue
++            # earlier there than in S1b, #0..56 instead of #0..67: neutral in the r4 model, A' x1.004)
++            room = ds_room() or (CFG["pipe_q3after"] and t >= ds_done[issued_ds[retired_ds]])
++            return o != 0 and t >= ds_next and room
+         if k == "SALU":
+             return o != 0 and t >= salu_free
+         return o != 0  # BAR / WAIT
+@@ -641,6 +654,8 @@
+         ready.discard(pick)
+         k = nd.kind
+         if k == "DS":
++            if not ds_room():  # q3after: issued past DS_MAX after the oldest load completed (see avail)
++                retired_ds += 1
+             done_t = max(t + CFG["dslat"], last_done)
+             last_done = done_t
+             ds_done[pick] = done_t
+@@ -676,7 +691,7 @@
+             else:
+                 e = t + LATK.get(k, l)
+             if k == "DS" and l > 1 and nodes[s_].kind == "BAR":
+-                e = max(e, ds_done[pick])
++                e = max(e, ds_done[pick] if CFG["arrivelat"] is None else t + CFG["arrivelat"])
+             earliest[s_] = max(earliest[s_], e)
+             npred[s_] -= 1
+             if npred[s_] == 0:
+@@ -1157,6 +1172,7 @@
+         v_loads()
+ 
+     q3 = []
++    bar = None
+     for i in active:
+         if i == 0 and not CFG["pipe_dsentry"]:
+             loads += q_loads(0)
+@@ -1165,8 +1181,11 @@
+                 CFG["pipe_vafter"] == "qk0"
+             ):  # program order here, issue after the last QK(0) WMMA (order edges)
+                 v_loads()
++            if CFG["pipe_q3after"]:  # A': the arrive retires the stage reads only; Q(3) is read after it
++                bar = add("s_barrier_signal -1", "BAR", "arrive")
+             q3 = q_loads(3)
+-            loads += q3
++            if not CFG["pipe_q3after"]:
++                loads += q3
+         for ks in range(NKS):  # QK(i): S[i][j] = sum_ks K[j][ks] Q[i][ks] (chains from +0)
+             for j in range(NKV):
+                 c = "0" if ks == 0 else vr(L.S(i, j), 8)
+@@ -1182,10 +1201,13 @@
+             softmax_nodes(
+                 L, i, dl[i] if i in masked_q else None, add, active, tree=CFG["pipe_tree"] == "body"
+             )
+-    bar = add("s_barrier_signal -1", "BAR", "arrive")  # after every LDS read of the region (order edges)
++    if bar is None:
++        bar = add("s_barrier_signal -1", "BAR", "arrive")  # after every LDS read of the region (order edges)
+     build_dag(nodes)
+     for nd in loads:
+         add_order(nodes, nd.idx, bar.idx, LAT["DS"])
++    for nd in q3 if CFG["pipe_q3after"] else ():  # A': Q(3) reads after the arrive
++        add_order(nodes, bar.idx, nd.idx, 1)
+     # an LDS load overwriting a source of a WMMA still in flight costs a va_vdst(0) drain (expert mode, more than
+     # one VALU class in flight): issue the V reads only after the LAST prefix PV WMMA and the Q(3) reads only after
+     # the LAST QK(0) WMMA, so each group pays one drain instead of one per buffer slice
+@@ -1196,10 +1218,10 @@
+     lpv = max(last[f"PV{i}p"] for i in range(QT))
+     if CFG["pipe_vafter"] == "qk0" and "QK0" in last:
+         lpv = max(lpv, last["QK0"])
+-    for nd in loads:
++    for nd in loads + (q3 if CFG["pipe_q3after"] else []):
+         if nd.tag.startswith("V"):
+             add_order(nodes, lpv, nd.idx, 1)
+-        if nd.tag.startswith("Q3") and "QK0" in last:
++        if nd.tag.startswith("Q3") and "QK0" in last and last["QK0"] < nd.idx:
+             add_order(nodes, last["QK0"], nd.idx, 1)
+     if CFG["pipe_dsentry"]:  # the first read before the first prefix WMMA (both are first in their classes)
+         fw = min(nd.idx for nd in nodes if nd.kind == "WMMA")
+--- a/gfx1250_mla_fwd/hip/hkf.h
++++ b/gfx1250_mla_fwd/hip/hkf.h
+@@ -20,6 +20,7 @@
+ typedef float f32x2 __attribute__((ext_vector_type(2)));
+ typedef float f32x4 __attribute__((ext_vector_type(4)));
+ typedef float f32x8 __attribute__((ext_vector_type(8)));
++typedef uint32_t u32x2 __attribute__((ext_vector_type(2)));
+ typedef uint32_t u32x4 __attribute__((ext_vector_type(4)));
+ typedef int32_t i32x4 __attribute__((ext_vector_type(4)));
+ typedef int32_t i32x8 __attribute__((ext_vector_type(8)));
+@@ -56,6 +57,24 @@
+ HKF_INLINE bf16x8 lds_tr16(const lds_u8* p, int off) {
+   return __builtin_amdgcn_ds_load_tr16_b128_v8bf16((lds_bf16x8*)(p + off));
+ }
++// epilogue staging (ds_store_b128 / ds_store_b32 / ds_load_b128 / ds_load_b64, base + immediate offset)
++typedef __attribute__((address_space(3))) unsigned char lds_u8w;
++typedef __attribute__((address_space(3))) u32x4 lds_u32x4;
++typedef __attribute__((address_space(3))) u32x2 lds_u32x2;
++typedef __attribute__((address_space(3))) uint32_t lds_u32;
++HKF_INLINE lds_u8w* lds_wptr(uint32_t a) { return (lds_u8w*)(uintptr_t)a; }
++HKF_INLINE void lds_store_b128(lds_u8w* p, int off, u32x4 v) { *(lds_u32x4*)(p + off) = v; }
++HKF_INLINE void lds_store_b32(lds_u8w* p, int off, uint32_t v) { *(lds_u32*)(p + off) = v; }
++HKF_INLINE u32x4 lds_load_u32x4(const lds_u8* p, int off) { return *(const lds_u32x4*)(p + off); }
++HKF_INLINE u32x2 lds_load_u32x2(const lds_u8* p, int off) { return *(const lds_u32x2*)(p + off); }
++// cross-lane LDS data of ONE wave (ds_store by some lanes, ds_load by others): the wave's LDS ops execute in order, so
++// no counter wait is needed; this only keeps the compiler from moving the loads above the stores (a wavefront-scope
++// fence emits no instruction on gfx1250)
++HKF_INLINE void wave_lds_order() {
++  __builtin_amdgcn_sched_barrier(0);
++  __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
++  __builtin_amdgcn_sched_barrier(0);
++}
+ 
+ // buffer resources (word-3 flags as FlyDSL's make_buffer_tensor on gfx1250) and raw buffer stores
+ inline constexpr int RSRC_FLAGS = 159744;
+@@ -65,6 +84,9 @@
+ HKF_INLINE void buf_store_b128(u32x4 v, __amdgpu_buffer_rsrc_t r, int voff, int soff) {
+   __builtin_amdgcn_raw_buffer_store_b128(v, r, voff, soff, 0);
+ }
++HKF_INLINE void buf_store_b64(u32x2 v, __amdgpu_buffer_rsrc_t r, int voff, int soff) {
++  __builtin_amdgcn_raw_buffer_store_b64(v, r, voff, soff, 0);
++}
+ HKF_INLINE void buf_store_b32(float v, __amdgpu_buffer_rsrc_t r, int voff, int soff) {
+   __builtin_amdgcn_raw_buffer_store_b32(__builtin_bit_cast(unsigned, v), r, voff, soff, 0);
+ }
+--- a/gfx1250_mla_fwd/hip/k_mla_fwd.hip
++++ b/gfx1250_mla_fwd/hip/k_mla_fwd.hip
+@@ -376,9 +376,28 @@
+ #endif
+   tensor_wait<0>();  // no TDM write may land after the workgroup retires
+ 
+-  // ---- epilogue: per q tile, out = bf16(O^T / d) and lse = (m + log2 d) ln 2 ------------------------------------------
+-  const auto r_o = rsrc(O, (int)min((long long)B * Sq * H * D_V * 2, 0x7FFFFFFFll));
+-  const auto r_l = rsrc(LSE, (int)min((long long)B * H * Sq * 4, 0x7FFFFFFFll));
++  // ---- epilogue (round 5, edev1): LDS-staged, row-contiguous, straight-line writeback -------------------------------
++  // Phase 1, per q tile i: out = bf16(O^T / d), lse = (m + log2 d) ln 2 (FINAL_i / the HIP reference), staged in this
++  // wave's own Q rows (rows 16 wv + 64 i .. + 15 of the Q staging area: no other wave reads them, and this wave's
++  // reads of them completed in the tiles): O row r at XO r (FlyDSL's 272-B staging stride), the lse of lane l at
++  // LSE_SLOT + 4 l (lanes 0..15 = rows 0..15, the slots read back; lanes 16..31 hold the same rows' lse, unread).
++  // Phase 2, after FINAL_3: per q tile 8 row-contiguous buffer stores (lane l: q row 2 j + l / 16, bytes 16 (l % 16)
++  // .. + 15 of the 256-B row, FlyDSL's global_store_async_from_lds pattern; the FINAL fragment layout put 16 rows x 32
++  // B in every store), then one lse store. Straight-line from the first global store to s_endpgm, every address
++  // operand computed before it and never rewritten: rows q >= Sq are dropped by the buffer range check instead of an
++  // EXEC mask, so no EXEC / SGPR / address write, branch or s_set_vgpr_msb (each one waits for XCNT; fprof: ~1.9k
++  // cycles behind every FINAL) sits between the stores; the data quads (ds_load results) are the only registers
++  // rewritten, each reload waiting for the store 8 back (a rolling XCNT window). The LDS ops of one wave execute in
++  // order: the staging needs no counter wait, only the compiler barrier (no load moves above a store).
++  constexpr int XO = 272;
++  constexpr int LSE_SLOT = 16 * XO;
++  static_assert(LSE_SLOT + 32 * 4 <= 16 * XK, "the staging of a q tile fits in its 16 Q rows");
++  constexpr unsigned OOB = 0x80000000u;  // > every num_records (< 2^31) and + soffset < 2^32: dropped, no wrap
++  const unsigned stg = lds0 + Q_OFF + (unsigned)(16 * wv * XK);  // q tile i at stg + 64 i XK
++  // Phase 1 write addresses of the lane: O row l % 16, 16-B half l / 16, and lse slot l (the uniform tile base added
++  // per q tile, so the dt offsets stay immediates)
++  const unsigned wl = (unsigned)((lane & 15) * XO + (lane >> 4) * 16);
++  const unsigned wls = (unsigned)(LSE_SLOT + 4 * lane);
+   static_for<QT>([&](auto i) {
+     i32x32 ob;
+     float lse;
+@@ -400,15 +419,53 @@
+       asm volatile("; HKGEN FINAL_3 o=%0 lse=%1" : "=v"(ob), "=v"(lse) : : HKGEN_CLOBBERS);
+     }
+ #endif
+-    const int q = q0 + 16 * (wv + 4 * i) + (lane & 15);
+-    if (q < Sq) {
+-      const int obase = (int)((((long long)bb * Sq + q) * H + hh) * D_V + (lane >> 4) * 8) * 2;
+-      static_for<NDT>([&](auto dt) {
+-        buf_store_b128(u32x4{(unsigned)ob[4 * dt], (unsigned)ob[4 * dt + 1], (unsigned)ob[4 * dt + 2],
+-                             (unsigned)ob[4 * dt + 3]},
+-                       r_o, obase + dt * 32, 0);
+-      });
+-      if ((lane >> 4) == 0) buf_store_b32(lse, r_l, (int)((((long long)bb * H + hh) * Sq + q) * 4), 0);
+-    }
++    lds_u8w* const wp = lds_wptr((stg + (unsigned)(i * 64 * XK)) + wl);
++    static_for<NDT>([&](auto dt) {
++      lds_store_b128(wp, dt * 32,
++                     u32x4{(unsigned)ob[4 * dt], (unsigned)ob[4 * dt + 1], (unsigned)ob[4 * dt + 2],
++                           (unsigned)ob[4 * dt + 3]});
++    });
++    lds_store_b32(lds_wptr((stg + (unsigned)(i * 64 * XK)) + wls), 0, __builtin_bit_cast(unsigned, lse));
++    sched_barrier<0>();
++  });
++  wave_lds_order();
++
++  // Phase 2 addresses (all before the first global store):
++  //   O, q tile i: V# r_o[i] based at the tile's first row q0 + 64 i, soffset 2 j * row bytes (store j: rows 2 j,
++  //     2 j + 1), voffset vo_l (the lane's row 16 wv + l / 16 and 16-B column l % 16). The 64 rows of a tile are all
++  //     < Sq or all >= Sq (Sq % 64 == 0, the kernel's domain): a tile past Sq gets num_records 0 (all stores dropped).
++  //   lse: one ds_load_b64 + one buffer_store_b64 for the wave's 64 rows (lane l: q tile l / 8, rows 2 (l % 8) and
++  //     2 (l % 8) + 1 = the slots of lanes 2 (l % 8), + 1), a row past Sq gets voffset OOB (soffset null).
++  const long long o_bytes = (long long)B * Sq * H * D_V * 2;
++  const unsigned rsb = (unsigned)H * (unsigned)(D_V * 2);  // bytes per q row
++  __amdgpu_buffer_rsrc_t r_o[QT];
++  static_for<QT>([&](auto i) {
++    const bool ok = q0 + 64 * i < Sq;
++    const long long off = (((long long)bb * Sq + q0 + 64 * i) * H + hh) * (D_V * 2);
++    const long long rem = min(o_bytes - off, 0x7FFFFFFFll);
++    const long long off2 = ok ? off : 0ll;
++    const int nrec = ok ? (int)rem : 0;
++    r_o[i] = rsrc((const unsigned char*)O + off2, nrec);
++  });
++  const auto r_l = rsrc(LSE, (int)min((long long)B * H * Sq * 4, 0x7FFFFFFFll));
++  // the lane id again from v_mbcnt (not CSE-able with Phase 1's tid & 31: nothing lane-derived stays live across the
++  // FINAL markers but Phase 1's write address)
++  const int ln = (int)__builtin_amdgcn_mbcnt_lo(~0u, 0u);
++  const int hl = ln >> 4, rl = ln & 15, lt = ln >> 3, lk = ln & 7;
++  const unsigned vo_l = (unsigned)(16 * wv + hl) * rsb + (unsigned)(rl * 16);
++  const lds_u8* const rd0 = lds_ptr(stg + (unsigned)(hl * XO + rl * 16));                // q tiles 0..2
++  const lds_u8* const rd3 = lds_ptr(stg + (unsigned)(3 * 64 * XK + hl * XO + rl * 16));  // q tile 3
++  const u32x2 lsev = lds_load_u32x2(lds_ptr(stg + (unsigned)(lt * 64 * XK + LSE_SLOT + 8 * lk)), 0);
++  const unsigned lq = (unsigned)(q0 + 16 * wv + 64 * lt + 2 * lk);
++  const unsigned la = (((unsigned)bb * (unsigned)H + (unsigned)hh) * (unsigned)Sq + lq) * 4u;
++  const unsigned lo = q0 + 64 * lt < Sq ? la : OOB;
++  sched_barrier<0>();
++  static_for<QT>([&](auto i) {
++    static_for<NDT>([&](auto j) {
++      const u32x4 w = i < 3 ? lds_load_u32x4(rd0, i * 64 * XK + 2 * j * XO) : lds_load_u32x4(rd3, 2 * j * XO);
++      buf_store_b128(w, r_o[i], (int)vo_l, (int)((unsigned)(2 * j) * rsb));
++    });
++    sched_barrier<0>();
+   });
++  buf_store_b64(lsev, r_l, (int)lo, 0);
+ }
+--- a/gfx1250_mla_fwd/README.md
++++ b/gfx1250_mla_fwd/README.md
+@@ -2,8 +2,9 @@
+ 
+ Causal attention forward of the DeepSeek-V3 MLA head dims (q/k 192, v 128, bf16, MHA, bottom-right causal) on gfx1250,
+ bit for bit the shipped FlyDSL forward (`primus_turbo/flydsl/attention/gfx1250_mla`): same out (bf16) and lse (fp32,
+-natural log). Status: round 5, step S1b (cross-tile software pipeline, CPU-built and CPU-checked; the W-S1a2 / S1a3
+-candidates passed the GPU gates bit for bit, but were 12-14 % slower than FlyDSL). Not wired into Turbo: the
++natural log). Status: round 5, step S1b + edev1 epilogue (cross-tile software pipeline; LDS-staged, row-contiguous,
++straight-line writeback; CPU-built and CPU-checked; S1b_A passed the GPU gates bit for bit at 0.815 ms, 10 % slower than
++FlyDSL, ~13 % of it in the old epilogue's store waits). Not wired into Turbo: the
+ Python integration (`impl.py`, `hsaco.py`, manifest, the `PRIMUS_TURBO_MLA_FWD_IMPL` switch, tests) is FWD-INT's.
+ 
+ ## Layout
+@@ -44,7 +45,9 @@
+ - one `s_barrier_signal` per TILE region (after `s_wait_dscnt 0` + `s_wait_tensorcnt 6`), none elsewhere;
+ - MSB mode 0 at every region end; no hazard left open (re-walk with asmkit's model from an unknown entry state);
+ - the shell's code holds no WMMA / TRANS (no hazard into a region); every marker runs with all lanes; the shell never
+-  references `s90..s103` and writes `vcc` / `scc` before reading them after every marker.
++  references `s90..s103` and writes `vcc` / `scc` before reading them after every marker;
++- every FINAL region ends with `s_wait_alu depctr_va_vdst(0)` (edev1): its outputs are VALU results and LLVM, which
++  does not see the inline asm's VALU writes, inserts no wait before the shell's first read of them (expert mode).
+ 
+ ## Build recipe
+ 
+@@ -55,7 +58,7 @@
+ python3 primus_turbo/hipkittens/gfx1250_mla_fwd/gen/build.py --out OUT [--sched list|program|slot] [--asmkit-root DIR]
+     [--diag] [--csgpr] [--qgroup none|pair|late] [--worder TAGS] [--trans-cost N] [--defer3|--defer2]
+     [--ds-lat N] [--ds-rate N] [--ds-first] [--pipe [--pipe-tree body|prefix] [--pipe-vafter pv|qk0]
+-    [--pipe-dsentry]] [--seed N]
++    [--pipe-dsentry] [--pipe-q3after] [--arrive-lat N]] [--seed N]
+ ```
+ 
+ The shipped candidates (W-S1a2) are built with
+@@ -90,6 +93,43 @@
+ (B: `--csgpr --trans-cost 3 --diag --pipe --ds-lat 290 --ds-first --ds-rate 8 --pipe-tree body --pipe-vafter pv
+ --pipe-dsentry`, the same structure under the greedy list scheduler).
+ 
++Round 5, iteration 2 (fwddev2; the S1b candidates passed the GPU gates bit for bit but ran 9.6 % / 11 % slower than
++FlyDSL): two more options of the same pipeline, still inside the unchanged marker shell (shell `.s` and HIP REF
++byte-identical). `--pipe-q3after` puts the arrive before Q(3)'s reads in program order (arrive -> Q(3) order edges:
++the arrive retires only the stage's K / V reads and Q(0); the Q staging area is outside the ring) and `--arrive-lat N`
++is the slot scheduler's load -> arrive latency (model only). Candidate A' (single-variable test of the late arrive,
++after WMMA #99 instead of #132) and candidate A2 (the slot schedule for the r4_params "measured" issue model: short
++LDS latency, V reads after QK(0)):
++
++```
++A':  build.py --out OUT --sched slot --csgpr --diag --pipe --ds-lat 290 --ds-first --ds-rate 6 --pipe-vafter pv \
++         --pipe-tree body --pipe-dsentry --pipe-q3after --arrive-lat 100
++A2:  build.py --out OUT --sched slot --csgpr --diag --pipe --ds-lat 150 --ds-first --ds-rate 4 --pipe-vafter qk0 \
++         --pipe-tree body --pipe-dsentry
++```
++
++Round 5, edev1 (the epilogue; fprof: the 4 O / 3 lse store batches of S1b_A waited ~10.5k cycles per workgroup, ~13 %
++of the kernel, on `s_wait_xcnt 0` before every EXEC change / branch / reuse of the output registers, while the
++16-row-scattered stores translated): the generated code is unchanged (the regions of a recipe are S1b's, up to the
++registers LLVM gives the marker operands, plus the FINAL output drain above); the shell's epilogue is new:
++- Phase 1, per q tile: FINAL_i (or the HIP reference), then this wave's `ds_store`s of out into its own 16 Q rows of the
++  staging area (no other wave reads them; this wave's reads of them are complete) at FlyDSL's 272-B row stride, and of
++  lse into a 32-slot array after them;
++- Phase 2, after FINAL_3 (no `s_set_vgpr_msb` after it, so no implicit XCNT drain): per q tile 8 `ds_load_b128` +
++  `buffer_store_b128` with whole rows per store (lane l: row 2 j + l / 16, bytes 16 (l % 16), FlyDSL's
++  `global_store_async_from_lds` pattern), one `ds_load_b64` + `buffer_store_b64` for the 64 lse. Straight-line from the
++  first store to `s_endpgm`: rows >= Sq are dropped by the buffer range check (a tile past Sq gets a descriptor with
++  num_records 0, an lse row past Sq voffset 0x80000000) instead of an EXEC mask; every address operand (per-tile
++  descriptors, soffsets 2 j * row bytes, the lane's voffset, the LDS read bases) is computed before the first store,
++  so the only registers rewritten while stores are in flight are the data quads, each reload behind LLVM's
++  `s_wait_xcnt N` for the store 8 back (a rolling window instead of a drain per q tile);
++- one wave's LDS stores / loads execute in order (the backward's epilogue relies on the same): no counter wait between
++  the staging and the read-back, only a compiler barrier (`wave_lds_order`).
++`build.py` checks the store phase (`checks.writeback` in build.json): no branch, EXEC / SGPR write or `s_set_vgpr_msb`
++inside it, no rewrite of an in-flight store's address VGPR, a data VGPR rewritten only by a `ds_load` behind an
++`s_wait_xcnt` that retires its store, every epilogue `ds_store` before every `ds_load`. Candidate E1 = the S1b_A recipe
++with this shell (the REF, `-DHKGEN_REF=1` of the same file, changes with it).
++
+ 1. `amdclang++ -x hip --offload-arch=gfx1250 --cuda-device-only --no-gpu-bundle-output -O3 -std=c++20 -DNDEBUG -I.
+    -save-temps=obj -mllvm -amdgpu-expert-scheduling-mode -cuid=k_mla_fwd -DHKGEN_REF=0 -c hip/k_mla_fwd.hip`
+    (cwd `hip/`); the saved `.s` is `OUT/shell.s`. The same with `-DHKGEN_REF=1` gives `OUT/ref/k_mla_fwd.hsaco`

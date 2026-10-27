@@ -1,0 +1,1078 @@
+--- a/gfx1250_mla_fwd/gen/build.py
++++ b/gfx1250_mla_fwd/gen/build.py
+@@ -22,9 +22,9 @@
+     global / buffer / flat / scratch / SMEM store / TDM in generated code), VGPR defs only in the generated range or
+     the marker outputs, SGPR defs only in the clobbered set, no exec / m0 writes, LDS read bases and offsets, one
+     s_barrier_signal per TILE, MSB mode 0 at every region end, no WMMA / TRANS in the shell's code;
+- 7. the shell's store phase (edev1, `writeback_check`): straight-line from the first global store to s_endpgm, no
+-    rewrite of an in-flight store's address / scalar operands, data registers reloaded only behind XCNT waits, the
+-    LDS staging stores ahead of the read-back;
++ 7. the shell's store phases (edev1, `writeback_check`; edev2: one per block, ending at the loop's back edge or
++    s_endpgm): straight-line, no rewrite of a store operand whose translation may be pending (XCNT waits), data
++    registers reloaded only by the staging ds_loads, the LDS staging stores ahead of the read-back;
+  8. --ref: also build the HIP reference variant (HKGEN_REF=1) as DIR/ref/k_mla_fwd.hsaco.
+ Writes DIR/build.json (recipe, tool versions, sha256s, register map, check results). Exit 1 on any failed check."""
+ 
+@@ -510,79 +510,103 @@
+ 
+ 
+ def writeback_check(objdump, fail):
+-    """The epilogue's global stores (edev1): from the first VMEM store to s_endpgm the code is straight-line and never
+-    rewrites an operand of an in-flight store except through LLVM's XCNT waits on the staged data quads:
+-      no branch, no EXEC / M0 write, no s_set_vgpr_msb (each one drains XCNT), no SGPR write at all (soffsets and
+-      descriptors are computed before the first store), no write of a VGPR that an earlier store used as its ADDRESS;
+-      a write of an earlier store's DATA VGPR only from a ds_load right after an s_wait_xcnt that retires that store
+-      (in-order XCNT: the store has at most N younger stores);
+-    and the store phase is the only VMEM in the kernel after the last TILE (the O / LSE writes of every q tile)."""
++    """The epilogue's global stores (edev1; edev2: the block loop): every store phase -- from a VMEM store to the next
++    branch or s_endpgm (both drain XCNT: SIInstrInfo::isXcntDrain), the loop's back edge included -- is straight-line
++    code that never rewrites an operand of a store whose address translation may still be pending:
++      no branch inside it (by construction), no EXEC / M0 write, no s_set_vgpr_msb (each one drains XCNT);
++      a write of any register an earlier store of the phase reads (data, address VGPR, srsrc, soffset) only behind an
++      s_wait_xcnt N that retires that store (in-order XCNT: at most N younger stores in flight);
++      the data VGPRs are rewritten only by ds_loads (the staged quads); every other rewrite of a store operand is
++      counted (`early_waits`: an s_wait_xcnt before a non-load write, i.e. a stall inside the phase);
++    the store phase is ONE (all the VMEM stores of the kernel: the O / LSE writes of every q tile of a block), and the LDS staging
++    of a phase (from the barrier wait before its first FINAL marker on) has every ds_store before every ds_load."""
+     from asmkit.isa import load_any, regs_of, sgpr_defs_uses
+ 
+     _, ins, _ = load_any(objdump)
+     seq = [x for x in ins if x.mn and x.cls not in ("LABEL", "DIR")]
+-    first = next((k for k, x in enumerate(seq) if x.mn.startswith(("buffer_store", "global_store"))), None)
+-    end = next((k for k, x in enumerate(seq) if x.mn == "s_endpgm"), None)
+-    res = {"stores": 0, "xcnt_waits": [], "first": first, "end": end}
+-    if first is None or end is None or end < first:
+-        fail.append("writeback: no store phase before s_endpgm")
++    is_store = lambda x: x.mn.startswith(("buffer_store", "global_store"))  # noqa: E731
++    is_end = lambda x: x.mn == "s_endpgm" or x.mn.startswith(("s_branch", "s_cbranch", "s_setpc", "s_swappc"))  # noqa: E731
++    res = {"phases": [], "stores": 0, "early_waits": 0}
++    allst = [k for k, x in enumerate(seq) if is_store(x)]
++    if not allst:
++        fail.append("writeback: no store phase")
+         return res
+-    stores = []  # (data regs, addr regs) of the stores issued so far, oldest first
+-    pend = None  # an s_wait_xcnt N seen and not yet consumed
+-    for k in range(first, end + 1):
+-        x = seq[k]
+-        t = x.text.strip()
+-        mn = x.mn
+-        if mn == "s_endpgm":
+-            break
+-        if mn.startswith(("s_branch", "s_cbranch", "s_set_vgpr_msb", "s_setpc", "s_getpc", "s_swappc")):
+-            fail.append(f"writeback: {t} inside the store phase")
+-        sd, _ = sgpr_defs_uses(x)
+-        if mn == "s_sendmsg" and "MSG_DEALLOC_VGPRS" in t:
+-            continue  # LLVM's VGPR release right before s_endpgm (the HIP reference has it)
+-        if sd and mn not in ("s_wait_xcnt", "s_wait_dscnt", "s_wait_alu", "s_nop"):
+-            fail.append(f"writeback: scalar write {sd} inside the store phase: {t}")
+-        if mn == "s_wait_xcnt":
+-            pend = int(x.ops[0], 0)
+-            res["xcnt_waits"].append(pend)
+-            continue
+-        if mn.startswith(("buffer_store", "global_store")):
+-            ops = [o.strip() for o in x.ops]
+-            dregs = set(regs_of(ops[0]))
+-            aregs = set(regs_of(ops[1])) if len(ops) > 1 else set()
+-            stores.append((dregs, aregs))
+-            res["stores"] += 1
+-            pend = None
+-            continue
+-        if mn.startswith(("buffer_", "global_", "flat_", "scratch_", "tensor_")):
+-            fail.append(f"writeback: other memory op inside the store phase: {t}")
+-            continue
+-        for r in x.defs:
+-            if any(r in a for _, a in stores):
+-                fail.append(f"writeback: rewrites the address VGPR v{r} of an in-flight store: {t}")
+-            hit = [j for j, (d, _) in enumerate(stores) if r in d]
+-            if hit:
+-                j = max(hit)
+-                younger = len(stores) - 1 - j
+-                if not mn.startswith("ds_load") or pend is None or pend > younger:
++    k = allst[0]
++    covered = set()
++    while k is not None:
++        first = k
++        stores = []  # (data regs, other operand regs (address VGPRs, srsrc / soffset SGPRs)), oldest first
++        retired = 0
++        pend = None
++        ph = {"first": first, "stores": 0, "xcnt_waits": []}
++        while not is_end(seq[k]):
++            x = seq[k]
++            t = x.text.strip()
++            mn = x.mn
++            if mn.startswith("s_set_vgpr_msb"):
++                fail.append(f"writeback: {t} inside a store phase")
++            sd, su = sgpr_defs_uses(x)
++            dst = t.split(",")[0].split()[-1] if t else ""
++            if (
++                any(r in ("exec_lo", "exec_hi", "exec", "m0") for r in sd)
++                or "saveexec" in mn
++                or re.fullmatch(r"(exec(_lo|_hi)?|m0)", dst)
++            ):
++                fail.append(f"writeback: EXEC / M0 write inside a store phase: {t}")
++            if mn == "s_wait_xcnt":
++                pend = int(x.ops[0], 0)
++                retired = max(retired, len(stores) - pend)
++                ph["xcnt_waits"].append(pend)
++                k += 1
++                continue
++            if is_store(x):
++                ops = [o.strip() for o in x.ops]
++                dregs = {f"v{r}" for r in regs_of(ops[0])}
++                oth = ({f"v{r}" for r in regs_of(ops[1])} if len(ops) > 1 else set()) | {
++                    r for r in su if not r.startswith(("exec", "m0"))
++                }
++                stores.append((dregs, oth))
++                covered.add(k)
++                ph["stores"] += 1
++                pend = None
++                k += 1
++                continue
++            if mn.startswith(("buffer_", "global_", "flat_", "scratch_")):
++                fail.append(f"writeback: other VMEM op inside a store phase: {t}")
++            wr = {f"v{r}" for r in x.defs} | set(sd)
++            for j in range(retired, len(stores)):
++                d, o = stores[j]
++                hit = wr & (d | o)
++                if hit:
+                     fail.append(
+-                        f"writeback: rewrites data VGPR v{r} of store #{j} ({younger} younger) without an "
+-                        f"s_wait_xcnt <= {younger}: {t}"
++                        f"writeback: rewrites {sorted(hit)} of store #{j} of the phase (translation pending, "
++                        f"{len(stores) - 1 - j} younger) without an s_wait_xcnt retiring it: {t}"
+                     )
+-        if not mn.startswith("s_wait"):
+-            pend = pend if mn.startswith("ds_load") else None
+-    vm_after = [x.text.strip() for x in seq[end + 1 :] if x.mn.startswith(("buffer_", "global_store"))]
+-    res["vmem_after_endpgm"] = len(vm_after)
+-    # the LDS staging: from the last TILE marker's barrier wait to s_endpgm, every ds_store precedes every ds_load
+-    # (the compiler kept the stores of all four q tiles ahead of the reads: cross-lane data of one wave, in-order LDS)
+-    lastbar = max(k for k, x in enumerate(seq[:end]) if x.mn == "s_barrier_wait")
+-    dss = [k for k in range(lastbar, end) if seq[k].mn.startswith("ds_store")]
+-    dsl = [k for k in range(lastbar, end) if seq[k].mn.startswith("ds_load")]
+-    res["staging"] = {"ds_store": len(dss), "ds_load": len(dsl)}
+-    if dss and dsl and max(dss) > min(dsl):
+-        fail.append("writeback: an epilogue ds_load precedes a ds_store (staging order)")
+-    if any(k >= first for k in dss):
+-        fail.append("writeback: a ds_store inside the store phase")
++            if any(wr & (d | o) for d, o in stores[:retired]):
++                if not mn.startswith("ds_load"):
++                    res["early_waits"] += 1
++            if not mn.startswith("s_wait"):
++                pend = pend if mn.startswith("ds_load") else None
++            k += 1
++        ph["end"] = seq[k].text.strip()[:40] or seq[k].mn
++        res["stores"] += ph["stores"]
++        res["phases"].append(ph)
++        k = next((j for j in allst if j > k), None)
++    if covered != set(allst):
++        fail.append("writeback: a store outside the store phases")
++    if len(res["phases"]) != 1:
++        fail.append(
++            f"writeback: {len(res['phases'])} store phases (the block's stores must form ONE straight-line phase "
++            f"ending at the back edge / s_endpgm: {[p['end'] for p in res['phases']]})"
++        )
++    # the LDS staging of each phase: from the last s_barrier_wait before the phase's first FINAL-region store on
++    for ph in res["phases"]:
++        lastbar = max((j for j in range(ph["first"]) if seq[j].mn == "s_barrier_wait"), default=0)
++        dss = [j for j in range(lastbar, ph["first"]) if seq[j].mn.startswith("ds_store")]
++        dsl = [j for j in range(lastbar, ph["first"]) if seq[j].mn.startswith("ds_load")]
++        ph["staging"] = {"ds_store": len(dss), "ds_load": len(dsl)}
++        if dss and dsl and max(dss) > min(dsl):
++            fail.append("writeback: an epilogue ds_load precedes a ds_store (staging order)")
+     return res
+ 
+ 
+@@ -628,7 +652,7 @@
+         name = region_of.get(k)
+         if name is None:
+             continue
+-        st = stats.setdefault(name, {"insts": 0, "signal": 0, "ds": 0, "wmma": 0})
++        st = stats.setdefault(name, {"insts": 0, "signal": 0, "ds": 0, "wmma": 0, "ds_after_signal": 0})
+         st["insts"] += 1
+         mn = x.mn.replace("_e32", "").replace("_e64", "")
+         if not mn.startswith(ALLOWED) and mn not in ALLOWED:
+@@ -643,6 +667,8 @@
+             fail.append(f"{name}: writes scalars outside the clobbered set: {sd} {x.text.strip()}")
+         if x.mn.startswith("ds_"):
+             st["ds"] += 1
++            if st["signal"]:
++                st["ds_after_signal"] += 1
+             ok_base = {L.qa, L.qb}
+             if name.startswith("TILE"):
+                 ok_base |= {vfirst(ops_of[name]["kb"]), vfirst(ops_of[name]["vb"])}
+@@ -665,6 +691,10 @@
+             fail.append(f"{name}: {st.get('signal', 0)} s_barrier_signal, want {want}")
+         if msb_mode.get(name, 0) != 0:
+             fail.append(f"{name}: MSB mode {msb_mode[name]:#x} at the region end")
++        # edev2: the next block's Q TDM is issued right after a block's last barrier and overwrites the whole Q area,
++        # so no TILE region may read LDS after its s_barrier_signal (A'-type recipes would race with it)
++        if st.get("ds_after_signal", 0):
++            fail.append(f"{name}: {st['ds_after_signal']} LDS reads after the s_barrier_signal (edev2 Q prefetch race)")
+     return stats
+ 
+ 
+--- a/gfx1250_mla_fwd/hip/k_mla_fwd.hip
++++ b/gfx1250_mla_fwd/hip/k_mla_fwd.hip
+@@ -13,11 +13,14 @@
+ //   out = bf16(O * (d > 0 ? 1 / d : 0)), lse = (m + log2 d) * ln 2. O is multiplied by corr on every tile (corr is
+ //   exactly 1 when m did not move), and the fully masked q tiles of the diagonal tiles run as exact no-ops.
+ //
+-// grid (ceil(Sq / 256), H, B) through FlyDSL's longest-first / head-grouped block remap; block 128 = 4 waves, one per
+-// SIMD, one workgroup per CU (LDS 274432 B). Wave w owns the 16-row q tiles {w, w + 4, w + 8, w + 12} of the 256-row
+-// block (slot i = tile w + 4 i). K / V go through a 4-stage LDS ring of 64-kv tiles (K 64 x 400 B, V 64 x 272 B; wave
+-// 0 issues the 3 TDM ops of tile t + 3 at the start of tile t, branch-free: waves 1..3 issue NULL descriptors, and
+-// past the last tile a 1-row copy of tile n - 1 into the free stage). Q stays in its LDS staging area for the block.
++// One q block of 256 rows per workgroup (npw == 0: grid (ceil(Sq / 256), H, B) through FlyDSL's longest-first /
++// head-grouped block remap), or (edev2, npw > 0: grid (npw, 1, 1)) a persistent workgroup running a static list of q
++// blocks (see the schedule below); block 128 = 4 waves, one per SIMD, one workgroup per CU (LDS 310272 B). Wave w owns
++// the 16-row q tiles {w, w + 4, w + 8, w + 12} of the 256-row block (slot i = tile w + 4 i). K / V go through a
++// 4-stage LDS ring of 64-kv tiles (K 64 x 400 B, V 64 x 272 B; wave 0 issues the 3 TDM ops of ring slot t + 3 at the
++// start of tile t, branch-free: waves 1..3 issue NULL descriptors; past a block's last tile the slots carry the next
++// block's tiles 0..2, past the last block a 1-row copy of tile n - 1 into the free stage). Q stays in its LDS staging
++// area for the block; the next block's Q is issued right after the block's last tile, behind the epilogue.
+ //
+ // This file is the SHELL (LLVM compiles the prologue, the TDM descriptors and issue, the ring barriers' waits, the
+ // loop control and the O / LSE stores). The per-tile work is spliced in after compilation at the HKGEN markers, inline
+@@ -79,8 +82,17 @@
+ constexpr int STG_B = K_B + V_B;   // 43008
+ constexpr int NSTG = 4;
+ constexpr int Q_OFF = NSTG * STG_B;     // 172032
+-constexpr int LDS_B = Q_OFF + BM * XK;  // 274432
++constexpr int TAIL = Q_OFF + BM * XK;   // 274432: the epilogue staging of q tiles 2, 3 (edev2)
++// epilogue staging (edev1 layout, edev2 places): per wave and q tile SQT bytes, O row r at XO r (16 rows), the lse of
++// lane l at LSE_SLOT + 4 l; q tiles 0, 1 of the 4 waves in the free ring stage, q tiles 2, 3 in the tail area
++constexpr int XO = 272;
++constexpr int LSE_SLOT = 16 * XO;          // 4352
++constexpr int SQT = LSE_SLOT + 32 * 4;     // 4480
++constexpr int LDS_B = TAIL + 2 * 4 * SQT;  // 310272
++static_assert(2 * 4 * SQT <= STG_B, "the staging of q tiles 0, 1 fits in one ring stage");
++static_assert(SQT % 16 == 0 && STG_B % 16 == 0, "16-byte aligned staging slots");
+ static_assert(LDS_B <= 327680 && 2 * LDS_B > 327680, "one workgroup per CU");
++constexpr unsigned OOB = 0x80000000u;  // > every num_records (< 2^31) and + soffset < 2^32: dropped, no wrap
+ constexpr unsigned W0_A = 0x47510000u;  // 128 columns, pad 72 elements -> 400-B rows
+ constexpr unsigned W0_B = 0x87110000u;  // 64 columns, pad 136 elements -> 400-B rows
+ constexpr unsigned W0_V = 0x07510000u;  // 128 columns, pad 8 elements -> 272-B rows
+@@ -163,309 +175,403 @@
+ #endif
+ }  // namespace
+ 
++// The kernel arguments as the kernarg segment holds them (natural alignment, in order): the block loop reads them
++// from the segment per q block (k_args), so LLVM keeps no argument-derived value live across blocks.
++struct KArgs {
++  const bf16* Q;
++  const bf16* K;
++  const bf16* V;
++  bf16* O;
++  float* LSE;
++  float scale;
++  int Sq, Skv, H, B, nqb, npw;
++};
++static_assert(sizeof(KArgs) == 72 && __builtin_offsetof(KArgs, npw) == 64, "kernarg layout");
++
+ extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+ void k_mla_fwd(const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf16* __restrict__ V,
+-               bf16* __restrict__ O, float* __restrict__ LSE, float scale, int Sq, int Skv, int H, int B, int nqb) {
++               bf16* __restrict__ O, float* __restrict__ LSE, float scale, int Sq, int Skv, int H, int B, int nqb,
++               int npw) {
+   __shared__ __attribute__((aligned(1024))) unsigned char smem[LDS_B];
+   lock_simd();
+-  const uint32_t lds0 = lds_addr(smem);
+-  const int tid = (int)__builtin_amdgcn_workitem_id_x();
+-  const int lane = tid & 31;
+-  const int wv = wave_id(tid);
+-  int qb, hh, bb;
+-  block_ids(nqb, H, B, qb, hh, bb);
+-  const int q0 = qb * BM;
+-  const int cshift = Skv - Sq;
+-  const int qv = min(q0 + BM, Sq);
+-  const int n = (qv + cshift + NB - 1) / NB;          // 64-kv tiles (ring stages) of the block
+-  const int ncc = min((q0 + cshift + 1) / NB, n);     // tiles [0, ncc) need no mask for any row of the block
+-  const float c2 = scale * LOG2E;
+-
+-  const unsigned long long krow = (unsigned long long)H * D_QK;
+-  const unsigned long long vrow = (unsigned long long)H * D_V;
+-  const unsigned long long gk0 = (unsigned long long)(uintptr_t)K + 2ull * (((unsigned long long)bb * Skv * H + hh) * D_QK);
+-  const unsigned long long gv0 = (unsigned long long)(uintptr_t)V + 2ull * (((unsigned long long)bb * Skv * H + hh) * D_V);
+-  const unsigned long long gq0 =
+-      (unsigned long long)(uintptr_t)Q + 2ull * ((((unsigned long long)bb * Sq + q0) * H + hh) * D_QK);
+-
+-  auto issue_tile = [&](int t) {
+-    const int kv0 = t * NB;
+-    const unsigned st = lds0 + (unsigned)((t & (NSTG - 1)) * STG_B);
+-    const unsigned rows = (unsigned)(Skv - kv0);
+-    const unsigned long long gk = gk0 + 2ull * (unsigned long long)kv0 * krow;
+-    const unsigned long long gv = gv0 + 2ull * (unsigned long long)kv0 * vrow;
+-    tdm_load(tdm_g0(st, gk), tdm_g1(W0_A, rows, 128, NB, krow));
+-    tdm_load(tdm_g0(st + 256, gk + 256), tdm_g1(W0_B, rows, 64, NB, krow));
+-    tdm_load(tdm_g0(st + K_B, gv), tdm_g1(W0_V, rows, 128, NB, vrow));
+-  };
+-  // branch-free in-loop issue (every wave executes it, waves 1..3 with NULL descriptors): tile t into stage t % 4, or
+-  // -- past the last tile -- a 1-row copy of tile n - 1 into that (free) stage, so wave 0 keeps exactly 3 ops per tile
+-  // in flight and its tensor waits stay static.
+-  const int cnt0 = wv == 0 ? 1 : 0;
+-  auto issue_tile_bf = [&](int t) {
+-    const bool real = t < n;
+-    const int kv0 = (real ? t : n - 1) * NB;
+-    const unsigned st = lds0 + (unsigned)((t & (NSTG - 1)) * STG_B);
+-    const unsigned rows = (unsigned)(Skv - kv0);
+-    const unsigned th = real ? NB : 1;
+-    const unsigned long long gk = gk0 + 2ull * (unsigned long long)kv0 * krow;
+-    const unsigned long long gv = gv0 + 2ull * (unsigned long long)kv0 * vrow;
+-    tdm_load(tdm_g0(st, gk, cnt0), tdm_g1(W0_A, rows, 128, th, krow));
+-    tdm_load(tdm_g0(st + 256, gk + 256, cnt0), tdm_g1(W0_B, rows, 64, th, krow));
+-    tdm_load(tdm_g0(st + K_B, gv, cnt0), tdm_g1(W0_V, rows, 128, th, vrow));
+-  };
+-
+-  // ---- prologue: tiles 0..2 in flight, Q staged; barrier B_0 = Q and tile 0 visible ---------------------------------
+-  if (wv == 0) {
+-    issue_tile(0);
+-    issue_tile_bf(1);
+-    issue_tile_bf(2);
+-    tensor_wait<6>();
+-  } else if (wv == 1) {
+-    tdm_load(tdm_g0(lds0 + Q_OFF, gq0), tdm_g1(W0_A, (unsigned)(Sq - q0), 128, BM, krow));
+-    tensor_wait<0>();
+-  } else if (wv == 2) {
+-    tdm_load(tdm_g0(lds0 + Q_OFF + 256, gq0 + 256), tdm_g1(W0_B, (unsigned)(Sq - q0), 64, BM, krow));
+-    tensor_wait<0>();
++  const uint32_t lds0k = lds_addr(smem);
++  const int wvk = wave_id((int)__builtin_amdgcn_workitem_id_x());
++  (void)Q, (void)K, (void)V, (void)O, (void)LSE, (void)scale, (void)Sq, (void)Skv, (void)H, (void)B, (void)nqb;
++
++  // ---- the schedule (edev2) --------------------------------------------------------------------------------------
++  // npw == 0: one q block per workgroup, grid (nqb, H, B) through FlyDSL's remap (block_ids), as before.
++  // npw > 0 (persistent; grid (npw, 1, 1); the host enables it only for Sq == Skv, Sq % 256 == 0, H * B % 8 == 0,
++  // (npw / 8) % nqb == 0 and an even number of steps): a static schedule, no atomics, no inter-workgroup dependence.
++  // Workgroup w: group x = w % 8 (the XCD of the round-robin dispatch: L2 locality only, correctness does not depend
++  // on it), slot w / 8 = r nqb + i. Step s: head-batch hb = 8 (R s + r) + x (R = npw / 8 / nqb heads per group and
++  // step), q block i on even steps and nqb - 1 - i on odd ones: every (q block, hb) exactly once, and every two steps
++  // each workgroup runs 4 (nqb + 1) tiles (perfect balance on full causal grids).
++  //
++  // HKF_BLOCK(z): the per-block view of the arguments and the helpers, z = 0 always. In the block loop z is derived
++  // from the loop counter (LLVM cannot prove it 0) and the arguments are re-read from the kernarg segment at an
++  // offset of 48 z (16-byte aligned, and not a load-size multiple: an unscaled SGPR soffset, no scale_offset form):
++  // nothing argument-derived is hoisted out of the loop and kept live across it (the shell's state must fit in the
++  // SGPRs the markers leave it, without spills).
++#define HKF_BLOCK(z)                                                                                                 \
++  const KArgs ka = *(const __attribute__((address_space(4))) KArgs*)(                                                \
++      (const __attribute__((address_space(4))) unsigned char*)__builtin_amdgcn_kernarg_segment_ptr() + 48 * (z));    \
++  const int Sq_ = ka.Sq, Skv_ = ka.Skv, H_ = ka.H, B_ = ka.B, nqb_ = ka.nqb, npw_ = ka.npw;                          \
++  const uint32_t lds0 = lds0k + (unsigned)(z);                                                                       \
++  const int wv = wvk + (z);                                                                                          \
++  const int cnt0 = wv == 0 ? 1 : 0;                                                                                  \
++  const int cshift = Skv_ - Sq_;                                                                                     \
++  const unsigned long long krow = (unsigned long long)H_ * D_QK;                                                     \
++  const unsigned long long vrow = (unsigned long long)H_ * D_V;                                                      \
++  auto block_at = [&](int s_, int& qb, int& hh, int& bb) -> bool {                                                   \
++    if (npw_ > 0) {                                                                                                  \
++      const int wg = (int)__builtin_amdgcn_workgroup_id_x();                                                         \
++      const int pr = (wg >> 3) / nqb_, pq = (wg >> 3) - pr * nqb_, pR = (npw_ >> 3) / nqb_;                          \
++      const int hx = pR * s_ + pr;                                                                                   \
++      const bool ok = pr < pR && hx < ((H_ * B_) >> 3);                                                              \
++      const int hb = ok ? 8 * hx + (wg & 7) : 0;                                                                     \
++      qb = ok ? ((s_ & 1) ? nqb_ - 1 - pq : pq) : 0;                                                                 \
++      hh = hb % H_;                                                                                                  \
++      bb = hb / H_;                                                                                                  \
++      return ok;                                                                                                     \
++    }                                                                                                                \
++    block_ids(nqb_, H_, B_, qb, hh, bb);                                                                             \
++    return s_ == 0;                                                                                                  \
++  };                                                                                                                 \
++  auto ntiles = [&](int qb) { return (min(qb * BM + BM, Sq_) + cshift + NB - 1) / NB; };                             \
++  auto kv_base = [&](int hh, int bb, unsigned long long& gk, unsigned long long& gv) {                               \
++    gk = (unsigned long long)(uintptr_t)ka.K + 2ull * (((unsigned long long)bb * Skv_ * H_ + hh) * D_QK);            \
++    gv = (unsigned long long)(uintptr_t)ka.V + 2ull * (((unsigned long long)bb * Skv_ * H_ + hh) * D_V);             \
++  };                                                                                                                 \
++  /* wave 0's 3 TDM ops of ring slot t of a block (stage (sb + t) % 4): its tile t, or past its last tile a 1-row */ \
++  /* copy of tile n - 1 into that (free) stage; branch-free: waves 1..3 issue NULL descriptors, so wave 0 keeps   */ \
++  /* exactly 3 ops per tile in flight and its tensor waits stay static                                           */ \
++  auto issue_slot = [&](int t, int n, int sb, unsigned long long gk0, unsigned long long gv0) {                      \
++    const bool real = t < n;                                                                                         \
++    const int kv0 = (real ? t : n - 1) * NB;                                                                         \
++    const unsigned long long gk = gk0 + 2ull * (unsigned long long)kv0 * krow;                                       \
++    const unsigned long long gv = gv0 + 2ull * (unsigned long long)kv0 * vrow;                                       \
++    const unsigned th = real ? NB : 1;                                                                               \
++    const unsigned rows = (unsigned)(Skv_ - kv0);                                                                    \
++    const unsigned st = lds0 + (unsigned)(((sb + t) & (NSTG - 1)) * STG_B);                                          \
++    tdm_load(tdm_g0(st, gk, cnt0), tdm_g1(W0_A, rows, 128, th, krow));                                              \
++    tdm_load(tdm_g0(st + 256, gk + 256, cnt0), tdm_g1(W0_B, rows, 64, th, krow));                                    \
++    tdm_load(tdm_g0(st + K_B, gv, cnt0), tdm_g1(W0_V, rows, 128, th, vrow));                                         \
++  };                                                                                                                 \
++  /* a block's prologue loads, branch-free (every wave issues the same 11 TDM ops, NULL descriptors where the op */ \
++  /* is not its own): Q columns 0..127 (wave 1) and 128..191 (wave 2) into the Q staging area, then the block's  */ \
++  /* tiles 0..2 = ring slots 0..2 (wave 0). B_0: every wave s_wait_tensorcnt 0 (whatever NULL descriptors count) */ \
++  auto issue_block = [&](int qb, int hh, int bb, int sb) {                                                           \
++    const int q0 = qb * BM;                                                                                          \
++    const unsigned long long gq =                                                                                    \
++        (unsigned long long)(uintptr_t)ka.Q + 2ull * ((((unsigned long long)bb * Sq_ + q0) * H_ + hh) * D_QK);       \
++    tdm_load(tdm_g0(lds0 + Q_OFF, gq, wv == 1 ? 1 : 0), tdm_g1(W0_A, (unsigned)(Sq_ - q0), 128, BM, krow));          \
++    tdm_load(tdm_g0(lds0 + Q_OFF + 256, gq + 256, wv == 2 ? 1 : 0),                                                  \
++             tdm_g1(W0_B, (unsigned)(Sq_ - q0), 64, BM, krow));                                                      \
++    const int n = ntiles(qb);                                                                                        \
++    unsigned long long gk0, gv0;                                                                                     \
++    kv_base(hh, bb, gk0, gv0);                                                                                       \
++    issue_slot(0, n, sb, gk0, gv0);                                                                                  \
++    issue_slot(1, n, sb, gk0, gv0);                                                                                  \
++    issue_slot(2, n, sb, gk0, gv0);                                                                                  \
++  };                                                                                                                 \
++  (void)cshift, (void)npw_, (void)nqb_, (void)B_;
++
++  // ---- the first block's prologue loads ---------------------------------------------------------------------------
++  {
++    HKF_BLOCK(0)
++    int qb, hh, bb;
++    if (!block_at(0, qb, hh, bb)) return;  // an idle persistent workgroup: no barrier, no memory access
++    issue_block(qb, hh, bb, 0);
+   }
+-  bar_signal();
+-  bar_wait();
+ 
+-  // per-lane LDS bases of the fragment reads (FlyDSL's lane patterns): Q B operands (q tiles 0, 1 from qa, 2, 3 from
+-  // qb), K A operands (+ kv16 * 16 * XK + ks * 64 + {0, 32}), V^T A operands via ds_load_tr16_b128 (+ (32 kt + 16 h)
+-  // * XV + dt * 32)
+-  const unsigned qa = lds0 + Q_OFF + (unsigned)((16 * wv + (lane & 15)) * XK + (lane >> 4) * 16);
+-  const unsigned qb2 = qa + (unsigned)(2 * 64 * XK);
+-  const unsigned k_lane = (unsigned)((lane & 15) * XK + (lane >> 4) * 16);
+-  const unsigned v_lane = (unsigned)((((lane >> 4) * 8) + (lane & 7)) * XV + ((lane >> 3) & 1) * 16);
+-  // causal: element e of kv16 tile j of tile t (kv = 64 t + 16 j + 8 (lane / 16) + e) is masked for slot i iff
+-  // 16 j + e > dl0 - 64 t + 64 i
+-  const int dl0 = q0 + 16 * wv + (lane & 15) + cshift - (lane >> 4) * 8;
++  // ---- block s of the workgroup's list per iteration: only s and sb (the ring stage of the block's tile 0; the ring
++  // runs on across the blocks) are carried from one block to the next ---------------------------------------------
++  int sb = 0;
++  for (int s = 0;; ++s) {
++    HKF_BLOCK(s >> 30)
++    const float c2 = ka.scale * LOG2E;
++    int qb, hh, bb;
++    block_at(s, qb, hh, bb);
++    const int q0 = qb * BM;
++    const int n = ntiles(qb);
++    const int ncc = min((q0 + cshift + 1) / NB, n);  // tiles [0, ncc) need no mask for any row of the block
++    unsigned long long gk0, gv0;
++    kv_base(hh, bb, gk0, gv0);
++    // the lane from v_mbcnt with a loop-variant addend (always 0): LLVM can neither hoist nor CSE it across blocks,
++    // so no lane-derived VGPR stays live across the epilogue (the generated code starts right above the shell's VGPRs)
++    const int lane = (int)__builtin_amdgcn_mbcnt_lo(~0u, (unsigned)(s >> 30));
++
++    // B_0: Q (waves 1, 2) and tiles 0..2 (wave 0) landed and visible (issue_block); every wave's reads of the
++    // previous block's staging (in the stage tile 3 of this block lands in) retired. Every wave waits for ALL its TDM
++    // ops: correct whether or not NULL descriptors count in TENSORcnt (wave 1 / 2 have one real op, their Q), and
++    // branch-free (a wave-dependent branch here doubles the bounds checker's work). Cost: wave 0 also waits for tiles
++    // 1, 2 -- issued with the Q ~5k cycles before B_0 (one block's epilogue), so in the block loop they have landed.
++    tensor_wait<0>();
++    bar_signal();
++    bar_wait();
++
++    // per-lane LDS bases of the fragment reads (FlyDSL's lane patterns): Q B operands (q tiles 0, 1 from qa, 2, 3 from
++    // qb), K A operands (+ kv16 * 16 * XK + ks * 64 + {0, 32}), V^T A operands via ds_load_tr16_b128 (+ (32 kt + 16 h)
++    // * XV + dt * 32)
++    const unsigned qa = lds0 + Q_OFF + (unsigned)((16 * wv + (lane & 15)) * XK + (lane >> 4) * 16);
++    const unsigned qb2 = qa + (unsigned)(2 * 64 * XK);
++    const unsigned k_lane = (unsigned)((lane & 15) * XK + (lane >> 4) * 16);
++    const unsigned v_lane = (unsigned)((((lane >> 4) * 8) + (lane & 7)) * XV + ((lane >> 3) & 1) * 16);
++    // causal: element e of kv16 tile j of tile t (kv = 64 t + 16 j + 8 (lane / 16) + e) is masked for slot i iff
++    // 16 j + e > dl0 - 64 t + 64 i
++    const int dl0 = q0 + 16 * wv + (lane & 15) + cshift - (lane >> 4) * 8;
+ 
+ #if HKGEN_REF
+-  f32x8 o[QT][NDT];
+-  float m[QT], d[QT];
+-  static_for<QT>([&](auto i) {
+-    m[i] = -1.0e30f;
+-    d[i] = 0.f;
+-    static_for<NDT>([&](auto dt) { o[i][dt] = zero8(); });
+-  });
+-  // first: q tiles below it are skipped; mask_only < 0: the mask on every q tile, else on that q tile only
+-  auto tile = [&](unsigned kb, unsigned vb, bool masked, int dl, int first, int mask_only) __attribute__((always_inline)) {
+-    const lds_u8* kp = lds_ptr(kb);
+-    const lds_u8* vp = lds_ptr(vb);
+-    bf16x16 kf[NKV][NKS];
+-    static_for<NKS>([&](auto ks) {
+-      static_for<NKV>([&](auto j) {
+-        kf[j][ks] = cat(lds_load_b128(kp, j * 16 * XK + ks * 64), lds_load_b128(kp, j * 16 * XK + ks * 64 + 32));
+-      });
+-    });
+-    bf16x16 vf[NDT][2];
+-    static_for<NDT>([&](auto dt) {
+-      static_for<2>([&](auto kt) {
+-        vf[dt][kt] = cat(lds_tr16(vp, kt * 32 * XV + dt * 32), lds_tr16(vp, (kt * 32 + 16) * XV + dt * 32));
+-      });
+-    });
+-    __builtin_amdgcn_s_wait_tensorcnt((short)6);
+-    bar_signal();  // B_{t+1}: this wave's reads of the stage are done, wave 0's tile t + 1 landed
++    f32x8 o[QT][NDT];
++    float m[QT], d[QT];
+     static_for<QT>([&](auto i) {
+-      if (i < first) return;
+-      const lds_u8* qp = lds_ptr((i < 2 ? qa : qb2) + (unsigned)((i & 1) * 64 * XK));
+-      f32x8 s[NKV];
++      m[i] = -1.0e30f;
++      d[i] = 0.f;
++      static_for<NDT>([&](auto dt) { o[i][dt] = zero8(); });
++    });
++    // first: q tiles below it are skipped; mask_only < 0: the mask on every q tile, else on that q tile only
++    auto tile = [&](unsigned kb, unsigned vb, bool masked, int dl, int first, int mask_only) __attribute__((always_inline)) {
++      const lds_u8* kp = lds_ptr(kb);
++      const lds_u8* vp = lds_ptr(vb);
++      bf16x16 kf[NKV][NKS];
+       static_for<NKS>([&](auto ks) {
+-        const bf16x16 qf = cat(lds_load_b128(qp, ks * 64), lds_load_b128(qp, ks * 64 + 32));
+         static_for<NKV>([&](auto j) {
+-          if constexpr (ks == 0) {
+-            s[j] = wmma(kf[j][0], qf, zero8());
+-          } else {
+-            s[j] = wmma(kf[j][ks], qf, s[j]);
+-          }
++          kf[j][ks] = cat(lds_load_b128(kp, j * 16 * XK + ks * 64), lds_load_b128(kp, j * 16 * XK + ks * 64 + 32));
+         });
+       });
+-      if (masked && (mask_only < 0 || mask_only == i)) {
+-        const int dli = dl + 64 * i;
+-        static_for<NKV>([&](auto j) {
+-          static_for<8>([&](auto e) { s[j][(int)e] = (j * 16 + e > dli) ? -__builtin_inff() : s[j][(int)e]; });
++      bf16x16 vf[NDT][2];
++      static_for<NDT>([&](auto dt) {
++        static_for<2>([&](auto kt) {
++          vf[dt][kt] = cat(lds_tr16(vp, kt * 32 * XV + dt * 32), lds_tr16(vp, (kt * 32 + 16) * XV + dt * 32));
+         });
+-      }
+-      float x32[32];
+-      static_for<NKV>([&](auto j) { static_for<8>([&](auto e) { x32[j * 8 + e] = s[j][(int)e]; }); });
+-      const float mx = tree_max<32>(x32);  // the generated code's grouping (max is exact: any grouping is equal)
+-      const float lm = fmax2(mx, peer(mx));
+-      const float need = __builtin_fmaf(lm, c2, -m[i]);
+-      const bool resc = __builtin_amdgcn_ballot_w32(need > LOG2E) != 0u;
+-      const float rmax = lm * c2;
+-      const float mfull = fmax2(m[i], rmax);
+-      const float mn = resc ? mfull : m[i];
+-      const float corr = exp2_raw(m[i] - mn);
+-      float p[32];
+-      static_for<NKV>([&](auto j) {
+-        static_for<8>([&](auto e) { p[j * 8 + e] = exp2_raw(__builtin_fmaf(s[j][(int)e], c2, -mn)); });
+       });
+-      const float ls = tree_sum<32>(p);
+-      const float tot = ls + peer(ls);
+-      d[i] = __builtin_fmaf(corr, d[i], tot);
+-      m[i] = mn;
+-      static_for<NDT>([&](auto dt) { o[i][dt] = o[i][dt] * corr; });
+-      static_for<2>([&](auto kt) {
+-        f32x8 pa, pb;
+-        static_for<8>([&](auto e) {
+-          pa[(int)e] = p[(2 * kt) * 8 + e];
+-          pb[(int)e] = p[(2 * kt + 1) * 8 + e];
++      // edev2: the Q fragments too are read before the arrive (the next block's Q TDM, issued right after the
++      // block's last barrier, overwrites the whole Q area: no LDS read may follow a TILE's s_barrier_signal)
++      bf16x16 qfs[QT][NKS];
++      static_for<QT>([&](auto i) {
++        if (i < first) return;
++        const lds_u8* qp = lds_ptr((i < 2 ? qa : qb2) + (unsigned)((i & 1) * 64 * XK));
++        static_for<NKS>([&](auto ks) {
++          qfs[i][ks] = cat(lds_load_b128(qp, ks * 64), lds_load_b128(qp, ks * 64 + 32));
+         });
+-        const bf16x16 pf = cat(to_bf16x8(pa), to_bf16x8(pb));
+-        static_for<NDT>([&](auto dt) { o[i][dt] = wmma(vf[dt][kt], pf, o[i][dt]); });
+       });
+-    });
+-  };
++      __builtin_amdgcn_s_wait_tensorcnt((short)6);
++      bar_signal();  // B_{t+1}: this wave's reads of the stage and of Q are done, wave 0's tile t + 1 landed
++      static_for<QT>([&](auto i) {
++        if (i < first) return;
++        f32x8 s[NKV];
++        static_for<NKS>([&](auto ks) {
++          const bf16x16 qf = qfs[i][ks];
++          static_for<NKV>([&](auto j) {
++            if constexpr (ks == 0) {
++              s[j] = wmma(kf[j][0], qf, zero8());
++            } else {
++              s[j] = wmma(kf[j][ks], qf, s[j]);
++            }
++          });
++        });
++        if (masked && (mask_only < 0 || mask_only == i)) {
++          const int dli = dl + 64 * i;
++          static_for<NKV>([&](auto j) {
++            static_for<8>([&](auto e) { s[j][(int)e] = (j * 16 + e > dli) ? -__builtin_inff() : s[j][(int)e]; });
++          });
++        }
++        float x32[32];
++        static_for<NKV>([&](auto j) { static_for<8>([&](auto e) { x32[j * 8 + e] = s[j][(int)e]; }); });
++        const float mx = tree_max<32>(x32);  // the generated code's grouping (max is exact: any grouping is equal)
++        const float lm = fmax2(mx, peer(mx));
++        const float need = __builtin_fmaf(lm, c2, -m[i]);
++        const bool resc = __builtin_amdgcn_ballot_w32(need > LOG2E) != 0u;
++        const float rmax = lm * c2;
++        const float mfull = fmax2(m[i], rmax);
++        const float mn = resc ? mfull : m[i];
++        const float corr = exp2_raw(m[i] - mn);
++        float p[32];
++        static_for<NKV>([&](auto j) {
++          static_for<8>([&](auto e) { p[j * 8 + e] = exp2_raw(__builtin_fmaf(s[j][(int)e], c2, -mn)); });
++        });
++        const float ls = tree_sum<32>(p);
++        const float tot = ls + peer(ls);
++        d[i] = __builtin_fmaf(corr, d[i], tot);
++        m[i] = mn;
++        static_for<NDT>([&](auto dt) { o[i][dt] = o[i][dt] * corr; });
++        static_for<2>([&](auto kt) {
++          f32x8 pa, pb;
++          static_for<8>([&](auto e) {
++            pa[(int)e] = p[(2 * kt) * 8 + e];
++            pb[(int)e] = p[(2 * kt + 1) * 8 + e];
++          });
++          const bf16x16 pf = cat(to_bf16x8(pa), to_bf16x8(pb));
++          static_for<NDT>([&](auto dt) { o[i][dt] = wmma(vf[dt][kt], pf, o[i][dt]); });
++        });
++      });
++    };
+ #else
+-  asm volatile("; HKGEN INIT qa=%0 qb=%1 c2=%2" ::"v"(qa), "v"(qb2), "s"(c2) : HKGEN_CLOBBERS);
++    asm volatile("; HKGEN INIT qa=%0 qb=%1 c2=%2" ::"v"(qa), "v"(qb2), "s"(c2) : HKGEN_CLOBBERS);
+ #endif
+ 
+-  // ---- the tiles: [0, ncc) need no mask, [ncc, n) carry the causal mask (diagonal tiles, kv tail) -------------------
+-  int t = 0;
+-  for (; t < ncc; ++t) {
+-    issue_tile_bf(t + 3);
+-    const unsigned st = lds0 + (unsigned)((t & (NSTG - 1)) * STG_B);
++    // ---- the tiles: [0, ncc) need no mask, [ncc, n) carry the causal mask (diagonal tiles, kv tail) -------------
++    int t = 0;
++    for (; t < ncc; ++t) {
++      issue_slot(t + 3, n, sb, gk0, gv0);
++      const unsigned st = lds0 + (unsigned)(((sb + t) & (NSTG - 1)) * STG_B);
+ #if HKGEN_REF
+-    tile(st + k_lane, st + K_B + v_lane, false, 0, 0, -1);
++      tile(st + k_lane, st + K_B + v_lane, false, 0, 0, -1);
+ #else
+-    asm volatile("; HKGEN TILE_C kb=%0 vb=%1" HKGEN_C2_TXT ::"v"(st + k_lane), "v"(st + K_B + v_lane) HKGEN_C2_OP
+-                 : HKGEN_CLOBBERS);
++      asm volatile("; HKGEN TILE_C kb=%0 vb=%1" HKGEN_C2_TXT ::"v"(st + k_lane), "v"(st + K_B + v_lane) HKGEN_C2_OP
++                   : HKGEN_CLOBBERS);
+ #endif
+-    bar_wait();  // B_{t+1}
+-  }
++      bar_wait();  // B_{t+1}
++    }
+ #if HKGEN_DIAG
+-  static_for<4>([&](auto k) {  // the diagonal tiles ncc + k (Sq == Skv: at most 4)
+-    if (ncc + k < n) {
+-      const int t2 = ncc + k;
+-      issue_tile_bf(t2 + 3);
+-      const unsigned st = lds0 + (unsigned)((t2 & (NSTG - 1)) * STG_B);
++    static_for<4>([&](auto k) {  // the diagonal tiles ncc + k (Sq == Skv: at most 4)
++      if (ncc + k < n) {
++        const int t2 = ncc + k;
++        issue_slot(t2 + 3, n, sb, gk0, gv0);
++        const unsigned st = lds0 + (unsigned)(((sb + t2) & (NSTG - 1)) * STG_B);
+ #if HKGEN_REF
+-      tile(st + k_lane, st + K_B + v_lane, true, dl0 - NB * t2, k, k);
++        tile(st + k_lane, st + K_B + v_lane, true, dl0 - NB * t2, k, k);
+ #else
+-      if constexpr (k == 0) {
+-        asm volatile("; HKGEN TILE_D0 kb=%0 vb=%1 dl=%2" HKGEN_C2_TXT3 ::"v"(st + k_lane), "v"(st + K_B + v_lane),
+-                     "v"(dl0 - NB * t2) HKGEN_C2_OP : HKGEN_CLOBBERS);
+-      } else if constexpr (k == 1) {
+-        asm volatile("; HKGEN TILE_D1 kb=%0 vb=%1 dl=%2" HKGEN_C2_TXT3 ::"v"(st + k_lane), "v"(st + K_B + v_lane),
+-                     "v"(dl0 - NB * t2) HKGEN_C2_OP : HKGEN_CLOBBERS);
+-      } else if constexpr (k == 2) {
+-        asm volatile("; HKGEN TILE_D2 kb=%0 vb=%1 dl=%2" HKGEN_C2_TXT3 ::"v"(st + k_lane), "v"(st + K_B + v_lane),
+-                     "v"(dl0 - NB * t2) HKGEN_C2_OP : HKGEN_CLOBBERS);
+-      } else {
+-        asm volatile("; HKGEN TILE_D3 kb=%0 vb=%1 dl=%2" HKGEN_C2_TXT3 ::"v"(st + k_lane), "v"(st + K_B + v_lane),
+-                     "v"(dl0 - NB * t2) HKGEN_C2_OP : HKGEN_CLOBBERS);
+-      }
++        if constexpr (k == 0) {
++          asm volatile("; HKGEN TILE_D0 kb=%0 vb=%1 dl=%2" HKGEN_C2_TXT3 ::"v"(st + k_lane), "v"(st + K_B + v_lane),
++                       "v"(dl0 - NB * t2) HKGEN_C2_OP : HKGEN_CLOBBERS);
++        } else if constexpr (k == 1) {
++          asm volatile("; HKGEN TILE_D1 kb=%0 vb=%1 dl=%2" HKGEN_C2_TXT3 ::"v"(st + k_lane), "v"(st + K_B + v_lane),
++                       "v"(dl0 - NB * t2) HKGEN_C2_OP : HKGEN_CLOBBERS);
++        } else if constexpr (k == 2) {
++          asm volatile("; HKGEN TILE_D2 kb=%0 vb=%1 dl=%2" HKGEN_C2_TXT3 ::"v"(st + k_lane), "v"(st + K_B + v_lane),
++                       "v"(dl0 - NB * t2) HKGEN_C2_OP : HKGEN_CLOBBERS);
++        } else {
++          asm volatile("; HKGEN TILE_D3 kb=%0 vb=%1 dl=%2" HKGEN_C2_TXT3 ::"v"(st + k_lane), "v"(st + K_B + v_lane),
++                       "v"(dl0 - NB * t2) HKGEN_C2_OP : HKGEN_CLOBBERS);
++        }
+ #endif
+-      bar_wait();  // B_{t2+1}
+-    }
+-  });
++        bar_wait();  // B_{t2+1}
++      }
++    });
+ #else
+-  for (; t < n; ++t) {
+-    issue_tile_bf(t + 3);
+-    const unsigned st = lds0 + (unsigned)((t & (NSTG - 1)) * STG_B);
++    for (; t < n; ++t) {
++      issue_slot(t + 3, n, sb, gk0, gv0);
++      const unsigned st = lds0 + (unsigned)(((sb + t) & (NSTG - 1)) * STG_B);
+ #if HKGEN_REF
+-    tile(st + k_lane, st + K_B + v_lane, true, dl0 - NB * t, 0, -1);
++      tile(st + k_lane, st + K_B + v_lane, true, dl0 - NB * t, 0, -1);
+ #else
+-    asm volatile("; HKGEN TILE_M kb=%0 vb=%1 dl=%2" HKGEN_C2_TXT3 ::"v"(st + k_lane), "v"(st + K_B + v_lane),
+-                 "v"(dl0 - NB * t) HKGEN_C2_OP : HKGEN_CLOBBERS);
++      asm volatile("; HKGEN TILE_M kb=%0 vb=%1 dl=%2" HKGEN_C2_TXT3 ::"v"(st + k_lane), "v"(st + K_B + v_lane),
++                   "v"(dl0 - NB * t) HKGEN_C2_OP : HKGEN_CLOBBERS);
+ #endif
+-    bar_wait();  // B_{t+1}
+-  }
++      bar_wait();  // B_{t+1}
++    }
+ #endif
+-  tensor_wait<0>();  // no TDM write may land after the workgroup retires
+ 
+-  // ---- epilogue (round 5, edev1): LDS-staged, row-contiguous, straight-line writeback -------------------------------
+-  // Phase 1, per q tile i: out = bf16(O^T / d), lse = (m + log2 d) ln 2 (FINAL_i / the HIP reference), staged in this
+-  // wave's own Q rows (rows 16 wv + 64 i .. + 15 of the Q staging area: no other wave reads them, and this wave's
+-  // reads of them completed in the tiles): O row r at XO r (FlyDSL's 272-B staging stride), the lse of lane l at
+-  // LSE_SLOT + 4 l (lanes 0..15 = rows 0..15, the slots read back; lanes 16..31 hold the same rows' lse, unread).
+-  // Phase 2, after FINAL_3: per q tile 8 row-contiguous buffer stores (lane l: q row 2 j + l / 16, bytes 16 (l % 16)
+-  // .. + 15 of the 256-B row, FlyDSL's global_store_async_from_lds pattern; the FINAL fragment layout put 16 rows x 32
+-  // B in every store), then one lse store. Straight-line from the first global store to s_endpgm, every address
+-  // operand computed before it and never rewritten: rows q >= Sq are dropped by the buffer range check instead of an
+-  // EXEC mask, so no EXEC / SGPR / address write, branch or s_set_vgpr_msb (each one waits for XCNT; fprof: ~1.9k
+-  // cycles behind every FINAL) sits between the stores; the data quads (ds_load results) are the only registers
+-  // rewritten, each reload waiting for the store 8 back (a rolling XCNT window). The LDS ops of one wave execute in
+-  // order: the staging needs no counter wait, only the compiler barrier (no load moves above a store).
+-  constexpr int XO = 272;
+-  constexpr int LSE_SLOT = 16 * XO;
+-  static_assert(LSE_SLOT + 32 * 4 <= 16 * XK, "the staging of a q tile fits in its 16 Q rows");
+-  constexpr unsigned OOB = 0x80000000u;  // > every num_records (< 2^31) and + soffset < 2^32: dropped, no wrap
+-  const unsigned stg = lds0 + Q_OFF + (unsigned)(16 * wv * XK);  // q tile i at stg + 64 i XK
+-  // Phase 1 write addresses of the lane: O row l % 16, 16-B half l / 16, and lse slot l (the uniform tile base added
+-  // per q tile, so the dt offsets stay immediates)
+-  const unsigned wl = (unsigned)((lane & 15) * XO + (lane >> 4) * 16);
+-  const unsigned wls = (unsigned)(LSE_SLOT + 4 * lane);
++    // ---- the next block's loads (edev2), right after B_n, overlapping the epilogue: every wave's reads of the ring
++    // and of the Q area retired before B_n, nothing reads them until the next block's B_0 (the staging below lives in
++    // the ring stage of tile n - 1 and the tail area), and the next block's tiles 0..2 go to the three other stages
++    // (each wave first waits for its TDM ops in flight: wave 0's 1-row copies of slots n..n + 2 target those stages)
++    // (in the epilogue's scope below: its own argument view, so nothing of it is live across the tiles)
++    bool nxt;
++    // ---- epilogue (edev1 writeback; edev2 staging area and per-block argument view) --------------------------------
++    // Phase 1, per q tile i: out = bf16(O^T / d), lse = (m + log2 d) ln 2 (FINAL_i / the HIP reference), staged in
++    // this wave's own SQT-byte slot: q tiles 0, 1 in the ring stage of tile n - 1 (free after B_n: the next block's
++    // tiles 0..2 or the 1-row copies past the last block go to the three other stages, and the next block's tile 3
++    // is issued behind its B_0), q tiles 2, 3 in the tail area after the Q staging; O row r at XO r (FlyDSL's 272-B
++    // staging stride), the lse of lane l at LSE_SLOT + 4 l (lanes 0..15 = rows 0..15, the slots read back).
++    // Phase 2, after FINAL_3: per q tile 8 row-contiguous buffer stores (lane l: q row 2 j + l / 16, bytes 16 (l % 16)
++    // .. + 15 of the 256-B row), then one lse store. Straight-line from the first global store to the loop's back
++    // edge / s_endpgm (both drain XCNT), every address operand computed before it and never rewritten: rows q >= Sq
++    // are dropped by the buffer range check, the data quads (ds_load results) are the only registers rewritten, each
++    // reload waiting for the store 8 back. The LDS ops of one wave execute in order: the staging needs no counter
++    // wait, only the compiler barrier.
++    {
++      HKF_BLOCK(n >> 30)
++      int qbn, hhn, bbn;
++      nxt = block_at(s + 1, qbn, hhn, bbn);
++      if (nxt) {
++        tensor_wait<0>();
++        issue_block(qbn, hhn, bbn, (sb + n) & (NSTG - 1));
++      }
++      sched_barrier<0>();
++
++      const int lane2 = (int)__builtin_amdgcn_mbcnt_lo(~0u, (unsigned)(n >> 30));
++      const unsigned sga = lds0 + (unsigned)(((sb + n - 1) & (NSTG - 1)) * STG_B) + (unsigned)(wv * SQT);
++      const unsigned sgb = lds0 + TAIL + (unsigned)(wv * SQT);
++      const unsigned wl = (unsigned)((lane2 & 15) * XO + (lane2 >> 4) * 16);
++      const unsigned wls = (unsigned)(LSE_SLOT + 4 * lane2);
+   static_for<QT>([&](auto i) {
+-    i32x32 ob;
+-    float lse;
++        i32x32 ob;
++        float lse;
+ #if HKGEN_REF
+-    const float inv = d[i] > 0.f ? 1.0f / d[i] : 0.f;
+-    static_for<NDT>([&](auto dt) {
+-      const u32x4 w = __builtin_bit_cast(u32x4, to_bf16x8(o[i][dt] * inv));
+-      static_for<4>([&](auto r) { ob[4 * dt + (int)r] = (int)w[(int)r]; });
+-    });
+-    lse = (m[i] + __builtin_log2f(d[i])) * LN2;
++        const float inv = d[i] > 0.f ? 1.0f / d[i] : 0.f;
++        static_for<NDT>([&](auto dt) {
++          const u32x4 w = __builtin_bit_cast(u32x4, to_bf16x8(o[i][dt] * inv));
++          static_for<4>([&](auto r) { ob[4 * dt + (int)r] = (int)w[(int)r]; });
++        });
++        lse = (m[i] + __builtin_log2f(d[i])) * LN2;
+ #else
+-    if constexpr (i == 0) {
+-      asm volatile("; HKGEN FINAL_0 o=%0 lse=%1" : "=v"(ob), "=v"(lse) : : HKGEN_CLOBBERS);
+-    } else if constexpr (i == 1) {
+-      asm volatile("; HKGEN FINAL_1 o=%0 lse=%1" : "=v"(ob), "=v"(lse) : : HKGEN_CLOBBERS);
+-    } else if constexpr (i == 2) {
+-      asm volatile("; HKGEN FINAL_2 o=%0 lse=%1" : "=v"(ob), "=v"(lse) : : HKGEN_CLOBBERS);
+-    } else {
+-      asm volatile("; HKGEN FINAL_3 o=%0 lse=%1" : "=v"(ob), "=v"(lse) : : HKGEN_CLOBBERS);
++        if constexpr (i == 0) {
++          asm volatile("; HKGEN FINAL_0 o=%0 lse=%1" : "=v"(ob), "=v"(lse) : : HKGEN_CLOBBERS);
++        } else if constexpr (i == 1) {
++          asm volatile("; HKGEN FINAL_1 o=%0 lse=%1" : "=v"(ob), "=v"(lse) : : HKGEN_CLOBBERS);
++        } else if constexpr (i == 2) {
++          asm volatile("; HKGEN FINAL_2 o=%0 lse=%1" : "=v"(ob), "=v"(lse) : : HKGEN_CLOBBERS);
++        } else {
++          asm volatile("; HKGEN FINAL_3 o=%0 lse=%1" : "=v"(ob), "=v"(lse) : : HKGEN_CLOBBERS);
++        }
++#endif
++        const unsigned tb = (i < 2 ? sga : sgb) + (unsigned)((i & 1) * 4 * SQT);
++        lds_u8w* const wp = lds_wptr(tb + wl);
++        static_for<NDT>([&](auto dt) {
++          lds_store_b128(wp, dt * 32,
++                         u32x4{(unsigned)ob[4 * dt], (unsigned)ob[4 * dt + 1], (unsigned)ob[4 * dt + 2],
++                               (unsigned)ob[4 * dt + 3]});
++        });
++        lds_store_b32(lds_wptr(tb + wls), 0, __builtin_bit_cast(unsigned, lse));
++        sched_barrier<0>();
++      });
++      wave_lds_order();
++
++      // Phase 2 addresses (all before the first global store):
++      //   O, q tile i: V# r_o[i] based at the tile's first row q0 + 64 i, soffset 2 j * row bytes (store j: rows 2 j,
++      //     2 j + 1), voffset vo_l (the lane's row 16 wv + l / 16 and 16-B column l % 16). The 64 rows of a tile are
++      //     all < Sq or all >= Sq (Sq % 64 == 0, the kernel's domain): a tile past Sq gets num_records 0.
++      //   lse: one ds_load_b64 + one buffer_store_b64 for the wave's 64 rows (lane l: q tile l / 8, rows 2 (l % 8)
++      //     and 2 (l % 8) + 1 = the slots of lanes 2 (l % 8), + 1), a row past Sq gets voffset OOB (soffset null).
++      const long long o_bytes = (long long)B_ * Sq_ * H_ * D_V * 2;
++      const unsigned rsb = (unsigned)H_ * (unsigned)(D_V * 2);  // bytes per q row
++      __amdgpu_buffer_rsrc_t r_o[QT];
++      static_for<QT>([&](auto i) {
++        const bool ok = q0 + 64 * i < Sq_;
++        const long long off = (((long long)bb * Sq_ + q0 + 64 * i) * H_ + hh) * (D_V * 2);
++        const long long rem = min(o_bytes - off, 0x7FFFFFFFll);
++        const long long off2 = ok ? off : 0ll;
++        const int nrec = ok ? (int)rem : 0;
++        r_o[i] = rsrc((const unsigned char*)ka.O + off2, nrec);
++      });
++      const auto r_l = rsrc(ka.LSE, (int)min((long long)B_ * H_ * Sq_ * 4, 0x7FFFFFFFll));
++      const int ln = (int)__builtin_amdgcn_mbcnt_lo(~0u, (unsigned)(ncc >> 30));
++      const int hl = ln >> 4, rl = ln & 15, lt = ln >> 3, lk = ln & 7;
++      const unsigned vo_l = (unsigned)(16 * wv + hl) * rsb + (unsigned)(rl * 16);
++      const lds_u8* const rda = lds_ptr(sga + (unsigned)(hl * XO + rl * 16));  // q tiles 0, 1
++      const lds_u8* const rdb = lds_ptr(sgb + (unsigned)(hl * XO + rl * 16));  // q tiles 2, 3
++      const u32x2 lsev =
++          lds_load_u32x2(lds_ptr((lt < 2 ? sga : sgb) + (unsigned)((lt & 1) * 4 * SQT + LSE_SLOT + 8 * lk)), 0);
++      const unsigned lq = (unsigned)(q0 + 16 * wv + 64 * lt + 2 * lk);
++      const unsigned la = (((unsigned)bb * (unsigned)H_ + (unsigned)hh) * (unsigned)Sq_ + lq) * 4u;
++      const unsigned lo = q0 + 64 * lt < Sq_ ? la : OOB;
++      sched_barrier<0>();
++      static_for<QT>([&](auto i) {
++        static_for<NDT>([&](auto j) {
++          const u32x4 w = i < 2 ? lds_load_u32x4(rda, (i & 1) * 4 * SQT + 2 * j * XO)
++                                : lds_load_u32x4(rdb, (i & 1) * 4 * SQT + 2 * j * XO);
++          buf_store_b128(w, r_o[i], (int)vo_l, (int)((unsigned)(2 * j) * rsb));
++        });
++        sched_barrier<0>();
++      });
++      buf_store_b64(lsev, r_l, (int)lo, 0);
++      sched_barrier<0>();
+     }
+-#endif
+-    lds_u8w* const wp = lds_wptr((stg + (unsigned)(i * 64 * XK)) + wl);
+-    static_for<NDT>([&](auto dt) {
+-      lds_store_b128(wp, dt * 32,
+-                     u32x4{(unsigned)ob[4 * dt], (unsigned)ob[4 * dt + 1], (unsigned)ob[4 * dt + 2],
+-                           (unsigned)ob[4 * dt + 3]});
+-    });
+-    lds_store_b32(lds_wptr((stg + (unsigned)(i * 64 * XK)) + wls), 0, __builtin_bit_cast(unsigned, lse));
+-    sched_barrier<0>();
+-  });
+-  wave_lds_order();
+-
+-  // Phase 2 addresses (all before the first global store):
+-  //   O, q tile i: V# r_o[i] based at the tile's first row q0 + 64 i, soffset 2 j * row bytes (store j: rows 2 j,
+-  //     2 j + 1), voffset vo_l (the lane's row 16 wv + l / 16 and 16-B column l % 16). The 64 rows of a tile are all
+-  //     < Sq or all >= Sq (Sq % 64 == 0, the kernel's domain): a tile past Sq gets num_records 0 (all stores dropped).
+-  //   lse: one ds_load_b64 + one buffer_store_b64 for the wave's 64 rows (lane l: q tile l / 8, rows 2 (l % 8) and
+-  //     2 (l % 8) + 1 = the slots of lanes 2 (l % 8), + 1), a row past Sq gets voffset OOB (soffset null).
+-  const long long o_bytes = (long long)B * Sq * H * D_V * 2;
+-  const unsigned rsb = (unsigned)H * (unsigned)(D_V * 2);  // bytes per q row
+-  __amdgpu_buffer_rsrc_t r_o[QT];
+-  static_for<QT>([&](auto i) {
+-    const bool ok = q0 + 64 * i < Sq;
+-    const long long off = (((long long)bb * Sq + q0 + 64 * i) * H + hh) * (D_V * 2);
+-    const long long rem = min(o_bytes - off, 0x7FFFFFFFll);
+-    const long long off2 = ok ? off : 0ll;
+-    const int nrec = ok ? (int)rem : 0;
+-    r_o[i] = rsrc((const unsigned char*)O + off2, nrec);
+-  });
+-  const auto r_l = rsrc(LSE, (int)min((long long)B * H * Sq * 4, 0x7FFFFFFFll));
+-  // the lane id again from v_mbcnt (not CSE-able with Phase 1's tid & 31: nothing lane-derived stays live across the
+-  // FINAL markers but Phase 1's write address)
+-  const int ln = (int)__builtin_amdgcn_mbcnt_lo(~0u, 0u);
+-  const int hl = ln >> 4, rl = ln & 15, lt = ln >> 3, lk = ln & 7;
+-  const unsigned vo_l = (unsigned)(16 * wv + hl) * rsb + (unsigned)(rl * 16);
+-  const lds_u8* const rd0 = lds_ptr(stg + (unsigned)(hl * XO + rl * 16));                // q tiles 0..2
+-  const lds_u8* const rd3 = lds_ptr(stg + (unsigned)(3 * 64 * XK + hl * XO + rl * 16));  // q tile 3
+-  const u32x2 lsev = lds_load_u32x2(lds_ptr(stg + (unsigned)(lt * 64 * XK + LSE_SLOT + 8 * lk)), 0);
+-  const unsigned lq = (unsigned)(q0 + 16 * wv + 64 * lt + 2 * lk);
+-  const unsigned la = (((unsigned)bb * (unsigned)H + (unsigned)hh) * (unsigned)Sq + lq) * 4u;
+-  const unsigned lo = q0 + 64 * lt < Sq ? la : OOB;
+-  sched_barrier<0>();
+-  static_for<QT>([&](auto i) {
+-    static_for<NDT>([&](auto j) {
+-      const u32x4 w = i < 3 ? lds_load_u32x4(rd0, i * 64 * XK + 2 * j * XO) : lds_load_u32x4(rd3, 2 * j * XO);
+-      buf_store_b128(w, r_o[i], (int)vo_l, (int)((unsigned)(2 * j) * rsb));
+-    });
+-    sched_barrier<0>();
+-  });
+-  buf_store_b64(lsev, r_l, (int)lo, 0);
++
++    if (!nxt) break;
++    sb = (sb + n) & (NSTG - 1);
++  }
++  tensor_wait<0>();  // past the last block: no TDM write (the 1-row copies) may land after the workgroup retires
+ }
+--- a/gfx1250_mla_fwd/README.md
++++ b/gfx1250_mla_fwd/README.md
+@@ -2,9 +2,10 @@
+ 
+ Causal attention forward of the DeepSeek-V3 MLA head dims (q/k 192, v 128, bf16, MHA, bottom-right causal) on gfx1250,
+ bit for bit the shipped FlyDSL forward (`primus_turbo/flydsl/attention/gfx1250_mla`): same out (bf16) and lse (fp32,
+-natural log). Status: round 5, step S1b + edev1 epilogue (cross-tile software pipeline; LDS-staged, row-contiguous,
+-straight-line writeback; CPU-built and CPU-checked; S1b_A passed the GPU gates bit for bit at 0.815 ms, 10 % slower than
+-FlyDSL, ~13 % of it in the old epilogue's store waits). Not wired into Turbo: the
++natural log). Status: round 5, step S1b + edev1 epilogue + edev2 persistent schedule (cross-tile software pipeline;
++LDS-staged, row-contiguous, straight-line writeback; static persistent workgroups with the next block's Q and first
++K / V tiles loaded behind the epilogue; CPU-built and CPU-checked; S1b_A passed the GPU gates bit for bit at 0.815 ms,
++10 % slower than FlyDSL). Not wired into Turbo: the
+ Python integration (`impl.py`, `hsaco.py`, manifest, the `PRIMUS_TURBO_MLA_FWD_IMPL` switch, tests) is FWD-INT's.
+ 
+ ## Layout
+@@ -22,8 +23,12 @@
+ 
+ ## Kernel
+ 
+-`k_mla_fwd(Q, K, V, O, LSE, scale, Sq, Skv, H, B, nqb)`, grid `(nqb = ceil(Sq / 256), H, B)` through FlyDSL's
+-longest-first / head-grouped block remap, block 128 (4 waves, 1 per SIMD), LDS 274432 B (one workgroup per CU),
++`k_mla_fwd(Q, K, V, O, LSE, scale, Sq, Skv, H, B, nqb, npw)` (edev2: 12 arguments, kernarg segment 68 B).
++`npw == 0`: grid `(nqb = ceil(Sq / 256), H, B)` through FlyDSL's longest-first / head-grouped block remap, one q block
++per workgroup. `npw > 0` (persistent, grid `(npw, 1, 1)`, the host's `fwd_ab.persist_npw` rule: `Sq == Skv`,
++`Sq % 256 == 0`, `(npw / 8) % nqb == 0`, `H * B % 8 == 0`, `H * B / 8` a whole, even number of steps of
++`R = npw / 8 / nqb` heads, `>= 2 npw` blocks; npw = 256): a static list of q blocks per workgroup (below). Block 128
++(4 waves, 1 per SIMD), LDS 310272 B (one workgroup per CU),
+ 1024 VGPRs. Wave `w` owns the 16-row q tiles `{w, w + 4, w + 8, w + 12}` of the 256-row block. Per 64-kv tile:
+ Q / K / V fragment reads (FlyDSL's lane patterns), the ring barrier's arrive once the stage's reads are issued, then
+ per q tile `QK -> [mask] -> softmax -> O *= corr -> PV`, list-scheduled across the four q tiles around an in-order
+@@ -48,6 +53,8 @@
+   references `s90..s103` and writes `vcc` / `scc` before reading them after every marker;
+ - every FINAL region ends with `s_wait_alu depctr_va_vdst(0)` (edev1): its outputs are VALU results and LLVM, which
+   does not see the inline asm's VALU writes, inserts no wait before the shell's first read of them (expert mode).
++- no TILE region reads LDS after its `s_barrier_signal` (edev2: the next block's Q is loaded right after a block's last
++  barrier; the HIP reference reads its Q fragments before the arrive for the same reason).
+ 
+ ## Build recipe
+ 
+@@ -130,6 +137,33 @@
+ `s_wait_xcnt` that retires its store, every epilogue `ds_store` before every `ds_load`. Candidate E1 = the S1b_A recipe
+ with this shell (the REF, `-DHKGEN_REF=1` of the same file, changes with it).
+ 
++Round 5, edev2 (S2: persistence; fprof: per workgroup ~4.4-5.0k cycles of prologue -- 1.9k of it the Q TDM wait --,
++~1.1-1.4k of end-of-workgroup drain, launch gaps and the dispatch tail, 545-620 cycles per tile-equivalent of fixed
++cost vs FlyDSL's 236): the generated code is unchanged again (the regions of a recipe are E1's / S1b's up to the
++registers LLVM gives the marker operands); the shell runs a loop over the workgroup's q blocks:
++- the schedule (npw > 0): workgroup `w`, group `x = w % 8` (the XCD of the round-robin dispatch: L2 locality only),
++  slot `w / 8 = r nqb + i`; step `s`: head-batch `hb = 8 (R s + r) + x`, q block `i` on even steps and `nqb - 1 - i` on
++  odd ones. Static: no atomics, no workgroup waits for another (a GPU with fewer CUs runs the surplus workgroups
++  later); every (q block, hb) exactly once, every two steps `4 (nqb + 1)` tiles per workgroup (perfect balance);
++- the ring runs on across blocks (`sb` = the stage of the block's tile 0); right after a block's last tile (B_n: every
++  wave's reads of the ring and of the Q area retired) every wave issues the same 11 TDM ops, NULL descriptors where the
++  op is not its own: the next block's Q (wave 1: columns 0..127, wave 2: 128..191) and its tiles 0..2 (wave 0, into the
++  three stages after the current block's last; wave 0 first waits for its 1-row copies, which target them). They land
++  behind the epilogue; B_0 of the next block waits `s_wait_tensorcnt 6` on every wave (each wave's first 5 ops);
++- the epilogue staging moves out of the Q area (which the next Q overwrites): q tiles 0, 1 into the ring stage of the
++  block's last tile (free after B_n until the next block's tile 3, issued behind its B_0), q tiles 2, 3 into a tail area
++  after the Q staging (LDS 274432 -> 310272 B); per wave and q tile a 4480-B slot (edev1's 272-B rows + 32 lse slots);
++- the store phase ends at the loop's back edge (a branch: an XCNT drain in LLVM's model) instead of s_endpgm; the
++  stores complete in the background of the next block;
++- per block the arguments are re-read from the kernarg segment (`HKF_BLOCK(z)`, z = 0 derived from the loop counter):
++  LLVM keeps no argument-derived value live across blocks, so the shell fits its SGPRs without spills and without
++  touching the markers' clobbered s90..s103, and the shell's VGPRs stay below v38 (generated base 38, as E1);
++- `build.py`'s writeback check now requires ONE straight-line store phase ending at a branch / s_endpgm, no EXEC / M0
++  write or s_set_vgpr_msb inside it, and no rewrite of any operand of a store whose translation may be pending
++  (s_wait_xcnt accounting over data, address, srsrc and soffset registers).
++Candidate E2 = the S1b_A recipe with this shell (the REF changes with it). The launch ABI changed: the bounds model
++(V's vbounds.launch_fwd) needs the 12-argument / persistent-grid launch (`tools/fwd_ab.py` builds it).
++
+ 1. `amdclang++ -x hip --offload-arch=gfx1250 --cuda-device-only --no-gpu-bundle-output -O3 -std=c++20 -DNDEBUG -I.
+    -save-temps=obj -mllvm -amdgpu-expert-scheduling-mode -cuid=k_mla_fwd -DHKGEN_REF=0 -c hip/k_mla_fwd.hip`
+    (cwd `hip/`); the saved `.s` is `OUT/shell.s`. The same with `-DHKGEN_REF=1` gives `OUT/ref/k_mla_fwd.hsaco`
+--- a/gfx1250_mla_fwd/tools/fwd_ab.py
++++ b/gfx1250_mla_fwd/tools/fwd_ab.py
+@@ -5,7 +5,8 @@
+ ###############################################################################
+ 
+ """fwd_ab.py -- GPU driver of the HK MLA forward code object: canary, bit-exactness gate and same-process A/B
+-against the shipped FlyDSL forward (M._forward_op).
++against the shipped FlyDSL forward (M._forward_op). edev2: the 12-argument kernel (..., nqb, npw), launched persistent
++(grid (npw, 1, 1), npw = persist_npw) where the static schedule covers the grid, else grid (nqb, H, B) with npw = 0.
+ 
+     python fwd_ab.py --hsaco K.hsaco [--shape toy|s640|prod|b1|b4 | --b B --s S --h H --layout sbhd|bshd]
+                      [--canary] [--no-check] [--no-perf] [--no-bwd] [--det-iters N] [--rounds 5] [--iters 30]
+@@ -60,7 +61,27 @@
+     ("H", "i32"),
+     ("B", "i32"),
+     ("nqb", "i32"),
++    ("npw", "i32"),
+ ]
++# edev2: the persistent schedule (k_mla_fwd npw > 0): NPW workgroups, one per CU of a 256-CU MI455X (a GPU with fewer
++# CUs only runs the surplus workgroups later: the schedule is static, no workgroup waits for another)
++NPW = 256
++
++
++def persist_npw(kb, sq, skv, kh):
++    """npw for the kernel-layout shape [kb, sq, kh] (the rule the kernel's static schedule needs for a complete and
++    balanced cover, edev2): Sq == Skv, Sq % 256 == 0, NPW / 8 workgroups per group a multiple of nqb, H * B % 8 == 0,
++    the heads of a group (H * B / 8) a whole, even number of steps of R = NPW / 8 / nqb heads, and at least 2 NPW
++    blocks; else 0 (one workgroup per q block, grid (nqb, H, B))."""
++    nqb = (sq + BM - 1) // BM
++    g, gyz = NPW // 8, kb * kh
++    if sq != skv or sq % BM or g % nqb or gyz % 8:
++        return 0
++    r = g // nqb
++    hx = gyz // 8
++    if hx % r or (hx // r) % 2 or nqb * gyz < 2 * NPW:
++        return 0
++    return NPW
+ 
+ 
+ def args_meta():
+@@ -69,7 +90,7 @@
+         sz = 8 if k == "ptr" else 4
+         out.append({"name": n, "kind": k, "offset": off, "size": sz})
+         off += sz
+-    return out, (off + 7) // 8 * 8
++    return out, off  # 68: the code object's .kernarg_segment_size
+ 
+ 
+ def out(tag, obj):
+@@ -127,6 +148,8 @@
+     if sq != skv or sq % 64 or kb * sq * kh * D_V * 2 >= 2**31:
+         raise SystemExit(f"shape outside the HK forward's domain: Sq {sq} Skv {skv} B {kb} H {kh}")
+     nqb = (sq + BM - 1) // BM
++    npw = persist_npw(kb, sq, skv, kh)
++    grid = (npw, 1, 1) if npw else (nqb, kh, kb)
+     meta, ksz = args_meta()
+     kern = kernel_from_hsaco(a.hsaco, a.name, meta, 128, ksz)
+     stream = torch.cuda.current_stream()
+@@ -140,7 +163,8 @@
+             "kernel_q": list(qk.shape),
+             "hsaco": a.hsaco,
+             "sha256": hashlib.sha256(open(a.hsaco, "rb").read()).hexdigest(),
+-            "grid": [nqb, kh, kb],
++            "grid": list(grid),
++            "npw": npw,
+             "canary": a.canary,
+             "tag": a.tag,
+         },
+@@ -156,7 +180,7 @@
+         else:
+             o = torch.empty((kb, sq, kh, D_V), device=dev, dtype=torch.bfloat16)
+             lse = torch.empty((kb, kh, sq), device=dev, dtype=torch.float32)
+-        kern.call((nqb, kh, kb), 128, (qk, kk, vk, o, lse, SCALE, sq, skv, kh, kb, nqb), stream)
++        kern.call(grid, 128, (qk, kk, vk, o, lse, SCALE, sq, skv, kh, kb, nqb, npw), stream)
+         return o, lse
+ 
+     def neq(x, y):

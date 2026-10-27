@@ -1,0 +1,1825 @@
+{
+ "ladder": "mla_fwd",
+ "results": [
+  {
+   "arm": "flydsl",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "flydsl_b12f5953",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "x6_m1",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.13
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "x6_m2e",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.07
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "x6_m2f",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.07
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "s1a",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a_diag",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a2_diag",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1b_A",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "e1",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "e2",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "x6_m2fx",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.07
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "ref",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "ref_diag",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a_prog",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a2",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a3_n200",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a3_d290",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1b_B",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "fdev2_Ap",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "fdev2_A2",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "e1d",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "ref_e2",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "e2_np",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.13,
+    "lse": 145.08
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "flydsl",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "flydsl_b12f5953",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "x6_m1",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.45
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "x6_m2e",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.99,
+    "lse": 145.4
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "x6_m2f",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.99,
+    "lse": 145.4
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "s1a",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a_diag",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a2_diag",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1b_A",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "e1",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "e2",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "x6_m2fx",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.99,
+    "lse": 145.4
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "ref",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "ref_diag",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a_prog",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a2",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a3_n200",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a3_d290",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1b_B",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "fdev2_Ap",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "fdev2_A2",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "e1d",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "ref_e2",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "e2_np",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.0,
+    "lse": 145.43
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "flydsl",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "flydsl_b12f5953",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "x6_m1",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.63
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "x6_m2e",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.6,
+    "lse": 144.5
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "x6_m2f",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.6,
+    "lse": 144.5
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "s1a",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a_diag",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a2_diag",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1b_A",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "e1",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "e2",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "x6_m2fx",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.6,
+    "lse": 144.5
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "ref",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "ref_diag",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a_prog",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a2",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a3_n200",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a3_d290",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1b_B",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "fdev2_Ap",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "fdev2_A2",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "e1d",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "ref_e2",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "e2_np",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.66
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "flydsl",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.13,
+    "lse": 144.73
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "flydsl_b12f5953",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.13,
+    "lse": 144.73
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "x6_m1",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "x6_m2e",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "x6_m2f",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "s1a",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "s1a_diag",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "s1a2_diag",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "s1b_A",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "e1",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "e2",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "x6_m2fx",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "ref",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "ref_diag",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "s1a_prog",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "s1a2",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "s1a3_n200",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "s1a3_d290",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "s1b_B",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "fdev2_Ap",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "fdev2_A2",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "e1d",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "ref_e2",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "e2_np",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: outside the HK forward's domain: Sq 4096 Skv 4128 (Sq == Skv, Sq % 64 == 0, MHA)"
+  },
+  {
+   "arm": "flydsl",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "flydsl_b12f5953",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "x6_m1",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "x6_m2e",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.53
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "x6_m2f",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.53
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "s1a",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a_diag",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a2_diag",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1b_A",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "e1",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "e2",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "x6_m2fx",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.62,
+    "lse": 144.53
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "ref",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "ref_diag",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a_prog",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a2",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a3_n200",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1a3_d290",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "s1b_B",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "fdev2_Ap",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "fdev2_A2",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "e1d",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "ref_e2",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  },
+  {
+   "arm": "e2_np",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 53.63,
+    "lse": 144.68
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl_b12f5953",
+   "bitwise": true
+  }
+ ]
+}

@@ -289,7 +289,8 @@ def kernel_meta(co_kernel, name, spec):
             raise HipError(f"{name}.{an}: value_kind {a['value_kind']} vs spec kind {kind}")
         out.append({"name": an, "kind": kind, "offset": a["offset"], "size": a["size"]})
         end = max(end, a["offset"] + a["size"])
-    if co_kernel["kernarg_size"] != end:
+    # the segment may end in tail padding to its 8-byte alignment (an 11-argument kernel: 60 B of arguments, 64 B)
+    if not end <= co_kernel["kernarg_size"] <= (end + 7) // 8 * 8:
         raise HipError(
             f"{name}: kernarg_segment_size {co_kernel['kernarg_size']} != {end} of the explicit arguments "
             "(hidden kernel arguments are not supported)"

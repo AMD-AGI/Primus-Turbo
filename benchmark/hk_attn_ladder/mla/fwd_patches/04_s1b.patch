@@ -1,0 +1,919 @@
+--- a/gfx1250_mla_fwd/gen/build.py
++++ b/gfx1250_mla_fwd/gen/build.py
+@@ -255,7 +255,8 @@
+ def main():
+     ap = argparse.ArgumentParser()
+     ap.add_argument("--out", required=True)
+-    ap.add_argument("--sched", default="list", choices=("list", "program"))
++    ap.add_argument("--sched", default="list", choices=("list", "program", "slot"))
++    ap.add_argument("--seed", type=int, default=None, help="--sched slot: random tie-break seed (search)")
+     ap.add_argument("--asmkit-root", default=None, help="directory that contains the asmkit package")
+     ap.add_argument("--cxx", default="amdclang++")
+     ap.add_argument(
+@@ -274,8 +275,49 @@
+     ap.add_argument(
+         "--trans-cost", type=int, default=G.CFG["trans"], help="fwdgen.CFG['trans'] (scheduler model)"
+     )
++    ap.add_argument(
++        "--defer3",
++        action="store_true",
++        help="q tile 3's softmax / PV in the next region (fwdgen.CFG['defer3'])",
++    )
++    ap.add_argument(
++        "--defer2",
++        action="store_true",
++        help="q tiles 2, 3's softmax / PV in the next region (fwdgen.CFG['defer2'])",
++    )
++    ap.add_argument(
++        "--ds-lat", type=int, default=G.CFG["dslat"], help="fwdgen.CFG['dslat'] (scheduler model)"
++    )
++    ap.add_argument("--ds-first", action="store_true", help="fwdgen.CFG['dsfirst'] (scheduler priority)")
++    ap.add_argument("--ds-rate", type=int, default=0, help="fwdgen.CFG['dsrate'] (scheduler model)")
++    ap.add_argument(
++        "--pipe",
++        action="store_true",
++        help="S1b cross-tile pipeline (fwdgen.CFG['pipe']; default --worder becomes fwdgen.PIPE_WORDER)",
++    )
++    ap.add_argument("--pipe-tree", default="body", choices=("body", "prefix"), help="fwdgen.CFG['pipe_tree']")
++    ap.add_argument("--pipe-vafter", default="pv", choices=("pv", "qk0"), help="fwdgen.CFG['pipe_vafter']")
++    ap.add_argument("--pipe-dsentry", action="store_true", help="fwdgen.CFG['pipe_dsentry']")
+     a = ap.parse_args()
+-    G.CFG.update(csgpr=a.csgpr, qgroup=a.qgroup, worder=a.worder, trans=a.trans_cost)
++    if a.pipe and a.worder == G.CFG["worder"]:
++        a.worder = G.PIPE_WORDER
++    G.CFG.update(
++        csgpr=a.csgpr,
++        qgroup=a.qgroup,
++        worder=a.worder,
++        trans=a.trans_cost,
++        defer3=a.defer3,
++        defer2=a.defer2,
++        dslat=a.ds_lat,
++        dsfirst=a.ds_first,
++        pipe=a.pipe,
++        dsrate=a.ds_rate,
++        pipe_tree=a.pipe_tree,
++        pipe_vafter=a.pipe_vafter,
++        pipe_dsentry=a.pipe_dsentry,
++        seed=a.seed,
++    )
++    G.LAT["DS"] = G.CFG["dslat"]
+     if a.asmkit_root:
+         sys.path.insert(0, a.asmkit_root)
+     else:
+@@ -396,7 +438,9 @@
+         else:
+             if vcount(ops["o"]) != 32 or vcount(ops["lse"]) != 1:
+                 raise RuntimeError(f"{name}: unexpected output operands {ops}")
+-            texts = G.region_final(L, {"o": vfirst(ops["o"]), "lse": vfirst(ops["lse"])}, int(name[-1]))
++            texts = G.region_final(
++                L, {"o": vfirst(ops["o"]), "lse": vfirst(ops["lse"])}, int(name[-1]), a.sched
++            )
+             # in-flight WMMAs of the last tile write O: retire every VALU first, then the WMMA -> VALU wait states
+             pre = ["\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"] + ["\tv_nop"] * 4
+         for t in texts:
+--- a/gfx1250_mla_fwd/gen/fwdgen.py
++++ b/gfx1250_mla_fwd/gen/fwdgen.py
+@@ -61,7 +61,81 @@
+ #           WMMA (one drain per q tile); 'late': Q(2) and Q(3) reads after the last QK(1) WMMA (one drain per tile)
+ #   worder  the in-order WMMA stream of the list scheduler, by tag (default QK0..3 then PV0..3)
+ #   trans   the list scheduler's issue cost of a TRANS (v_exp) in cycles (model only; default 2)
+-CFG = {"csgpr": False, "qgroup": "none", "worder": "QK0,QK1,QK2,QK3,PV0,PV1,PV2,PV3", "trans": 2}
++#   defer3  (S1a3) q tile 3's softmax + O *= corr + PV of tile t run at the start of the NEXT region (TILE t + 1, or
++#           FINAL_0 after the last tile) as a prefix whose VALU / TRANS / WMMA work hides the LDS latency of tile t + 1's
++#           K / Q reads (GPU fwdgate3s_1: the ~290-cycle load-to-use latency at every tile entry is the main loss).
++#           Per q tile the op order is unchanged (bit-identical). The (2, 3) pair's packed sum tree runs twice: in the
++#           body for d[2] (q tile 3's half stale, unused) and in the prefix for d[3] (q tile 2's half stale, unused).
++#           INIT makes the first region's prefix an exact no-op: S(3) = -inf, V = 0, the PR leaves = 0 (p = exp2(-inf)
++#           = +0, corr = exp2(0) = 1, d = fma(1, 0, +0) = +0, O += 0 * 0). The prefix's WMMAs carry tag PV3p (worder).
++#           The FINAL_0 drain reads c from the (c, c) VGPR pair (s102 is a clobber: no upward-exposed read).
++#   defer2  (S1a3) like defer3 for q tiles 2 AND 3 (the whole (2, 3) pair: one tree in the prefix, no stale half);
++#           a TILE_D body that skips q tile 2 sets S(2) = -inf so the next prefix is an exact no-op for it (as the
++#           masked q tiles of TILE_M are: corr 1, p +0, d = fma(1, d, +0), O += V * 0 with finite V). WMMA tags PV2p,
++#           PV3p.
++#   dslat   the list scheduler's LDS load-to-use latency (model only; default 120)
++#   dsfirst the list scheduler picks a ready LDS load (room permitting) before any other non-WMMA instruction (issue
++#           the loads as early as their dependences allow: their latency, not their issue slot, is what costs)
++#   dsrate  (S1b) the list scheduler issues at most one LDS load per dsrate cycles (model only; 0 = no limit; the
++#           calibrated issue_sim3 rate is 4-6 when the four waves read together)
++#   pipe    (S1b, fwddev1) cross-tile software pipeline inside the unchanged marker shell. The region of tile t (whose
++#           K / V stage can only be read between the shell's B_t wait and this wave's arrive) runs, as a PREFIX, the
++#           tail of tile t - 1: q tiles 2, 3's softmax (+ the (2, 3) pair tree, O *= corr) and the PV WMMAs of ALL
++#           four q tiles (64 WMMAs; P(0), P(1) were computed in region t - 1); then the BODY of tile t: K / V / Q
++#           reads, QK(0..3), the full softmax of q tiles 0, 1 (P into S(i, 0 / 2), O *= corr, pair tree), the mask
++#           only of q tiles 2, 3. So every region opens with >= 32 WMMAs that need no LDS data (PV0p, PV1p) and
++#           ~64 WMMAs + ~280 VALU before QK(0) needs the stage: the K / Q reads issued at the region start have
++#           ~500 cycles to land (fwdgate3s_1: the ~290-cycle LDS latency + the 4-wave burst at every tile entry was
++#           the main loss), and the softmax VALU spreads over the whole region (prefix: SM2 / SM3 under the PV
++#           WMMAs, body: SM0 / SM1 under QK1..3) instead of piling up behind the last QK.
++#           Q: q tiles 1, 2 resident (qbuf[1], qbuf[2], read once in INIT from the staging area the shell never
++#           writes again); q tiles 0 and 3 share qbuf[0] (Q(0) read at the region start, Q(3) after the last QK(0)
++#           WMMA, 48 QK WMMAs before QK(3) needs it): 24 Q reads per tile instead of 48. Registers: the sum tree runs
++#           in place in the PR leaves (after the cvts read them), the FINAL scratch lives in qbuf[0] (dead there).
++#           Live across regions (Layout.persistent): V, P(0), P(1) (S(i, 0 / 2)), S(2), S(3), qbuf[1], qbuf[2].
++#           INIT makes the first prefix an exact no-op (S(2), S(3) = -inf, P(0), P(1) = 0, V = 0: corr = 1, p = +0,
++#           d = fma(1, d, +0), O += 0 * 0); a TILE_D body that skips q tile i leaves the same no-op state for it
++#           (P(i) = 0 for i < 2, S(i) = -inf for i >= 2); FINAL_0 drains the last tile's prefix. Per q tile the
++#           operation sequence is unchanged (bit-identical). Excludes defer3 / defer2 / qgroup.
++#   pipe_tree    'body': the (0, 1) pair tree (d[0], d[1]) right after q tile 1's softmax; 'prefix': at the start of
++#                the next region's prefix (PR and corr(0), corr(1) then live across the boundary; INIT / skipped q
++#                tiles: PR = 0, corr = 1.0, so d = fma(1, d, +0 + +0) = d)
++#   pipe_vafter  the V reads of tile t after the last prefix PV WMMA ('pv') or after the last QK(0) WMMA ('qk0':
++#                the same va_vdst(0) drain as the Q(3) reads)
++#   pipe_dsentry the K / Q(0) reads first in program order and the first one before the first prefix WMMA (the
++#                region-entry drain then covers them; else the first read after a WMMA pays its own drain)
++CFG = {
++    "csgpr": False,
++    "qgroup": "none",
++    "worder": "QK0,QK1,QK2,QK3,PV0,PV1,PV2,PV3",
++    "trans": 2,
++    "defer3": False,
++    "dslat": 120,
++    "dsfirst": False,
++    "dsrate": 0,
++    "defer2": False,
++    "pipe": False,
++    "pipe_tree": "body",
++    "pipe_vafter": "pv",
++    "pipe_dsentry": False,
++    "seed": None,
++    "slotpar": True,
++}
++PIPE_WORDER = "PV0p,PV1p,PV2p,PV3p,QK0,QK1,QK2,QK3"
++
++
++def deferred():
++    """The q tiles whose softmax / PV run in the next region's prefix."""
++    if CFG["pipe"]:
++        return [2, 3]
++    return [2, 3] if CFG["defer2"] else ([3] if CFG["defer3"] else [])
++
++
++def drained():
++    """The q tiles whose O changes in FINAL_0's drain (the PV WMMAs of the next region's prefix)."""
++    return [0, 1, 2, 3] if CFG["pipe"] else deferred()
++
++
+ S_C = ("s102", "s103")  # csgpr: the (c, c) SGPR pair
+ 
+ 
+@@ -97,13 +171,23 @@
+         self.dl = [None] + [take(1, 1) for _ in range(3)]  # masked tiles: dl + 64 i, i = 1..3
+         self.corr = [take(2) for _ in range(4)]  # (corr, junk) pairs: packed ops broadcast the low half
+         self.mn = [take(2) for _ in range(4)]  # (m', junk)
+-        self.qbuf = [take(48, 8) for _ in range(2)]  # Q fragments of q tile i in qbuf[i % 2]
++        if CFG["pipe"]:  # qbuf[0]: Q(0) / Q(3); qbuf[1], qbuf[2]: Q(1), Q(2) resident
++            self.qbuf = [take(48, 8) for _ in range(3)]
++        else:
++            self.qbuf = [take(48, 8) for _ in range(2)]  # Q fragments of q tile i in qbuf[i % 2]
+         # per q tile parity: max tree (<= 11 live) + lmx/pl/lm/need/rmax/mfull/dm
+         self.sm = [[take(1, 1) for _ in range(18)] for _ in range(2)]
+-        self.tree = [take(2) for _ in range(11)]  # sum tree (in place by level)
++        if CFG["pipe"]:
++            self.tree = None  # the sum tree's first level writes the PR leaves in place
++        else:
++            self.tree = [take(2) for _ in range(11)]  # sum tree (in place by level)
+         self.tot = [take(1, 1) for _ in range(4)]  # pl0, tot0, pl1, tot1
+-        self.fin = [take(1, 1) for _ in range(14)]  # FINAL scratch (+ the inv pair below)
+-        self.inv = take(2)
++        if CFG["pipe"]:  # FINAL scratch in qbuf[0] (no Q fragment is read after the last tile)
++            self.fin = [self.qbuf[0] + k for k in range(14)]
++            self.inv = self.qbuf[0] + 14
++        else:
++            self.fin = [take(1, 1) for _ in range(14)]  # FINAL scratch (+ the inv pair below)
++            self.inv = take(2)
+         self.end0 = nxt[0]
+         self.base = base
+         self.o = 256  # block 1: O[i][dt] = 256 + 64 i + 8 dt
+@@ -125,6 +209,8 @@
+         return self.k + 48 * j + 8 * ks
+ 
+     def Q(self, i, ks):
++        if CFG["pipe"]:
++            return self.qbuf[(0, 1, 2, 0)[i]] + 8 * ks
+         return self.qbuf[i % 2] + 8 * ks
+ 
+     def PR(self, i, leaf):
+@@ -136,7 +222,28 @@
+ 
+     def persistent(self):
+         """VGPRs whose values live across markers (INIT -> TILEs -> FINALs)."""
+-        return set(self.m) | set(self.d) | {self.cc, self.cc + 1, self.qa, self.qb} | set(range(256, 512))
++        p = set(self.m) | set(self.d) | {self.cc, self.cc + 1, self.qa, self.qb} | set(range(256, 512))
++        if CFG["pipe"]:  # V, P(0), P(1), S(2), S(3), the resident Q fragments of q tiles 1, 2
++            p |= set(range(self.v, self.v + 128))
++            for i in (0, 1):
++                for kt in range(2):
++                    p |= set(range(self.P(i, kt), self.P(i, kt) + 8))
++            for i in (2, 3):
++                p |= set(range(self.S(i, 0), self.S(i, 0) + 32))
++            for b in (1, 2):
++                p |= set(range(self.qbuf[b], self.qbuf[b] + 48))
++            if (
++                CFG["pipe_tree"] == "prefix"
++            ):  # the (0, 1) leaves and corr(0), corr(1) for the next prefix's tree
++                p |= set(range(self.pr, self.pr + 64)) | {self.corr[0], self.corr[1]}
++            return p
++        if (
++            deferred()
++        ):  # the deferred q tiles' scores, the V fragments and the PR leaves cross into the next region
++            for i in deferred():
++                p |= set(range(self.S(i, 0), self.S(i, 0) + 32))
++            p |= set(range(self.v, self.v + 128)) | set(range(self.pr, self.pr + 64))
++        return p
+ 
+     def all_regs(self):
+         return set(range(self.base, self.end0)) | set(range(256, 1024))
+@@ -306,7 +413,7 @@
+ DS_MAX = 56  # outstanding LDS loads a schedule allows (the dscnt field is 6 bits)
+ 
+ 
+-def schedule(nodes, mode="list", trace=None):
++def schedule(nodes, mode="list", trace=None, worder=None):
+     """(ordered node list, modelled cycles). mode 'program': list order; 'list': cycle-driven list scheduling around
+     an in-order WMMA stream QK(0..3), PV(0..3) (WMMAs occupy the XDL pipe 8 cycles), the other instructions picked
+     earliest-deadline-first (deadline = the first WMMA that needs them), then by critical path ('cp': critical path
+@@ -358,10 +465,10 @@
+         cp[i] = c + max((l + cp[s] for s, l in succ[i]), default=0)
+     # the WMMA stream, in order: QK(0..3) then PV(0..3) (program order within each group)
+     wseq = []
+-    for tg in CFG["worder"].split(","):
++    for tg in (worder or CFG["worder"]).split(","):
+         wseq += [i for i in range(n) if nodes[i].kind == "WMMA" and nodes[i].tag == tg]
+     if sorted(wseq) != [i for i in range(n) if nodes[i].kind == "WMMA"]:
+-        raise ValueError(f"worder {CFG['worder']} does not cover the WMMAs")
++        raise ValueError(f"worder {worder or CFG['worder']} does not cover the WMMAs")
+     wpos = {i: k for k, i in enumerate(wseq)}
+     # deadline of a non-WMMA node: position of the first WMMA that needs it (transitively); none: after the last
+     dl = [10**6] * n
+@@ -370,12 +477,15 @@
+             dl[i] = min(dl[i], wpos[s_] if s_ in wpos else dl[s_])
+     if mode == "cp":
+         prio = lambda i: (nodes[i].kind == "BAR", cp[i])  # noqa: E731
++    elif CFG["dsfirst"]:
++        prio = lambda i: (nodes[i].kind == "BAR", nodes[i].kind == "DS", -dl[i], cp[i])  # noqa: E731
+     else:
+         prio = lambda i: (nodes[i].kind == "BAR", -dl[i], cp[i])  # noqa: E731
+     npred = [len(nd.preds) for nd in nodes]
+     earliest = [0] * n
+     ready = set(i for i in range(n) if npred[i] == 0)
+     t, xdl_free, out, done, last_trans, wk = 0, 0, [], 0, False, 0
++    ds_next = 0
+     while done < n:
+         pick = None
+         nw = wseq[wk] if wk < len(wseq) else None
+@@ -385,7 +495,9 @@
+             o = [
+                 i
+                 for i in ready
+-                if earliest[i] <= t and nodes[i].kind != "WMMA" and (nodes[i].kind != "DS" or ds_room())
++                if earliest[i] <= t
++                and nodes[i].kind != "WMMA"
++                and (nodes[i].kind != "DS" or (ds_room() and t >= ds_next))
+             ]
+             if o:
+                 pick = max(
+@@ -393,6 +505,8 @@
+                 )
+         if pick is None:
+             nxt = [earliest[i] for i in ready if earliest[i] > t]
++            if ds_next > t and any(nodes[i].kind == "DS" and earliest[i] <= t for i in ready):
++                nxt.append(ds_next)
+             if nw is not None and nw in ready and xdl_free > t:
+                 nxt.append(xdl_free)
+             if not nxt:
+@@ -411,6 +525,7 @@
+         if nd.kind == "DS":
+             seq[pick] = state["issued"]
+             state["issued"] += 1
++            ds_next = t + CFG["dsrate"]
+         consume(nd)
+         out.append(nd)
+         done += 1
+@@ -430,6 +545,164 @@
+     return out, max(t, xdl_free)
+ 
+ 
++def schedule_slot(nodes, worder=None, seed=None):
++    """(ordered node list, modelled cycles): the list scheduler of mode 'slot' (S1b). Same contract as schedule()
++    (an in-order WMMA stream by worder, the other nodes along the dependence graph, <= DS_MAX LDS loads in flight),
++    but cycle-stepped on the issue model the candidates are evaluated with (fwdmeas issue_sim3, slot model measured
++    in fwdd_mb4a): a WMMA occupies the XDL pipe 8 cycles; inside its window only offsets 2, 3, 6, 7 take a VALU /
++    TRANS, offsets 1, 4, 5 (and 8 if the next WMMA is not ready) an LDS load / SALU; a TRANS blocks VALU / TRANS the
++    next cycle; v_permlane* issues only outside a window and takes 2 cycles; one SALU per 2 cycles; one LDS load per
++    CFG['dsrate'] cycles; LDS loads complete in order CFG['dslat'] cycles after issue; result latencies VALU 3,
++    TRANS 8, permlane 6, WMMA 20 (D -> any use). Ties: deadline (first WMMA needing the node), then critical path,
++    then program order (seed: a random tie-break for search)."""
++    import random
++
++    rnd = random.Random(seed) if seed is not None else None
++    n = len(nodes)
++    succ = [[] for _ in range(n)]
++    for i, nd in enumerate(nodes):
++        for p, l in nd.preds:
++            succ[p].append((i, l))
++    wseq = []
++    for tg in (worder or CFG["worder"]).split(","):
++        wseq += [i for i in range(n) if nodes[i].kind == "WMMA" and nodes[i].tag == tg]
++    if sorted(wseq) != [i for i in range(n) if nodes[i].kind == "WMMA"]:
++        raise ValueError(f"worder {worder or CFG['worder']} does not cover the WMMAs")
++    wpos = {i: k for k, i in enumerate(wseq)}
++    dl = [10**6] * n
++    for i in range(n - 1, -1, -1):
++        for s_, _ in succ[i]:
++            dl[i] = min(dl[i], wpos[s_] if s_ in wpos else dl[s_])
++    cp = [0] * n
++    for i in range(n - 1, -1, -1):
++        c = 8 if nodes[i].kind == "WMMA" else 1
++        cp[i] = c + max((l + cp[s] for s, l in succ[i]), default=0)
++    jit = [rnd.random() if rnd else 0.0 for _ in range(n)]
++    LATK = {"WMMA": 20, "VALU": 3, "TRANS": 8, "PERM": 6, "SALU": 2, "BAR": 1, "WAIT": 1}
++    npred = [len(nd.preds) for nd in nodes]
++    earliest = [0] * n
++    ready = set(i for i in range(n) if npred[i] == 0)
++    ds_done = {}  # DS node -> completion cycle (in order)
++    last_done = 0
++    issued_ds, retired_ds = [], 0  # issue order of DS nodes; how many are known retired (consumer waits)
++    out = []
++    t, last_w, wk, trans_at, salu_free, ds_next, done = 0, -100, 0, -100, 0, 0, 0
++    perm_busy = -1
++
++    def ds_room():
++        return len(issued_ds) - retired_ds < DS_MAX
++
++    def avail(i):
++        k = nodes[i].kind
++        if earliest[i] > t:
++            return False
++        o = t - last_w
++        inwin = 0 <= o <= 8
++        if k in ("VALU", "TRANS"):
++            return (not inwin or o in (2, 3, 6, 7)) and t != trans_at + 1 and t > perm_busy
++        if k == "PERM":
++            return o >= 8 and t != trans_at + 1 and t > perm_busy
++        if k == "DS":
++            return o != 0 and t >= ds_next and ds_room()
++        if k == "SALU":
++            return o != 0 and t >= salu_free
++        return o != 0  # BAR / WAIT
++
++    while done < n:
++        pick = None
++        nw = wseq[wk] if wk < len(wseq) else None
++        # a ready permlane (outside a window only) goes before the next WMMA: else a dense WMMA stream starves it
++        perms = [i for i in ready if nodes[i].kind == "PERM" and avail(i)]
++        if perms:
++            pick = max(perms, key=lambda i: (-dl[i], cp[i], -i))
++        elif nw is not None and nw in ready and earliest[nw] <= t and t >= last_w + 8 and t > perm_busy:
++            pick = nw
++        else:
++            cand = [i for i in ready if nodes[i].kind != "WMMA" and avail(i)]
++            if cand:
++                o = t - last_w
++                if 0 <= o < 8 and o in (2, 3, 6, 7):
++                    # a VALU slot: VALU / TRANS first (an LDS load / SALU only if none is ready); a TRANS at 3 / 7
++                    # blocks only the next (non-VALU) offset, at 2 / 6 it wastes a VALU slot
++                    vt = [i for i in cand if nodes[i].kind in ("VALU", "TRANS")]
++                    if vt:
++                        want = "VALU" if o in (2, 6) else "TRANS"
++                        pref = [i for i in vt if nodes[i].kind == want]
++                        cand = pref if (pref and (o in (3, 7) or CFG["slotpar"])) else vt
++                elif CFG["dsfirst"] and any(nodes[i].kind == "DS" for i in cand):
++                    cand = [i for i in cand if nodes[i].kind in ("DS", "BAR")]
++                pick = max(cand, key=lambda i: (nodes[i].kind == "BAR", -dl[i], cp[i] + 4 * jit[i], -i))
++        if pick is None:
++            t += 1
++            if t > 10**6:
++                raise RuntimeError("slot scheduler deadlock")
++            continue
++        nd = nodes[pick]
++        ready.discard(pick)
++        k = nd.kind
++        if k == "DS":
++            done_t = max(t + CFG["dslat"], last_done)
++            last_done = done_t
++            ds_done[pick] = done_t
++            issued_ds.append(pick)
++            ds_next = t + max(1, CFG["dsrate"])
++        if k == "BAR":
++            retired_ds = len(issued_ds)
++        # a consumer of an LDS load retires every load issued before it (in-order completion)
++        for p, _ in nd.preds:
++            if (
++                nodes[p].kind == "DS"
++                and k != "DS"
++                and p in ds_done
++                and any(r in nodes[p].vdefs for r in nd.vuses)
++            ):
++                retired_ds = max(retired_ds, issued_ds.index(p) + 1)
++        out.append(nd)
++        done += 1
++        if k == "WMMA":
++            last_w = t
++            wk += 1
++        elif k == "TRANS":
++            trans_at = t
++        elif k == "PERM":
++            perm_busy = t + 1
++        elif k == "SALU":
++            salu_free = t + 2
++        for s_, l in succ[pick]:
++            if k == "DS":
++                e = ds_done[pick] if any(r in nd.vdefs for r in nodes[s_].vuses) else t + 1
++            elif l <= 1:
++                e = t + 1  # WAR / WAW / order edge
++            else:
++                e = t + LATK.get(k, l)
++            if k == "DS" and l > 1 and nodes[s_].kind == "BAR":
++                e = max(e, ds_done[pick])
++            earliest[s_] = max(earliest[s_], e)
++            npred[s_] -= 1
++            if npred[s_] == 0:
++                ready.add(s_)
++        t += 1
++    # the DS_MAX waits: re-walk the order (the scheduler kept <= DS_MAX in flight only through retirement by
++    # consumers; insert the explicit waits where a load would exceed it)
++    res, nds, ret, seqn = [], 0, 0, {}
++    for nd in out:
++        if nd.kind == "DS":
++            if nds - ret >= DS_MAX:
++                keep = DS_MAX - 1
++                res.append(Node(f"s_wait_dscnt 0x{keep:x}", "WAIT", "dsmax"))
++                ret = nds - keep
++            seqn[nd.idx] = nds
++            nds += 1
++        elif nd.kind == "BAR":
++            ret = nds
++        else:
++            for p, _ in nd.preds:
++                if p in seqn and any(r in nodes[p].vdefs for r in nd.vuses):
++                    ret = max(ret, seqn[p] + 1)
++        res.append(nd)
++    return res, max(t, last_w + 8)
++
++
+ # --------------------------------------------------------------------------------------------------------------
+ # regions
+ # --------------------------------------------------------------------------------------------------------------
+@@ -445,6 +718,44 @@
+     out.append(f"v_mov_b32_e32 {vr(L.qb)}, {vr(ops['qb'])}")
+     for r in range(L.o, L.o + 256):
+         out.append(f"v_mov_b32_e32 {vr(r)}, 0")
++    if CFG["pipe"]:
++        # the resident Q fragments of q tiles 1, 2 (B_0 made the staging area visible; the shell never writes it
++        # again), the same addresses the per-tile reads used
++        for i in (1, 2):
++            qbase = L.qa if i < 2 else L.qb
++            for ks in range(NKS):
++                for h in range(2):
++                    if MUTATE == "qres" and (i, ks, h) == (2, 3, 1):
++                        continue  # test hook: one resident Q register quad left unread
++                    off = (i & 1) * QOFF1 + ks * 64 + 32 * h
++                    out.append(f"ds_load_b128 {vr(L.Q(i, ks) + 4 * h, 4)}, {vr(qbase)} offset:{off}")
++        # the first region's prefix: an exact no-op (S(2), S(3) = -inf; P(0), P(1) = 0; V = 0)
++        for i in (2, 3):
++            for r in range(L.S(i, 0), L.S(i, 0) + 32):
++                out.append(f"v_mov_b32_e32 {vr(r)}, 0x{NEG_INF:x}")
++        for i in (0, 1):
++            for kt in range(2):
++                for e in range(8):
++                    if MUTATE == "pinit" and (i, kt, e) == (1, 1, 3):
++                        continue  # test hook: one P register left undefined for the first prefix
++                    out.append(f"v_mov_b32_e32 {vr(L.P(i, kt) + e)}, 0")
++        for r in range(L.v, L.v + 128):
++            out.append(f"v_mov_b32_e32 {vr(r)}, 0")
++        if CFG["pipe_tree"] == "prefix":  # the first prefix's (0, 1) tree: d = fma(1, d, +0 + +0)
++            for r in range(L.pr, L.pr + 64):
++                out.append(f"v_mov_b32_e32 {vr(r)}, 0")
++            for i in (0, 1):
++                out.append(f"v_mov_b32_e32 {vr(L.corr[i])}, 1.0")
++        out.append("s_wait_dscnt 0x0")
++        return out
++    if deferred():  # the first region's prefix: an exact no-op on these
++        for i in deferred():
++            for r in range(L.S(i, 0), L.S(i, 0) + 32):
++                out.append(f"v_mov_b32_e32 {vr(r)}, 0x{NEG_INF:x}")
++        for r in list(range(L.v, L.v + 128)) + list(range(L.pr, L.pr + 64)):
++            if MUTATE == "d3init" and r == L.v + 5:
++                continue  # test hook: one V register left undefined for the first region's no-op prefix
++            out.append(f"v_mov_b32_e32 {vr(r)}, 0")
+     return out
+ 
+ 
+@@ -471,6 +782,14 @@
+                 continue  # test hook: s102 (the c the packed fma / need / rmax read) left unset
+             add(f"s_mov_b32 {r}, {ops['c2']}", "SALU", "c2")
+     dl = [ops.get("dl")] + L.dl[1:]
++    if deferred():  # the previous tile's deferred q tiles (or INIT's no-op state): softmax, O *= corr, PV
++        deferred_q3_nodes(L, add)
++    for (
++        i
++    ) in deferred():  # a skipped deferred q tile (TILE_D): -inf scores make the next prefix a no-op for it
++        if i not in active:
++            for e in range(32):
++                add(f"v_mov_b32_e32 {vr(L.S(i, 0) + e)}, 0x{NEG_INF:x}", "VALU", f"skip{i}")
+     for i in masked_q:
+         if i > 0:
+             add(f"v_add_nc_u32_e32 {vr(dl[i])}, {64 * i}, {vr(ops['dl'])}", "VALU", "dl")
+@@ -530,7 +849,13 @@
+                     "WMMA",
+                     f"QK{i}",
+                 )
+-        softmax_nodes(L, i, dl[i] if i in masked_q else None, add, active)
++        if i in deferred():  # only the mask now; the rest is the next region's prefix
++            softmax_nodes(L, i, dl[i] if i in masked_q else None, add, active, rest=False)
++            continue
++        if CFG["defer3"] and not CFG["defer2"] and i == 2:  # the (2, 3) tree for d[2] only (3's half stale)
++            softmax_nodes(L, i, dl[i] if i in masked_q else None, add, active, upd=[2])
++        else:
++            softmax_nodes(L, i, dl[i] if i in masked_q else None, add, active)
+         for kt in range(2):  # PV(i): O[i][dt] += V[dt][kt] P[i][kt], kt = 0 then 1
+             for dt in range(NDT):
+                 o = vr(L.O(i, dt), 8)
+@@ -566,7 +891,9 @@
+     return nodes
+ 
+ 
+-def softmax_nodes(L, i, dl, add, active=(0, 1, 2, 3)):
++def softmax_nodes(L, i, dl, add, active=(0, 1, 2, 3), rest=True, upd=None, tree=True):
++    """rest False: the mask only. upd None: the pair tree after an odd q tile (d of the active ones), else the
++    pair (2 (i // 2), +1) tree right after this q tile, updating d of the q tiles in upd only."""
+     S = [[L.S(i, j) + e for e in range(8)] for j in range(NKV)]
+     sc = L.sm[i % 2]
+     if dl is not None:  # s = -inf where 16 j + e > dl (kv > q)
+@@ -582,6 +909,8 @@
+                 add(
+                     f"v_cndmask_b32_e64 {vr(S[j][e])}, {vr(S[j][e])}, 0x{NEG_INF:x}, {sm}", "VALU", f"mask{i}"
+                 )
++    if not rest:
++        return
+     # row max over the lane's 32 values (exact; any tree): 32 -> 11 -> 4 -> 2 -> 1 in scratch sc[0..10]
+     vals, slot = [S[j][e] for j in range(NKV) for e in range(8)], 0
+     while len(vals) > 1:
+@@ -643,7 +972,13 @@
+         for r in range(0, 8, 2):
+             o = vr(L.O(i, dt) + r, 2)
+             add(f"v_pk_mul_f32 {o}, {o}, {vr(corr, 2)} op_sel_hi:[1,0]", "VALU", f"resc{i}")
+-    if i % 2 == 1:  # the pair's tree (an inactive lo tile: its half is computed on stale values and not used)
++    if not tree:
++        return
++    if upd is not None:
++        sum_nodes(L, 2 * (i // 2), add, upd)
++    elif (
++        i % 2 == 1
++    ):  # the pair's tree (an inactive lo tile: its half is computed on stale values and not used)
+         sum_nodes(L, i - 1, add, [x for x in (i - 1, i) if x in active])
+ 
+ 
+@@ -657,7 +992,8 @@
+             rem = len(leaves) - a
+             if rem >= 2:
+                 # level 1 writes the tree slots; later levels write in place into their first operand's slot
+-                r = L.tree[k] if level == 0 else leaves[a]
++                # pipe: no tree slots, level 1 writes its first leaf in place (the cvts read the leaves before)
++                r = L.tree[k] if (level == 0 and L.tree is not None) else leaves[a]
+                 k += 1
+                 b1, b2 = (a + 2, a + 1) if (MUTATE == "tree" and level == 0 and a == 0) else (a + 1, a + 2)
+                 add(f"v_pk_add_f32 {vr(r, 2)}, {vr(leaves[a], 2)}, {vr(leaves[b1], 2)}", "VALU", f"sum{i0}")
+@@ -684,10 +1020,225 @@
+         add(f"v_fma_f32 {vr(L.d[qi])}, {vr(cq)}, {vr(L.d[qi])}, {vr(tot)}", "VALU", f"sum{qi}")
+ 
+ 
++def deferred_q3_nodes(L, add):
++    """defer3: q tile 3 of the previous tile (its masked scores in S(3), its V fragments in V): softmax (no mask: the
++    previous region applied it), the (2, 3) tree for d[3] only, O(3) *= corr(3), PV(3) as WMMAs tagged PV3p."""
++    if CFG["defer2"]:  # q tiles 2, 3: the pair tree after q tile 3 (both halves live)
++        softmax_nodes(L, 2, None, add, rest=True)
++        softmax_nodes(L, 3, None, add, rest=True)
++    else:
++        softmax_nodes(L, 3, None, add, rest=True, upd=[2] if MUTATE == "d3upd" else [3])
++    for i in deferred():
++        for kt in range(2):
++            for dt in range(NDT):
++                o = vr(L.O(i, dt), 8)
++                add(
++                    f"v_wmma_f32_16x16x32_bf16 {o}, {vr(L.V(dt, kt), 8)}, {vr(L.P(i, kt), 8)}, {o}",
++                    "WMMA",
++                    f"PV{i}p",
++                )
++
++
++def pipe_prefix_nodes(L, add):
++    """pipe: the previous tile's tail (or INIT's no-op state): q tiles 2, 3's softmax (masked scores in S(2), S(3);
++    no mask here), the (2, 3) pair tree for d[2], d[3], O(2), O(3) *= corr, then the PV WMMAs of all four q tiles
++    (P(0), P(1) from the previous region, P(2), P(3) from this softmax; V of the previous tile), tags PV{i}p."""
++    if CFG["pipe_tree"] == "prefix":  # the previous body's (0, 1) pair tree, before q tile 2's exps reuse PR
++        sum_nodes(L, 0, add, [0, 1])
++    softmax_nodes(L, 2, None, add, rest=True)
++    softmax_nodes(L, 3, None, add, rest=True)  # the (2, 3) tree after q tile 3: d[2], d[3]
++    for i in range(QT):
++        for kt in range(2):
++            for dt in range(NDT):
++                o = vr(L.O(i, dt), 8)
++                add(
++                    f"v_wmma_f32_16x16x32_bf16 {o}, {vr(L.V(dt, kt), 8)}, {vr(L.P(i, kt), 8)}, {o}",
++                    "WMMA",
++                    f"PV{i}p",
++                )
++
++
++def tile_nodes_pipe(L, ops, masked, first=0, mask_only=None):
++    """pipe (S1b): the nodes of one region in program order (see CFG): the prefix (tile t - 1's tail), the no-op
++    state of the q tiles this body skips, the K / V / Q reads of tile t, QK(0..3) with the full softmax of q tiles
++    0, 1 and the mask only of q tiles 2, 3, the arrive after every LDS read of the region."""
++    if CFG["defer3"] or CFG["defer2"] or CFG["qgroup"] != "none":
++        raise ValueError("pipe excludes defer3 / defer2 / qgroup")
++    active = [i for i in range(QT) if i >= first]
++    masked_q = [i for i in active if masked and (mask_only is None or i == mask_only)]
++    nodes = []
++
++    def add(text, kind, tag=""):
++        nd = mk(text, kind, tag)
++        nodes.append(nd)
++        return nd
++
++    add(f"s_mov_b32 {S_SEL}, 0x{SEL_LO:x}", "SALU", "sel")
++    if CFG["csgpr"]:
++        if "c2" not in ops:
++            raise ValueError("csgpr needs the TILE marker's c2 operand")
++        for r in S_C:
++            if MUTATE == "c2" and r == S_C[0]:
++                continue
++            add(f"s_mov_b32 {r}, {ops['c2']}", "SALU", "c2")
++    dl = [ops.get("dl")] + L.dl[1:]
++    loads = []
++
++    def k_loads():
++        for ks in range(NKS):  # K fragments, k-step major (FlyDSL's issue order)
++            for j in range(NKV):
++                for h in range(2):
++                    off = (
++                        j * 16 * XK
++                        + ks * 64
++                        + 32 * h
++                        + (16 if (MUTATE == "koff" and (j, ks, h) == (1, 2, 0)) else 0)
++                    )
++                    loads.append(
++                        add(
++                            f"ds_load_b128 {vr(L.K(j, ks) + 4 * h, 4)}, {vr(ops['kb'])} offset:{off}",
++                            "DS",
++                            f"K{j}.{ks}.{h}",
++                        )
++                    )
++
++    def q_loads(i):  # q tiles 0, 3 into qbuf[0] (1, 2 are resident)
++        qbase = L.qa if i < 2 else L.qb
++        return [
++            add(
++                f"ds_load_b128 {vr(L.Q(i, ks) + 4 * h, 4)}, {vr(qbase)} "
++                f"offset:{(i & 1) * QOFF1 + ks * 64 + 32 * h + (16 if (MUTATE == 'qoff' and (i, ks, h) == (3, 4, 0)) else 0)}",
++                "DS",
++                f"Q{i}.{ks}.{h}",
++            )
++            for ks in range(NKS)
++            for h in range(2)
++        ]
++
++    if CFG["pipe_dsentry"]:  # nothing in the prefix touches K or qbuf[0]
++        k_loads()
++        if 0 in active:
++            loads.extend(q_loads(0))
++    pipe_prefix_nodes(L, add)
++    for i in range(QT):  # q tiles this body skips: the next prefix must be an exact no-op for them
++        if i in active or (MUTATE == "pskip" and i == 0):
++            continue
++        if i < 2:  # P(i) = 0: O(i) += V * 0
++            for kt in range(2):
++                for e in range(8):
++                    add(f"v_mov_b32_e32 {vr(L.P(i, kt) + e)}, 0", "VALU", f"skip{i}")
++            if CFG["pipe_tree"] == "prefix":  # its leaves 0 and corr 1: the next prefix's tree keeps d[i]
++                for x in range(32):
++                    add(f"v_mov_b32_e32 {vr(L.PR(i, x))}, 0", "VALU", f"skip{i}")
++                add(f"v_mov_b32_e32 {vr(L.corr[i])}, 1.0", "VALU", f"skip{i}")
++        else:  # S(i) = -inf: corr 1, p +0, d = fma(1, d, +0), O(i) += V * 0
++            for e in range(32):
++                add(f"v_mov_b32_e32 {vr(L.S(i, 0) + e)}, 0x{NEG_INF:x}", "VALU", f"skip{i}")
++    for i in masked_q:
++        if i > 0:
++            add(f"v_add_nc_u32_e32 {vr(dl[i])}, {64 * i}, {vr(ops['dl'])}", "VALU", "dl")
++    if not CFG["pipe_dsentry"]:
++        k_loads()
++
++    def v_loads():  # V^T fragments of tile t (after the prefix's PV WMMAs read tile t - 1's: WAR + order edges)
++        for dt in range(NDT):
++            for kt in range(2):
++                for h in range(2):
++                    off = (32 * kt + 16 * h) * XV + dt * 32
++                    loads.append(
++                        add(
++                            f"ds_load_tr16_b128 {vr(L.V(dt, kt) + 4 * h, 4)}, {vr(ops['vb'])} offset:{off}",
++                            "DS",
++                            f"V{dt}.{kt}.{h}",
++                        )
++                    )
++
++    if CFG["pipe_vafter"] == "pv":
++        v_loads()
++
++    q3 = []
++    for i in active:
++        if i == 0 and not CFG["pipe_dsentry"]:
++            loads += q_loads(0)
++        if i == 3:  # after the last QK(0) WMMA read qbuf[0] (WAR edges); QK(1), QK(2) hide its latency
++            if (
++                CFG["pipe_vafter"] == "qk0"
++            ):  # program order here, issue after the last QK(0) WMMA (order edges)
++                v_loads()
++            q3 = q_loads(3)
++            loads += q3
++        for ks in range(NKS):  # QK(i): S[i][j] = sum_ks K[j][ks] Q[i][ks] (chains from +0)
++            for j in range(NKV):
++                c = "0" if ks == 0 else vr(L.S(i, j), 8)
++                kk = {1: 2, 2: 1}.get(ks, ks) if (MUTATE == "chain" and i == 1 and j == 3) else ks
++                add(
++                    f"v_wmma_f32_16x16x32_bf16 {vr(L.S(i, j), 8)}, {vr(L.K(j, kk), 8)}, {vr(L.Q(i, kk), 8)}, {c}",
++                    "WMMA",
++                    f"QK{i}",
++                )
++        if i >= 2:  # the mask now, the rest in the next region's prefix
++            softmax_nodes(L, i, dl[i] if i in masked_q else None, add, active, rest=False)
++        else:  # the full softmax (P(i) for the next prefix's PV); the (0, 1) pair tree after q tile 1 (or next prefix)
++            softmax_nodes(
++                L, i, dl[i] if i in masked_q else None, add, active, tree=CFG["pipe_tree"] == "body"
++            )
++    bar = add("s_barrier_signal -1", "BAR", "arrive")  # after every LDS read of the region (order edges)
++    build_dag(nodes)
++    for nd in loads:
++        add_order(nodes, nd.idx, bar.idx, LAT["DS"])
++    # an LDS load overwriting a source of a WMMA still in flight costs a va_vdst(0) drain (expert mode, more than
++    # one VALU class in flight): issue the V reads only after the LAST prefix PV WMMA and the Q(3) reads only after
++    # the LAST QK(0) WMMA, so each group pays one drain instead of one per buffer slice
++    last = {}
++    for nd in nodes:
++        if nd.kind == "WMMA":
++            last[nd.tag] = nd.idx
++    lpv = max(last[f"PV{i}p"] for i in range(QT))
++    if CFG["pipe_vafter"] == "qk0" and "QK0" in last:
++        lpv = max(lpv, last["QK0"])
++    for nd in loads:
++        if nd.tag.startswith("V"):
++            add_order(nodes, lpv, nd.idx, 1)
++        if nd.tag.startswith("Q3") and "QK0" in last:
++            add_order(nodes, last["QK0"], nd.idx, 1)
++    if CFG["pipe_dsentry"]:  # the first read before the first prefix WMMA (both are first in their classes)
++        fw = min(nd.idx for nd in nodes if nd.kind == "WMMA")
++        add_order(nodes, loads[0].idx, fw, 1)
++    return nodes
++
++
++def region_drain(L, mode="list"):
++    """defer3 / defer2 / pipe: FINAL_0's prefix -- the last tile's deferred work (c from the (c, c) VGPR pair)."""
++    nodes = []
++
++    def add(text, kind, tag=""):
++        nd = mk(text, kind, tag)
++        nodes.append(nd)
++        return nd
++
++    add(f"s_mov_b32 {S_SEL}, 0x{SEL_LO:x}", "SALU", "sel")
++    saved = CFG["csgpr"]
++    CFG["csgpr"] = False
++    try:
++        if CFG["pipe"]:
++            pipe_prefix_nodes(L, add)
++        else:
++            deferred_q3_nodes(L, add)
++    finally:
++        CFG["csgpr"] = saved
++    build_dag(nodes)
++    wo = ",".join(f"PV{i}p" for i in drained())
++    order, _ = schedule_slot(nodes, wo) if mode == "slot" else schedule(nodes, mode, worder=wo)
++    return [nd.text for nd in order]
++
++
+ def region_tile(L, ops, masked, mode="list", first=0, mask_only=None):
+     """(lines, modelled cycles) of a TILE region."""
+-    nodes = tile_nodes(L, ops, masked, first, mask_only)
+-    order, cyc = schedule(nodes, mode)
++    if CFG["pipe"]:
++        nodes = tile_nodes_pipe(L, ops, masked, first, mask_only)
++    else:
++        nodes = tile_nodes(L, ops, masked, first, mask_only)
++    order, cyc = schedule_slot(nodes, seed=CFG.get("seed")) if mode == "slot" else schedule(nodes, mode)
+     out = []
+     for nd in order:
+         if nd.kind == "BAR":  # the arrive: this wave's LDS reads retired, wave 0's tile t + 1 landed
+@@ -697,8 +1248,10 @@
+     return out, cyc
+ 
+ 
+-def region_final(L, ops, i):
+-    """FINAL_i (program order). ops = {'o': first of the 32 output VGPRs, 'lse': output VGPR}."""
++def region_final(L, ops, i, mode="list"):
++    """FINAL_i (program order; defer3: FINAL_0 starts with the scheduled drain of q tile 3). ops = {'o': first of the
++    32 output VGPRs, 'lse': output VGPR}."""
++    drain = region_drain(L, mode) if (drained() and i == 0 and MUTATE != "d3drain") else []
+     d, m = L.d[i], L.m[i]
+     a, b, rc, e1, q, e2, sh, sub, x, lg, s = L.fin[:11]
+     inv = L.inv
+@@ -735,4 +1288,4 @@
+         f"v_add_f32_e32 {vr(s)}, {vr(m)}, {vr(lg)}",
+         f"v_mul_f32_e32 {vr(ops['lse'])}, 0x{LN2 + (1 if MUTATE == 'lse' else 0):x}, {vr(s)}",
+     ]
+-    return out
++    return drain + out
+--- a/gfx1250_mla_fwd/README.md
++++ b/gfx1250_mla_fwd/README.md
+@@ -2,7 +2,8 @@
+ 
+ Causal attention forward of the DeepSeek-V3 MLA head dims (q/k 192, v 128, bf16, MHA, bottom-right causal) on gfx1250,
+ bit for bit the shipped FlyDSL forward (`primus_turbo/flydsl/attention/gfx1250_mla`): same out (bf16) and lse (fp32,
+-natural log). Status: round 4, step W-S1a (CPU-built and CPU-checked; no GPU run yet). Not wired into Turbo: the
++natural log). Status: round 5, step S1b (cross-tile software pipeline, CPU-built and CPU-checked; the W-S1a2 / S1a3
++candidates passed the GPU gates bit for bit, but were 12-14 % slower than FlyDSL). Not wired into Turbo: the
+ Python integration (`impl.py`, `hsaco.py`, manifest, the `PRIMUS_TURBO_MLA_FWD_IMPL` switch, tests) is FWD-INT's.
+ 
+ ## Layout
+@@ -51,8 +52,10 @@
+ `asmkit` on the path (`primus_turbo/hipkittens/asmkit`, or `--asmkit-root`):
+ 
+ ```
+-python3 primus_turbo/hipkittens/gfx1250_mla_fwd/gen/build.py --out OUT [--sched list|program] [--asmkit-root DIR]
+-    [--diag] [--csgpr] [--qgroup none|pair|late] [--worder TAGS] [--trans-cost N]
++python3 primus_turbo/hipkittens/gfx1250_mla_fwd/gen/build.py --out OUT [--sched list|program|slot] [--asmkit-root DIR]
++    [--diag] [--csgpr] [--qgroup none|pair|late] [--worder TAGS] [--trans-cost N] [--defer3|--defer2]
++    [--ds-lat N] [--ds-rate N] [--ds-first] [--pipe [--pipe-tree body|prefix] [--pipe-vafter pv|qk0]
++    [--pipe-dsentry]] [--seed N]
+ ```
+ 
+ The shipped candidates (W-S1a2) are built with
+@@ -71,6 +74,22 @@
+   of the re-reads.
+ - `--trans-cost`: the list scheduler's issue cost of a TRANS op (model parameter only).
+ 
++S1b (`--pipe`, the `fwdgen.CFG['pipe']` docstring has the details): a cross-tile software pipeline inside the same
++marker shell (the shell, and so the HIP reference, are byte-identical). The region of tile t first runs the tail of
++tile t - 1 (q tiles 2, 3's softmax, then the PV WMMAs of all four q tiles), then tile t's reads, QK(0..3), the full
++softmax of q tiles 0, 1 and the mask of q tiles 2, 3; Q(1), Q(2) stay resident (read once in INIT), Q(0) / Q(3)
++share one buffer (24 instead of 48 Q reads per tile); FINAL_0 drains the last tile's tail. `--sched slot` is a list
++scheduler that steps the measured issue-slot model (VALU / TRANS at WMMA-window offsets 2, 3, 6, 7, a TRANS placed at
++3 / 7, LDS loads at 1, 4, 5 and at most one per `--ds-rate` cycles, `--ds-lat` load-to-use). The S1b candidate A is
++
++```
++build.py --out OUT --sched slot --csgpr --diag --pipe --ds-lat 290 --ds-first --ds-rate 6 --pipe-vafter pv \
++    --pipe-tree body --pipe-dsentry
++```
++
++(B: `--csgpr --trans-cost 3 --diag --pipe --ds-lat 290 --ds-first --ds-rate 8 --pipe-tree body --pipe-vafter pv
++--pipe-dsentry`, the same structure under the greedy list scheduler).
++
+ 1. `amdclang++ -x hip --offload-arch=gfx1250 --cuda-device-only --no-gpu-bundle-output -O3 -std=c++20 -DNDEBUG -I.
+    -save-temps=obj -mllvm -amdgpu-expert-scheduling-mode -cuid=k_mla_fwd -DHKGEN_REF=0 -c hip/k_mla_fwd.hip`
+    (cwd `hip/`); the saved `.s` is `OUT/shell.s`. The same with `-DHKGEN_REF=1` gives `OUT/ref/k_mla_fwd.hsaco`
+--- a/gfx1250_mla_fwd/tools/emu.py
++++ b/gfx1250_mla_fwd/tools/emu.py
+@@ -504,7 +504,25 @@
+     for i in range(4):
+         poison_shell()
+         poison_gen()
+-        W.run(rg["regions"][f"FINAL_{i}"])
++        fin = rg["regions"][f"FINAL_{i}"]
++        # FINAL_0 = the drain of the deferred work (if any), then q tile 0's epilogue (its first instruction is the
++        # v_div_scale of 1 / d): the drained q tiles' fp32 state is read between the two (pipe drains q tile 0 too,
++        # whose O the epilogue then scales in place)
++        cut = (
++            next((k for k, x in enumerate(fin) if x.mn.startswith("v_div_scale")), len(fin))
++            if i == 0
++            else len(fin)
++        )
++        W.run(fin[:cut])
++        for qi in rg.get("deferred", []) if i == 0 else []:  # drained in FINAL_0: the fp32 state is final now
++            state["m"][16 * qi : 16 * qi + 16] = u2f(W.v[L.m[qi]])[:16]
++            state["d"][16 * qi : 16 * qi + 16] = u2f(W.v[L.d[qi]])[:16]
++            for dt in range(8):
++                for l in range(32):
++                    h, col = l // 16, l % 16
++                    for r in range(8):
++                        state["O"][16 * qi + col, 16 * dt + 8 * h + r] = u2f(W.v[L.O(qi, dt) + r, l])
++        W.run(fin[cut:])
+         o0 = rg["ops"][f"FINAL_{i}.o"]
+         words = W.v[
+             o0 : o0 + 32
+@@ -532,6 +550,8 @@
+ 
+     bj = json.loads((build_dir / "build.json").read_text())
+     base = bj["layout"]["base"]
++    # the build's generator options (defer3 changes the registers that live across regions)
++    G.CFG.update(bj["recipe"]["variant"].get("gen_cfg", {}))
+     L = G.Layout(base)
+     ops = {}
+ 
+@@ -549,6 +569,8 @@
+         "end0": L.end0,
+         "persistent": L.persistent(),
+         "L": L,
++        # the q tiles whose fp32 state FINAL_0's drain still changes (defer3 / defer2: deferred(); pipe: all four)
++        "deferred": G.drained() if hasattr(G, "drained") else G.deferred(),
+     }
+ 
+ 

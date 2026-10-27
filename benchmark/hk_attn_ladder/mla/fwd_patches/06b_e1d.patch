@@ -1,0 +1,28 @@
+--- a/gfx1250_mla_fwd/hip/k_mla_fwd.hip
++++ b/gfx1250_mla_fwd/hip/k_mla_fwd.hip
+@@ -452,9 +452,11 @@
+   // FINAL markers but Phase 1's write address)
+   const int ln = (int)__builtin_amdgcn_mbcnt_lo(~0u, 0u);
+   const int hl = ln >> 4, rl = ln & 15, lt = ln >> 3, lk = ln & 7;
+-  const unsigned vo_l = (unsigned)(16 * wv + hl) * rsb + (unsigned)(rl * 16);
+-  const lds_u8* const rd0 = lds_ptr(stg + (unsigned)(hl * XO + rl * 16));                // q tiles 0..2
+-  const lds_u8* const rd3 = lds_ptr(stg + (unsigned)(3 * 64 * XK + hl * XO + rl * 16));  // q tile 3
++  // DIAGNOSTIC variant E1d: the stores keep FINAL's fragment layout (lane l: row l % 16, bytes 16 (l / 16) + 32 j,
++  // 16 rows x 32 B per store, as S1b_A), everything else as E1 (staging, straight-line phase, rolling XCNT window)
++  const unsigned vo_l = (unsigned)(16 * wv + rl) * rsb + (unsigned)(hl * 16);
++  const lds_u8* const rd0 = lds_ptr(stg + (unsigned)(rl * XO + hl * 16));                // q tiles 0..2
++  const lds_u8* const rd3 = lds_ptr(stg + (unsigned)(3 * 64 * XK + rl * XO + hl * 16));  // q tile 3
+   const u32x2 lsev = lds_load_u32x2(lds_ptr(stg + (unsigned)(lt * 64 * XK + LSE_SLOT + 8 * lk)), 0);
+   const unsigned lq = (unsigned)(q0 + 16 * wv + 64 * lt + 2 * lk);
+   const unsigned la = (((unsigned)bb * (unsigned)H + (unsigned)hh) * (unsigned)Sq + lq) * 4u;
+@@ -462,8 +464,8 @@
+   sched_barrier<0>();
+   static_for<QT>([&](auto i) {
+     static_for<NDT>([&](auto j) {
+-      const u32x4 w = i < 3 ? lds_load_u32x4(rd0, i * 64 * XK + 2 * j * XO) : lds_load_u32x4(rd3, 2 * j * XO);
+-      buf_store_b128(w, r_o[i], (int)vo_l, (int)((unsigned)(2 * j) * rsb));
++      const u32x4 w = i < 3 ? lds_load_u32x4(rd0, i * 64 * XK + 32 * j) : lds_load_u32x4(rd3, 32 * j);
++      buf_store_b128(w, r_o[i], (int)(vo_l + (unsigned)(32 * j)), 0);
+     });
+     sched_barrier<0>();
+   });

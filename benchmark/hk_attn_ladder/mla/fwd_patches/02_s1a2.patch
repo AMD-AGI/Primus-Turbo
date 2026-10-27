@@ -1,0 +1,307 @@
+--- a/gfx1250_mla_fwd/gen/build.py
++++ b/gfx1250_mla_fwd/gen/build.py
+@@ -108,7 +108,7 @@
+     return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+ 
+ 
+-def compile_variant(cxx, out_dir, ref, diag=0):
++def compile_variant(cxx, out_dir, ref, diag=0, tile_c2=0):
+     """Compile the shell (ref=0) or the HIP reference (ref=1) into out_dir; returns (compile argv, .s path)."""
+     out_dir.mkdir(parents=True, exist_ok=True)
+     tmp = out_dir / "tmp"
+@@ -123,6 +123,9 @@
+             f"-cuid={KERNEL}",
+             f"-DHKGEN_REF={ref}",
+             f"-DHKGEN_DIAG={diag}",
++        ]
++        + ([f"-DHKGEN_TILE_C2={tile_c2}"] if tile_c2 else [])
++        + [
+             "-c",
+             str(HIP / SRC),
+             "-o",
+@@ -263,7 +266,16 @@
+         action="store_true",
+         help="skip the HIP reference variant (its .s also feeds the MSB field map: DS operands)",
+     )
++    ap.add_argument(
++        "--csgpr", action="store_true", help="c from an SGPR pair in the tiles (fwdgen.CFG['csgpr'])"
++    )
++    ap.add_argument("--qgroup", default="none", choices=("none", "pair", "late"), help="fwdgen.CFG['qgroup']")
++    ap.add_argument("--worder", default=G.CFG["worder"], help="fwdgen.CFG['worder']")
++    ap.add_argument(
++        "--trans-cost", type=int, default=G.CFG["trans"], help="fwdgen.CFG['trans'] (scheduler model)"
++    )
+     a = ap.parse_args()
++    G.CFG.update(csgpr=a.csgpr, qgroup=a.qgroup, worder=a.worder, trans=a.trans_cost)
+     if a.asmkit_root:
+         sys.path.insert(0, a.asmkit_root)
+     else:
+@@ -284,8 +296,8 @@
+ 
+     # 1. the shell
+     diag = 1 if a.diag else 0
+-    rec["recipe"]["variant"] = {"sched": a.sched, "diag": diag}
+-    cmd, s_path = compile_variant(a.cxx, out / "shell", 0, diag)
++    rec["recipe"]["variant"] = {"sched": a.sched, "diag": diag, "gen_cfg": dict(G.CFG)}
++    cmd, s_path = compile_variant(a.cxx, out / "shell", 0, diag, 1 if a.csgpr else 0)
+     rec["recipe"]["compile"] = cmd
+     shell = s_path.read_text().rstrip("\n").split("\n")
+     (out / "shell.s").write_text("\n".join(shell) + "\n")
+@@ -368,6 +380,10 @@
+             pre = []
+         elif name.startswith("TILE"):
+             o = {"kb": vfirst(ops["kb"]), "vb": vfirst(ops["vb"])}
++            if "c2" in ops:
++                if not re.fullmatch(r"s\d+", ops["c2"]) or 90 <= int(ops["c2"][1:]) <= 103:
++                    raise RuntimeError(f"{name}: c2 operand {ops['c2']} is not a plain, unclobbered SGPR")
++                o["c2"] = ops["c2"]
+             if "dl" in ops:
+                 o["dl"] = vfirst(ops["dl"])
+             if name.startswith("TILE_D"):
+--- a/gfx1250_mla_fwd/gen/fwdgen.py
++++ b/gfx1250_mla_fwd/gen/fwdgen.py
+@@ -51,6 +51,18 @@
+ S_ANY = ("s95", "s96", "s97", "s98")
+ S_MASK = ("s99", "s100", "s101", "s102", "s103")
+ CLOBBERED = {f"s{i}" for i in range(90, 104)} | {"vcc", "scc"}
++# build options (set by build.py; recorded in build.json):
++#   csgpr   c = scale log2(e) from the SGPR pair s[102:103] (copied from the TILE marker's c2 operand at the tile
++#           start) instead of the (c, c) VGPR pair: v_pk_fma_f32 then has 2 VGPR sources (fwdmeas: a 3-VGPR-source
++#           pk_fma costs ~0.75 cycle), the need fma / rmax mul read s102; the mask rotation shrinks to s99..s101.
++#           Bit-identical (the same value through the same instructions).
++#   qgroup  'none': the Q re-reads of q tiles 2 / 3 placed freely (each one that lands right after the WMMA that
++#           last read its buffer costs a va_vdst(0) drain); 'pair': every Q(i) read (i = 2, 3) after the last QK(i - 2)
++#           WMMA (one drain per q tile); 'late': Q(2) and Q(3) reads after the last QK(1) WMMA (one drain per tile)
++#   worder  the in-order WMMA stream of the list scheduler, by tag (default QK0..3 then PV0..3)
++#   trans   the list scheduler's issue cost of a TRANS (v_exp) in cycles (model only; default 2)
++CFG = {"csgpr": False, "qgroup": "none", "worder": "QK0,QK1,QK2,QK3,PV0,PV1,PV2,PV3", "trans": 2}
++S_C = ("s102", "s103")  # csgpr: the (c, c) SGPR pair
+ 
+ 
+ def vr(r, n=1):
+@@ -345,8 +357,11 @@
+         c = 8 if nodes[i].kind == "WMMA" else COST[nodes[i].kind]
+         cp[i] = c + max((l + cp[s] for s, l in succ[i]), default=0)
+     # the WMMA stream, in order: QK(0..3) then PV(0..3) (program order within each group)
+-    wseq = [i for i in range(n) if nodes[i].kind == "WMMA" and nodes[i].tag.startswith("QK")]
+-    wseq += [i for i in range(n) if nodes[i].kind == "WMMA" and nodes[i].tag.startswith("PV")]
++    wseq = []
++    for tg in CFG["worder"].split(","):
++        wseq += [i for i in range(n) if nodes[i].kind == "WMMA" and nodes[i].tag == tg]
++    if sorted(wseq) != [i for i in range(n) if nodes[i].kind == "WMMA"]:
++        raise ValueError(f"worder {CFG['worder']} does not cover the WMMAs")
+     wpos = {i: k for k, i in enumerate(wseq)}
+     # deadline of a non-WMMA node: position of the first WMMA that needs it (transitively); none: after the last
+     dl = [10**6] * n
+@@ -403,7 +418,9 @@
+             xdl_free = t + 8
+             wk += 1
+         else:
+-            t += COST[nd.kind] + (2 if (last_trans and nd.kind == "TRANS") else 0)
++            t += (CFG["trans"] if nd.kind == "TRANS" else COST[nd.kind]) + (
++                2 if (last_trans and nd.kind == "TRANS") else 0
++            )
+         last_trans = nd.kind == "TRANS"
+         for s_, l in succ[pick]:
+             earliest[s_] = max(earliest[s_], ti + l)
+@@ -446,6 +463,13 @@
+         return nd
+ 
+     add(f"s_mov_b32 {S_SEL}, 0x{SEL_LO:x}", "SALU", "sel")
++    if CFG["csgpr"]:
++        if "c2" not in ops:
++            raise ValueError("csgpr needs the TILE marker's c2 operand")
++        for r in S_C:
++            if MUTATE == "c2" and r == S_C[0]:
++                continue  # test hook: s102 (the c the packed fma / need / rmax read) left unset
++            add(f"s_mov_b32 {r}, {ops['c2']}", "SALU", "c2")
+     dl = [ops.get("dl")] + L.dl[1:]
+     for i in masked_q:
+         if i > 0:
+@@ -525,6 +549,20 @@
+         add_order(nodes, nd.idx, bar.idx, 1)
+     for nd in q23:
+         add_order(nodes, bar.idx, nd.idx, 1)
++    if CFG["qgroup"] != "none":
++        last_qk = {}
++        for nd in nodes:
++            if nd.kind == "WMMA" and nd.tag.startswith("QK"):
++                last_qk[int(nd.tag[2:])] = nd.idx
++        for nd in q23:
++            qi = int(nd.tag[1])
++            # the buffer's in-region reader is QK(qi - 2); a skipped q tile (below `first`) read nothing here and the
++            # region-entry drain covers its buffer: no edge
++            if qi - 2 not in last_qk:
++                continue
++            src = (qi - 2) if CFG["qgroup"] == "pair" else 1
++            if src in last_qk and last_qk[src] < nd.idx:
++                add_order(nodes, last_qk[src], nd.idx, 1)
+     return nodes
+ 
+ 
+@@ -535,7 +573,8 @@
+         k = 0
+         for j in range(NKV):
+             for e in range(8):
+-                sm = S_MASK[k % len(S_MASK)]
++                smk = S_MASK[:3] if CFG["csgpr"] else S_MASK
++                sm = smk[k % len(smk)]
+                 k += 1
+                 if MUTATE == "mask" and i == 0 and j == 0 and e == 5:
+                     continue
+@@ -565,8 +604,9 @@
+     lmx, pl, lm, need, rmax, mfull, dm = vals[0], sc[11], sc[12], sc[13], sc[14], sc[15], sc[16]
+     add(f"v_permlanex16_b32 {vr(pl)}, {vr(lmx)}, {S_SEL}, 0x{SEL_HI:x}", "PERM", f"max{i}")
+     add(f"v_max_num_f32_e32 {vr(lm)}, {vr(lmx)}, {vr(pl)}", "VALU", f"max{i}")
+-    add(f"v_fma_f32 {vr(need)}, {vr(lm)}, {vr(L.cc)}, -{vr(L.m[i])}", "VALU", f"dec{i}")
+-    add(f"v_mul_f32_e32 {vr(rmax)}, {vr(L.cc)}, {vr(lm)}", "VALU", f"dec{i}")
++    cs = S_C[0] if CFG["csgpr"] else vr(L.cc)
++    add(f"v_fma_f32 {vr(need)}, {vr(lm)}, {cs}, -{vr(L.m[i])}", "VALU", f"dec{i}")
++    add(f"v_mul_f32_e32 {vr(rmax)}, {cs}, {vr(lm)}", "VALU", f"dec{i}")
+     add(f"v_max_num_f32_e32 {vr(mfull)}, {vr(L.m[i])}, {vr(rmax)}", "VALU", f"dec{i}")
+     add(f"v_cmp_lt_f32_e64 {S_NEED[i]}, 0x{LOG2E:x}, {vr(need)}", "VALU", f"dec{i}")
+     add(f"s_cmp_lg_u32 {S_NEED[i]}, 0", "SALU", f"dec{i}")
+@@ -580,9 +620,12 @@
+     for j in range(NKV):
+         for e in range(0, 8, 2):
+             add(
+-                f"v_pk_fma_f32 {vr(S[j][e], 2)}, {vr(S[j][e], 2)}, {vr(L.cc, 2)}, "
++                f"v_pk_fma_f32 {vr(S[j][e], 2)}, {vr(S[j][e], 2)}, "
++                f"{('s[' + S_C[0][1:] + ':' + S_C[1][1:] + ']') if CFG['csgpr'] else vr(L.cc, 2)}, "
+                 f"{vr(L.corr[i], 2) if (MUTATE == 'exparg' and i == 2) else vr(mn, 2)} "
+-                f"op_sel_hi:[1,1,0] neg_lo:[0,0,1] neg_hi:[0,0,1]",
++                # an SGPR-pair source of a packed f32 op must take op_sel_hi 0 (the assembler rejects 1): both
++                # halves read s102 = c
++                f"op_sel_hi:[1,{0 if CFG['csgpr'] else 1},0] neg_lo:[0,0,1] neg_hi:[0,0,1]",
+                 "VALU",
+                 f"p{i}",
+             )
+--- a/gfx1250_mla_fwd/hip/k_mla_fwd.hip
++++ b/gfx1250_mla_fwd/hip/k_mla_fwd.hip
+@@ -46,6 +46,20 @@
+ #ifndef HKGEN_DIAG
+ #define HKGEN_DIAG 0
+ #endif
++// HKGEN_TILE_C2=1: the TILE markers also carry c2 = scale * log2(e) in an SGPR ("c2=sN"), so the generated tile can
++// use it as a scalar operand (build.py --csgpr)
++#ifndef HKGEN_TILE_C2
++#define HKGEN_TILE_C2 0
++#endif
++#if HKGEN_TILE_C2
++#define HKGEN_C2_TXT " c2=%2"
++#define HKGEN_C2_TXT3 " c2=%3"
++#define HKGEN_C2_OP , "s"(c2)
++#else
++#define HKGEN_C2_TXT ""
++#define HKGEN_C2_TXT3 ""
++#define HKGEN_C2_OP
++#endif
+ 
+ // SGPRs the generated code may use as temporaries (and vcc / scc): declared clobbered at every marker
+ #define HKGEN_CLOBBERS "memory", "vcc", "scc", "s90", "s91", "s92", "s93", "s94", "s95", "s96", "s97", "s98", \
+@@ -316,7 +330,8 @@
+ #if HKGEN_REF
+     tile(st + k_lane, st + K_B + v_lane, false, 0, 0, -1);
+ #else
+-    asm volatile("; HKGEN TILE_C kb=%0 vb=%1" ::"v"(st + k_lane), "v"(st + K_B + v_lane) : HKGEN_CLOBBERS);
++    asm volatile("; HKGEN TILE_C kb=%0 vb=%1" HKGEN_C2_TXT ::"v"(st + k_lane), "v"(st + K_B + v_lane) HKGEN_C2_OP
++                 : HKGEN_CLOBBERS);
+ #endif
+     bar_wait();  // B_{t+1}
+   }
+@@ -330,17 +345,17 @@
+       tile(st + k_lane, st + K_B + v_lane, true, dl0 - NB * t2, k, k);
+ #else
+       if constexpr (k == 0) {
+-        asm volatile("; HKGEN TILE_D0 kb=%0 vb=%1 dl=%2" ::"v"(st + k_lane), "v"(st + K_B + v_lane),
+-                     "v"(dl0 - NB * t2) : HKGEN_CLOBBERS);
++        asm volatile("; HKGEN TILE_D0 kb=%0 vb=%1 dl=%2" HKGEN_C2_TXT3 ::"v"(st + k_lane), "v"(st + K_B + v_lane),
++                     "v"(dl0 - NB * t2) HKGEN_C2_OP : HKGEN_CLOBBERS);
+       } else if constexpr (k == 1) {
+-        asm volatile("; HKGEN TILE_D1 kb=%0 vb=%1 dl=%2" ::"v"(st + k_lane), "v"(st + K_B + v_lane),
+-                     "v"(dl0 - NB * t2) : HKGEN_CLOBBERS);
++        asm volatile("; HKGEN TILE_D1 kb=%0 vb=%1 dl=%2" HKGEN_C2_TXT3 ::"v"(st + k_lane), "v"(st + K_B + v_lane),
++                     "v"(dl0 - NB * t2) HKGEN_C2_OP : HKGEN_CLOBBERS);
+       } else if constexpr (k == 2) {
+-        asm volatile("; HKGEN TILE_D2 kb=%0 vb=%1 dl=%2" ::"v"(st + k_lane), "v"(st + K_B + v_lane),
+-                     "v"(dl0 - NB * t2) : HKGEN_CLOBBERS);
++        asm volatile("; HKGEN TILE_D2 kb=%0 vb=%1 dl=%2" HKGEN_C2_TXT3 ::"v"(st + k_lane), "v"(st + K_B + v_lane),
++                     "v"(dl0 - NB * t2) HKGEN_C2_OP : HKGEN_CLOBBERS);
+       } else {
+-        asm volatile("; HKGEN TILE_D3 kb=%0 vb=%1 dl=%2" ::"v"(st + k_lane), "v"(st + K_B + v_lane),
+-                     "v"(dl0 - NB * t2) : HKGEN_CLOBBERS);
++        asm volatile("; HKGEN TILE_D3 kb=%0 vb=%1 dl=%2" HKGEN_C2_TXT3 ::"v"(st + k_lane), "v"(st + K_B + v_lane),
++                     "v"(dl0 - NB * t2) HKGEN_C2_OP : HKGEN_CLOBBERS);
+       }
+ #endif
+       bar_wait();  // B_{t2+1}
+@@ -353,8 +368,8 @@
+ #if HKGEN_REF
+     tile(st + k_lane, st + K_B + v_lane, true, dl0 - NB * t, 0, -1);
+ #else
+-    asm volatile("; HKGEN TILE_M kb=%0 vb=%1 dl=%2" ::"v"(st + k_lane), "v"(st + K_B + v_lane), "v"(dl0 - NB * t)
+-                 : HKGEN_CLOBBERS);
++    asm volatile("; HKGEN TILE_M kb=%0 vb=%1 dl=%2" HKGEN_C2_TXT3 ::"v"(st + k_lane), "v"(st + K_B + v_lane),
++                 "v"(dl0 - NB * t) HKGEN_C2_OP : HKGEN_CLOBBERS);
+ #endif
+     bar_wait();  // B_{t+1}
+   }
+--- a/gfx1250_mla_fwd/README.md
++++ b/gfx1250_mla_fwd/README.md
+@@ -52,8 +52,25 @@
+ 
+ ```
+ python3 primus_turbo/hipkittens/gfx1250_mla_fwd/gen/build.py --out OUT [--sched list|program] [--asmkit-root DIR]
++    [--diag] [--csgpr] [--qgroup none|pair|late] [--worder TAGS] [--trans-cost N]
+ ```
+ 
++The shipped candidates (W-S1a2) are built with
++`--csgpr --qgroup late --worder QK0,QK1,PV0,QK2,QK3,PV1,PV2,PV3 --trans-cost 3` (and `--diag` for the diagonal-tile
++variant). All of these only change the instruction schedule / operand form, never the math (bit-identical by design,
++checked by `tools/emu.py`):
++
++- `--csgpr`: the shell passes `c2 = scale * log2(e)` to every TILE marker (`-DHKGEN_TILE_C2=1`); the tile copies it
++  into `s[102:103]` and the packed `p = fma(s, c, -m')` reads it as a scalar pair (`op_sel_hi` 0: both halves read
++  s102). A `v_pk_fma_f32` with 3 VGPR sources costs ~0.75 cycle more (fwd measurement J5); the mask rotation shrinks
++  to s99..s101.
++- `--qgroup late` + `--worder`: the Q re-reads of q tiles 2 / 3 overwrite the buffers QK(0) / QK(1) read; under the
++  expert-mode rule LLVM uses (`va_vdst(0)` once more than one VALU class is in flight) each re-read that follows its
++  buffer's last WMMA reader needs a full drain. All 24 re-reads are issued after the last QK(1) WMMA (one drain per
++  tile instead of five) and the WMMA stream runs `QK0 QK1 PV0 QK2 QK3 PV1 PV2 PV3`, so PV(0) hides the LDS latency
++  of the re-reads.
++- `--trans-cost`: the list scheduler's issue cost of a TRANS op (model parameter only).
++
+ 1. `amdclang++ -x hip --offload-arch=gfx1250 --cuda-device-only --no-gpu-bundle-output -O3 -std=c++20 -DNDEBUG -I.
+    -save-temps=obj -mllvm -amdgpu-expert-scheduling-mode -cuid=k_mla_fwd -DHKGEN_REF=0 -c hip/k_mla_fwd.hip`
+    (cwd `hip/`); the saved `.s` is `OUT/shell.s`. The same with `-DHKGEN_REF=1` gives `OUT/ref/k_mla_fwd.hsaco`
+--- a/gfx1250_mla_fwd/tools/emu.py
++++ b/gfx1250_mla_fwd/tools/emu.py
+@@ -342,10 +342,15 @@
+         neg_lo, neg_hi = mods("neg_lo", nsrc, 0), mods("neg_hi", nsrc, 0)
+         srcs = []
+         for k in range(nsrc):
+-            rr = self.vregs(ops[1 + k])
+-            if len(rr) != 2:
+-                raise ValueError(f"packed source must be a VGPR pair: {x.text.strip()}")
+-            pair = [u2f(self.v[rr[0]]), u2f(self.v[rr[1]])]
++            ms = re.fullmatch(r"s\[(\d+):(\d+)\]", ops[1 + k].strip())
++            if ms and int(ms.group(2)) == int(ms.group(1)) + 1 and int(ms.group(1)) % 2 == 0:
++                # an aligned SGPR pair: the same 32-bit values in every lane
++                pair = [u2f(np.full(32, self.sget(f"s{int(ms.group(1)) + h}"), np.uint32)) for h in range(2)]
++            else:
++                rr = self.vregs(ops[1 + k])
++                if len(rr) != 2:
++                    raise ValueError(f"packed source must be a VGPR or aligned SGPR pair: {x.text.strip()}")
++                pair = [u2f(self.v[rr[0]]), u2f(self.v[rr[1]])]
+             lo = pair[op_sel[k]] * (-1 if neg_lo[k] else 1)
+             hi = pair[op_sel_hi[k]] * (-1 if neg_hi[k] else 1)
+             srcs.append((lo.astype(np.float32), hi.astype(np.float32)))
+@@ -476,6 +481,8 @@
+         setv(f"{name}.vb", st + K_B + v_lane)
+         if name != "TILE_C":
+             setv(f"{name}.dl", dl0 - NB * t)
++        if f"{name}.c2" in rg["ops"]:  # the shell's c2 SGPR (set after the poisoning)
++            W.s[rg["ops"][f"{name}.c2"]] = int(f2u(c2))
+         W.run(rg["regions"][name])
+     # the fp32 state before the epilogue: m, d (lanes 0..15 = rows of the q tile) and O^T (lane l = row l % 16,
+     # VGPR r of O[i][dt] = column 16 dt + 8 (l // 16) + r)

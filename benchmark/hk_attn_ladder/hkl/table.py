@@ -27,8 +27,13 @@ def main(argv=None):
     print("|" + "---|" * len(cols))
     for r in spec["rungs"]:
         ks = r["kernels"]
-        src = "; ".join(f"`{k['src'].split('/')[-1]}`" + (f" `{' '.join(f for f in k['extra_flags'] if f.startswith('-D'))}`"
-                        if any(f.startswith("-D") for f in k["extra_flags"]) else "") for k in ks.values())  # fmt: skip
+        def kdesc(k):
+            if k.get("gen") is not None:  # a generator kernel (hkl.build): its gen/build.py arguments
+                return f"gen `{' '.join(k['gen']) or '(defaults)'}`" + (" ref" if k.get("gen_ref") else "")
+            fl = [f for f in k["extra_flags"] if f.startswith("-D") or f.startswith("-amdgpu")]
+            return f"`{k['src'].split('/')[-1]}`" + (f" `{' '.join(fl)}`" if fl else "")
+
+        src = "; ".join(kdesc(k) for k in ks.values())
         if r.get("patch"):
             src = f"`{r['patch'].split('/')[-1]}`; " + src
         pins = [("yes" if k.get("sha256") else "-") for k in ks.values()]

@@ -2,7 +2,8 @@
 # campaign.sh <stage> -- the measurement campaign of the HK attention ladders, in the order it must run.
 # Every GPU step goes through tools/run_gpu.sh (HKL_GPU = gpu index; container from start_gpu_container.sh).
 #   A  CPU only: build every rung of the three ladders (sha256 pins must match) + self-check (no GPU)
-#   B  smoke: every rung written for the ladders (Llama fwd f*, bwd b*, MLA m*; the rebuilt MLA sub-rungs r1a..r2f),
+#   B  smoke: every rung written for the ladders (Llama fwd f*, bwd b*, MLA m*; the rebuilt MLA sub-rungs r1a..r2f;
+#      every MLA forward rung),
 #      ONE rung per job, toy shape only, stop at the first failure
 #   C  correctness: every rung + baseline, every shape of its problem kind (toy first; prod last)
 #   D  timing: the main line of each ladder (+ side rungs), -r 10, JSON + Markdown tables in logs/
@@ -13,10 +14,11 @@ HERE=$(readlink -f "$(dirname "$0")/..")
 cd "$HERE"
 STAGE=${1:?stage A|B|C|D|E}
 RUN=tools/run_gpu.sh
-LADDERS="llama/ladder_fwd.json llama/ladder_bwd.json mla/ladder_bwd.json"
+LADDERS="llama/ladder_fwd.json llama/ladder_bwd.json mla/ladder_bwd.json mla/ladder_fwd.json"
 case "$STAGE" in
 A)
   tools/start_cpu_container.sh
+  tools/vendor_flydsl_fwd.sh  # the MLA forward ladder's b12f5953 FlyDSL baseline (build/vendor/)
   for l in $LADDERS; do python3 -m hkl.build "$l" --check; done
   docker exec -u "$(id -u):$(id -g)" -e HOME=/tmp -w "$HERE" lhz-hk-cpu python3 -m hkl.selfcheck $LADDERS
   ;;
@@ -30,6 +32,13 @@ B)
   for r in m00 m01 m02 m03q m04b m05w m06g m07q m07k m07l m08p m08q m08h m09r m10t; do
     $RUN "smoke_mla_$r" 600 -- python3 -m hkl.test mla/ladder_bwd.json --rung "$r" --baseline --shapes toy
   done
+  # MLA forward: the X6 kernels and the generated (asm) code objects, one per job, toy shape (only the prod shape
+  # reaches E2's persistent schedule: run its full shape set alone before stage C)
+  for r in x6_m1 x6_m2e x6_m2f x6_m2fx ref s1a ref_diag s1a_diag s1a_prog s1a2 s1a2_diag s1a3_n200 s1a3_d290 s1b_A \
+           s1b_B fdev2_Ap fdev2_A2 e1 e1d ref_e2 e2_np e2; do
+    $RUN "smoke_mlafwd_$r" 600 -- python3 -m hkl.test mla/ladder_fwd.json --rung "$r" --baseline flydsl_b12f5953 --shapes toy
+  done
+  $RUN smoke_mlafwd_e2_all 900 -- python3 -m hkl.test mla/ladder_fwd.json --rung e2 --baseline flydsl_b12f5953
   for r in r1a r1b r1c r1d r1e r1f r1g r1h r1i r1j r1k r1l r2a r2b r2c r2d r2e; do  # never ran in this form
     $RUN "smoke_mla_$r" 600 -- python3 -m hkl.test mla/ladder_bwd.json --rung hk_v0 "$r" --baseline --shapes toy
   done
@@ -38,6 +47,7 @@ C)
   $RUN test_llama_fwd 3600 -- python3 -m hkl.test llama/ladder_fwd.json --json logs/test_llama_fwd.json
   $RUN test_llama_bwd 3600 -- python3 -m hkl.test llama/ladder_bwd.json --json logs/test_llama_bwd.json
   $RUN test_mla_bwd 3600 -- python3 -m hkl.test mla/ladder_bwd.json --keep-going --json logs/test_mla_bwd.json
+  $RUN test_mla_fwd 3600 -- python3 -m hkl.test mla/ladder_fwd.json --keep-going --json logs/test_mla_fwd.json
   ;;
 D)
   for l in $LADDERS; do
@@ -67,6 +77,7 @@ E)
     HKL_ATT_TAG=dkdv tools/att.sh mla/ladder_bwd.json "$r" 'k_dkdv96ds'
     HKL_ATT_TAG=dq tools/att.sh mla/ladder_bwd.json "$r" 'k_dqds_c'
   done
+  for r in x6_m1 x6_m2e x6_m2f s1a s1a_diag s1a2_diag s1b_A e1 e2; do tools/att.sh mla/ladder_fwd.json "$r" 'k_mla_fwd'; done
   ;;
 *) echo "unknown stage $STAGE" >&2; exit 2 ;;
 esac

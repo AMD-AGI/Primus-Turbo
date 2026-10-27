@@ -1,0 +1,158 @@
+--- a/gfx1250_mla_fwd/gen/build.py
++++ b/gfx1250_mla_fwd/gen/build.py
+@@ -298,6 +298,8 @@
+     ap.add_argument("--pipe-tree", default="body", choices=("body", "prefix"), help="fwdgen.CFG['pipe_tree']")
+     ap.add_argument("--pipe-vafter", default="pv", choices=("pv", "qk0"), help="fwdgen.CFG['pipe_vafter']")
+     ap.add_argument("--pipe-dsentry", action="store_true", help="fwdgen.CFG['pipe_dsentry']")
++    ap.add_argument("--pipe-q3after", action="store_true", help="fwdgen.CFG['pipe_q3after'] (A')")
++    ap.add_argument("--arrive-lat", type=int, default=None, help="fwdgen.CFG['arrivelat'] (scheduler model)")
+     a = ap.parse_args()
+     if a.pipe and a.worder == G.CFG["worder"]:
+         a.worder = G.PIPE_WORDER
+@@ -315,6 +317,8 @@
+         pipe_tree=a.pipe_tree,
+         pipe_vafter=a.pipe_vafter,
+         pipe_dsentry=a.pipe_dsentry,
++        pipe_q3after=a.pipe_q3after,
++        arrivelat=a.arrive_lat,
+         seed=a.seed,
+     )
+     G.LAT["DS"] = G.CFG["dslat"]
+--- a/gfx1250_mla_fwd/gen/fwdgen.py
++++ b/gfx1250_mla_fwd/gen/fwdgen.py
+@@ -104,6 +104,12 @@
+ #                the same va_vdst(0) drain as the Q(3) reads)
+ #   pipe_dsentry the K / Q(0) reads first in program order and the first one before the first prefix WMMA (the
+ #                region-entry drain then covers them; else the first read after a WMMA pays its own drain)
++#   pipe_q3after (fwddev2, A') the arrive sits before Q(3)'s reads in program order, with order edges arrive -> Q(3)
++#                reads: the arrive retires only the stage's K / V reads and Q(0) (the Q staging area is not in the
++#                ring; S1a2 read 24 Q fragments after its arrive). Moves the arrive from after WMMA #132 to about one
++#                LDS latency after the last V read (fgate1: test whether the late arrive is the per-tile loss)
++#   arrivelat    (fwddev2) the slot scheduler's load -> arrive latency (model only; None = dslat): the arrive's
++#                s_wait_dscnt 0 retires the loads in hardware anyway, so this only places the arrive
+ CFG = {
+     "csgpr": False,
+     "qgroup": "none",
+@@ -118,6 +124,8 @@
+     "pipe_tree": "body",
+     "pipe_vafter": "pv",
+     "pipe_dsentry": False,
++    "pipe_q3after": False,
++    "arrivelat": None,
+     "seed": None,
+     "slotpar": True,
+ }
+@@ -603,7 +611,12 @@
+         if k == "PERM":
+             return o >= 8 and t != trans_at + 1 and t > perm_busy
+         if k == "DS":
+-            return o != 0 and t >= ds_next and ds_room()
++            # no room: (q3after) wait for the oldest outstanding load (the re-walk below inserts the s_wait_dscnt).
++            # Needed by the TILE_D bodies (their only consumers of the K loads need Q(3), which waits for the arrive,
++            # which waits for every V load: deadlock otherwise); also taken in TILE_C / TILE_D0 (the K reads issue
++            # earlier there than in S1b, #0..56 instead of #0..67: neutral in the r4 model, A' x1.004)
++            room = ds_room() or (CFG["pipe_q3after"] and t >= ds_done[issued_ds[retired_ds]])
++            return o != 0 and t >= ds_next and room
+         if k == "SALU":
+             return o != 0 and t >= salu_free
+         return o != 0  # BAR / WAIT
+@@ -641,6 +654,8 @@
+         ready.discard(pick)
+         k = nd.kind
+         if k == "DS":
++            if not ds_room():  # q3after: issued past DS_MAX after the oldest load completed (see avail)
++                retired_ds += 1
+             done_t = max(t + CFG["dslat"], last_done)
+             last_done = done_t
+             ds_done[pick] = done_t
+@@ -676,7 +691,7 @@
+             else:
+                 e = t + LATK.get(k, l)
+             if k == "DS" and l > 1 and nodes[s_].kind == "BAR":
+-                e = max(e, ds_done[pick])
++                e = max(e, ds_done[pick] if CFG["arrivelat"] is None else t + CFG["arrivelat"])
+             earliest[s_] = max(earliest[s_], e)
+             npred[s_] -= 1
+             if npred[s_] == 0:
+@@ -1157,6 +1172,7 @@
+         v_loads()
+ 
+     q3 = []
++    bar = None
+     for i in active:
+         if i == 0 and not CFG["pipe_dsentry"]:
+             loads += q_loads(0)
+@@ -1165,8 +1181,11 @@
+                 CFG["pipe_vafter"] == "qk0"
+             ):  # program order here, issue after the last QK(0) WMMA (order edges)
+                 v_loads()
++            if CFG["pipe_q3after"]:  # A': the arrive retires the stage reads only; Q(3) is read after it
++                bar = add("s_barrier_signal -1", "BAR", "arrive")
+             q3 = q_loads(3)
+-            loads += q3
++            if not CFG["pipe_q3after"]:
++                loads += q3
+         for ks in range(NKS):  # QK(i): S[i][j] = sum_ks K[j][ks] Q[i][ks] (chains from +0)
+             for j in range(NKV):
+                 c = "0" if ks == 0 else vr(L.S(i, j), 8)
+@@ -1182,10 +1201,13 @@
+             softmax_nodes(
+                 L, i, dl[i] if i in masked_q else None, add, active, tree=CFG["pipe_tree"] == "body"
+             )
+-    bar = add("s_barrier_signal -1", "BAR", "arrive")  # after every LDS read of the region (order edges)
++    if bar is None:
++        bar = add("s_barrier_signal -1", "BAR", "arrive")  # after every LDS read of the region (order edges)
+     build_dag(nodes)
+     for nd in loads:
+         add_order(nodes, nd.idx, bar.idx, LAT["DS"])
++    for nd in q3 if CFG["pipe_q3after"] else ():  # A': Q(3) reads after the arrive
++        add_order(nodes, bar.idx, nd.idx, 1)
+     # an LDS load overwriting a source of a WMMA still in flight costs a va_vdst(0) drain (expert mode, more than
+     # one VALU class in flight): issue the V reads only after the LAST prefix PV WMMA and the Q(3) reads only after
+     # the LAST QK(0) WMMA, so each group pays one drain instead of one per buffer slice
+@@ -1196,10 +1218,10 @@
+     lpv = max(last[f"PV{i}p"] for i in range(QT))
+     if CFG["pipe_vafter"] == "qk0" and "QK0" in last:
+         lpv = max(lpv, last["QK0"])
+-    for nd in loads:
++    for nd in loads + (q3 if CFG["pipe_q3after"] else []):
+         if nd.tag.startswith("V"):
+             add_order(nodes, lpv, nd.idx, 1)
+-        if nd.tag.startswith("Q3") and "QK0" in last:
++        if nd.tag.startswith("Q3") and "QK0" in last and last["QK0"] < nd.idx:
+             add_order(nodes, last["QK0"], nd.idx, 1)
+     if CFG["pipe_dsentry"]:  # the first read before the first prefix WMMA (both are first in their classes)
+         fw = min(nd.idx for nd in nodes if nd.kind == "WMMA")
+--- a/gfx1250_mla_fwd/README.md
++++ b/gfx1250_mla_fwd/README.md
+@@ -55,7 +55,7 @@
+ python3 primus_turbo/hipkittens/gfx1250_mla_fwd/gen/build.py --out OUT [--sched list|program|slot] [--asmkit-root DIR]
+     [--diag] [--csgpr] [--qgroup none|pair|late] [--worder TAGS] [--trans-cost N] [--defer3|--defer2]
+     [--ds-lat N] [--ds-rate N] [--ds-first] [--pipe [--pipe-tree body|prefix] [--pipe-vafter pv|qk0]
+-    [--pipe-dsentry]] [--seed N]
++    [--pipe-dsentry] [--pipe-q3after] [--arrive-lat N]] [--seed N]
+ ```
+ 
+ The shipped candidates (W-S1a2) are built with
+@@ -90,6 +90,21 @@
+ (B: `--csgpr --trans-cost 3 --diag --pipe --ds-lat 290 --ds-first --ds-rate 8 --pipe-tree body --pipe-vafter pv
+ --pipe-dsentry`, the same structure under the greedy list scheduler).
+ 
++Round 5, iteration 2 (fwddev2; the S1b candidates passed the GPU gates bit for bit but ran 9.6 % / 11 % slower than
++FlyDSL): two more options of the same pipeline, still inside the unchanged marker shell (shell `.s` and HIP REF
++byte-identical). `--pipe-q3after` puts the arrive before Q(3)'s reads in program order (arrive -> Q(3) order edges:
++the arrive retires only the stage's K / V reads and Q(0); the Q staging area is outside the ring) and `--arrive-lat N`
++is the slot scheduler's load -> arrive latency (model only). Candidate A' (single-variable test of the late arrive,
++after WMMA #99 instead of #132) and candidate A2 (the slot schedule for the r4_params "measured" issue model: short
++LDS latency, V reads after QK(0)):
++
++```
++A':  build.py --out OUT --sched slot --csgpr --diag --pipe --ds-lat 290 --ds-first --ds-rate 6 --pipe-vafter pv \
++         --pipe-tree body --pipe-dsentry --pipe-q3after --arrive-lat 100
++A2:  build.py --out OUT --sched slot --csgpr --diag --pipe --ds-lat 150 --ds-first --ds-rate 4 --pipe-vafter qk0 \
++         --pipe-tree body --pipe-dsentry
++```
++
+ 1. `amdclang++ -x hip --offload-arch=gfx1250 --cuda-device-only --no-gpu-bundle-output -O3 -std=c++20 -DNDEBUG -I.
+    -save-temps=obj -mllvm -amdgpu-expert-scheduling-mode -cuid=k_mla_fwd -DHKGEN_REF=0 -c hip/k_mla_fwd.hip`
+    (cwd `hip/`); the saved `.s` is `OUT/shell.s`. The same with `-DHKGEN_REF=1` gives `OUT/ref/k_mla_fwd.hsaco`

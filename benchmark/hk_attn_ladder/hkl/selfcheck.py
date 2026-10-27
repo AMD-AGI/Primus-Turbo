@@ -40,6 +40,12 @@ def check(ladder, rid):
         lse = torch.empty((1, B * H, S), dtype=torch.float32, device="meta")
         pl = mod._plan(t(128), t(192), t(192), t(128), t(128), lse, None, True, None, hk_delta="k_delta" in k)
         msg += f", prod plan grids {pl['grids']} delta {'hk' if 'k_delta' in k else 'flydsl'} ds {pl['ds_layout_bytes'] / 1e9:.2f} GB"
+    if hasattr(mod, "persist_npw"):  # MLA forward (fwd_hk): the production grid, folded SBHD [1, S, B*H, d]
+        p = PROD["mla"]
+        kb, kh, sq = 1, p["b"] * p["hq"], p["sq"]
+        npw = mod.persist_npw(kb, sq, sq, kh) if mod.PERSISTENT else 0
+        grid = (npw, 1, 1) if npw else ((sq + 255) // 256, kh, kb)
+        msg += f", prod grid {grid} nargs {mod.NARGS}"
     if hasattr(mod, "flash_attn_fwd") and "llama" in str(ladder):
         p = PROD["llama"]
         q = torch.empty((p["b"], p["sq"], p["hq"], p["d"]), dtype=torch.bfloat16, device="meta")

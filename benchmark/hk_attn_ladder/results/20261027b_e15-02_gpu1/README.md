@@ -59,6 +59,24 @@ faster under the kernel trace (0.811 vs 0.780 ms; 384 VGPRs of accumulators take
 * MLA dK / dV: 20.3% (m00) -> 29.3% (m05w) -> 28.2% (m07q); hk_v0 41.5%, r7 56.2%. MLA dQ: m07q 28.4%, hk_v0 57.5%.
   The remaining MLA gap is in both kernels (`ktrace_bwd.txt`: m07q dK / dV 2.69 + dQ 0.81 ms, hk_v0 1.81 + 0.51).
 
+DeepSeek-V3 MLA forward (b2 s4096 h128; FlyDSL main 0.859, FlyDSL b12f5953 persistent 0.821; timed at 11:43 UTC,
+null control 0.9996x +- 0.0032):
+
+| x6_m1 | x6_m2f | s1a | s1a_diag | s1a2_diag | s1b_A | e1 | e2 |
+|---|---|---|---|---|---|---|---|
+| 1.245 | 1.017 | 0.989 | 0.956 | 0.939 | 0.907 | 0.833 | 0.830 |
+| | 1.223x | 1.030x | 1.032x | 1.018x | 1.035x | 1.088x | 1.004x |
+
+The a08-1 HK forward, rebuilt byte for byte (22 code objects): X6's pure-HIP kernel with its chunk pipeline and
+LDS bursts, then the marker shell with generated asm tiles (S1a), diagonal specialization, SGPR scale / regrouped
+Q / interleaved WMMA order, cross-tile software pipelining with the slot scheduler, the row-staged epilogue (E1),
+the persistent schedule (E2). E2 is 1.2% slower than the b12f5953 FlyDSL forward in time and 0.5% in cycles (1.143
+vs 1.137 Mcycles), 1.035x faster than main's FlyDSL forward; every generated rung is bitwise equal to b12f5953's
+output at every shape (`test_mla_fwd.json`). a08-1 had E2 0.7396 vs 0.7378 (x1.0024): the same parity, ~12% higher
+absolute times here. WMMA-pipe use (`att_mla_fwd.txt`): 31% (x6_m1) -> 45% (x6_m2f) -> 49% (s1a) -> 51% (s1b_A)
+-> 61% (e1) / 60% (e2). x6_m2e (the final M2 source with X6_BURST=0, no recorded sha) runs 1.41 ms here against
+a08-1 m2e's 0.995, so it is not the measured version and is a side rung; m2d / m2e were not kept as source.
+
 ## Negative and flat results (side rungs, same tables)
 
 * Register-path double buffering (f01, b01): 0.86x / 0.98x -- the in-flight loads cost a wave per SIMD; the TDM
@@ -73,5 +91,8 @@ faster under the kernel trace (0.811 vs 0.780 ms; 384 VGPRs of accumulators take
 * The co-execution scheduler matters: b10p in the default scheduler is 0.98x.
 * MLA at m06g / m07q's geometry: LD rows by TDM (m07l), the pipelined softmax (m08p), barrier + readback (m09r), a
   3-slot ring (m10t), wave kinds (m07k): all 0.99-1.00x; 2-wave dK / dV workgroups (m08h): 0.97x.
+* MLA forward: REF (the shell with LLVM-compiled tiles) is 0.90x of s1a; generated regions in program order 0.84x;
+  s1a3's deferred LDS reads and fdev2's A' / A2 schedules flat (0.98-1.00x); s1b with the old list scheduler 0.98x of
+  s1b_A; E1 with the old scattered write-back 0.91x of E1; E2's code launched non-persistent 0.99x of E2.
 * The first-draft backward chain (b03..b07: a GQA dQ kernel, fusion with 16 queries x 128 d per wave and K read
   from LDS, a deferred dQ on it) goes from 7.3 to 14.9 ms.

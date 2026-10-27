@@ -27,6 +27,12 @@ bytes are not the recorded ones. ``-cuid=<kernel>`` pins the ``__hip_cuid_*`` sy
 not depend on the build directory, and a ``sha256`` in the ladder file proves a rung rebuilt the
 exact code object that was measured when the rung was first written.
 
+A kernel with ``"gen": [args]`` is not compiled from ``src``: the rung's tree holds a generator package (the MLA
+forward's ``gfx1250_mla_fwd/`` next to ``asmkit/``, or ``gen_pkg``), and ``gen/build.py --out <tmp> --asmkit-root
+<tree> <args>`` builds it (marker shell compiled by LLVM, generated hot-loop regions spliced in, assembled, verified);
+the rung takes its ``k_mla_fwd.hsaco``, or the HIP reference variant's ``ref/k_mla_fwd.hsaco`` with ``"gen_ref":
+true``. The generator's own build.json is kept as ``<kernel>.gen.json``.
+
 The compiler runs in a container that maps no device (default ``lhz-hk-cpu``, image
 amdprimus/amdprimus:tas-20261019, AMD clang 862306352beb, the toolchain every pin was made with);
 the build refuses a container that maps any device. ``--local`` runs ``amdclang++`` from PATH instead.
@@ -200,6 +206,17 @@ def _patch_and_reassemble(name, kspec, cmd, tree, tmp, runner):
             raise BuildError(f"{name}: {step[0]} failed ({r.returncode}): {r.stderr[-2000:]}")
 
 
+def _gen_build(kspec, tree, tmp, runner):
+    """A generator kernel (module docstring): gen/build.py in the tree's package; returns (cmd, process, hsaco, .s)."""
+    pkg = Path(tree) / kspec.get("gen_pkg", "gfx1250_mla_fwd")
+    gen_out = tmp / "gen"
+    cmd = ["env", "PYTHONDONTWRITEBYTECODE=1", "python3", "gen/build.py", "--out", str(gen_out), "--asmkit-root",
+           str(tree), *kspec["gen"]]  # fmt: skip
+    r = _run(runner, cmd, pkg)
+    sub = gen_out / "ref" if kspec.get("gen_ref") else gen_out
+    return cmd, r, sub / "k_mla_fwd.hsaco", sub / "k_mla_fwd.s", gen_out / "build.json"
+
+
 def build_kernel(spec, rung, name, kspec, tree, out_dir, runner, tc):
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp = out_dir / f".tmp_{name}"
@@ -210,11 +227,26 @@ def build_kernel(spec, rung, name, kspec, tree, out_dir, runner, tc):
     for p in (hsaco, out_dir / f"{name}.meta.json"):
         if p.exists():
             p.unlink()
-    cmd = ["amdclang++", *spec["flags"], f"-cuid={name}", *WARN_FLAGS, *kspec.get("extra_flags", []),
-           "-c", kspec["src"], "-o", str(tmp / f"{name}.hsaco")]  # fmt: skip
-    (out_dir / f"{name}.flags").write_text(" ".join(cmd) + "\n")
+    gen = kspec.get("gen") is not None
+    if not gen:
+        cmd = ["amdclang++", *spec["flags"], f"-cuid={name}", *WARN_FLAGS, *kspec.get("extra_flags", []),
+               "-c", kspec["src"], "-o", str(tmp / f"{name}.hsaco")]  # fmt: skip
+        (out_dir / f"{name}.flags").write_text(" ".join(cmd) + "\n")
     t0 = time.time()
-    r = _run(runner, cmd, tree)
+    if gen:
+        cmd, r, gen_hsaco, gen_s, gen_json = _gen_build(kspec, tree, tmp, runner)
+        (out_dir / f"{name}.flags").write_text(" ".join(cmd) + "\n")
+        if not r.returncode:
+            if gen_hsaco.is_file():
+                shutil.copy2(gen_hsaco, tmp / f"{name}.hsaco")
+                s_src = gen_s if gen_s.is_file() else next(iter(sorted(gen_s.parent.rglob("*-hip-*.s"))), None)
+                if s_src is not None:  # the REF variant keeps only the compiler's -save-temps .s
+                    shutil.copy2(s_src, tmp / f"{name}.gen.s")
+                shutil.copy2(gen_json, out_dir / f"{name}.gen.json")
+            else:
+                r = subprocess.CompletedProcess(cmd, 1, r.stdout, r.stderr + f"\nno {gen_hsaco}")
+    else:
+        r = _run(runner, cmd, tree)
     secs = time.time() - t0
     (out_dir / f"{name}.log").write_text(r.stdout + r.stderr)
     errors = []
@@ -225,7 +257,7 @@ def build_kernel(spec, rung, name, kspec, tree, out_dir, runner, tc):
         errors.append(f"{len(ub)} UB-class warning(s): {ub[0][:200]}")
     meta = {"name": name, "rung": rung["id"], "ladder": ladder_name(spec), "toolchain": tc, "flags": cmd,
             "tree": str(tree), "ok": False, "errors": errors, "kernels": {}}  # fmt: skip
-    if not r.returncode and kspec.get("asm_patch"):
+    if not r.returncode and kspec.get("asm_patch") and not gen:
         try:
             meta["asm_patch"] = kspec["asm_patch"]
             _patch_and_reassemble(name, kspec, cmd, tree, tmp, runner)
