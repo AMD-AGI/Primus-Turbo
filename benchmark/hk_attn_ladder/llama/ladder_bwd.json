@@ -22,6 +22,78 @@
  ],
  "rungs": [
   {
+   "id": "b00",
+   "kernels": {
+    "k_bwd_b00": {
+     "src": "src/ladder/b00_naive.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b00",
+     "plan": "split"
+    }
+   },
+   "feature": "naive FA2 backward: prep + dK/dV kernel + separate dQ kernel (S, dP recomputed), register-mediated single-buffer fills"
+  },
+  {
+   "id": "b01",
+   "parent": "b00",
+   "kernels": {
+    "k_bwd_b01": {
+     "src": "src/ladder/b01_double_buf.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b01",
+     "plan": "split"
+    }
+   },
+   "feature": "double-buffered fills: the next tiles' global loads in flight during this iteration, 1 barrier per iteration"
+  },
+  {
+   "id": "b02",
+   "parent": "b01",
+   "kernels": {
+    "k_bwd_b02": {
+     "src": "src/ladder/b02_tdm.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b02",
+     "plan": "split"
+    }
+   },
+   "feature": "TDM fills: one 32-row tensor_load_to_lds per wave per tile pair instead of the register path"
+  },
+  {
+   "id": "b03",
+   "parent": "b02",
+   "kernels": {
+    "k_bwd_b03": {
+     "src": "src/ladder/b03_gqa4.hip",
+     "extra_flags": []
+    }
+   },
+   "launch": {
+    "module": "bwd_ladder",
+    "opts": {
+     "prefix": "k_bwd_b03",
+     "plan": "split",
+     "heads_per_wg": 4
+    }
+   },
+   "feature": "dQ kernel takes the 4 q heads of one kv head per WG (K / V tiles shared)"
+  },
+  {
    "id": "v0",
    "kernels": {
     "k_attn_bwd_v0": {
