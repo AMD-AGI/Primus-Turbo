@@ -1,0 +1,3898 @@
+{
+ "ladder": "mla_bwd",
+ "results": [
+  {
+   "arm": "flydsl",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m00",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.16,
+    "dk": 52.16,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m01",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.16,
+    "dk": 52.16,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m02",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.16,
+    "dk": 52.16,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m03q",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.16,
+    "dk": 52.16,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m04b",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.16,
+    "dk": 52.16,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m05w",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.16,
+    "dk": 52.16,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m06g",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.16,
+    "dk": 52.16,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m07q",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.16,
+    "dk": 52.16,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "hk_v0",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "flydsl",
+   "bitwise": true
+  },
+  {
+   "arm": "r1a",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1b",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1c",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1d",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1e",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1f",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1g",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1h",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1i",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1j",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1k",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1l",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1m",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2a",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2b",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2c",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2d",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2e",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2f",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r3",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r4",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r5",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r6",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r7",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.06,
+    "dk": 52.09,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "m07k",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.16,
+    "dk": 52.16,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m07l",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.16,
+    "dk": 52.16,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m08p",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.16,
+    "dk": 52.16,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m08q",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.16,
+    "dk": 52.16,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m08h",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.16,
+    "dk": 52.16,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m09r",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.16,
+    "dk": 52.16,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m10t",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.16,
+    "dk": 52.16,
+    "dv": 52.78
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "flydsl",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m00",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.2,
+    "dk": 52.23,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m01",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.2,
+    "dk": 52.23,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m02",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.2,
+    "dk": 52.23,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m03q",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.2,
+    "dk": 52.23,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m04b",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.2,
+    "dk": 52.23,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m05w",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.2,
+    "dk": 52.23,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m06g",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.2,
+    "dk": 52.23,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m07q",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.2,
+    "dk": 52.23,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "hk_v0",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "flydsl",
+   "bitwise": true
+  },
+  {
+   "arm": "r1a",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1b",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1c",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1d",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1e",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1f",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1g",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1h",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1i",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1j",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1k",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1l",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1m",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2a",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2b",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2c",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2d",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2e",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2f",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r3",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r4",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r5",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r6",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r7",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.12,
+    "dk": 52.17,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "m07k",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.2,
+    "dk": 52.23,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m07l",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.2,
+    "dk": 52.23,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m08p",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.2,
+    "dk": 52.23,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m08q",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.2,
+    "dk": 52.23,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m08h",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.2,
+    "dk": 52.23,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m09r",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.2,
+    "dk": 52.23,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m10t",
+   "shape": "s640",
+   "desc": "b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.2,
+    "dk": 52.23,
+    "dv": 52.76
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "flydsl",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m00",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.33,
+    "dk": 52.31,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m01",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.33,
+    "dk": 52.31,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m02",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.33,
+    "dk": 52.31,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m03q",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.33,
+    "dk": 52.31,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m04b",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.33,
+    "dk": 52.31,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m05w",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.33,
+    "dk": 52.31,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m06g",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.33,
+    "dk": 52.31,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m07q",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.33,
+    "dk": 52.31,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "hk_v0",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "flydsl",
+   "bitwise": true
+  },
+  {
+   "arm": "r1a",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1b",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1c",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1d",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1e",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1f",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1g",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1h",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1i",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1j",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1k",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1l",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1m",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2a",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2b",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2c",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2d",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2e",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2f",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r3",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r4",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r5",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r6",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r7",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.3,
+    "dk": 52.29,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "m07k",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.33,
+    "dk": 52.31,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m07l",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.33,
+    "dk": 52.31,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m08p",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.33,
+    "dk": 52.31,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m08q",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.33,
+    "dk": 52.31,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m08h",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.33,
+    "dk": 52.31,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m09r",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.33,
+    "dk": 52.31,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m10t",
+   "shape": "b1_s4096",
+   "desc": "b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.33,
+    "dk": 52.31,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "flydsl",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "ValueError: seqlen_kv must be a positive multiple of 64, got 4128"
+  },
+  {
+   "arm": "m00",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: k_mla_m00: sq 4096 / skv 4128 must be multiples of 64 / 64, causal sq <= skv"
+  },
+  {
+   "arm": "m01",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: k_mla_m01: sq 4096 / skv 4128 must be multiples of 64 / 64, causal sq <= skv"
+  },
+  {
+   "arm": "m02",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: k_mla_m02: sq 4096 / skv 4128 must be multiples of 64 / 64, causal sq <= skv"
+  },
+  {
+   "arm": "m03q",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: k_mla_m03q: sq 4096 / skv 4128 must be multiples of 128 / 64, causal sq <= skv"
+  },
+  {
+   "arm": "m04b",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: k_mla_m04b: sq 4096 / skv 4128 must be multiples of 128 / 64, causal sq <= skv"
+  },
+  {
+   "arm": "m05w",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: k_mla_m05w: sq 4096 / skv 4128 must be multiples of 128 / 128, causal sq <= skv"
+  },
+  {
+   "arm": "m06g",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: k_mla_m06g: sq 4096 / skv 4128 must be multiples of 128 / 128, causal sq <= skv"
+  },
+  {
+   "arm": "m07q",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: k_mla_m07q: sq 4096 / skv 4128 must be multiples of 128 / 128, causal sq <= skv"
+  },
+  {
+   "arm": "hk_v0",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "flydsl",
+   "bitwise": null
+  },
+  {
+   "arm": "r1a",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1b",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1c",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1d",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1e",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1f",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1g",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1h",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1i",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1j",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1k",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1l",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1m",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2a",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2b",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2c",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.51,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2d",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "FAIL",
+   "snr": {
+    "dq": 17.68,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": false
+  },
+  {
+   "arm": "r2e",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "FAIL",
+   "snr": {
+    "dq": 17.68,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": false
+  },
+  {
+   "arm": "r2f",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "FAIL",
+   "snr": {
+    "dq": 17.68,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": false
+  },
+  {
+   "arm": "r2",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "FAIL",
+   "snr": {
+    "dq": 17.68,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": false
+  },
+  {
+   "arm": "r3",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "FAIL",
+   "snr": {
+    "dq": 17.68,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": false
+  },
+  {
+   "arm": "r4",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "FAIL",
+   "snr": {
+    "dq": 17.68,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": false
+  },
+  {
+   "arm": "r5",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "FAIL",
+   "snr": {
+    "dq": 17.68,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": false
+  },
+  {
+   "arm": "r6",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "FAIL",
+   "snr": {
+    "dq": 17.68,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": false
+  },
+  {
+   "arm": "r7",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "FAIL",
+   "snr": {
+    "dq": 17.68,
+    "dk": 52.56,
+    "dv": 52.58
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": false
+  },
+  {
+   "arm": "m07k",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: k_mla_m07k: sq 4096 / skv 4128 must be multiples of 128 / 128, causal sq <= skv"
+  },
+  {
+   "arm": "m07l",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: k_mla_m07l: sq 4096 / skv 4128 must be multiples of 128 / 128, causal sq <= skv"
+  },
+  {
+   "arm": "m08p",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: k_mla_m08p: sq 4096 / skv 4128 must be multiples of 128 / 128, causal sq <= skv"
+  },
+  {
+   "arm": "m08q",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: k_mla_m08q: sq 4096 / skv 4128 must be multiples of 128 / 128, causal sq <= skv"
+  },
+  {
+   "arm": "m08h",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: k_mla_m08h: sq 4096 / skv 4128 must be multiples of 128 / 64, causal sq <= skv"
+  },
+  {
+   "arm": "m09r",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: k_mla_m09r: sq 4096 / skv 4128 must be multiples of 128 / 128, causal sq <= skv"
+  },
+  {
+   "arm": "m10t",
+   "shape": "rect32",
+   "desc": "b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd",
+   "status": "skip",
+   "reason": "NotImplementedError: k_mla_m10t: sq 4096 / skv 4128 must be multiples of 128 / 128, causal sq <= skv"
+  },
+  {
+   "arm": "flydsl",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m00",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m01",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m02",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m03q",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m04b",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m05w",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m06g",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m07q",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "hk_v0",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "flydsl",
+   "bitwise": true
+  },
+  {
+   "arm": "r1a",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1b",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1c",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1d",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1e",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1f",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1g",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1h",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1i",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1j",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1k",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1l",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1m",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r1",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2a",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2b",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2c",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2d",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2e",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2f",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r2",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r3",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r4",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r5",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r6",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "r7",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": "hk_v0",
+   "bitwise": true
+  },
+  {
+   "arm": "m07k",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m07l",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m08p",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m08q",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m08h",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m09r",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "m10t",
+   "shape": "prod",
+   "desc": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "dq": 52.31,
+    "dk": 52.35,
+    "dv": 52.71
+   },
+   "finite": true,
+   "det": {
+    "dq": true,
+    "dk": true,
+    "dv": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  }
+ ]
+}

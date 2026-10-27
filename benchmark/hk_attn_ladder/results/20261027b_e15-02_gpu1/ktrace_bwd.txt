@@ -1,0 +1,25 @@
+per-kernel mean time (ms) under rocprofv3 --kernel-trace (hkl.one, 7 calls, no flush; hk_v0..r4 with r7's HIP k_delta)
+llama_ladder_bwd_b00          total   8.835  k_bwd_b00_dkdv=5.932  k_bwd_b00_dq=2.850  k_bwd_b00_prep=0.053
+llama_ladder_bwd_b01t         total   7.663  k_bwd_b01t_dkdv=4.957  k_bwd_b01t_dq=2.653  k_bwd_b01t_prep=0.052
+llama_ladder_bwd_b02          total   6.644  k_bwd_b02_dkdv=4.232  k_bwd_b02_dq=2.360  k_bwd_b02_prep=0.053
+llama_ladder_bwd_b03b         total   6.209  k_bwd_b03b_dkdv=3.665  k_bwd_b03b_dq=2.491  k_bwd_b03b_prep=0.053
+llama_ladder_bwd_b04f         total   5.555  k_bwd_b04f_dkdv=5.390  k_bwd_b04f_cvt=0.115  k_bwd_b04f_prep=0.050
+llama_ladder_bwd_b12l         total   3.756  k_bwd_b12l_dkdv=3.581  k_bwd_b12l_cvt=0.118  k_bwd_b12l_prep=0.056
+llama_ladder_bwd_v0           total   3.142  k_hk_bwd_g4=3.052  k_hk_bwd_dqcvt=0.053  k_hk_bwd_prep=0.037
+llama_ladder_bwd_p1           total   2.959  k_hk_bwd_g4=2.868  k_hk_bwd_dqcvt=0.053  k_hk_bwd_prep=0.037
+llama_ladder_bwd_v1_atom2     total   2.817  k_hk_bwd1_g4=2.690  k_hk_bwd1_prep_z=0.073  k_hk_bwd1_dqcvt=0.053
+llama_ladder_bwd_v11_best     total   2.791  k_hk_bwd1_g4=2.662  k_hk_bwd1_prep_z=0.075  k_hk_bwd1_dqcvt=0.054
+mla_ladder_bwd_m00          total   6.681  k_mla_m00_dkdv=4.089  k_mla_m00_dq=2.544  k_mla_m00_prep=0.047
+mla_ladder_bwd_m01          total   5.755  k_mla_m01_dkdv=3.551  k_mla_m01_dq=2.160  k_mla_m01_prep=0.045
+mla_ladder_bwd_m02          total   5.335  k_mla_m02_dkdv=3.850  k_mla_m02_dq=1.439  k_mla_m02_prep=0.046
+mla_ladder_bwd_m03q         total   4.766  k_mla_m03q_dkdv=3.800  k_mla_m03q_dq=0.920  k_mla_m03q_prep=0.046
+mla_ladder_bwd_m04b         total   4.477  k_mla_m04b_dkdv=3.520  k_mla_m04b_dq=0.911  k_mla_m04b_prep=0.047
+mla_ladder_bwd_m05w         total   4.282  k_mla_m05w_dkdv=3.311  k_mla_m05w_dq=0.924  k_mla_m05w_prep=0.047
+mla_ladder_bwd_m06g         total   3.521  k_mla_m06g_dkdv=2.694  k_mla_m06g_dq=0.780  k_mla_m06g_prep=0.047
+mla_ladder_bwd_m07q         total   3.549  k_mla_m07q_dkdv=2.691  k_mla_m07q_dq=0.811  k_mla_m07q_prep=0.046
+mla_ladder_bwd_hk_v0        total   2.365  k_dkdv96ds=1.810  k_dqds_c=0.513  k_delta=0.042
+mla_ladder_bwd_r1           total   2.100  k_dkdv96ds=1.571  k_dqds_c=0.488  k_delta=0.041
+mla_ladder_bwd_r2           total   2.094  k_dkdv96ds=1.574  k_dqds_c=0.479  k_delta=0.041
+mla_ladder_bwd_r3           total   2.035  k_dkdv96ds=1.523  k_dqds_c=0.469  k_delta=0.042
+mla_ladder_bwd_r4           total   2.026  k_dkdv96ds=1.508  k_dqds_c=0.475  k_delta=0.042
+mla_ladder_bwd_r7           total   1.995  k_dkdv96ds=1.489  k_dqds_c=0.464  k_delta=0.042

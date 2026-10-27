@@ -11,9 +11,10 @@ checks and times them all in one process on one GPU.
 | `llama/ladder_bwd.json` | the same backward | `b00` naive 3-kernel FA2 | `v11_best` (v1.1) | Primus-Turbo FlyDSL |
 | `mla/ladder_bwd.json` | DeepSeek-V3 MLA backward: bf16, qk 192 / v 128, MHA 128 heads, causal, SBHD (b2 s4096) | `m00` naive 3-kernel FA2 | `r7` (71bd0329) | Primus-Turbo FlyDSL |
 
-Nothing in this directory has run on a GPU yet (prepared CPU-only, 2026-10-27). The `ref` / `ref_ms`
-values in the ladder files are a08-1 measurements from when a rung was first written (GPU2 / GPU3 of
-another node, other sessions): orientation only, every rung is re-measured by `tools/campaign.sh`.
+Every rung was built, checked and timed on e15-02 GPU1 on 2026-10-27: `results/20261027_e15-02_gpu1/` holds the
+first campaign (the first-draft bottom rungs), `results/20261027b_e15-02_gpu1/` the one with the redesigned bottom
+rungs (the current main lines). The `ref` / `ref_ms` values in the ladder files are a08-1 measurements from when a
+rung was first written (GPU2 / GPU3 of another node, other sessions): orientation only.
 
 ## Where the rungs come from
 
@@ -25,14 +26,23 @@ another node, other sessions): orientation only, every rung is re-measured by `t
   object that was measured; `hkl.build` checks it, so a matching rung is that binary, byte for byte
   (all 28 Llama and 27 MLA pins match with AMD clang 862306352beb, image `amdprimus/amdprimus:tas-20261019`).
 * **New rungs** (`src/ladder/*.hip`, written for this ladder, no pin) fill the bottom the history does
-  not have: nothing below Llama v0 / MLA d3590be4 survived. Llama forward `f00`..`f08` climb from a naive
-  kernel to v0 minus software pipelining; Llama backward `b00`..`b07` from FlashAttention-2's three-kernel
-  backward to v0 minus its step pipeline; MLA backward `m00`..`m02` from the same three-kernel backward with
-  the MLA head dims, through TDM fills, to the dS-export idea of hk_v0 (dQ read back from a dS^T scratch
-  instead of recomputing S and dP). The MLA bottom rungs live in the Llama tree (`"tree": "../llama/hip"`,
-  they use its hk_attn primitives) and launch through `mla/lab/bwd_mladder.py`. They are reviewed on the CPU (an independent review of
-  `f00`..`f08` found no correctness issue) but only a GPU run can validate them: stage B of the campaign
-  runs each one alone at a toy shape first.
+  not have: nothing below Llama v0 / MLA d3590be4 survived. Each is the rung below it plus one feature, in the
+  order the measurements support (the first draft added features in "natural" order and was non-monotonic; it
+  is kept as side rungs):
+  * Llama forward `f00` -> `f10z`: naive, TDM fill, double buffer, operand bursts, a 3-slot ring, software
+    pipelining (S^T(c+1) under the softmax of c, co-execution scheduler), GQA packing, longest-first order,
+    lock_simd, mask on the diagonal block only, lazy rescale; `f10z` runs at v0's speed.
+  * Llama backward `b00` -> `b12l`: FlashAttention-2's three-kernel backward, TDM fill, double buffer, bursts,
+    dQ fused in v0's decomposition (`b04f`: 128 kv rows per WG, 32-query steps, dS^T exchanged through LDS, each
+    wave's K slice of dQ resident, 128-B-line atomics on a C-fragment dQ_acc), longest-first order, wave kinds
+    (FULL steps first), LD rows by TDM, deferred dQ, the softmax pipelined under the WMMAs, v0's split barrier,
+    lock_simd; v0 is 1.13x above `b12l`.
+  * MLA backward `m00` -> `m07q`: the same three-kernel backward with the MLA head dims, TDM fill, the dS export
+    of hk_v0, wider dQ waves, bursts, 32 kv rows per dK / dV wave, longest-first order, 64-query dQ waves;
+    hk_v0 is still 1.48x above `m07q` (see Known issues).
+  The MLA bottom rungs live in the Llama tree (`"tree": "../llama/hip"`, they use its hk_attn primitives) and
+  launch through `mla/lab/bwd_mladder.py`. Every new rung passes `hkl.test` at every shape of its problem kind,
+  production shape included.
 * **Side rungs** (`"side": true`) are measured dead ends that make good "what did not work" notes (v0 flags
   alone, TAIL, LSUM=1, the 8-wave ping-pong forward, ONEPHASE, the default-scheduling v1 backward, ...).
 
@@ -78,7 +88,8 @@ any subset (run them through `tools/run_gpu.sh <tag> <timeout> -- ...`).
 seconds (sclk settles under the power cap); R rounds in a rotated order; a cell = W unmeasured calls + I
 calls, each timed by its own event pair with a 512 MB fill enqueued before it; the top rung loaded twice
 (the second, `#null`, bounds the noise of a step); a host thread samples the GPU's hwmon sclk. Steps are
-per-round ratios against the previous main-line rung (median and 95% CI). On this card time follows the
+per-round ratios against the rung's parent when it was timed, else the previous main-line rung (median and 95%
+CI). On this card time follows the
 clock while cycle counts are stable, so a step that changes power (e.g. the MLA dS export) can be worth
 less in time than in cycles; the sclk column shows it.
 
@@ -107,9 +118,14 @@ barriers; asm-patched kernels only from their verified patch (`hkl.build` refuse
 * The HK MLA forward reached parity with FlyDSL but was never integrated (a08-1 `fwd_summary.md`): a
   sidebar, not a ladder. The MLA forward is FlyDSL.
 * `v11_best` of the Llama forward never ran on a GPU (it was blocked by a halted card on a08-1).
-* `m02` -> `hk_v0` is still a large step (96-row kv blocks on a 3-stage ring, packed dS layout, 384-query dQ
-  workgroups, lock_simd): the pre-squash kernels between them (k1, k1ds, q1 / q2, k3) were lost with the
-  host they were written on.
+* `m07q` -> `hk_v0` is still a large step (1.48x): hk_v0's 48-kv-row waves on 2-wave workgroups (each Q / dO
+  operand feeds 3 WMMAs at 998 VGPRs), its dS^T export in whole 128-B lines to a causal-packed layout and its
+  384-query dQ workgroups on a K ring were not rebuilt as single steps; the Llama backward ladder's later
+  steps (LD rows by TDM, pipelined softmax, barrier + readback, a deeper ring, wave kinds, 2-wave workgroups)
+  measured flat or negative on MLA at `m07q`'s geometry and are side rungs. The pre-squash kernels between
+  m02 and hk_v0 (k1, k1ds, q1 / q2, k3) were lost with the host they were written on.
+* `b12l` -> Llama backward v0 is a 1.13x step (v0's register-double-buffered operand sets, 4-slot ring with TDM
+  roles, packed LD records, sched_group_barrier interleave).
 
 ## Rungs
 
@@ -120,15 +136,17 @@ Generated with `python3 -m hkl.table <ladder> --build` (VGPRs / static LDS of th
 | Rung | Parent | Source / flags | Pin | a08-1 ms | Feature | VGPR / LDS |
 |---|---|---|---|---|---|---|
 | f00 |  | `f00_naive.hip` | new |  | naive: 64 queries x 1 head per WG, register-mediated single-buffer K/V fill, 2 barriers per block, eager rescale | 238/35K |
-| f01 | f00 | `f01_double_buf.hip` | new |  | double-buffered LDS: block j+1's global loads in flight during block j's compute, 1 barrier per block | 292/70K |
-| f02 | f01 | `f02_tdm.hip` | new |  | TDM fill: one 32-row tensor_load_to_lds per wave per block instead of the register path | 201/70K |
-| f03 | f02 | `f03_gqa4.hip` | new |  | GQA packing: the 4 q heads of one kv head per WG share every K / V tile and LDS operand | 657/70K |
-| f04 | f03 | `f04_longest_first.hip` | new |  | longest-first workgroup order (causal load balance) | 657/70K |
-| f05 | f04 | `f05_ring4.hip` | new |  | 4-slot TDM ring with prefetch distance 2 (two blocks of compute cover each block's TDM latency) | 657/140K |
-| f06 | f05 | `f06_split_barrier.hip` | new |  | split barrier: signal after S^T(j), wait at the top of block j+1 (softmax + PV absorb wave skew) | 659/140K |
-| f07 | f06 | `f07_lock_simd.hip` | new |  | lock_simd: no WMMA arbitration pause at one wave per SIMD | 659/140K |
-| f08 | f07 | `f08_lazy_rescale.hip` | new |  | lazy rescale: O / l rescaled only when a query's max grew by > 8 nat (uniform branch) | 788/140K |
-| v0 | f08 | `k_attn_fwd_v0.hip` | yes | 1.123 | first HK forward (Primus-Turbo fd4a1bd0): f08 + software pipelining (QK(c+1) \|\| softmax(c) on 32-row chunks, double-buffered S^T), mask on the last stage only, Q through TDM, O through LDS, 320 KB LDS | 692/320K |
+| f01t | f00 | `f01t_tdm.hip` | new |  | TDM fill (one buffer, 2 barriers per block): no VGPRs, VALU or buffer-load waits for the fill | 218/35K |
+| f02 | f01t | `f02_tdm.hip` | new |  | double-buffered TDM fill: block j+1's tensor_load_to_lds ops in flight during block j's compute, 1 barrier per block | 201/70K |
+| f03b | f02 | `f03b_bursts.hip` | new |  | operand bursts: a phase's LDS operands loaded at once (V before the softmax), not one load before each WMMA | 298/70K |
+| f04r | f03b | `f04r_ring3.hip` | new |  | 3-slot TDM ring, prefetch distance 2 (enabler of the pipelined rung) | 298/105K |
+| f05p | f04r | `f05p_pipeline.hip` | new |  | software pipelining: S^T(j+1) WMMAs under the softmax of block j (one branch-free region) | 284/105K |
+| f06g | f05p | `f06g_gqa4.hip` | new |  | GQA packing on the pipelined kernel: each K / V operand feeds the 4 q heads of its kv head | 672/105K |
+| f07l | f06g | `f07l_longest_first.hip` | new |  | longest-first workgroup order (causal load balance) | 672/105K |
+| f08s | f07l | `f08s_lock_simd.hip` | new |  | lock_simd: no WMMA arbitration pause at one wave per SIMD | 672/105K |
+| f09m | f08s | `f09m_diag_mask.hip` | new |  | causal mask on the diagonal block only (peeled loop, no branch in the hot loop) | 809/105K |
+| f10z | f09m | `f10z_lazy_rescale.hip` | new |  | lazy rescale behind one unlikely branch per chunk (v0's RESC form), max taken a phase ahead | 678/105K |
+| v0 | f10z | `k_attn_fwd_v0.hip` | yes | 1.123 | first HK forward (Primus-Turbo fd4a1bd0), the shipped form of f10z: 4-slot ring with split barriers, Q by TDM, O through LDS, a finer QK \|\| softmax interleave (same speed as f10z) | 692/320K |
 | v0_resc | v0 | `k_attn_fwd_v0.hip` `-DHK_FWD_OPT_RESC=1` | yes | 1.101 | lazy-rescale test as one max + one VCC branch | 696/320K |
 | v0_resc_desc | v0_resc | `k_attn_fwd_v0.hip` `-DHK_FWD_OPT_RESC=1 -DHK_FWD_OPT_DESC=1` | new |  | TDM descriptor math inside the QK WMMA run, burst LDS bases one stage ahead | 696/320K |
 | p1 | v0_resc_desc | `k_attn_fwd_v0.hip` `-DHK_FWD_OPT_ALL=1 -DHK_FWD_OPT_TAIL=0` | yes | 1.045 | K(c+2) and V(c+1) loads as one burst per chunk (Primus-Turbo cade7db6 pin) | 752/320K |
@@ -136,6 +154,14 @@ Generated with `python3 -m hkl.table <ladder> --build` (VGPRs / static LDS of th
 | v1_v0body_pairs | v1_v0body | `k_attn_fwd_v1.hip` `-DFWD1_MDS=0 -DFWD1_LSUM=0 -DFWD1_SM1L=0 -DFWD1_FSPLIT=0` | yes | 1.099 | persistent grid: zig-zag causal pairs, XCD-major | 714/320K |
 | v1_lsum0 | v1_v0body_pairs | `k_attn_fwd_v1.hip` `-DFWD1_LSUM=0` | yes | 1.041 | lean SM1 / FSPLIT, F1 interleave, MDS2 (v1 as validated) | 768/320K |
 | v11_best | v1_lsum0 | `k_attn_fwd_v1.hip` `-DFWD1_LSUM=0 -DFWD1_OPT_RESC=1 -DFWD1_MDS=3 -DFWD1_OPT_UNROLL=1` | yes |  | v1.1: RESC + one burst per stage (MDS3) + 2-stage unroll (never run on a GPU) | 898/320K |
+| f01 | f00 | `f01_double_buf.hip` | new |  | negative: register-path double buffer -- 64 more VGPRs hold block j+1's loads, occupancy 4 -> 3 waves/SIMD (ATT); the TDM path (f01t, f02) double-buffers without VGPRs *(side)* | 292/70K |
+| f03 | f02 | `f03_gqa4.hip` | new |  | side chain (GQA before pipelining; one S^T -> softmax -> PV dependency chain per block): GQA packing on f02 -- 4x the work per WG at 1 wave/SIMD, nothing to hide the softmax under *(side)* | 657/70K |
+| f04 | f03 | `f04_longest_first.hip` | new |  | side chain (GQA before pipelining; one S^T -> softmax -> PV dependency chain per block): longest-first workgroup order (causal load balance) *(side)* | 657/70K |
+| f05 | f04 | `f05_ring4.hip` | new |  | side chain (GQA before pipelining; one S^T -> softmax -> PV dependency chain per block): 4-slot TDM ring with prefetch distance 2 (two blocks of compute cover each block's TDM latency) *(side)* | 657/140K |
+| f06 | f05 | `f06_split_barrier.hip` | new |  | side chain (GQA before pipelining; one S^T -> softmax -> PV dependency chain per block): split barrier: signal after S^T(j), wait at the top of block j+1 (softmax + PV absorb wave skew) *(side)* | 659/140K |
+| f07 | f06 | `f07_lock_simd.hip` | new |  | side chain (GQA before pipelining; one S^T -> softmax -> PV dependency chain per block): lock_simd: no WMMA arbitration pause at one wave per SIMD *(side)* | 659/140K |
+| f08 | f07 | `f08_lazy_rescale.hip` | new |  | side chain (GQA before pipelining; one S^T -> softmax -> PV dependency chain per block): lazy rescale: O / l rescaled only when a query's max grew by > 8 nat (uniform branch) *(side)* | 788/140K |
+| f09z | f08s | `f09z_lazy_rescale.hip` | new |  | negative: lazy rescale with a per-head branch at every chunk end (the branches cut the interleaved schedule) *(side)* | 676/105K |
 | x_desc | v0 | `k_attn_fwd_v0.hip` `-DHK_FWD_OPT_DESC=1` | yes | 1.111 | DESC alone on v0 *(side)* | 684/320K |
 | x_merge | v0 | `k_attn_fwd_v0.hip` `-DHK_FWD_OPT_MERGE=1` | yes | 1.113 | MERGE alone on v0 *(side)* | 748/320K |
 | x_p1_tail | p1 | `k_attn_fwd_v0.hip` `-DHK_FWD_OPT_ALL=1` | yes | 1.065 | negative: row sums moved into the PV run (TAIL) *(side)* | 776/320K |
@@ -147,14 +173,19 @@ Generated with `python3 -m hkl.table <ladder> --build` (VGPRs / static LDS of th
 | Rung | Parent | Source / flags | Pin | a08-1 ms | Feature | VGPR / LDS |
 |---|---|---|---|---|---|---|
 | b00 |  | `b00_naive.hip` | new |  | naive FA2 backward: prep + dK/dV kernel + separate dQ kernel (S, dP recomputed), register-mediated single-buffer fills | 338/34K, 234/34K |
-| b01 | b00 | `b01_double_buf.hip` | new |  | double-buffered fills: the next tiles' global loads in flight during this iteration, 1 barrier per iteration | 433/68K, 298/68K |
-| b02 | b01 | `b02_tdm.hip` | new |  | TDM fills: one 32-row tensor_load_to_lds per wave per tile pair instead of the register path | 320/68K, 220/68K |
-| b03 | b02 | `b03_gqa4.hip` | new |  | dQ kernel takes the 4 q heads of one kv head per WG (K / V tiles shared) | 320/68K, 872/68K |
-| b04 | b03 | `b04_fused_dq.hip` | new |  | dQ fused into the dK/dV kernel: dS^T through LDS, dQ = dS K, fp32 atomics (5 GEMMs per pair instead of 7) | 342/96K |
-| b05 | b04 | `b05_kv32.hip` | new |  | 32 kv rows per wave (128 per WG): every Q / dO LDS operand feeds 2 WMMAs, half the Q / dO traffic per kv row | 598/124K |
-| b06 | b05 | `b06_deferred_dq.hip` | new |  | dQ one iteration late from a double-buffered dS^T: 1 barrier per iteration instead of 2 | 584/144K |
-| b07 | b06 | `b07_lock_simd.hip` | new |  | lock_simd in the dK/dV kernel (one wave per SIMD) | 584/144K |
-| v0 | b07 | `k_attn_bwd_v0.hip` | yes | 3.491 | first HK backward (Primus-Turbo fd4a1bd0): b07 + 32-query steps (q pairs, heads inner, unmasked steps first) on a 4-deep TDM ring of Q / dO / LD records with one split-barrier phase per step, dQ_acc in C-fragment order (one 128-B line per atomic), and the 9-phase software pipeline (softmax interleaved into the WMMA runs, dQ(s-1) under step s) | 754/260K |
+| b01t | b00 | `b01t_tdm.hip` | new |  | TDM fills (one buffer, 2 barriers per iteration): no VGPRs, VALU or buffer-load waits for the fill | 324/34K, 218/34K |
+| b02 | b01t | `b02_tdm.hip` | new |  | double-buffered TDM fills: the next iteration's tiles in flight during this one's compute, 1 barrier per iteration | 320/68K, 220/68K |
+| b03b | b02 | `b03b_bursts.hip` | new |  | operand bursts (next group's burst during this group's WMMAs, tr16 operands during the softmax), NL / delta requested a run ahead | 474/68K, 338/68K |
+| b04f | b03b | `b04f_fused.hip` | new |  | dQ fused in v0's split: 128 kv / WG, 32-query steps, dS^T exchanged through LDS, each wave's K slice of dQ resident, 128-B-line fp32 atomics (5 GEMMs instead of 7) | 693/92K |
+| b05g | b04f | `b05g_longest_first.hip` | new |  | longest-first workgroup order: kv heads fastest, kv blocks ascending (v0's grid order) | 693/92K |
+| b06k | b05g | `b06k_wave_kinds.hip` | new |  | wave kinds per step (v0's FULL / DIAG / DEAD): the mask only on diagonal squares, fully masked squares skipped | 822/92K |
+| b07l | b06k | `b07l_ld_tdm.hip` | new |  | NL / delta rows by TDM with the step's Q / dO tiles, read from LDS (v0's LD records): no global loads in the loop (flat alone; the enabler of b08d) | 822/92K |
+| b08d | b07l | `b08d_deferred_dq.hip` | new |  | deferred dQ: dS operands requested right after the barrier, dQ(s) WMMAs + atomics in step s+1 after its S / dP run | 910/92K |
+| b09i | b08d | `b09i_dq_softmax.hip` | new |  | dQ(s-1) WMMAs and step s's softmax in one scheduling region (no branch, no sched_barrier), atomics after the dS^T stores | 918/92K |
+| b10p | b09i | `b10p_pipeline.hip` | new |  | two pipelined regions per step (co-execution scheduler): S / dP(q tile 1) \|\| softmax(q tile 0), dQ(s-1) \|\| softmax(q tile 1) | 808/92K |
+| b11s | b10p | `b11s_split_barrier.hip` | new |  | v0's split step barrier: tr16 of dV / dK in flight past the signal, dV / dK WMMAs in the window, 3-slot ring with ops after the wait | 688/109K |
+| b12l | b11s | `b12l_lock_simd.hip` | new |  | lock_simd: no WMMA arbitration pause at one wave per SIMD | 688/109K |
+| v0 | b12l | `k_attn_bwd_v0.hip` | yes | 3.491 | first HK backward (Primus-Turbo fd4a1bd0), the shipped form of b12l: next step's operand sets double-buffered in registers (x2-unrolled parity steps, readback a phase ahead), a 4-slot ring with TDM roles (wave 3 moves K / V), LD records per 4 queries, S / dP by kv tile with the softmax interleaved by sched_group_barrier | 754/260K |
 | v0_regs | v0 | `k_attn_bwd_v0.hip` `-DHK_BWD_OPT_REGS=7` | yes | 3.433 | holds on the S / dP WMMA source registers (no WAR v_nops) | 770/260K |
 | v0_regs_masked | v0_regs | `k_attn_bwd_v0.hip` `-DHK_BWD_OPT_REGS=7 -DHK_BWD_OPT_MASKED=1` | new |  | diagonal steps use the full step's operand layout | 770/260K |
 | v0_regs_masked_atom4 | v0_regs_masked | `k_attn_bwd_v0.hip` `-DHK_BWD_OPT_REGS=7 -DHK_BWD_OPT_MASKED=1 -DHK_BWD_OPT_ATOM=4` | new |  | the 32 dQ atomics of a step as 4 sub-bursts of 8 | 776/260K |
@@ -166,6 +197,17 @@ Generated with `python3 -m hkl.table <ladder> --build` (VGPRs / static LDS of th
 | v11_regs | v1_atom2 | `k_attn_bwd_v1.hip` `-DHK_ATTN_EXPERT_SCHED_BUILD -DBWD1_ATOM=2 -DBWD1_OPT_REGS=15` | yes | 3.211 | v1.1: register holds | 842/260K |
 | v11_regs_tdm3 | v11_regs | `k_attn_bwd_v1.hip` `-DHK_ATTN_EXPERT_SCHED_BUILD -DBWD1_ATOM=2 -DBWD1_OPT_REGS=15 -DBWD1_OPT_TDM3=1` | yes | 3.203 | v1.1: dummy TDM op instead of a role branch | 860/260K |
 | v11_best | v11_regs_tdm3 | `k_attn_bwd_v1.hip` `-DHK_ATTN_EXPERT_SCHED_BUILD -DBWD1_ATOM=2 -DBWD1_OPT_REGS=15 -DBWD1_OPT_TDM3=1 -DBWD1_OPT_MASKED=2` | yes | 3.194 | v1.1: diagonal steps on the full layout (MASKED=2) | 860/260K |
+| b01 | b00 | `b01_double_buf.hip` | new |  | negative: register-path double buffer -- 64 more VGPRs for the in-flight loads cost a wave per SIMD (ATT); the TDM path (b01t, b02) double-buffers without VGPRs *(side)* | 433/68K, 298/68K |
+| b05r | b04f | `b05r_ring3.hip` | new |  | negative: 3-slot ring + split step barrier on b04f -- the signal's DS drain right after the dS^T stores costs more than the skew it absorbs *(side)* | 693/109K |
+| b05s | b04f | `b05s_split_barrier.hip` | new |  | negative: split step barrier with two Q / dO buffers -- the early signal waits for step s+1's TDM op *(side)* | 693/92K |
+| b05n | b04f | `b05n_prefetch.hip` | new |  | negative: the same prefetch on b04f (before the work order and the wave kinds) *(side)* | 819/92K |
+| b07n | b06k | `b07n_prefetch.hip` | new |  | negative: next step's operands a step ahead in registers (NL / delta, Q / dO readback) -- 990 VGPRs *(side)* | 990/92K |
+| x_b10p_nocoexec | b10p | `b10p_pipeline.hip` | new |  | b10p in the default scheduler (no co-execution strategy) *(side)* | 902/92K |
+| b03 | b02 | `b03_gqa4.hip` | new |  | side chain (first draft: GQA / fusion before the v0 decomposition): dQ kernel takes the 4 q heads of one kv head per WG (K / V tiles shared) *(side)* | 320/68K, 872/68K |
+| b04 | b03 | `b04_fused_dq.hip` | new |  | side chain (first draft: GQA / fusion before the v0 decomposition): dQ fused into the dK/dV kernel: dS^T through LDS, dQ = dS K, fp32 atomics (5 GEMMs per pair instead of 7) *(side)* | 342/96K |
+| b05 | b04 | `b05_kv32.hip` | new |  | side chain (first draft: GQA / fusion before the v0 decomposition): 32 kv rows per wave (128 per WG): every Q / dO LDS operand feeds 2 WMMAs, half the Q / dO traffic per kv row *(side)* | 598/124K |
+| b06 | b05 | `b06_deferred_dq.hip` | new |  | side chain (first draft: GQA / fusion before the v0 decomposition): dQ one iteration late from a double-buffered dS^T: 1 barrier per iteration instead of 2 *(side)* | 584/144K |
+| b07 | b06 | `b07_lock_simd.hip` | new |  | side chain (first draft: GQA / fusion before the v0 decomposition): lock_simd in the dK/dV kernel (one wave per SIMD) *(side)* | 584/144K |
 | x_masked | v0 | `k_attn_bwd_v0.hip` `-DHK_BWD_OPT_MASKED=1` | yes | 3.448 | MASKED alone on v0 *(side)* | 754/260K |
 | x_atom4 | v0 | `k_attn_bwd_v0.hip` `-DHK_BWD_OPT_ATOM=4` | yes | 3.464 | ATOM=4 alone on v0 *(side)* | 760/260K |
 | x_tdm3 | v0 | `k_attn_bwd_v0.hip` `-DHK_BWD_OPT_TDM3=1` | yes | 3.473 | TDM3 alone on v0 *(side)* | 754/260K |
@@ -174,6 +216,8 @@ Generated with `python3 -m hkl.table <ladder> --build` (VGPRs / static LDS of th
 | x_onephase | v0 | `k_attn_bwd_v0.hip` `-DHK_BWD_OPT_ONEPHASE=1` | yes | 4.233 | negative: one memory phase per step (zero-window barrier) *(side)* | 850/260K |
 | x_v1_noexp | v1 | `k_attn_bwd_v1.hip` | yes | 5.263 | negative: v1's interleaved source in the default scheduling mode *(side)* | 830/260K |
 | x_v1_atom0 | v1 | `k_attn_bwd_v1.hip` `-DHK_ATTN_EXPERT_SCHED_BUILD -DBWD1_ATOM=0` | yes | 3.400 | negative: all 32 atomics as one burst *(side)* | 830/260K |
+| x_v0_noint | v0 | `k_attn_bwd_v0.hip` `-DBWD_INTERLEAVE=0` | new |  | v0 without the sched_group_barrier interleave of the softmax into the S / dP and dQ WMMA runs *(side)* | 762/260K |
+| x_v0_nodead | v0 | `k_attn_bwd_v0.hip` `-DBWD_SKIP_DEAD=0` | new |  | v0 with DEAD waves running the masked diagonal path *(side)* | 734/260K |
 
 ### DeepSeek-V3 MLA backward
 
@@ -182,7 +226,12 @@ Generated with `python3 -m hkl.table <ladder> --build` (VGPRs / static LDS of th
 | m00 |  | `m00_naive.hip` | new |  | naive FA2 backward with MLA dims (qk 192 / v 128, MHA): prep + dK/dV kernel + separate dQ kernel recomputing S and dP | 424/42K, 319/42K |
 | m01 | m00 | `m01_tdm_dbuf.hip` | new |  | double-buffered TDM fills (the Llama ladder's b01 + b02): 192-wide tiles as 128- and 64-column ops | 387/84K, 277/84K |
 | m02 | m01 | `m02_ds_export.hip` | new |  | dS^T exported by the dK/dV kernel to a scratch, dQ = dS K read back from it: no S/dP recompute, no atomics | 364/84K, 134/70K |
-| hk_v0 | m02 | `k_dkdv96ds.hip`; `k_dqds_c.hip` | yes | 2.529 | first HK backward (d3590be4): m02 + 96-row kv blocks (two 48-row waves on a 3-stage Q/dO TDM ring, 1 wave/SIMD), causal-packed dS layout (4.33 GB), 384-query dQ workgroups on a K ring, lock_simd | 1012/63K, 887/270K |
+| m03q | m02 | `m03q_dq_wide.hip` | new |  | dQ kernel: 32 queries per wave (128 per WG), each K^T operand feeds 2 WMMAs, a chunk's operands as one burst | 364/84K, 309/86K |
+| m04b | m03q | `m04b_bursts.hip` | new |  | dK/dV kernel: operand bursts per q tile, tr16 operands of dV / dK during the softmax, NL / delta requested a run ahead | 540/84K, 309/86K |
+| m05w | m04b | `m05w_kv32.hip` | new |  | dK/dV kernel: 32 kv rows per wave (128 per WG), 32-query steps: every Q / dO operand feeds 2 WMMAs | 771/42K, 309/86K |
+| m06g | m05w | `m06g_longest_first.hip` | new |  | longest-first workgroup order in both kernels (heads fastest; kv blocks ascending, q blocks descending) | 771/42K, 309/86K |
+| m07q | m06g | `m07q_dq64.hip` | new |  | dQ kernel: 64 queries per wave (256 per WG): each K^T operand feeds 4 WMMAs, a K tile serves 256 queries | 771/42K, 517/118K |
+| hk_v0 | m07q | `k_dkdv96ds.hip`; `k_dqds_c.hip` | yes | 2.529 | first HK backward (d3590be4): 48 kv rows per wave on 2-wave workgroups (each Q / dO operand feeds 3 WMMAs), a 3-stage Q / dO ring with per-q-tile readback, dS^T exported in whole 128-B lines (DPP regroup) to a causal-packed layout (4.33 GB), 384-query dQ workgroups on a K ring, lock_simd | 1012/63K, 887/270K |
 | r1a | hk_v0 | `01a_dkdv_dsexport_pin.patch`; `k_dkdv96ds.hip`; `k_dqds_c.hip` | part |  | dK/dV: the dS^T export (6 buffer stores) is pinned by a sched_barrier right after the dO^T tr16 burst, ahead of the first dV WMMA: without expert scheduling a store issued inside the WMMA run waits for every earlier WMMA, under the tr16 latency it is free. | 1016/63K, 887/270K |
 | r1b | r1a | `01b_dkdv_split_barrier.patch`; `k_dkdv96ds.hip`; `k_dqds_c.hip` | part |  | dK/dV: split ring barrier (hk1.h lds_arrive = release fence + s_barrier_signal, lds_wait = s_barrier_wait + acquire) with the 24 register-only dK kh1/kh2 WMMAs between arrive and wait, so the other wave's late arrival overlaps matrix work instead of an idle s_barrier. | 1012/63K, 887/270K |
 | r1c | r1b | `01c_dkdv_mha_loop_top.patch`; `k_dkdv96ds.hip`; `k_dqds_c.hip` | part |  | dK/dV: the full loop specialised for G == 1 (MHA: the q-pair counter is ii, the q head 0), so the clamped prefetch tiles are min(ii + k, n - 1) instead of the k1_nx_* / k1_pf_* select chains: loop-top SALU 156 -> 57 per 2 iterations (the G != 1 loop stays as a second copy). | 1008/63K, 887/270K |
@@ -209,3 +258,10 @@ Generated with `python3 -m hkl.table <ladder> --build` (VGPRs / static LDS of th
 | r5 | r4 | `05_5b19697f.patch`; `k_dkdv96ds.hip`; `k_dqds_c.hip`; `k_delta.hip` | yes | 2.218 | HIP k_delta (several b128 loads in flight per lane) | 1015/63K, 934/295K, 48/0K |
 | r6 | r5 | `06_7ccfba3b.patch`; `k_dkdv96ds.hip`; `k_dqds_c.hip`; `k_delta.hip` | yes |  | hardening: s_wait_xcnt before the tail block reuses its K/V descriptor SGPRs (perf-neutral) | 1015/63K, 934/295K, 48/0K |
 | r7 | r6 | `07_71bd0329.patch`; `k_dkdv96ds.hip`; `k_dqds_c.hip`; `k_delta.hip` | yes | 2.220 | redundant causal test dropped from the masked dK/dV loop | 1015/63K, 934/295K, 48/0K |
+| m07k | m06g | `m07k_wave_kinds.hip` | new |  | flat on MLA (1.00x): q steps descending, FULL steps without the mask, wave kinds on the diagonal -- the mask is a smaller share of a 6-k-step S tile, at 966 VGPRs *(side)* | 966/42K, 309/86K |
+| m07l | m06g | `m07l_ld_tdm.hip` | new |  | flat on MLA (side): NL / delta rows by TDM with the step's Q / dO tiles (the Llama ladder's b07l; 1.00x) *(side)* | 771/42K, 309/86K |
+| m08p | m06g | `m08p_pipeline.hip` | new |  | flat on MLA (side): q tile 1's S / dP WMMAs \|\| q tile 0's softmax, co-execution scheduler (0.99x; by kv tile: 0.98x) *(side)* | 868/42K, 309/86K |
+| m08q | m07l | `m08q_dq64.hip` | new |  | m07l + the 64-query dQ waves of m07q *(side)* | 771/42K, 517/118K |
+| m08h | m07q | `m08h_two_waves.hip` | new |  | negative on MLA (side): 2-wave dK / dV workgroups (64 kv rows; 0.97x: twice the Q / dO staging per kv row) *(side)* | 771/42K, 517/118K |
+| m09r | m08q | `m09r_readback.hip` | new |  | flat on MLA (side): step barrier between the dV and dK runs, the next step's first operands + NL / delta read back under the dK WMMAs (1.00x) *(side)* | 852/42K, 517/118K |
+| m10t | m09r | `m10t_ring3.hip` | new |  | flat on MLA (side): 3-slot Q / dO ring, TDM ops two steps ahead (1.00x) *(side)* | 857/63K, 517/118K |
