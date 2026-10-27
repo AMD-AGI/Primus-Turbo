@@ -182,6 +182,43 @@ __device__ __forceinline__ uint32_t ballot(bool pred) {
     return __builtin_amdgcn_ballot_w32(pred);
 }
 
+// Element `k` of a 16-byte vector of `dtype_t`, as float. Works on the vector's words rather than
+// through a pointer to it, which would keep the vector out of registers.
+template <typename dtype_t> __device__ __forceinline__ float vec_elem(const int4 &v, int k) {
+    constexpr int kPerWord = static_cast<int>(sizeof(int) / sizeof(dtype_t));
+    const int     i        = k / kPerWord;
+    const int     word     = i == 0 ? v.x : (i == 1 ? v.y : (i == 2 ? v.z : v.w));
+    if constexpr (kPerWord == 2)
+        return __uint_as_float(k % 2 ? static_cast<uint32_t>(word) & 0xffff0000u
+                                     : static_cast<uint32_t>(word) << 16);
+    else
+        return __int_as_float(word);
+}
+
+// hip_bfloat16's float conversion (round to nearest even, signaling NaNs kept), as V1 casts
+__device__ __forceinline__ uint32_t bf16_bits(float value) {
+    uint32_t bits = __float_as_uint(value);
+    if (~bits & 0x7f800000u)
+        bits += 0x7fffu + ((bits >> 16) & 1u);
+    else if (bits & 0xffffu)
+        bits |= 0x10000u;
+    return bits >> 16;
+}
+
+template <typename dtype_t, int kElems>
+__device__ __forceinline__ int4 vec_pack(const float (&values)[kElems]) {
+    int words[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        if constexpr (sizeof(dtype_t) == 2)
+            words[i] =
+                static_cast<int>(bf16_bits(values[2 * i]) | (bf16_bits(values[2 * i + 1]) << 16));
+        else
+            words[i] = __float_as_int(values[i]);
+    }
+    return make_int4(words[0], words[1], words[2], words[3]);
+}
+
 #endif // __gfx1250__
 
 template <typename Kernel> void set_dynamic_lds(Kernel kernel, int bytes) {
@@ -483,8 +520,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                    int64_t region_offset, int slot_bytes) {
 #if defined(__gfx1250__)
     extern __shared__ __align__(128) int smem[];
-    constexpr int kVecElems     = static_cast<int>(sizeof(int4) / sizeof(dtype_t));
-    constexpr int kReduceUnroll = kNumRanks <= 4 ? 8 : 4;
+    constexpr int kVecElems = static_cast<int>(sizeof(int4) / sizeof(dtype_t));
+    // 16 vectors of rows in flight per lane: more would not fit 1024-thread blocks' 128 VGPRs
+    constexpr int kReduceUnroll = 16 / kNumRanks;
 
     const int   thread_id = static_cast<int>(threadIdx.x), lane_id = thread_id % kV2WarpSize;
     const int   warp_id  = uniform(thread_id / kV2WarpSize);
@@ -632,7 +670,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             device::BufferSRD row_srds[kNumRanks];
 #pragma unroll
             for (int r = 0; r < kNumRanks; ++r)
-                row_srds[r] = device::BufferSRD(rows[r], hidden_bytes);
+                row_srds[r] = device::BufferSRD(rows[r], routed[r] ? hidden_bytes : 0);
             const auto *bias_0_row = bias_0 == nullptr ? nullptr
                                                        : reinterpret_cast<const int4 *>(bias_0) +
                                                              static_cast<int64_t>(token) * num_vecs;
@@ -643,7 +681,19 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 reinterpret_cast<int4 *>(recv_x) + static_cast<int64_t>(token) * num_vecs;
 
             for (int i0 = lane_id; i0 < num_vecs; i0 += kV2WarpSize * kReduceUnroll) {
-                float values[kReduceUnroll][kVecElems];
+                // every rank's loads in flight at once (an unrouted rank's empty range loads
+                // nothing, and past the row the range returns zeros), added in rank order
+                int4 recv_values[kNumRanks][kReduceUnroll];
+#pragma unroll
+                for (int r = 0; r < kNumRanks; ++r) {
+#pragma unroll
+                    for (int u = 0; u < kReduceUnroll; ++u) {
+                        const auto value = llvm_amdgcn_raw_buffer_load_v4i32(
+                            row_srds[r].srd,
+                            (i0 + u * kV2WarpSize) * static_cast<int>(sizeof(int4)), 0, kSysCPol);
+                        recv_values[r][u] = make_int4(value[0], value[1], value[2], value[3]);
+                    }
+                }
 #pragma unroll
                 for (int u = 0; u < kReduceUnroll; ++u) {
                     const int i      = i0 + u * kV2WarpSize;
@@ -652,44 +702,20 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                         bias_a = bias_0_row[i];
                     if (i < num_vecs and bias_1_row != nullptr)
                         bias_b = bias_1_row[i];
-                    const auto *a = reinterpret_cast<const dtype_t *>(&bias_a);
-                    const auto *b = reinterpret_cast<const dtype_t *>(&bias_b);
+                    float values[kVecElems];
 #pragma unroll
                     for (int k = 0; k < kVecElems; ++k)
-                        values[u][k] = static_cast<float>(a[k]) + static_cast<float>(b[k]);
-                }
+                        values[k] = vec_elem<dtype_t>(bias_a, k) + vec_elem<dtype_t>(bias_b, k);
 #pragma unroll
-                for (int r = 0; r < kNumRanks; ++r) {
-                    if (not routed[r])
-                        continue;
-                    int4 recv_values[kReduceUnroll];
-#pragma unroll
-                    for (int u = 0; u < kReduceUnroll; ++u) {
-                        // past the row the SRD's range returns zeros
-                        auto value = llvm_amdgcn_raw_buffer_load_v4i32(
-                            row_srds[r].srd,
-                            (i0 + u * kV2WarpSize) * static_cast<int>(sizeof(int4)), 0, kSysCPol);
-                        recv_values[u] = *reinterpret_cast<int4 *>(&value);
-                    }
-#pragma unroll
-                    for (int u = 0; u < kReduceUnroll; ++u) {
-                        const auto *v = reinterpret_cast<const dtype_t *>(&recv_values[u]);
+                    for (int r = 0; r < kNumRanks; ++r) {
+                        if (not routed[r])
+                            continue;
 #pragma unroll
                         for (int k = 0; k < kVecElems; ++k)
-                            values[u][k] += static_cast<float>(v[k]);
+                            values[k] += vec_elem<dtype_t>(recv_values[r][u], k);
                     }
-                }
-#pragma unroll
-                for (int u = 0; u < kReduceUnroll; ++u) {
-                    const int i = i0 + u * kV2WarpSize;
-                    if (i < num_vecs) {
-                        int4  out;
-                        auto *out_values = reinterpret_cast<dtype_t *>(&out);
-#pragma unroll
-                        for (int k = 0; k < kVecElems; ++k)
-                            out_values[k] = static_cast<dtype_t>(values[u][k]);
-                        out_row[i] = out;
-                    }
+                    if (i < num_vecs)
+                        out_row[i] = vec_pack<dtype_t>(values);
                 }
             }
             if (lane_id < num_topk) {
