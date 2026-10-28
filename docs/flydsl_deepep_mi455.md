@@ -5,7 +5,7 @@
 ## 0. Status
 
 - **Backends**: `Buffer(..., intranode_backend=...)` or the environment variable `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`, one of `cpp` (HIP V1), `flydsl` (FlyDSL V1) and `flydsl_v2` (FlyDSL V2; tuned for gfx1250, experimental elsewhere). The C++ V2 backend, a separate change, uses `cpp_v2`; the two value lists are merged when it lands.
-  - gfx1250: the C++ DeepEP is not loaded (§5), the default is `flydsl_v2`, and selecting `cpp` raises an error. Use `flydsl` for CUDA graphs or a different token count per rank (§6).
+  - gfx1250: the C++ DeepEP is not loaded (§5), the default is `flydsl_v2`, and selecting `cpp` raises an error. Use `flydsl` for CUDA graphs, or for token counts that change per step without a known maximum (§6).
   - Other architectures: the C++ DeepEP is loaded and the default is `cpp`; `flydsl_v2` runs there with a register copy instead of TDM and is experimental (§6, `flydsl_deepep_v2_unified.md`).
   - How to choose, size and tune a backend: [the DeepEP README](../primus_turbo/pytorch/deep_ep/README.md#intranode-backend).
 - **Changes**:
@@ -17,7 +17,7 @@
   | V1 on gfx1250 | wave32, gfx12 split-counter waits, realtime clock, `SCOPE_SYS` loads and stores (§2, §4); the gfx1250 `read_clock`, `wait_mem_all` and `copy_warp` live in `deep_ep/common.py`, and `primus_turbo/flydsl/utils` is unchanged (§3) |
   | V2 | The `flydsl_v2` backend for gfx1250: fixed slots instead of rings, per-row flags and a reduce queue in the combine, LDS pieces for wide rows (§6) |
   | `ArchTraits` | The per-arch choices in `arch.py`, a NamedTuple (§3) |
-  | Safety | Lower-bound check on the combine ring depth; `s_trap` after a 5 s spin timeout on gfx1250; the V2 combine no longer reads the top-k weights of an empty `x`; `Buffer.destroy()` frees the heap only once every rank is done; `flydsl_v2` refuses CUDA-graph capture (§6, §7) |
+  | Safety | Lower-bound check on the combine ring depth; `s_trap` after a 300 s spin timeout on gfx1250, as the C++ DeepEP; the V2 combine no longer reads the top-k weights of an empty `x`; `Buffer.destroy()` frees the heap only once every rank is done; `flydsl_v2` refuses CUDA-graph capture (§6, §7) |
   | V1 tuning on gfx1250 | 8 KiB copy pieces; backend-aware `get_*_config` with larger combine chunks (§8) |
   | FlyDSL API | `fx.as_ir_value` instead of the private `buffer_ops._unwrap_value`, which #581 removed |
   | Buffer sizing | `init_buffer` sizes the `flydsl_v2` heap from the dispatched tokens (§6) |
@@ -58,7 +58,7 @@
 | A12 | 1024-thread blocks, at most 128 VGPRs per thread | same | VGPRs / spills checked in the ISA (§8) |
 | A13 | chunk and CU counts chosen for MI300 / MI355 | — | chunk defaults per backend (§8) |
 | A14 | combine ring lower bound `recv >= reduce warps + send - 1` (15 reduce warps on wave64) | 31 on wave32 | host-side check (§7) |
-| A15 | spin timeout of 30 s; print and keep waiting | MES enters an unrecoverable state when the driver preempts or destroys a queue that is spinning | `s_trap 2` after 5 s on gfx1250 (§7) |
+| A15 | spin timeout of 30 s; print and keep waiting | MES enters an unrecoverable state when the driver preempts or destroys a queue that is spinning | `s_trap 2` after 300 s on gfx1250, as the C++ DeepEP (§7) |
 
 ## 3. `ArchTraits`
 
@@ -91,7 +91,7 @@ TRAITS = get_arch_traits()        # FLYDSL_GPU_ARCH or the current device; unkno
   | `cpol_sys_store` | 0 | `0x19` | §4 |
   | `copy_piece_table` | table measured on MI355X | 8 KiB | §8 |
   | `combine_loads_in_flight` | 32 | 32 | smaller values remove the spills but are not faster (§8) |
-  | `spin_timeout_cycles` / `trap_on_timeout` | 3e9 (30 s) / False | 5e8 (5 s) / True | §7 |
+  | `spin_timeout_cycles` / `trap_on_timeout` | 3e9 (30 s) / False | 3e10 (300 s) / True | §7 |
 
 ## 4. Memory ordering: the cheap fence and `SCOPE_SYS` stores on gfx1250
 
@@ -140,7 +140,7 @@ From Xiaoming's gfx1250 branch:
 - `num_sms` blocks are `num_sms` channels, which need not be even; the chunk fields of `Config` are not used.
 - **No CUDA-graph capture**: every call advances host state that its launch takes (the epoch of the dispatch counts and the combine flags, the base of the reduce queue); a graph replay would rerun the old values and take the previous call's flags as fresh, so dispatch and combine raise under capture. `cpp` and `flydsl` keep no such host state.
 - **The heap size scales with the token count**: heap ≥ `DATA_OFFSET` (about 4.25 MiB) + 2 × max(dispatch region, combine region). Dispatch region = received tokens × (H bytes + 4 + top-k × (index bytes + 4) + scales × 4); combine region = this rank's tokens × number of ranks × align128(H bytes + top-k × 4). For example, DSv3 EP4 (T 8192, H 7168 bf16, top-8) needs about 0.95 GB and GPT-OSS EP4 (T 32768, H 2880, top-4) about 1.55 GB. `Config.get_nvl_buffer_size_hint` sizes V1's rings (about 128 MB for GPT-OSS EP4 at 32 CUs), which is not enough for V2.
-- **Who sizes the heap**: `Buffer.get_token_buffer_size_hint(num_max_tokens_per_rank, hidden_bytes, num_ranks, num_topk)` gives the V2 size (0 for the ring backends), and `init_buffer`, behind `moe_dispatch` / `DeepEPTokenDispatcher`, takes the larger of it and the ring hint. As Megatron does with DeepEP V2's `ElasticBuffer`, the token count comes from the first dispatch, and a larger dispatch later reallocates the heap, after a device sync and a barrier since peers may still be writing into the old one; `set_buffer_global_config(num_max_tokens_per_rank=...)` allocates up front instead. Every rank must dispatch the same number of tokens, as DeepEP V2 requires; in Megatron / Primus that is S / TP × B on every rank.
+- **Who sizes the heap**: `Buffer.get_token_buffer_size_hint(num_max_tokens_per_rank, hidden_bytes, num_ranks, num_topk)` gives the V2 size (0 for the ring backends), and `init_buffer`, behind `moe_dispatch` / `DeepEPTokenDispatcher`, takes the larger of it and the ring hint. As Megatron does with DeepEP V2's `ElasticBuffer`, the token count comes from the first dispatch, and a larger dispatch later reallocates the heap, after a device sync and a barrier since peers may still be writing into the old one; `set_buffer_global_config(num_max_tokens_per_rank=...)` allocates up front instead. Each allocation all-reduces the group's largest token count, so ranks may dispatch different numbers of tokens; a later, larger dispatch grows the heap only once every rank of the group grows it (each dispatching more than its heap holds), and until then a growing rank waits in the barrier, with a warning. Token counts that change per step (THD, dynamic CP) need `num_max_tokens_per_rank` set to their maximum, or `flydsl`. In Megatron / Primus every rank dispatches S / TP × B.
 - Limits: channels ≤ 1024; tokens per channel < 2^19; an 11-bit dispatch epoch (wraps after 2047; the counts carry an epoch tag); a 4 MiB combine flag region, i.e. T × number of ranks ≤ 1 Mi rows; LDS per block ≤ 320 KiB.
 
 **Bug fixed**: to read the top-k weights, the reduce first loaded from every rank with raw global loads and then discarded the ranks the token was not routed to. When such a rank was this rank, the address came from the combine's `topk_weights`; when a rank received 0 tokens in that call, that was an empty tensor with a null address, so the load accessed illegal memory (with tokens it could also read one row past the end). Now a rank the token is not routed to is read from a slot on this rank's heap instead. Regression test `test_rank_receives_nothing`: rank 0 receives no tokens.
@@ -168,8 +168,8 @@ From Xiaoming's gfx1250 branch:
 - Probe: every token sent to every rank, a single channel, the ring exactly at the bound (send 1 / 8 / 24, recv 31 / 38 / 54): passes. Xiaoming showed that one slot below the bound always times out (trap). Dispatch has no such constraint (the receiver consumes whole chunks).
 
 **Spin timeout**
-- Xiaoming hit this on MI455X: when the combine deadlocked, the watchdog only printed and kept spinning, the driver failed to reset the queue (`MES failed to respond`), the GPU reset did not complete either, and in the end the machine had to be rebooted. The driver's queue preemption timeout is 9 s. So on gfx1250 the timeout is 5 s, after which the location is printed and `s_trap 2` is executed; he verified that the trap aborts the queue cleanly, the process exits within 3 s, and the GPU stays usable.
-- Whether skew between ranks caused by first-time compilation can trigger it by mistake: the 4-GPU UT with an empty FlyDSL cache (40 s) did not trigger it. In training, ranks that drift apart by more than 5 s (e.g. first compilation without a cache, or uneven host stalls) will trap; keep this in mind.
+- Xiaoming hit this on MI455X: when the combine deadlocked, the watchdog only printed and kept spinning, the driver failed to reset the queue (`MES failed to respond`), the GPU reset did not complete either, and in the end the machine had to be rebooted. The driver's queue preemption timeout is 9 s. So on gfx1250 the watchdog prints the location and executes `s_trap 2`; he verified that the trap aborts the queue cleanly, the process exits within 3 s, and the GPU stays usable.
+- The timeout is 300 s, as the C++ DeepEP's `NUM_TIMEOUT_CYCLES` (it was 5 s, under the preemption timeout, but then any rank more than 5 s behind its peers, e.g. from a data loader stall, a first compilation without a cache or a host stall, killed the job). The cost: a process killed while its kernel is still deadlocked, before the 300 s trap, can again leave MES unrecoverable; let a hung job reach the trap instead of killing it.
 
 **Host heap corruption at exit (a HIP runtime bug, not DeepEP)**
 - Seen in V2 stress runs (glibc `corrupted double-linked list` after `STRESS PASS`, or a SIGSEGV at exit on 4 GPUs); Xiaoming also hit it once with his V1 port. It happens inside `dist.destroy_process_group()`, in RCCL's `ncclCommDestroy` → `hipMemUnmap`, and just as often without any DeepEP code (a few percent of 2-rank runs; every run under glibc `malloc.perturb`). The V2 fix in §6 did not fix it; the clean runs after it were luck.
@@ -288,7 +288,7 @@ Distance to the link (GB/s = MB a GPU receives from the other / time, per GPU an
 
 - End-to-end runs with real (unforced) routing and GPT-OSS 120B.
 - `flydsl` under CUDA-graph capture on MI455X, the backend to use there.
-- V2 with a different token count per rank (THD, dynamic CP): an all-reduce of the maximum before sizing, as Megatron's HybridEP path offers.
+- V2 with token counts that change per step and no known maximum (THD, dynamic CP): a per-step all-reduce of the maximum before sizing, as Megatron's HybridEP path offers.
 - A benchmark that calls the ops the way Primus does.
 - EP4 numbers with the §8 method; runs on gfx950; 8 GPUs.
 - Whether the VGPR spills of the V1 / V2 combine and the SGPR spills of the V2 dispatch are worth addressing.

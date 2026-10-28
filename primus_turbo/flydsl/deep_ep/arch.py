@@ -106,9 +106,10 @@ _TRAITS = {
         # MI455X (DSv3 shape, 2 and 4 ranks)
         copy_piece_table=(("dispatch", ((_INF, 8 * 1024),)), ("combine", ((_INF, 8 * 1024),))),
         combine_loads_in_flight=32,
-        # 5 s, under the driver's 9 s queue preemption timeout: a queue still spinning when it is
-        # evicted or torn down has left MES unrecoverable on MI455X, a trapped one has no waves left
-        spin_timeout_cycles=500_000_000,
+        # 300 s and a trap, as the C++ DeepEP's NUM_TIMEOUT_CYCLES: a slow peer is not an error. A
+        # deadlocked queue still spinning when it is torn down has left MES unrecoverable on MI455X,
+        # a trapped one has no waves left
+        spin_timeout_cycles=30_000_000_000,
         trap_on_timeout=True,
         has_tdm=True,
         max_lds_bytes=320 * 1024,

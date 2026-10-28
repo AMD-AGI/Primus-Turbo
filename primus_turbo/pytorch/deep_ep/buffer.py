@@ -102,9 +102,10 @@ class Buffer:
                 built). `"cpp"` and `"flydsl"` return interchangeable handles; `"flydsl_v2"` (direct slot
                 writes, no channel rings; TDM on gfx1250, a register copy elsewhere, where it is
                 experimental) returns the same outputs with handles of its own, is
-                not capturable in a CUDA graph, and needs every rank to dispatch the same number of tokens
-                and `num_nvl_bytes` that hold the whole batch (`get_token_buffer_size_hint`; `moe_dispatch`
-                sizes it itself). The internode and low-latency paths always use `"cpp"`.
+                not capturable in a CUDA graph, and needs `num_nvl_bytes` that hold the whole batch of the
+                rank with the most tokens (`get_token_buffer_size_hint` with the same
+                `num_max_tokens_per_rank` on every rank; `moe_dispatch` sizes it itself). The internode and
+                low-latency paths always use `"cpp"`.
 
         Note:
             Controlled by ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM`` (default ``0``).

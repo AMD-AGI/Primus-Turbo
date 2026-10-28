@@ -15,7 +15,7 @@ steps that are still open are in [`flydsl_deepep_v2_mi355.md`](flydsl_deepep_v2_
   one-line change once the data supports it.
 
 Not in scope: internode and low-latency (always `cpp`), changes to V2's protocol, CUDA-graph capture of V2,
-a different token count per rank.
+token counts that change per step without a known maximum (the heap holds the largest dispatch of the group).
 
 ## Layer 1: what the GPU is (`ArchTraits`)
 
