@@ -355,7 +355,6 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
         assert sizes[1] > sizes[0], sizes
         dist.barrier()
 
-    @unittest.skipUnless(IS_GFX1250, "flydsl_v2 runs on gfx1250 only")
     @skip_if_lt_x_gpu(2)
     def test_moe_ops_v2_buffer_with_uneven_tokens(self):
         """moe_dispatch / moe_combine on flydsl_v2 with a different number of tokens on every rank: the
