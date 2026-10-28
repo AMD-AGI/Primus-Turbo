@@ -10,7 +10,6 @@
 
 ###############################################################################
 
-from primus_turbo.pytorch._C.deep_ep import Config
-
+from ._compat import Config
 from .buffer import Buffer
 from .utils import EventOverlap

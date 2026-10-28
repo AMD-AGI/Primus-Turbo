@@ -31,10 +31,12 @@ Please following [Primus-Turbo Install from Source](../../../README.md#3-install
 The intranode path (a single node, `num_ranks` in {2, 4, 8}, no low-latency mode) has two kernel
 backends with the same `Buffer` API:
 
-- `cpp` (default): the HIP kernels in `csrc/kernels/deep_ep/{layout,intranode}.cu`.
+- `cpp` (default where the C++ DeepEP is loaded): the HIP kernels in
+  `csrc/kernels/deep_ep/{layout,intranode}.cu`.
 - `flydsl`: FlyDSL ports of the same kernels in `primus_turbo/flydsl/deep_ep/`
   (`get_dispatch_layout`, `notify_dispatch`, `dispatch`, `cached_notify_combine`, `combine`).
-  It runs on gfx942 / gfx950 and owns its own uncached HIP-IPC heap of `num_nvl_bytes`.
+  It runs on gfx942 / gfx950 / gfx1250 and owns its own uncached HIP-IPC heap of `num_nvl_bytes`.
+  On gfx1250 the C++ DeepEP is not loaded and `flydsl` is the default.
 
 Pick one per `Buffer` with `intranode_backend="cpp" | "flydsl"`, or globally with
 `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND=cpp|flydsl`. The two backends use the same channel
