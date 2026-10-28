@@ -354,6 +354,42 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
         assert sizes[1] > sizes[0], sizes
         dist.barrier()
 
+    @unittest.skipUnless(IS_GFX1250, "flydsl_v2 runs on gfx1250 only")
+    @skip_if_lt_x_gpu(2)
+    def test_moe_ops_v2_buffer_with_uneven_tokens(self):
+        """moe_dispatch / moe_combine on flydsl_v2 with a different number of tokens on every rank: the
+        buffers are sized from the group's largest dispatch, so later dispatches up to it do not grow them."""
+        os.environ["PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND"] = "flydsl_v2"
+        torch.cuda.set_device(self.device)
+        store = dist.FileStore(self.file_name, self.world_size)
+        dist.init_process_group(backend="nccl", world_size=self.world_size, rank=self.rank, store=store)
+        group = dist.group.WORLD
+        num_ranks = group.size()
+        clear_backend_instances()
+        set_buffer_global_config(num_use_cu=24)
+        backend = _get_backend_instance(_resolve_backend_name())
+        hidden, num_topk, num_experts = 4096, 4, 64
+        torch.manual_seed(42 + self.rank)
+        max_tokens = 2048 * num_ranks
+        sizes = []
+        # the last rank sends the most first, then rank 0 does
+        for num_tokens in (2048 * (self.rank + 1), 2048 * (num_ranks - self.rank)):
+            x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+            topk_idx = torch.topk(torch.rand((num_tokens, num_experts), device="cuda"), num_topk, dim=-1)[1]
+            topk_weights = torch.rand((num_tokens, num_topk), dtype=torch.float32, device="cuda")
+            recv_x, _, _, _, handle = pt.ops.moe_dispatch(x, topk_idx, topk_weights, num_experts, group)
+            combined_x = pt.ops.moe_combine(recv_x, group, handle)
+            torch.cuda.synchronize()
+            in_rank = torch.zeros((num_tokens, num_ranks), dtype=torch.bool, device="cuda")
+            in_rank.scatter_(1, topk_idx // (num_experts // num_ranks), True)
+            ref_x = x.float() * in_rank.sum(dim=1, keepdim=True)
+            assert torch.allclose(combined_x.float(), ref_x, rtol=2e-2, atol=2e-2)
+            hint = pt.deep_ep.Buffer.get_token_buffer_size_hint(max_tokens, 2 * hidden, num_ranks, num_topk)
+            assert backend._buffer.num_nvl_bytes >= hint, (backend._buffer.num_nvl_bytes, hint)
+            sizes.append(backend._buffer.num_nvl_bytes)
+        assert sizes[0] == sizes[1], sizes
+        dist.barrier()
+
 
 class IntranodeBackendSelectionTestCase(TestCase):
     """``get_intranode_backend`` per architecture, host only (the architecture and the C++ DeepEP are
