@@ -178,6 +178,15 @@ class FlyDSLIntranodeRuntime:
             self.symm.destroy()
             self.symm = None
 
+    @staticmethod
+    def _check_not_capturing() -> None:
+        # a V2 launch takes host state that every call advances (the epoch its flags carry, the base of
+        # the reduce queue): a graph replay would rerun the old values and take stale flags as fresh
+        _check(
+            not torch.cuda.is_current_stream_capturing(),
+            "flydsl_v2 cannot be captured in a CUDA graph: each call advances host-side epochs",
+        )
+
     def get_local_buffer_tensor(self, dtype: torch.dtype, offset: int) -> torch.Tensor:
         return self.symm.get_buffer(
             self.rank, ((self.num_nvl_bytes - offset * dtype.itemsize) // dtype.itemsize,), dtype, offset
@@ -271,6 +280,7 @@ class FlyDSLIntranodeRuntime:
         num_ranks, rank = self.num_ranks, self.rank
         cached_mode = cached_rank_prefix_matrix is not None
         if self.version == 2:
+            self._check_not_capturing()
             num_channels = config.num_sms
         else:
             _check(config.num_sms % 2 == 0, "num_sms must be even")
@@ -640,6 +650,7 @@ class FlyDSLIntranodeRuntime:
         _check(rank_prefix_matrix.is_contiguous() and rank_prefix_matrix.dtype == torch.int32)
         _check(channel_prefix_matrix.is_contiguous() and channel_prefix_matrix.dtype == torch.int32)
         if self.version == 2:
+            self._check_not_capturing()
             num_channels = config.num_sms
         else:
             _check(config.num_sms % 2 == 0, "num_sms must be even")

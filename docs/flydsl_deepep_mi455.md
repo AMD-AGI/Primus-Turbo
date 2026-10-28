@@ -137,6 +137,7 @@ From Xiaoming's gfx1250 branch:
 **Differences for callers**
 - Outputs are bit-identical to V1; handles use V2's own format (`send_head` holds stream indices) and cannot be mixed with V1 / `cpp` handles. Using them in pairs within one `Buffer` is fine.
 - `num_sms` blocks are `num_sms` channels, which need not be even; the chunk fields of `Config` are not used.
+- **No CUDA-graph capture**: every call advances host state that its launch takes (the epoch of the dispatch counts and the combine flags, the base of the reduce queue); a graph replay would rerun the old values and take the previous call's flags as fresh, so dispatch and combine raise under capture. `cpp` and `flydsl` keep no such host state.
 - **The heap size scales with the token count**: heap ≥ `DATA_OFFSET` (about 4.25 MiB) + 2 × max(dispatch region, combine region). Dispatch region = received tokens × (H bytes + 4 + top-k × (index bytes + 4) + scales × 4); combine region = this rank's tokens × number of ranks × align128(H bytes + top-k × 4). For example, DSv3 EP4 (T 8192, H 7168 bf16, top-8) needs about 0.95 GB and GPT-OSS EP4 (T 32768, H 2880, top-4) about 1.55 GB. `Config.get_nvl_buffer_size_hint` sizes V1's rings (about 128 MB for GPT-OSS EP4 at 32 CUs), which is not enough for V2.
 - **Who sizes the heap**: `Buffer.get_token_buffer_size_hint(num_max_tokens_per_rank, hidden_bytes, num_ranks, num_topk)` gives the V2 size (0 for the ring backends), and `init_buffer`, behind `moe_dispatch` / `DeepEPTokenDispatcher`, takes the larger of it and the ring hint. As Megatron does with DeepEP V2's `ElasticBuffer`, the token count comes from the first dispatch, and a larger dispatch later reallocates the heap, after a device sync and a barrier since peers may still be writing into the old one; `set_buffer_global_config(num_max_tokens_per_rank=...)` allocates up front instead. Every rank must dispatch the same number of tokens, as DeepEP V2 requires; in Megatron / Primus that is S / TP × B on every rank.
 - Limits: channels ≤ 1024; tokens per channel < 2^19; an 11-bit dispatch epoch (wraps after 2047; the counts carry an epoch tag); a 4 MiB combine flag region, i.e. T × number of ranks ≤ 1 Mi rows; LDS per block ≤ 320 KiB.
@@ -150,6 +151,7 @@ From Xiaoming's gfx1250 branch:
 - `test_dispatch_layout`: the layout against a torch reference.
 - `test_rank_receives_nothing`: a rank receives 0 tokens. `flydsl_v2` fails without the fix in §6.
 - `test_destroy_and_recreate`: `Buffer.destroy()` (a collective: every rank waits for the others before freeing its heap) and a new buffer on the same group, for `flydsl` and `flydsl_v2`.
+- `test_flydsl_v2_refuses_graph_capture`: `flydsl_v2` dispatch and combine raise under CUDA-graph capture and the buffer keeps working.
 - `test_flydsl_matches_cpp`: bit-for-bit comparison with the C++ backend; skipped on gfx1250.
 - Result: 8 tests pass and 2 are skipped, on 2 GPUs and on 4 GPUs.
 
