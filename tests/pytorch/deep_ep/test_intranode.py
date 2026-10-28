@@ -9,6 +9,8 @@
 
 import os
 import unittest
+from typing import Optional
+from unittest import mock
 
 import torch
 import torch.distributed as dist
@@ -24,6 +26,7 @@ from torch.testing._internal.common_utils import (
 )
 
 import primus_turbo.pytorch as pt
+import primus_turbo.pytorch.deep_ep.flydsl_intranode as flydsl_intranode
 from primus_turbo.flydsl.deep_ep.common import IS_GFX1250
 from primus_turbo.flydsl.deep_ep.intranode_v2_kernel import combine_v2_layout, dispatch_v2_layout
 from primus_turbo.pytorch.deep_ep._compat import deep_ep_cpp
@@ -59,7 +62,7 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
     def device(self) -> torch.device:
         return torch.device("cuda", self.rank)
 
-    def _init_process(self, backend: str = "cpp", **buffer_kwargs):
+    def _init_process(self, backend: Optional[str] = "cpp", **buffer_kwargs):
         torch.cuda.set_device(self.device)
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
@@ -69,7 +72,7 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
             store=store,
         )
         buffer = pt.deep_ep.Buffer(dist.group.WORLD, int(1e9), intranode_backend=backend, **buffer_kwargs)
-        assert buffer.intranode_backend == backend
+        assert backend is None or buffer.intranode_backend == backend
         return buffer
 
     @staticmethod
@@ -202,6 +205,18 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
             )
         self._check_round_trip(buffer)
         buffer.destroy()
+
+    @skip_if_lt_x_gpu(2)
+    def test_default_backend(self):
+        """A Buffer with no backend and no PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND takes this GPU's default
+        and runs a dispatch + combine."""
+        os.environ.pop("PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND", None)
+        expected = "flydsl_v2" if IS_GFX1250 else ("cpp" if HAS_CPP else "flydsl")
+        buffer = self._init_process(None)
+        assert buffer.intranode_backend == expected, (buffer.intranode_backend, expected)
+        torch.manual_seed(42 + self.rank)
+        self._check_round_trip(buffer)
+        dist.barrier()
 
     @unittest.skipUnless(IS_GFX1250, "flydsl_v2 runs on gfx1250 only")
     @skip_if_lt_x_gpu(2)
@@ -338,6 +353,53 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
             sizes.append(buffer.num_nvl_bytes)
         assert sizes[1] > sizes[0], sizes
         dist.barrier()
+
+
+class IntranodeBackendSelectionTestCase(TestCase):
+    """``get_intranode_backend`` per architecture, host only (the architecture and the C++ DeepEP are
+    patched)."""
+
+    ENV = "PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND"
+
+    def _patched(self, gfx1250: bool, has_cpp: bool, env: Optional[str] = None):
+        environ = {k: v for k, v in os.environ.items() if k != self.ENV}
+        if env is not None:
+            environ[self.ENV] = env
+        return (
+            mock.patch.object(flydsl_intranode, "IS_GFX1250", gfx1250),
+            mock.patch.object(flydsl_intranode, "deep_ep_cpp", object() if has_cpp else None),
+            mock.patch.dict(os.environ, environ, clear=True),
+        )
+
+    def _resolve(self, gfx1250: bool, has_cpp: bool, env: Optional[str] = None, backend=None) -> str:
+        arch, cpp, environ = self._patched(gfx1250, has_cpp, env)
+        with arch, cpp, environ:
+            return flydsl_intranode.get_intranode_backend(backend)
+
+    def test_default_per_architecture(self):
+        # gfx1250 never loads the C++ DeepEP; has_cpp=True covers a build that would
+        assert self._resolve(gfx1250=True, has_cpp=False) == "flydsl_v2"
+        assert self._resolve(gfx1250=True, has_cpp=True) == "flydsl_v2"
+        assert self._resolve(gfx1250=False, has_cpp=True) == "cpp"
+        assert self._resolve(gfx1250=False, has_cpp=False) == "flydsl"
+
+    def test_env_and_argument_override_the_default(self):
+        for gfx1250, has_cpp in ((True, False), (False, True)):
+            for env in ("cpp", "flydsl", "flydsl_v2", " FlyDSL "):
+                assert self._resolve(gfx1250, has_cpp, env=env) == env.strip().lower()
+            assert self._resolve(gfx1250, has_cpp, env="cpp", backend="flydsl") == "flydsl"
+        with self.assertRaisesRegex(ValueError, "Unknown DeepEP intranode backend"):
+            self._resolve(True, False, env="v2")
+
+    def test_flydsl_v2_off_gfx1250_names_the_alternatives(self):
+        arch, cpp, environ = self._patched(gfx1250=False, has_cpp=True)
+        with (
+            arch,
+            cpp,
+            environ,
+            self.assertRaisesRegex(RuntimeError, "gfx1250 only.*'cpp' \\(the default\\)"),
+        ):
+            flydsl_intranode.FlyDSLIntranodeRuntime(None, 0, None, version=2)
 
 
 class TokenBufferSizeHintTestCase(TestCase):
