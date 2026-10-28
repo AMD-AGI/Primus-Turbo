@@ -758,6 +758,11 @@ def _launch_grouped_bf16_variable_k(
     # and the correctness gate refuses to judge it. `const_expr` and defaulted to 0,
     # so the shipped trace is unchanged.
     wpath_only: Constexpr[int] = 0,
+    # 1 = beta=1 epilogue, ``out[g] += A^T B``: the tile's current C is pulled into
+    # the staging through the same backed-off window the operand reads use (so the
+    # load never leaves the row) and added in fp32 before the store. Requires
+    # OUT_N % 8 == 0 so that k_back keeps every lane's 16-byte LDS read aligned.
+    accumulate: Constexpr[int] = 0,
 ):
     """``out[g][n, k] = sum_{m in g} A[m, n] * B[m, k]``.
 
@@ -1042,6 +1047,7 @@ def _launch_grouped_bf16_variable_k(
             )
             vec8 = ir.VectorType.get([8], elem_cls.ir_type)
             _PTR3 = ir.Type.parse("!llvm.ptr<3>")
+            c_lds_load_b128 = _make_lds_copy_ops(128)[0] if accumulate else None
 
             def _tr(addr, const_off):
                 """One transpose read at ``addr + const_off``.
@@ -1278,6 +1284,33 @@ def _launch_grouped_bf16_variable_k(
             # ---- epilogue: out[g] tile, both output axes clamped ------------------
             accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
             _fence(outstanding=0)
+            if const_expr(accumulate):
+                c_off_eff = (
+                    fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS) + fx.Int64(blk_n_eff) * ldc64 + fx.Int64(blk_k_eff)
+                )
+                gtCl = _gv(gC_base, c_off_eff, (tile_m, tile_n), (tile_n, 1))
+                atomCl = fx.rocdl.make_tdm_atom(
+                    gtCl,
+                    [tile_m, tile_n],
+                    strides=[ldc64, None],
+                    num_warps=num_waves,
+                    cache_modifier=tdm_load_cache,
+                    early_timeout=False,
+                )
+                fx.copy(atomCl, gtCl, _lv(fx.recast_iter(elem_cls, base_ptr), (tile_m, tile_n), (tile_n, 1)))
+                tdm_ops.tensor_wait(0)
+                gpu.barrier()
+                c_lds = _bidx(base_ptr)
+                for wm in range_constexpr(wmma_m_rep):
+                    row_src = wmb + wm * WMMA_M + lane16 + n_back
+                    for wn in range_constexpr(wmma_n_rep):
+                        col_src = wnb + wn * WMMA_N + kgrp * 8 + k_back
+                        prev = Vec(c_lds_load_b128(c_lds, (row_src * tile_n + col_src) * EB))
+                        idx = wm * wmma_n_rep + wn
+                        accs[idx] = accs[idx] + prev.bitcast(elem_cls).to(fx.Float32)
+                # The writes below land at the unshifted position, which another
+                # lane's shifted read above may still be targeting.
+                gpu.barrier()
             if PREFETCH_OK:
                 # ---- fetch the NEXT tile's first stage, here -------------------------
                 # WHERE: immediately after the entry fence, which is `tensor_wait(0) +
@@ -1540,6 +1573,9 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     # MEASUREMENT ONLY -- see the launcher's `wpath_only`. 1 emits the output write
     # path alone and RETURNS GARBAGE. Never set it on a correctness or delivery run.
     wpath_only: int = 0,
+    # True = ``out[g] += a[rows_g].T @ b[rows_g]`` into the caller's ``out``
+    # (beta=1, the fused weight-gradient accumulation epilogue).
+    accumulate: bool = False,
 ) -> torch.Tensor:
     """Variable-K grouped wgrad: ``out[g] = a[rows_g].T @ b[rows_g]``.
 
@@ -1603,6 +1639,17 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
             f"ones, on any input whose per-expert row counts disagree with it. Pass "
             f"i_am_running_an_experiment=True if that is genuinely what you want."
         )
+
+    if accumulate:
+        if out is None or out_ldc or wpath_only:
+            raise ValueError("accumulate=True needs the caller's out, and no out_ldc / wpath_only")
+        if tuple(out.shape) != (G, OUT_M, OUT_N) or not out.is_contiguous() or out.dtype != a.dtype:
+            raise ValueError(
+                f"accumulate=True needs a contiguous {a.dtype} out of shape {(G, OUT_M, OUT_N)}, "
+                f"got {out.dtype} {tuple(out.shape)} contiguous={out.is_contiguous()}"
+            )
+        if OUT_N % 8:
+            raise ValueError(f"accumulate=True needs OUT_N % 8 == 0, got OUT_N={OUT_N}")
 
     _avg_m = max(1, M_total // max(G, 1))
     cfg = _pick_variable_k_config(OUT_M, OUT_N, _avg_m)
@@ -1691,6 +1738,7 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
             wave_grid,
             persist,
             wpath_only,
+            1 if accumulate else 0,
         )
     )
     # The caller asked for [G, OUT_M, OUT_N]; the padding is this function's business.

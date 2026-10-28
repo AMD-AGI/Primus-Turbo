@@ -598,8 +598,8 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
         # gfx950 (CDNA4) builds the body on mfma_f32_16x16x32_bf16; gfx1250 on
         # v_wmma_f32_16x16x32_bf16 with the transpose done by ds_load_tr16_b128 in LDS.
         supported &= gfx950 or gfx1250
-        # This backend has no beta=1 accumulate epilogue.
-        supported &= not inplace_add_to_out
+        # Only the gfx1250 kernel carries the beta=1 accumulate epilogue.
+        supported &= gfx1250 or not inplace_add_to_out
         supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
         supported &= a.dim() == 2 and b.dim() == 2 and a.shape[0] == b.shape[0]
         supported &= a.dtype in (torch.bfloat16, torch.float16) and b.dtype == a.dtype
@@ -617,6 +617,15 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
             lhs, rhs = (b, a) if trans_c else (a, b)
             avg_m = max(1, a.shape[0] // max(group_lens.numel(), 1))
             supported &= grouped_gemm_bf16_variable_k_supported(lhs.shape[1], rhs.shape[1], avg_m)
+            if inplace_add_to_out:
+                out = kwargs.get("out")
+                supported &= (
+                    out is not None
+                    and out.is_contiguous()
+                    and out.dtype == a.dtype
+                    and tuple(out.shape) == (group_lens.numel(), lhs.shape[1], rhs.shape[1])
+                    and rhs.shape[1] % 8 == 0
+                )
         return supported
 
     @staticmethod
@@ -630,6 +639,8 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
         trans_c: bool,
         num_cu: int | None,
         schedule: str = "static",
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if is_gfx1250():
@@ -649,6 +660,8 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
                 group_offs,
                 masked_k=group_lens,
                 out_dtype=a.dtype,
+                out=out if inplace_add_to_out else None,
+                accumulate=inplace_add_to_out,
             )
 
         from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
