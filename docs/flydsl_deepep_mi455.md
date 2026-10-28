@@ -269,7 +269,7 @@ Distance to the link (GB/s = MB a GPU receives from the other / time, per GPU an
 - **In V1's `rank_prefix_matrix` only column `rank` is meaningful**; the other columns are leftovers in the heap (the same in the C++ version). V2 fills the whole matrix.
 - **With `num_worst_tokens`, the rows beyond the actual receive count** are uninitialized memory (only `recv_topk_idx` is filled with -1); truncate them before comparing.
 - **`common.py` has its own `read_clock` and `copy_warp`** beside the `prims` ones (on gfx9 they emit the same code): a fix to the `prims` versions may need to be made here too.
-- **Nothing has run on gfx950**: the V1 kernels compile to the same gfx950 ISA as before these changes (§1), and the gfx942 CI covers `cpp` and `flydsl`.
+- **Nothing has run on gfx950**: the V1 kernels compile to the same gfx950 ISA as before these changes (§1), and the gfx942 CI covers `cpp`, `flydsl` and (register copy, EP8) `flydsl_v2` (`flydsl_deepep_v2_unified.md`).
 - **Merging with the C++ V2 change**: both add `intranode_backend` and `get_intranode_backend` to `Buffer` and read the same environment variable; when merging, unify the values as `cpp` / `cpp_v2` / `flydsl` / `flydsl_v2` and drop the check that keeps the C++ DeepEP unloaded on gfx1250.
 
 ## 11. Reproducing

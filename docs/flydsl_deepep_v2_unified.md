@@ -85,6 +85,7 @@ the default of this GPU from one table:
 
 1. **wave64 and gfx9 ordering, on CI**: `test_intranode.py` with its `flydsl_v2` tests on the gfx942
    runner (wave64, no TDM, gfx9 memory model). With this branch the tests run there without any switch.
+   Passed at EP8 on 8× MI300X (see the validation table).
 2. **Correctness on MI355X**: `test_intranode.py` on 2 and 8 GPUs; the V1 / V2 stress test.
 3. **Kernel performance against `cpp`** (`benchmark/ops/deep_ep_v2/bench_ops.py`, DeepSeek-V3 shape, EP2
    and EP8, at the CU counts training uses): `flydsl_v2` at least on par with `cpp`. Tune
@@ -101,13 +102,15 @@ the default of this GPU from one table:
 | Both paths run | 2× MI455X | `test_intranode.py` with TDM and with `PRIMUS_TURBO_DEEPEP_V2_TDM=0` (`NCCL_CUMEM_ENABLE=0`, #584); a short benchmark of both | 20 tests each: 18 pass, 2 skipped (`cpp`); dispatch / combine at 32 / 128 / 256 CUs: TDM 332 / 347, 182 / 151, 175 / 136 µs, register copy 758 / 604, 261 / 170, 185 / 139 µs, outputs checked. V2 stress test with the register copy (10 configurations with tiny rings, 30% dropped top-k slots, every row checked): 100 repetitions each, all pass |
 | Tuning values | MI455X, compile only | gfx950 at EP2 / EP4 with `v2_copy_piece_bytes` 1 / 2 / 4 KiB and `combine_loads_in_flight` 16 / 12 / 8 | all compile; with the variable unset, 72 / 72 ISA files byte-identical to `461d9caa`. On gfx950 `combine_loads_in_flight=16` removes the combine spills (59 / 48 VGPRs at EP2 / EP4 → 0); 1 KiB pieces take the dispatch from 90 to 56 VGPRs |
 | Tuning values run | 2× MI455X, register copy | the same values (and 2 KiB with 16), `test_intranode.py` + V2 stress (30 repetitions) + a short benchmark | all pass. On gfx1250 smaller pieces are slower (64 / 128 / 256 CUs dispatch 430 / 265 / 189 µs at 8 KiB, 543 / 315 / 204 µs at 1 KiB) and the loads in flight do not matter; gfx9's counters differ, so this does not settle gfx950 |
-| wave64 at run time | gfx942 CI | gate 1 (manual dispatch of the CI workflow on this branch) | not run yet |
+| Combine fix (`41655cf2`: push only the received rows) | MI455X, compile only | the 9 kernels at EP2 / EP4 on gfx1250 (TDM and register copy), gfx950, gfx942, against the commit before | all compile; only `combine_v2` changes, with the same VGPRs, VGPR spills, scratch and LDS everywhere (1–2 SGPRs fewer) |
+| wave64 at run time | gfx942 CI, 8× MI300X | gate 1: the CI workflow on `f1eb24bf` (run 40720916625), `--dist-only` step with all 8 GPUs, so EP8 with the register copy | passed on the first attempt: every `flydsl_v2` test (round trip at 4096 tokens, dispatch layout, a rank that receives nothing, destroy and recreate, CUDA-graph refusal, `moe_dispatch` buffer sizing) and the host-only selection / traits tests; `test_moe_ops_v2_buffer_with_uneven_tokens` was still skipped off gfx1250 there (fixed in `b00e402b`); run 40740004045 on `51d5c39c` adds it and the combine-fix test |
 | MI355X | MI355X host | gates 2–4 | not run yet |
 
 ## Risks
 
-- The wave64 branches and the gfx9 ordering of V2 have not run on hardware yet (gates 1–2). Read for
-  wave64, without finding a problem: `_ballot` (64-bit mask), `_popc` (64-bit count truncated),
+- The wave64 branches and the gfx9 ordering of V2 have run on MI300X (gate 1, EP8, correctness tests
+  only), not yet on MI355X (gate 2) or under the stress test on gfx9. Read for wave64, without finding a
+  problem: `_ballot` (64-bit mask), `_popc` (64-bit count truncated),
   `_lanes_below` (`mbcnt_lo` + `mbcnt_hi`); the register copy's ragged last step; the reduce queue, whose
   claim uses `REDUCE_GRAB_TOKENS × num_ranks` lanes (at most 32; the upper lanes idle on wave64), with
   `readlane` and `lane % num_ranks`; the combine's columns, which step by `WARP_SIZE` and leave the
@@ -120,5 +123,6 @@ the default of this GPU from one table:
   bytes of scratch per lane; none at EP8), against 8 / 75 on gfx1250 with TDM, and the EP8 dispatch spills
   97 SGPRs (to VGPRs, no scratch). A smaller `combine_loads_in_flight` removes the combine spills; on
   gfx1250 it was not faster (`flydsl_deepep_mi455.md` §8), on gfx950 it has to be measured.
-- EP8 has not run with V2 (MI455X nodes have 4 GPUs). The heap holds the batch: about 1.9 GB for the
+- EP8 has run with V2 only through the gfx942 CI (register copy, correctness tests); EP8 with TDM has not
+  (MI455X nodes have 4 GPUs). The heap holds the batch: about 1.9 GB for the
   DeepSeek-V3 shape at EP8 (`Buffer.get_token_buffer_size_hint`).

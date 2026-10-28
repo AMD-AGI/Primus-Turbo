@@ -67,7 +67,8 @@ Not done. What it takes, in order:
 
 1. Correctness on gfx950. The wave64 branches of the V2 kernels (`_ballot`, `_popc`, `_lanes_below`)
    and gfx9's memory ordering (`ArchTraits` for gfx9: a store to the uncached heap is acknowledged only
-   from memory) have not run with V2. Run the unit tests on 2 GPUs, then 8:
+   from memory) have run with V2 on gfx942 only: the CI's `test_intranode.py` at EP8 on 8× MI300X
+   passes (`flydsl_deepep_v2_unified.md`, validation table). Run the unit tests on 2 GPUs, then 8:
 
    ```bash
    NCCL_CUMEM_ENABLE=0 FLYDSL_RUNTIME_CACHE_DIR=/tmp/v2_gfx950_cache \
@@ -76,7 +77,8 @@ Not done. What it takes, in order:
 
    `NCCL_CUMEM_ENABLE=0` only matters on the MI455X image's ROCm SDK (issue #584).
 
-2. EP8. A MI355X node has 8 GPUs; V2 has run at EP2 and EP4 only (MI455X nodes have 4). Check the heap
+2. EP8. A MI355X node has 8 GPUs; V2 has run at EP2 and EP4 on MI455X (4 GPUs per node) and at EP8 only
+   in the gfx942 CI (correctness tests, register copy). Check the heap
    size (`Buffer.get_token_buffer_size_hint`) and the channel split at 8 ranks.
 
 3. Performance against `cpp`, at the same shape, at EP2 and EP8:
