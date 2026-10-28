@@ -52,9 +52,11 @@ class EPBufferConfig:
             behaviour as *dispatch_config*.
         num_max_tokens_per_rank: Tokens per rank to allocate up front for a
             backend whose buffer holds whole batches (``flydsl_v2``). ``0``
-            sizes it from the first dispatch's tokens and grows it when a
-            larger dispatch comes, as Megatron does for DeepEP V2. Every rank
-            must dispatch the same number of tokens.
+            sizes it from the group's largest first dispatch and grows it
+            when a larger dispatch comes, as Megatron does for DeepEP V2.
+            Ranks may dispatch different numbers of tokens, but a growth
+            waits for every rank to grow; for counts that change per step,
+            set this to their maximum.
     """
 
     num_sms: int = 32
@@ -265,13 +267,14 @@ class _DeepEPLikeBackend:
                 pass
 
         token_size_hint = getattr(BufferClass, "get_token_buffer_size_hint", None)
+        num_token_bytes = 0
         if token_size_hint is not None:
             self._num_max_tokens = max(self._num_max_tokens, config.num_max_tokens_per_rank, num_tokens)
             self._num_topk = max(self._num_topk, num_topk)
-            num_nvl_bytes = max(
-                num_nvl_bytes,
-                token_size_hint(self._num_max_tokens, hidden_bytes, group.size(), self._num_topk),
+            num_token_bytes = token_size_hint(
+                self._num_max_tokens, hidden_bytes, group.size(), self._num_topk
             )
+            num_nvl_bytes = max(num_nvl_bytes, num_token_bytes)
 
         buf_kwargs = self._make_buffer_kwargs(group)
 
@@ -283,9 +286,29 @@ class _DeepEPLikeBackend:
             or self._buffer.num_rdma_bytes < num_rdma_bytes
         ):
             if self._buffer is not None and self._buffer.group == group:
+                if self._buffer.num_nvl_bytes < num_token_bytes:
+                    warnings.warn(
+                        f"the DeepEP buffer grows for {self._num_max_tokens} tokens per rank and waits for "
+                        "every rank of the group to grow it too, which a rank does when it dispatches more "
+                        "tokens than its buffer holds; where ranks dispatch different numbers of tokens, "
+                        "set_buffer_global_config(num_max_tokens_per_rank=...) allocates up front"
+                    )
                 # peers may still have kernels writing into this rank's old buffer
                 torch.cuda.synchronize()
                 dist.barrier(group=group)
+            if num_token_bytes > 0:
+                # every rank sizes its buffer from the group's largest dispatch: its peers write into it
+                agreed = torch.tensor(
+                    [self._num_max_tokens, self._num_topk],
+                    dtype=torch.int64,
+                    device=torch.cuda.current_device(),
+                )
+                dist.all_reduce(agreed, op=dist.ReduceOp.MAX, group=group)
+                self._num_max_tokens, self._num_topk = agreed.tolist()
+                num_token_bytes = token_size_hint(
+                    self._num_max_tokens, hidden_bytes, group.size(), self._num_topk
+                )
+                num_nvl_bytes = max(num_nvl_bytes, num_token_bytes)
             self._buffer = BufferClass(group, num_nvl_bytes, num_rdma_bytes, **buf_kwargs)
 
     # ----- helpers ------------------------------------------------------
