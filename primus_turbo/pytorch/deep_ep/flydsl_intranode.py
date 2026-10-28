@@ -34,8 +34,8 @@ from primus_turbo.flydsl.deep_ep.intranode_kernel import (
     launch_dispatch,
     launch_notify_dispatch,
 )
+from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
 from primus_turbo.flydsl.deep_ep.layout_kernel import get_dispatch_layout_flydsl
-from primus_turbo.flydsl.utils.launch_cache import run_launcher
 from primus_turbo.pytorch._C.deep_ep import EventHandle
 from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
 
