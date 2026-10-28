@@ -36,7 +36,6 @@ from primus_turbo.flydsl.mega.tune_utils import (
     autotune,
 )
 from primus_turbo.flydsl.utils.buffer_ops import (
-    _unwrap_value,
     buffer_load,
     buffer_store,
     create_buffer_resource,
@@ -197,7 +196,7 @@ def _make_swiglu_bwd(
         thread_index = fx.thread_idx.x
         block_index_x, block_index_y, _ = fx.block_idx
         # LDS scratch for cross-warp gate reduction (one f32 slot per warp).
-        lds_base = _unwrap_value(_fly_ptrtoint(get_dyn_shared())) if with_gate else None
+        lds_base = fx.as_ir_value(_fly_ptrtoint(get_dyn_shared())) if with_gate else None
 
         dact_rsrc = create_buffer_resource(DACT, max_size=True)
         acc_rsrc = create_buffer_resource(ACC1, max_size=True)
