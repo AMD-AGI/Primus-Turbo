@@ -149,6 +149,7 @@ From Xiaoming's gfx1250 branch:
 - `test_intranode`: the DeepEP reference flow (bf16 / fp8 + scales, with and without top-k, sync / async, `previous_event`, `num_worst_tokens`, cached dispatch, combine), once each for `flydsl` and `flydsl_v2` (`flydsl_v2` on gfx1250 only).
 - `test_dispatch_layout`: the layout against a torch reference.
 - `test_rank_receives_nothing`: a rank receives 0 tokens. `flydsl_v2` fails without the fix in §6.
+- `test_destroy_and_recreate`: `Buffer.destroy()` (a collective: every rank waits for the others before freeing its heap) and a new buffer on the same group, for `flydsl` and `flydsl_v2`.
 - `test_flydsl_matches_cpp`: bit-for-bit comparison with the C++ backend; skipped on gfx1250.
 - Result: 8 tests pass and 2 are skipped, on 2 GPUs and on 4 GPUs.
 
