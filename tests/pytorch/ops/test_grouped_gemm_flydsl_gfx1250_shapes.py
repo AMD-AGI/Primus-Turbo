@@ -6,16 +6,10 @@
 
 """Shape rules and ragged-K coverage for the FlyDSL bf16 grouped GEMM on gfx1250.
 
-Two groups of tests:
-
-* The gate-consistency tests are **pure host** -- they call the tile picker and the
-  published shape gates, which are plain Python, so they need flydsl importable but
-  no GPU. They are the permanent guard against the gate and the entry point growing
-  two copies of the same rule, which is how a clean Triton fallback turned into an
-  ``AssertionError`` once already.
-* The numeric tests need a gfx1250 card. They cover the K values the repo's own
-  shape list cannot reach: ``GROUPED_GEMM_SHAPES`` is 128-aligned in K throughout,
-  so the backed-off tail k-tile and the short-reduction pipeline never execute there.
+The gate-consistency tests are host-only and keep the published gates and the entry
+point's own preconditions from drifting into two different rules. The numeric tests
+need a gfx1250 card and cover the K tails that ``GROUPED_GEMM_SHAPES``, 128-aligned
+in K throughout, never reaches.
 """
 
 import itertools
@@ -40,54 +34,44 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import ( 
 )
 
 needs_gfx1250 = pytest.mark.skipif(
-    not (torch.cuda.is_available() and is_gfx1250()), reason="needs a gfx1250 (MI455X) GPU"
+    not (torch.cuda.is_available() and is_gfx1250()), reason="needs a gfx1250 GPU"
 )
 
-# The scan the gate-consistency tests sweep. K steps by 8 rather than by 32 so that
-# tails which are *not* a whole number of WMMA sub-steps are in the space too, and it
-# starts below the smallest tile_k so ``K < tile_k`` is covered.
+# K steps by 8, not by 32, so tails that are not a whole number of WMMA sub-steps are
+# in the space, and starts below the smallest tile_k so ``K < tile_k`` is covered.
 _SCAN_KS = range(32, 4097, 8)
 _SCAN_NS = (768, 2048, 2880, 4096, 7168)
-_SCAN_AVG_MS = (32, 64, 96, 128, 256, 512, 1024)
+# 2048 covers the exact-key picks, which are all conditioned on it.
+_SCAN_AVG_MS = (32, 64, 96, 128, 256, 512, 1024, 2048)
 _SCAN_GS = (8, 32)
+
+# NT keys are the forward weight's (N, K); NN keys are (N_out, K_red).
+_KEYED_NT = ((4096, 7168), (7168, 2048))
+_KEYED_NN = ((7168, 4096), (2048, 7168))
+_KEYED_AVG_M = 2048
 
 
 def _n_steady(K: int, cfg) -> int:
-    """The launcher's ``n_steady = K_TILES - (num_buffers - 1)`` for this tile.
-
-    Recomputed here rather than imported: the point of the test is to check the host
-    rules against an independent statement of what the K loop does.
-    """
+    """The launcher's ``n_steady = K_TILES - (num_buffers - 1)``, restated independently."""
     tile_k, num_buffers = cfg[2], cfg[5]
     k_tiles = K // tile_k + (1 if K % tile_k else 0)
     return k_tiles - (num_buffers - 1)
 
 
 def _pipeline_is_legal(K: int, cfg) -> bool:
-    """Whether the launcher can run this ``(K, cfg)`` at all.
-
-    ``n_steady`` must be non-negative, or the prologue issues k-tiles past K -- an
-    out-of-bounds read, because the reduction axis is dim-1 of the A/B descriptors
-    and carries no extent. With a tail it must be at least 1, because the iteration
-    that prefetches the tail is peeled out at index ``n_steady - 1``.
+    """Whether the launcher can run this ``(K, cfg)``: a negative ``n_steady`` issues
+    k-tiles past K, which the extent-less reduction axis cannot stop.
     """
     return _n_steady(K, cfg) >= (1 if K % cfg[2] else 0)
 
 
-# ---------------------------------------------------------------------------
-# Host-only: the gate and the entry point must agree, shape for shape.
-# ---------------------------------------------------------------------------
+# --- Host-only: the gate and the entry point must agree, shape for shape. ---
 
 
 @pytest.mark.parametrize("direction", ["nt", "nn"])
 def test_gate_admits_only_shapes_the_pipeline_can_run(direction):
-    """Everything the published gate admits must satisfy every entry-side K rule.
-
-    The gate is the non-throwing form of the entry's preconditions, so a shape it
-    admits has to clear all of them: the ``K % tile_k`` tail must be a whole number
-    of WMMA sub-steps, and K must give the software pipeline a legal ``n_steady``.
-    Asserted against the tile the picker really hands out, which is what the entry
-    will use.
+    """Everything the gate admits must satisfy every entry-side K rule, asserted
+    against the tile the picker really hands out.
     """
     gate = grouped_gemm_bf16_nt_supported if direction == "nt" else grouped_gemm_bf16_nn_supported
     picker = _pick_config if direction == "nt" else _pick_config_nn
@@ -117,11 +101,8 @@ def test_gate_admits_only_shapes_the_pipeline_can_run(direction):
 
 
 def test_nn_gate_agrees_with_the_published_reason_function():
-    """``grouped_gemm_bf16_nn_supported`` must be exactly ``reason is None``.
-
-    Both are in ``__all__`` and a dispatcher may use either, so they cannot disagree.
-    The reason function is also what the entry point consults, which is what keeps
-    the native path from being entered on a shape the gate declined.
+    """``grouped_gemm_bf16_nn_supported`` must be exactly ``reason is None``: both are
+    in ``__all__`` and a dispatcher may use either.
     """
     for N, avg_m, G in itertools.product(_SCAN_NS, _SCAN_AVG_MS, _SCAN_GS):
         for K in _SCAN_KS:
@@ -134,14 +115,8 @@ def test_nn_gate_agrees_with_the_published_reason_function():
 
 @pytest.mark.parametrize("direction", ["nt", "nn"])
 def test_picker_never_asks_for_a_ring_k_cannot_fill(direction):
-    """Either the picked ring fits K, or it is the launcher's minimum and K is declined.
-
-    This is the invariant that joins the two halves of the rule. The picker backs
-    ``num_buffers`` off to ``K // tile_k + 1`` so that a short reduction keeps this
-    kernel instead of falling back, but it cannot go below the launcher's two-buffer
-    floor -- so ``K < tile_k`` is left for the gate to refuse. Asserted together,
-    because "clamped" and "declined" are the only two acceptable outcomes and a tile
-    that is neither is an out-of-bounds read.
+    """Either the picked ring fits K, or it is the two-buffer floor and the gate declines
+    K. A tile that is neither clamped nor declined is an out-of-bounds read.
     """
     gate = grouped_gemm_bf16_nt_supported if direction == "nt" else grouped_gemm_bf16_nn_supported
     picker = _pick_config if direction == "nt" else _pick_config_nn
@@ -163,11 +138,8 @@ def test_picker_never_asks_for_a_ring_k_cannot_fill(direction):
 
 
 def test_k128_avgm128_picks_a_legal_pipeline():
-    """The regression this file exists for: K=128 at ``64 < avg_m <= 128``.
-
-    ``_pick_config_shape`` answers ``(128, 256, 128, 2, 2, 3)`` here, and at K=128
-    that is one k-tile against a three-deep ring -- ``n_steady = -1``. The picker has
-    to back the ring off instead.
+    """K=128 at ``64 < avg_m <= 128``: one k-tile against a three-deep ring, so the
+    picker has to back the ring off or ``n_steady`` goes negative.
     """
     for N, avg_m in itertools.product((768, 2048, 2880, 4096, 7168), (96, 128)):
         for picker, direction in ((_pick_config, "nt"), (_pick_config_nn, "nn")):
@@ -178,6 +150,24 @@ def test_k128_avgm128_picks_a_legal_pipeline():
     # And the gate has to admit them, because the shapes themselves are fine.
     assert grouped_gemm_bf16_nt_supported(2048, 128, 128, 8)
     assert grouped_gemm_bf16_nn_supported(2048, 128, 128, 8)
+
+
+def test_exact_key_picks_stay_inside_the_published_gate():
+    """A pin returns before the general rules, so every pinned tile must still pass the gate."""
+    for N, K in _KEYED_NT:
+        for G in _SCAN_GS:
+            cfg = _pick_config(N, K, _KEYED_AVG_M, G)
+            assert grouped_gemm_bf16_nt_supported(N, K, _KEYED_AVG_M, G), f"NT N={N} K={K} G={G}: {cfg}"
+            assert _n_steady(K, cfg) >= 0, f"NT N={N} K={K} G={G} picked {cfg}"
+            assert K % cfg[2] % WMMA_K_ENTRY == 0, f"NT N={N} K={K}: tail of {K % cfg[2]} is not WMMA-aligned"
+    for N, K in _KEYED_NN:
+        for G in _SCAN_GS:
+            cfg = _pick_config_nn(N, K, _KEYED_AVG_M, G)
+            why = nn_native_unsupported_reason(N, K, cfg[1], cfg[2], cfg[5])
+            assert why is None, f"NN N={N} K={K} G={G} picked {cfg}, which the gate refuses: {why}"
+            assert grouped_gemm_bf16_nn_supported(N, K, _KEYED_AVG_M, G)
+            # The 4-wave TDM dealing halves tile_k; each half must stay a whole number of WMMA k-steps.
+            assert cfg[2] % (2 * WMMA_K_ENTRY) == 0, f"NN N={N} K={K}: tile_k={cfg[2]} is not split-safe"
 
 
 @pytest.mark.parametrize(
@@ -204,11 +194,8 @@ def test_short_and_ragged_reductions_are_served(N, K, avg_m):
 
 @pytest.mark.parametrize("K", [32, 64, 96, 128, 160, 352, 2056, 2080, 2880])
 def test_gate_false_means_the_entry_would_refuse(K):
-    """A declined shape must be declined for a reason the entry also holds.
-
-    The direction that matters for a fixed backend: ``can_handle`` returning True on
-    a shape the entry then raises on is what turns a Triton fallback into a crash.
-    This is the contrapositive, spot-checked on the K values the fix moved.
+    """A declined shape must be declined for a reason the entry also holds: a gate that
+    admits what the entry raises on turns a fallback into a crash.
     """
     for N, avg_m in itertools.product((768, 2048, 4096), (32, 128, 512)):
         cfg = _pick_config(N, K, avg_m, 8)
@@ -218,9 +205,7 @@ def test_gate_false_means_the_entry_would_refuse(K):
         )
 
 
-# ---------------------------------------------------------------------------
-# Numeric: needs a gfx1250 card.
-# ---------------------------------------------------------------------------
+# --- Numeric: needs a gfx1250 card. ---
 
 
 def _group_offs(G: int, avg_m: int, device) -> torch.Tensor:
@@ -229,12 +214,8 @@ def _group_offs(G: int, avg_m: int, device) -> torch.Tensor:
 
 
 def _ref(a, b, offs, trans_b: bool):
-    """fp32-accumulated per-expert matmul, on the **CPU**.
-
-    Deliberately not a device matmul: hipBLASLt has no Tensile library for gfx1250 in
-    every image this runs in, so a device reference would turn a kernel test into a
-    hipBLASLt availability test. Same reason the MLA suite keeps its reference on the
-    host.
+    """fp32-accumulated per-expert matmul, on the host: hipBLASLt has no gfx1250 Tensile
+    library in every image this runs in.
     """
     offs = offs.cpu().tolist()
     a32, b32 = a.detach().float().cpu(), b.detach().float().cpu()
@@ -255,11 +236,8 @@ def _assert_matches_ref(out, a, b, offs, trans_b: bool):
 
 
 def _run_nt(a, b, offs):
-    """Four calls, checking the fourth.
-
-    The entry's own docstring records that the first one or two calls in a fresh
-    process have been observed to return corrupt results, root cause unknown and
-    predating this kernel's tuning. A correctness harness has to burn through that.
+    """Four calls, checking the fourth: the first calls in a fresh process are the ones
+    the module docstring's known defect hits most often.
     """
     for _ in range(3):
         grouped_gemm_bf16_nt_flydsl_kernel(a, b, offs)
@@ -275,11 +253,7 @@ def _run_nn(a, b, offs):
 @needs_gfx1250
 @pytest.mark.parametrize("N", [2048, 768])
 def test_nt_k128_avgm128_numeric(N):
-    """K=128 with avg_m=128: the shape whose pipeline depth went negative.
-
-    Before the fix the picker answered ``(128, 256, 128, 2, 2, 3)`` here, the
-    prologue issued a k-tile past K, and the drain's first index was -1.
-    """
+    """K=128 with avg_m=128: the shape whose pipeline depth went negative."""
     G, avg_m, K = 8, 128, 128
     torch.manual_seed(0)
     device = "cuda"
@@ -317,10 +291,8 @@ def test_nn_k128_avgm128_numeric(N):
 @pytest.mark.parametrize("K", [352, 2080])
 @pytest.mark.parametrize("avg_m", [128, 512])
 def test_nt_ragged_k_tail_numeric(K, avg_m):
-    """NT with ``K % 64 == 32``: the backed-off tail k-tile, which has no other test.
-
-    K=352 is DeepSeek-V2-Lite's fc2 reduction under ETP=4. Every K in the repo's
-    shape list is a multiple of 128, so this path does not run there at all.
+    """NT with ``K % 64 == 32``: the backed-off tail k-tile. Every K in the repo's shape
+    list is a multiple of 128, so this path never runs there.
     """
     G, N = 8, 2048
     assert K % 64 == 32, "the point of this case is a tail that is half a tile_k"
@@ -342,11 +314,8 @@ def test_nt_ragged_k_tail_numeric(K, avg_m):
 @needs_gfx1250
 @pytest.mark.parametrize("K", [2848, 2880, 2912])  # tails of 32, 64 and 96
 def test_nn_ragged_k_tail_numeric(K):
-    """NN with ``K % 128`` in {32, 64, 96}: gpt-oss's dgrad reduction length and neighbours.
-
-    The NN entry enables the ragged-K upgrade unconditionally, so these reduction
-    lengths take the tail path by default -- which the repo's 128-aligned shape list
-    never exercises.
+    """NN with ``K % 128`` in {32, 64, 96}: the NN entry enables the ragged-K upgrade
+    unconditionally, so these lengths take the tail path by default.
     """
     G, N, avg_m = 8, 2048, 128
     assert K % 128 in (32, 64, 96), "the point of this case is a sub-tile tail"
@@ -362,10 +331,8 @@ def test_nn_ragged_k_tail_numeric(K):
 
 @needs_gfx1250
 def test_nt_entry_refuses_what_the_gate_refuses():
-    """The contract, on hardware: gate False and the entry raises; gate True and it runs.
-
-    Checked on a shape the gate used to admit and the entry used to raise on
-    (N=2048, K=176: the tail is 48, which is not a whole number of WMMA sub-steps).
+    """The contract, on hardware: gate False and the entry raises. N=2048, K=176 leaves
+    a tail of 48, which is not a whole number of WMMA sub-steps.
     """
     G, N, K, avg_m = 8, 2048, 176, 512
     device = "cuda"
