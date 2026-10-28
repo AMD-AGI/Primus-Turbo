@@ -41,7 +41,8 @@ from tests.pytorch.ref.deep_ep_ref import (
 
 # builds without the C++ DeepEP (gfx1250) have the FlyDSL backends only; flydsl_v2 runs on gfx1250 only
 HAS_CPP = deep_ep_cpp is not None
-BACKENDS = (["cpp"] if HAS_CPP else []) + ["flydsl"] + (["flydsl_v2"] if IS_GFX1250 else [])
+FLYDSL_BACKENDS = ["flydsl"] + (["flydsl_v2"] if IS_GFX1250 else [])
+BACKENDS = (["cpp"] if HAS_CPP else []) + FLYDSL_BACKENDS
 
 
 @instantiate_parametrized_tests
@@ -58,7 +59,7 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
     def device(self) -> torch.device:
         return torch.device("cuda", self.rank)
 
-    def _init_process(self, backend: str = "cpp"):
+    def _init_process(self, backend: str = "cpp", **buffer_kwargs):
         torch.cuda.set_device(self.device)
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
@@ -67,9 +68,33 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
             rank=self.rank,
             store=store,
         )
-        buffer = pt.deep_ep.Buffer(dist.group.WORLD, int(1e9), intranode_backend=backend)
+        buffer = pt.deep_ep.Buffer(dist.group.WORLD, int(1e9), intranode_backend=backend, **buffer_kwargs)
         assert buffer.intranode_backend == backend
         return buffer
+
+    @staticmethod
+    def _check_round_trip(buffer, num_tokens=512, hidden=4096, num_topk=4, num_experts=64):
+        """Dispatch random tokens and combine them back; returns the dispatch's x, outputs and handle."""
+        x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+        topk_idx = torch.topk(torch.rand((num_tokens, num_experts), device="cuda"), num_topk, dim=-1)[1]
+        topk_weights = torch.rand((num_tokens, num_topk), dtype=torch.float32, device="cuda")
+        num_tokens_per_rank, _, num_tokens_per_expert, is_token_in_rank, _ = buffer.get_dispatch_layout(
+            topk_idx, num_experts
+        )
+        recv_x, _, recv_topk_weights, _, handle, _ = buffer.dispatch(
+            x,
+            num_tokens_per_rank=num_tokens_per_rank,
+            is_token_in_rank=is_token_in_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+        )
+        combined_x, combined_topk_weights, _ = buffer.combine(recv_x, handle, topk_weights=recv_topk_weights)
+        torch.cuda.synchronize()
+        ref_x = x.float() * is_token_in_rank.sum(dim=1, keepdim=True)
+        assert torch.allclose(combined_x.float(), ref_x, rtol=2e-2, atol=2e-2)
+        assert torch.allclose(combined_topk_weights, topk_weights)
+        return x, recv_x, recv_topk_weights, handle
 
     @skip_if_lt_x_gpu(2)
     @parametrize("num_tokens", [4096])
@@ -162,6 +187,21 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
         ref_x = x.float() * is_token_in_rank.sum(dim=1, keepdim=True)
         assert torch.allclose(combined_x.float(), ref_x, rtol=2e-2, atol=2e-2)
         assert torch.allclose(combined_topk_weights, topk_weights)
+
+    @skip_if_lt_x_gpu(2)
+    @parametrize("backend", FLYDSL_BACKENDS)
+    def test_destroy_and_recreate(self, backend: str):
+        """``destroy()`` (collective) frees the heap, and a new buffer on the same group works."""
+        buffer = self._init_process(backend, explicitly_destroy=True)
+        torch.manual_seed(42 + self.rank)
+        for _ in range(2):
+            self._check_round_trip(buffer)
+            buffer.destroy()
+            buffer = pt.deep_ep.Buffer(
+                dist.group.WORLD, int(1e9), intranode_backend=backend, explicitly_destroy=True
+            )
+        self._check_round_trip(buffer)
+        buffer.destroy()
 
     @unittest.skipUnless(HAS_CPP, "needs the C++ DeepEP")
     @skip_if_lt_x_gpu(2)

@@ -211,6 +211,7 @@ class Buffer:
     def destroy(self):
         """
         Destroy the cpp runtime and release resources.
+        Collective: every rank of the group calls it.
 
         """
 
