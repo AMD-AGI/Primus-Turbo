@@ -26,6 +26,9 @@ import pytest
 import torch
 
 import primus_turbo.pytorch  # noqa: F401  (pytorch before the flydsl kernels)
+from primus_turbo.pytorch.core.utils import is_gfx1250
+
+pytestmark = pytest.mark.skipif(not is_gfx1250(), reason="gfx1250 kernel")
 
 flyc = pytest.importorskip("flydsl.compiler")
 fx = pytest.importorskip("flydsl.expr")
@@ -49,8 +52,6 @@ from primus_turbo.flydsl.utils.buffer_ops import (  # noqa: E402
     buffer_store,
     create_buffer_resource_from_addr,
 )
-
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 # One scratch allocation; "rank 1" is its upper half, so SymBuffer.map(addr, 1) == addr + _HALF_BYTES.
 _HALF_WORDS = 1 << 22
