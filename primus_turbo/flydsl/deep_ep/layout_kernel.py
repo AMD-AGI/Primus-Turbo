@@ -25,8 +25,8 @@ from primus_turbo.flydsl.deep_ep.common import (
     st_lds,
     tensor_addr,
 )
+from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
 from primus_turbo.flydsl.utils.buffer_ops import buffer_store, create_buffer_resource
-from primus_turbo.flydsl.utils.launch_cache import run_launcher
 from primus_turbo.flydsl.utils.prims import atomic_add
 
 _THREADS = 256
