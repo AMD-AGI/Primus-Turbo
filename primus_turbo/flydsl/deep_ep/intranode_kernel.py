@@ -54,7 +54,6 @@ from primus_turbo.flydsl.deep_ep.common import (
 )
 from primus_turbo.flydsl.utils.attn_helper import _wave_any
 from primus_turbo.flydsl.utils.buffer_ops import (
-    _unwrap_value,
     buffer_load,
     buffer_store,
     create_buffer_resource,
@@ -192,7 +191,7 @@ def _sload_u8(res, idx):
     vmcnt, which on gfx9 also counts this warp's outstanding (remote) stores, so every flag read
     would wait out the XGMI round trip of the copies before it; a scalar load waits on lgkmcnt."""
     word = buffer_load(res, idx >> fx.Int32(2), vec_width=1, is_scalar=True)
-    word = fx.arith.ArithValue(_unwrap_value(word), signed=True)
+    word = fx.arith.ArithValue(fx.as_ir_value(word), signed=True)
     return (word >> ((idx & fx.Int32(3)) * fx.Int32(8))) & fx.Int32(0xFF)
 
 
@@ -243,7 +242,7 @@ def _uniform_i64(value):
     """``_readfirstlane_i32`` for an i64 (an address), one half at a time. A warp-uniform value the
     compiler cannot prove uniform (a vector load, an LDS read) stays in VGPRs, and every buffer
     descriptor or branch built from it then pays a readfirstlane waterfall."""
-    value = fx.arith.ArithValue(_unwrap_value(value), signed=True)
+    value = fx.arith.ArithValue(fx.as_ir_value(value), signed=True)
     low = _readfirstlane_i32(cast(value, fx.T.i32))
     high = _readfirstlane_i32(cast(value >> fx.Int64(32), fx.T.i32))
     return (_i64(high) << fx.Int64(32)) | (_i64(low) & fx.Int64(0xFFFFFFFF))

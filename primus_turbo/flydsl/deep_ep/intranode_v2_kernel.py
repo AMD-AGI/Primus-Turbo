@@ -92,7 +92,6 @@ from primus_turbo.flydsl.deep_ep.intranode_kernel import (
     barrier_block,
 )
 from primus_turbo.flydsl.utils.buffer_ops import (
-    _unwrap_value,
     buffer_load,
     buffer_store,
     create_buffer_resource,
@@ -135,13 +134,13 @@ def _tdm_row(lds_addr, global_addr, num_bytes):
     elems = num_bytes // 8
     assert num_bytes % 8 == 0 and elems < (1 << 16)
     i32 = fx.T.i32
-    addr = fx.arith.ArithValue(_unwrap_value(global_addr), signed=False)
-    lo = fx.arith.trunci(i32, _unwrap_value(addr))
-    hi = fx.arith.ArithValue(fx.arith.trunci(i32, _unwrap_value(addr >> fx.Int64(32))), signed=False)
+    addr = fx.arith.ArithValue(fx.as_ir_value(global_addr), signed=False)
+    lo = fx.arith.trunci(i32, fx.as_ir_value(addr))
+    hi = fx.arith.ArithValue(fx.arith.trunci(i32, fx.as_ir_value(addr >> fx.Int64(32))), signed=False)
     hi = hi | fx.Int32(-(1 << 31))  # descriptor type 2 in [31:30]
     group0 = vector.from_elements(
         fx.T.vec(4, i32),
-        [_unwrap_value(v) for v in (fx.Int32(1), lds_addr, lo, hi)],
+        [fx.as_ir_value(v) for v in (fx.Int32(1), lds_addr, lo, hi)],
     )
     words = (
         3 << 16,  # 8-byte elements
@@ -153,7 +152,7 @@ def _tdm_row(lds_addr, global_addr, num_bytes):
         0,
         0,
     )
-    group1 = vector.from_elements(fx.T.vec(8, i32), [_unwrap_value(fx.Int32(w)) for w in words])
+    group1 = vector.from_elements(fx.T.vec(8, i32), [fx.as_ir_value(fx.Int32(w)) for w in words])
     return tdm_ops.TDMDescriptor2D(dgroup0=group0, dgroup1=group1)
 
 
@@ -214,14 +213,14 @@ def combine_v2_layout(num_nvl_bytes, hidden_bytes, num_topk):
 def _ballot(pred):
     """Lanes where ``pred`` holds, as a WARP_SIZE-bit mask."""
     mask_type = ir.IntegerType.get_signless(WARP_SIZE)
-    return fx.arith.ArithValue(rocdl.ballot(mask_type, _unwrap_value(pred)), signed=False)
+    return fx.arith.ArithValue(rocdl.ballot(mask_type, fx.as_ir_value(pred)), signed=False)
 
 
 def _popc(mask):
-    count = fx.arith.ArithValue(llvm.intr_ctpop(_unwrap_value(mask)), signed=False)
+    count = fx.arith.ArithValue(llvm.intr_ctpop(fx.as_ir_value(mask)), signed=False)
     if WARP_SIZE == 64:
-        count = fx.arith.ArithValue(fx.arith.trunci(fx.T.i32, _unwrap_value(count)), signed=True)
-    return fx.arith.ArithValue(_unwrap_value(count), signed=True)
+        count = fx.arith.ArithValue(fx.arith.trunci(fx.T.i32, fx.as_ir_value(count)), signed=True)
+    return fx.arith.ArithValue(fx.as_ir_value(count), signed=True)
 
 
 def _lanes_below(mask):
@@ -229,17 +228,17 @@ def _lanes_below(mask):
     i32 = fx.Int32.ir_type
     if WARP_SIZE == 32:
         return fx.arith.ArithValue(
-            rocdl.mbcnt_lo(i32, _unwrap_value(mask), fx.Int32(0).ir_value()), signed=True
+            rocdl.mbcnt_lo(i32, fx.as_ir_value(mask), fx.Int32(0).ir_value()), signed=True
         )
-    m = fx.arith.ArithValue(_unwrap_value(mask), signed=False)
-    lo = fx.arith.trunci(fx.T.i32, _unwrap_value(m))
-    hi = fx.arith.trunci(fx.T.i32, _unwrap_value(m >> fx.Int64(32)))
+    m = fx.arith.ArithValue(fx.as_ir_value(mask), signed=False)
+    lo = fx.arith.trunci(fx.T.i32, fx.as_ir_value(m))
+    hi = fx.arith.trunci(fx.T.i32, fx.as_ir_value(m >> fx.Int64(32)))
     count = rocdl.mbcnt_lo(i32, lo, fx.Int32(0).ir_value())
     return fx.arith.ArithValue(rocdl.mbcnt_hi(i32, hi, count), signed=True)
 
 
 def _signed(value):
-    return fx.arith.ArithValue(_unwrap_value(value), signed=True)
+    return fx.arith.ArithValue(fx.as_ir_value(value), signed=True)
 
 
 def _uniform_load_i32(res, idx):

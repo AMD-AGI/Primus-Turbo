@@ -27,7 +27,6 @@ from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
 from primus_turbo.flydsl.deep_ep.arch import TRAITS
 from primus_turbo.flydsl.utils.buffer_ops import (
-    _unwrap_value,
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
@@ -81,7 +80,7 @@ def copy_warp(dst, src, nbytes, dst_off=0, src_off=0, load_cache_modifier=0, sto
     def _addr_i64(addr):
         if isinstance(addr, int):
             return fx.Int64(addr)
-        v = _unwrap_value(addr)
+        v = fx.as_ir_value(addr)
         if isinstance(v.type, ir.IndexType):
             v = std_arith.IndexCastOp(fx.T.i64, v).result
         elif isinstance(v.type, ir.IntegerType) and v.type.width < 64:
@@ -89,7 +88,7 @@ def copy_warp(dst, src, nbytes, dst_off=0, src_off=0, load_cache_modifier=0, sto
         return fx.arith.ArithValue(v, signed=True)
 
     def _copy_operand(operand, word_off, nbytes):
-        if "ptr" in str(_unwrap_value(operand).type):
+        if "ptr" in str(fx.as_ir_value(operand).type):
             return operand, fx.Int32(word_off) if isinstance(word_off, int) else word_off
         base = _addr_i64(operand) + _addr_i64(word_off) * fx.Int64(_I32_BYTES)
         return create_buffer_resource_from_addr(base, num_records_bytes=nbytes), fx.Int32(0)
@@ -100,7 +99,7 @@ def copy_warp(dst, src, nbytes, dst_off=0, src_off=0, load_cache_modifier=0, sto
     tail_words = nbytes // _I32_BYTES - num_full_chunks * cols
     # A ragged tail parks its idle lanes' stores one row past the end, which only the
     # num_records of an address-built dst resource turns into a dropped store.
-    assert not tail_words or "ptr" not in str(_unwrap_value(dst).type), (
+    assert not tail_words or "ptr" not in str(fx.as_ir_value(dst).type), (
         "a ragged copy needs dst as an address"
     )
     src, src_off = _copy_operand(src, src_off, nbytes)
@@ -133,7 +132,7 @@ def load_index(res, elem_idx, element_type):
     """Load one i32 / i64 index element as i32."""
     value = buffer_load(res, elem_idx, vec_width=1, dtype=element_type)
     if element_type.width == 64:
-        value = fx.arith.ArithValue(fx.arith.trunci(fx.T.i32, _unwrap_value(value)), signed=True)
+        value = fx.arith.ArithValue(fx.arith.trunci(fx.T.i32, fx.as_ir_value(value)), signed=True)
     return value
 
 
@@ -148,7 +147,7 @@ def tensor_addr(tensor):
 
 def lds_base():
     """Base address of the dynamic LDS allocation."""
-    return _unwrap_value(_fly_ptrtoint(get_dyn_shared()))
+    return fx.as_ir_value(_fly_ptrtoint(get_dyn_shared()))
 
 
 def ld_lds(base, idx):
