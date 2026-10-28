@@ -203,6 +203,23 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
         self._check_round_trip(buffer)
         buffer.destroy()
 
+    @unittest.skipUnless(IS_GFX1250, "flydsl_v2 runs on gfx1250 only")
+    @skip_if_lt_x_gpu(2)
+    def test_flydsl_v2_refuses_graph_capture(self):
+        """A replay would rerun a call's host-side epochs: flydsl_v2 dispatch and combine raise under
+        capture before touching any state, and the buffer keeps working."""
+        buffer = self._init_process("flydsl_v2")
+        torch.manual_seed(42 + self.rank)
+        x, recv_x, recv_topk_weights, handle = self._check_round_trip(buffer)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            with self.assertRaisesRegex(RuntimeError, "CUDA graph"):
+                buffer.dispatch(x, handle=handle)
+            with self.assertRaisesRegex(RuntimeError, "CUDA graph"):
+                buffer.combine(recv_x, handle, topk_weights=recv_topk_weights)
+        self._check_round_trip(buffer)
+        dist.barrier()
+
     @unittest.skipUnless(HAS_CPP, "needs the C++ DeepEP")
     @skip_if_lt_x_gpu(2)
     @parametrize("num_sms", [8, 24])
