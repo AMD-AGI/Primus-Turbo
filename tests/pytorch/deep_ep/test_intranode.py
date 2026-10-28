@@ -223,7 +223,9 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
             received = int((recv_topk_idx >= 0).any(dim=1).sum())
             recv_x[received:] = float("nan")
             recv_topk_weights[received:] = float("nan")
-            combined_x, combined_topk_weights, _ = buffer.combine(recv_x, handle, topk_weights=recv_topk_weights)
+            combined_x, combined_topk_weights, _ = buffer.combine(
+                recv_x, handle, topk_weights=recv_topk_weights
+            )
             torch.cuda.synchronize()
             ref_x = x.float() * is_token_in_rank.sum(dim=1, keepdim=True)
             assert torch.isfinite(combined_x).all(), "the worst-case tail reached the combine"
