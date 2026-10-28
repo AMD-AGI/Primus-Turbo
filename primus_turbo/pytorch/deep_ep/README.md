@@ -72,9 +72,10 @@ raises as well.
 - `cpp`, `flydsl`: the channel rings, `Config.get_nvl_buffer_size_hint(hidden_bytes, num_ranks)`.
 - `flydsl_v2`: the whole batch, `Buffer.get_token_buffer_size_hint(num_max_tokens_per_rank, hidden_bytes,
   num_ranks, num_topk)` (0 for the ring backends), with the same `num_max_tokens_per_rank` on every rank.
-  `turbo.ops.moe_dispatch` sizes the buffer from the first dispatch and reallocates it for a larger one
-  (after a device sync and a barrier); `set_buffer_global_config(num_max_tokens_per_rank=...)` allocates
-  it up front. If a rank receives more than the buffer holds, that rank raises
+  `turbo.ops.moe_dispatch` sizes the buffer from the group's largest first dispatch (an all-reduce at
+  allocation, so ranks may dispatch different numbers of tokens) and reallocates it for a larger one
+  (after a device sync and a barrier, which waits for every rank to grow it); for token counts that
+  change per step, `set_buffer_global_config(num_max_tokens_per_rank=...)` allocates it up front. If a rank receives more than the buffer holds, that rank raises
   `V2 dispatch receives ... > the heap's ...; raise num_nvl_bytes` and the others stop at the kernels'
   timeout (300 s on gfx1250, as the C++ DeepEP).
 
@@ -90,7 +91,7 @@ Primus, whose default is 32 (Primus also limits it to 32 at EP >= 16, for the in
 ```bash
 # MI455X: flydsl_v2 by default
 torchrun --nproc-per-node 4 train.py
-# MI455X with CUDA graphs or a different token count per rank
+# MI455X with CUDA graphs, or token counts that change per step without a known maximum
 PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND=flydsl torchrun --nproc-per-node 4 train.py
 ```
 
