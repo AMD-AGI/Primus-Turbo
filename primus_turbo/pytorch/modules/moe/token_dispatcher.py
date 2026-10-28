@@ -21,6 +21,22 @@ from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
     set_buffer_global_config,
 )
 
+# Per-device count of permutes that dropped rows because ``permute_max_token_num`` was too
+# small. Accumulated on the GPU, so checking it costs one D2H when the caller asks.
+_permute_overflow_count = {}
+
+
+def permute_overflow_count(reset: bool = True) -> int:
+    """Number of sync-free permutes on this device that overflowed ``permute_max_token_num``
+    since the last reset (host sync). Non-zero means tokens were dropped."""
+    flag = _permute_overflow_count.get(torch.cuda.current_device())
+    if flag is None:
+        return 0
+    count = int(flag.item())
+    if reset:
+        flag.zero_()
+    return count
+
 
 class TokenDispatcher:
     def __init__(
@@ -339,7 +355,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             hidden_states,
             self.row_id_map,
             tokens_per_expert,
-            _,
+            overflow_flag,
             _,
             permuted_probs,
         ) = turbo.ops.moe_permute(
@@ -354,6 +370,11 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             backend=self.permute_backend,
             quantize_dtype=quantize_dtype,
         )
+        if self.permute_max_token_num > 0 and overflow_flag.is_cuda:
+            device = overflow_flag.device.index
+            if device not in _permute_overflow_count:
+                _permute_overflow_count[device] = torch.zeros(1, dtype=torch.int32, device=overflow_flag.device)
+            _permute_overflow_count[device].add_(overflow_flag)
 
         if not self.deepep_use_cuda_num_tokens_per_expert:
             if self.tokens_per_expert.numel() > 0:
