@@ -123,6 +123,7 @@ class FlyDSLIntranodeRuntime:
         # V2 has only been built and tested for gfx1250; its non-TDM path has never run
         _check(version == 1 or IS_GFX1250, "the V2 backend (flydsl_v2) runs on gfx1250 only")
         self.version = version
+        self.group = group
         self.rank = group.rank()
         self.num_ranks = group.size()
         _check(
@@ -167,8 +168,13 @@ class FlyDSLIntranodeRuntime:
         group.barrier()
 
     def destroy(self) -> None:
+        """Collective: every rank of the group calls it."""
         if self.symm is not None:
             torch.cuda.synchronize()
+            # a peer's kernels may still write into this heap (the V1 receivers' queue head updates):
+            # free it only once every rank's kernels are done
+            if dist.is_initialized():
+                dist.barrier(group=self.group)
             self.symm.destroy()
             self.symm = None
 
