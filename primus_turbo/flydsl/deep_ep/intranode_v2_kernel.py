@@ -50,6 +50,7 @@ second half.
 """
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -120,8 +121,10 @@ assert TAILS_OFFSET + 8 * MAX_CHANNELS * 4 <= 192 * 1024
 # a warp loads at most this much of a row before storing it, which bounds the VGPRs of a copy
 FANOUT_PIECE_BYTES = 8 * 1024
 # rows move global -> LDS -> global through the Tensor Data Mover: a warp copy of the row
-# through VGPRs caps how much each CU keeps in flight, and with it the bandwidth per CU
-USE_TDM = IS_GFX1250
+# through VGPRs caps how much each CU keeps in flight, and with it the bandwidth per CU.
+# PRIMUS_TURBO_DEEPEP_V2_TDM=0 takes the VGPR copy on gfx1250 too (the only path elsewhere); read at
+# import
+USE_TDM = IS_GFX1250 and os.environ.get("PRIMUS_TURBO_DEEPEP_V2_TDM", "1") != "0"
 # LDS a block can allocate on gfx1250
 MAX_LDS_BYTES = 320 * 1024
 # combine: tokens a warp claims from the reduce queue at a time

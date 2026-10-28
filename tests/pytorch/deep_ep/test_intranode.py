@@ -44,7 +44,7 @@ from tests.pytorch.ref.deep_ep_ref import (
 
 # builds without the C++ DeepEP (gfx1250) have the FlyDSL backends only; flydsl_v2 runs on gfx1250 only
 HAS_CPP = deep_ep_cpp is not None
-FLYDSL_BACKENDS = ["flydsl"] + (["flydsl_v2"] if IS_GFX1250 else [])
+FLYDSL_BACKENDS = ["flydsl"] + (["flydsl_v2"] if flydsl_intranode.v2_allowed() else [])
 BACKENDS = (["cpp"] if HAS_CPP else []) + FLYDSL_BACKENDS
 
 
@@ -218,7 +218,7 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
         self._check_round_trip(buffer)
         dist.barrier()
 
-    @unittest.skipUnless(IS_GFX1250, "flydsl_v2 runs on gfx1250 only")
+    @unittest.skipUnless(flydsl_intranode.v2_allowed(), "flydsl_v2 runs on gfx1250 only")
     @skip_if_lt_x_gpu(2)
     def test_flydsl_v2_refuses_graph_capture(self):
         """A replay would rerun a call's host-side epochs: flydsl_v2 dispatch and combine raise under
@@ -318,7 +318,7 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
         torch.cuda.synchronize()
         dist.barrier()
 
-    @unittest.skipUnless(IS_GFX1250, "flydsl_v2 runs on gfx1250 only")
+    @unittest.skipUnless(flydsl_intranode.v2_allowed(), "flydsl_v2 runs on gfx1250 only")
     @skip_if_lt_x_gpu(2)
     def test_moe_ops_size_the_v2_buffer(self):
         """moe_dispatch / moe_combine on flydsl_v2 through init_buffer: the buffer is sized from the
@@ -362,7 +362,9 @@ class IntranodeBackendSelectionTestCase(TestCase):
     ENV = "PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND"
 
     def _patched(self, gfx1250: bool, has_cpp: bool, env: Optional[str] = None):
-        environ = {k: v for k, v in os.environ.items() if k != self.ENV}
+        environ = {
+            k: v for k, v in os.environ.items() if k not in (self.ENV, "PRIMUS_TURBO_DEEPEP_V2_ANY_ARCH")
+        }
         if env is not None:
             environ[self.ENV] = env
         return (

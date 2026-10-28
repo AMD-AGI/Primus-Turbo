@@ -71,6 +71,12 @@ def _as_i32(value: int) -> int:
     return value - (1 << 32) if value >= (1 << 31) else value
 
 
+def v2_allowed() -> bool:
+    """flydsl_v2 runs on gfx1250; ``PRIMUS_TURBO_DEEPEP_V2_ANY_ARCH=1`` allows it elsewhere, where it
+    takes the untuned VGPR-copy path (bring-up only, see docs/flydsl_deepep_v2_mi355.md)."""
+    return IS_GFX1250 or os.environ.get("PRIMUS_TURBO_DEEPEP_V2_ANY_ARCH") == "1"
+
+
 def default_intranode_backend() -> str:
     """``flydsl_v2`` on gfx1250; elsewhere ``cpp`` where the C++ DeepEP is loaded and ``flydsl`` where it
     is not."""
@@ -128,9 +134,10 @@ class FlyDSLIntranodeRuntime:
         self, group: dist.ProcessGroup, num_nvl_bytes: int, comm_stream: torch.cuda.Stream, version: int = 1
     ) -> None:
         _check(version in (1, 2), f"version must be 1 or 2, got {version}")
-        # V2 has only been built and tested for gfx1250; its non-TDM path has never run
+        # V2 is tuned and tested on gfx1250; its VGPR-copy path passes the tests there with TDM off, but
+        # has not run on gfx942 / gfx950
         _check(
-            version == 1 or IS_GFX1250,
+            version == 1 or v2_allowed(),
             "the V2 backend (flydsl_v2) runs on gfx1250 only; on this GPU use intranode_backend="
             f"'{default_intranode_backend()}' (the default) or 'flydsl', or unset "
             "PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND",
