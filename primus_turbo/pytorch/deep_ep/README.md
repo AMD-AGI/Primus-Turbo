@@ -76,7 +76,7 @@ raises as well.
   (after a device sync and a barrier); `set_buffer_global_config(num_max_tokens_per_rank=...)` allocates
   it up front. If a rank receives more than the buffer holds, that rank raises
   `V2 dispatch receives ... > the heap's ...; raise num_nvl_bytes` and the others stop at the kernels'
-  5 s timeout.
+  timeout (300 s on gfx1250, as the C++ DeepEP).
 
 #### Number of CUs
 
