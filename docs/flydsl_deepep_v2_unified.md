@@ -98,7 +98,13 @@ the default of this GPU from one table:
 
 ## Risks
 
-- The wave64 branches and the gfx9 ordering of V2 have not run on hardware yet (gates 1–2).
+- The wave64 branches and the gfx9 ordering of V2 have not run on hardware yet (gates 1–2). Read for
+  wave64, without finding a problem: `_ballot` (64-bit mask), `_popc` (64-bit count truncated),
+  `_lanes_below` (`mbcnt_lo` + `mbcnt_hi`); the register copy's ragged last step; the reduce queue, whose
+  claim uses `REDUCE_GRAB_TOKENS × num_ranks` lanes (at most 32; the upper lanes idle on wave64), with
+  `readlane` and `lane % num_ranks`; the combine's columns, which step by `WARP_SIZE` and leave the
+  lanes past a row to the buffer bounds (loads 0, stores dropped); the flags and counts, published after
+  `s_waitcnt 0` on the uncached heap like V1's tails, which already run on gfx9.
 - Without TDM, V2 needs many CUs to reach the link: on MI455X the register copy is 1.4× / 1.1× slower
   than TDM at 128 CUs and within 6% at 256. On MI355X `cpp` may stay ahead at the CU counts training can
   spare; then the gfx950 default stays `cpp`.
