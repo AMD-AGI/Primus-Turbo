@@ -1,0 +1,20 @@
+[2026-10-28T02:16:35 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m hkl.test mla/ladder_bwd.json --rung hk_v0 r7 r8a --baseline --shapes s640 rect32 b1_s4096 prod --keep-going
+device gfx1250  torch 2.14.0+rocm10.2.0a20261011  ladder mla_bwd
+[s640] b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd  (reference 1.4 s)
+  hk_v0            PASS  dq  52.12 dk  52.17 dv  52.76  det bitwise(flydsl)=n/a
+  r7               PASS  dq  52.12 dk  52.17 dv  52.76  det bitwise(hk_v0)=yes
+  r8a              PASS  dq  52.12 dk  52.17 dv  52.76  det bitwise(hk_v0)=yes
+[rect32] b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd  (reference 0.0 s)
+  hk_v0            PASS  dq  52.51 dk  52.56 dv  52.58  det bitwise(flydsl)=n/a
+  r7               FAIL  dq  17.68 dk  52.56 dv  52.58  det bitwise(hk_v0)=no
+  r8a              PASS  dq  52.51 dk  52.56 dv  52.58  det bitwise(hk_v0)=yes
+[b1_s4096] b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd  (reference 0.0 s)
+  hk_v0            PASS  dq  52.30 dk  52.29 dv  52.71  det bitwise(flydsl)=n/a
+  r7               PASS  dq  52.30 dk  52.29 dv  52.71  det bitwise(hk_v0)=yes
+  r8a              PASS  dq  52.30 dk  52.29 dv  52.71  det bitwise(hk_v0)=yes
+[prod] b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd  (reference 0.3 s)
+  hk_v0            PASS  dq  52.31 dk  52.35 dv  52.71  det bitwise(flydsl)=n/a
+  r7               PASS  dq  52.31 dk  52.35 dv  52.71  det bitwise(hk_v0)=yes
+  r8a              PASS  dq  52.31 dk  52.35 dv  52.71  det bitwise(hk_v0)=yes
+FAILURES
+[02:16:41 UTC] rc=1 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261028_021635_r8a_all.log

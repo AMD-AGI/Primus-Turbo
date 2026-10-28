@@ -1,0 +1,40 @@
+diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
+--- a/include/dqds/dqds_impl.h	2026-10-28 02:15:58.496200635 +0000
++++ b/include/dqds/dqds_impl.h	2026-10-28 02:15:58.506413343 +0000
+@@ -357,6 +357,10 @@
+     const int nf    = steady_units(nfu, nu);
+     int       u     = 0;
+     if constexpr (NQW == MAIN_NQW) {
++        // the unrolled steady units burst row 2u + 2 assuming all of its pairs are stored (sh = 0); for the last
++        // steady unit that row belongs to the first masked unit, whose stored pairs start mid-row when
++        // (Skv - Sq) % 64 == 32: then the last steady unit runs as a generic unit (its bursts handle sh) below
++        const int nfs = ((cshift & 63) == 32 && nf > 0) ? nf - 1 : nf;
+         // steady units, unrolled by the ring depth: precomputed burst bases, K stages 0 / 1 off kb01
+         // (immediates <= 54176), stage 2 off kb2; dS stage s off db[s] (the wave's pair 0; pair 2 = pair 0 + 8
+         // blocks) and db1[s] (pair 1)
+@@ -395,21 +399,21 @@
+             steady_unit(uu, [&]() DQ_INL { burst_stage(Y, ic<s>{}, ic<1>{}); },
+                         [&]() DQ_INL { burst_stage(X, ic<s1>{}, ic<0>{}); });
+         };
+-        for (; u + 3 <= nf; u += 3) {
++        for (; u + 3 <= nfs; u += 3) {
+             unit_stage(u, ic<0>{});
+             unit_stage(u + 1, ic<1>{});
+             unit_stage(u + 2, ic<2>{});
+         }
+-        if (u < nf) { // nf % 3 == 1 or 2 (u % 3 == 0 here)
++        if (u < nfs) { // nfs % 3 == 1 or 2 (u % 3 == 0 here)
+             unit_stage(u, ic<0>{});
+             ++u;
+-            if (u < nf) {
++            if (u < nfs) {
+                 unit_stage(u, ic<1>{});
+                 ++u;
+             }
+         }
+     }
+-    for (; u < nf; ++u) // head tile (no main-tile steady unit is left)
++    for (; u < nf; ++u) // head tile, and a main tile's last steady unit when (Skv - Sq) % 64 == 32
+         unit(u, ic<0>{}, ic<0>{}, ic<1>{});
+     for (u = nf; u < nloop; ++u)
+         unit(u, ic<1>{}, ic<0>{}, ic<0>{});

@@ -1,0 +1,23 @@
+[2026-10-28T02:14:28 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: micro/wmma_toggle 3 3
+grid 256 x 4 waves (1 wave / SIMD), 131072 WMMA per wave per launch, 3.0 s per cell
+round 0 share_a  0.7016 ms/launch  implied 1495 MHz
+round 0 share_b  0.7078 ms/launch  implied 1482 MHz
+round 0 none     0.7196 ms/launch  implied 1457 MHz
+round 0 zeros    0.5348 ms/launch  implied 1961 MHz
+round 1 share_b  0.7090 ms/launch  implied 1479 MHz
+round 1 none     0.7208 ms/launch  implied 1455 MHz
+round 1 zeros    0.5261 ms/launch  implied 1993 MHz
+round 1 share_a  0.7129 ms/launch  implied 1471 MHz
+round 2 none     0.7189 ms/launch  implied 1458 MHz
+round 2 zeros    0.5301 ms/launch  implied 1978 MHz
+round 2 share_a  0.7082 ms/launch  implied 1481 MHz
+round 2 share_b  0.7148 ms/launch  implied 1467 MHz
+share_a  median 0.7082 ms  implied 1481 MHz
+share_b  median 0.7090 ms  implied 1479 MHz
+none     median 0.7196 ms  implied 1457 MHz
+zeros    median 0.5301 ms  implied 1978 MHz
+speed share_a  / none = 1.016x
+speed share_b  / none = 1.015x
+speed none     / none = 1.000x
+speed zeros    / none = 1.357x
+[02:14:50 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261028_021428_wmma_toggle.log

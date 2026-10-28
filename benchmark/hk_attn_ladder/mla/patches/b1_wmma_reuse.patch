@@ -1,0 +1,69 @@
+diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
+--- a/include/dqds/dqds_impl.h	2026-10-28 02:09:11.062057495 +0000
++++ b/include/dqds/dqds_impl.h	2026-10-28 02:09:11.070582002 +0000
+@@ -185,7 +185,11 @@
+                     if (!pair_zero(k, r)) {
+                         sfor<a, bb>([&](auto I) DQ_INL {
+                             constexpr int i = decltype(I)::value, h = i / NDT, dt = i % NDT;
++#if HKL_DQ_REUSE // B (the dS operand of sub-tile h) is the previous WMMA's inside this block
++                            acc[i] = wmma_bf16_r<false, (dt > 0 && i > a)>(S.kt[dt], S.ds[h], acc[i]);
++#else
+                             acc[i] = wmma_bf16(S.kt[dt], S.ds[h], acc[i]);
++#endif
+                         });
+                     }
+                 }
+@@ -195,7 +199,11 @@
+         }
+         sfor<lo, hi>([&](auto I) DQ_INL {
+             constexpr int i = decltype(I)::value, h = i / NDT, dt = i % NDT;
++#if HKL_DQ_REUSE
++            acc[i] = wmma_bf16_r<false, (dt > 0 && i > lo)>(S.kt[dt], S.ds[h], acc[i]);
++#else
+             acc[i] = wmma_bf16(S.kt[dt], S.ds[h], acc[i]);
++#endif
+         });
+         Q1_SCHED_BARRIER();
+     };
+@@ -207,7 +215,11 @@
+         constexpr int lo = decltype(LO)::value, hi = decltype(HI)::value;
+         sfor<lo, hi>([&](auto I) DQ_INL {
+             constexpr int i = decltype(I)::value, h = i / NDT, dt = i % NDT;
++#if HKL_DQ_REUSE
++            acc[i] = wmma_bf16_r<false, (dt > 0 && i > lo)>(S.kt[dt], S.ds[h], acc[i]);
++#else
+             acc[i] = wmma_bf16(S.kt[dt], S.ds[h], acc[i]);
++#endif
+         });
+     };
+ 
+diff -ruN a/include/hk1.h b/include/hk1.h
+--- a/include/hk1.h	2026-10-28 02:09:11.062083065 +0000
++++ b/include/hk1.h	2026-10-28 02:09:11.070414852 +0000
+@@ -59,8 +59,12 @@
+ // ---- WMMA 16x16x32 bf16 -> f32 (llvm.amdgcn.wmma.f32.16x16x32.bf16, neg 0, c_mod 0)
+ // --------------------
+ template <bool REUSE_A, bool REUSE_B> HK1_INLINE f32x8 wmma(bf16x16 a, bf16x16 b, f32x8 c) {
++#if HKL_ABL_NOREUSE // ablation (timing only): no operand-reuse hints
++    return __builtin_amdgcn_wmma_f32_16x16x32_bf16(false, a, false, b, (short) 0, c, false, false);
++#else
+     return __builtin_amdgcn_wmma_f32_16x16x32_bf16(false, a, false, b, (short) 0, c, REUSE_A,
+                                                    REUSE_B);
++#endif
+ }
+ 
+ // ---- LDS (addresses are byte offsets in the workgroup's LDS)
+diff -ruN a/include/q1/prims.h b/include/q1/prims.h
+--- a/include/q1/prims.h	2026-10-28 02:09:11.062250406 +0000
++++ b/include/q1/prims.h	2026-10-28 02:09:11.070503512 +0000
+@@ -64,6 +64,10 @@
+ Q1_DEV bf16x16 cat16(bf16x8 a, bf16x8 b) {
+     return __builtin_shufflevector(a, b, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+ }
++// the same with the operand-reuse hints (A / B is the previous WMMA's, same registers): a register-file read saved
++template <bool RA, bool RB> Q1_DEV f32x8 wmma_bf16_r(bf16x16 a, bf16x16 b, f32x8 c) {
++    return __builtin_amdgcn_wmma_f32_16x16x32_bf16(false, a, false, b, (short) 0, c, RA, RB);
++}
+ Q1_DEV f32x8 wmma_bf16(bf16x16 a, bf16x16 b, f32x8 c) {
+     return __builtin_amdgcn_wmma_f32_16x16x32_bf16(false, a, false, b, (short) 0, c, false, false);
+ }

@@ -1035,6 +1035,46 @@
    "bitwise_with": "hk_v0"
   },
   {
+   "id": "r8a",
+   "parent": "r7",
+   "patch": "patches/08a_dq_rect32.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness"
+     ],
+     "sha256": "853798b9a06588a3c8d82c5de3fcbd963f8946f2e2be548b1c0ea82bb6585673",
+     "asm_patch": "asm/k_dkdv96ds.s.patch",
+     "asm_input_sha256": "386bfa6733d3c5b5c057ab3d4f20c7ab8fa491a314abb7a4d41fd4c56643e076"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "dq: when (Skv - Sq) % 64 == 32 the last steady unit runs as a generic unit, whose burst handles the first masked row's partly stored pairs (fixes the r2d..r7 rect32 dQ read; production shapes unchanged)",
+   "bitwise_with": "hk_v0"
+  },
+  {
    "id": "m07k",
    "parent": "m06g",
    "tree": "../llama/hip",
@@ -1506,6 +1546,484 @@
    },
    "side": true,
    "feature": "ablation (wrong results): dq's K ops are 16-B dummies"
+  },
+  {
+   "id": "r7c",
+   "parent": "r7",
+   "patch": "patches/b0_cachepol_knobs.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness"
+     ],
+     "sha256": "853798b9a06588a3c8d82c5de3fcbd963f8946f2e2be548b1c0ea82bb6585673",
+     "asm_patch": "asm/k_dkdv96ds.s.patch",
+     "asm_input_sha256": "386bfa6733d3c5b5c057ab3d4f20c7ab8fa491a314abb7a4d41fd4c56643e076"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "5e3782d65b17dfed8abfa1a1227d42fd5bf825ae52d2df55b6c20c5ce88dda2a"
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "bitwise_with": "r7",
+   "feature": "cache-policy / dq head-order knobs (HKL_DS_ST_AUX, HKL_KV_TDM_CPOL, HKL_DQ_*), all default: == r7 bytes",
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "side": true
+  },
+  {
+   "id": "r7cnp",
+   "parent": "r7c",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness"
+     ]
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "5e3782d65b17dfed8abfa1a1227d42fd5bf825ae52d2df55b6c20c5ce88dda2a"
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "bitwise_with": "r7",
+   "feature": "control: r7c without the dK/dV asm patch",
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "side": true
+  },
+  {
+   "id": "cp_st1",
+   "parent": "r7cnp",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness",
+      "-DHKL_DS_ST_AUX=1"
+     ]
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "5e3782d65b17dfed8abfa1a1227d42fd5bf825ae52d2df55b6c20c5ce88dda2a"
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "bitwise_with": "r7",
+   "feature": "dS^T export stores th NT",
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "side": true
+  },
+  {
+   "id": "cp_st3",
+   "parent": "r7cnp",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness",
+      "-DHKL_DS_ST_AUX=3"
+     ]
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "5e3782d65b17dfed8abfa1a1227d42fd5bf825ae52d2df55b6c20c5ce88dda2a"
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "bitwise_with": "r7",
+   "feature": "dS^T export stores th WB (high-temporal with write-back in MALL)",
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "side": true
+  },
+  {
+   "id": "cp_st5",
+   "parent": "r7cnp",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness",
+      "-DHKL_DS_ST_AUX=5"
+     ]
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "5e3782d65b17dfed8abfa1a1227d42fd5bf825ae52d2df55b6c20c5ce88dda2a"
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "bitwise_with": "r7",
+   "feature": "dS^T export stores th RT_NT (regular in CU / SE, non-temporal in MALL)",
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "side": true
+  },
+  {
+   "id": "cp_kv2",
+   "parent": "r7cnp",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness",
+      "-DHKL_KV_TDM_CPOL=2"
+     ]
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "5e3782d65b17dfed8abfa1a1227d42fd5bf825ae52d2df55b6c20c5ce88dda2a"
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "bitwise_with": "r7",
+   "feature": "dK/dV Q / dO ring TDM loads th HT",
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "side": true
+  },
+  {
+   "id": "cp_dqds1",
+   "parent": "r7c",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness"
+     ],
+     "sha256": "853798b9a06588a3c8d82c5de3fcbd963f8946f2e2be548b1c0ea82bb6585673",
+     "asm_patch": "asm/k_dkdv96ds.s.patch",
+     "asm_input_sha256": "386bfa6733d3c5b5c057ab3d4f20c7ab8fa491a314abb7a4d41fd4c56643e076"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHKL_DQ_DS_CPOL=1"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "bitwise_with": "r7",
+   "feature": "dq dS ring TDM loads th NT (K regular)",
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "side": true
+  },
+  {
+   "id": "cp_dqds3",
+   "parent": "r7c",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness"
+     ],
+     "sha256": "853798b9a06588a3c8d82c5de3fcbd963f8946f2e2be548b1c0ea82bb6585673",
+     "asm_patch": "asm/k_dkdv96ds.s.patch",
+     "asm_input_sha256": "386bfa6733d3c5b5c057ab3d4f20c7ab8fa491a314abb7a4d41fd4c56643e076"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHKL_DQ_DS_CPOL=3"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "bitwise_with": "r7",
+   "feature": "dq dS ring TDM loads th LU (last use)",
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "side": true
+  },
+  {
+   "id": "r7r",
+   "parent": "r7c",
+   "patch": "patches/b1_wmma_reuse.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness"
+     ],
+     "sha256": "853798b9a06588a3c8d82c5de3fcbd963f8946f2e2be548b1c0ea82bb6585673",
+     "asm_patch": "asm/k_dkdv96ds.s.patch",
+     "asm_input_sha256": "386bfa6733d3c5b5c057ab3d4f20c7ab8fa491a314abb7a4d41fd4c56643e076"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "5e3782d65b17dfed8abfa1a1227d42fd5bf825ae52d2df55b6c20c5ce88dda2a"
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "feature": "WMMA reuse-hint knobs (HKL_ABL_NOREUSE, HKL_DQ_REUSE), all default: == r7 bytes",
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "side": true,
+   "bitwise_with": "r7"
+  },
+  {
+   "id": "r7rnp",
+   "parent": "r7r",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness"
+     ]
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "5e3782d65b17dfed8abfa1a1227d42fd5bf825ae52d2df55b6c20c5ce88dda2a"
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "feature": "control: r7r without the dK/dV asm patch",
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "side": true,
+   "bitwise_with": "r7"
+  },
+  {
+   "id": "rr_noreuse",
+   "parent": "r7rnp",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness",
+      "-DHKL_ABL_NOREUSE=1"
+     ]
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ],
+     "sha256": "5e3782d65b17dfed8abfa1a1227d42fd5bf825ae52d2df55b6c20c5ce88dda2a"
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "feature": "ablation: dK/dV without any WMMA operand-reuse hint (bits unchanged)",
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "side": true,
+   "bitwise_with": "r7"
+  },
+  {
+   "id": "rr_dqreuse",
+   "parent": "r7r",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness"
+     ],
+     "sha256": "853798b9a06588a3c8d82c5de3fcbd963f8946f2e2be548b1c0ea82bb6585673",
+     "asm_patch": "asm/k_dkdv96ds.s.patch",
+     "asm_input_sha256": "386bfa6733d3c5b5c057ab3d4f20c7ab8fa491a314abb7a4d41fd4c56643e076"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHKL_DQ_REUSE=1"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "feature": "dq: matrix_b_reuse on the 11 of 12 consecutive WMMAs that share a dS operand (bits unchanged)",
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "side": true,
+   "bitwise_with": "r7"
   }
  ],
  "baselines": [

@@ -1,0 +1,108 @@
+diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
+--- a/include/dqds/dqds_impl.h	2026-10-28 02:04:18.251294305 +0000
++++ b/include/dqds/dqds_impl.h	2026-10-28 02:03:50.292206698 +0000
+@@ -267,7 +267,22 @@
+         d.g1 = dsw ? dd.g1 : dk.g1;
+         return d;
+     };
+-    auto issue   = [&](const TdmDesc &d) DQ_INL { tdm_load(d.g0, d.g1); };
++#ifndef HKL_DQ_DS_CPOL
++#define HKL_DQ_DS_CPOL 0 // dS ring loads: regular
++#endif
++#ifndef HKL_DQ_K_CPOL
++#define HKL_DQ_K_CPOL 0 // K ring loads: regular
++#endif
++#if HKL_DQ_DS_CPOL == HKL_DQ_K_CPOL
++    auto issue = [&](const TdmDesc &d) DQ_INL { tdm_load<HKL_DQ_DS_CPOL>(d.g0, d.g1); };
++#else
++    auto issue = [&](const TdmDesc &d) DQ_INL {
++        if (dsw)
++            tdm_load<HKL_DQ_DS_CPOL>(d.g0, d.g1);
++        else
++            tdm_load<HKL_DQ_K_CPOL>(d.g0, d.g1);
++    };
++#endif
+     auto c_issue = [&](int u) DQ_INL { issue(c_desc(u, ic<0>{})); };
+ 
+     // ---- one 64-kv unit: rows 2u (set X, burst into Y) and 2u + 1 (set Y, burst into X unless
+diff -ruN a/include/hk1ds.h b/include/hk1ds.h
+--- a/include/hk1ds.h	2026-10-28 02:04:18.251340925 +0000
++++ b/include/hk1ds.h	2026-10-28 02:03:50.285418427 +0000
+@@ -31,8 +31,9 @@
+ }
+ // buffer_store_b128 of four dwords at voffset + soffset (+ the constant part of voffset in the
+ // offset field)
+-HK1_INLINE void buf_store_u32x4(u32x4 v, __amdgpu_buffer_rsrc_t r, int voff, int soff) {
+-    __builtin_amdgcn_raw_buffer_store_b128(v, r, voff, soff, 0);
++// AUX: the store's cache policy immediate (gfx12 th bits [2:0], scope [4:3]); 0 = regular
++template <int AUX = 0> HK1_INLINE void buf_store_u32x4(u32x4 v, __amdgpu_buffer_rsrc_t r, int voff, int soff) {
++    __builtin_amdgcn_raw_buffer_store_b128(v, r, voff, soff, AUX);
+ }
+ 
+ } // namespace hk1
+diff -ruN a/include/hk1.h b/include/hk1.h
+--- a/include/hk1.h	2026-10-28 02:04:18.251564145 +0000
++++ b/include/hk1.h	2026-10-28 02:03:50.285428627 +0000
+@@ -111,10 +111,11 @@
+ 
+ // ---- Tensor Data Mover (2-D tensor_load_to_lds, clang-23 6-operand form)
+ // ------------------------------
+-HK1_INLINE void tdm_load(i32x4 g0, i32x8 g1) {
++// CPOL: the op's cache policy immediate (gfx12 th bits [2:0], scope [4:3]); 0 = regular
++template <int CPOL = 0> HK1_INLINE void tdm_load(i32x4 g0, i32x8 g1) {
+     const i32x4 z4 = {0, 0, 0, 0};
+     const i32x8 z8 = {0, 0, 0, 0, 0, 0, 0, 0};
+-    __builtin_amdgcn_tensor_load_to_lds(g0, g1, z4, z4, z8, 0);
++    __builtin_amdgcn_tensor_load_to_lds(g0, g1, z4, z4, z8, CPOL);
+ }
+ template <int N> HK1_INLINE void tensor_wait() {
+     __builtin_amdgcn_s_wait_tensorcnt((short) N);
+diff -ruN a/include/q1/prims.h b/include/q1/prims.h
+--- a/include/q1/prims.h	2026-10-28 02:04:18.251539535 +0000
++++ b/include/q1/prims.h	2026-10-28 02:03:50.285655158 +0000
+@@ -151,11 +151,12 @@
+ 
+ // ---- TDM
+ // ----------------------------------------------------------------------------------------------
+-Q1_DEV void tdm_load(u32x4 g0, u32x8 g1) {
++// CPOL: the op's cache policy immediate (gfx12 th bits [2:0], scope [4:3]); 0 = regular
++template <int CPOL = 0> Q1_DEV void tdm_load(u32x4 g0, u32x8 g1) {
+     i32x4 z4 = {0, 0, 0, 0};
+     i32x8 z8 = {0, 0, 0, 0, 0, 0, 0, 0};
+     __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(i32x4, g0),
+-                                        __builtin_bit_cast(i32x8, g1), z4, z4, z8, 0);
++                                        __builtin_bit_cast(i32x8, g1), z4, z4, z8, CPOL);
+ }
+ 
+ // ---- waits, barrier, scheduling
+diff -ruN a/src/k_dkdv96ds.hip b/src/k_dkdv96ds.hip
+--- a/src/k_dkdv96ds.hip	2026-10-28 02:04:18.251670985 +0000
++++ b/src/k_dkdv96ds.hip	2026-10-28 02:03:50.285747328 +0000
+@@ -153,7 +153,15 @@
+     });
+     return t;
+   };
+-  auto tdm_issue = [&](const TdmG0& t) { static_for<3>([&](auto op) { tdm_load(t.g0[op], g1[op]); }); };
++#ifndef HKL_KV_TDM_CPOL
++#define HKL_KV_TDM_CPOL 0  // Q / dO ring loads: regular
++#endif
++#ifndef HKL_DS_ST_AUX
++#define HKL_DS_ST_AUX 0  // dS^T export stores: regular
++#endif
++  auto tdm_issue = [&](const TdmG0& t) {
++    static_for<3>([&](auto op) { tdm_load<HKL_KV_TDM_CPOL>(t.g0[op], g1[op]); });
++  };
+   auto tdm_tile = [&](int qt, int gh, int stage_off) { tdm_issue(tdm_prep(qt, gh, stage_off)); };
+ 
+   // ---- NL / ND: the 8 vec4 loads of (query pair qt, q head gh); voffset 32*half, soffset uniform -------
+@@ -542,8 +550,8 @@
+         });
+         sched_barrier<0>();
+         static_for<NKV>([&](auto kh) {
+-          buf_store_u32x4(dsx[kh], r_ds, vds, so_c + ds_rc[kh]);
+-          buf_store_u32x4(dsy[kh], r_ds, vds + K1DS_ST_B, so_c + ds_rc[kh]);
++          buf_store_u32x4<HKL_DS_ST_AUX>(dsx[kh], r_ds, vds, so_c + ds_rc[kh]);
++          buf_store_u32x4<HKL_DS_ST_AUX>(dsy[kh], r_ds, vds + K1DS_ST_B, so_c + ds_rc[kh]);
+         });
+         // X1b1: the export is pinned here, under the dO^T tr16 latency, ahead of the first dV WMMA (in the
+         // non-expert mode a store issued inside the WMMA run waits for every earlier WMMA)
