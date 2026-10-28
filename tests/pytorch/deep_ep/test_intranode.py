@@ -195,6 +195,43 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
         assert torch.allclose(combined_topk_weights, topk_weights)
 
     @skip_if_lt_x_gpu(2)
+    @parametrize("backend", BACKENDS)
+    def test_combine_ignores_the_worst_case_tail(self, backend: str):
+        """After a ``num_worst_tokens`` dispatch, the combine's x has the worst-case row count and
+        only the received rows are meaningful: NaN in the rest must not reach any token."""
+        buffer = self._init_process(backend)
+        num_ranks = dist.group.WORLD.size()
+        num_tokens, hidden, num_topk, num_experts = 1024, 4096, 8, 128
+        torch.manual_seed(42 + self.rank)
+        for _ in range(8):
+            x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+            topk_idx = torch.topk(torch.rand((num_tokens, num_experts), device="cuda"), num_topk, dim=-1)[1]
+            topk_weights = torch.rand((num_tokens, num_topk), dtype=torch.float32, device="cuda")
+            num_tokens_per_rank, _, num_tokens_per_expert, is_token_in_rank, _ = buffer.get_dispatch_layout(
+                topk_idx, num_experts
+            )
+            recv_x, recv_topk_idx, recv_topk_weights, _, handle, _ = buffer.dispatch(
+                x,
+                num_tokens_per_rank=num_tokens_per_rank,
+                is_token_in_rank=is_token_in_rank,
+                num_tokens_per_expert=num_tokens_per_expert,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                num_worst_tokens=num_tokens * num_ranks,
+            )
+            assert recv_x.size(0) == num_tokens * num_ranks, recv_x.shape
+            received = int((recv_topk_idx >= 0).any(dim=1).sum())
+            recv_x[received:] = float("nan")
+            recv_topk_weights[received:] = float("nan")
+            combined_x, combined_topk_weights, _ = buffer.combine(recv_x, handle, topk_weights=recv_topk_weights)
+            torch.cuda.synchronize()
+            ref_x = x.float() * is_token_in_rank.sum(dim=1, keepdim=True)
+            assert torch.isfinite(combined_x).all(), "the worst-case tail reached the combine"
+            assert torch.allclose(combined_x.float(), ref_x, rtol=2e-2, atol=2e-2)
+            assert torch.allclose(combined_topk_weights, topk_weights)
+        dist.barrier()
+
+    @skip_if_lt_x_gpu(2)
     @parametrize("backend", FLYDSL_BACKENDS)
     def test_destroy_and_recreate(self, backend: str):
         """``destroy()`` (collective) frees the heap, and a new buffer on the same group works."""
