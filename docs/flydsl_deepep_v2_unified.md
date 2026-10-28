@@ -82,7 +82,7 @@ the default of this GPU from one table:
 2. **Correctness on MI355X**: `test_intranode.py` on 2 and 8 GPUs; the V1 / V2 stress test.
 3. **Kernel performance against `cpp`** (`benchmark/ops/deep_ep_v2/bench_ops.py`, DeepSeek-V3 shape, EP2
    and EP8, at the CU counts training uses): `flydsl_v2` at least on par with `cpp`. Tune
-   `v2_copy_piece_bytes` first.
+   `v2_copy_piece_bytes` and `combine_loads_in_flight` (gfx950 entry of `arch.py`) first.
 4. **End to end on MI355X** (DeepSeek-V3 proxy, EP8) against `cpp`, as in PR #583's MI355X section.
 
 ## Validation on this branch
@@ -102,5 +102,9 @@ the default of this GPU from one table:
 - Without TDM, V2 needs many CUs to reach the link: on MI455X the register copy is 1.4× / 1.1× slower
   than TDM at 128 CUs and within 6% at 256. On MI355X `cpp` may stay ahead at the CU counts training can
   spare; then the gfx950 default stays `cpp`.
+- Registers on gfx9 (compiled at 64 channels): the V2 combine spills 59 / 48 VGPRs at EP2 / EP4 (224 / 180
+  bytes of scratch per lane; none at EP8), against 8 / 75 on gfx1250 with TDM, and the EP8 dispatch spills
+  97 SGPRs (to VGPRs, no scratch). A smaller `combine_loads_in_flight` removes the combine spills; on
+  gfx1250 it was not faster (`flydsl_deepep_mi455.md` §8), on gfx950 it has to be measured.
 - EP8 has not run with V2 (MI455X nodes have 4 GPUs). The heap holds the batch: about 1.9 GB for the
   DeepSeek-V3 shape at EP8 (`Buffer.get_token_buffer_size_hint`).
