@@ -47,6 +47,13 @@ class ArchTraits(NamedTuple):
     # prints and keeps spinning
     spin_timeout_cycles: int
     trap_on_timeout: bool
+    # the Tensor Data Mover: V2 moves its rows global -> LDS -> global with it where there is one, and
+    # through VGPRs elsewhere
+    has_tdm: bool
+    # LDS one block can allocate
+    max_lds_bytes: int
+    # V2's register copy: bytes of a row a warp loads before it stores them
+    v2_copy_piece_bytes: int
 
     def copy_piece_bytes(self, op: str, num_channels: int) -> int:
         for max_channels, piece in dict(self.copy_piece_table)[op]:
@@ -75,14 +82,17 @@ _GFX9 = dict(
     combine_loads_in_flight=32,
     spin_timeout_cycles=3_000_000_000,
     trap_on_timeout=False,
+    has_tdm=False,
+    # as on gfx1250; not tuned on gfx9 yet
+    v2_copy_piece_bytes=8 * 1024,
 )
 
 # gfx12 buffer cache policy: TH in bits 2:0 (TH_NT = 1), SCOPE in bits 4:3 (SCOPE_SYS = 3 << 3)
 _GFX12_SYS_STREAM = 0x1 | (0x3 << 3)
 
 _TRAITS = {
-    "gfx942": ArchTraits(name="gfx942", **_GFX9),
-    "gfx950": ArchTraits(name="gfx950", **_GFX9),
+    "gfx942": ArchTraits(name="gfx942", max_lds_bytes=64 * 1024, **_GFX9),
+    "gfx950": ArchTraits(name="gfx950", max_lds_bytes=160 * 1024, **_GFX9),
     "gfx1250": ArchTraits(
         name="gfx1250",
         wave_size=32,
@@ -97,16 +107,19 @@ _TRAITS = {
         # evicted or torn down has left MES unrecoverable on MI455X, a trapped one has no waves left
         spin_timeout_cycles=500_000_000,
         trap_on_timeout=True,
+        has_tdm=True,
+        max_lds_bytes=320 * 1024,
+        v2_copy_piece_bytes=8 * 1024,
     ),
 }
 
 
 @functools.lru_cache(maxsize=None)
 def get_arch_traits(arch: Optional[str] = None) -> ArchTraits:
-    """Traits of ``arch``, else of the target FlyDSL compiles for. Other targets get the gfx942 /
-    gfx950 choices."""
+    """Traits of ``arch``, else of the target FlyDSL compiles for. Other targets get the gfx942
+    choices."""
     arch = (arch or get_rocm_arch()).split(":", 1)[0].lower()
-    return _TRAITS.get(arch) or ArchTraits(name=arch, **_GFX9)
+    return _TRAITS.get(arch) or _TRAITS["gfx942"]._replace(name=arch)
 
 
 TRAITS = get_arch_traits()

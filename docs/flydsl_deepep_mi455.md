@@ -4,9 +4,9 @@
 
 ## 0. Status
 
-- **Backends**: `Buffer(..., intranode_backend=...)` or the environment variable `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`, one of `cpp` (HIP V1), `flydsl` (FlyDSL V1) and `flydsl_v2` (FlyDSL V2, gfx1250 only). The C++ V2 backend, a separate change, uses `cpp_v2`; the two value lists are merged when it lands.
+- **Backends**: `Buffer(..., intranode_backend=...)` or the environment variable `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`, one of `cpp` (HIP V1), `flydsl` (FlyDSL V1) and `flydsl_v2` (FlyDSL V2; tuned for gfx1250, experimental elsewhere). The C++ V2 backend, a separate change, uses `cpp_v2`; the two value lists are merged when it lands.
   - gfx1250: the C++ DeepEP is not loaded (§5), the default is `flydsl_v2`, and selecting `cpp` raises an error. Use `flydsl` for CUDA graphs or a different token count per rank (§6).
-  - Other architectures: the C++ DeepEP is loaded and the default is `cpp`; the runtime refuses `flydsl_v2` there (§6).
+  - Other architectures: the C++ DeepEP is loaded and the default is `cpp`; `flydsl_v2` runs there with a register copy instead of TDM and is experimental (§6, `flydsl_deepep_v2_unified.md`).
   - How to choose, size and tune a backend: [the DeepEP README](../primus_turbo/pytorch/deep_ep/README.md#intranode-backend).
 - **Changes**:
 
@@ -132,7 +132,7 @@ From Xiaoming's gfx1250 branch:
 - In V1 each (channel, rank) pair is a ring with one head / tail handshake per chunk, and the receiver then copies from the ring into `recv_x`. V2 drops the rings: every token has a fixed slot on each rank it goes to, and the sender writes there directly without waiting for the receiver.
 - dispatch: a token's slot on rank `d` = this rank's offset in `d`'s receive order (from the rank prefix matrix computed by notify; V2 needs the whole matrix, `full_rank_matrix`) + its index in the token stream this rank sends to `d`. This is the same order as V1's receiver, so `recv_x` and every per-token output match V1. Each block owns one channel (a contiguous range of tokens), and each warp reads a token's row once and writes it to every destination rank. After the rows are written, the block tells each rank how many rows this channel sent; once a rank has the counts, it copies the rows from its own heap into the output.
 - combine: the rows of `x` are pushed, together with their top-k weights, back into a compact region on the source rank laid out as [destination rank][index in the stream the source rank sent to it], so the slot of (rank `r`, token `t`) is `base_r + send_head[t, r]`; this rank's own rows stay in `x` and are not pushed. Once a row has landed, the pushing warp sets that slot's flag to the epoch of this combine. The reduce takes 4 tokens at a time, in token order, from an atomic queue and adds them as their flags arrive (bias first, then ranks in ascending order, the same summation order as HIP / V1), so push and reduce overlap.
-- Rows go through LDS via TDM (one load, then one store per destination rank). The kernel also has a VGPR-copy path for other targets, but it has never run, so the runtime accepts `flydsl_v2` on gfx1250 only and the tests run it only there. Wide rows (e.g. H=7168) that do not fit in LDS are moved in pieces.
+- Rows go through LDS via TDM (one load, then one store per destination rank). Other targets, which have no TDM, take a register (VGPR) copy instead; it passes the tests on gfx1250 with TDM turned off and is experimental elsewhere (`flydsl_deepep_v2_unified.md`). Wide rows (e.g. H=7168) that do not fit in LDS are moved in pieces.
 - Between two combines: a rank may push into a peer's combine region only after the peer has finished the previous reduce. With a dispatch in between, the dispatch's notify is that barrier; otherwise the host launches a `launch_barrier`.
 
 **Differences for callers**
@@ -148,7 +148,7 @@ From Xiaoming's gfx1250 branch:
 ## 7. Correctness
 
 **Unit tests** (`tests/pytorch/deep_ep/test_intranode.py`, added to the gfx1250 allow list in `tests/conftest.py`)
-- `test_intranode`: the DeepEP reference flow (bf16 / fp8 + scales, with and without top-k, sync / async, `previous_event`, `num_worst_tokens`, cached dispatch, combine), once each for `flydsl` and `flydsl_v2` (`flydsl_v2` on gfx1250 only).
+- `test_intranode`: the DeepEP reference flow (bf16 / fp8 + scales, with and without top-k, sync / async, `previous_event`, `num_worst_tokens`, cached dispatch, combine), once each for `flydsl` and `flydsl_v2`.
 - `test_dispatch_layout`: the layout against a torch reference.
 - `test_rank_receives_nothing`: a rank receives 0 tokens. `flydsl_v2` fails without the fix in §6.
 - `test_destroy_and_recreate`: `Buffer.destroy()` (a collective: every rank waits for the others before freeing its heap) and a new buffer on the same group, for `flydsl` and `flydsl_v2`.

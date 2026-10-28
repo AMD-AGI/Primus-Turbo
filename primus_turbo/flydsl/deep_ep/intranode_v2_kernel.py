@@ -62,7 +62,6 @@ from flydsl.expr.rocdl import tdm_ops
 
 from primus_turbo.flydsl.deep_ep.arch import TRAITS
 from primus_turbo.flydsl.deep_ep.common import (
-    IS_GFX1250,
     SYS_LOAD,
     SYS_STORE,
     WARP_SIZE,
@@ -118,15 +117,15 @@ DATA_OFFSET = COMBINE_FLAGS_OFFSET + COMBINE_FLAGS_BYTES
 assert RECV_CHANNEL_OFFSET_OFFSET + 8 * MAX_CHANNELS * 4 <= TAILS_OFFSET
 assert TAILS_OFFSET + 8 * MAX_CHANNELS * 4 <= 192 * 1024
 
-# a warp loads at most this much of a row before storing it, which bounds the VGPRs of a copy
-FANOUT_PIECE_BYTES = 8 * 1024
-# rows move global -> LDS -> global through the Tensor Data Mover: a warp copy of the row
-# through VGPRs caps how much each CU keeps in flight, and with it the bandwidth per CU.
-# PRIMUS_TURBO_DEEPEP_V2_TDM=0 takes the VGPR copy on gfx1250 too (the only path elsewhere); read at
+# register copy: a warp loads at most this much of a row before storing it, which bounds the VGPRs of
+# a copy
+FANOUT_PIECE_BYTES = TRAITS.v2_copy_piece_bytes
+# rows move global -> LDS -> global through the Tensor Data Mover where there is one: a warp copy of
+# the row through VGPRs caps how much each CU keeps in flight, and with it the bandwidth per CU.
+# PRIMUS_TURBO_DEEPEP_V2_TDM=0 takes the register copy there too (the only path elsewhere); read at
 # import
-USE_TDM = IS_GFX1250 and os.environ.get("PRIMUS_TURBO_DEEPEP_V2_TDM", "1") != "0"
-# LDS a block can allocate on gfx1250
-MAX_LDS_BYTES = 320 * 1024
+USE_TDM = TRAITS.has_tdm and os.environ.get("PRIMUS_TURBO_DEEPEP_V2_TDM", "1") != "0"
+MAX_LDS_BYTES = TRAITS.max_lds_bytes
 # combine: tokens a warp claims from the reduce queue at a time
 REDUCE_GRAB_TOKENS = 4
 
@@ -444,6 +443,7 @@ def _make_dispatch_v2(
     row_buffer_bytes = min(_align(hidden_bytes, 128), (MAX_LDS_BYTES - lds_rows) // NUM_WARPS // 128 * 128)
     if USE_TDM:
         lds_words = (lds_rows + NUM_WARPS * row_buffer_bytes) // 4
+    assert lds_words * 4 <= MAX_LDS_BYTES, f"V2 dispatch needs {lds_words * 4} LDS bytes > {MAX_LDS_BYTES}"
     grid_threads = num_channels * NUM_THREADS
     idx_dtype = fx.T.i64 if topk_idx_bytes == 8 else fx.T.i32
 
@@ -913,6 +913,7 @@ def _make_combine_v2(
     row_buffer_bytes = slot_bytes
     lds_grab = (push_warps * row_buffer_bytes if USE_TDM else 0) // 4
     smem_bytes = lds_grab * 4 + NUM_WARPS * 4
+    assert smem_bytes <= MAX_LDS_BYTES, f"V2 combine needs {smem_bytes} LDS bytes > {MAX_LDS_BYTES}"
 
     @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
     def combine_v2_kernel(

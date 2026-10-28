@@ -22,14 +22,16 @@ writes into fixed slots instead of channel rings. Its outputs match V1's; its ha
 """
 
 import contextlib
+import functools
 import os
+import warnings
 from typing import Optional
 
 import torch
 import torch.distributed as dist
 
 from primus_turbo.common.constants import ENV_EP_FORCE_CURRENT_STREAM
-from primus_turbo.flydsl.deep_ep.common import IS_GFX1250
+from primus_turbo.flydsl.deep_ep.arch import TRAITS
 from primus_turbo.flydsl.deep_ep.intranode_kernel import (
     combine_buffer_layout,
     combine_min_recv_buffer_tokens,
@@ -46,6 +48,7 @@ from primus_turbo.flydsl.deep_ep.intranode_v2_kernel import (
     MAX_EPOCH,
     META_BYTES,
     TAIL_DONE_BIT,
+    USE_TDM,
     combine_v2_grabs,
     combine_v2_layout,
     combine_v2_slot_bytes,
@@ -71,18 +74,39 @@ def _as_i32(value: int) -> int:
     return value - (1 << 32) if value >= (1 << 31) else value
 
 
-def v2_allowed() -> bool:
-    """flydsl_v2 runs on gfx1250; ``PRIMUS_TURBO_DEEPEP_V2_ANY_ARCH=1`` allows it elsewhere, where it
-    takes the untuned VGPR-copy path (bring-up only, see docs/flydsl_deepep_v2_mi355.md)."""
-    return IS_GFX1250 or os.environ.get("PRIMUS_TURBO_DEEPEP_V2_ANY_ARCH") == "1"
+# The GPU this process runs on, its default intranode backend, and where flydsl_v2 is supported (tested
+# and tuned); elsewhere flydsl_v2 runs as experimental (docs/flydsl_deepep_v2_unified.md, layer 3)
+ARCH = TRAITS.name
+_DEFAULT_BACKENDS = {"gfx1250": "flydsl_v2"}
+_V2_SUPPORTED = ("gfx1250",)
 
 
 def default_intranode_backend() -> str:
-    """``flydsl_v2`` on gfx1250; elsewhere ``cpp`` where the C++ DeepEP is loaded and ``flydsl`` where it
-    is not."""
-    if IS_GFX1250:
-        return "flydsl_v2"
+    """This GPU's entry of the default table (``flydsl_v2`` on gfx1250); elsewhere ``cpp`` where the C++
+    DeepEP is loaded and ``flydsl`` where it is not."""
+    default = _DEFAULT_BACKENDS.get(ARCH)
+    if default is not None:
+        return default
     return "cpp" if deep_ep_cpp is not None else "flydsl"
+
+
+def v2_supported() -> bool:
+    """Whether flydsl_v2 is tested and tuned on this GPU; elsewhere it runs as experimental."""
+    return ARCH in _V2_SUPPORTED
+
+
+def v2_code_path() -> str:
+    """How flydsl_v2 moves its rows in this process: ``"tdm"`` (gfx1250) or ``"register copy"``."""
+    return "tdm" if USE_TDM else "register copy"
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_v2_experimental() -> None:
+    warnings.warn(
+        f"flydsl_v2 is experimental on {ARCH} ({v2_code_path()}): it has not been validated or tuned there "
+        "(docs/flydsl_deepep_v2_unified.md)",
+        stacklevel=3,
+    )
 
 
 def get_intranode_backend(backend: Optional[str] = None) -> str:
@@ -134,14 +158,8 @@ class FlyDSLIntranodeRuntime:
         self, group: dist.ProcessGroup, num_nvl_bytes: int, comm_stream: torch.cuda.Stream, version: int = 1
     ) -> None:
         _check(version in (1, 2), f"version must be 1 or 2, got {version}")
-        # V2 is tuned and tested on gfx1250; its VGPR-copy path passes the tests there with TDM off, but
-        # has not run on gfx942 / gfx950
-        _check(
-            version == 1 or v2_allowed(),
-            "the V2 backend (flydsl_v2) runs on gfx1250 only; on this GPU use intranode_backend="
-            f"'{default_intranode_backend()}' (the default) or 'flydsl', or unset "
-            "PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND",
-        )
+        if version == 2 and not v2_supported():
+            _warn_v2_experimental()
         self.version = version
         self.group = group
         self.rank = group.rank()

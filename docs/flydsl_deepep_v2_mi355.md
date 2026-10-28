@@ -1,11 +1,13 @@
 # FlyDSL DeepEP V2 without TDM, and bringing it up on MI355X (gfx950)
 
-Status: **bring-up branch, not supported.** `flydsl_v2` ships for MI455X (gfx1250) only (PR #583). This
-branch adds two switches that let V2 run without TDM and off gfx1250, the benchmark used to measure it,
-and what is known so far. Adapting V2 to MI355X is parked: on MI355X it would have to beat the C++
-DeepEP (`cpp`, the default there), and nothing has been measured there yet.
+Status: **bring-up branch, not supported.** `flydsl_v2` ships for MI455X (gfx1250) (PR #583). On this
+branch the same backend runs on every GPU and picks its code path per GPU (design:
+[`flydsl_deepep_v2_unified.md`](flydsl_deepep_v2_unified.md)); off gfx1250 it is experimental. This
+document has the register-copy path, the benchmark used to measure it, and what is known so far. On
+MI355X V2 would have to beat the C++ DeepEP (`cpp`, the default there), and nothing has been measured
+there yet.
 
-## Why `flydsl_v2` is gfx1250 only
+## TDM on gfx1250, a register copy elsewhere
 
 V2 moves every token row global -> LDS -> remote heap with the Tensor Data Mover (TDM): one
 `tensor_load_2d` of a row into LDS, then one `tensor_store_2d` per destination rank. gfx942 / gfx950
@@ -24,8 +26,11 @@ TDM. With enough CUs that cap stops mattering (results below).
 
 | Variable | Effect |
 | --- | --- |
-| `PRIMUS_TURBO_DEEPEP_V2_TDM=0` | `flydsl_v2` takes the register copy on gfx1250 too. Read when `intranode_v2_kernel` is imported; `intranode_v2_kernel.USE_TDM` shows the path. |
-| `PRIMUS_TURBO_DEEPEP_V2_ANY_ARCH=1` | The runtime accepts `flydsl_v2` off gfx1250 (`flydsl_intranode.v2_allowed()`), and `tests/pytorch/deep_ep/test_intranode.py` runs its `flydsl_v2` tests there. |
+| `PRIMUS_TURBO_DEEPEP_V2_TDM=0` | `flydsl_v2` takes the register copy on gfx1250 too. Read when `intranode_v2_kernel` is imported; `flydsl_intranode.v2_code_path()` shows the path. |
+
+No switch is needed off gfx1250: the runtime accepts `flydsl_v2` on every GPU (with one warning per
+process where it is experimental), and `tests/pytorch/deep_ep/test_intranode.py` runs its `flydsl_v2`
+tests everywhere.
 
 Give each setting its own FlyDSL compile cache (`FLYDSL_RUNTIME_CACHE_DIR`) when switching between them,
 so that no kernel compiled for the other path is picked up.
@@ -64,7 +69,7 @@ Not done. What it takes, in order:
    from memory) have not run with V2. Run the unit tests on 2 GPUs, then 8:
 
    ```bash
-   PRIMUS_TURBO_DEEPEP_V2_ANY_ARCH=1 NCCL_CUMEM_ENABLE=0 FLYDSL_RUNTIME_CACHE_DIR=/tmp/v2_gfx950_cache \
+   NCCL_CUMEM_ENABLE=0 FLYDSL_RUNTIME_CACHE_DIR=/tmp/v2_gfx950_cache \
      python3 tests/pytorch/deep_ep/test_intranode.py -v -k flydsl_v2
    ```
 
@@ -76,7 +81,7 @@ Not done. What it takes, in order:
 3. Performance against `cpp`, at the same shape, at EP2 and EP8:
 
    ```bash
-   PRIMUS_TURBO_DEEPEP_V2_ANY_ARCH=1 PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM=1 \
+   PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM=1 \
    BACKENDS=cpp,flydsl_v2,flydsl CU_LIST=32,64,128,160,256 OUT_JSON=/tmp/ops_mi355_ep2.json \
    FLYDSL_RUNTIME_CACHE_DIR=/tmp/v2_gfx950_cache PYTHONPATH=benchmark/ops/deep_ep_v2:. \
      python3 -m torch.distributed.run --nproc_per_node=2 benchmark/ops/deep_ep_v2/bench_ops.py

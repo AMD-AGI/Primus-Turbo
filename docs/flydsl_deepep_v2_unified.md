@@ -87,14 +87,14 @@ the default of this GPU from one table:
 
 ## Validation on this branch
 
-| Check | Where | How |
-| --- | --- | --- |
-| gfx1250 TDM path unchanged | MI455X, compile only | all 9 kernels at EP2 / EP4, ISA byte-identical to `461d9caa` |
-| gfx1250 register copy unchanged | MI455X, compile only | the same with `PRIMUS_TURBO_DEEPEP_V2_TDM=0` |
-| gfx950 / gfx942 code unchanged and within limits | MI455X, compile only | ISA byte-identical to `461d9caa`; LDS of every kernel ≤ `max_lds_bytes`; no TDM instructions |
-| Both paths run | 2× MI455X | `test_intranode.py` with TDM and with `PRIMUS_TURBO_DEEPEP_V2_TDM=0`; a short benchmark of both |
-| wave64 at run time | gfx942 CI | gate 1 (manual dispatch of the CI workflow on this branch) |
-| MI355X | MI355X host | gates 2–4 |
+| Check | Where | How | Result |
+| --- | --- | --- | --- |
+| gfx1250 TDM path unchanged | MI455X, compile only | all 9 kernels at EP2 / EP4, ISA against `461d9caa` | 18 / 18 byte-identical |
+| gfx1250 register copy unchanged | MI455X, compile only | the same with `PRIMUS_TURBO_DEEPEP_V2_TDM=0` | 18 / 18 byte-identical |
+| gfx950 / gfx942 code unchanged and within limits | MI455X, compile only | ISA against `461d9caa`; LDS of every V2 kernel checked against `max_lds_bytes` when it is built; EP8 | 36 / 36 byte-identical; EP8 compiles on all four; wave64 code (`v_mbcnt_hi`, 64-bit exec), no TDM instructions |
+| Both paths run | 2× MI455X | `test_intranode.py` with TDM and with `PRIMUS_TURBO_DEEPEP_V2_TDM=0` (`NCCL_CUMEM_ENABLE=0`, #584); a short benchmark of both | 20 tests each: 18 pass, 2 skipped (`cpp`); dispatch / combine at 32 / 128 / 256 CUs: TDM 332 / 347, 182 / 151, 175 / 136 µs, register copy 758 / 604, 261 / 170, 185 / 139 µs, outputs checked |
+| wave64 at run time | gfx942 CI | gate 1 (manual dispatch of the CI workflow on this branch) | not run yet |
+| MI355X | MI355X host | gates 2–4 | not run yet |
 
 ## Risks
 

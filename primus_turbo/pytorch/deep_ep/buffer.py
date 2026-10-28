@@ -100,7 +100,8 @@ class Buffer:
                 `"cpp"` (HIP), `"flydsl"` or `"flydsl_v2"`; defaults to `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`,
                 else `"flydsl_v2"` on gfx1250 and `"cpp"` elsewhere (`"flydsl"` where the C++ DeepEP is not
                 built). `"cpp"` and `"flydsl"` return interchangeable handles; `"flydsl_v2"` (direct slot
-                writes, no channel rings, gfx1250 only) returns the same outputs with handles of its own, is
+                writes, no channel rings; TDM on gfx1250, a register copy elsewhere, where it is
+                experimental) returns the same outputs with handles of its own, is
                 not capturable in a CUDA graph, and needs every rank to dispatch the same number of tokens
                 and `num_nvl_bytes` that hold the whole batch (`get_token_buffer_size_hint`; `moe_dispatch`
                 sizes it itself). The internode and low-latency paths always use `"cpp"`.

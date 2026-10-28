@@ -36,7 +36,7 @@ the same `Buffer` API. Internode (rocSHMEM) and low-latency kernels always use `
 | --- | --- | --- | --- |
 | `cpp` | HIP V1 (channel rings): `csrc/kernels/deep_ep/{layout,intranode}.cu` | gfx942, gfx950; not loaded on gfx1250 | gfx942, gfx950 |
 | `flydsl` | FlyDSL V1, the same channel protocol: `primus_turbo/flydsl/deep_ep/intranode_kernel.py` | gfx942, gfx950, gfx1250 | builds without the C++ DeepEP |
-| `flydsl_v2` | FlyDSL V2, every token written straight into a fixed slot on its destination rank, no rings: `primus_turbo/flydsl/deep_ep/intranode_v2_kernel.py` | gfx1250 only | gfx1250 (MI455X) |
+| `flydsl_v2` | FlyDSL V2, every token written straight into a fixed slot on its destination rank, no rings: `primus_turbo/flydsl/deep_ep/intranode_v2_kernel.py` | gfx1250 (TDM); gfx942, gfx950 experimental (register copy) | gfx1250 (MI455X) |
 
 All three return the same tensors. `cpp` and `flydsl` also return the same handles, so a handle from
 one can drive the other's cached dispatch or combine; `flydsl_v2` handles work with `flydsl_v2` only.
