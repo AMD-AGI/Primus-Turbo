@@ -16,7 +16,11 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from primus_turbo.pytorch.core.utils import is_gfx1250
+from primus_turbo.flydsl.deep_ep.arch import (
+    CPP_DEEPEP_ARCHS,
+    default_intranode_backend,
+    rocm_arch,
+)
 
 from ._compat import Config, EventHandle, deep_ep_cpp
 from .flydsl_intranode import (
@@ -30,11 +34,31 @@ from .utils import EventOverlap, check_nvlink_connections
 
 def _require_deep_ep_cpp(what: str):
     if deep_ep_cpp is None:
+        if default_intranode_backend() == "cpp":
+            raise RuntimeError(
+                f"{what} needs the C++ DeepEP, which this build of primus_turbo does not include; "
+                f"DeepEP on {' / '.join(CPP_DEEPEP_ARCHS)} needs a build with it"
+            )
         raise RuntimeError(
-            f"{what} needs the C++ DeepEP, which this build of primus_turbo does not include; "
-            "only the FlyDSL intranode backend (intranode_backend='flydsl') runs without it"
+            f"{what} needs the C++ DeepEP, which is not loaded on {rocm_arch()}: only "
+            f"{' / '.join(CPP_DEEPEP_ARCHS)} run it. On {rocm_arch()} DeepEP runs intranode only: "
+            f"{' / '.join(map(str, SUPPORTED_NUM_RANKS))} ranks, num_nvl_bytes > 0, no low-latency mode; "
+            "use the all-to-all (RCCL) token dispatcher otherwise (use_turbo_deepep: false in Primus)"
         )
     return deep_ep_cpp
+
+
+def _check_device_arch() -> None:
+    """The backend and the FlyDSL kernels follow ``get_rocm_arch()``, which reads ``FLYDSL_GPU_ARCH``,
+    ``HSA_OVERRIDE_GFX_VERSION`` or ``rocm_agent_enumerator`` and falls back to gfx942 when that fails;
+    this GPU must be the one it names."""
+    device_arch = rocm_arch(torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName)
+    if device_arch != rocm_arch():
+        raise RuntimeError(
+            f"this GPU is {device_arch}, but get_rocm_arch() returns {rocm_arch()}, which picks the DeepEP "
+            "intranode backend and the target of the FlyDSL kernels; unset or fix FLYDSL_GPU_ARCH / "
+            "HSA_OVERRIDE_GFX_VERSION, or check that rocm_agent_enumerator lists this GPU"
+        )
 
 
 class _NoCppRuntime:
@@ -43,7 +67,7 @@ class _NoCppRuntime:
     def __getattr__(self, name):
         raise RuntimeError(
             f"Buffer.runtime.{name}: the FlyDSL intranode backend has no C++ runtime "
-            "(internode and low-latency need intranode_backend='cpp')"
+            "(internode and low-latency need the C++ DeepEP)"
         )
 
 
@@ -96,11 +120,12 @@ class Buffer:
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
                 otherwise, the resources will be released by the destructor.
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
-            intranode_backend: the kernels of the intranode path (`num_ranks <= 8`, no low-latency mode),
-                `"cpp"` (HIP), `"flydsl"` or `"flydsl_v2"`; defaults to `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`,
-                else `"cpp"` (`"flydsl"` where the C++ DeepEP is not loaded, as on gfx1250). `"cpp"` and
-                `"flydsl"` return interchangeable handles; `"flydsl_v2"` (direct slot writes, no channel rings,
-                gfx1250 only) returns the same outputs with handles of its own, is not capturable in a CUDA graph,
+            intranode_backend: for the tests only; users leave it unset. The kernels of the intranode path
+                (`num_ranks <= 8`, no low-latency mode), `"cpp"` (HIP), `"flydsl"` or `"flydsl_v2"`; unset,
+                the one of this GPU's architecture (`get_rocm_arch()`): `"cpp"` on gfx942 / gfx950,
+                `"flydsl_v2"` on gfx1250; other architectures are not supported and raise. `"cpp"` and `"flydsl"`
+                return interchangeable handles; `"flydsl_v2"` (direct slot writes, no channel rings, not on
+                gfx942 / gfx950) returns the same outputs with handles of its own, is not capturable in a CUDA graph,
                 and needs `num_nvl_bytes` that hold the whole batch of the
                 rank with the most tokens (`get_token_buffer_size_hint` with the same
                 `num_max_tokens_per_rank` on every rank; `moe_dispatch` sizes it itself). The internode and low-latency paths always use `"cpp"`.
@@ -120,6 +145,7 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
+        _check_device_arch()
         self.intranode_backend = get_intranode_backend(intranode_backend)
         use_flydsl = (
             self.intranode_backend in ("flydsl", "flydsl_v2")
@@ -329,8 +355,8 @@ class Buffer:
 
         Argument:
             num_ranks: the number of ranks.
-            backend: the intranode backend the config is for, else `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND` or the
-                default one (see `Buffer`). The backends share the dispatch values so far.
+            backend: for the tests only; users leave it unset. The intranode backend the config is for,
+                else this GPU's default one (see `Buffer`). The backends share the dispatch values so far.
 
         Returns:
             config: the recommended config.
@@ -359,8 +385,8 @@ class Buffer:
 
         Argument:
             num_ranks: the number of ranks.
-            backend: the intranode backend the config is for, else `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND` or the
-                default one (see `Buffer`).
+            backend: for the tests only; users leave it unset. The intranode backend the config is for,
+                else this GPU's default one (see `Buffer`).
 
         Returns:
             config: the recommended config.
@@ -368,7 +394,11 @@ class Buffer:
 
         # FlyDSL V1 on gfx1250 (8 KiB copy pieces): a larger send chunk halves the combine at 2 ranks and
         # cuts it by up to 60% at 4, DSv3 shape at 32-160 SMs
-        if num_ranks in (2, 4) and is_gfx1250() and get_intranode_backend(backend) == "flydsl":
+        if (
+            num_ranks in (2, 4)
+            and default_intranode_backend() == "flydsl_v2"
+            and get_intranode_backend(backend) == "flydsl"
+        ):
             return Config(Buffer.num_sms, 48 if num_ranks == 2 else 24, 256, 6, 128)
 
         # TODO: automatically tune
@@ -405,7 +435,8 @@ class Buffer:
             hidden_bytes: the bytes of a bf16 hidden row.
             num_ranks: the number of ranks.
             num_topk: the number of top-k experts per token.
-            backend: the intranode backend, else `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND` or the default one.
+            backend: for the tests only; users leave it unset. The intranode backend, else this GPU's
+                default one.
 
         Returns:
             size: the NVL buffer size in bytes, or 0.

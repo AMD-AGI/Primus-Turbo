@@ -9,25 +9,30 @@
 """The C++ DeepEP module when it is built, else Python stand-ins for what the FlyDSL
 intranode backend needs of it (``Config``, ``EventHandle``).
 
-The C++ DeepEP does not run on gfx1250 (MI455X) even where ``_C`` carries it, and ``_C``
-has no ``deep_ep`` where it is not compiled; the FlyDSL intranode backend runs without it.
+The C++ DeepEP runs on gfx942 / gfx950 only (``CPP_DEEPEP_ARCHS``): it is not loaded on gfx1250
+(MI455X) even where ``_C`` carries it, and ``_C`` has no ``deep_ep`` where it is not compiled; the
+FlyDSL intranode backend runs without it.
 """
 
 from typing import Optional
 
 import torch
 
-try:
-    import primus_turbo.pytorch._C.deep_ep as deep_ep_cpp
-except ImportError:
-    deep_ep_cpp = None
 
-if deep_ep_cpp is not None:
-    # rocm_agent_enumerator, so importing this does not initialize the device
-    from flydsl.runtime.device import get_rocm_arch
+def _load_deep_ep_cpp():
+    """``primus_turbo.pytorch._C.deep_ep`` on ``CPP_DEEPEP_ARCHS`` where it is built, else ``None``."""
+    try:
+        import primus_turbo.pytorch._C.deep_ep as module
+    except ImportError:
+        return None
+    # get_rocm_arch() reads rocm_agent_enumerator, so importing this does not initialize the device;
+    # the list, not default_intranode_backend(), which raises on other GPUs and must not at import
+    from primus_turbo.flydsl.deep_ep.arch import CPP_DEEPEP_ARCHS, rocm_arch
 
-    if get_rocm_arch().startswith("gfx1250"):
-        deep_ep_cpp = None
+    return module if rocm_arch() in CPP_DEEPEP_ARCHS else None
+
+
+deep_ep_cpp = _load_deep_ep_cpp()
 
 NUM_MAX_NVL_PEERS = 8
 

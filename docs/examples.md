@@ -473,7 +473,7 @@ print(c.shape)  # [128, 256]
 
 We added some new params for DeepEP buffer and dispatch. The normal kernels can be used in model training as the below example code shows.
 
-The intranode kernels default to `flydsl_v2` on MI455X (gfx1250) and to `cpp` on MI300 / MI355; see [Intranode backend](../primus_turbo/pytorch/deep_ep/README.md#intranode-backend) for how to choose one. `flydsl_v2` keeps the whole batch in its buffer, so size the buffer from the tokens per rank as `get_buffer` below does (`turbo.ops.moe_dispatch` does this by itself).
+The intranode kernels default to `flydsl_v2` on MI455X (gfx1250) and to `cpp` on MI300 / MI355; see [Intranode backend](../primus_turbo/pytorch/deep_ep/README.md#intranode-backend) for the known issues on MI455X. `flydsl_v2` keeps the whole batch in its buffer, so size the buffer from the tokens per rank as `get_buffer` below does (`turbo.ops.moe_dispatch` does this by itself).
 
 ```python
 import torch

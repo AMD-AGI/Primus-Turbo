@@ -8,7 +8,7 @@ run on gfx1250:
 - **`flydsl` (V1)**: the FlyDSL port of the DeepEP intranode kernels, the same ring protocol as the
   C++ (HIP) DeepEP, ported from gfx942 / gfx950 to gfx1250.
 - **`flydsl_v2` (V2)**: a gfx1250-only backend that replaces the rings with fixed per-token slots
-  and moves rows with TDM. It is the default on gfx1250.
+  and moves rows with TDM. It is the backend gfx1250 runs; V1 is kept for the tests.
 
 On gfx942 / gfx950 nothing changes: the default stays `cpp`, and the V1 kernels compile to the same
 ISA as before.
@@ -58,10 +58,12 @@ What differs on gfx1250, and how it is handled:
 
 ### 1. Backends and the host side
 
-- **Selection**: `Buffer(intranode_backend=...)`, then `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`,
-  then the default: `flydsl_v2` on gfx1250; elsewhere `cpp` when the C++ DeepEP is built, otherwise
-  `flydsl`. An explicit choice is never replaced; `flydsl_v2` off gfx1250 raises and names the
-  alternatives.
+- **Selection**: by architecture, from FlyDSL's `get_rocm_arch()` (`primus_turbo/flydsl/deep_ep/arch.py`):
+  `cpp` on gfx942 / gfx950 (`CPP_DEEPEP_ARCHS`), `flydsl_v2` on gfx1250 (`FLYDSL_DEEPEP_ARCHS`); other
+  architectures are not supported: they log an error pointing to the all-to-all (RCCL) token dispatcher and
+  raise. No environment variable picks the backend; a `Buffer` raises when `get_rocm_arch()` is not its
+  GPU's `gcnArchName`. `Buffer(intranode_backend=...)` is for the tests only, which take another one
+  with it (V1 on gfx1250); users leave it unset. `flydsl_v2` on gfx942 / gfx950 raises and names the default.
 - **No C++ `deep_ep`** (`primus_turbo/pytorch/deep_ep/_compat.py`): the C++ `Config` / `EventHandle`
   are used when the module can be imported, Python versions otherwise (`PyConfig` with
   `get_nvl_buffer_size_hint`, `PyEventHandle` over `torch.cuda.Event`). On gfx1250 the C++ module is
@@ -168,7 +170,7 @@ For callers:
   used.
 - **No CUDA-graph capture**: every call advances host state that its launch takes (the epochs of the
   counts and the flags, the base of the reduce queue), which a replay would reuse, so dispatch and
-  combine raise under capture. Use `flydsl` for CUDA graphs.
+  combine raise under capture. On MI455X, CUDA graphs need the all-to-all (RCCL) token dispatcher.
 - Limits: channels ≤ 1024; tokens per channel < 2^19; an 11-bit dispatch epoch with an epoch tag on
   the counts; a 4 MiB combine flag region (T × ranks ≤ 1 Mi rows); LDS per block ≤ 320 KiB.
 
@@ -189,8 +191,8 @@ The V2 heap scales with the token count, unlike V1's rings:
   `set_buffer_global_config(num_max_tokens_per_rank=...)` allocates up front instead.
 - Every allocation all-reduces the group's largest token count and top-k, because peers write into
   this rank's heap; ranks may dispatch different numbers of tokens. Token counts that change per step
-  without a known maximum (THD, dynamic CP) need `num_max_tokens_per_rank` set to the maximum, or
-  `flydsl`.
+  without a known maximum (THD, dynamic CP) are not supported: with a known maximum, set
+  `num_max_tokens_per_rank` to it; without one, use the all-to-all (RCCL) token dispatcher.
 
 ### 6. Watchdog
 

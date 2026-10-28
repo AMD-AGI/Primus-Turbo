@@ -16,12 +16,45 @@
 ``TRAITS`` holds the choices for the target FlyDSL compiles for (``FLYDSL_GPU_ARCH`` or the
 device), read once at import time: a process builds for one architecture, and FlyDSL keys its
 compile cache on the target.
+
+``default_intranode_backend`` picks the intranode backend of an architecture: ``cpp`` on
+``CPP_DEEPEP_ARCHS``, ``flydsl_v2`` on ``FLYDSL_DEEPEP_ARCHS``; any other is not supported: it logs an
+error pointing to the all-to-all (RCCL) token dispatcher and raises.
 """
 
 import functools
 from typing import NamedTuple, Optional
 
 from flydsl.runtime.device import get_rocm_arch
+
+from primus_turbo.common.logger import logger
+
+CPP_DEEPEP_ARCHS = ("gfx942", "gfx950")
+FLYDSL_DEEPEP_ARCHS = ("gfx1250",)
+
+
+def rocm_arch(arch: Optional[str] = None) -> str:
+    """``arch``, else ``get_rocm_arch()``, without its feature suffix (``gfx942:sramecc+`` -> ``gfx942``)."""
+    return (arch or get_rocm_arch()).split(":", 1)[0].lower()
+
+
+def default_intranode_backend(arch: Optional[str] = None) -> str:
+    """The intranode backend of ``arch``, else of this GPU: ``cpp`` on gfx942 / gfx950, ``flydsl_v2`` on
+    gfx1250; other architectures raise."""
+    arch = rocm_arch(arch)
+    if arch in CPP_DEEPEP_ARCHS:
+        intranode_backend = "cpp"
+    elif arch in FLYDSL_DEEPEP_ARCHS:
+        intranode_backend = "flydsl_v2"
+    else:
+        msg = (
+            f"DeepEP intranode is not supported on {arch} "
+            f"(supported: {', '.join(CPP_DEEPEP_ARCHS + FLYDSL_DEEPEP_ARCHS)}); use the all-to-all (RCCL) "
+            "token dispatcher instead (use_turbo_deepep: false in Primus)"
+        )
+        logger.error(msg, once=True)
+        raise RuntimeError(msg)
+    return intranode_backend
 
 
 class ArchTraits(NamedTuple):
@@ -106,7 +139,7 @@ _TRAITS = {
 def get_arch_traits(arch: Optional[str] = None) -> ArchTraits:
     """Traits of ``arch``, else of the target FlyDSL compiles for. Other targets get the gfx942 /
     gfx950 choices."""
-    arch = (arch or get_rocm_arch()).split(":", 1)[0].lower()
+    arch = rocm_arch(arch)
     return _TRAITS.get(arch) or ArchTraits(name=arch, **_GFX9)
 
 
