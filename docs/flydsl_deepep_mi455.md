@@ -5,8 +5,9 @@
 ## 0. Status
 
 - **Backends**: `Buffer(..., intranode_backend=...)` or the environment variable `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`, one of `cpp` (HIP V1), `flydsl` (FlyDSL V1) and `flydsl_v2` (FlyDSL V2, gfx1250 only). The C++ V2 backend, a separate change, uses `cpp_v2`; the two value lists are merged when it lands.
-  - gfx1250: the C++ DeepEP is not loaded (§5), the default is `flydsl`, and selecting `cpp` raises an error.
+  - gfx1250: the C++ DeepEP is not loaded (§5), the default is `flydsl_v2`, and selecting `cpp` raises an error. Use `flydsl` for CUDA graphs or a different token count per rank (§6).
   - Other architectures: the C++ DeepEP is loaded and the default is `cpp`; the runtime refuses `flydsl_v2` there (§6).
+  - How to choose, size and tune a backend: [the DeepEP README](../primus_turbo/pytorch/deep_ep/README.md#intranode-backend).
 - **Changes**:
 
   | Area | Content |
@@ -122,7 +123,7 @@ notify and `barrier_block` already are release fence + system-scope atomics + ac
 From Xiaoming's gfx1250 branch:
 - `primus_turbo/pytorch/deep_ep/_compat.py`: uses the C++ `Config` / `EventHandle` when the C++ `deep_ep` can be imported, and Python versions otherwise (`PyConfig` with `get_nvl_buffer_size_hint`, `PyEventHandle` wrapping `torch.cuda.Event`). On gfx1250 the C++ `deep_ep` is not loaded even if `_C` was built with it (decided with FlyDSL's `get_rocm_arch()`, which does not initialize the GPU).
 - `Buffer`: with a FlyDSL backend no C++ `Buffer` is constructed; the comm stream is `torch.cuda.Stream(priority=-1)`; `runtime` is a `_NoCppRuntime`, so internode / low-latency calls raise a clear error.
-- Default backend: `cpp` when the C++ can be loaded, otherwise `flydsl`.
+- Default backend (`default_intranode_backend`): `flydsl_v2` on gfx1250; elsewhere `cpp` when the C++ can be loaded, otherwise `flydsl`. An explicit choice is never replaced: `flydsl_v2` off gfx1250 raises and names the alternatives.
 - Tests: without the C++, the `cpp` parameter and `test_flydsl_matches_cpp` are skipped.
 
 ## 6. V2 (`flydsl_v2`)
@@ -281,11 +282,12 @@ Distance to the link (GB/s = MB a GPU receives from the other / time, per GPU an
   ```
 
 - The stress test, the combine ring lower-bound probe and the DSv3-shape benchmark behind §7 and §8 are not part of this repository; their parameters and results are given in §7 and §8.
-- A benchmark that calls the ops the way Primus does (`turbo.ops.moe_dispatch` + `moe_combine`, forward and backward, `async_finish=True`, `allocate_on_comm_stream=True`) and end-to-end training have not been run yet. §9 of Xiaoming's document has ready-made scripts and the DSv3 proxy command, as well as his DSv3 EP2 end-to-end result on MI455X (FlyDSL V1 with the default full fence 1318 ms/iter, RCCL all-to-all 1133 ms/iter, nearly identical lm loss).
+- A benchmark that calls the ops the way Primus does (`turbo.ops.moe_dispatch` + `moe_combine`, forward and backward, `async_finish=True`, `allocate_on_comm_stream=True`) has not been run yet; end-to-end training at EP4 (DSv3 proxy, GPT-OSS 20B) is in the description of PR #583. §9 of Xiaoming's document has ready-made scripts and the DSv3 proxy command, as well as his DSv3 EP2 end-to-end result on MI455X (FlyDSL V1 with the default full fence 1318 ms/iter, RCCL all-to-all 1133 ms/iter, nearly identical lm loss).
 
 ## 12. To do
 
-- End-to-end runs with V2 (DSv3 proxy, GPT-OSS 20B / 120B).
+- End-to-end runs with real (unforced) routing and GPT-OSS 120B.
+- `flydsl` under CUDA-graph capture on MI455X, the backend to use there.
 - V2 with a different token count per rank (THD, dynamic CP): an all-reduce of the maximum before sizing, as Megatron's HybridEP path offers.
 - A benchmark that calls the ops the way Primus does.
 - EP4 numbers with the §8 method; runs on gfx950; 8 GPUs.
