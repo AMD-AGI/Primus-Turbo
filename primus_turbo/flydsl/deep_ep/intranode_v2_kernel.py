@@ -965,15 +965,18 @@ def _make_combine_v2(
         warps_per_peer = grid_push_warps // num_peers
         warp_source = global_warp % fx.Int32(num_peers)
         warp_source = warp_source + arith.select(warp_source >= rank, fx.Int32(1), fx.Int32(0))
+        # the rows actually received, not num_rows: under a worst-case allocation x has
+        # num_worst_tokens rows, and pushing its tail would land on other ranks' slots
+        rows_received = _rank_prefix(rank_prefix_res, num_ranks, num_ranks - 1, rank)
         peer = peers[0]
         row_begin = row_begins[0]
-        row_end = row_begins[1] if num_ranks > 1 else num_rows
+        row_end = row_begins[1] if num_ranks > 1 else rows_received
         base = bases[0]
         for s in range_constexpr(1, num_ranks):
             is_s = warp_source == fx.Int32(s)
             peer = arith.select(is_s, peers[s], peer)
             row_begin = arith.select(is_s, row_begins[s], row_begin)
-            row_end = arith.select(is_s, row_begins[s + 1] if s + 1 < num_ranks else num_rows, row_end)
+            row_end = arith.select(is_s, row_begins[s + 1] if s + 1 < num_ranks else rows_received, row_end)
             base = arith.select(is_s, bases[s], base)
         row = row_begin + global_warp // fx.Int32(num_peers)
         is_pusher = (warp_id < fx.Int32(push_warps)) & (global_warp < fx.Int32(warps_per_peer * num_peers))
