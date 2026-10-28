@@ -48,7 +48,6 @@ from primus_turbo.flydsl.mega.fp8.gemm_helper import run_compiled
 from primus_turbo.flydsl.mega.fp8.prims import atomic_add, ld, st
 from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, sym_layout_key, sym_map
 from primus_turbo.flydsl.utils.buffer_ops import (
-    _unwrap_value,
     buffer_load,
     buffer_store,
     create_buffer_resource,
@@ -79,12 +78,12 @@ _LDS_SCOPE = "workgroup"
 
 def lds_base_addr():
     """Integer addrspace-3 base of the dynamic shared region (for prims ld/st/atomic_add)."""
-    return _unwrap_value(_fly_ptrtoint(get_dyn_shared()))
+    return fx.as_ir_value(_fly_ptrtoint(get_dyn_shared()))
 
 
 def _ext_i64(v):
     """Sign-extend an fx i32 value to i64 (group_lens/offs stored as int64)."""
-    return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64, _unwrap_value(v)), signed=True)
+    return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64, fx.as_ir_value(v)), signed=True)
 
 
 # The prologue returns one flat positional handle (DeepEP-style) the dispatch/combine kernels
@@ -152,7 +151,7 @@ def _make_dispatch_prologue(
         def load_expert_id(elem_index):
             value = buffer_load(topk_resource, elem_index, vec_width=1, dtype=idx_load_dtype)
             if idx_is_i64:
-                value = fx.arith.ArithValue(fx.arith.trunci(fx.T.i32, _unwrap_value(value)), signed=True)
+                value = fx.arith.ArithValue(fx.arith.trunci(fx.T.i32, fx.as_ir_value(value)), signed=True)
             return value
 
         # single scratch tensor; sub-regions addressed via WS_* offsets below

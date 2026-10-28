@@ -51,12 +51,7 @@ from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
     gemm_bf16_nn_tile,
     gemm_bf16_nt_tile,
 )
-from primus_turbo.flydsl.utils.buffer_ops import (
-    _create_i64_constant,
-    _unwrap_value,
-    create_llvm_ptr,
-    get_element_ptr,
-)
+from primus_turbo.flydsl.utils.buffer_ops import create_llvm_ptr, get_element_ptr
 from primus_turbo.flydsl.utils.gemm_helper import (
     BLOCK_K,
     G2SLoader,
@@ -81,19 +76,19 @@ from primus_turbo.flydsl.utils.prims import _i64
 
 def _load_i32(base, offset):
     """Scalar i32 table read at element `offset` off an int64 base pointer."""
-    ptr = create_llvm_ptr(base + _i64(offset) * _create_i64_constant(4))
-    return ArithValue(_unwrap_value(_llvm.load(ir.IntegerType.get_signless(32), ptr)))
+    ptr = create_llvm_ptr(base + _i64(offset) * _std_arith.constant(fx.T.i64, 4))
+    return ArithValue(_llvm.load(ir.IntegerType.get_signless(32), ptr))
 
 
 def _load_i64_as_i32(base, offset):
     # load global i64 at base[offset] and truncate to i32
-    ptr = create_llvm_ptr(_unwrap_value(base), 1)  # global address space
-    idx = _unwrap_value(offset)
+    ptr = create_llvm_ptr(base, 1)  # global address space
+    idx = fx.as_ir_value(offset)
     if isinstance(idx.type, ir.IndexType):
-        idx = _unwrap_value(_std_arith.IndexCastOp(fx.T.i64, idx).result)
+        idx = _std_arith.IndexCastOp(fx.T.i64, idx).result
     elif isinstance(idx.type, ir.IntegerType) and idx.type.width < 64:
-        idx = _unwrap_value(_std_arith.ExtSIOp(fx.T.i64, idx).result)
-    byte_off = _unwrap_value(_std_arith.MulIOp(idx, _create_i64_constant(8)).result)
+        idx = _std_arith.ExtSIOp(fx.T.i64, idx).result
+    byte_off = _std_arith.MulIOp(idx, _std_arith.constant(fx.T.i64, 8)).result
     elem = get_element_ptr(ptr, byte_offset=byte_off, elem_type=fx.T.i8)
     val = _llvm.LoadOp(fx.T.i64, elem, ordering=_llvm.AtomicOrdering.monotonic, alignment=8)
     trunc = _std_arith.TruncIOp(fx.T.i32, val.result)

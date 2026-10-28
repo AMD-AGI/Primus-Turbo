@@ -21,7 +21,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
-from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace as _TargetAddressSpace
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
@@ -737,22 +736,13 @@ class DualwaveKernelContext:
         self.q_gmem_elem_offset = self.q_start * self.stride_q_n_v + self.q_head_idx * traits.HEAD_DIM
         self.kv_gmem_elem_offset = self.kv_head_idx * traits.HEAD_DIM
 
-        self.buf_flags_i32 = fx.Int32(buffer_ops._get_buffer_flags())
         self.elem_ir = self.elem_dtype.ir_type
 
         def _view(tensor, byte_off, nrec, layout):
             base_iter = fx.get_iter(tensor)
             base_i64 = fx.Int64(fx.ptrtoint(base_iter))
             shifted = fx.inttoptr(base_iter.type, base_i64 + fx.Int64(byte_off))
-            buf_ptr_ty = fx.PointerType.get(
-                elem_ty=self.elem_ir,
-                address_space=_TargetAddressSpace.BufferDesc,
-                alignment=base_iter.alignment,
-            )
-            buf_ptr = fx.make_ptr(
-                buf_ptr_ty,
-                [shifted, fx.Int16(0).ir_value(), fx.Int64(nrec).ir_value(), self.buf_flags_i32.ir_value()],
-            )
+            buf_ptr = fx.rocdl.make_buffer_ptr(shifted, num_records_bytes=fx.Int64(nrec))
             return fx.logical_divide(fx.make_view(buf_ptr, layout), fx.make_layout(1, 1))
 
         def _batch_views(seqlen, stride, sbhd_heads, tok_base, ta, tb):

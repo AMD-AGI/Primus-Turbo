@@ -37,7 +37,6 @@ from primus_turbo.flydsl.mega.tune_utils import (
     autotune,
 )
 from primus_turbo.flydsl.utils.buffer_ops import (
-    _unwrap_value,
     buffer_load,
     buffer_store,
     create_buffer_resource,
@@ -138,7 +137,7 @@ def _make_dispatch_prologue(
 
     def _ext_i64(v):
         """Sign-extend an fx i32 value to i64 (group_lens/offs stored as int64)."""
-        return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64, _unwrap_value(v)), signed=True)
+        return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64, fx.as_ir_value(v)), signed=True)
 
     @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def dispatch_prologue_kernel(
@@ -178,7 +177,7 @@ def _make_dispatch_prologue(
         recv_token_to_pool_rows_base = workspace.get_recv_token_to_pool_rows_ptr()
         weight_recv_base = workspace.get_weight_recv_buf_ptr()
 
-        lds_base = _unwrap_value(_fly_ptrtoint(get_dyn_shared()))
+        lds_base = fx.as_ir_value(_fly_ptrtoint(get_dyn_shared()))
         topk_resource = create_buffer_resource(TOPK_INDICES, max_size=True)
         idx_load_dtype = TOPK_INDICES.element_type
         idx_is_i64 = fx.const_expr(idx_load_dtype.width == 64)
@@ -186,7 +185,7 @@ def _make_dispatch_prologue(
         def load_expert_id(elem_idx):
             value = buffer_load(topk_resource, elem_idx, vec_width=1, dtype=idx_load_dtype)
             if idx_is_i64:
-                value = fx.arith.ArithValue(fx.arith.trunci(fx.T.i32, _unwrap_value(value)), signed=True)
+                value = fx.arith.ArithValue(fx.arith.trunci(fx.T.i32, fx.as_ir_value(value)), signed=True)
             return value
 
         def route_order(route_idx):
