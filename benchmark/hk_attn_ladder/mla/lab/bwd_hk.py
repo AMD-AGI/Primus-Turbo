@@ -128,10 +128,15 @@ SPECS = {
 }  # fmt: skip
 
 
-def configure(delta=None):
+def configure(delta=None, dkdv_block=64):
+    """delta: see DELTA; dkdv_block: the k_dkdv96ds workgroup size of the rung (64; 128 for the 4-wave
+    wave-specialized kernel, which supports MHA only)."""
     global DELTA, _KERNELS
     if delta not in (None, "hk", "flydsl"):
         raise ValueError(f"delta must be None, 'hk' or 'flydsl', got {delta!r}")
+    if dkdv_block not in (64, 128):
+        raise ValueError(f"dkdv_block must be 64 or 128, got {dkdv_block!r}")
+    SPECS["k_dkdv96ds"] = dict(SPECS["k_dkdv96ds"], block=dkdv_block)
     with _LOCK:
         DELTA, _KERNELS = delta, None
 
@@ -294,6 +299,8 @@ def _plan(
         softmax_scale = 1.0 / math.sqrt(_k.D_QK)
     scale = float(softmax_scale)
     g = hq // hkv
+    if SPECS["k_dkdv96ds"]["block"] == 128 and g != 1:
+        raise NotImplementedError("hk_attn_bwd: the wave-specialized k_dkdv96ds (block 128) supports MHA only")
     budget = MAX_SCRATCH_BYTES if max_scratch_bytes is None else int(max_scratch_bytes)
     hc = _chunk_heads(b, sq, skv, hq, c, math.lcm(hg_kv, hg_q), budget)
     if hc == 0:
@@ -380,7 +387,8 @@ def _plan(
             DS_MODE,
         )
         dq_values = (ds, k_, dq_, sq, skv, hq, hkv, g, skv // 32, skv - sq, c, q_off, ntile, hg_q)
-        launches.append(("dkdv", "k_dkdv96ds", ((hg_kv, limits.k3_nblk(skv), gz_kv), 64, dkdv_values)))
+        launches.append(("dkdv", "k_dkdv96ds", ((hg_kv, limits.k3_nblk(skv), gz_kv), SPECS["k_dkdv96ds"]["block"],
+                                                dkdv_values)))
         launches.append(("dq", "k_dqds_c", ((hg_q, ntile + nhead, gz_q), 128, dq_values)))
     return {
         "launches": launches,

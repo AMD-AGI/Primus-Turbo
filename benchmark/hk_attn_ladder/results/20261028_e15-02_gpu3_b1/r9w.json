@@ -1,0 +1,182 @@
+{
+ "meta": {
+  "ladder": "mla_bwd",
+  "shape": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+  "device": "gfx1250",
+  "cus": 256,
+  "torch": "2.14.0+rocm10.2.0a20261011",
+  "rounds": 10,
+  "iters": 20,
+  "settle_s": 1.0,
+  "flush_mb": 512,
+  "hip_visible_devices": null,
+  "host": "7b22589a8076",
+  "time": "2026-10-28 02:38:12",
+  "useful_flops": 3574285205504,
+  "data": "randn"
+ },
+ "rows": [
+  {
+   "arm": "r8a",
+   "ms": 2.3467040061950684,
+   "mean": 2.3511284589767456,
+   "ci95": 0.006006266853474117,
+   "tflops": 1523.1086647775933,
+   "sclk": 1297.0,
+   "mcyc": 3.0526152721643447,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    2.3420565128326416,
+    2.34706449508667,
+    2.344220519065857,
+    2.346343517303467,
+    2.3619664907455444,
+    2.362207055091858,
+    2.357980966567993,
+    2.346102476119995,
+    2.342918038368225,
+    2.360424518585205
+   ],
+   "sclk_rounds": [
+    1303.0,
+    1301.0,
+    1300.0,
+    1297.0,
+    1297.0,
+    1296.0,
+    1296.0,
+    1300.0,
+    1293.0,
+    1295.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "dq: when (Skv - Sq) % 64 == 32 the last steady unit runs as a generic unit, whose burst handles the first masked row's partly stored pairs (fixes the r2d..r7 rect32 dQ read; production shapes unchanged)",
+   "ref_ms_a08": null
+  },
+  {
+   "arm": "r9w",
+   "ms": 2.9477059841156006,
+   "mean": 2.9475778937339783,
+   "ci95": 0.009878261071493486,
+   "tflops": 1212.565033542988,
+   "sclk": 1603.5,
+   "mcyc": 4.723065303981304,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    2.924330472946167,
+    2.9735054969787598,
+    2.9401345252990723,
+    2.9319019317626953,
+    2.9484870433807373,
+    2.955538511276245,
+    2.9439005851745605,
+    2.946924924850464,
+    2.9562588930130005,
+    2.954796552658081
+   ],
+   "sclk_rounds": [
+    1606.0,
+    1609.0,
+    1609.0,
+    1604.0,
+    1615.0,
+    1601.0,
+    1603.0,
+    1600.0,
+    1599.0,
+    1595.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "dK/dV wave-specialized: 4-wave workgroups, producer waves (S/dP, softmax, dS export) and consumer waves (dV/dK, TDM) on different SIMDs, P/dS through a double-buffered LDS exchange, 4-stage ring",
+   "ref_ms_a08": null,
+   "step": {
+    "over": "r8a",
+    "median": 0.7990463101065337,
+    "mean": 0.7976598576629724,
+    "ci95": 0.002840135941265971
+   },
+   "step_cyc": {
+    "median": 0.646916375864109,
+    "ci95": 0.00260226719052333
+   }
+  },
+  {
+   "arm": "r9w#null",
+   "ms": 2.950520694255829,
+   "mean": 2.9497953772544863,
+   "ci95": 0.010493245431860214,
+   "tflops": 1211.4082820915428,
+   "sclk": 1603.0,
+   "mcyc": 4.724637671232223,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    2.933084487915039,
+    2.9541760683059692,
+    2.9331640005111694,
+    2.9416369199752808,
+    2.9822579622268677,
+    2.9509514570236206,
+    2.950089931488037,
+    2.9518924951553345,
+    2.9394339323043823,
+    2.96126651763916
+   ],
+   "sclk_rounds": [
+    1606.0,
+    1601.0,
+    1604.0,
+    1605.0,
+    1602.0,
+    1605.0,
+    1601.0,
+    1605.0,
+    1596.0,
+    1596.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "dK/dV wave-specialized: 4-wave workgroups, producer waves (S/dP, softmax, dS export) and consumer waves (dV/dK, TDM) on different SIMDs, P/dS through a double-buffered LDS exchange, 4-stage ring",
+   "ref_ms_a08": null
+  }
+ ],
+ "null_control": {
+  "median": 0.9981095689544155,
+  "mean": 0.9992614225297392,
+  "ci95": 0.0036773333072506213
+ }
+}
