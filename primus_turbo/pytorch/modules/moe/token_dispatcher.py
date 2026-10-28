@@ -38,6 +38,53 @@ def permute_overflow_count(reset: bool = True) -> int:
     return count
 
 
+_DEBUG_NAN = os.environ.get("PRIMUS_TURBO_DEBUG_NAN", "0") == "1"
+_debug_nan_calls = [0]
+_debug_nan_records = []
+
+
+def _nan_probe(tag: str, t: Optional[torch.Tensor], valid_rows=None, grad: bool = False):
+    """Debug only (PRIMUS_TURBO_DEBUG_NAN=1): count, on the device and without a host sync,
+    the non-finite entries of ``t`` in its first ``valid_rows`` rows (a device scalar) and in
+    the rest; with ``grad`` the same for its gradient in backward. ``nan_probe_report`` prints."""
+    if not _DEBUG_NAN or t is None or not t.is_floating_point():
+        return
+    call = _debug_nan_calls[0]
+
+    def record(x, what):
+        x = x.detach()
+        n = x.shape[0] if x.dim() else 1
+        rowbad = (~torch.isfinite(x)).reshape(n, -1).sum(1)
+        if valid_rows is None:
+            mask = torch.ones(n, dtype=torch.bool, device=x.device)
+        else:
+            mask = torch.arange(n, device=x.device) < valid_rows
+        # products, not boolean indexing, which would sync
+        _debug_nan_records.append((call, what, n, (rowbad * mask).sum(), (rowbad * ~mask).sum()))
+
+    record(t, tag)
+    if grad and t.requires_grad:
+        t.register_hook(lambda g: record(g, tag + ".grad"))
+
+
+def nan_probe_report(limit: int = 12) -> None:
+    """Print the first ``limit`` non-finite records since the last report, in recording order."""
+    if not _DEBUG_NAN:
+        return
+    shown = 0
+    for call, what, n, bad_v, bad_t in _debug_nan_records:
+        bv, bt = int(bad_v), int(bad_t)
+        if (bv or bt) and shown < limit:
+            print(
+                f"[nan-probe] rank={torch.distributed.get_rank()} call={call} {what}: rows={n} "
+                f"nonfinite valid={bv} tail={bt}",
+                flush=True,
+            )
+            shown += 1
+    print(f"[nan-probe] rank={torch.distributed.get_rank()} records={len(_debug_nan_records)} bad={shown}", flush=True)
+    _debug_nan_records.clear()
+
+
 class TokenDispatcher:
     def __init__(
         self,
@@ -305,6 +352,8 @@ class DeepEPTokenDispatcher(TokenDispatcher):
                 warnings.warn("DeepEP only supports float32 probs!")
             token_probs = token_probs.float()
 
+        if _DEBUG_NAN:
+            _nan_probe("dispatch.in", hidden_states, grad=True)
         # DeepEP already synced to build these host counts; reuse them in _post_dispatch.
         (
             hidden_states,
@@ -326,6 +375,11 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         self.handle = handle
         self.tokens_per_expert = tokens_per_expert
         self.dispatched_indices = dispatched_indices
+        if _DEBUG_NAN:
+            _debug_nan_calls[0] += 1
+            self._debug_num_recv = (dispatched_indices >= 0).any(1).sum()
+            _nan_probe("dispatch.recv_x", hidden_states, self._debug_num_recv, grad=True)
+            _nan_probe("dispatch.recv_probs", dispatched_probs, self._debug_num_recv, grad=True)
 
         return hidden_states, dispatched_probs
 
@@ -375,6 +429,10 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             if device not in _permute_overflow_count:
                 _permute_overflow_count[device] = torch.zeros(1, dtype=torch.int32, device=overflow_flag.device)
             _permute_overflow_count[device].add_(overflow_flag)
+        if _DEBUG_NAN:
+            self._debug_num_perm = tokens_per_expert.sum()
+            _nan_probe("permute.x", hidden_states, self._debug_num_perm, grad=True)
+            _nan_probe("permute.probs", permuted_probs, self._debug_num_perm, grad=True)
 
         if not self.deepep_use_cuda_num_tokens_per_expert:
             if self.tokens_per_expert.numel() > 0:
@@ -388,6 +446,8 @@ class DeepEPTokenDispatcher(TokenDispatcher):
     def _pre_combine(self, hidden_states, grad_quantize_dtype=None):
         """``grad_quantize_dtype`` (FP8): backward hands the experts their output gradient as
         a tensorwise ``QuantizedTensor`` (see ``moe_unpermute``); the experts must accept it."""
+        if _DEBUG_NAN:
+            _nan_probe("experts.out", hidden_states, self._debug_num_perm, grad=True)
         hidden_states, _ = turbo.ops.moe_unpermute(
             hidden_states,
             self.row_id_map,
@@ -397,6 +457,8 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             backend=self.permute_backend,
             grad_quantize_dtype=grad_quantize_dtype,
         )
+        if _DEBUG_NAN:
+            _nan_probe("unpermute.out", hidden_states, self._debug_num_recv, grad=True)
         return hidden_states
 
     def _exec_combine(self, hidden_states):
@@ -407,6 +469,8 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             async_finish=self.deepep_async_finish,
             allocate_on_comm_stream=self.deepep_allocate_on_comm_stream,
         )
+        if _DEBUG_NAN:
+            _nan_probe("combine.out", hidden_states, grad=True)
         # Clear per-dispatch state; a second combine without re-dispatch must fail loudly.
         self.handle = None
         self.row_id_map = None
