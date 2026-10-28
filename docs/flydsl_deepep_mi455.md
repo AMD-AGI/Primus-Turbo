@@ -154,7 +154,7 @@ From Xiaoming's gfx1250 branch:
 - `test_flydsl_v2_refuses_graph_capture`: `flydsl_v2` dispatch and combine raise under CUDA-graph capture and the buffer keeps working.
 - `test_flydsl_matches_cpp`: bit-for-bit comparison with the C++ backend; skipped on gfx1250.
 - `test_moe_ops_size_the_v2_buffer` (gfx1250): `moe_dispatch` / `moe_combine` on `flydsl_v2` with no preset buffer, 4096 then 12288 tokens; the buffer grows. `TokenBufferSizeHintTestCase` (host only): the size hint against the V2 heap layout.
-- Result on MI455X, 2 GPUs: 9 tests pass and 2 are skipped (`test_flydsl_matches_cpp`), before `test_destroy_and_recreate` and `test_flydsl_v2_refuses_graph_capture` were added. gfx942 CI: every `cpp` and `flydsl` test passes, `test_destroy_and_recreate` and `test_flydsl_matches_cpp` included.
+- Result on MI455X: 12 tests pass and 2 are skipped (`test_flydsl_matches_cpp`), on 2 GPUs and on 4 GPUs. With the ROCm SDK used here a test process can still crash after its test, inside `dist.destroy_process_group()` (the HIP bug below; 4 of 7 four-GPU runs of `test_moe_ops_size_the_v2_buffer`, 1 of 10 two-GPU runs of `test_rank_receives_nothing`); with `NCCL_CUMEM_ENABLE=0` none of 15 runs did. gfx942 CI: every `cpp` and `flydsl` test passes, `test_destroy_and_recreate` and `test_flydsl_matches_cpp` included.
 
 **Stress test** (ported from Xiaoming's `stress.py`, with V2 added; run on an earlier revision of this branch, before its rebase onto `main`)
 - 10 configurations (num_sms, send, recv, T, H): (2, 1, 2, 37, 256), (2, 2, 4, 513, 7168), (8, 1, 2, 1000, 2048), (8, 4, 8, 4096, 7168), (8, 8, 16, 2049, 4096), (24, 6, 256, 4096, 7168), (24, 3, 7, 777, 1024), (8, 8, 256, 1, 7168), (8, 4, 8, 1000, 2880), (24, 6, 256, 4096, 2880). Dispatch uses small rings to force frequent wrap-around and back-pressure, and the combine ring is at its lower bound; 30% of the top-k entries are set to -1; every iteration checks each row against its source token through `src_idx` and checks the combine result.
@@ -273,7 +273,7 @@ Distance to the link (GB/s = MB a GPU receives from the other / time, per GPU an
 
 ## 11. Reproducing
 
-- Unit tests (inside the container; `HIP_VISIBLE_DEVICES` sets the number of GPUs):
+- Unit tests (inside the container; `HIP_VISIBLE_DEVICES` sets the number of GPUs; with ROCm SDK `10.2.0a20261011` add `NCCL_CUMEM_ENABLE=0` to avoid the crash at exit in §7):
 
   ```bash
   HIP_VISIBLE_DEVICES=0,1 python tests/pytorch/deep_ep/test_intranode.py -v
