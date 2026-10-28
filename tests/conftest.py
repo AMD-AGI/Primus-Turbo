@@ -47,6 +47,18 @@ _GFX1250_ENABLED_TESTS = (
     # runs here.
     "tests/pytorch/ops/test_attention.py::test_sparse_mla_op",
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_sparse_mla.py",
+    # Buffer OOB, copy_warp and cross-XCD flag handoff of the BF16 Mega MoE EP path.
+    "tests/pytorch/ops/test_mega_bf16_gfx1250_prims.py",
+    # The BF16 Mega NT GEMM tile (gathered A, LDS-staged buffer-store epilogue).
+    "tests/pytorch/ops/test_mega_bf16_gfx1250_gemm.py",
+    # The fused Mega dispatch + L1 GEMM, single GPU (EP1).
+    "tests/pytorch/ops/test_mega_bf16_gfx1250_dispatch_gemm.py",
+    # The fused Mega L2 GEMM + combine, single GPU (EP1).
+    "tests/pytorch/ops/test_mega_bf16_gfx1250_gemm_combine.py",
+    # The fused_mega_moe op (forward and backward) on the gfx1250 kernels, single GPU (EP1).
+    "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe.py",
+    # The same op across every visible GPU (EP2+).
+    "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe_ep.py",
 )
 
 

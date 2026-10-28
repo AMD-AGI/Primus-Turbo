@@ -33,6 +33,7 @@ from primus_turbo.pytorch.core.backend import (
     KernelBackend,
     TuneCache,
 )
+from primus_turbo.pytorch.core.utils import is_gfx1250
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
 
@@ -51,6 +52,12 @@ class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
         supported &= x.dim() == 2 and w1.dim() == 3 and w2.dim() == 3
         supported &= x.dtype in _SUPPORTED_DTYPES
         supported &= w1.dtype in _SUPPORTED_DTYPES and w2.dtype in _SUPPORTED_DTYPES
+        if is_gfx1250():
+            from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_gfx1250_impl import (
+                gfx1250_supports,
+            )
+
+            supported &= gfx1250_supports(w1, w2, kwargs.get("layout"))
         return supported
 
     @staticmethod
@@ -66,6 +73,14 @@ class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
         **kwargs,
     ):
 
+        if is_gfx1250():
+            from primus_turbo.pytorch.kernels.fused_mega_moe import (
+                fused_mega_moe_gfx1250_impl as gfx1250,
+            )
+
+            l1_out, dispatch_weights, handle = gfx1250.stage1_forward(x, w1, group, topk_idx, topk_weights)
+            y = gfx1250.stage2_forward(l1_out, w2, handle, topk_idx, dispatch_weights, activation)
+            return y, l1_out, dispatch_weights, list(handle)
         handle, dispatch_weights = run_dispatch_prologue(x, w1, group, topk_idx, topk_weights)
         l1_out, _, _ = dispatch_grouped_gemm_bf16_flydsl_kernel(x, w1, group, handle=handle, layout=layout)
 
@@ -153,16 +168,27 @@ def _fused_mega_moe_forward_meta(
     layout: str,
     activation: Optional[List[float]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
-    # eager-only path (EP rendezvous can't be traced); approximate meta for completeness.
+    # Pool and routing-table lengths depend on the routing, so they are unbacked sizes; inductor
+    # checks every real output against these shapes.
+    ctx = torch.library.get_ctx()
     N2 = w2.shape[1] if layout == "nt" else w2.shape[2]
     two_I = w1.shape[1] if layout == "nt" else w1.shape[2]
     num_tokens = x.shape[0]
+    num_pool_rows = ctx.new_dynamic_size()
     y = x.new_empty((num_tokens, N2), dtype=torch.bfloat16)
-    l1_out = x.new_empty((0, two_I), dtype=torch.bfloat16)
-    dispatch_weights = x.new_empty((0,), dtype=torch.float32)
+    l1_out = x.new_empty((num_pool_rows, two_I), dtype=torch.bfloat16)
+    dispatch_weights = x.new_empty((num_pool_rows,), dtype=torch.float32)
     # save_for_backward(*handle) fixes the handle length at trace time, so the fake needs every field.
-    handle = [x.new_empty((0,), dtype=dtype) for dtype in DISPATCH_HANDLE_DTYPES]
-    return y, l1_out, dispatch_weights, handle
+    handle = DispatchHandle(
+        *(x.new_empty((ctx.new_dynamic_size(),), dtype=dtype) for dtype in DISPATCH_HANDLE_DTYPES)
+    )
+    handle = handle._replace(
+        pool_row_to_route=x.new_empty((num_pool_rows,), dtype=DISPATCH_HANDLE_DTYPES.pool_row_to_route),
+        recv_token_to_pool_rows=x.new_empty(
+            (ctx.new_dynamic_size(), topk_idx.shape[-1]), dtype=DISPATCH_HANDLE_DTYPES.recv_token_to_pool_rows
+        ),
+    )
+    return y, l1_out, dispatch_weights, list(handle)
 
 
 def fused_mega_moe_forward_impl(

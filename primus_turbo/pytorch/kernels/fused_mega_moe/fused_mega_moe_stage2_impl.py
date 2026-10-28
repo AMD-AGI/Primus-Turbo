@@ -23,6 +23,7 @@ from primus_turbo.flydsl.utils.swiglu_kernel import (
     swiglu_backward_flydsl_kernel,
     swiglu_flydsl_kernel,
 )
+from primus_turbo.pytorch.core.utils import is_gfx1250
 from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_bias_impl import (
     fc1_bias_backward,
     fc2_bias_backward,
@@ -43,6 +44,14 @@ def fused_mega_moe_stage2_forward_impl(
 
     ``fc1_bias`` [E_local, 2I] is added to ``l1_out`` inside the activation, ``fc2_bias`` [E_local, H]
     to each row's L2 output scaled by its routing weight, inside the combine push."""
+    if is_gfx1250():
+        from primus_turbo.pytorch.kernels.fused_mega_moe import (
+            fused_mega_moe_gfx1250_impl as gfx1250,
+        )
+
+        return gfx1250.stage2_forward(
+            l1_out, w2, handle, topk_idx, dispatch_weights, activation, fc1_bias, fc2_bias
+        )
     # bound swiglu by THIS handle's tile count (per-forward, not shared symm)
     act = swiglu_flydsl_kernel(
         l1_out,
@@ -80,6 +89,14 @@ def fused_mega_moe_stage2_backward_impl(
     """L2 dgrad (nn) + SwiGLU^T + dW2 (+ the bias grads).
 
     Returns ``(grad_l1, grad_gate, dW2, d_fc1_bias, d_fc2_bias)``; a bias grad is None without its bias."""
+    if is_gfx1250():
+        from primus_turbo.pytorch.kernels.fused_mega_moe import (
+            fused_mega_moe_gfx1250_impl as gfx1250,
+        )
+
+        return gfx1250.stage2_backward(
+            grad_y, l1_out, dispatch_weights, w2, handle, activation, fc1_bias, fc2_bias
+        )
     dy = grad_y.contiguous().to(torch.bfloat16)
 
     # L2 dgrad: cross-rank dispatch PUSH + grouped GEMM (nn)
