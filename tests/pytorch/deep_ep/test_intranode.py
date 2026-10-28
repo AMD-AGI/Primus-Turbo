@@ -7,6 +7,8 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import unittest
+
 import torch
 import torch.distributed as dist
 from torch.testing._internal.common_distributed import (
@@ -20,13 +22,16 @@ from torch.testing._internal.common_utils import (
 )
 
 import primus_turbo.pytorch as pt
+from primus_turbo.pytorch.deep_ep._compat import deep_ep_cpp
 from tests.pytorch.ref.deep_ep_ref import (
     get_dispatch_layout_ref,
     per_token_cast_to_fp8,
     tune_and_verify_intranode,
 )
 
-BACKENDS = ["cpp", "flydsl"]
+# builds without the C++ DeepEP (gfx1250) have the FlyDSL backend only
+HAS_CPP = deep_ep_cpp is not None
+BACKENDS = ["cpp", "flydsl"] if HAS_CPP else ["flydsl"]
 
 
 @instantiate_parametrized_tests
@@ -115,6 +120,7 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
             assert torch.equal(num_tokens_per_expert, ref_per_expert), case
             assert torch.equal(is_token_in_rank, ref_in_rank), case
 
+    @unittest.skipUnless(HAS_CPP, "needs the C++ DeepEP")
     @skip_if_lt_x_gpu(2)
     @parametrize("num_sms", [8, 24])
     def test_flydsl_matches_cpp(self, num_sms: int):

@@ -32,6 +32,8 @@ if _worker_id is not None:
 # pytest_collection_modifyitems. Paths are matched as suffixes of the test file path; an
 # optional "::<prefix>" narrows an entry to the test ids starting with that prefix.
 _GFX1250_ENABLED_TESTS = (
+    # FlyDSL intranode DeepEP (primus_turbo/flydsl/deep_ep); the C++ DeepEP is not loaded here.
+    "tests/pytorch/deep_ep/test_intranode.py",
     # bf16 grouped GEMM through the backend registry: Triton, plus the FlyDSL
     # WMMA/TDM kernels in grouped_gemm_bf16_kernel_gfx1250.py.
     "tests/pytorch/ops/test_grouped_gemm.py",
