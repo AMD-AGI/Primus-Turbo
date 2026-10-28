@@ -98,10 +98,12 @@ class Buffer:
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
             intranode_backend: the kernels of the intranode path (`num_ranks <= 8`, no low-latency mode),
                 `"cpp"` (HIP), `"flydsl"` or `"flydsl_v2"`; defaults to `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`,
-                else `"cpp"` (`"flydsl"` where the C++ DeepEP is not loaded, as on gfx1250). `"cpp"` and
-                `"flydsl"` return interchangeable handles; `"flydsl_v2"` (direct slot writes, no channel rings,
-                gfx1250 only, not capturable in a CUDA graph) returns the same outputs with handles of its own.
-                The internode and low-latency paths always use `"cpp"`.
+                else `"flydsl_v2"` on gfx1250 and `"cpp"` elsewhere (`"flydsl"` where the C++ DeepEP is not
+                built). `"cpp"` and `"flydsl"` return interchangeable handles; `"flydsl_v2"` (direct slot
+                writes, no channel rings, gfx1250 only) returns the same outputs with handles of its own, is
+                not capturable in a CUDA graph, and needs every rank to dispatch the same number of tokens
+                and `num_nvl_bytes` that hold the whole batch (`get_token_buffer_size_hint`; `moe_dispatch`
+                sizes it itself). The internode and low-latency paths always use `"cpp"`.
 
         Note:
             Controlled by ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM`` (default ``0``).

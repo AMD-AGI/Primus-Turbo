@@ -71,10 +71,18 @@ def _as_i32(value: int) -> int:
     return value - (1 << 32) if value >= (1 << 31) else value
 
 
+def default_intranode_backend() -> str:
+    """``flydsl_v2`` on gfx1250; elsewhere ``cpp`` where the C++ DeepEP is loaded and ``flydsl`` where it
+    is not."""
+    if IS_GFX1250:
+        return "flydsl_v2"
+    return "cpp" if deep_ep_cpp is not None else "flydsl"
+
+
 def get_intranode_backend(backend: Optional[str] = None) -> str:
     """``backend``, else ``PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`` (``cpp`` | ``flydsl`` | ``flydsl_v2``),
-    else ``cpp`` where the C++ DeepEP is loaded and ``flydsl`` where it is not."""
-    default = "cpp" if deep_ep_cpp is not None else "flydsl"
+    else ``default_intranode_backend()``."""
+    default = default_intranode_backend()
     backend = (backend or os.environ.get("PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND", default)).strip().lower()
     if backend not in INTRANODE_BACKENDS:
         raise ValueError(
@@ -121,7 +129,12 @@ class FlyDSLIntranodeRuntime:
     ) -> None:
         _check(version in (1, 2), f"version must be 1 or 2, got {version}")
         # V2 has only been built and tested for gfx1250; its non-TDM path has never run
-        _check(version == 1 or IS_GFX1250, "the V2 backend (flydsl_v2) runs on gfx1250 only")
+        _check(
+            version == 1 or IS_GFX1250,
+            "the V2 backend (flydsl_v2) runs on gfx1250 only; on this GPU use intranode_backend="
+            f"'{default_intranode_backend()}' (the default) or 'flydsl', or unset "
+            "PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND",
+        )
         self.version = version
         self.group = group
         self.rank = group.rank()
@@ -184,7 +197,8 @@ class FlyDSLIntranodeRuntime:
         # the reduce queue): a graph replay would rerun the old values and take stale flags as fresh
         _check(
             not torch.cuda.is_current_stream_capturing(),
-            "flydsl_v2 cannot be captured in a CUDA graph: each call advances host-side epochs",
+            "flydsl_v2 cannot be captured in a CUDA graph: each call advances host-side epochs; "
+            "to capture DeepEP, set PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND=flydsl (or intranode_backend='flydsl')",
         )
 
     def get_local_buffer_tensor(self, dtype: torch.dtype, offset: int) -> torch.Tensor:
