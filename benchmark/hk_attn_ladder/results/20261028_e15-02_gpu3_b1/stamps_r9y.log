@@ -1,0 +1,6 @@
+[2026-10-28T02:57:35 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m micro.ws_stamps mla/ladder_bwd.json r9y_st
+wave 0 producer: steps 127  step median 1348 cyc;  readback issued +181  B + A done +705  arrived +81  waited +276
+wave 1 producer: steps 127  step median 1350 cyc;  readback issued +181  B + A done +706  arrived +81  waited +231
+wave 2 consumer: steps 127  step median 1349 cyc;  reads issued +230  dV done +341  tensor wait +77  arrived +41  dK + export +563  waited +36
+wave 3 consumer: steps 127  step median 1354 cyc;  reads issued +230  dV done +330  tensor wait +77  arrived +41  dK + export +576  waited +36
+[02:57:39 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261028_025735_stamps_r9y_st.log

@@ -1,0 +1,217 @@
+{
+ "meta": {
+  "ladder": "mla_bwd",
+  "shape": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+  "device": "gfx1250",
+  "cus": 256,
+  "torch": "2.14.0+rocm10.2.0a20261011",
+  "rounds": 8,
+  "iters": 20,
+  "settle_s": 1.0,
+  "flush_mb": 512,
+  "hip_visible_devices": null,
+  "host": "7b22589a8076",
+  "time": "2026-10-28 02:48:10",
+  "useful_flops": 3574285205504,
+  "data": "randn"
+ },
+ "rows": [
+  {
+   "arm": "r8a",
+   "ms": 2.352148711681366,
+   "mean": 2.3486163169145584,
+   "ci95": 0.008530269424807394,
+   "tflops": 1519.583004149863,
+   "sclk": 1298.5,
+   "mcyc": 3.0498384532928466,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    2.3336424827575684,
+    2.3521690368652344,
+    2.3603415489196777,
+    2.344336986541748,
+    2.3341420888900757,
+    2.3544124364852905,
+    2.357757568359375,
+    2.3521283864974976
+   ],
+   "sclk_rounds": [
+    1303.0,
+    1298.0,
+    1302.0,
+    1298.0,
+    1299.0,
+    1296.0,
+    1299.0,
+    1296.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "dq: when (Skv - Sq) % 64 == 32 the last steady unit runs as a generic unit, whose burst handles the first masked row's partly stored pairs (fixes the r2d..r7 rect32 dQ read; production shapes unchanged)",
+   "ref_ms_a08": null
+  },
+  {
+   "arm": "r9w",
+   "ms": 2.9558854699134827,
+   "mean": 2.9515734165906906,
+   "ci95": 0.011479489583903834,
+   "tflops": 1209.2096401856252,
+   "sclk": 1601.0,
+   "mcyc": 4.727575732111931,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    2.9508684873580933,
+    2.940211534500122,
+    2.9664509296417236,
+    2.9272119998931885,
+    2.9614830017089844,
+    2.9625444412231445,
+    2.9429144859313965,
+    2.960902452468872
+   ],
+   "sclk_rounds": [
+    1602.0,
+    1608.0,
+    1600.0,
+    1605.0,
+    1597.0,
+    1598.0,
+    1602.0,
+    1592.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "dK/dV wave-specialized: 4-wave workgroups, producer waves (S/dP, softmax, dS export) and consumer waves (dV/dK, TDM) on different SIMDs, P/dS through a double-buffered LDS exchange, 4-stage ring",
+   "ref_ms_a08": null,
+   "step": {
+    "over": "r8a",
+    "median": 0.7952025310697599,
+    "mean": 0.7957301310506163,
+    "ci95": 0.003967068617314473
+   },
+   "step_cyc": {
+    "median": 0.6462325683116936,
+    "ci95": 0.0022790818990448933
+   }
+  },
+  {
+   "arm": "r9x",
+   "ms": 2.932600200176239,
+   "mean": 2.9333361834287643,
+   "ci95": 0.008712440400288742,
+   "tflops": 1218.8109396191128,
+   "sclk": 1594.0,
+   "mcyc": 4.672129728198051,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    2.9196619987487793,
+    2.923506498336792,
+    2.937106490135193,
+    2.9287344217300415,
+    2.9266910552978516,
+    2.9483635425567627,
+    2.9461594820022583,
+    2.9364659786224365
+   ],
+   "sclk_rounds": [
+    1593.0,
+    1595.0,
+    1590.0,
+    1596.0,
+    1599.0,
+    1593.0,
+    1601.0,
+    1590.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "wave-specialized dK/dV v2: producers pipeline B(k-1) (softmax, exchange stores) with A(k) (S/dP WMMAs, causal mask as the S C-init), consumers lag 2 steps and export dS^T, split barriers, 5-stage ring",
+   "ref_ms_a08": null,
+   "step": {
+    "over": "r9w",
+    "median": 1.0070178849869627,
+    "mean": 1.0062239253474226,
+    "ci95": 0.004136028637030053
+   },
+   "step_cyc": {
+    "median": 1.0101061085368843,
+    "ci95": 0.0048321062384742396
+   }
+  },
+  {
+   "arm": "r9x#null",
+   "ms": 2.934072494506836,
+   "mean": 2.9401787519454956,
+   "ci95": 0.012120726752775781,
+   "tflops": 1218.1993499464545,
+   "sclk": 1588.0,
+   "mcyc": 4.657788824439049,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    2.927472949028015,
+    2.9369670152664185,
+    2.9311779737472534,
+    2.951307535171509,
+    2.924127459526062,
+    2.959099054336548,
+    2.9602210521698,
+    2.9310569763183594
+   ],
+   "sclk_rounds": [
+    1588.0,
+    1583.0,
+    1585.0,
+    1592.0,
+    1594.0,
+    1590.0,
+    1586.0,
+    1588.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "wave-specialized dK/dV v2: producers pipeline B(k-1) (softmax, exchange stores) with A(k) (S/dP WMMAs, causal mask as the S C-init), consumers lag 2 steps and export dS^T, split barriers, 5-stage ring",
+   "ref_ms_a08": null
+  }
+ ],
+ "null_control": {
+  "median": 0.9968519395508902,
+  "mean": 0.9976833426673232,
+  "ci95": 0.002953032198708433
+ }
+}

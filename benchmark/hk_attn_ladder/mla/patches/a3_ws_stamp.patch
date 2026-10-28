@@ -1,0 +1,91 @@
+diff -ruN d/src/k_dkdv96ws.hip e/src/k_dkdv96ws.hip
+--- d/src/k_dkdv96ws.hip	2026-10-28 02:52:56.622457581 +0000
++++ e/src/k_dkdv96ws.hip	2026-10-28 02:55:58.331002657 +0000
+@@ -157,6 +157,19 @@
+                              + lane * 16);
+   };
+   auto stg = [&](int t) { return (t % WS_DEPTH) * K1_QDO_B; };
++#if HKL_WS_STAMP  // timing probe: shader cycles of fixed points of every step of workgroup (0, 0, 0), into the 64 KB
++                  // guard in front of the dS layout (wave w: entries [w * 2048, +2048), step s point p: s * 16 + p)
++  const bool stamp_wg = blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0;
++  unsigned long long* const stamp_p = reinterpret_cast<unsigned long long*>(DS) - 8192 + wv * 2048;
++  auto stamp = [&](int step, int pt) {
++    sched_barrier<0>();
++    const unsigned long long c = __builtin_readcyclecounter();
++    if (stamp_wg && step < 127) stamp_p[(step + 1) * 16 + pt] = c;
++    sched_barrier<0>();
++  };
++#else
++  auto stamp = [&](int, int) {};
++#endif
+ 
+   auto body = [&](auto nkv_c) __attribute__((always_inline)) {
+     constexpr int NKV = decltype(nkv_c)::value;
+@@ -255,22 +268,27 @@
+       auto pstep = [&](int k, const Raw& rin, Raw& rout, const f32x4 (&pin)[NLD], f32x4 (&pout)[NLD], auto do_a,
+                        auto do_b) __attribute__((always_inline)) {
+         bf16x8 ops[NRB];
++        stamp(k, 0);
+         if constexpr (decltype(do_a)::value) {
+           if (k < n_mask + 1) set_bias(k);   // diagonal tiles and the first full one (back to 0)
+           sched_barrier<0>();
+           ldl(tile_q(k), pout);              // NL / ND of tile k, for B(k) in the next step
+           rdqd(rd_base(stg(k)), ops);
+         }
++        stamp(k, 1);
+ #if !HKL_WS_NOP  // ablation (timing only): producers skip B and A (readback / NL / ND / barriers stay)
+         if constexpr (decltype(do_b)::value) stage_b(k - 1, rin, pin);
+         if constexpr (decltype(do_a)::value) stage_a(ops, bias, rout);
+ #else
+         if constexpr (decltype(do_a)::value) { for (int e = 0; e < NRB; ++e) asm volatile("" :: "v"(ops[e])); }
+ #endif
++        stamp(k, 2);
+         sched_barrier<0>();
+         lds_arrive();                        // ARRIVE(k): P / dS of tile k - 1 written, stage(k) reads retired
++        stamp(k, 3);
+         sched_barrier<0>();
+         lds_wait();                          // WAIT(k)
++        stamp(k, 4);
+         sched_barrier<0>();
+       };
+       static_for<2>([&](auto hh) { static_for<NKV>([&](auto kh) { bias[hh][kh] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; }); });
+@@ -336,6 +354,7 @@
+       sched_barrier<0>();
+       // step s: TDM tile s + 2; s >= 2: dV / dK and the export of tile s - 2 (published at BARRIER(s - 1))
+       for (int s = 0; s <= N + 1; ++s) {
++        stamp(s, 0);
+         tdm_tile(tile_q(s + WS_PF), stg(s + WS_PF));  // WAR: that stage's previous tile was last read in step s - 1
+         sched_barrier<0>();
+         if (s >= 2) {
+@@ -350,6 +369,7 @@
+           bf16x16 b_do[NDO_V];
+           static_for<NDO_V>([&](auto d) { b_do[d] = tr(tv, 0, d); });
+           sched_barrier<0>();
++          stamp(s, 1);
+           bf16x16 b_q[NDO_QK];
+           static_for<NDO_V>([&](auto d) {
+             static_for<NKV>([&](auto kh) {
+@@ -362,10 +382,13 @@
+             if constexpr (i < NDO_QK) sched_group_barrier<0x100, 2, 0>();
+           });
+           sched_barrier<0>();
++          stamp(s, 2);
+           tensor_wait<3 * (WS_PF - 1)>();     // own half of tile s + 1 landed (the newer tiles may be in flight)
+           sched_barrier<0>();
++          stamp(s, 3);
+           lds_arrive();                       // ARRIVE(s): this step's DS reads retired
+           sched_barrier<0>();
++          stamp(s, 4);
+ #if !HKL_WS_NOC  // ablation (timing only): consumers skip dK and the export (dV stays: it consumes the reads)
+           static_for<NKV>([&](auto kh) {
+             static_for<NDO_QK>([&](auto d) {
+@@ -378,7 +401,9 @@
+           for (int kh = 0; kh < NKV; ++kh) asm volatile("" :: "v"(a_dsk[kh]));
+ #endif
+           sched_barrier<0>();
++          stamp(s, 5);
+           lds_wait();                         // WAIT(s)
++          stamp(s, 6);
+           sched_barrier<0>();
+         } else {
+           tensor_wait<3 * (WS_PF - 1)>();

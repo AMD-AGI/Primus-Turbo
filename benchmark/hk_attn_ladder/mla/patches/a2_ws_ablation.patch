@@ -1,0 +1,34 @@
+diff -ruN b/src/k_dkdv96ws.hip c/src/k_dkdv96ws.hip
+--- b/src/k_dkdv96ws.hip	2026-10-28 02:46:36.511245651 +0000
++++ c/src/k_dkdv96ws.hip	2026-10-28 02:51:25.027634525 +0000
+@@ -257,8 +257,12 @@
+           ldl(tile_q(k), pout);              // NL / ND of tile k, for B(k) in the next step
+           rdqd(rd_base(stg(k)), ops);
+         }
++#if !HKL_WS_NOP  // ablation (timing only): producers skip B and A (readback / NL / ND / barriers stay)
+         if constexpr (decltype(do_b)::value) stage_b(k - 1, rin, pin);
+         if constexpr (decltype(do_a)::value) stage_a(ops, bias, rout);
++#else
++        if constexpr (decltype(do_a)::value) { for (int e = 0; e < NRB; ++e) asm volatile("" :: "v"(ops[e])); }
++#endif
+         sched_barrier<0>();
+         lds_arrive();                        // ARRIVE(k): P / dS of tile k - 1 written, stage(k) reads retired
+         sched_barrier<0>();
+@@ -359,12 +363,17 @@
+           sched_barrier<0>();
+           lds_arrive();                       // ARRIVE(s): this step's DS reads retired
+           sched_barrier<0>();
++#if !HKL_WS_NOC  // ablation (timing only): consumers skip dK and the export (dV stays: it consumes the reads)
+           static_for<NKV>([&](auto kh) {
+             static_for<NDO_QK>([&](auto d) {
+               acc[DK0 + kh * NDO_QK + d] = wmma<false, (d > 0)>(b_q[d], a_dsk[kh], acc[DK0 + kh * NDO_QK + d]);
+             });
+           });
+           export_ds(t, a_dsk);
++#else
++          for (int d = 0; d < NDO_QK; ++d) asm volatile("" :: "v"(b_q[d]));
++          for (int kh = 0; kh < NKV; ++kh) asm volatile("" :: "v"(a_dsk[kh]));
++#endif
+           sched_barrier<0>();
+           lds_wait();                         // WAIT(s)
+           sched_barrier<0>();

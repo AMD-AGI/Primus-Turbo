@@ -1,0 +1,328 @@
+diff -ruN a/src/k_dkdv96ws.hip b/src/k_dkdv96ws.hip
+--- a/src/k_dkdv96ws.hip	2026-10-28 02:44:41.044619376 +0000
++++ b/src/k_dkdv96ws.hip	2026-10-28 02:46:36.511245651 +0000
+@@ -52,7 +52,7 @@
+ constexpr int NHB = NQE + 2 * NDT_V;   // 20 entries per hh
+ constexpr int NRB = 2 * NHB;           // 40 readback entries of a stage
+ constexpr int NLD = 8;                 // NL/ND vec4 entries
+-constexpr int WS_DEPTH = 4;                                  // ring stages
++constexpr int WS_DEPTH = 5;                                  // ring stages
+ constexpr int WS_RING_B = WS_DEPTH * K1_QDO_B;               // 86016
+ constexpr int WS_FRAG_B = 1024;                              // one bf16x16 B fragment: 2 pieces x 32 lanes x 16 B
+ constexpr int WS_PW_B = 2 * K3_NKV * WS_FRAG_B;              // P then dS fragments of one producer wave: 6144
+@@ -152,7 +152,7 @@
+     return lds0 + (uint32_t)(WS_RING_B + (t & 1) * WS_BUF_B + pw * WS_PW_B + (isds * K3_NKV + kh) * WS_FRAG_B
+                              + lane * 16);
+   };
+-  auto stg = [&](int t) { return (t & (WS_DEPTH - 1)) * K1_QDO_B; };
++  auto stg = [&](int t) { return (t % WS_DEPTH) * K1_QDO_B; };
+ 
+   auto body = [&](auto nkv_c) __attribute__((always_inline)) {
+     constexpr int NKV = decltype(nkv_c)::value;
+@@ -166,7 +166,11 @@
+     const int n_mask = k3_nmaskp(kv0g, ROWS, cshift, causal, nqt);
+     const int N = k1_nqp_eff(kv0g, cshift, causal, nqt);   // G == 1: one tile per query pair
+     auto tile_q = [&](int t) { return k1_clampqt(qp_start + (t < N ? t : N - 1), nqt2); };
++    if (N <= 0) return;                     // no query pair (uniform per workgroup): no barrier at all
+ 
++    // the dS^T export descriptor of this wave's kv rows (k_dkdv96ds's); both roles of pair pw share it
++    const int kt0 = k3ds_kt0(kv0);
++    const int64_t ds_base = k3ds_base(bat, Hq, hkv, G, kt0, Sq, Skv, causal);
+     if (producer) {
+       // ---- K / V fragments of this wave's 16 NKV kv rows ----------------------------------------------------------
+       const auto r_k = rsrc(K, nk_b), r_v = rsrc(V, nv_b);
+@@ -181,67 +185,118 @@
+                            buf_load_b128(r_v, 16 * k1_vfrag(vbase, Hkv, kv0, kh, dt, 1, lane), 0));
+         });
+       });
+-      if constexpr (!K3) {
+-        asm volatile("s_wait_xcnt 0x0" ::: "memory");  // k_dkdv96ds's tail-body XCNT drain (r_k SGPR reuse)
+-        sched_barrier<0>();
+-      }
+-      // ---- dS^T export: per-wave descriptor, row constants, voffset (k_dkdv96ds's) ----------------------------
+-      const int kt0 = k3ds_kt0(kv0);
+-      const int64_t ds_base = k3ds_base(bat, Hq, hkv, G, kt0, Sq, Skv, causal);
+-      const auto r_ds = rsrc64((const unsigned char*)DS + ds_base, k3ds_nrec(ds_mode, G, kt0, NKV, Sq, Skv, causal));
+-      int ds_rc[NKV];
+-      static_for<NKV>([&](auto kh) { ds_rc[kh] = k3ds_rowc(kh, kt0, Sq, Skv, causal); });
+-      const int vds = k1ds_voff(lane);
+-
+-      auto sdp_one = [&](auto do_mask, auto hh, auto kh, const bf16x16 (&qfr)[NDT_QK], const bf16x16 (&dfr)[NDT_V],
+-                         const f32x4 (&pre)[NLD], int q0, bf16 (&ph)[NKV][16], bf16 (&dh)[NKV][16]) {
+-        const int qb = q0 + hh * 16 + half * 8;
+-        f32x8 s = {0, 0, 0, 0, 0, 0, 0, 0}, p = {0, 0, 0, 0, 0, 0, 0, 0};
+-        static_for<NDT_QK>([&](auto dt) {
+-          s = wmma<false, false>(qfr[dt], kf[kh][dt], s);
+-          if constexpr (dt < NDT_V) p = wmma<false, false>(dfr[dt], vf[kh][dt], p);
+-        });
+-        const int kvl = kv0 + kh * 16 + row;
+-        static_for<8>([&](auto si) {
+-          const float nl = pre[hh * 4 + si / 4][si % 4];
+-          const float nd = pre[hh * 4 + 2 + si / 4][si % 4];
+-          float tt = __builtin_fmaf(s[si.value], c1, nl);
+-          if constexpr (decltype(do_mask)::value) {
+-            tt = (kvl > qb + si + cshift) ? K1_NEG : tt;
+-          }
+-          const float pf = exp2_raw(tt);
+-          ph[kh][hh * 8 + si] = to_bf16(pf);
+-          dh[kh][hh * 8 + si] = to_bf16(pf * __builtin_fmaf(p[si.value], scale, nd));
++      // A: the S / dP WMMAs of one tile (k_dkdv96ds's chains: dt ascending, S from the C-init `bias`)
++      using Raw = f32x8[2][NKV][2];          // [hh][kh][S | dP]
++      auto stage_a = [&](const bf16x8 (&ops)[NRB], const f32x8 (&bias)[2][NKV], Raw& raw) {
++        static_for<2>([&](auto hh) {
++          static_for<NKV>([&](auto kh) {
++            f32x8 s = bias[hh][kh], p = {0, 0, 0, 0, 0, 0, 0, 0};
++            static_for<NDT_QK>([&](auto dt) {
++              s = wmma<false, false>(cat(ops[hh * NHB + dt * 2], ops[hh * NHB + dt * 2 + 1]), kf[kh][dt], s);
++              if constexpr (dt < NDT_V)
++                p = wmma<false, false>(cat(ops[hh * NHB + NQE + dt * 2], ops[hh * NHB + NQE + dt * 2 + 1]),
++                                       vf[kh][dt], p);
++            });
++            raw[hh][kh][0] = s;
++            raw[hh][kh][1] = p;
++          });
+         });
+       };
+-      auto frags = [&](const bf16x8* ops, bf16x16 (&qfr)[NDT_QK], bf16x16 (&dfr)[NDT_V]) {
+-        static_for<NDT_QK>([&](auto dt) { qfr[dt] = cat(ops[dt * 2], ops[dt * 2 + 1]); });
+-        static_for<NDT_V>([&](auto dt) { dfr[dt] = cat(ops[NQE + dt * 2], ops[NQE + dt * 2 + 1]); });
++      // the causal mask of a diagonal tile as the S C-init: -3e38 where kv > q + cshift (exp2 -> +0, as
++      // k_dkdv96ds's select of K1_NEG), 0 elsewhere; full tiles start from 0
++      f32x8 bias[2][NKV];
++      auto set_bias = [&](int t) {
++        const bool diag = t < n_mask;
++        const int q0 = (qp_start + t) * 32;
++        static_for<2>([&](auto hh) {
++          static_for<NKV>([&](auto kh) {
++            const int kvl = kv0 + kh * 16 + row;
++            const int qb = q0 + hh * 16 + half * 8;
++            static_for<8>([&](auto si) {
++              bias[hh][kh][si.value] = (diag && kvl > qb + si + cshift) ? K1_NEG : 0.0f;
++            });
++          });
++        });
+       };
+-      auto sdp = [&](auto do_mask, const bf16x8 (&ops)[NRB], const f32x4 (&pre)[NLD], int q0,
+-                     bf16x16 (&a_pk)[NKV], bf16x16 (&a_dsk)[NKV]) {
++      // B: softmax / dS of one tile from its raw S / dP (k_dkdv96ds's arithmetic) -> the exchange buffer
++      auto stage_b = [&](int t, const Raw& raw, const f32x4 (&pre)[NLD]) {
+         bf16 ph[NKV][16], dh[NKV][16];
+         static_for<2>([&](auto hh) {
+-          bf16x16 qfr[NDT_QK], dfr[NDT_V];
+-          frags(ops + hh * NHB, qfr, dfr);
+-          static_for<NKV>([&](auto kh) { sdp_one(do_mask, hh, kh, qfr, dfr, pre, q0, ph, dh); });
++          static_for<NKV>([&](auto kh) {
++            static_for<8>([&](auto si) {
++              const float nl = pre[hh * 4 + si / 4][si % 4];
++              const float nd = pre[hh * 4 + 2 + si / 4][si % 4];
++              const float pf = exp2_raw(__builtin_fmaf(raw[hh][kh][0][si.value], c1, nl));
++              ph[kh][hh * 8 + si] = to_bf16(pf);
++              dh[kh][hh * 8 + si] = to_bf16(pf * __builtin_fmaf(raw[hh][kh][1][si.value], scale, nd));
++            });
++          });
+         });
+         static_for<NKV>([&](auto kh) {
+-          a_pk[kh] = bf16x16{ph[kh][0], ph[kh][1], ph[kh][2], ph[kh][3], ph[kh][4], ph[kh][5], ph[kh][6], ph[kh][7],
+-                             ph[kh][8], ph[kh][9], ph[kh][10], ph[kh][11], ph[kh][12], ph[kh][13], ph[kh][14],
+-                             ph[kh][15]};
+-          a_dsk[kh] = bf16x16{dh[kh][0], dh[kh][1], dh[kh][2], dh[kh][3], dh[kh][4], dh[kh][5], dh[kh][6], dh[kh][7],
+-                              dh[kh][8], dh[kh][9], dh[kh][10], dh[kh][11], dh[kh][12], dh[kh][13], dh[kh][14],
+-                              dh[kh][15]};
++          const bf16x16 a_pk = bf16x16{ph[kh][0], ph[kh][1], ph[kh][2], ph[kh][3], ph[kh][4], ph[kh][5], ph[kh][6],
++                                       ph[kh][7], ph[kh][8], ph[kh][9], ph[kh][10], ph[kh][11], ph[kh][12], ph[kh][13],
++                                       ph[kh][14], ph[kh][15]};
++          const bf16x16 a_dsk = bf16x16{dh[kh][0], dh[kh][1], dh[kh][2], dh[kh][3], dh[kh][4], dh[kh][5], dh[kh][6],
++                                        dh[kh][7], dh[kh][8], dh[kh][9], dh[kh][10], dh[kh][11], dh[kh][12],
++                                        dh[kh][13], dh[kh][14], dh[kh][15]};
++          lds_store_b128(xbuf(t, 0, kh), lo8(a_pk));
++          lds_store_b128(xbuf(t, 0, kh) + 512, hi8(a_pk));
++          lds_store_b128(xbuf(t, 1, kh), lo8(a_dsk));
++          lds_store_b128(xbuf(t, 1, kh) + 512, hi8(a_dsk));
+         });
+       };
+-
+-      // the pending export: the previous tile's dS^T regrouped (DPP row_ror:8, k1ds's recipe), its soffset and, for
+-      // a diagonal tile, which blocks to put
+-      u32x4 dsx[NKV], dsy[NKV];
+-      int pend_so = 0, pend_qt = 0;
+-      bool pend_mask = false, pend_any = false;
+-      auto regroup = [&](const bf16x16 (&a_dsk)[NKV]) {
++      // producer step k: readback of tile k, NL / ND of tile k, B(k - 1) -> buffer, ARRIVE(k), A(k), WAIT(k)
++      // one straight-line block per step so the scheduler interleaves B(k - 1)'s VALU / exchange stores with A(k)'s
++      // WMMAs; the readback of tile k leads, its latency under B's first VALU
++      auto pstep = [&](int k, const Raw& rin, Raw& rout, const f32x4 (&pin)[NLD], f32x4 (&pout)[NLD], auto do_a,
++                       auto do_b) __attribute__((always_inline)) {
++        bf16x8 ops[NRB];
++        if constexpr (decltype(do_a)::value) {
++          if (k < n_mask + 1) set_bias(k);   // diagonal tiles and the first full one (back to 0)
++          sched_barrier<0>();
++          ldl(tile_q(k), pout);              // NL / ND of tile k, for B(k) in the next step
++          rdqd(rd_base(stg(k)), ops);
++        }
++        if constexpr (decltype(do_b)::value) stage_b(k - 1, rin, pin);
++        if constexpr (decltype(do_a)::value) stage_a(ops, bias, rout);
++        sched_barrier<0>();
++        lds_arrive();                        // ARRIVE(k): P / dS of tile k - 1 written, stage(k) reads retired
++        sched_barrier<0>();
++        lds_wait();                          // WAIT(k)
++        sched_barrier<0>();
++      };
++      static_for<2>([&](auto hh) { static_for<NKV>([&](auto kh) { bias[hh][kh] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; }); });
++      Raw rawA, rawB;
++      f32x4 preA[NLD], preB[NLD];
++      sched_barrier<0>();
++      lds_barrier();                          // BARRIER(pro): tile 0 landed in stage 0
++      sched_barrier<0>();
++      pstep(0, rawB, rawA, preB, preA, std::true_type{}, std::false_type{});
++      int k = 1;
++      for (; k + 1 < N; k += 2) {
++        pstep(k, rawA, rawB, preA, preB, std::true_type{}, std::true_type{});
++        pstep(k + 1, rawB, rawA, preB, preA, std::true_type{}, std::true_type{});
++      }
++      if (k < N) {                            // k == N - 1: one more A + B, the last B below takes rawB
++        pstep(k, rawA, rawB, preA, preB, std::true_type{}, std::true_type{});
++        pstep(N, rawB, rawA, preB, preA, std::false_type{}, std::true_type{});
++      } else {                                // k == N: the last B takes rawA
++        pstep(N, rawA, rawB, preA, preB, std::false_type{}, std::true_type{});
++      }
++      sched_barrier<0>();
++      lds_barrier();                          // BARRIER(N + 1)
++      sched_barrier<0>();
++      lds_barrier();                          // BARRIER(exit)
++    } else {
++      // ---- the dS^T export of the consumed tile (k_dkdv96ds's DPP regroup and stores; diagonal tiles: put blocks)
++      const auto r_ds = rsrc64((const unsigned char*)DS + ds_base, k3ds_nrec(ds_mode, G, kt0, NKV, Sq, Skv, causal));
++      int ds_rc[NKV];
++      static_for<NKV>([&](auto kh) { ds_rc[kh] = k3ds_rowc(kh, kt0, Sq, Skv, causal); });
++      const int vds = k1ds_voff(lane);
++      auto export_ds = [&](int t, const bf16x16 (&a_dsk)[NKV]) {
++        const int qt = qp_start + t;
++        const int so = k3ds_sq(qt, 0, Sq, Skv, causal);
++        u32x4 dsx[NKV], dsy[NKV];
+         static_for<NKV>([&](auto kh) {
+           const u32x8 w = __builtin_bit_cast(u32x8, a_dsk[kh]);
+           dsx[kh] = u32x4{dpp_ror8<0xC>(w[0], w[4]), dpp_ror8<0xC>(w[1], w[5]), dpp_ror8<0xC>(w[2], w[6]),
+@@ -249,59 +304,20 @@
+           dsy[kh] = u32x4{dpp_ror8<0x3>(w[4], w[0]), dpp_ror8<0x3>(w[5], w[1]), dpp_ror8<0x3>(w[6], w[2]),
+                           dpp_ror8<0x3>(w[7], w[3])};
+         });
+-      };
+-      auto flush_export = [&]() {
+-        if (pend_any) {
++        if (t < n_mask) {
+           static_for<NKV>([&](auto kh) {
+-            if (!pend_mask || k3ds_put(kh, pend_qt, kt0, Sq, Skv, causal)) {
+-              buf_store_u32x4(dsx[kh], r_ds, vds, pend_so + ds_rc[kh]);
+-              buf_store_u32x4(dsy[kh], r_ds, vds + K1DS_ST_B, pend_so + ds_rc[kh]);
++            if (k3ds_put(kh, qt, kt0, Sq, Skv, causal)) {
++              buf_store_u32x4(dsx[kh], r_ds, vds, so + ds_rc[kh]);
++              buf_store_u32x4(dsy[kh], r_ds, vds + K1DS_ST_B, so + ds_rc[kh]);
+             }
+           });
++        } else {
++          static_for<NKV>([&](auto kh) {
++            buf_store_u32x4(dsx[kh], r_ds, vds, so + ds_rc[kh]);
++            buf_store_u32x4(dsy[kh], r_ds, vds + K1DS_ST_B, so + ds_rc[kh]);
++          });
+         }
+       };
+-
+-      f32x4 preA[NLD], preB[NLD];
+-      ldl(tile_q(0), preA);
+-      sched_barrier<0>();
+-      lds_barrier();                          // BARRIER(pro): tile 0 landed in stage 0
+-      sched_barrier<0>();
+-      auto pstep = [&](auto do_mask, int t) __attribute__((always_inline)) {
+-        const int qt = qp_start + t;
+-        bf16x8 ops[NRB];
+-        rdqd(rd_base(stg(t)), ops);
+-        ldl(tile_q(t + 1), preB);
+-        sched_barrier<SB_ALU>();
+-        flush_export();                       // the previous tile's stores, under the readback latency
+-        sched_barrier<0>();
+-        bf16x16 a_pk[NKV], a_dsk[NKV];
+-        sdp(do_mask, ops, preA, qt * 32, a_pk, a_dsk);
+-        static_for<NKV>([&](auto kh) {
+-          lds_store_b128(xbuf(t, 0, kh), lo8(a_pk[kh]));
+-          lds_store_b128(xbuf(t, 0, kh) + 512, hi8(a_pk[kh]));
+-          lds_store_b128(xbuf(t, 1, kh), lo8(a_dsk[kh]));
+-          lds_store_b128(xbuf(t, 1, kh) + 512, hi8(a_dsk[kh]));
+-        });
+-        regroup(a_dsk);
+-        pend_so = k3ds_sq(qt, 0, Sq, Skv, causal);
+-        pend_qt = qt;
+-        pend_mask = decltype(do_mask)::value;
+-        pend_any = true;
+-        sched_barrier<0>();
+-        lds_barrier();                        // BARRIER(t): P / dS of tile t published, stage(t) reads retired
+-        sched_barrier<0>();
+-        static_for<NLD>([&](auto e) { preA[e] = preB[e]; });
+-      };
+-      int t = 0;
+-      for (; t < n_mask; ++t) pstep(std::true_type{}, t);
+-      for (; t < N; ++t) pstep(std::false_type{}, t);
+-      sched_barrier<0>();
+-      flush_export();                         // the last tile's dS^T
+-      sched_barrier<0>();
+-      lds_barrier();                          // BARRIER(N)
+-      sched_barrier<0>();
+-      lds_barrier();                          // BARRIER(exit)
+-    } else {
+       f32x8 acc[NST];
+       static_for<NST>([&](auto i) { acc[i] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; });
+       sched_barrier<0>();
+@@ -311,11 +327,12 @@
+       sched_barrier<0>();
+       lds_barrier();                          // BARRIER(pro)
+       sched_barrier<0>();
+-      for (int s = 0; s <= N; ++s) {
+-        tdm_tile(tile_q(s + 2), stg(s + 2));  // WAR: stage(s + 2)'s previous tile s - 2 was read before BARRIER(s - 1)
++      // step s: TDM tile s + 2; s >= 2: dV / dK and the export of tile s - 2 (published at BARRIER(s - 1))
++      for (int s = 0; s <= N + 1; ++s) {
++        tdm_tile(tile_q(s + 2), stg(s + 2));  // WAR: stage(s + 2)'s previous tile s - 3 was last read in step s - 1
+         sched_barrier<0>();
+-        if (s >= 1) {
+-          const int t = s - 1;
++        if (s >= 2) {
++          const int t = s - 2;
+           bf16x16 a_pk[NKV], a_dsk[NKV];
+           static_for<NKV>([&](auto kh) {
+             a_pk[kh] = cat(lds_load_b128(xbuf(t, 0, kh)), lds_load_b128(xbuf(t, 0, kh) + 512));
+@@ -326,7 +343,6 @@
+           bf16x16 b_do[NDO_V];
+           static_for<NDO_V>([&](auto d) { b_do[d] = tr(tv, 0, d); });
+           sched_barrier<0>();
+-          // dV d-outer / kh-inner (A = b_do[d] for NKV consecutive WMMAs), the Q^T tr16 interleaved behind it
+           bf16x16 b_q[NDO_QK];
+           static_for<NDO_V>([&](auto d) {
+             static_for<NKV>([&](auto kh) {
+@@ -339,17 +355,25 @@
+             if constexpr (i < NDO_QK) sched_group_barrier<0x100, 2, 0>();
+           });
+           sched_barrier<0>();
++          tensor_wait<K1_TW>();               // own half of tile s + 1 landed (tile s + 2 may be in flight)
++          sched_barrier<0>();
++          lds_arrive();                       // ARRIVE(s): this step's DS reads retired
++          sched_barrier<0>();
+           static_for<NKV>([&](auto kh) {
+             static_for<NDO_QK>([&](auto d) {
+               acc[DK0 + kh * NDO_QK + d] = wmma<false, (d > 0)>(b_q[d], a_dsk[kh], acc[DK0 + kh * NDO_QK + d]);
+             });
+           });
++          export_ds(t, a_dsk);
++          sched_barrier<0>();
++          lds_wait();                         // WAIT(s)
++          sched_barrier<0>();
++        } else {
++          tensor_wait<K1_TW>();
++          sched_barrier<0>();
++          lds_barrier();                      // BARRIER(s), s < 2
+           sched_barrier<0>();
+         }
+-        tensor_wait<K1_TW>();                 // own half of tile s + 1 landed (tile s + 2 may be in flight)
+-        sched_barrier<0>();
+-        lds_barrier();                        // BARRIER(s)
+-        sched_barrier<0>();
+       }
+       tensor_wait<0>();                       // the clamped prefetches too, before the epilogue overwrites the ring
+       sched_barrier<0>();

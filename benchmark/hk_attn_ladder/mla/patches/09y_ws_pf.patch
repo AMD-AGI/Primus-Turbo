@@ -1,0 +1,77 @@
+diff -ruN b/src/k_dkdv96ws.hip d/src/k_dkdv96ws.hip
+--- b/src/k_dkdv96ws.hip	2026-10-28 02:46:36.511245651 +0000
++++ d/src/k_dkdv96ws.hip	2026-10-28 02:52:56.622457581 +0000
+@@ -52,7 +52,11 @@
+ constexpr int NHB = NQE + 2 * NDT_V;   // 20 entries per hh
+ constexpr int NRB = 2 * NHB;           // 40 readback entries of a stage
+ constexpr int NLD = 8;                 // NL/ND vec4 entries
+-constexpr int WS_DEPTH = 5;                                  // ring stages
++#ifndef HKL_WS_PF
++#define HKL_WS_PF 2
++#endif
++constexpr int WS_PF = HKL_WS_PF;                             // TDM prefetch distance (tiles)
++constexpr int WS_DEPTH = WS_PF + 3;                          // ring stages: consumer t-2, t-1, producer t, in flight
+ constexpr int WS_RING_B = WS_DEPTH * K1_QDO_B;               // 86016
+ constexpr int WS_FRAG_B = 1024;                              // one bf16x16 B fragment: 2 pieces x 32 lanes x 16 B
+ constexpr int WS_PW_B = 2 * K3_NKV * WS_FRAG_B;              // P then dS fragments of one producer wave: 6144
+@@ -257,8 +261,12 @@
+           ldl(tile_q(k), pout);              // NL / ND of tile k, for B(k) in the next step
+           rdqd(rd_base(stg(k)), ops);
+         }
++#if !HKL_WS_NOP  // ablation (timing only): producers skip B and A (readback / NL / ND / barriers stay)
+         if constexpr (decltype(do_b)::value) stage_b(k - 1, rin, pin);
+         if constexpr (decltype(do_a)::value) stage_a(ops, bias, rout);
++#else
++        if constexpr (decltype(do_a)::value) { for (int e = 0; e < NRB; ++e) asm volatile("" :: "v"(ops[e])); }
++#endif
+         sched_barrier<0>();
+         lds_arrive();                        // ARRIVE(k): P / dS of tile k - 1 written, stage(k) reads retired
+         sched_barrier<0>();
+@@ -321,15 +329,14 @@
+       f32x8 acc[NST];
+       static_for<NST>([&](auto i) { acc[i] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; });
+       sched_barrier<0>();
+-      tdm_tile(tile_q(0), stg(0));
+-      tdm_tile(tile_q(1), stg(1));
+-      tensor_wait<K1_TW>();
++      static_for<WS_PF>([&](auto j) { tdm_tile(tile_q(j), stg(j)); });
++      tensor_wait<3 * (WS_PF - 1)>();         // tile 0 landed
+       sched_barrier<0>();
+       lds_barrier();                          // BARRIER(pro)
+       sched_barrier<0>();
+       // step s: TDM tile s + 2; s >= 2: dV / dK and the export of tile s - 2 (published at BARRIER(s - 1))
+       for (int s = 0; s <= N + 1; ++s) {
+-        tdm_tile(tile_q(s + 2), stg(s + 2));  // WAR: stage(s + 2)'s previous tile s - 3 was last read in step s - 1
++        tdm_tile(tile_q(s + WS_PF), stg(s + WS_PF));  // WAR: that stage's previous tile was last read in step s - 1
+         sched_barrier<0>();
+         if (s >= 2) {
+           const int t = s - 2;
+@@ -355,21 +362,26 @@
+             if constexpr (i < NDO_QK) sched_group_barrier<0x100, 2, 0>();
+           });
+           sched_barrier<0>();
+-          tensor_wait<K1_TW>();               // own half of tile s + 1 landed (tile s + 2 may be in flight)
++          tensor_wait<3 * (WS_PF - 1)>();     // own half of tile s + 1 landed (the newer tiles may be in flight)
+           sched_barrier<0>();
+           lds_arrive();                       // ARRIVE(s): this step's DS reads retired
+           sched_barrier<0>();
++#if !HKL_WS_NOC  // ablation (timing only): consumers skip dK and the export (dV stays: it consumes the reads)
+           static_for<NKV>([&](auto kh) {
+             static_for<NDO_QK>([&](auto d) {
+               acc[DK0 + kh * NDO_QK + d] = wmma<false, (d > 0)>(b_q[d], a_dsk[kh], acc[DK0 + kh * NDO_QK + d]);
+             });
+           });
+           export_ds(t, a_dsk);
++#else
++          for (int d = 0; d < NDO_QK; ++d) asm volatile("" :: "v"(b_q[d]));
++          for (int kh = 0; kh < NKV; ++kh) asm volatile("" :: "v"(a_dsk[kh]));
++#endif
+           sched_barrier<0>();
+           lds_wait();                         // WAIT(s)
+           sched_barrier<0>();
+         } else {
+-          tensor_wait<K1_TW>();
++          tensor_wait<3 * (WS_PF - 1)>();
+           sched_barrier<0>();
+           lds_barrier();                      // BARRIER(s), s < 2
+           sched_barrier<0>();

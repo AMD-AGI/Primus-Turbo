@@ -19,3 +19,23 @@ of stall cycles. Operand order and cache hints do not move it; removing stall cy
 The unrolled steady loop (r2d on) bursts row 2u + 2 with all pairs assumed stored; for the last steady unit that row
 is the first masked unit's, whose stored pairs start mid-row when (Skv - Sq) % 64 == 32. r8a runs that unit as a
 generic unit. rect32: dq 17.68 -> 52.51 dB (bitwise == hk_v0); every other shape bitwise == hk_v0 / r7.
+
+## Wave-specialized dK/dV (r9w, r9x, r9y): correct, but 0.80x of r8a -- closed
+
+4-wave workgroups (one per CU, one wave per SIMD): producer waves run S/dP + softmax, consumer waves dV/dK + TDM + the
+dS^T export; P/dS cross through a double-buffered LDS exchange. 665 VGPR, bitwise == hk_v0 at every shape.
+
+| rung | change | step | Mcycles (r8a 3.05) |
+|---|---|---:|---:|
+| r9w | lockstep v1, 4-stage ring | 0.80x | 4.73 |
+| r9x | producers pipeline B(k-1) with A(k) (mask as S C-init), consumers lag 2 and export, split barriers, 5 stages | 1.007x | 4.67 |
+| r9y | TDM prefetch distance 3 (6 stages) | 1.003x | 4.69 |
+| ws_nop / ws_noc | producers / consumers skip their math | | 4.04 / 4.66 |
+
+Untraced per-step shader-cycle stamps (micro/ws_stamps.py, HKL_WS_STAMP, workgroup (0,0,0), stamps_r9y.log): one step
+is ~1350 cycles. Consumer: reads issued +230, dV (24 WMMA) +335, tensor wait +77, dK (36 WMMA) + export +563; producer:
+readback issued +181, B + A (60 WMMA) +705, then ~250 waiting. Each role spends 500-800 cycles per step outside its 60
+WMMAs (memory-op issue, LDS latency, sync), where the 2-wave kernel hides the same costs among 120 WMMAs per wave
+(r8a: ~837 cycles per 96-row step per CU). Splitting the chain across SIMDs at one wave per SIMD adds per-step fixed
+cost faster than it removes the chain's stalls; even with the export moved back and reads prefetched, each role stays
+above ~900 cycles. ATT is useless for this question (traced WMMAs take 11-18 cycles); the stamp probe is the tool.

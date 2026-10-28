@@ -1,0 +1,189 @@
+{
+ "meta": {
+  "ladder": "mla_bwd",
+  "shape": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+  "device": "gfx1250",
+  "cus": 256,
+  "torch": "2.14.0+rocm10.2.0a20261011",
+  "rounds": 6,
+  "iters": 20,
+  "settle_s": 1.0,
+  "flush_mb": 512,
+  "hip_visible_devices": null,
+  "host": "7b22589a8076",
+  "time": "2026-10-28 02:52:15",
+  "useful_flops": 3574285205504,
+  "data": "randn"
+ },
+ "rows": [
+  {
+   "arm": "r8a",
+   "ms": 2.356776475906372,
+   "mean": 2.358362396558126,
+   "ci95": 0.010242545387233258,
+   "tflops": 1516.5991522931324,
+   "sclk": 1299.5,
+   "mcyc": 3.065229205965996,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    2.35857892036438,
+    2.3549740314483643,
+    2.364408016204834,
+    2.3444384336471558,
+    2.3732014894485474,
+    2.3545734882354736
+   ],
+   "sclk_rounds": [
+    1306.0,
+    1301.0,
+    1297.0,
+    1301.0,
+    1296.5,
+    1298.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "dq: when (Skv - Sq) % 64 == 32 the last steady unit runs as a generic unit, whose burst handles the first masked row's partly stored pairs (fixes the r2d..r7 rect32 dQ read; production shapes unchanged)",
+   "ref_ms_a08": null
+  },
+  {
+   "arm": "r9x",
+   "ms": 2.958931028842926,
+   "mean": 2.9575754404067993,
+   "ci95": 0.01684286517285214,
+   "tflops": 1207.9650288103217,
+   "sclk": 1592.0,
+   "mcyc": 4.720115645051003,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    2.9410529136657715,
+    2.937108039855957,
+    2.975406050682068,
+    2.960422992706299,
+    2.9740235805511475,
+    2.9574390649795532
+   ],
+   "sclk_rounds": [
+    1603.0,
+    1593.0,
+    1591.0,
+    1604.0,
+    1589.0,
+    1590.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "wave-specialized dK/dV v2: producers pipeline B(k-1) (softmax, exchange stores) with A(k) (S/dP WMMAs, causal mask as the S C-init), consumers lag 2 steps and export dS^T, split barriers, 5-stage ring",
+   "ref_ms_a08": null
+  },
+  {
+   "arm": "ws_nop",
+   "ms": 2.2942532300949097,
+   "mean": 2.2911049922307334,
+   "ci95": 0.009112986595966271,
+   "tflops": 1557.929682137197,
+   "sclk": 1766.0,
+   "mcyc": 4.0449738098979005,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    2.2969470024108887,
+    2.279961585998535,
+    2.2809430360794067,
+    2.2974274158477783,
+    2.29979145526886,
+    2.2915594577789307
+   ],
+   "sclk_rounds": [
+    1768.0,
+    1767.0,
+    1769.0,
+    1765.0,
+    1764.0,
+    1758.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "ablation of r9x: producers skip S/dP + softmax",
+   "ref_ms_a08": null,
+   "step": {
+    "over": "r9x",
+    "median": 1.2895804850418082,
+    "mean": 1.2909067207212552,
+    "ci95": 0.008282739334693295
+   },
+   "step_cyc": {
+    "median": 1.1660638242047716,
+    "ci95": 0.005269847517372478
+   }
+  },
+  {
+   "arm": "ws_noc",
+   "ms": 2.6800922751426697,
+   "mean": 2.680452843507131,
+   "ci95": 0.03420826765320308,
+   "tflops": 1333.6425908371864,
+   "sclk": 1740.0,
+   "mcyc": 4.663494633793831,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    2.6489354372024536,
+    2.7068625688552856,
+    2.6533219814300537,
+    2.715816020965576,
+    2.6503175497055054,
+    2.707463502883911
+   ],
+   "sclk_rounds": [
+    1767.0,
+    1722.0,
+    1764.0,
+    1718.0,
+    1758.0,
+    1718.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "ablation of r9x: consumers skip dK + export",
+   "ref_ms_a08": null,
+   "step": {
+    "over": "r9x",
+    "median": 1.1013028163932006,
+    "mean": 1.1035434476989063,
+    "ci95": 0.017294952808496834
+   },
+   "step_cyc": {
+    "median": 1.0111778179607689,
+    "ci95": 0.005194147250638127
+   }
+  }
+ ],
+ "null_control": null
+}
