@@ -21,10 +21,11 @@ Within a block the threads split into one group per peer rank, and each group ru
 its own ring buffer on the receiver's heap: the sender bumps the tail, the receiver
 the head.
 
-Ordering follows the HIP path's cheap fence (gfx942 / gfx950): the heap is uncached,
-so a sender that waits for its own stores (``s_waitcnt``) before the tail store has
-put the payload in memory, and the receiver reads it with system-scope loads that
-miss every cache.
+Ordering follows the HIP path's cheap fence (gfx942 / gfx950 / gfx1250): the heap is
+uncached, so a sender that waits for its own stores (``s_waitcnt``) before the tail
+store has put the payload in memory, and the receiver reads it with system-scope
+loads that miss every cache. On gfx1250 the payload stores carry SCOPE_SYS
+(``SYS_STORE``), without which the wait would return before they reach the peer.
 """
 
 import functools
@@ -34,14 +35,22 @@ import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, range_constexpr
 
+from primus_turbo.flydsl.deep_ep.arch import TRAITS
 from primus_turbo.flydsl.deep_ep.common import (
+    SYS_LOAD,
+    SYS_STORE,
     WARP_SIZE,
+    copy_warp,
     ld_lds,
     lds_base,
     load_i32,
     load_index,
+    read_clock,
     st_lds,
     tensor_addr,
+    timed_out,
+    timeout_hit,
+    wait_mem_all,
 )
 from primus_turbo.flydsl.utils.attn_helper import _wave_any
 from primus_turbo.flydsl.utils.buffer_ops import (
@@ -57,11 +66,8 @@ from primus_turbo.flydsl.utils.prims import (
     _readlane_i32,
     atomic_add,
     cast,
-    copy_warp,
     ld,
     memory_fence,
-    read_clock,
-    spin_timed_out,
     st,
 )
 
@@ -69,27 +75,26 @@ NUM_THREADS = 1024
 NUM_WARPS = NUM_THREADS // WARP_SIZE
 FINISHED_SUM_TAG = 1024
 NOTIFY_THREADS = 256
-# sc0 | sc1 | nt: a system-scope streaming load, which misses every GPU cache
-SYS_LOAD = 0x13
+# butterfly-reduction lane offsets; a 32-lane offset on wave32 would lower to a wave64 permlane
+_WARP_XOR_OFFSETS = tuple(WARP_SIZE >> i for i in range(1, WARP_SIZE.bit_length()))
 _INT_MAX = 0x7FFFFFFF
 
 
 def dispatch_copy_piece_bytes(num_channels):
-    """Bytes of a row one ``copy_warp`` call loads before it stores them (1 KiB a warp step).
-
-    gfx9's vmcnt counts stores too, so the loads of the next piece wait for this piece's (remote)
-    stores; the more channels push at once, the smaller the piece that keeps a sender streaming.
-    Measured on MI355X, 8 ranks, hidden 7168, a DeepEP forward + backward per step
-    (num_sms -> best dispatch / combine): 20 -> 2 KiB / 8 KiB, 40 -> 1 KiB / 2 KiB,
-    64 and 80 -> 1 KiB / 1 KiB."""
-    return 2 * 1024 if num_channels <= 10 else 1024
+    """Bytes of a row one ``copy_warp`` call loads before it stores them (``ArchTraits.copy_piece_table``)."""
+    return TRAITS.copy_piece_bytes("dispatch", num_channels)
 
 
 def combine_copy_piece_bytes(num_channels):
     """The combine sender's ``dispatch_copy_piece_bytes``."""
-    if num_channels <= 10:
-        return 8 * 1024
-    return 2 * 1024 if num_channels <= 20 else 1024
+    return TRAITS.copy_piece_bytes("combine", num_channels)
+
+
+def combine_min_recv_buffer_tokens(num_max_send_tokens):
+    """Smallest combine ring that cannot deadlock. A reducer warp moves its queue head only once
+    its token is summed, so the published head trails the oldest pending token by up to one token
+    per reducer warp, and the sender still needs a whole chunk free past that."""
+    return NUM_WARPS - 1 + num_max_send_tokens - 1
 
 
 # ── Heap layout (byte offsets from a rank's buffer base) ─────────────────────
@@ -220,7 +225,7 @@ def _region_res(base, layout, name, slot):
     )
 
 
-def _copy_row(dst_addr, src_addr, num_bytes, piece_bytes, load_cache_modifier=0):
+def _copy_row(dst_addr, src_addr, num_bytes, piece_bytes, load_cache_modifier=0, store_cache_modifier=0):
     """Warp copy of one row between two warp-uniform i64 addresses."""
     # a row base the compiler cannot prove uniform turns every load / store into a waterfall
     dst_addr, src_addr = _uniform_i64(dst_addr), _uniform_i64(src_addr)
@@ -230,6 +235,7 @@ def _copy_row(dst_addr, src_addr, num_bytes, piece_bytes, load_cache_modifier=0)
             src_addr + fx.Int64(piece),
             min(piece_bytes, num_bytes - piece),
             load_cache_modifier=load_cache_modifier,
+            store_cache_modifier=store_cache_modifier,
         )
 
 
@@ -250,7 +256,7 @@ def group_barrier(lds, bar_id, num_arrived, num_warps_per_group: int, publish: b
     ``num_arrived`` is the count this warp expects before this barrier; returns the next one.
     ``publish`` first waits for the warp's own stores, the cheap fence in front of a tail store."""
     if publish:
-        fx.rocdl.s_waitcnt(0)
+        wait_mem_all()
     memory_fence(order="release", scope="workgroup")
     num_arrived = num_arrived + fx.Int32(num_warps_per_group)
     if fx.lane_id() == fx.Int32(0):
@@ -276,13 +282,14 @@ def barrier_block(barrier_ptrs_res, rank, num_ranks: int, sync_only: bool, tag: 
         spin_start = read_clock()
         value = _ld_sys(own_signal, thread_id)
         while value > fx.Int32(0):
-            if spin_timed_out(spin_start):
+            if timed_out(spin_start):
                 fx.printf(
                     "[DeepEP FlyDSL " + tag + "] barrier timeout: rank={} thread={} value={}\n",
                     rank,
                     thread_id,
                     value,
                 )
+                timeout_hit()
                 spin_start = read_clock()
             value = _ld_sys(own_signal, thread_id)
     fx.gpu.barrier()
@@ -295,8 +302,9 @@ def wait_nonzero_sys(addr, rank, channel, tag: str):
     spin_start = read_clock()
     value = _ld_sys(addr)
     while value == fx.Int32(0):
-        if spin_timed_out(spin_start):
+        if timed_out(spin_start):
             fx.printf("[DeepEP FlyDSL " + tag + "] timeout: rank={} channel={}\n", rank, channel)
+            timeout_hit()
             spin_start = read_clock()
         value = _ld_sys(addr)
     return value
@@ -308,8 +316,9 @@ def wait_free_slots(head_addr, tail, num_needed, num_recv_buffer_tokens: int, ra
     spin_start = read_clock()
     head = _ld_sys(head_addr)
     while fx.Int32(num_recv_buffer_tokens) - (tail - head) < num_needed:
-        if spin_timed_out(spin_start):
+        if timed_out(spin_start):
             fx.printf("[DeepEP FlyDSL " + tag + "] sender timeout: rank={} channel={}\n", rank, channel)
+            timeout_hit()
             spin_start = read_clock()
         head = _ld_sys(head_addr)
     return head
@@ -319,13 +328,14 @@ def wait_free_slots(head_addr, tail, num_needed, num_recv_buffer_tokens: int, ra
 def wait_new_tail(tail_addr, head, rank, channel, tag: str):
     """Whole-warp poll of a local queue tail until it moves past ``head``; returns it."""
     spin_start = read_clock()
-    fx.rocdl.s_waitcnt(0)
+    wait_mem_all()
     tail = _ld_sys(tail_addr)
     while tail == head:
-        if spin_timed_out(spin_start):
+        if timed_out(spin_start):
             fx.printf("[DeepEP FlyDSL " + tag + "] receiver timeout: rank={} channel={}\n", rank, channel)
+            timeout_hit()
             spin_start = read_clock()
-        fx.rocdl.s_waitcnt(0)
+        wait_mem_all()
         tail = _ld_sys(tail_addr)
     return tail
 
@@ -428,7 +438,7 @@ def _make_notify_dispatch(num_ranks, num_experts, num_channels, num_memset_int, 
                 while token < token_end:
                     count = count + _load_u8(in_rank_res, token * fx.Int32(num_ranks) + dst_rank)
                     token = token + fx.Int32(WARP_SIZE)
-                for offset in (32, 16, 8, 4, 2, 1):
+                for offset in _WARP_XOR_OFFSETS:
                     count = count + fx.shuffle_xor(count, offset, WARP_SIZE)
                 if lane_id == fx.Int32(0):
                     st_lds(lds, channel, count)
@@ -648,9 +658,10 @@ def _make_dispatch(
                                 _addr(x_base, 0, token, hidden_bytes),
                                 hidden_bytes,
                                 copy_piece_bytes,
+                                store_cache_modifier=SYS_STORE,
                             )
                             if lane_id == fx.Int32(0):
-                                buffer_store(token, src_idx_ring, dst_slot)
+                                buffer_store(token, src_idx_ring, dst_slot, cache_modifier=SYS_STORE)
                             if fx.const_expr(num_topk > 0):
                                 if lane_id < fx.Int32(num_topk):
                                     topk_idx_res = create_buffer_resource(TOPK_IDX, max_size=True)
@@ -667,14 +678,22 @@ def _make_dispatch(
                                     )
                                     local_expert = arith.select(is_local, expert - expert_begin, fx.Int32(-1))
                                     if fx.const_expr(topk_idx_bytes == 8):
-                                        buffer_store(_i64(local_expert), topk_idx_ring, ring_elem)
+                                        buffer_store(
+                                            _i64(local_expert),
+                                            topk_idx_ring,
+                                            ring_elem,
+                                            cache_modifier=SYS_STORE,
+                                        )
                                     else:
-                                        buffer_store(local_expert, topk_idx_ring, ring_elem)
+                                        buffer_store(
+                                            local_expert, topk_idx_ring, ring_elem, cache_modifier=SYS_STORE
+                                        )
                                     weight = buffer_load(topk_weights_res, elem, vec_width=1, dtype=fx.T.f32)
                                     buffer_store(
                                         arith.select(is_local, weight, fx.Float32(0.0)),
                                         topk_weights_ring,
                                         ring_elem,
+                                        cache_modifier=SYS_STORE,
                                     )
                             if fx.const_expr(num_scales > 0):
                                 x_scales_res = create_buffer_resource(X_SCALES, max_size=True)
@@ -687,7 +706,10 @@ def _make_dispatch(
                                             token * scale_token_stride + scale_idx * scale_hidden_stride,
                                         )
                                         buffer_store(
-                                            value, x_scales_ring, dst_slot * fx.Int32(num_scales) + scale_idx
+                                            value,
+                                            x_scales_ring,
+                                            dst_slot * fx.Int32(num_scales) + scale_idx,
+                                            cache_modifier=SYS_STORE,
                                         )
                         num_chunk_tokens = num_chunk_tokens + fx.Int32(1)
                     token = token + fx.Int32(1)
@@ -992,7 +1014,7 @@ def _make_combine(
     vec_elems = 16 // elem_bytes
     num_vecs = hidden_bytes // 16
     num_steps = (num_vecs + WARP_SIZE - 1) // WARP_SIZE
-    steps_per_pass = max(1, 32 // (num_ranks + int(has_bias_0) + int(has_bias_1)))
+    steps_per_pass = max(1, TRAITS.combine_loads_in_flight // (num_ranks + int(has_bias_0) + int(has_bias_1)))
 
     @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
     def combine_kernel(
@@ -1088,12 +1110,14 @@ def _make_combine(
                         _addr(x_base, 0, token + i, hidden_bytes),
                         hidden_bytes,
                         copy_piece_bytes,
+                        store_cache_modifier=SYS_STORE,
                     )
                     if lane_id == fx.Int32(0):
                         buffer_store(
                             load_i32(src_idx_res, token + i),
                             src_idx_ring,
                             dst_slot,
+                            cache_modifier=SYS_STORE,
                         )
                     if fx.const_expr(num_topk > 0):
                         if lane_id < fx.Int32(num_topk):
@@ -1105,7 +1129,12 @@ def _make_combine(
                                 vec_width=1,
                                 dtype=fx.T.f32,
                             )
-                            buffer_store(weight, topk_weights_ring, dst_slot * fx.Int32(num_topk) + lane_id)
+                            buffer_store(
+                                weight,
+                                topk_weights_ring,
+                                dst_slot * fx.Int32(num_topk) + lane_id,
+                                cache_modifier=SYS_STORE,
+                            )
                     i = i + fx.Int32(warps_per_rank)
                 token = token + num_round_tokens
                 tail = tail + num_round_tokens
@@ -1124,7 +1153,7 @@ def _make_combine(
                     last_head = fx.Int32(0)
                     num_retired = _sum_lds(lds, lds_retired + 1, num_reduce_warps)
                     while num_retired < fx.Int32(num_reduce_warps):
-                        fx.rocdl.s_waitcnt(0)
+                        wait_mem_all()
                         st_lds(lds, fx.Int32(lds_tail) + lane_id, _ld_sys(tail_addr))
                         min_head = fx.Int32(_INT_MAX)
                         for w in range_constexpr(1, NUM_WARPS):
@@ -1156,7 +1185,7 @@ def _make_combine(
                     spin_start = read_clock()
                     pending = _waits_on_tail(lds, lds_tail, lane_rank, expected_head)
                     while _wave_any(pending):
-                        if spin_timed_out(spin_start):
+                        if timed_out(spin_start):
                             if lane_id == fx.Int32(0):
                                 fx.printf(
                                     "[DeepEP FlyDSL combine] receiver timeout: rank={} channel={} token={}\n",
@@ -1164,6 +1193,7 @@ def _make_combine(
                                     channel,
                                     token,
                                 )
+                            timeout_hit()
                             spin_start = read_clock()
                         pending = _waits_on_tail(lds, lds_tail, lane_rank, expected_head)
 
