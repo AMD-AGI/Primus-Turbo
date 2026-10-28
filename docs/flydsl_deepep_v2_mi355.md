@@ -27,6 +27,7 @@ TDM. With enough CUs that cap stops mattering (results below).
 | Variable | Effect |
 | --- | --- |
 | `PRIMUS_TURBO_DEEPEP_V2_TDM=0` | `flydsl_v2` takes the register copy on gfx1250 too. Read when `intranode_v2_kernel` is imported; `flydsl_intranode.v2_code_path()` shows the path. |
+| `PRIMUS_TURBO_DEEPEP_ARCH_TRAITS="field=value,..."` | Replaces the tuning fields of this GPU's `ArchTraits` (`v2_copy_piece_bytes`, `combine_loads_in_flight`, `spin_timeout_cycles`, `trap_on_timeout`), for tuning on MI355X without editing `arch.py`. Read at import. |
 
 No switch is needed off gfx1250: the runtime accepts `flydsl_v2` on every GPU (with one warning per
 process where it is experimental), and `tests/pytorch/deep_ep/test_intranode.py` runs its `flydsl_v2`

@@ -120,6 +120,7 @@ assert TAILS_OFFSET + 8 * MAX_CHANNELS * 4 <= 192 * 1024
 # register copy: a warp loads at most this much of a row before storing it, which bounds the VGPRs of
 # a copy
 FANOUT_PIECE_BYTES = TRAITS.v2_copy_piece_bytes
+assert FANOUT_PIECE_BYTES > 0 and FANOUT_PIECE_BYTES % 16 == 0, FANOUT_PIECE_BYTES
 # rows move global -> LDS -> global through the Tensor Data Mover where there is one: a warp copy of
 # the row through VGPRs caps how much each CU keeps in flight, and with it the bandwidth per CU.
 # PRIMUS_TURBO_DEEPEP_V2_TDM=0 takes the register copy there too (the only path elsewhere); read at

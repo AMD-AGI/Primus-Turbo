@@ -28,7 +28,7 @@ from torch.testing._internal.common_utils import (
 
 import primus_turbo.pytorch as pt
 import primus_turbo.pytorch.deep_ep.flydsl_intranode as flydsl_intranode
-from primus_turbo.flydsl.deep_ep.arch import TRAITS, get_arch_traits
+from primus_turbo.flydsl.deep_ep.arch import TRAITS, get_arch_traits, with_overrides
 from primus_turbo.flydsl.deep_ep.common import IS_GFX1250
 from primus_turbo.flydsl.deep_ep.intranode_v2_kernel import combine_v2_layout, dispatch_v2_layout
 from primus_turbo.pytorch.deep_ep._compat import deep_ep_cpp
@@ -428,6 +428,26 @@ class ArchTraitsTestCase(TestCase):
             )
         unknown = get_arch_traits("gfx90a")
         assert unknown == get_arch_traits("gfx942")._replace(name="gfx90a")
+
+    def test_tuning_overrides(self):
+        """``PRIMUS_TURBO_DEEPEP_ARCH_TRAITS`` sets the tuning fields and refuses the hardware ones."""
+        base = get_arch_traits("gfx950")
+        tuned = with_overrides(
+            base, " v2_copy_piece_bytes=2048, combine_loads_in_flight=0x10,trap_on_timeout=1"
+        )
+        assert (tuned.v2_copy_piece_bytes, tuned.combine_loads_in_flight, tuned.trap_on_timeout) == (
+            2048,
+            16,
+            True,
+        )
+        assert (
+            tuned._replace(v2_copy_piece_bytes=8192, combine_loads_in_flight=32, trap_on_timeout=False)
+            == base
+        )
+        assert with_overrides(base, "") == base
+        for spec in ("wave_size=32", "has_tdm=1", "max_lds_bytes=1", "cpol_sys_store=0", "bogus=1"):
+            with self.assertRaisesRegex(ValueError, "not one of the tunable fields"):
+                with_overrides(base, spec)
 
     def test_code_path_follows_the_traits(self):
         expected = TRAITS.has_tdm and os.environ.get("PRIMUS_TURBO_DEEPEP_V2_TDM", "1") != "0"

@@ -32,6 +32,12 @@ gfx942 and gfx950 get their own entries (their LDS differs); every other field k
 An unknown target gets the gfx942 values (no TDM, 64 KiB LDS). Being a NamedTuple keeps every field in
 FlyDSL's compile cache key (`flydsl_deepep_mi455.md` §9).
 
+`PRIMUS_TURBO_DEEPEP_ARCH_TRAITS="field=value,..."` (read at import) replaces the tuning fields of the
+target's traits, `v2_copy_piece_bytes`, `combine_loads_in_flight`, `spin_timeout_cycles` and
+`trap_on_timeout`, so other values can be measured without editing `arch.py`; it refuses the fields that
+describe the hardware. Each value is part of the compile cache key, but give each its own
+`FLYDSL_RUNTIME_CACHE_DIR` anyway when comparing.
+
 ## Layer 2: the code path inside V2 (`intranode_v2_kernel.py`)
 
 Chosen when a kernel is built, from `TRAITS`:
@@ -93,6 +99,8 @@ the default of this GPU from one table:
 | gfx1250 register copy unchanged | MI455X, compile only | the same with `PRIMUS_TURBO_DEEPEP_V2_TDM=0` | 18 / 18 byte-identical |
 | gfx950 / gfx942 code unchanged and within limits | MI455X, compile only | ISA against `461d9caa`; LDS of every V2 kernel checked against `max_lds_bytes` when it is built; EP8 | 36 / 36 byte-identical; EP8 compiles on all four; wave64 code (`v_mbcnt_hi`, 64-bit exec), no TDM instructions |
 | Both paths run | 2× MI455X | `test_intranode.py` with TDM and with `PRIMUS_TURBO_DEEPEP_V2_TDM=0` (`NCCL_CUMEM_ENABLE=0`, #584); a short benchmark of both | 20 tests each: 18 pass, 2 skipped (`cpp`); dispatch / combine at 32 / 128 / 256 CUs: TDM 332 / 347, 182 / 151, 175 / 136 µs, register copy 758 / 604, 261 / 170, 185 / 139 µs, outputs checked. V2 stress test with the register copy (10 configurations with tiny rings, 30% dropped top-k slots, every row checked): 100 repetitions each, all pass |
+| Tuning values | MI455X, compile only | gfx950 at EP2 / EP4 with `v2_copy_piece_bytes` 1 / 2 / 4 KiB and `combine_loads_in_flight` 16 / 12 / 8 | all compile; with the variable unset, 72 / 72 ISA files byte-identical to `461d9caa`. On gfx950 `combine_loads_in_flight=16` removes the combine spills (59 / 48 VGPRs at EP2 / EP4 → 0); 1 KiB pieces take the dispatch from 90 to 56 VGPRs |
+| Tuning values run | 2× MI455X, register copy | the same values (and 2 KiB with 16), `test_intranode.py` + V2 stress (30 repetitions) + a short benchmark | all pass. On gfx1250 smaller pieces are slower (64 / 128 / 256 CUs dispatch 430 / 265 / 189 µs at 8 KiB, 543 / 315 / 204 µs at 1 KiB) and the loads in flight do not matter; gfx9's counters differ, so this does not settle gfx950 |
 | wave64 at run time | gfx942 CI | gate 1 (manual dispatch of the CI workflow on this branch) | not run yet |
 | MI355X | MI355X host | gates 2–4 | not run yet |
 

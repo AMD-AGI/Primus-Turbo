@@ -15,10 +15,13 @@
 
 ``TRAITS`` holds the choices for the target FlyDSL compiles for (``FLYDSL_GPU_ARCH`` or the
 device), read once at import time: a process builds for one architecture, and FlyDSL keys its
-compile cache on the target.
+compile cache on the target. ``PRIMUS_TURBO_DEEPEP_ARCH_TRAITS`` replaces its tuning fields, e.g.
+``v2_copy_piece_bytes=2048,combine_loads_in_flight=16``, to measure other values without editing this
+file.
 """
 
 import functools
+import os
 from typing import NamedTuple, Optional
 
 from flydsl.runtime.device import get_rocm_arch
@@ -122,4 +125,24 @@ def get_arch_traits(arch: Optional[str] = None) -> ArchTraits:
     return _TRAITS.get(arch) or _TRAITS["gfx942"]._replace(name=arch)
 
 
-TRAITS = get_arch_traits()
+# the fields PRIMUS_TURBO_DEEPEP_ARCH_TRAITS may set; the others describe the hardware
+TUNABLE_FIELDS = ("v2_copy_piece_bytes", "combine_loads_in_flight", "spin_timeout_cycles", "trap_on_timeout")
+
+
+def with_overrides(traits: ArchTraits, spec: str) -> ArchTraits:
+    """``traits`` with the ``field=value,...`` of ``spec`` (``PRIMUS_TURBO_DEEPEP_ARCH_TRAITS``) applied."""
+    fields = {}
+    for item in filter(None, (part.strip() for part in spec.split(","))):
+        name, _, value = (x.strip() for x in item.partition("="))
+        if name not in TUNABLE_FIELDS:
+            raise ValueError(
+                f"PRIMUS_TURBO_DEEPEP_ARCH_TRAITS: {name!r} is not one of the tunable fields {TUNABLE_FIELDS}"
+            )
+        if isinstance(getattr(traits, name), bool):
+            fields[name] = value.lower() in ("1", "true")
+        else:
+            fields[name] = int(value, 0)
+    return traits._replace(**fields)
+
+
+TRAITS = with_overrides(get_arch_traits(), os.environ.get("PRIMUS_TURBO_DEEPEP_ARCH_TRAITS", ""))
