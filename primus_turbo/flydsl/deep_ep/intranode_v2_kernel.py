@@ -133,9 +133,11 @@ FANOUT_PIECE_BYTES = 8 * 1024
 USE_TDM = IS_GFX1250
 # LDS a block can allocate on gfx1250
 MAX_LDS_BYTES = 320 * 1024
-# combine: tokens a warp claims from the reduce queue at a time (PRIMUS_TURBO_DEEPEP_V2_REDUCE_GRAB_TOKENS
-# for experiments; REDUCE_GRAB_TOKENS x num_ranks lanes must fit a wave)
-REDUCE_GRAB_TOKENS = int(os.environ.get("PRIMUS_TURBO_DEEPEP_V2_REDUCE_GRAB_TOKENS", "4"))
+# combine: tokens a warp claims from the reduce queue at a time. A claim waits for all its tokens' rows,
+# so one late row holds up the claim: one token per claim takes the reduce tail after the last push from
+# 34 to 12 us at EP2 / 160 CUs (PRIMUS_TURBO_DEEPEP_V2_REDUCE_GRAB_TOKENS for experiments;
+# REDUCE_GRAB_TOKENS x num_ranks lanes must fit a wave)
+REDUCE_GRAB_TOKENS = int(os.environ.get("PRIMUS_TURBO_DEEPEP_V2_REDUCE_GRAB_TOKENS", "1"))
 
 
 def _tdm_row(lds_addr, global_addr, num_bytes):
@@ -905,7 +907,8 @@ COMBINE_PUSH_WARPS = int(os.environ.get("PRIMUS_TURBO_DEEPEP_V2_COMBINE_PUSH_WAR
 def combine_v2_push_warps(num_channels):
     """Warps of each block that push before they reduce; the others reduce from the start. A grid
     of 96+ blocks saturates the links with about 2/3 of its warps pushing, and the rest overlap
-    the reduce with the push; a narrower one is bound by how fast each CU sends, so all push."""
+    the reduce with the push; a narrower one is bound by how fast each CU sends, so all push (with
+    TDM, LDS caps both at 22 slots for hidden 7168; fewer pushers measured slower at every grid)."""
     if COMBINE_PUSH_WARPS > 0:
         return min(COMBINE_PUSH_WARPS, NUM_WARPS)
     return NUM_WARPS * 11 // 16 if num_channels >= 96 else NUM_WARPS
