@@ -40,7 +40,9 @@ of the hardware. Branch `dev/boyang/flydsl_deepep_gfx1250_roofline`, from PR #58
   local writes + 6 µs): the rank's own rows are stored by the sending warps one row at a time, and the
   peers' rows are copied out of the heap after each block's send (phase stamps: the copy runs 14 µs past
   the last send); the notify and host wait add 57 µs; the combine's reduce ran up to 40 µs past its last
-  push; with 64 CUs or fewer each CU's issue rate bounds the send.
+  push; with 64 CUs or fewer each CU's issue rate bounds the send. At EP4 (160 CUs, one-token claims) the
+  stamps put the dispatch at a send 11–18 µs over the copy kernel plus a 30–34 µs receive-copy tail, and
+  the combine at a push at 92–93% of the copy kernel plus a 36–37 µs reduce tail ([EP4](#ep4)).
 - **First change on this branch** (`550ad251`): the combine's reduce claims one token at a time instead
   of four (a claim waits for all its tokens' rows, so one late row held up four tokens). Combine at 160
   CUs: EP2 145.7 → 126.8 µs (49% → 56% of 1.62 TB/s), EP4 302.5 → 260.6 µs (57% → 66%); outputs
@@ -507,16 +509,26 @@ times by under 1%):
 
 One-token claims stay the best claim size at EP4. With one-token claims, 16 push warps take 8 µs off the
 combine at 160 CUs (the reduce tail after the last push 37 → 21 µs), cost 15 µs at 80 CUs and change
-nothing at 256; at EP2, 16 push warps were measured only with claims of four.
+nothing at 256. Fewer pushers with one-token claims, stamps off (combine µs):
+
+| push warps | EP2 32 CUs | 80 | 160 | 256 | EP4 32 CUs | 80 | 160 | 256 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 22 (default) | 332.5 | 152.7 | 126.4 | 120.4 | 664.4 | 310.9 | 262.3 | 248.0 |
+| 16 | 375.5 | 173.2 | 131.1 | 120.7 | 713.6 | 324.6 | 255.0 | 248.5 |
+| 12 | 386.6 | 179.5 | 127.5 | 118.0 | 756.3 | 340.3 | 253.8 | 252.3 |
+
+Fewer pushers gain 3% only at EP4 / 160 CUs and lose at EP2 below 256 CUs and everywhere below 160 CUs
+(ten repeats of the EP4 default spread 2–6 µs), so the default stays at 22.
 
 Kernel time alone at EP4 with one-token claims (rocprofv3, slowest rank): combine kernel 300.9 / 251.6 /
 239.8 µs at 80 / 160 / 256 CUs (before: 284.3 µs at 160, 274.8 at 256).
 
 **One unexplained fault**: the first EP4 run with stamps on hit an illegal memory access at the first
-160-CU call, after the 32- and 80-CU runs had passed; it compiled its kernels from an empty cache. Ten
-further stamps-on runs (three from an empty cache) and ten stamps-off runs (three from an empty cache),
-every CU count with the outputs checked, passed. The stamps are experiment-only code, but a race in the kernels cannot be ruled
-out from this (see [Next measurements](#next-measurements)).
+160-CU call, after the 32- and 80-CU runs had passed; it compiled its kernels from an empty cache. Twenty
+further stamps-on runs (thirteen from an empty cache), twenty stamps-off runs (thirteen from an empty
+cache), every CU count with the outputs checked, and `test_intranode.py` twice at EP4 (21 tests, 2 skipped)
+passed: 1 fault in 21 stamps-on runs, none without stamps. The stamps are experiment-only code; a rare race
+in the kernels is not ruled out by this, but it did not show in about 40 runs.
 
 ## What could still be gained
 
@@ -555,10 +567,10 @@ same case as the cached dispatch here (58%).
 5. ~~Tuned RCCL at EP4~~: measured 2026-10-29 ([Tuned RCCL](#tuned-rccl-all-to-all-against-flydsl_v2)).
 6. ~~`06-rccl`'s RCCL build (`105dd4f`) here~~: not done; the baseline stays the container's RCCL
    (user, 2026-10-29).
-7. The EP4 illegal memory access ([EP4](#ep4)): many back-to-back `test_intranode.py` and `bench_ops.py`
-   runs at EP4 with stamps off, from empty caches, to tell a kernel race from the stamp code.
-8. 16 push warps with one-token claims at EP2 (2 GPUs), to decide whether the combine should use fewer
-   pushers from 160 CUs up.
+7. The EP4 illegal memory access ([EP4](#ep4)): 20 stamps-on and 20 stamps-off runs plus `test_intranode.py`
+   twice did not reproduce it (2026-10-29). Open; a `HSA_TOOLS_REPORT_LOAD_FAILURE` / address-sanitizer
+   build would be the next step if it shows again.
+8. ~~Fewer push warps with one-token claims~~: measured at EP2 and EP4; the default stays at 22 ([EP4](#ep4)).
 
 ## References
 
