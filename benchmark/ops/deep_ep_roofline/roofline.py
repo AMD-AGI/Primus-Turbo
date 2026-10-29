@@ -23,10 +23,11 @@ import json
 from collections import defaultdict
 
 # AMD Instinct MI455X, peak (amd.com product page and brochure): 23.3 TB/s HBM4; 3.6 TB/s bidirectional
-# scale-up per GPU (36 links x 400 Gbit/s each way, so 1.8 TB/s each way); 315 TFLOP/s vector FP32.
+# scale-up per GPU (36 links x 400 Gbit/s each way, so 1.8 TB/s each way). FP32: the combine's plain v_add_f32
+# peaks at 256 CUs x 2.4 GHz x 4 SIMDs x 32 lanes = 78.6 TFLOP/s (157 with FMA, 315 packed, the spec value).
 PEAK_HBM = 23.3e12
 PEAK_LINK = 1.8e12
-PEAK_VALU = 315e12
+PEAK_VALU = 78.6e12
 
 DISPATCH_OPS = ("dispatch_sync", "dispatch_cached", "dispatch_worst")
 
@@ -99,7 +100,7 @@ def roofline_table(data, ceil):
     lay, t = layouts(data), times(data)
     print(f"### Roofline per kernel: EP{data['world']}, hidden {H} bf16, top-{data['K']} of {data['E']}\n")
     print(
-        "Bounds at the MI455X peaks: link 1.8 TB/s each way, HBM 23.3 TB/s, vector FP32 315 TFLOP/s. "
+        "Bounds at the MI455X peaks: link 1.8 TB/s each way, HBM 23.3 TB/s, FP32 add 78.6 TFLOP/s. "
         '"measured link": the best copy (copy engines or the TDM copy kernel) over the link.\n'
     )
     print(
