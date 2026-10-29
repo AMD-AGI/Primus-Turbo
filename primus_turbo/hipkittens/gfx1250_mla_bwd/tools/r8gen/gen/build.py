@@ -241,12 +241,18 @@ def main():
         G.set_nkv(nkv)
         mlines = {m[2] for m in markers}
         hi, seen = shellbase.shell_span(shell, ins, bl, by["INIT"][2], by["FINAL"][2], mlines)
-        base = hi + 1
-        for _, ops, _, _, _ in by.values():
-            for v in ops.values():
+        base, why = hi + 1, f"shell code v{hi}"
+        for mk, (_, ops, _, _, _) in by.items():
+            for k, v in ops.items():
                 m = re.fullmatch(r"v(\d+)|v\[(\d+):(\d+)\]", v)
-                if m:
-                    base = max(base, int(m.group(3) or m.group(1)) + 1)
+                if m and int(m.group(3) or m.group(1)) + 1 > base:
+                    base, why = int(m.group(3) or m.group(1)) + 1, f"{mk} operand {k}={v}"
+        log(f"nkv={nkv}: base v{base} set by {why}")
+        if hi >= 15:
+            for i in sorted(seen):
+                vs = [r for r in list(ins[i].defs) + list(ins[i].uses) if r >= 15]
+                if vs:
+                    log(f"   line {i + 1}: {shell[i].strip()[:100]}")
         if shell_hi >= base:
             fail.append(f"nkv={nkv}: the shell references v{shell_hi} (line {shell_hi_at}) at or above base v{base}")
         L = G.Layout(base)

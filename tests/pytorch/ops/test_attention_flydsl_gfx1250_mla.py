@@ -723,6 +723,8 @@ def test_hk_manifest():
     fold = bool(m.get("nd_fold"))
     assert ("--nd-fold" in m["kernels"]["k_dkdv96ds"].get("gen_args", [])) == fold
     assert ("-DHK_ND_FOLD=1" in m["kernels"]["k_delta"]["extra_flags"]) == fold
+    # ticket: k_dkdv96ds built with HKGEN_TICKET takes its work items from the counter the "ticket" step zeroes
+    assert ("-DHKGEN_TICKET=1" in m["kernels"]["k_dkdv96ds"]["extra_flags"]) == bool(m.get("ticket"))
     for name, k in m["kernels"].items():
         assert (hsaco.HIP_DIR / k["src"]).is_file(), name
         assert len(k["hsaco_sha256"]) == 64 and k["block"] in (64, 128, 256)
@@ -813,8 +815,9 @@ def test_hk_asm_patches(tmp_path):
 
 
 def test_hk_plan_on_meta_tensors():
-    """The launch plan at DeepSeek-V3's shape, on meta tensors (no GPU): three launches, the grids,
-    the dS scratch size, and argument tuples that match the manifest's kernel signatures."""
+    """The launch plan at DeepSeek-V3's shape, on meta tensors (no GPU): three kernel launches (and the
+    ticket counter's host step in front of dkdv), the grids, the dS scratch size, and argument tuples that
+    match the manifest's kernel signatures."""
     impl = _hk_package("impl")
     m = _hk_package("hsaco").load_manifest()
     b, s, h = 2, 4096, 128
@@ -822,13 +825,16 @@ def test_hk_plan_on_meta_tensors():
     o = torch.empty(b, s, h, D_V, dtype=torch.bfloat16, device="meta")
     lse = torch.empty(b, h, s, dtype=torch.float32, device="meta")
     plan = impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None)
-    assert [x[0] for x in plan["launches"]] == ["delta", "dkdv", "dq"]
+    ticket = ["ticket"] if impl._ticket() else []
+    assert [x[0] for x in plan["launches"]] == ["delta"] + ticket + ["dkdv", "dq"]
     assert plan["grids"]["dkdv"] == (32, 43, 8)  # 42 blocks of 96 kv rows + one 64-row tail
     assert plan["grids"]["dq"] == (32, 11, 8)  # 10 tiles of 384 queries + the 256-query head
     assert plan["ds_layout_bytes"] == 4_328_521_728
     assert plan["ds_full"].numel() * 2 == 4_328_521_728 + 2 * impl.DS_GUARD_B
-    for _, name, (grid, block, values) in plan["launches"][1:]:
-        assert block == m["kernels"][name]["block"] and len(values) == len(m["kernels"][name]["args"])
+    for _, name, args in plan["launches"]:
+        if name in m["kernels"]:
+            grid, block, values = args
+            assert block == m["kernels"][name]["block"] and len(values) == len(m["kernels"][name]["args"])
     with pytest.raises(ValueError, match="not proven"):
         impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None, head_group=48)
 
@@ -853,7 +859,7 @@ def test_hk_plan_delta_launch(monkeypatch):
     assert len(values) == len(args) and values[6:] == (f32_arg, s, h)
     assert (values[0], values[1], values[3]) == (o, o, lse)
     assert (values[2], values[4], values[5]) == (hip["delta"], hip["nl"], hip["nd"])
-    assert hip["launches"][1][2][2][4:6] == (hip["nl"], hip["nd"])  # what dkdv reads
+    assert next(x for x in hip["launches"] if x[0] == "dkdv")[2][2][4:6] == (hip["nl"], hip["nd"])  # dkdv reads
     fly = impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None, hk_delta=False)
     assert fly["launches"][0][1] is impl._k.launch_delta and fly["grids"]["delta"] == (128, 256, 1)
     assert fly["launches"][0][2][4:6] == (fly["nl"], fly["nd"])
@@ -1105,6 +1111,31 @@ def test_hk_delta_falls_back_to_flydsl(monkeypatch):
         assert torch.isfinite(a).all() and torch.equal(a, b)
 
 
+def test_hk_plan_ticket_step():
+    """With the manifest's ticket, a host step zeroes k_dkdv96ds's ticket counter (the int 64 B in front of the dS
+    layout) right before every dkdv launch, head chunks included (they share one scratch); it touches nothing else."""
+    impl = _hk_package("impl")
+    if not impl._ticket():
+        pytest.skip("the manifest has no ticket")
+    b, s, h = 2, 4096, 128
+    q, k, v = _meta(b, s, s, h)
+    o = torch.empty(b, s, h, D_V, dtype=torch.bfloat16, device="meta")
+    lse = torch.empty(b, h, s, dtype=torch.float32, device="meta")
+    for budget in (None, impl._scratch_bytes(1, s, s, 64, True)):
+        plan = impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None, max_scratch_bytes=budget)
+        steps = plan["launches"]
+        idx = [i for i, x in enumerate(steps) if x[0] == "dkdv"]
+        assert idx and all(steps[i - 1] == ("ticket", impl._zero_ticket, (plan["ds_full"],)) for i in idx)
+        assert sum(x[0] == "ticket" for x in steps) == len(idx) and impl._zero_ticket in impl.HOST_STEPS
+    ds_full = torch.full(((2 * impl.DS_GUARD_B + 1024) // 2,), 3.0, dtype=torch.bfloat16)
+    before = ds_full.view(torch.uint8).clone()
+    impl._zero_ticket(ds_full)
+    after = ds_full.view(torch.uint8)
+    lo, hi = impl.DS_GUARD_B - 64, impl.DS_GUARD_B
+    assert torch.all(after[lo:hi] == 0)
+    assert torch.equal(after[:lo], before[:lo]) and torch.equal(after[hi:], before[hi:])
+
+
 def test_hk_plan_head_chunks_under_a_scratch_budget():
     """A dS scratch budget below the whole call's splits the (dkdv, dq) pair into head chunks of one
     batch that share one scratch; no head group fitting raises ScratchBudgetError."""
@@ -1114,13 +1145,15 @@ def test_hk_plan_head_chunks_under_a_scratch_budget():
     o = torch.empty(b, s, h, D_V, dtype=torch.bfloat16, device="meta")
     lse = torch.empty(b, h, s, dtype=torch.float32, device="meta")
     full = impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None)
-    assert full["chunks"] is None and len(full["launches"]) == 3
+    ticket = ["ticket"] if impl._ticket() else []
+    assert full["chunks"] is None and [x[0] for x in full["launches"]] == ["delta"] + ticket + ["dkdv", "dq"]
     half = impl._scratch_bytes(1, s, s, 64, True)
     plan = impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None, max_scratch_bytes=half)
     assert plan["chunks"] == [(0, 0, 64), (0, 64, 64), (1, 0, 64), (1, 64, 64)]
-    assert [x[0] for x in plan["launches"]] == ["delta"] + ["dkdv", "dq"] * 4
+    assert [x[0] for x in plan["launches"]] == ["delta"] + (ticket + ["dkdv", "dq"]) * 4
     assert plan["ds_full"].numel() * 2 == half
-    assert plan["launches"][1][2][0] == (32, 43, 2) and plan["launches"][2][2][0] == (32, 11, 2)
+    grids = {x[0]: x[2][0] for x in plan["launches"] if x[0] in ("dkdv", "dq")}
+    assert grids == {"dkdv": (32, 43, 2), "dq": (32, 11, 2)}
     with pytest.raises(impl.ScratchBudgetError):
         impl._plan(
             o,

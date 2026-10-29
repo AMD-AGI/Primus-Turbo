@@ -6,7 +6,7 @@
 
 """hk_attn_bwd: the gfx1250 MLA backward with HIP dK/dV and dQ kernels.
 
-Three launches, all on the caller's current stream, in this order:
+Three kernel launches, all on the caller's current stream, in this order:
   "delta"  HIP k_delta: delta, and the per-row constants the dK/dV kernel reads (64-query workgroups).
            With the manifest's ``nd_fold`` (the generated k_dkdv96ds starts its dP chains from -delta and
            its softmax yields scale * P): NL = -LOG2E*lse + l2s, ND = -delta, l2s = log2(scale) rounded to
@@ -17,12 +17,18 @@ Three launches, all on the caller's current stream, in this order:
            one fp32 add, one negation), so NL / ND and the gradients are the same bits either way;
   "dkdv"   HIP k_dkdv96ds: dK and dV (96-row kv blocks of two 48-row waves on one 3-stage Q/dO TDM ring,
            then 64-row tail blocks), and every bf16 dS^T tile it feeds the dK WMMA (softmax scale
-           included) stored into this call's scratch in dslayout.h v1;
+           included) stored into this call's scratch in dslayout.h v1. With the manifest's ``ticket``
+           (-DHKGEN_TICKET=1) a workgroup takes its kv block from a ticket counter (the int 64 B in front of
+           the dS layout, zeroed on the host by the "ticket" step right before the launch) instead of its
+           block id, in the grid's own order: the dispatcher deals a fixed number of blocks to each XCD, and
+           on a slower XCD they start later and take the later, shorter blocks instead of that XCD finishing
+           last. The block-to-workgroup assignment only changes which workgroup computes a block, not what
+           it computes;
   "dq"     HIP k_dqds_c: dQ = dS K read back from that scratch (384-query workgroups of 4 waves sharing
            one K ring, plus one merged 256-query head tile), so S and dP are never recomputed.
 k_dqds_c reads what k_dkdv96ds writes: there is no side stream. Every output element is written by
-exactly one workgroup (no atomics), so the results are deterministic and do not depend on the
-head-group targets.
+exactly one workgroup (the ticket's atomic only hands out work items), so the results are deterministic
+and do not depend on the head-group targets.
 
 Scratch: guard | layout | guard bf16, from the torch caching allocator on the current stream and
 referenced by this call only (4.33 GB at b2 s4096 h128, ``limits.ds_layout_bytes``); when the call
@@ -183,6 +189,11 @@ def _nd_fold():
     return bool(hsaco.load_manifest().get("nd_fold", False))
 
 
+def _ticket():
+    """The manifest's ticket: k_dkdv96ds takes its work items from a ticket counter (see the module docstring)."""
+    return bool(hsaco.load_manifest().get("ticket", False))
+
+
 def nd_fold_offset(scale):
     """log2(softmax scale) rounded to fp32: the HIP k_delta's f32 argument and the FlyDSL-delta fold's addend."""
     return struct.unpack("f", struct.pack("f", math.log2(scale)))[0]
@@ -193,6 +204,14 @@ def _fold_nl_nd(nl, nd, delta, l2s):
     (NL + l2s, -delta), bit for bit: the same fp32 add, a negation."""
     nl.add_(l2s)
     torch.neg(delta, out=nd)
+
+
+def _zero_ticket(ds_full):
+    """k_dkdv96ds's ticket counter (the int 64 B in front of the dS layout) = 0, before every dkdv launch."""
+    ds_full.view(torch.int32)[(DS_GUARD_B - 64) // 4 : DS_GUARD_B // 4].zero_()
+
+
+HOST_STEPS = (_fold_nl_nd, _zero_ticket)  # launches that are torch ops on the host side, not kernels
 
 
 def _hk_delta_reason(sq):
@@ -214,8 +233,10 @@ def _plan(
 ):
     """Every launch hk_attn_bwd makes for these inputs, in issue order, plus what it allocates.
 
-    launches: [(name, launcher, args)]: "delta", then "dkdv" / "dq" once, or once per head chunk; a HIP
-    launch is (kernel name, (grid, block, kernel argument values)), a FlyDSL one (launcher, its arguments).
+    launches: [(name, launcher, args)]: "delta" (+ "fold" after the FlyDSL k_delta with nd_fold), then
+    ("ticket" with the manifest's ticket) "dkdv" / "dq" once, or once per head chunk; a HIP launch is (kernel
+    name, (grid, block, kernel argument values)), a FlyDSL one (launcher, its arguments), a host step (one of
+    HOST_STEPS, its arguments).
     hk_delta: "delta" on the HIP k_delta (True) or the FlyDSL k_delta (False); None: HIP when
     _hk_delta_reason(sq) is None. head_group:
     target for both kernels (None: HEAD_GROUP_KV / HEAD_GROUP_Q); one the index proofs do not replay
@@ -330,6 +351,8 @@ def _plan(
             DS_MODE,
         )
         dq_values = (ds, k_, dq_, sq, skv, hq, hkv, g, skv // 32, skv - sq, c, q_off, ntile, hg_q)
+        if _ticket():
+            launches.append(("ticket", _zero_ticket, (ds_full,)))
         launches.append(("dkdv", "k_dkdv96ds", ((hg_kv, limits.k3_nblk(skv), gz_kv), 64, dkdv_values)))
         launches.append(("dq", "k_dqds_c", ((hg_q, ntile + nhead, gz_q), 128, dq_values)))
     return {
@@ -382,7 +405,7 @@ def hk_attn_bwd(
         if isinstance(fn, str):
             grid, block, values = args
             table[fn].call(grid, block, values, stream)
-        elif fn is _fold_nl_nd:
+        elif fn in HOST_STEPS:
             fn(*args)
         else:
             _fly._launch(fn, args)

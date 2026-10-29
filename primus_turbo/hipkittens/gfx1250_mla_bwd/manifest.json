@@ -18,6 +18,7 @@
   "toolchain": "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git 862306352beb9946c78b3e355d0d5201bbccfa3a)",
   "hipkittens_commit": "be1c91841b817c9690aa3af22ea771f8e3624bf4",
   "nd_fold": true,
+  "ticket": true,
   "kernels": {
     "k_dkdv96ds": {
       "src": "src/k_dkdv96ds.hip",
@@ -31,19 +32,20 @@
         "-mllvm",
         "-greedy-regclass-priority-trumps-globalness",
         "-DHKGEN=1",
-        "-DHKGEN_EARLY_TDM=1"
+        "-DHKGEN_EARLY_TDM=1",
+        "-DHKGEN_TICKET=1"
       ],
       "gen_args": [
         "--nd-fold",
         "--scal-in-body",
         "--tdm-dummy"
       ],
-      "hsaco_sha256": "b1d7e60a6b64921ebbbcddbfcf298ca249ef3282304f578a0471bc2cc2f74619",
+      "hsaco_sha256": "3bddad7482d668050f386022b5567fa92eae6e5901df62710eef7292d82be6c4",
       "asm_patch": "asm/k_dkdv96ds.s.patch",
-      "asm_input_sha256": "7f8d64a6efbf6e9d117c0bca416a1dc3c498d7916cee6faaba93a6f5eff278f8",
+      "asm_input_sha256": "673302aa75b8cc9a96e7fef4d3e73e2bac0c773ff3fb6a37f418d5920dbc5cd3",
       "block": 64,
       "kernarg_size": 120,
-      "lds": 64512,
+      "lds": 64516,
       "vgpr": 1024,
       "args": [
         {

@@ -15,7 +15,7 @@ Each backward call makes three launches on the caller's current stream:
 | launch | kernel | work |
 |---|---|---|
 | `delta` | HIP `k_delta` | delta, and the row constants k_dkdv96ds reads: NL = -LOG2E·lse + l2s, ND = -delta with the manifest's `nd_fold` (l2s = log2(scale) rounded to fp32 on the host, the kernel's f32 argument); 64-query workgroups of 16 rows × 16 lanes, delta bitwise equal to the FlyDSL `k_delta` (below) |
-| `dkdv` | HIP `k_dkdv96ds` | dK, dV over 96-row kv blocks (two 48-row waves on a 3-stage Q/dO TDM ring), then 64-row tail blocks; stores every bf16 dS^T tile it feeds the dK WMMA into the dS scratch. Its tile loop is generated (`tools/r8gen`, below) |
+| `dkdv` | HIP `k_dkdv96ds` | dK, dV over 96-row kv blocks (two 48-row waves on a 3-stage Q/dO TDM ring), then 64-row tail blocks; stores every bf16 dS^T tile it feeds the dK WMMA into the dS scratch. Its tile loop is generated (`tools/r8gen`, below); with the manifest's `ticket` a workgroup takes its kv block from a ticket counter (below), zeroed by a host step (`"ticket"`, `impl._zero_ticket`) right before the launch |
 | `dq` | HIP `k_dqds_c` | dQ = dS·K from that scratch: 384-query workgroups (4 waves sharing one K ring) plus one merged 256-query head tile |
 
 **dS scratch.** One block per call from the torch caching allocator, on the current stream:
@@ -56,7 +56,16 @@ packed FMAs per tile); dV is accumulated from scale·P and divided by scale once
 their SNR; dV rounds scale·P to bf16 instead of P (0.02-0.07 dB lower SNR against the fp32 reference at the
 test shapes, e.g. 52.64 vs 52.71 dB at b2 s4096 h128).
 
-**Results.** Every output element is written by exactly one workgroup (no atomics), so dQ / dK /
+**Ticket.** The dispatcher deals the dK/dV blocks to the 8 XCDs round robin, a fixed number each, and at
+b2 s4096 h128 the odd XCDs need 5-11% more cycles for the same blocks (memory stalls), so the even ones idled
+through the last ~100 us. Built with `-DHKGEN_TICKET=1` (manifest `ticket`), wave 0 of every workgroup takes
+`atomicAdd(counter, 1)` (agent scope; the int 64 B in front of the dS layout, in the scratch's front guard) and
+runs that block of the grid's own order (per batch / head group the longest kv blocks first) instead of its block
+id: on a slower XCD the workgroups start later and take the later, shorter blocks, and all XCDs end together.
+The counter only hands out work items; each block is computed exactly as before, so the results are unchanged
+bit for bit. Every dkdv launch, head chunks included, is preceded by the host step that zeroes the counter.
+
+**Results.** Every output element is written by exactly one workgroup (no atomics on results), so dQ / dK /
 dV are deterministic, and independent of the head-group launch targets and of head chunking. Without
 `nd_fold` they are also bitwise equal to the FlyDSL backward's (same dS rounding, same accumulation order);
 with it they round P / dS differently (the ND fold above) and match the fp32 reference as closely as the
@@ -159,13 +168,13 @@ MI455X (e15-02 GPU3), b2 s4096 h128, SBHD, causal, bf16, `scripts/mla_b0_bench.p
 
 | | time (ms) |
 |---|---|
-| forward (FlyDSL) | 0.807 |
-| backward, `hk` (hot / cold) | 2.361 / 2.352 |
-| per kernel: k_delta / k_dkdv96ds / k_dqds_c | 0.059 / 1.721 / 0.505 |
-| backward, FlyDSL | 3.553 |
-| autograd fwd + bwd, `hk` / FlyDSL | 3.184 / 4.385 |
+| forward (FlyDSL) | 0.806 |
+| backward, `hk` (hot / cold) | 2.336 / 2.327 |
+| per launch: k_delta / ticket step / k_dkdv96ds / k_dqds_c | 0.059 / 0.006 / 1.672 / 0.509 |
+| backward, FlyDSL | 3.547 |
+| autograd fwd + bwd, `hk` / FlyDSL | 3.152 / 4.379 |
 
-The `hk` backward is 1.50x faster than the FlyDSL one, and forward + backward is 1.38x faster. Against the
-LLVM-scheduled dK/dV kernel (71bd0329, the same runs interleaved): backward 2.432 -> 2.361 ms hot, 2.425 -> 2.352
-cold; k_dkdv96ds 1.809 -> 1.721 ms. The kernels are power-capped at this shape (~1.24 GHz): a saved cycle converts to
+The `hk` backward is 1.52x faster than the FlyDSL one, and forward + backward is 1.39x faster. Against the
+LLVM-scheduled dK/dV kernel (71bd0329, the same runs interleaved): backward 2.439 -> 2.336 ms hot, 2.431 -> 2.327
+cold; k_dkdv96ds 1.806 -> 1.672 ms. The kernels are power-capped at this shape (~1.2 GHz): a saved cycle converts to
 about a third of a cycle of time.
