@@ -12,7 +12,7 @@
 ###############################################################################
 
 """Kernel-level autotune for the FlyDSL builder ops, switched by ``PRIMUS_TURBO_AUTO_TUNE``. The
-``@flyc.jit`` ops tune through flydsl's own autotuner instead (see ``autotuner.py``)."""
+``@flyc.jit`` ops (rope, swiglu) keep ``mega/tune_utils.autotune`` instead."""
 
 from primus_turbo.flydsl.autotune import runtime
 from primus_turbo.flydsl.autotune.engine import NoWorkingConfig

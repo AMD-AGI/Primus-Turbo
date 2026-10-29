@@ -704,47 +704,6 @@ def test_op_entry_races_on_a_miss_only(enabled):
     assert made == (["a", "b", "c"] if enabled else ["a"]) and bench.calls == int(enabled)
 
 
-# ── jit ops: flydsl's own autotuner, guarded for capture ────────────────────
-
-
-def _jit_fn(tmp_path, monkeypatch, times, calls):
-    from primus_turbo.flydsl.autotune.autotuner import Config, autotune
-
-    monkeypatch.setenv("FLYDSL_AUTOTUNE_CACHE_DIR", str(tmp_path))
-
-    def bench(f, warmup, rep):
-        f()
-        return times[calls[-1]]
-
-    @autotune([Config(v=1), Config(v=2), Config(v=3)], key=["n"], do_bench=bench)
-    def fn(n, v):
-        calls.append(v)
-
-    return fn
-
-
-def test_jit_capture_runs_the_first_config_and_caches_nothing(tmp_path, monkeypatch, capturing):
-    calls = []
-    fn = _jit_fn(tmp_path, monkeypatch, {1: 3.0, 2: 1.0, 3: 2.0}, calls)
-    capturing["on"] = True
-    fn(8)
-    assert calls == [1] and fn.cache == {} and not (tmp_path / "fn.json").exists()
-    capturing["on"] = False
-    fn(8)
-    assert calls == [1, 1, 2, 3, 2] and len(fn.cache) == 1 and (tmp_path / "fn.json").exists()
-    capturing["on"] = True
-    fn(8)
-    assert calls[-1] == 2
-
-
-def test_jit_switch_does_not_gate_tuning(tmp_path, monkeypatch):
-    rt.force(False)
-    calls = []
-    fn = _jit_fn(tmp_path, monkeypatch, {1: 3.0, 2: 1.0, 3: 2.0}, calls)
-    fn(8)
-    assert calls[-1] == 2 and rt.report() == []
-
-
 # ── op level ────────────────────────────────────────────────────────────────
 
 
