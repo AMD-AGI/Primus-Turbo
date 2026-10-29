@@ -233,9 +233,10 @@ matches the byte table within 2–11%. `GL2C_EA_RDREQ_DRAM` / `GL2C_EA_WRREQ_DRA
 4 × MI455X, GPUs 0–3, 2026-10-29 (`ut_logs/roofline_ep4_20261029_102813/`), the same commands with
 `--nproc_per_node=4`, after a warm-up (see Time). Ceilings, per GPU to all three peers at once
 (`bench_ceiling.py`): TDM copy kernel 1.52–1.53 TB/s (32768 rows per peer, 64–256 blocks; 1.60 TB/s one
-way), copy engines 1.51 TB/s (a stream per peer); at 8192 rows per peer the ceiling run fell into the
-cold start and is not used. The MAIDAS alltoall roofline at the same volume per GPU (277.5 MB to the peers
-is the alltoall of a 353 MiB buffer): about 183 µs.
+way), 1.44–1.46 TB/s at 8192 rows per peer (from 96 blocks; repeated after a warm-up, the first run fell
+into the cold start); copy engines 1.51 TB/s (a stream per peer). A TDM copy block sends 33–37 GB/s at
+EP4 against 22–25 at EP2: one load feeds three peers. The MAIDAS alltoall roofline at the same volume per
+GPU (277.5 MB to the peers is the alltoall of a 353 MiB buffer): about 183 µs.
 
 DeepSeek-V3 routing (top-8 of 128 experts in the top 4 of 8 groups), T = 8192; link bytes 277.5 MB:
 
@@ -266,6 +267,26 @@ Uniform routing (top-8 of 256 experts, PR #583's EP4 case), T = 8192; link bytes
 | 256 | combine | 320.1 | 1000 | 56% | 62% | 66% |
 
 The host-wait dispatch (368 µs) and the combine (341 µs) match PR #583's EP4 table (0.36 / 0.34 ms).
+
+Where the time goes at EP4 (DeepSeek-V3 routing, ceilings at 8192 rows per peer and the same block count;
+a repeat of the CU sweep agrees within 1%):
+
+| CUs | cached dispatch µs | send at the harness ceiling | own rows + receive copy at the local copy rate | rest | combine µs | send at the harness ceiling | rest |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 429.6 | 263.1 | 86.3 | 80.2 | 668.7 | 263.1 | 405.6 |
+| 80 | 271.8 | 211.1 | 58.2 | 2.4 | 323.7 | 211.1 | 112.6 |
+| 160 | 258.1 | 191.8 | 47.6 | 18.8 | 302.5 | 191.8 | 110.7 |
+| 256 | 254.6 | 190.2 | 44.3 | 20.2 | 285.4 | 190.2 | 95.2 |
+
+Fits over T = 256 … 32768 at 160 CUs: cached dispatch 41.7 µs + bytes / 1302 GB/s, with host wait
+95.6 µs + 1264 GB/s, `num_worst_tokens` 62.3 µs + 1263 GB/s, combine 65.4 µs + 1198 GB/s. HBM traffic
+is 1.04 GB per kernel and rank (45 µs at the peak, 29% of the link time). Counters at 160 CUs:
+`WRITE_SIZE` 659–663 MB (dispatch) and 426–430 MB (combine) against 646 / 395 MB in the byte model;
+`FETCH_SIZE` 288–294 MB (dispatch) and 673 MB (combine): at EP4 it counts reads of the uncached heap
+that it did not count at EP2, so the read counters are not used.
+
+- The dispatch's "rest" is 14–25 µs from 96 CUs up (6 µs at EP2); the combine is 95–118 µs above the
+  send (41–64 µs at EP2).
 
 ## Where the time goes
 
@@ -325,8 +346,7 @@ same case as the cached dispatch here (58%).
 ## Next measurements
 
 1. ~~EP2 on this branch's head, kernel times and counters~~: done 2026-10-29 (above).
-2. ~~EP4~~: measured 2026-10-29 (above). Still open at EP4: the ceiling at 8192 rows per peer after a
-   warm-up (for the phase model), the counters.
+2. ~~EP4~~: measured 2026-10-29 (above), with the ceilings, the phase model and the write counters.
 3. **Per-phase timing** inside the kernels (`s_memrealtime` per block: send start and end, counts
    published, receive copy start and end; combine push end and reduce end) to split the local writes
    between the send and the receive copy, and the combine's 40–60 µs.
