@@ -25,7 +25,9 @@
 #
 # env: TOKENS_LIST (8192), HIDDEN (7168), TOPK (8), EXPERTS (128), ROUTING (dsv3 | uniform), GROUPS (8),
 #      GROUP_TOPK (4), BACKENDS (flydsl_v2,flydsl,rccl), CU_LIST (32,48,64,80,96,128,160,192,224,256),
-#      CHECK (1: check DeepEP outputs once per configuration), ITERS, ROUNDS, FLUSH_MB, OUT_JSON, TAG
+#      CHECK (1: check DeepEP outputs once per configuration), ITERS, ROUNDS, FLUSH_MB, OUT_JSON, TAG,
+#      PRIMUS_TURBO_DEEPEP_V2_PHASE_TIMING (1: also an "<op>_phases" row per flydsl_v2 op, from the
+#      kernels' stamps of the op's last call; use its own FLYDSL_RUNTIME_CACHE_DIR)
 import os
 
 import torch
@@ -47,6 +49,12 @@ NLE = E // WORLD
 
 group = init()
 import primus_turbo.pytorch as pt  # noqa: E402
+from primus_turbo.flydsl.deep_ep.intranode_v2_kernel import (  # noqa: E402
+    MAX_CHANNELS,
+    PHASE_EVENTS,
+    PHASE_TIMING,
+    PHASE_TIMING_OFFSET,
+)
 
 Buffer = pt.deep_ep.Buffer
 results = Results(
@@ -183,6 +191,46 @@ def run_deepep_cu(backend, T, x, topk_idx, topk_w, buf, cu):
         ("combine", combine),
     ):
         results.add(op=op, **common, **bench(fn))
+        if PHASE_TIMING and backend == "flydsl_v2":
+            results.add(
+                op=f"{op}_phases", **common, **phases(buf, "combine" if op == "combine" else "dispatch", cu)
+            )
+
+
+def phases(buf, kernel, num_blocks):
+    """The stamps of the last call of ``kernel`` on every rank (PRIMUS_TURBO_DEEPEP_V2_PHASE_TIMING), in µs
+    from the rank's first block start. dispatch: send = every block has sent, recv = every block has
+    copied what it received, per block medians of the same; combine: push = warp 0 of every block has
+    pushed, end = every block is done."""
+    torch.cuda.synchronize()
+    runtime = buf.intranode_runtime
+    k = 0 if kernel == "dispatch" else 1
+    first = (PHASE_TIMING_OFFSET + k * MAX_CHANNELS * PHASE_EVENTS * 8) // 8
+    stamps = runtime.symm.get_buffer(RANK, (num_blocks, PHASE_EVENTS), torch.int64, first).clone()
+    gathered = [torch.empty_like(stamps) for _ in range(WORLD)]
+    dist.all_gather(gathered, stamps)
+    out = {}
+    for r, s in enumerate(gathered):
+        s = (s.cpu().double() - s[:, 0].min().item()) / 100.0  # 100 MHz ticks -> µs
+        if kernel == "dispatch":
+            out[f"r{r}"] = dict(
+                send=s[:, 1].max().item(),
+                recv=s[:, 2].max().item(),
+                send_block_median=(s[:, 1] - s[:, 0]).median().item(),
+                recv_block_median=(s[:, 2] - s[:, 1]).median().item(),
+                first_send_end=s[:, 1].min().item(),
+                start_spread=s[:, 0].max().item(),
+            )
+        else:
+            out[f"r{r}"] = dict(
+                push=s[:, 1].max().item(),
+                end=s[:, 3].max().item(),
+                push_block_median=(s[:, 1] - s[:, 0]).median().item(),
+                reduce_w0_block_median=(s[:, 2] - s[:, 1]).median().item(),
+                end_block_median=(s[:, 3] - s[:, 0]).median().item(),
+                start_spread=s[:, 0].max().item(),
+            )
+    return dict(phases=out)
 
 
 def run_rccl(T, x, topk_idx, itr):

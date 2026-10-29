@@ -50,6 +50,7 @@ second half.
 """
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -116,6 +117,14 @@ COMBINE_FLAGS_BYTES = 4 << 20
 DATA_OFFSET = COMBINE_FLAGS_OFFSET + COMBINE_FLAGS_BYTES
 assert RECV_CHANNEL_OFFSET_OFFSET + 8 * MAX_CHANNELS * 4 <= TAILS_OFFSET
 assert TAILS_OFFSET + 8 * MAX_CHANNELS * 4 <= 192 * 1024
+# PRIMUS_TURBO_DEEPEP_V2_PHASE_TIMING=1: thread 0 of every block stores realtime-counter stamps (100 MHz)
+# into this rank's heap at PHASE_TIMING_OFFSET, int64 [kernel][block][PHASE_EVENTS], dispatch then
+# combine; read once per process, so give such a run its own FLYDSL_RUNTIME_CACHE_DIR. The combine
+# then waits for all its warps before its last stamp. Off, no code is emitted.
+PHASE_TIMING = os.environ.get("PRIMUS_TURBO_DEEPEP_V2_PHASE_TIMING", "0") == "1"
+PHASE_TIMING_OFFSET = 192 * 1024
+PHASE_EVENTS = 4
+assert PHASE_TIMING_OFFSET + 2 * MAX_CHANNELS * PHASE_EVENTS * 8 <= COMBINE_FLAGS_OFFSET
 
 # a warp loads at most this much of a row before storing it, which bounds the VGPRs of a copy
 FANOUT_PIECE_BYTES = 8 * 1024
@@ -154,6 +163,12 @@ def _tdm_row(lds_addr, global_addr, num_bytes):
     )
     group1 = vector.from_elements(fx.T.vec(8, i32), [fx.as_ir_value(fx.Int32(w)) for w in words])
     return tdm_ops.TDMDescriptor2D(dgroup0=group0, dgroup1=group1)
+
+
+def _stamp(local, kernel: int, block, event: int):
+    """One phase stamp (see PHASE_TIMING); the caller picks the thread."""
+    slot = fx.Int32((kernel * MAX_CHANNELS) * PHASE_EVENTS + event) + block * fx.Int32(PHASE_EVENTS)
+    _st_sys(local + fx.Int64(PHASE_TIMING_OFFSET), slot, read_clock())
 
 
 def _align(value, alignment):
@@ -481,6 +496,9 @@ def _make_dispatch_v2(
         recv_channel_offset_res = create_buffer_resource(RECV_CHANNEL_OFFSET, max_size=True)
         x_base = tensor_addr(X)
         token_start, token_end = _channel_task_range(num_tokens, num_channels, channel)
+        if fx.const_expr(PHASE_TIMING):
+            if thread_id == fx.Int32(0):
+                _stamp(local, 0, channel, 0)
 
         # the channel's first index in our stream to each rank, published to that rank before any
         # of its rows; and nothing received yet (our own rows go to the outputs directly)
@@ -669,6 +687,9 @@ def _make_dispatch_v2(
             tdm_ops.tensor_wait(0)
         wait_mem_all()
         fx.gpu.barrier()
+        if fx.const_expr(PHASE_TIMING):
+            if thread_id == fx.Int32(0):
+                _stamp(local, 0, channel, 1)
         if (thread_id < fx.Int32(num_ranks)) & (thread_id != rank):
             _st_sys(
                 _load_lane_ptr(buffer_ptrs_res, thread_id) + fx.Int64(TAILS_OFFSET),
@@ -729,6 +750,9 @@ def _make_dispatch_v2(
             fx.gpu.barrier()
         if fx.const_expr(USE_TDM):
             tdm_ops.tensor_wait(0)
+        if fx.const_expr(PHASE_TIMING):
+            if thread_id == fx.Int32(0):
+                _stamp(local, 0, channel, 2)
 
         # with a worst-case allocation, the rows past the received ones read as unrouted
         if fx.const_expr(num_topk > 0):
@@ -937,6 +961,9 @@ def _make_combine_v2(
         local = _load_ptr(buffer_ptrs_res, rank)
         rank_prefix_res = create_buffer_resource(RANK_PREFIX_MATRIX, max_size=True)
         lds = fx.arith.ArithValue(lds_base(), signed=True)
+        if fx.const_expr(PHASE_TIMING):
+            if thread_id == fx.Int32(0):
+                _stamp(local, 1, block_id, 0)
 
         # per source rank s: where its rows of x begin, and where our rank's rows start
         # in s's region (the tokens s sends to the ranks before ours)
@@ -1039,6 +1066,9 @@ def _make_combine_v2(
             wait_mem_all()
         if (pushed >= fx.Int32(0)) & (lane_id == fx.Int32(0)):
             _st_sys(peer_flags, pushed, epoch)
+        if fx.const_expr(PHASE_TIMING):
+            if thread_id == fx.Int32(0):
+                _stamp(local, 1, block_id, 1)
 
         # ---- reduce: each of our tokens over the ranks it went to, as soon as its rows are in;
         # warps claim tokens in order from a queue, the pushers once they are done ----
@@ -1174,6 +1204,12 @@ def _make_combine_v2(
                         buffer_store(weight, recv_topk_weights_res, token * fx.Int32(num_topk) + lane_id)
                 token = token + fx.Int32(1)
             first = _grab_tokens(counter, lds, lds_slot, grab_base)
+        if fx.const_expr(PHASE_TIMING):
+            if thread_id == fx.Int32(0):
+                _stamp(local, 1, block_id, 2)
+            fx.gpu.barrier()
+            if thread_id == fx.Int32(0):
+                _stamp(local, 1, block_id, 3)
 
     return combine_v2_kernel, smem_bytes
 
