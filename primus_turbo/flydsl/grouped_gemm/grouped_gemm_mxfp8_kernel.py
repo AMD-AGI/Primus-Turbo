@@ -13,8 +13,6 @@
 
 """FlyDSL MXFP8 (per-1x32 E8M0 block-scaled) grouped GEMM for gfx950 (NT fwd/dgrad)."""
 
-import math
-
 import torch
 
 # isort: off
@@ -26,7 +24,6 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.utils.gemm_helper import (
-    compile_with_scratch_out,
     compute_global_swizzle,
     _emit_lds_repack,
     emit_for,
@@ -37,7 +34,6 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     MfmaScale16x16x128,
     _PRESHUF_KT,
     resolve_accum_out,
-    _robust_time,
     S2RLoader,
     scale_opsel,
     ScaleBComb,
@@ -47,14 +43,11 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     wait_barrier,
     xcd_remap_pid,
 )
-from primus_turbo.flydsl.utils.gemm_epilogue_helper import (
-    MX8_LDS_WORDS_PER_WAVE,
-    MXFP8DualQuantStore,
-    StoreCSwiGLUQuantMX,
-)
+from primus_turbo.flydsl.autotune import Op, Race, Refine, staged
+from primus_turbo.flydsl.autotune.engine import Entry
+from primus_turbo.flydsl.autotune.policies import MatchBase, Point, RealArgs, Synthetic
 from primus_turbo.flydsl.utils.prims import (
     ceildiv,
-    _lds_barrier,
     _readfirstlane_i32,
 )
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
@@ -74,16 +67,6 @@ _PRESHUF_BLK = 256
 # E8M0 scale packing factor for the fwd/dgrad NT path (grouped-only opt-in; the
 # shared gemm_helper defaults to unpacked). wgrad stays unpacked (pack=1).
 _GG_SCALE_PACK = 4
-
-
-def run_eager_or_capture(entry, args, compiled_idx):
-    """Eager runs the compiled object; capture runs the raw closure (compiled regresses under capture)."""
-    if torch.cuda.is_current_stream_capturing():
-        entry[0](*args)
-    else:
-        if entry[compiled_idx] is None:
-            entry[compiled_idx] = compile_with_scratch_out(entry[0], args)
-        entry[compiled_idx](*args)
 
 
 def _wgrad_mx_accum(mfma, a_frags, b_frags, acc_regs, sa, sb):
@@ -255,25 +238,17 @@ def _wgrad_ssa_chunk(
     return a_cur0, a_cur1, b_cur0, b_cur1, a_next0, a_next1, b_next0, b_next1
 
 
-def _build_grouped_preshuffle_kernel(
-    K128: int, G: int, N: int, KT: int = _PRESHUF_KT, BLK: int = 256, glu_i: int = 0
-):
+def _build_grouped_preshuffle_kernel(K128: int, G: int, N: int, KT: int = _PRESHUF_KT, BLK: int = 256):
     """Fused per-group A (layout 1) + B (B-comb layout 3) E8M0 scale preshuffle.
 
     Returns ``(kern, n_kt, b_blocks_pg)``. Per-group into 64-row slabs (go_pre) so a
     32-aligned group data base needs no 64-alignment from the quantizer.
-
-    ``glu_i`` non-zero selects the fused-GLU B layout: ``N`` is then the weight's full
-    ``2 * glu_i`` row count, and a tile block's two halves become the gate and up bands
-    rather than 128 adjacent columns each -- see ``comb`` in :func:`_emit_lds_repack`.
     """
     TILE = 64 * KT  # noqa: F841 (mirrors build_preshuffle_ab_kernel; sized in Smem)
     n_kt = ceildiv(K128, KT)
     K128p = ceildiv(K128, _GG_SCALE_PACK)  # packed K-groups (PACK scales / dword)
     _a_slab_i32 = K128p * 256  # per-slab a_sp span (i32 elems, packed)
-    # Under glu a tile block is 128 gate columns, so its four 64-row slab groups are two of
-    # gate and two of up; the block count follows the gate width rather than N.
-    b_ngrp_pg = (ceildiv(glu_i, 128) if glu_i else ceildiv(N, 256)) * 4
+    b_ngrp_pg = ceildiv(N, 256) * 4
     b_blocks_pg = b_ngrp_pg * n_kt
     _b_slab_i32 = b_ngrp_pg * K128p * 256  # per-group b_sp slab (i32 elems, packed)
 
@@ -366,9 +341,6 @@ def _build_grouped_preshuffle_kernel(
                 rd_base=g * (N * K128),
                 wr_base=g * _b_slab_i32,
                 pack=_GG_SCALE_PACK,
-                # Under glu a tile block spans 128 gate columns and its second half is the
-                # up band, so the comb reads (128, I) rather than (256, 128).
-                comb=(128, glu_i) if glu_i else None,
             )
 
     return kern, n_kt, b_blocks_pg
@@ -388,30 +360,11 @@ def _build_grouped_mxfp8_nt_kernel(
     blgp: int = 0,
     out_fp16: bool = False,
     persistent: bool = False,
-    glu: bool = False,
-    glu_i: int = 0,
-    q_fp8: str = "e4m3",
-    act_hook: bool = False,
-    activation: str = "silu",
-    clamp_limit: "float | None" = None,
 ):
-    """Grouped MXFP8 NT (out = a @ b^T) with grouped per-tile addressing.
-
-    ``glu`` fuses the SwiGLU activation and its dual MXFP8 quantization into the epilogue.
-    ``N`` stays the weight's full ``2 * glu_i`` row count -- which keeps n_blocks, b_nrec
-    and the B-scale slab sizing correct as they are -- but a tile block then spans
-    ``glu_i``-relative 128 columns whose two LDS pools are the gate and up bands, so that
-    ``(c00, c01)`` and ``(c10, c11)`` each arrive as a gate/up pair in one lane.
-    """
+    """Grouped MXFP8 NT (out = a @ b^T) with grouped per-tile addressing."""
     BLOCK_K = 128
     assert BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0 and BLOCK_M >= 128 and BLOCK_N >= 256
     assert K % BLOCK_K == 0 and G >= 1
-    if glu:
-        # 64 keeps the up band on a B-comb group boundary in the preshuffle; 32 puts the
-        # ragged-I edge on a wave's column span so the past-I mask stays wave-uniform.
-        assert glu_i > 0 and glu_i % 64 == 0 and N == 2 * glu_i
-    # Tile-block column stride: under glu a block is 128 gate columns, not BLOCK_N.
-    NCB = 128 if glu else BLOCK_N
     K_ITERS = K // BLOCK_K
     assert K_ITERS >= 2
 
@@ -438,30 +391,8 @@ def _build_grouped_mxfp8_nt_kernel(
         B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
         B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
-    def _emit(
-        A,
-        B_T,
-        C,
-        ACT,
-        PROBS,
-        AQ_OUT,
-        AQ_SC,
-        AQ_TOUT,
-        AQ_TSC,
-        A_scale,
-        B_scale,
-        group_offs,
-        group_offs_out,
-        c_scale_rows,
-        c_n,
-        aq_row_rows,
-        aq_col_rows,
-    ):
-        """The tile body, shared by the plain and fused-GLU kernel signatures.
-
-        The two signatures stay apart because the plain launch is the tuned production
-        path and the GLU operands would be dead arguments on it.
-        """
+    def _emit(A, B_T, C, A_scale, B_scale, group_offs, group_offs_out, c_scale_rows, c_n):
+        """The tile body."""
         F8_IR_t = fx.Float8E4M3FN.ir_type
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
         n_blocks = ceildiv(c_n, BLOCK_N)
@@ -502,11 +433,6 @@ def _build_grouped_mxfp8_nt_kernel(
             tile_start = fx.Int32(0)
             sa_pre = fx.Int32(0)
             sacc = fx.Int32(0)
-            # The quantiser pads each group's col-wise rows to 128, so that operand's
-            # per-group base is the exclusive scan of ceil128(tight length) -- a third
-            # group table, and not derivable from either of the two that arrive.
-            col_pre = fx.Int32(0)
-            cacc = fx.Int32(0)
             p2 = _load_go(go_out_div, 0)
             sp = _load_go(go_pad_div, 0)
             for g in range_constexpr(G):
@@ -519,9 +445,6 @@ def _build_grouped_mxfp8_nt_kernel(
                 sa_pre = arith.select(inq, sacc, sa_pre)
                 sn = _load_go(go_pad_div, g + 1)
                 sacc = sacc + ceildiv(sn - sp, 64)
-                if const_expr(glu):
-                    col_pre = arith.select(inq, cacc, col_pre)
-                    cacc = cacc + ceildiv(nx - p2, 128) * fx.Int32(128)
                 cum = nc
                 p2 = nx
                 sp = sn
@@ -555,7 +478,7 @@ def _build_grouped_mxfp8_nt_kernel(
             cn_i = arith.index_cast(T.index, c_n)
             a_base = arith.index_cast(T.index, m_row_a) * arith.index(K)
             b_base = (
-                arith.index_cast(T.index, group_idx) * cn_i + arith.index_cast(T.index, block_n * NCB)
+                arith.index_cast(T.index, group_idx) * cn_i + arith.index_cast(T.index, block_n * BLOCK_N)
             ) * arith.index(K)
             a_nrec = (
                 arith.index_cast(T.index, m_total_pad) - arith.index_cast(T.index, m_row_a)
@@ -564,9 +487,7 @@ def _build_grouped_mxfp8_nt_kernel(
             A0_gl_offset = 0
             A1_gl_offset = LDS_BLOCK_M * K
             B0_gl_offset = 0
-            # Plain: the block's next 128 columns. Glu: the up band, so the R pool's
-            # accumulator is the gate accumulator's partner in the same lane.
-            B1_gl_offset = (glu_i if glu else LDS_BLOCK_N) * K
+            B1_gl_offset = LDS_BLOCK_N * K
 
             gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, a_nrec)
             gB = make_fp8_buffer_tensor_rebased(B_T, F8_IR_t, b_base, b_nrec)
@@ -586,59 +507,6 @@ def _build_grouped_mxfp8_nt_kernel(
             sa_s2r = ScaleS2R(A_scale, c_scale_rows, K, SA_TILES, pack=_GG_SCALE_PACK)
             sb_s2r = ScaleBComb(B_scale, c_n, K, n_slabs=G, pack=_GG_SCALE_PACK)
             store_c = StoreCPerTensor(None, None, C, m_end, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty)
-
-            if const_expr(glu):
-                # The band borrows the B pools, dead by the epilogue, so it costs no
-                # allocation. ``B_lds_cur_0`` is the PHYSICAL base: the mainloop rotates
-                # the python names by swapping, so ``b_cur0`` is whichever pool it last
-                # landed on and is not addressable as a base.
-                # All four B pools are dead here, not just the two ``cur`` ones, and
-                # SharedStorage declares them adjacent -- which is what buys the band a
-                # padded row pitch.
-                assert 8 * MX8_LDS_WORDS_PER_WAVE * 4 <= 4 * b_lds_size, (
-                    f"the quant band wants {8 * MX8_LDS_WORDS_PER_WAVE * 4} B of dead B pool, "
-                    f"the four adjacent pools give {4 * b_lds_size}"
-                )
-                _q = MXFP8DualQuantStore(
-                    AQ_OUT,
-                    AQ_SC,
-                    AQ_TOUT,
-                    AQ_TSC,
-                    aq_row_rows,
-                    glu_i,
-                    ceildiv(glu_i, 128) * 128,  # the quantiser's row-wise pad
-                    aq_col_rows,
-                    # The pool is typed fp8 for the mainloop; the staging addresses it as
-                    # the i32-packed bf16 pairs the quantiser's LDS helpers expect.
-                    fx.recast_iter(fx.Int32, lds.B_lds_cur_0.ptr),
-                    wave_id,
-                    lane_id,
-                    out_fp8=q_fp8,
-                )
-                store_q = StoreCSwiGLUQuantMX(
-                    None,
-                    None,
-                    C,
-                    # Nothing goes through the act stream unless the validation hook asks
-                    # for it, but the base still gets extracted; alias C rather than pass
-                    # a null, as the MXFP4 twin does.
-                    ACT if const_expr(act_hook) else C,
-                    PROBS,
-                    m_end,
-                    glu_i,
-                    mfma.idx,
-                    N_TILES_A,
-                    N_TILES_B,
-                    _out_ty,
-                    # l1 leaves through the four plain store_c calls below, not through an
-                    # in-mainloop store slot, so this epilogue must not require ``cst``.
-                    cst=False,
-                    ilv=0,
-                    activation=activation,
-                    clamp_limit=clamp_limit,
-                    quant_store=_q,
-                    act_hook=act_hook,
-                )
 
             wave_m_offset = wave_m * (N_TILES_A * 16)
             wave_n_offset = wave_n * (N_TILES_B * 16)
@@ -678,7 +546,7 @@ def _build_grouped_mxfp8_nt_kernel(
             sb0, sb1 = sb_all[0:2], sb_all[2:4]
 
             for k in range_constexpr(K_ITERS - 2):
-                mfma.opsel = scale_opsel(k, _GG_SCALE_PACK)  # select packed scale byte for K-iter k
+                mfma.opsel = scale_opsel(k, _GG_SCALE_PACK)
                 sa0n = sa_s2r.load(sa_base0, k + 1)
                 b0_frag = b_s2r.load(b_cur0)
                 a0_frag = a_s2r.load(a_cur0)
@@ -780,61 +648,11 @@ def _build_grouped_mxfp8_nt_kernel(
             rocdl.s_barrier()
 
             base_row = m_row_c + wave_m_offset
-            base_col = block_n * NCB + wave_n_offset
-            # The R pool's column offset: the block's second half, or the up band under glu
-            # -- the same rebase B1_gl_offset applies, now on the output side.
-            COL2 = glu_i if glu else LDS_BLOCK_N
-
-            def _epilogue():
-                # l1 goes out either way: the backward reads it, and it is not the traffic
-                # that fusing buys back. Under glu only the activation is diverted.
-                store_c.store(c00_frag, base_row + 0, base_col + 0)
-                store_c.store(c01_frag, base_row + 0, base_col + COL2)
-                store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-                store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + COL2)
-                if const_expr(glu):
-                    # Three row spaces, one per consumer: probs is indexed by the tight
-                    # token, the row-wise operand by the quantiser's 64-aligned row, and
-                    # the col-wise one by its 128-aligned row.
-                    q_row0 = m_row_a + wave_m_offset
-                    q_row_end = m_start_pad + (m_end - m_start)
-                    col_row0 = col_pre + local_block_m * BLOCK_M + wave_m_offset
-                    col_row_end = col_pre + ceildiv(m_end - m_start, 128) * fx.Int32(128)
-                    # Both A halves at once: the epilogue groups them into bands itself,
-                    # one quadrant per band at BLOCK_M=256 and two at 128, where a
-                    # quadrant is only half a band.
-                    store_q.store_pair_quant(
-                        [
-                            (c00_frag, c01_frag, 0),
-                            (c10_frag, c11_frag, LDS_BLOCK_M),
-                        ],
-                        base_row,
-                        base_col,
-                        q_row0,
-                        q_row_end,
-                        col_row0,
-                        col_row_end,
-                    )
-
-            if const_expr(glu):
-                # The band overwrites the B pools, so the mainloop's g2s prefetch and every
-                # wave's ds_reads have to retire before the first staging write. Both fences
-                # drain vmcnt and both are needed: one leaves a g2s the scheduler placed
-                # after the first drain free to overwrite the band. They sit OUTSIDE the
-                # guard below -- ``base_col`` varies with wave_n, so a barrier inside it
-                # would be reached by only some of the workgroup's waves.
-                _lds_barrier(vmcnt=0)
-                _lds_barrier(vmcnt=0)
-                # THE RAGGED-I GUARD. I is a multiple of 32 but not of NCB = 128, so the
-                # last tile block overhangs the gate band and its upper waves sit wholly
-                # past I. Their l1 gate store is still inside l1's c_cols = 2I bound, so
-                # unguarded it silently overwrites the first columns of l1's up half.
-                # I % 32 == 0 and a wave spans exactly 32 columns, so every wave is wholly
-                # inside I or wholly past it: the predicate is wave-uniform and one branch
-                # around the whole epilogue is both correct and cheap.
-                emit_if_then(base_col < fx.Int32(glu_i), _epilogue)
-            else:
-                _epilogue()
+            base_col = block_n * BLOCK_N + wave_n_offset
+            store_c.store(c00_frag, base_row + 0, base_col + 0)
+            store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
+            store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+            store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
         if const_expr(persistent):
             # Dynamic bounds, and ``_emit`` is outside the body-only AST rewrite, so the
@@ -843,81 +661,19 @@ def _build_grouped_mxfp8_nt_kernel(
         else:
             _do_tile(pid)
 
-    if glu:
-
-        @flyc.kernel(known_block_size=[512, 1, 1])
-        def kernel_grouped_mxfp8_nt(
-            A: fx.Tensor,
-            B_T: fx.Tensor,
-            C: fx.Tensor,  # l1 [total_M, 2I]
-            ACT: fx.Tensor,  # bf16 act [total_M, I]; aliased to C unless act_hook
-            PROBS: fx.Tensor,  # [total_M] fp32, indexed by the tight token
-            AQ_OUT: fx.Tensor,  # act row-wise fp8 [M_pad_row, ceil128(I)] i32
-            AQ_SC: fx.Tensor,  # act row-wise E8M0 [M_pad_row, ceil128(I)/32] u8
-            AQ_TOUT: fx.Tensor,  # act col-wise fp8 [I, M_pad_col] i32
-            AQ_TSC: fx.Tensor,  # act col-wise E8M0 [I, M_pad_col/32] u8
-            A_scale: fx.Tensor,
-            B_scale: fx.Tensor,
-            group_offs: fx.Tensor,  # padded read offsets (int32 view of int64 [G+1])
-            group_offs_out: fx.Tensor,  # tight write offsets (int32 view of int64 [G+1])
-            c_scale_rows: fx.Int32,  # A-scale slab rows = a_ngrp_ub*64
-            c_n: fx.Int32,
-            aq_row_rows: fx.Int32,  # the row-wise operand's 64-aligned row extent
-            aq_col_rows: fx.Int32,  # the col-wise operand's 128-aligned row extent
-        ):
-            _emit(
-                A,
-                B_T,
-                C,
-                ACT,
-                PROBS,
-                AQ_OUT,
-                AQ_SC,
-                AQ_TOUT,
-                AQ_TSC,
-                A_scale,
-                B_scale,
-                group_offs,
-                group_offs_out,
-                c_scale_rows,
-                c_n,
-                aq_row_rows,
-                aq_col_rows,
-            )
-
-    else:
-
-        @flyc.kernel(known_block_size=[512, 1, 1])
-        def kernel_grouped_mxfp8_nt(
-            A: fx.Tensor,
-            B_T: fx.Tensor,
-            C: fx.Tensor,
-            A_scale: fx.Tensor,
-            B_scale: fx.Tensor,
-            group_offs: fx.Tensor,  # padded read offsets (int32 view of int64 [G+1])
-            group_offs_out: fx.Tensor,  # tight write offsets (int32 view of int64 [G+1])
-            c_scale_rows: fx.Int32,  # A-scale slab rows = a_ngrp_ub*64 -> ScaleS2R buffer sizing
-            c_n: fx.Int32,
-        ):
-            _emit(
-                A,
-                B_T,
-                C,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                A_scale,
-                B_scale,
-                group_offs,
-                group_offs_out,
-                c_scale_rows,
-                c_n,
-                None,
-                None,
-            )
+    @flyc.kernel(known_block_size=[512, 1, 1])
+    def kernel_grouped_mxfp8_nt(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+        group_offs: fx.Tensor,  # padded read offsets (int32 view of int64 [G+1])
+        group_offs_out: fx.Tensor,  # tight write offsets (int32 view of int64 [G+1])
+        c_scale_rows: fx.Int32,  # A-scale slab rows = a_ngrp_ub*64 -> ScaleS2R buffer sizing
+        c_n: fx.Int32,
+    ):
+        _emit(A, B_T, C, A_scale, B_scale, group_offs, group_offs_out, c_scale_rows, c_n)
 
     return kernel_grouped_mxfp8_nt, BLOCK_M, BLOCK_N, waves_per_eu
 
@@ -926,12 +682,9 @@ def _build_grouped_mxfp8_nt_kernel(
 
 _GNT_FUSED_CACHE: dict = {}  # (K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persist) -> launch
 _GNT_WS_CACHE: dict = {}  # (M_pad, N, K128, G, device, stream) -> (a_sp, b_sp, a_blocks, a_ngrp)
-_GNT_AT_CACHE: dict = {}  # (N, K, G, cbsz, blgp, out_fp16, persist) -> [raw, compiled]
-_GNT_CFG_CACHE: dict = {}  # same key (NO M_pad) -> (bm, gm, xcd, gn) chosen by autotune
 
 # fwd/dgrad NT autotune. The launch is M-generic (M is a runtime arg), so the config race
-# keys on the static shape only (cfg_key, no M_pad) and is reused for every M.
-_GNT_NT_DEFAULT_CFG = (256, 4, 4, 0)  # (BLOCK_M, GROUP_M, num_xcd, group_n); cand[0] = base ref
+# keys on the static shape only (no M_pad) and is reused for every M.
 
 # tokens/group points the race times on (geomean). The swizzle is not M-invariant: a single
 # midpoint mis-picks a cfg that wins there but loses at the range ends, so two spread steady
@@ -1002,63 +755,27 @@ def _canon_nt_targs(args, K, G, N, pm):
     return targs, out_c
 
 
-def _select_nt_cfg(cfg_key, K, G, N, cbsz, blgp, out_fp16, persistent, args):
-    """First-call race on synthetic canonical tensors; cache the winning cfg per static shape
-    (cfg_key, no M_pad -> reused for every M)."""
-    cached = _GNT_CFG_CACHE.get(cfg_key)
-    if cached is not None:
-        return cached
+# Never adopt a config that drifts from the base at any point; adopt one only if the geomean over
+# the points is >=1.5% faster than the base.
+_GNT_RACE = Race.interleaved(1, 50, warmup=250, visit=(0, 5), margin=0.985, check="match")
+_GROUPED_GEMM_MXFP8 = Op("grouped_gemm_mxfp8")
 
-    cands = _gnt_nt_candidates(N)
-    # one (targs, out_view) per steady point; candidates scored by geomean over points
-    points = [_canon_nt_targs(args, K, G, N, pm) for pm in _GNT_PM_CANON]
 
-    def _geomean(ts):
-        return math.exp(sum(math.log(t) for t in ts) / len(ts))
+def _gnt_entry(cfg, K, G, N, cbsz, blgp, out_fp16, persistent, tuned=True):
+    return Entry(cfg, _get_nt_launch(K, G, N, *cfg, cbsz, blgp, out_fp16, persistent), tuned=tuned)
 
-    try:
-        base = _get_nt_launch(K, G, N, *cands[0], cbsz, blgp, out_fp16, persistent)
-        refs, base_ts = [], []
-        for targs, out_view in points:
-            base(*targs)
-            torch.cuda.synchronize()
-            r = out_view.detach().clone().float()
-            if not torch.isfinite(r.reshape(-1)[:1024]).all().item():
-                raise RuntimeError("base cfg produced non-finite output")
-            refs.append((r, float((r * r).sum().item()) or 1.0))
-            base_ts.append(_robust_time(base, targs))
-        best_cfg, best_score = cands[0], _geomean(base_ts)
-    except Exception:
-        _GNT_CFG_CACHE[cfg_key] = _GNT_NT_DEFAULT_CFG
-        return _GNT_NT_DEFAULT_CFG
 
-    for cfg in cands[1:]:
-        try:
-            launch = _get_nt_launch(K, G, N, *cfg, cbsz, blgp, out_fp16, persistent)
-            ts, matched = [], True
-            for (targs, out_view), (ref, ref_n) in zip(points, refs):
-                # Candidates share this buffer: without the clear, one that never launches
-                # some of its tiles inherits the base's values there and passes the guard.
-                out_view.zero_()
-                launch(*targs)
-                torch.cuda.synchronize()
-                o = out_view.detach().float()
-                err = float(((o - ref) * (o - ref)).sum().item())
-                # never adopt a config that drifts from the base at any point
-                if not ((err / ref_n) < (2e-2**2) and torch.isfinite(o.reshape(-1)[:1024]).all().item()):
-                    matched = False
-                    break
-                ts.append(_robust_time(launch, targs))
-            if not matched:
-                continue
-            score = _geomean(ts)
-        except Exception:
-            continue
-        if score < best_score * 0.985:  # adopt only if geomean >=1.5% faster than the base
-            best_cfg, best_score = cfg, score
+def _gnt_probe(args, K, G, N):
+    """Canonical synthetic tensors: the race needs only the static shape (``args``' b-side)."""
+    return Synthetic(lambda: [Point(*_canon_nt_targs(args, K, G, N, pm)) for pm in _GNT_PM_CANON])
 
-    _GNT_CFG_CACHE[cfg_key] = best_cfg
-    return best_cfg
+
+def _pick_gnt(key, args, K, G, N, cbsz, blgp, out_fp16, persistent):
+    cfgs = _gnt_nt_candidates(N)
+    space = staged(Refine(lambda _prev: cfgs, _GNT_RACE), base=cfgs[0])
+    build = _GROUPED_GEMM_MXFP8.build(lambda cfg: _gnt_entry(cfg, K, G, N, cbsz, blgp, out_fp16, persistent))
+    res = _GROUPED_GEMM_MXFP8.pick(key, space, probe=_gnt_probe(args, K, G, N), build=build)
+    return build.winner(res)
 
 
 def _compile_grouped_mxfp8_nt_fused(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent):
@@ -1120,102 +837,6 @@ def _compile_grouped_mxfp8_nt_fused(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp
         ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
 
     return launch_grouped_mxfp8_nt_fused
-
-
-def _compile_grouped_mxfp8_nt_glu(
-    K,
-    G,
-    glu_i,
-    bm,
-    gm,
-    xcd,
-    gn,
-    out_fp16,
-    q_fp8="e4m3",
-    act_hook=False,
-    activation="silu",
-    clamp_limit=None,
-):
-    """:func:`_compile_grouped_mxfp8_nt_fused` with the fused GLU + dual-quant epilogue.
-
-    Kept apart from the plain entry rather than folded into it: the fused kernel carries
-    six more tensor arguments and two more extents, and the plain launch is the tuned
-    production path whose argument list should not move for them.
-    """
-    N = 2 * glu_i  # the weight's full row count: gate||up
-    K128 = K // 128
-    pre_kern, n_kt, b_blocks_pg = _build_grouped_preshuffle_kernel(K128, G, N, glu_i=glu_i)
-    gemm_kern, BM, BN, wpe = _build_grouped_mxfp8_nt_kernel(
-        K=K,
-        G=G,
-        N=N,
-        BLOCK_M=bm,
-        BLOCK_N=_BLOCK_N,
-        group_m=gm,
-        group_n=gn,
-        num_xcd=xcd,
-        out_fp16=out_fp16,
-        persistent=False,
-        glu=True,
-        glu_i=glu_i,
-        q_fp8=q_fp8,
-        act_hook=act_hook,
-        activation=activation,
-        clamp_limit=clamp_limit,
-    )
-
-    @flyc.jit
-    def launch_grouped_mxfp8_nt_glu(
-        a8: fx.Tensor,
-        b8: fx.Tensor,
-        C: fx.Tensor,
-        ACT: fx.Tensor,
-        PROBS: fx.Tensor,
-        ROW_OUT: fx.Tensor,
-        ROW_SC: fx.Tensor,
-        COL_OUT: fx.Tensor,
-        COL_SC: fx.Tensor,
-        a_raw: fx.Tensor,
-        b_raw: fx.Tensor,
-        a_sp: fx.Tensor,
-        b_sp: fx.Tensor,
-        group_offs: fx.Tensor,
-        group_offs_out: fx.Tensor,
-        c_m_pad: fx.Int32,
-        c_scale_rows: fx.Int32,
-        c_n: fx.Int32,
-        aq_row_rows: fx.Int32,
-        aq_col_rows: fx.Int32,
-        a_blocks: fx.Int32,
-        a_ngrp: fx.Int32,
-        grid_upper: fx.Int32,
-        stream: fx.Stream,
-    ):
-        pre_kern(a_raw, b_raw, a_sp, b_sp, group_offs, c_m_pad, a_blocks, a_ngrp).launch(
-            grid=(a_blocks + G * b_blocks_pg, 1, 1), block=(_PRESHUF_BLK, 1, 1), stream=stream
-        )
-        gemm_kern(
-            a8,
-            b8,
-            C,
-            ACT,
-            PROBS,
-            ROW_OUT,
-            ROW_SC,
-            COL_OUT,
-            COL_SC,
-            a_sp,
-            b_sp,
-            group_offs,
-            group_offs_out,
-            c_scale_rows,
-            c_n,
-            aq_row_rows,
-            aq_col_rows,
-            value_attrs=make_value_attrs(wpe, 0, "512,512"),
-        ).launch(grid=(grid_upper, 1, 1), block=(512, 1, 1), stream=stream)
-
-    return launch_grouped_mxfp8_nt_glu
 
 
 def _get_grouped_mx_workspace(M_pad, N, K128, G, device, stream):
@@ -1311,19 +932,14 @@ def grouped_gemm_mxfp8_flydsl_kernel(
             stream,
         )
 
-    at_key = (N, K, G, cbsz, blgp, out_fp16, persistent)
-    entry = _GNT_AT_CACHE.get(at_key)
-    if entry is None:
-        # race on canonical synthetic tensors -> needs only the static shape (args' b-side)
-        bm, gm, xcd, gn = _select_nt_cfg(at_key, K, G, N, cbsz, blgp, out_fp16, persistent, _args(0))
-        torch.cuda.empty_cache()
-        launch = _get_nt_launch(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent)
-        entry = [launch, None, bm]
-        _GNT_AT_CACHE[at_key] = entry
+    key = (N, K, G, cbsz, blgp, out_fp16, persistent)
+    entry = _GROUPED_GEMM_MXFP8.entry(
+        key, lambda: _pick_gnt(key, _args(0), K, G, N, cbsz, blgp, out_fp16, persistent)
+    )
     # The device-side tile count sums ceildiv(tight length, bm) over the groups, so the
     # grid has to follow the chosen bm or the trailing tiles never launch.
-    bm = entry[2]
-    run_eager_or_capture(entry, _args(((M_pad + bm - 1) // bm + G) * n_blocks), 1)
+    bm = entry.config[0]
+    _GROUPED_GEMM_MXFP8.launch(entry, _args(((M_pad + bm - 1) // bm + G) * n_blocks))
     return out
 
 
@@ -1542,8 +1158,6 @@ def _build_grouped_mxfp8_wgrad_kernel(
             sa_base1 = sa_base0 + fx.Int32(LDS_BLOCK_M)
             sb_base0 = b_row + wave_n_offset
 
-            # Accumulators (rmem) are allocated just before the K-loop below.
-
             # Prologue: tile 0 -> cur, tile 1 -> next (distance-2 prelude).
             b_g2s.load(b_cur0, 0 + 0 * BLOCK_K)
             a_g2s.load(a_cur0, 0 + 0 * BLOCK_K)
@@ -1673,26 +1287,23 @@ def _build_grouped_mxfp8_wgrad_kernel(
 
 _GWG_FUSED_CACHE: dict = {}  # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta1) -> launch
 _GWG_WS_CACHE: dict = {}  # (OUT_M, OUT_N, device, stream) -> (a_sp, b_sp), sized to the largest K128 seen
-_GWG_AT_CACHE: dict = {}  # (OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta1) -> [raw, compiled]
-_GWG_CFG_CACHE: dict = {}  # at_key -> (bm, bn, gm, xcd, gn) chosen by autotune
 
 # variable-K wgrad config autotune (mirrors the fwd/dgrad NT path).
-_GWG_WGRAD_DEFAULT_CFG = (256, 256, 4, 8, 0)  # (bm, bn, gm, xcd, gn); cand[0] = base ref (prior fixed cfg)
 
 
 def _gwg_wgrad_candidates():
-    """(bm,bn,gm,xcd,gn) autotune candidates; cand[0] = the prior fixed default (base ref).
+    """(bm,bn,gm,xcd,gn) autotune candidates; cand[0] is the base reference.
     bm=256 dominates (bm=128 measured ~1.3x slower); the win at the DSv3 dW2 shape is xcd 8->1."""
     return [
-        (256, 256, 4, 8, 0),  # base ref (prior fixed default)
+        (256, 256, 4, 8, 0),  # base ref
         (256, 256, 4, 1, 0),  # xcd=1 -- wins the DSv3 dW2 shape (~5%)
         (256, 256, 1, 1, 0),
         (256, 256, 8, 4, 0),
-        # R2 sweep (occupancy-bound at G=32): probe more L2 swizzles + a smaller-A-LDS tile.
+        # occupancy-bound at G=32: more L2 swizzles + a smaller-A-LDS tile
         (256, 256, 2, 1, 0),
         (256, 256, 8, 1, 0),
         (256, 256, 16, 1, 0),
-        (128, 256, 4, 1, 0),  # bm=128 -> ~96KB LDS (less A); test occupancy trade vs ~1.3x MFMA loss
+        (128, 256, 4, 1, 0),  # bm=128 -> ~96KB LDS (less A): occupancy vs ~1.3x MFMA loss
         (128, 256, 8, 1, 0),
     ]
 
@@ -1708,59 +1319,44 @@ def _get_wgrad_launch(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16
     return launch
 
 
-def _select_wgrad_cfg(at_key, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one, out_view, args):
-    """First-call micro-bench for this static shape; cache the winning (bm,bn,gm,xcd,gn).
-    Guarded: falls back to the base cfg under CUDA-graph capture or if anything faults."""
-    cached = _GWG_CFG_CACHE.get(at_key)
-    if cached is not None:
-        return cached
-    if beta_is_one:
-        # beta=1 accumulates into out, so a re-launch is not idempotent: each candidate would add
-        # another acc, which corrupts the caller's gradient and leaves the drift check below
-        # unable to ever pass. Tuning this path needs a scratch output; until then, base cfg.
-        return _GWG_WGRAD_DEFAULT_CFG
-    if torch.cuda.is_current_stream_capturing():
-        return _GWG_WGRAD_DEFAULT_CFG  # don't cache under capture -> autotune on a later eager call
-    # The default cfg is the base, always: every other candidate is only ever accepted by
-    # scoring it against the base's output, so the base is the one config nothing validates.
-    # Deriving it from a filtered list instead (e.g. dropping cfgs whose bm does not divide
-    # OUT_M) hands that unchecked role to whichever cfg the filter happens to leave first.
-    # Partial M/N tiles need no filter: A/B reads are buffer-bounds clamped and StoreC drops
-    # the OOB rows/cols, so every candidate is legal at any OUT_M/OUT_N.
-    base_cfg = _GWG_WGRAD_DEFAULT_CFG
-    try:
-        base = _get_wgrad_launch(OUT_M, OUT_N, G, *base_cfg, cbsz, blgp, out_fp16, beta_is_one)
-        base(*args)
-        torch.cuda.synchronize()
-        ref = out_view.detach().clone().float()
-        ref_n = float((ref * ref).sum().item()) or 1.0
-        if not torch.isfinite(ref).all().item():
-            raise RuntimeError("base cfg produced non-finite output")
-        best_cfg, best_t = base_cfg, _robust_time(base, args)
-    except Exception:
-        _GWG_CFG_CACHE[at_key] = _GWG_WGRAD_DEFAULT_CFG
-        return _GWG_WGRAD_DEFAULT_CFG
+# The base is always cand[0]: every other candidate is only ever accepted by scoring it against
+# the base's output, so the base is the one config nothing checks. Partial M/N tiles need no
+# filter: A/B reads are buffer-bounds clamped and StoreC drops the OOB rows/cols, so every
+# candidate is legal at any OUT_M/OUT_N.
+# Adopt only if >=1.5% faster than the base.
+_GWG_RACE = Race.interleaved(1, 50, warmup=250, visit=(0, 5), margin=0.985, check=MatchBase(n=None))
+_GROUPED_GEMM_MXFP8_VARIABLE_K = Op("grouped_gemm_mxfp8_variable_k", release=True)
 
-    def _matches_base():
-        o = out_view.detach().float()
-        err = float(((o - ref) * (o - ref)).sum().item())
-        return (err / ref_n) < (2e-2**2) and torch.isfinite(o).all().item()
 
-    for cfg in [c for c in _gwg_wgrad_candidates() if c != base_cfg]:
-        try:
-            launch = _get_wgrad_launch(OUT_M, OUT_N, G, *cfg, cbsz, blgp, out_fp16, beta_is_one)
-            launch(*args)
-            torch.cuda.synchronize()
-            if not _matches_base():  # never adopt a config that drifts from the base
-                continue
-            t = _robust_time(launch, args)
-        except Exception:
-            continue
-        if t < best_t * 0.985:  # adopt only if >=1.5% faster
-            best_cfg, best_t = cfg, t
+def _gwg_entry(cfg, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one, tuned=True):
+    launch = _get_wgrad_launch(OUT_M, OUT_N, G, *cfg, cbsz, blgp, out_fp16, beta_is_one=beta_is_one)
+    return Entry(cfg, launch, tuned=tuned)
 
-    _GWG_CFG_CACHE[at_key] = best_cfg
-    return best_cfg
+
+def _gwg_probe(args, beta_is_one):
+    """The caller's own arguments, or at beta=1 a scratch output: beta=1 accumulates into it, so
+    re-launching there would corrupt the caller's gradient."""
+    if not beta_is_one:
+        return RealArgs(Point(args, args[2]))
+
+    def scratch():
+        out_s = torch.empty_like(args[2])
+        return [Point(args[:2] + (out_s,) + args[3:], out_s)]
+
+    return Synthetic(scratch)
+
+
+def _pick_gwg(key, args, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one):
+    """The beta=0 entry for the shape (a beta=1 call runs it with the accumulating epilogue).
+    Timed at beta=0 for either beta, unlike the fp8 wgrad, which times at beta=1 because the C
+    read-back reorders its candidates; whether it reorders these is unmeasured."""
+    cfgs = _gwg_wgrad_candidates()
+    space = staged(Refine(lambda _prev: cfgs, _GWG_RACE), base=cfgs[0])
+    build = _GROUPED_GEMM_MXFP8_VARIABLE_K.build(
+        lambda cfg: _gwg_entry(cfg, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, False)
+    )
+    res = _GROUPED_GEMM_MXFP8_VARIABLE_K.pick(key, space, probe=_gwg_probe(args, beta_is_one), build=build)
+    return build.winner(res)
 
 
 def _compile_grouped_mxfp8_wgrad_fused(
@@ -1882,16 +1478,18 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
 
     # Single universal variable-K kernel: chunk-local SSA accumulation, no balance detection.
     args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go, M_total, K128, n_kt, a_blocks, pre_grid, stream)
-    at_key = (OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one)
-    entry = _GWG_AT_CACHE.get(at_key)
-    if entry is None:
-        # first call for this shape: autotune (bm,bn,gm,xcd,gn) (eager only; base cfg under capture).
-        bm, bn, gm, xcd, gn = _select_wgrad_cfg(
-            at_key, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one, out, args
+    # beta=1 takes the beta=0 pick for the shape (the same kernel with the accumulating
+    # epilogue), and that race runs on a scratch output when beta=0 has not been picked yet.
+    key = (OUT_M, OUT_N, G, cbsz, blgp, out_fp16, False)
+    entry = _GROUPED_GEMM_MXFP8_VARIABLE_K.entry(
+        key, lambda: _pick_gwg(key, args, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one)
+    )
+    if beta_is_one:
+        entry = _GROUPED_GEMM_MXFP8_VARIABLE_K.derived(
+            key,
+            True,
+            entry,
+            lambda e: _gwg_entry(e.config, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, True, e.tuned),
         )
-        torch.cuda.empty_cache()
-        launch = _get_wgrad_launch(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one)
-        entry = [launch, None]
-        _GWG_AT_CACHE[at_key] = entry
-    run_eager_or_capture(entry, args, 1)
+    _GROUPED_GEMM_MXFP8_VARIABLE_K.launch(entry, args)
     return out

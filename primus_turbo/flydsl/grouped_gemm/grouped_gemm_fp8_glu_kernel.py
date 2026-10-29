@@ -15,17 +15,18 @@
 
 Two entries: the fc1 forward, which emits the pre-activation ``l1`` and the
 activation together, and the fc2 dgrad, which consumes ``dact`` in registers so
-it never reaches HBM. Both go through the shared NT/NN kernel factories in
-``grouped_gemm_fp8_kernel``, which carry the fused epilogue behind their ``glu``
-and ``dglu`` flags -- the fusion reuses those mainloops rather than forking them,
-so what lives here is the entry layer and the swizzle race it needs.
+it never reaches HBM. Both use the shared NT/NN kernel factories in
+``grouped_gemm_fp8_kernel`` (``glu`` / ``dglu`` flags); this module holds the
+entry layer and its swizzle race.
 """
 
 from typing import NamedTuple
 
 import torch
-from flydsl.compiler.kernel_function import CompilationContext
 
+from primus_turbo.flydsl.autotune import Compile, Op, Race, Refine, staged
+from primus_turbo.flydsl.autotune.engine import Entry
+from primus_turbo.flydsl.autotune.policies import Point, Synthetic
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
     _GG_SCHED_HINTS,
     _GROUPED_AGPR,
@@ -39,100 +40,201 @@ from primus_turbo.flydsl.utils.gemm_epilogue_helper import (
     _check_clamp_limit,
 )
 
-_GROUPED_GLU_CACHE: dict = {}
-
-# Swizzle arms for the fused entries, per direction. Each of these wins at some
-# measured shape; the ones left out are dominated everywhere (group-major (1, 4)
-# is 3-20% down at every shape).
+# Swizzle arms per direction; each wins at some measured shape (group-major (1, 4) loses 3-20%
+# everywhere).
 _GLU_NT_CANDS = ((4, 4), (4, 8), (8, 8), (4, 0))
 _GLU_NN_CANDS = ((4, 4), (8, 4), (8, 8), (4, 8))
 
 
 def _glu_probe_m(G: int) -> int:
-    """Rows for the race's synthetic probe: production scale, and enough to fill.
-
-    One canonical M, unlike the plain path's two: what moves with M is under
-    1.5%, not worth a second point in a race this slow per launch.
-    """
+    """Rows for the race's synthetic probe. One M only: the M sensitivity is under 1.5%."""
     pm = max(1024, -(-32768 // max(G, 1)))  # >= 32768 rows, so the grid fills
     return G * pm
 
 
-def _glu_race_time(launch, args, warmup=40, reps=3, iters=20):
-    """Median-of-`reps`. Shorter warmup than ``_robust_time``: its 250 iters are
-    for short-K kernels that mis-pick before boost clock, and these are two
-    orders of magnitude longer per launch, so they get there in a few."""
-    for _ in range(warmup):
-        launch(*args)
-    torch.cuda.synchronize()
-    ts = []
-    for _ in range(reps):
-        e0 = torch.cuda.Event(enable_timing=True)
-        e1 = torch.cuda.Event(enable_timing=True)
-        e0.record()
-        for _ in range(iters):
-            launch(*args)
-        e1.record()
-        torch.cuda.synchronize()
-        ts.append(e0.elapsed_time(e1) / iters)
-    ts.sort()
-    return ts[len(ts) // 2]
+# Swizzle race for the fused kernels: timed on a balanced synthetic distribution so the pick
+# depends only on the static shape, each arm checked numerically. (4, 4) is within 0.4% at the
+# production MLP widths but up to 9% off elsewhere. The base arm is the fallback when others fail
+# to build. Short warmup: these launches are ~100x longer than the plain race's short-K ones.
+# The probes (up to 1 GB a side) go back to the device once the entry is built (``Synthetic``);
+# left in the caching allocator they make the plain GEMM's later race in the same process mis-pick
+# an arm that stays 2x slow.
+# The 0.985 margin sits past the noise.
+_GLU_RACE = Race.interleaved(1, 20, warmup=40, visit=(0, 3), margin=0.985, check="match")
+# The fused entries launch raw, under the schedule hints their race traced them with.
+_HINTED_RAW = Compile(raw=True, hints=_GG_SCHED_HINTS)
+_GROUPED_GEMM_FP8_TENSORWISE_EPI_GLU = Op("grouped_gemm_fp8_tensorwise_epi_glu", compile=_HINTED_RAW)
+_GROUPED_GEMM_FP8_TENSORWISE_EPI_DGLU = Op("grouped_gemm_fp8_tensorwise_epi_dglu", compile=_HINTED_RAW)
 
 
-def _autotune_glu(build, cands, mk_probe):
-    """Race the tile swizzle for a fused GLU kernel and return the winner.
+def _glu_entry(cfg, key, tuned=True):
+    """The fused fc1 launch at ``cfg`` = (num_xcd, group_m) for ``key``'s static shape."""
+    I, K, G, out_fp16, cbsz, blgp, num_cu, _amax, activation, clamp_limit = key
+    _xcd, _gm = cfg
+    _capped = num_cu > 0
+    launch = _compile_grouped_nt(
+        K=K,
+        G=G,
+        BLOCK_M=256,
+        BLOCK_N=256,
+        nt_vmcnt=3,
+        # VGPR accumulator (mma mode 3): the SwiGLU epilogue reads it as a
+        # VALU source without v_accvgpr_read shuffles.
+        acc_mode="vgpr",
+        # Raced over _GLU_NT_CANDS: the plain row-major default loses
+        # 0.66 ms of L2 reuse at I=5760 (8.2 GB extra HBM reads).
+        num_xcd=_xcd,
+        agpr_inplace=_GROUPED_AGPR,
+        out_fp16=out_fp16,
+        cbsz=cbsz,
+        blgp=blgp,
+        group_m=_gm,
+        # CShuffle stages one fragment through LDS; the gate/up pair store needs the scalar path.
+        store_cshuffle=False,
+        sched_schedbar=True,
+        # One tile per WG unless CUs are capped: the scf.for tile loop costs ~0.6 ms here.
+        persistent=_capped,
+        cap_cu=(num_cu if _capped else -1),
+        N=I,
+        glu=True,
+        glu_i=I,
+        # Non-temporal outputs (1.11x): keeps 4.4 GB of write-once data from
+        # evicting the A/B tiles. aux=16 instead costs 1.5x.
+        cstore_aux=2,
+        glu_act_aux=2,
+        glu_amax=_amax,
+        activation=activation,
+        clamp_limit=clamp_limit,
+    )
+    return Entry(cfg, launch, tuned=tuned)
 
-    Same shape as the plain path's race, for the same reasons: time on a
-    *balanced* synthetic distribution so the pick depends only on the static
-    shape and not on whichever token skew the first real call happens to carry,
-    and guard each arm numerically so a bad compile cannot win on speed alone.
-    Only the swizzle is raced; an arm compiled unlike production would not
-    transfer.
 
-    Worth racing at all because the spread runs both ways: the hardcoded (4, 4)
-    is within 0.4% at the two production MLP widths but up to 9% off elsewhere.
-    """
-    probe = mk_probe()
-    if probe is None:  # probe would not fit; keep the static arm
-        return build(*cands[0])
-    args, out_view = probe
+def _glu_probe(key, a, b, a_scale, b_scale, out_dtype):
+    """One balanced synthetic fc1 on the caller's weight; none when it would not fit, which
+    keeps the static arm."""
+    I, K, G, _out_fp16, _cbsz, _blgp, _num_cu, _amax, _activation, _clamp_limit = key
 
-    base = build(*cands[0])
-    base(*args)
-    torch.cuda.synchronize()
-    # Cloned: the other arms overwrite out_view, and .float() is a no-op view
-    # when the output is already fp32.
-    ref = out_view.detach().float().clone()
-    refnorm = float((ref * ref).sum().item()) or 1.0
-
-    def score(launch):
-        launch(*args)
-        torch.cuda.synchronize()
-        o = out_view.detach().float()
-        e = float(((o - ref) * (o - ref)).sum().item())
-        if (e / refnorm) >= (2e-2**2) or not torch.isfinite(o.view(-1)[:1024]).all().item():
-            return None
-        return _glu_race_time(launch, args)
-
-    best, bs = base, score(base)
-    for cand in cands[1:]:
-        # An arm that will not build is one arm lost, not a failed call: the base
-        # is the config that shipped, so it is always there to fall back on.
+    def points():
+        M_c = _glu_probe_m(G)
         try:
-            cl = build(*cand)
-        except Exception:
-            continue
-        s = score(cl)
-        if s is not None and bs is not None and s < bs * 0.985:  # past the noise margin
-            best, bs = cl, s
+            a_c = torch.empty((M_c, K), device=a.device, dtype=torch.uint8)
+            a_c.random_(0, 64, generator=torch.Generator(device=a.device).manual_seed(0))
+            l1_c = torch.empty((M_c, 2 * I), device=a.device, dtype=out_dtype)
+            act_c = torch.empty((M_c, I), device=a.device, dtype=out_dtype)
+            probs_c = torch.ones(M_c, device=a.device, dtype=torch.float32)
+            amax_c = torch.zeros(AMAX_PARTIAL_SLOTS, device=a.device, dtype=torch.float32) if _amax else act_c
+        except torch.cuda.OutOfMemoryError:
+            return None
+        args = (
+            a_c.view(torch.int8),
+            b.view(torch.int8),
+            l1_c,
+            act_c,
+            probs_c,
+            amax_c,
+            a_scale.float().reshape(1),
+            b_scale.float().reshape(1),
+            _balanced_group_offs(M_c, G, a.device),
+            M_c,
+            I,
+            torch.cuda.current_stream(),
+        )
+        return [Point(args, act_c)]
 
-    # Hand the allocator back the probe outright. The probes run to a gigabyte a
-    # side, and leaving them in the caching allocator was measured to make the
-    # *plain* GEMM's own race, running later in the same process, mis-pick an arm
-    # and stay 2x slow for the rest of it.
-    probe = args = out_view = ref = None
-    torch.cuda.empty_cache()
-    return best
+    return Synthetic(points)
+
+
+def _pick_glu(key, a, b, a_scale, b_scale, out_dtype):
+    space = staged(Refine(lambda _prev: list(_GLU_NT_CANDS), _GLU_RACE), base=_GLU_NT_CANDS[0])
+    build = _GROUPED_GEMM_FP8_TENSORWISE_EPI_GLU.build(lambda cfg: _glu_entry(cfg, key))
+    res = _GROUPED_GEMM_FP8_TENSORWISE_EPI_GLU.pick(
+        key, space, probe=_glu_probe(key, a, b, a_scale, b_scale, out_dtype), build=build
+    )
+    return build.winner(res)
+
+
+def _dglu_entry(cfg, key, tuned=True):
+    """The fused fc2-dgrad launch at ``cfg`` = (num_xcd, group_m) for ``key``'s static shape."""
+    I, K, G, out_fp16, cbsz, blgp, num_cu, n_stride, _amax, activation, clamp_limit = key
+    _xcd, _gm = cfg
+    _capped = num_cu > 0
+    launch = _compile_grouped_nn(
+        K=K,
+        G=G,
+        BLOCK_M=256,
+        BLOCK_N=_DGLU_BLOCK_N,
+        nt_vmcnt=3,
+        # Raced over _GLU_NN_CANDS (spread up to 1.09x at I=1024).
+        num_xcd=_xcd,
+        group_m=_gm,
+        agpr_inplace=_GROUPED_AGPR,
+        out_fp16=out_fp16,
+        cbsz=cbsz,
+        blgp=blgp,
+        store_cshuffle=False,
+        sched_schedbar=False,
+        persistent=_capped,
+        cap_cu=(num_cu if _capped else -1),
+        N=I,
+        n_stride=n_stride,
+        dglu=True,
+        dglu_amax=_amax,
+        glu_i=I,
+        # Non-temporal pays only because the banded epilogue stores whole
+        # lines; half-line stores must merge in L2, which non-temporal prevents.
+        cstore_aux=2,
+        activation=activation,
+        clamp_limit=clamp_limit,
+    )
+    return Entry(cfg, launch, tuned=tuned)
+
+
+def _dglu_probe(key, a, b, a_scale, b_scale, out_dtype, n_partial):
+    """One balanced synthetic fc2 dgrad on the caller's weight; none when it would not fit."""
+    I, K, G, _out_fp16, _cbsz, _blgp, _num_cu, _n_stride, _amax, _activation, _clamp_limit = key
+
+    def points():
+        M_c = _glu_probe_m(G)
+        try:
+            a_c = torch.empty((M_c, K), device=a.device, dtype=torch.uint8)
+            a_c.random_(0, 64, generator=torch.Generator(device=a.device).manual_seed(0))
+            # Not zeros: all-zero gradients would make the numeric check vacuous.
+            l1_c = torch.empty((M_c, 2 * I), device=a.device, dtype=out_dtype)
+            l1_c.uniform_(-2.0, 2.0)
+            dl1_c = torch.empty((M_c, 2 * I), device=a.device, dtype=out_dtype)
+            probs_c = torch.ones(M_c, device=a.device, dtype=torch.float32)
+            grad_probs_c = torch.zeros((n_partial, M_c), device=a.device, dtype=torch.float32)
+            amax_c = torch.zeros(AMAX_PARTIAL_SLOTS, device=a.device, dtype=torch.float32) if _amax else dl1_c
+        except torch.cuda.OutOfMemoryError:
+            return None
+        args = (
+            a_c.view(torch.int8),
+            b.view(torch.int8),
+            dl1_c,
+            a_scale.float().reshape(1),
+            b_scale.float().reshape(1),
+            _balanced_group_offs(M_c, G, a.device),
+            l1_c,
+            probs_c,
+            grad_probs_c,
+            amax_c,
+            M_c,
+            I,
+            M_c,
+            torch.cuda.current_stream(),
+        )
+        return [Point(args, dl1_c)]
+
+    return Synthetic(points)
+
+
+def _pick_dglu(key, a, b, a_scale, b_scale, out_dtype, n_partial):
+    space = staged(Refine(lambda _prev: list(_GLU_NN_CANDS), _GLU_RACE), base=_GLU_NN_CANDS[0])
+    build = _GROUPED_GEMM_FP8_TENSORWISE_EPI_DGLU.build(lambda cfg: _dglu_entry(cfg, key))
+    res = _GROUPED_GEMM_FP8_TENSORWISE_EPI_DGLU.pick(
+        key, space, probe=_dglu_probe(key, a, b, a_scale, b_scale, out_dtype, n_partial), build=build
+    )
+    return build.winner(res)
 
 
 def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
@@ -156,28 +258,20 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
 
     Computes ``l1 = [gate|up] = (a[g] @ b[g]^T) * a_scale * b_scale`` [M, 2I] and
     ``act = f(gate) * up * probs`` [M, I] in one launch, both in ``out_dtype``.
-    ``l1`` is written because backward's dswiglu needs both halves; ``act`` is the
-    only one that carries ``probs``.
+    ``l1`` is kept for backward's dswiglu; only ``act`` carries ``probs``.
 
-    Where the Triton twin computes a 2I-wide tile and permutes it to bring gate
-    beside up (its epilogue's largest single cost), this points the tile's second
-    B pool at the up half of the weight, so the pair already shares a lane. See
-    ``StoreCSwiGLU``.
-
-    NT only (``trans_b=True``, b [G, 2I, K]): the pairing lives in the NT body's
-    quadrant registers, and the NN twin has no equivalent hook yet.
+    The tile's second B pool points at the up half of the weight, so gate and up
+    share a lane without a permute (see ``StoreCSwiGLU``). NT only
+    (``trans_b=True``, b [G, 2I, K]).
 
     Args:
         clamp_limit: pre-multiplication clamp bound, or None for no clamp; silu only.
             See :func:`~primus_turbo.flydsl.utils.gemm_epilogue_helper._glu_clamp`.
         act_out: [M_total, I] buffer receiving the activation.
-        intermediate_out: [M_total, 2I] buffer receiving ``l1``. Both are the
-            caller's to allocate: every slot is written, so neither needs
-            initialising.
+        intermediate_out: [M_total, 2I] buffer receiving ``l1``. Both are fully
+            written, so neither needs initialising.
         amax_partial: optional zeroed float32 [``AMAX_PARTIAL_SLOTS``] receiving
-            ``act``'s abs-max, folded a work group at a time. Passing it saves the
-            tensorwise quantiser a whole read of ``act``; the value is the same one
-            that pass would have found, a max being exact and order-independent.
+            ``act``'s abs-max (exact), saving the tensorwise quantiser a read of ``act``.
 
     Returns:
         ``(act_out, intermediate_out)``.
@@ -210,7 +304,7 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
     cbsz = 1 if a.dtype == torch.float8_e5m2 else 0
     blgp = 1 if b.dtype == torch.float8_e5m2 else 0
     _capped = num_cu is not None and num_cu > 0
-    ckey = (
+    key = (
         I,
         K,
         G,
@@ -223,105 +317,26 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
         clamp_limit,
     )
 
-    launch = _GROUPED_GLU_CACHE.get(ckey)
-    if launch is None:
-
-        def _build(_xcd, _gm):
-            return _compile_grouped_nt(
-                K=K,
-                G=G,
-                BLOCK_M=256,
-                BLOCK_N=256,
-                nt_vmcnt=3,
-                # "vgpr" keeps the accumulator in VGPR (mma mode 3) so the fused
-                # SwiGLU epilogue -- its only consumer -- reads it as a VALU source
-                # without the v_accvgpr_read shuffle an AGPR accumulator would need.
-                # The NT feed is S2RLoader, not transpose asm, so the register budget
-                # is unchanged.
-                acc_mode="vgpr",
-                # Raced per shape over _GLU_NT_CANDS, not defaulted: taking the
-                # plain entry's row-major default literally cost 0.66 ms of L2
-                # reuse at I=5760 (8.2 GB of extra HBM reads).
-                num_xcd=_xcd,
-                agpr_inplace=_GROUPED_AGPR,
-                out_fp16=out_fp16,
-                cbsz=cbsz,
-                blgp=blgp,
-                group_m=_gm,
-                # The pair store is the scalar path's; CShuffle stages one fragment
-                # through LDS and has nowhere to put the second.
-                store_cshuffle=False,
-                sched_schedbar=True,
-                # One tile per WG unless the caller reserves CUs, matching the
-                # plain GEMM's fast path: the scf.for tile loop costs ~0.6 ms at
-                # this shape against a straight-line one-tile body.
-                persistent=_capped,
-                cap_cu=(num_cu if _capped else -1),
-                N=I,
-                glu=True,
-                glu_i=I,
-                # Non-temporal on both output streams, worth 1.11x: 4.4 GB that
-                # nothing here reads again would otherwise evict the A/B tiles the
-                # next mainloop wants. Bit 1 is the one that pays -- bit 4
-                # (aux=16) costs 1.5x, so this is not a monotone knob.
-                cstore_aux=2,
-                glu_act_aux=2,
-                glu_amax=_amax,
-                activation=activation,
-                clamp_limit=clamp_limit,
-            )
-
-        def _probe():
-            M_c = _glu_probe_m(G)
-            try:
-                a_c = torch.empty((M_c, K), device=a.device, dtype=torch.uint8)
-                a_c.random_(0, 64, generator=torch.Generator(device=a.device).manual_seed(0))
-                l1_c = torch.empty((M_c, N2), device=a.device, dtype=out_dtype)
-                act_c = torch.empty((M_c, I), device=a.device, dtype=out_dtype)
-                probs_c = torch.ones(M_c, device=a.device, dtype=torch.float32)
-                amax_c = (
-                    torch.zeros(AMAX_PARTIAL_SLOTS, device=a.device, dtype=torch.float32) if _amax else act_c
-                )
-            except torch.cuda.OutOfMemoryError:
-                return None
-            return (
-                a_c.view(torch.int8),
-                b.view(torch.int8),
-                l1_c,
-                act_c,
-                probs_c,
-                amax_c,
-                a_scale.float().reshape(1),
-                b_scale.float().reshape(1),
-                _balanced_group_offs(M_c, G, a.device),
-                M_c,
-                I,
-                torch.cuda.current_stream(),
-            ), act_c
-
-        with CompilationContext.compile_hints(_GG_SCHED_HINTS):
-            launch = _autotune_glu(_build, _GLU_NT_CANDS, _probe)
-        _GROUPED_GLU_CACHE[ckey] = launch
-
-    with CompilationContext.compile_hints(_GG_SCHED_HINTS):
-        launch(
-            a.view(torch.int8),
-            b.view(torch.int8),
-            l1,
-            act,
-            probs,
-            amax_partial if _amax else act,
-            a_scale.float().reshape(1),
-            b_scale.float().reshape(1),
-            go32,
-            M_total,
-            I,  # c_n is the gate width; the kernel derives 2I where it needs it
-            torch.cuda.current_stream(),
-        )
+    args = (
+        a.view(torch.int8),
+        b.view(torch.int8),
+        l1,
+        act,
+        probs,
+        amax_partial if _amax else act,
+        a_scale.float().reshape(1),
+        b_scale.float().reshape(1),
+        go32,
+        M_total,
+        I,  # c_n is the gate width; the kernel derives 2I where it needs it
+        torch.cuda.current_stream(),
+    )
+    entry = _GROUPED_GEMM_FP8_TENSORWISE_EPI_GLU.entry(
+        key, lambda: _pick_glu(key, a, b, a_scale, b_scale, out_dtype)
+    )
+    _GROUPED_GEMM_FP8_TENSORWISE_EPI_GLU.launch(entry, args)
     return act, l1
 
-
-_GROUPED_DGLU_CACHE: dict = {}
 
 _DGLU_BLOCK_N = 256
 
@@ -338,17 +353,14 @@ def grouped_gemm_fp8_dglu_grad_probs_partial_spec(
 ) -> GradProbsPartialSpec:
     """The buffer :func:`grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel` expects.
 
-    ``grad_probs_partial.sum(0)`` is the gradient wrt ``probs``. Allocating and
-    folding stay with the caller, so this module owns neither.
+    ``grad_probs_partial.sum(0)`` is the gradient wrt ``probs``; the caller
+    allocates and folds it.
 
-    One slice per ``(block_n, 16-lane half)``, rather than the Triton twin's one
-    per tile: every wave's rows are disjoint in the banded epilogue, so waves
-    share a slice and only the column block and the half of the 32 lanes
-    covering a row have to be distinct.
+    One slice per ``(block_n, 16-lane half)``: waves' rows are disjoint in the
+    banded epilogue, so they share a slice.
 
-    ``needs_zero`` is True, unlike the Triton twin: a group's last M-tile is
-    clamped off at ``m_end``, so the rows past it are never written and would
-    otherwise poison the fold.
+    ``needs_zero`` is True: a group's last M-tile is clamped at ``m_end``, so rows
+    past it are never written and would otherwise poison the fold.
 
     Returns:
         ``shape`` is ``(n_blocks * 2, M_total)``, float32.
@@ -385,27 +397,21 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
 
         dl1 = [f'(gate) * up * (dact * probs) | f(gate) * (dact * probs)]
 
-    Unlike the forward twin this needs no tile geometry changes -- the GEMM's N
-    axis is already I, so gate and up are a plain pair of global reads I columns
-    apart. What it adds is the ``grad_probs`` reduction, whose sum spans all of
-    I while a tile spans 256 columns: each wave folds the columns it owns and
-    writes one partial for the caller to sum. No atomics, so the result is
-    bitwise reproducible, matching the Triton entry.
+    Gate and up are read I columns apart from ``intermediate``. ``grad_probs``
+    spans all of I, so each wave writes a partial over its columns for the caller
+    to sum; no atomics, so the result is bitwise reproducible.
 
     NN only (``trans_b=False``, b [G, K, I]).
 
     Args:
         clamp_limit: pre-multiplication clamp bound, or None for no clamp; silu only.
-            Must match the forward's, which decided the values this differentiates.
+            Must match the forward's.
         out: [M_total, 2I] buffer receiving ``dl1``, in ``intermediate``'s dtype,
             gate gradient in [:, :I] and up in [:, I:].
-        grad_probs_partial: float32 buffer receiving the grad_probs partials, as
-            :func:`grouped_gemm_fp8_dglu_grad_probs_partial_spec` describes it --
-            including that it has to arrive zeroed.
+        grad_probs_partial: zeroed float32 buffer shaped by
+            :func:`grouped_gemm_fp8_dglu_grad_probs_partial_spec`.
         amax_partial: optional zeroed float32 [``AMAX_PARTIAL_SLOTS``] receiving
-            ``dl1``'s abs-max, folded a work group at a time. Passing it saves the
-            tensorwise quantiser a whole read of ``dl1``; the value is the same one
-            that pass would have found, a max being exact and order-independent.
+            ``dl1``'s abs-max (exact), saving the tensorwise quantiser a read of ``dl1``.
 
     Returns:
         ``out``, for call-site convenience.
@@ -416,9 +422,8 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
     assert a.ndim == 2 and b.ndim == 3 and intermediate.ndim == 2
     M_total, K = a.shape
     G, K_b, N_pitch = b.shape
-    # b (w2) may be padded on its I axis to N_pitch; i_real is the tight I. The
-    # kernel reads B at the N_pitch storage stride (n_stride) but computes,
-    # indexes intermediate, and stores dl1 at the real I width.
+    # b (w2) may be padded on I to N_pitch; B is read at that stride (n_stride),
+    # everything else uses the real I (i_real).
     if i_real is not None and i_real != N_pitch:
         n_stride, I = N_pitch, i_real
     else:
@@ -451,7 +456,7 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
     cbsz = 1 if a.dtype == torch.float8_e5m2 else 0
     blgp = 1 if b.dtype == torch.float8_e5m2 else 0
     _capped = num_cu is not None and num_cu > 0
-    ckey = (
+    key = (
         I,
         K,
         G,
@@ -465,97 +470,24 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
         clamp_limit,
     )
 
-    launch = _GROUPED_DGLU_CACHE.get(ckey)
-    if launch is None:
-
-        def _build(_xcd, _gm):
-            return _compile_grouped_nn(
-                K=K,
-                G=G,
-                BLOCK_M=256,
-                BLOCK_N=_DGLU_BLOCK_N,
-                nt_vmcnt=3,
-                # Raced per shape over _GLU_NN_CANDS. The arms differ from the
-                # forward's -- (8, 4) pays here and row-major does not -- and the
-                # spread reaches 1.090x at I=1024.
-                num_xcd=_xcd,
-                group_m=_gm,
-                agpr_inplace=_GROUPED_AGPR,
-                out_fp16=out_fp16,
-                cbsz=cbsz,
-                blgp=blgp,
-                store_cshuffle=False,
-                sched_schedbar=False,
-                persistent=_capped,
-                cap_cu=(num_cu if _capped else -1),
-                N=I,
-                n_stride=n_stride,
-                dglu=True,
-                dglu_amax=_amax,
-                glu_i=I,
-                # Non-temporal, as in the forward, but this only pays because the
-                # banded epilogue's accesses are whole lines: at 64 bytes a store
-                # is half a line whose other half belongs to the neighbouring
-                # wave, and the two have to meet in L2 to form one, which
-                # non-temporal prevents. Per-wave staging preferred aux=0.
-                cstore_aux=2,
-                activation=activation,
-                clamp_limit=clamp_limit,
-            )
-
-        def _probe():
-            M_c = _glu_probe_m(G)
-            try:
-                a_c = torch.empty((M_c, K), device=a.device, dtype=torch.uint8)
-                a_c.random_(0, 64, generator=torch.Generator(device=a.device).manual_seed(0))
-                # Not zeros: at gate = up = 0 every gradient is 0 for every arm,
-                # which would leave the numeric guard comparing zero to zero.
-                l1_c = torch.empty((M_c, 2 * I), device=a.device, dtype=out_dtype)
-                l1_c.uniform_(-2.0, 2.0)
-                dl1_c = torch.empty((M_c, 2 * I), device=a.device, dtype=out_dtype)
-                probs_c = torch.ones(M_c, device=a.device, dtype=torch.float32)
-                grad_probs_c = torch.zeros((partial_shape[0], M_c), device=a.device, dtype=torch.float32)
-                amax_c = (
-                    torch.zeros(AMAX_PARTIAL_SLOTS, device=a.device, dtype=torch.float32) if _amax else dl1_c
-                )
-            except torch.cuda.OutOfMemoryError:
-                return None
-            return (
-                a_c.view(torch.int8),
-                b.view(torch.int8),
-                dl1_c,
-                a_scale.float().reshape(1),
-                b_scale.float().reshape(1),
-                _balanced_group_offs(M_c, G, a.device),
-                l1_c,
-                probs_c,
-                grad_probs_c,
-                amax_c,
-                M_c,
-                I,
-                M_c,
-                torch.cuda.current_stream(),
-            ), dl1_c
-
-        with CompilationContext.compile_hints(_GG_SCHED_HINTS):
-            launch = _autotune_glu(_build, _GLU_NN_CANDS, _probe)
-        _GROUPED_DGLU_CACHE[ckey] = launch
-
-    with CompilationContext.compile_hints(_GG_SCHED_HINTS):
-        launch(
-            a.view(torch.int8),
-            b.view(torch.int8),
-            dl1,
-            a_scale.float().reshape(1),
-            b_scale.float().reshape(1),
-            go32,
-            intermediate,
-            probs,
-            grad_probs_partial,
-            amax_partial if _amax else dl1,
-            M_total,
-            I,
-            M_total,
-            torch.cuda.current_stream(),
-        )
+    args = (
+        a.view(torch.int8),
+        b.view(torch.int8),
+        dl1,
+        a_scale.float().reshape(1),
+        b_scale.float().reshape(1),
+        go32,
+        intermediate,
+        probs,
+        grad_probs_partial,
+        amax_partial if _amax else dl1,
+        M_total,
+        I,
+        M_total,
+        torch.cuda.current_stream(),
+    )
+    entry = _GROUPED_GEMM_FP8_TENSORWISE_EPI_DGLU.entry(
+        key, lambda: _pick_dglu(key, a, b, a_scale, b_scale, out_dtype, partial_shape[0])
+    )
+    _GROUPED_GEMM_FP8_TENSORWISE_EPI_DGLU.launch(entry, args)
     return dl1
