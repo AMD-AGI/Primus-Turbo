@@ -2,8 +2,7 @@
 
 How we measure the roofline of the `flydsl_v2` dispatch and combine, and how far they are from the limits
 of the hardware. Branch `dev/boyang/flydsl_deepep_gfx1250_roofline`, from PR #583
-(`dev/boyang/flydsl_deepep_gfx1250`). The EP2 numbers are measured; the EP4 numbers are an estimate until
-the EP4 run of [Next measurements](#next-measurements).
+(`dev/boyang/flydsl_deepep_gfx1250`). EP2 and EP4 are measured on this branch (2026-10-29).
 
 ## Summary
 
@@ -27,10 +26,12 @@ the EP4 run of [Next measurements](#next-measurements).
   At 256 CUs the cached dispatch is 118.2 µs (54% of the peak) and the combine 138.1 µs (47%). Kernel time
   alone (rocprofv3, as DeepEP V2 times): 108.9 µs dispatch kernel (plus a 9.9 µs notify kernel), 136.0 µs
   combine at 160 CUs.
-- **EP4 (estimate):** the PR #583 EP4 runs (160 CUs, uniform top-8 of 256 experts) take 0.36 ms
-  (dispatch with host wait) and 0.34 ms (combine) for about 317 MB per GPU to its three peers. An RCCL
-  alltoall of that volume is about 208 µs on AMD's achievable roofline (MAIDAS), 176 µs at 1.8 TB/s:
-  58–61% of the achievable roofline, 49–52% of the peak. At EP4 the three peers share the GPU's 1.8 TB/s.
+- **EP4 (measured)**, 4 GPUs, DeepSeek-V3 routing, 160 CUs: 277.5 MB from each GPU to its three peers;
+  cached dispatch 258.1 µs (60% of the 1.8 TB/s peak, 66% of 1.62 TB/s, 71% of the MAIDAS alltoall
+  roofline at this volume), combine 302.5 µs (51% / 57% / 61%), dispatch with host wait 319.9 µs (48% /
+  54% / 57%). Kernel time alone: 242.4 / 284.3 µs, 71% / 60% of 1.62 TB/s. EP4 is closer to the limit
+  than EP2: the fixed costs spread over 2.4× the bytes. The three peers share the GPU's 1.8 TB/s; the
+  copy kernel reaches 1.52–1.53 TB/s to all three (1.60 one way).
 - **In DeepEP's own terms**: DeepEP V2's model puts the ceiling at 0.9 × the link speed, 1.62 TB/s here
   (TransferBench measures 1.61–1.65); the cached dispatch is at 58% of it, the combine at 49%. DeepEP V1
   on H800 reaches 84–86% of its stated link maximum at EP8 (its printed GB/s count a rank's own rows too,
@@ -84,6 +85,9 @@ link 115.7 MB, HBM 580 MB (either kernel), 57 MFLOP (combine). The counters belo
 each iteration counts; a round is the median of 30 iterations; the result is the mean of 3 rounds;
 outputs are checked against a reference once per configuration. Kernels run on the timed stream
 (`PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM=1`). The run-to-run spread is 0.2% median, 2.6% at most.
+At EP4 the first minute of traffic after the GPUs have been idle runs about 3× slower and erratic, for
+RCCL as for these kernels (DeepSeek-V3 routing at 160 CUs: 828 µs instead of 258 µs for the cached
+dispatch, RCCL's alltoall 1108 µs instead of 413 µs): run a short warm-up first.
 
 ### 4. Placing the kernel
 
@@ -224,21 +228,44 @@ Reads from the uncached heap (the receive copy's and the reduce's) do not show i
 matches the byte table within 2–11%. `GL2C_EA_RDREQ_DRAM` / `GL2C_EA_WRREQ_DRAM` were collected too
 (`pmc_summary.md`), but their units are not documented for gfx1250, so they are not used.
 
-## How far from the limits (EP4, estimate)
+## How far from the limits (EP4, measured)
 
-Not measured with this harness yet. From PR #583's EP4 table (4 × MI455X, T = 8192, hidden 7168 bf16,
-random (uniform) top-8 of 256 experts, 160 CUs, `Buffer` interface, mean of 20 iterations on rank 0 and of 3
-passes, a different harness from `bench_ops.py`):
-dispatch with host wait 0.36 ms, combine 0.34 ms. A peer receives a token with probability
-1 − C(192,8)/C(256,8) ≈ 0.90, so a GPU sends about 3 × 0.90 × 8192 rows = 317 MB:
+4 × MI455X, GPUs 0–3, 2026-10-29 (`ut_logs/roofline_ep4_20261029_102813/`), the same commands with
+`--nproc_per_node=4`, after a warm-up (see Time). Ceilings, per GPU to all three peers at once
+(`bench_ceiling.py`): TDM copy kernel 1.52–1.53 TB/s (32768 rows per peer, 64–256 blocks; 1.60 TB/s one
+way), copy engines 1.51 TB/s (a stream per peer); at 8192 rows per peer the ceiling run fell into the
+cold start and is not used. The MAIDAS alltoall roofline at the same volume per GPU (277.5 MB to the peers
+is the alltoall of a 353 MiB buffer): about 183 µs.
 
-| | µs | of 1.8 TB/s (176 µs) | of the MAIDAS alltoall roofline at this volume (≈ 208 µs) |
-|---|---:|---:|---:|
-| dispatch with host wait | 360 | 49% | 58% |
-| combine | 340 | 52% | 61% |
+DeepSeek-V3 routing (top-8 of 128 experts in the top 4 of 8 groups), T = 8192; link bytes 277.5 MB:
 
-(MAIDAS gives the time of a 4-GPU alltoall per rank buffer size; 317 MB to the peers is the alltoall of
-a 403 MiB buffer, between its 256 MB and 512 MB points.)
+| CUs | op | µs | link GB/s | of the link peak (154 µs) | of 1.62 TB/s (171 µs) | of the MAIDAS roofline (≈ 183 µs) |
+|---:|---|---:|---:|---:|---:|---:|
+| 32 | dispatch, counts known | 429.6 | 646 | 36% | 40% | 43% |
+| 32 | combine | 668.7 | 415 | 23% | 26% | 27% |
+| 80 | dispatch, counts known | 271.8 | 1021 | 57% | 63% | 68% |
+| 80 | combine | 323.7 | 857 | 48% | 53% | 57% |
+| 160 | dispatch, counts known | 258.1 | 1075 | 60% | 66% | 71% |
+| 160 | dispatch, `num_worst_tokens` | 287.1 | 967 | 54% | 60% | 64% |
+| 160 | dispatch with host wait | 319.9 | 868 | 48% | 54% | 57% |
+| 160 | combine | 302.5 | 917 | 51% | 57% | 61% |
+| 256 | dispatch, counts known | 254.6 | 1090 | 61% | 67% | 72% |
+| 256 | combine | 285.4 | 972 | 54% | 60% | 64% |
+
+Kernel time alone (rocprofv3), 160 / 256 CUs: dispatch kernel 242.4 / 239.1 µs (71% / 72% of 1.62 TB/s),
+combine kernel 284.3 / 274.8 µs (60% / 62%); notify kernels 12.5 µs (cached path) and 29.4 µs (with the
+count exchange). RCCL's alltoall of the same rows: 413 µs (dispatch), 413 µs (combine).
+
+Uniform routing (top-8 of 256 experts, PR #583's EP4 case), T = 8192; link bytes 320.0 MB:
+
+| CUs | op | µs | link GB/s | of the link peak (178 µs) | of 1.62 TB/s (198 µs) | of the MAIDAS roofline (≈ 210 µs) |
+|---:|---|---:|---:|---:|---:|---:|
+| 160 | dispatch, counts known | 295.4 | 1083 | 60% | 67% | 71% |
+| 160 | dispatch with host wait | 368.1 | 869 | 48% | 54% | 57% |
+| 160 | combine | 340.5 | 940 | 52% | 58% | 62% |
+| 256 | combine | 320.1 | 1000 | 56% | 62% | 66% |
+
+The host-wait dispatch (368 µs) and the combine (341 µs) match PR #583's EP4 table (0.36 / 0.34 ms).
 
 ## Where the time goes
 
@@ -298,10 +325,8 @@ same case as the cached dispatch here (58%).
 ## Next measurements
 
 1. ~~EP2 on this branch's head, kernel times and counters~~: done 2026-10-29 (above).
-2. **EP4** (4 GPUs, about 15 minutes): `bench_ceiling.py` (per-GPU aggregate over three peers against
-   1.8 TB/s and the MAIDAS points; its copy-engine references now copy to each peer on its own stream;
-   not yet run) and `bench_ops.py`, with uniform and DeepSeek-V3 routing, at 32 / 64 / 80 / 160 / 256
-   CUs.
+2. ~~EP4~~: measured 2026-10-29 (above). Still open at EP4: the ceiling at 8192 rows per peer after a
+   warm-up (for the phase model), the counters.
 3. **Per-phase timing** inside the kernels (`s_memrealtime` per block: send start and end, counts
    published, receive copy start and end; combine push end and reduce end) to split the local writes
    between the send and the receive copy, and the combine's 40–60 µs.
