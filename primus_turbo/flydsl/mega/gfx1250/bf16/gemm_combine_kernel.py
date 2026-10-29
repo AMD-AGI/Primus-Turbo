@@ -39,8 +39,11 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, rocdl
+from flydsl._mlir.dialects import arith as std_arith
+from flydsl.expr import arith, const_expr, rocdl
+from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import Constexpr, T
+from flydsl.expr.utils.arith import ArithValue
 
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
     _as_ptr,
@@ -63,6 +66,7 @@ from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (
 )
 from primus_turbo.flydsl.mega.gfx1250.prims import (
     CPOL_DEVICE_STREAM,
+    CPOL_SYSTEM_STREAM,
     atomic_add,
     cast,
     ld,
@@ -75,7 +79,7 @@ from primus_turbo.flydsl.mega.gfx1250.symm_buffer import (
     Workspace,
     get_symm_buffer_for_mega_moe,
 )
-from primus_turbo.flydsl.utils.buffer_ops import create_buffer_resource_from_addr
+from primus_turbo.flydsl.utils.buffer_ops import buffer_load, create_buffer_resource_from_addr
 
 # fold rows per combine work item: two rows for each wave of the default 8-wave workgroup
 _FOLD_CHUNK_ROWS = 16
@@ -134,6 +138,7 @@ def _launch_gemm_combine_nt(
     HAS_GRAD_GATE: Constexpr[bool],
     B_NN: Constexpr[bool],
     HAS_BIAS: Constexpr[bool],
+    SCATTER: Constexpr[bool],
 ):
     block = m_warp * n_warp * WAVE
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
@@ -209,6 +214,8 @@ def _launch_gemm_combine_nt(
         num_max_routes = int(workspace.num_max_routes)
         combine_flag_base = workspace.get_combine_flag_ptr()
         reduce_flag_base = workspace.get_reduce_flag_ptr()
+        combine_token_base = workspace.get_combine_token_buffer_ptr()
+        combine_gate_base = workspace.get_combine_gate_ptr()
         combine_token_res = create_buffer_resource_from_addr(
             workspace.get_combine_token_buffer_ptr(), num_records_bytes=num_max_routes * N * EB
         )
@@ -248,7 +255,49 @@ def _launch_gemm_combine_nt(
         expert = live.select(expert, fx.Int32(0))
         blk_n = block_n * fx.Int32(tile_n)
         m_row = block_m * fx.Int32(tile_m)
-        nt_gemm_tile(
+        c_rows = None
+        c_bias = None
+        if const_expr(SCATTER):
+            # dead tiles and the combine workgroups run the tile too, possibly over an empty pool
+            pool_bytes = num_tiles_m * fx.Int32(tile_m * 4)
+            recv_token_res = create_buffer_resource_from_addr(
+                _addr(arg_pool_row_to_recv_token), num_records_bytes=pool_bytes
+            )
+            route_res = create_buffer_resource_from_addr(
+                _addr(arg_pool_row_to_route), num_records_bytes=pool_bytes
+            )
+            scale_res = (
+                create_buffer_resource_from_addr(_addr(arg_bias_scale), num_records_bytes=pool_bytes)
+                if HAS_BIAS
+                else None
+            )
+
+            def c_rows(lane_row):
+                # each row goes straight to its route's combine row on the token's source rank
+                pool_row = m_row + lane_row
+                recv_token = buffer_load(recv_token_res, pool_row, vec_width=1, dtype=T.i32)
+                route = buffer_load(route_res, pool_row, vec_width=1, dtype=T.i32)
+                # padding rows carry the num_max_recv_tokens sentinel
+                ok = (
+                    live
+                    & (recv_token >= fx.Int32(0))
+                    & (recv_token < fx.Int32(NUM_RANKS * NUM_MAX_TOKENS_PER_RANK))
+                    & (route >= fx.Int32(0))
+                    & (route < fx.Int32(num_max_routes))
+                )
+                src_rank = ok.select(recv_token // fx.Int32(NUM_MAX_TOKENS_PER_RANK), fx.Int32(RANK))
+                route = ok.select(route, fx.Int32(0))
+                addr = sym_buffer.map(combine_token_base, src_rank) + fx.Int64(route) * fx.Int64(N * EB)
+                scale = (
+                    buffer_load(scale_res, pool_row, vec_width=1, dtype=T.f32)
+                    if const_expr(HAS_BIAS)
+                    else None
+                )
+                return addr, ok, scale, (pool_row, src_rank, route, ok)
+
+            if const_expr(HAS_BIAS):
+                c_bias = _addr(arg_bias) + fx.Int64(expert) * fx.Int64(N * EB)
+        rows_out = nt_gemm_tile(
             base_ptr,
             gA_base=fx.recast_iter(fx.Int8, arg_act),
             lda=K,
@@ -272,10 +321,32 @@ def _launch_gemm_combine_nt(
             m_warp=m_warp,
             n_warp=n_warp,
             gather=False,
-            c_cache_modifier=CPOL_DEVICE_STREAM,  # read by combine workgroups on other CUs
+            # scattered rows are read by the reduce on their source rank; the staged ones by
+            # combine workgroups on other CUs
+            c_cache_modifier=CPOL_SYSTEM_STREAM if SCATTER else CPOL_DEVICE_STREAM,
             b_nn=B_NN,
             i32_n=fx.Int32(N),
+            c_rows=c_rows,
+            c_bias=c_bias,
         )
+        if const_expr(SCATTER):
+            pool_row, src_rank, route, row_ok = rows_out[3]
+        if const_expr(SCATTER and HAS_GRAD_GATE):
+            # one N block per pool block carries each row's gate value to its route
+            if block_n == fx.Int32(0):
+                if row_ok:
+                    gate = buffer_load(
+                        create_buffer_resource_from_addr(_addr(arg_grad_gate), num_records_bytes=pool_bytes),
+                        pool_row,
+                        vec_width=1,
+                        dtype=T.f32,
+                    )
+                    st(
+                        sym_buffer.map(combine_gate_base, src_rank),
+                        route,
+                        ArithValue(std_arith.BitcastOp(T.i32, _raw(gate)).result),
+                        scope="sys",
+                    )
         # every wave's C stores retire before the flag; two rendezvous, which LLVM would fold
         wait_mem_all()
         fx.gpu.barrier()
@@ -283,109 +354,130 @@ def _launch_gemm_combine_nt(
         fx.gpu.barrier()
         if live:
             if fx.Int32(tid) == fx.Int32(0):
-                atomic_add(combine_flag_base, combine_bank + block_m, fx.Int64(1))
+                flag_before = atomic_add(combine_flag_base, combine_bank + block_m, fx.Int64(1))
+                if const_expr(SCATTER):
+                    is_last_n = (flag_before + fx.Int64(1) == expected_combine).select(
+                        fx.Int32(1), fx.Int32(0)
+                    )
+                    st(_addr(base_ptr), fx.Int32(0), is_last_n, scope="workgroup", space=3)
+        if const_expr(SCATTER):
+            fx.gpu.barrier()
+            is_last_n = live & (ld(_addr(base_ptr), fx.Int32(0), scope="workgroup", space=3) == fx.Int32(1))
+            # Every N block's stores of this pool block retired before its flag add, so the
+            # last one to add publishes the block's rows: their routes' reduce flags go up.
+            if is_last_n:
+                if row_ok:
+                    st(
+                        sym_buffer.map(reduce_flag_base, src_rank),
+                        reduce_bank + route,
+                        expected_reduce,
+                        scope="sys",
+                    )
 
         if is_combine:
-            # Work items are _FOLD_CHUNK_ROWS-row chunks of the fold rows of all segments, in pool
-            # order, taken from one counter: a segment can hold most of the fold rows (a token's
-            # fold row sits in its highest local expert's segment), and the lead workgroups, if
-            # any, get the early chunks while the tail ones, which start once the GEMM has drained,
-            # take what is left. LDS: [0] the taken chunk, [2 + s] segment s's first
-            # chunk, [2 + NUM_EXPERTS] the chunk count.
             lds = _addr(base_ptr)
-            seg = fx.Int32(tid)
-            while seg < fx.Int32(NUM_EXPERTS):
-                fold_count = _i32_table(arg_recv_fold_count)[seg]
-                num_chunks = (fold_count + fx.Int32(_FOLD_CHUNK_ROWS - 1)) // fx.Int32(_FOLD_CHUNK_ROWS)
-                st(lds, fx.Int32(2) + seg, num_chunks, scope="workgroup", space=3)
-                seg = seg + fx.Int32(block)
-            fx.gpu.barrier()
-            if fx.Int32(tid) == fx.Int32(0):
-                running = fx.Int32(0)
-                for s_idx in range(fx.Int32(NUM_EXPERTS)):
-                    num_chunks = ld(lds, fx.Int32(2) + s_idx, scope="workgroup", space=3)
-                    st(lds, fx.Int32(2) + s_idx, running, scope="workgroup", space=3)
-                    running = running + num_chunks
-                st(lds, fx.Int32(2 + NUM_EXPERTS), running, scope="workgroup", space=3)
-                taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(0), fx.Int32(1))
-                st(lds, fx.Int32(0), taken, scope="workgroup", space=3)
-            fx.gpu.barrier()
-            total_chunks = rocdl.readfirstlane(
-                T.i32, ld(lds, fx.Int32(2 + NUM_EXPERTS), scope="workgroup", space=3)
-            )
-            chunk = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(0), scope="workgroup", space=3))
-            # every pool block below next_tile_m is already confirmed, so each is polled once
-            next_tile_m = fx.Int32(0)
-            segment_idx = fx.Int32(0)
-            while chunk < total_chunks:
-                # taken chunks only grow, so the segment cursor only moves forward
-                while ld(lds, fx.Int32(3) + segment_idx, scope="workgroup", space=3) <= chunk:
-                    segment_idx = segment_idx + fx.Int32(1)
-                segment_idx = rocdl.readfirstlane(T.i32, segment_idx)
-                first_chunk = ld(lds, fx.Int32(2) + segment_idx, scope="workgroup", space=3)
-                start_row = rocdl.readfirstlane(T.i32, _i32_table(arg_recv_start_row)[segment_idx])
-                fold_count = rocdl.readfirstlane(T.i32, _i32_table(arg_recv_fold_count)[segment_idx])
-                part_offset = (chunk - first_chunk) * fx.Int32(_FOLD_CHUNK_ROWS)
-                num_part_rows = arith.select(
-                    fold_count - part_offset < fx.Int32(_FOLD_CHUNK_ROWS),
-                    fold_count - part_offset,
-                    fx.Int32(_FOLD_CHUNK_ROWS),
-                )
-                # a fold row's other pool rows lie in lower blocks, so wait for the whole prefix
-                last_tile_m = (start_row + part_offset + num_part_rows - fx.Int32(1)) // fx.Int32(BLOCK_M)
-                if fx.Int32(tid) == fx.Int32(0):
-                    polled_tile_m = next_tile_m
-                    while polled_tile_m <= last_tile_m:
-                        spin_until_flag_reaches(
-                            combine_flag_base,
-                            combine_bank + polled_tile_m,
-                            expected_combine,
-                            "agent",
-                            RANK,
-                            "combine",
-                        )
-                        polled_tile_m = polled_tile_m + fx.Int32(1)
-                    # take the next chunk now, so its counter round trip overlaps this one's push
-                    taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(0), fx.Int32(1))
-                    st(lds, fx.Int32(1), taken, scope="workgroup", space=3)
-                next_tile_m = arith.select(last_tile_m < next_tile_m, next_tile_m, last_tile_m + fx.Int32(1))
-                wait_mem_all()
+            if const_expr(not SCATTER):
+                # Work items are _FOLD_CHUNK_ROWS-row chunks of the fold rows of all segments, in pool
+                # order, taken from one counter: a segment can hold most of the fold rows (a token's
+                # fold row sits in its highest local expert's segment), and the lead workgroups, if
+                # any, get the early chunks while the tail ones, which start once the GEMM has drained,
+                # take what is left. LDS: [0] the taken chunk, [2 + s] segment s's first
+                # chunk, [2 + NUM_EXPERTS] the chunk count.
+                seg = fx.Int32(tid)
+                while seg < fx.Int32(NUM_EXPERTS):
+                    fold_count = _i32_table(arg_recv_fold_count)[seg]
+                    num_chunks = (fold_count + fx.Int32(_FOLD_CHUNK_ROWS - 1)) // fx.Int32(_FOLD_CHUNK_ROWS)
+                    st(lds, fx.Int32(2) + seg, num_chunks, scope="workgroup", space=3)
+                    seg = seg + fx.Int32(block)
                 fx.gpu.barrier()
-                combine_bf16_tile(
-                    sym_buffer,
-                    workspace,
-                    thread_index=tid,
-                    segment_idx=segment_idx,
-                    first_fold_row=start_row + part_offset,
-                    num_fold_rows=num_part_rows,
-                    recv_dst_rank_res=create_buffer_resource_from_addr(_addr(arg_recv_dst_rank)),
-                    pool_row_to_route_res=create_buffer_resource_from_addr(_addr(arg_pool_row_to_route)),
-                    pool_row_to_recv_token_res=create_buffer_resource_from_addr(
-                        _addr(arg_pool_row_to_recv_token)
-                    ),
-                    recv_token_to_pool_rows_res=create_buffer_resource_from_addr(
-                        _addr(arg_recv_token_to_pool_rows)
-                    ),
-                    l2_ptr=l2_base,
-                    epoch=expected_reduce,
-                    reduce_bank=reduce_bank,
-                    grad_gate_res=(
-                        create_buffer_resource_from_addr(_addr(arg_grad_gate)) if HAS_GRAD_GATE else None
-                    ),
-                    has_grad_gate=HAS_GRAD_GATE,
-                    bias=(
-                        (
-                            _addr(arg_bias),
-                            create_buffer_resource_from_addr(_addr(arg_tile_to_expert)),
-                            create_buffer_resource_from_addr(_addr(arg_bias_scale)),
-                        )
-                        if HAS_BIAS
-                        else None
-                    ),
-                    block_threads=block,
+                if fx.Int32(tid) == fx.Int32(0):
+                    running = fx.Int32(0)
+                    for s_idx in range(fx.Int32(NUM_EXPERTS)):
+                        num_chunks = ld(lds, fx.Int32(2) + s_idx, scope="workgroup", space=3)
+                        st(lds, fx.Int32(2) + s_idx, running, scope="workgroup", space=3)
+                        running = running + num_chunks
+                    st(lds, fx.Int32(2 + NUM_EXPERTS), running, scope="workgroup", space=3)
+                    taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(0), fx.Int32(1))
+                    st(lds, fx.Int32(0), taken, scope="workgroup", space=3)
+                fx.gpu.barrier()
+                total_chunks = rocdl.readfirstlane(
+                    T.i32, ld(lds, fx.Int32(2 + NUM_EXPERTS), scope="workgroup", space=3)
                 )
-                chunk = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(1), scope="workgroup", space=3))
-                fx.gpu.barrier()  # every wave has the chunk before thread 0 takes the next one
+                chunk = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(0), scope="workgroup", space=3))
+                # every pool block below next_tile_m is already confirmed, so each is polled once
+                next_tile_m = fx.Int32(0)
+                segment_idx = fx.Int32(0)
+                while chunk < total_chunks:
+                    # taken chunks only grow, so the segment cursor only moves forward
+                    while ld(lds, fx.Int32(3) + segment_idx, scope="workgroup", space=3) <= chunk:
+                        segment_idx = segment_idx + fx.Int32(1)
+                    segment_idx = rocdl.readfirstlane(T.i32, segment_idx)
+                    first_chunk = ld(lds, fx.Int32(2) + segment_idx, scope="workgroup", space=3)
+                    start_row = rocdl.readfirstlane(T.i32, _i32_table(arg_recv_start_row)[segment_idx])
+                    fold_count = rocdl.readfirstlane(T.i32, _i32_table(arg_recv_fold_count)[segment_idx])
+                    part_offset = (chunk - first_chunk) * fx.Int32(_FOLD_CHUNK_ROWS)
+                    num_part_rows = arith.select(
+                        fold_count - part_offset < fx.Int32(_FOLD_CHUNK_ROWS),
+                        fold_count - part_offset,
+                        fx.Int32(_FOLD_CHUNK_ROWS),
+                    )
+                    # a fold row's other pool rows lie in lower blocks, so wait for the whole prefix
+                    last_tile_m = (start_row + part_offset + num_part_rows - fx.Int32(1)) // fx.Int32(BLOCK_M)
+                    if fx.Int32(tid) == fx.Int32(0):
+                        polled_tile_m = next_tile_m
+                        while polled_tile_m <= last_tile_m:
+                            spin_until_flag_reaches(
+                                combine_flag_base,
+                                combine_bank + polled_tile_m,
+                                expected_combine,
+                                "agent",
+                                RANK,
+                                "combine",
+                            )
+                            polled_tile_m = polled_tile_m + fx.Int32(1)
+                        # take the next chunk now, so its counter round trip overlaps this one's push
+                        taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(0), fx.Int32(1))
+                        st(lds, fx.Int32(1), taken, scope="workgroup", space=3)
+                    next_tile_m = arith.select(
+                        last_tile_m < next_tile_m, next_tile_m, last_tile_m + fx.Int32(1)
+                    )
+                    wait_mem_all()
+                    fx.gpu.barrier()
+                    combine_bf16_tile(
+                        sym_buffer,
+                        workspace,
+                        thread_index=tid,
+                        segment_idx=segment_idx,
+                        first_fold_row=start_row + part_offset,
+                        num_fold_rows=num_part_rows,
+                        recv_dst_rank_res=create_buffer_resource_from_addr(_addr(arg_recv_dst_rank)),
+                        pool_row_to_route_res=create_buffer_resource_from_addr(_addr(arg_pool_row_to_route)),
+                        pool_row_to_recv_token_res=create_buffer_resource_from_addr(
+                            _addr(arg_pool_row_to_recv_token)
+                        ),
+                        recv_token_to_pool_rows_res=create_buffer_resource_from_addr(
+                            _addr(arg_recv_token_to_pool_rows)
+                        ),
+                        l2_ptr=l2_base,
+                        epoch=expected_reduce,
+                        reduce_bank=reduce_bank,
+                        grad_gate_res=(
+                            create_buffer_resource_from_addr(_addr(arg_grad_gate)) if HAS_GRAD_GATE else None
+                        ),
+                        has_grad_gate=HAS_GRAD_GATE,
+                        bias=(
+                            (
+                                _addr(arg_bias),
+                                create_buffer_resource_from_addr(_addr(arg_tile_to_expert)),
+                                create_buffer_resource_from_addr(_addr(arg_bias_scale)),
+                            )
+                            if HAS_BIAS
+                            else None
+                        ),
+                        block_threads=block,
+                    )
+                    chunk = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(1), scope="workgroup", space=3))
+                    fx.gpu.barrier()  # every wave has the chunk before thread 0 takes the next one
 
             # ---- reduce: every chunk is taken by a running workgroup, so the flags waited on come ----
             # pool blocks this call left empty still have to reach the never-reset expected
@@ -439,6 +531,7 @@ def _launch_gemm_combine_nt(
                         has_grad_gate=HAS_GRAD_GATE,
                         block_threads=block,
                         vec_unroll=4,
+                        all_routes=SCATTER,
                     )
                 fx.gpu.barrier()
                 take = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(1), scope="workgroup", space=3))
@@ -506,6 +599,7 @@ def gemm_combine_nt_gfx1250(
     b_nn: bool = False,
     bias: torch.Tensor | None = None,
     bias_scale: torch.Tensor | None = None,
+    scatter: bool = True,
 ):
     """``act`` [pool rows, K] (pool order, as the L1 + activation left it) -> ``[tokens, N]`` combined,
     ``tokens = topk_idx.shape[0]``.
@@ -517,7 +611,12 @@ def gemm_combine_nt_gfx1250(
     this rank's token ``t``, on whichever rank holds them. No routing weight is applied here.
     ``w2`` is ``[experts, N, K]``, or ``[experts, K, N]`` with ``b_nn`` (``act[p] @ w2[e(p)]``).
     ``bias`` [experts, N] adds ``bias[e(p)] * bias_scale[p]`` to every pool row before the sum,
-    ``bias_scale`` being the rows' f32 routing weight. ``tile_k`` 0 is 128 when it divides K, else 64."""
+    ``bias_scale`` being the rows' f32 routing weight. ``tile_k`` 0 is 128 when it divides K, else 64.
+
+    ``scatter`` stores every GEMM row straight into its route's combine row on the token's source
+    rank, and the reduce sums all of a token's routes; without it the GEMM stages the rows locally
+    and the combine workgroups push one sum per (token, rank), which waits for the token's last
+    local expert."""
     _require_gfx1250(act.device)
     symm = get_symm_buffer_for_mega_moe()
     G, N, K = w2.shape
@@ -556,8 +655,8 @@ def gemm_combine_nt_gfx1250(
         assert bias.dtype == torch.bfloat16 and tuple(bias.shape) == (G, N), f"bias must be bf16 [{G}, {N}]"
         assert bias_scale is not None and bias_scale.dtype == torch.float32 and bias_scale.numel() == rows
         bias, bias_scale = bias.contiguous(), bias_scale.contiguous()
-    # local stage of the L2 output: only this rank's combine workgroups read it
-    l2 = torch.empty(rows, N, dtype=torch.bfloat16, device=act.device)
+    # local stage of the L2 output, which only this rank's combine workgroups read; a scatter has none
+    l2 = out if scatter else torch.empty(rows, N, dtype=torch.bfloat16, device=act.device)
     args = (
         _as_ptr(out),
         _as_ptr(act),
@@ -607,6 +706,7 @@ def gemm_combine_nt_gfx1250(
         has_grad_gate,
         b_nn,
         has_bias,
+        scatter,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)
