@@ -25,15 +25,17 @@ fc2's weight comes in as [G, I, K].
 
 import torch
 
+from primus_turbo.flydsl.autotune import Op, Reference, staged
+from primus_turbo.flydsl.autotune.engine import Entry
+from primus_turbo.flydsl.autotune.policies import NoArgs
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_glu_kernel import GradProbsPartialSpec
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp4_kernel import (
     _BLOCK,
+    _GMXFP4_COMPILE,
     _PRESHUF_BLK,
     _PRESHUF_FO,
-    _bound_caches,
     _compile_grouped_mxfp4_nt_glu,
     _get_grouped_mxfp4_ws,
-    _run_mxfp4_sched,
     _select_gmxfp4_nt_cfg,
 )
 from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
@@ -47,7 +49,9 @@ from primus_turbo.flydsl.utils.gemm_epilogue_helper import (
 )
 from primus_turbo.flydsl.utils.prims import ceildiv
 
-_GMXFP4_GLU_CACHE: dict = {}  # -> [launch, compiled, n_blocks]
+# One blocking per shape, the NT selector's; nothing is raced. ``Entry.extra`` is n_blocks.
+_GROUPED_GEMM_MXFP4_EPI_GLU_QUANT = Op("grouped_gemm_mxfp4_epi_glu_quant", compile=_GMXFP4_COMPILE)
+_GROUPED_GEMM_MXFP4_EPI_DGLU_QUANT = Op("grouped_gemm_mxfp4_epi_dglu_quant", compile=_GMXFP4_COMPILE)
 
 _WLV, _ELGK = 10, 9  # whole-loop / early-load-gap knobs, as the plain NT entry sets them
 
@@ -56,16 +60,14 @@ _WLV, _ELGK = 10, 9  # whole-loop / early-load-gap knobs, as the plain NT entry 
 _DGLU_BLOCK_N = _BLOCK
 
 
-def _glu_entry(
+def _glu_key(
     K256,
     k_real,
     G,
     glu_i,
     out_fp16,
-    *,
-    glu,
-    dglu,
     cfg,
+    *,
     quant_row=False,
     fuse_act_quant=False,
     total_M=0,
@@ -77,9 +79,9 @@ def _glu_entry(
     clamp_limit=None,
     scale_rounding_bias=1 << 21,
 ):
-    """Compiled launch for one fused shape, cached on the static shape + blocking."""
+    """The static shape + blocking one fused launch compiles for."""
     gm, xcd, gn, span, _nt = cfg
-    key = (
+    return (
         K256,
         k_real,
         G,
@@ -89,7 +91,6 @@ def _glu_entry(
         gn,
         span,
         out_fp16,
-        glu,
         quant_row,
         fuse_act_quant,
         total_M,
@@ -101,37 +102,67 @@ def _glu_entry(
         clamp_limit,
         scale_rounding_bias,
     )
-    ent = _GMXFP4_GLU_CACHE.get(key)
-    if ent is None:
-        launch, n_blocks = _compile_grouped_mxfp4_nt_glu(
-            K256,
-            G,
-            glu_i,
-            gm,
-            xcd,
-            gn,
-            _WLV,
-            _ELGK,
-            out_fp16,
-            k_real=k_real,
-            span=span,
-            glu=glu,
-            dglu=dglu,
-            glu_i=glu_i,
-            glu_quant_row=quant_row,
-            fuse_act_quant=fuse_act_quant,
-            quant_total_M=total_M,
-            epi_act_quant=epi_act_quant,
-            dglu_epi_quant=dglu_epi_quant,
-            epi_row_sr=epi_row_sr,
-            epi_col_sr=epi_col_sr,
-            activation=activation,
-            clamp_limit=clamp_limit,
-            epi_scale_rounding_bias=scale_rounding_bias,
-        )
-        ent = [launch, None, n_blocks]
-        _GMXFP4_GLU_CACHE[key] = ent
-    return ent
+
+
+def _glu_entry(cfg, key, glu, tuned=True):
+    """``glu`` False is the dgrad."""
+    (
+        K256,
+        k_real,
+        G,
+        glu_i,
+        _gm,
+        _xcd,
+        _gn,
+        _span,
+        out_fp16,
+        quant_row,
+        fuse_act_quant,
+        total_M,
+        epi_act_quant,
+        dglu_epi_quant,
+        epi_row_sr,
+        epi_col_sr,
+        activation,
+        clamp_limit,
+        scale_rounding_bias,
+    ) = key
+    gm, xcd, gn, span, _nt = cfg
+    launch, n_blocks = _compile_grouped_mxfp4_nt_glu(
+        K256,
+        G,
+        glu_i,
+        gm,
+        xcd,
+        gn,
+        _WLV,
+        _ELGK,
+        out_fp16,
+        k_real=k_real,
+        span=span,
+        glu=glu,
+        dglu=not glu,
+        glu_i=glu_i,
+        glu_quant_row=quant_row,
+        fuse_act_quant=fuse_act_quant,
+        quant_total_M=total_M,
+        epi_act_quant=epi_act_quant,
+        dglu_epi_quant=dglu_epi_quant,
+        epi_row_sr=epi_row_sr,
+        epi_col_sr=epi_col_sr,
+        activation=activation,
+        clamp_limit=clamp_limit,
+        epi_scale_rounding_bias=scale_rounding_bias,
+    )
+    return Entry(cfg, launch, tuned=tuned, extra=n_blocks)
+
+
+def _pick_glu(op, key, cfg, glu):
+    """``cfg``, the NT selector's blocking, is the pick."""
+    space = staged(Reference(lambda _prev: [cfg], check=None), base=cfg)
+    build = op.build(lambda c: _glu_entry(c, key, glu))
+    res = op.pick(key, space, probe=NoArgs(), build=build)
+    return build.winner(res)
 
 
 def _pack_operands(a, a_scale, b, b_scale, group_offs):
@@ -232,21 +263,23 @@ def grouped_gemm_mxfp4_epi_glu_quant_flydsl_kernel(
     a8, b8, a_raw, b_raw, go32 = _pack_operands(a, a_scale, b, b_scale, group_offs)
     K256 = ceildiv(K, 256) * 256
     a_sp, b_sp, slab_rows = _get_grouped_mxfp4_ws(M_total, N, K256 // 128, G, a.device)
-    ent = _glu_entry(
+    cfg = _select_gmxfp4_nt_cfg(M_total, G)
+    key = _glu_key(
         K256,
         K,
         G,
         I,
         out_dtype == torch.float16,
-        glu=True,
-        dglu=False,
-        cfg=_select_gmxfp4_nt_cfg(M_total, G),
+        cfg,
         epi_act_quant=True,
         epi_row_sr=row_use_sr,
         epi_col_sr=col_use_sr,
         activation=activation,
         clamp_limit=clamp_limit,
         scale_rounding_bias=_mxfp4_scale_rounding_bias(scale_rounding_mode),
+    )
+    entry = _GROUPED_GEMM_MXFP4_EPI_GLU_QUANT.entry(
+        key, lambda: _pick_glu(_GROUPED_GEMM_MXFP4_EPI_GLU_QUANT, key, cfg, True)
     )
     # The col-wise operand's row stride: one 256-block per tile row, per group.
     col_rows = col_out.shape[1] * 2
@@ -264,7 +297,7 @@ def grouped_gemm_mxfp4_epi_glu_quant_flydsl_kernel(
         I,
         slab_rows,
         ceildiv(slab_rows * (K256 // 128), _PRESHUF_FO * _PRESHUF_BLK),
-        (ceildiv(M_total, _BLOCK) + G) * ent[2],
+        (ceildiv(M_total, _BLOCK) + G) * entry.extra,
         row_out.view(torch.int32),
         # E8M0 has no memref element type; the scales are raw bytes to the kernel.
         row_sc.view(torch.uint8),
@@ -274,8 +307,7 @@ def grouped_gemm_mxfp4_epi_glu_quant_flydsl_kernel(
         _next_sr_seed() if (row_use_sr or col_use_sr) else 0,
         torch.cuda.current_stream(),
     )
-    _run_mxfp4_sched(ent, args, 1)
-    _bound_caches(_GMXFP4_GLU_CACHE)
+    _GROUPED_GEMM_MXFP4_EPI_GLU_QUANT.launch(entry, args)
     return l1, row_out, row_sc, col_out, col_sc
 
 
@@ -303,7 +335,7 @@ def dglu_epi_quant_supported(K: int, I: int, out_dtype=torch.bfloat16) -> bool:
     """Whether :func:`grouped_gemm_mxfp4_epi_dglu_quant_flydsl_kernel` covers this shape.
 
     Unlike the forward's, this epilogue competes for no store slot -- the dgrad
-    never had one -- and its band is the parent's, so K is free and only the
+    has none -- and its band is the parent's, so K is free and only the
     micro-block alignment matters: a row-wise block of 32 columns must not straddle
     the ``dg`` and ``du`` halves of ``grad_l1``.
     """
@@ -339,7 +371,7 @@ def grouped_gemm_mxfp4_epi_dglu_quant_flydsl_kernel(
     Computes the fc2 dgrad and turns it into the pre-activation gradient, whose two
     MXFP4 operands are what backward actually consumes -- row-wise for ``grad_x`` and
     col-wise (RHT) for ``grad_w1``. ``grad_l1`` is [M, 2I], the largest tensor in the
-    MLP, so keeping it out of bf16 removes the biggest round trip there was: at
+    MLP, so keeping it out of bf16 removes the MLP's largest round trip: at
     [131072, 5760] a 1.5 GB write and a 1.5 GB read, against 0.82 GB written once.
 
     ``grad_probs`` is reduced from the per-tile partials the epilogue leaves.
@@ -388,21 +420,23 @@ def grouped_gemm_mxfp4_epi_dglu_quant_flydsl_kernel(
     a8, b8, a_raw, b_raw, go32 = _pack_operands(a, a_scale, b, b_scale, group_offs)
     K256 = ceildiv(K, 256) * 256
     a_sp, b_sp, slab_rows = _get_grouped_mxfp4_ws(M_total, I, K256 // 128, G, a.device)
-    ent = _glu_entry(
+    cfg = _select_gmxfp4_nt_cfg(M_total, G)
+    key = _glu_key(
         K256,
         K,
         G,
         I,
         out_dtype == torch.float16,
-        glu=False,
-        dglu=True,
-        cfg=_select_gmxfp4_nt_cfg(M_total, G),
+        cfg,
         dglu_epi_quant=True,
         epi_row_sr=row_use_sr,
         epi_col_sr=col_use_sr,
         activation=activation,
         clamp_limit=clamp_limit,
         scale_rounding_bias=_mxfp4_scale_rounding_bias(scale_rounding_mode),
+    )
+    entry = _GROUPED_GEMM_MXFP4_EPI_DGLU_QUANT.entry(
+        key, lambda: _pick_glu(_GROUPED_GEMM_MXFP4_EPI_DGLU_QUANT, key, cfg, False)
     )
     # The col-wise operand's row stride: one 256-block per tile row, per group.
     col_rows = col_out.shape[1] * 2
@@ -422,7 +456,7 @@ def grouped_gemm_mxfp4_epi_dglu_quant_flydsl_kernel(
         slab_rows,
         M_total,  # gp_stride: the partial buffer's row pitch
         ceildiv(slab_rows * (K256 // 128), _PRESHUF_FO * _PRESHUF_BLK),
-        (ceildiv(M_total, _BLOCK) + G) * ent[2],
+        (ceildiv(M_total, _BLOCK) + G) * entry.extra,
         row_out.view(torch.int32),
         # E8M0 has no memref element type; the scales are raw bytes to the kernel.
         row_sc.view(torch.uint8),
@@ -432,6 +466,5 @@ def grouped_gemm_mxfp4_epi_dglu_quant_flydsl_kernel(
         _next_sr_seed() if (row_use_sr or col_use_sr) else 0,
         torch.cuda.current_stream(),
     )
-    _run_mxfp4_sched(ent, args, 1)
-    _bound_caches(_GMXFP4_GLU_CACHE)
+    _GROUPED_GEMM_MXFP4_EPI_DGLU_QUANT.launch(entry, args)
     return row_out, row_sc, col_out, col_sc

@@ -13,20 +13,12 @@
 
 """8-wave MXFP8 matmul (per-1x32 E8M0 block scaling) for AMD CDNA4 (gfx950).
 
-Structurally parallels the tensorwise FP8 path in ``gemm_fp8_kernel.py``; the
-difference vs that kernel:
+Parallels the tensorwise FP8 path in ``gemm_fp8_kernel.py``, except the per-32-K-block
+E8M0 scale is fed to ``v_mfma_scale_f32_16x16x128_f8f6f4`` every K-iteration, so the
+epilogue is a plain FP32->BF16 store.
 
-  * tensorwise applies a single per-row (A) / per-col (B) FP32 scale in the
-    epilogue, with the MFMA run un-scaled (identity scale operand).
-  * mxfp8 carries a per-32-element-K-block E8M0 scale that MUST be fed to the
-    ``v_mfma_scale_f32_16x16x128_f8f6f4`` instruction per K-iteration. The
-    epilogue therefore becomes a plain FP32->BF16 store (all scaling already
-    folded into the accumulator by the MMA).
-
-Scale operand semantics (gfx950): the MMA takes one i32 scale per operand,
-holding 4 packed E8M0 bytes -- one byte per 32-K block. A single
-16x16x128 MFMA spans K=128 == 4 micro-blocks, so exactly one i32 scale per
-(row/col tile, K-iteration).
+The MMA takes one i32 scale per operand holding 4 packed E8M0 bytes (one per 32-K block);
+a 16x16x128 MFMA spans K=128, so one i32 scale per (row/col tile, K-iteration).
 
 Scale tensor layout expected by this kernel (passed pre-packed from host):
   A_scale: int32 [M, K // 128]   (each i32 == 4 consecutive E8M0 bytes of a row)
@@ -39,14 +31,10 @@ import warnings
 import torch
 
 # isort: off
-# Shared fp8 GEMM primitives from primus_turbo/flydsl/utils/gemm_helper.py (the
-# tensorwise FlyDSL backend, #356). Must be importable as module globals
-# (@flyc.kernel needs them as globals, not closure cells). NT only (compute-only
-# PR), so the NN/TN transpose loaders (S2RLoaderTr / swizzle_nn) are not imported.
+# @flyc.kernel resolves these as module globals, not closure cells.
 from primus_turbo.flydsl.utils.gemm_helper import (
     block_mn,
     build_preshuffle_ab_kernel,
-    compile_with_scratch_out,
     compute_global_swizzle,
     G2SLoader,
     make_fp8_buffer_tensor_rebased,
@@ -55,7 +43,6 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     MfmaScale16x16x128,
     _PRESHUF_KT,
     resolve_accum_out,
-    _robust_time,
     S2RLoader,
     ScaleBComb,
     scale_opsel,
@@ -69,6 +56,10 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 )
 from primus_turbo.flydsl.utils.prims import ceildiv
 from primus_turbo.flydsl.utils import buffer_ops
+from primus_turbo.flydsl.autotune import Compile, NoWorkingConfig, Op, Race, Refine
+from primus_turbo.flydsl.autotune.engine import Entry
+from primus_turbo.flydsl.autotune.policies import Point, Synthetic
+from primus_turbo.flydsl.autotune.race import staged
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -272,7 +263,7 @@ def _build_mxfp8_nt_kernel(
     a_lds_size = LDS_BLOCK_M * BLOCK_K
     b_lds_size = LDS_BLOCK_N * BLOCK_K
 
-    # scale-tile fanout per MFMA wrapper call (A sub-tiles / B sub-tiles per wave).
+    # A scale tiles per MFMA wrapper call.
     SA_TILES = N_TILES_A
 
     @fx.struct
@@ -319,8 +310,6 @@ def _build_mxfp8_nt_kernel(
         # Keep the SIMD-mate pair on different wave_m so they share B, not the heavier A.
         if const_expr(_MX_WAVE_MAP == 1):
             wave_n = wave_n ^ (wave_m * 2)
-        # 1D GROUP_M super-row swizzle (group_n=0) or 2D N-band (group_n>0, big-N L2
-        # reuse: cuts the B re-stream). XCD-aware remap. See block_mn / xcd_remap_pid.
         # Tile-minor slice walk, so one XCD still sees the unsplit contiguous tile run.
         num_pid_m = ceildiv(c_m, BLOCK_M)
         if const_expr(k_split > 1):
@@ -334,10 +323,8 @@ def _build_mxfp8_nt_kernel(
             pid = pid_off + xcd_remap_pid(fx.block_idx.x, pid_span, num_xcd)
         block_m, block_n = block_mn(pid, num_pid_m, n_blocks, GROUP_M, group_n)
 
-        # i64 input re-base (same as tensorwise NT): fold the per-tile row base
-        # (m_row*K, n_row*K) into the SRD base in T.index (64-bit); A/B_T are
-        # K-contiguous (foldable), so the running k*BLOCK_K offset stays small int32
-        # -> no 2^31/2^32 cap. Output StoreCPlain already re-bases per band in i64.
+        # Fold the per-tile row base (m_row*K, n_row*K) into the 64-bit SRD base; the running
+        # k*BLOCK_K offset stays small int32, so there is no 2^31/2^32 cap.
         a_base = arith.index_cast(T.index, block_m * BLOCK_M) * arith.index(K)
         b_base = arith.index_cast(T.index, block_n * BLOCK_N) * arith.index(K)
         a_nrec = (
@@ -410,7 +397,6 @@ def _build_mxfp8_nt_kernel(
         sa_base1 = sa_base0 + fx.Int32(LDS_BLOCK_M)
         sb_base0 = fx.Int32(block_n * BLOCK_N + wave_n_offset)
 
-        # 2x2 config of accumulators
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS
         c10_frag = [mfma.zero_value] * N_ACCUMS
@@ -430,7 +416,6 @@ def _build_mxfp8_nt_kernel(
         a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
         b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K)
 
-        # Same zero-iteration hazard as the dense fp8 NT kernel, with no incidental cover:
         # K_ITERS == 2 skips the main loop and the non-transpose S2RLoader emits no s_waitcnt
         # of its own, so k=1's b_next0/a_next0 have to land here.
         wait_barrier(N_LDS_STEPS_B if K_ITERS == 2 else N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
@@ -611,9 +596,7 @@ def _build_mxfp8_nt_kernel(
                 store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col)
             store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
-    # Bare kernel (NOT a launch): the fused factory issues it + the preshuffle kernel
-    # from a single @flyc.jit host stub. BLOCK_M/BLOCK_N/waves_per_eu are returned so
-    # that stub can size the grid + value_attrs.
+    # Bare kernel, not a launch: the fused host stub issues it and sizes grid/value_attrs from these.
     return kernel_mxfp8_nt, BLOCK_M, BLOCK_N, waves_per_eu
 
 
@@ -624,46 +607,18 @@ _PRESHUF_BLK = 256  # preshuffle kernel block size (matches build_preshuffle_ab_
 
 # (K, bm, gm, xcd, gn, cbsz, blgp, out_fp16, beta1) -> launch_mxfp8_fused (preshuffle+gemm jit)
 _MXFP8_FUSED_CACHE: dict = {}
-_MXFP8_AT_CACHE: dict = {}  # (M,N,K,bm,gm,xcd,gn,cbsz,blgp,out_fp16,beta1) -> [raw_launch, compiled_or_None]
-# (M, N, K128, device, stream) -> (a_sp, b_sp, a_blocks, a_ngrp, b_ngrp). Caller-owned
-# scale workspace (turbo-style): the fused stub's preshuffle writes a_sp/b_sp then the
-# gemm reads them, in stream order, so reuse across same-shape calls on one stream is safe.
+# (M, N, K128, device, stream) -> (a_sp, b_sp, a_blocks, a_ngrp, b_ngrp). The preshuffle writes
+# a_sp/b_sp and the gemm reads them in stream order, so same-stream reuse is safe.
 _MXFP8_WS_CACHE: dict = {}
 _MXFP8_SPLIT_WS_CACHE: dict = {}  # (tail, k_split, device, stream, dtype) -> bf16 partial workspace
 
-# Per-shape NT autotune candidates (BLOCK_M, GROUP_M, num_xcd); BLOCK_N fixed 256.
-# BLOCK_M=128 doubles the tiles (fills the CUs on skinny/small shapes), 256 wins big
-# square / B-streaming; GROUP_M is the per-XCD L2-reuse super-block depth.
-# BLOCK_M fixed at 256 (n_tiles_a = 256//64 = 4): the A-scale preshuffle layout is
-# bm-dependent and the fused stub preshuffles the raw E8M0 scales to int32 (one fixed
-# config) before the gemm, so the gemm cannot re-pack per candidate -> BLOCK_M constant.
-# autotune sweeps only GROUP_M / num_xcd / group_n (none of which change the layout).
+# NT tile candidates (BLOCK_M, GROUP_M, num_xcd); BLOCK_N fixed 256. BLOCK_M stays 256: the
+# A-scale preshuffle layout is bm-dependent and built once per launch, so autotune only sweeps
+# knobs that leave it unchanged (GROUP_M / num_xcd / group_n).
 _MXFP8_NT_CANDIDATES = [
     (256, 4, 8),
     (256, 8, 8),
 ]
-
-
-# Repeats a candidate must return identical bytes for before it is timed at all.
-_MX_REPRO_REPS = 64
-# Enough to evict the operands a candidate just read.
-_MX_REPRO_FLUSH_MB = 512
-_MX_REPRO_FLUSH: dict = {}
-
-
-def _repro_flush_buf(device):
-    """One flush buffer per device for the whole process. A per-autotune allocation competes
-    with the scratch output on the largest shapes, and losing it there would fail every
-    candidate; a shape that cannot spare it runs the check warm instead."""
-    if device not in _MX_REPRO_FLUSH:
-        try:
-            _MX_REPRO_FLUSH[device] = torch.empty(_MX_REPRO_FLUSH_MB << 20, dtype=torch.uint8, device=device)
-        except torch.OutOfMemoryError:
-            _MX_REPRO_FLUSH[device] = None
-    return _MX_REPRO_FLUSH[device]
-
-
-_MXFP8_AUTOTUNE_CACHE: dict = {}  # (M,N,K,out_dtype,cbsz,blgp) -> (BLOCK_M, GROUP_M, num_xcd, group_n)
 
 
 def _mx_col_safe(N):
@@ -693,18 +648,10 @@ def _mx_ksplit(M, N, K, out_dtype, beta_is_one):
 
 
 def _mx_nt_gn_cands(N):
-    """NT 2D N-band candidate widths for the autotune stage-2 sweep. The seed band
-    (gn=0, NT's 1D swizzle) is measured separately as the baseline, so the final
-    pick can never regress. Only offer a band when there are >= 2*gn 256-col
-    N-blocks (else the band can't create the cross-tile B reuse it exists for).
-    Winners are shape-dependent (NT: 7B GateUp gn16, 70B QKV gn8/16), so the
-    per-shape bench picks rather than a single heuristic."""
+    """NT 2D N-band widths for the stage-2 sweep (the gn=0 seed is raced separately). A band
+    needs >= 2*gn N-blocks to create the cross-tile B reuse it exists for."""
     n_blocks = (N + _BLOCK_N - 1) // _BLOCK_N
-    # gn=32 was probed and dropped: its only win (NT 7B_GateUp +1.7% over gn16) is
-    # coupled to tile (256,4), but stage-1 picks the tile at the seed band and lands
-    # on (256,8) there, so the gn=32 win isn't reliably reachable — not worth the
-    # extra autotune compile on every N>=16384 shape. {4,8,16} captures the robust
-    # wins. (A fuller tile x gn cross-sweep could reach it but costs far more.)
+    # No gn=32: its one win needs a tile that stage 1 does not pick at gn=0.
     return [g for g in (4, 8, 16) if n_blocks >= 2 * g]
 
 
@@ -722,16 +669,12 @@ def _compile_mxfp8_fused(
     k_split=1,
     cstore_aux=0,
 ):
-    """Build the turbo-style fused @flyc.jit ``launch_mxfp8_fused``: ONE host stub
-    that enqueues the A+B scale preshuffle kernel and then the NT mxfp8 GEMM kernel
-    on the same stream (single Python dispatch, no separate preshuffle launch, no
-    CPU sync). The preshuffle repacks raw E8M0 (int32-viewed) into the caller-owned
-    a_sp / b_sp workspace; the gemm reads it in stream order. gn = autotuned 2D
-    N-band width (0 = 1D swizzle); cbsz/blgp = per-operand fp8 format (0=E4M3,1=E5M2).
+    """Build the fused @flyc.jit ``launch_mxfp8_fused``: one host stub enqueues the scale
+    preshuffle (raw E8M0 -> caller-owned a_sp / b_sp) and then the NT GEMM on the same stream.
+    gn = 2D N-band width (0 = 1D swizzle); cbsz/blgp = per-operand fp8 format (0=E4M3, 1=E5M2).
 
-    NOTE: never name this jit (or any module global) ``launch`` -- the ``.launch()``
-    method attribute lands in co_names and the cache-key dependency walker would
-    resolve a module-global ``launch`` back to this JitFunction (infinite recursion).
+    Never name this jit (or any module global) ``launch``: ``.launch()`` lands in co_names and
+    the cache-key dependency walker would resolve it back to this JitFunction (infinite recursion).
     """
     K128 = K // 128
     # The split plan and the fold both decode tile ids at _BLOCK_M.
@@ -851,12 +794,9 @@ def _get_mxfp8_fused_launch(
 
 
 def _get_mx_workspace(M, N, K128, device, stream):
-    """Caller-owned scale workspace (a_sp/b_sp) + the preshuffle launch dims, cached
-    by (M, N, K128, device, stream). a_sp/b_sp are flat int32 buffers the fused stub's
-    preshuffle writes and the gemm reads; sizing mirrors the A (layout-1) / combined-B
-    (layout-3) repack (A: cdiv(M,64) groups; B: cdiv(N,256)*4 groups; each group*K128*256
-    i32, packed K-groups). cdiv for A (not M//64): a partial last 64-row group covers
-    general (non-64) M, the preshuffle masks its OOB rows to 0 and StoreC drops them."""
+    """Caller-owned flat int32 scale workspace (a_sp/b_sp) + the preshuffle launch dims, cached
+    by (M, N, K128, device, stream). A has cdiv(M,64) groups, B cdiv(N,256)*4; a partial last A
+    group covers general M (the preshuffle zeroes its OOB rows and StoreC drops them)."""
     key = (M, N, K128, device, stream)
     e = _MXFP8_WS_CACHE.get(key)
     if e is None:
@@ -883,164 +823,129 @@ def _get_mx_split_ws(tail, k_split, device, stream, out_dtype):
     return ws
 
 
-def _autotune_mxfp8(
-    a8, b8, out_view, a_raw, b_raw, a_sp, b_sp, M, N, K, a_blocks, a_ngrp, b_ngrp, out_dtype, cbsz=0, blgp=0
-):
-    """First-call micro-bench of the candidates for (M,N,K); cache the fastest cfg by
-    shape. Returns (BLOCK_M, GROUP_M, num_xcd, group_n, k_split, cstore_aux). Each candidate times the
-    FUSED stub (preshuffle + gemm): the preshuffle config is fixed (same K128) so it is a
-    constant offset across candidates and the gemm-config ranking is preserved.
+# Every step holds its candidates to reproducible output: several configs the race can reach
+# return different bytes on every call, and which settings are safe differs by shape (#570).
+_MX_TILE = Race.interleaved(1, 20, warmup=2, visit=(0, 3), check="reproducible")
+# adopt a band only if it beats the re-measured seed by >1.5%
+_MX_BAND = Race.interleaved(4, 20, visit=(2, 3), margin=0.985, check="reproducible")
+# The C-store and split plans, both shape-dependent in sign; the split plan is judged against the
+# time the C-store step's pick won with, not a re-measure.
+_MX_TAIL = Race.interleaved(3, 20, visit=(2, 3), margin=0.99, check="reproducible")
+_MX_RACES = (_MX_TILE, _MX_BAND, _MX_TAIL)
+# The same steps held to a finite output alone: the last resort when nothing reproduces.
+_MX_UNCHECKED = tuple(r.checked_by("finite") for r in _MX_RACES)
+_GEMM_MXFP8 = Op("gemm_mxfp8", compile=Compile(once=True))
+# Untuned: the leading tile at NT's native 1D swizzle, one arm, default C-store policy.
+_MXFP8_BASE = _MXFP8_NT_CANDIDATES[0] + (0, 1, 0)
 
-    Two-stage for NT: stage 1 picks (BM,GM,XCD) at group_n=0 (1D swizzle); stage 2
-    fixes that tile and sweeps the 2D N-band width group_n. gn=0 is measured in
-    stage 1, so the staged pick can never regress vs the gn-less NT path — it only
-    captures the big-/mid-N L2-reuse win on shapes where a band helps. Stage 3 races the
-    tail-round split-K plan against the single arm at a protection margin, so a shape whose
-    partial-sum traffic outweighs the refilled round keeps one arm."""
-    key = (M, N, K, out_dtype, cbsz, blgp)
-    _ofp16 = out_dtype == torch.float16
-    cached = _MXFP8_AUTOTUNE_CACHE.get(key)
-    if cached is not None:
-        return cached
-    cands = _MXFP8_NT_CANDIDATES
-    stream = torch.cuda.current_stream()
+
+def _mxfp8_entry(M, N, K, cfg, out_dtype, cbsz, blgp, beta_is_one, tuned=True):
+    """``cfg``'s launch, ``extra`` = its (k_split, head, tail) plan. A split pick runs as one arm
+    under beta=1 or a non-bf16 C (see _mx_ksplit)."""
+    bm, gm, xcd, gn, ks, aux = cfg
+    ks, head, tail = _mx_ksplit(M, N, K, out_dtype, beta_is_one) if ks > 1 else (1, 0, 0)
+    if ks == 1:
+        head = ceildiv(M, bm) * ceildiv(N, _BLOCK_N)
+    launch = _get_mxfp8_fused_launch(
+        K,
+        bm,
+        gm,
+        xcd,
+        gn,
+        cbsz=cbsz,
+        blgp=blgp,
+        out_fp16=out_dtype == torch.float16,
+        beta_is_one=beta_is_one,
+        col_safe=_mx_col_safe(N),
+        k_split=ks,
+        cstore_aux=aux,
+    )
+    return Entry(cfg, launch, tuned=tuned, extra=(ks, head, tail))
+
+
+def _mx_space(tiles, N, bks, races, skip_gn=()):
+    """The NT search from the stage-1 ``tiles``: (BM, GM, XCD), then group_n bands against the
+    re-measured incumbent (never a width in ``skip_gn``), then the C-store policy, then the
+    tail-round split-K plan against one arm at a margin. ``races``: the (tile, band, tail) races."""
+    tile, band, tail = races
+
+    def gn_stage(prev):
+        # The incumbent is re-measured with the bands' estimator.
+        widths = sorted(set([0] + _mx_nt_gn_cands(N)) - {prev[3]} - set(skip_gn))
+        return [prev] + [prev[:3] + (gn,) + prev[4:] for gn in widths]
+
+    return staged(
+        Refine(lambda _prev: tiles, tile),
+        Refine(gn_stage if _mx_nt_gn_cands(N) else (lambda prev: [prev]), band),
+        Refine(lambda prev: [prev, prev[:5] + (_MX_CSTORE_NT,)], tail, reuse_winner_time=True),
+        Refine(
+            lambda prev: [prev] + ([prev[:4] + (bks, prev[5])] if bks > 1 else []),
+            tail,
+            reuse_winner_time=True,
+        ),
+        base=_MXFP8_BASE,
+    )
+
+
+def _mx_search(pick, key, M, N, K, bks):
+    """The NT pick, ``pick(key, space) -> Pick``, held to reproducible output with two fallbacks
+    (#570): a correct config at any speed beats a fast one that returns different bytes, and a
+    warning beats refusing a shape that ran before the check existed.
+
+    1. The tiles at the seed width group_n=0.
+    2. None of them reproduces: the tiles at every other width, under ``key + ("any-width",)``.
+       The band step then starts from that pick and never goes back to the seed width.
+    3. Nothing reproduces at any width: warn, and race on finite output alone under
+       ``key + ("unchecked",)``, as the kernel did before the check existed.
+
+    A key where nothing at the seed width builds raises at once. Steps 2 and 3 run under their
+    own keys, so a width that does not build is remembered there and step 3 still runs."""
+    tiles = [c + (0, 1, 0) for c in _MXFP8_NT_CANDIDATES]
+    try:
+        return pick(key, _mx_space(tiles, N, bks, _MX_RACES))
+    except NoWorkingConfig as ex:
+        if not ex.data_dependent:
+            raise
+    widths = _mx_nt_gn_cands(N)
+    if widths:
+        wide = [t[:3] + (gn,) + t[4:] for gn in widths for t in tiles]
+        try:
+            return pick(key + ("any-width",), _mx_space(wide, N, bks, _MX_RACES, skip_gn=(0,)))
+        except NoWorkingConfig:
+            pass
+    warnings.warn(
+        f"mxfp8 NT: no reproducible config for M={M} N={N} K={K}; ranking on time alone, "
+        "so this shape may return different results from call to call",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return pick(key + ("unchecked",), _mx_space(tiles, N, bks, _MX_UNCHECKED))
+
+
+def _pick_mxfp8(key, out, args_for, M, N, K, out_dtype, cbsz, blgp):
+    """The beta=0 Entry for (M,N,K), its config (BLOCK_M, GROUP_M, num_xcd, group_n, k_split,
+    cstore_aux); ``args_for(entry, c)`` gives an entry's launch arguments onto C ``c``. Candidates
+    time the fused stub; the preshuffle is a constant offset, so the gemm ranking holds.
+
+    The search and its fallbacks: see _mx_space and _mx_search."""
     # Race on a scratch: each candidate is run dozens of times, which a beta=1 build
     # would fold into the caller's accumulation buffer.
-    out_view = torch.empty_like(out_view)
-    _repro_flush = _repro_flush_buf(out_view.device)
+    scratch = {}
 
-    def _time_cfg(bm, gm, xcd, gn, ks=1, aux=0, repro=True):
-        try:
-            ks, head, tail = _mx_ksplit(M, N, K, out_dtype, False) if ks > 1 else (1, 0, 0)
-            ws, head = (
-                (_get_mx_split_ws(tail, ks, out_view.device, stream, out_dtype), head)
-                if ks > 1
-                else (out_view, ceildiv(M, bm) * ceildiv(N, _BLOCK_N))
-            )
-            launch = _get_mxfp8_fused_launch(
-                K,
-                bm,
-                gm,
-                xcd,
-                gn,
-                cbsz=cbsz,
-                blgp=blgp,
-                out_fp16=_ofp16,
-                col_safe=_mx_col_safe(N),
-                k_split=ks,
-                cstore_aux=aux,
-            )
-            args = (
-                a8,
-                b8,
-                out_view,
-                a_raw,
-                b_raw,
-                a_sp,
-                b_sp,
-                ws,
-                M,
-                N,
-                a_blocks,
-                a_ngrp,
-                b_ngrp,
-                head,
-                tail,
-                stream,
-            )
-            launch(*args)
-            torch.cuda.synchronize()
-            if not torch.isfinite(out_view.reshape(-1)[:1024].float()).all().item():
-                return float("inf")
-            # A config whose output moves between calls on one set of operands is not a
-            # candidate at any speed: the race would otherwise rank a wrong answer first.
-            _ref = out_view.clone()
-            for _ in range(_MX_REPRO_REPS if repro else 0):
-                # Back to back the operands stay cached and the window the race needs never
-                # opens, so the check has to pay for a cold one.
-                if _repro_flush is not None:
-                    _repro_flush.zero_()
-                launch(*args)
-                torch.cuda.synchronize()
-                if not torch.equal(_ref, out_view):
-                    return float("inf")
-            return _robust_time(launch, args, warmup=2, reps=3, iters=20)
-        except Exception:
-            return float("inf")
+    def probe():
+        scratch["out"] = torch.empty_like(out)
+        return [Point((), scratch["out"])]
 
-    # Stage 1: best (BLOCK_M, GROUP_M, num_xcd) at the SEED band width gn=0 (NT's
-    # native 1D swizzle); stage 2 sweeps the 2D N-band width on top.
-    seed_gn = 0
-    best_us = float("inf")
-    best = None
-    for bm, gm, xcd in cands:
-        us = _time_cfg(bm, gm, xcd, seed_gn)
-        if us < best_us:
-            best_us = us
-            best = (bm, gm, xcd, seed_gn)
-    if best is None:
-        # Every candidate at the seed band width was rejected as non-reproducible. A width
-        # that is reproducible may still exist, and a correct config at any speed beats a
-        # fast one that returns different bytes each call.
-        for _gn in _mx_nt_gn_cands(N):
-            for bm, gm, xcd in cands:
-                us = _time_cfg(bm, gm, xcd, _gn)
-                if us < best_us:
-                    best_us = us
-                    best = (bm, gm, xcd, _gn)
-            if best is not None:
-                break
-    if best is None:
-        # No width reproduced. Say so and rank on time alone rather than refusing the shape:
-        # this is what the kernel did before the check existed, and a warning beats a stop.
-        warnings.warn(
-            f"mxfp8 NT: no reproducible config for M={M} N={N} K={K}; ranking on time alone, "
-            "so this shape may return different results from call to call",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        for bm, gm, xcd in cands:
-            for _gn in [seed_gn] + list(_mx_nt_gn_cands(N)):
-                us = _time_cfg(bm, gm, xcd, _gn, repro=False)
-                if us < best_us:
-                    best_us = us
-                    best = (bm, gm, xcd, _gn)
-    if best is None:
-        raise RuntimeError(
-            f"mxfp8 autotune: all candidates failed for M={M} N={N} K={K}. "
-            f"Check FlyDSL compilation (MLIR dialect, gfx target, OOM)."
-        )
-    # Stage 2: sweep 2D N-band width; adopt only if it beats re-measured seed by >1.5%.
-    # gn=0 wins by default (bgn=seed_gn); sweep only visits non-seed bands.
-    gn_cands = _mx_nt_gn_cands(N)
-    if gn_cands:
-        bm, gm, xcd, _ = best
+    def build(cfg):
+        e = _mxfp8_entry(M, N, K, cfg, out_dtype, cbsz, blgp, False)
+        args = args_for(e, scratch["out"])
+        return lambda: e.raw(*args)
 
-        def _robust(gn):
-            return min(_time_cfg(bm, gm, xcd, gn) for _ in range(4))
+    def pick(k, space):
+        return _GEMM_MXFP8.pick(k, space, probe=Synthetic(probe), build=build)
 
-        seed_us = _robust(seed_gn)  # re-measured seed baseline (same estimator as the bands)
-        bgn, bus = seed_gn, seed_us
-        for gn in sorted(set([0] + gn_cands) - {seed_gn}):
-            us = _robust(gn)
-            if us < bus and us < seed_us * 0.985:
-                bgn, bus = gn, us
-        best = (bm, gm, xcd, bgn)
-    # Stage 3: C-store policy then split plan; both are shape-dependent in sign, so raced.
-    bm, gm, xcd, gn = best
-    seed_us = min(_time_cfg(bm, gm, xcd, gn) for _ in range(3))
-    baux, bus = 0, seed_us
-    nt_us = min(_time_cfg(bm, gm, xcd, gn, aux=_MX_CSTORE_NT) for _ in range(3))
-    if nt_us < seed_us * 0.99:
-        baux, bus = _MX_CSTORE_NT, nt_us
-    bks = _mx_ksplit(M, N, K, out_dtype, False)[0]
-    if bks > 1 and min(_time_cfg(bm, gm, xcd, gn, ks=bks, aux=baux) for _ in range(3)) >= bus * 0.99:
-        bks = 1
-    best = (bm, gm, xcd, gn, bks, baux)
-    out_view = None
-    torch.cuda.empty_cache()
-    _MXFP8_AUTOTUNE_CACHE[key] = best
-    return best
+    res = _mx_search(pick, key, M, N, K, _mx_ksplit(M, N, K, out_dtype, False)[0])
+    return _mxfp8_entry(M, N, K, res.config, out_dtype, cbsz, blgp, False, tuned=res.tuned)
 
 
 def gemm_mxfp8_flydsl_kernel(
@@ -1062,22 +967,16 @@ def gemm_mxfp8_flydsl_kernel(
     ``beta=1.0`` accumulates into ``out`` (``out += a @ b^T``) in the epilogue instead
     of overwriting it, and therefore requires ``out``.
 
-    ``a_scale`` / ``b_scale`` are the RAW E8M0 block scales ([M, K//32] / [N, K//32],
-    uint8/e8m0): this kernel preshuffles them to the broadcast int32 layout itself,
-    fused into the GEMM launch (turbo-style single dispatch -- one @flyc.jit host stub
-    enqueues the A+B preshuffle kernel then the gemm kernel on the same stream, with a
-    caller-owned int32 workspace, so there is no separate preshuffle launch and no CPU
-    sync). The quant emits only raw E8M0 scales.
+    ``a_scale`` / ``b_scale`` are the raw E8M0 block scales ([M, K//32] / [N, K//32],
+    uint8/e8m0); the launch preshuffles them itself in the same stream-ordered dispatch.
 
-    Constraints: K % 128 == 0 and K >= 256; M >= 1; N >= 1 (general M/N: the A-scale
-    preshuffle / gemm size A by cdiv(M,64) and bound the partial tail by the StoreC clamp).
+    Constraints: K % 128 == 0 and K >= 256; M >= 1; N >= 1 (general M/N).
     """
     assert a.dim() == 2 and b.dim() == 2, "a, b must be 2D"
     assert out_dtype in (torch.bfloat16, torch.float16), "mxfp8 FlyDSL store emits bf16/fp16"
     # Per-operand fp8 format -> MFMA cbsz(srcA)/blgp(srcB): 0=E4M3, 1=E5M2.
     cbsz = 1 if a.dtype == torch.float8_e5m2 else 0
     blgp = 1 if b.dtype == torch.float8_e5m2 else 0
-    out_fp16 = out_dtype == torch.float16
 
     if (not trans_a) and trans_b:
         M, K = a.shape
@@ -1095,57 +994,29 @@ def gemm_mxfp8_flydsl_kernel(
     assert a_scale.shape[1] == K // 32 and b_scale.shape[1] == K // 32, "raw E8M0 scales are [dim, K//32]"
 
     K128 = K // 128
-    # Raw E8M0 byte scales viewed little-endian as flat int32 [dim*K128] (the preshuffle
-    # kernel reads grow*K128+gk); contiguous straight out of quant, copy only if a view broke it.
+    # Raw E8M0 bytes viewed little-endian as flat int32 [dim*K128].
     a_raw = (a_scale if a_scale.is_contiguous() else a_scale.contiguous()).view(torch.int32).reshape(-1)
     b_raw = (b_scale if b_scale.is_contiguous() else b_scale.contiguous()).view(torch.int32).reshape(-1)
     out = resolve_accum_out(out, beta, (M, N), a.device, out_dtype)
     beta_is_one = beta == 1.0
-    # Keep 2D int8 views (NOT flat 1D): FlyDSL marshals each shape dim as int32, so a
-    # 1D [M*K] view overflows when M*K > 2^31. The kernel addresses via i64 SRD re-base
-    # (extract_base_index reads only the base ptr), so the 2D shape is just metadata.
+    # Keep 2D views: FlyDSL marshals each shape dim as int32, so a flat [M*K] view overflows
+    # past 2^31. The kernel re-bases the i64 SRD, so the 2D shape is just metadata.
     a8 = a.contiguous().view(torch.int8)
     b8 = b.contiguous().view(torch.int8)
     stream = torch.cuda.current_stream()
     a_sp, b_sp, a_blocks, a_ngrp, b_ngrp = _get_mx_workspace(M, N, K128, a.device, stream)
-    # Per-shape cfg: first call benches GROUP_M/num_xcd/group_n (BLOCK_M fixed 256) on
-    # the fused stub, caches the winner by (M,N,K).
-    bm, gm, xcd, gn, ks, aux = _autotune_mxfp8(
-        a8, b8, out, a_raw, b_raw, a_sp, b_sp, M, N, K, a_blocks, a_ngrp, b_ngrp, out_dtype, cbsz, blgp
-    )
-    ks, head, tail = _mx_ksplit(M, N, K, out_dtype, beta_is_one) if ks > 1 else (1, 0, 0)
-    if ks > 1:
-        ws = _get_mx_split_ws(tail, ks, a.device, stream, out_dtype)
-    else:
-        ws, head = out, ceildiv(M, bm) * ceildiv(N, _BLOCK_N)
-    launch = _get_mxfp8_fused_launch(
-        K,
-        bm,
-        gm,
-        xcd,
-        gn,
-        cbsz=cbsz,
-        blgp=blgp,
-        out_fp16=out_fp16,
-        beta_is_one=beta_is_one,
-        col_safe=_mx_col_safe(N),
-        k_split=ks,
-        cstore_aux=aux,
-    )
-    args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, ws, M, N, a_blocks, a_ngrp, b_ngrp, head, tail, stream)
-    # [raw, compiled]: raw for CUDA-graph capture (flyc.compile regresses under capture);
-    # compiled for eager (skips per-call jit dispatch overhead). Mirrors _GROUPED_AT_CACHE.
-    at_key = (M, N, K, bm, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one, ks, aux) + _mx_arm_key()
-    entry = _MXFP8_AT_CACHE.get(at_key)
-    if entry is None:
-        entry = [launch, None]
-        _MXFP8_AT_CACHE[at_key] = entry
-    raw, compiled = entry
-    if torch.cuda.is_current_stream_capturing():
-        raw(*args)
-    else:
-        if compiled is None:
-            compiled = compile_with_scratch_out(raw, args)
-            entry[1] = compiled
-        compiled(*args)
+
+    def args_for(entry, c):
+        ks, head, tail = entry.extra
+        ws = _get_mx_split_ws(tail, ks, c.device, stream, out_dtype) if ks > 1 else c
+        return (a8, b8, c, a_raw, b_raw, a_sp, b_sp, ws, M, N, a_blocks, a_ngrp, b_ngrp, head, tail, stream)
+
+    # The arm knobs are in the key: a config is only timed on the arm it runs.
+    key = (M, N, K, out_dtype, cbsz, blgp) + _mx_arm_key()
+    entry = _GEMM_MXFP8.entry(key, lambda: _pick_mxfp8(key, out, args_for, M, N, K, out_dtype, cbsz, blgp))
+    if beta_is_one:
+        entry = _GEMM_MXFP8.derived(
+            key, True, entry, lambda e: _mxfp8_entry(M, N, K, e.config, out_dtype, cbsz, blgp, True, e.tuned)
+        )
+    _GEMM_MXFP8.launch(entry, args_for(entry, out))
     return out
