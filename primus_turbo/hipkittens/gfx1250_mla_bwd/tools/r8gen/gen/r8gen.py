@@ -171,6 +171,39 @@ def region_init(L, ops):
         out += [f"v_rcp_f32 {vr(L.ccs)}, {ops['sc']}", f"v_mov_b32 {vr(L.ccs + 1)}, {vr(L.ccs)}"]
     else:
         out += [f"v_mov_b32 {vr(L.ccs)}, {ops['sc']}", f"v_mov_b32 {vr(L.ccs + 1)}, {ops['sc']}"]
+    if "lk" in ops:  # shell -DHKGEN_KV_TDM: K / V rows by TDM into the wave's LDS staging area ([16 NKV][XV] of V,
+        #              then [16 NKV][XK] of K; ops as a ring stage's, descriptors in s96..s103 / s92..s95 one op
+        #              at a time: INIT may clobber only s90..s103), the accumulators cleared while they are in
+        #              flight, the fragments read once every TDM op landed
+        rows = 16 * NKV
+        kg, vg = ops["kg"], ops["vg"]
+        for o in range(3):
+            g1, g0 = 96, 92
+            ga = (vg if o == 0 else kg)
+            lo, hi = _sv(ga, 0), _sv(ga, 1)
+            words = [hex(TDM_W0[o]), "0xffff0000", hex((rows << 16) | 0x7FFF), hex((64 if o == 2 else 128) << 16),
+                     str(rows)]
+            out += [f"s_mov_b32 s{g1 + i}, {w}" for i, w in enumerate(words)]
+            out += [f"s_mul_i32 s{g1 + 5}, {ops['hkv']}, {128 if o == 0 else 192}", f"s_mov_b32 s{g1 + 6}, 0",
+                    f"s_mov_b32 s{g1 + 7}, 0", f"s_mov_b32 s{g0}, 1",
+                    f"s_add_co_i32 s{g0 + 1}, {ops['kvl']}, {0 if o == 0 else rows * XV + (256 if o == 2 else 0)}",
+                    f"s_add_co_u32 s{g0 + 2}, {lo}, {256 if o == 2 else 0}", f"s_add_co_ci_u32 s{g0 + 3}, {hi}, 0",
+                    f"s_bitset1_b32 s{g0 + 3}, 31", f"tensor_load_to_lds s[{g0}:{g0 + 3}], s[{g1}:{g1 + 7}]"]  # fmt: skip
+        for t in L.acc:
+            for q in range(0, 8, 2):
+                out.append(f"v_mov_b64 {vr(t + q, 2)}, 0")
+        out += [f"v_mov_b32 {vr(r)}, 0" for r in L.PRB]
+        out.append("s_wait_tensorcnt 0x0")
+        for kh in range(NKV):
+            for dt in range(NDT_QK):
+                for u in range(2):
+                    off = kh * 16 * XK + dt * 64 + u * 32
+                    out.append(f"ds_load_b128 {vr(L.kf[kh][dt] + 4 * u, 4)}, {ops['lk']}" + (f" offset:{off}" if off else ""))
+            for dt in range(NDT_V):
+                for u in range(2):
+                    off = kh * 16 * XV + dt * 64 + u * 32
+                    out.append(f"ds_load_b128 {vr(L.vf[kh][dt] + 4 * u, 4)}, {ops['lv']}" + (f" offset:{off}" if off else ""))
+        return out
     for kh in range(NKV):
         for dt in range(NDT_QK):
             for u in range(2):
@@ -255,6 +288,10 @@ SCAL_IN_BODY = False  # each body computes the next tile's scalars (SALU nodes i
 #                      only the M / U branch, and U falls through into N (the M bodies out of line)
 TDM_DUMMY = False  # a tile past the last (k + 2 >= N) moves 16 B (tile 8 x 1) instead of re-loading tile N-1: no
 #                   wasted L2 / HBM traffic, and the epilogue's tensorcnt-0 wait finds the ring settled
+FINAL_PIPE = False  # FINAL in program order, pipelined: group (V / K image, kh) converted + stored to its image while
+#                    the previous group's rows are read back and stored to global memory (a readback needs only its
+#                    own group's image stores; LDS ops of a wave are in order). Else list-scheduled, every image
+#                    store before every readback
 SCAL_XCNT_GAP = 160  # cycles between a VMEM / TDM op and the next tile's redefinition of an SGPR it reads
 HH1_SPLIT = 0  # hh1's S / dP order: dt < HH1_SPLIT dt outer (every kh), the rest kh-major (6: all dt outer)
 BDO_AFTER_HH1 = False  # the dO^T loads issue only after every hh1 operand load (they do not crowd the LDS queue)
@@ -467,7 +504,10 @@ def region_step(L, ops, masked, stage, mode="list", probe=False, scal=None):
 def region_final(L, ops):
     """FINAL: accumulators -> bf16 images (k3_epi_wr: lane base ev / ek + kh * 16 * x + d * 32), whole-line readback
     (k3_epi_rd: lane base rv / rk + rb * 4 * x + li * 128) and global stores (lane voffset gv / gk, soffset sov / sok
-    + rb * rsv / rsk, offset li * 128). The image stores precede every readback (order edges: LDS)."""
+    + rb * rsv / rsk, offset li * 128). The image stores precede every readback (order edges: LDS); FINAL_PIPE: see
+    there."""
+    if FINAL_PIPE:
+        return region_final_pipe(L, ops)
     nodes = []
 
     def add(text):
@@ -508,6 +548,71 @@ def region_final(L, ops):
     apply_model()
     out, _ = schedule(nodes, [i for i, n in enumerate(nodes) if n.kind == "WMMA"], "list")
     return [n.text for n in out]
+
+
+FINAL_LAG = 8  # FINAL_PIPE: readback loads issued this many (load, store) pairs ahead of their global stores
+
+
+def region_final_pipe(L, ops):
+    """FINAL_PIPE: conversions in the order (V, kh = 0 .. NKV-1), (K, kh = 0 .. NKV-1) (ND_FOLD: dV * 1/scale), each
+    image store one conversion later (its cvt results are in by then); a group's readback rows rb = 4 kh .. 4 kh + 3
+    become loadable after its last image store (a wave's LDS ops are in order), one ds_load_b128 per conversion,
+    its buffer_store_b128 FINAL_LAG pairs later; the soffset of row block rb in one of 4 rotating SGPRs per image
+    (a store's SGPR is never redefined while it is in flight). asmkit derives the waits."""
+    convs = []  # (group, VALU texts, image store text)
+    pairs = {}  # group -> [(load text, store pre texts, store text)]
+    tmp = [L.O[i] for i in range(10)] + list(L.R0) + list(L.R1)
+    k = 0
+    for isk, x, n_d, base in ((0, XV, NDO_V, ops["ev"]), (1, XK, NDO_QK, ops["ek"])):
+        for kh in range(NKV):
+            for d in range(n_d):
+                a_ = L.dv(kh, d) if isk == 0 else L.dk(kh, d)
+                c = []
+                if ND_FOLD and isk == 0:  # dV' = dO^T P' = scale * dV
+                    c += [f"v_pk_mul_f32 {vr(a_ + 2 * q, 2)}, {vr(a_ + 2 * q, 2)}, {vr(L.ccs, 2)}" for q in range(4)]
+                c += [f"v_cvt_pk_bf16_f32 {vr(a_ + q)}, {vr(a_ + 2 * q)}, {vr(a_ + 2 * q + 1)}" for q in range(4)]
+                off = kh * 16 * x + d * 32
+                convs.append(((isk, kh), c, f"ds_store_b128 {base}, {vr(a_, 4)}" + (f" offset:{off}" if off else "")))
+            nli, rbase, gv, so, rs, rsrc = ((2, ops["rv"], ops["gv"], ops["sov"], ops["rsv"], ops["rdv"]),
+                                            (3, ops["rk"], ops["gk"], ops["sok"], ops["rsk"], ops["rdk"]))[isk]
+            sregs = ("s92", "s94", "s96", "s98") if isk == 0 else ("s93", "s95", "s97", "s99")
+            lst = []
+            for rb in range(4 * kh, 4 * kh + 4):
+                sr = sregs[rb % 4]
+                pre = [f"s_mov_b32 {sr}, {so}" if rb == 0 else f"s_add_co_i32 {sr}, {sregs[(rb - 1) % 4]}, {rs}"]
+                for li in range(nli):
+                    t = tmp[k % len(tmp)] + 4 * ((k // len(tmp)) % 2)
+                    k += 1
+                    off = rb * 4 * x + li * 128
+                    lst.append((f"ds_load_b128 {vr(t, 4)}, {rbase}" + (f" offset:{off}" if off else ""),
+                                pre if li == 0 else [],
+                                f"buffer_store_b128 {vr(t, 4)}, {gv}, {rsrc}, {sr} offen"
+                                + (f" offset:{li * 128}" if li else "")))  # fmt: skip
+            pairs[(isk, kh)] = lst
+    text, ready, flight = [], [], []
+
+    def step(final=False):
+        if ready:
+            ld, pre, st = ready.pop(0)
+            text.append(ld)
+            flight.append((pre, st))
+        if flight and (len(flight) > FINAL_LAG or final and not ready):
+            pre, st = flight.pop(0)
+            text.extend(pre + [st])
+
+    for i, (g, c, st) in enumerate(convs):
+        text.extend(c)
+        if i:
+            pg, _, pst = convs[i - 1]
+            text.append(pst)
+            if pg != g:  # group pg's last image store is out: its rows can be read back
+                ready.extend(pairs[pg])
+        step()
+    text.append(convs[-1][2])
+    ready.extend(pairs[convs[-1][0]])
+    while ready or flight:
+        step(final=True)
+    return text
 
 
 # --------------------------------------------------------------------------------------------------------------

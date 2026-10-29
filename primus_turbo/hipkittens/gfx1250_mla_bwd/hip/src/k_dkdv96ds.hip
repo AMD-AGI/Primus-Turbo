@@ -103,6 +103,11 @@ constexpr int KH0_SALU = 2;
 #ifndef HKGEN_TICKET
 #define HKGEN_TICKET 0  // HKGEN: the work item from a ticket counter instead of the block id (the int 64 B in front of
 #endif                  // DS, zeroed before the launch): items go to workgroups in the order they start
+#ifndef HKGEN_KV_TDM
+#define HKGEN_KV_TDM 0  // HKGEN: K / V of a wave's rows by TDM into an LDS staging area (V [rows][272 B], K [rows][400 B],
+#endif                  // after the ring), INIT reads the fragments from there (else 60 buffer loads per wave)
+// one wave's K / V staging area (HKGEN_KV_TDM): 16 * K3_NKV rows of V (K1_XV) then of K (K1_XK)
+#define K3_KV_W (16 * K3_NKV * (K1_XV + K1_XK))
 #ifndef HKGEN_PROBE
 // HKGEN: 1 / 2: per-phase cycle sums of the steps (s96..s99) handed to the shell (PROBE marker) + every workgroup's
 // span (1) or prologue | epilogue (2); 3: prologue / epilogue split; 4: every workgroup's [start, end) on the 100-MHz
@@ -129,7 +134,7 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
     bf16* __restrict__ DV, bf16* __restrict__ DK, bf16* __restrict__ DS,
     float scale, int Sq, int Skv, int Hq, int Hkv, int G, int nqt, int cshift, int causal, int B, int HG,
     int ds_mode) {
-  __shared__ __attribute__((aligned(1024))) unsigned char smem[K1_LDS];
+  __shared__ __attribute__((aligned(1024))) unsigned char smem[K1_LDS + (HKGEN && HKGEN_KV_TDM ? K1_NW * K3_KV_W : 0)];
 #if HKGEN && HKGEN_PROBE >= 3
   const unsigned int pr_s = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
   const unsigned int pr_rs = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readsteadycounter());
@@ -477,6 +482,14 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
       unsigned int pr_t1 = 0, pr_ta = 0, pr_tb = 0;  // ta / tb: around the LOOP marker (prologue | loop | epilogue)
       unsigned int pr_i = 0, pr_w = 0, pr_e1 = 0, pr_e2 = 0;  // mode 3: INIT issued, tile 0 landed; epilogue waits
 #endif
+#if HKGEN_KV_TDM
+      // this wave's K / V staging area (16 * NKV rows of V, then of K); INIT moves the rows there by TDM (ops as a
+      // ring stage's: V cols [0, 128), K cols [0, 128), K cols [128, 192)), waits for every TDM op, then reads the
+      // fragments (ds_load_b128 at lane part + kh * 16 rows + dt * 64 + u * 32)
+      const uint32_t kv_l = lds0 + K1_LDS + (uint32_t)(wv * K3_KV_W);
+      const uint64_t kv_kg = (uint64_t)(uintptr_t)K + 2u * (uint64_t)(((int64_t)(bat * Skv + kv0) * Hkv + hkv) * K1_D_QK);
+      const uint64_t kv_vg = (uint64_t)(uintptr_t)V + 2u * (uint64_t)(((int64_t)(bat * Skv + kv0) * Hkv + hkv) * K1_D_V);
+#endif
 #if HKGEN_EARLY_TDM
       if (N > 0) {
         sched_barrier<0>();
@@ -485,11 +498,20 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
         sched_barrier<0>();
       }
 #endif
+#if HKGEN_KV_TDM
+      (void)vk, (void)vv, (void)sk, (void)sv;
+      asm volatile("; HKGEN INIT nkv=%8 lk=%0 lv=%1 kg=%2 vg=%3 hkv=%4 kvl=%5 c1=%6 sc=%7"
+                   ::"v"(kv_l + (uint32_t)(16 * NKV * K1_XV + (lane % 16) * K1_XK + (lane / 16) * 16)),
+                   "v"(kv_l + (uint32_t)((lane % 16) * K1_XV + (lane / 16) * 16)), "s"(kv_kg), "s"(kv_vg), "s"(Hkv),
+                   "s"(kv_l), "s"(c1), "s"(scale), "i"(NKV)
+                   : HKGEN_CLOBBERS);  // its TDM descriptors in s92..s103, one op at a time
+#else
       asm volatile("; HKGEN INIT nkv=%12 rk=%0 rv=%1 vk=%2 vv=%3 sk0=%4 sk1=%5 sk2=%6 sv0=%7 sv1=%8 sv2=%9 c1=%10 "
                    "sc=%11"
                    ::"s"(r_k), "s"(r_v), "v"(vk), "v"(vv), "s"(sk[0]), "s"(sk[1]), "s"(sk[NKV - 1]), "s"(sv[0]),
                    "s"(sv[1]), "s"(sv[NKV - 1]), "s"(c1), "s"(scale), "i"(NKV)
                    : HKGEN_CLOBBERS);
+#endif
 #if HKGEN_PROBE >= 3
       pr_i = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
 #endif

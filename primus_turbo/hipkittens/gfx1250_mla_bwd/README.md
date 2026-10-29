@@ -114,9 +114,12 @@ The compiler is `--cxx`, `$PRIMUS_TURBO_HK_CXX`, `amdclang++` on `PATH`, or
 Why the patch: `k_dkdv96ds` built with `-DHKGEN=1` (its manifest flags) is a marker shell. The HIP code keeps the
 workgroup set-up, the TDM descriptors and the uniform control flow; inline-asm markers
 (`; HKGEN INIT / LOOP / FINAL nkv=3 | nkv=2`) stand where the dK / dV work goes, for the 96-row and the 64-row
-blocks. The patch inserts behind each marker the region `tools/r8gen` generates: the K / V fragments; the whole
-tile loop with its SALU descriptor and index math (unrolled by the 3-stage ring, masked and full bodies); the
-epilogue. The loop runs on a static register plan (bf16 P / dS written in place of the raw S / dP, dedicated
+blocks. The patch inserts behind each marker the region `tools/r8gen` generates: the K / V fragments (with
+`-DHKGEN_KV_TDM=1`: the wave's K / V rows moved by 3 TDM ops into an LDS staging area after the ring, 64512 B per
+workgroup, the accumulators cleared meanwhile, then 60 ds_load_b128 at a conflict-free 272 / 400-B pitch, instead
+of 60 buffer loads touching 16 cache lines each); the whole tile loop with its SALU descriptor and index math
+(unrolled by the 3-stage ring, masked and full bodies); the epilogue (with `--final-pipe`: each (dV / dK, 16-row)
+group's conversions and image stores overlap the previous group's whole-line readback and global stores). The loop runs on a static register plan (bf16 P / dS written in place of the raw S / dP, dedicated
 dO^T operands) under a schedule of its own: WMMA windows filled with the softmax VALU and the LDS operand loads,
 memory ops that overwrite an in-flight WMMA's operands waited for by the per-class `va_vdst` bound, one VALU drain
 per tile. Two more lines raise the VGPR allocation to 1024. Effect: the dK/dV kernel takes ~3.5% fewer cycles
@@ -169,12 +172,12 @@ MI455X (e15-02 GPU3), b2 s4096 h128, SBHD, causal, bf16, `scripts/mla_b0_bench.p
 | | time (ms) |
 |---|---|
 | forward (FlyDSL) | 0.806 |
-| backward, `hk` (hot / cold) | 2.336 / 2.327 |
-| per launch: k_delta / ticket step / k_dkdv96ds / k_dqds_c | 0.059 / 0.006 / 1.672 / 0.509 |
-| backward, FlyDSL | 3.547 |
-| autograd fwd + bwd, `hk` / FlyDSL | 3.152 / 4.379 |
+| backward, `hk` (hot / cold) | 2.315 / 2.304 |
+| per launch: k_delta / ticket step / k_dkdv96ds / k_dqds_c | 0.061 / 0.006 / 1.639 / 0.511 |
+| backward, FlyDSL | 3.556 |
+| autograd fwd + bwd, `hk` / FlyDSL | 3.133 / 4.384 |
 
-The `hk` backward is 1.52x faster than the FlyDSL one, and forward + backward is 1.39x faster. Against the
-LLVM-scheduled dK/dV kernel (71bd0329, the same runs interleaved): backward 2.439 -> 2.336 ms hot, 2.431 -> 2.327
-cold; k_dkdv96ds 1.806 -> 1.672 ms. The kernels are power-capped at this shape (~1.2 GHz): a saved cycle converts to
+The `hk` backward is 1.54x faster than the FlyDSL one, and forward + backward is 1.40x faster. Against the
+LLVM-scheduled dK/dV kernel (71bd0329, the same runs interleaved): backward 2.448 -> 2.315 ms hot, 2.443 -> 2.304
+cold; k_dkdv96ds 1.820 -> 1.639 ms. The kernels are power-capped at this shape (~1.2 GHz): a saved cycle converts to
 about a third of a cycle of time.

@@ -106,6 +106,7 @@ def main():
     ap.add_argument("--nd-fold", action="store_true", help="r8gen.ND_FOLD (needs k_delta -DHK_ND_FOLD=1)")
     ap.add_argument("--scal-in-body", action="store_true", help="r8gen.SCAL_IN_BODY (the next tile's scalars in the bodies)")
     ap.add_argument("--tdm-dummy", action="store_true", help="r8gen.TDM_DUMMY (16-B ops past the last tile)")
+    ap.add_argument("--final-pipe", action="store_true", help="r8gen.FINAL_PIPE (pipelined epilogue)")
     ap.add_argument("--asmkit-root", default=None, help="ignored: the package carries its own asmkit")
     a = ap.parse_args()
     from asmkit import build as B
@@ -119,7 +120,7 @@ def main():
     G.ABL = set(x for x in a.abl.split(",") if x)
     G.PROBE_PTS = [int(x) for x in a.probe_pts.split(",") if x] or None
     G.HH1_SPLIT, G.BDO_AFTER_HH1, G.ND_FOLD = a.hh1_split, a.bdo_after_hh1, a.nd_fold
-    G.SCAL_IN_BODY, G.TDM_DUMMY = a.scal_in_body, a.tdm_dummy
+    G.SCAL_IN_BODY, G.TDM_DUMMY, G.FINAL_PIPE = a.scal_in_body, a.tdm_dummy, a.final_pipe
     import bwdgen as BG
 
     for kv in [x for x in a.win.split(",") if x]:

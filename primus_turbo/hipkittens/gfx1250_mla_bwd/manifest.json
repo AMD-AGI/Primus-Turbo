@@ -33,19 +33,21 @@
         "-greedy-regclass-priority-trumps-globalness",
         "-DHKGEN=1",
         "-DHKGEN_EARLY_TDM=1",
-        "-DHKGEN_TICKET=1"
+        "-DHKGEN_TICKET=1",
+        "-DHKGEN_KV_TDM=1"
       ],
       "gen_args": [
         "--nd-fold",
         "--scal-in-body",
-        "--tdm-dummy"
+        "--tdm-dummy",
+        "--final-pipe"
       ],
-      "hsaco_sha256": "3bddad7482d668050f386022b5567fa92eae6e5901df62710eef7292d82be6c4",
+      "hsaco_sha256": "abeea38ec402459872df2c8640f5249e817d9df31d5b40326903426d20bbffbe",
       "asm_patch": "asm/k_dkdv96ds.s.patch",
-      "asm_input_sha256": "673302aa75b8cc9a96e7fef4d3e73e2bac0c773ff3fb6a37f418d5920dbc5cd3",
+      "asm_input_sha256": "9d987c934625c1b2d9d33b8553a2716841060a654c85288ea58ff62447372feb",
       "block": 64,
       "kernarg_size": 120,
-      "lds": 64516,
+      "lds": 129028,
       "vgpr": 1024,
       "args": [
         {
