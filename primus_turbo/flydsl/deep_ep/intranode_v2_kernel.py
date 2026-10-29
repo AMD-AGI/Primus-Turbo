@@ -897,10 +897,16 @@ def _wait_rows(flags, flag_idx, waits, epoch, rank, token):
         value = _ld_sys(flags, flag_idx)
 
 
+# PRIMUS_TURBO_DEEPEP_V2_COMBINE_PUSH_WARPS=n: n push warps per block at every grid size (experiments)
+COMBINE_PUSH_WARPS = int(os.environ.get("PRIMUS_TURBO_DEEPEP_V2_COMBINE_PUSH_WARPS", "0"))
+
+
 def combine_v2_push_warps(num_channels):
     """Warps of each block that push before they reduce; the others reduce from the start. A grid
     of 96+ blocks saturates the links with about 2/3 of its warps pushing, and the rest overlap
     the reduce with the push; a narrower one is bound by how fast each CU sends, so all push."""
+    if COMBINE_PUSH_WARPS > 0:
+        return min(COMBINE_PUSH_WARPS, NUM_WARPS)
     return NUM_WARPS * 11 // 16 if num_channels >= 96 else NUM_WARPS
 
 
