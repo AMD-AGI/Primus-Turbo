@@ -256,6 +256,7 @@ def _launch_gemm_combine_nt(
         blk_n = block_n * fx.Int32(tile_n)
         m_row = block_m * fx.Int32(tile_m)
         c_rows = None
+        c_rank_bases = None
         c_bias = None
         if const_expr(SCATTER):
             # dead tiles and the combine workgroups run the tile too, possibly over an empty pool
@@ -265,11 +266,6 @@ def _launch_gemm_combine_nt(
             )
             route_res = create_buffer_resource_from_addr(
                 _addr(arg_pool_row_to_route), num_records_bytes=pool_bytes
-            )
-            scale_res = (
-                create_buffer_resource_from_addr(_addr(arg_bias_scale), num_records_bytes=pool_bytes)
-                if HAS_BIAS
-                else None
             )
 
             def c_rows(lane_row):
@@ -287,16 +283,17 @@ def _launch_gemm_combine_nt(
                 )
                 src_rank = ok.select(recv_token // fx.Int32(NUM_MAX_TOKENS_PER_RANK), fx.Int32(RANK))
                 route = ok.select(route, fx.Int32(0))
-                addr = sym_buffer.map(combine_token_base, src_rank) + fx.Int64(route) * fx.Int64(N * EB)
-                scale = (
-                    buffer_load(scale_res, pool_row, vec_width=1, dtype=T.f32)
-                    if const_expr(HAS_BIAS)
-                    else None
-                )
-                return addr, ok, scale, (pool_row, src_rank, route, ok)
+                return src_rank, route, ok, (pool_row, src_rank, route, ok)
 
+            c_rank_bases = [sym_buffer.map(combine_token_base, fx.Int32(r)) for r in range(NUM_RANKS)]
             if const_expr(HAS_BIAS):
-                c_bias = _addr(arg_bias) + fx.Int64(expert) * fx.Int64(N * EB)
+                scale_res = create_buffer_resource_from_addr(
+                    _addr(arg_bias_scale), num_records_bytes=pool_bytes
+                )
+                c_bias = (
+                    _addr(arg_bias) + fx.Int64(expert) * fx.Int64(N * EB),
+                    lambda tile_row: buffer_load(scale_res, m_row + tile_row, vec_width=1, dtype=T.f32),
+                )
         rows_out = nt_gemm_tile(
             base_ptr,
             gA_base=fx.recast_iter(fx.Int8, arg_act),
@@ -327,6 +324,8 @@ def _launch_gemm_combine_nt(
             b_nn=B_NN,
             i32_n=fx.Int32(N),
             c_rows=c_rows,
+            c_rank_bases=c_rank_bases,
+            c_num_rows=num_max_routes,
             c_bias=c_bias,
         )
         if const_expr(SCATTER):

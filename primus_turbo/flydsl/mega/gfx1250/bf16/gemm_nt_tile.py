@@ -183,18 +183,31 @@ def _readlane_i32(v, lane: int):
     return ArithValue(op.result if hasattr(op, "result") else op)
 
 
-def _split_i64(v):
-    i32 = ir.IntegerType.get_signless(32)
-    lo = std_arith.TruncIOp(i32, _raw(v)).result
-    hi = std_arith.TruncIOp(i32, std_arith.ShRUIOp(_raw(v), _raw(fx.Int64(32))).result).result
-    return ArithValue(lo), ArithValue(hi)
+# rows per TDM gather-store with 32-bit row indices
+_SCATTER_ROWS = 8
 
 
-def _join_i64(lo, hi):
-    i64 = ir.IntegerType.get_signless(64)
-    lo64 = std_arith.ExtUIOp(i64, _raw(lo)).result
-    hi64 = std_arith.ShLIOp(std_arith.ExtUIOp(i64, _raw(hi)).result, _raw(fx.Int64(32))).result
-    return ArithValue(std_arith.OrIOp(lo64, hi64).result)
+def _scatter_dgroups(row_indices, row_cols, num_rows: int, row_width: int, stride: int):
+    """dgroup1..3 of a gather-store of dense LDS rows: ``row_cols`` (i32) columns of each row kept
+    out of ``row_width``, row indices past ``num_rows`` dropped, rows ``stride`` elements apart."""
+    cols = _raw(row_cols)
+    s1 = arith.shli(arith.andi(cols, _c32(0xFFFF)), _c32(16))
+    s2 = arith.ori(arith.andi(arith.shrui(cols, _c32(16)), _c32(0xFFFF)), _c32((num_rows & 0xFFFF) << 16))
+    s3 = _c32(((num_rows >> 16) & 0xFFFF) | (row_width << 16))
+    words = (
+        _c32((EB.bit_length() - 1) << 16),
+        s1,
+        s2,
+        s3,
+        _c32(len(row_indices)),
+        _c32(stride),
+        _c32(0),
+        _c32(0),
+    )
+    dgroup1 = vector.from_elements(T.vec(8, T.i32), [as_ir_value(v) for v in words])
+    dgroup2 = vector.from_elements(T.vec(4, T.i32), [as_ir_value(_raw(w)) for w in row_indices[:4]])
+    dgroup3 = vector.from_elements(T.vec(4, T.i32), [as_ir_value(_raw(w)) for w in row_indices[4:]])
+    return dgroup1, dgroup2, dgroup3
 
 
 # ── the tile ─────────────────────────────────────────────────────────────────
@@ -231,6 +244,8 @@ def nt_gemm_tile(
     b_nn: bool = False,
     i32_n=None,
     c_rows=None,
+    c_rank_bases=None,
+    c_num_rows: int = 0,
     c_bias=None,
 ):
     """One ``tile_m x tile_n`` block; must be called by all ``m_warp * n_warp`` waves.
@@ -246,12 +261,15 @@ def nt_gemm_tile(
     tile into a no-op. ``c_cache_modifier`` is the C stores' cache policy (``CPOL_DEVICE_STREAM``
     when another workgroup consumes C in the same launch).
 
-    ``c_rows`` scatters C by row instead (``c_addr`` / ``ldc`` unused): called once with each
-    lane's tile row (lane ``l`` of wave ``w`` holds row ``w + l * num_waves``, the row that wave
-    stores at step ``l``), it returns ``(addr, ok, scale, extra)``: the i64 byte address of the
-    row's column 0, whether to store it at all, and with ``c_bias`` (the i64 address of the
-    expert's bias row) the f32 ``scale`` that row's ``bias * scale`` term is added with. The tile
-    returns that tuple, so the caller can reuse ``extra`` without loading it again.
+    ``c_rows`` scatters C by row instead (``c_addr`` unused), with 8-row TDM gather-stores out
+    of LDS: C lives on several ranks, ``c_rank_bases[r]`` the i64 byte address of rank ``r``'s
+    row 0, ``c_num_rows`` rows of ``ldc`` elements. Called once with each lane's tile row (lane
+    ``l`` of wave ``w`` holds row ``8 * (w + num_waves * (l // 8)) + l % 8``, so lanes
+    ``8j .. 8j + 7`` hold the wave's ``j``-th group of 8 rows), it returns
+    ``(rank, row, ok, extra)``: where the row goes and whether to store it at all. The tile
+    returns that tuple, so the caller can reuse ``extra`` without loading it again. ``c_bias``
+    ``(addr, scale)`` adds ``bias * scale(tile row)`` in f32 before the bf16 rounding, ``addr``
+    the i64 address of the expert's bias row.
     """
     KB = tile_k * EB
     KSB = WMMA_K * EB
@@ -550,49 +568,75 @@ def nt_gemm_tile(
     chunks_per_row = tile_n * EB // 16
     rows_out = None
     if const_expr(c_rows is not None):
-        # each wave stores whole rows, so a row's destination is wave-uniform at every step
-        assert chunks_per_row == WAVE and tile_m == num_waves * WAVE, "a scattered C wants 256 x 256"
+        assert tile_m == num_waves * WAVE and WAVE % _SCATTER_ROWS == 0, (
+            "a scattered C wants one row per lane"
+        )
         # issued before the accumulators go to LDS, which hides the index loads
-        rows_out = c_rows(wave + lane * fx.Int32(num_waves))
+        rows_out = c_rows(
+            fx.Int32(_SCATTER_ROWS) * (wave + fx.Int32(num_waves) * (lane // fx.Int32(_SCATTER_ROWS)))
+            + lane % fx.Int32(_SCATTER_ROWS)
+        )
     accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
+    f32x8 = T.vec(8, T.f32)
+    bf16x8 = T.vec(8, T.bf16)
+    if const_expr(c_bias is not None):
+        bias_addr, bias_scale = c_bias
+        # columns past N read past num_records as 0
+        bias_res = create_buffer_resource_from_addr(
+            bias_addr + fx.Int64(blk_n) * fx.Int64(EB), num_records_bytes=n_ext * fx.Int32(EB)
+        )
+        bias_words = [
+            buffer_load(bias_res, (wnb + wn * WMMA_N + kgrp * 8) // 2, vec_width=4, dtype=T.i32)
+            for wn in range_constexpr(wmma_n_rep)
+        ]
+        bias_scales = [bias_scale(wmb + wm * WMMA_M + lane16) for wm in range_constexpr(wmma_m_rep)]
     _pipeline_fence(outstanding=0)
     for wm in range_constexpr(wmma_m_rep):
         row_rel = wmb + wm * WMMA_M + lane16
         for wn in range_constexpr(wmma_n_rep):
             col_rel = wnb + wn * WMMA_N + kgrp * 8
-            h = accs[wm * wmma_n_rep + wn].to(fx.BFloat16)
+            acc = accs[wm * wmma_n_rep + wn]
+            if const_expr(c_bias is not None):
+                bias = std_arith.ExtFOp(f32x8, vector.bitcast(bf16x8, _raw(bias_words[wn]))).result
+                term = std_arith.MulFOp(bias, vector.broadcast(f32x8, _raw(bias_scales[wm]))).result
+                acc = Vec(std_arith.AddFOp(as_ir_value(acc), term).result)
+            h = acc.to(fx.BFloat16)
             fx.ptr_store(h.bitcast(fx.Int8), base_ptr + (row_rel * tile_n + col_rel) * EB)
     _workgroup_barrier()
     lds_c = fx.Int32(_bidx(base_ptr))
     if const_expr(c_rows is not None):
-        row_addr, row_ok, row_scale, _extra = rows_out
-        addr_lo, addr_hi = _split_i64(row_addr)
-        ok32 = row_ok.select(fx.Int32(1), zero32)
-        row_bytes = n_ext * fx.Int32(EB)  # columns past N land past num_records and are dropped
-        f32x8 = T.vec(8, T.f32)
-        bf16x8 = T.vec(8, T.bf16)
-        if const_expr(c_bias is not None):
-            # the lane's 8 columns are the same at every step
-            bias_res = create_buffer_resource_from_addr(
-                c_bias + fx.Int64(blk_n) * fx.Int64(EB), num_records_bytes=row_bytes
-            )
-            bias_raw = buffer_load(bias_res, lane * fx.Int32(4), vec_width=4, dtype=T.i32)
-            bias_v = std_arith.ExtFOp(f32x8, vector.bitcast(bf16x8, _raw(bias_raw))).result
-            scale_i32 = std_arith.BitcastOp(T.i32, _raw(row_scale)).result
-        for i in range_constexpr(tile_m // num_waves):
-            row = wave + fx.Int32(i * num_waves)
-            addr = _join_i64(_readlane_i32(addr_lo, i), _readlane_i32(addr_hi, i))
-            ok = _readlane_i32(ok32, i) != zero32
-            res = create_buffer_resource_from_addr(
-                addr + fx.Int64(blk_n) * fx.Int64(EB), num_records_bytes=ok.select(row_bytes, zero32)
-            )
-            v = lds_load_b128(lds_c, row * fx.Int32(tile_n * EB) + lane * fx.Int32(16))
-            if const_expr(c_bias is not None):
-                s = std_arith.BitcastOp(T.f32, _raw(_readlane_i32(scale_i32, i))).result
-                vf = std_arith.ExtFOp(f32x8, vector.bitcast(bf16x8, _raw(v))).result
-                vf = std_arith.AddFOp(vf, std_arith.MulFOp(bias_v, vector.broadcast(f32x8, s)).result).result
-                v = vector.bitcast(T.vec(4, T.i32), std_arith.TruncFOp(bf16x8, vf).result)
-            buffer_store(v, res, lane * fx.Int32(4), cache_modifier=c_cache_modifier)
+        row_rank, row_idx, row_ok, _extra = rows_out
+        # per destination rank, the lane's row index, or past the rows (dropped) when it goes elsewhere
+        rank_rows = [
+            (row_ok & (row_rank == fx.Int32(r))).select(row_idx, fx.Int32(c_num_rows))
+            for r in range_constexpr(len(c_rank_bases))
+        ]
+        rank_bit = row_ok.select(
+            ArithValue(std_arith.ShLIOp(_raw(fx.Int32(1)), _raw(row_rank)).result), zero32
+        )
+        rank_bases = [base + fx.Int64(blk_n) * fx.Int64(EB) for base in c_rank_bases]
+        for j in range_constexpr(tile_m // num_waves // _SCATTER_ROWS):
+            lanes = [j * _SCATTER_ROWS + i for i in range(_SCATTER_ROWS)]
+            ranks_hit = _readlane_i32(rank_bit, lanes[0])
+            for group_lane in lanes[1:]:
+                ranks_hit = ranks_hit | _readlane_i32(rank_bit, group_lane)
+            lds_row = fx.Int32(_SCATTER_ROWS) * (wave + fx.Int32(j * num_waves))
+            lds_addr = lds_c + lds_row * fx.Int32(tile_n * EB)
+            # a pool block holds its rows by source rank, so most groups go to one rank
+            for r in range_constexpr(len(c_rank_bases)):
+                if (ranks_hit & fx.Int32(1 << r)) != zero32:
+                    dgroup1, dgroup2, dgroup3 = _scatter_dgroups(
+                        [_readlane_i32(rank_rows[r], group_lane) for group_lane in lanes],
+                        n_ext,
+                        c_num_rows,
+                        tile_n,
+                        ldc,
+                    )
+                    tdm_ops.tensor_store_gather(
+                        _GatherDesc(_gather_dgroup0(lds_addr, rank_bases[r], 32), dgroup1, dgroup2, dgroup3),
+                        cache_policy=c_cache_modifier,
+                    )
+        tdm_ops.tensor_wait(0)
     else:
         c_res = create_buffer_resource_from_addr(c_addr, num_records_bytes=m_ext * fx.Int32(ldc * EB))
         dropped = m_ext * fx.Int32(ldc // 2)  # first word past num_records: the store is dropped
