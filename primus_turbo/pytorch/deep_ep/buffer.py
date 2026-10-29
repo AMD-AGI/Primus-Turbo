@@ -16,10 +16,35 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-import primus_turbo.pytorch._C.deep_ep as deep_ep_cpp
-from primus_turbo.pytorch._C.deep_ep import Config, EventHandle
+from primus_turbo.pytorch.core.utils import is_gfx1250
 
+from ._compat import Config, EventHandle, deep_ep_cpp
+from .flydsl_intranode import (
+    SUPPORTED_NUM_RANKS,
+    FlyDSLIntranodeRuntime,
+    get_intranode_backend,
+    v2_heap_bytes,
+)
 from .utils import EventOverlap, check_nvlink_connections
+
+
+def _require_deep_ep_cpp(what: str):
+    if deep_ep_cpp is None:
+        raise RuntimeError(
+            f"{what} needs the C++ DeepEP, which this build of primus_turbo does not include; "
+            "only the FlyDSL intranode backend (intranode_backend='flydsl') runs without it"
+        )
+    return deep_ep_cpp
+
+
+class _NoCppRuntime:
+    """``Buffer.runtime`` of the FlyDSL intranode backend: no C++ runtime behind it."""
+
+    def __getattr__(self, name):
+        raise RuntimeError(
+            f"Buffer.runtime.{name}: the FlyDSL intranode backend has no C++ runtime "
+            "(internode and low-latency need intranode_backend='cpp')"
+        )
 
 
 class Buffer:
@@ -51,6 +76,7 @@ class Buffer:
         allow_nvlink_for_low_latency_mode: bool = True,
         allow_mnnvl: bool = False,
         explicitly_destroy: bool = False,
+        intranode_backend: Optional[str] = None,
     ) -> None:
         """
         Initialize the communication buffer.
@@ -70,6 +96,14 @@ class Buffer:
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
                 otherwise, the resources will be released by the destructor.
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
+            intranode_backend: the kernels of the intranode path (`num_ranks <= 8`, no low-latency mode),
+                `"cpp"` (HIP), `"flydsl"` or `"flydsl_v2"`; defaults to `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`,
+                else `"flydsl_v2"` on gfx1250 and `"cpp"` elsewhere (`"flydsl"` where the C++ DeepEP is not
+                built). `"cpp"` and `"flydsl"` return interchangeable handles; `"flydsl_v2"` (direct slot
+                writes, no channel rings, gfx1250 only) returns the same outputs with handles of its own, is
+                not capturable in a CUDA graph, and needs `num_nvl_bytes` that hold the whole batch of the
+                rank with the most tokens (`get_token_buffer_size_hint` with the same
+                `num_max_tokens_per_rank` on every rank; `moe_dispatch` sizes it itself). The internode and low-latency paths always use `"cpp"`.
 
         Note:
             Controlled by ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM`` (default ``0``).
@@ -86,7 +120,32 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
-        self.runtime = deep_ep_cpp.Buffer(
+        self.intranode_backend = get_intranode_backend(intranode_backend)
+        use_flydsl = (
+            self.intranode_backend in ("flydsl", "flydsl_v2")
+            and num_nvl_bytes > 0
+            and not low_latency_mode
+            and self.group_size in SUPPORTED_NUM_RANKS
+        )
+        if self.intranode_backend in ("flydsl", "flydsl_v2") and not use_flydsl:
+            self.intranode_backend = "cpp"
+
+        if use_flydsl:
+            # intranode only: the FlyDSL runtime owns the NVL heap, and nothing needs the C++ one
+            assert num_rdma_bytes == 0, "the FlyDSL intranode backend has no RDMA buffer"
+            self.runtime = _NoCppRuntime()
+            self.num_rdma_ranks = 1
+            # like the C++ runtime's comm stream, a high-priority one from the pool
+            self._comm_stream = torch.cuda.Stream(priority=-1)
+            self.intranode_runtime = FlyDSLIntranodeRuntime(
+                group,
+                num_nvl_bytes,
+                self._comm_stream,
+                version=2 if self.intranode_backend == "flydsl_v2" else 1,
+            )
+            return
+
+        self.runtime = _require_deep_ep_cpp("the 'cpp' DeepEP backend").Buffer(
             self.rank,
             self.group_size,
             num_nvl_bytes,
@@ -148,21 +207,28 @@ class Buffer:
         # Make CPP runtime available
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
         assert self.runtime.is_available()
+        self.num_rdma_ranks = self.runtime.get_num_rdma_ranks()
+        self.intranode_runtime = self.runtime
 
     def destroy(self):
         """
         Destroy the cpp runtime and release resources.
+        Collective: every rank of the group calls it.
 
         """
 
         assert self.explicitly_destroy, "`explicitly_destroy` flag must be set"
 
-        self.runtime.destroy()
+        if self.intranode_runtime is not self.runtime:
+            self.intranode_runtime.destroy()
+        else:
+            self.runtime.destroy()
+        self.intranode_runtime = None
         self.runtime = None
 
     @staticmethod
     def is_sm90_compiled():
-        return deep_ep_cpp.is_sm90_compiled()
+        return deep_ep_cpp is not None and deep_ep_cpp.is_sm90_compiled()
 
     @staticmethod
     def set_num_sms(new_num_sms: int) -> None:
@@ -202,7 +268,7 @@ class Buffer:
         Returns:
             size: the RDMA buffer size recommended.
         """
-        return deep_ep_cpp.get_low_latency_rdma_size_hint(
+        return _require_deep_ep_cpp("the low-latency mode").get_low_latency_rdma_size_hint(
             num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts
         )
 
@@ -213,6 +279,8 @@ class Buffer:
         Returns:
             stream: the communication stream.
         """
+        if self.intranode_runtime is not self.runtime:
+            return self._comm_stream
         ts: torch.Stream = self.runtime.get_comm_stream()
         return torch.cuda.Stream(
             stream_id=ts.stream_id, device_index=ts.device_index, device_type=ts.device_type
@@ -234,7 +302,10 @@ class Buffer:
             offset: the offset of the beginning element.
             use_rdma_buffer: whether to return the RDMA buffer.
         """
-        tensor = self.runtime.get_local_buffer_tensor(dtype, offset, use_rdma_buffer)
+        if not use_rdma_buffer and self.intranode_runtime is not self.runtime:
+            tensor = self.intranode_runtime.get_local_buffer_tensor(dtype, offset)
+        else:
+            tensor = self.runtime.get_local_buffer_tensor(dtype, offset, use_rdma_buffer)
         if size is None:
             return tensor
 
@@ -252,12 +323,14 @@ class Buffer:
         return bias_0, bias_1
 
     @staticmethod
-    def get_dispatch_config(num_ranks: int) -> Config:
+    def get_dispatch_config(num_ranks: int, backend: Optional[str] = None) -> Config:
         """
         Get a recommended dispatch config.
 
         Argument:
             num_ranks: the number of ranks.
+            backend: the intranode backend the config is for, else `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND` or the
+                default one (see `Buffer`). The backends share the dispatch values so far.
 
         Returns:
             config: the recommended config.
@@ -280,16 +353,23 @@ class Buffer:
         return config_map[num_ranks]
 
     @staticmethod
-    def get_combine_config(num_ranks: int) -> Config:
+    def get_combine_config(num_ranks: int, backend: Optional[str] = None) -> Config:
         """
         Get a recommended combine config.
 
         Argument:
             num_ranks: the number of ranks.
+            backend: the intranode backend the config is for, else `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND` or the
+                default one (see `Buffer`).
 
         Returns:
             config: the recommended config.
         """
+
+        # FlyDSL V1 on gfx1250 (8 KiB copy pieces): a larger send chunk halves the combine at 2 ranks and
+        # cuts it by up to 60% at 4, DSv3 shape at 32-160 SMs
+        if num_ranks in (2, 4) and is_gfx1250() and get_intranode_backend(backend) == "flydsl":
+            return Config(Buffer.num_sms, 48 if num_ranks == 2 else 24, 256, 6, 128)
 
         # TODO: automatically tune
         config_map = {
@@ -306,6 +386,38 @@ class Buffer:
         }
         assert num_ranks in config_map, f"Unsupported number of EP ranks: {num_ranks}"
         return config_map[num_ranks]
+
+    @staticmethod
+    def get_token_buffer_size_hint(
+        num_max_tokens_per_rank: int,
+        hidden_bytes: int,
+        num_ranks: int,
+        num_topk: int,
+        backend: Optional[str] = None,
+    ) -> int:
+        """
+        Get the NVL buffer size of an intranode backend whose heap holds whole batches (`flydsl_v2`),
+        like DeepEP V2's `ElasticBuffer.get_buffer_size_hint`; 0 for the backends sized by their channel
+        rings (`Config.get_nvl_buffer_size_hint`).
+
+        Arguments:
+            num_max_tokens_per_rank: the most tokens a rank dispatches; every rank must use the same value.
+            hidden_bytes: the bytes of a bf16 hidden row.
+            num_ranks: the number of ranks.
+            num_topk: the number of top-k experts per token.
+            backend: the intranode backend, else `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND` or the default one.
+
+        Returns:
+            size: the NVL buffer size in bytes, or 0.
+        """
+        if get_intranode_backend(backend) != "flydsl_v2" or num_ranks not in SUPPORTED_NUM_RANKS:
+            return 0
+        if num_max_tokens_per_rank <= 0:
+            raise ValueError(
+                "the flydsl_v2 intranode backend sizes its buffer from the number of tokens per rank: "
+                "dispatch once before combine, or set num_max_tokens_per_rank in set_buffer_global_config"
+            )
+        return v2_heap_bytes(num_max_tokens_per_rank, num_ranks, hidden_bytes, num_topk)
 
     # noinspection PyTypeChecker
     def get_dispatch_layout(
@@ -336,7 +448,7 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
         num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event = (
-            self.runtime.get_dispatch_layout(
+            self.intranode_runtime.get_dispatch_layout(
                 topk_idx,
                 num_experts,
                 getattr(previous_event, "event", None),
@@ -417,10 +529,12 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
         # Default config
-        config = self.get_dispatch_config(self.group_size) if config is None else config
+        config = (
+            self.get_dispatch_config(self.group_size, self.intranode_backend) if config is None else config
+        )
 
         # Internode
-        if self.runtime.get_num_rdma_ranks() > 1:
+        if self.num_rdma_ranks > 1:
             return self.internode_dispatch(
                 x,
                 handle,
@@ -451,7 +565,7 @@ class Buffer:
                 send_head,
             ) = handle
             num_recv_tokens = recv_src_idx.size(0)
-            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, event = self.runtime.intranode_dispatch(
+            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, event = self.intranode_runtime.intranode_dispatch(
                 x,
                 x_scales,
                 None,
@@ -495,7 +609,7 @@ class Buffer:
                 recv_src_idx,
                 send_head,
                 event,
-            ) = self.runtime.intranode_dispatch(
+            ) = self.intranode_runtime.intranode_dispatch(
                 x,
                 x_scales,
                 topk_idx,
@@ -564,10 +678,12 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
         # Default config
-        config = self.get_combine_config(self.group_size) if config is None else config
+        config = (
+            self.get_combine_config(self.group_size, self.intranode_backend) if config is None else config
+        )
 
         # Internode
-        if self.runtime.get_num_rdma_ranks() > 1:
+        if self.num_rdma_ranks > 1:
             return self.internode_combine(
                 x, handle, topk_weights, bias, config, previous_event, async_finish, allocate_on_comm_stream
             )
@@ -577,7 +693,7 @@ class Buffer:
         bias_0, bias_1 = Buffer._unpack_bias(bias)
 
         # Launch the kernel
-        recv_x, recv_topk_weights, event = self.runtime.intranode_combine(
+        recv_x, recv_topk_weights, event = self.intranode_runtime.intranode_combine(
             x,
             topk_weights,
             bias_0,

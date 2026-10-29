@@ -316,6 +316,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("num_max_nvl_chunked_recv_tokens")  = DEFAULT_NUM_MAX_XGMI_CHUNKED_RECV_TOKENS,
              py::arg("num_max_rdma_chunked_send_tokens") = DEFAULT_NUM_MAX_RDMA_CHUNKED_SEND_TOKENS,
              py::arg("num_max_rdma_chunked_recv_tokens") = DEFAULT_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS)
+        // Readable from Python: the FlyDSL intranode backend launches its kernels from there.
+        .def_readonly("num_sms", &primus_turbo::deep_ep::Config::num_sms)
+        .def_readonly("num_max_nvl_chunked_send_tokens",
+                      &primus_turbo::deep_ep::Config::num_max_nvl_chunked_send_tokens)
+        .def_readonly("num_max_nvl_chunked_recv_tokens",
+                      &primus_turbo::deep_ep::Config::num_max_nvl_chunked_recv_tokens)
+        .def_readonly("num_max_rdma_chunked_send_tokens",
+                      &primus_turbo::deep_ep::Config::num_max_rdma_chunked_send_tokens)
+        .def_readonly("num_max_rdma_chunked_recv_tokens",
+                      &primus_turbo::deep_ep::Config::num_max_rdma_chunked_recv_tokens)
         .def("get_nvl_buffer_size_hint", &primus_turbo::deep_ep::Config::get_nvl_buffer_size_hint)
         .def("get_rdma_buffer_size_hint",
              &primus_turbo::deep_ep::Config::get_rdma_buffer_size_hint);

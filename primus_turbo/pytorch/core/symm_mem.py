@@ -91,6 +91,7 @@ class SymmetricMemory:
         alloc_size: int,
         signal_pad_size: int = _DEFAULT_SIGNAL_PAD_SIZE,
         uncached_signal_pad: bool = False,
+        uncached_buffer: bool = False,
     ):
         if alloc_size <= 0:
             raise ValueError(f"requested alloc size must be greater than 0, got {alloc_size}")
@@ -116,7 +117,11 @@ class SymmetricMemory:
         buffer_ptr = None
         signal_pad_ptr = None
         try:
-            buffer_ptr = self.lib.hipMalloc(alloc_size)
+            # ``uncached_buffer``: same trade-off as ``uncached_signal_pad`` below, for a caller whose
+            # cross-rank protocol relies on every access to the heap bypassing L2 (DeepEP's channel
+            # ring buffers, which drop the release/acquire fences around their head/tail updates).
+            alloc_buffer = self.lib.hipMallocUncached if uncached_buffer else self.lib.hipMalloc
+            buffer_ptr = alloc_buffer(alloc_size)
             self.lib.hipMemset(buffer_ptr, 0, alloc_size)
             self.buffer_ptrs = self._rendezvous(buffer_ptr)
             # signal_pad allocated only when requested (bf16 mega passes 0 and skips it).
