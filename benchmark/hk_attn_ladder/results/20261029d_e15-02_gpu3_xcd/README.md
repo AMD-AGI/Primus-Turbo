@@ -125,7 +125,26 @@ energy (sclk 1190 -> 1219 MHz), but the loop takes ~7% more cycles per step (r11
 block's extra masked steps explain ~1.4%; the rest is the 4-wave barrier and all four waves reading the same stage
 in the same phase, where two 2-wave workgroups per WGP interleave): **0.988x ± 0.002** vs r10x.
 
-## 11. Next
+Per-phase probe of workgroup (0, 0, 0) at b2 s4224 (r10w_pr vs r11_pr, cycles per step): 1414 -> 1574; waves 2, 3
+spend ~90 more cycles in the post-barrier readback than waves 0, 1, which points at the WGP's split LDS (a 4-wave
+workgroup spans both CUs; a 2-wave one can sit on one). Desynchronizing the pairs would not remove that: parked.
+
+## 11. Schedule and order knobs on r10x (all bitwise == r10x; prod, hkl.ladder)
+
+| variant | vs r10x |
+|---|---|
+| ring barrier gap 20 / 28 WMMAs (was 12; `--bar-gap`) | ~1.00 (clean rounds; the run was disturbed) |
+| slot scheduler LDS latency 110 / 150 / 200 (was 70; `--slot dslat=`) | 0.999 / 0.995 / 0.992 |
+| dQ items longest first across every z (-DDQ_YMAJOR, r10x_dqy) | **0.957** (K leaves L2) |
+| dK/dV ticket order head-major / y-major (-DHKGEN_TICKET_ORDER=1 / 2) | 0.989 / **0.856** (sclk 1190 -> 1050) |
+| head groups dK/dV, dQ = 8/32, 16/32, 32/8, 32/16, 16/16 (launch only) | 1.003, 1.001-1.005, 0.997, 1.001, 1.004-1.008 |
+
+The y-major ticket order spreads every head's Q / dO over the resident workgroups: far more MALL / HBM reads, and
+the clock drops 12%. Locality of the streamed operands is worth power; the grid's own order (per z, per kv block,
+the head lanes) stays best. The model's LDS latency 70 also stays: with 110..200 the model step grows 996 -> 1303
+cycles and the kernel does not get faster.
+
+## 12. Next
 
 r10t is landed on Primus-Turbo b1 (d10b4db8: bwd 2.361 -> 2.336 ms hot). A persistent dK/dV kernel would also
 hide the ticket latency (~1.9% of a workgroup),

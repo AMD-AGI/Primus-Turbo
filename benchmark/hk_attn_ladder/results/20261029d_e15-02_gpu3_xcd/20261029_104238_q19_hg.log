@@ -1,0 +1,25 @@
+[2026-10-29T10:42:38 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m hkl.ladder mla/ladder_bwd.json --rung r10x r10x_hg16_16 r10x_hg16_32 --baseline -r 10
+device gfx1250 (256 CUs)  torch 2.14.0+rocm10.2.0a20261011  ladder mla_bwd  shape b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd
+reference 1.6 s
+  verify r10x               dq 52.3 dk 52.3 dv 52.6
+  verify r10x_hg16_16       dq 52.3 dk 52.3 dv 52.6
+  verify r10x_hg16_32       dq 52.3 dk 52.3 dv 52.6
+  verify r10x_hg16_32#null  dq 52.3 dk 52.3 dv 52.6
+  round 1/10: r10x=2.2849 r10x_hg16_16=2.2723 r10x_hg16_32=2.2838 r10x_hg16_32#null=2.2697
+  round 2/10: r10x=2.2960 r10x_hg16_16=2.2781 r10x_hg16_32=2.2822 r10x_hg16_32#null=2.2796
+  round 3/10: r10x=2.3015 r10x_hg16_16=2.2727 r10x_hg16_32=2.2858 r10x_hg16_32#null=2.2825
+  round 4/10: r10x=2.2833 r10x_hg16_16=2.2867 r10x_hg16_32=2.2902 r10x_hg16_32#null=2.2890
+  round 5/10: r10x=2.2874 r10x_hg16_16=2.2853 r10x_hg16_32=2.2930 r10x_hg16_32#null=2.2973
+  round 6/10: r10x=2.2827 r10x_hg16_16=2.3060 r10x_hg16_32=2.2914 r10x_hg16_32#null=2.2757
+  round 7/10: r10x=2.2892 r10x_hg16_16=2.2740 r10x_hg16_32=2.2873 r10x_hg16_32#null=2.2833
+  round 8/10: r10x=2.2968 r10x_hg16_16=2.2919 r10x_hg16_32=2.2920 r10x_hg16_32#null=2.2929
+  round 9/10: r10x=2.2854 r10x_hg16_16=2.2926 r10x_hg16_32=2.2881 r10x_hg16_32#null=2.2930
+  round 10/10: r10x=2.2936 r10x_hg16_16=2.2780 r10x_hg16_32=2.2913 r10x_hg16_32#null=2.2866
+arm                        ms  TFLOP/s     over             step  step cyc   sclk    Mcyc      W     mJ  a08 ms  feature
+------------------------------------------------------------------------------------------------------------------------
+r10x                   2.2883   1562.0                                       1186   2.713      -      -          r10w + K / V by TDM (-DHKGEN_KV_TDM=1): INIT moves the wave'
+r10x_hg16_16           2.2817   1566.5     r10x     1.004x±0.005    1.012x   1176   2.684      -      -          r10x launched with head groups dK/dV 16, dQ 16 (was 32 / 32)
+r10x_hg16_32           2.2892   1561.4     r10x     1.001x±0.003    1.012x   1176   2.689      -      -          r10x launched with head groups dK/dV 16, dQ 32 (was 32 / 32)
+r10x_hg16_32#null      2.2849   1564.3                                       1178   2.685      -      -          r10x launched with head groups dK/dV 16, dQ 32 (was 32 / 32)
+null control r10x_hg16_32 vs #null: 1.0013x ± 0.0021
+[10:43:35 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_104238_q19_hg.log

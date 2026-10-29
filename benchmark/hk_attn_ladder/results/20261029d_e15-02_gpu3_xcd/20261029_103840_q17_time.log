@@ -1,0 +1,23 @@
+[2026-10-29T10:38:40 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m hkl.ladder mla/ladder_bwd.json --rung r10x r10x_th r10x_ty --baseline -r 8
+device gfx1250 (256 CUs)  torch 2.14.0+rocm10.2.0a20261011  ladder mla_bwd  shape b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd
+reference 1.6 s
+  verify r10x               dq 52.3 dk 52.3 dv 52.6
+  verify r10x_th            dq 52.3 dk 52.3 dv 52.6
+  verify r10x_ty            dq 52.3 dk 52.3 dv 52.6
+  verify r10x_ty#null       dq 52.3 dk 52.3 dv 52.6
+  round 1/8: r10x=2.2855 r10x_th=2.3094 r10x_ty=2.6713 r10x_ty#null=2.6662
+  round 2/8: r10x=2.2899 r10x_th=2.3147 r10x_ty=2.6690 r10x_ty#null=2.6669
+  round 3/8: r10x=2.2862 r10x_th=2.3166 r10x_ty=2.6717 r10x_ty#null=2.6765
+  round 4/8: r10x=2.2982 r10x_th=2.3114 r10x_ty=2.6707 r10x_ty#null=2.6855
+  round 5/8: r10x=2.2915 r10x_th=2.3348 r10x_ty=2.6813 r10x_ty#null=2.6692
+  round 6/8: r10x=2.2900 r10x_th=2.3104 r10x_ty=2.6760 r10x_ty#null=2.6851
+  round 7/8: r10x=2.2923 r10x_th=2.3295 r10x_ty=2.6770 r10x_ty#null=2.6822
+  round 8/8: r10x=2.3067 r10x_th=2.3206 r10x_ty=2.6839 r10x_ty#null=2.6776
+arm                        ms  TFLOP/s     over             step  step cyc   sclk    Mcyc      W     mJ  a08 ms  feature
+------------------------------------------------------------------------------------------------------------------------
+r10x                   2.2907   1560.3                                       1190   2.726      -      -          r10w + K / V by TDM (-DHKGEN_KV_TDM=1): INIT moves the wave'
+r10x_th                2.3156   1543.6     r10x     0.989x±0.004    0.982x   1199   2.779      -      -          r10x with the ticket's items in head-major (every kv block o
+r10x_ty                2.6738   1336.8     r10x     0.856x±0.002    0.971x   1050   2.807      -      -          r10x with the ticket's items in y-major (the longest kv bloc
+r10x_ty#null           2.6771   1335.2                                       1050   2.809      -      -          r10x with the ticket's items in y-major (the longest kv bloc
+null control r10x_ty vs #null: 0.9995x ± 0.0028
+[10:39:27 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_103840_q17_time.log

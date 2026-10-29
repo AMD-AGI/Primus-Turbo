@@ -196,7 +196,7 @@ def main():
                 v = sorted(byn[st])
                 print(f"   steps {st:4d}: n {len(v):4d}  median {v[len(v) // 2]:7d}  per step {v[len(v) // 2] / max(st, 1):6.0f}")
     names, nph = (PHASES8, 8) if a.fine else (PHASES, 6)
-    for w in range(2):
+    for w in range(a.waves):
         sums = [x & 0xFFFFFFFF for x in g[w * 16: w * 16 + nph]]
         n = g[w * 16 + nph]
         tot = (sums[0] if a.abc else sum(sums)) / max(n, 1)

@@ -2799,8 +2799,8 @@ diff -ruN a/r8gen/asmkit/verify_obj.py b/r8gen/asmkit/verify_obj.py
 +    sys.exit(1 if r else 0)
 diff -ruN a/r8gen/gen/build.py b/r8gen/gen/build.py
 --- a/r8gen/gen/build.py	1970-01-01 00:00:00.000000000 +0000
-+++ b/r8gen/gen/build.py	2026-10-29 10:11:49.000000000 +0000
-@@ -0,0 +1,392 @@
++++ b/r8gen/gen/build.py	2026-10-29 10:30:29.000000000 +0000
+@@ -0,0 +1,400 @@
 +###############################################################################
 +# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 +#
@@ -2911,6 +2911,8 @@ diff -ruN a/r8gen/gen/build.py b/r8gen/gen/build.py
 +    ap.add_argument("--tdm-dummy", action="store_true", help="r8gen.TDM_DUMMY (16-B ops past the last tile)")
 +    ap.add_argument("--final-pipe", action="store_true", help="r8gen.FINAL_PIPE (pipelined epilogue)")
 +    ap.add_argument("--tdm-lim-sc7", action="store_true", help="r8gen.TDM_LIM_SC7 (shell -DHKGEN_W4)")
++    ap.add_argument("--bar-gap", type=int, default=None, help="bwdgen.SLOT['bar_gap']: WMMAs between ring signal / wait")
++    ap.add_argument("--slot", default="", help="bwdgen.SLOT overrides for the slot scheduler: KEY=INT,KEY=INT")
 +    ap.add_argument("--asmkit-root", default=None, help="ignored: the package carries its own asmkit")
 +    a = ap.parse_args()
 +    from asmkit import build as B
@@ -2927,6 +2929,12 @@ diff -ruN a/r8gen/gen/build.py b/r8gen/gen/build.py
 +    G.SCAL_IN_BODY, G.TDM_DUMMY, G.FINAL_PIPE = a.scal_in_body, a.tdm_dummy, a.final_pipe
 +    G.TDM_LIM_SC7 = a.tdm_lim_sc7
 +    import bwdgen as BG
++    if a.bar_gap is not None:
++        BG.SLOT["bar_gap"] = a.bar_gap
++    for kv in (x for x in a.slot.split(",") if x):
++        key, val = kv.split("=")
++        assert key in BG.SLOT and isinstance(BG.SLOT[key], int), key
++        BG.SLOT[key] = int(val)
 +
 +    for kv in [x for x in a.win.split(",") if x]:
 +        k, v = kv.split("=")
@@ -10152,8 +10160,8 @@ diff -ruN a/r8gen/hip/src/k_delta.hip b/r8gen/hip/src/k_delta.hip
 +}
 diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 --- a/r8gen/hip/src/k_dkdv96ds.hip	1970-01-01 00:00:00.000000000 +0000
-+++ b/r8gen/hip/src/k_dkdv96ds.hip	2026-10-29 10:19:25.000000000 +0000
-@@ -0,0 +1,1027 @@
++++ b/r8gen/hip/src/k_dkdv96ds.hip	2026-10-29 10:37:49.000000000 +0000
+@@ -0,0 +1,1040 @@
 +/***************************************************************************************************
 + * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 + *
@@ -10256,6 +10264,9 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +#ifndef HKGEN_EARLY_TDM
 +#define HKGEN_EARLY_TDM 0  // HKGEN: the first two tiles' TDM ahead of INIT's K / V fragment loads (latencies overlap)
 +#endif
++#ifndef HKGEN_TICKET_ORDER
++#define HKGEN_TICKET_ORDER 0  // HKGEN_TICKET: the item order (0 the grid's, 1 head-major, 2 y-major)
++#endif
 +#ifndef HKGEN_TICKET
 +#define HKGEN_TICKET 0  // HKGEN: the work item from a ticket counter instead of the block id (the int 64 B in front of
 +#endif                  // DS, zeroed before the launch): items go to workgroups in the order they start
@@ -10322,9 +10333,19 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +                                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 +  lds_barrier();
 +  const int k3_item = __builtin_amdgcn_readfirstlane(s_item[0]);
++#if HKGEN_TICKET_ORDER == 1  // head-major: every kv block of a (head group lane, z) in a row, longest first
++#define K3_BY (k3_item % K3_NBY)
++#define K3_BX (k3_item / K3_NBY % HG)
++#define K3_BZ (k3_item / (HG * K3_NBY))
++#elif HKGEN_TICKET_ORDER == 2  // y-major: the longest kv blocks of every head first
++#define K3_BX (k3_item % HG)
++#define K3_BZ (k3_item / HG % (B * Hkv / HG))
++#define K3_BY (k3_item / (HG * (B * Hkv / HG)))
++#else  // the grid's own order: per z, per kv block, the HG head group lanes
 +#define K3_BX (k3_item % HG)
 +#define K3_BY (k3_item / HG % K3_NBY)
 +#define K3_BZ (k3_item / (HG * K3_NBY))
++#endif
 +#define K3_LI k3_item
 +#else
 +#define K3_BX ((int)blockIdx.x)

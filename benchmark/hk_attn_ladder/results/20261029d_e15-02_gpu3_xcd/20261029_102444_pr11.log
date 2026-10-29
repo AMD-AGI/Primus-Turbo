@@ -1,0 +1,43 @@
+[2026-10-29T10:24:44 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: sh -c python3 -m hkl.test mla/ladder_bwd.json --rung r10w_pr r11_pr --shapes toy | tail -3; for s in 4224; do echo == r10w_pr; python3 -m micro.k3_probe mla/ladder_bwd.json r10w_pr --abc --calls 20 --shape b=2 sq=4224 skv=4224 | sed -n 1,14p; echo == r11_pr; python3 -m micro.k3_probe mla/ladder_bwd.json r11_pr --abc --calls 20 --waves 4 --shape b=2 sq=4224 skv=4224 | sed -n 1,30p; done
+  r10w_pr          PASS  dq  52.06 dk  52.09 dv  52.72  det
+  r11_pr           PASS  dq  52.06 dk  52.09 dv  52.72  det
+ALL PASS
+== r10w_pr
+wave 0: 132 steps, 1414 cycles per iteration
+   start -> signal (B + C)      657.7
+   signal -> wait (barrier)     274.8
+   wait -> C end                143.8
+   C end -> end (A)             181.2
+   prologue 7527 cycles, epilogue 5651 cycles, loop 173514 cycles (1314 per step incl. headers)
+wave 1: 132 steps, 1414 cycles per iteration
+   start -> signal (B + C)      658.3
+   signal -> wait (barrier)     274.4
+   wait -> C end                145.5
+   C end -> end (A)             180.8
+   prologue 7537 cycles, epilogue 5628 cycles, loop 173540 cycles (1315 per step incl. headers)
+== r11_pr
+wave 0: 132 steps, 1574 cycles per iteration
+   start -> signal (B + C)      728.3
+   signal -> wait (barrier)     312.7
+   wait -> C end                156.9
+   C end -> end (A)             188.1
+   prologue 9245 cycles, epilogue 7930 cycles, loop 190612 cycles (1444 per step incl. headers)
+wave 1: 132 steps, 1574 cycles per iteration
+   start -> signal (B + C)      723.7
+   signal -> wait (barrier)     312.8
+   wait -> C end                161.5
+   C end -> end (A)             187.8
+   prologue 9243 cycles, epilogue 7893 cycles, loop 190589 cycles (1444 per step incl. headers)
+wave 2: 132 steps, 1574 cycles per iteration
+   start -> signal (B + C)      695.7
+   signal -> wait (barrier)     284.1
+   wait -> C end                226.7
+   C end -> end (A)             178.8
+   prologue 9239 cycles, epilogue 7939 cycles, loop 190597 cycles (1444 per step incl. headers)
+wave 3: 132 steps, 1574 cycles per iteration
+   start -> signal (B + C)      691.9
+   signal -> wait (barrier)     283.9
+   wait -> C end                246.0
+   C end -> end (A)             162.5
+   prologue 9235 cycles, epilogue 7975 cycles, loop 190556 cycles (1444 per step incl. headers)
+[10:24:54 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_102444_pr11.log

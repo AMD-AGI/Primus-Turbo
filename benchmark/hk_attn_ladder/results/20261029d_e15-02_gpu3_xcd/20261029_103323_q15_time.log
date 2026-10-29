@@ -1,0 +1,25 @@
+[2026-10-29T10:33:23 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m hkl.ladder mla/ladder_bwd.json --rung r10x r10x_dl110 r10x_dl150 r10x_dl200 --baseline -r 8
+device gfx1250 (256 CUs)  torch 2.14.0+rocm10.2.0a20261011  ladder mla_bwd  shape b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd
+reference 1.6 s
+  verify r10x               dq 52.3 dk 52.3 dv 52.6
+  verify r10x_dl110         dq 52.3 dk 52.3 dv 52.6
+  verify r10x_dl150         dq 52.3 dk 52.3 dv 52.6
+  verify r10x_dl200         dq 52.3 dk 52.3 dv 52.6
+  verify r10x_dl200#null    dq 52.3 dk 52.3 dv 52.6
+  round 1/8: r10x=2.2846 r10x_dl110=2.2862 r10x_dl150=2.2984 r10x_dl200=2.3098 r10x_dl200#null=2.3083
+  round 2/8: r10x=2.2931 r10x_dl110=2.2756 r10x_dl150=2.2990 r10x_dl200=2.3078 r10x_dl200#null=2.3065
+  round 3/8: r10x=2.2923 r10x_dl110=2.2968 r10x_dl150=2.3107 r10x_dl200=2.3122 r10x_dl200#null=2.3037
+  round 4/8: r10x=2.2928 r10x_dl110=2.2995 r10x_dl150=2.3090 r10x_dl200=2.3219 r10x_dl200#null=2.2999
+  round 5/8: r10x=2.3018 r10x_dl110=2.3015 r10x_dl150=2.3121 r10x_dl200=2.3143 r10x_dl200#null=2.3033
+  round 6/8: r10x=2.2906 r10x_dl110=2.3015 r10x_dl150=2.3245 r10x_dl200=2.3096 r10x_dl200#null=2.2977
+  round 7/8: r10x=2.2908 r10x_dl110=2.3050 r10x_dl150=2.2991 r10x_dl200=2.3151 r10x_dl200#null=2.3036
+  round 8/8: r10x=2.2925 r10x_dl110=2.2870 r10x_dl150=2.2986 r10x_dl200=2.3115 r10x_dl200#null=2.3087
+arm                        ms  TFLOP/s     over             step  step cyc   sclk    Mcyc      W     mJ  a08 ms  feature
+------------------------------------------------------------------------------------------------------------------------
+r10x                   2.2924   1559.2                                       1190   2.727      -      -          r10w + K / V by TDM (-DHKGEN_KV_TDM=1): INIT moves the wave'
+r10x_dl110             2.2981   1555.3     r10x     0.999x±0.004    0.996x   1192   2.743      -      -          r10x scheduled with an LDS load latency of 110 cycles (slot 
+r10x_dl150             2.3041   1551.3     r10x     0.995x±0.003    0.991x   1194   2.755      -      -          r10x scheduled with an LDS load latency of 150 cycles (slot 
+r10x_dl200             2.3118   1546.1     r10x     0.992x±0.002    0.982x   1199   2.772      -      -          r10x scheduled with an LDS load latency of 200 cycles (slot 
+r10x_dl200#null        2.3037   1551.6                                       1198   2.761      -      -          r10x scheduled with an LDS load latency of 200 cycles (slot 
+null control r10x_dl200 vs #null: 1.0042x ± 0.0025
+[10:34:21 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_103323_q15_time.log

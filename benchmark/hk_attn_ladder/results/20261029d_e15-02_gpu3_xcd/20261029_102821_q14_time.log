@@ -1,0 +1,23 @@
+[2026-10-29T10:28:21 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m hkl.ladder mla/ladder_bwd.json --rung r10x r10x_bg20 r10x_bg28 --baseline -r 8
+device gfx1250 (256 CUs)  torch 2.14.0+rocm10.2.0a20261011  ladder mla_bwd  shape b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd
+reference 1.6 s
+  verify r10x               dq 52.3 dk 52.3 dv 52.6
+  verify r10x_bg20          dq 52.3 dk 52.3 dv 52.6
+  verify r10x_bg28          dq 52.3 dk 52.3 dv 52.6
+  verify r10x_bg28#null     dq 52.3 dk 52.3 dv 52.6
+  round 1/8: r10x=2.2878 r10x_bg20=2.2842 r10x_bg28=2.2858 r10x_bg28#null=2.2833
+  round 2/8: r10x=2.2982 r10x_bg20=2.7508 r10x_bg28=2.2836 r10x_bg28#null=2.2753
+  round 3/8: r10x=2.7065 r10x_bg20=2.2882 r10x_bg28=2.2833 r10x_bg28#null=2.2819
+  round 4/8: r10x=2.0328 r10x_bg20=2.3038 r10x_bg28=2.1958 r10x_bg28#null=2.3361
+  round 5/8: r10x=2.2957 r10x_bg20=3.0854 r10x_bg28=2.2866 r10x_bg28#null=2.2957
+  round 6/8: r10x=2.2962 r10x_bg20=2.2807 r10x_bg28=2.2904 r10x_bg28#null=2.2936
+  round 7/8: r10x=2.3787 r10x_bg20=3.8697 r10x_bg28=2.2698 r10x_bg28#null=3.1712
+  round 8/8: r10x=2.3295 r10x_bg20=2.3882 r10x_bg28=3.5752 r10x_bg28#null=3.3983
+arm                        ms  TFLOP/s     over             step  step cyc   sclk    Mcyc      W     mJ  a08 ms  feature
+------------------------------------------------------------------------------------------------------------------------
+r10x                   2.2972   1555.9                                       1263   2.789   2135 4339.55          r10w + K / V by TDM (-DHKGEN_KV_TDM=1): INIT moves the wave'
+r10x_bg20              2.3460   1523.6     r10x     0.929x±0.147    0.883x   1378   3.235      -      -          r10x with 20 WMMAs between the ring barrier's signal and wai
+r10x_bg28              2.2847   1564.5     r10x     1.003x±0.126    1.013x   1192   2.723      -      -          r10x with 28 WMMAs between the ring barrier's signal and wai
+r10x_bg28#null         2.2947   1557.7                                       1190   2.726      -      -          r10x with 28 WMMAs between the ring barrier's signal and wai
+null control r10x_bg28 vs #null: 0.9996x ± 0.0872
+[10:29:08 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_102821_q14_time.log

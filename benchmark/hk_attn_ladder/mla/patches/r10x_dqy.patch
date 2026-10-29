@@ -1,0 +1,73 @@
+diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
+--- a/include/dqds/dqds_impl.h	2026-10-29 10:35:05.883800161 +0000
++++ b/include/dqds/dqds_impl.h	2026-10-29 10:35:42.137422180 +0000
+@@ -114,7 +114,7 @@
+ 
+ template <int NQW>
+ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int Skv, int Hq,
+-                      int Hkv, int G, int nkvt, int cshift, int causal, int q0g, int HG) {
++                      int Hkv, int G, int nkvt, int cshift, int causal, int q0g, int HG, int bx, int bz) {
+     constexpr int NB_G = nbg(NQW);
+     constexpr int NACC = NQW * NDT;
+ 
+@@ -125,7 +125,7 @@
+     const int  wv   = readfirstlane(tid / WAVE); // uniform (SGPR) wave index 0..3
+     const bool dsw  = c_role_ds(wv); // uniform: this wave issues the dS ops (else the K ops)
+     const int  hh   = c_half(wv);    // its kv32 row / K half inside a unit
+-    const int  hb   = head_hb(block_id_x(), block_id_z(), HG); // = bat*Hq + qh = dslayout's bh
++    const int  hb   = head_hb(bx, bz, HG); // = bat*Hq + qh = dslayout's bh
+     const int  bat  = head_bat(hb, Hq);
+     const int  qh   = head_qh(hb, bat, Hq);
+     const int  hkv  = head_kv(qh, G);
+@@ -448,15 +448,28 @@
+ // The kernel entry: grid (HG, ntile + nhead, B*Hq/HG), block 128.
+ Q1_DEV void dqds_kernel(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int Skv, int Hq,
+                         int Hkv, int G, int nkvt, int cshift, int causal, int q_off, int ntile,
+-                        int HG) {
++                        int HG
++#if DQ_YMAJOR
++                        , int nz
++#endif
++                        ) {
+     lock_simd(); // SCHED_MODE.DISABLE_XDL_ARB_STALL, as bwd_r6_a's k_dqds192 / k_dqg96 / k_dqds_b
+-    const int gy = block_id_y();
++#if DQ_YMAJOR
++    // the block of dispatch index li = (z * gy_n + y) * HG + x runs the item li of the order y, z, x: the longest q
++    // tiles of every (batch, head group) first and the shortest last (the grid's own order is per z, so the last
++    // z's long tiles end the kernel); x is kept (its XCD under round-robin dispatch); nz = the grid's z extent
++    const int gy_n = ntile + (q_off > 0 ? 1 : 0);
++    const int li   = (block_id_z() * gy_n + block_id_y()) * HG + block_id_x();
++    const int bx = block_id_x(), gy = li / (HG * nz), bz = li / HG % nz;
++#else
++    const int bx = block_id_x(), gy = block_id_y(), bz = block_id_z();
++#endif
+     if (!tile_is_head(gy, ntile)) {
+         dqds_body<MAIN_NQW>(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal,
+-                            tile_q0g(q_off, ntile, gy), HG);
++                            tile_q0g(q_off, ntile, gy), HG, bx, bz);
+     } else {
+         dqds_body<HEAD_NQW>(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, head_q0g(q_off),
+-                            HG);
++                            HG, bx, bz);
+     }
+ }
+ 
+diff -ruN a/src/k_dqds_c.hip b/src/k_dqds_c.hip
+--- a/src/k_dqds_c.hip	2026-10-29 10:35:05.884248962 +0000
++++ b/src/k_dqds_c.hip	2026-10-29 10:35:42.137517320 +0000
+@@ -15,7 +15,15 @@
+ #include "dqds/dqds_impl.h"
+ 
+ extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128)))
++#if DQ_YMAJOR
++// nz = the grid's z extent (B * Hq / HG)
++void k_dqds_c(const __bf16* DS, const __bf16* K, __bf16* DQ, int Sq, int Skv, int Hq, int Hkv, int G, int nkvt,
++              int cshift, int causal, int q_off, int ntile, int HG, int nz) {
++  dq::dqds_kernel(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q_off, ntile, HG, nz);
++}
++#else
+ void k_dqds_c(const __bf16* DS, const __bf16* K, __bf16* DQ, int Sq, int Skv, int Hq, int Hkv, int G, int nkvt,
+               int cshift, int causal, int q_off, int ntile, int HG) {
+   dq::dqds_kernel(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q_off, ntile, HG);
+ }
++#endif
