@@ -2799,8 +2799,8 @@ diff -ruN a/r8gen/asmkit/verify_obj.py b/r8gen/asmkit/verify_obj.py
 +    sys.exit(1 if r else 0)
 diff -ruN a/r8gen/gen/build.py b/r8gen/gen/build.py
 --- a/r8gen/gen/build.py	1970-01-01 00:00:00.000000000 +0000
-+++ b/r8gen/gen/build.py	2026-10-29 09:31:37.000000000 +0000
-@@ -0,0 +1,390 @@
++++ b/r8gen/gen/build.py	2026-10-29 10:11:49.000000000 +0000
+@@ -0,0 +1,392 @@
 +###############################################################################
 +# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 +#
@@ -2910,6 +2910,7 @@ diff -ruN a/r8gen/gen/build.py b/r8gen/gen/build.py
 +    ap.add_argument("--scal-in-body", action="store_true", help="r8gen.SCAL_IN_BODY (the next tile's scalars in the bodies)")
 +    ap.add_argument("--tdm-dummy", action="store_true", help="r8gen.TDM_DUMMY (16-B ops past the last tile)")
 +    ap.add_argument("--final-pipe", action="store_true", help="r8gen.FINAL_PIPE (pipelined epilogue)")
++    ap.add_argument("--tdm-lim-sc7", action="store_true", help="r8gen.TDM_LIM_SC7 (shell -DHKGEN_W4)")
 +    ap.add_argument("--asmkit-root", default=None, help="ignored: the package carries its own asmkit")
 +    a = ap.parse_args()
 +    from asmkit import build as B
@@ -2924,6 +2925,7 @@ diff -ruN a/r8gen/gen/build.py b/r8gen/gen/build.py
 +    G.PROBE_PTS = [int(x) for x in a.probe_pts.split(",") if x] or None
 +    G.HH1_SPLIT, G.BDO_AFTER_HH1, G.ND_FOLD = a.hh1_split, a.bdo_after_hh1, a.nd_fold
 +    G.SCAL_IN_BODY, G.TDM_DUMMY, G.FINAL_PIPE = a.scal_in_body, a.tdm_dummy, a.final_pipe
++    G.TDM_LIM_SC7 = a.tdm_lim_sc7
 +    import bwdgen as BG
 +
 +    for kv in [x for x in a.win.split(",") if x]:
@@ -3949,8 +3951,8 @@ diff -ruN a/r8gen/gen/bwdgen.py b/r8gen/gen/bwdgen.py
 +    return out, int(round(t))
 diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 --- a/r8gen/gen/r8gen.py	1970-01-01 00:00:00.000000000 +0000
-+++ b/r8gen/gen/r8gen.py	2026-10-29 09:42:24.000000000 +0000
-@@ -0,0 +1,745 @@
++++ b/r8gen/gen/r8gen.py	2026-10-29 10:11:49.000000000 +0000
+@@ -0,0 +1,750 @@
 +###############################################################################
 +# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 +#
@@ -3999,7 +4001,7 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +NEG = "0xff61b1e6"  # K1_NEG = -3e38
 +EPI_RB = 4 * NKV  # whole-line readback rows of 4 kv rows
 +XS_DK = 12  # dK WMMAs between the barrier signal and its wait
-+ABL = set()  # timing-only ablations (garbage numerics): "nosoft" (no softmax VALU), "nolds" (no S/dP-operand or tr16 LDS
++ABL = set()  # "tdm2x": every tile's TDM twice (results unchanged); timing-only ablations (garbage numerics): "nosoft" (no softmax VALU), "nolds" (no S/dP-operand or tr16 LDS
 +#              loads: the WMMAs read stale registers), "nonl" (no NL/ND loads, no dS^T stores), "notdm" (no TDM)
 +
 +# machine model for the list scheduler (micro/wmma_mix: a WMMA issues every 8 cycles; ~3 core VALU + 1 TRANS behind
@@ -4245,6 +4247,8 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +#                    the previous group's rows are read back and stored to global memory (a readback needs only its
 +#                    own group's image stores; LDS ops of a wave are in order). Else list-scheduled, every image
 +#                    store before every readback
++TDM_LIM_SC7 = False  # TDM_DUMMY's limit is sc[7] (the tiles this wave moves), not N: a wave with sc[7] = 0 only
++#                     moves 16-B dummies (shell -DHKGEN_W4: waves 2, 3 share waves 0, 1's ring)
 +SCAL_XCNT_GAP = 160  # cycles between a VMEM / TDM op and the next tile's redefinition of an SGPR it reads
 +HH1_SPLIT = 0  # hh1's S / dP order: dt < HH1_SPLIT dt outer (every kh), the rest kh-major (6: all dt outer)
 +BDO_AFTER_HH1 = False  # the dO^T loads issue only after every hh1 operand load (they do not crowd the LDS queue)
@@ -4300,6 +4304,8 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +    # TDM of tile k+2 (its stage's previous tile was last read before the previous step's barrier); it must issue
 +    # before the tensorcnt wait below, which then retires tile k+1 (outstanding: k+1, k+2)
 +    tdm = [add(f"tensor_load_to_lds {ops['g0' + c]}, {ops['g1' + c]}") for c in "abc"] if "notdm" not in ABL else []
++    if "tdm2x" in ABL:  # the same 3 ops again (same stage, same bytes): the stream's cost at unchanged results
++        tdm += [add(f"tensor_load_to_lds {ops['g0' + c]}, {ops['g1' + c]}") for c in "abc"]
 +
 +    def wmma_sdp(hh, kind, kh, dt):
 +        if kind == "S":
@@ -4381,7 +4387,7 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +        ex = [i for i in ex if nodes[i].kind != "VM_ST"]
 +    # ---- the ring barrier after the last LDS read of stage k (tensorcnt 3: tile k+1 landed), dK (d outer), the
 +    # next step's hh0 operands (stage k+1) into O as dK releases Q^T 0..9 (program order: after the barrier wait)
-+    tw = add("s_wait_tensorcnt 0x3")
++    tw = add("s_wait_tensorcnt 0x6" if "tdm2x" in ABL else "s_wait_tensorcnt 0x3")
 +    bs = add("s_barrier_signal -1")
 +    bw = add("s_barrier_wait -1")
 +    for d in range(NDO_QK):
@@ -4631,7 +4637,8 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +           f"s_add_co_i32 s98, {SG_T1}, {qps}", f"s_lshl_b32 s98, s98, 7", f"s_add_co_i32 {SG_NLS}, {_sv(sc, 2)}, s98"]  # fmt: skip
 +    so_tdm = ((stage + 2) % DEPTH) * QDO_B
 +    if TDM_DUMMY:  # tile k + kofs + 2 past the last: the three ops move 16 B each (words 3, 4: tile0 8, tile1 1)
-+        out += [f"s_add_co_i32 s98, {SG_K}, {2 + kofs}", f"s_cmp_ge_i32 s98, {_sv(tdm, 14)}",
++        out += [f"s_add_co_i32 s98, {SG_K}, {2 + kofs}",
++                f"s_cmp_ge_i32 s98, {_sv(ops['sc'], 7) if TDM_LIM_SC7 else _sv(tdm, 14)}",
 +                f"s_mov_b32 s98, {hex(8 << 16)}"]  # one literal per SALU op (s_mov keeps scc)
 +        for o in range(3):
 +            g1 = int(SG_G1[o][2:].split(":")[0])
@@ -10145,8 +10152,8 @@ diff -ruN a/r8gen/hip/src/k_delta.hip b/r8gen/hip/src/k_delta.hip
 +}
 diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 --- a/r8gen/hip/src/k_dkdv96ds.hip	1970-01-01 00:00:00.000000000 +0000
-+++ b/r8gen/hip/src/k_dkdv96ds.hip	2026-10-29 09:42:24.000000000 +0000
-@@ -0,0 +1,992 @@
++++ b/r8gen/hip/src/k_dkdv96ds.hip	2026-10-29 10:19:25.000000000 +0000
+@@ -0,0 +1,1027 @@
 +/***************************************************************************************************
 + * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 + *
@@ -10252,6 +10259,9 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +#ifndef HKGEN_TICKET
 +#define HKGEN_TICKET 0  // HKGEN: the work item from a ticket counter instead of the block id (the int 64 B in front of
 +#endif                  // DS, zeroed before the launch): items go to workgroups in the order they start
++#ifndef HKGEN_W4
++#define HKGEN_W4 0  // HKGEN (+ HKGEN_KV_TDM, generator --tdm-lim-sc7, G == 1): 4-wave workgroups, the pair of kv blocks
++#endif              // (2 by, 2 by + 1) on one Q / dO ring: half the ring traffic per kv row (see the HKGEN block)
 +#ifndef HKGEN_KV_TDM
 +#define HKGEN_KV_TDM 0  // HKGEN: K / V of a wave's rows by TDM into an LDS staging area (V [rows][272 B], K [rows][400 B],
 +#endif                  // after the ring), INIT reads the fragments from there (else 60 buffer loads per wave)
@@ -10277,13 +10287,14 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +constexpr int SB_ALU = 0x002 | 0x004 | 0x400;   // VALU, SALU, transcendental
 +}  // namespace
 +
-+extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
++extern "C" __global__ __launch_bounds__(HKGEN && HKGEN_W4 ? 128 : 64) void k_dkdv96ds(
 +    const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf16* __restrict__ V,
 +    const bf16* __restrict__ DO, const float* __restrict__ NL, const float* __restrict__ ND,
 +    bf16* __restrict__ DV, bf16* __restrict__ DK, bf16* __restrict__ DS,
 +    float scale, int Sq, int Skv, int Hq, int Hkv, int G, int nqt, int cshift, int causal, int B, int HG,
 +    int ds_mode) {
-+  __shared__ __attribute__((aligned(1024))) unsigned char smem[K1_LDS + (HKGEN && HKGEN_KV_TDM ? K1_NW * K3_KV_W : 0)];
++  __shared__ __attribute__((aligned(1024))) unsigned char
++      smem[K1_LDS + (HKGEN && HKGEN_KV_TDM ? (HKGEN_W4 ? 4 : K1_NW) * K3_KV_W : 0)];
 +#if HKGEN && HKGEN_PROBE >= 3
 +  const unsigned int pr_s = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
 +  const unsigned int pr_rs = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readsteadycounter());
@@ -10295,6 +10306,11 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +  const int wv = wave_id(tid);
 +  const int half = lane / 16;
 +  const int row = lane % 16;
++#if HKGEN && HKGEN_W4
++#define K3_NBY ((k3_nblk(Skv) + 1) / 2)
++#else
++#define K3_NBY k3_nblk(Skv)
++#endif
 +#if HKGEN && HKGEN_TICKET
 +  // ---- work item li = (bz * nblk + by) * HG + bx (the grid's own order: per bz the longest kv blocks first) from a
 +  // ticket counter (the int 64 B in front of DS, zeroed before the launch): the workgroups take the items in the
@@ -10307,18 +10323,27 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +  lds_barrier();
 +  const int k3_item = __builtin_amdgcn_readfirstlane(s_item[0]);
 +#define K3_BX (k3_item % HG)
-+#define K3_BY (k3_item / HG % k3_nblk(Skv))
-+#define K3_BZ (k3_item / (HG * k3_nblk(Skv)))
++#define K3_BY (k3_item / HG % K3_NBY)
++#define K3_BZ (k3_item / (HG * K3_NBY))
 +#define K3_LI k3_item
 +#else
 +#define K3_BX ((int)blockIdx.x)
 +#define K3_BY ((int)blockIdx.y)
 +#define K3_BZ ((int)blockIdx.z)
-+#define K3_LI (((int)blockIdx.z * k3_nblk(Skv) + (int)blockIdx.y) * HG + (int)blockIdx.x)
++#define K3_LI (((int)blockIdx.z * K3_NBY + (int)blockIdx.y) * HG + (int)blockIdx.x)
 +#endif
 +  const int bat = k1_bat(K3_BZ, K3_BX, HG, Hkv);
 +  const int hkv = k1_hkv(K3_BZ, K3_BX, HG, Hkv);
-+  const int bid = K3_BY;
++#if HKGEN && HKGEN_W4
++  // 4 waves: wave w computes kv block bid0 + w / 2 as wave w % 2 of a 2-wave workgroup would; with no second block
++  // waves 2, 3 repeat the first (the same values stored twice)
++  const int bid0 = 2 * K3_BY;
++  const int bid = bid0 + (bid0 + 1 < k3_nblk(Skv) ? wv / 2 : 0);
++  const int wvb = wv % 2;
++#else
++  const int bid0 = K3_BY, bid = K3_BY, wvb = wv;
++#endif
++  (void)bid0;
 +  const int n96 = k3_n96(Skv);
 +
 +  // TRUE byte extents on every buffer descriptor (FlyDSL _bv): an over-read returns 0, never the next page
@@ -10414,7 +10439,7 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +    constexpr int NST = NKV * (NDO_V + NDO_QK);   // accumulators: dV (kh, d) then dK (kh, d)
 +    constexpr int DK0 = NKV * NDO_V;
 +    const int kv0g = k3_kv0g(bid, n96);
-+    const int kv0 = k3_kv0(kv0g, wv, NKV);
++    const int kv0 = k3_kv0(kv0g, wvb, NKV);
 +
 +    // ---- K / V fragments of this wave's 16*NKV kv rows: invariant over every query and q head -------------
 +    // (loaded by load_kv() on the LLVM-compiled paths; the HKGEN path loads its own copy in the INIT region)
@@ -10612,9 +10637,22 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +    //         operands of stage k+1
 +    //   FINAL acc -> bf16 dV / dK images (epi_images' layout)
 +    {  // both block heights (NKV 3: 96 rows, NKV 2: the 64-row tail); the markers carry nkv
++#if HKGEN_W4
++      // the ring moves block bid0's tiles (N of them from pair qp_ring, waves 0, 1; waves 2, 3 issue 16-B dummies);
++      // this wave's block starts qp_start - qp_ring pairs later: those steps are fully masked for it (M bodies: P = 0,
++      // no dS^T store before its blocks' first pairs)
++      const int qp_ring = k1_qp_start(k3_kv0g(bid0, n96), cshift, causal);
++      const int N = G * k1_nqp_eff(k3_kv0g(bid0, n96), cshift, causal, nqt);
++      const int n_mask_r = (qp_start - qp_ring) + n_mask;
++      const bool tdm_w = wv < 2;
++#else
++      const int qp_ring = qp_start;
 +      const int N = n_mask + n_full;
++      const int n_mask_r = n_mask;
++      const bool tdm_w = true;
++#endif
 +      auto stg = [&](int t) { return (t % K1_DEPTH) * K1_QDO_B; };
-+      auto tq = [&](int t) { return k1_clampqt(qp_start + (t < N ? t : N - 1), nqt2); };
++      auto tq = [&](int t) { return k1_clampqt(qp_ring + (t < N ? t : N - 1), nqt2); };
 +      auto nls = [&](int qt) { return uniform(k1_nl_soff(bat, Hq, k1_qh(hkv, G, 0), Sq, qt * 32)); };
 +      const uint32_t rdq_l = lds0 + (uint32_t)k1_rd_lane(1, lane), rdv_l = lds0 + (uint32_t)k1_rd_lane(0, lane);
 +      const uint32_t trv_l = lds0 + (uint32_t)k1_tr_lane(0, lane), trk_l = lds0 + (uint32_t)k1_tr_lane(1, lane);
@@ -10640,7 +10678,7 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +      const uint64_t kv_vg = (uint64_t)(uintptr_t)V + 2u * (uint64_t)(((int64_t)(bat * Skv + kv0) * Hkv + hkv) * K1_D_V);
 +#endif
 +#if HKGEN_EARLY_TDM
-+      if (N > 0) {
++      if (N > 0 && tdm_w) {
 +        sched_barrier<0>();
 +        tdm_tile(tq(0), 0, stg(0));
 +        tdm_tile(tq(1), 0, stg(1));
@@ -10689,18 +10727,21 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +        {
 +          i32x16 tdmv;
 +          static_for<3>([&](auto op) {
-+            const uint64_t ga0 = gb[op] + (uint64_t)((int64_t)qp_start * gstep_q[op]);
++            const uint64_t ga0 = gb[op] + (uint64_t)((int64_t)qp_ring * gstep_q[op]);
 +            tdmv[4 * op + 0] = (int)(uint32_t)ga0;
 +            tdmv[4 * op + 1] = (int)(uint32_t)(ga0 >> 32);
 +            tdmv[4 * op + 2] = (int)gstep_q[op];
-+            tdmv[4 * op + 3] = (int)ldsb[op];
++            // W4 waves 2, 3: their 16-B dummies land in the K / V staging area (dead during the loop), stage offsets
++            // included (< 64 KB past it)
++            tdmv[4 * op + 3] = tdm_w ? (int)ldsb[op] : (int)(lds0 + K1_LDS);
 +          });
 +          tdmv[12] = (int)k1_tdm_stride(Hq, 0);
 +          tdmv[13] = (int)k1_tdm_stride(Hq, 1);
 +          tdmv[14] = N;
-+          tdmv[15] = n_mask;
-+          const i32x8 scv = {qp_start, nqt2 - 1, nls(0), cshift - kv0, k3ds_qpf(0, kt0, Sq, Skv, causal),
-+                             k3ds_qpf(1, kt0, Sq, Skv, causal), k3ds_qpf(NKV - 1, kt0, Sq, Skv, causal), 0};
++          tdmv[15] = n_mask_r;
++          const i32x8 scv = {qp_ring, nqt2 - 1, nls(0), cshift - kv0, k3ds_qpf(0, kt0, Sq, Skv, causal),
++                             k3ds_qpf(1, kt0, Sq, Skv, causal), k3ds_qpf(NKV - 1, kt0, Sq, Skv, causal),
++                             HKGEN_W4 ? (tdm_w ? N : 0) : 0};  // W4: the tiles this wave moves (--tdm-lim-sc7)
 +          const i32x4 rcv = {ds_rc[0], ds_rc[1], ds_rc[NKV - 1], 0};
 +#if HKGEN_PROBE
 +          pr_ta = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
@@ -10755,13 +10796,14 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +        // 8 j + 4 w + 0..3 = (INIT issued | tile 0 landed), (prologue | entry -> INIT), (tensorcnt 0 + barrier |
 +        // epilogue), loop cycles; prologue / INIT / tile 0 from INIT's start (pr_t0), epilogue from LOOP's end (pr_tb)
 +        (void)pr_e1;
-+        if (pr_li % 64 < 8) {
++        if (pr_li % 64 < 8) {  // (HKGEN_W4: 4 waves, 16 words per sample)
 +          const int j = pr_li / 64 * 8 + pr_li % 8;
 +          const unsigned int w[4] = {(sat(pr_i - pr_t0) << 16) | sat(pr_w - pr_t0),
 +                                     (sat(pr_ta - pr_t0) << 16) | sat(pr_t0 - pr_s),
 +                                     (sat(pr_e2 - pr_tb) << 16) | sat(pr_t1 - pr_tb), pr_tb - pr_ta};
 +          static_for<4>([&](auto i) {
-+            __builtin_amdgcn_raw_buffer_store_b32(w[i], r_all, 0, 4096 + 4 * (8 * j + 4 * wv + i), 0);
++            __builtin_amdgcn_raw_buffer_store_b32(w[i], r_all, 0, 4096 + 4 * ((HKGEN_W4 ? 16 : 8) * j + 4 * wv + i),
++                                                  0);
 +          });
 +        }
 +#else

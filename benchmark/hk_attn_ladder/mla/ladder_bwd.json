@@ -2303,6 +2303,500 @@
    "patch": "patches/r10y.patch"
   },
   {
+   "id": "r10z_notdm",
+   "parent": "r10x",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_KV_TDM=1",
+      "--abl",
+      "notdm"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10x timing ablation --abl notdm (wrong results; hkl.ladder --verify none): no Q / dO TDM in the loop (the ring keeps stale tiles)",
+   "side": true
+  },
+  {
+   "id": "r10z_nolds",
+   "parent": "r10x",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_KV_TDM=1",
+      "--abl",
+      "nolds"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10x timing ablation --abl nolds (wrong results; hkl.ladder --verify none): no LDS operand loads in the loop (WMMAs on stale registers)",
+   "side": true
+  },
+  {
+   "id": "r10z_nosoft",
+   "parent": "r10x",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_KV_TDM=1",
+      "--abl",
+      "nosoft"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10x timing ablation --abl nosoft (wrong results; hkl.ladder --verify none): no softmax / dS VALU",
+   "side": true
+  },
+  {
+   "id": "r10z_nonl",
+   "parent": "r10x",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_KV_TDM=1",
+      "--abl",
+      "nonl"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10x timing ablation --abl nonl (wrong results; hkl.ladder --verify none): no NL / ND loads and no dS^T stores (dq reads a stale dS)",
+   "side": true
+  },
+  {
+   "id": "r10z_tdm2x",
+   "parent": "r10x",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_KV_TDM=1",
+      "--abl",
+      "tdm2x"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10x with every Q / dO tile's TDM issued twice (same stage, same bytes; ring wait tensorcnt 6): the cost of one more Q / dO stream at unchanged results",
+   "bitwise_with": "r10x",
+   "side": true
+  },
+  {
+   "id": "r11",
+   "parent": "r10x",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "--tdm-lim-sc7",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_KV_TDM=1",
+      "-D",
+      "HKGEN_W4=1"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true,
+     "w4": true,
+     "dkdv_block": 128
+    }
+   },
+   "feature": "r10x on 4-wave dK/dV workgroups (-DHKGEN_W4=1, generator --tdm-lim-sc7): the pair of 96-row kv blocks (2 by, 2 by + 1) shares one Q / dO ring (waves 0, 1 move the tiles, waves 2, 3 issue 16-B dummies); waves 2, 3 run the second block from the first block's tiles (its leading pairs fully masked): half the L2 -> LDS ring traffic per kv row; LDS 193540 B, one workgroup per WGP",
+   "bitwise_with": "r10x"
+  },
+  {
+   "id": "r11_rt",
+   "parent": "r11",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "--tdm-lim-sc7",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_KV_TDM=1",
+      "-D",
+      "HKGEN_W4=1",
+      "-D",
+      "HKGEN_PROBE=4"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true,
+     "w4": true,
+     "dkdv_block": 128
+    }
+   },
+   "feature": "r11 + probe mode 4 (micro.k3_probe --allwg N --rt)",
+   "side": true
+  },
+  {
+   "id": "r11_ps",
+   "parent": "r11",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "--tdm-lim-sc7",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_KV_TDM=1",
+      "-D",
+      "HKGEN_W4=1",
+      "-D",
+      "HKGEN_PROBE=3"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true,
+     "w4": true,
+     "dkdv_block": 128
+    }
+   },
+   "feature": "r11 + probe mode 3 (micro.k3_probe --allwg N --split [--waves 4])",
+   "side": true
+  },
+  {
+   "id": "r10x_ps2",
+   "parent": "r10x",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_KV_TDM=1",
+      "-D",
+      "HKGEN_PROBE=3"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10x + probe mode 3 (micro.k3_probe --allwg N --split [--waves 4])",
+   "side": true
+  },
+  {
+   "id": "r10x_rt",
+   "parent": "r10x",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_KV_TDM=1",
+      "-D",
+      "HKGEN_PROBE=4"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10x + probe mode 4 (micro.k3_probe --allwg N --rt)",
+   "side": true
+  },
+  {
    "id": "r10l",
    "parent": "r9a",
    "patch": "patches/r10b.patch",

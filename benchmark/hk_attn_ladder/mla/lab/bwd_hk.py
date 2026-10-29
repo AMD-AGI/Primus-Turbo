@@ -119,6 +119,7 @@ ND_FOLD = False  # configure(): the rung's k_dkdv96ds folds ND into its dP C ini
 #                  ND = -delta, l2s = log2(scale) rounded to fp32 on the host, k_delta's f32 argument)
 TICKET = False  # configure(): k_dkdv96ds built with -DHKGEN_TICKET (k_dqds_c -DDQ_TICKET) takes its work item from
 #                 a ticket counter (the int 64 / 128 B in front of the dS layout), zeroed before every dkdv launch
+W4 = False  # configure(): k_dkdv96ds built with -DHKGEN_W4: 4-wave workgroups (block 128) on pairs of kv blocks
 DQ_PERSIST = 0  # configure(): k_dqds_c built with -DDQ_PERSIST runs this many persistent workgroups (grid x) on
 #                 per-XCD queues (the ints 128 B in front of the dS layout, zeroed with the ticket) + argument nz
 
@@ -156,12 +157,13 @@ SPECS = {
 }  # fmt: skip
 
 
-def configure(delta=None, dkdv_block=64, nd_fold=False, ticket=False, dq_persist=0):
+def configure(delta=None, dkdv_block=64, nd_fold=False, ticket=False, dq_persist=0, w4=False):
     """delta: see DELTA; dkdv_block: the k_dkdv96ds workgroup size of the rung (64; 128 for the 4-wave
     wave-specialized kernel, which supports MHA only); nd_fold: see ND_FOLD; ticket / dq_persist: see TICKET,
     DQ_PERSIST."""
-    global DELTA, _KERNELS, ND_FOLD, TICKET, DQ_PERSIST
+    global DELTA, _KERNELS, ND_FOLD, TICKET, DQ_PERSIST, W4
     ND_FOLD = bool(nd_fold)
+    W4 = bool(w4)
     TICKET = bool(ticket)
     DQ_PERSIST = int(dq_persist)
     args = [a for a in SPECS["k_dqds_c"]["args"] if a[0] != "nz"] + ([("nz", "i32")] if DQ_PERSIST else [])
@@ -425,8 +427,8 @@ def _plan(
         dq_values = (ds, k_, dq_, sq, skv, hq, hkv, g, skv // 32, skv - sq, c, q_off, ntile, hg_q)
         if TICKET or DQ_PERSIST:
             launches.append(("ticket", _zero_ticket, (ds_full,)))
-        launches.append(("dkdv", "k_dkdv96ds", ((hg_kv, limits.k3_nblk(skv), gz_kv), SPECS["k_dkdv96ds"]["block"],
-                                                dkdv_values)))
+        nby = (limits.k3_nblk(skv) + 1) // 2 if W4 else limits.k3_nblk(skv)  # W4: pairs of kv blocks
+        launches.append(("dkdv", "k_dkdv96ds", ((hg_kv, nby, gz_kv), SPECS["k_dkdv96ds"]["block"], dkdv_values)))
         if DQ_PERSIST:
             launches.append(("dq", "k_dqds_c", ((DQ_PERSIST, 1, 1), 128, dq_values + (gz_q,))))
         else:

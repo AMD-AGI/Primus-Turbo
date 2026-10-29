@@ -91,7 +91,41 @@ state (gaps between workgroups ~3.5%: ~1.4 us per workgroup change) plus a ~2-3%
 1.3% (K leaves its XCD's L2, the atomic's latency per workgroup); next: persistent dQ workgroups on per-XCD queues
 (r10y), which keep the items per XCD, hide the ticket and drop the workgroup changes.
 
-## 8. Next
+## 8. Persistent dQ (r10y): no
+
+`-DDQ_PERSIST=1` (patches/r10y.patch): 256 workgroups (one per WGP), per-XCD queues of the grid's items + stealing,
+the next ticket asked for as an item starts (inline-asm atomic, read after the epilogue), argument nz. Bitwise ==
+r10x at every shape. The first build hoisted both tile bodies' loop invariants out of the item loop (70 SGPR spills,
+912 waits vs 632): 0.972x. With the arguments and the thread id re-read per item through opaque values (kernarg
+pointer in the constant address space; "+v" and "+s" asm in separate statements, else the whole asm counts as
+divergent) the hot blocks are clean (no lane spills, 134 waits vs 136), and it is still **0.990x ± 0.001**: the
+~3.5% dQ gaps between workgroups are not recoverable this way (item-boundary sync, argument reloads, ticket).
+
+## 9. Where the energy goes now (r10x, timing ablations, hkl.ladder --verify none)
+
+| variant | time | cycles | sclk |
+|---|---|---|---|
+| no Q / dO TDM in the loop (stale ring) | 1.121x | 1.045x | 1186 -> 1271 |
+| no LDS operand loads (stale registers) | 1.057x | 1.049x | 1198 |
+| no softmax VALU | 1.049x | 1.087x | 1148 |
+| no NL / ND loads, no dS^T stores | 0.997x | 0.992x | 1194 |
+| every Q / dO tile's TDM twice (r10z_tdm2x, results bitwise unchanged) | **0.929x ± 0.003** | 0.900x | 1221 |
+
+The stale-data ablations also cut operand toggling (power), so they overstate; the doubled stream is clean: one more
+Q / dO stream costs 7% of the backward. The dS^T stores (4.33 GB to HBM) cost nothing measurable any more (r7: 7.6%).
+
+## 10. 4-wave dK / dV workgroups (r11): no
+
+`-DHKGEN_W4=1` + generator `--tdm-lim-sc7` (bwd_hk configure(w4=True), block 128): a workgroup takes the pair of
+96-row kv blocks (2 by, 2 by + 1) on one Q / dO ring. Waves 0, 1 move the tiles; waves 2, 3 issue 16-B dummies (TDM
+limit sc[7] = 0, destination the dead K / V staging area) and run the second block from the first block's tiles,
+its leading pairs fully masked (M bodies); with no second block they repeat the first (same values stored twice).
+LDS 193540 B, one workgroup per WGP. Bitwise == r10x at every shape. Half the ring traffic per kv row shows as
+energy (sclk 1190 -> 1219 MHz), but the loop takes ~7% more cycles per step (r11_ps: ~1312 vs ~1223; the second
+block's extra masked steps explain ~1.4%; the rest is the 4-wave barrier and all four waves reading the same stage
+in the same phase, where two 2-wave workgroups per WGP interleave): **0.988x ± 0.002** vs r10x.
+
+## 11. Next
 
 r10t is landed on Primus-Turbo b1 (d10b4db8: bwd 2.361 -> 2.336 ms hot). A persistent dK/dV kernel would also
 hide the ticket latency (~1.9% of a workgroup),

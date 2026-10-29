@@ -1,0 +1,21 @@
+[2026-10-29T10:04:45 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m hkl.ladder mla/ladder_bwd.json --rung r10x r10z_tdm2x --baseline -r 8
+device gfx1250 (256 CUs)  torch 2.14.0+rocm10.2.0a20261011  ladder mla_bwd  shape b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd
+reference 1.6 s
+  verify r10x               dq 52.3 dk 52.3 dv 52.6
+  verify r10z_tdm2x         dq 52.3 dk 52.3 dv 52.6
+  verify r10z_tdm2x#null    dq 52.3 dk 52.3 dv 52.6
+  round 1/8: r10x=2.2745 r10z_tdm2x=2.4610 r10z_tdm2x#null=2.4683
+  round 2/8: r10x=2.2778 r10z_tdm2x=2.4575 r10z_tdm2x#null=2.5058
+  round 3/8: r10x=2.2974 r10z_tdm2x=2.4677 r10z_tdm2x#null=2.4694
+  round 4/8: r10x=2.3257 r10z_tdm2x=2.4712 r10z_tdm2x#null=2.4647
+  round 5/8: r10x=2.3035 r10z_tdm2x=2.3266 r10z_tdm2x#null=4.7354
+  round 6/8: r10x=3.7282 r10z_tdm2x=2.4721 r10z_tdm2x#null=2.4887
+  round 7/8: r10x=3.6176 r10z_tdm2x=4.5845 r10z_tdm2x#null=3.9818
+  round 8/8: r10x=2.2960 r10z_tdm2x=3.7119 r10z_tdm2x#null=4.6633
+arm                        ms  TFLOP/s     over             step  step cyc   sclk    Mcyc      W     mJ  a08 ms  feature
+------------------------------------------------------------------------------------------------------------------------
+r10x                   2.3005   1553.7                                       1207   2.778      -      -          r10w + K / V by TDM (-DHKGEN_KV_TDM=1): INIT moves the wave'
+r10z_tdm2x             2.4695   1447.4     r10x     0.929x±0.212    0.905x   1242   3.069      -      -          r10x with every Q / dO tile's TDM issued twice (same stage, 
+r10z_tdm2x#null        2.4973   1431.3                                       1316   3.288      -      -          r10x with every Q / dO tile's TDM issued twice (same stage, 
+null control r10z_tdm2x vs #null: 0.9952x ± 0.1670
+[10:05:23 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_100445_q12_time.log

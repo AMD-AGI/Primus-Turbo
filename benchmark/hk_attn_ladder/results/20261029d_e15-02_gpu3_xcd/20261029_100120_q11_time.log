@@ -1,0 +1,19 @@
+[2026-10-29T10:01:20 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m hkl.ladder mla/ladder_bwd.json --rung r10x r10z_notdm r10z_nolds r10z_nosoft r10z_nonl --baseline -r 6 --verify none
+device gfx1250 (256 CUs)  torch 2.14.0+rocm10.2.0a20261011  ladder mla_bwd  shape b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd
+reference 0.3 s
+  round 1/6: r10x=2.2853 r10z_notdm=2.0595 r10z_nolds=2.1704 r10z_nosoft=2.1852 r10z_nonl=2.2934 r10z_nonl#null=2.3029
+  round 2/6: r10x=2.2951 r10z_notdm=2.0383 r10z_nolds=2.1682 r10z_nosoft=2.1784 r10z_nonl=2.3026 r10z_nonl#null=2.3043
+  round 3/6: r10x=2.3031 r10z_notdm=2.0553 r10z_nolds=2.1812 r10z_nosoft=2.1905 r10z_nonl=2.2972 r10z_nonl#null=2.2912
+  round 4/6: r10x=2.2910 r10z_notdm=2.0373 r10z_nolds=2.1651 r10z_nosoft=2.1926 r10z_nonl=2.2954 r10z_nonl#null=2.3054
+  round 5/6: r10x=2.3046 r10z_notdm=2.0674 r10z_nolds=2.1690 r10z_nosoft=2.1797 r10z_nonl=2.3088 r10z_nonl#null=2.3025
+  round 6/6: r10x=2.2870 r10z_notdm=2.0384 r10z_nolds=2.1723 r10z_nosoft=2.1880 r10z_nonl=2.3107 r10z_nonl#null=2.3067
+arm                        ms  TFLOP/s     over             step  step cyc   sclk    Mcyc      W     mJ  a08 ms  feature
+------------------------------------------------------------------------------------------------------------------------
+r10x                   2.2931   1558.7                                       1186   2.722      -      -          r10w + K / V by TDM (-DHKGEN_KV_TDM=1): INIT moves the wave'
+r10z_notdm             2.0468   1746.2     r10x     1.121x±0.007    1.045x   1271   2.605      -      -          r10x timing ablation --abl notdm (wrong results; hkl.ladder 
+r10z_nolds             2.1697   1647.4     r10x     1.057x±0.004    1.049x   1198   2.595      -      -          r10x timing ablation --abl nolds (wrong results; hkl.ladder 
+r10z_nosoft            2.1866   1634.6     r10x     1.049x±0.005    1.087x   1148   2.510      -      -          r10x timing ablation --abl nosoft (wrong results; hkl.ladder
+r10z_nonl              2.2999   1554.1     r10x     0.997x±0.004    0.992x   1194   2.747      -      -          r10x timing ablation --abl nonl (wrong results; hkl.ladder -
+r10z_nonl#null         2.3036   1551.6                                       1195   2.752      -      -          r10x timing ablation --abl nonl (wrong results; hkl.ladder -
+null control r10z_nonl vs #null: 1.0005x ± 0.0034
+[10:02:14 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_100120_q11_time.log

@@ -30,16 +30,16 @@ def _stats(v):
     return f"mean {sum(v) / len(v):7.0f}  median {v[len(v) // 2]:6d}  p10 {v[len(v) // 10]:6d}  p90 {v[len(v) * 9 // 10]:6d}"
 
 
-def split_report(g, nwg):
+def split_report(g, nwg, waves=2):
     """HKGEN_PROBE=3: workgroups li % 64 < 8 (sample j = li / 64 * 8 + li % 8): the prologue (from INIT's start), the
     loop and the epilogue (from the LOOP marker's end), per wave and per dispatch slot li % 8 (XCD)."""
-    for w in range(2):
+    for w in range(waves):
         rows = []
         for li in range(nwg):
             if li % 64 >= 8:
                 continue
             j = li // 64 * 8 + li % 8
-            x = [g[1024 + 8 * j + 4 * w + i] & 0xFFFFFFFF for i in range(4)]
+            x = [g[1024 + 4 * waves * j + 4 * w + i] & 0xFFFFFFFF for i in range(4)]
             if x[3]:
                 rows.append(dict(li=li, init=x[0] >> 16, tile0=x[0] & 0xFFFF, pro=x[1] >> 16, entry=x[1] & 0xFFFF,
                                  ewait=x[2] >> 16, epi=x[2] & 0xFFFF, loop=x[3]))
@@ -140,6 +140,7 @@ def main():
                     "(realtime start mod 2^18) << 14 | min(end - start, 0x3FFF) in 10-ns ticks")
     ap.add_argument("--slots", type=int, default=512, help="--rt: workgroups resident at once (occupancy)")
     ap.add_argument("--dq", action="store_true", help="--rt: the words are k_dqds_c's (-DDQ_PROBE=1), its grid")
+    ap.add_argument("--waves", type=int, default=2, help="--split: waves per workgroup (4: -DHKGEN_W4)")
     a = ap.parse_args()
     spec = runner.load_ladder(a.ladder)
     sh = L.parse_shape(a.shape, spec["problem"])
@@ -166,7 +167,7 @@ def main():
     torch.cuda.synchronize()
     g = plan["ds_full"][: mod.DS_GUARD_B // 2].view(torch.int32).cpu().tolist()
     if a.allwg and (a.split or a.rt):  # modes 3 / 4 leave the per-phase words unwritten
-        split_report(g, a.allwg) if a.split else rt_report(g, a.allwg, a.slots, plan["grids"]["dq" if a.dq else "dkdv"])
+        split_report(g, a.allwg, a.waves) if a.split else rt_report(g, a.allwg, a.slots, plan["grids"]["dq" if a.dq else "dkdv"])
         return 0
     if a.allwg and a.proepi:
         rec = [x & 0xFFFFFFFF for x in g[1024: 1024 + a.allwg]]

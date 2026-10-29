@@ -1,0 +1,96 @@
+[2026-10-29T10:20:17 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: sh -c python3 -m hkl.test mla/ladder_bwd.json --rung r11_ps --shapes toy | tail -2; echo == r10x_ps2; python3 -m micro.k3_probe mla/ladder_bwd.json r10x_ps2 --abc --calls 20 --allwg 11008 --split | sed -n 1,30p; echo == r11_ps; python3 -m micro.k3_probe mla/ladder_bwd.json r11_ps --abc --calls 20 --allwg 5504 --split --waves 4 | sed -n 1,60p
+  r11_ps           PASS  dq  52.06 dk  52.09 dv  52.72  det
+ALL PASS
+== r10x_ps2
+wave 0: 1376 workgroups (li % 64 < 8), cycles
+   entry -> INIT start                mean    2501  median   2338  p10   1879  p90   3228
+   INIT issued                        mean    3252  median   2809  p10   2276  p90   5493
+   tile 0 landed (own half)           mean    3742  median   3240  p10   2706  p90   6937
+   prologue (+ barrier, LOOP inputs)  mean    4000  median   3449  p10   2903  p90   7221
+   epilogue: tensorcnt 0 + barrier    mean      86  median     31  p10     31  p90     90
+   epilogue (FINAL issued)            mean    2776  median   2297  p10   1843  p90   3436
+   per li % 8 (XCD), workgroups li >= 512: mean entry / prologue / loop / epilogue (cycles)
+      0: n 164    2382    3567     79131    2378
+      1: n 164    2347    4058     79743    2542
+      2: n 164    2386    3477     79429    2537
+      3: n 164    2378    4086     79739    2498
+      4: n 164    2365    3483     79415    2496
+      5: n 164    2362    4038     79891    2525
+      6: n 164    2372    3486     79093    2553
+      7: n 164    2330    4060     79718    2678
+wave 1: 1376 workgroups (li % 64 < 8), cycles
+   entry -> INIT start                mean    2496  median   2331  p10   1871  p90   3235
+   INIT issued                        mean    3225  median   2791  p10   2244  p90   5293
+   tile 0 landed (own half)           mean    3715  median   3222  p10   2670  p90   6743
+   prologue (+ barrier, LOOP inputs)  mean    4004  median   3455  p10   2908  p90   7230
+   epilogue: tensorcnt 0 + barrier    mean      88  median     35  p10     31  p90     98
+   epilogue (FINAL issued)            mean    2775  median   2294  p10   1841  p90   3460
+   per li % 8 (XCD), workgroups li >= 512: mean entry / prologue / loop / epilogue (cycles)
+      0: n 164    2375    3572     79128    2372
+      1: n 164    2347    4059     79743    2543
+      2: n 164    2378    3484     79426    2512
+      3: n 164    2369    4093     79738    2492
+      4: n 164    2363    3485     79413    2496
+      5: n 164    2355    4044     79895    2531
+== r11_ps
+wave 0: 688 workgroups (li % 64 < 8), cycles
+   entry -> INIT start                mean    2336  median   2015  p10   1954  p90   2702
+   INIT issued                        mean    3376  median   3142  p10   2609  p90   4102
+   tile 0 landed (own half)           mean    3806  median   3502  p10   2969  p90   4536
+   prologue (+ barrier, LOOP inputs)  mean    4167  median   3797  p10   3247  p90   4804
+   epilogue: tensorcnt 0 + barrier    mean     138  median    111  p10     78  p90    144
+   epilogue (FINAL issued)            mean    3392  median   3108  p10   2705  p90   3908
+   per li % 8 (XCD), workgroups li >= 512: mean entry / prologue / loop / epilogue (cycles)
+      0: n  78    2221    3440     88908    3221
+      1: n  78    2169    4211     89396    3156
+      2: n  78    2186    3493     88941    3035
+      3: n  78    2178    4398     89098    3180
+      4: n  78    2186    3496     89345    3177
+      5: n  78    2178    4291     89400    3099
+      6: n  78    2147    3556     88973    3209
+      7: n  78    2139    4483     89404    3277
+wave 1: 688 workgroups (li % 64 < 8), cycles
+   entry -> INIT start                mean    2328  median   2007  p10   1945  p90   2698
+   INIT issued                        mean    3398  median   3127  p10   2609  p90   4059
+   tile 0 landed (own half)           mean    3828  median   3487  p10   2969  p90   4542
+   prologue (+ barrier, LOOP inputs)  mean    4171  median   3798  p10   3249  p90   4807
+   epilogue: tensorcnt 0 + barrier    mean     111  median     75  p10     62  p90    109
+   epilogue (FINAL issued)            mean    3189  median   2872  p10   2511  p90   3652
+   per li % 8 (XCD), workgroups li >= 512: mean entry / prologue / loop / epilogue (cycles)
+      0: n  78    2213    3444     88944    2909
+      1: n  78    2159    4215     89423    2939
+      2: n  78    2179    3498     88973    2821
+      3: n  78    2171    4401     89119    3007
+      4: n  78    2178    3500     89381    2971
+      5: n  78    2170    4296     89421    2899
+      6: n  78    2139    3560     89010    2990
+      7: n  78    2131    4487     89429    3092
+wave 2: 688 workgroups (li % 64 < 8), cycles
+   entry -> INIT start                mean    2326  median   2007  p10   1943  p90   2692
+   INIT issued                        mean    2695  median   2453  p10   2009  p90   3146
+   tile 0 landed (own half)           mean    3126  median   2813  p10   2369  p90   3506
+   prologue (+ barrier, LOOP inputs)  mean    4171  median   3799  p10   3250  p90   4809
+   epilogue: tensorcnt 0 + barrier    mean     115  median     80  p10     62  p90    113
+   epilogue (FINAL issued)            mean    3243  median   2928  p10   2572  p90   3693
+   per li % 8 (XCD), workgroups li >= 512: mean entry / prologue / loop / epilogue (cycles)
+      0: n  78    2211    3445     88937    3032
+      1: n  78    2159    4215     89421    2993
+      2: n  78    2176    3498     88967    2867
+      3: n  78    2169    4402     89119    3047
+      4: n  78    2177    3500     89372    3015
+      5: n  78    2168    4296     89421    2980
+      6: n  78    2138    3561     88999    3035
+      7: n  78    2129    4488     89430    3136
+wave 3: 688 workgroups (li % 64 < 8), cycles
+   entry -> INIT start                mean    2322  median   2001  p10   1939  p90   2690
+   INIT issued                        mean    2670  median   2455  p10   1999  p90   3091
+   tile 0 landed (own half)           mean    3103  median   2815  p10   2359  p90   3451
+   prologue (+ barrier, LOOP inputs)  mean    4174  median   3796  p10   3255  p90   4813
+   epilogue: tensorcnt 0 + barrier    mean     116  median     80  p10     62  p90    117
+   epilogue (FINAL issued)            mean    3346  median   3059  p10   2663  p90   3851
+   per li % 8 (XCD), workgroups li >= 512: mean entry / prologue / loop / epilogue (cycles)
+      0: n  78    2207    3448     88941    3145
+      1: n  78    2155    4218     89419    3090
+      2: n  78    2172    3501     88971    2987
+      3: n  78    2165    4405     89116    3161
+[10:20:31 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_102017_ps11.log

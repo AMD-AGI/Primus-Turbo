@@ -1,16 +1,21 @@
 diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
 --- a/include/dqds/dqds_impl.h	2026-10-29 09:46:15.343936169 +0000
-+++ b/include/dqds/dqds_impl.h	2026-10-29 09:46:15.357877132 +0000
-@@ -114,7 +114,7 @@
++++ b/include/dqds/dqds_impl.h	2026-10-29 09:52:49.079658355 +0000
+@@ -114,18 +114,19 @@
  
  template <int NQW>
  Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int Skv, int Hq,
 -                      int Hkv, int G, int nkvt, int cshift, int causal, int q0g, int HG) {
-+                      int Hkv, int G, int nkvt, int cshift, int causal, int q0g, int HG, int bx, int bz) {
++                      int Hkv, int G, int nkvt, int cshift, int causal, int q0g, int HG, int bx, int bz,
++                      int tid_in) {
      constexpr int NB_G = nbg(NQW);
      constexpr int NACC = NQW * NDT;
  
-@@ -125,7 +125,7 @@
+     // ---- identity
+     // ----------------------------------------------------------------------------------------------
+-    const int  tid  = thread_id_x();
++    const int  tid  = tid_in;
+     const int  lane = tid % WAVE;
      const int  wv   = readfirstlane(tid / WAVE); // uniform (SGPR) wave index 0..3
      const bool dsw  = c_role_ds(wv); // uniform: this wave issues the dS ops (else the K ops)
      const int  hh   = c_half(wv);    // its kv32 row / K half inside a unit
@@ -19,7 +24,7 @@ diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
      const int  bat  = head_bat(hb, Hq);
      const int  qh   = head_qh(hb, bat, Hq);
      const int  hkv  = head_kv(qh, G);
-@@ -448,16 +448,59 @@
+@@ -448,16 +449,81 @@
  // The kernel entry: grid (HG, ntile + nhead, B*Hq/HG), block 128.
  Q1_DEV void dqds_kernel(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int Skv, int Hq,
                          int Hkv, int G, int nkvt, int cshift, int causal, int q_off, int ntile,
@@ -30,22 +35,6 @@ diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
 +#endif
 +                        ) {
      lock_simd(); // SCHED_MODE.DISABLE_XDL_ARB_STALL, as bwd_r6_a's k_dqds192 / k_dqg96 / k_dqds_b
--    const int gy = block_id_y();
--    if (!tile_is_head(gy, ntile)) {
--        dqds_body<MAIN_NQW>(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal,
--                            tile_q0g(q_off, ntile, gy), HG);
--    } else {
--        dqds_body<HEAD_NQW>(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, head_q0g(q_off),
--                            HG);
-+    auto item_body = [&](int bx, int gy, int bz) DQ_INL {
-+        if (!tile_is_head(gy, ntile)) {
-+            dqds_body<MAIN_NQW>(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal,
-+                                tile_q0g(q_off, ntile, gy), HG, bx, bz);
-+        } else {
-+            dqds_body<HEAD_NQW>(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal,
-+                                head_q0g(q_off), HG, bx, bz);
-+        }
-+    };
 +#if DQ_PERSIST
 +    // persistent workgroups (grid x = resident workgroups, one per WGP), work items li = (bz * gy_n + gy) * HG + bx
 +    // (the non-persistent grid's: per bz the longest q tiles first) from one queue per XCD (the dispatcher deals
@@ -53,10 +42,18 @@ diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
 +    // front of DS, zeroed before the launch): the same items per XCD as the non-persistent grid (a head's K stays
 +    // in its L2), and a workgroup whose queue ran dry takes the next item of the other queues. Every item asks
 +    // its own queue for the next one when it starts (the reply read after its epilogue); the stealing waits.
++    // The arguments and the thread id are re-read per item through opaque values: nothing loop-invariant of the
++    // two tile bodies is hoisted out of the item loop (it would stay live across it and spill SGPRs).
++    (void)K, (void)DQ, (void)Sq, (void)Skv, (void)Hq, (void)Hkv, (void)G, (void)nkvt, (void)cshift, (void)causal;
 +    __shared__ int s_item[1];
-+    const int gy_n = ntile + (q_off > 0 ? 1 : 0), n = HG * gy_n * nz, k0 = block_id_x() % 8;
-+    int *const cnt = reinterpret_cast<int *>(reinterpret_cast<unsigned char *>(const_cast<__bf16 *>(DS)) - 128);
-+    auto steal = [&](int first) -> int { // lane 0 of wave 0: queues k0 + first .. k0 + 7
++    struct DqA {
++        const __bf16 *DS, *K;
++        __bf16 *DQ;
++        int Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q_off, ntile, HG, nz;
++    };
++    using DqAC = const __attribute__((address_space(4))) DqA;
++    const int k0 = block_id_x() % 8;
++    auto steal = [&](int *cnt, int n, int first) -> int { // lane 0 of wave 0: queues k0 + first .. k0 + 7
 +        for (int j = first; j < 8; ++j) {
 +            const int k = (k0 + j) % 8;
 +            const int t = __hip_atomic_fetch_add(cnt + k, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -66,23 +63,48 @@ diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
 +        return n;
 +    };
 +    if (thread_id_x() == 0)
-+        s_item[0] = steal(0);
++        s_item[0] = steal(reinterpret_cast<int *>(reinterpret_cast<unsigned char *>(const_cast<__bf16 *>(DS)) - 128),
++                          HG * (ntile + (q_off > 0 ? 1 : 0)) * nz, 0);
 +    wg_sync();
-+    for (int item = readfirstlane(s_item[0]); item < n;) {
++    for (;;) {
++        DqAC *a   = (DqAC *) __builtin_amdgcn_kernarg_segment_ptr();
++        int   tid = (int) __builtin_amdgcn_workitem_id_x();
++        asm volatile("" : "+s"(a));
++        asm volatile("" : "+v"(tid));
++        const int gy_n = a->ntile + (a->q_off > 0 ? 1 : 0), n = a->HG * gy_n * a->nz;
++        const int item = readfirstlane(s_item[0]);
++        if (item >= n)
++            break;
++        int *const cnt = reinterpret_cast<int *>(reinterpret_cast<unsigned char *>(const_cast<__bf16 *>(a->DS)) - 128);
 +        int pre = 0; // own queue's reply for the next item (inline asm: no wait until it is read below)
-+        if (thread_id_x() == 0)
++        if (tid == 0)
 +            asm volatile("global_atomic_add_u32 %0, %1, %2, %3 th:TH_ATOMIC_RETURN scope:SCOPE_DEV\n\t"
 +                         "s_wait_alu depctr_vm_vsrc(0)"
 +                         : "=&v"(pre) : "v"(4 * k0), "v"(1), "s"(cnt) : "memory");
-+        item_body(item % HG, item / HG % gy_n, item / (HG * gy_n));
++        const int bx = item % a->HG, gy = item / a->HG % gy_n, bz = item / (a->HG * gy_n);
++        if (!tile_is_head(gy, a->ntile)) {
++            dqds_body<MAIN_NQW>(a->DS, a->K, a->DQ, a->Sq, a->Skv, a->Hq, a->Hkv, a->G, a->nkvt, a->cshift,
++                                a->causal, tile_q0g(a->q_off, a->ntile, gy), a->HG, bx, bz, tid);
++        } else {
++            dqds_body<HEAD_NQW>(a->DS, a->K, a->DQ, a->Sq, a->Skv, a->Hq, a->Hkv, a->G, a->nkvt, a->cshift,
++                                a->causal, head_q0g(a->q_off), a->HG, bx, bz, tid);
++        }
 +        asm volatile("s_wait_loadcnt 0x0" ::: "memory");
-+        if (thread_id_x() == 0)
-+            s_item[0] = pre < (n - k0 + 7) / 8 ? 8 * pre + k0 : steal(1);
++        if (tid == 0)
++            s_item[0] = pre < (n - k0 + 7) / 8 ? 8 * pre + k0 : steal(cnt, n, 1);
 +        wg_sync(); // also: every wave's epilogue done before the next item's TDM fills the rings
-+        item = readfirstlane(s_item[0]);
-     }
++    }
 +#else
-+    item_body(block_id_x(), block_id_y(), block_id_z());
+     const int gy = block_id_y();
+     if (!tile_is_head(gy, ntile)) {
+         dqds_body<MAIN_NQW>(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal,
+-                            tile_q0g(q_off, ntile, gy), HG);
++                            tile_q0g(q_off, ntile, gy), HG, block_id_x(), block_id_z(), thread_id_x());
+     } else {
+         dqds_body<HEAD_NQW>(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, head_q0g(q_off),
+-                            HG);
++                            HG, block_id_x(), block_id_z(), thread_id_x());
+     }
 +#endif
  }
  

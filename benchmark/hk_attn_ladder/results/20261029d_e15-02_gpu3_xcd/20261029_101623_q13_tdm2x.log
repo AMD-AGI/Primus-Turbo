@@ -1,0 +1,19 @@
+[2026-10-29T10:16:23 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m hkl.ladder mla/ladder_bwd.json --rung r10x r10z_tdm2x --baseline -r 6
+device gfx1250 (256 CUs)  torch 2.14.0+rocm10.2.0a20261011  ladder mla_bwd  shape b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd
+reference 1.6 s
+  verify r10x               dq 52.3 dk 52.3 dv 52.6
+  verify r10z_tdm2x         dq 52.3 dk 52.3 dv 52.6
+  verify r10z_tdm2x#null    dq 52.3 dk 52.3 dv 52.6
+  round 1/6: r10x=2.2871 r10z_tdm2x=2.4628 r10z_tdm2x#null=2.4802
+  round 2/6: r10x=2.2914 r10z_tdm2x=2.4671 r10z_tdm2x#null=2.4680
+  round 3/6: r10x=2.2860 r10z_tdm2x=2.4698 r10z_tdm2x#null=2.4742
+  round 4/6: r10x=2.2829 r10z_tdm2x=2.4563 r10z_tdm2x#null=2.4657
+  round 5/6: r10x=2.3001 r10z_tdm2x=2.4664 r10z_tdm2x#null=2.4596
+  round 6/6: r10x=2.2904 r10z_tdm2x=2.4713 r10z_tdm2x#null=2.4720
+arm                        ms  TFLOP/s     over             step  step cyc   sclk    Mcyc      W     mJ  a08 ms  feature
+------------------------------------------------------------------------------------------------------------------------
+r10x                   2.2887   1561.7                                       1186   2.714      -      -          r10w + K / V by TDM (-DHKGEN_KV_TDM=1): INIT moves the wave'
+r10z_tdm2x             2.4667   1449.0     r10x     0.929x±0.003    0.900x   1221   3.010      -      -          r10x with every Q / dO tile's TDM issued twice (same stage, 
+r10z_tdm2x#null        2.4700   1447.1                                       1220   3.013      -      -          r10x with every Q / dO tile's TDM issued twice (same stage, 
+null control r10z_tdm2x vs #null: 0.9989x ± 0.0035
+[10:16:58 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_101623_q13_tdm2x.log
