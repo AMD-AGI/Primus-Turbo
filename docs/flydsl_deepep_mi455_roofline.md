@@ -38,9 +38,13 @@ of the hardware. Branch `dev/boyang/flydsl_deepep_gfx1250_roofline`, from PR #58
   so compare link bytes, as nccl-tests' busbw does).
 - **Where the gap is** (dispatch at 160 CUs: 123 µs = 88 µs send at the copy kernel's ceiling + 29 µs of
   local writes + 6 µs): the rank's own rows are stored by the sending warps one row at a time, and the
-  peers' rows are copied out of the heap after each block's send, about half each; the notify and host wait
-  add 57 µs; below 96 channels the combine reduces only after pushing; with 64 CUs or fewer each CU's
-  issue rate bounds the send.
+  peers' rows are copied out of the heap after each block's send (phase stamps: the copy runs 14 µs past
+  the last send); the notify and host wait add 57 µs; the combine's reduce ran up to 40 µs past its last
+  push; with 64 CUs or fewer each CU's issue rate bounds the send.
+- **First change on this branch** (`550ad251`): the combine's reduce claims one token at a time instead
+  of four (a claim waits for all its tokens' rows, so one late row held up four tokens). Combine at 160
+  CUs: EP2 145.7 → 126.8 µs (49% → 56% of 1.62 TB/s), EP4 302.5 → 260.6 µs (57% → 66%); outputs
+  checked, `test_intranode.py` passes on 2 and 4 GPUs. See [Inside the kernels](#inside-the-kernels-phase-stamps).
 
 ## How the roofline is measured
 
@@ -310,13 +314,49 @@ EP2, T = 8192, every term from the ceilings measured with the same number of blo
   copy kernel's own 15–20 µs of launch, ramp and tail.
 - **Notify and host wait**: +57 µs over the cached dispatch (of it the notify kernel 27 µs against the
   cached path's 10 µs); `num_worst_tokens` (no host wait) +23 µs.
-- **Combine**: below 96 channels every warp pushes first and reduces afterwards
-  (`combine_v2_push_warps`), so push and reduce add up (32 CUs: 164 + 184 µs). From 96 channels 22 of 32
-  warps push (LDS holds 22 row slots at hidden 7168) and 10 reduce from the start; the combine is then
-  41–64 µs above the send while HBM runs at 17% of its peak: not a bandwidth limit (flag waits, the
-  reduce tail, fewer pushers).
+- **Combine**: at every grid size 22 of 32 warps push (with TDM, LDS holds 22 row slots at hidden 7168;
+  `combine_v2_push_warps` asks for all 32 below 96 channels, but the LDS cap applies) and 10 reduce from
+  the start. The combine was 41–64 µs above the send while HBM ran at 17% of its peak: not a bandwidth
+  limit. The phase stamps below place it: the slowest block's push ends 33 µs after the median one, and
+  with claims of four tokens the reduce ran 34–40 µs past the last push.
 - **Few CUs**: the TDM send moves about 22 GB/s per CU, so 32 CUs give 707 GB/s, 39% of the link peak,
   whatever the protocol does.
+
+## Inside the kernels: phase stamps
+
+`PRIMUS_TURBO_DEEPEP_V2_PHASE_TIMING=1` makes thread 0 of every block store realtime-counter stamps
+(100 MHz) into the local heap; `bench_ops.py` then adds an `<op>_phases` row per op from its last call
+on every rank. Off, the kernels compile to the same ISA (gfx1250, EP2 and EP4); on, the timed results
+move by under 1%. Stamps (µs from the first block's start, slowest rank; EP2, T = 8192,
+`ut_logs/phase_timing_20261029_104412/`):
+
+| CUs | dispatch: every block has sent | receive copy done | after the last send | combine: warp 0 of every block has pushed | median block | every block done | after the last push |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 216.1 | 252.4 | 36.3 | 271.9 | 244.0 | 335.1 | 63.2 |
+| 80 | 103.0 | 124.7 | 21.7 | 120.1 | 95.5 | 157.5 | 37.4 |
+| 160 | 94.9 | 108.9 | 14.0 | 97.2 | 63.8 | 136.9 | 39.7 |
+| 256 | 90.2 | 104.3 | 14.1 | 88.2 | 43.7 | 128.0 | 39.8 |
+
+- The dispatch kernel's 108.9 µs at 160 CUs: 95 µs until every block has sent (about 7 µs over the
+  copy kernel's ceiling, own-row stores included), then 14 µs in which the last channels' rows are copied
+  out of the heap.
+- The combine: the median block's warp 0 has pushed at 64 µs, the slowest at 97 µs; the reduce then ran
+  another 40 µs.
+
+Two knobs were swept with the stamps on (EP2, combine µs; `ut_logs/push_warps_*`, `ut_logs/reduce_grab_*`):
+
+| | 32 CUs | 80 CUs | 160 CUs | 256 CUs |
+|---|---:|---:|---:|---:|
+| default before (22 push warps, claims of 4) | 347.6 | 168.4 | 145.7 | 137.9 |
+| 16 / 12 / 8 / 4 push warps (claims of 4) | 406.7 / 409.6 / 429.4 / 413.7 | 182.2 / 186.3 / 196.9 / 207.7 | 165.2 / 175.3 / 178.9 / 156.5 | 141.6 / 147.6 / 153.2 / 154.9 |
+| claims of 8 | 357.6 | 192.4 | 167.6 | 161.0 |
+| claims of 2 | 344.0 | 162.5 | 134.8 | 127.1 |
+| **claims of 1 (new default)** | **333.0** | **153.1** | **126.8** | **120.0** |
+
+Fewer pushers shorten the reduce tail but slow the push more; one-token claims take the reduce tail after
+the last push from 34 to 12 µs at 160 CUs. At EP4 (DeepSeek-V3 routing) the combine goes from 302.5 to
+260.6 µs at 160 CUs and from 285.4 to 248.1 µs at 256 (`ut_logs/grab1_validate_20261029_105409/`);
+`test_intranode.py` passes on 2 and 4 GPUs (21 tests, 2 skipped: C++ only).
 
 ## What could still be gained
 
@@ -324,10 +364,11 @@ EP2, 160 CUs; modelled from the terms above, not yet measured:
 
 | change | removes | cached dispatch | combine |
 |---|---|---:|---:|
-| overlap or drop the receive copy (receive warps beside the senders, or `recv_x` in the heap) | about 15 µs | → about 108 µs | – |
-| take the own-row stores off the send's path (two row buffers per warp, in pieces; the next load while the stores drain) | about 15 µs | → about 108 µs (94 with the row above) | – |
-| overlap push and reduce below 96 channels | most of the 184 µs at 32 CUs | – | 32 CUs: toward the send alone, 164 µs |
-| reach the achievable link rate on the send (1.32 → 1.6 TB/s) | about 15 µs | → about 108 µs (79 with both rows above) | → about 131 µs |
+| ~~one token per reduce claim~~ (done, `550ad251`) | the reduce tail 34 → 12 µs | – | 145.7 → 126.8 µs (measured) |
+| overlap or drop the receive copy (receive warps beside the senders, or `recv_x` in the heap) | the 14 µs after the last send (stamps) | → about 109 µs | – |
+| take the own-row stores off the send's path (two row buffers per warp, in pieces; the next load while the stores drain) | about 7 µs (the send is 7 µs above the copy kernel, stamps) | → about 116 µs (102 with the row above) | – |
+| balance the push across blocks (the slowest block's warp 0 ends 33 µs after the median) | up to about 33 µs | – | → about 95–110 µs |
+| reach the achievable link rate on the send (1.32 → 1.6 TB/s) | about 15 µs | → about 108 µs (87 with both rows above) | → about 112 µs |
 | the link peak | | 64 µs | 64 µs |
 
 ### What DeepEP does about the same parts
@@ -336,7 +377,7 @@ EP2, 160 CUs; modelled from the terms above, not yet measured:
 |---|---|---|---|
 | receive copy into `recv_x` | overlapped: even blocks send, odd blocks receive and copy from per-channel rings into `recv_x` as the tails advance (the design `flydsl` V1 ports) | a separate copy kernel after the transfer (`dispatch_copy_epilogue_impl`); `defer_epilogue=True` moves it, and the CPU count wait, to `event.current_stream_wait()` so compute can run in between; the benchmark's bandwidth leaves it out | overlap it inside the kernel (V1's way), or drop it by returning `recv_x` as a view of a double-buffered heap (neither DeepEP version does this) |
 | notify and host wait | the dispatch needs the counts first; `num_worst_tokens` skips the host wait | the transfer writes into buffer slots before the counts are known; the CPU waits afterwards | the same as V2: give each source rank its own heap region so the send needs no prefix matrix, and let the receive copy order the rows |
-| combine reduce | odd blocks reduce as the pushed rows arrive | a separate, deferrable reduce epilogue | reduce while pushing at every grid size; all warps pushing (LDS in pieces); flags per chunk |
+| combine reduce | odd blocks reduce as the pushed rows arrive | a separate, deferrable reduce epilogue | already overlapped (10 reduce warps per block from the start); claims of one token (done); balance the push across blocks |
 | per-CU send rate | – (on H800 a handful of SMs fill NVLink: 160 GB/s against 45 GB/s of writes per SM; the benchmark uses 24 of 132) | TMA-based backends | on MI455X about 74 CUs fill the link (1.62 TB/s against 22 GB/s per CU), so the per-CU rate and copy engines matter far more than on H800 |
 | copy engines | – | used for all-gather (`num_sms=0`); EP dispatch and combine need SMs | copy engines for the bulk rows at low CU counts (SDMA moves 1.38–1.54 TB/s here) |
 
