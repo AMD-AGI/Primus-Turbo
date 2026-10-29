@@ -41,7 +41,7 @@ the same `Buffer` API. Internode (rocSHMEM) and low-latency kernels always use `
 All three return the same tensors. `cpp` and `flydsl` also return the same handles, so a handle from
 one can drive the other's cached dispatch or combine; `flydsl_v2` handles work with `flydsl_v2` only.
 On MI455X, `flydsl_v2` is 2.2–5.1× faster than `flydsl` at the kernel level and as fast or faster end
-to end (`docs/flydsl_deepep_mi455.md`).
+to end (design and kernel numbers: `docs/flydsl_deepep_mi455.md`).
 
 #### Choosing a backend
 
