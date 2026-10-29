@@ -26,7 +26,7 @@ import os
 
 import torch
 import torch.distributed as dist
-from common import RANK, WORLD, Results, bench, finish, gather_matrix, init, routing, xgmi_rows
+from common import RANK, ROUNDS, WORLD, Results, bench, finish, gather_matrix, init, routing, xgmi_rows
 
 T = int(os.environ.get("TOKENS", 8192))
 H = int(os.environ.get("HIDDEN", 7168))
@@ -345,24 +345,33 @@ def measure_equal(kind, sbuf, rbuf):
         except RuntimeError as e:
             results.add(impl=f"rccl_{kind}", T=T, op="equal_alltoall", launch=launch, error=str(e)[:200])
     if B2B and "eager" in LAUNCH:
-        results.add(op="equal_alltoall_b2b", launch="eager", **fields, us=back_to_back(equal, B2B))
+        results.add(op="equal_alltoall_b2b", launch="eager", **fields, **back_to_back(equal, B2B))
 
 
 def back_to_back(fn, iters, warmup=10):
-    """Mean µs per call of `iters` calls between two events, slowest rank (06-rccl's timing)."""
+    """06-rccl's timing: per round, the mean µs per call of `iters` calls between two events on the slowest
+    rank; ROUNDS rounds give mean (min-max)."""
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
-    dist.barrier()
-    s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    s.record()
-    for _ in range(iters):
-        fn()
-    e.record()
-    torch.cuda.synchronize()
-    t = torch.tensor([s.elapsed_time(e) * 1e3 / iters], device="cuda")
-    dist.all_reduce(t, op=dist.ReduceOp.MAX)
-    return t.item()
+    per_round = []
+    for _ in range(ROUNDS):
+        torch.cuda.synchronize()
+        dist.barrier()
+        s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        s.record()
+        for _ in range(iters):
+            fn()
+        e.record()
+        torch.cuda.synchronize()
+        t = torch.tensor([s.elapsed_time(e) * 1e3 / iters], device="cuda")
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+        per_round.append(t.item())
+    return {
+        "us": sum(per_round) / len(per_round),
+        "min": min(per_round),
+        "max": max(per_round),
+        "rounds": per_round,
+    }
 
 
 for kind in BUFFERS:
