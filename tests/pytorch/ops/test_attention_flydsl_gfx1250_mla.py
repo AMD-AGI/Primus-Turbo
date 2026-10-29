@@ -729,8 +729,6 @@ def test_hk_manifest():
 
 
 _ASM_HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@$")
-# A VGPR operand; above v255 the compiler adds the true register as a comment: v[26:29] /*v[794:797]*/
-_ASM_VGPR = re.compile(r"v(\[\d+:\d+\]|\d+)(?:\s*/\*\s*v(\[\d+:\d+\]|\d+)\s*\*/)?")
 
 
 def _asm_patch_hunks(patch):
@@ -747,42 +745,52 @@ def _asm_patch_hunks(patch):
     return hunks
 
 
-def _asm_vgpr_shape(line):
-    """The line with every VGPR operand replaced by its tuple size and 256-VGPR block."""
-
-    def shape(m):
-        lo, *hi = (int(n) for n in re.findall(r"\d+", m.group(2) or m.group(1)))
-        return f"v<{(hi[0] if hi else lo) - lo + 1}@{lo // 256}>"
-
-    return _ASM_VGPR.sub(shape, line)
+_ASM_MARKER = re.compile(r";\s*HKGEN (INIT|LOOP|FINAL) nkv=(\d)\b")
+_ASM_ALLOC = re.compile(r"\s*(\.amdhsa_next_free_vgpr\s+|\.vgpr_count:\s+)(\d+)$")
 
 
 def test_hk_asm_patches(tmp_path):
-    """Every manifest asm_patch (tools/regen_asm_patch.py) is shipped and only renumbers VGPRs (same
-    tuple sizes, same 256-VGPR blocks, so every s_set_vgpr_msb stays valid) and changes s_wait_alu lines.
-    hsaco.py applies it to its own context only: it applies to an input rebuilt from its hunks, a
-    changed context line is rejected, and a compiler .s with another sha256 is refused before anything
-    is patched or assembled (no compiler needed)."""
+    """Every manifest asm_patch (tools/regen_asm_patch.py: the r8gen generator) is shipped and has the generated
+    kernel's shape: each hunk either inserts one region right behind its ``; HKGEN <INIT|LOOP|FINAL> nkv=<3|2>``
+    marker line (every region of both block heights exactly once; no s_endpgm or PC change inside, branches only to
+    the region's own labels) or raises the VGPR allocation to 1024 (``.amdhsa_next_free_vgpr``, ``.vgpr_count``).
+    hsaco.py applies it to its own context only: it applies to an input rebuilt from its hunks, a changed context
+    line is rejected, and a compiler .s with another sha256 is refused before anything is patched or assembled (no
+    compiler needed)."""
     hsaco = _hk_package("hsaco")
     kernels = {n: k for n, k in hsaco.load_manifest()["kernels"].items() if "asm_patch" in k}
     assert set(kernels) == {"k_dkdv96ds"}
     for name, k in kernels.items():
         assert re.fullmatch(r"[0-9a-f]{64}", k["asm_input_sha256"]), name
+        assert "-DHKGEN=1" in k["extra_flags"] and k["vgpr"] == 1024, name
         patch = (hsaco.HIP_DIR / k["asm_patch"]).read_text()
-        src, want, shift, renumbered = [], [], 0, 0
+        src, want, shift, regions, allocs = [], [], 0, [], 0
         for old_start, new_start, ops in _asm_patch_hunks(patch):
             assert old_start > len(src) and new_start == old_start + shift, (name, old_start)
             fill = [f"\t; line {n + 1}" for n in range(len(src), old_start - 1)]
             src += fill + [t for tag, t in ops if tag != "+"]
             want += fill + [t for tag, t in ops if tag != "-"]
             shift += sum(t == "+" for t, _ in ops) - sum(t == "-" for t, _ in ops)
-            old = [t for tag, t in ops if tag == "-" and "s_wait_alu" not in t]
-            new = [t for tag, t in ops if tag == "+" and "s_wait_alu" not in t]
-            assert len(old) == len(new), (name, old_start)
-            for a, b in zip(old, new):
-                assert a != b and _asm_vgpr_shape(a) == _asm_vgpr_shape(b), (name, a, b)
-            renumbered += len(new)
-        assert renumbered > 0, name
+            old = [t for tag, t in ops if tag == "-"]
+            new = [t for tag, t in ops if tag == "+"]
+            if old:  # the VGPR allocation, one line
+                assert len(old) == len(new) == 1, (name, old_start)
+                mo, mn = _ASM_ALLOC.fullmatch(old[0]), _ASM_ALLOC.fullmatch(new[0])
+                assert mo and mn and mo.group(1) == mn.group(1) and mn.group(2) == "1024", (name, old, new)
+                allocs += 1
+                continue
+            first_new = next(j for j, (tag, _) in enumerate(ops) if tag == "+")
+            marker = _ASM_MARKER.search(ops[first_new - 1][1]) if first_new else None
+            assert marker and all(tag == "+" for tag, _ in ops[first_new : first_new + len(new)]), (name, old_start)
+            labels = {t.strip()[:-1] for t in new if re.fullmatch(r"\s*\.L\w+:", t)}
+            for t in new:
+                ins = t.split(";")[0].strip()
+                assert not re.match(r"s_(endpgm|setpc|swappc|getpc|rfe)", ins), (name, t)
+                if re.match(r"s_(c)?branch", ins):
+                    assert ins.split()[-1] in labels, (name, t)
+            regions.append((marker.group(1), int(marker.group(2))))
+        assert sorted(regions) == sorted((r, n) for r in ("INIT", "LOOP", "FINAL") for n in (3, 2)), (name, regions)
+        assert allocs == 2, name
         text = "\n".join(src + ["\ts_endpgm"]) + "\n"
         assert hsaco._apply_unified_diff(text, patch) == "\n".join(want + ["\ts_endpgm"]) + "\n"
         first = _asm_patch_hunks(patch)[0][0] - 1  # the first hunk's first (context) line

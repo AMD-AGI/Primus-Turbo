@@ -7,7 +7,7 @@
 // dqds/dqds_impl.h (bwd_hk_dqds2) -- the recompute-free dQ kernel of the S1 line in HIP, 384-query
 // tiles:
 //
-//   dQ[q, :] = sum_{kv attended by q} dS[q, kv] K[kv, :]      (dS from the S1 scratch, dslayout v1,
+//   dQ[q, :] = sum_{kv attended by q} dS[q, kv] K[kv, :]      (dS from the S1 scratch, dslayout v2,
 //   scale included)
 //
 // bwd_hk_dqds's k_dqds_b with the workgroup doubled to 4 waves (block 128, 1 wave per SIMD, one
@@ -54,8 +54,8 @@
 #include "../q1/prims.h"
 #include "idx.h" // arm root (build.py: -Iinclude -I.)
 
-static_assert(DSL_VERSION == 1 && DSL_SCALED == 1,
-              "bwd_hk_dqds2 reads dslayout v1 with the scale included");
+static_assert(DSL_VERSION == 2 && DSL_SCALED == 1,
+              "bwd_hk_dqds2 reads dslayout v2 with the scale included");
 
 static_assert(dq::lds_bytes() <= 327680 && 2 * dq::lds_bytes() > 327680,
               "one workgroup per CU, inside the 320-KiB LDS");
@@ -152,7 +152,7 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
         const int d1 = r1 + ds_lane(lane);
         sfor<0, NQW>([&](auto Q) DQ_INL {
             constexpr int h  = decltype(Q)::value;
-            const int     po = wave_pair(wv, h / 2, NQW) * DSI_BLK_B + (h % 2) * 32;
+            const int     po = wave_pair(wv, h / 2, NQW) * DSI_BLK_B + ds_half(h % 2);
             S.ds[h]          = cat16(tr16(lds, d0 + po), tr16(lds, d1 + po));
         });
     };
@@ -389,7 +389,7 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
                 constexpr int h = decltype(Q)::value, k = h / 2;
                 static_assert(wave_pair(0, 2, MAIN_NQW) - wave_pair(0, 0, MAIN_NQW) == 8, "pair 2 = pair 0 + 8");
                 const int     base = k == 1 ? db1[s] : db[s];
-                constexpr int po   = (k == 2 ? 8 * DSI_BLK_B : 0) + (h % 2) * 32;
+                constexpr int po   = (k == 2 ? 8 * DSI_BLK_B : 0) + ds_half(h % 2);
                 Sx.ds[h] = cat16(tr16(lds, base + so + po), tr16(lds, base + so + r1 + po));
             });
         };

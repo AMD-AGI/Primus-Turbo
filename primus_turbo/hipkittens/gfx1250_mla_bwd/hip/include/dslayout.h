@@ -4,7 +4,7 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
-// dslayout.h -- the S1 dS^T scratch contract, version 1.
+// dslayout.h -- the S1 dS^T scratch contract, version 2 (v1 + fragment-native blocks).
 //
 // Owner: bwd_hk_k1ds (writer, k_dkdv64ds). Consumer: bwd_hk_dqds (reader, k_dqds), which carries a
 // BYTE-IDENTICAL copy of this file and checks its sha256 against the writer's. Any change is a new
@@ -29,10 +29,13 @@
 //     qp = dsl_qp_first(kt) .. Sq/32 - 1 in order ("packed causal": the leading q pairs of a row
 //     are fully masked for all 16 kv rows and are NOT stored; non-causal: dsl_qp_first == 0, a
 //     dense rectangle);
-//   * a block (bh, kt, qp) is the [16 kv][32 q] bf16 tile, row-major: element (kv, q) with kv = kv
-//   row - 16 kt
-//     in [0, 16) and q = query - 32 qp in [0, 32) sits at block byte kv * 64 + q * 2; 1024 B per
-//     block, so a 128-B line of a block holds kv rows 2l and 2l + 1.
+//   * a block (bh, kt, qp) is the [16 kv][32 q] bf16 tile in the order of the writer's dK B operand
+//     (version 2, "fragment-native"): 64 chunks of 16 B, chunk (kv, c) = the 8 queries [8 c, 8 c + 8) of kv
+//     row kv (kv = kv row - 16 kt in [0, 16), c in [0, 4)) at block byte dsl_chunk(kv, c) = (c / 2) * 512 +
+//     ((c % 2) * 16 + kv) * 16, so element (kv, q), q = query - 32 qp in [0, 32), sits at dsl_chunk(kv, q / 8)
+//     + (q % 8) * 2. A writer lane (kv row r = lane % 16, half h = lane / 16) holds chunks (r, h) and (r, h + 2)
+//     in its dK operand (dwords 0..3, 4..7) and stores them at lane * 16 and 512 + lane * 16: two whole 512-B
+//     stores per block, no cross-lane regroup. 1024 B per block. (v1: row-major, element at kv * 64 + q * 2.)
 //   dsl_qp_first(kt) = causal ? max(0, floor(kt / 2) - cshift / 32) : 0 is the first q pair with an
 //   attended entry (16 kt <= 32 qp + 31 + cshift); it is <= Sq/32 - 1 for every kt < Skv/16, so
 //   every row is non-empty. Size per region (prod s4096 causal): 16512 blocks = 16.9 MB; b2
@@ -52,11 +55,11 @@
 #endif
 #define DSL_FN static inline constexpr __host__ __device__
 
-#define DSL_VERSION 1
+#define DSL_VERSION 2
 #define DSL_SCALED 1   // dS carries the softmax scale (the dK operand as k_dkdv64 consumes it)
 #define DSL_KV 16      // kv rows per block
 #define DSL_Q 32       // queries per block (one q pair of 16-row tiles)
-#define DSL_ROW_B 64   // bytes of one block row (32 bf16)
+#define DSL_ROW_B 64   // bytes of 4 chunks (the readers' TDM pad interval; v1: one kv row of 32 bf16)
 #define DSL_BLK_B 1024 // bytes of one block
 
 DSL_FN int dsl_nqp(int Sq) {
@@ -101,11 +104,15 @@ DSL_FN int64_t dsl_blk(int64_t bh, int kt, int qp, int Sq, int Skv, int causal) 
     return bh * dsl_nblk_bh(Sq, Skv, causal) + dsl_row_off(kt, Sq, Skv - Sq, causal) +
            (int64_t) (qp - dsl_qp_first(kt, Skv - Sq, causal));
 }
+// block byte of chunk (kv row kv in [0, 16), query chunk c in [0, 4): queries [8 c, 8 c + 8))
+DSL_FN int dsl_chunk(int kv, int c) {
+    return (c >> 1) * 512 + ((c & 1) * 16 + kv) * 16;
+}
 // byte of element (kv row kvr, query qr) of head bh (kvr in row kt = kvr / 16, qr in pair qp = qr /
 // 32)
 DSL_FN int64_t dsl_byte(int64_t bh, int kvr, int qr, int Sq, int Skv, int causal) {
     return dsl_blk(bh, kvr / DSL_KV, qr / DSL_Q, Sq, Skv, causal) * DSL_BLK_B +
-           (int64_t) (kvr % DSL_KV) * DSL_ROW_B + (int64_t) (qr % DSL_Q) * 2;
+           (int64_t) dsl_chunk(kvr % DSL_KV, (qr % DSL_Q) / 8) + (int64_t) (qr % 8) * 2;
 }
 // is (kv16 row kt, q pair qp) stored?
 DSL_FN bool dsl_stored(int kt, int qp, int Sq, int Skv, int causal) {

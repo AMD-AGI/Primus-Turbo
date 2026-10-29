@@ -28,15 +28,16 @@
         "-mllvm",
         "-amdgpu-enable-delay-alu=false",
         "-mllvm",
-        "-greedy-regclass-priority-trumps-globalness"
+        "-greedy-regclass-priority-trumps-globalness",
+        "-DHKGEN=1"
       ],
-      "hsaco_sha256": "853798b9a06588a3c8d82c5de3fcbd963f8946f2e2be548b1c0ea82bb6585673",
+      "hsaco_sha256": "3025f55348c0e5dbc3fa6b8d9772c8202d44e3f8d90dbcd159596981ecfd8109",
       "asm_patch": "asm/k_dkdv96ds.s.patch",
-      "asm_input_sha256": "386bfa6733d3c5b5c057ab3d4f20c7ab8fa491a314abb7a4d41fd4c56643e076",
+      "asm_input_sha256": "82857db831a89bb21017f2fb409403e702a483bdb21ede77c5bd9ef11221f5e2",
       "block": 64,
       "kernarg_size": 120,
       "lds": 64512,
-      "vgpr": 1015,
+      "vgpr": 1024,
       "args": [
         {
           "name": "Q",
@@ -172,7 +173,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "hsaco_sha256": "f0956ad25711559d2a75734614a3465f11364969b1b2c57233221bc063e8879e",
+      "hsaco_sha256": "65c7cbb7e8e17b53734bad15d2dc9f73b3351dee1815532892502b28099ce1ee",
       "block": 128,
       "kernarg_size": 68,
       "lds": 302080,

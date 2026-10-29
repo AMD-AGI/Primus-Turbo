@@ -8,7 +8,7 @@
 // constexpr
 // __host__ __device__ functions of scalars. The kernel calls exactly these; bounds_proof.py
 // compiles this file for the host and replays them over every launched shape. The layout is
-// dslayout.h v1.
+// dslayout.h v2.
 //
 // k1ds_idx.h (bwd_hk_k1ds, byte-identical here) indexes a wave by (64-row block bid, wave wv), i.e.
 // kv16 rows kt0 = 4 bid + 2 wv and kt0 + 1. A k_dkdv96ds wave owns nkv kv16 rows starting at kt0 =

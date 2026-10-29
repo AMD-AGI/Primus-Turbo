@@ -7,7 +7,7 @@
 // idx.h -- every index formula of bwd_hk_dqds2's recompute-free dQ kernel k_dqds_c (main 384-query
 // tiles + the merged 256-query head tile), in ONE place.
 //
-//   dQ[q, :] = sum_kv dS[q, kv] K[kv, :]   (dS read from the S1 scratch in the dslayout v1
+//   dQ[q, :] = sum_kv dS[q, kv] K[kv, :]   (dS read from the S1 scratch in the dslayout v2
 //   contract, scale included)
 //
 // constexpr __host__ __device__ functions: the HIP kernel (src/k_dqds_c.hip via
@@ -79,7 +79,7 @@ constexpr int MAIN_ROWS = 16 * MAIN_NQW * NWAVE; // 384
 constexpr int HEAD_ROWS = 16 * HEAD_NQW * NWAVE; // 256
 constexpr int DS_BLK_EL = DSL_BLK_B / 2;         // 512 bf16 per dslayout block [16 kv][32 q]
 constexpr int DSI_ROW_B =
-    DSL_ROW_B + 16; // LDS row of a dS block image: 64 B data + 16 B pad (80 B)
+    DSL_ROW_B + 16; // LDS row of a dS block image: 64 B data (4 dslayout v2 chunks) + 16 B pad (80 B)
 constexpr int       DSI_BLK_B    = DSL_KV * DSI_ROW_B; // one block image (1280 B)
 constexpr unsigned  TDIM0        = 0x7FFFFFFFu; // inner extent: never clamps (bwd_hk_q1's TDM_DIM0)
 constexpr int       DQ_IMG_ROW_B = 400; // dQ epilogue image row (bwd_hk_q1: 384 B data + 16 B pad)
@@ -360,7 +360,8 @@ constexpr unsigned DS_W0 = (1u << 16) | (1u << 20) | (3u << 22) | (3u << 25);
 // LDS byte of element (block row rr in {0,1}, stored block j, kv k, q c) of an op landing at L
 // (stream pad model: destination byte b -> b + (b / 64) * 16)
 DQ_HD constexpr int dsop_elem_lds(int L, int nv, int rr, int j, int k, int c) {
-    return L + ((rr * nv + j) * DSL_BLK_B + k * DSL_ROW_B + 2 * c) / 64 * 80 + (2 * c) % 64;
+    return L + ((rr * nv + j) * DSL_BLK_B + dsl_chunk(k, c / 8) + 2 * (c % 8)) / 64 * 80 +
+           (dsl_chunk(k, c / 8) + 2 * (c % 8)) % 64;
 }
 
 // ---- K TDM ops
@@ -427,13 +428,21 @@ DQ_HD constexpr int c_k_imm(int dt, int h) {
     return dt * 32 + (dt / 4) * 32 + h * 16 * C_KROW_B;
 #endif
 }
+// dslayout v2: the tr16 lane reads chunk (kv row lane_r, query chunk 2 qhalf + lane_c / 8) of a block image,
+// at dsl_chunk = qhalf * 512 + g * 16 with g = (lane_c / 8) * 16 + lane_r, i.e. image byte qhalf * 640 + (g / 4) * 80 +
+// (g % 4) * 16 (the TDM pads 16 B after every 64 B): ds_lane(lane) + ds_half(qhalf)
 DQ_HD constexpr int ds_lane(int lane) {
-    return lane_r(lane) * DSI_ROW_B + lane_c(lane) * 2;
+    const int g = (lane_c(lane) / 8) * 16 + lane_r(lane);
+    return (g / 4) * DSI_ROW_B + (g % 4) * 16;
+}
+// image offset of the 16-query half qhalf of a block (its second 512 data bytes = 8 padded 64-B groups)
+DQ_HD constexpr int ds_half(int qhalf) {
+    return qhalf * 8 * DSI_ROW_B;
 }
 // operand of query sub-tile qh (q pair lb = qh / 2 relative to the reader's first block, 16-query
 // half qh % 2)
 DQ_HD constexpr int ds_imm(int qh) {
-    return (qh / 2) * DSI_BLK_B + (qh % 2) * 32;
+    return (qh / 2) * DSI_BLK_B + ds_half(qh % 2);
 }
 // row-1 image base of a slot whose op landed with shift sh (nbs blocks per row)
 DQ_HD constexpr int ds_row1(int slot, int nbs, int sh) {

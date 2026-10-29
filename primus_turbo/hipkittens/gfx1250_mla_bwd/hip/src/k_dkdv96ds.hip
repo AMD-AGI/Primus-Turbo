@@ -6,19 +6,19 @@
 
 // k_dkdv96ds (bwd_hk_k3ds): bwd_hk_k3's k_dkdv96
 // PLUS the S1 write side of bwd_hk_k1ds: every wave-iteration exports the bf16 dS^T it feeds the dK WMMA (a_dsk)
-// into the scratch DS in dslayout.h v1. The dK/dV computation is k3's, instruction for instruction in operands and
+// into the scratch DS in dslayout.h v2. The dK/dV computation is k3's, instruction for instruction in operands and
 // per-accumulator WMMA order, so dk / dv stay bitwise equal to bwd_hk_k3's (and bwd_r10_c's); the exported bytes are
 // k1ds's (same S/dP chains in the same lanes, same layout).
 //
 // Export:
-//   * regroup (k1ds's DPP recipe): a_dsk[kh] lane (row r, half h) holds 16-B chunks h and h + 2 of kv row 16 kh + r;
-//     per dword k < 4, X[k] = DPP row_ror:8 (a[4+k] -> lanes r >= 8, bank mask 0xC; old a[k]), Y[k] = DPP row_ror:8
-//     (a[k] -> lanes r < 8, bank mask 0x3; old a[4+k]); each buffer_store_b128 is 512 contiguous bytes = 4 whole
-//     128-B lines; 2 stores per kv16 block.
+//   * dslayout v2 (fragment-native): a_dsk[kh] lane (row r, half h) holds the 16-B chunks (r, h) and (r, h + 2) of
+//     the block of kv rows 16 kh .. 16 kh + 15; it stores dwords 0..3 at lane * 16 and dwords 4..7 at 512 + lane *
+//     16 (dslayout.h dsl_chunk): each buffer_store_b128 is 512 contiguous bytes = 4 whole 128-B lines, 2 stores per
+//     kv16 block, no cross-lane regroup (v1 needed 8 DPP + 8 moves per block).
 //   * descriptor per wave: 64-bit base = scratch + region bh0 = bat*Hq + hkv*G, row kt0 = kv0 / 16 (int64 math,
 //     k3ds_idx.h), num_records = the wave's TRUE extent (its NKV kv16 rows over the G q heads; route dsw0: ds_mode 0
 //     -> num_records 0, every store dropped at the address stage); soffset = gh * hstride + 1024 qt + rowc(kh)
-//     (SGPR), voffset per lane, loop-invariant (k1ds_voff; +512 for Y).
+//     (SGPR), voffset per lane, loop-invariant (k1ds_voff; +512 for the second store).
 //   * placement, 96-row body (NKV 3): full loop -> this iteration's 3 blocks right after the dO^T tr16 burst, at the
 //     head of the DS-free dV WMMA run (24 WMMAs before the Q^T burst); no payload crosses the back edge (k3 holds 998
 //     VGPRs; k1ds's deferred payload would add 24 at the S/dP peak). Masked loop -> at the end of the body, a block
@@ -79,7 +79,7 @@
 
 using namespace hk1;
 
-static_assert(DSL_VERSION == 1 && DSL_SCALED == 1, "k_dkdv96ds writes dslayout v1 with the scale inside dS");
+static_assert(DSL_VERSION == 2 && DSL_SCALED == 1, "k_dkdv96ds writes dslayout v2 with the scale inside dS");
 
 namespace {
 constexpr int NDT_QK = K1_D_QK / 32;   // 6: WMMA k-steps of S = Q K^T
@@ -90,7 +90,26 @@ constexpr int NQE = 2 * NDT_QK;        // 12 Q readback entries per hh
 constexpr int NHB = NQE + 2 * NDT_V;   // 20 entries per hh
 constexpr int NRB = 2 * NHB;           // 40 readback entries of a stage
 constexpr int NLD = 8;                 // carried NL/ND vec4 entries
-constexpr int KH0_SALU = 2;            // SALU per WMMA of the TDM-prep run (FlyDSL KH0_SALU)
+constexpr int KH0_SALU = 2;
+#ifndef HKGEN
+#define HKGEN 0        // 1: the 96-row blocks run the generated dK / dV loop (gen/r8gen.py) at inline-asm markers
+#endif
+#ifndef HKGEN_TAIL
+#define HKGEN_TAIL 1   // HKGEN: also run the 64-row tail blocks (generated too: markers nkv=2); 0 = timing only
+#endif
+#ifndef HKGEN_PROBE
+#define HKGEN_PROBE 0  // HKGEN: per-phase cycle sums of the steps (s96..s99) handed to the shell (PROBE marker)
+#endif
+// SGPRs the generated code may use as temporaries (and vcc / scc): declared clobbered at every marker
+#define HKGEN_CLOBBERS "memory", "vcc", "scc", "s90", "s91", "s92", "s93", "s94", "s95", "s96", "s97", "s98", \
+                       "s99", "s100", "s101", "s102", "s103"
+// the LOOP region keeps its loop state, TDM descriptors and per-tile scalars in s48..s103
+#define HKGEN_LOOP_CLOBBERS HKGEN_CLOBBERS, "s48", "s49", "s50", "s51", "s52", "s53", "s54", "s55", "s56", "s57", \
+    "s58", "s59", "s60", "s61", "s62", "s63", "s64", "s65", "s66", "s67", "s68", "s69", "s70", "s71", "s72", "s73",  \
+    "s74", "s75", "s76", "s77", "s78", "s79", "s80", "s81", "s82", "s83", "s84", "s85", "s86", "s87", "s88", "s89"
+// the two 16-B halves of a v16 operand: a dK operand's dwords 0..3 / 4..7 = its two dslayout v2 chunks
+HK1_INLINE bf16x8 lo8(bf16x16 v) { return __builtin_shufflevector(v, v, 0, 1, 2, 3, 4, 5, 6, 7); }
+HK1_INLINE bf16x8 hi8(bf16x16 v) { return __builtin_shufflevector(v, v, 8, 9, 10, 11, 12, 13, 14, 15); }            // SALU per WMMA of the TDM-prep run (FlyDSL KH0_SALU)
 // sched_barrier masks (llvm.amdgcn.sched.barrier): what may cross the fence
 constexpr int SB_ALU = 0x002 | 0x004 | 0x400;   // VALU, SALU, transcendental
 }  // namespace
@@ -210,17 +229,20 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
     const int kv0 = k3_kv0(kv0g, wv, NKV);
 
     // ---- K / V fragments of this wave's 16*NKV kv rows: invariant over every query and q head -------------
+    // (loaded by load_kv() on the LLVM-compiled paths; the HKGEN path loads its own copy in the INIT region)
     bf16x16 kf[NKV][NDT_QK], vf[NKV][NDT_V];
-    static_for<NKV>([&](auto kh) {
-      static_for<NDT_QK>([&](auto dt) {
-        kf[kh][dt] = cat(buf_load_b128(r_k, 16 * k1_kfrag(kbase, Hkv, kv0, kh, dt, 0, lane), 0),
-                         buf_load_b128(r_k, 16 * k1_kfrag(kbase, Hkv, kv0, kh, dt, 1, lane), 0));
+    auto load_kv = [&]() __attribute__((always_inline)) {
+      static_for<NKV>([&](auto kh) {
+        static_for<NDT_QK>([&](auto dt) {
+          kf[kh][dt] = cat(buf_load_b128(r_k, 16 * k1_kfrag(kbase, Hkv, kv0, kh, dt, 0, lane), 0),
+                           buf_load_b128(r_k, 16 * k1_kfrag(kbase, Hkv, kv0, kh, dt, 1, lane), 0));
+        });
+        static_for<NDT_V>([&](auto dt) {
+          vf[kh][dt] = cat(buf_load_b128(r_v, 16 * k1_vfrag(vbase, Hkv, kv0, kh, dt, 0, lane), 0),
+                           buf_load_b128(r_v, 16 * k1_vfrag(vbase, Hkv, kv0, kh, dt, 1, lane), 0));
+        });
       });
-      static_for<NDT_V>([&](auto dt) {
-        vf[kh][dt] = cat(buf_load_b128(r_v, 16 * k1_vfrag(vbase, Hkv, kv0, kh, dt, 0, lane), 0),
-                         buf_load_b128(r_v, 16 * k1_vfrag(vbase, Hkv, kv0, kh, dt, 1, lane), 0));
-      });
-    });
+    };
 
     // XCNT drain before the export's scalar math, 64-row tail body only (once per tail workgroup): the allocator gives
     // that math r_k's SGPRs while the last K fragment loads may still be in address translation, and LLVM emits no
@@ -232,22 +254,46 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
       sched_barrier<0>();
     }
 
-    // ---- dS^T export (k3ds_idx.h over k1ds_idx.h, dslayout.h v1): per-wave descriptor, row constants, voffset --
+    // ---- dS^T export (k3ds_idx.h over k1ds_idx.h, dslayout.h v2): per-wave descriptor, row constants, voffset --
     const int kt0 = k3ds_kt0(kv0);
     const int64_t ds_base = k3ds_base(bat, Hq, hkv, G, kt0, Sq, Skv, causal);
     const auto r_ds = rsrc64((const unsigned char*)DS + ds_base, k3ds_nrec(ds_mode, G, kt0, NKV, Sq, Skv, causal));
     int ds_rc[NKV];
     static_for<NKV>([&](auto kh) { ds_rc[kh] = k3ds_rowc(kh, kt0, Sq, Skv, causal); });
     const int vds = k1ds_voff(lane);
-    // the two stores of one kv16 block: DPP row_ror:8 regroup of a_dsk[kh] (X -> block rows 0..7, Y -> 8..15)
+    // the two stores of one kv16 block, dslayout v2: a_dsk[kh]'s dwords 0..3 (queries 0..15) at vds = lane * 16,
+    // dwords 4..7 (queries 16..31) at 512 + lane * 16 -- the operand's own bytes, no cross-lane regroup
     auto ds_store = [&](const bf16x16& a, int so) {
-      const u32x8 w = __builtin_bit_cast(u32x8, a);
-      const u32x4 x = {dpp_ror8<0xC>(w[0], w[4]), dpp_ror8<0xC>(w[1], w[5]), dpp_ror8<0xC>(w[2], w[6]),
-                       dpp_ror8<0xC>(w[3], w[7])};
-      const u32x4 y = {dpp_ror8<0x3>(w[4], w[0]), dpp_ror8<0x3>(w[5], w[1]), dpp_ror8<0x3>(w[6], w[2]),
-                       dpp_ror8<0x3>(w[7], w[3])};
-      buf_store_u32x4(x, r_ds, vds, so);
-      buf_store_u32x4(y, r_ds, vds + K1DS_ST_B, so);
+      buf_store_b128(lo8(a), r_ds, vds, so);
+      buf_store_b128(hi8(a), r_ds, vds + K1DS_ST_B, so);
+    };
+
+    // ---- epilogue (bwd_r9_a): C fragments -> this wave's row-major dV / dK images (epi_images; the HKGEN path's
+    // FINAL region writes the same images), then whole-line loads + global stores (epi_stores) ----------------------
+    auto epi_images = [&](const auto& acc) __attribute__((always_inline)) {
+      static_for<NKV>([&](auto kh) {
+        static_for<NDO_QK>([&](auto d) {
+          if constexpr (d < NDO_V)
+            lds_store_b128(lds0 + (uint32_t)k3_epi_wr(NKV, wv, 0, kh, d, lane), to_bf16x8(acc[kh * NDO_V + d]));
+          lds_store_b128(lds0 + (uint32_t)k3_epi_wr(NKV, wv, 1, kh, d, lane),
+                         to_bf16x8(acc[NKV * NDO_V + kh * NDO_QK + d]));
+        });
+      });
+    };
+    auto epi_stores = [&]() __attribute__((always_inline)) {
+      sched_barrier<0>();
+      __builtin_amdgcn_wave_barrier();
+      const auto r_dv = rsrc(DV, nv_b), r_dk = rsrc(DK, nk_b);
+      static_for<4 * NKV>([&](auto rb) {
+        static_for<K1_D_V * 2 / 128>([&](auto li) {
+          const bf16x8 vv = lds_load_b128(lds0 + (uint32_t)k3_epi_rd(NKV, wv, 0, rb, li, lane));
+          buf_store_b128(vv, r_dv, 16 * k1_epi_g(bat, Skv, Hkv, hkv, kv0, 0, rb, li, lane), 0);
+        });
+        static_for<K1_D_QK * 2 / 128>([&](auto li) {
+          const bf16x8 kk = lds_load_b128(lds0 + (uint32_t)k3_epi_rd(NKV, wv, 1, rb, li, lane));
+          buf_store_b128(kk, r_dk, 16 * k1_epi_g(bat, Skv, Hkv, hkv, kv0, 1, rb, li, lane), 0);
+        });
+      });
     };
 
     // ---- S/dP + softmax/dS of one (hh, kh): S = Q K^T and dP = dO V^T (A = the Q / dO rows of hh, B = K / V of
@@ -363,6 +409,137 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
 
     f32x8 acc[NST];
     static_for<NST>([&](auto i) { acc[i] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; });
+#if HKGEN
+    // ---- HKGEN (96-row blocks, G == 1 -- limits.py admits MHA only): the dK / dV loop as generated regions at
+    // inline-asm markers (gen/r8gen.py; gen/build.py splices them into this shell's .s). The shell keeps the
+    // scalar work: the TDM ring (3 stages, tile t in stage t mod 3, prefetch distance 2), the clamped tile indices,
+    // the NL/ND and dS^T soffsets, the loop over tiles (the first n_mask diagonal), the epilogue's global stores.
+    // Marker contract (checked by build.py): the generated code writes only VGPRs above every VGPR this shell
+    // touches between INIT and FINAL, the clobbered SGPRs, vcc and scc; one workgroup barrier per STEP.
+    //   INIT  K / V fragments (buffer loads from r_k / r_v), accumulators = 0, (c1, c1) and (scale, scale)
+    //   RB    after the prologue barrier: hh0 operands of tile 0 (stage 0), NL/ND of tile 0
+    //   STEP / STEPM (tile k, STEPM: diagonal, causal mask on, dS^T stores of unstored blocks dropped): hh1
+    //         operands of stage k; S / dP + softmax; dV / dK (tr16 of stage k); the dS^T stores of tile k; NL/ND of
+    //         tile k+1; TDM of tile k+2 into stage k+2; tensorcnt 3 + barrier after the last read of stage k; hh0
+    //         operands of stage k+1
+    //   FINAL acc -> bf16 dV / dK images (epi_images' layout)
+    {  // both block heights (NKV 3: 96 rows, NKV 2: the 64-row tail); the markers carry nkv
+      const int N = n_mask + n_full;
+      auto stg = [&](int t) { return (t % K1_DEPTH) * K1_QDO_B; };
+      auto tq = [&](int t) { return k1_clampqt(qp_start + (t < N ? t : N - 1), nqt2); };
+      auto nls = [&](int qt) { return uniform(k1_nl_soff(bat, Hq, k1_qh(hkv, G, 0), Sq, qt * 32)); };
+      const uint32_t rdq_l = lds0 + (uint32_t)k1_rd_lane(1, lane), rdv_l = lds0 + (uint32_t)k1_rd_lane(0, lane);
+      const uint32_t trv_l = lds0 + (uint32_t)k1_tr_lane(0, lane), trk_l = lds0 + (uint32_t)k1_tr_lane(1, lane);
+      // K / V fragment bytes 16 * k1_kfrag / k1_vfrag = lane part + kv sub-tile part (SGPR) + dt * 64 + u * 32
+      const int vk = 16 * k1_kfrag(0, Hkv, 0, 0, 0, 0, lane), vv = 16 * k1_vfrag(0, Hkv, 0, 0, 0, 0, lane);
+      int sk[NKV], sv[NKV];
+      static_for<NKV>([&](auto kh) {
+        sk[kh] = 16 * k1_kfrag(kbase, Hkv, kv0, kh, 0, 0, 0);
+        sv[kh] = 16 * k1_vfrag(vbase, Hkv, kv0, kh, 0, 0, 0);
+      });
+#if HKGEN_PROBE
+      // the workgroup's whole generated span: INIT (K / V fragments) .. FINAL (dK / dV stores issued)
+      const unsigned int pr_t0 = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
+      unsigned int pr_t1 = 0, pr_ta = 0, pr_tb = 0;  // ta / tb: around the LOOP marker (prologue | loop | epilogue)
+#endif
+      asm volatile("; HKGEN INIT nkv=%12 rk=%0 rv=%1 vk=%2 vv=%3 sk0=%4 sk1=%5 sk2=%6 sv0=%7 sv1=%8 sv2=%9 c1=%10 "
+                   "sc=%11"
+                   ::"s"(r_k), "s"(r_v), "v"(vk), "v"(vv), "s"(sk[0]), "s"(sk[1]), "s"(sk[NKV - 1]), "s"(sv[0]),
+                   "s"(sv[1]), "s"(sv[NKV - 1]), "s"(c1), "s"(scale), "i"(NKV)
+                   : HKGEN_CLOBBERS);
+      if (N > 0) {
+        sched_barrier<0>();
+        tdm_tile(tq(0), 0, stg(0));
+        tdm_tile(tq(1), 0, stg(1));
+        tensor_wait<K1_TW>();                    // own half of tile 0
+        sched_barrier<0>();
+        lds_barrier();                           // RAW: both halves of tile 0
+        sched_barrier<0>();
+        // LOOP: the hh0 operands of tile 0 + its NL/ND, then every tile k = 0 .. N-1 (the first n_mask diagonal) in a
+        // generated loop (unrolled by the ring depth: the stage is static per body). Every per-tile scalar is derived
+        // inside from these loop-invariant inputs (r8gen.region_loop): no shell code runs between the tiles.
+        //   tdm: per op o (dO, Q 0..127, Q 128..191): global byte base of tile 0's slice (lo, hi), bytes per tile,
+        //        LDS byte of stage 0; then the outer strides (elements) of op 0 / ops 1, 2; N; n_mask
+        //   sc:  qp_start, the last query pair, NL/ND soffset of pair 0, thr0 = cshift - kv0, qp_first of kv16 rows
+        //        kt0 + kh (dS^T blocks stored iff qt >= it), 0
+        //   rc:  the dS^T row constants k3ds_rowc(kh) (soffset of pair qt = 1024 qt + rc[kh]), 0
+        const int dl = row - 8 * half;           // the mask's lane part: kv row - q row offset of this lane
+        {
+          i32x16 tdmv;
+          static_for<3>([&](auto op) {
+            const uint64_t ga0 = gb[op] + (uint64_t)((int64_t)qp_start * gstep_q[op]);
+            tdmv[4 * op + 0] = (int)(uint32_t)ga0;
+            tdmv[4 * op + 1] = (int)(uint32_t)(ga0 >> 32);
+            tdmv[4 * op + 2] = (int)gstep_q[op];
+            tdmv[4 * op + 3] = (int)ldsb[op];
+          });
+          tdmv[12] = (int)k1_tdm_stride(Hq, 0);
+          tdmv[13] = (int)k1_tdm_stride(Hq, 1);
+          tdmv[14] = N;
+          tdmv[15] = n_mask;
+          const i32x8 scv = {qp_start, nqt2 - 1, nls(0), cshift - kv0, k3ds_qpf(0, kt0, Sq, Skv, causal),
+                             k3ds_qpf(1, kt0, Sq, Skv, causal), k3ds_qpf(NKV - 1, kt0, Sq, Skv, causal), 0};
+          const i32x4 rcv = {ds_rc[0], ds_rc[1], ds_rc[NKV - 1], 0};
+#if HKGEN_PROBE
+          pr_ta = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
+#endif
+          asm volatile("; HKGEN LOOP nkv=%13 lq=%0 lv=%1 ltv=%2 ltk=%3 nlv=%4 vds=%5 dl=%6 tdm=%7 sc=%8 rc=%9 rnl=%10 "
+                       "rnd=%11 rds=%12"
+                       ::"v"(rdq_l), "v"(rdv_l), "v"(trv_l), "v"(trk_l), "v"(voff_l), "v"(vds), "v"(dl), "s"(tdmv),
+                       "s"(scv), "s"(rcv), "s"(r_nl), "s"(r_nd), "s"(r_ds), "i"(NKV)
+                       : HKGEN_LOOP_CLOBBERS);
+#if HKGEN_PROBE
+          pr_tb = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
+#endif
+        }
+#undef HKGEN_STEP_TXT
+      }
+      tensor_wait<0>();                          // no TDM may land after the ring is reused
+      sched_barrier<0>();
+      lds_barrier();                             // every wave's last ring read before the images overwrite it
+      sched_barrier<0>();
+      // FINAL: images (lane bases ev / ek), whole-line readback (rv / rk), global stores: byte 16 * k1_epi_g = lane
+      // part gv / gk + row base sov / sok + rb * rsv / rsk (4 kv rows) + li * 128
+      {
+        const int rsv = Hkv * (K1_D_V / 8), rsk = Hkv * (K1_D_QK / 8);
+        const auto r_dv = rsrc(DV, nv_b), r_dk = rsrc(DK, nk_b);
+        asm volatile("; HKGEN FINAL nkv=%12 ev=%0 ek=%1 rv=%2 rk=%3 gv=%4 gk=%5 sov=%6 sok=%7 rsv=%8 rsk=%9 rdv=%10 "
+                     "rdk=%11"
+                     ::"v"(lds0 + (uint32_t)k3_epi_wr(NKV, wv, 0, 0, 0, lane)),
+                     "v"(lds0 + (uint32_t)k3_epi_wr(NKV, wv, 1, 0, 0, lane)),
+                     "v"(lds0 + (uint32_t)k3_epi_rd(NKV, wv, 0, 0, 0, lane)),
+                     "v"(lds0 + (uint32_t)k3_epi_rd(NKV, wv, 1, 0, 0, lane)), "v"(16 * ((lane / 8) * rsv + lane % 8)),
+                     "v"(16 * ((lane / 8) * rsk + lane % 8)), "s"(16 * (vbase + kv0 * rsv)), "s"(16 * (kbase + kv0 * rsk)),
+                     "s"(64 * rsv), "s"(64 * rsk), "s"(r_dv), "s"(r_dk), "i"(NKV)
+                     : HKGEN_CLOBBERS);
+#if HKGEN_PROBE
+        pr_t1 = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
+#endif
+      }
+#if HKGEN_PROBE
+      {
+        const bool pr_wg = blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0;
+        const auto r_pr = rsrc(reinterpret_cast<const unsigned char*>(DS) - 65536, pr_wg ? 65536 : 0);
+        unsigned int pp[4];
+        asm volatile("; HKGEN PROBE nkv=%4 a=%0 b=%1 c=%2 d=%3" : "=s"(pp[0]), "=s"(pp[1]), "=s"(pp[2]), "=s"(pp[3])
+                     : "i"(NKV) : HKGEN_CLOBBERS);
+        __builtin_amdgcn_raw_buffer_store_b32(pr_t1 - pr_t0, r_pr, 0, wv * 64, 0);
+        static_for<4>([&](auto i) { __builtin_amdgcn_raw_buffer_store_b32(pp[i], r_pr, 0, wv * 64 + 4 + 4 * i, 0); });
+        __builtin_amdgcn_raw_buffer_store_b32((unsigned int)N, r_pr, 0, wv * 64 + 24, 0);
+        __builtin_amdgcn_raw_buffer_store_b32(pr_ta - pr_t0, r_pr, 0, wv * 64 + 28, 0);  // prologue
+        __builtin_amdgcn_raw_buffer_store_b32(pr_t1 - pr_tb, r_pr, 0, wv * 64 + 32, 0);  // epilogue
+        // every workgroup (wave 0): steps << 24 | whole-span cycles at word 1024 + its linear index (no gridDim)
+        const int pr_li = ((int)blockIdx.z * k3_nblk(Skv) + (int)blockIdx.y) * HG + (int)blockIdx.x;
+        const auto r_all = rsrc(reinterpret_cast<const unsigned char*>(DS) - 65536, 65536);
+        if (wv == 0)
+          __builtin_amdgcn_raw_buffer_store_b32(((unsigned int)N << 24) | ((pr_t1 - pr_t0) & 0xFFFFFFu), r_all, 0,
+                                                4096 + 4 * pr_li, 0);
+      }
+#endif
+      return;
+    }
+#endif
+    load_kv();
 
     // ---- X3: the masked (diagonal) iterations ride the full loop's 3-stage Q/dO ring (k3m_idx.h) ----------
     // Flat tile sequence j < N = n_mask + n_full, T_j = (qp_start + j / G, j % G) in stage sigma(j) = (j - n_mask)
@@ -531,19 +708,10 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
         // k3ds: this iteration's dS^T (all NKV blocks) at the head of the DS-free dV WMMA run, 24 WMMAs before the
         // Q^T burst; the soffset from this iteration's counters (they advance only at the end of full_iter)
         const int so_c = k3ds_sq(qt0 + qi, gh, Sq, Skv, causal);
-        // X1b1s: regroup all NKV blocks first (distinct staging registers), then the 2*NKV stores
-        u32x4 dsx[NKV], dsy[NKV];
+        // dslayout v2: the 2*NKV stores straight from the a_dsk operands (no regroup)
         static_for<NKV>([&](auto kh) {
-          const u32x8 w = __builtin_bit_cast(u32x8, a_dsk[kh]);
-          dsx[kh] = u32x4{dpp_ror8<0xC>(w[0], w[4]), dpp_ror8<0xC>(w[1], w[5]), dpp_ror8<0xC>(w[2], w[6]),
-                          dpp_ror8<0xC>(w[3], w[7])};
-          dsy[kh] = u32x4{dpp_ror8<0x3>(w[4], w[0]), dpp_ror8<0x3>(w[5], w[1]), dpp_ror8<0x3>(w[6], w[2]),
-                          dpp_ror8<0x3>(w[7], w[3])};
-        });
-        sched_barrier<0>();
-        static_for<NKV>([&](auto kh) {
-          buf_store_u32x4(dsx[kh], r_ds, vds, so_c + ds_rc[kh]);
-          buf_store_u32x4(dsy[kh], r_ds, vds + K1DS_ST_B, so_c + ds_rc[kh]);
+          buf_store_b128(lo8(a_dsk[kh]), r_ds, vds, so_c + ds_rc[kh]);
+          buf_store_b128(hi8(a_dsk[kh]), r_ds, vds + K1DS_ST_B, so_c + ds_rc[kh]);
         });
         // X1b1: the export is pinned here, under the dO^T tr16 latency, ahead of the first dV WMMA (in the
         // non-expert mode a store issued inside the WMMA run waits for every earlier WMMA)
@@ -690,32 +858,18 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
     sched_barrier<0>();
 
     // ---- epilogue (bwd_r9_a): C fragments -> this wave's row-major dV / dK images -> whole-line stores ----
-    static_for<NKV>([&](auto kh) {
-      static_for<NDO_QK>([&](auto d) {
-        if constexpr (d < NDO_V)
-          lds_store_b128(lds0 + (uint32_t)k3_epi_wr(NKV, wv, 0, kh, d, lane), to_bf16x8(acc[kh * NDO_V + d]));
-        lds_store_b128(lds0 + (uint32_t)k3_epi_wr(NKV, wv, 1, kh, d, lane), to_bf16x8(acc[DK0 + kh * NDO_QK + d]));
-      });
-    });
-    sched_barrier<0>();
-    __builtin_amdgcn_wave_barrier();
-    const auto r_dv = rsrc(DV, nv_b), r_dk = rsrc(DK, nk_b);
-    static_for<4 * NKV>([&](auto rb) {
-      static_for<K1_D_V * 2 / 128>([&](auto li) {
-        const bf16x8 vv = lds_load_b128(lds0 + (uint32_t)k3_epi_rd(NKV, wv, 0, rb, li, lane));
-        buf_store_b128(vv, r_dv, 16 * k1_epi_g(bat, Skv, Hkv, hkv, kv0, 0, rb, li, lane), 0);
-      });
-      static_for<K1_D_QK * 2 / 128>([&](auto li) {
-        const bf16x8 kk = lds_load_b128(lds0 + (uint32_t)k3_epi_rd(NKV, wv, 1, rb, li, lane));
-        buf_store_b128(kk, r_dk, 16 * k1_epi_g(bat, Skv, Hkv, hkv, kv0, 1, rb, li, lane), 0);
-      });
-    });
+    epi_images(acc);
+    epi_stores();
   };
 
   // uniform (SGPR) branch on the block id: 96-row blocks first, then the 64-row tail blocks
+#if HKGEN && !HKGEN_TAIL
+  if (bid < n96) body(std::integral_constant<int, K3_NKV>{});   // HKGEN_TAIL=0: the 64-row tail blocks are not run
+#else
   if (bid < n96) {
     body(std::integral_constant<int, K3_NKV>{});
   } else {
     body(std::integral_constant<int, 2>{});
   }
+#endif
 }

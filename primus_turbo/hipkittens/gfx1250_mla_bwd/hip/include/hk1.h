@@ -27,6 +27,7 @@ typedef float                                    f32x8 __attribute__((ext_vector
 typedef uint32_t                                 u32x4 __attribute__((ext_vector_type(4)));
 typedef int32_t                                  i32x4 __attribute__((ext_vector_type(4)));
 typedef int32_t                                  i32x8 __attribute__((ext_vector_type(8)));
+typedef int32_t                                  i32x16 __attribute__((ext_vector_type(16)));
 typedef __attribute__((address_space(3))) bf16x8 lds_bf16x8;
 typedef __attribute__((address_space(3))) unsigned char lds_u8;
 

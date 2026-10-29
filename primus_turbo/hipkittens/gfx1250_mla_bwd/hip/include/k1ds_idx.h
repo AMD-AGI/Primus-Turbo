@@ -8,7 +8,7 @@
 // constexpr
 // __host__ __device__ functions of scalars. The kernel calls exactly these; bounds_proof.py
 // compiles this file for the host and replays them over every launched shape. The layout is
-// dslayout.h v1.
+// dslayout.h v2.
 //
 // Per wave (kv block bid, wave wv): kv16 rows kt0 = (64 bid + 32 wv) / 16 (kv sub-tile kh = 0) and
 // kt0 + 1 (kh = 1). One wave-iteration (query pair qt, q head gh of the group) exports two blocks
@@ -116,12 +116,11 @@ K1DS_FN int k1ds_so(int kh, int qt, int gh, int bid, int wv, int Sq, int Skv, in
     return gh * k1ds_hstride(Sq, Skv, causal) + qt * DSL_BLK_B +
            k1ds_rowc(kh, bid, wv, Sq, Skv, causal);
 }
-// voffset of lane `lane` (loop-invariant): after the DPP regroup lane (r = lane % 16, h = lane /
-// 16) holds block row 8t + (r & 7), 16-B chunk h + 2 (r >> 3) of store t; its 16 B go to row*64 +
-// chunk*16 (store t adds 512 t)
+// voffset of lane `lane` (loop-invariant, dslayout v2): lane (r = lane % 16, h = lane / 16) stores its dK
+// operand's dwords 0..3 = chunk (r, h) at dsl_chunk(r, h) = lane * 16 and dwords 4..7 = chunk (r, h + 2) at
+// dsl_chunk(r, h + 2) = 512 + lane * 16 (store t adds 512 t)
 K1DS_FN int k1ds_voff(int lane) {
-    const int r = lane % 16, h = lane / 16;
-    return (r & 7) * DSL_ROW_B + (h + 2 * (r >> 3)) * 16;
+    return dsl_chunk(lane % 16, lane / 16);
 }
 // counters (query pair, q head) after the peeled full iteration 0: k1_wrap_q / k1_wrap_g (0, 0, G)
 // in integer form (G >= 1): gh = min(G - 1, 1), qi = 1 - gh. The select form made clang carry (G >
