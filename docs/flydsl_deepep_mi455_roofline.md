@@ -29,6 +29,10 @@ the EP4 run of [Next measurements](#next-measurements).
   (dispatch with host wait) and 0.34 ms (combine) for about 317 MB per GPU to its three peers. An RCCL
   alltoall of that volume is about 208 µs on AMD's achievable roofline (MAIDAS), 176 µs at 1.8 TB/s:
   58–61% of the achievable roofline, 49–52% of the peak. At EP4 the three peers share the GPU's 1.8 TB/s.
+- **In DeepEP's own terms**: DeepEP V2's model puts the ceiling at 0.9 × the link speed, 1.62 TB/s here
+  (TransferBench measures 1.61–1.65); the cached dispatch is at 58% of it, the combine at 49%. DeepEP V1
+  on H800 reaches 84–86% of its stated link maximum at EP8 (its printed GB/s count a rank's own rows too,
+  so compare link bytes, as nccl-tests' busbw does).
 - **Where the gap is** (dispatch at 160 CUs: 123 µs = 87 µs send at the copy kernel's ceiling + 29 µs
   receive copy + 6 µs): the receiver's copy from the heap into `recv_x` runs after each block's send; the
   notify and host wait add 57 µs; below 96 channels the combine reduces only after pushing; with 64 CUs or
@@ -116,6 +120,36 @@ rocprofv3 --pmc FETCH_SIZE WRITE_SIZE GL2C_EA_RDREQ_DRAM GL2C_EA_WRREQ_DRAM --ke
 ```
 
 `roofline.py` needs no GPU: it prints the ceiling, roofline, phase and fixed-cost tables from the JSON.
+
+## How DeepEP and nccl-tests define the throughput ceiling
+
+| Source | Bandwidth it reports | Ceiling it compares with |
+|---|---|---|
+| nccl-tests (`doc/PERFORMANCE.md`), also rccl-tests and the MAIDAS data | `algbw = S / t`, S the per-rank buffer; `busbw = algbw × (n − 1) / n` for alltoall: the bytes a GPU sends to its peers per second | the per-GPU, one-direction link bandwidth B ("busbw … comparable with the hardware peak") |
+| DeepEP V1 (`tests/test_intranode.py`, `docs/legacy.md`) | "bottleneck bandwidth" = `recv_x` bytes a rank receives, **its own rows included**, / time (CUDA events, L2 flushed once before the timed calls, mean of 50) | "~160 GB/s NVLink maximum" on H800: dispatch 153, combine 158 GB/s at EP8. The maintainers call it algorithm bandwidth: the link carries (n − 1) / n of it (PR #130), so about 134 / 138 GB/s, 84–86% of that maximum |
+| DeepEP V2 (`tests/ep/test_ep.py`) | scale-up (SU) and scale-out (SO) bytes with the per-token metadata, own rows included unless `--ignore-local-traffic`, / kernel time from the PyTorch profiler (barrier before each call, L2 flushed); the receive copy is a separate kernel (`dispatch_copy_epilogue_impl`) with its own bandwidth, `2 × bytes / copy time` | – |
+| DeepEP V2 model (`EPBuffer.get_theoretical_num_sms`) | link-bound time = link traffic / link speed (0.9 × the NVLink link speeds from `nvidia-smi nvlink -s`; the NIC rate from `ibstat`); own rows do not count as link traffic; tokens go to `n·(1 − C(E − E/n, k) / C(E, k))` ranks on average (balanced routing) | SMs needed so that no SM-side rate limits: link rate × SM bytes per link byte / per-SM HBM rate (defaults 180 GB/s read, 45 GB/s write per SM, Hopper), × 1.3, at least 64 when not overlapping compute |
+
+The same ceiling on MI455X, in each convention (EP2, T = 8192, 160 CUs, link bytes 115.7 MB per rank and
+direction, received rows 231.4 MB with the rank's own):
+
+| | DeepEP V2 model: 0.9 × 1.8 = 1.62 TB/s | nccl-tests busbw (= our link GB/s) | DeepEP V1 algorithm bandwidth (own rows counted) |
+|---|---|---:|---:|
+| ceiling | 71 µs for 115.7 MB (equal to TransferBench's 1.61–1.65 TB/s) | 1.62 TB/s | 3.24 TB/s (twice the link at EP2: half the rows are local) |
+| dispatch, counts known, 122.7 µs | 58% | 943 GB/s | 1.89 TB/s |
+| combine, 145.7 µs | 49% | 794 GB/s | 1.59 TB/s |
+| for reference: DeepEP V1 on H800, EP8 | | 134 / 138 GB/s physical | 153 / 158 GB/s |
+
+- Use busbw (link bytes only) for "how far from the hardware"; DeepEP's V1 numbers overstate the link by
+  n / (n − 1): 2× at EP2, 1.33× at EP4, 1.14× at EP8.
+- DeepEP's own reference reaches 84–86% of its stated link maximum at EP8; the `flydsl_v2` kernels reach
+  49–58% of the equivalent ceiling at EP2.
+- The SM side of the DeepEP model with MI455X numbers: our TDM send moves about 22 GB/s per CU over the
+  link, so 1.62 TB/s needs about 74 CUs, 96 with DeepEP's 1.3 margin; the register copy (9 GB/s per CU)
+  would need all 256. This matches where the measured kernels stop gaining (96–160 CUs).
+- The nccl-tests style baseline for the same bytes is already in `bench_ops.py`: RCCL `all_to_all_single`
+  of the rows DeepEP sends (one per token and destination rank, "dedup"), 200 µs against 123 µs for the
+  cached dispatch at EP2; at 4 GPUs RCCL's alltoall reaches 1.49 TB/s busbw at 1 GB (`06-rccl`).
 
 ## How far from the limits (EP2, measured)
 
@@ -229,4 +263,11 @@ EP2, 160 CUs; modelled from the terms above, not yet measured:
   [017 Arithmetic Optimizations](https://github.com/wenxie-amd/hip-training-course-tas/blob/main/hip-training-course/017_Arithmetic_Optimizations/note.md)
   §1 (speed of light, arithmetic intensity, ridge point) and 009 Profiling §3 (hierarchical roofline,
   "below both roofs").
+- DeepEP: [V1 performance and method](https://github.com/deepseek-ai/DeepEP/blob/main/docs/legacy.md),
+  V1 `tests/test_intranode.py` (before the V2 release, `b306af0^`), V2
+  [`tests/ep/test_ep.py`](https://github.com/deepseek-ai/DeepEP/blob/main/tests/ep/test_ep.py) and
+  `EPBuffer.get_theoretical_num_sms` in [`deep_ep/buffers/ep.py`](https://github.com/deepseek-ai/DeepEP/blob/main/deep_ep/buffers/ep.py),
+  [PR #130](https://github.com/deepseek-ai/DeepEP/pull/130) (algorithm against physical bandwidth).
+- nccl-tests [`doc/PERFORMANCE.md`](https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md)
+  (algbw, busbw, the alltoall factor (n − 1) / n).
 - PR #583 document `docs/flydsl_deepep_mi455.md` (Performance) for the measurement setup.
