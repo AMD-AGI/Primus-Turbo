@@ -23,6 +23,7 @@ def main():
     ap.add_argument("ladder")
     ap.add_argument("rung")
     ap.add_argument("--calls", type=int, default=30)
+    ap.add_argument("--k3", action="store_true", help="the 2-wave kernel's probe (HKL_STAMP): 5 points per full iteration")
     a = ap.parse_args()
     spec = runner.load_ladder(a.ladder)
     sh = L.parse_shape(None, spec["problem"])
@@ -50,16 +51,19 @@ def main():
     raw = plan["ds_full"][: mod.DS_GUARD_B // 2].view(torch.int64).cpu().tolist()
     names = {"producer": ["readback issued", "B + A done", "arrived", "waited"],
              "consumer": ["reads issued", "dV done", "tensor wait", "arrived", "dK + export", "waited"]}
-    for w in range(4):
-        role = "producer" if w < 2 else "consumer"
+    if a.k3:
+        names = {"wave": ["S/dP + softmax", "dO^T + export + dV (+Q^T)", "dK kh0 + tensorcnt + arrive",
+                          "dK kh1/kh2 window + wait", "readback + loop"]}
+    for w in range(2 if a.k3 else 4):
+        role = "wave" if a.k3 else ("producer" if w < 2 else "consumer")
         st = [raw[w * 2048 + (s + 1) * 16: w * 2048 + (s + 2) * 16] for s in range(127)]
         st = [x for x in st if x[0] > 0]
         n = len(names[role])
         rows = []
-        for x in st[3:-3]:  # steady steps
-            pts = x[: n + 1]
+        for i, x in enumerate(st[3:-4], 3):  # steady steps
+            pts = x[:n] + [st[i + 1][0]] if a.k3 else x[: n + 1]
             if all(v > 0 for v in pts):
-                rows.append([pts[i + 1] - pts[i] for i in range(n)])
+                rows.append([pts[j + 1] - pts[j] for j in range(n)])
         steps = [st[i + 1][0] - st[i][0] for i in range(3, len(st) - 4)]
         med = [statistics.median(r[i] for r in rows) for i in range(n)] if rows else []
         print(f"wave {w} {role}: steps {len(st)}  step median {statistics.median(steps) if steps else 0:.0f} cyc;  "

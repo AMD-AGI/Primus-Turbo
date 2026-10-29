@@ -1075,6 +1075,45 @@
    "bitwise_with": "hk_v0"
   },
   {
+   "id": "r8b",
+   "parent": "r8a",
+   "patch": "patches/08b_dkdv_msrc_asm.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness"
+     ],
+     "asm_patch": "asm/k_dkdv96ds_msrc.s.patch",
+     "asm_input_sha256": "386bfa6733d3c5b5c057ab3d4f20c7ab8fa491a314abb7a4d41fd4c56643e076"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "dK/dV asm patch v2: the Q^T tr16 units held up by in-flight export stores reading their registers re-targeted too (14 tuples, was 5), vm_vsrc waits recomputed (the store-data waits in the dV run go); bits unchanged",
+   "bitwise_with": "hk_v0"
+  },
+  {
    "id": "r9w",
    "parent": "r8a",
    "patch": "patches/09w_ws.patch",
@@ -2357,6 +2396,165 @@
    },
    "side": true,
    "feature": "timing probe of ws_nop3: per-step shader-cycle stamps (wrong scratch guard, timing only)"
+  },
+  {
+   "id": "r8a_np",
+   "parent": "r8a",
+   "patch": "patches/a4_stamp.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness"
+     ]
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "control: r8a without the dK/dV asm patch",
+   "bitwise_with": "hk_v0",
+   "side": true
+  },
+  {
+   "id": "r8a_st",
+   "parent": "r8a",
+   "patch": "patches/a4_stamp.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness",
+      "-DHKL_STAMP=1"
+     ]
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "timing probe of r8a (no asm patch): per-iteration shader-cycle stamps",
+   "bitwise_with": "hk_v0",
+   "side": true
+  },
+  {
+   "id": "r8a_pr",
+   "parent": "r8a",
+   "patch": "patches/a5_probe.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness",
+      "-DHKL_PROBE=1"
+     ],
+     "asm_patch": "asm/k_dkdv96ds_probe.s.patch",
+     "asm_input_sha256": "1b5a5e8c3dbf13c7a8eec601ec59499f074c7e0abeaf63021c5010682ccfe406"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "timing probe of r8a: per-phase shader-cycle sums (SALU only in the loop) of workgroup (0,0,0), production asm patch regenerated for its .s",
+   "bitwise_with": "hk_v0",
+   "side": true
+  },
+  {
+   "id": "r8b_pr",
+   "parent": "r8a_pr",
+   "patch": "patches/a6_probe_msrc_asm.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness",
+      "-DHKL_PROBE=1"
+     ],
+     "asm_patch": "asm/k_dkdv96ds_probe_msrc.s.patch",
+     "asm_input_sha256": "1b5a5e8c3dbf13c7a8eec601ec59499f074c7e0abeaf63021c5010682ccfe406"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "timing probe of r8b (r8a_pr's source, the msrc asm patch regenerated for its .s)",
+   "bitwise_with": "hk_v0",
+   "side": true
   }
  ],
  "baselines": [

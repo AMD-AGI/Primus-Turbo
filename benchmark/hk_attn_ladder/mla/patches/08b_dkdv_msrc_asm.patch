@@ -1,0 +1,461 @@
+diff -ruN a/asm/k_dkdv96ds_msrc.s.patch b/asm/k_dkdv96ds_msrc.s.patch
+--- a/asm/k_dkdv96ds_msrc.s.patch	1970-01-01 00:00:00.000000000 +0000
++++ b/asm/k_dkdv96ds_msrc.s.patch	2026-10-29 01:59:33.931788331 +0000
+@@ -0,0 +1,457 @@
++--- k_dkdv96ds.s
+++++ k_dkdv96ds.s
++@@ -4189,6 +4189,7 @@
++ 	s_lshl_b32 s2, s2, 7
++ 	s_add_co_i32 s2, s2, s12
++ 	s_set_vgpr_msb 0xc3                     ;  msbs: dst=3 src0=3 src1=0 src2=0
+++	s_wait_alu depctr_va_vdst(0)
++ 	s_clause 0x1
++ 	buffer_load_b128 v[202:205] /*v[970:973]*/, v233 /*v1001*/, s[60:63], s2 offen
++ 	buffer_load_b128 v[198:201] /*v[966:969]*/, v237 /*v1005*/, s[60:63], s2 offen
++@@ -4196,8 +4197,8 @@
++ 	buffer_load_b128 v[210:213] /*v[978:981]*/, v233 /*v1001*/, s[64:67], s2 offen
++ 	buffer_load_b128 v[206:209] /*v[974:977]*/, v237 /*v1005*/, s[64:67], s2 offen
++ 	buffer_load_b128 v[194:197] /*v[962:965]*/, v238 /*v1006*/, s[60:63], s2 offen
++-	s_wait_alu depctr_va_vdst(0)
++ 	buffer_load_b128 v[190:193] /*v[958:961]*/, v239 /*v1007*/, s[60:63], s2 offen
+++	s_wait_alu depctr_vm_vsrc(6)
++ 	s_clause 0x2
++ 	buffer_load_b128 v[186:189] /*v[954:957]*/, v238 /*v1006*/, s[64:67], s2 offen
++ 	s_set_vgpr_msb 0xc303                   ;  msbs: dst=0 src0=3 src1=0 src2=0
++@@ -4223,13 +4224,13 @@
++ 	ds_load_b128 v[158:161] /*v[926:929]*/, v35 offset:4448
++ 	ds_load_b128 v[162:165] /*v[930:933]*/, v35 offset:4480
++ 	ds_load_b128 v[166:169] /*v[934:937]*/, v35 offset:4512
++-	s_wait_alu depctr_vm_vsrc(0)
+++	s_wait_alu depctr_vm_vsrc(6)
++ 	ds_load_b128 v[170:173] /*v[938:941]*/, v35 offset:4544
++ 	ds_load_b128 v[174:177] /*v[942:945]*/, v35 offset:4576
++ 	; sched_barrier mask(0x00000406)
++-	s_wait_alu depctr_vm_vsrc(0)
++ 	s_set_vgpr_msb 0xc00f                   ;  msbs: dst=0 src0=3 src1=3 src2=0
++ 	s_wait_loadcnt_dscnt 0x3e26
+++	s_wait_alu depctr_vm_vsrc(0)
++ 	v_wmma_f32_16x16x32_bf16 v[34:41], v[98:105] /*v[866:873]*/, v[18:25] /*v[786:793]*/, 0
++ 	tensor_load_to_lds s[68:71], s[36:43]
++ 	s_wait_tensorcnt 0xa
++@@ -4744,10 +4745,9 @@
++ 	s_set_vgpr_msb 0xc350                   ;  msbs: dst=1 src0=0 src1=0 src2=1
++ 	s_wait_dscnt 0xd
++ 	v_wmma_f32_16x16x32_bf16 v[98:105] /*v[354:361]*/, v[18:25], v[50:57], v[98:105] /*v[354:361]*/
++-	s_wait_alu depctr_vm_vsrc(4)
++ 	s_set_vgpr_msb 0x50c3                   ;  msbs: dst=3 src0=3 src1=0 src2=0
++-	ds_load_tr16_b128 v[78:81] /*v[846:849]*/, v139 /*v907*/ offset:15104
++-	ds_load_tr16_b128 v[74:77] /*v[842:845]*/, v139 /*v907*/ offset:8704
+++	ds_load_tr16_b128 v[244:247] /*v[1012:1015]*/, v139 /*v907*/ offset:15104
+++	ds_load_tr16_b128 v[240:243] /*v[1008:1011]*/, v139 /*v907*/ offset:8704
++ 	s_add_co_i32 s80, s30, -1
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++ 	; sched_group_barrier mask(0x00000100) size(2) SyncID(0)
++@@ -4755,10 +4755,9 @@
++ 	; sched_group_barrier mask(0x00000004) size(2) SyncID(0)
++ 	s_set_vgpr_msb 0xc300                   ;  msbs: dst=0 src0=0 src1=0 src2=0
++ 	v_wmma_f32_16x16x32_bf16 v[242:249], v[18:25], v[10:17], v[242:249] matrix_a_reuse
++-	s_wait_alu depctr_vm_vsrc(0)
++ 	s_set_vgpr_msb 0xc3                     ;  msbs: dst=3 src0=3 src1=0 src2=0
++-	ds_load_tr16_b128 v[82:85] /*v[850:853]*/, v139 /*v907*/ offset:8736
++-	ds_load_tr16_b128 v[86:89] /*v[854:857]*/, v139 /*v907*/ offset:15136
+++	ds_load_tr16_b128 v[248:251] /*v[1016:1019]*/, v139 /*v907*/ offset:8736
+++	ds_load_tr16_b128 v[252:255] /*v[1020:1023]*/, v139 /*v907*/ offset:15136
++ 	s_add_co_i32 s2, s2, s28
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++ 	; sched_group_barrier mask(0x00000100) size(2) SyncID(0)
++@@ -4779,8 +4778,8 @@
++ 	s_wait_dscnt 0x12
++ 	v_wmma_f32_16x16x32_bf16 v[162:169] /*v[418:425]*/, v[26:33], v[50:57], v[162:169] /*v[418:425]*/
++ 	s_set_vgpr_msb 0x50c3                   ;  msbs: dst=3 src0=3 src1=0 src2=0
++-	ds_load_tr16_b128 v[90:93] /*v[858:861]*/, v139 /*v907*/ offset:8800
++-	ds_load_tr16_b128 v[94:97] /*v[862:865]*/, v139 /*v907*/ offset:15200
+++	ds_load_tr16_b128 v[178:181] /*v[946:949]*/, v139 /*v907*/ offset:8800
+++	ds_load_tr16_b128 v[182:185] /*v[950:953]*/, v139 /*v907*/ offset:15200
++ 	s_add_co_i32 s69, s14, s29
++ 	s_bitset1_b32 s71, 31
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++@@ -4811,8 +4810,8 @@
++ 	s_wait_dscnt 0xc
++ 	v_wmma_f32_16x16x32_bf16 v[146:153] /*v[402:409]*/, v[58:65], v[50:57], v[146:153] /*v[402:409]*/
++ 	s_set_vgpr_msb 0x50c3                   ;  msbs: dst=3 src0=3 src1=0 src2=0
++-	ds_load_tr16_b128 v[106:109] /*v[874:877]*/, v139 /*v907*/ offset:8896
++-	ds_load_tr16_b128 v[110:113] /*v[878:881]*/, v139 /*v907*/ offset:15296
+++	ds_load_tr16_b128 v[146:149] /*v[914:917]*/, v139 /*v907*/ offset:8896
+++	ds_load_tr16_b128 v[150:153] /*v[918:921]*/, v139 /*v907*/ offset:15296
++ 	s_add_nc_u64 s[78:79], s[2:3], s[90:91]
++ 	s_add_co_i32 s77, s14, s5
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++@@ -4821,8 +4820,8 @@
++ 	s_set_vgpr_msb 0xc300                   ;  msbs: dst=0 src0=0 src1=0 src2=0
++ 	v_wmma_f32_16x16x32_bf16 v[210:217], v[58:65], v[10:17], v[210:217] matrix_a_reuse
++ 	s_set_vgpr_msb 0xc3                     ;  msbs: dst=3 src0=3 src1=0 src2=0
++-	ds_load_tr16_b128 v[114:117] /*v[882:885]*/, v139 /*v907*/ offset:8928
++-	ds_load_tr16_b128 v[118:121] /*v[886:889]*/, v139 /*v907*/ offset:15328
+++	ds_load_tr16_b128 v[154:157] /*v[922:925]*/, v139 /*v907*/ offset:8928
+++	ds_load_tr16_b128 v[158:161] /*v[926:929]*/, v139 /*v907*/ offset:15328
++ 	s_bitset1_b32 s79, 31
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++ 	; sched_group_barrier mask(0x00000100) size(2) SyncID(0)
++@@ -4839,8 +4838,8 @@
++ 	s_set_vgpr_msb 0x353                    ;  msbs: dst=1 src0=3 src1=0 src2=1
++ 	v_wmma_f32_16x16x32_bf16 v[130:137] /*v[386:393]*/, v[26:33] /*v[794:801]*/, v[50:57], v[130:137] /*v[386:393]*/
++ 	s_set_vgpr_msb 0x53c3                   ;  msbs: dst=3 src0=3 src1=0 src2=0
++-	ds_load_tr16_b128 v[122:125] /*v[890:893]*/, v139 /*v907*/ offset:8992
++-	ds_load_tr16_b128 v[126:129] /*v[894:897]*/, v139 /*v907*/ offset:15392
+++	ds_load_tr16_b128 v[168:171] /*v[936:939]*/, v139 /*v907*/ offset:8992
+++	ds_load_tr16_b128 v[172:175] /*v[940:943]*/, v139 /*v907*/ offset:15392
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++ 	; sched_group_barrier mask(0x00000100) size(2) SyncID(0)
++ 	; sched_group_barrier mask(0x00000004) size(2) SyncID(0)
++@@ -4854,10 +4853,9 @@
++ 	; sched_group_barrier mask(0x00000004) size(2) SyncID(0)
++ 	s_set_vgpr_msb 0xc30f                   ;  msbs: dst=0 src0=3 src1=3 src2=0
++ 	v_wmma_f32_16x16x32_bf16 v[98:105], v[26:33] /*v[794:801]*/, v[66:73] /*v[834:841]*/, v[98:105] matrix_a_reuse
++-	s_wait_alu depctr_va_vdst(0)
++ 	s_set_vgpr_msb 0xfc3                    ;  msbs: dst=3 src0=3 src1=0 src2=0
++-	ds_load_tr16_b128 v[26:29] /*v[794:797]*/, v139 /*v907*/ offset:9056
++-	ds_load_tr16_b128 v[30:33] /*v[798:801]*/, v139 /*v907*/ offset:15456
+++	ds_load_tr16_b128 v[216:219] /*v[984:987]*/, v139 /*v907*/ offset:9056
+++	ds_load_tr16_b128 v[220:223] /*v[988:991]*/, v139 /*v907*/ offset:15456
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++ 	; sched_group_barrier mask(0x00000100) size(2) SyncID(0)
++ 	; sched_group_barrier mask(0x00000004) size(2) SyncID(0)
++@@ -4912,15 +4910,15 @@
++ 	; sched_barrier mask(0x00000000)
++ 	s_set_vgpr_msb 0xfa3                    ;  msbs: dst=2 src0=3 src1=0 src2=2
++ 	s_wait_dscnt 0x16
++-	v_wmma_f32_16x16x32_bf16 v[34:41] /*v[546:553]*/, v[74:81] /*v[842:849]*/, v[34:41], v[34:41] /*v[546:553]*/
+++	v_wmma_f32_16x16x32_bf16 v[34:41] /*v[546:553]*/, v[240:247] /*v[1008:1015]*/, v[34:41], v[34:41] /*v[546:553]*/
++ 	s_wait_dscnt 0x14
++-	v_wmma_f32_16x16x32_bf16 v[26:33] /*v[538:545]*/, v[82:89] /*v[850:857]*/, v[34:41], v[26:33] /*v[538:545]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[26:33] /*v[538:545]*/, v[248:255] /*v[1016:1023]*/, v[34:41], v[26:33] /*v[538:545]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0xa3a0                   ;  msbs: dst=2 src0=0 src1=0 src2=2
++ 	s_wait_dscnt 0x12
++ 	v_wmma_f32_16x16x32_bf16 v[18:25] /*v[530:537]*/, v[18:25], v[34:41], v[18:25] /*v[530:537]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0xa0a3                   ;  msbs: dst=2 src0=3 src1=0 src2=2
++ 	s_wait_dscnt 0x10
++-	v_wmma_f32_16x16x32_bf16 v[10:17] /*v[522:529]*/, v[90:97] /*v[858:865]*/, v[34:41], v[10:17] /*v[522:529]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[10:17] /*v[522:529]*/, v[178:185] /*v[946:953]*/, v[34:41], v[10:17] /*v[522:529]*/ matrix_b_reuse
++ 	s_wait_dscnt 0xe
++ 	v_wmma_f32_16x16x32_bf16 v[2:9] /*v[514:521]*/, v[98:105] /*v[866:873]*/, v[34:41], v[2:9] /*v[514:521]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0xa350                   ;  msbs: dst=1 src0=0 src1=0 src2=1
++@@ -4928,85 +4926,96 @@
++ 	v_wmma_f32_16x16x32_bf16 v[250:257] /*v[506:513]*/, v[26:33], v[34:41], v[250:257] /*v[506:513]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x5053                   ;  msbs: dst=1 src0=3 src1=0 src2=1
++ 	s_wait_dscnt 0xa
++-	v_wmma_f32_16x16x32_bf16 v[242:249] /*v[498:505]*/, v[106:113] /*v[874:881]*/, v[34:41], v[242:249] /*v[498:505]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[242:249] /*v[498:505]*/, v[146:153] /*v[914:921]*/, v[34:41], v[242:249] /*v[498:505]*/ matrix_b_reuse
++ 	s_wait_dscnt 0x8
++-	v_wmma_f32_16x16x32_bf16 v[226:233] /*v[482:489]*/, v[114:121] /*v[882:889]*/, v[34:41], v[226:233] /*v[482:489]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[226:233] /*v[482:489]*/, v[154:161] /*v[922:929]*/, v[34:41], v[226:233] /*v[482:489]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x5350                   ;  msbs: dst=1 src0=0 src1=0 src2=1
++ 	s_wait_dscnt 0x6
++ 	v_wmma_f32_16x16x32_bf16 v[234:241] /*v[490:497]*/, v[58:65], v[34:41], v[234:241] /*v[490:497]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x5053                   ;  msbs: dst=1 src0=3 src1=0 src2=1
++ 	s_wait_dscnt 0x4
++-	v_wmma_f32_16x16x32_bf16 v[218:225] /*v[474:481]*/, v[122:129] /*v[890:897]*/, v[34:41], v[218:225] /*v[474:481]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[218:225] /*v[474:481]*/, v[168:175] /*v[936:943]*/, v[34:41], v[218:225] /*v[474:481]*/ matrix_b_reuse
++ 	s_wait_dscnt 0x2
++ 	v_wmma_f32_16x16x32_bf16 v[210:217] /*v[466:473]*/, v[130:137] /*v[898:905]*/, v[34:41], v[210:217] /*v[466:473]*/ matrix_b_reuse
++ 	s_wait_dscnt 0x0
++-	v_wmma_f32_16x16x32_bf16 v[202:209] /*v[458:465]*/, v[26:33] /*v[794:801]*/, v[34:41], v[202:209] /*v[458:465]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[202:209] /*v[458:465]*/, v[216:223] /*v[984:991]*/, v[34:41], v[202:209] /*v[458:465]*/ matrix_b_reuse
++ 	; sched_barrier mask(0x00000000)
++ 	s_wait_tensorcnt 0x3
++ 	; sched_barrier mask(0x00000000)
++ 	s_barrier_signal -1
++ 	; sched_barrier mask(0x00000000)
++-	v_wmma_f32_16x16x32_bf16 v[194:201] /*v[450:457]*/, v[74:81] /*v[842:849]*/, v[42:49], v[194:201] /*v[450:457]*/
++-	v_wmma_f32_16x16x32_bf16 v[186:193] /*v[442:449]*/, v[82:89] /*v[850:857]*/, v[42:49], v[186:193] /*v[442:449]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[194:201] /*v[450:457]*/, v[240:247] /*v[1008:1015]*/, v[42:49], v[194:201] /*v[450:457]*/
+++	v_wmma_f32_16x16x32_bf16 v[186:193] /*v[442:449]*/, v[248:255] /*v[1016:1023]*/, v[42:49], v[186:193] /*v[442:449]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x5350                   ;  msbs: dst=1 src0=0 src1=0 src2=1
++ 	v_wmma_f32_16x16x32_bf16 v[178:185] /*v[434:441]*/, v[18:25], v[42:49], v[178:185] /*v[434:441]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x5053                   ;  msbs: dst=1 src0=3 src1=0 src2=1
++-	v_wmma_f32_16x16x32_bf16 v[170:177] /*v[426:433]*/, v[90:97] /*v[858:865]*/, v[42:49], v[170:177] /*v[426:433]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[170:177] /*v[426:433]*/, v[178:185] /*v[946:953]*/, v[42:49], v[170:177] /*v[426:433]*/ matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[154:161] /*v[410:417]*/, v[98:105] /*v[866:873]*/, v[42:49], v[154:161] /*v[410:417]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x5350                   ;  msbs: dst=1 src0=0 src1=0 src2=1
++ 	v_wmma_f32_16x16x32_bf16 v[138:145] /*v[394:401]*/, v[26:33], v[42:49], v[138:145] /*v[394:401]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x5053                   ;  msbs: dst=1 src0=3 src1=0 src2=1
++-	v_wmma_f32_16x16x32_bf16 v[122:129] /*v[378:385]*/, v[106:113] /*v[874:881]*/, v[42:49], v[122:129] /*v[378:385]*/ matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[106:113] /*v[362:369]*/, v[114:121] /*v[882:889]*/, v[42:49], v[106:113] /*v[362:369]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[122:129] /*v[378:385]*/, v[146:153] /*v[914:921]*/, v[42:49], v[122:129] /*v[378:385]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[106:113] /*v[362:369]*/, v[154:161] /*v[922:929]*/, v[42:49], v[106:113] /*v[362:369]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x5350                   ;  msbs: dst=1 src0=0 src1=0 src2=1
++ 	v_wmma_f32_16x16x32_bf16 v[82:89] /*v[338:345]*/, v[58:65], v[42:49], v[82:89] /*v[338:345]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x5053                   ;  msbs: dst=1 src0=3 src1=0 src2=1
++-	v_wmma_f32_16x16x32_bf16 v[74:81] /*v[330:337]*/, v[122:129] /*v[890:897]*/, v[42:49], v[74:81] /*v[330:337]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[74:81] /*v[330:337]*/, v[168:175] /*v[936:943]*/, v[42:49], v[74:81] /*v[330:337]*/ matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[66:73] /*v[322:329]*/, v[130:137] /*v[898:905]*/, v[42:49], v[66:73] /*v[322:329]*/ matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[58:65] /*v[314:321]*/, v[26:33] /*v[794:801]*/, v[42:49], v[58:65] /*v[314:321]*/ matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[34:41] /*v[290:297]*/, v[74:81] /*v[842:849]*/, v[2:9], v[34:41] /*v[290:297]*/
++-	v_wmma_f32_16x16x32_bf16 v[26:33] /*v[282:289]*/, v[82:89] /*v[850:857]*/, v[2:9], v[26:33] /*v[282:289]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[58:65] /*v[314:321]*/, v[216:223] /*v[984:991]*/, v[42:49], v[58:65] /*v[314:321]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[34:41] /*v[290:297]*/, v[240:247] /*v[1008:1015]*/, v[2:9], v[34:41] /*v[290:297]*/
+++	v_wmma_f32_16x16x32_bf16 v[26:33] /*v[282:289]*/, v[248:255] /*v[1016:1023]*/, v[2:9], v[26:33] /*v[282:289]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x5350                   ;  msbs: dst=1 src0=0 src1=0 src2=1
++ 	v_wmma_f32_16x16x32_bf16 v[18:25] /*v[274:281]*/, v[18:25], v[2:9], v[18:25] /*v[274:281]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x5053                   ;  msbs: dst=1 src0=3 src1=0 src2=1
++-	v_wmma_f32_16x16x32_bf16 v[10:17] /*v[266:273]*/, v[90:97] /*v[858:865]*/, v[2:9], v[10:17] /*v[266:273]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[10:17] /*v[266:273]*/, v[178:185] /*v[946:953]*/, v[2:9], v[10:17] /*v[266:273]*/ matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[2:9] /*v[258:265]*/, v[98:105] /*v[866:873]*/, v[2:9], v[2:9] /*v[258:265]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x5300                   ;  msbs: dst=0 src0=0 src1=0 src2=0
++ 	v_wmma_f32_16x16x32_bf16 v[234:241], v[26:33], v[2:9], v[234:241] matrix_b_reuse
++ 	s_set_vgpr_msb 3                        ;  msbs: dst=0 src0=3 src1=0 src2=0
++-	v_wmma_f32_16x16x32_bf16 v[218:225], v[106:113] /*v[874:881]*/, v[2:9], v[218:225] matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[186:193], v[114:121] /*v[882:889]*/, v[2:9], v[186:193] matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[218:225], v[146:153] /*v[914:921]*/, v[2:9], v[218:225] matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[186:193], v[154:161] /*v[922:929]*/, v[2:9], v[186:193] matrix_b_reuse
++ 	s_set_vgpr_msb 0x300                    ;  msbs: dst=0 src0=0 src1=0 src2=0
++ 	v_wmma_f32_16x16x32_bf16 v[194:201], v[58:65], v[2:9], v[194:201] matrix_b_reuse
++ 	s_set_vgpr_msb 3                        ;  msbs: dst=0 src0=3 src1=0 src2=0
++-	v_wmma_f32_16x16x32_bf16 v[178:185], v[122:129] /*v[890:897]*/, v[2:9], v[178:185] matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[178:185], v[168:175] /*v[936:943]*/, v[2:9], v[178:185] matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[170:177], v[130:137] /*v[898:905]*/, v[2:9], v[170:177] matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[146:153], v[26:33] /*v[794:801]*/, v[2:9], v[146:153] matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[146:153], v[216:223] /*v[984:991]*/, v[2:9], v[146:153] matrix_b_reuse
++ 	; sched_barrier mask(0x00000000)
++ 	s_barrier_wait -1
++ 	; sched_barrier mask(0x00000000)
++-	s_wait_alu depctr_va_vdst(0)
+++	s_wait_alu depctr_va_vdst(14)
++ 	s_set_vgpr_msb 0x3c3                    ;  msbs: dst=3 src0=3 src1=0 src2=0
++ 	ds_load_b128 v[26:29] /*v[794:797]*/, v138 /*v906*/ offset:8832
++ 	ds_load_b128 v[30:33] /*v[798:801]*/, v138 /*v906*/ offset:8864
+++	s_wait_alu depctr_va_vdst(14)
++ 	ds_load_b128 v[34:37] /*v[802:805]*/, v138 /*v906*/ offset:8896
++ 	ds_load_b128 v[38:41] /*v[806:809]*/, v138 /*v906*/ offset:8928
+++	s_wait_alu depctr_va_vdst(14)
++ 	ds_load_b128 v[42:45] /*v[810:813]*/, v138 /*v906*/ offset:8960
++ 	ds_load_b128 v[46:49] /*v[814:817]*/, v138 /*v906*/ offset:8992
+++	s_wait_alu depctr_va_vdst(14)
++ 	ds_load_b128 v[50:53] /*v[818:821]*/, v138 /*v906*/ offset:9024
++ 	ds_load_b128 v[54:57] /*v[822:825]*/, v138 /*v906*/ offset:9056
+++	s_wait_alu depctr_va_vdst(14)
++ 	ds_load_b128 v[58:61] /*v[826:829]*/, v166 /*v934*/
++ 	ds_load_b128 v[62:65] /*v[830:833]*/, v166 /*v934*/ offset:32
++ 	ds_load_b128 v[66:69] /*v[834:837]*/, v166 /*v934*/ offset:64
++ 	ds_load_b128 v[70:73] /*v[838:841]*/, v166 /*v934*/ offset:96
+++	s_wait_alu depctr_vm_vsrc(5)
++ 	ds_load_b128 v[74:77] /*v[842:845]*/, v166 /*v934*/ offset:128
+++	s_wait_alu depctr_vm_vsrc(4)
++ 	ds_load_b128 v[78:81] /*v[846:849]*/, v166 /*v934*/ offset:160
+++	s_wait_alu depctr_vm_vsrc(3)
++ 	ds_load_b128 v[82:85] /*v[850:853]*/, v166 /*v934*/ offset:192
+++	s_wait_alu depctr_vm_vsrc(2)
++ 	ds_load_b128 v[86:89] /*v[854:857]*/, v166 /*v934*/ offset:224
++ 	s_set_vgpr_msb 0xc303                   ;  msbs: dst=0 src0=3 src1=0 src2=0
+++	s_wait_alu depctr_va_vdst(14)
++ 	ds_load_b128 v[38:41], v138 /*v906*/ offset:8704
+++	s_wait_alu depctr_va_vdst(12)
++ 	ds_load_b128 v[42:45], v138 /*v906*/ offset:8736
++ 	ds_load_b128 v[54:57], v138 /*v906*/ offset:8768
+++	s_wait_alu depctr_va_vdst(3)
++ 	ds_load_b128 v[58:61], v138 /*v906*/ offset:8800
++ 	; sched_barrier mask(0x00000000)
++ 	; sched_barrier mask(0x00000000)
++@@ -5019,6 +5028,7 @@
++ 	s_add_co_i32 s2, s2, s28
++ 	s_lshl_b32 s2, s2, 7
++ 	s_add_co_i32 s2, s2, s12
+++	s_wait_alu depctr_va_vdst(0)
++ 	s_clause 0x1
++ 	buffer_load_b128 v[2:5], v233 /*v1001*/, s[60:63], s2 offen
++ 	buffer_load_b128 v[6:9], v237 /*v1005*/, s[60:63], s2 offen
++@@ -5033,6 +5043,7 @@
++ 	buffer_load_b128 v[30:33], v239 /*v1007*/, s[64:67], s2 offen
++ 	; sched_barrier mask(0x00000406)
++ 	s_set_vgpr_msb 0x3c3                    ;  msbs: dst=3 src0=3 src1=0 src2=0
+++	s_wait_alu depctr_vm_vsrc(6)
++ 	ds_load_b128 v[90:93] /*v[858:861]*/, v138 /*v906*/ offset:15104
++ 	ds_load_b128 v[94:97] /*v[862:865]*/, v138 /*v906*/ offset:15136
++ 	ds_load_b128 v[98:101] /*v[866:869]*/, v138 /*v906*/ offset:15168
++@@ -5547,10 +5558,9 @@
++ 	s_set_vgpr_msb 0xc353                   ;  msbs: dst=1 src0=3 src1=0 src2=1
++ 	s_wait_dscnt 0xd
++ 	v_wmma_f32_16x16x32_bf16 v[98:105] /*v[354:361]*/, v[34:41] /*v[802:809]*/, v[50:57], v[98:105] /*v[354:361]*/
++-	s_wait_alu depctr_vm_vsrc(3)
++ 	s_set_vgpr_msb 0x53c3                   ;  msbs: dst=3 src0=3 src1=0 src2=0
++-	ds_load_tr16_b128 v[110:113] /*v[878:881]*/, v170 /*v938*/ offset:15104
++-	ds_load_tr16_b128 v[106:109] /*v[874:877]*/, v170 /*v938*/ offset:8704
+++	ds_load_tr16_b128 v[244:247] /*v[1012:1015]*/, v170 /*v938*/ offset:15104
+++	ds_load_tr16_b128 v[240:243] /*v[1008:1011]*/, v170 /*v938*/ offset:8704
++ 	s_min_i32 s2, s30, s22
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++ 	; sched_group_barrier mask(0x00000100) size(2) SyncID(0)
++@@ -5558,10 +5568,9 @@
++ 	; sched_group_barrier mask(0x00000004) size(2) SyncID(0)
++ 	s_set_vgpr_msb 0xc30f                   ;  msbs: dst=0 src0=3 src1=3 src2=0
++ 	v_wmma_f32_16x16x32_bf16 v[242:249], v[34:41] /*v[802:809]*/, v[26:33] /*v[794:801]*/, v[242:249] matrix_a_reuse
++-	s_wait_alu depctr_vm_vsrc(0)
++ 	s_set_vgpr_msb 0xfc3                    ;  msbs: dst=3 src0=3 src1=0 src2=0
++-	ds_load_tr16_b128 v[114:117] /*v[882:885]*/, v170 /*v938*/ offset:8736
++-	ds_load_tr16_b128 v[118:121] /*v[886:889]*/, v170 /*v938*/ offset:15136
+++	ds_load_tr16_b128 v[248:251] /*v[1016:1019]*/, v170 /*v938*/ offset:8736
+++	ds_load_tr16_b128 v[252:255] /*v[1020:1023]*/, v170 /*v938*/ offset:15136
++ 	s_ashr_i32 s3, s2, 31
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++ 	; sched_group_barrier mask(0x00000100) size(2) SyncID(0)
++@@ -5569,10 +5578,9 @@
++ 	; sched_group_barrier mask(0x00000004) size(2) SyncID(0)
++ 	s_set_vgpr_msb 0xc30f                   ;  msbs: dst=0 src0=3 src1=3 src2=0
++ 	v_wmma_f32_16x16x32_bf16 v[122:129], v[34:41] /*v[802:809]*/, v[98:105] /*v[866:873]*/, v[122:129] matrix_a_reuse
++-	s_wait_alu depctr_va_vdst(0)
++ 	s_set_vgpr_msb 0xfc3                    ;  msbs: dst=3 src0=3 src1=0 src2=0
++-	ds_load_tr16_b128 v[34:37] /*v[802:805]*/, v170 /*v938*/ offset:8768
++-	ds_load_tr16_b128 v[38:41] /*v[806:809]*/, v170 /*v938*/ offset:15168
+++	ds_load_tr16_b128 v[198:201] /*v[966:969]*/, v170 /*v938*/ offset:8768
+++	ds_load_tr16_b128 v[202:205] /*v[970:973]*/, v170 /*v938*/ offset:15168
++ 	s_add_nc_u64 s[70:71], s[6:7], s[94:95]
++ 	s_add_co_i32 s69, s33, s29
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++@@ -5582,8 +5590,8 @@
++ 	s_wait_dscnt 0x12
++ 	v_wmma_f32_16x16x32_bf16 v[162:169] /*v[418:425]*/, v[42:49] /*v[810:817]*/, v[50:57], v[162:169] /*v[418:425]*/
++ 	s_set_vgpr_msb 0x53c3                   ;  msbs: dst=3 src0=3 src1=0 src2=0
++-	ds_load_tr16_b128 v[122:125] /*v[890:893]*/, v170 /*v938*/ offset:8800
++-	ds_load_tr16_b128 v[126:129] /*v[894:897]*/, v170 /*v938*/ offset:15200
+++	ds_load_tr16_b128 v[206:209] /*v[974:977]*/, v170 /*v938*/ offset:8800
+++	ds_load_tr16_b128 v[210:213] /*v[978:981]*/, v170 /*v938*/ offset:15200
++ 	s_mul_u64 s[2:3], s[92:93], s[2:3]
++ 	s_bitset1_b32 s71, 31
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++@@ -5601,10 +5609,9 @@
++ 	; sched_group_barrier mask(0x00000004) size(2) SyncID(0)
++ 	s_set_vgpr_msb 0xc30f                   ;  msbs: dst=0 src0=3 src1=3 src2=0
++ 	v_wmma_f32_16x16x32_bf16 v[114:121], v[42:49] /*v[810:817]*/, v[98:105] /*v[866:873]*/, v[114:121] matrix_a_reuse
++-	s_wait_alu depctr_va_vdst(0)
++ 	s_set_vgpr_msb 0xfc3                    ;  msbs: dst=3 src0=3 src1=0 src2=0
++-	ds_load_tr16_b128 v[42:45] /*v[810:813]*/, v170 /*v938*/ offset:8864
++-	ds_load_tr16_b128 v[46:49] /*v[814:817]*/, v170 /*v938*/ offset:15264
+++	ds_load_tr16_b128 v[190:193] /*v[958:961]*/, v170 /*v938*/ offset:8864
+++	ds_load_tr16_b128 v[194:197] /*v[962:965]*/, v170 /*v938*/ offset:15264
++ 	s_add_nc_u64 s[78:79], s[2:3], s[90:91]
++ 	s_bitset1_b32 s75, 31
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++@@ -5631,10 +5638,9 @@
++ 	; sched_group_barrier mask(0x00000004) size(2) SyncID(0)
++ 	s_set_vgpr_msb 0xc30f                   ;  msbs: dst=0 src0=3 src1=3 src2=0
++ 	v_wmma_f32_16x16x32_bf16 v[106:113], v[50:57] /*v[818:825]*/, v[98:105] /*v[866:873]*/, v[106:113] matrix_a_reuse
++-	s_wait_alu depctr_va_vdst(0)
++ 	s_set_vgpr_msb 0xfc3                    ;  msbs: dst=3 src0=3 src1=0 src2=0
++-	ds_load_tr16_b128 v[50:53] /*v[818:821]*/, v170 /*v938*/ offset:8960
++-	ds_load_tr16_b128 v[54:57] /*v[822:825]*/, v170 /*v938*/ offset:15360
+++	ds_load_tr16_b128 v[182:185] /*v[950:953]*/, v170 /*v938*/ offset:8960
+++	ds_load_tr16_b128 v[186:189] /*v[954:957]*/, v170 /*v938*/ offset:15360
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++ 	; sched_group_barrier mask(0x00000100) size(2) SyncID(0)
++ 	; sched_group_barrier mask(0x00000004) size(2) SyncID(0)
++@@ -5657,10 +5663,9 @@
++ 	; sched_group_barrier mask(0x00000004) size(2) SyncID(0)
++ 	s_set_vgpr_msb 0xc30f                   ;  msbs: dst=0 src0=3 src1=3 src2=0
++ 	v_wmma_f32_16x16x32_bf16 v[98:105], v[58:65] /*v[826:833]*/, v[98:105] /*v[866:873]*/, v[98:105] matrix_a_reuse
++-	s_wait_alu depctr_va_vdst(0)
++ 	s_set_vgpr_msb 0xfc3                    ;  msbs: dst=3 src0=3 src1=0 src2=0
++-	ds_load_tr16_b128 v[58:61] /*v[826:829]*/, v170 /*v938*/ offset:9056
++-	ds_load_tr16_b128 v[62:65] /*v[830:833]*/, v170 /*v938*/ offset:15456
+++	ds_load_tr16_b128 v[216:219] /*v[984:987]*/, v170 /*v938*/ offset:9056
+++	ds_load_tr16_b128 v[220:223] /*v[988:991]*/, v170 /*v938*/ offset:15456
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++ 	; sched_group_barrier mask(0x00000100) size(2) SyncID(0)
++ 	; sched_group_barrier mask(0x00000004) size(2) SyncID(0)
++@@ -5715,60 +5720,60 @@
++ 	; sched_barrier mask(0x00000000)
++ 	s_set_vgpr_msb 0xfa3                    ;  msbs: dst=2 src0=3 src1=0 src2=2
++ 	s_wait_dscnt 0x16
++-	v_wmma_f32_16x16x32_bf16 v[34:41] /*v[546:553]*/, v[106:113] /*v[874:881]*/, v[34:41], v[34:41] /*v[546:553]*/
+++	v_wmma_f32_16x16x32_bf16 v[34:41] /*v[546:553]*/, v[240:247] /*v[1008:1015]*/, v[34:41], v[34:41] /*v[546:553]*/
++ 	s_wait_dscnt 0x14
++-	v_wmma_f32_16x16x32_bf16 v[26:33] /*v[538:545]*/, v[114:121] /*v[882:889]*/, v[34:41], v[26:33] /*v[538:545]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[26:33] /*v[538:545]*/, v[248:255] /*v[1016:1023]*/, v[34:41], v[26:33] /*v[538:545]*/ matrix_b_reuse
++ 	s_wait_dscnt 0x12
++-	v_wmma_f32_16x16x32_bf16 v[18:25] /*v[530:537]*/, v[34:41] /*v[802:809]*/, v[34:41], v[18:25] /*v[530:537]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[18:25] /*v[530:537]*/, v[198:205] /*v[966:973]*/, v[34:41], v[18:25] /*v[530:537]*/ matrix_b_reuse
++ 	s_wait_dscnt 0x10
++-	v_wmma_f32_16x16x32_bf16 v[10:17] /*v[522:529]*/, v[122:129] /*v[890:897]*/, v[34:41], v[10:17] /*v[522:529]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[10:17] /*v[522:529]*/, v[206:213] /*v[974:981]*/, v[34:41], v[10:17] /*v[522:529]*/ matrix_b_reuse
++ 	s_wait_dscnt 0xe
++ 	v_wmma_f32_16x16x32_bf16 v[2:9] /*v[514:521]*/, v[130:137] /*v[898:905]*/, v[34:41], v[2:9] /*v[514:521]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0xa353                   ;  msbs: dst=1 src0=3 src1=0 src2=1
++ 	s_wait_dscnt 0xc
++-	v_wmma_f32_16x16x32_bf16 v[250:257] /*v[506:513]*/, v[42:49] /*v[810:817]*/, v[34:41], v[250:257] /*v[506:513]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[250:257] /*v[506:513]*/, v[190:197] /*v[958:965]*/, v[34:41], v[250:257] /*v[506:513]*/ matrix_b_reuse
++ 	s_wait_dscnt 0xa
++ 	v_wmma_f32_16x16x32_bf16 v[242:249] /*v[498:505]*/, v[138:145] /*v[906:913]*/, v[34:41], v[242:249] /*v[498:505]*/ matrix_b_reuse
++ 	s_wait_dscnt 0x8
++ 	v_wmma_f32_16x16x32_bf16 v[226:233] /*v[482:489]*/, v[146:153] /*v[914:921]*/, v[34:41], v[226:233] /*v[482:489]*/ matrix_b_reuse
++ 	s_wait_dscnt 0x6
++-	v_wmma_f32_16x16x32_bf16 v[234:241] /*v[490:497]*/, v[50:57] /*v[818:825]*/, v[34:41], v[234:241] /*v[490:497]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[234:241] /*v[490:497]*/, v[182:189] /*v[950:957]*/, v[34:41], v[234:241] /*v[490:497]*/ matrix_b_reuse
++ 	s_wait_dscnt 0x4
++ 	v_wmma_f32_16x16x32_bf16 v[218:225] /*v[474:481]*/, v[154:161] /*v[922:929]*/, v[34:41], v[218:225] /*v[474:481]*/ matrix_b_reuse
++ 	s_wait_dscnt 0x2
++ 	v_wmma_f32_16x16x32_bf16 v[210:217] /*v[466:473]*/, v[162:169] /*v[930:937]*/, v[34:41], v[210:217] /*v[466:473]*/ matrix_b_reuse
++ 	s_wait_dscnt 0x0
++-	v_wmma_f32_16x16x32_bf16 v[202:209] /*v[458:465]*/, v[58:65] /*v[826:833]*/, v[34:41], v[202:209] /*v[458:465]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[202:209] /*v[458:465]*/, v[216:223] /*v[984:991]*/, v[34:41], v[202:209] /*v[458:465]*/ matrix_b_reuse
++ 	; sched_barrier mask(0x00000000)
++ 	s_wait_tensorcnt 0x3
++ 	; sched_barrier mask(0x00000000)
++ 	s_barrier_signal -1
++ 	; sched_barrier mask(0x00000000)
++-	v_wmma_f32_16x16x32_bf16 v[194:201] /*v[450:457]*/, v[106:113] /*v[874:881]*/, v[42:49], v[194:201] /*v[450:457]*/
++-	v_wmma_f32_16x16x32_bf16 v[186:193] /*v[442:449]*/, v[114:121] /*v[882:889]*/, v[42:49], v[186:193] /*v[442:449]*/ matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[178:185] /*v[434:441]*/, v[34:41] /*v[802:809]*/, v[42:49], v[178:185] /*v[434:441]*/ matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[170:177] /*v[426:433]*/, v[122:129] /*v[890:897]*/, v[42:49], v[170:177] /*v[426:433]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[194:201] /*v[450:457]*/, v[240:247] /*v[1008:1015]*/, v[42:49], v[194:201] /*v[450:457]*/
+++	v_wmma_f32_16x16x32_bf16 v[186:193] /*v[442:449]*/, v[248:255] /*v[1016:1023]*/, v[42:49], v[186:193] /*v[442:449]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[178:185] /*v[434:441]*/, v[198:205] /*v[966:973]*/, v[42:49], v[178:185] /*v[434:441]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[170:177] /*v[426:433]*/, v[206:213] /*v[974:981]*/, v[42:49], v[170:177] /*v[426:433]*/ matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[154:161] /*v[410:417]*/, v[130:137] /*v[898:905]*/, v[42:49], v[154:161] /*v[410:417]*/ matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[138:145] /*v[394:401]*/, v[42:49] /*v[810:817]*/, v[42:49], v[138:145] /*v[394:401]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[138:145] /*v[394:401]*/, v[190:197] /*v[958:965]*/, v[42:49], v[138:145] /*v[394:401]*/ matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[122:129] /*v[378:385]*/, v[138:145] /*v[906:913]*/, v[42:49], v[122:129] /*v[378:385]*/ matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[106:113] /*v[362:369]*/, v[146:153] /*v[914:921]*/, v[42:49], v[106:113] /*v[362:369]*/ matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[82:89] /*v[338:345]*/, v[50:57] /*v[818:825]*/, v[42:49], v[82:89] /*v[338:345]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[82:89] /*v[338:345]*/, v[182:189] /*v[950:957]*/, v[42:49], v[82:89] /*v[338:345]*/ matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[74:81] /*v[330:337]*/, v[154:161] /*v[922:929]*/, v[42:49], v[74:81] /*v[330:337]*/ matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[66:73] /*v[322:329]*/, v[162:169] /*v[930:937]*/, v[42:49], v[66:73] /*v[322:329]*/ matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[58:65] /*v[314:321]*/, v[58:65] /*v[826:833]*/, v[42:49], v[58:65] /*v[314:321]*/ matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[34:41] /*v[290:297]*/, v[106:113] /*v[874:881]*/, v[58:65], v[34:41] /*v[290:297]*/
++-	v_wmma_f32_16x16x32_bf16 v[26:33] /*v[282:289]*/, v[114:121] /*v[882:889]*/, v[58:65], v[26:33] /*v[282:289]*/ matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[18:25] /*v[274:281]*/, v[34:41] /*v[802:809]*/, v[58:65], v[18:25] /*v[274:281]*/ matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[10:17] /*v[266:273]*/, v[122:129] /*v[890:897]*/, v[58:65], v[10:17] /*v[266:273]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[58:65] /*v[314:321]*/, v[216:223] /*v[984:991]*/, v[42:49], v[58:65] /*v[314:321]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[34:41] /*v[290:297]*/, v[240:247] /*v[1008:1015]*/, v[58:65], v[34:41] /*v[290:297]*/
+++	v_wmma_f32_16x16x32_bf16 v[26:33] /*v[282:289]*/, v[248:255] /*v[1016:1023]*/, v[58:65], v[26:33] /*v[282:289]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[18:25] /*v[274:281]*/, v[198:205] /*v[966:973]*/, v[58:65], v[18:25] /*v[274:281]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[10:17] /*v[266:273]*/, v[206:213] /*v[974:981]*/, v[58:65], v[10:17] /*v[266:273]*/ matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[2:9] /*v[258:265]*/, v[130:137] /*v[898:905]*/, v[58:65], v[2:9] /*v[258:265]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x5303                   ;  msbs: dst=0 src0=3 src1=0 src2=0
++-	v_wmma_f32_16x16x32_bf16 v[234:241], v[42:49] /*v[810:817]*/, v[58:65], v[234:241] matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[234:241], v[190:197] /*v[958:965]*/, v[58:65], v[234:241] matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[218:225], v[138:145] /*v[906:913]*/, v[58:65], v[218:225] matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[186:193], v[146:153] /*v[914:921]*/, v[58:65], v[186:193] matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[194:201], v[50:57] /*v[818:825]*/, v[58:65], v[194:201] matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[194:201], v[182:189] /*v[950:957]*/, v[58:65], v[194:201] matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[178:185], v[154:161] /*v[922:929]*/, v[58:65], v[178:185] matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[170:177], v[162:169] /*v[930:937]*/, v[58:65], v[170:177] matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[146:153], v[58:65] /*v[826:833]*/, v[58:65], v[146:153] matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[146:153], v[216:223] /*v[984:991]*/, v[58:65], v[146:153] matrix_b_reuse
++ 	; sched_barrier mask(0x00000000)
++ 	s_barrier_wait -1
++ 	; sched_barrier mask(0x00000000)
++@@ -5778,7 +5783,6 @@
++ 	ds_load_b128 v[102:105] /*v[870:873]*/, v172 /*v940*/ offset:8736
++ 	ds_load_b128 v[66:69] /*v[834:837]*/, v172 /*v940*/ offset:8768
++ 	ds_load_b128 v[70:73] /*v[838:841]*/, v172 /*v940*/ offset:8800
++-	s_wait_alu depctr_va_vdst(3)
++ 	ds_load_b128 v[50:53] /*v[818:821]*/, v172 /*v940*/ offset:8832
++ 	ds_load_b128 v[54:57] /*v[822:825]*/, v172 /*v940*/ offset:8864
++ 	ds_load_b128 v[42:45] /*v[810:813]*/, v172 /*v940*/ offset:8896
++@@ -5793,7 +5797,6 @@
++ 	ds_load_b128 v[86:89] /*v[854:857]*/, v171 /*v939*/ offset:96
++ 	ds_load_b128 v[74:77] /*v[842:845]*/, v171 /*v939*/ offset:128
++ 	ds_load_b128 v[78:81] /*v[846:849]*/, v171 /*v939*/ offset:160
++-	s_wait_alu depctr_va_vdst(0)
++ 	ds_load_b128 v[58:61] /*v[826:829]*/, v171 /*v939*/ offset:192
++ 	ds_load_b128 v[62:65] /*v[830:833]*/, v171 /*v939*/ offset:224
++ 	; sched_barrier mask(0x00000000)

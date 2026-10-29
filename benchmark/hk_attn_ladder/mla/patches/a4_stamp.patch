@@ -1,0 +1,67 @@
+diff -ruN a/src/k_dkdv96ds.hip b/src/k_dkdv96ds.hip
+--- a/src/k_dkdv96ds.hip	2026-10-28 02:59:31.142525818 +0000
++++ b/src/k_dkdv96ds.hip	2026-10-28 03:00:01.735118788 +0000
+@@ -155,6 +155,20 @@
+   };
+   auto tdm_issue = [&](const TdmG0& t) { static_for<3>([&](auto op) { tdm_load(t.g0[op], g1[op]); }); };
+   auto tdm_tile = [&](int qt, int gh, int stage_off) { tdm_issue(tdm_prep(qt, gh, stage_off)); };
++#if HKL_STAMP  // timing probe: shader cycles at fixed points of every full iteration of workgroup (0, 0, 0), into the
++               // 64 KB guard in front of the dS layout (wave w: entries [w * 2048, +2048), iteration ii point p:
++               // (ii + 1) * 16 + p)
++  const bool stamp_wg = blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0;
++  unsigned long long* const stamp_p = reinterpret_cast<unsigned long long*>(DS) - 8192 + wv * 2048;
++  auto stamp = [&](int it, int pt) {
++    sched_barrier<0>();
++    const unsigned long long c = __builtin_readcyclecounter();
++    if (stamp_wg && it < 126) stamp_p[(it + 1) * 16 + pt] = c;
++    sched_barrier<0>();
++  };
++#else
++  auto stamp = [&](int, int) {};
++#endif
+ 
+   // ---- NL / ND: the 8 vec4 loads of (query pair qt, q head gh); voffset 32*half, soffset uniform -------
+   const int voff_l = k1_nl_voff(lane);
+@@ -509,6 +523,7 @@
+       const int qn = k1_wrap_q(qi, gh, G), gn = k1_wrap_g(qi, gh, G);
+       const int ncur = k1_ncur(cur);         // (ii+1)%3: next iteration's stage == this one's readback stage
+       // NL/ND prefetch for ii+1 (clamped) at the top
++      if constexpr (K3) stamp(ii, 0);
+       sched_barrier<0>();
+       if constexpr (G1) {
+         ldl(qt0 + (ii + 1 < n_full ? ii + 1 : n_full - 1), 0, nxt);
+@@ -523,6 +538,7 @@
+         const lds_u8* tv = tr_base(cur, 0);
+         const lds_u8* tk = tr_base(cur, 1);
+         const RdBase rbb = rd_base(ncur);
++        stamp(ii, 1);
+         sched_barrier<SB_ALU>();             // the softmax / pack VALU tail may overlap the burst
+         // (2) tr16 burst 1: dO^T of stage cur
+         bf16x16 b_do[NDO_V];
+@@ -574,6 +590,7 @@
+           sched_group_barrier<0x004, KH0_SALU, 0>();
+         });
+         sched_barrier<0>();
++        stamp(ii, 2);
+         dk_kh(std::integral_constant<int, 0>{}, acc, b_q, a_dsk);
+         // the ring barrier after the last DS read of stage cur: tensorcnt 3 retires this wave's half of
+         // (ii+1)%3, the release fence drains every wave's DS reads of cur (WAR for the prefetch below)
+@@ -586,6 +603,7 @@
+         constexpr int XS = 24;
+         lds_arrive();
+         sched_barrier<0>();
++        stamp(ii, 3);
+         // window: global WMMA index j = (kh - 1) * NDO_QK + d over kh 1..NKV-1
+         static_for<NKV - 1>([&](auto k) {
+           constexpr int lo = k * NDO_QK, hi = lo + NDO_QK;
+@@ -594,8 +612,10 @@
+                  acc, b_q, a_dsk);
+         });
+         sched_barrier<0>();
++        
+         lds_wait();
+         sched_barrier<0>();
++        stamp(ii, 4);
+         rdqd_hh(rbb, std::integral_constant<int, 0>{}, qd);   // (1) hh0 of ncur; qd died in hh0's S/dP
+         sched_barrier<0>();
+         static_for<NKV - 1>([&](auto k) {
