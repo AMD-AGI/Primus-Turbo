@@ -10,6 +10,11 @@
 
 With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its guiding principles, Primus-Turbo is designed to fully unleash the potential of AMD GPUs for large-scale training workloads, offering a robust and complete acceleration foundation for next-generation AI systems.
 
+<p align="center">
+  <img src="docs/images/Primus-Turbo-Architecture.png" width="500"/>
+</p>
+Note: JAX support is under active development. Optim support is planned but not yet available.
+
 👉 **[Scope and Supported Operators](./docs/supported_ops.md)** — the full list of operators, modules, precisions, and kernel backends.
 
 | Category | Operators |
@@ -21,8 +26,6 @@ With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its 
 | Norm / Act / RoPE / Loss | `rmsnorm`, `rmsnorm_residual`, `rmsnorm_residual_fp4`, `swiglu_with_probs`, `geglu_with_probs`, `fused_qkv_rope`, `fused_qkv_rmsnorm_rope`, `cross_entropy` |
 | Quantization | `quantize_fp8` / `quantize_fp4` (+ `_with_trans`, grouped, dequantize), `weight_deosc_*` |
 | Communication | `fused_all_gather_matmul`, `fused_matmul_reduce_scatter`, `FP8AllToAll`, DeepEP `Buffer` |
-
-Note: JAX support is under active development. Optim support is planned but not yet available.
 
 > **Part of the Primus Ecosystem**: Primus-Turbo is the high-performance operator layer of the [Primus ecosystem](#-primus-ecosystem), working together with [Primus-LM](https://github.com/AMD-AGI/Primus) (training framework) and [Primus-SaFE](https://github.com/AMD-AGI/Primus-SaFE) (stability & platform).
 
@@ -256,12 +259,6 @@ Primus-Turbo is part of a comprehensive stack for large-model training on AMD GP
 │  MegaMoE | FP8/MXFP8/MXFP4 | AITER | CK | FlyDSL    │
 └─────────────────────────────────────────────────────┘
 ```
-
-Inside Primus-Turbo:
-
-<p align="center">
-  <img src="docs/images/Primus-Turbo-Architecture.png" width="500"/>
-</p>
 
 ### 📦 Component Details
 
