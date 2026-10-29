@@ -162,7 +162,9 @@ class Workspace:
         return self.base + align(self.NUM_BARRIER_SIGNAL_BYTES, BLOCK_M)
 
     def get_combine_token_buffer_ptr(self):
-        buffer_bytes = align(self.num_max_recv_tokens * self.hidden * self.token_dtype.itemsize, BLOCK_M)
+        # Pool-sized so contiguous-M dispatch can land rows in GEMM order (P1). Recv-token
+        # addressing still fits: num_max_pool_tokens >= num_max_recv_tokens.
+        buffer_bytes = align(self.num_max_pool_tokens * self.hidden * self.token_dtype.itemsize, BLOCK_M)
         return self.get_dispatch_token_buffer_ptr() + buffer_bytes
 
     def get_dispatch_flag_ptr(self):
@@ -267,7 +269,7 @@ def get_symm_buffer_size_for_mega_moe(
         return (
             _tensor_from_device_ptr(
                 int(workspace.get_dispatch_token_buffer_ptr()),
-                (num_max_recv_tokens, hidden),
+                (npt, hidden),
                 token_dtype,
                 dev,
             ),
