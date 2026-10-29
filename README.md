@@ -6,19 +6,29 @@
 [What's Primus-Turbo?](#-whats-primus-turbo) | [What's New](#-whats-new) | [Quick Start](#-quick-start) | [Example](#-example) | [Performance](#-performance) | [Roadmap](#-roadmap) | [Primus Ecosystem](#-primus-ecosystem) | [Acknowledgements](#-acknowledgements) | [License](#-license)
 
 ## 🔍 What's Primus-Turbo?
-**Primus-Turbo** is a high-performance acceleration library dedicated to large-scale model training on AMD GPUs. Built and optimized for the AMD ROCm platform, it covers the full training stack — including core compute operators (GEMM, Attention, GroupedGEMM), communication primitives, low-precision computation (FP8), and compute–communication overlap kernels.
+**Primus-Turbo** is a high-performance acceleration library dedicated to large-scale model training on AMD GPUs. Built and optimized for the AMD ROCm platform, it covers the full training stack — including core compute operators (GEMM, Attention, GroupedGEMM), communication primitives (DeepEP), fused MoE layers (Mega MoE), low-precision computation (FP8), and compute–communication overlap kernels.
 
 With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its guiding principles, Primus-Turbo is designed to fully unleash the potential of AMD GPUs for large-scale training workloads, offering a robust and complete acceleration foundation for next-generation AI systems.
 
-<p align="center">
-  <img src="docs/images/Primus-Turbo-Architecture.png" width="500"/>
-</p>
+👉 **[Scope and Supported Operators](./docs/supported_ops.md)** — the full list of operators, modules, precisions, and kernel backends.
+
+| Category | Operators (`primus_turbo.pytorch.ops`) |
+|---|---|
+| GEMM | `gemm` (BF16/FP16), `gemm_fp8` (tensorwise / rowwise / blockwise / MXFP8), `gemm_fp4` (MXFP4), `mlp_fp4` |
+| Grouped GEMM | `grouped_gemm`, `grouped_gemm_fp8`, `grouped_gemm_fp4`, `grouped_mlp_fp8`, `grouped_mlp_fp4` |
+| Attention | `flash_attn_func`, `flash_attn_varlen_func`, `flash_attn_fp8_func`, `flash_attn_*_usp_func` (context parallel), `sparse_mla_func` |
+| MoE | `fused_group_topk_routing_with_aux_score`, `moe_permute` / `moe_unpermute`, `moe_dispatch` / `moe_combine`, `fused_mega_moe` (BF16 / MXFP8) |
+| Norm / Act / RoPE / Loss | `rmsnorm`, `rmsnorm_residual`, `rmsnorm_residual_fp4`, `swiglu_with_probs`, `geglu_with_probs`, `fused_qkv_rope`, `fused_qkv_rmsnorm_rope`, `cross_entropy` |
+| Quantization | `quantize_fp8` / `quantize_fp4` (+ `_with_trans`, grouped, dequantize), `weight_deosc_*` |
+| Communication | `fused_all_gather_matmul`, `fused_matmul_reduce_scatter`, `FP8AllToAll`, DeepEP `Buffer` |
+
 Note: JAX support is under active development. Optim support is planned but not yet available.
 
 > **Part of the Primus Ecosystem**: Primus-Turbo is the high-performance operator layer of the [Primus ecosystem](#-primus-ecosystem), working together with [Primus-LM](https://github.com/AMD-AGI/Primus) (training framework) and [Primus-SaFE](https://github.com/AMD-AGI/Primus-SaFE) (stability & platform).
 
 ## 🚀 What's New
 
+- **[2026/10/28]** 🔥 **Mega MoE on MI455X (gfx1250)** — BF16 fused Mega MoE forward and backward on gfx1250, including the staged op with per-expert biases for GPT-OSS shapes; validated on 4× MI455X (EP4) ([#582](https://github.com/AMD-AGI/Primus-Turbo/pull/582), [overview](./docs/README_Mega_MoE.md)).
 - **[2026/10/21]** 🔥 **Release [v0.6.1](https://github.com/AMD-AGI/Primus-Turbo/releases/tag/v0.6.1)** (patch over [v0.6.0](https://github.com/AMD-AGI/Primus-Turbo/releases/tag/v0.6.0)) — Mega MoE ownership and MXFP8 combine fixes, MXFP4 gather fusion into quantization, tensorwise FP8 from the TURBO permute, head_dim-128 fused QK RMSNorm + RoPE, DeepEP cheap-fence default, and FlyDSL attention / GEMM correctness on gfx950 ([changes since v0.5.0](https://github.com/AMD-AGI/Primus-Turbo/compare/v0.5.0...v0.6.1)).
 - **[2026/10/19–10/21]** 🔥 **Mega MoE: dispatch-sized buffers & GPT-OSS** — size BF16 / MXFP8 Mega MoE memory to the rows dispatched to each rank (#566, #568); support GPT-OSS shapes (H/I=2880) and per-expert biases (#571) ([overview](./docs/README_Mega_MoE.md)).
 - **[2026/10/19]** 🔥 **FlyDSL 0.3.4.1 / AITER v0.1.24.post1** — port kernels to FlyDSL 0.3 and bump the pinned AITER release (#544).
@@ -246,6 +256,12 @@ Primus-Turbo is part of a comprehensive stack for large-model training on AMD GP
 │  Mega MoE | FP8/MXFP8/MXFP4 | AITER | CK | FlyDSL    │
 └─────────────────────────────────────────────────────┘
 ```
+
+Inside Primus-Turbo:
+
+<p align="center">
+  <img src="docs/images/Primus-Turbo-Architecture.png" width="500"/>
+</p>
 
 ### 📦 Component Details
 
