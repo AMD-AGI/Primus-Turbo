@@ -1,0 +1,21 @@
+[2026-10-29T09:09:28 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m hkl.ladder mla/ladder_bwd.json --rung r10n r10t --baseline -r 8
+device gfx1250 (256 CUs)  torch 2.14.0+rocm10.2.0a20261011  ladder mla_bwd  shape b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd
+reference 1.6 s
+  verify r10n               dq 52.3 dk 52.3 dv 52.6
+  verify r10t               dq 52.3 dk 52.3 dv 52.6
+  verify r10t#null          dq 52.3 dk 52.3 dv 52.6
+  round 1/8: r10n=2.3312 r10t=2.2943 r10t#null=2.3130
+  round 2/8: r10n=2.3348 r10t=2.3093 r10t#null=2.3063
+  round 3/8: r10n=2.3656 r10t=2.3080 r10t#null=2.3022
+  round 4/8: r10n=2.3488 r10t=2.3150 r10t#null=2.3070
+  round 5/8: r10n=2.3477 r10t=2.3072 r10t#null=2.3106
+  round 6/8: r10n=2.3610 r10t=2.3141 r10t#null=2.3204
+  round 7/8: r10n=2.3573 r10t=2.2998 r10t#null=2.3083
+  round 8/8: r10n=2.3550 r10t=2.3183 r10t#null=2.3104
+arm                        ms  TFLOP/s     over             step  step cyc   sclk    Mcyc      W     mJ  a08 ms  feature
+------------------------------------------------------------------------------------------------------------------------
+r10n                   2.3519   1519.8                                       1223   2.878      -      -          r10k + k_dqds_c dS images padded 16 B per 256 B (was per 64 
+r10t                   2.3087   1548.2     r10n     1.017x±0.004    1.042x   1195   2.758      -      -          r10n + the work item from a ticket counter instead of the bl
+r10t#null              2.3094   1547.7                                       1197   2.766      -      -          r10n + the work item from a ticket counter instead of the bl
+null control r10t vs #null: 0.9999x ± 0.0034
+[09:10:05 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_090928_tk_time.log

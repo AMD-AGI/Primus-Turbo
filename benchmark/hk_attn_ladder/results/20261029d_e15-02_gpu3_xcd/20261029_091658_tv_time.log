@@ -1,0 +1,23 @@
+[2026-10-29T09:16:58 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m hkl.ladder mla/ladder_bwd.json --rung r10n r10t r10v --baseline -r 8
+device gfx1250 (256 CUs)  torch 2.14.0+rocm10.2.0a20261011  ladder mla_bwd  shape b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd
+reference 1.6 s
+  verify r10n               dq 52.3 dk 52.3 dv 52.6
+  verify r10t               dq 52.3 dk 52.3 dv 52.6
+  verify r10v               dq 52.3 dk 52.3 dv 52.6
+  verify r10v#null          dq 52.3 dk 52.3 dv 52.6
+  round 1/8: r10n=2.3576 r10t=2.3171 r10v=2.3718 r10v#null=2.3666
+  round 2/8: r10n=2.3682 r10t=2.3014 r10v=2.3525 r10v#null=2.3645
+  round 3/8: r10n=2.3650 r10t=2.3077 r10v=2.3536 r10v#null=2.3689
+  round 4/8: r10n=2.3587 r10t=2.3081 r10v=2.3703 r10v#null=2.3716
+  round 5/8: r10n=2.3695 r10t=2.3204 r10v=2.3698 r10v#null=2.3604
+  round 6/8: r10n=2.3830 r10t=2.3079 r10v=2.3749 r10v#null=2.3709
+  round 7/8: r10n=2.3776 r10t=2.3161 r10v=2.3722 r10v#null=2.3757
+  round 8/8: r10n=2.3690 r10t=2.3099 r10v=2.3686 r10v#null=2.3681
+arm                        ms  TFLOP/s     over             step  step cyc   sclk    Mcyc      W     mJ  a08 ms  feature
+------------------------------------------------------------------------------------------------------------------------
+r10n                   2.3686   1509.0                                       1238   2.935      -      -          r10k + k_dqds_c dS images padded 16 B per 256 B (was per 64 
+r10t                   2.3090   1548.0     r10n     1.025x±0.004    1.062x   1196   2.764      -      -          r10n + the work item from a ticket counter instead of the bl
+r10v                   2.3700   1508.1     r10n     1.001x±0.004    0.998x   1246   2.943      -      -          r10n + ticket mode 2 (-DHKGEN_TICKET=2): one queue per XCD (
+r10v#null              2.3685   1509.1                                       1243   2.944      -      -          r10n + ticket mode 2 (-DHKGEN_TICKET=2): one queue per XCD (
+null control r10v vs #null: 0.9998x ± 0.0030
+[09:17:46 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_091658_tv_time.log

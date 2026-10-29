@@ -1,0 +1,36 @@
+[2026-10-29T08:48:58 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: sh -c python3 -m hkl.test mla/ladder_bwd.json --rung r10n_ps --shapes toy | tail -2; python3 -m micro.k3_probe mla/ladder_bwd.json r10n_ps --abc --calls 20 --allwg 11008 --split
+  r10n_ps          PASS  dq  52.06 dk  52.09 dv  52.72  det
+ALL PASS
+wave 0: 1376 workgroups (li % 64 < 8), cycles
+   entry -> INIT start                mean    1001  median    819  p10    791  p90    852
+   INIT issued                        mean    2735  median   2351  p10   1901  p90   4066
+   tile 0 landed (own half)           mean    3267  median   2814  p10   2339  p90   4701
+   prologue (+ barrier, LOOP inputs)  mean    3757  median   3253  p10   2776  p90   5167
+   epilogue: tensorcnt 0 + barrier    mean     156  median    130  p10    122  p90    214
+   epilogue (FINAL issued)            mean    3695  median   3323  p10   3120  p90   4394
+   per li % 8 (XCD), workgroups li >= 512: mean entry / prologue / loop / epilogue (cycles)
+      0: n 164     823    3373     79101    3471
+      1: n 164     820    3735     87834    3699
+      2: n 164     829    3364     78697    3423
+      3: n 164     820    3442     82859    3634
+      4: n 164     826    3305     79023    3534
+      5: n 164     820    3608     85332    3664
+      6: n 164     816    3303     78783    3445
+      7: n 164     818    3441     83616    3621
+wave 1: 1376 workgroups (li % 64 < 8), cycles
+   entry -> INIT start                mean    1009  median    827  p10    798  p90    858
+   INIT issued                        mean    2876  median   2463  p10   2014  p90   4312
+   tile 0 landed (own half)           mean    3400  median   2932  p10   2452  p90   4864
+   prologue (+ barrier, LOOP inputs)  mean    3748  median   3246  p10   2767  p90   5174
+   epilogue: tensorcnt 0 + barrier    mean     149  median    122  p10    122  p90    205
+   epilogue (FINAL issued)            mean    3687  median   3323  p10   3116  p90   4415
+   per li % 8 (XCD), workgroups li >= 512: mean entry / prologue / loop / epilogue (cycles)
+      0: n 164     832    3365     79110    3458
+      1: n 164     830    3723     87838    3709
+      2: n 164     833    3359     78708    3416
+      3: n 164     828    3430     82856    3631
+      4: n 164     834    3299     79041    3515
+      5: n 164     827    3599     85337    3663
+      6: n 164     826    3289     78799    3431
+      7: n 164     824    3430     83619    3616
+[08:49:06 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_084858_ps2.log

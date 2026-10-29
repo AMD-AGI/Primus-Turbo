@@ -1,0 +1,70 @@
+[2026-10-29T09:08:41 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: sh -c for r in r10n_rt r10t_rt r10n_rt r10t_rt; do echo == $r; python3 -m micro.k3_probe mla/ladder_bwd.json $r --abc --calls 20 --allwg 11008 --rt | sed -n 1,16p; done
+== r10n_rt
+11008 workgroups; first start .. last end 1405.5 us; sum of spans 669642 us = 93.1% of 512 slots x span; durations saturated: 0
+resident workgroups per 1/40 of the span: 506 512 512 500 499 498 512 505 500 497 505 512 502 501 498 509 505 506 499 504 508 506 499 500 504 502 510 498 508 499 503 504 501 507 498 507 372 252 221 78
+   middle 3/4 mean 503.3; first bin 506, last 3 bins 252, 221, 78
+   90% of the workgroups ended by 1257.0 us
+   99% of the workgroups ended by 1384.6 us
+   workgroup span (us): median 58.4, p10 17.3, p90 104.6, max 140.0
+   per li % 8 (XCD): n, sum of spans (us), mean span (us), last end (us), busy share of 64 slots x span
+      0:  1376     80605   58.58   1294.1   97.3%
+      1:  1376     88244   64.13   1405.5   98.1%
+      2:  1376     80977   58.85   1294.0   97.8%
+      3:  1376     85678   62.27   1365.8   98.0%
+      4:  1376     80724   58.67   1288.3   97.9%
+      5:  1376     87236   63.40   1392.0   97.9%
+      6:  1376     80440   58.46   1286.9   97.7%
+      7:  1376     85737   62.31   1373.8   97.5%
+   the 12 last to end: li (x, y, z) start..end us
+== r10t_rt
+11008 workgroups; first start .. last end 1417.4 us; sum of spans 704396 us = 97.1% of 512 slots x span; durations saturated: 0
+resident workgroups per 1/40 of the span: 508 512 512 498 506 496 512 512 501 504 497 512 509 502 495 502 512 501 511 492 509 512 500 511 492 508 512 500 510 485 512 512 499 508 493 512 512 495 500 201
+   middle 3/4 mean 504.1; first bin 508, last 3 bins 495, 500, 201
+   90% of the workgroups ended by 1326.5 us
+   99% of the workgroups ended by 1404.3 us
+   workgroup span (us): median 61.6, p10 19.7, p90 109.7, max 136.6
+   per li % 8 (XCD): n, sum of spans (us), mean span (us), last end (us), busy share of 64 slots x span
+      0:  1376     87908   63.89   1417.2   96.9%
+      1:  1376     88644   64.42   1417.2   97.7%
+      2:  1376     87679   63.72   1417.4   96.7%
+      3:  1376     88279   64.16   1417.4   97.3%
+      4:  1376     87710   63.74   1417.3   96.7%
+      5:  1376     88282   64.16   1417.4   97.3%
+      6:  1376     87806   63.81   1417.2   96.8%
+      7:  1376     88087   64.02   1417.2   97.1%
+   the 12 last to end: li (x, y, z) start..end us
+== r10n_rt
+11008 workgroups; first start .. last end 1457.1 us; sum of spans 691153 us = 92.6% of 512 slots x span; durations saturated: 0
+resident workgroups per 1/40 of the span: 505 512 510 502 501 500 512 502 501 497 505 511 497 502 492 508 506 505 500 490 507 507 476 502 494 500 509 495 510 482 505 502 504 497 493 496 323 249 251 114
+   middle 3/4 mean 500.3; first bin 505, last 3 bins 249, 251, 114
+   90% of the workgroups ended by 1296.2 us
+   99% of the workgroups ended by 1438.6 us
+   workgroup span (us): median 60.2, p10 17.8, p90 107.1, max 151.8
+   per li % 8 (XCD): n, sum of spans (us), mean span (us), last end (us), busy share of 64 slots x span
+      0:  1376     82864   60.22   1321.2   98.0%
+      1:  1376     90049   65.44   1437.8   97.9%
+      2:  1376     83324   60.56   1333.0   97.7%
+      3:  1376     88798   64.53   1457.1   95.2%
+      4:  1376     83431   60.63   1331.6   97.9%
+      5:  1376     90683   65.90   1447.9   97.9%
+      6:  1376     83200   60.47   1326.6   98.0%
+      7:  1376     88804   64.54   1441.1   96.3%
+   the 12 last to end: li (x, y, z) start..end us
+== r10t_rt
+11008 workgroups; first start .. last end 1355.5 us; sum of spans 675309 us = 97.3% of 512 slots x span; durations saturated: 0
+resident workgroups per 1/40 of the span: 507 512 512 497 507 490 512 512 500 505 496 512 512 500 503 498 512 512 501 499 502 512 503 508 494 507 512 500 510 490 511 512 500 505 493 511 512 499 504 243
+   middle 3/4 mean 504.1; first bin 507, last 3 bins 499, 504, 243
+   90% of the workgroups ended by 1269.9 us
+   99% of the workgroups ended by 1342.7 us
+   workgroup span (us): median 59.4, p10 18.8, p90 105.4, max 139.4
+   per li % 8 (XCD): n, sum of spans (us), mean span (us), last end (us), busy share of 64 slots x span
+      0:  1376     84110   61.13   1352.1   97.2%
+      1:  1376     84892   61.69   1352.1   98.1%
+      2:  1376     84202   61.19   1352.1   97.3%
+      3:  1376     84642   61.51   1352.1   97.8%
+      4:  1376     84188   61.18   1352.1   97.3%
+      5:  1376     84572   61.46   1346.3   98.1%
+      6:  1376     84130   61.14   1352.1   97.2%
+      7:  1376     84574   61.46   1355.5   97.5%
+   the 12 last to end: li (x, y, z) start..end us
+[09:08:51 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_090841_tk_rt.log

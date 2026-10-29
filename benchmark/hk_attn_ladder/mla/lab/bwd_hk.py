@@ -117,6 +117,8 @@ HSACO_DIR = None
 DELTA = None  # configure(): None = HIP k_delta iff built, "hk" = required, "flydsl" = never
 ND_FOLD = False  # configure(): the rung's k_dkdv96ds folds ND into its dP C init (k_delta -DHK_ND_FOLD: NL += l2s,
 #                  ND = -delta, l2s = log2(scale) rounded to fp32 on the host, k_delta's f32 argument)
+TICKET = False  # configure(): k_dkdv96ds built with -DHKGEN_TICKET (k_dqds_c -DDQ_TICKET) takes its work item from
+#                 a ticket counter (the int 64 / 128 B in front of the dS layout), zeroed before every dkdv launch
 
 
 def nd_fold_offset(scale):
@@ -129,6 +131,15 @@ def _fold_nl_nd(nl, nd, delta, l2s):
     (NL + l2s, -delta), bit for bit: the same fp32 add, a negation."""
     nl.add_(l2s)
     torch.neg(delta, out=nd)
+
+
+def _zero_ticket(ds_full):
+    """The ticket counters in the 128 B in front of the dS layout = 0 (k_dkdv96ds -DHKGEN_TICKET: the int at -64,
+    k_dqds_c -DDQ_TICKET: the int at -128)."""
+    ds_full.view(torch.int32)[(DS_GUARD_B - 128) // 4 : DS_GUARD_B // 4].zero_()
+
+
+HOST_STEPS = (_fold_nl_nd, _zero_ticket)  # launches run on the host side (torch ops), not HIP / FlyDSL kernels
 # kernel argument kinds (manifest.json of 71bd0329; identical in every rung)
 SPECS = {
     "k_dkdv96ds": {"block": 64, "args": [("Q", "ptr"), ("K", "ptr"), ("V", "ptr"), ("DO", "ptr"), ("NL", "ptr"),
@@ -143,11 +154,12 @@ SPECS = {
 }  # fmt: skip
 
 
-def configure(delta=None, dkdv_block=64, nd_fold=False):
+def configure(delta=None, dkdv_block=64, nd_fold=False, ticket=False):
     """delta: see DELTA; dkdv_block: the k_dkdv96ds workgroup size of the rung (64; 128 for the 4-wave
-    wave-specialized kernel, which supports MHA only); nd_fold: see ND_FOLD."""
-    global DELTA, _KERNELS, ND_FOLD
+    wave-specialized kernel, which supports MHA only); nd_fold: see ND_FOLD; ticket: see TICKET."""
+    global DELTA, _KERNELS, ND_FOLD, TICKET
     ND_FOLD = bool(nd_fold)
+    TICKET = bool(ticket)
     if delta not in (None, "hk", "flydsl"):
         raise ValueError(f"delta must be None, 'hk' or 'flydsl', got {delta!r}")
     if dkdv_block not in (64, 128):
@@ -405,6 +417,8 @@ def _plan(
             DS_MODE,
         )
         dq_values = (ds, k_, dq_, sq, skv, hq, hkv, g, skv // 32, skv - sq, c, q_off, ntile, hg_q)
+        if TICKET:
+            launches.append(("ticket", _zero_ticket, (ds_full,)))
         launches.append(("dkdv", "k_dkdv96ds", ((hg_kv, limits.k3_nblk(skv), gz_kv), SPECS["k_dkdv96ds"]["block"],
                                                 dkdv_values)))
         launches.append(("dq", "k_dqds_c", ((hg_q, ntile + nhead, gz_q), 128, dq_values)))
@@ -454,7 +468,7 @@ def hk_attn_bwd(
         if isinstance(fn, str):
             grid, block, values = args
             table[fn].call(grid, block, values, stream)
-        elif fn is _fold_nl_nd:
+        elif fn in HOST_STEPS:
             fn(*args)
         else:
             _fly._launch(fn, args)

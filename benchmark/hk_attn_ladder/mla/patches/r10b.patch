@@ -2799,8 +2799,8 @@ diff -ruN a/r8gen/asmkit/verify_obj.py b/r8gen/asmkit/verify_obj.py
 +    sys.exit(1 if r else 0)
 diff -ruN a/r8gen/gen/build.py b/r8gen/gen/build.py
 --- a/r8gen/gen/build.py	1970-01-01 00:00:00.000000000 +0000
-+++ b/r8gen/gen/build.py	2026-10-29 07:42:21.000000000 +0000
-@@ -0,0 +1,383 @@
++++ b/r8gen/gen/build.py	2026-10-29 08:57:25.000000000 +0000
+@@ -0,0 +1,389 @@
 +###############################################################################
 +# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 +#
@@ -3044,12 +3044,18 @@ diff -ruN a/r8gen/gen/build.py b/r8gen/gen/build.py
 +        G.set_nkv(nkv)
 +        mlines = {m[2] for m in markers}
 +        hi, seen = shellbase.shell_span(shell, ins, bl, by["INIT"][2], by["FINAL"][2], mlines)
-+        base = hi + 1
-+        for _, ops, _, _, _ in by.values():
-+            for v in ops.values():
++        base, why = hi + 1, f"shell code v{hi}"
++        for mk, (_, ops, _, _, _) in by.items():
++            for k, v in ops.items():
 +                m = re.fullmatch(r"v(\d+)|v\[(\d+):(\d+)\]", v)
-+                if m:
-+                    base = max(base, int(m.group(3) or m.group(1)) + 1)
++                if m and int(m.group(3) or m.group(1)) + 1 > base:
++                    base, why = int(m.group(3) or m.group(1)) + 1, f"{mk} operand {k}={v}"
++        log(f"nkv={nkv}: base v{base} set by {why}")
++        if hi >= 15:
++            for i in sorted(seen):
++                vs = [r for r in list(ins[i].defs) + list(ins[i].uses) if r >= 15]
++                if vs:
++                    log(f"   line {i + 1}: {shell[i].strip()[:100]}")
 +        if shell_hi >= base:
 +            fail.append(f"nkv={nkv}: the shell references v{shell_hi} (line {shell_hi_at}) at or above base v{base}")
 +        L = G.Layout(base)
@@ -10033,8 +10039,8 @@ diff -ruN a/r8gen/hip/src/k_delta.hip b/r8gen/hip/src/k_delta.hip
 +}
 diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 --- a/r8gen/hip/src/k_dkdv96ds.hip	1970-01-01 00:00:00.000000000 +0000
-+++ b/r8gen/hip/src/k_dkdv96ds.hip	2026-10-29 07:50:57.000000000 +0000
-@@ -0,0 +1,888 @@
++++ b/r8gen/hip/src/k_dkdv96ds.hip	2026-10-29 09:20:59.000000000 +0000
+@@ -0,0 +1,970 @@
 +/***************************************************************************************************
 + * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 + *
@@ -10137,8 +10143,14 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +#ifndef HKGEN_EARLY_TDM
 +#define HKGEN_EARLY_TDM 0  // HKGEN: the first two tiles' TDM ahead of INIT's K / V fragment loads (latencies overlap)
 +#endif
++#ifndef HKGEN_TICKET
++#define HKGEN_TICKET 0  // HKGEN: the work item from a ticket counter instead of the block id (the int 64 B in front of
++#endif                  // DS, zeroed before the launch): items go to workgroups in the order they start
 +#ifndef HKGEN_PROBE
-+#define HKGEN_PROBE 0  // HKGEN: per-phase cycle sums of the steps (s96..s99) handed to the shell (PROBE marker)
++// HKGEN: 1 / 2: per-phase cycle sums of the steps (s96..s99) handed to the shell (PROBE marker) + every workgroup's
++// span (1) or prologue | epilogue (2); 3: prologue / epilogue split; 4: every workgroup's [start, end) on the 100-MHz
++// realtime counter (3, 4: no PROBE marker, the loop is not instrumented)
++#define HKGEN_PROBE 0
 +#endif
 +// SGPRs the generated code may use as temporaries (and vcc / scc): declared clobbered at every marker
 +#define HKGEN_CLOBBERS "memory", "vcc", "scc", "s90", "s91", "s92", "s93", "s94", "s95", "s96", "s97", "s98", \
@@ -10161,6 +10173,10 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +    float scale, int Sq, int Skv, int Hq, int Hkv, int G, int nqt, int cshift, int causal, int B, int HG,
 +    int ds_mode) {
 +  __shared__ __attribute__((aligned(1024))) unsigned char smem[K1_LDS];
++#if HKGEN && HKGEN_PROBE >= 3
++  const unsigned int pr_s = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
++  const unsigned int pr_rs = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readsteadycounter());
++#endif
 +  lock_simd();                           // the champion's first statement (rocdl.disable_xdl_arb_stall)
 +  const uint32_t lds0 = lds_addr(smem);
 +  const int tid = (int)threadIdx.x;
@@ -10168,9 +10184,30 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +  const int wv = wave_id(tid);
 +  const int half = lane / 16;
 +  const int row = lane % 16;
-+  const int bat = k1_bat((int)blockIdx.z, (int)blockIdx.x, HG, Hkv);
-+  const int hkv = k1_hkv((int)blockIdx.z, (int)blockIdx.x, HG, Hkv);
-+  const int bid = (int)blockIdx.y;
++#if HKGEN && HKGEN_TICKET
++  // ---- work item li = (bz * nblk + by) * HG + bx (the grid's own order: per bz the longest kv blocks first) from a
++  // ticket counter (the int 64 B in front of DS, zeroed before the launch): the workgroups take the items in the
++  // order they start. The dispatcher deals the blocks to the 8 XCDs round robin, a fixed number each; on a slower
++  // XCD they start later and take the later, shorter items, instead of that XCD finishing last
++  __shared__ int s_item[1];
++  if (tid == 0)
++    s_item[0] = __hip_atomic_fetch_add(reinterpret_cast<int*>(reinterpret_cast<unsigned char*>(DS) - 64), 1,
++                                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
++  lds_barrier();
++  const int k3_item = __builtin_amdgcn_readfirstlane(s_item[0]);
++#define K3_BX (k3_item % HG)
++#define K3_BY (k3_item / HG % k3_nblk(Skv))
++#define K3_BZ (k3_item / (HG * k3_nblk(Skv)))
++#define K3_LI k3_item
++#else
++#define K3_BX ((int)blockIdx.x)
++#define K3_BY ((int)blockIdx.y)
++#define K3_BZ ((int)blockIdx.z)
++#define K3_LI (((int)blockIdx.z * k3_nblk(Skv) + (int)blockIdx.y) * HG + (int)blockIdx.x)
++#endif
++  const int bat = k1_bat(K3_BZ, K3_BX, HG, Hkv);
++  const int hkv = k1_hkv(K3_BZ, K3_BX, HG, Hkv);
++  const int bid = K3_BY;
 +  const int n96 = k3_n96(Skv);
 +
 +  // TRUE byte extents on every buffer descriptor (FlyDSL _bv): an over-read returns 0, never the next page
@@ -10481,6 +10518,7 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +      // the workgroup's whole generated span: INIT (K / V fragments) .. FINAL (dK / dV stores issued)
 +      const unsigned int pr_t0 = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
 +      unsigned int pr_t1 = 0, pr_ta = 0, pr_tb = 0;  // ta / tb: around the LOOP marker (prologue | loop | epilogue)
++      unsigned int pr_i = 0, pr_w = 0, pr_e1 = 0, pr_e2 = 0;  // mode 3: INIT issued, tile 0 landed; epilogue waits
 +#endif
 +#if HKGEN_EARLY_TDM
 +      if (N > 0) {
@@ -10495,6 +10533,9 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +                   ::"s"(r_k), "s"(r_v), "v"(vk), "v"(vv), "s"(sk[0]), "s"(sk[1]), "s"(sk[NKV - 1]), "s"(sv[0]),
 +                   "s"(sv[1]), "s"(sv[NKV - 1]), "s"(c1), "s"(scale), "i"(NKV)
 +                   : HKGEN_CLOBBERS);
++#if HKGEN_PROBE >= 3
++      pr_i = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
++#endif
 +      if (N > 0) {
 +        sched_barrier<0>();
 +#if !HKGEN_EARLY_TDM
@@ -10503,6 +10544,9 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +#endif
 +        tensor_wait<K1_TW>();                    // own half of tile 0
 +        sched_barrier<0>();
++#if HKGEN_PROBE >= 3
++        pr_w = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
++#endif
 +        lds_barrier();                           // RAW: both halves of tile 0
 +        sched_barrier<0>();
 +        // LOOP: the hh0 operands of tile 0 + its NL/ND, then every tile k = 0 .. N-1 (the first n_mask diagonal) in a
@@ -10546,8 +10590,14 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +      }
 +      tensor_wait<0>();                          // no TDM may land after the ring is reused
 +      sched_barrier<0>();
++#if HKGEN_PROBE >= 3
++      pr_e1 = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
++#endif
 +      lds_barrier();                             // every wave's last ring read before the images overwrite it
 +      sched_barrier<0>();
++#if HKGEN_PROBE >= 3
++      pr_e2 = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
++#endif
 +      // FINAL: images (lane bases ev / ek), whole-line readback (rv / rk), global stores: byte 16 * k1_epi_g = lane
 +      // part gv / gk + row base sov / sok + rb * rsv / rsk (4 kv rows) + li * 128
 +      {
@@ -10566,9 +10616,39 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +        pr_t1 = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
 +#endif
 +      }
-+#if HKGEN_PROBE
++#if HKGEN_PROBE >= 3
 +      {
-+        const bool pr_wg = blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0;
++        // word 1024 + linear index (no gridDim); saturated 16-bit cycle counts
++        const int pr_li = K3_LI;
++        const auto r_all = rsrc(reinterpret_cast<const unsigned char*>(DS) - 65536, 65536);
++        auto sat = [](unsigned int x) { return x < 0xFFFFu ? x : 0xFFFFu; };
++#if HKGEN_PROBE == 3
++        // workgroups li % 64 < 8 (every dispatch slot li % 8), sample j = li / 64 * 8 + li % 8, wave w: words
++        // 8 j + 4 w + 0..3 = (INIT issued | tile 0 landed), (prologue | entry -> INIT), (tensorcnt 0 + barrier |
++        // epilogue), loop cycles; prologue / INIT / tile 0 from INIT's start (pr_t0), epilogue from LOOP's end (pr_tb)
++        (void)pr_e1;
++        if (pr_li % 64 < 8) {
++          const int j = pr_li / 64 * 8 + pr_li % 8;
++          const unsigned int w[4] = {(sat(pr_i - pr_t0) << 16) | sat(pr_w - pr_t0),
++                                     (sat(pr_ta - pr_t0) << 16) | sat(pr_t0 - pr_s),
++                                     (sat(pr_e2 - pr_tb) << 16) | sat(pr_t1 - pr_tb), pr_tb - pr_ta};
++          static_for<4>([&](auto i) {
++            __builtin_amdgcn_raw_buffer_store_b32(w[i], r_all, 0, 4096 + 4 * (8 * j + 4 * wv + i), 0);
++          });
++        }
++#else
++        // every workgroup (wave 0): (realtime start mod 2^18) << 14 | min(end - start, 0x3FFF), 10-ns ticks; start =
++        // the kernel's first statement, end = FINAL's stores issued
++        const unsigned int pr_re = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readsteadycounter());
++        if (wv == 0)
++          __builtin_amdgcn_raw_buffer_store_b32(((pr_rs & 0x3FFFFu) << 14) | (pr_re - pr_rs < 0x3FFFu ? pr_re - pr_rs
++                                                                                                     : 0x3FFFu),
++                                                r_all, 0, 4096 + 4 * pr_li, 0);
++#endif
++      }
++#elif HKGEN_PROBE
++      {
++        const bool pr_wg = K3_BX == 0 && K3_BY == 0 && K3_BZ == 0;
 +        const auto r_pr = rsrc(reinterpret_cast<const unsigned char*>(DS) - 65536, pr_wg ? 65536 : 0);
 +        unsigned int pp[4];
 +        asm volatile("; HKGEN PROBE nkv=%4 a=%0 b=%1 c=%2 d=%3" : "=s"(pp[0]), "=s"(pp[1]), "=s"(pp[2]), "=s"(pp[3])
@@ -10579,11 +10659,15 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +        __builtin_amdgcn_raw_buffer_store_b32(pr_ta - pr_t0, r_pr, 0, wv * 64 + 28, 0);  // prologue
 +        __builtin_amdgcn_raw_buffer_store_b32(pr_t1 - pr_tb, r_pr, 0, wv * 64 + 32, 0);  // epilogue
 +        // every workgroup (wave 0): steps << 24 | whole-span cycles at word 1024 + its linear index (no gridDim)
-+        const int pr_li = ((int)blockIdx.z * k3_nblk(Skv) + (int)blockIdx.y) * HG + (int)blockIdx.x;
++        const int pr_li = K3_LI;
 +        const auto r_all = rsrc(reinterpret_cast<const unsigned char*>(DS) - 65536, 65536);
++        // HKGEN_PROBE 2: prologue << 16 | epilogue (cycles, saturated at 0xFFFF) instead of steps << 24 | span
++        const unsigned int pr_pro = pr_ta - pr_t0 < 0xFFFFu ? pr_ta - pr_t0 : 0xFFFFu;
++        const unsigned int pr_epi = pr_t1 - pr_tb < 0xFFFFu ? pr_t1 - pr_tb : 0xFFFFu;
 +        if (wv == 0)
-+          __builtin_amdgcn_raw_buffer_store_b32(((unsigned int)N << 24) | ((pr_t1 - pr_t0) & 0xFFFFFFu), r_all, 0,
-+                                                4096 + 4 * pr_li, 0);
++          __builtin_amdgcn_raw_buffer_store_b32(HKGEN_PROBE == 2 ? (pr_pro << 16) | pr_epi
++                                                                  : ((unsigned int)N << 24) | ((pr_t1 - pr_t0) & 0xFFFFFFu),
++                                                r_all, 0, 4096 + 4 * pr_li, 0);
 +      }
 +#endif
 +      return;
@@ -10922,4 +11006,8 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +    body(std::integral_constant<int, 2>{});
 +  }
 +#endif
++#undef K3_BX
++#undef K3_BY
++#undef K3_BZ
++#undef K3_LI
 +}

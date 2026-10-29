@@ -1,0 +1,56 @@
+diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
+--- a/include/dqds/dqds_impl.h	2026-10-29 09:11:15.911147883 +0000
++++ b/include/dqds/dqds_impl.h	2026-10-29 09:11:15.924292105 +0000
+@@ -114,7 +114,7 @@
+ 
+ template <int NQW>
+ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int Skv, int Hq,
+-                      int Hkv, int G, int nkvt, int cshift, int causal, int q0g, int HG) {
++                      int Hkv, int G, int nkvt, int cshift, int causal, int q0g, int HG, int bx, int bz) {
+     constexpr int NB_G = nbg(NQW);
+     constexpr int NACC = NQW * NDT;
+ 
+@@ -125,7 +125,7 @@
+     const int  wv   = readfirstlane(tid / WAVE); // uniform (SGPR) wave index 0..3
+     const bool dsw  = c_role_ds(wv); // uniform: this wave issues the dS ops (else the K ops)
+     const int  hh   = c_half(wv);    // its kv32 row / K half inside a unit
+-    const int  hb   = head_hb(block_id_x(), block_id_z(), HG); // = bat*Hq + qh = dslayout's bh
++    const int  hb   = head_hb(bx, bz, HG); // = bat*Hq + qh = dslayout's bh
+     const int  bat  = head_bat(hb, Hq);
+     const int  qh   = head_qh(hb, bat, Hq);
+     const int  hkv  = head_kv(qh, G);
+@@ -450,13 +450,31 @@
+                         int Hkv, int G, int nkvt, int cshift, int causal, int q_off, int ntile,
+                         int HG) {
+     lock_simd(); // SCHED_MODE.DISABLE_XDL_ARB_STALL, as bwd_r6_a's k_dqds192 / k_dqg96 / k_dqds_b
+-    const int gy = block_id_y();
++#if DQ_TICKET
++    // the work item li = (bz * gy_n + by) * HG + bx (the grid's own order: per bz the longest q tiles first) from a
++    // ticket counter (the int 128 B in front of DS, zeroed before the launch) instead of the block id: workgroups
++    // take the items in the order they start, so an XCD that runs slower (round-robin dispatch) ends with the
++    // shorter items of the tail instead of finishing last
++    __shared__ int s_item[1];
++    if (thread_id_x() == 0)
++        s_item[0] = __hip_atomic_fetch_add(reinterpret_cast<int *>(reinterpret_cast<unsigned char *>(
++                                               const_cast<__bf16 *>(DS)) - 128), 1, __ATOMIC_RELAXED,
++                                           __HIP_MEMORY_SCOPE_AGENT);
++    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
++    __builtin_amdgcn_s_barrier_signal(-1);
++    __builtin_amdgcn_s_barrier_wait(-1);
++    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
++    const int li = readfirstlane(s_item[0]), gy_n = ntile + (q_off > 0 ? 1 : 0);
++    const int bx = li % HG, gy = li / HG % gy_n, bz = li / (HG * gy_n);
++#else
++    const int bx = block_id_x(), gy = block_id_y(), bz = block_id_z();
++#endif
+     if (!tile_is_head(gy, ntile)) {
+         dqds_body<MAIN_NQW>(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal,
+-                            tile_q0g(q_off, ntile, gy), HG);
++                            tile_q0g(q_off, ntile, gy), HG, bx, bz);
+     } else {
+         dqds_body<HEAD_NQW>(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, head_q0g(q_off),
+-                            HG);
++                            HG, bx, bz);
+     }
+ }
+ 

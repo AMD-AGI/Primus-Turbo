@@ -1,0 +1,15 @@
+[2026-10-29T08:29:57 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m micro.k3_probe mla/ladder_bwd.json r10n_pe --abc --calls 20 --allwg 11008 --proepi
+all workgroups (11008): prologue mean 3641 median 3153 p90 5220; epilogue mean 3779 median 3382 p90 4704 cycles
+wave 0: 128 steps, 1550 cycles per iteration
+   start -> signal (B + C)      735.7
+   signal -> wait (barrier)     314.0
+   wait -> C end                154.6
+   C end -> end (A)             179.9
+   prologue 9566 cycles, epilogue 3347 cycles, loop 185514 cycles (1449 per step incl. headers)
+wave 1: 128 steps, 1549 cycles per iteration
+   start -> signal (B + C)      734.5
+   signal -> wait (barrier)     310.2
+   wait -> C end                161.8
+   C end -> end (A)             178.0
+   prologue 9564 cycles, epilogue 3159 cycles, loop 185588 cycles (1450 per step incl. headers)
+[08:30:01 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_082957_pe_probe.log

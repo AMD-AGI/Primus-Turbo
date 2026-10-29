@@ -1719,6 +1719,312 @@
    "bitwise_with": "r10k"
   },
   {
+   "id": "r10n_pe",
+   "parent": "r10n",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_PROBE=2"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true
+    }
+   },
+   "feature": "r10n + probe mode 2: every workgroup's prologue / epilogue cycles (micro.k3_probe --allwg --proepi)",
+   "side": true
+  },
+  {
+   "id": "r10n_ps",
+   "parent": "r10n",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_PROBE=3"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true
+    }
+   },
+   "feature": "r10n + probe mode 3: prologue / epilogue split of every 8th workgroup (micro.k3_probe --allwg --split)",
+   "side": true
+  },
+  {
+   "id": "r10n_rt",
+   "parent": "r10n",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_PROBE=4"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true
+    }
+   },
+   "feature": "r10n + probe mode 4: every workgroup's [start, end) on the realtime counter (micro.k3_probe --allwg --rt)",
+   "side": true
+  },
+  {
+   "id": "r10t",
+   "parent": "r10n",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10n + the work item from a ticket counter instead of the block id (-DHKGEN_TICKET=1; the int 64 B in front of DS, zeroed by a host step before the launch): workgroups take the items in the order they start, so the slower odd XCDs (~8% longer items, round-robin dispatch) end with the short tail items",
+   "bitwise_with": "r10n"
+  },
+  {
+   "id": "r10t_rt",
+   "parent": "r10n",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_PROBE=4"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10t + probe mode 4 (micro.k3_probe --allwg --rt)",
+   "bitwise_with": "r10n",
+   "side": true
+  },
+  {
+   "id": "r10t_ps",
+   "parent": "r10n",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_PROBE=3"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10t + probe mode 3 (micro.k3_probe --allwg --split)",
+   "bitwise_with": "r10n",
+   "side": true
+  },
+  {
+   "id": "r10u",
+   "parent": "r10t",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DDQ_TICKET=1"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10t + k_dqds_c takes its work item from a ticket counter too (-DDQ_TICKET=1, the int 128 B in front of DS, zeroed with dkdv's by the same host step)",
+   "bitwise_with": "r10t",
+   "patch": "patches/r10u.patch"
+  },
+  {
    "id": "r10l",
    "parent": "r9a",
    "patch": "patches/r10b.patch",

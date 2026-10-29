@@ -1,0 +1,24 @@
+[2026-10-29T09:09:15 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m hkl.test mla/ladder_bwd.json --rung r10n r10t --shapes toy_full s640 rect32 b1_s4096 prod
+device gfx1250  torch 2.14.0+rocm10.2.0a20261011  ladder mla_bwd
+[toy_full] b1 sq384 skv384 hq16 hkv16 d192/128 full sbhd  (reference 1.4 s)
+  flydsl           skip  ValueError: the gfx1250 MLA attention backward supports causal attention only
+  r10n             PASS  dq  52.54 dk  52.60 dv  52.59  det bitwise(r10k)=n/a
+  r10t             PASS  dq  52.54 dk  52.60 dv  52.59  det bitwise(r10n)=yes
+[s640] b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd  (reference 0.0 s)
+  flydsl           PASS  dq  52.12 dk  52.17 dv  52.76  det
+  r10n             PASS  dq  52.12 dk  52.17 dv  52.71  det bitwise(r10k)=n/a
+  r10t             PASS  dq  52.12 dk  52.17 dv  52.71  det bitwise(r10n)=yes
+[rect32] b1 sq4096 skv4128 hq4 hkv4 d192/128 causal sbhd  (reference 0.0 s)
+  flydsl           skip  ValueError: seqlen_kv must be a positive multiple of 64, got 4128
+  r10n             PASS  dq  52.51 dk  52.56 dv  52.56  det bitwise(r10k)=n/a
+  r10t             PASS  dq  52.51 dk  52.56 dv  52.56  det bitwise(r10n)=yes
+[b1_s4096] b1 sq4096 skv4096 hq16 hkv16 d192/128 causal sbhd  (reference 0.0 s)
+  flydsl           PASS  dq  52.30 dk  52.29 dv  52.71  det
+  r10n             PASS  dq  52.30 dk  52.29 dv  52.69  det bitwise(r10k)=n/a
+  r10t             PASS  dq  52.30 dk  52.29 dv  52.69  det bitwise(r10n)=yes
+[prod] b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd  (reference 0.2 s)
+  flydsl           PASS  dq  52.31 dk  52.35 dv  52.71  det
+  r10n             PASS  dq  52.31 dk  52.35 dv  52.64  det bitwise(r10k)=n/a
+  r10t             PASS  dq  52.31 dk  52.35 dv  52.64  det bitwise(r10n)=yes
+ALL PASS
+[09:09:21 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_090915_tk_all.log
