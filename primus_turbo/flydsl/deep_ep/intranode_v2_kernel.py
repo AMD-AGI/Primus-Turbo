@@ -133,8 +133,9 @@ FANOUT_PIECE_BYTES = 8 * 1024
 USE_TDM = IS_GFX1250
 # LDS a block can allocate on gfx1250
 MAX_LDS_BYTES = 320 * 1024
-# combine: tokens a warp claims from the reduce queue at a time
-REDUCE_GRAB_TOKENS = 4
+# combine: tokens a warp claims from the reduce queue at a time (PRIMUS_TURBO_DEEPEP_V2_REDUCE_GRAB_TOKENS
+# for experiments; REDUCE_GRAB_TOKENS x num_ranks lanes must fit a wave)
+REDUCE_GRAB_TOKENS = int(os.environ.get("PRIMUS_TURBO_DEEPEP_V2_REDUCE_GRAB_TOKENS", "4"))
 
 
 def _tdm_row(lds_addr, global_addr, num_bytes):
