@@ -6,7 +6,7 @@
 [What's Primus-Turbo?](#-whats-primus-turbo) | [What's New](#-whats-new) | [Quick Start](#-quick-start) | [Example](#-example) | [Performance](#-performance) | [Roadmap](#-roadmap) | [Primus Ecosystem](#-primus-ecosystem) | [Acknowledgements](#-acknowledgements) | [License](#-license)
 
 ## 🔍 What's Primus-Turbo?
-**Primus-Turbo** is a high-performance acceleration library dedicated to large-scale model training on AMD GPUs. Built and optimized for the AMD ROCm platform, it covers the full training stack — including core compute operators (GEMM, Attention, GroupedGEMM), communication primitives (DeepEP), fused MoE layers (Mega MoE), low-precision computation (FP8), and compute–communication overlap kernels.
+**Primus-Turbo** is a high-performance acceleration library dedicated to large-scale model training on AMD GPUs. Built and optimized for the AMD ROCm platform, it covers the full training stack — including core compute operators (GEMM, Attention, GroupedGEMM), communication primitives (DeepEP), fused MoE layers (MegaMoE), low-precision computation (FP8), and compute–communication overlap kernels.
 
 With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its guiding principles, Primus-Turbo is designed to fully unleash the potential of AMD GPUs for large-scale training workloads, offering a robust and complete acceleration foundation for next-generation AI systems.
 
@@ -28,16 +28,16 @@ Note: JAX support is under active development. Optim support is planned but not 
 
 ## 🚀 What's New
 
-- **[2026/10/28]** 🔥 **Mega MoE on MI455X (gfx1250)** — BF16 fused Mega MoE forward and backward on gfx1250, including the staged op with per-expert biases for GPT-OSS shapes; validated on 4× MI455X (EP4) ([#582](https://github.com/AMD-AGI/Primus-Turbo/pull/582), [overview](./docs/mega_moe.md)).
-- **[2026/10/21]** 🔥 **Release [v0.6.1](https://github.com/AMD-AGI/Primus-Turbo/releases/tag/v0.6.1)** (patch over [v0.6.0](https://github.com/AMD-AGI/Primus-Turbo/releases/tag/v0.6.0)) — Mega MoE ownership and MXFP8 combine fixes, MXFP4 gather fusion into quantization, tensorwise FP8 from the TURBO permute, head_dim-128 fused QK RMSNorm + RoPE, DeepEP cheap-fence default, and FlyDSL attention / GEMM correctness on gfx950 ([changes since v0.5.0](https://github.com/AMD-AGI/Primus-Turbo/compare/v0.5.0...v0.6.1)).
-- **[2026/10/19–10/21]** 🔥 **Mega MoE: dispatch-sized buffers & GPT-OSS** — size BF16 / MXFP8 Mega MoE memory to the rows dispatched to each rank (#566, #568); support GPT-OSS shapes (H/I=2880) and per-expert biases (#571) ([overview](./docs/mega_moe.md)).
+- **[2026/10/28]** 🔥 **MegaMoE on MI455X (gfx1250)** — BF16 fused MegaMoE forward and backward on gfx1250, including the staged op with per-expert biases for GPT-OSS shapes; validated on 4× MI455X (EP4) ([#582](https://github.com/AMD-AGI/Primus-Turbo/pull/582), [overview](./docs/mega_moe.md)).
+- **[2026/10/21]** 🔥 **Release [v0.6.1](https://github.com/AMD-AGI/Primus-Turbo/releases/tag/v0.6.1)** (patch over [v0.6.0](https://github.com/AMD-AGI/Primus-Turbo/releases/tag/v0.6.0)) — MegaMoE ownership and MXFP8 combine fixes, MXFP4 gather fusion into quantization, tensorwise FP8 from the TURBO permute, head_dim-128 fused QK RMSNorm + RoPE, DeepEP cheap-fence default, and FlyDSL attention / GEMM correctness on gfx950 ([changes since v0.5.0](https://github.com/AMD-AGI/Primus-Turbo/compare/v0.5.0...v0.6.1)).
+- **[2026/10/19–10/21]** 🔥 **MegaMoE: dispatch-sized buffers & GPT-OSS** — size BF16 / MXFP8 MegaMoE memory to the rows dispatched to each rank (#566, #568); support GPT-OSS shapes (H/I=2880) and per-expert biases (#571) ([overview](./docs/mega_moe.md)).
 - **[2026/10/19]** 🔥 **FlyDSL 0.3.4.1 / AITER v0.1.24.post1** — port kernels to FlyDSL 0.3 and bump the pinned AITER release (#544).
-- **[2026/09/16]** 🔥 **Release v0.5.0** — Mega MoE / GroupedMLP MXFP8 maturity, FlyDSL grouped GEMM BF16, and operator auto-tune on MI355X ([changes since v0.4.0](https://github.com/AMD-AGI/Primus-Turbo/compare/v0.4.0...v0.5.0)).
+- **[2026/09/16]** 🔥 **Release v0.5.0** — MegaMoE / GroupedMLP MXFP8 maturity, FlyDSL grouped GEMM BF16, and operator auto-tune on MI355X ([changes since v0.4.0](https://github.com/AMD-AGI/Primus-Turbo/compare/v0.4.0...v0.5.0)).
 - **[2026/08/25–09/14]** 🔥 **Fused GroupedMLP (FP8 / MXFP8)** — expert MLP with SwiGLU folded into grouped GEMM; pad-aware paths for GPT-OSS-20B-style MoE (#476, #488, #503).
-- **[2026/08/18]** 🔥 **Mega MoE (MXFP8)** — fused forward and backward in the MXFP8 Mega MoE path: dispatch+FC1 and FC2+combine with intra-node EP (#456).
-- **[2026/07/15]** 🔥 **Mega MoE (BF16)** — FlyDSL fused MoE layer with comm–compute overlap inside the grouped GEMMs ([overview](./docs/mega_moe.md)) (#412).
+- **[2026/08/18]** 🔥 **MegaMoE (MXFP8)** — fused forward and backward in the MXFP8 MegaMoE path: dispatch+FC1 and FC2+combine with intra-node EP (#456).
+- **[2026/07/15]** 🔥 **MegaMoE (BF16)** — FlyDSL fused MoE layer with comm–compute overlap inside the grouped GEMMs ([overview](./docs/mega_moe.md)) (#412).
 - **[2026/07]** 🔥 **MXFP4 GEMM & grouped GEMM** — FlyDSL and hipBLASLt stacks for dense and expert GEMMs in low-precision training (#424, #483).
-- **[2026/07/30]** 🔥 **Release v0.4.0** — grouped GEMM autotune, MXFP4 correctness, and Mega MoE stability fixes on gfx950.
+- **[2026/07/30]** 🔥 **Release v0.4.0** — grouped GEMM autotune, MXFP4 correctness, and MegaMoE stability fixes on gfx950.
 - **[2026/06/10]** 🔥 **DeepEP** — JAX intranode/internode token dispatch (#344); PyTorch `DeepEPTokenDispatcher` (introduced in #114). The separate rocSHMEM backend integration is tracked in #409 ([guide](./primus_turbo/pytorch/deep_ep/README.md)).
 - **[2025/12/16]** 🔥 [MoE training best practices on AMD GPUs](https://rocm.blogs.amd.com/software-tools-optimization/primus-moe-package/README.html) — DeepEP, grouped GEMM, and Primus recipes end to end.
 
@@ -253,7 +253,7 @@ Primus-Turbo is part of a comprehensive stack for large-model training on AMD GP
 │                  Primus-Turbo                       │
 │           (High-Performance Operators)              │
 │  Attention | GEMM | GroupedGEMM | MoE | DeepEP      │
-│  Mega MoE | FP8/MXFP8/MXFP4 | AITER | CK | FlyDSL    │
+│  MegaMoE | FP8/MXFP8/MXFP4 | AITER | CK | FlyDSL    │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -268,13 +268,13 @@ Inside Primus-Turbo:
 | Component | Role | Key Features | Repository |
 |-----------|------|--------------|------------|
 | **Primus (Primus-LM)** | Training framework | Multi-backend training (Megatron, TorchTitan, MaxText), unified CLI, projection and tuning agent, MegaMoE integration in Megatron recipes | [Primus](https://github.com/AMD-AGI/Primus) |
-| **Primus-Turbo** | Performance layer | FlashAttention-class kernels, GEMM / GroupedGEMM (BF16, FP8, MXFP8, MXFP4), **Mega MoE** (BF16 + MXFP8, GPT-OSS shapes/biases), DeepEP, fused GroupedMLP; backends CK, hipBLASLt, AITER, Triton, FlyDSL | [This repo](https://github.com/AMD-AGI/Primus-Turbo) |
+| **Primus-Turbo** | Performance layer | FlashAttention-class kernels, GEMM / GroupedGEMM (BF16, FP8, MXFP8, MXFP4), **MegaMoE** (BF16 + MXFP8, GPT-OSS shapes/biases), DeepEP, fused GroupedMLP; backends CK, hipBLASLt, AITER, Triton, FlyDSL | [This repo](https://github.com/AMD-AGI/Primus-Turbo) |
 | **Primus-SaFE** | Platform layer | Cluster sanity checks, topology-aware scheduling, fault tolerance | [Primus-SaFE](https://github.com/AMD-AGI/Primus-SaFE) |
 
 ### 🔗 How They Work Together
 
 1. **Primus-LM** provides the training framework and workflow orchestration.
-2. **Primus-Turbo** supplies the optimized compute kernels (for example Mega MoE, grouped GEMM, attention, and low-precision GEMMs) that Primus recipes call into.
+2. **Primus-Turbo** supplies the optimized compute kernels (for example MegaMoE, grouped GEMM, attention, and low-precision GEMMs) that Primus recipes call into.
 3. **Primus-SaFE** ensures stability and efficient resource utilization at scale.
 
 This separation of concerns allows each component to evolve independently while staying integrated through pinned versions in Primus training images.
@@ -287,8 +287,8 @@ Primus-Turbo builds on excellent open-source work from the wider community. We e
 - [**AITER**](https://github.com/ROCm/aiter) — AI Tensor Engine for ROCm, providing high-performance operator backends (e.g. FlashAttention, FP8) that Primus-Turbo integrates.
 - [**tritonBLAS**](https://github.com/ROCm/tritonBLAS) — high-quality Triton GEMM kernels for AMD GPUs. Our persistent BF16/FP16 and FP8 GEMM kernels are adapted from it.
 - [**Triton**](https://github.com/ROCm/triton) — our Triton attention kernel is adapted from the AMD performance kernels in `python/perf-kernels/flash-attention.py`, which implement the FlashAttention v2 algorithm by Tri Dao.
-- [**Triton-distributed**](https://github.com/ByteDance-Seed/Triton-distributed) — a distributed compiler for computation-communication overlapping. Our Mega MoE comm-compute fused kernels reference its overlapping-kernel design.
-- [**DeepGEMM**](https://github.com/deepseek-ai/DeepGEMM) — a clean and efficient FP8/BF16 GEMM library. Our Mega MoE barrier and symmetric-heap layout designs reference it.
+- [**Triton-distributed**](https://github.com/ByteDance-Seed/Triton-distributed) — a distributed compiler for computation-communication overlapping. Our MegaMoE comm-compute fused kernels reference its overlapping-kernel design.
+- [**DeepGEMM**](https://github.com/deepseek-ai/DeepGEMM) — a clean and efficient FP8/BF16 GEMM library. Our MegaMoE barrier and symmetric-heap layout designs reference it.
 - [**NVIDIA TransformerEngine**](https://github.com/NVIDIA/TransformerEngine) — our Triton MoE permute/unpermute kernels are adapted from TransformerEngine. That file remains under Apache-2.0 and carries NVIDIA attribution — see `LICENSE` and `LICENSE-APACHE`.
 - [**NVIDIA Megatron-LM**](https://github.com/NVIDIA/Megatron-LM) — parts of our MoE token permutation and dispatch layer are adapted from Megatron-LM. Those files carry NVIDIA attribution and remain under the 3-clause BSD license — see `LICENSE`.
 

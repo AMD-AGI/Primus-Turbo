@@ -8,7 +8,7 @@ This page shows usage of **Primus-Turbo**.
   - [1.1 Gemm](#11-gemm)
   - [1.2 Attention](#12-attention)
   - [1.3 Grouped Gemm](#13-grouped-gemm)
-  - [1.4 Mega MoE](#14-mega-moe)
+  - [1.4 MegaMoE](#14-megamoe)
 - [2. Modules](#2-modules)
   - [2.1 Linear](#21-linear)
 - [3. Low-Precision](#3-low-precision)
@@ -141,12 +141,12 @@ print(c)
 print(c.shape) # [128, 256]
 ```
 
-### 1.4 Mega MoE
+### 1.4 MegaMoE
 
 `fused_mega_moe` is an EP intra-node MoE op that fuses communication with the grouped GEMM
 (`dispatch_grouped_gemm` + `grouped_gemm_combine`). It is a single autograd op; the per-shape
 communication buffer is allocated once and cached internally. See
-[Mega MoE](./mega_moe.md) for the design and performance.
+[MegaMoE](./mega_moe.md) for the design and performance.
 
 > **Hardware requirements:** `gfx950` (not supported on `gfx1250`), intra-node expert parallelism
 > (one rank per GPU).

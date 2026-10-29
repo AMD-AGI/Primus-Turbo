@@ -22,7 +22,7 @@ What that means in practice:
   gradients, MoE expert parallelism with dispatch/combine backward, context-parallel attention.
 - **Training precisions.** BF16 master path plus FP8 (tensorwise / rowwise / blockwise / MXFP8) and
   MXFP4 with the quantize-with-transpose variants backward needs.
-- **Training communication.** DeepEP dispatch/combine, Mega MoE comm–compute fusion, Async-TP, and
+- **Training communication.** DeepEP dispatch/combine, MegaMoE comm–compute fusion, Async-TP, and
   ring / all-to-all context parallelism.
 - **Acceptance criterion.** A kernel change is accepted when it is correct in forward and backward
   and its gain carries over to an end-to-end training step (see `benchmark/pretrain`).
@@ -87,7 +87,7 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | `tokens_per_expert_to_mask` | – | ✅ | ✅ | ✅ | Index helper, fwd only |
 | `moe_permute`, `moe_unpermute` | BF16 / FP8 tensorwise | ✅ | ✅ | ✅ | |
 | `moe_dispatch`, `moe_combine` | – | ✅ | ✅ | — | Expert-parallel token dispatch / combine (intra- and inter-node) |
-| `fused_mega_moe` (+ `_stage1` / `_stage2`) | BF16 | — | ✅ | ✅ | Dispatch + FC1 and FC2 + combine fused, intra-node EP. See [Mega MoE](./mega_moe.md) |
+| `fused_mega_moe` (+ `_stage1` / `_stage2`) | BF16 | — | ✅ | ✅ | Dispatch + FC1 and FC2 + combine fused, intra-node EP. See [MegaMoE](./mega_moe.md) |
 | `fused_mega_moe_fp8_stage1` / `_stage2` | MXFP8 | — | ✅ | — | |
 
 ### 2.5 Normalization, activation, position embedding, loss

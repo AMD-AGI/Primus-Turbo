@@ -1,8 +1,8 @@
-# Mega MoE
+# MegaMoE
 
 ## Overview
 
-**Mega MoE** is a Mixture-of-Experts (MoE) EP intra-node implementation for AMD GPUs, built on
+**MegaMoE** is a Mixture-of-Experts (MoE) EP intra-node implementation for AMD GPUs, built on
 **FlyDSL** and Primus-Turbo. It is **not** a single fully-fused layer kernel; instead it provides
 **two communication-computation fused operators** — `dispatch_grouped_gemm` and
 `grouped_gemm_combine` — each folding EP intra-node communication and a grouped GEMM into one
@@ -11,7 +11,7 @@ FlyDSL kernel so the cross-rank traffic is hidden behind compute.
 The design target is intra-node expert parallelism (`gfx950` / MI355X-class devices) where every
 rank owns a slice of the experts and tokens are routed directly into a peer rank's memory.
 
-> **Status:** Mega MoE is under active development. The BF16 path is the primary, validated path.
+> **Status:** MegaMoE is under active development. The BF16 path is the primary, validated path.
 
 ### Key points
 
@@ -170,9 +170,9 @@ python benchmark/ops/training/bench_mega_moe.py --mode grouped_gemm_combine --mo
 ## Acknowledgements
 
 - [**Triton-distributed**](https://github.com/ByteDance-Seed/Triton-distributed) (ByteDance-Seed,
-  MIT License) — Mega MoE's comm-compute overlapping design (symmetric-memory push, signal/wait
+  MIT License) — MegaMoE's comm-compute overlapping design (symmetric-memory push, signal/wait
   synchronization, fusing intra-node EP communication into the GEMM kernel) references
   Triton-distributed's overlapping-kernel approach.
-- [**DeepGEMM**](https://github.com/deepseek-ai/DeepGEMM) (DeepSeek, MIT License) — Mega MoE's
+- [**DeepGEMM**](https://github.com/deepseek-ai/DeepGEMM) (DeepSeek, MIT License) — MegaMoE's
   cross-rank barrier and symmetric-buffer layout follow DeepGEMM's design; see the file headers of
   `primus_turbo/flydsl/mega/barrier.py` and `primus_turbo/flydsl/mega/symm_buffer.py` for details.
