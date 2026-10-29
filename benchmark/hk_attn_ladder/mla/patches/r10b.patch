@@ -2799,8 +2799,8 @@ diff -ruN a/r8gen/asmkit/verify_obj.py b/r8gen/asmkit/verify_obj.py
 +    sys.exit(1 if r else 0)
 diff -ruN a/r8gen/gen/build.py b/r8gen/gen/build.py
 --- a/r8gen/gen/build.py	1970-01-01 00:00:00.000000000 +0000
-+++ b/r8gen/gen/build.py	2026-10-29 10:30:29.000000000 +0000
-@@ -0,0 +1,400 @@
++++ b/r8gen/gen/build.py	2026-10-29 11:03:18.000000000 +0000
+@@ -0,0 +1,402 @@
 +###############################################################################
 +# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 +#
@@ -2911,6 +2911,7 @@ diff -ruN a/r8gen/gen/build.py b/r8gen/gen/build.py
 +    ap.add_argument("--tdm-dummy", action="store_true", help="r8gen.TDM_DUMMY (16-B ops past the last tile)")
 +    ap.add_argument("--final-pipe", action="store_true", help="r8gen.FINAL_PIPE (pipelined epilogue)")
 +    ap.add_argument("--tdm-lim-sc7", action="store_true", help="r8gen.TDM_LIM_SC7 (shell -DHKGEN_W4)")
++    ap.add_argument("--dv-interleave", action="store_true", help="r8gen.DV_INTERLEAVE (dV of kh after hh1's kh + 1)")
 +    ap.add_argument("--bar-gap", type=int, default=None, help="bwdgen.SLOT['bar_gap']: WMMAs between ring signal / wait")
 +    ap.add_argument("--slot", default="", help="bwdgen.SLOT overrides for the slot scheduler: KEY=INT,KEY=INT")
 +    ap.add_argument("--asmkit-root", default=None, help="ignored: the package carries its own asmkit")
@@ -2928,6 +2929,7 @@ diff -ruN a/r8gen/gen/build.py b/r8gen/gen/build.py
 +    G.HH1_SPLIT, G.BDO_AFTER_HH1, G.ND_FOLD = a.hh1_split, a.bdo_after_hh1, a.nd_fold
 +    G.SCAL_IN_BODY, G.TDM_DUMMY, G.FINAL_PIPE = a.scal_in_body, a.tdm_dummy, a.final_pipe
 +    G.TDM_LIM_SC7 = a.tdm_lim_sc7
++    G.DV_INTERLEAVE = a.dv_interleave
 +    import bwdgen as BG
 +    if a.bar_gap is not None:
 +        BG.SLOT["bar_gap"] = a.bar_gap
@@ -3959,8 +3961,8 @@ diff -ruN a/r8gen/gen/bwdgen.py b/r8gen/gen/bwdgen.py
 +    return out, int(round(t))
 diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 --- a/r8gen/gen/r8gen.py	1970-01-01 00:00:00.000000000 +0000
-+++ b/r8gen/gen/r8gen.py	2026-10-29 10:11:49.000000000 +0000
-@@ -0,0 +1,750 @@
++++ b/r8gen/gen/r8gen.py	2026-10-29 11:03:18.000000000 +0000
+@@ -0,0 +1,766 @@
 +###############################################################################
 +# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 +#
@@ -4260,6 +4262,8 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +SCAL_XCNT_GAP = 160  # cycles between a VMEM / TDM op and the next tile's redefinition of an SGPR it reads
 +HH1_SPLIT = 0  # hh1's S / dP order: dt < HH1_SPLIT dt outer (every kh), the rest kh-major (6: all dt outer)
 +BDO_AFTER_HH1 = False  # the dO^T loads issue only after every hh1 operand load (they do not crowd the LDS queue)
++DV_INTERLEAVE = False  # the WMMA stream runs dV of kh right after hh1's S / dP of kh + 1 (dV of the last kh after
++#                       hh1's run): each kh's softmax spreads over the next kh's WMMAs instead of bunching before dV
 +
 +
 +def hh1_order():
@@ -4347,8 +4351,10 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +                                   + (f" offset:{off}" if off else "")))  # fmt: skip
 +            bdo_loads.append(stage_reads[-1])
 +    # ---- S / dP of hh1, kh-major
++    kh_sdp1 = []
 +    for kind, kh, dt in hh1_order():
 +        w_sdp1.append(wmma_sdp(1, kind, kh, dt))
++        kh_sdp1.append(kh)
 +    # ---- softmax / dS: hh0 then hh1, kh by kh; bf16 P / dS in place of hh0's raw
 +    soft = {}
 +    for hh in range(2):
@@ -4430,6 +4436,18 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +        for i in bdo_loads:
 +            for j in hh1_ld:
 +                add_order(nodes, j, i)
++    if DV_INTERLEAVE:  # dV of kh (8 WMMAs, kh outer in w_dv) once hh1's last S / dP WMMA of kh + 1 is in
++        dv_kh = [w_dv[kh * NDO_V:(kh + 1) * NDO_V] for kh in range(NKV)]
++        last = {kh: max(i for i, k in enumerate(kh_sdp1) if k == kh) for kh in range(NKV)}
++        mid, nxt = [], 0
++        for i, w in enumerate(w_sdp1):
++            mid.append(w)
++            while nxt < NKV - 1 and i == last[nxt + 1]:
++                mid += dv_kh[nxt]
++                nxt += 1
++        for kh in range(nxt, NKV):
++            mid += dv_kh[kh]
++        return nodes, w_sdp0 + mid + w_dk
 +    return nodes, w_sdp0 + w_sdp1 + w_dv + w_dk
 +
 +

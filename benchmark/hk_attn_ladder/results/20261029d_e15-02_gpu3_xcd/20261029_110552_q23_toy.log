@@ -1,0 +1,22 @@
+[2026-10-29T11:05:52 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m hkl.test mla/ladder_bwd.json --rung r10x r10x_dvi r10x_dvib r10x_bdo --shapes toy s640 prod
+device gfx1250  torch 2.14.0+rocm10.2.0a20261011  ladder mla_bwd
+[toy] b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd  (reference 1.4 s)
+  flydsl           PASS  dq  52.06 dk  52.09 dv  52.78  det
+  r10x             PASS  dq  52.06 dk  52.09 dv  52.72  det bitwise(r10w)=n/a
+  r10x_dvi         PASS  dq  52.06 dk  52.09 dv  52.72  det bitwise(r10x)=yes
+  r10x_dvib        PASS  dq  52.06 dk  52.09 dv  52.72  det bitwise(r10x)=yes
+  r10x_bdo         PASS  dq  52.06 dk  52.09 dv  52.72  det bitwise(r10x)=yes
+[s640] b1 sq640 skv640 hq16 hkv16 d192/128 causal sbhd  (reference 0.0 s)
+  flydsl           PASS  dq  52.12 dk  52.17 dv  52.76  det
+  r10x             PASS  dq  52.12 dk  52.17 dv  52.71  det bitwise(r10w)=n/a
+  r10x_dvi         PASS  dq  52.12 dk  52.17 dv  52.71  det bitwise(r10x)=yes
+  r10x_dvib        PASS  dq  52.12 dk  52.17 dv  52.71  det bitwise(r10x)=yes
+  r10x_bdo         PASS  dq  52.12 dk  52.17 dv  52.71  det bitwise(r10x)=yes
+[prod] b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd  (reference 0.3 s)
+  flydsl           PASS  dq  52.31 dk  52.35 dv  52.71  det
+  r10x             PASS  dq  52.31 dk  52.35 dv  52.64  det bitwise(r10w)=n/a
+  r10x_dvi         PASS  dq  52.31 dk  52.35 dv  52.64  det bitwise(r10x)=yes
+  r10x_dvib        PASS  dq  52.31 dk  52.35 dv  52.64  det bitwise(r10x)=yes
+  r10x_bdo         PASS  dq  52.31 dk  52.35 dv  52.64  det bitwise(r10x)=yes
+ALL PASS
+[11:06:02 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_110552_q23_toy.log

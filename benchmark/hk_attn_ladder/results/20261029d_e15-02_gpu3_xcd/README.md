@@ -164,6 +164,12 @@ and ~45 at its end. The ablations put ~105 cycles per step on the softmax VALU (
 minimum) and ~60 on the LDS operand loads: what is left is their placement around hh1, i.e. fine-grained schedule
 work worth a few % of loop cycles (~1% of time at the cap).
 
+Static view of r10x's U0 body: the VALU bursts (11 instructions after W40, 12 after W59) sit where the WMMA stream
+waits anyway -- hh1's operand loads counted down by `s_wait_dscnt` through W30..W40 (the LDS port also carries the 16
+dO^T tr16 loads in W0..W30), and dV needing P of both q halves. Two schedule changes, bitwise == r10x:
+`--dv-interleave` (dV of kh right after hh1's S / dP of kh + 1; removes the W59 burst) 0.997x, `--bdo-after-hh1`
+0.996x, both 0.995x. The slot schedule of r10x stays the local optimum of this register plan.
+
 ## 13. Next
 
 r10t is landed on Primus-Turbo b1 (d10b4db8: bwd 2.361 -> 2.336 ms hot). A persistent dK/dV kernel would also
