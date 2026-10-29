@@ -719,6 +719,10 @@ def test_hk_manifest():
     assert not any("KITTENS_CDNA4" in f for f in m["flags"])
     assert set(m["kernels"]) == {"k_dkdv96ds", "k_dqds_c", "k_delta"}
     assert [n for n, k in m["kernels"].items() if k.get("optional")] == ["k_delta"]
+    # nd_fold: k_dkdv96ds generated with --nd-fold reads the folded NL / ND the k_delta built with HK_ND_FOLD writes
+    fold = bool(m.get("nd_fold"))
+    assert ("--nd-fold" in m["kernels"]["k_dkdv96ds"].get("gen_args", [])) == fold
+    assert ("-DHK_ND_FOLD=1" in m["kernels"]["k_delta"]["extra_flags"]) == fold
     for name, k in m["kernels"].items():
         assert (hsaco.HIP_DIR / k["src"]).is_file(), name
         assert len(k["hsaco_sha256"]) == 64 and k["block"] in (64, 128, 256)
@@ -845,13 +849,16 @@ def test_hk_plan_delta_launch(monkeypatch):
         "delta"
     ] == grid
     assert [a["name"] for a in args] == ["DO", "O", "DEL", "LSE", "NL", "ND", "scale", "S", "H"]
-    assert len(values) == len(args) and values[6:] == (MLA_SCALE, s, h)
+    f32_arg = impl.nd_fold_offset(MLA_SCALE) if impl._nd_fold() else MLA_SCALE  # l2s with nd_fold
+    assert len(values) == len(args) and values[6:] == (f32_arg, s, h)
     assert (values[0], values[1], values[3]) == (o, o, lse)
     assert (values[2], values[4], values[5]) == (hip["delta"], hip["nl"], hip["nd"])
     assert hip["launches"][1][2][2][4:6] == (hip["nl"], hip["nd"])  # what dkdv reads
     fly = impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None, hk_delta=False)
     assert fly["launches"][0][1] is impl._k.launch_delta and fly["grids"]["delta"] == (128, 256, 1)
     assert fly["launches"][0][2][4:6] == (fly["nl"], fly["nd"])
+    if impl._nd_fold():  # the FlyDSL k_delta's NL / ND folded on the host before dkdv
+        assert fly["launches"][1] == ("fold", impl._fold_nl_nd, (fly["nl"], fly["nd"], fly["delta"], f32_arg))
     for reason, want in ((None, "k_delta"), ("k_delta.hsaco is not built", impl._k.launch_delta)):
         monkeypatch.setattr(hsaco, "kernel_unavailable_reason", lambda name, *a, r=reason: r)
         assert impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None)["launches"][0][1] == want
@@ -930,16 +937,25 @@ def _run_hk(monkeypatch, q, k, v, dout):
     ids=["toy", "toy_folded", "rect", "sq640"],
 )
 def test_hk_matches_reference_and_flydsl(monkeypatch, dims, layout):
-    """The HIP backward matches the fp32 reference, is bitwise deterministic and bitwise equal to
-    the FlyDSL backward (same dS rounding and accumulation order)."""
+    """The HIP backward matches the fp32 reference and is bitwise deterministic. Without the manifest's
+    nd_fold it is bitwise equal to the FlyDSL backward (same dS rounding and accumulation order); with it
+    (the softmax yields scale * P, the dP chains start from -delta: other roundings) every gradient's SNR
+    against the reference is within 0.3 dB of the FlyDSL backward's."""
     q, k, v, dout = _inputs(*dims, layout=layout)
     got = _run_hk(monkeypatch, q, k, v, dout)
-    _check(got, _reference(q, k, v, dout, MLA_SCALE))
+    ref = _reference(q, k, v, dout, MLA_SCALE)
+    _check(got, ref)
     again = _run_hk(monkeypatch, q, k, v, dout)
     monkeypatch.setattr(mla_impl, "MLA_BWD_IMPL_SETTING", "flydsl")
     fly = _run(q, k, v, dout)
-    for a, b, c in zip(got, again, fly):
-        assert torch.equal(a, b) and torch.equal(a, c)
+    folded = _hk_package("impl")._nd_fold()
+    for name, a, b, c, r in zip(("out", "lse", "dq", "dk", "dv"), got, again, fly, ref):
+        assert torch.equal(a, b), name
+        if not folded or name in ("out", "lse"):
+            assert torch.equal(a, c), name
+        else:
+            snr_hk, snr_fly = compute_snr(r, a.detach().float().cpu()), compute_snr(r, c.detach().float().cpu())
+            assert snr_hk >= snr_fly - 0.3, f"{name}: {snr_hk:.2f} dB vs FlyDSL {snr_fly:.2f} dB"
 
 
 @needs_hk
@@ -1033,12 +1049,16 @@ def _delta_launches(do, o, lse, scale=MLA_SCALE):
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(impl, "POISON", True)
             plan = impl._plan(do, q, q, v, o, lse, scale, True, stream, hk_delta=hk)
-        _, fn, args = plan["launches"][0]
-        if hk:
-            grid, block, values = args
-            impl.kernels()[fn].call(grid, block, values, stream)
-        else:
-            impl._fly._launch(fn, args)
+        for name, fn, args in plan["launches"]:  # "delta", and the FlyDSL path's NL / ND "fold" (nd_fold)
+            if name not in ("delta", "fold"):
+                break
+            if isinstance(fn, str):
+                grid, block, values = args
+                impl.kernels()[fn].call(grid, block, values, stream)
+            elif fn is impl._fold_nl_nd:
+                fn(*args)
+            else:
+                impl._fly._launch(fn, args)
         got[key] = (plan["delta"], plan["nl"], plan["nd"])
     torch.cuda.synchronize()
     return got
@@ -1058,8 +1078,9 @@ def _delta_launches(do, o, lse, scale=MLA_SCALE):
     ids=["toy", "b2", "sq640", "sq4096", "b2_denormals", "sq640_denormals"],
 )
 def test_hk_delta_matches_flydsl(dims, special):
-    """The HIP k_delta writes delta, NL and ND bitwise equal to the FlyDSL k_delta, also for denormal
-    inputs, products that underflow fp32, signed zeros and an lse whose NL overflows."""
+    """The HIP k_delta writes delta, NL and ND bitwise equal to the FlyDSL k_delta (followed by the launcher's
+    NL / ND fold when the manifest has nd_fold), also for denormal inputs, products that underflow fp32,
+    signed zeros and an lse whose NL overflows."""
     got = _delta_launches(*_delta_inputs(*dims, special))
     for name, x, y in zip(("delta", "NL", "ND"), got["hk"], got["flydsl"]):
         assert not torch.isnan(x).any(), name

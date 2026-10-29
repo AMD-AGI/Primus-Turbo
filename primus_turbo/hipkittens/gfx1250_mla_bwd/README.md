@@ -14,7 +14,7 @@ Each backward call makes three launches on the caller's current stream:
 
 | launch | kernel | work |
 |---|---|---|
-| `delta` | HIP `k_delta` | delta, and the row constants NL = -LOG2E·lse, ND = -scale·delta: 64-query workgroups of 16 rows × 16 lanes, bitwise equal to the FlyDSL `k_delta` (below) |
+| `delta` | HIP `k_delta` | delta, and the row constants k_dkdv96ds reads: NL = -LOG2E·lse + l2s, ND = -delta with the manifest's `nd_fold` (l2s = log2(scale) rounded to fp32 on the host, the kernel's f32 argument); 64-query workgroups of 16 rows × 16 lanes, delta bitwise equal to the FlyDSL `k_delta` (below) |
 | `dkdv` | HIP `k_dkdv96ds` | dK, dV over 96-row kv blocks (two 48-row waves on a 3-stage Q/dO TDM ring), then 64-row tail blocks; stores every bf16 dS^T tile it feeds the dK WMMA into the dS scratch. Its tile loop is generated (`tools/r8gen`, below) |
 | `dq` | HIP `k_dqds_c` | dQ = dS·K from that scratch: 384-query workgroups (4 waves sharing one K ring) plus one merged 256-query head tile |
 
@@ -45,12 +45,22 @@ run; the results are the same bits.
 elements (even, odd), their sum, then a 1/2/4/8 xor butterfly over the row's 16 lanes. It is built
 with fp contraction off (`#pragma clang fp contract(off)`): FlyDSL multiplies and adds separately,
 and a fused multiply-add rounds differently once a bf16 × bf16 product underflows into the fp32
-denormal range. fp32 denormals are preserved in both. The tests cover denormal inputs, underflowing
-products, signed zeros and an lse whose NL overflows.
+denormal range. fp32 denormals are preserved in both. With `nd_fold` (`-DHK_ND_FOLD=1`) it writes the
+folded constants; when the FlyDSL `k_delta` runs in its place, the launcher folds its NL / ND on the host with
+the same fp32 add and a negation (`impl._fold_nl_nd`), so NL / ND and the gradients are the same bits on both
+paths. The tests cover denormal inputs, underflowing products, signed zeros and an lse whose NL overflows.
+
+**ND fold.** k_dkdv96ds's dP chains start from ND = -delta (the WMMA's C operand) instead of 0, and NL carries
+log2(scale), so its softmax yields scale·P and dS = (scale·P)·(dP - delta) is one multiply (no dP fma: -24
+packed FMAs per tile); dV is accumulated from scale·P and divided by scale once in the epilogue. dQ / dK keep
+their SNR; dV rounds scale·P to bf16 instead of P (0.02-0.07 dB lower SNR against the fp32 reference at the
+test shapes, e.g. 52.64 vs 52.71 dB at b2 s4096 h128).
 
 **Results.** Every output element is written by exactly one workgroup (no atomics), so dQ / dK /
-dV are deterministic. They are also bitwise equal to the FlyDSL backward's (same dS rounding, same
-accumulation order), and independent of the head-group launch targets and of head chunking.
+dV are deterministic, and independent of the head-group launch targets and of head chunking. Without
+`nd_fold` they are also bitwise equal to the FlyDSL backward's (same dS rounding, same accumulation order);
+with it they round P / dS differently (the ND fold above) and match the fp32 reference as closely as the
+FlyDSL backward does (each gradient within 0.3 dB of its SNR).
 
 ## Files
 
@@ -137,10 +147,11 @@ from it).
    ```
 
    The HIP numeric tests skip when the code objects are unavailable, so check first that
-   `hsaco.py --check` prints `ok` and no `optional k_delta` line. They cover the fp32 reference,
-   bitwise equality with the FlyDSL backward and of `k_delta` with the FlyDSL `k_delta` (denormal
-   inputs included), determinism, a NaN-filled scratch at a production-like shape, and head
-   chunking. The static checks are not a proof; run the GPU gates after every patch regeneration.
+   `hsaco.py --check` prints `ok` and no `optional k_delta` line. They cover the fp32 reference, the
+   FlyDSL backward (bitwise without `nd_fold`, within 0.3 dB of its SNR with it), `k_delta` against the
+   FlyDSL `k_delta` (plus the host fold; denormal inputs included), the FlyDSL-`k_delta` fallback (bitwise),
+   determinism, a NaN-filled scratch at a production-like shape, and head chunking. The static checks are
+   not a proof; run the GPU gates after every patch regeneration.
 
 ## Performance
 
@@ -148,13 +159,13 @@ MI455X (e15-02 GPU3), b2 s4096 h128, SBHD, causal, bf16, `scripts/mla_b0_bench.p
 
 | | time (ms) |
 |---|---|
-| forward (FlyDSL) | 0.803 |
-| backward, `hk` (hot / cold) | 2.416 / 2.408 |
-| per kernel: k_delta / k_dkdv96ds / k_dqds_c | 0.057 / 1.775 / 0.508 |
-| backward, FlyDSL | 3.533 |
-| autograd fwd + bwd, `hk` / FlyDSL | 3.223 / 4.370 |
+| forward (FlyDSL) | 0.807 |
+| backward, `hk` (hot / cold) | 2.361 / 2.352 |
+| per kernel: k_delta / k_dkdv96ds / k_dqds_c | 0.059 / 1.721 / 0.505 |
+| backward, FlyDSL | 3.553 |
+| autograd fwd + bwd, `hk` / FlyDSL | 3.184 / 4.385 |
 
-The `hk` backward is 1.46x faster than the FlyDSL one, and forward + backward is 1.36x faster. Against the
-LLVM-scheduled dK/dV kernel (71bd0329, the same runs interleaved): backward 2.440 -> 2.416 ms hot, 2.437 -> 2.408
-cold; k_dkdv96ds 1.813 -> 1.775 ms. The kernels are power-capped at this shape (~1.24 GHz): a saved cycle converts to
+The `hk` backward is 1.50x faster than the FlyDSL one, and forward + backward is 1.38x faster. Against the
+LLVM-scheduled dK/dV kernel (71bd0329, the same runs interleaved): backward 2.432 -> 2.361 ms hot, 2.425 -> 2.352
+cold; k_dkdv96ds 1.809 -> 1.721 ms. The kernels are power-capped at this shape (~1.24 GHz): a saved cycle converts to
 about a third of a cycle of time.

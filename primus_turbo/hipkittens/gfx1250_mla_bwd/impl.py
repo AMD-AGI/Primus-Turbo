@@ -7,10 +7,14 @@
 """hk_attn_bwd: the gfx1250 MLA backward with HIP dK/dV and dQ kernels.
 
 Three launches, all on the caller's current stream, in this order:
-  "delta"  HIP k_delta: delta, and the per-row constants NL = -LOG2E*lse, ND = -scale*delta the dK/dV
-           kernel reads (64-query workgroups, bitwise equal to the FlyDSL k_delta of
-           ``primus_turbo.flydsl.attention.gfx1250_mla``, which runs in its place when bin/k_delta.hsaco
-           is missing or not the pinned one: k_delta is the manifest's one ``optional`` kernel);
+  "delta"  HIP k_delta: delta, and the per-row constants the dK/dV kernel reads (64-query workgroups).
+           With the manifest's ``nd_fold`` (the generated k_dkdv96ds starts its dP chains from -delta and
+           its softmax yields scale * P): NL = -LOG2E*lse + l2s, ND = -delta, l2s = log2(scale) rounded to
+           fp32 on the host (k_delta's f32 argument). The FlyDSL k_delta of
+           ``primus_turbo.flydsl.attention.gfx1250_mla`` (NL = -LOG2E*lse, ND = -scale*delta, delta bitwise
+           equal) runs in its place when bin/k_delta.hsaco is missing or not the pinned one (k_delta is
+           the manifest's one ``optional`` kernel), followed by the same fold on the host (``_fold_nl_nd``:
+           one fp32 add, one negation), so NL / ND and the gradients are the same bits either way;
   "dkdv"   HIP k_dkdv96ds: dK and dV (96-row kv blocks of two 48-row waves on one 3-stage Q/dO TDM ring,
            then 64-row tail blocks), and every bf16 dS^T tile it feeds the dK WMMA (softmax scale
            included) stored into this call's scratch in dslayout.h v1;
@@ -38,6 +42,7 @@ not even one head group fits, the call runs the FlyDSL backward instead (same re
 
 import math
 import os
+import struct
 import threading
 
 import torch
@@ -173,6 +178,23 @@ def _alloc(shape, device, dtype):
     return torch.empty(shape, device=device, dtype=dtype)
 
 
+def _nd_fold():
+    """The manifest's nd_fold: k_dkdv96ds expects the folded NL / ND (see the module docstring)."""
+    return bool(hsaco.load_manifest().get("nd_fold", False))
+
+
+def nd_fold_offset(scale):
+    """log2(softmax scale) rounded to fp32: the HIP k_delta's f32 argument and the FlyDSL-delta fold's addend."""
+    return struct.unpack("f", struct.pack("f", math.log2(scale)))[0]
+
+
+def _fold_nl_nd(nl, nd, delta, l2s):
+    """After the FlyDSL k_delta (NL = -LOG2E lse, ND = -scale delta): the folded constants the HIP k_delta writes
+    (NL + l2s, -delta), bit for bit: the same fp32 add, a negation."""
+    nl.add_(l2s)
+    torch.neg(delta, out=nd)
+
+
 def _hk_delta_reason(sq):
     """None when the HIP k_delta can take seqlen_q ``sq`` and its code object is the pinned one, else why not."""
     if sq % DELTA_ROWS:
@@ -261,7 +283,7 @@ def _plan(
         raise ValueError(f"hk_attn_bwd: the HIP k_delta needs seqlen_q % {DELTA_ROWS} == 0, got {sq}")
     if hk_delta:
         delta_grid = (sq // DELTA_ROWS, b * hq, 1)
-        delta_values = (do, o, delta, lse, nl, nd, scale, sq, hq)
+        delta_values = (do, o, delta, lse, nl, nd, nd_fold_offset(scale) if _nd_fold() else scale, sq, hq)
         launches = [("delta", "k_delta", (delta_grid, DELTA_BLOCK, delta_values))]
     else:
         delta_grid = (sq // _k.ROWS_DELTA, b * hq, 1)
@@ -281,6 +303,8 @@ def _plan(
             stream,
         )
         launches = [("delta", _k.launch_delta, delta_args)]
+        if _nd_fold():
+            launches.append(("fold", _fold_nl_nd, (nl, nd, delta, nd_fold_offset(scale))))
     for (q_, k_, v_, do_, nl_, nd_, dv_, dk_, dq_), b_, gz_kv, gz_q in parts:
         dkdv_values = (
             q_,
@@ -316,8 +340,8 @@ def _plan(
         "nd": nd,
         "grids": {
             "delta": delta_grid,
-            "dkdv": launches[1][2][0],
-            "dq": launches[2][2][0],
+            "dkdv": next(l for l in launches if l[0] == "dkdv")[2][0],
+            "dq": next(l for l in launches if l[0] == "dq")[2][0],
         },
         "head_group": {"kv": hg_kv, "q": hg_q},
         "chunks": chunks,  # None, or [(batch, first head, heads)] of every (dkdv, dq) launch pair
@@ -358,6 +382,8 @@ def hk_attn_bwd(
         if isinstance(fn, str):
             grid, block, values = args
             table[fn].call(grid, block, values, stream)
+        elif fn is _fold_nl_nd:
+            fn(*args)
         else:
             _fly._launch(fn, args)
     return plan["outputs"]

@@ -31,8 +31,9 @@ Steps:
         [--gen-arg ARG ...]
 
 ``--check`` writes nothing and fails unless the regenerated patch equals the committed one byte for byte and both
-sha256 values equal the manifest's. ``--gen-arg`` passes options to gen/build.py (the shipped patch: none, i.e.
-``--sched slot --rule warv``). CPU only; needs the pinned toolchain (``manifest.json`` ``toolchain``).
+sha256 values equal the manifest's. The generator's options are the manifest's ``gen_args`` of k_dkdv96ds, and the
+``-D`` flags of its ``extra_flags`` beyond ``-DHKGEN=1`` go to the shell compile too; ``--gen-arg`` adds options for
+experiments. CPU only; needs the pinned toolchain (``manifest.json`` ``toolchain``).
 """
 
 import argparse
@@ -81,10 +82,13 @@ def main(argv=None) -> int:
     if version != m["toolchain"]:
         print(f"toolchain {version!r} != manifest {m['toolchain']!r}", file=sys.stderr)
         return 2
-    want_flags = list(gen.FLAGS), list(gen.EXTRA) + ["-DHKGEN=1"]
-    if (list(m["flags"]), list(k["extra_flags"])) != want_flags:
-        print(f"manifest flags {m['flags']} + {k['extra_flags']} != the generator's {want_flags}", file=sys.stderr)
+    base = list(gen.EXTRA) + ["-DHKGEN=1"]
+    extra = list(k["extra_flags"])
+    defs = extra[len(base):]
+    if list(m["flags"]) != list(gen.FLAGS) or extra[: len(base)] != base or not all(f.startswith("-D") for f in defs):
+        print(f"manifest flags {m['flags']} + {extra} != the generator's {gen.FLAGS} + {base} + -D...", file=sys.stderr)
         return 2
+    gen_args = list(k.get("gen_args", [])) + [x for d in defs for x in ("-D", d[2:])] + list(a.gen_arg)
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         # 1. the compiler's .s, as hsaco.py makes it
@@ -103,7 +107,7 @@ def main(argv=None) -> int:
         sha_in = _sha256(s_in)
         # 2. the generator
         out = tmp / "gen"
-        r = subprocess.run([sys.executable, str(GEN), "--out", str(out), "--cxx", cxx, *a.gen_arg],
+        r = subprocess.run([sys.executable, str(GEN), "--out", str(out), "--cxx", cxx, *gen_args],
                            capture_output=True, text=True)  # fmt: skip
         print(r.stdout[-3000:], end="")
         if r.returncode != 0:

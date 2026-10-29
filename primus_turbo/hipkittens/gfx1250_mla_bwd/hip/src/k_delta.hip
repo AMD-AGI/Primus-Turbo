@@ -6,6 +6,10 @@
 
 // k_delta -- the backward's row constants, all [B, H, S] fp32: delta = rowsum(dO * O), and what k_dkdv96ds reads,
 // NL = -LOG2E * lse and ND = -scale * delta. Bitwise equal to FlyDSL k_delta_bshd (same per-row arithmetic).
+// -DHK_ND_FOLD=1 (the generated k_dkdv96ds built with --nd-fold): the f32 argument is l2s = log2(softmax scale)
+// rounded to fp32 on the host; ND = -delta (the dP chains' C init) and NL = -LOG2E * lse + l2s (its softmax then
+// yields scale * P), DEL unchanged -- bit for bit what the FlyDSL k_delta's NL / delta give after the launcher's fold
+// (the same fp32 add, a negation).
 // dO / O: [B, S, H, 128] bf16 contiguous; lse [B, H, S] fp32 contiguous (natural log).
 // grid (S / 64, B * H), block 256 = 16 rows x 16 lanes: workgroup (sblk, bh) owns queries [64 sblk, 64 sblk + 64)
 // of batch-major head bh (FlyDSL's mapping with 64 queries instead of 32), so each output is one 256-B run. Pass p
@@ -19,6 +23,10 @@
 // byte extent B*S*H*256 below 2^31.
 #include <hip/hip_runtime.h>
 #include <stdint.h>
+
+#ifndef HK_ND_FOLD
+#define HK_ND_FOLD 0
+#endif
 
 namespace {
 constexpr int kQPW = 64;                 // queries per workgroup
@@ -69,7 +77,13 @@ extern "C" __global__ __launch_bounds__(256) void k_delta(const u32x4* __restric
     const long long o = (long long)bh * S + s0 + t;
     const float v = sums[t];
     DEL[o] = v;
+#if HK_ND_FOLD
+    (void)nsc;
+    ND[o] = -v;
+    NL[o] = LSE[o] * nlog2e + scale;  // scale: l2s here (see above)
+#else
     ND[o] = v * nsc;
     NL[o] = LSE[o] * nlog2e;
+#endif
   }
 }

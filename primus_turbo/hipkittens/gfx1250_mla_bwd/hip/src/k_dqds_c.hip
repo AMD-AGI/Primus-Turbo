@@ -5,7 +5,7 @@
  **************************************************************************************************/
 
 // k_dqds_c -- bwd_hk_dqds2: the recompute-free dQ kernel of the S1 line (dQ = dS K from the S1 scratch, dslayout v2)
-// with 384-query workgroups: 4 waves (1 per SIMD, one workgroup per CU, LDS 276480 B) share ONE K ring (K bytes per
+// with 384-query workgroups: 4 waves (1 per SIMD, one workgroup per CU, LDS 274432 B) share ONE K ring (K bytes per
 // call / 2 vs bwd_hk_dqds's k_dqds_b); role-split TDM issue (waves 0 / 3 the dS of kv32 rows 2u / 2u + 1 for all 12 q
 // pairs, waves 1 / 2 the two 32-row K halves: one op per wave per 64-kv unit, the two TDM engines balanced), K and dS
 // rings 3 stages each (every op 2 units ahead), <= 2 TDM ops in flight per wave, barrier every 64 kv.

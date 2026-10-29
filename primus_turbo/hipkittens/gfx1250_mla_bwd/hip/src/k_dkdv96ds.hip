@@ -97,6 +97,9 @@ constexpr int KH0_SALU = 2;
 #ifndef HKGEN_TAIL
 #define HKGEN_TAIL 1   // HKGEN: also run the 64-row tail blocks (generated too: markers nkv=2); 0 = timing only
 #endif
+#ifndef HKGEN_EARLY_TDM
+#define HKGEN_EARLY_TDM 0  // HKGEN: the first two tiles' TDM ahead of INIT's K / V fragment loads (latencies overlap)
+#endif
 #ifndef HKGEN_PROBE
 #define HKGEN_PROBE 0  // HKGEN: per-phase cycle sums of the steps (s96..s99) handed to the shell (PROBE marker)
 #endif
@@ -442,6 +445,14 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
       const unsigned int pr_t0 = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
       unsigned int pr_t1 = 0, pr_ta = 0, pr_tb = 0;  // ta / tb: around the LOOP marker (prologue | loop | epilogue)
 #endif
+#if HKGEN_EARLY_TDM
+      if (N > 0) {
+        sched_barrier<0>();
+        tdm_tile(tq(0), 0, stg(0));
+        tdm_tile(tq(1), 0, stg(1));
+        sched_barrier<0>();
+      }
+#endif
       asm volatile("; HKGEN INIT nkv=%12 rk=%0 rv=%1 vk=%2 vv=%3 sk0=%4 sk1=%5 sk2=%6 sv0=%7 sv1=%8 sv2=%9 c1=%10 "
                    "sc=%11"
                    ::"s"(r_k), "s"(r_v), "v"(vk), "v"(vv), "s"(sk[0]), "s"(sk[1]), "s"(sk[NKV - 1]), "s"(sv[0]),
@@ -449,8 +460,10 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
                    : HKGEN_CLOBBERS);
       if (N > 0) {
         sched_barrier<0>();
+#if !HKGEN_EARLY_TDM
         tdm_tile(tq(0), 0, stg(0));
         tdm_tile(tq(1), 0, stg(1));
+#endif
         tensor_wait<K1_TW>();                    // own half of tile 0
         sched_barrier<0>();
         lds_barrier();                           // RAW: both halves of tile 0

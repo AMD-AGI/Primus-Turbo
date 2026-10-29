@@ -17,6 +17,7 @@
   ],
   "toolchain": "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git 862306352beb9946c78b3e355d0d5201bbccfa3a)",
   "hipkittens_commit": "be1c91841b817c9690aa3af22ea771f8e3624bf4",
+  "nd_fold": true,
   "kernels": {
     "k_dkdv96ds": {
       "src": "src/k_dkdv96ds.hip",
@@ -29,11 +30,17 @@
         "-amdgpu-enable-delay-alu=false",
         "-mllvm",
         "-greedy-regclass-priority-trumps-globalness",
-        "-DHKGEN=1"
+        "-DHKGEN=1",
+        "-DHKGEN_EARLY_TDM=1"
       ],
-      "hsaco_sha256": "3025f55348c0e5dbc3fa6b8d9772c8202d44e3f8d90dbcd159596981ecfd8109",
+      "gen_args": [
+        "--nd-fold",
+        "--scal-in-body",
+        "--tdm-dummy"
+      ],
+      "hsaco_sha256": "b1d7e60a6b64921ebbbcddbfcf298ca249ef3282304f578a0471bc2cc2f74619",
       "asm_patch": "asm/k_dkdv96ds.s.patch",
-      "asm_input_sha256": "82857db831a89bb21017f2fb409403e702a483bdb21ede77c5bd9ef11221f5e2",
+      "asm_input_sha256": "7f8d64a6efbf6e9d117c0bca416a1dc3c498d7916cee6faaba93a6f5eff278f8",
       "block": 64,
       "kernarg_size": 120,
       "lds": 64512,
@@ -173,10 +180,10 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "hsaco_sha256": "65c7cbb7e8e17b53734bad15d2dc9f73b3351dee1815532892502b28099ce1ee",
+      "hsaco_sha256": "c182284e1ed7d0c1530e24f433ce719cdb950aea2fb7fd2020149e4921051b67",
       "block": 128,
       "kernarg_size": 68,
-      "lds": 302080,
+      "lds": 274432,
       "vgpr": 934,
       "args": [
         {
@@ -267,9 +274,11 @@
     },
     "k_delta": {
       "src": "src/k_delta.hip",
-      "extra_flags": [],
+      "extra_flags": [
+        "-DHK_ND_FOLD=1"
+      ],
       "optional": true,
-      "hsaco_sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f",
+      "hsaco_sha256": "61d3bc136087a0160a26ae139f0701cc74d8775091d972ff8c15651473dfff89",
       "block": 256,
       "kernarg_size": 60,
       "lds": 256,

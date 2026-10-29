@@ -573,10 +573,11 @@ def loop_scalars(ops, stage, kofs=0):
            f"s_add_co_i32 s98, {SG_T1}, {qps}", f"s_lshl_b32 s98, s98, 7", f"s_add_co_i32 {SG_NLS}, {_sv(sc, 2)}, s98"]  # fmt: skip
     so_tdm = ((stage + 2) % DEPTH) * QDO_B
     if TDM_DUMMY:  # tile k + kofs + 2 past the last: the three ops move 16 B each (words 3, 4: tile0 8, tile1 1)
-        out += [f"s_add_co_i32 s98, {SG_K}, {2 + kofs}", f"s_cmp_ge_i32 s98, {_sv(tdm, 14)}"]
+        out += [f"s_add_co_i32 s98, {SG_K}, {2 + kofs}", f"s_cmp_ge_i32 s98, {_sv(tdm, 14)}",
+                f"s_mov_b32 s98, {hex(8 << 16)}"]  # one literal per SALU op (s_mov keeps scc)
         for o in range(3):
             g1 = int(SG_G1[o][2:].split(":")[0])
-            out += [f"s_cselect_b32 s{g1 + 3}, {hex(8 << 16)}, {hex(TDM_W3[o])}", f"s_cselect_b32 s{g1 + 4}, 1, 16"]
+            out += [f"s_cselect_b32 s{g1 + 3}, s98, {hex(TDM_W3[o])}", f"s_cselect_b32 s{g1 + 4}, 1, 16"]
     for o in range(3):
         g0 = SG_G0[o]
         out += [f"s_mul_i32 s96, {SG_T2}, {_sv(tdm, 4 * o + 2)}", "s_mov_b32 s97, 0",

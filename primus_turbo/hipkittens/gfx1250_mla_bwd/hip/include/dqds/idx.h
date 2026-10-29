@@ -18,7 +18,7 @@
 // bounds_proof.py and the gates).
 //
 // What changed against bwd_hk_dqds variant B (k_dqds_b, the base of this file):
-//   * 4 waves per workgroup (block 128, 1 wave per SIMD, ONE workgroup per CU: LDS 276480 B): the
+//   * 4 waves per workgroup (block 128, 1 wave per SIMD, ONE workgroup per CU: LDS 274432 B): the
 //   main tile is 384
 //     queries (4 x 96, NQW 6) and shares ONE K ring, so every K tile moved by the TDM feeds 384
 //     queries instead of 192 (K bytes per call / 2); the head tile [0, 256) is 4 x 64 queries (NQW
@@ -78,9 +78,11 @@ constexpr int HEAD_NQW  = 4;  // merged head tile: 4 waves x 64 queries = 256 (q
 constexpr int MAIN_ROWS = 16 * MAIN_NQW * NWAVE; // 384
 constexpr int HEAD_ROWS = 16 * HEAD_NQW * NWAVE; // 256
 constexpr int DS_BLK_EL = DSL_BLK_B / 2;         // 512 bf16 per dslayout block [16 kv][32 q]
-constexpr int DSI_ROW_B =
-    DSL_ROW_B + 16; // LDS row of a dS block image: 64 B data (4 dslayout v2 chunks) + 16 B pad (80 B)
-constexpr int       DSI_BLK_B    = DSL_KV * DSI_ROW_B; // one block image (1280 B)
+// dS block images in LDS: the TDM pads 16 B after every 256 data bytes (16 dslayout v2 chunks), so the 32 tr16 lanes
+// of one operand (16 chunks of one 256-B group + 16 of the next) hit every bank exactly twice (64-B padding: 3 times)
+constexpr int DSI_GRP_B = 256 + 16;                // one padded 256-B group (272 B)
+constexpr int DSI_ROW_B = DSI_GRP_B;               // (proof-table name)
+constexpr int       DSI_BLK_B    = 4 * DSI_GRP_B;  // one block image (1088 B)
 constexpr unsigned  TDIM0        = 0x7FFFFFFFu; // inner extent: never clamps (bwd_hk_q1's TDM_DIM0)
 constexpr int       DQ_IMG_ROW_B = 400; // dQ epilogue image row (bwd_hk_q1: 384 B data + 16 B pad)
 constexpr int       DQ_LINE_EL   = 64;  // bf16 per 128-B dq line
@@ -95,7 +97,7 @@ constexpr int RSRC_FLAGS = 0x27000;      // bwd_hk_q1's V# word 3
 //   + 32) of the unit, written by the K wave of half h (wave 1 + h; one 12-KB op).
 // dS ring: C_DSDEPTH stages of 2 slots; slot h = kv32 row 2u + h for ALL NB_G q pairs of the
 // workgroup (2 block rows x
-//   NB_G block images of 1280 B), written by the dS wave of half h (wave 3h; one 2-D op, <= 24 KB
+//   NB_G block images of 1088 B), written by the dS wave of half h (wave 3h; one 2-D op, <= 24 KB
 //   at the main tile).
 // Op order per wave: op(0) op(1) | P_0 | op(2) | P_1 | op(3) ...: op(v) = the wave's role op of
 // unit v. P_{u+1} sits in
@@ -146,10 +148,10 @@ DQ_HD constexpr int c_slot_b(int nqw) {
 DQ_HD constexpr int c_dsstg_b(int nqw) {
     return 2 * c_slot_b(nqw);
 } // 2 slots (kv32 rows 2u, 2u + 1)
-constexpr int LDS_C = C_DS_OFF + C_DSDEPTH * c_dsstg_b(MAIN_NQW); // 276480: the rings
+constexpr int LDS_C = C_DS_OFF + C_DSDEPTH * c_dsstg_b(MAIN_NQW); // 248832: the rings
 constexpr int EPI_IMG_B = 16 * DQ_IMG_ROW_B; // one wave's dQ epilogue image: 16 rows x 400 B, after the rings
 DQ_HD constexpr int lds_bytes() {
-    return LDS_C + NWAVE * EPI_IMG_B; // 302080: one workgroup per CU
+    return LDS_C + NWAVE * EPI_IMG_B; // 274432: one workgroup per CU
 }
 
 // ---- roles (wave-uniform): waves 0 / 3 issue dS (kv32 row 2u + half), waves 1 / 2 issue K (rows
@@ -355,13 +357,13 @@ DQ_HD constexpr int dsop_lds(int slot, int nbs, int nv) {
 DQ_HD constexpr int dsop_sh(int nbs, int nv) {
     return nbs - imax(nv, 0);
 } // <= nbs: reads stay in the slot
-// D# group-1 word 0 of a dS op: bf16, pad on, interval 16 dw (enc 3), amount 4 dw (enc 3)
-constexpr unsigned DS_W0 = (1u << 16) | (1u << 20) | (3u << 22) | (3u << 25);
+// D# group-1 word 0 of a dS op: bf16, pad on, interval 64 dw (enc 5), amount 4 dw (enc 3)
+constexpr unsigned DS_W0 = (1u << 16) | (1u << 20) | (5u << 22) | (3u << 25);
 // LDS byte of element (block row rr in {0,1}, stored block j, kv k, q c) of an op landing at L
-// (stream pad model: destination byte b -> b + (b / 64) * 16)
+// (stream pad model: destination byte b -> b + (b / 256) * 16)
 DQ_HD constexpr int dsop_elem_lds(int L, int nv, int rr, int j, int k, int c) {
-    return L + ((rr * nv + j) * DSL_BLK_B + dsl_chunk(k, c / 8) + 2 * (c % 8)) / 64 * 80 +
-           (dsl_chunk(k, c / 8) + 2 * (c % 8)) % 64;
+    return L + ((rr * nv + j) * DSL_BLK_B + dsl_chunk(k, c / 8) + 2 * (c % 8)) / 256 * DSI_GRP_B +
+           (dsl_chunk(k, c / 8) + 2 * (c % 8)) % 256;
 }
 
 // ---- K TDM ops
@@ -429,15 +431,15 @@ DQ_HD constexpr int c_k_imm(int dt, int h) {
 #endif
 }
 // dslayout v2: the tr16 lane reads chunk (kv row lane_r, query chunk 2 qhalf + lane_c / 8) of a block image,
-// at dsl_chunk = qhalf * 512 + g * 16 with g = (lane_c / 8) * 16 + lane_r, i.e. image byte qhalf * 640 + (g / 4) * 80 +
-// (g % 4) * 16 (the TDM pads 16 B after every 64 B): ds_lane(lane) + ds_half(qhalf)
+// at dsl_chunk = qhalf * 512 + g * 16 with g = (lane_c / 8) * 16 + lane_r, i.e. image byte qhalf * 544 + (g / 16) * 272
+// + (g % 16) * 16 (the TDM pads 16 B after every 256 B): ds_lane(lane) + ds_half(qhalf)
 DQ_HD constexpr int ds_lane(int lane) {
     const int g = (lane_c(lane) / 8) * 16 + lane_r(lane);
-    return (g / 4) * DSI_ROW_B + (g % 4) * 16;
+    return (g / 16) * DSI_GRP_B + (g % 16) * 16;
 }
-// image offset of the 16-query half qhalf of a block (its second 512 data bytes = 8 padded 64-B groups)
+// image offset of the 16-query half qhalf of a block (its second 512 data bytes = 2 padded 256-B groups)
 DQ_HD constexpr int ds_half(int qhalf) {
-    return qhalf * 8 * DSI_ROW_B;
+    return qhalf * 2 * DSI_GRP_B;
 }
 // operand of query sub-tile qh (q pair lb = qh / 2 relative to the reader's first block, 16-query
 // half qh % 2)
