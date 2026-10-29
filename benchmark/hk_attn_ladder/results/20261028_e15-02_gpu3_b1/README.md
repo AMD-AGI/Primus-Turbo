@@ -39,3 +39,33 @@ WMMAs (memory-op issue, LDS latency, sync), where the 2-wave kernel hides the sa
 (r8a: ~837 cycles per 96-row step per CU). Splitting the chain across SIMDs at one wave per SIMD adds per-step fixed
 cost faster than it removes the chain's stalls; even with the export moved back and reads prefetched, each role stays
 above ~900 cycles. ATT is useless for this question (traced WMMAs take 11-18 cycles); the stamp probe is the tool.
+
+## 2026-10-29: where r7/r8a's dK/dV iteration goes, and four schedule experiments (GPU3; r7 2.43 ms / 1265 MHz today)
+
+Untraced per-phase probe (micro/k3_probe.py, HKL_PROBE: SALU-only s_get_shader_cycles sums of workgroup (0,0,0), the
+production asm patch regenerated for the probe's .s; probe_r8a_pr.log, probe8.log): ~1566 cycles per full iteration.
+
+| phase | cycles | WMMA floor (10.06 cyc each) | over |
+|---|---:|---:|---:|
+| loop top + hh0 S/dP + softmax (NL/ND loads, hh1 readback burst, TDM, 30 WMMA) | 455 | 302 | ~150 |
+| hh1 S/dP + softmax (30 WMMA) | 342 | 302 | ~40 |
+| pack / dO^T issue / dS^T export | 28 / 38 / 89 | | |
+| dV + Q^T tr16 (24 WMMA) | 230-250 | 241 | ~0 |
+| dK + split ring barrier (36 WMMA) | 340 | 362 | ~0 |
+| readback hh0 + loop back | 89 | | |
+
+micro/wmma_chain.cpp (wmma_chain.log): one wave per SIMD issues a WMMA every 10.06 shader cycles when its C was
+written >= 2 WMMAs earlier, 15.9 when written by the WMMA right before it. The dV / dK runs are at that rate; the loss
+is in the S/dP + softmax half (loop top, readback / NL/ND waits, softmax tail) and the export.
+
+| rung | change | time step vs r8a | cycles | |
+|---|---|---:|---:|---|
+| r8b | asm patch v2 (msrc: Q^T units re-using the export stores' data registers re-targeted, vm_vsrc recomputed) | 1.003x / 1.000x (two runs) | 1.005x / 1.000x | noise: the store-data waits were cheap |
+| r8c | S as two half-chains (no back-to-back dependent S/dP WMMA left in source order; the compiler still issues 20/trip) | 0.995x (0/12) | 0.998x | slower |
+| r8d | every barrier waits tensorcnt 0 + hh0 readback of the next stage before the barrier (under dK) | 0.984x (0/12) | 0.964x | slower |
+| r8d_tw0 | only the tensorcnt 0 waits (diagnostic) | 0.993x | 0.988x | TDM tiles issued one iteration earlier have not always landed |
+
+All bitwise == hk_v0 (r8c: SNR unchanged to 0.01 dB). The LLVM-scheduled loop sits at a local optimum: moving its
+waits / chains / readbacks around costs more than it saves; the remaining ~190 cycles per iteration in the S/dP half
+need a hand-scheduled loop (the a08 ABC design). Production branch dev/lhz/dsv3-attn-hk-b1 a8fefb40 (rect32 dQ fix):
+tests/pytorch/ops/test_attention_flydsl_gfx1250_mla.py 142 passed on GPU3 (new rect32 test included).

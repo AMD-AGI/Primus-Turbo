@@ -1,0 +1,188 @@
+{
+ "meta": {
+  "ladder": "mla_bwd",
+  "shape": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+  "device": "gfx1250",
+  "cus": 256,
+  "torch": "2.14.0+rocm10.2.0a20261011",
+  "rounds": 10,
+  "iters": 20,
+  "settle_s": 1.0,
+  "flush_mb": 512,
+  "hip_visible_devices": null,
+  "host": "7b22589a8076",
+  "time": "2026-10-29 02:52:52",
+  "useful_flops": 3574285205504,
+  "data": "randn"
+ },
+ "rows": [
+  {
+   "arm": "r8a",
+   "ms": 2.4146652221679688,
+   "mean": 2.4153460264205933,
+   "ci95": 0.004569375801313047,
+   "tflops": 1480.2404791728788,
+   "sclk": 1263.0,
+   "mcyc": 3.05231556725502,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    2.4130024909973145,
+    2.416327953338623,
+    2.4127819538116455,
+    2.4124014377593994,
+    2.402325987815857,
+    2.4212549924850464,
+    2.4178500175476074,
+    2.411360502243042,
+    2.422897458076477,
+    2.4232574701309204
+   ],
+   "sclk_rounds": [
+    1272.0,
+    1268.0,
+    1264.0,
+    1264.0,
+    1262.0,
+    1260.0,
+    1262.0,
+    1267.0,
+    1262.0,
+    1260.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "dq: when (Skv - Sq) % 64 == 32 the last steady unit runs as a generic unit, whose burst handles the first masked row's partly stored pairs (fixes the r2d..r7 rect32 dQ read; production shapes unchanged)",
+   "ref_ms_a08": null
+  },
+  {
+   "arm": "r8d_tw0",
+   "ms": 2.4314602613449097,
+   "mean": 2.428515839576721,
+   "ci95": 0.006325343150487344,
+   "tflops": 1470.0158840050142,
+   "sclk": 1271.5,
+   "mcyc": 3.0921359248161315,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    2.429787516593933,
+    2.4186309576034546,
+    2.4210749864578247,
+    2.434594988822937,
+    2.4333534240722656,
+    2.4311904907226562,
+    2.4336135387420654,
+    2.431730031967163,
+    2.4402434825897217,
+    2.4109389781951904
+   ],
+   "sclk_rounds": [
+    1277.0,
+    1272.0,
+    1274.0,
+    1271.0,
+    1272.0,
+    1271.0,
+    1273.0,
+    1268.0,
+    1268.0,
+    1270.5
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "diagnostic: r8a with every ring barrier waiting tensorcnt 0 (readback unchanged)",
+   "ref_ms_a08": null,
+   "step": {
+    "over": "r8a",
+    "median": 0.9933072822538106,
+    "mean": 0.9945908073380686,
+    "ci95": 0.003524689522147193
+   },
+   "step_cyc": {
+    "median": 0.9884728494298045,
+    "ci95": 0.0036471874451207676
+   }
+  },
+  {
+   "arm": "r8d",
+   "ms": 2.4497377276420593,
+   "mean": 2.45031453371048,
+   "ci95": 0.0026801084507049396,
+   "tflops": 1459.0481116296266,
+   "sclk": 1291.0,
+   "mcyc": 3.163656774401665,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    2.4486160278320312,
+    2.4443295001983643,
+    2.4471534490585327,
+    2.452541947364807,
+    2.448556065559387,
+    2.4508594274520874,
+    2.452882409095764,
+    2.4551055431365967,
+    2.455846905708313,
+    2.4472540616989136
+   ],
+   "sclk_rounds": [
+    1297.0,
+    1292.0,
+    1293.0,
+    1290.0,
+    1292.0,
+    1294.0,
+    1289.0,
+    1288.0,
+    1290.0,
+    1288.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "dK/dV: every ring barrier also retires the newest tile (tensorcnt 0), so the full loop reads back hh0 of the next stage before its barrier, under dK kh0, instead of after it (its latency was exposed at the top of every iteration)",
+   "ref_ms_a08": null,
+   "step": {
+    "over": "r8a",
+    "median": 0.9858361834531802,
+    "mean": 0.9857305403457334,
+    "ci95": 0.002017859321089738
+   },
+   "step_cyc": {
+    "median": 0.9651198060194393,
+    "ci95": 0.002384546683728563
+   }
+  }
+ ],
+ "null_control": null
+}

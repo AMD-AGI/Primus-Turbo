@@ -1,0 +1,9 @@
+[2026-10-29T02:41:09 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: micro/wmma_chain
+D (WMMAs between a WMMA and the one that writes its C) -> shader cycles per WMMA (median wave)
+D=1 15.89
+D=2 10.06
+D=3 10.06
+D=4 10.06
+D=6 10.06
+D=8 10.06
+[02:41:11 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_024109_wmma_chain.log

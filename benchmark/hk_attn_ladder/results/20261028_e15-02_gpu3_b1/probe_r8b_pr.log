@@ -1,0 +1,16 @@
+[2026-10-29T02:39:24 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m micro.k3_probe mla/ladder_bwd.json r8b_pr
+wave 0: 125 full iterations, 1548 cycles per iteration
+   readback + loop         93.5  ( 6.0%)
+   S/dP + softmax         765.3  (49.4%)
+   dO^T burst issue        37.8  ( 2.4%)
+   dS^T export             87.9  ( 5.7%)
+   dV + Q^T tr16          220.5  (14.2%)
+   dK + ring barrier      343.4  (22.2%)
+wave 1: 125 full iterations, 1547 cycles per iteration
+   readback + loop         91.3  ( 5.9%)
+   S/dP + softmax         766.1  (49.5%)
+   dO^T burst issue        37.8  ( 2.4%)
+   dS^T export             88.4  ( 5.7%)
+   dV + Q^T tr16          219.4  (14.2%)
+   dK + ring barrier      344.3  (22.3%)
+[02:39:29 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_023924_probe_r8b_pr.log

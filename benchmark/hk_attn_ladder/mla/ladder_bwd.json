@@ -1075,6 +1075,46 @@
    "bitwise_with": "hk_v0"
   },
   {
+   "id": "a7_probe8",
+   "parent": "r8a",
+   "patch": "patches/a7_probe8.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness",
+      "-DHKL_PROBE=1"
+     ],
+     "asm_patch": "asm/k_dkdv96ds_a7_probe8.s.patch",
+     "asm_input_sha256": "4ddd24d2543d3b986eb8d1beb5e5441923eb66b4125ac3e9ffcc81decf3be6bb"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "timing probe of r8a, 8 phases (S/dP + softmax split per hh half), asm patch v2 (msrc)",
+   "side": true
+  },
+  {
    "id": "r8b",
    "parent": "r8a",
    "patch": "patches/08b_dkdv_msrc_asm.patch",
@@ -1111,6 +1151,126 @@
     "module": "bwd_hk"
    },
    "feature": "dK/dV asm patch v2: the Q^T tr16 units held up by in-flight export stores reading their registers re-targeted too (14 tuples, was 5), vm_vsrc waits recomputed (the store-data waits in the dV run go); bits unchanged",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r8c",
+   "parent": "r8a",
+   "patch": "patches/r8c.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness",
+      "-DHKL_S_SPLIT=1"
+     ],
+     "asm_patch": "asm/k_dkdv96ds_r8c.s.patch",
+     "asm_input_sha256": "e3b70646eae3449aa19a2997844b5b6822843de915ed462503da23261e5a33f8"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "dK/dV: S = Q K^T as two half-chains (even / odd dt) summed before the softmax, so no S/dP WMMA accumulates into the result of the WMMA right before it (15.9 vs 10.1 cycles per WMMA, micro/wmma_chain); asm patch v2 (msrc)"
+  },
+  {
+   "id": "r8d",
+   "parent": "r8a",
+   "patch": "patches/r8d.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness",
+      "-DHKL_EARLY_RB=1"
+     ],
+     "asm_patch": "asm/k_dkdv96ds_r8d.s.patch",
+     "asm_input_sha256": "d29522089915a21235de3536cebf5fa7e377b26ea6378315acd97ce245f9b0ea"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "dK/dV: every ring barrier also retires the newest tile (tensorcnt 0), so the full loop reads back hh0 of the next stage before its barrier, under dK kh0, instead of after it (its latency was exposed at the top of every iteration)",
+   "bitwise_with": "hk_v0"
+  },
+  {
+   "id": "r8d_tw0",
+   "parent": "r8a",
+   "patch": "patches/r8d_tw0.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness",
+      "-DHKL_TW0=1"
+     ],
+     "asm_patch": "asm/k_dkdv96ds_r8d_tw0.s.patch",
+     "asm_input_sha256": "c4d39dd1c5ceb9ddfbce1ebd8c1332b754e28fc0eab50483b6bfbdc1a8aacb1d"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "diagnostic: r8a with every ring barrier waiting tensorcnt 0 (readback unchanged)",
+   "side": true,
    "bitwise_with": "hk_v0"
   },
   {
