@@ -1,0 +1,18 @@
+[2026-10-29T03:22:33 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m hkl.ladder mla/ladder_bwd.json --rung r8a abc0 --baseline -r 5
+device gfx1250 (256 CUs)  torch 2.14.0+rocm10.2.0a20261011  ladder mla_bwd  shape b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd
+reference 1.7 s
+  verify r8a                dq 52.3 dk 52.3 dv 52.7
+  verify abc0               dq 52.3 dk 52.3 dv 52.7
+  verify abc0#null          dq 52.3 dk 52.3 dv 52.7
+  round 1/5: r8a=2.4074 abc0=3.7704 abc0#null=3.7969
+  round 2/5: r8a=2.4132 abc0=3.7938 abc0#null=3.7813
+  round 3/5: r8a=2.4151 abc0=3.8028 abc0#null=3.8034
+  round 4/5: r8a=2.4151 abc0=3.7979 abc0#null=3.8043
+  round 5/5: r8a=2.4224 abc0=3.7928 abc0#null=3.7994
+arm                        ms  TFLOP/s     over             step  step cyc   sclk    Mcyc      W     mJ  a08 ms  feature
+------------------------------------------------------------------------------------------------------------------------
+r8a                    2.4151   1480.0                                       1270   3.065      -      -          dq: when (Skv - Sq) % 64 == 32 the last steady unit runs as 
+abc0                   3.7938    942.1      r8a     0.636x±0.002    0.453x   1783   6.764      -      -          ABC skeleton (HIP, LLVM rules): dK/dV full loop software-pip
+abc0#null              3.7994    940.8                                       1782   6.770      -      -          ABC skeleton (HIP, LLVM rules): dK/dV full loop software-pip
+null control abc0 vs #null: 0.9983x ± 0.0046
+[03:23:04 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_032233_abc0_time.log

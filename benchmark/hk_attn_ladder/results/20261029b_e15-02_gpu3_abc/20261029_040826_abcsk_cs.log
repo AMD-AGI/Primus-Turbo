@@ -1,0 +1,32 @@
+[2026-10-29T04:08:26 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: sh -c for r in abcsk_wp abcsk_c5l2 abcsk_c8 abcsk_c11 abcsk_c13; do echo == $r; python3 -m micro.k3_probe mla/ladder_bwd.json $r --abc --calls 5 --shape b=1 sq=384 skv=384 hq=16 hkv=16 | head -5; done
+== abcsk_wp
+wave 0: 12 steps, 1585 cycles per iteration
+   start -> signal (B + C)      799.8
+   signal -> wait (barrier)      74.5
+   wait -> C end                128.4
+   C end -> end (A)             493.3
+== abcsk_c5l2
+wave 0: 12 steps, 1554 cycles per iteration
+   start -> signal (B + C)      769.6
+   signal -> wait (barrier)      80.2
+   wait -> C end                136.0
+   C end -> end (A)             479.2
+== abcsk_c8
+wave 0: 12 steps, 1474 cycles per iteration
+   start -> signal (B + C)      712.5
+   signal -> wait (barrier)      33.2
+   wait -> C end                135.6
+   C end -> end (A)             504.2
+== abcsk_c11
+wave 0: 12 steps, 1420 cycles per iteration
+   start -> signal (B + C)      681.1
+   signal -> wait (barrier)      18.4
+   wait -> C end                 98.0
+   C end -> end (A)             532.8
+== abcsk_c13
+wave 0: 12 steps, 1437 cycles per iteration
+   start -> signal (B + C)      615.2
+   signal -> wait (barrier)      17.2
+   wait -> C end                170.6
+   C end -> end (A)             543.6
+[04:08:37 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_040826_abcsk_cs.log

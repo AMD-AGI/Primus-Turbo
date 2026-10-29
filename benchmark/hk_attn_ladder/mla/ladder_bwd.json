@@ -1115,6 +1115,334 @@
    "side": true
   },
   {
+   "id": "abc0",
+   "parent": "r8a",
+   "patch": "patches/abc0.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness",
+      "-DHKL_ABC=1",
+      "-DHKL_ABC_CB=0",
+      "-DHKL_ABC_KEEP=0",
+      "-DHKL_ABC_ALEAD=1"
+     ]
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "ABC skeleton (HIP, LLVM rules): dK/dV full loop software-pipelined across tiles, 4-stage ring; numerics meant bitwise r8a",
+   "side": true,
+   "bitwise_with": "r8a"
+  },
+  {
+   "id": "abc0_pr",
+   "parent": "r8a",
+   "patch": "patches/abc0_pr.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness",
+      "-DHKL_ABC=1",
+      "-DHKL_ABC_CB=0",
+      "-DHKL_ABC_KEEP=0",
+      "-DHKL_ABC_ALEAD=1",
+      "-DHKL_PROBE=1"
+     ]
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "abc0 + SALU phase probe (micro/abc_probe.py)",
+   "side": true
+  },
+  {
+   "id": "abcsk_l",
+   "parent": "abc0",
+   "patch": "patches/abcsk.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "llvm"
+     ],
+     "gen_pkg": "abcgen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "ABC timing skeleton (generated steady STEP regions, abcgen package; LLVM va_vdst rule); numerics garbage, no dK/dV",
+   "side": true
+  },
+  {
+   "id": "abcsk_w",
+   "parent": "abcsk_l",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv"
+     ],
+     "gen_pkg": "abcgen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "abcsk_l with WAR-V-by-class va_vdst waits (micro/warv_stress PASS 0 / 4.7e11 lane-trips, controls caught; tools/warv_regen.check_warv clean)",
+   "side": true
+  },
+  {
+   "id": "abcsk_wp",
+   "parent": "abcsk_w",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1"
+     ],
+     "gen_pkg": "abcgen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "abcsk_w + generated phase probe (s96..s99 -> DS guard slots 1..4; micro.k3_probe --abc)",
+   "side": true
+  },
+  {
+   "id": "abcsk_c8",
+   "parent": "abcsk_wp",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--cslots",
+      "8",
+      "--ds-lat",
+      "200"
+     ],
+     "gen_pkg": "abcgen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "abcsk_wp, skeleton only: --cslots 8 --ds-lat 200 (extra C slots borrow K fragments)",
+   "side": true
+  },
+  {
+   "id": "abcsk_c11",
+   "parent": "abcsk_wp",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--cslots",
+      "11",
+      "--ds-lat",
+      "200"
+     ],
+     "gen_pkg": "abcgen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "abcsk_wp, skeleton only: --cslots 11 --ds-lat 200 (extra C slots borrow K fragments)",
+   "side": true
+  },
+  {
+   "id": "abcsk_c13",
+   "parent": "abcsk_wp",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--cslots",
+      "13",
+      "--ds-lat",
+      "290"
+     ],
+     "gen_pkg": "abcgen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "abcsk_wp, skeleton only: --cslots 13 --ds-lat 290 (extra C slots borrow K fragments)",
+   "side": true
+  },
+  {
+   "id": "abcsk_c5l2",
+   "parent": "abcsk_wp",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--cslots",
+      "5",
+      "--ds-lat",
+      "200"
+     ],
+     "gen_pkg": "abcgen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "abcsk_wp, skeleton only: --cslots 5 --ds-lat 200 (extra C slots borrow K fragments)",
+   "side": true
+  },
+  {
    "id": "r8b",
    "parent": "r8a",
    "patch": "patches/08b_dkdv_msrc_asm.patch",

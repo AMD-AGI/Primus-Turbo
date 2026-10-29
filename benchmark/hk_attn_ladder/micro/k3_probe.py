@@ -31,9 +31,11 @@ def main():
     ap.add_argument("rung")
     ap.add_argument("--calls", type=int, default=30)
     ap.add_argument("--fine", action="store_true", help="8-phase probe (patches/a7_probe8.patch)")
+    ap.add_argument("--shape", nargs="*", help="overrides of the ladder's problem, e.g. b=1 sq=384 skv=384 hq=16 hkv=16")
+    ap.add_argument("--abc", action="store_true", help="HKGEN skeleton (abcsk_*): slot 0 = the whole loop, n = steps")
     a = ap.parse_args()
     spec = runner.load_ladder(a.ladder)
-    sh = L.parse_shape(None, spec["problem"])
+    sh = L.parse_shape(a.shape, spec["problem"])
     mod = runner.load(a.ladder, a.rung).module
     dev = torch.device("cuda")
     inp = R.make_inputs(sh, dev, seed=0)
@@ -58,8 +60,13 @@ def main():
     for w in range(2):
         sums = [x & 0xFFFFFFFF for x in g[w * 16: w * 16 + nph]]
         n = g[w * 16 + nph]
-        tot = sum(sums) / max(n, 1)
-        print(f"wave {w}: {n} full iterations, {tot:.0f} cycles per iteration")
+        tot = (sums[0] if a.abc else sum(sums)) / max(n, 1)
+        print(f"wave {w}: {n} {'steps' if a.abc else 'full iterations'}, {tot:.0f} cycles per iteration")
+        if a.abc:
+            for i, lab in enumerate(("start -> signal (B + C)", "signal -> wait (barrier)", "wait -> C end",
+                                     "C end -> end (A)")):
+                print(f"   {lab:26s} {sums[1 + i] / max(n, 1):7.1f}")
+            continue
         order = (6, 7, 1, 2, 3, 4, 5, 0) if a.fine else range(nph)
         for i in order:
             name, s = names[i], sums[i]

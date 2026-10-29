@@ -30,8 +30,8 @@ exact code object that was measured when the rung was first written.
 A kernel with ``"gen": [args]`` is not compiled from ``src``: the rung's tree holds a generator package (the MLA
 forward's ``gfx1250_mla_fwd/`` next to ``asmkit/``, or ``gen_pkg``), and ``gen/build.py --out <tmp> --asmkit-root
 <tree> <args>`` builds it (marker shell compiled by LLVM, generated hot-loop regions spliced in, assembled, verified);
-the rung takes its ``k_mla_fwd.hsaco``, or the HIP reference variant's ``ref/k_mla_fwd.hsaco`` with ``"gen_ref":
-true``. The generator's own build.json is kept as ``<kernel>.gen.json``.
+the rung takes its ``k_mla_fwd.hsaco`` (``"gen_kernel"``: another name, e.g. the dK/dV ABC package ``abcgen``'s
+``k_dkdv96ds``), or the HIP reference variant's ``ref/k_mla_fwd.hsaco`` with ``"gen_ref": true``. The generator's own build.json is kept as ``<kernel>.gen.json``.
 
 The compiler runs in a container that maps no device (default ``lhz-hk-cpu``, image
 amdprimus/amdprimus:tas-20261019, AMD clang 862306352beb, the toolchain every pin was made with);
@@ -214,7 +214,8 @@ def _gen_build(kspec, tree, tmp, runner):
            str(tree), *kspec["gen"]]  # fmt: skip
     r = _run(runner, cmd, pkg)
     sub = gen_out / "ref" if kspec.get("gen_ref") else gen_out
-    return cmd, r, sub / "k_mla_fwd.hsaco", sub / "k_mla_fwd.s", gen_out / "build.json"
+    kn = kspec.get("gen_kernel", "k_mla_fwd")
+    return cmd, r, sub / f"{kn}.hsaco", sub / f"{kn}.s", gen_out / "build.json"
 
 
 def build_kernel(spec, rung, name, kspec, tree, out_dir, runner, tc):

@@ -1,0 +1,312 @@
+diff -ruN a/src/k_dkdv96ds.hip b/src/k_dkdv96ds.hip
+--- a/src/k_dkdv96ds.hip	2026-10-29 02:00:41.493967337 +0000
++++ b/src/k_dkdv96ds.hip	2026-10-29 03:19:14.766865380 +0000
+@@ -91,6 +91,22 @@
+ constexpr int NRB = 2 * NHB;           // 40 readback entries of a stage
+ constexpr int NLD = 8;                 // carried NL/ND vec4 entries
+ constexpr int KH0_SALU = 2;            // SALU per WMMA of the TDM-prep run (FlyDSL KH0_SALU)
++#ifndef HKL_ABC
++#define HKL_ABC 0      // 1: the software-pipelined (ABC) full loop for the 96-row body when G == 1
++#endif
++#ifndef HKL_ABC_CB
++#define HKL_ABC_CB 1   // ABC: C's tr16 operands in two bursts (dO^T, Q^T); 0: each loaded right before its WMMAs
++#endif
++#ifndef HKL_ABC_KEEP
++#define HKL_ABC_KEEP 1 // ABC: A's unit u - 1 held over unit u's WMMAs (register rotation)
++#endif
++#ifndef HKL_ABC_ALEAD
++#define HKL_ABC_ALEAD 2 // ABC: A's operand units loaded this many units ahead
++#endif
++#ifndef HKL_ABC_SGB
++#define HKL_ABC_SGB 3  // ABC: VALU per WMMA in the sched_group_barrier interleave of B under C (0: none)
++#endif
++constexpr int ABC_DEPTH = 4;           // ABC ring stages
+ // sched_barrier masks (llvm.amdgcn.sched.barrier): what may cross the fence
+ constexpr int SB_ALU = 0x002 | 0x004 | 0x400;   // VALU, SALU, transcendental
+ }  // namespace
+@@ -101,7 +117,7 @@
+     bf16* __restrict__ DV, bf16* __restrict__ DK, bf16* __restrict__ DS,
+     float scale, int Sq, int Skv, int Hq, int Hkv, int G, int nqt, int cshift, int causal, int B, int HG,
+     int ds_mode) {
+-  __shared__ __attribute__((aligned(1024))) unsigned char smem[K1_LDS];
++  __shared__ __attribute__((aligned(1024))) unsigned char smem[HKL_ABC ? ABC_DEPTH * K1_QDO_B : K1_LDS];
+   lock_simd();                           // the champion's first statement (rocdl.disable_xdl_arb_stall)
+   const uint32_t lds0 = lds_addr(smem);
+   const int tid = (int)threadIdx.x;
+@@ -364,6 +380,251 @@
+     f32x8 acc[NST];
+     static_for<NST>([&](auto i) { acc[i] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; });
+ 
++#if HKL_ABC
++    // ---- ABC (HKL_ABC, 96-row body, G == 1): the full loop software-pipelined across tiles. Tiles t = 0 .. N-1
++    // (query pair qp_start + t, the first n_mask diagonal) in stage t mod 4 of a 4-stage ring. Step k = 0 .. N+1:
++    //   first half  C(k-2): dV^T / dK^T of tile k-2 (P / dS from step k-1, tr16 bursts of stage k-2), with
++    //               B(k-1): softmax / dS of tile k-1 from its raw S / dP (registers, from step k-1) under its WMMAs:
++    //               dO^T burst | dV (24 WMMA) + B hh0 | Q^T burst | dK (36 WMMA) + B hh1, pack, dS^T regroup;
++    //   BARRIER(k)  (k < N; tensorcnt 3 first: tile k landed; tile k+1 may be in flight);
++    //   second half the dS^T stores of tile k-1; A(k): S / dP of tile k from stage k, in units (dt, hh) whose two
++    //               operands feed 2 NKV WMMAs; the NL/ND loads of tile k; the TDM of tile min(k+2, N-1) into stage k+2.
++    // RAW: tile k is issued in step k-2 (or the prologue) and retired before BARRIER(k). WAR: stage (k+2) mod 4 held
++    // tile k-2, last read by A(k-2) (before BARRIER(k-1)) and C(k-2) (before BARRIER(k)). Per wave N + 1 barriers.
++    // Numerics: per accumulator the S / dP chains, the softmax and every dV / dK WMMA (one per tile, ascending) are
++    // the legacy loop's, so dk / dv / dS are meant to be bitwise equal to it.
++    auto abc = [&]() __attribute__((always_inline)) {
++      const int N = n_mask + n_full;
++      auto stg = [&](int t) { return (t & (ABC_DEPTH - 1)) * K1_QDO_B; };
++      auto tq = [&](int t) { return k1_clampqt(qp_start + (t < N ? t : N - 1), nqt2); };
++      using T = std::true_type;
++      using F = std::false_type;
++      f32x8 raw[2][NKV][2];                  // [hh][kh][S | dP] of the tile B works on next
++      f32x4 pre[NLD];                        // its NL / ND
++      // keep(v): an empty asm use that holds v's registers (operand rotation: the next loads take other registers)
++      auto keep = [](const bf16x16& v) { asm volatile("" ::"v"(v)); };
++      // A(t): unit u = (dt, hh): Q (and dO for dt < 4) of rows hh, 2 NKV WMMAs (S and dP of the NKV kv tiles)
++      auto stage_a = [&](int t) {
++        const RdBase b = rd_base(stg(t));
++        constexpr int NU = 2 * NDT_QK;
++        bf16x16 uq[NU], uo[NU];
++        auto load_u = [&](auto u) {
++          constexpr int dt = u / 2, hh = u % 2;
++          uq[u] = cat(lds_load_b128(b.q, k1_rd_const(hh, 1, dt, 0)), lds_load_b128(b.q, k1_rd_const(hh, 1, dt, 1)));
++          if constexpr (dt < NDT_V)
++            uo[u] = cat(lds_load_b128(b.v, k1_rd_const(hh, 0, dt, 0)), lds_load_b128(b.v, k1_rd_const(hh, 0, dt, 1)));
++        };
++        static_for<HKL_ABC_ALEAD>([&](auto u) { load_u(u); });
++        static_for<NU>([&](auto u) {
++          constexpr int dt = u / 2, hh = u % 2;
++          sched_barrier<0>();
++          if constexpr (u + HKL_ABC_ALEAD < NU) load_u(std::integral_constant<int, u + HKL_ABC_ALEAD>{});
++          static_for<NKV>([&](auto kh) {
++            const f32x8 z = {0, 0, 0, 0, 0, 0, 0, 0};
++            raw[hh][kh][0] = wmma<false, false>(uq[u], kf[kh][dt], dt == 0 ? z : raw[hh][kh][0]);
++            if constexpr (dt < NDT_V)
++              raw[hh][kh][1] = wmma<false, false>(uo[u], vf[kh][dt], dt == 0 ? z : raw[hh][kh][1]);
++          });
++          // unit u - 1 stays allocated until unit u's WMMAs issued: unit u + 2 cannot take its registers
++          if constexpr (u >= 1 && HKL_ABC_KEEP) {
++            keep(uq[u - 1]);
++            if constexpr ((u - 1) / 2 < NDT_V) keep(uo[u - 1]);
++          }
++        });
++        sched_barrier<0>();
++      };
++      // B of rows hh of tile t: k_dkdv96ds's softmax / dS arithmetic into ph / dh [kh][hh*8 + si]
++      auto b_half = [&](auto do_mask, auto hh, int t, bf16 (&ph)[NKV][16], bf16 (&dh)[NKV][16]) {
++        const int q0 = (qp_start + t) * 32;
++        static_for<NKV>([&](auto kh) {
++          const int qb = q0 + hh * 16 + half * 8;
++          const int kvl = kv0 + kh * 16 + row;
++          static_for<8>([&](auto si) {
++            const float nl = pre[hh * 4 + si / 4][si % 4];
++            const float nd = pre[hh * 4 + 2 + si / 4][si % 4];
++            float tt = __builtin_fmaf(raw[hh][kh][0][si.value], c1, nl);
++            if constexpr (decltype(do_mask)::value) tt = (kvl > qb + si + cshift) ? K1_NEG : tt;
++            const float pf = exp2_raw(tt);
++            ph[kh][hh * 8 + si] = to_bf16(pf);
++            dh[kh][hh * 8 + si] = to_bf16(pf * __builtin_fmaf(raw[hh][kh][1][si.value], scale, nd));
++          });
++        });
++      };
++      // the dS^T regroup (k1ds's DPP recipe) and the stores of tile t (diagonal tiles: put blocks only; the test is
++      // true for every block of a full tile)
++      u32x4 dsx[NKV], dsy[NKV];
++      auto regroup = [&](const bf16x16 (&a_dsk)[NKV]) {
++        static_for<NKV>([&](auto kh) {
++          const u32x8 w = __builtin_bit_cast(u32x8, a_dsk[kh]);
++          dsx[kh] = u32x4{dpp_ror8<0xC>(w[0], w[4]), dpp_ror8<0xC>(w[1], w[5]), dpp_ror8<0xC>(w[2], w[6]),
++                          dpp_ror8<0xC>(w[3], w[7])};
++          dsy[kh] = u32x4{dpp_ror8<0x3>(w[4], w[0]), dpp_ror8<0x3>(w[5], w[1]), dpp_ror8<0x3>(w[6], w[2]),
++                          dpp_ror8<0x3>(w[7], w[3])};
++        });
++      };
++      auto ds_export = [&](int t) {
++        const int qt = qp_start + t;
++        const int so = k3ds_sq(qt, 0, Sq, Skv, causal);
++        if (t < n_mask) {
++          static_for<NKV>([&](auto kh) {
++            if (k3ds_put(kh, qt, kt0, Sq, Skv, causal)) {
++              buf_store_u32x4(dsx[kh], r_ds, vds, so + ds_rc[kh]);
++              buf_store_u32x4(dsy[kh], r_ds, vds + K1DS_ST_B, so + ds_rc[kh]);
++            }
++          });
++        } else {
++          static_for<NKV>([&](auto kh) {
++            buf_store_u32x4(dsx[kh], r_ds, vds, so + ds_rc[kh]);
++            buf_store_u32x4(dsy[kh], r_ds, vds + K1DS_ST_B, so + ds_rc[kh]);
++          });
++        }
++      };
++#if HKL_PROBE
++      // per-phase cycles of the steady steps (B unmasked, C and A present), SALU only: s_get_shader_cycles deltas
++      // summed under an SCC select
++      unsigned int pr_acc[6] = {0, 0, 0, 0, 0, 0}, pr_prev = 0, pr_n = 0;
++      auto probe = [&](bool on, int pt) {
++        sched_barrier<0>();
++        const unsigned int tc = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
++        pr_acc[pt] += on ? tc - pr_prev : 0u;
++        pr_prev = tc;
++        sched_barrier<0>();
++      };
++#else
++      auto probe = [&](bool, int) {};
++#endif
++      // the first half of step k: C(k-2) and / or B(k-1); pa = P / dS of tile k-2 (C reads), pb = tile k-1 (B writes)
++      auto first_half = [&](int k, auto do_b, auto mask_b, auto do_c, bool prb, bf16x16 (&pa_pk)[NKV],
++                            bf16x16 (&pa_ds)[NKV], bf16x16 (&pb_pk)[NKV], bf16x16 (&pb_ds)[NKV])
++          __attribute__((always_inline)) {
++        constexpr bool DB = decltype(do_b)::value, DC = decltype(do_c)::value;
++        // a distinct marker per variant at both ends: keeps SimplifyCFG / branch folding from hoisting or sinking the
++        // code the variants share into common blocks
++        constexpr int VID = (DB ? 1 : 0) + (decltype(mask_b)::value ? 2 : 0) + (DC ? 4 : 0);
++        asm volatile("; abc first half %0" ::"i"(VID));
++        bf16 ph[NKV][16], dh[NKV][16];
++        bf16x16 b_do[NDO_V], b_q[NDO_QK];
++        sched_barrier<0>();
++        const lds_u8* tv = tr_base(stg(k - 2), 0);
++        const lds_u8* tk = tr_base(stg(k - 2), 1);
++#if HKL_ABC_CB
++        if constexpr (DC) static_for<NDO_V>([&](auto d) { b_do[d] = tr(tv, 0, d); });
++        sched_barrier<0>();
++#endif
++        probe(prb, 4);
++        // dV (d outer, kh inner) + B hh0
++        if constexpr (DC) {
++          static_for<NDO_V>([&](auto d) {
++            if constexpr (!HKL_ABC_CB) b_do[d] = tr(tv, 0, d);
++            static_for<NKV>([&](auto kh) {
++              acc[kh * NDO_V + d] = wmma<(kh > 0), false>(b_do[d], pa_pk[kh], acc[kh * NDO_V + d]);
++            });
++          });
++        }
++        if constexpr (DB) b_half(mask_b, std::integral_constant<int, 0>{}, k - 1, ph, dh);
++#if HKL_ABC_SGB
++        if constexpr (DB && DC) {
++          static_for<NDO_V * NKV>([&](auto) {
++            sched_group_barrier<0x008, 1, 3>();
++            sched_group_barrier<0x400, 1, 3>();
++            sched_group_barrier<0x002, HKL_ABC_SGB, 3>();
++          });
++        }
++#endif
++        sched_barrier<0>();
++        probe(prb, 1);
++#if HKL_ABC_CB
++        if constexpr (DC) static_for<NDO_QK>([&](auto d) { b_q[d] = tr(tk, 1, d); });
++        sched_barrier<0>();
++#endif
++        probe(prb, 5);
++        // dK (d outer, kh inner) + B hh1, pack, regroup
++        if constexpr (DC) {
++          static_for<NDO_QK>([&](auto d) {
++            if constexpr (!HKL_ABC_CB) b_q[d] = tr(tk, 1, d);
++            static_for<NKV>([&](auto kh) {
++              acc[DK0 + kh * NDO_QK + d] = wmma<(kh > 0), false>(b_q[d], pa_ds[kh], acc[DK0 + kh * NDO_QK + d]);
++            });
++          });
++        }
++        if constexpr (DB) {
++          b_half(mask_b, std::integral_constant<int, 1>{}, k - 1, ph, dh);
++          pack(ph, dh, pb_pk, pb_ds);
++          regroup(pb_ds);
++        }
++#if HKL_ABC_SGB
++        if constexpr (DB && DC) {
++          static_for<NDO_QK * NKV>([&](auto) {
++            sched_group_barrier<0x008, 1, 4>();
++            sched_group_barrier<0x400, 1, 4>();
++            sched_group_barrier<0x002, HKL_ABC_SGB, 4>();
++          });
++        }
++#endif
++        sched_barrier<0>();
++        probe(prb, 2);
++        asm volatile("; abc first half end %0" ::"i"(VID));
++      };
++      // step k
++      auto step = [&](int k, bf16x16 (&pa_pk)[NKV], bf16x16 (&pa_ds)[NKV], bf16x16 (&pb_pk)[NKV],
++                      bf16x16 (&pb_ds)[NKV]) __attribute__((always_inline)) {
++        const bool steady = k >= 2 && k < N && k - 1 >= n_mask;
++        if (k >= 2 && k <= N) {
++          if (k - 1 < n_mask) {
++            first_half(k, T{}, T{}, T{}, false, pa_pk, pa_ds, pb_pk, pb_ds);
++          } else {
++            first_half(k, T{}, F{}, T{}, steady, pa_pk, pa_ds, pb_pk, pb_ds);
++          }
++        } else if (k == 1) {
++          first_half(k, T{}, T{}, F{}, false, pa_pk, pa_ds, pb_pk, pb_ds);
++        } else if (k == N + 1) {
++          first_half(k, F{}, F{}, T{}, false, pa_pk, pa_ds, pb_pk, pb_ds);
++        }
++        if (k < N) {
++          sched_barrier<0>();
++          tensor_wait<K1_TW>();              // own half of tile k landed
++          sched_barrier<0>();
++          lds_barrier();                     // BARRIER(k)
++          sched_barrier<0>();
++          probe(steady, 3);
++          if (k >= 1) ds_export(k - 1);
++          sched_barrier<0>();
++          ldl(tq(k), 0, pre);
++          tdm_tile(tq(k + 2), 0, stg(k + 2));
++          stage_a(k);
++          probe(steady, 0);
++        } else if (k == N) {
++          sched_barrier<0>();
++          ds_export(k - 1);
++          sched_barrier<0>();
++        }
++      };
++      bf16x16 pa_pk[NKV], pa_ds[NKV], pb_pk[NKV], pb_ds[NKV];
++      if (N <= 0) return;                    // uniform per workgroup: no barrier on either wave
++      sched_barrier<0>();
++      tdm_tile(tq(0), 0, stg(0));
++      tdm_tile(tq(1), 0, stg(1));
++#if HKL_PROBE
++      pr_n = (unsigned int)(N - 2 - (n_mask > 1 ? n_mask - 1 : 0));
++      pr_prev = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
++#endif
++      // two steps per trip so pa / pb alternate without copies
++      for (int k = 0; k < N + 2; k += 2) {
++        step(k, pa_pk, pa_ds, pb_pk, pb_ds);
++        if (k + 1 < N + 2) step(k + 1, pb_pk, pb_ds, pa_pk, pa_ds);
++      }
++#if HKL_PROBE
++      {
++        const bool pr_wg = blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0;
++        const auto r_pr = rsrc(reinterpret_cast<const unsigned char*>(DS) - 65536, pr_wg ? 65536 : 0);
++        static_for<6>([&](auto i) { __builtin_amdgcn_raw_buffer_store_b32(pr_acc[i], r_pr, 0, wv * 64 + i * 4, 0); });
++        __builtin_amdgcn_raw_buffer_store_b32(pr_n, r_pr, 0, wv * 64 + 24, 0);
++      }
++#endif
++    };
++#endif
++
++    auto legacy = [&]() __attribute__((always_inline)) {
+     // ---- X3: the masked (diagonal) iterations ride the full loop's 3-stage Q/dO ring (k3m_idx.h) ----------
+     // Flat tile sequence j < N = n_mask + n_full, T_j = (qp_start + j / G, j % G) in stage sigma(j) = (j - n_mask)
+     // mod 3 (the full loop's first tile lands in stage 0); every prefetch is clamped to T_{N-1}.
+@@ -683,6 +944,24 @@
+       static_for<NKV>([&](auto kh) { ds_store(pend[kh], pso + ds_rc[kh]); });
+       sched_barrier<0>();
+     }
++    };
++#if HKL_ABC
++    if constexpr (K3) {
++#if HKL_ABC_ONLY  // skeleton: no legacy path in the 96-row body (G != 1 unsupported)
++      abc();
++#else
++      if (G == 1) {
++        abc();
++      } else {
++        legacy();
++      }
++#endif
++    } else {
++      legacy();
++    }
++#else
++    legacy();
++#endif
+     // retire the last (clamped) prefetch -- or the prologue's -- before the epilogue reuses the ring
+     tensor_wait<0>();
+     sched_barrier<0>();

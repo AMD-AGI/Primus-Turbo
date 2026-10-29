@@ -3,3 +3,12 @@
 build/
 __pycache__/
 logs/
+# micro/ build outputs (amdclang++ -save-temps and the binaries)
+micro/*-hip-*
+micro/*-host-*
+micro/*.hipfb*
+micro/wmma_chain
+micro/wmma_toggle
+micro/warv_stress
+micro/wmma_mix
+micro/wmma_mix_w*

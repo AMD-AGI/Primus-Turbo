@@ -1,0 +1,21 @@
+[2026-10-29T04:05:15 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: micro/wmma_mix
+pattern                   cycles/rep  (one wave per SIMD, median)
+W*64                          512.19
+W*256                        2048.19
+W*512                        4096.19
+W*1024                       8192.19
+WPP*16                        147.16
+WPP*64                        579.16
+WPP*128                      1155.16
+WPP*256                      2322.07
+WPP*512                      4626.07
+WPPE*16                       158.10
+WPPE*64                       602.10
+WPPE*128                     1194.10
+WPPE*256                     2393.02
+WPPE*512                     4761.02
+M*256                         276.09
+M*1024                       1059.04
+M*2048                       2083.04
+M*4096                       4131.04
+[04:05:18 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_040515_wmma_mix6.log
