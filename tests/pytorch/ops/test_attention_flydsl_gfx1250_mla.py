@@ -947,6 +947,24 @@ def test_hk_production_shape_matches_reference():
     _check(got, _reference_by_heads(q, k, v, dout, MLA_SCALE))
 
 
+@needs_hk
+def test_hk_direct_rect32_matches_reference():
+    """hk_attn_bwd called directly at (Skv - Sq) % 64 == 32 (the adapter's FlyDSL gate refuses it, the HIP
+    kernels' own shape rules admit it): the dQ kernel's last steady unit reads the first masked kv32 row, whose
+    stored pairs start mid-row there (5c20de7e .. 71bd0329 read the wrong half-block: dq ~18 dB)."""
+    impl = _hk_package("impl")
+    q, k, v, dout = _inputs(1, 4096, 4128, 4, layout="bshd")
+    ref = _reference_by_heads(q, k, v, dout, MLA_SCALE)
+    out, lse = ref[0].to(torch.bfloat16).cuda(), ref[1].float().cuda()
+    args = [t.cuda().contiguous() for t in (dout, q, k, v)]
+    got = impl.hk_attn_bwd(args[0], args[1], args[2], args[3], out, lse, MLA_SCALE, True)
+    again = impl.hk_attn_bwd(args[0], args[1], args[2], args[3], out, lse, MLA_SCALE, True)
+    for name, x, y, r in zip(("dq", "dk", "dv"), got, again, ref[2:]):
+        assert torch.equal(x, y), name
+        snr = compute_snr(r, x.float().cpu())
+        assert snr >= 48.0, f"{name}: {snr:.1f} dB < 48 dB"
+
+
 needs_hk_delta = pytest.mark.skipif(
     not (torch.cuda.is_available() and is_gfx1250())
     or _hk_code_objects_reason() is not None
