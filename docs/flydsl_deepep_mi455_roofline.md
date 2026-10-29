@@ -45,13 +45,13 @@ of the hardware. Branch `dev/boyang/flydsl_deepep_gfx1250_roofline`, from PR #58
   of four (a claim waits for all its tokens' rows, so one late row held up four tokens). Combine at 160
   CUs: EP2 145.7 → 126.8 µs (49% → 56% of 1.62 TB/s), EP4 302.5 → 260.6 µs (57% → 66%); outputs
   checked, `test_intranode.py` passes on 2 and 4 GPUs. See [Inside the kernels](#inside-the-kernels-phase-stamps).
-- **Against tuned RCCL** (all rccl-tests variants, as `06-rccl`; T = 8192, 160 CUs): on this node
+- **Against tuned RCCL** (the container's RCCL, all rccl-tests variants as `06-rccl`; T = 8192, 160 CUs):
   `flydsl_v2` is 1.28–1.32× faster than the fastest RCCL all-to-all of the same rows (EP4: dispatch
   258.7 against 339.3 µs, combine 262.7 against 336.9 µs; EP2: 122.8 / 126.8 against 162.5 / 162.0 µs).
-  `06-rccl`'s fastest all-to-all (copy engines, symmetric windows, `NCCL_CTA_POLICY=2`, on another node
-  and RCCL build) would take about 209 µs for the EP4 volume and streams at 1.59 TB/s against the cached
-  dispatch's 1.31 TB/s: `flydsl_v2` is at 80% of it, 71% of the MAIDAS roofline. That variant does not
-  reproduce with this container's RCCL. See [Tuned RCCL](#tuned-rccl-all-to-all-against-flydsl_v2).
+  For reference only, `06-rccl`'s fastest all-to-all (copy engines, symmetric windows,
+  `NCCL_CTA_POLICY=2`, another node and RCCL build) would take about 209 µs for the EP4 volume and streams
+  at 1.59 TB/s against the cached dispatch's 1.31 TB/s: `flydsl_v2` is at 80% of it, 71% of the MAIDAS
+  roofline. See [Tuned RCCL](#tuned-rccl-all-to-all-against-flydsl_v2).
 
 ## How the roofline is measured
 
@@ -316,7 +316,8 @@ that it did not count at EP2, so the read counters are not used.
 
 ## Tuned RCCL all-to-all against flydsl_v2
 
-The baseline is RCCL's all-to-all after the tuning of `06-rccl`: every variant of the RCCL team's
+The baseline is the container's RCCL (`2.32.3-HEAD:2f2a927`, not rebuilt; user, 2026-10-29) after the
+tuning of `06-rccl`: every variant of the RCCL team's
 rccl-tests sweep (buffers plain / `ncclCommRegister` / symmetric window, eager or hipGraph launch,
 `NCCL_CTA_POLICY` 0 / 1 / 2, `RCCL_FORCE_CE`), each checked against torch's all-to-all
 (`bench_rccl_tune.py`). It moves the rows the DeepEP kernels move (one per token and destination rank,
@@ -324,7 +325,8 @@ rccl-tests sweep (buffers plain / `ncclCommRegister` / symmetric window, eager o
 an equal-split `ncclAllToAll` of the same volume (the collective of `06-rccl`'s busbw figures) is timed
 next to it. EP4: 2026-10-29, GPUs 0–3, after a warm-up, `flydsl_v2` with one-token claims in the same
 session (`ut_logs/rccl_tuned_ep4_20261029_110534/`); EP2: the RCCL sweep of 2026-10-28 on the same node
-(`cursor-work/pr583_bench_data/pr583_rccl_tune_20261028_020918`, `pr583_rccl_tuned_20261028_021525`).
+(`cursor-work/pr583_bench_data/pr583_rccl_tune_20261028_020918`, `pr583_rccl_tuned_20261028_021525`)
+against the EP2 `flydsl_v2` runs above.
 
 At the proxy shape, T = 8192, `flydsl_v2` at 160 CUs; µs (link GB/s):
 
@@ -353,7 +355,8 @@ EP4, time and link GB/s against the volume, `flydsl_v2` at 160 CUs (combine with
 two references are equal-split all-to-alls of the same link bytes, interpolated between their published
 sizes (per-rank buffer = link bytes × 4 / 3): the MAIDAS busbw roofline, and the fastest RCCL variant of
 `06-rccl` (symmetric windows, `NCCL_CTA_POLICY=2`: RCCL's copy-engine all-to-all, no CUs; measured on
-`ctheliosr-rck-g02-e15-01` with RCCL `105dd4f`):
+`ctheliosr-rck-g02-e15-01` with RCCL `105dd4f`). "Fastest RCCL here": the faster of local / eager /
+policy 0 and symmetric / eager / policy 2 on the DeepEP rows, every variant at T = 8192:
 
 | T | link MB | MAIDAS roofline | `06-rccl` fastest | `flydsl_v2` dispatch, counts known | `flydsl_v2` combine | fastest RCCL here |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -504,9 +507,8 @@ same case as the cached dispatch here (58%).
 4. The copy kernel with 22 warps per block (the combine's pushers), to see whether the push alone reaches
    the harness ceiling.
 5. ~~Tuned RCCL at EP4~~: measured 2026-10-29 ([Tuned RCCL](#tuned-rccl-all-to-all-against-flydsl_v2)).
-6. `06-rccl`'s RCCL build (`build_rccl.sh`, `105dd4f`) in a separate container (it replaces torch's
-   `librccl.so.1`, so not in the shared one), then `bench_rccl_tune.py` at EP4: whether the copy-engine
-   all-to-all reaches 1.59 TB/s here, and whether its `ncclAlltoAllv` does with the real splits.
+6. ~~`06-rccl`'s RCCL build (`105dd4f`) here~~: not done; the baseline stays the container's RCCL
+   (user, 2026-10-29).
 
 ## References
 
