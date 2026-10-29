@@ -1,0 +1,79 @@
+diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
+--- a/include/dqds/dqds_impl.h	2026-10-29 10:52:22.899839215 +0000
++++ b/include/dqds/dqds_impl.h	2026-10-29 10:52:57.765521259 +0000
+@@ -114,7 +114,7 @@
+ 
+ template <int NQW>
+ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int Skv, int Hq,
+-                      int Hkv, int G, int nkvt, int cshift, int causal, int q0g, int HG) {
++                      int Hkv, int G, int nkvt, int cshift, int causal, int q0g, int HG, int pr_li) {
+     constexpr int NB_G = nbg(NQW);
+     constexpr int NACC = NQW * NDT;
+ 
+@@ -337,6 +337,9 @@
+         run(Y, MASK, r1);
+     };
+ 
++#if DQ_PROBE == 2
++    const unsigned int pr_t0 = readfirstlane((int) __builtin_readcyclecounter());
++#endif
+     // ---- prologue
+     // ---------------------------------------------------------------------------------------------
+     c_issue(0);
+@@ -356,6 +359,9 @@
+     const int nloop = nu - 1;
+     const int nf    = steady_units(nfu, nu);
+     int       u     = 0;
++#if DQ_PROBE == 2
++    const unsigned int pr_t1 = readfirstlane((int) __builtin_readcyclecounter());
++#endif
+     if constexpr (NQW == MAIN_NQW) {
+         // the unrolled steady units burst row 2u + 2 assuming all of its pairs are stored (sh = 0); for the last
+         // steady unit that row belongs to the first masked unit, whose stored pairs start mid-row when
+@@ -420,6 +426,9 @@
+     unit(nloop, ic<1>{}, ic<1>{}, ic<0>{});
+ 
+     // ---- exit: every wave's TDM landed (incl. dummies), every ring read retired
++#if DQ_PROBE == 2
++    const unsigned int pr_t2 = readfirstlane((int) __builtin_readcyclecounter());
++#endif
+     Q1_WAIT_TENSORCNT(0);
+     wg_sync();
+     const rsrc_t g_dq = make_rsrc(DQ, DQ_EXTENT_B, RSRC_FLAGS);
+@@ -443,6 +452,20 @@
+             });
+         });
+     });
++#if DQ_PROBE == 2
++    // timing probe: workgroups li % 64 < 8 (sample j = li / 64 * 8 + li % 8), wave wv: words 1024 + 8 j + 2 wv + 0..1 of
++    // the 64 KB in front of DS = (prologue << 16 | epilogue) cycles (saturated), (units << 24 | loop cycles)
++    const unsigned int pr_t3 = readfirstlane((int) __builtin_readcyclecounter());
++    if (pr_li % 64 < 8 && lane == 0) {
++        const int      j   = pr_li / 64 * 8 + pr_li % 8;
++        const unsigned pro = pr_t1 - pr_t0 < 0xFFFFu ? pr_t1 - pr_t0 : 0xFFFFu;
++        const unsigned epi = pr_t3 - pr_t2 < 0xFFFFu ? pr_t3 - pr_t2 : 0xFFFFu;
++        unsigned int  *w   = reinterpret_cast<unsigned int *>(
++                              reinterpret_cast<unsigned char *>(const_cast<__bf16 *>(DS)) - 65536) + 1024 + 8 * j + 2 * wv;
++        w[0] = (pro << 16) | epi;
++        w[1] = ((unsigned) nu << 24) | ((pr_t2 - pr_t1) & 0xFFFFFFu);
++    }
++#endif
+ }
+ 
+ // The kernel entry: grid (HG, ntile + nhead, B*Hq/HG), block 128.
+@@ -451,12 +474,13 @@
+                         int HG) {
+     lock_simd(); // SCHED_MODE.DISABLE_XDL_ARB_STALL, as bwd_r6_a's k_dqds192 / k_dqg96 / k_dqds_b
+     const int gy = block_id_y();
++    const int pr_li = (block_id_z() * (ntile + (q_off > 0 ? 1 : 0)) + gy) * HG + block_id_x(); // probe only
+     if (!tile_is_head(gy, ntile)) {
+         dqds_body<MAIN_NQW>(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal,
+-                            tile_q0g(q_off, ntile, gy), HG);
++                            tile_q0g(q_off, ntile, gy), HG, pr_li);
+     } else {
+         dqds_body<HEAD_NQW>(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, head_q0g(q_off),
+-                            HG);
++                            HG, pr_li);
+     }
+ }
+ 

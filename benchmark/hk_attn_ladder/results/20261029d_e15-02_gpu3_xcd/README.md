@@ -149,6 +149,12 @@ first dkdv): bitwise == r10x, 1.000x ± 0.002 under hkl.ladder (cold calls; one 
 
 r10x_dqy2 (-DDQ_YMAJOR=2: only the last two z interleaved by y, against the dQ tail): bitwise == r10x, 1.000x.
 
+dQ inside (r10x_dqp: k_dqds_c -DDQ_PROBE=2, workgroups li % 64 < 8, every wave): the loop runs a 384-query unit
+in a median 1186-1203 cycles against the 1152-cycle WMMA floor (97%), the same on all four waves; prologue median
+~2.3K cycles (mean 3.1K), epilogue median ~3.9-4.2K (mean ~5.4K, p90 ~9.4K: dQ images, whole-line readback, 72
+stores per wave). Prologue + epilogue are ~14% of a dQ workgroup; dK/dV's FINAL showed that a shorter epilogue does
+not free the slot earlier (r10w), so it is not pursued.
+
 ## 12. Next
 
 r10t is landed on Primus-Turbo b1 (d10b4db8: bwd 2.361 -> 2.336 ms hot). A persistent dK/dV kernel would also

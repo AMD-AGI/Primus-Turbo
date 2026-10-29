@@ -1,0 +1,16 @@
+[2026-10-29T10:53:42 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: sh -c python3 -m hkl.test mla/ladder_bwd.json --rung r10x_dqp --shapes toy | tail -2; python3 -m micro.k3_probe mla/ladder_bwd.json r10x_dqp --abc --calls 20 --allwg 2816 --dqsplit
+  r10x_dqp         PASS  dq  52.06 dk  52.09 dv  52.72  det
+ALL PASS
+wave 0: 352 workgroups; prologue mean    3075  median   2287  p10   2060  p90   6591
+        epilogue mean    5453  median   4242  p10   4062  p90   9422
+        loop cycles per unit (units >= 8): mean 1249 median 1186 (floor 1152 for a 384-query tile)
+wave 1: 352 workgroups; prologue mean    3072  median   2282  p10   2063  p90   6592
+        epilogue mean    5343  median   4098  p10   3923  p90   9268
+        loop cycles per unit (units >= 8): mean 1252 median 1190 (floor 1152 for a 384-query tile)
+wave 2: 352 workgroups; prologue mean    3077  median   2289  p10   2068  p90   6592
+        epilogue mean    5386  median   4159  p10   3945  p90   9393
+        loop cycles per unit (units >= 8): mean 1254 median 1194 (floor 1152 for a 384-query tile)
+wave 3: 352 workgroups; prologue mean    3067  median   2278  p10   2052  p90   6589
+        epilogue mean    5179  median   3889  p10   3694  p90   9010
+        loop cycles per unit (units >= 8): mean 1261 median 1203 (floor 1152 for a 384-query tile)
+[10:53:49 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_105342_dqp.log

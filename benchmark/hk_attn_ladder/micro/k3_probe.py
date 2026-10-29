@@ -60,6 +60,30 @@ def split_report(g, nwg, waves=2):
                 print(f"      {k}: n {len(v):3d}  {m['entry']:6.0f} {m['pro']:7.0f} {m['loop']:9.0f} {m['epi']:7.0f}")
 
 
+def dq_split_report(g, nwg):
+    """k_dqds_c -DDQ_PROBE=2: workgroups li % 64 < 8 (sample j = li / 64 * 8 + li % 8), wave w words 1024 + 8 j + 2 w
+    + 0..1 = (prologue << 16 | epilogue), (units << 24 | loop cycles); WMMA floor per unit: 8 cycles x 144 (main)."""
+    for w in range(4):
+        rows = []
+        for li in range(nwg):
+            if li % 64 >= 8:
+                continue
+            j = li // 64 * 8 + li % 8
+            a, b = (g[1024 + 8 * j + 2 * w + i] & 0xFFFFFFFF for i in range(2))
+            if b:
+                rows.append((li, a >> 16, a & 0xFFFF, b >> 24, b & 0xFFFFFF))
+        if not rows:
+            print(f"wave {w}: nothing recorded")
+            continue
+        per = [r[4] / r[3] for r in rows if r[3] >= 8]
+        print(f"wave {w}: {len(rows)} workgroups; prologue {_stats([r[1] for r in rows])}")
+        print(f"        epilogue {_stats([r[2] for r in rows])}")
+        if per:
+            per.sort()
+            print(f"        loop cycles per unit (units >= 8): mean {sum(per) / len(per):.0f} median "
+                  f"{per[len(per) // 2]:.0f} (floor 1152 for a 384-query tile)")
+
+
 def rt_report(g, nwg, slots, grid=None):
     """HKGEN_PROBE=4: every workgroup's [start, end) (10-ns ticks): the kernel's occupancy over time."""
     rec = [(li, (x >> 14) & 0x3FFFF, x & 0x3FFF) for li, x in ((li, g[1024 + li] & 0xFFFFFFFF) for li in range(nwg)) if x]
@@ -141,6 +165,7 @@ def main():
     ap.add_argument("--slots", type=int, default=512, help="--rt: workgroups resident at once (occupancy)")
     ap.add_argument("--dq", action="store_true", help="--rt: the words are k_dqds_c's (-DDQ_PROBE=1), its grid")
     ap.add_argument("--waves", type=int, default=2, help="--split: waves per workgroup (4: -DHKGEN_W4)")
+    ap.add_argument("--dqsplit", action="store_true", help="with --allwg, k_dqds_c -DDQ_PROBE=2 words")
     a = ap.parse_args()
     spec = runner.load_ladder(a.ladder)
     sh = L.parse_shape(a.shape, spec["problem"])
@@ -166,6 +191,9 @@ def main():
                 mod._fly._launch(fn, args)
     torch.cuda.synchronize()
     g = plan["ds_full"][: mod.DS_GUARD_B // 2].view(torch.int32).cpu().tolist()
+    if a.allwg and a.dqsplit:
+        dq_split_report(g, a.allwg)
+        return 0
     if a.allwg and (a.split or a.rt):  # modes 3 / 4 leave the per-phase words unwritten
         split_report(g, a.allwg, a.waves) if a.split else rt_report(g, a.allwg, a.slots, plan["grids"]["dq" if a.dq else "dkdv"])
         return 0

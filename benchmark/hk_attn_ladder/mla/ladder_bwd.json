@@ -3099,6 +3099,54 @@
    "side": true
   },
   {
+   "id": "r10x_dqp",
+   "parent": "r10x",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_KV_TDM=1"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DDQ_PROBE=2"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10x + k_dqds_c prologue / loop / epilogue probe (micro.k3_probe --allwg 2816 --dqsplit)",
+   "patch": "patches/r10x_dqp.patch",
+   "side": true
+  },
+  {
    "id": "r10x_th",
    "parent": "r10x",
    "kernels": {
