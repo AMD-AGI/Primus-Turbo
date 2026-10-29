@@ -3942,8 +3942,8 @@ diff -ruN a/r8gen/gen/bwdgen.py b/r8gen/gen/bwdgen.py
 +    return out, int(round(t))
 diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 --- a/r8gen/gen/r8gen.py	1970-01-01 00:00:00.000000000 +0000
-+++ b/r8gen/gen/r8gen.py	2026-10-29 07:42:21.000000000 +0000
-@@ -0,0 +1,639 @@
++++ b/r8gen/gen/r8gen.py	2026-10-29 07:51:36.000000000 +0000
+@@ -0,0 +1,640 @@
 +###############################################################################
 +# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 +#
@@ -4519,10 +4519,11 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +           f"s_add_co_i32 s98, {SG_T1}, {qps}", f"s_lshl_b32 s98, s98, 7", f"s_add_co_i32 {SG_NLS}, {_sv(sc, 2)}, s98"]  # fmt: skip
 +    so_tdm = ((stage + 2) % DEPTH) * QDO_B
 +    if TDM_DUMMY:  # tile k + kofs + 2 past the last: the three ops move 16 B each (words 3, 4: tile0 8, tile1 1)
-+        out += [f"s_add_co_i32 s98, {SG_K}, {2 + kofs}", f"s_cmp_ge_i32 s98, {_sv(tdm, 14)}"]
++        out += [f"s_add_co_i32 s98, {SG_K}, {2 + kofs}", f"s_cmp_ge_i32 s98, {_sv(tdm, 14)}",
++                f"s_mov_b32 s98, {hex(8 << 16)}"]  # one literal per SALU op (s_mov keeps scc)
 +        for o in range(3):
 +            g1 = int(SG_G1[o][2:].split(":")[0])
-+            out += [f"s_cselect_b32 s{g1 + 3}, {hex(8 << 16)}, {hex(TDM_W3[o])}", f"s_cselect_b32 s{g1 + 4}, 1, 16"]
++            out += [f"s_cselect_b32 s{g1 + 3}, s98, {hex(TDM_W3[o])}", f"s_cselect_b32 s{g1 + 4}, 1, 16"]
 +    for o in range(3):
 +        g0 = SG_G0[o]
 +        out += [f"s_mul_i32 s96, {SG_T2}, {_sv(tdm, 4 * o + 2)}", "s_mov_b32 s97, 0",
@@ -9939,8 +9940,8 @@ diff -ruN a/r8gen/hip/include/q1/prims.h b/r8gen/hip/include/q1/prims.h
 +#endif // Q1_HOST_EMU
 diff -ruN a/r8gen/hip/src/k_delta.hip b/r8gen/hip/src/k_delta.hip
 --- a/r8gen/hip/src/k_delta.hip	1970-01-01 00:00:00.000000000 +0000
-+++ b/r8gen/hip/src/k_delta.hip	2026-10-29 06:59:03.000000000 +0000
-@@ -0,0 +1,87 @@
++++ b/r8gen/hip/src/k_delta.hip	2026-10-29 07:59:28.000000000 +0000
+@@ -0,0 +1,89 @@
 +/***************************************************************************************************
 + * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 + *
@@ -9949,8 +9950,10 @@ diff -ruN a/r8gen/hip/src/k_delta.hip b/r8gen/hip/src/k_delta.hip
 +
 +// k_delta -- the backward's row constants, all [B, H, S] fp32: delta = rowsum(dO * O), and what k_dkdv96ds reads,
 +// NL = -LOG2E * lse and ND = -scale * delta. Bitwise equal to FlyDSL k_delta_bshd (same per-row arithmetic).
-+// -DHK_ND_FOLD=1 (the generated k_dkdv96ds built with --nd-fold): ND = -delta (the dP chains' C init) and
-+// NL = -LOG2E * lse + log2(scale) (its softmax then yields scale * P), DEL unchanged.
++// -DHK_ND_FOLD=1 (the generated k_dkdv96ds built with --nd-fold): the f32 argument is l2s = log2(softmax scale)
++// rounded to fp32 on the host; ND = -delta (the dP chains' C init) and NL = -LOG2E * lse + l2s (its softmax then
++// yields scale * P), DEL unchanged -- bit for bit what the FlyDSL k_delta's NL / delta give after the launcher's fold
++// (the same fp32 add, a negation).
 +// dO / O: [B, S, H, 128] bf16 contiguous; lse [B, H, S] fp32 contiguous (natural log).
 +// grid (S / 64, B * H), block 256 = 16 rows x 16 lanes: workgroup (sblk, bh) owns queries [64 sblk, 64 sblk + 64)
 +// of batch-major head bh (FlyDSL's mapping with 64 queries instead of 32), so each output is one 256-B run. Pass p
@@ -10020,8 +10023,8 @@ diff -ruN a/r8gen/hip/src/k_delta.hip b/r8gen/hip/src/k_delta.hip
 +    DEL[o] = v;
 +#if HK_ND_FOLD
 +    (void)nsc;
-+    ND[o] = 0.0f - v;
-+    NL[o] = LSE[o] * nlog2e + log2f(scale);
++    ND[o] = -v;
++    NL[o] = LSE[o] * nlog2e + scale;  // scale: l2s here (see above)
 +#else
 +    ND[o] = v * nsc;
 +    NL[o] = LSE[o] * nlog2e;
@@ -10030,8 +10033,8 @@ diff -ruN a/r8gen/hip/src/k_delta.hip b/r8gen/hip/src/k_delta.hip
 +}
 diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 --- a/r8gen/hip/src/k_dkdv96ds.hip	1970-01-01 00:00:00.000000000 +0000
-+++ b/r8gen/hip/src/k_dkdv96ds.hip	2026-10-29 07:35:35.000000000 +0000
-@@ -0,0 +1,875 @@
++++ b/r8gen/hip/src/k_dkdv96ds.hip	2026-10-29 07:50:57.000000000 +0000
+@@ -0,0 +1,888 @@
 +/***************************************************************************************************
 + * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 + *
@@ -10130,6 +10133,9 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +#endif
 +#ifndef HKGEN_TAIL
 +#define HKGEN_TAIL 1   // HKGEN: also run the 64-row tail blocks (generated too: markers nkv=2); 0 = timing only
++#endif
++#ifndef HKGEN_EARLY_TDM
++#define HKGEN_EARLY_TDM 0  // HKGEN: the first two tiles' TDM ahead of INIT's K / V fragment loads (latencies overlap)
 +#endif
 +#ifndef HKGEN_PROBE
 +#define HKGEN_PROBE 0  // HKGEN: per-phase cycle sums of the steps (s96..s99) handed to the shell (PROBE marker)
@@ -10476,6 +10482,14 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +      const unsigned int pr_t0 = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
 +      unsigned int pr_t1 = 0, pr_ta = 0, pr_tb = 0;  // ta / tb: around the LOOP marker (prologue | loop | epilogue)
 +#endif
++#if HKGEN_EARLY_TDM
++      if (N > 0) {
++        sched_barrier<0>();
++        tdm_tile(tq(0), 0, stg(0));
++        tdm_tile(tq(1), 0, stg(1));
++        sched_barrier<0>();
++      }
++#endif
 +      asm volatile("; HKGEN INIT nkv=%12 rk=%0 rv=%1 vk=%2 vv=%3 sk0=%4 sk1=%5 sk2=%6 sv0=%7 sv1=%8 sv2=%9 c1=%10 "
 +                   "sc=%11"
 +                   ::"s"(r_k), "s"(r_v), "v"(vk), "v"(vv), "s"(sk[0]), "s"(sk[1]), "s"(sk[NKV - 1]), "s"(sv[0]),
@@ -10483,8 +10497,10 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +                   : HKGEN_CLOBBERS);
 +      if (N > 0) {
 +        sched_barrier<0>();
++#if !HKGEN_EARLY_TDM
 +        tdm_tile(tq(0), 0, stg(0));
 +        tdm_tile(tq(1), 0, stg(1));
++#endif
 +        tensor_wait<K1_TW>();                    // own half of tile 0
 +        sched_barrier<0>();
 +        lds_barrier();                           // RAW: both halves of tile 0

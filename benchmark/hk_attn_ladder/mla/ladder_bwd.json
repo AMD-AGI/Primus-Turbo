@@ -1473,7 +1473,10 @@
     }
    },
    "launch": {
-    "module": "bwd_hk"
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true
+    }
    },
    "feature": "r10b + ND fold: k_delta -DHK_ND_FOLD (ND = -delta, NL += log2 scale) -> the dP chains start from -delta (C init), the softmax yields scale*P, no dP fma (-24 pk_fma per step), dV /= scale in FINAL",
    "side": true
@@ -1509,7 +1512,10 @@
     }
    },
    "launch": {
-    "module": "bwd_hk"
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true
+    }
    },
    "feature": "r10g scheduled by the window model (r10f's scheduler)",
    "side": true
@@ -1578,9 +1584,211 @@
     }
    },
    "launch": {
-    "module": "bwd_hk"
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true
+    }
    },
    "feature": "r10g (ND fold) + r10i (the next tile's scalars in the bodies, fall-through layout)",
+   "side": true
+  },
+  {
+   "id": "r10k",
+   "parent": "r9a",
+   "patch": "patches/r10b.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "-D",
+      "HKGEN_EARLY_TDM=1"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true
+    }
+   },
+   "feature": "r10j + 16-B TDM ops past the last tile (no tile N-1 re-loads, a short tensorcnt-0 wait before the epilogue) + the first two tiles' TDM ahead of the K/V fragment loads",
+   "side": true
+  },
+  {
+   "id": "r10k_fd",
+   "parent": "r9a",
+   "patch": "patches/r10b.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "-D",
+      "HKGEN_EARLY_TDM=1"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "delta": "flydsl"
+    }
+   },
+   "feature": "r10k with the FlyDSL k_delta + the launcher's NL/ND fold (must equal r10k bit for bit)",
+   "side": true,
+   "bitwise_with": "r10k"
+  },
+  {
+   "id": "r10n",
+   "parent": "r10k",
+   "patch": "patches/r10n.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "-D",
+      "HKGEN_EARLY_TDM=1"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true
+    }
+   },
+   "feature": "r10k + k_dqds_c dS images padded 16 B per 256 B (was per 64 B): the dslayout v2 tr16 lanes hit every LDS bank twice instead of up to 3 times; block image 1088 B (was 1280)",
+   "side": true,
+   "bitwise_with": "r10k"
+  },
+  {
+   "id": "r10l",
+   "parent": "r9a",
+   "patch": "patches/r10b.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "-D",
+      "HKGEN_EARLY_TDM=1"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10i + 16-B TDM ops past the last tile + early first TDM (bitwise == r9a)",
+   "bitwise_with": "r9a",
+   "side": true
+  },
+  {
+   "id": "r10m",
+   "parent": "r9a",
+   "patch": "patches/r10b.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--tdm-dummy",
+      "-D",
+      "HKGEN_EARLY_TDM=1"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b + 16-B TDM ops past the last tile + early first TDM (bitwise == r9a)",
+   "bitwise_with": "r9a",
    "side": true
   },
   {
@@ -1680,7 +1888,10 @@
     }
    },
    "launch": {
-    "module": "bwd_hk"
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true
+    }
    },
    "feature": "r10j + loop cycle probe (whole-span INIT..FINAL in slot 0)",
    "side": true
@@ -1749,7 +1960,10 @@
     }
    },
    "launch": {
-    "module": "bwd_hk"
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true
+    }
    },
    "feature": "r10g + loop cycle probe (whole-span INIT..FINAL in slot 0)",
    "side": true

@@ -54,6 +54,8 @@ def main():
             if isinstance(fn, str):
                 grid, block, values = args
                 table[fn].call(grid, block, values, stream)
+            elif fn is getattr(mod, "_fold_nl_nd", None):
+                fn(*args)
             else:
                 mod._fly._launch(fn, args)
     torch.cuda.synchronize()

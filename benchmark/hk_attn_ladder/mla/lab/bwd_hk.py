@@ -55,6 +55,7 @@ not even one head group fits, the call runs the FlyDSL backward instead (same re
 
 import math
 import os
+import struct
 import threading
 
 import torch
@@ -114,6 +115,20 @@ _LOCK = threading.Lock()
 _DEVICES_CHECKED = set()
 HSACO_DIR = None
 DELTA = None  # configure(): None = HIP k_delta iff built, "hk" = required, "flydsl" = never
+ND_FOLD = False  # configure(): the rung's k_dkdv96ds folds ND into its dP C init (k_delta -DHK_ND_FOLD: NL += l2s,
+#                  ND = -delta, l2s = log2(scale) rounded to fp32 on the host, k_delta's f32 argument)
+
+
+def nd_fold_offset(scale):
+    """log2(softmax scale) rounded to fp32: the HIP k_delta's f32 argument and the FlyDSL-delta fold's addend."""
+    return struct.unpack("f", struct.pack("f", math.log2(scale)))[0]
+
+
+def _fold_nl_nd(nl, nd, delta, l2s):
+    """After the FlyDSL k_delta (NL = -LOG2E lse, ND = -scale delta): the folded constants the HIP k_delta writes
+    (NL + l2s, -delta), bit for bit: the same fp32 add, a negation."""
+    nl.add_(l2s)
+    torch.neg(delta, out=nd)
 # kernel argument kinds (manifest.json of 71bd0329; identical in every rung)
 SPECS = {
     "k_dkdv96ds": {"block": 64, "args": [("Q", "ptr"), ("K", "ptr"), ("V", "ptr"), ("DO", "ptr"), ("NL", "ptr"),
@@ -128,10 +143,11 @@ SPECS = {
 }  # fmt: skip
 
 
-def configure(delta=None, dkdv_block=64):
+def configure(delta=None, dkdv_block=64, nd_fold=False):
     """delta: see DELTA; dkdv_block: the k_dkdv96ds workgroup size of the rung (64; 128 for the 4-wave
-    wave-specialized kernel, which supports MHA only)."""
-    global DELTA, _KERNELS
+    wave-specialized kernel, which supports MHA only); nd_fold: see ND_FOLD."""
+    global DELTA, _KERNELS, ND_FOLD
+    ND_FOLD = bool(nd_fold)
     if delta not in (None, "hk", "flydsl"):
         raise ValueError(f"delta must be None, 'hk' or 'flydsl', got {delta!r}")
     if dkdv_block not in (64, 128):
@@ -342,7 +358,7 @@ def _plan(
         raise ValueError(f"hk_attn_bwd: the HIP k_delta needs seqlen_q % {DELTA_ROWS} == 0, got {sq}")
     if hk_delta:
         delta_grid = (sq // DELTA_ROWS, b * hq, 1)
-        delta_values = (do, o, delta, lse, nl, nd, scale, sq, hq)
+        delta_values = (do, o, delta, lse, nl, nd, nd_fold_offset(scale) if ND_FOLD else scale, sq, hq)
         launches = [("delta", "k_delta", (delta_grid, DELTA_BLOCK, delta_values))]
     else:
         delta_grid = (sq // _k.ROWS_DELTA, b * hq, 1)
@@ -362,6 +378,8 @@ def _plan(
             stream,
         )
         launches = [("delta", _k.launch_delta, delta_args)]
+        if ND_FOLD:
+            launches.append(("fold", _fold_nl_nd, (nl, nd, delta, nd_fold_offset(scale))))
     for (q_, k_, v_, do_, nl_, nd_, dv_, dk_, dq_), b_, gz_kv, gz_q in parts:
         dkdv_values = (
             q_,
@@ -398,8 +416,8 @@ def _plan(
         "nd": nd,
         "grids": {
             "delta": delta_grid,
-            "dkdv": launches[1][2][0],
-            "dq": launches[2][2][0],
+            "dkdv": next(l for l in launches if l[0] == "dkdv")[2][0],
+            "dq": next(l for l in launches if l[0] == "dq")[2][0],
         },
         "head_group": {"kv": hg_kv, "q": hg_q},
         "chunks": chunks,  # None, or [(batch, first head, heads)] of every (dkdv, dq) launch pair
@@ -436,6 +454,8 @@ def hk_attn_bwd(
         if isinstance(fn, str):
             grid, block, values = args
             table[fn].call(grid, block, values, stream)
+        elif fn is _fold_nl_nd:
+            fn(*args)
         else:
             _fly._launch(fn, args)
     return plan["outputs"]
