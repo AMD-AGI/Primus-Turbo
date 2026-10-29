@@ -122,8 +122,8 @@ The numbers above come from the PR #583 run of 2026-10-27 (EP2, GPUs 2,3, commit
 
 1. EP2 on this branch's head with the scripts above, to confirm the numbers (about 2 minutes of 2 GPUs).
 2. **EP4** (4 GPUs): `bench_ceiling.py` for the per-GPU aggregate over three peers against 1.8 TB/s
-   (the `hipmemcpy` / `sdma` references issue the peers one after another on one stream and need a
-   stream per peer first), and `bench_ops.py` at the CU counts training uses.
+   (its `hipmemcpy` / `sdma` references now copy to each peer on its own stream past EP2; not yet run),
+   and `bench_ops.py` at the CU counts training uses.
 3. **Per-phase timing** inside the kernels (`s_memrealtime` per block: send start / end, counts
    published, receive copy start / end; combine push end and reduce end) to confirm the serialized
    receive copy and to split the combine's 40–60 µs.

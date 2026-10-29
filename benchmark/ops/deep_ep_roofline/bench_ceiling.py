@@ -205,14 +205,24 @@ MEMCPY_KINDS = {
 }
 
 
+# one stream per peer past EP2: on one stream the copies to the peers would run one after another
+peer_streams = [torch.cuda.Stream() for _ in range(PEERS)] if PEERS > 1 else [stream]
+fork = torch.cuda.Event()
+joins = [torch.cuda.Event() for _ in peer_streams]
+
+
 def hipmemcpy_fn(kind, rows, direction):
     nbytes = rows * ROW_BYTES
 
     def fn():
         if direction == "bi" or RANK == 0:
-            for j in range(1, WORLD):
+            fork.record(stream)
+            for j, (peer_stream, join) in enumerate(zip(peer_streams, joins), start=1):
+                peer_stream.wait_event(fork)
                 dst = peer_ptrs[(RANK + j) % WORLD] + RANK * REGION_BYTES
-                lib.hipMemcpyAsync(dst, src.data_ptr(), nbytes, MEMCPY_KINDS[kind], stream.cuda_stream)
+                lib.hipMemcpyAsync(dst, src.data_ptr(), nbytes, MEMCPY_KINDS[kind], peer_stream.cuda_stream)
+                join.record(peer_stream)
+                stream.wait_event(join)
 
     return fn
 
