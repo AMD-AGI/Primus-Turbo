@@ -144,7 +144,8 @@ JAX support is under active development. `primus_turbo.jax.lax`:
 
 | Op | Fwd / Bwd |
 |---|---|
-| `grouped_gemm`, `compute_group_offs` | ✅ / ✅ |
+| `grouped_gemm` | ✅ / ✅ |
+| `compute_group_offs` | ✅ / – (index helper) |
 | `grouped_gemm_fp8` | ✅ / ✅ |
 | `rmsnorm` | ✅ / ✅ |
 | `quantize_fp8`, `dequantize_fp8` | ✅ / – |
