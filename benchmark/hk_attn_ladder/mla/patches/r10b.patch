@@ -2799,8 +2799,8 @@ diff -ruN a/r8gen/asmkit/verify_obj.py b/r8gen/asmkit/verify_obj.py
 +    sys.exit(1 if r else 0)
 diff -ruN a/r8gen/gen/build.py b/r8gen/gen/build.py
 --- a/r8gen/gen/build.py	1970-01-01 00:00:00.000000000 +0000
-+++ b/r8gen/gen/build.py	2026-10-29 06:42:28.000000000 +0000
-@@ -0,0 +1,370 @@
++++ b/r8gen/gen/build.py	2026-10-29 07:42:21.000000000 +0000
+@@ -0,0 +1,383 @@
 +###############################################################################
 +# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 +#
@@ -2835,7 +2835,8 @@ diff -ruN a/r8gen/gen/build.py b/r8gen/gen/build.py
 +
 +HERE = Path(__file__).resolve().parent
 +PKG = HERE.parent
-+HIP = PKG / "hip"
++# the HIP tree: the package's own hip/ (the ladder's copy), else Primus-Turbo's gfx1250_mla_bwd/hip (tools/r8gen/..)
++HIP = PKG / "hip" if (PKG / "hip").is_dir() else PKG.parent.parent / "hip"
 +sys.path.insert(0, str(HERE))
 +sys.path.insert(0, str(PKG))
 +import r8gen as G  # noqa: E402
@@ -2904,6 +2905,10 @@ diff -ruN a/r8gen/gen/build.py b/r8gen/gen/build.py
 +    ap.add_argument("--probe-pts", default="", help="HKGEN_PROBE: three WMMA counts (comma separated) as probe points")
 +    ap.add_argument("--hh1-split", type=int, default=0, help="r8gen.HH1_SPLIT (0 kh-major .. 6 dt outer)")
 +    ap.add_argument("--bdo-after-hh1", action="store_true", help="r8gen.BDO_AFTER_HH1")
++    ap.add_argument("--win", default="", help="bwdgen.WIN overrides for --sched win: KEY=VAL,KEY=VAL")
++    ap.add_argument("--nd-fold", action="store_true", help="r8gen.ND_FOLD (needs k_delta -DHK_ND_FOLD=1)")
++    ap.add_argument("--scal-in-body", action="store_true", help="r8gen.SCAL_IN_BODY (the next tile's scalars in the bodies)")
++    ap.add_argument("--tdm-dummy", action="store_true", help="r8gen.TDM_DUMMY (16-B ops past the last tile)")
 +    ap.add_argument("--asmkit-root", default=None, help="ignored: the package carries its own asmkit")
 +    a = ap.parse_args()
 +    from asmkit import build as B
@@ -2916,7 +2921,15 @@ diff -ruN a/r8gen/gen/build.py b/r8gen/gen/build.py
 +    M.VA_RULE_LLVM = {"llvm": True, "warv": "warv"}[a.rule]
 +    G.ABL = set(x for x in a.abl.split(",") if x)
 +    G.PROBE_PTS = [int(x) for x in a.probe_pts.split(",") if x] or None
-+    G.HH1_SPLIT, G.BDO_AFTER_HH1 = a.hh1_split, a.bdo_after_hh1
++    G.HH1_SPLIT, G.BDO_AFTER_HH1, G.ND_FOLD = a.hh1_split, a.bdo_after_hh1, a.nd_fold
++    G.SCAL_IN_BODY, G.TDM_DUMMY = a.scal_in_body, a.tdm_dummy
++    import bwdgen as BG
++
++    for kv in [x for x in a.win.split(",") if x]:
++        k, v = kv.split("=")
++        if k not in BG.WIN:
++            raise SystemExit(f"--win: unknown key {k}")
++        BG.WIN[k] = type(BG.WIN[k])(float(v)) if isinstance(BG.WIN[k], (int, float)) else v
 +    out = Path(a.out).resolve()
 +    out.mkdir(parents=True, exist_ok=True)
 +    rec = {"recipe": {"sched": a.sched, "rule": a.rule, "defs": a.defs}, "checks": {}, "fail": []}
@@ -3929,8 +3942,8 @@ diff -ruN a/r8gen/gen/bwdgen.py b/r8gen/gen/bwdgen.py
 +    return out, int(round(t))
 diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 --- a/r8gen/gen/r8gen.py	1970-01-01 00:00:00.000000000 +0000
-+++ b/r8gen/gen/r8gen.py	2026-10-29 06:36:39.000000000 +0000
-@@ -0,0 +1,592 @@
++++ b/r8gen/gen/r8gen.py	2026-10-29 07:42:21.000000000 +0000
+@@ -0,0 +1,639 @@
 +###############################################################################
 +# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 +#
@@ -4053,7 +4066,8 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +        # bf16 P / dS operands in place of hh0's raw S / dP (hh0's dwords 0..3, hh1's 4..7)
 +        self.P = [self.R0[2 * kh] for kh in range(NKV)]
 +        self.DS = [self.R0[2 * kh + 1] for kh in range(NKV)]
-+        self.PRE = [take(4, 4) for _ in range(8)]
++        pre8 = [take(8, 8) for _ in range(4)]  # (hh0 NL, hh0 ND, hh1 NL, hh1 ND): 8-VGPR tuples (ND: a C operand)
++        self.PRE = [pre8[e // 2] + 4 * (e % 2) for e in range(8)]
 +        self.cc1, self.ccs = take(2), take(2)
 +        self.T = [take(1, 1) for _ in range(2 + NKV)]  # mask scratch (2), STEPM's dS^T voffsets (NKV)
 +        self.PRB = [take(1, 1) for _ in range(4)]  # probe: per-segment cycle sums (HKGEN_PROBE builds)
@@ -4096,10 +4110,13 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +# regions
 +# --------------------------------------------------------------------------------------------------------------
 +def region_init(L, ops):
-+    """INIT: (c1, c1), (scale, scale); accumulators = 0; K / V fragments (buffer loads: lane part + kv sub-tile part
-+    + dt * 64 + u * 32)."""
-+    out = [f"v_mov_b32 {vr(L.cc1)}, {ops['c1']}", f"v_mov_b32 {vr(L.cc1 + 1)}, {ops['c1']}",
-+           f"v_mov_b32 {vr(L.ccs)}, {ops['sc']}", f"v_mov_b32 {vr(L.ccs + 1)}, {ops['sc']}"]  # fmt: skip
++    """INIT: (c1, c1), (scale, scale) (ND_FOLD: (1 / scale, 1 / scale), FINAL's dV factor); accumulators = 0; K / V
++    fragments (buffer loads: lane part + kv sub-tile part + dt * 64 + u * 32)."""
++    out = [f"v_mov_b32 {vr(L.cc1)}, {ops['c1']}", f"v_mov_b32 {vr(L.cc1 + 1)}, {ops['c1']}"]
++    if ND_FOLD:
++        out += [f"v_rcp_f32 {vr(L.ccs)}, {ops['sc']}", f"v_mov_b32 {vr(L.ccs + 1)}, {vr(L.ccs)}"]
++    else:
++        out += [f"v_mov_b32 {vr(L.ccs)}, {ops['sc']}", f"v_mov_b32 {vr(L.ccs + 1)}, {ops['sc']}"]
 +    for kh in range(NKV):
 +        for dt in range(NDT_QK):
 +            for u in range(2):
@@ -4169,7 +4186,8 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +                nodes.append(add(f"v_cndmask_b32 {vr(s2 + e)}, {NEG}, {vr(s2 + e)}, vcc_lo"))
 +        nodes.append(add(f"v_exp_f32 {vr(s2)}, {vr(s2)}"))
 +        nodes.append(add(f"v_exp_f32 {vr(s2 + 1)}, {vr(s2 + 1)}"))
-+        nodes.append(add(f"v_pk_fma_f32 {vr(d2, 2)}, {vr(d2, 2)}, {vr(L.ccs, 2)}, {vr(nd, 2)}"))
++        if not ND_FOLD:
++            nodes.append(add(f"v_pk_fma_f32 {vr(d2, 2)}, {vr(d2, 2)}, {vr(L.ccs, 2)}, {vr(nd, 2)}"))
 +        nodes.append(add(f"v_pk_mul_f32 {vr(d2, 2)}, {vr(s2, 2)}, {vr(d2, 2)}"))
 +        w = hh * 4 + j
 +        nodes.append(add(f"v_cvt_pk_bf16_f32 {vr(L.P[kh] + w)}, {vr(s2)}, {vr(s2 + 1)}"))
@@ -4177,6 +4195,13 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +    return nodes
 +
 +
++ND_FOLD = False  # k_delta -DHK_ND_FOLD: ND' = -delta is the dP chains' C init, NL' = NL + log2(scale) makes the
++#                 softmax's P' = scale * P, so dS = P' dP' needs no dP fma; dV = (dO^T P') / scale in FINAL
++SCAL_IN_BODY = False  # each body computes the next tile's scalars (SALU nodes in its WMMA windows); the headers keep
++#                      only the M / U branch, and U falls through into N (the M bodies out of line)
++TDM_DUMMY = False  # a tile past the last (k + 2 >= N) moves 16 B (tile 8 x 1) instead of re-loading tile N-1: no
++#                   wasted L2 / HBM traffic, and the epilogue's tensorcnt-0 wait finds the ring settled
++SCAL_XCNT_GAP = 160  # cycles between a VMEM / TDM op and the next tile's redefinition of an SGPR it reads
 +HH1_SPLIT = 0  # hh1's S / dP order: dt < HH1_SPLIT dt outer (every kh), the rest kh-major (6: all dt outer)
 +BDO_AFTER_HH1 = False  # the dO^T loads issue only after every hh1 operand load (they do not crowd the LDS queue)
 +
@@ -4210,7 +4235,7 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +    return out
 +
 +
-+def step_nodes(L, ops, masked, stage):
++def step_nodes(L, ops, masked, stage, scal=None):
 +    """Nodes of one tile in ring stage `stage` (program order = semantics) and the WMMA stream order.
 +
 +    Register roles over the step (Layout): hh0's S / dP operands in O (read back in the previous step), hh0's raw S /
@@ -4238,7 +4263,7 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +            c = "0" if dt == 0 else vr(s_, 8)
 +            return add(f"v_wmma_f32_16x16x32_bf16 {vr(s_, 8)}, {vr(L.op_hh0(1, dt), 8)}, {vr(L.kf[kh][dt], 8)}, {c}")
 +        d_ = L.raw(hh, kh, 1)
-+        c = "0" if dt == 0 else vr(d_, 8)
++        c = (vr(L.PRE[hh * 4 + 2], 8) if ND_FOLD else "0") if dt == 0 else vr(d_, 8)
 +        return add(f"v_wmma_f32_16x16x32_bf16 {vr(d_, 8)}, {vr(L.op_hh0(0, dt), 8)}, {vr(L.vf[kh][dt], 8)}, {c}")
 +
 +    # ---- S / dP of hh0, dt outer (S of every kh, then dP: the A operand shared by consecutive WMMAs); hh1's operands
@@ -4321,7 +4346,12 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +            w_dk.append(add(f"v_wmma_f32_16x16x32_bf16 {vr(a, 8)}, {vr(L.bq(d), 8)}, {vr(L.DS[kh], 8)}, {vr(a, 8)}"))
 +    for _, t in rb_texts(L, ops["lq"], ops["lv"], 0, L.op_hh0, (stage + 1) % DEPTH) if not nolds else []:
 +        nxt_reads.append(add(t))
++    scal_nodes = [add(t) for t in scal or []]  # the next tile's scalars (after every use of this tile's values)
 +    build_dag(nodes)
++    for j in scal_nodes:  # an SGPR an in-flight VMEM / TDM op still reads: redefine it well after (XCNT)
++        for i in range(len(nodes)):
++            if nodes[i].kind in ("VM_LD", "VM_ST", "TDM") and i < j and nodes[i].suses & nodes[j].sdefs:
++                add_order(nodes, i, j, SCAL_XCNT_GAP)
 +    for i in tdm:
 +        add_order(nodes, i, tw)
 +    add_order(nodes, tw, bs)
@@ -4349,11 +4379,11 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +PROBE_SEGS = ("S/dP hh0+hh1 (+softmax hh0)", "softmax hh1 + dV", "dK to the barrier wait", "dK rest")
 +
 +
-+def region_step(L, ops, masked, stage, mode="list", probe=False):
++def region_step(L, ops, masked, stage, mode="list", probe=False, scal=None):
 +    """(texts, modelled cycles). probe: s_get_shader_cycles at the region start, after the last S / dP WMMA, after the
 +    last dV WMMA, after the barrier wait and at the end; segment k's delta added to L.PRB[k] (VALU, per lane)."""
 +    apply_model()
-+    nodes, wseq = step_nodes(L, ops, masked, stage)
++    nodes, wseq = step_nodes(L, ops, masked, stage, scal)
 +    if mode == "win":
 +        out, cyc = B.schedule_win(nodes, wseq)
 +    elif mode == "slot":
@@ -4372,8 +4402,9 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +        for seg, k in enumerate(pts + [len(texts)]):
 +            res += texts[k0:k]
 +            cur = "s100" if prev == "s102" else "s102"
-+            res += [f"s_get_shader_cycles_u64 s[{cur[1:]}:{int(cur[1:]) + 1}]", f"s_sub_co_i32 s98, {cur}, {prev}",
-+                    f"v_add_nc_u32 {vr(L.PRB[seg])}, s98, {vr(L.PRB[seg])}"]  # fmt: skip
++            res += [f"s_get_shader_cycles_u64 s[{cur[1:]}:{int(cur[1:]) + 1}]",
++                    f"v_add_nc_u32 {vr(L.PRB[seg])}, {cur}, {vr(L.PRB[seg])}",
++                    f"v_subrev_nc_u32 {vr(L.PRB[seg])}, {prev}, {vr(L.PRB[seg])}"]  # fmt: skip
 +            prev, k0 = cur, k
 +        texts = res
 +    return texts, cyc
@@ -4394,6 +4425,9 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +        for kh in range(NKV):
 +            for d in range(n_d):
 +                a = L.dv(kh, d) if isk == 0 else L.dk(kh, d)
++                if ND_FOLD and isk == 0:  # dV' = dO^T P' = scale * dV
++                    for q in range(4):
++                        add(f"v_pk_mul_f32 {vr(a + 2 * q, 2)}, {vr(a + 2 * q, 2)}, {vr(L.ccs, 2)}")
 +                for q in range(4):
 +                    add(f"v_cvt_pk_bf16_f32 {vr(a + q)}, {vr(a + 2 * q)}, {vr(a + 2 * q + 1)}")
 +                off = kh * 16 * x + d * 32
@@ -4474,15 +4508,21 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +    return out
 +
 +
-+def loop_scalars(ops, stage):
-+    """The per-tile scalars of tile k (in SG_K) for a body in ring stage `stage`."""
++def loop_scalars(ops, stage, kofs=0):
++    """The per-tile scalars of tile k + kofs (k in SG_K) for a body in ring stage `stage`."""
 +    tdm, sc, rc = ops["tdm"], ops["sc"], ops["rc"]
 +    qps, nm1 = _sv(sc, 0), "s99"
-+    out = [f"s_add_co_i32 {SG_QT}, {qps}, {SG_K}", f"s_add_co_i32 {nm1}, {_sv(tdm, 14)}, -1",
-+           f"s_add_co_i32 {SG_T1}, {SG_K}, 1", f"s_min_i32 {SG_T1}, {SG_T1}, {nm1}",
-+           f"s_add_co_i32 {SG_T2}, {SG_K}, 2", f"s_min_i32 {SG_T2}, {SG_T2}, {nm1}",
++    out = [f"s_add_co_i32 {SG_QT}, {qps}, {SG_K}"] + ([f"s_add_co_i32 {SG_QT}, {SG_QT}, {kofs}"] if kofs else [])
++    out += [f"s_add_co_i32 {nm1}, {_sv(tdm, 14)}, -1",
++           f"s_add_co_i32 {SG_T1}, {SG_K}, {1 + kofs}", f"s_min_i32 {SG_T1}, {SG_T1}, {nm1}",
++           f"s_add_co_i32 {SG_T2}, {SG_K}, {2 + kofs}", f"s_min_i32 {SG_T2}, {SG_T2}, {nm1}",
 +           f"s_add_co_i32 s98, {SG_T1}, {qps}", f"s_lshl_b32 s98, s98, 7", f"s_add_co_i32 {SG_NLS}, {_sv(sc, 2)}, s98"]  # fmt: skip
 +    so_tdm = ((stage + 2) % DEPTH) * QDO_B
++    if TDM_DUMMY:  # tile k + kofs + 2 past the last: the three ops move 16 B each (words 3, 4: tile0 8, tile1 1)
++        out += [f"s_add_co_i32 s98, {SG_K}, {2 + kofs}", f"s_cmp_ge_i32 s98, {_sv(tdm, 14)}"]
++        for o in range(3):
++            g1 = int(SG_G1[o][2:].split(":")[0])
++            out += [f"s_cselect_b32 s{g1 + 3}, {hex(8 << 16)}, {hex(TDM_W3[o])}", f"s_cselect_b32 s{g1 + 4}, 1, 16"]
 +    for o in range(3):
 +        g0 = SG_G0[o]
 +        out += [f"s_mul_i32 s96, {SG_T2}, {_sv(tdm, 4 * o + 2)}", "s_mov_b32 s97, 0",
@@ -4504,6 +4544,26 @@ diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
 +    lo = loop_ops(ops)
 +    tdm = ops["tdm"]
 +    blocks, cyc = [], {}
++    if SCAL_IN_BODY:
++        # H0 U0 N0 H1 U1 N1 H2 U2 N2 M0 M1 M2: a full tile falls through header -> body -> counter; the bodies compute
++        # the next tile's scalars, so a header is only the masked / full branch
++        mblocks = []
++        for s in range(DEPTH):
++            blocks.append((f"H{s}", f"{lp}_H{s}", [f"s_cmp_lt_i32 {SG_K}, {_sv(tdm, 15)}", f"s_cbranch_scc1 {lp}_M{s}"],
++                           [f"U{s}", f"M{s}"]))  # fmt: skip
++            nxt = loop_scalars(ops, (s + 1) % DEPTH, 1)
++            tu, cyc[f"U{s}"] = region_step(L, lo, False, s, mode, probe, nxt)
++            blocks.append((f"U{s}", f"{lp}_U{s}", tu, [f"N{s}"]))
++            if s < DEPTH - 1:
++                blocks.append((f"N{s}", f"{lp}_N{s}", [f"s_add_co_i32 {SG_K}, {SG_K}, 1",
++                               f"s_cmp_ge_i32 {SG_K}, {_sv(tdm, 14)}", f"s_cbranch_scc1 {lp}_X"], ["X", f"H{s + 1}"]))  # fmt: skip
++            else:
++                blocks.append((f"N{s}", f"{lp}_N{s}", [f"s_add_co_i32 {SG_K}, {SG_K}, 1",
++                               f"s_cmp_lt_i32 {SG_K}, {_sv(tdm, 14)}", f"s_cbranch_scc1 {lp}_H0", f"s_branch {lp}_X"],
++                               ["H0", "X"]))  # fmt: skip
++            tm, cyc[f"M{s}"] = region_step(L, lo, True, s, mode, probe, nxt)
++            mblocks.append((f"M{s}", f"{lp}_M{s}", tm + [f"s_branch {lp}_N{s}"], [f"N{s}"]))
++        return loop_init(L, ops) + loop_scalars(ops, 0, 0), blocks + mblocks, cyc
 +    for s in range(DEPTH):
 +        hdr = []
 +        if s == 0:
@@ -9877,10 +9937,101 @@ diff -ruN a/r8gen/hip/include/q1/prims.h b/r8gen/hip/include/q1/prims.h
 +
 +} // namespace q1
 +#endif // Q1_HOST_EMU
+diff -ruN a/r8gen/hip/src/k_delta.hip b/r8gen/hip/src/k_delta.hip
+--- a/r8gen/hip/src/k_delta.hip	1970-01-01 00:00:00.000000000 +0000
++++ b/r8gen/hip/src/k_delta.hip	2026-10-29 06:59:03.000000000 +0000
+@@ -0,0 +1,87 @@
++/***************************************************************************************************
++ * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
++ *
++ * See LICENSE for license information.
++ **************************************************************************************************/
++
++// k_delta -- the backward's row constants, all [B, H, S] fp32: delta = rowsum(dO * O), and what k_dkdv96ds reads,
++// NL = -LOG2E * lse and ND = -scale * delta. Bitwise equal to FlyDSL k_delta_bshd (same per-row arithmetic).
++// -DHK_ND_FOLD=1 (the generated k_dkdv96ds built with --nd-fold): ND = -delta (the dP chains' C init) and
++// NL = -LOG2E * lse + log2(scale) (its softmax then yields scale * P), DEL unchanged.
++// dO / O: [B, S, H, 128] bf16 contiguous; lse [B, H, S] fp32 contiguous (natural log).
++// grid (S / 64, B * H), block 256 = 16 rows x 16 lanes: workgroup (sblk, bh) owns queries [64 sblk, 64 sblk + 64)
++// of batch-major head bh (FlyDSL's mapping with 64 queries instead of 32), so each output is one 256-B run. Pass p
++// (0..3) loads query 64 sblk + 16 p + (tid >> 4); lane l = tid & 15 loads elements [8 l, 8 l + 8) of its dO and O
++// rows (16 B each). All 8 loads are issued before any arithmetic.
++// Arithmetic, as k_delta_bshd: two chains per lane, e0 += dO[2c] O[2c] and e1 += dO[2c+1] O[2c+1] (c = 0..3, from
++// 0), acc = e0 + e1, then acc += shfl_xor(acc, 1 / 2 / 4 / 8). FlyDSL issues separate multiplies and adds; a fused
++// multiply-add would round differently once a bf16 x bf16 product underflows into the fp32 denormal range, so fp
++// contraction is off here. fp32 denormals are preserved, as in FlyDSL (.amdhsa_float_denorm_mode_32 3).
++// Bounds: impl launches it only with S % 64 == 0 (the grid covers [0, S) exactly), and impl._check keeps the dO / O
++// byte extent B*S*H*256 below 2^31.
++#include <hip/hip_runtime.h>
++#include <stdint.h>
++
++#ifndef HK_ND_FOLD
++#define HK_ND_FOLD 0
++#endif
++
++namespace {
++constexpr int kQPW = 64;                 // queries per workgroup
++constexpr int kLanes = 16;               // lanes per row: 16 x 8 bf16 = D_V 128
++constexpr int kRows = 256 / kLanes;      // rows per pass
++constexpr int kPasses = kQPW / kRows;
++typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
++
++__device__ __forceinline__ float bf_lo(unsigned w) { return __uint_as_float(w << 16); }
++__device__ __forceinline__ float bf_hi(unsigned w) { return __uint_as_float(w & 0xFFFF0000u); }
++}  // namespace
++
++extern "C" __global__ __launch_bounds__(256) void k_delta(const u32x4* __restrict__ DO, const u32x4* __restrict__ O,
++                                                          float* __restrict__ DEL, const float* __restrict__ LSE,
++                                                          float* __restrict__ NL, float* __restrict__ ND,
++                                                          float scale, int S, int H) {
++#pragma clang fp contract(off)
++  __shared__ float sums[kQPW];
++  const int t = threadIdx.x, lr = t & (kLanes - 1), rg = t / kLanes;
++  const int s0 = blockIdx.x * kQPW, bh = blockIdx.y, b = bh / H, h = bh - b * H;
++  u32x4 vd[kPasses], vo[kPasses];
++#pragma unroll
++  for (int p = 0; p < kPasses; ++p) {
++    const long long e = (((long long)b * S + s0 + p * kRows + rg) * H + h) * kLanes + lr;
++    vd[p] = DO[e];
++    vo[p] = O[e];
++  }
++#pragma unroll
++  for (int p = 0; p < kPasses; ++p) {
++    float e0 = 0.0f, e1 = 0.0f;
++#pragma unroll
++    for (int c = 0; c < 4; ++c) {
++      const unsigned wd = vd[p][c], wo = vo[p][c];
++      e0 = e0 + bf_lo(wd) * bf_lo(wo);
++      e1 = e1 + bf_hi(wd) * bf_hi(wo);
++    }
++    float acc = e0 + e1;
++    acc = acc + __shfl_xor(acc, 1, 32);
++    acc = acc + __shfl_xor(acc, 2, 32);
++    acc = acc + __shfl_xor(acc, 4, 32);
++    acc = acc + __shfl_xor(acc, 8, 32);
++    if (lr == 0) sums[p * kRows + rg] = acc;
++  }
++  __syncthreads();
++  const float nsc = 0.0f - scale;
++  const float nlog2e = (float)(-1.4426950408889634);  // FlyDSL's fx.Float32(-LOG2E)
++  if (t < kQPW) {
++    const long long o = (long long)bh * S + s0 + t;
++    const float v = sums[t];
++    DEL[o] = v;
++#if HK_ND_FOLD
++    (void)nsc;
++    ND[o] = 0.0f - v;
++    NL[o] = LSE[o] * nlog2e + log2f(scale);
++#else
++    ND[o] = v * nsc;
++    NL[o] = LSE[o] * nlog2e;
++#endif
++  }
++}
 diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 --- a/r8gen/hip/src/k_dkdv96ds.hip	1970-01-01 00:00:00.000000000 +0000
-+++ b/r8gen/hip/src/k_dkdv96ds.hip	2026-10-29 05:47:14.000000000 +0000
-@@ -0,0 +1,859 @@
++++ b/r8gen/hip/src/k_dkdv96ds.hip	2026-10-29 07:35:35.000000000 +0000
+@@ -0,0 +1,875 @@
 +/***************************************************************************************************
 + * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 + *
@@ -10320,14 +10471,16 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +        sk[kh] = 16 * k1_kfrag(kbase, Hkv, kv0, kh, 0, 0, 0);
 +        sv[kh] = 16 * k1_vfrag(vbase, Hkv, kv0, kh, 0, 0, 0);
 +      });
++#if HKGEN_PROBE
++      // the workgroup's whole generated span: INIT (K / V fragments) .. FINAL (dK / dV stores issued)
++      const unsigned int pr_t0 = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
++      unsigned int pr_t1 = 0, pr_ta = 0, pr_tb = 0;  // ta / tb: around the LOOP marker (prologue | loop | epilogue)
++#endif
 +      asm volatile("; HKGEN INIT nkv=%12 rk=%0 rv=%1 vk=%2 vv=%3 sk0=%4 sk1=%5 sk2=%6 sv0=%7 sv1=%8 sv2=%9 c1=%10 "
 +                   "sc=%11"
 +                   ::"s"(r_k), "s"(r_v), "v"(vk), "v"(vv), "s"(sk[0]), "s"(sk[1]), "s"(sk[NKV - 1]), "s"(sv[0]),
 +                   "s"(sv[1]), "s"(sv[NKV - 1]), "s"(c1), "s"(scale), "i"(NKV)
 +                   : HKGEN_CLOBBERS);
-+#if HKGEN_PROBE
-+      unsigned int pr_t0 = 0, pr_t1 = 0;
-+#endif
 +      if (N > 0) {
 +        sched_barrier<0>();
 +        tdm_tile(tq(0), 0, stg(0));
@@ -10361,16 +10514,19 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +          const i32x8 scv = {qp_start, nqt2 - 1, nls(0), cshift - kv0, k3ds_qpf(0, kt0, Sq, Skv, causal),
 +                             k3ds_qpf(1, kt0, Sq, Skv, causal), k3ds_qpf(NKV - 1, kt0, Sq, Skv, causal), 0};
 +          const i32x4 rcv = {ds_rc[0], ds_rc[1], ds_rc[NKV - 1], 0};
++#if HKGEN_PROBE
++          pr_ta = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
++#endif
 +          asm volatile("; HKGEN LOOP nkv=%13 lq=%0 lv=%1 ltv=%2 ltk=%3 nlv=%4 vds=%5 dl=%6 tdm=%7 sc=%8 rc=%9 rnl=%10 "
 +                       "rnd=%11 rds=%12"
 +                       ::"v"(rdq_l), "v"(rdv_l), "v"(trv_l), "v"(trk_l), "v"(voff_l), "v"(vds), "v"(dl), "s"(tdmv),
 +                       "s"(scv), "s"(rcv), "s"(r_nl), "s"(r_nd), "s"(r_ds), "i"(NKV)
 +                       : HKGEN_LOOP_CLOBBERS);
++#if HKGEN_PROBE
++          pr_tb = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
++#endif
 +        }
 +#undef HKGEN_STEP_TXT
-+#if HKGEN_PROBE
-+        pr_t1 = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
-+#endif
 +      }
 +      tensor_wait<0>();                          // no TDM may land after the ring is reused
 +      sched_barrier<0>();
@@ -10390,6 +10546,9 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +                     "v"(16 * ((lane / 8) * rsk + lane % 8)), "s"(16 * (vbase + kv0 * rsv)), "s"(16 * (kbase + kv0 * rsk)),
 +                     "s"(64 * rsv), "s"(64 * rsk), "s"(r_dv), "s"(r_dk), "i"(NKV)
 +                     : HKGEN_CLOBBERS);
++#if HKGEN_PROBE
++        pr_t1 = __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter());
++#endif
 +      }
 +#if HKGEN_PROBE
 +      {
@@ -10401,6 +10560,14 @@ diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
 +        __builtin_amdgcn_raw_buffer_store_b32(pr_t1 - pr_t0, r_pr, 0, wv * 64, 0);
 +        static_for<4>([&](auto i) { __builtin_amdgcn_raw_buffer_store_b32(pp[i], r_pr, 0, wv * 64 + 4 + 4 * i, 0); });
 +        __builtin_amdgcn_raw_buffer_store_b32((unsigned int)N, r_pr, 0, wv * 64 + 24, 0);
++        __builtin_amdgcn_raw_buffer_store_b32(pr_ta - pr_t0, r_pr, 0, wv * 64 + 28, 0);  // prologue
++        __builtin_amdgcn_raw_buffer_store_b32(pr_t1 - pr_tb, r_pr, 0, wv * 64 + 32, 0);  // epilogue
++        // every workgroup (wave 0): steps << 24 | whole-span cycles at word 1024 + its linear index (no gridDim)
++        const int pr_li = ((int)blockIdx.z * k3_nblk(Skv) + (int)blockIdx.y) * HG + (int)blockIdx.x;
++        const auto r_all = rsrc(reinterpret_cast<const unsigned char*>(DS) - 65536, 65536);
++        if (wv == 0)
++          __builtin_amdgcn_raw_buffer_store_b32(((unsigned int)N << 24) | ((pr_t1 - pr_t0) & 0xFFFFFFu), r_all, 0,
++                                                4096 + 4 * pr_li, 0);
 +      }
 +#endif
 +      return;

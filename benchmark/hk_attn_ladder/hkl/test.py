@@ -41,6 +41,7 @@ SHAPES = {
     ],
     "mla": [
         ("toy", dict(b=1, sq=384, skv=384, hq=16, hkv=16)),
+        ("toy_full", dict(b=1, sq=384, skv=384, hq=16, hkv=16, causal=False)),  # not causal: every tile full
         ("s640", dict(b=1, sq=640, skv=640, hq=16, hkv=16)),
         ("b1_s4096", dict(b=1, sq=4096, skv=4096, hq=16, hkv=16)),
         # causal with (Skv - Sq) % 64 == 32: the steady-loop region-C read of the dQ kernel from 5c20de7e (r2d) on

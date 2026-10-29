@@ -33,6 +33,8 @@ def main():
     ap.add_argument("--fine", action="store_true", help="8-phase probe (patches/a7_probe8.patch)")
     ap.add_argument("--shape", nargs="*", help="overrides of the ladder's problem, e.g. b=1 sq=384 skv=384 hq=16 hkv=16")
     ap.add_argument("--abc", action="store_true", help="HKGEN skeleton (abcsk_*): slot 0 = the whole loop, n = steps")
+    ap.add_argument("--allwg", type=int, default=0, help="HKGEN probe shells: fit every workgroup's whole span "
+                    "(word 1024 + linear index: steps << 24 | cycles) over this many workgroups")
     a = ap.parse_args()
     spec = runner.load_ladder(a.ladder)
     sh = L.parse_shape(a.shape, spec["problem"])
@@ -56,6 +58,24 @@ def main():
                 mod._fly._launch(fn, args)
     torch.cuda.synchronize()
     g = plan["ds_full"][: mod.DS_GUARD_B // 2].view(torch.int32).cpu().tolist()
+    if a.allwg:
+        rec = [x & 0xFFFFFFFF for x in g[1024: 1024 + a.allwg]]
+        pts = [(x >> 24, x & 0xFFFFFF) for x in rec if x]
+        if pts:
+            n_ = len(pts)
+            sx = sum(p[0] for p in pts); sy = sum(p[1] for p in pts)
+            sxx = sum(p[0] * p[0] for p in pts); sxy = sum(p[0] * p[1] for p in pts)
+            b_ = (n_ * sxy - sx * sy) / max(n_ * sxx - sx * sx, 1)
+            a_ = (sy - b_ * sx) / n_
+            tot = sum(p[1] for p in pts)
+            print(f"all workgroups: {n_} recorded, fit span = {a_:.0f} + {b_:.1f} * steps; "
+                  f"sum of spans {tot / 1e6:.2f} Mcycles, fixed part {n_ * a_ / max(tot, 1) * 100:.1f}%")
+            byn = {}
+            for st, cy in pts:
+                byn.setdefault(st, []).append(cy)
+            for st in sorted(byn)[:: max(1, len(byn) // 8)]:
+                v = sorted(byn[st])
+                print(f"   steps {st:4d}: n {len(v):4d}  median {v[len(v) // 2]:7d}  per step {v[len(v) // 2] / max(st, 1):6.0f}")
     names, nph = (PHASES8, 8) if a.fine else (PHASES, 6)
     for w in range(2):
         sums = [x & 0xFFFFFFFF for x in g[w * 16: w * 16 + nph]]
@@ -66,6 +86,10 @@ def main():
             for i, lab in enumerate(("start -> signal (B + C)", "signal -> wait (barrier)", "wait -> C end",
                                      "C end -> end (A)")):
                 print(f"   {lab:26s} {sums[1 + i] / max(n, 1):7.1f}")
+            pro, epi = g[w * 16 + 7] & 0xFFFFFFFF, g[w * 16 + 8] & 0xFFFFFFFF
+            if pro or epi:  # HKGEN shells since r10j_pr: prologue (INIT .. LOOP marker) / epilogue (LOOP .. FINAL)
+                print(f"   prologue {pro} cycles, epilogue {epi} cycles, loop {sums[0] - pro - epi} cycles "
+                      f"({(sums[0] - pro - epi) / max(n, 1):.0f} per step incl. headers)")
             continue
         order = (6, 7, 1, 2, 3, 4, 5, 0) if a.fine else range(nph)
         for i in order:

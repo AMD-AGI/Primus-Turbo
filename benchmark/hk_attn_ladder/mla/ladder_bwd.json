@@ -1410,6 +1410,180 @@
    "side": true
   },
   {
+   "id": "r10f",
+   "parent": "r9a",
+   "patch": "patches/r10b.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--sched",
+      "win"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b scheduled by the window model (bwdgen.schedule_win: measured per-window issue costs, VALU paired, one LDS op per window, pressure-aware budget)",
+   "bitwise_with": "r9a",
+   "side": true
+  },
+  {
+   "id": "r10g",
+   "parent": "r9a",
+   "patch": "patches/r10b.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b + ND fold: k_delta -DHK_ND_FOLD (ND = -delta, NL += log2 scale) -> the dP chains start from -delta (C init), the softmax yields scale*P, no dP fma (-24 pk_fma per step), dV /= scale in FINAL",
+   "side": true
+  },
+  {
+   "id": "r10h",
+   "parent": "r9a",
+   "patch": "patches/r10b.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--sched",
+      "win"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10g scheduled by the window model (r10f's scheduler)",
+   "side": true
+  },
+  {
+   "id": "r10i",
+   "parent": "r9a",
+   "patch": "patches/r10b.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--scal-in-body"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b + the next tile's scalars computed inside each body (SALU in its WMMA windows, >= 160 cycles after the VMEM / TDM ops reading the old values); headers keep only the M/U branch; U falls through into N, the M bodies out of line (5 serial scalar instructions between tiles instead of ~43 and a taken branch)",
+   "bitwise_with": "r9a",
+   "side": true
+  },
+  {
+   "id": "r10j",
+   "parent": "r9a",
+   "patch": "patches/r10b.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10g (ND fold) + r10i (the next tile's scalars in the bodies, fall-through layout)",
+   "side": true
+  },
+  {
    "id": "r10a_pr",
    "parent": "r10a",
    "kernels": {
@@ -1473,6 +1647,111 @@
     "module": "bwd_hk"
    },
    "feature": "r10b + loop cycle probe (micro.k3_probe --abc)",
+   "side": true
+  },
+  {
+   "id": "r10j_pr",
+   "parent": "r10j",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--nd-fold",
+      "--scal-in-body"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10j + loop cycle probe (whole-span INIT..FINAL in slot 0)",
+   "side": true
+  },
+  {
+   "id": "r10i_pr",
+   "parent": "r10i",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--scal-in-body"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10i + loop cycle probe (whole-span INIT..FINAL in slot 0)",
+   "side": true
+  },
+  {
+   "id": "r10g_pr",
+   "parent": "r10g",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--nd-fold"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10g + loop cycle probe (whole-span INIT..FINAL in slot 0)",
    "side": true
   },
   {

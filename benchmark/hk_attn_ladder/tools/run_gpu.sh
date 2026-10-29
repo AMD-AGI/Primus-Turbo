@@ -5,7 +5,8 @@
 #   * one job per GPU at a time (flock), never two processes on the card; refuse when the card already has
 #     VRAM allocated (someone else's job: other containers may map every GPU);
 #   * refuse while logs/GPU<n>.FAULT exists (only a person removes it, after reading the kernel log);
-#   * refuse when the kernel log already holds amdgpu errors for this card since boot (a degraded card);
+#   * refuse when the kernel log already holds amdgpu errors for this card since boot (a degraded card), except
+#     lines older than the ISO UTC time on the first line of logs/GPU<n>.ACK (written after a person reviewed them);
 #   * hard timeout; afterwards any NEW amdgpu error line for this card (hang, page fault, ring / MES timeout,
 #     uncorrectable or UMC ECC, reset) writes the FAULT file and fails the job. Correctable PCIe ACA lines are
 #     not faults (a08-1 rule) but are kept in the job's .dmesg file.
@@ -28,9 +29,11 @@ NDEV=$(docker inspect -f '{{range .HostConfig.Devices}}{{.PathOnHost}} {{end}}' 
 ERR_RE='amdgpu.*('"$PCI"').*(hang|page fault|GCVM_L2_PROTECTION|VM_L2_PROTECTION|timeout|ring .* (test )?failed|MES.*(fail|timeout|full|not respond|hang)|(gpu|mode[0-9]?) reset|reset (begin|succeeded|failed)|uncorrect|UMC|poison|fatal)'
 ACA_RE='correctable.*(ACA|pcie)|ACA.*correctable'
 klog() { sudo -n dmesg --time-format iso 2>/dev/null; }
-if klog | grep -E "$ERR_RE" | grep -v -i -E "$ACA_RE" | grep -q .; then
-  echo "refusing: the kernel log already has amdgpu errors for $PCI since boot (degraded card?):" >&2
-  klog | grep -E "$ERR_RE" | grep -v -i -E "$ACA_RE" | tail -5 >&2; exit 5
+ACK_T=$(head -1 "$LOGS/GPU$GPU.ACK" 2>/dev/null | awk '{print $1}')
+klog_new() { klog | awk -v a="$ACK_T" '$1 >= a'; }  # ACK_T empty: every line
+if klog_new | grep -E "$ERR_RE" | grep -v -i -E "$ACA_RE" | grep -q .; then
+  echo "refusing: the kernel log has amdgpu errors for $PCI since boot${ACK_T:+ (after the reviewed $ACK_T)} (degraded card?):" >&2
+  klog_new | grep -E "$ERR_RE" | grep -v -i -E "$ACA_RE" | tail -5 >&2; exit 5
 fi
 # someone else's job on this card (another container may map every GPU): its VRAM shows up here
 USED=$(rocm-smi --showbus --showmemuse --json 2>/dev/null | python3 -c "
