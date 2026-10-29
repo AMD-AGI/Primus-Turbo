@@ -11,8 +11,8 @@
 #
 # Bytes per rank and kernel (bf16 rows of RB = 2 * H bytes; per-row metadata, under 1%, not counted):
 #   link     the larger direction: rows to peers (rows_out) or from peers (rows_in)
-#   dispatch HBM: read x once per token (T), the heap writes of every received row (rows_in + rows_self),
-#            and the receiver's copy of those rows from the heap into recv_x (read + write)
+#   dispatch HBM: read x once per token (T); this rank's own rows written straight into recv_x (rows_self);
+#            the peers' rows written into the heap, then read from it and written into recv_x (3 x rows_in)
 #   combine  HBM: read the rows pushed back (rows_in), the heap writes of the rows coming back (rows_out),
 #            the reduce reading this rank's own rows and the returned ones (rows_self + rows_out), the output (T)
 #   FLOPs    dispatch none; combine one fp32 add per element beyond the first row of a token
@@ -44,8 +44,7 @@ def account(op, T, rows_in, rows_out, rows_self, H):
         hbm = (rows_in + rows_out + rows_self + rows_out + T) * rb
         flops = max(rows_self + rows_out - T, 0) * H
     else:
-        received = rows_in + rows_self
-        hbm = (T + received + 2 * received) * rb
+        hbm = (T + rows_self + 3 * rows_in) * rb
         flops = 0
     return link, hbm, flops
 
@@ -123,14 +122,15 @@ def roofline_table(data, ceil):
 
 
 def phase_table(data, ceil, ref_rows):
-    """Dispatch as the send at the link ceiling plus the receiver's copy at the local copy rate, both
+    """Dispatch as the send at the link ceiling plus its local writes at the local copy rate (its own rows, stored
+    by the same warps during the send, and the peers' rows, copied out of the heap after it), both
     measured with the same block count; the combine against the send alone."""
     H = data["H"]
     rb = 2 * H
     lay, t = layouts(data), times(data)
     print(f"### Phases at the measured ceilings (same block count; ceilings at {ref_rows} rows per peer)\n")
     print(
-        "| T | CUs | op | µs | send at link ceiling µs | receive copy at local copy rate µs | model µs | "
+        "| T | CUs | op | µs | send at link ceiling µs | own rows + receive copy at local copy rate µs | model µs | "
         "measured − model µs |"
     )
     print("|---:|---:|---|---:|---:|---:|---:|---:|")
