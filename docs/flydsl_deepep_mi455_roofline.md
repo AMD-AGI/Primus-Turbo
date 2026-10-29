@@ -237,6 +237,19 @@ EP2, 160 CUs; modelled from the terms above, not yet measured:
 | reach the achievable link rate on the send (1.32 → 1.6 TB/s) | about 15 µs | → about 108 µs (79 with the first row) | → about 131 µs |
 | the link peak | | 64 µs | 64 µs |
 
+### What DeepEP does about the same parts
+
+| part of the time | DeepEP V1 (`csrc/kernels/intranode.cu`) | DeepEP V2 (`EPBuffer`) | idea here |
+|---|---|---|---|
+| receive copy into `recv_x` | overlapped: even blocks send, odd blocks receive and copy from per-channel rings into `recv_x` as the tails advance (the design `flydsl` V1 ports) | a separate copy kernel after the transfer (`dispatch_copy_epilogue_impl`); `defer_epilogue=True` moves it, and the CPU count wait, to `event.current_stream_wait()` so compute can run in between; the benchmark's bandwidth leaves it out | overlap it inside the kernel (V1's way), or drop it by returning `recv_x` as a view of a double-buffered heap (neither DeepEP version does this) |
+| notify and host wait | the dispatch needs the counts first; `num_worst_tokens` skips the host wait | the transfer writes into buffer slots before the counts are known; the CPU waits afterwards | the same as V2: give each source rank its own heap region so the send needs no prefix matrix, and let the receive copy order the rows |
+| combine reduce | odd blocks reduce as the pushed rows arrive | a separate, deferrable reduce epilogue | reduce while pushing at every grid size; all warps pushing (LDS in pieces); flags per chunk |
+| per-CU send rate | – (on H800 a handful of SMs fill NVLink: 160 GB/s against 45 GB/s of writes per SM; the benchmark uses 24 of 132) | TMA-based backends | on MI455X about 74 CUs fill the link (1.62 TB/s against 22 GB/s per CU), so the per-CU rate and copy engines matter far more than on H800 |
+| copy engines | – | used for all-gather (`num_sms=0`); EP dispatch and combine need SMs | copy engines for the bulk rows at low CU counts (SDMA moves 1.38–1.54 TB/s here) |
+
+The 84–86% of DeepEP V1 on H800 is its cached dispatch (the counts known) at the best chunk size, the
+same case as the cached dispatch here (58%).
+
 ## Next measurements
 
 1. EP2 on this branch's head with the commands above, plus the counters, to confirm the byte table and
