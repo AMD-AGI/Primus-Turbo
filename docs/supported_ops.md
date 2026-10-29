@@ -87,8 +87,8 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | `tokens_per_expert_to_mask` | – | ✅ | ✅ | ✅ | Index helper, fwd only |
 | `moe_permute`, `moe_unpermute` | BF16 / FP8 tensorwise | ✅ | ✅ | ✅ | |
 | `moe_dispatch`, `moe_combine` | – | ✅ | ✅ | — | Expert-parallel token dispatch / combine (intra- and inter-node) |
-| `fused_mega_moe` (+ `_stage1` / `_stage2`) | BF16 | — | ✅ | ✅ | Dispatch + FC1 and FC2 + combine fused, intra-node EP. See [MegaMoE](./mega_moe.md) |
-| `fused_mega_moe_fp8_stage1` / `_stage2` | MXFP8 | — | ✅ | — | |
+| **MegaMoE**<br>`fused_mega_moe` (+ `_stage1` / `_stage2`) | BF16 | — | ✅ | ✅ | Dispatch + FC1 and FC2 + combine fused, intra-node EP. See [MegaMoE](./mega_moe.md) |
+| **MegaMoE**<br>`fused_mega_moe_fp8_stage1` / `_stage2` | MXFP8 | — | ✅ | — | Staged API only |
 
 ### 2.5 Normalization, activation, position embedding, loss
 
@@ -174,7 +174,7 @@ registration order, with the arch / format limits from each backend's `can_handl
 | `sparse_mla_func` | FLYDSL (gfx950, gfx1250), TRITON |
 | `moe_permute`, `moe_unpermute` | TRITON, TURBO |
 | `moe_dispatch`, `moe_combine` | TURBO, DEEP_EP |
-| `fused_mega_moe*` | FLYDSL |
+| MegaMoE (`fused_mega_moe*`) | FLYDSL |
 | `rmsnorm*`, `swiglu_with_probs`, `geglu_with_probs`, `cross_entropy`, router | TRITON (`rmsnorm_residual_fp4`: FLYDSL) |
 | `fused_qkv_rope`, `fused_qkv_rmsnorm_rope` | FLYDSL |
 | Quantization | TURBO (HIP), TRITON (blockwise), FLYDSL (MXFP8 / MXFP4) |

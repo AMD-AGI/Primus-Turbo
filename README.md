@@ -17,7 +17,7 @@ With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its 
 | GEMM | `gemm` (BF16/FP16), `gemm_fp8` (tensorwise / rowwise / blockwise / MXFP8), `gemm_fp4` (MXFP4), `mlp_fp4` |
 | Grouped GEMM | `grouped_gemm`, `grouped_gemm_fp8`, `grouped_gemm_fp4`, `grouped_mlp_fp8`, `grouped_mlp_fp4` |
 | Attention | `flash_attn_func`, `flash_attn_varlen_func`, `flash_attn_fp8_func`, `flash_attn_*_usp_func` (context parallel), `sparse_mla_func` |
-| MoE | `fused_group_topk_routing_with_aux_score`, `moe_permute` / `moe_unpermute`, `moe_dispatch` / `moe_combine`, `fused_mega_moe` (BF16), `fused_mega_moe_fp8_stage1` / `_stage2` (MXFP8) |
+| MoE | `fused_group_topk_routing_with_aux_score`, `moe_permute` / `moe_unpermute`, `moe_dispatch` / `moe_combine`, MegaMoE: `fused_mega_moe` (BF16), `fused_mega_moe_fp8_stage1` / `_stage2` (MXFP8) |
 | Norm / Act / RoPE / Loss | `rmsnorm`, `rmsnorm_residual`, `rmsnorm_residual_fp4`, `swiglu_with_probs`, `geglu_with_probs`, `fused_qkv_rope`, `fused_qkv_rmsnorm_rope`, `cross_entropy` |
 | Quantization | `quantize_fp8` / `quantize_fp4` (+ `_with_trans`, grouped, dequantize), `weight_deosc_*` |
 | Communication | `fused_all_gather_matmul`, `fused_matmul_reduce_scatter`, `FP8AllToAll`, DeepEP `Buffer` |
