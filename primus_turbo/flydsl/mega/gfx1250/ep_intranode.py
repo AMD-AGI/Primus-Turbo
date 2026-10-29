@@ -469,11 +469,13 @@ def topk_reduce_bf16_tile(
     has_grad_gate: bool = False,
     block_threads: int = _BLOCK_THREADS,
     vec_unroll: int = 1,
+    all_routes: bool = False,
 ):
     """Sum each token's primary-route combine rows into its output row once their reduce flags reach epoch.
 
     ``vec_unroll`` > 1 issues the loads of that many 64-lane column steps before summing any, so
-    a warp keeps more of the row in flight; 1 is the one-step-at-a-time loop."""
+    a warp keeps more of the row in flight; 1 is the one-step-at-a-time loop. ``all_routes`` sums
+    (and waits for) every valid route's row: each route carries its own row, not a per-rank sum."""
     f32_vec = fx.T.vec(_PVEC, fx.T.f32)
     bf16_vec = fx.T.vec(_PVEC, fx.T.bf16)
     num_vec_chunks = hidden // _PVEC
@@ -492,7 +494,10 @@ def topk_reduce_bf16_tile(
             expert_id = buffer_load(topk_indices_res, route_base + fx.Int32(j), vec_width=1, dtype=fx.T.i64)
             is_valid = (expert_id >= fx.Int64(0)) & (expert_id < fx.Int64(num_experts))
             expert_ids.append(arith.select(is_valid, cast(expert_id, fx.T.i32), fx.Int32(-1)))
-        is_primary = [is_primary_route(expert_ids, j, num_experts_per_rank) for j in range(num_topk)]
+        if const_expr(all_routes):
+            is_primary = [expert_ids[j] >= fx.Int32(0) for j in range(num_topk)]
+        else:
+            is_primary = [is_primary_route(expert_ids, j, num_experts_per_rank) for j in range(num_topk)]
         for j in range_constexpr(num_topk):
             if is_primary[j]:
                 if is_wave_leader:
