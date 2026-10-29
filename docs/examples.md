@@ -146,7 +146,7 @@ print(c.shape) # [128, 256]
 `fused_mega_moe` is an EP intra-node MoE op that fuses communication with the grouped GEMM
 (`dispatch_grouped_gemm` + `grouped_gemm_combine`). It is a single autograd op; the per-shape
 communication buffer is allocated once and cached internally. See
-[README_Mega_MoE](./README_Mega_MoE.md) for the design and performance.
+[Mega MoE](./mega_moe.md) for the design and performance.
 
 > **Hardware requirements:** `gfx950` (not supported on `gfx1250`), intra-node expert parallelism
 > (one rank per GPU).

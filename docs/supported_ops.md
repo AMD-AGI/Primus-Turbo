@@ -82,7 +82,7 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | `tokens_per_expert_to_mask` | – | ✅ | ✅ | ✅ | Index helper, fwd only |
 | `moe_permute`, `moe_unpermute` | BF16 / FP8 tensorwise | ✅ | ✅ | ✅ | |
 | `moe_dispatch`, `moe_combine` | – | ✅ | ✅ | — | Expert-parallel token dispatch / combine (intra- and inter-node) |
-| `fused_mega_moe` (+ `_stage1` / `_stage2`) | BF16 | — | ✅ | ✅ | Dispatch + FC1 and FC2 + combine fused, intra-node EP. See [Mega MoE](./README_Mega_MoE.md) |
+| `fused_mega_moe` (+ `_stage1` / `_stage2`) | BF16 | — | ✅ | ✅ | Dispatch + FC1 and FC2 + combine fused, intra-node EP. See [Mega MoE](./mega_moe.md) |
 | `fused_mega_moe_fp8_stage1` / `_stage2` | MXFP8 | — | ✅ | — | |
 
 ### 2.5 Normalization, activation, position embedding, loss
