@@ -29,8 +29,13 @@ What that means in practice:
 
 ## 2. Supported operators (PyTorch)
 
-All entry points are under `primus_turbo.pytorch.ops` (imported as `turbo.ops`). Every operator
-below implements backward unless marked "fwd only".
+Operators are available as `turbo.ops.<name>` (`import primus_turbo.pytorch as turbo`), except:
+
+- `grouped_mlp_fp8`: `from primus_turbo.pytorch.ops.grouped_mlp_fp8 import grouped_mlp_fp8`
+- `fused_mega_moe_fp8_stage1` / `_stage2`: `from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import ...`
+- the communication APIs in [2.7](#27-communication-and-overlap), which are listed with their full paths.
+
+Every operator below implements backward unless marked "fwd only".
 
 Legend: ✅ supported · — not supported or not validated. MI455X (gfx1250) is in preview: ✅ means the
 code path is enabled, with thinner test coverage than gfx942 / gfx950. Shape and layout limits are
@@ -103,9 +108,11 @@ These are fwd-only utilities; the `_with_trans` variants also emit the transpose
 
 | Op | Precision | gfx942 | gfx950 | gfx1250 | Notes |
 |---|---|:-:|:-:|:-:|---|
-| `quantize_fp8`, `quantize_fp8_with_trans`, `dequantize_fp8` | FP8 tensorwise / rowwise / blockwise | ✅ | ✅ | ✅ | |
+| `quantize_fp8`, `dequantize_fp8` | FP8 tensorwise / rowwise / blockwise | ✅ | ✅ | ✅ | |
 | | MXFP8 | — | ✅ | ✅ | |
-| `grouped_quantize_fp8` / `_with_trans`, `grouped_dequantize_fp8` | FP8 / MXFP8 | ✅ | ✅ | ✅ | Per-expert; MXFP8 needs gfx950+ |
+| `quantize_fp8_with_trans` | FP8 blockwise | ✅ | ✅ | ✅ | |
+| | MXFP8 | — | ✅ | ✅ | |
+| `grouped_quantize_fp8` / `_with_trans`, `grouped_dequantize_fp8` | MXFP8 | — | ✅ | ✅ | Per-expert |
 | `quantize_fp4`, `quantize_fp4_with_trans`, `dequantize_fp4` | MXFP4 | — | ✅ | ✅ | |
 | `grouped_quantize_fp4` / `_with_trans`, `grouped_dequantize_fp4` | MXFP4 | — | ✅ | ✅ | Fuses MoE gather. See [MoE gather quantization](./moe_gather_quantization.md) |
 | `weight_deosc_update`, `weight_deosc_close` | MXFP4 | ✅ | ✅ | — | Suppresses low-precision weight oscillation during training |
@@ -115,7 +122,7 @@ These are fwd-only utilities; the `_with_trans` variants also emit the transpose
 
 | API | gfx942 | gfx950 | gfx1250 | Notes |
 |---|:-:|:-:|:-:|---|
-| `fused_all_gather_matmul`, `fused_all_gather_scaled_matmul`, `fused_matmul_reduce_scatter` | ✅ | ✅ | — | Async tensor parallelism |
+| `turbo.ops.fused_all_gather_matmul`, `turbo.ops.fused_all_gather_scaled_matmul`, `turbo.ops.fused_matmul_reduce_scatter` | ✅ | ✅ | — | Async tensor parallelism; fwd only, the training integration supplies the backward |
 | `primus_turbo.pytorch.dist.FP8AllToAll` | ✅ | ✅ | — | All-to-all on FP8 payloads, with backward |
 | `primus_turbo.pytorch.deep_ep.Buffer` | ✅ | ✅ | — | Intra-node and inter-node EP buffers (needs rocSHMEM). See [DeepEP guide](../primus_turbo/pytorch/deep_ep/README.md) |
 
@@ -155,7 +162,7 @@ registration order, with the arch / format limits from each backend's `can_handl
 | `gemm` | HIPBLASLT, TRITON |
 | `gemm_fp8` | TURBO (MXFP8, gfx950), HIPBLASLT (tensorwise; MXFP8 not on gfx942), CK (tensorwise / rowwise / blockwise; not gfx1250), TRITON (tensorwise / rowwise / blockwise), FLYDSL (tensorwise / MXFP8; gfx950) |
 | `gemm_fp4` | AITER (gfx950, NT layout), HIPBLASLT (not gfx942), FLYDSL (gfx950) |
-| `mlp_fp4` | HIPBLASLT |
+| `mlp_fp4` | FLYDSL (fused GLU + MXFP4 quantization, forward and backward; required, gfx950), HIPBLASLT (remaining GEMMs, default) |
 | `grouped_gemm` | CK (not gfx1250), HIPBLASLT, TRITON, FLYDSL (gfx950, gfx1250) |
 | `grouped_gemm_fp8` | CK (tensorwise / rowwise; not gfx1250), HIPBLASLT (tensorwise), TRITON (all formats; MXFP8 not on gfx942), FLYDSL (tensorwise / MXFP8; gfx950) |
 | `grouped_gemm_fp4` | FLYDSL (gfx950), TRITON (not gfx942) |
