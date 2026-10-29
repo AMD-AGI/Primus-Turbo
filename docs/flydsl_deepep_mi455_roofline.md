@@ -45,6 +45,13 @@ of the hardware. Branch `dev/boyang/flydsl_deepep_gfx1250_roofline`, from PR #58
   of four (a claim waits for all its tokens' rows, so one late row held up four tokens). Combine at 160
   CUs: EP2 145.7 → 126.8 µs (49% → 56% of 1.62 TB/s), EP4 302.5 → 260.6 µs (57% → 66%); outputs
   checked, `test_intranode.py` passes on 2 and 4 GPUs. See [Inside the kernels](#inside-the-kernels-phase-stamps).
+- **Against tuned RCCL** (all rccl-tests variants, as `06-rccl`; T = 8192, 160 CUs): on this node
+  `flydsl_v2` is 1.28–1.32× faster than the fastest RCCL all-to-all of the same rows (EP4: dispatch
+  258.7 against 339.3 µs, combine 262.7 against 336.9 µs; EP2: 122.8 / 126.8 against 162.5 / 162.0 µs).
+  `06-rccl`'s fastest all-to-all (copy engines, symmetric windows, `NCCL_CTA_POLICY=2`, on another node
+  and RCCL build) would take about 209 µs for the EP4 volume and streams at 1.59 TB/s against the cached
+  dispatch's 1.31 TB/s: `flydsl_v2` is at 80% of it, 71% of the MAIDAS roofline. That variant does not
+  reproduce with this container's RCCL. See [Tuned RCCL](#tuned-rccl-all-to-all-against-flydsl_v2).
 
 ## How the roofline is measured
 
@@ -134,9 +141,21 @@ for C in FETCH_SIZE WRITE_SIZE; do                                              
     --output-format csv -d /tmp/pmc_$C -- python3 -m torch.distributed.run --nproc_per_node=$N bench_ops.py
 done
 python3 rocprof_summary.py trace /tmp/ktrace; python3 rocprof_summary.py pmc /tmp/pmc_FETCH_SIZE
+# tuned RCCL: one process per setting (NCCL_CTA_POLICY / RCCL_FORCE_CE are read at communicator creation)
+for P in 0 1 2; do for V in plain_torch:eager plain:eager plain:graph local:eager local:graph symm:eager symm:graph; do
+  NCCL_CTA_POLICY=$P BUFFERS=${V%:*} LAUNCH=${V#*:} OUT_JSON=/tmp/rccl_${P}_${V/:/_}.json \
+    torchrun --nproc_per_node=$N bench_rccl_tune.py
+done; done
+for T in 256 512 1024 2048 4096 8192 16384 32768; do                                          # RCCL token sweep
+  TOKENS=$T BUFFERS=local LAUNCH=eager OUT_JSON=/tmp/rccl_T$T.json torchrun --nproc_per_node=$N bench_rccl_tune.py
+done
+python3 roofline.py --ops /tmp/ops.json --tsweep /tmp/tsweep.json --rccl /tmp/rccl_*.json
 ```
 
-`roofline.py` needs no GPU: it prints the ceiling, roofline, phase and fixed-cost tables from the JSON.
+`roofline.py` needs no GPU: it prints the ceiling, roofline, phase and fixed-cost tables from the JSON,
+and with `--rccl` the comparison with RCCL (fastest variant per op, time against volume, fits).
+`bench_rccl_tune.py` also times an equal-split `ncclAllToAll` of the same volume (`EQUAL=1`, default) or
+of `EQUAL_MB` per rank, and with `B2B=50` back to back as `06-rccl` does.
 
 ## How DeepEP and nccl-tests define the throughput ceiling
 
@@ -166,7 +185,8 @@ direction, received rows 231.4 MB with the rank's own):
   would need all 256. This matches where the measured kernels stop gaining (96–160 CUs).
 - The nccl-tests style baseline for the same bytes is already in `bench_ops.py`: RCCL `all_to_all_single`
   of the rows DeepEP sends (one per token and destination rank, "dedup"), 200 µs against 123 µs for the
-  cached dispatch at EP2; at 4 GPUs RCCL's alltoall reaches 1.49 TB/s busbw at 1 GB (`06-rccl`).
+  cached dispatch at EP2 (163 µs tuned); at 4 GPUs RCCL's alltoall reaches 1.49 TB/s busbw at 1 GB
+  (`06-rccl`).
 
 ## How far from the limits (EP2, measured)
 
@@ -259,7 +279,8 @@ DeepSeek-V3 routing (top-8 of 128 experts in the top 4 of 8 groups), T = 8192; l
 
 Kernel time alone (rocprofv3), 160 / 256 CUs: dispatch kernel 242.4 / 239.1 µs (71% / 72% of 1.62 TB/s),
 combine kernel 284.3 / 274.8 µs (60% / 62%); notify kernels 12.5 µs (cached path) and 29.4 µs (with the
-count exchange). RCCL's alltoall of the same rows: 413 µs (dispatch), 413 µs (combine).
+count exchange). RCCL's alltoall of the same rows: 413 µs (dispatch), 413 µs (combine); 339 / 337 µs
+after tuning ([Tuned RCCL](#tuned-rccl-all-to-all-against-flydsl_v2)).
 
 Uniform routing (top-8 of 256 experts, PR #583's EP4 case), T = 8192; link bytes 320.0 MB:
 
@@ -283,7 +304,8 @@ a repeat of the CU sweep agrees within 1%):
 | 256 | 254.6 | 190.2 | 44.3 | 20.2 | 285.4 | 190.2 | 95.2 |
 
 Fits over T = 256 … 32768 at 160 CUs: cached dispatch 41.7 µs + bytes / 1302 GB/s, with host wait
-95.6 µs + 1264 GB/s, `num_worst_tokens` 62.3 µs + 1263 GB/s, combine 65.4 µs + 1198 GB/s. HBM traffic
+95.6 µs + 1264 GB/s, `num_worst_tokens` 62.3 µs + 1263 GB/s, combine 65.4 µs + 1198 GB/s (with
+one-token claims, `ut_logs/rccl_tuned_ep4_20261029_110534/`: 33.0 µs + 1179 GB/s). HBM traffic
 is 1.04 GB per kernel and rank (45 µs at the peak, 29% of the link time). Counters at 160 CUs:
 `WRITE_SIZE` 659–663 MB (dispatch) and 426–430 MB (combine) against 646 / 395 MB in the byte model;
 `FETCH_SIZE` 288–294 MB (dispatch) and 673 MB (combine): at EP4 it counts reads of the uncached heap
@@ -291,6 +313,94 @@ that it did not count at EP2, so the read counters are not used.
 
 - The dispatch's "rest" is 14–25 µs from 96 CUs up (6 µs at EP2); the combine is 95–118 µs above the
   send (41–64 µs at EP2).
+
+## Tuned RCCL all-to-all against flydsl_v2
+
+The baseline is RCCL's all-to-all after the tuning of `06-rccl`: every variant of the RCCL team's
+rccl-tests sweep (buffers plain / `ncclCommRegister` / symmetric window, eager or hipGraph launch,
+`NCCL_CTA_POLICY` 0 / 1 / 2, `RCCL_FORCE_CE`), each checked against torch's all-to-all
+(`bench_rccl_tune.py`). It moves the rows the DeepEP kernels move (one per token and destination rank,
+"dedup"), already packed by destination, with the same routing, timing and L2 flush as `bench_ops.py`;
+an equal-split `ncclAllToAll` of the same volume (the collective of `06-rccl`'s busbw figures) is timed
+next to it. EP4: 2026-10-29, GPUs 0–3, after a warm-up, `flydsl_v2` with one-token claims in the same
+session (`ut_logs/rccl_tuned_ep4_20261029_110534/`); EP2: the RCCL sweep of 2026-10-28 on the same node
+(`cursor-work/pr583_bench_data/pr583_rccl_tune_20261028_020918`, `pr583_rccl_tuned_20261028_021525`).
+
+At the proxy shape, T = 8192, `flydsl_v2` at 160 CUs; µs (link GB/s):
+
+| | EP2 `flydsl_v2` | EP2 RCCL default | EP2 RCCL tuned | EP4 `flydsl_v2` | EP4 RCCL default | EP4 RCCL tuned |
+|---|---:|---:|---:|---:|---:|---:|
+| dispatch, counts known | 122.8 (942) | 199.9 (579) | 162.5 (712) | 258.7 (1073) | 412.7 (672) | 339.3 (818) |
+| combine | 126.8 (912) | 200.6 (577) | 162.0 (714) | 262.7 (1057) | 413.0 (672) | 336.9 (824) |
+| dispatch with the count exchange and host wait | 180.2 (642) | 242.4 (477) | 211.1 (548) | 322.1 (862) | 477.4 (581) | 401.9 (691) |
+
+- **`flydsl_v2` is faster than RCCL after tuning**: dispatch 1.31–1.32×, combine 1.28×, dispatch with
+  the host wait 1.17× (EP2) and 1.25× (EP4); against the default `dist.all_to_all_single` 1.35–1.63×.
+  Uniform routing at EP4 (top-8 of 256): 294.9 against 383.4 µs (dispatch), 296.3 against 386.4 µs
+  (combine), 1.30×.
+- **Tuning RCCL gains 1.2×, all of it from registered buffers** (`ncclCommRegister` or a symmetric
+  window): 413 → 339 µs at EP4, 200 → 163 µs at EP2. On registered buffers, graph launch, policies 0 / 1
+  and `RCCL_FORCE_CE` stay within about 1% (EP4 dispatch 339.3–342.7 µs); policy 2 makes the eager
+  `ncclAlltoAllv` on symmetric windows slower (408 µs at EP4, 205 at EP2).
+- RCCL's times count the all-to-all only. A dispatch built on it also needs the rows packed by
+  destination before it (Megatron's permute: one read and one write of the 369 MB sent at EP4, about
+  50 µs at the 15 TB/s local copy rate), and Megatron's dispatcher sends one row per token and expert,
+  2.6× the rows: tuned RCCL 739–743 µs at EP4, 489 µs at EP2.
+
+### Against the volume (communication roofline)
+
+EP4, time and link GB/s against the volume, `flydsl_v2` at 160 CUs (combine with one-token claims). The
+two references are equal-split all-to-alls of the same link bytes, interpolated between their published
+sizes (per-rank buffer = link bytes × 4 / 3): the MAIDAS busbw roofline, and the fastest RCCL variant of
+`06-rccl` (symmetric windows, `NCCL_CTA_POLICY=2`: RCCL's copy-engine all-to-all, no CUs; measured on
+`ctheliosr-rck-g02-e15-01` with RCCL `105dd4f`):
+
+| T | link MB | MAIDAS roofline | `06-rccl` fastest | `flydsl_v2` dispatch, counts known | `flydsl_v2` combine | fastest RCCL here |
+|---:|---:|---:|---:|---:|---:|---:|
+| 256 | 9 | – | – | 48.5 (184) | 46.5 (192) | 43.1 (207) |
+| 512 | 18 | – | 46.0 (389) | 52.6 (341) | 53.3 (336) | 83.4 (215) |
+| 1024 | 35 | – | 57.1 (617) | 66.2 (532) | 66.1 (534) | 103.1 (342) |
+| 2048 | 70 | – | 78.8 (886) | 91.9 (759) | 90.0 (776) | 131.2 (532) |
+| 4096 | 140 | 97.3 (1435) | 122.7 (1139) | 150.1 (931) | 141.4 (988) | 205.4 (680) |
+| 8192 | 278 | 183.5 (1512) | 209.1 (1328) | 260.0 (1068) | 262.6 (1057) | 339.3 (818) |
+| 16384 | 555 | 356.9 (1555) | 383.1 (1448) | 471.3 (1177) | 506.3 (1096) | 596.8 (930) |
+| 32768 | 1106 | – | – | 884.8 (1250) | 972.1 (1137) | 1082.7 (1021) |
+
+Each curve as time = fixed + link bytes / streaming rate (fits over the sizes above; MAIDAS and
+`06-rccl` over 128 MiB … 1 GiB and 16 MiB … 1 GiB per rank):
+
+| | fixed µs | streaming GB/s | of 1.8 TB/s | T = 8192, µs |
+|---|---:|---:|---:|---:|
+| MAIDAS all-to-all roofline (4 GPUs) | 10 | 1599 | 89% | 183.5 |
+| `06-rccl` fastest (copy engines, other node and RCCL build) | 35 | 1592 | 88% | 209.1 |
+| `flydsl_v2` dispatch, counts known | 41.6 | 1306 | 73% | 260.0 |
+| `flydsl_v2` combine | 33.0 | 1179 | 65% | 262.6 |
+| `flydsl_v2` dispatch with host wait | 93.5 | 1264 | 70% | 322.1 |
+| RCCL here, `ncclAlltoAllv` (local, eager, policy 0) | 65.2 | 1063 | 59% | 340.5 |
+| RCCL here, `ncclAlltoAllv` (symmetric, eager, policy 2: copy engines) | 170.9 | 1204 | 67% | 407.9 |
+| RCCL here, equal-split `ncclAllToAll` (symmetric, eager, policy 2) | 122.7 | 1216 | 68% | 347.1 |
+
+At EP2 the same fits give `flydsl_v2` 36.6 µs + 1323 GB/s (cached dispatch) and tuned RCCL 47.7 µs +
+1065 GB/s; there are no EP2 references (MAIDAS and `06-rccl` measure 4 GPUs).
+
+- **Against the best all-to-all the gap is the streaming rate, not the fixed cost**: 1.31 TB/s for the
+  cached dispatch against 1.59–1.60 TB/s, while the fixed parts are 42 µs against 10–35 µs. The cached
+  dispatch is at 71% of the MAIDAS roofline at T = 8192 and at 80% of `06-rccl`'s fastest RCCL; at
+  1.59 TB/s with its own fixed cost it would take about 216 µs.
+- **`06-rccl`'s fastest all-to-all runs on the copy engines**, with no CUs, and streams at 1.59 TB/s. That
+  supports the copy-engine idea in [What DeepEP does about the same parts](#what-deepep-does-about-the-same-parts)
+  (DeepEP itself uses SMs for dispatch and combine). At EP4, RCCL here is faster than `flydsl_v2` only at
+  T = 256.
+- **`06-rccl`'s fastest variant does not reproduce in this container.** RCCL logs "Taking CE collective
+  path with symmetric registered windows", but the equal-split all-to-all takes 289 µs at 256 MiB per
+  rank (`06-rccl`: 161 µs) and 472 µs at 512 MiB (287 µs). With policy 0 the two nodes agree at 512 MiB
+  and 1 GiB (472 / 838 µs here, 474 / 847 µs there), and `06-rccl`'s own script with plain buffers gives
+  237.2 µs at 256 MiB here against 237.5 there, so the fabric is not the difference. Neither the L2 flush
+  (295 µs without it) nor `06-rccl`'s timing, 50 calls back to back (`B2B=50`: 289 µs at 256 MiB, 524 at
+  512 MiB), explains it. The software differs: this container's RCCL is `2.32.3-HEAD:2f2a927` (ROCm SDK
+  wheel 10.2.0a20261011; the commit is not in the public ROCm repositories), torch 2.14; `06-rccl` builds
+  RCCL `105dd4f` from ROCm/rocm-systems, torch 2.15. Torch 2.14 cannot run `06-rccl`'s registered-buffer
+  variants ("NCCL mem allocator is not supported"); `bench_rccl_tune.py` registers through RCCL directly.
 
 ## Where the time goes
 
@@ -379,7 +489,7 @@ EP2, 160 CUs; modelled from the terms above, not yet measured:
 | notify and host wait | the dispatch needs the counts first; `num_worst_tokens` skips the host wait | the transfer writes into buffer slots before the counts are known; the CPU waits afterwards | the same as V2: give each source rank its own heap region so the send needs no prefix matrix, and let the receive copy order the rows |
 | combine reduce | odd blocks reduce as the pushed rows arrive | a separate, deferrable reduce epilogue | already overlapped (10 reduce warps per block from the start); claims of one token (done); balance the push across blocks |
 | per-CU send rate | – (on H800 a handful of SMs fill NVLink: 160 GB/s against 45 GB/s of writes per SM; the benchmark uses 24 of 132) | TMA-based backends | on MI455X about 74 CUs fill the link (1.62 TB/s against 22 GB/s per CU), so the per-CU rate and copy engines matter far more than on H800 |
-| copy engines | – | used for all-gather (`num_sms=0`); EP dispatch and combine need SMs | copy engines for the bulk rows at low CU counts (SDMA moves 1.38–1.54 TB/s here) |
+| copy engines | – | used for all-gather (`num_sms=0`); EP dispatch and combine need SMs | copy engines for the bulk rows at low CU counts (SDMA moves 1.38–1.54 TB/s here; RCCL's copy-engine all-to-all streams at 1.59 TB/s in `06-rccl`, see [Tuned RCCL](#tuned-rccl-all-to-all-against-flydsl_v2)) |
 
 The 84–86% of DeepEP V1 on H800 is its cached dispatch (the counts known) at the best chunk size, the
 same case as the cached dispatch here (58%).
@@ -393,6 +503,10 @@ same case as the cached dispatch here (58%).
    between the send and the receive copy, and the combine's 40–60 µs.
 4. The copy kernel with 22 warps per block (the combine's pushers), to see whether the push alone reaches
    the harness ceiling.
+5. ~~Tuned RCCL at EP4~~: measured 2026-10-29 ([Tuned RCCL](#tuned-rccl-all-to-all-against-flydsl_v2)).
+6. `06-rccl`'s RCCL build (`build_rccl.sh`, `105dd4f`) in a separate container (it replaces torch's
+   `librccl.so.1`, so not in the shared one), then `bench_rccl_tune.py` at EP4: whether the copy-engine
+   all-to-all reaches 1.59 TB/s here, and whether its `ncclAlltoAllv` does with the real splits.
 
 ## References
 
