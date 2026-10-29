@@ -537,7 +537,7 @@ EP2, 160 CUs; modelled from the terms above, not yet measured:
 | change | removes | cached dispatch | combine |
 |---|---|---:|---:|
 | ~~one token per reduce claim~~ (done, `550ad251`) | the reduce tail 34 → 12 µs | – | 145.7 → 126.8 µs (measured) |
-| overlap or drop the receive copy (receive warps beside the senders, or `recv_x` in the heap) | the 14 µs after the last send (stamps) | → about 109 µs | – |
+| overlap or drop the receive copy (receive warps beside the senders, or `recv_x` in the heap); receive warps with per-row flags implemented in `8e3d509f`, not yet measured | the 14 µs after the last send (stamps; 30–34 µs at EP4) | → about 109 µs | – |
 | take the own-row stores off the send's path (two row buffers per warp, in pieces; the next load while the stores drain) | about 7 µs (the send is 7 µs above the copy kernel, stamps) | → about 116 µs (102 with the row above) | – |
 | balance the push across blocks (the slowest block's warp 0 ends 33 µs after the median) | up to about 33 µs | – | → about 95–110 µs |
 | reach the achievable link rate on the send (1.32 → 1.6 TB/s) | about 15 µs | → about 108 µs (87 with both rows above) | → about 112 µs |
@@ -571,6 +571,11 @@ same case as the cached dispatch here (58%).
    twice did not reproduce it (2026-10-29). Open; if it shows again, keep that run's core dump (the
    benchmark runs set `prlimit --core=0`) and the faulting address from the kernel log.
 8. ~~Fewer push warps with one-token claims~~: measured at EP2 and EP4; the default stays at 22 ([EP4](#ep4)).
+9. The dispatch receive overlap (`8e3d509f`: from 64 channels, one receive warp per source rank copies
+   rows as their per-row flags come up while the other warps send): `test_intranode.py` on 2 and 4 GPUs,
+   then `bench_ops.py` at EP2 / EP4 with it on and off (`PRIMUS_TURBO_DEEPEP_V2_DISPATCH_RECV_MIN_CHANNELS`),
+   with and without stamps, and at 32 / 48 channels; script `ut_logs/recv_overlap_validate/run.sh`.
+   Compiled for gfx1250 at EP2 / 4 / 8, not yet run on a GPU.
 
 ## References
 
