@@ -1,0 +1,32 @@
+diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
+--- a/include/dqds/dqds_impl.h	2026-10-29 09:29:26.440177533 +0000
++++ b/include/dqds/dqds_impl.h	2026-10-29 09:29:26.453656481 +0000
+@@ -449,6 +449,9 @@
+ Q1_DEV void dqds_kernel(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int Skv, int Hq,
+                         int Hkv, int G, int nkvt, int cshift, int causal, int q_off, int ntile,
+                         int HG) {
++#if DQ_PROBE
++    const unsigned int pr_rs = readfirstlane((int) __builtin_readsteadycounter());
++#endif
+     lock_simd(); // SCHED_MODE.DISABLE_XDL_ARB_STALL, as bwd_r6_a's k_dqds192 / k_dqg96 / k_dqds_b
+     const int gy = block_id_y();
+     if (!tile_is_head(gy, ntile)) {
+@@ -458,6 +461,18 @@
+         dqds_body<HEAD_NQW>(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, head_q0g(q_off),
+                             HG);
+     }
++#if DQ_PROBE
++    // timing probe: every workgroup (lane 0 of wave 0) at word 1024 + li of the 64 KB in front of DS (li = (bz *
++    // gy_n + by) * HG + bx, no gridDim): (realtime start mod 2^18) << 14 | min(end - start, 0x3FFF), 10-ns ticks;
++    // end = the dQ stores issued
++    const unsigned int pr_re = readfirstlane((int) __builtin_readsteadycounter());
++    if (thread_id_x() == 0) {
++        const int li = (block_id_z() * (ntile + (q_off > 0 ? 1 : 0)) + gy) * HG + block_id_x();
++        unsigned int *w = reinterpret_cast<unsigned int *>(
++                              reinterpret_cast<unsigned char *>(const_cast<__bf16 *>(DS)) - 65536) + 1024 + li;
++        *w = ((pr_rs & 0x3FFFFu) << 14) | (pr_re - pr_rs < 0x3FFFu ? pr_re - pr_rs : 0x3FFFu);
++    }
++#endif
+ }
+ 
+ } // namespace dq

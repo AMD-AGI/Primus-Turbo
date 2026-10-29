@@ -1,0 +1,38 @@
+[2026-10-29T09:38:43 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: sh -c for r in r10t_ps r10w_ps r10t_ps r10w_ps; do echo == $r; python3 -m micro.k3_probe mla/ladder_bwd.json $r --abc --calls 20 --allwg 11008 --split | sed -n 1,8p; done
+== r10t_ps
+wave 0: 1376 workgroups (li % 64 < 8), cycles
+   entry -> INIT start                mean    2431  median   2240  p10   1814  p90   3205
+   INIT issued                        mean    3155  median   2646  p10   2180  p90   5022
+   tile 0 landed (own half)           mean    3650  median   3082  p10   2611  p90   5548
+   prologue (+ barrier, LOOP inputs)  mean    3890  median   3306  p10   2817  p90   5747
+   epilogue: tensorcnt 0 + barrier    mean      53  median     33  p10     31  p90     90
+   epilogue (FINAL issued)            mean    3859  median   3380  p10   3114  p90   5199
+   per li % 8 (XCD), workgroups li >= 512: mean entry / prologue / loop / epilogue (cycles)
+== r10w_ps
+wave 0: 1376 workgroups (li % 64 < 8), cycles
+   entry -> INIT start                mean    2492  median   2298  p10   1831  p90   3308
+   INIT issued                        mean    3128  median   2648  p10   2183  p90   4857
+   tile 0 landed (own half)           mean    3609  median   3097  p10   2612  p90   5290
+   prologue (+ barrier, LOOP inputs)  mean    3848  median   3308  p10   2828  p90   5521
+   epilogue: tensorcnt 0 + barrier    mean      58  median     33  p10     31  p90     93
+   epilogue (FINAL issued)            mean    2610  median   2136  p10   1753  p90   4153
+   per li % 8 (XCD), workgroups li >= 512: mean entry / prologue / loop / epilogue (cycles)
+== r10t_ps
+wave 0: 1376 workgroups (li % 64 < 8), cycles
+   entry -> INIT start                mean    2466  median   2339  p10   1826  p90   3195
+   INIT issued                        mean    3200  median   2666  p10   2177  p90   5191
+   tile 0 landed (own half)           mean    3678  median   3112  p10   2605  p90   5666
+   prologue (+ barrier, LOOP inputs)  mean    3943  median   3358  p10   2815  p90   5961
+   epilogue: tensorcnt 0 + barrier    mean      52  median     33  p10     31  p90     95
+   epilogue (FINAL issued)            mean    4115  median   3430  p10   3134  p90   5459
+   per li % 8 (XCD), workgroups li >= 512: mean entry / prologue / loop / epilogue (cycles)
+== r10w_ps
+wave 0: 1376 workgroups (li % 64 < 8), cycles
+   entry -> INIT start                mean    2544  median   2331  p10   1830  p90   3312
+   INIT issued                        mean    3268  median   2693  p10   2208  p90   5179
+   tile 0 landed (own half)           mean    3787  median   3152  p10   2638  p90   5737
+   prologue (+ barrier, LOOP inputs)  mean    4065  median   3379  p10   2855  p90   5953
+   epilogue: tensorcnt 0 + barrier    mean      80  median     33  p10     31  p90    100
+   epilogue (FINAL issued)            mean    2789  median   2197  p10   1788  p90   3910
+   per li % 8 (XCD), workgroups li >= 512: mean entry / prologue / loop / epilogue (cycles)
+[09:38:53 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_093843_q7_split.log

@@ -139,6 +139,7 @@ def main():
     ap.add_argument("--rt", action="store_true", help="with --allwg, an HKGEN_PROBE=4 build: every workgroup's "
                     "(realtime start mod 2^18) << 14 | min(end - start, 0x3FFF) in 10-ns ticks")
     ap.add_argument("--slots", type=int, default=512, help="--rt: workgroups resident at once (occupancy)")
+    ap.add_argument("--dq", action="store_true", help="--rt: the words are k_dqds_c's (-DDQ_PROBE=1), its grid")
     a = ap.parse_args()
     spec = runner.load_ladder(a.ladder)
     sh = L.parse_shape(a.shape, spec["problem"])
@@ -165,7 +166,7 @@ def main():
     torch.cuda.synchronize()
     g = plan["ds_full"][: mod.DS_GUARD_B // 2].view(torch.int32).cpu().tolist()
     if a.allwg and (a.split or a.rt):  # modes 3 / 4 leave the per-phase words unwritten
-        split_report(g, a.allwg) if a.split else rt_report(g, a.allwg, a.slots, plan["grids"]["dkdv"])
+        split_report(g, a.allwg) if a.split else rt_report(g, a.allwg, a.slots, plan["grids"]["dq" if a.dq else "dkdv"])
         return 0
     if a.allwg and a.proepi:
         rec = [x & 0xFFFFFFFF for x in g[1024: 1024 + a.allwg]]

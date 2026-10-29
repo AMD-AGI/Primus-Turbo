@@ -1,0 +1,108 @@
+diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
+--- a/include/dqds/dqds_impl.h	2026-10-29 09:46:15.343936169 +0000
++++ b/include/dqds/dqds_impl.h	2026-10-29 09:46:15.357877132 +0000
+@@ -114,7 +114,7 @@
+ 
+ template <int NQW>
+ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int Skv, int Hq,
+-                      int Hkv, int G, int nkvt, int cshift, int causal, int q0g, int HG) {
++                      int Hkv, int G, int nkvt, int cshift, int causal, int q0g, int HG, int bx, int bz) {
+     constexpr int NB_G = nbg(NQW);
+     constexpr int NACC = NQW * NDT;
+ 
+@@ -125,7 +125,7 @@
+     const int  wv   = readfirstlane(tid / WAVE); // uniform (SGPR) wave index 0..3
+     const bool dsw  = c_role_ds(wv); // uniform: this wave issues the dS ops (else the K ops)
+     const int  hh   = c_half(wv);    // its kv32 row / K half inside a unit
+-    const int  hb   = head_hb(block_id_x(), block_id_z(), HG); // = bat*Hq + qh = dslayout's bh
++    const int  hb   = head_hb(bx, bz, HG); // = bat*Hq + qh = dslayout's bh
+     const int  bat  = head_bat(hb, Hq);
+     const int  qh   = head_qh(hb, bat, Hq);
+     const int  hkv  = head_kv(qh, G);
+@@ -448,16 +448,59 @@
+ // The kernel entry: grid (HG, ntile + nhead, B*Hq/HG), block 128.
+ Q1_DEV void dqds_kernel(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int Skv, int Hq,
+                         int Hkv, int G, int nkvt, int cshift, int causal, int q_off, int ntile,
+-                        int HG) {
++                        int HG
++#if DQ_PERSIST
++                        , int nz
++#endif
++                        ) {
+     lock_simd(); // SCHED_MODE.DISABLE_XDL_ARB_STALL, as bwd_r6_a's k_dqds192 / k_dqg96 / k_dqds_b
+-    const int gy = block_id_y();
+-    if (!tile_is_head(gy, ntile)) {
+-        dqds_body<MAIN_NQW>(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal,
+-                            tile_q0g(q_off, ntile, gy), HG);
+-    } else {
+-        dqds_body<HEAD_NQW>(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, head_q0g(q_off),
+-                            HG);
++    auto item_body = [&](int bx, int gy, int bz) DQ_INL {
++        if (!tile_is_head(gy, ntile)) {
++            dqds_body<MAIN_NQW>(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal,
++                                tile_q0g(q_off, ntile, gy), HG, bx, bz);
++        } else {
++            dqds_body<HEAD_NQW>(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal,
++                                head_q0g(q_off), HG, bx, bz);
++        }
++    };
++#if DQ_PERSIST
++    // persistent workgroups (grid x = resident workgroups, one per WGP), work items li = (bz * gy_n + gy) * HG + bx
++    // (the non-persistent grid's: per bz the longest q tiles first) from one queue per XCD (the dispatcher deals
++    // the workgroups round robin: XCD k = blockIdx.x % 8; queue k = the items li = 8 t + k, the ints 128 B in
++    // front of DS, zeroed before the launch): the same items per XCD as the non-persistent grid (a head's K stays
++    // in its L2), and a workgroup whose queue ran dry takes the next item of the other queues. Every item asks
++    // its own queue for the next one when it starts (the reply read after its epilogue); the stealing waits.
++    __shared__ int s_item[1];
++    const int gy_n = ntile + (q_off > 0 ? 1 : 0), n = HG * gy_n * nz, k0 = block_id_x() % 8;
++    int *const cnt = reinterpret_cast<int *>(reinterpret_cast<unsigned char *>(const_cast<__bf16 *>(DS)) - 128);
++    auto steal = [&](int first) -> int { // lane 0 of wave 0: queues k0 + first .. k0 + 7
++        for (int j = first; j < 8; ++j) {
++            const int k = (k0 + j) % 8;
++            const int t = __hip_atomic_fetch_add(cnt + k, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
++            if (t < (n - k + 7) / 8)
++                return 8 * t + k;
++        }
++        return n;
++    };
++    if (thread_id_x() == 0)
++        s_item[0] = steal(0);
++    wg_sync();
++    for (int item = readfirstlane(s_item[0]); item < n;) {
++        int pre = 0; // own queue's reply for the next item (inline asm: no wait until it is read below)
++        if (thread_id_x() == 0)
++            asm volatile("global_atomic_add_u32 %0, %1, %2, %3 th:TH_ATOMIC_RETURN scope:SCOPE_DEV\n\t"
++                         "s_wait_alu depctr_vm_vsrc(0)"
++                         : "=&v"(pre) : "v"(4 * k0), "v"(1), "s"(cnt) : "memory");
++        item_body(item % HG, item / HG % gy_n, item / (HG * gy_n));
++        asm volatile("s_wait_loadcnt 0x0" ::: "memory");
++        if (thread_id_x() == 0)
++            s_item[0] = pre < (n - k0 + 7) / 8 ? 8 * pre + k0 : steal(1);
++        wg_sync(); // also: every wave's epilogue done before the next item's TDM fills the rings
++        item = readfirstlane(s_item[0]);
+     }
++#else
++    item_body(block_id_x(), block_id_y(), block_id_z());
++#endif
+ }
+ 
+ } // namespace dq
+diff -ruN a/src/k_dqds_c.hip b/src/k_dqds_c.hip
+--- a/src/k_dqds_c.hip	2026-10-29 09:46:15.344283449 +0000
++++ b/src/k_dqds_c.hip	2026-10-29 09:46:15.357738082 +0000
+@@ -15,7 +15,15 @@
+ #include "dqds/dqds_impl.h"
+ 
+ extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128)))
++#if DQ_PERSIST
++// persistent: grid (resident workgroups, 1, 1); nz = the non-persistent grid's z (B * Hq / HG)
++void k_dqds_c(const __bf16* DS, const __bf16* K, __bf16* DQ, int Sq, int Skv, int Hq, int Hkv, int G, int nkvt,
++              int cshift, int causal, int q_off, int ntile, int HG, int nz) {
++  dq::dqds_kernel(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q_off, ntile, HG, nz);
++}
++#else
+ void k_dqds_c(const __bf16* DS, const __bf16* K, __bf16* DQ, int Sq, int Skv, int Hq, int Hkv, int G, int nkvt,
+               int cshift, int causal, int q_off, int ntile, int HG) {
+   dq::dqds_kernel(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q_off, ntile, HG);
+ }
++#endif

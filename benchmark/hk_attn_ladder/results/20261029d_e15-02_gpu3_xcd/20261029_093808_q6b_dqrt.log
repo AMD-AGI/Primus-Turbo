@@ -1,0 +1,62 @@
+[2026-10-29T09:38:08 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: sh -c for i in 1 2; do python3 -m micro.k3_probe mla/ladder_bwd.json r10t_dqrt --abc --calls 20 --allwg 2816 --rt --dq --slots 256 | sed -n 1,30p; done
+2816 workgroups; first start .. last end 442.8 us; sum of spans 105364 us = 92.9% of 256 slots x span; durations saturated: 0
+resident workgroups per 1/40 of the span: 246 256 256 256 245 245 245 254 256 239 239 252 255 252 238 243 253 255 244 227 247 254 253 247 238 246 255 251 242 241 253 255 252 240 238 254 251 219 110 15
+   middle 3/4 mean 247.0; first bin 246, last 3 bins 219, 110, 15
+   90% of the workgroups ended by 415.6 us
+   99% of the workgroups ended by 433.4 us
+   workgroup span (us): median 38.9, p10 12.2, p90 59.1, max 72.7
+   per li % 8 (XCD): n, sum of spans (us), mean span (us), last end (us), busy share of 64 slots x span
+      0:   352     12997   36.92    430.3   94.4%
+      1:   352     13207   37.52    430.4   95.9%
+      2:   352     12940   36.76    430.3   94.0%
+      3:   352     13123   37.28    430.4   95.3%
+      4:   352     13269   37.70    442.8   93.6%
+      5:   352     13326   37.86    442.8   94.0%
+      6:   352     13217   37.55    442.8   93.3%
+      7:   352     13285   37.74    442.8   93.8%
+   the 12 last to end: li (x, y, z) start..end us
+        2796 ( 12, 10, 7)   432.5 ..   436.8
+        2788 (  4, 10, 7)   432.5 ..   436.9
+        2716 ( 28,  7, 7)   419.2 ..   437.2
+        2748 ( 28,  8, 7)   424.0 ..   437.3
+        2764 ( 12,  9, 7)   428.2 ..   437.4
+        2772 ( 20,  9, 7)   430.0 ..   439.0
+        2780 ( 28,  9, 7)   430.2 ..   439.2
+        2799 ( 15, 10, 7)   426.9 ..   442.8
+        2804 ( 20, 10, 7)   433.7 ..   442.8
+        2812 ( 28, 10, 7)   433.9 ..   442.8
+        2789 (  5, 10, 7)   428.3 ..   442.8
+        2790 (  6, 10, 7)   424.2 ..   442.8
+   per (z, y): mean start / mean span (us), every 6th y
+      z 0 y  0: start     0.4  span   71.1
+2816 workgroups; first start .. last end 441.0 us; sum of spans 105071 us = 93.1% of 256 slots x span; durations saturated: 0
+resident workgroups per 1/40 of the span: 246 256 256 256 246 245 244 256 256 241 238 255 254 252 239 242 253 255 244 235 252 255 255 242 236 252 254 252 240 234 253 255 244 240 245 255 253 226 112 6
+   middle 3/4 mean 247.3; first bin 246, last 3 bins 226, 112, 6
+   90% of the workgroups ended by 413.8 us
+   99% of the workgroups ended by 428.9 us
+   workgroup span (us): median 38.8, p10 12.0, p90 59.0, max 76.3
+   per li % 8 (XCD): n, sum of spans (us), mean span (us), last end (us), busy share of 64 slots x span
+      0:   352     12937   36.75    427.6   94.5%
+      1:   352     13143   37.34    428.5   95.8%
+      2:   352     13079   37.16    427.6   95.6%
+      3:   352     13134   37.31    430.6   95.3%
+      4:   352     13180   37.44    428.0   96.2%
+      5:   352     13273   37.71    441.0   94.0%
+      6:   352     13118   37.27    441.0   93.0%
+      7:   352     13208   37.52    441.0   93.6%
+   the 12 last to end: li (x, y, z) start..end us
+        2733 ( 13,  8, 7)   416.0 ..   430.4
+        2811 ( 27, 10, 7)   422.7 ..   430.6
+        2773 ( 21,  9, 7)   421.9 ..   431.4
+        2815 ( 31, 10, 7)   427.1 ..   431.4
+        2781 ( 29,  9, 7)   423.1 ..   432.2
+        2749 ( 29,  8, 7)   418.9 ..   432.5
+        2741 ( 21,  8, 7)   418.9 ..   432.5
+        2813 ( 29, 10, 7)   427.8 ..   441.0
+        2814 ( 30, 10, 7)   424.4 ..   441.0
+        2791 (  7, 10, 7)   424.4 ..   441.0
+        2797 ( 13, 10, 7)   426.5 ..   441.0
+        2805 ( 21, 10, 7)   427.6 ..   441.0
+   per (z, y): mean start / mean span (us), every 6th y
+      z 0 y  0: start     0.4  span   72.4
+[09:38:14 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_093808_q6b_dqrt.log

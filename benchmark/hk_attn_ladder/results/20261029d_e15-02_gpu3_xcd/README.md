@@ -65,8 +65,35 @@ take the later, shorter items.
 | per-XCD queues + stealing (ticket mode 2) | 1.001x vs r10n | non-persistent: each XCD runs a fixed number of blocks, its queue has exactly that many items, no stealing happens |
 | persistent dK/dV workgroups (512, a loop around INIT .. FINAL, next ticket fetched before FINAL) | does not build | the LOOP marker's 40 SGPR operands plus the values live across LOOP exceed s0..s47: SGPR spills into VGPR lanes push the generated base to v24..v34 (needs v15); opaque per-item roots (kernarg pointer in the constant address space, tid, LDS base, separate SGPR / VGPR asm statements) got it from v132 to v24 |
 
-## 6. Next
+## 6. The epilogue and the prologue (r10w, r10x)
 
-Land r10t on Primus-Turbo b1. A persistent dK/dV kernel would also hide the ticket latency (~1.9% of a workgroup),
+- **r10w** (`--final-pipe`, generator only): FINAL had every image store ordered before every readback, so it ran
+  as 336 VALU + 60 LDS stores, then 60 readbacks each followed by `s_wait_dscnt 0` + a global store (and 24
+  `s_wait_xcnt 0` for the reused soffset SGPR). Now: conversions in (V, K) x kh groups, each image store one
+  conversion later, a group's rows read back right after its last image store (a wave's LDS ops are in order),
+  their global stores 8 pairs behind the loads, soffsets in 4 rotating SGPRs per image. Bitwise == r10t at every
+  shape. Epilogue median 3380 -> 2136 cycles (r10w_ps), but bwd only 1.003-1.004x vs r10t (noise): the slot is not
+  free earlier.
+- **r10x** (`-DHKGEN_KV_TDM=1`): INIT's 60 K / V buffer_load_b128 per wave touch 16 cache lines each and take ~2.3K
+  cycles to issue. INIT now moves the wave's 16 NKV K / V rows into an LDS staging area with 3 TDM ops (shapes and
+  pads of a ring stage's ops, descriptors built in s92..s103 one op at a time), clears the accumulators meanwhile,
+  waits for every TDM op and reads the fragments with 60 ds_load_b128 (pitch 272 / 400 B: conflict-free). LDS
+  129028 B per workgroup (two per WGP: 258 KB of 320). Bitwise == r10w at every shape. Prologue median unchanged
+  (~3.4K: now bound by the ~100 KB of first TDM data per workgroup), mean -4..8%, p90 5.7-6.0K -> 4.5K.
+  **bwd 1.010x ± 0.002 vs r10t (8/8)**, r10w 1.003x in the same run.
+- An attempt to issue the K / V TDM from the shell spilled SGPRs into v15..v17 (the layout needs the shell below
+  v16: 30 eight-aligned tuples in VGPR block 0); building the descriptors inside INIT keeps the shell at v15.
+
+## 7. dQ (r10t_dqrt: realtime probe in k_dqds_c, 2816 workgroups on 256 slots)
+
+The XCDs are within ~2% (no odd / even pattern), but the slots are only 93% busy: 247 of 256 resident in the steady
+state (gaps between workgroups ~3.5%: ~1.4 us per workgroup change) plus a ~2-3% tail. A dQ ticket (r10u) lost
+1.3% (K leaves its XCD's L2, the atomic's latency per workgroup); next: persistent dQ workgroups on per-XCD queues
+(r10y), which keep the items per XCD, hide the ticket and drop the workgroup changes.
+
+## 8. Next
+
+r10t is landed on Primus-Turbo b1 (d10b4db8: bwd 2.361 -> 2.336 ms hot). A persistent dK/dV kernel would also
+hide the ticket latency (~1.9% of a workgroup),
 the gaps (~1.7%) and, with the next item's K / V staged in LDS, most of the prologue: it first needs the LOOP
 region's descriptor / scalar operands passed through LDS instead of 40 SGPRs.

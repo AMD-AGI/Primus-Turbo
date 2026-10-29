@@ -1,0 +1,21 @@
+[2026-10-29T09:38:53 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m hkl.ladder mla/ladder_bwd.json --rung r10t r10w --baseline -r 8
+device gfx1250 (256 CUs)  torch 2.14.0+rocm10.2.0a20261011  ladder mla_bwd  shape b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd
+reference 1.6 s
+  verify r10t               dq 52.3 dk 52.3 dv 52.6
+  verify r10w               dq 52.3 dk 52.3 dv 52.6
+  verify r10w#null          dq 52.3 dk 52.3 dv 52.6
+  round 1/8: r10t=2.3166 r10w=2.3034 r10w#null=2.3010
+  round 2/8: r10t=2.3056 r10w=2.3076 r10w#null=2.3034
+  round 3/8: r10t=2.3069 r10w=2.3138 r10w#null=2.2985
+  round 4/8: r10t=2.3063 r10w=2.3237 r10w#null=2.2962
+  round 5/8: r10t=2.3044 r10w=2.2932 r10w#null=2.3057
+  round 6/8: r10t=2.3080 r10w=2.2917 r10w#null=2.3150
+  round 7/8: r10t=2.3169 r10w=2.2947 r10w#null=2.3099
+  round 8/8: r10t=2.3095 r10w=2.3038 r10w#null=2.2952
+arm                        ms  TFLOP/s     over             step  step cyc   sclk    Mcyc      W     mJ  a08 ms  feature
+------------------------------------------------------------------------------------------------------------------------
+r10t                   2.3074   1549.0                                       1191   2.750      -      -          r10n + the work item from a ticket counter instead of the bl
+r10w                   2.3036   1551.6     r10t     1.004x±0.005    1.006x   1188   2.749      -      -          r10t + pipelined FINAL (--final-pipe): conversions in (V, K)
+r10w#null              2.3022   1552.6                                       1189   2.743      -      -          r10t + pipelined FINAL (--final-pipe): conversions in (V, K)
+null control r10w vs #null: 1.0014x ± 0.0061
+[09:39:30 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_093853_q7_time.log
