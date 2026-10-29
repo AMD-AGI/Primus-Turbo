@@ -1,6 +1,6 @@
 diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
 --- a/include/dqds/dqds_impl.h	2026-10-29 10:35:05.883800161 +0000
-+++ b/include/dqds/dqds_impl.h	2026-10-29 10:35:42.137422180 +0000
++++ b/include/dqds/dqds_impl.h	2026-10-29 10:48:37.883528643 +0000
 @@ -114,7 +114,7 @@
  
  template <int NQW>
@@ -19,7 +19,7 @@ diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
      const int  bat  = head_bat(hb, Hq);
      const int  qh   = head_qh(hb, bat, Hq);
      const int  hkv  = head_kv(qh, G);
-@@ -448,15 +448,28 @@
+@@ -448,15 +448,38 @@
  // The kernel entry: grid (HG, ntile + nhead, B*Hq/HG), block 128.
  Q1_DEV void dqds_kernel(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int Skv, int Hq,
                          int Hkv, int G, int nkvt, int cshift, int causal, int q_off, int ntile,
@@ -31,13 +31,23 @@ diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
 +                        ) {
      lock_simd(); // SCHED_MODE.DISABLE_XDL_ARB_STALL, as bwd_r6_a's k_dqds192 / k_dqg96 / k_dqds_b
 -    const int gy = block_id_y();
-+#if DQ_YMAJOR
++#if DQ_YMAJOR == 1
 +    // the block of dispatch index li = (z * gy_n + y) * HG + x runs the item li of the order y, z, x: the longest q
 +    // tiles of every (batch, head group) first and the shortest last (the grid's own order is per z, so the last
 +    // z's long tiles end the kernel); x is kept (its XCD under round-robin dispatch); nz = the grid's z extent
 +    const int gy_n = ntile + (q_off > 0 ? 1 : 0);
 +    const int li   = (block_id_z() * gy_n + block_id_y()) * HG + block_id_x();
 +    const int bx = block_id_x(), gy = li / (HG * nz), bz = li / HG % nz;
++#elif DQ_YMAJOR == 2
++    // the grid's order (per z) except the last two z: their items in the order y, z, x (both z's long tiles before
++    // either's short ones), so the kernel does not end on the last z's long tiles; the K working set doubles there only
++    const int gy_n = ntile + (q_off > 0 ? 1 : 0);
++    int bx = block_id_x(), gy = block_id_y(), bz = block_id_z();
++    if (nz >= 2 && bz >= nz - 2) {
++        const int j = ((bz - (nz - 2)) * gy_n + gy); // index of (z, y) in the last two z's, grid order
++        gy = j / 2;
++        bz = nz - 2 + j % 2;
++    }
 +#else
 +    const int bx = block_id_x(), gy = block_id_y(), bz = block_id_z();
 +#endif

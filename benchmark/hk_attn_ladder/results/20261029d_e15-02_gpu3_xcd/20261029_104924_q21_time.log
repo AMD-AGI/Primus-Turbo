@@ -1,0 +1,23 @@
+[2026-10-29T10:49:24 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m hkl.ladder mla/ladder_bwd.json --rung r10x r10x_dqy2 --baseline -r 10
+device gfx1250 (256 CUs)  torch 2.14.0+rocm10.2.0a20261011  ladder mla_bwd  shape b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd
+reference 1.6 s
+  verify r10x               dq 52.3 dk 52.3 dv 52.6
+  verify r10x_dqy2          dq 52.3 dk 52.3 dv 52.6
+  verify r10x_dqy2#null     dq 52.3 dk 52.3 dv 52.6
+  round 1/10: r10x=2.2803 r10x_dqy2=2.2888 r10x_dqy2#null=2.2868
+  round 2/10: r10x=2.2867 r10x_dqy2=2.2715 r10x_dqy2#null=2.2901
+  round 3/10: r10x=2.2869 r10x_dqy2=2.2726 r10x_dqy2#null=2.2872
+  round 4/10: r10x=2.2731 r10x_dqy2=2.2888 r10x_dqy2#null=2.2836
+  round 5/10: r10x=2.2927 r10x_dqy2=2.2838 r10x_dqy2#null=2.2838
+  round 6/10: r10x=2.2902 r10x_dqy2=2.2927 r10x_dqy2#null=2.2993
+  round 7/10: r10x=2.2893 r10x_dqy2=2.2886 r10x_dqy2#null=2.3035
+  round 8/10: r10x=2.3025 r10x_dqy2=2.2897 r10x_dqy2#null=2.2918
+  round 9/10: r10x=2.2874 r10x_dqy2=2.2923 r10x_dqy2#null=2.2914
+  round 10/10: r10x=2.2840 r10x_dqy2=2.2930 r10x_dqy2#null=2.2941
+arm                        ms  TFLOP/s     over             step  step cyc   sclk    Mcyc      W     mJ  a08 ms  feature
+------------------------------------------------------------------------------------------------------------------------
+r10x                   2.2872   1562.8                                       1186   2.718      -      -          r10w + K / V by TDM (-DHKGEN_KV_TDM=1): INIT moves the wave'
+r10x_dqy2              2.2888   1561.7     r10x     1.000x±0.003    1.002x   1186   2.711      -      -          r10x + k_dqds_c's last two z interleaved by y (-DDQ_YMAJOR=2
+r10x_dqy2#null         2.2908   1560.3                                       1189   2.722      -      -          r10x + k_dqds_c's last two z interleaved by y (-DDQ_YMAJOR=2
+null control r10x_dqy2 vs #null: 0.9993x ± 0.0026
+[10:50:07 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_104924_q21_time.log

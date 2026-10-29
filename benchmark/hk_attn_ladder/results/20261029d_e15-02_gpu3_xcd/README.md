@@ -147,6 +147,8 @@ cycles and the kernel does not get faster.
 r10xk (k_delta -DHK_TICKET=1 zeroes the ticket counter through one more argument TK; no host fill launch before the
 first dkdv): bitwise == r10x, 1.000x ± 0.002 under hkl.ladder (cold calls; one launch fewer per call).
 
+r10x_dqy2 (-DDQ_YMAJOR=2: only the last two z interleaved by y, against the dQ tail): bitwise == r10x, 1.000x.
+
 ## 12. Next
 
 r10t is landed on Primus-Turbo b1 (d10b4db8: bwd 2.361 -> 2.336 ms hot). A persistent dK/dV kernel would also
