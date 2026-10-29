@@ -256,12 +256,34 @@ def insert_vm(M, lines, log=print):
         edits += 1
 
 
+def retarget_nl(M, lines, log=print):
+    """Re-target the NL/ND prefetch loads of the trip's first iteration (their value is consumed by the second
+    iteration, never across the back edge) with the regen tool's own retarget, then recompute va_vdst. In r8a they
+    overwrite an operand of the WMMA issued right before them (a va_vdst(0) drain per trip)."""
+    ins = M.parse(lines)
+    _, first, last = M.full_loop(ins)
+    vm = [i for i in range(first, last + 1) if ins[i].cls == "VMEM" and ins[i].defs]
+    moved = M.retarget(lines, first, last, vm[:8], log)
+    ins = M.parse(lines)
+    _, first, last = M.full_loop(ins)
+    before, after = M.apply_plan(lines, ins, M.recompute_va_vdst(ins, first, last))
+    new = []
+    for i, l in enumerate(lines):
+        if before[i] is not None:
+            new.append(before[i])
+        if after[i] is not None:
+            new.append(after[i])
+    lines[:] = new
+    return moved
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("s_file")
     ap.add_argument("--out", required=True)
     ap.add_argument("--mode", choices=("warv", "llvm"), default="warv")
     ap.add_argument("--msrc", action="store_true", help="also re-target Q^T units held up by in-flight memory sources")
+    ap.add_argument("--nl", action="store_true", help="(with --msrc) also re-target the first iteration's NL/ND loads")
     ap.add_argument("--turbo", default=str(Path(__file__).resolve().parents[3]))
     a = ap.parse_args(argv)
     M = load_regen(a.turbo, msrc=a.msrc)
@@ -273,6 +295,9 @@ def main(argv=None):
         stripped = "\n".join(strip_vm(M, orig)) + "\n"
         edited, patch = M.regenerate(stripped)
         lines = edited[:-1].split("\n")
+        if a.nl:
+            nl = retarget_nl(M, lines)
+            print(f"[warv_regen] NL/ND loads re-targeted: {len(nl)} units")
         n_ins = insert_vm(M, lines)
         print(f"[warv_regen] vm_vsrc waits re-inserted where needed: {n_ins} edits")
     else:
@@ -288,6 +313,16 @@ def main(argv=None):
         new_open = {k: he[k] - ho[k] for k in he if he[k] - ho[k]}
         if new_open or M.clause_violations(ie):
             raise SystemExit(f"relax_vm broke a check: new open hazards {new_open}, clauses {M.clause_violations(ie)}")
+        # dataflow against the compiler's original: the same non-wait instructions (register numbers aside) reading
+        # the same definitions over two trips, the same definitions reaching the exit
+        ko = [i for i in range(fo, lo + 1) if io[i].cls != "WAIT_ALU"]
+        ke = [i for i in range(first, last + 1) if ie[i].cls != "WAIT_ALU"]
+        if [io[i].mn for i in ko] != [ie[i].mn for i in ke]:
+            raise SystemExit("final check: the loop's instructions differ from the compiler's")
+        if M.dataflow(io, fo, lo)[0] != M.dataflow(ie, first, last)[0]:
+            raise SystemExit("final check: dataflow differs from the compiler's (a moved tuple overwrites a live value)")
+        if orig[:fo] != lines[:first] or orig[lo + 1:] != lines[last + 1:]:
+            raise SystemExit("final check: text outside the loop differs")
         print(f"[warv_regen] relax_vm: {n_vm} vm_vsrc waits loosened, no new open hazard on either path")
         import difflib
         patch = "".join(difflib.unified_diff([l + "\n" for l in orig], [l + "\n" for l in lines],
