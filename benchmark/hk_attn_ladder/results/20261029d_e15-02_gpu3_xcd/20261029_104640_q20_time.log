@@ -1,0 +1,23 @@
+[2026-10-29T10:46:40 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: python3 -m hkl.ladder mla/ladder_bwd.json --rung r10x r10xk --baseline -r 10
+device gfx1250 (256 CUs)  torch 2.14.0+rocm10.2.0a20261011  ladder mla_bwd  shape b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd
+reference 1.6 s
+  verify r10x               dq 52.3 dk 52.3 dv 52.6
+  verify r10xk              dq 52.3 dk 52.3 dv 52.6
+  verify r10xk#null         dq 52.3 dk 52.3 dv 52.6
+  round 1/10: r10x=2.2738 r10xk=2.2811 r10xk#null=2.2909
+  round 2/10: r10x=2.2819 r10xk=2.2831 r10xk#null=2.2866
+  round 3/10: r10x=2.2854 r10xk=2.2843 r10xk#null=2.2945
+  round 4/10: r10x=2.2817 r10xk=2.2745 r10xk#null=2.2932
+  round 5/10: r10x=2.2834 r10xk=2.2797 r10xk#null=2.2979
+  round 6/10: r10x=2.2795 r10xk=2.2816 r10xk#null=2.2871
+  round 7/10: r10x=2.2754 r10xk=2.2937 r10xk#null=2.2774
+  round 8/10: r10x=2.2873 r10xk=2.2852 r10xk#null=2.2897
+  round 9/10: r10x=2.2811 r10xk=2.2818 r10xk#null=2.2951
+  round 10/10: r10x=2.2872 r10xk=2.2883 r10xk#null=2.2918
+arm                        ms  TFLOP/s     over             step  step cyc   sclk    Mcyc      W     mJ  a08 ms  feature
+------------------------------------------------------------------------------------------------------------------------
+r10x                   2.2818   1566.4                                       1188   2.714      -      -          r10w + K / V by TDM (-DHKGEN_KV_TDM=1): INIT moves the wave'
+r10xk                  2.2824   1566.0     r10x     1.000x±0.002    1.002x   1186   2.708      -      -          r10x with the ticket counter zeroed by k_delta (-DHK_TICKET=
+r10xk#null             2.2914   1559.9                                       1190   2.723      -      -          r10x with the ticket counter zeroed by k_delta (-DHK_TICKET=
+null control r10xk vs #null: 0.9967x ± 0.0031
+[10:47:29 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_104640_q20_time.log

@@ -3392,6 +3392,54 @@
    "side": true
   },
   {
+   "id": "r10xk",
+   "parent": "r10x",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_KV_TDM=1"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1",
+      "-DHK_TICKET=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true,
+     "delta_ticket": true
+    }
+   },
+   "feature": "r10x with the ticket counter zeroed by k_delta (-DHK_TICKET=1, argument TK) instead of a host fill launch before dkdv",
+   "bitwise_with": "r10x"
+  },
+  {
    "id": "r10w_pr",
    "parent": "r10w",
    "kernels": {

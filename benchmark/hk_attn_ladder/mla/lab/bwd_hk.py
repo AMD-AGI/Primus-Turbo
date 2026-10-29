@@ -119,6 +119,8 @@ ND_FOLD = False  # configure(): the rung's k_dkdv96ds folds ND into its dP C ini
 #                  ND = -delta, l2s = log2(scale) rounded to fp32 on the host, k_delta's f32 argument)
 TICKET = False  # configure(): k_dkdv96ds built with -DHKGEN_TICKET (k_dqds_c -DDQ_TICKET) takes its work item from
 #                 a ticket counter (the int 64 / 128 B in front of the dS layout), zeroed before every dkdv launch
+DELTA_TICKET = False  # configure(): k_delta built with -DHK_TICKET takes TK (the 64 B in front of the dS layout) and
+#                       zeroes it: the first dkdv launch needs no "ticket" step (head chunks after it still do)
 DQ_NZ = False  # configure(): k_dqds_c takes the grid's z extent as a last argument nz (-DDQ_YMAJOR)
 W4 = False  # configure(): k_dkdv96ds built with -DHKGEN_W4: 4-wave workgroups (block 128) on pairs of kv blocks
 DQ_PERSIST = 0  # configure(): k_dqds_c built with -DDQ_PERSIST runs this many persistent workgroups (grid x) on
@@ -159,12 +161,15 @@ SPECS = {
 
 
 def configure(delta=None, dkdv_block=64, nd_fold=False, ticket=False, dq_persist=0, w4=False, dq_nz=False,
-              hg_kv=32, hg_q=32):
+              hg_kv=32, hg_q=32, delta_ticket=False):
     """delta: see DELTA; dkdv_block: the k_dkdv96ds workgroup size of the rung (64; 128 for the 4-wave
     wave-specialized kernel, which supports MHA only); nd_fold: see ND_FOLD; ticket / dq_persist: see TICKET,
     DQ_PERSIST."""
-    global DELTA, _KERNELS, ND_FOLD, TICKET, DQ_PERSIST, W4, DQ_NZ, HEAD_GROUP_KV, HEAD_GROUP_Q
+    global DELTA, _KERNELS, ND_FOLD, TICKET, DQ_PERSIST, W4, DQ_NZ, HEAD_GROUP_KV, HEAD_GROUP_Q, DELTA_TICKET
     ND_FOLD = bool(nd_fold)
+    DELTA_TICKET = bool(delta_ticket)
+    dargs = [a for a in SPECS["k_delta"]["args"] if a[0] != "TK"] + ([("TK", "ptr")] if DELTA_TICKET else [])
+    SPECS["k_delta"] = dict(SPECS["k_delta"], args=dargs)
     HEAD_GROUP_KV, HEAD_GROUP_Q = int(hg_kv), int(hg_q)  # launch grids' head-group targets (the proofs' lists)
     W4 = bool(w4)
     DQ_NZ = bool(dq_nz)
@@ -383,6 +388,8 @@ def _plan(
     if hk_delta:
         delta_grid = (sq // DELTA_ROWS, b * hq, 1)
         delta_values = (do, o, delta, lse, nl, nd, nd_fold_offset(scale) if ND_FOLD else scale, sq, hq)
+        if DELTA_TICKET:  # TK: the 64 B in front of the dS layout (k_dkdv96ds's ticket counter), zeroed by k_delta
+            delta_values += (ds_full.view(torch.int32)[(DS_GUARD_B - 64) // 4 :],)
         launches = [("delta", "k_delta", (delta_grid, DELTA_BLOCK, delta_values))]
     else:
         delta_grid = (sq // _k.ROWS_DELTA, b * hq, 1)
@@ -404,7 +411,7 @@ def _plan(
         launches = [("delta", _k.launch_delta, delta_args)]
         if ND_FOLD:
             launches.append(("fold", _fold_nl_nd, (nl, nd, delta, nd_fold_offset(scale))))
-    for (q_, k_, v_, do_, nl_, nd_, dv_, dk_, dq_), b_, gz_kv, gz_q in parts:
+    for ci, ((q_, k_, v_, do_, nl_, nd_, dv_, dk_, dq_), b_, gz_kv, gz_q) in enumerate(parts):
         dkdv_values = (
             q_,
             k_,
@@ -429,7 +436,7 @@ def _plan(
             DS_MODE,
         )
         dq_values = (ds, k_, dq_, sq, skv, hq, hkv, g, skv // 32, skv - sq, c, q_off, ntile, hg_q)
-        if TICKET or DQ_PERSIST:
+        if (TICKET or DQ_PERSIST) and not (ci == 0 and hk_delta and DELTA_TICKET and not DQ_PERSIST):
             launches.append(("ticket", _zero_ticket, (ds_full,)))
         nby = (limits.k3_nblk(skv) + 1) // 2 if W4 else limits.k3_nblk(skv)  # W4: pairs of kv blocks
         launches.append(("dkdv", "k_dkdv96ds", ((hg_kv, nby, gz_kv), SPECS["k_dkdv96ds"]["block"], dkdv_values)))

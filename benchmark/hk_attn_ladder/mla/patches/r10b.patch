@@ -10067,8 +10067,8 @@ diff -ruN a/r8gen/hip/include/q1/prims.h b/r8gen/hip/include/q1/prims.h
 +#endif // Q1_HOST_EMU
 diff -ruN a/r8gen/hip/src/k_delta.hip b/r8gen/hip/src/k_delta.hip
 --- a/r8gen/hip/src/k_delta.hip	1970-01-01 00:00:00.000000000 +0000
-+++ b/r8gen/hip/src/k_delta.hip	2026-10-29 07:59:28.000000000 +0000
-@@ -0,0 +1,89 @@
++++ b/r8gen/hip/src/k_delta.hip	2026-10-29 10:45:24.000000000 +0000
+@@ -0,0 +1,101 @@
 +/***************************************************************************************************
 + * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 + *
@@ -10092,11 +10092,16 @@ diff -ruN a/r8gen/hip/src/k_delta.hip b/r8gen/hip/src/k_delta.hip
 +// contraction is off here. fp32 denormals are preserved, as in FlyDSL (.amdhsa_float_denorm_mode_32 3).
 +// Bounds: impl launches it only with S % 64 == 0 (the grid covers [0, S) exactly), and impl._check keeps the dO / O
 +// byte extent B*S*H*256 below 2^31.
++// -DHK_TICKET=1 (k_dkdv96ds built with HKGEN_TICKET): one more argument TK, the 64 B in front of the dS layout, which
++// workgroup (0, 0) zeroes: the ticket counter k_dkdv96ds then counts from 0 (stream order), without a fill kernel.
 +#include <hip/hip_runtime.h>
 +#include <stdint.h>
 +
 +#ifndef HK_ND_FOLD
 +#define HK_ND_FOLD 0
++#endif
++#ifndef HK_TICKET
++#define HK_TICKET 0
 +#endif
 +
 +namespace {
@@ -10113,10 +10118,17 @@ diff -ruN a/r8gen/hip/src/k_delta.hip b/r8gen/hip/src/k_delta.hip
 +extern "C" __global__ __launch_bounds__(256) void k_delta(const u32x4* __restrict__ DO, const u32x4* __restrict__ O,
 +                                                          float* __restrict__ DEL, const float* __restrict__ LSE,
 +                                                          float* __restrict__ NL, float* __restrict__ ND,
-+                                                          float scale, int S, int H) {
++                                                          float scale, int S, int H
++#if HK_TICKET
++                                                          , unsigned int* __restrict__ TK
++#endif
++                                                          ) {
 +#pragma clang fp contract(off)
 +  __shared__ float sums[kQPW];
 +  const int t = threadIdx.x, lr = t & (kLanes - 1), rg = t / kLanes;
++#if HK_TICKET
++  if (blockIdx.x == 0 && blockIdx.y == 0 && t < 16) TK[t] = 0u;
++#endif
 +  const int s0 = blockIdx.x * kQPW, bh = blockIdx.y, b = bh / H, h = bh - b * H;
 +  u32x4 vd[kPasses], vo[kPasses];
 +#pragma unroll

@@ -144,6 +144,9 @@ the clock drops 12%. Locality of the streamed operands is worth power; the grid'
 the head lanes) stays best. The model's LDS latency 70 also stays: with 110..200 the model step grows 996 -> 1303
 cycles and the kernel does not get faster.
 
+r10xk (k_delta -DHK_TICKET=1 zeroes the ticket counter through one more argument TK; no host fill launch before the
+first dkdv): bitwise == r10x, 1.000x ± 0.002 under hkl.ladder (cold calls; one launch fewer per call).
+
 ## 12. Next
 
 r10t is landed on Primus-Turbo b1 (d10b4db8: bwd 2.361 -> 2.336 ms hot). A persistent dK/dV kernel would also
