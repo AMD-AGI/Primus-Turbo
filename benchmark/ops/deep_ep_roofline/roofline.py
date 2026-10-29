@@ -214,6 +214,9 @@ def rccl_rows(paths):
         tag = f"CTA {env.get('NCCL_CTA_POLICY', '0')}"
         if "RCCL_FORCE_CE" in env:
             tag += f", CE {env['RCCL_FORCE_CE']}"
+        for k, v in sorted(env.items()):
+            if k not in ("NCCL_CTA_POLICY", "RCCL_FORCE_CE") and not k.startswith("NCCL_DEBUG"):
+                tag += f", {k}={v}"
         if d.get("flush_mb") == 0:
             tag += ", no L2 flush"
         for r in d["rows"]:
@@ -294,6 +297,65 @@ def rccl_table(data, rccl, cus):
     print()
 
 
+# µs of an equal-split all-to-all on 4 x MI455X by per-rank buffer (MiB): the MAIDAS busbw roofline
+# (MAIDAS_20260813_MI455X_SPX.csv) and the fastest RCCL variant of minimax-poc-20261006 examples/06-rccl
+# (symm buffers, NCCL_CTA_POLICY=2, RCCL 2.32.3-HEAD:105dd4f, on ctheliosr-rck-g02-e15-01)
+A2A_REFS_EP4 = {
+    "MAIDAS roofline": {128: 72.9, 256: 135.88, 512: 261.77, 1024: 513.48},
+    "06-rccl fastest": {16: 42.5, 32: 50.8, 64: 66.6, 128: 98.1, 256: 161.4, 512: 287.3, 1024: 541.0},
+}
+
+
+def interp(points, x):
+    xs = sorted(points)
+    if not xs[0] <= x <= xs[-1]:
+        return None
+    for a, b in zip(xs, xs[1:]):
+        if a <= x <= b:
+            return points[a] + (points[b] - points[a]) * (x - a) / (b - a)
+    return points[xs[-1]]
+
+
+def size_table(data, rccl, cus):
+    """Communication roofline over the token sweep: time and link GB/s against the volume, flydsl_v2 next to the
+    fastest RCCL measured here and (EP4) the equal-split all-to-all references at the same volume."""
+    world = data["world"]
+    lay, t = layouts(data), times(data)
+    refs = A2A_REFS_EP4 if world == 4 else {}
+    same = [
+        r for r in rccl if r["world"] == world and r["routing"] == data["routing"] and r["E"] == data["E"]
+    ]
+    print(
+        f"### Time against volume: EP{world}, {data['routing']} routing, {cus} CUs (µs, link GB/s in brackets)\n"
+    )
+    if refs:
+        print(
+            "References: equal-split all-to-all of the same link bytes (per-rank buffer = link bytes × n / (n − 1)), "
+            "interpolated between the published sizes.\n"
+        )
+    cols = list(refs) + [
+        "flydsl_v2 dispatch, counts known",
+        "flydsl_v2 combine",
+        "fastest RCCL here (dedup rows)",
+    ]
+    print("| T | link MB | " + " | ".join(cols) + " |")
+    print("|---:|---:|" + "---:|" * len(cols))
+
+    def cell(us, link):
+        return f"{us:.1f} ({link / (us * 1e-6) / 1e9:.0f})" if us else "–"
+
+    for T in sorted({T for (_, T, n) in t if n == cus and (T, n) in lay}):
+        rows_in, rows_out, _ = lay[(T, cus)]
+        link = max(rows_in, rows_out) * 2 * data["H"]
+        buf_mib = link * world / (world - 1) / 2**20
+        cells = [cell(interp(p, buf_mib), link) for p in refs.values()]
+        cells += [cell(t.get((op, T, cus)), link) for op in ("dispatch_cached", "combine")]
+        cand = [r["us"] for r in same if r["op"] == "dedup_dispatch" and r["T"] == T]
+        cells.append(cell(min(cand), link) if cand else "–")
+        print(f"| {T} | {link / 1e6:.0f} | " + " | ".join(cells) + " |")
+    print()
+
+
 def rccl_latency_table(rccl):
     """time = fixed + link bytes / bandwidth per RCCL variant and op, over the files' token counts."""
     series = defaultdict(lambda: defaultdict(list))
@@ -338,6 +400,8 @@ def main():
     if a.rccl:
         rccl = rccl_rows(a.rccl)
         rccl_table(ops, rccl, a.rccl_cus)
+        if a.tsweep:
+            size_table(load(a.tsweep), rccl, a.rccl_cus)
         rccl_latency_table(rccl)
 
 
