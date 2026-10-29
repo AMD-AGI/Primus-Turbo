@@ -28,7 +28,11 @@ from torch.testing._internal.common_utils import (
 import primus_turbo.pytorch as pt
 import primus_turbo.pytorch.deep_ep.flydsl_intranode as flydsl_intranode
 from primus_turbo.flydsl.deep_ep.common import IS_GFX1250
-from primus_turbo.flydsl.deep_ep.intranode_v2_kernel import combine_v2_layout, dispatch_v2_layout
+from primus_turbo.flydsl.deep_ep.intranode_v2_kernel import (
+    combine_v2_layout,
+    dispatch_v2_layout,
+    dispatch_v2_recv_warps,
+)
 from primus_turbo.pytorch.deep_ep._compat import deep_ep_cpp
 from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
     _get_backend_instance,
@@ -256,6 +260,20 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
         torch.manual_seed(42 + self.rank)
         self._check_round_trip(buffer)
         dist.barrier()
+
+    @unittest.skipUnless(IS_GFX1250, "flydsl_v2 runs on gfx1250 only")
+    @skip_if_lt_x_gpu(2)
+    def test_flydsl_v2_receive_overlaps_send(self):
+        """From DISPATCH_RECV_MIN_CHANNELS channels on, receive warps copy rows out of the heap while
+        the block sends: the outputs match the reference on every path of tune_and_verify_intranode."""
+        buffer = self._init_process("flydsl_v2")
+        num_ranks = dist.group.WORLD.size()
+        num_sms = 160
+        assert dispatch_v2_recv_warps(num_ranks, num_sms) == num_ranks - 1
+        torch.manual_seed(42 + self.rank)
+        tune_and_verify_intranode(
+            num_sms, 4096, 4096, 8, 128, self.rank, num_ranks, self.rank, buffer, dist.group.WORLD
+        )
 
     @unittest.skipUnless(IS_GFX1250, "flydsl_v2 runs on gfx1250 only")
     @skip_if_lt_x_gpu(2)

@@ -176,7 +176,7 @@ For callers:
 
 The V2 heap scales with the token count, unlike V1's rings:
 
-- heap ≥ `DATA_OFFSET` (about 4.25 MiB) + 2 × max(dispatch region, combine region), where the
+- heap ≥ `DATA_OFFSET` (about 8.25 MiB) + 2 × max(dispatch region, combine region), where the
   dispatch region is received tokens × (H bytes + 4 + top-k × (index bytes + 4) + scales × 4), and
   the combine region is this rank's tokens × ranks × align128(H bytes + top-k × 4).
 - DeepSeek-V3 at EP4 (T 8192, H 7168 bf16, top-8) needs about 0.95 GB; GPT-OSS at EP4 (T 32768, H

@@ -43,6 +43,7 @@ from primus_turbo.flydsl.deep_ep.intranode_kernel import (
 from primus_turbo.flydsl.deep_ep.intranode_v2_kernel import (
     COMBINE_FLAGS_BYTES,
     DATA_OFFSET,
+    DISPATCH_FLAG_ROWS,
     MAX_EPOCH,
     META_BYTES,
     TAIL_DONE_BIT,
@@ -50,6 +51,7 @@ from primus_turbo.flydsl.deep_ep.intranode_v2_kernel import (
     combine_v2_layout,
     combine_v2_slot_bytes,
     dispatch_v2_layout,
+    dispatch_v2_recv_warps,
     launch_barrier,
     launch_combine_v2,
     launch_dispatch_v2,
@@ -164,11 +166,12 @@ class FlyDSLIntranodeRuntime:
         self.counters_ready = torch.cuda.Event()
         if version == 2:
             _check(num_nvl_bytes > DATA_OFFSET, f"the V2 heap needs more than {DATA_OFFSET} bytes")
-            # the combine's row flags hold epochs, which start at 1
+            # the dispatch's and the combine's row flags hold epochs, which start at 1
             self.symm.get_buffer(
                 self.rank, ((DATA_OFFSET - META_BYTES) // 4,), torch.int32, META_BYTES // 4
             ).zero_()
             self.dispatch_epoch = 0
+            self.dispatch_flag_epoch = 0
             self.combine_epoch = 0
             # the combine's reduce queue; it only ever grows, each combine claims from where the
             # previous one left it
@@ -444,7 +447,12 @@ class FlyDSLIntranodeRuntime:
                 (num_tokens + num_channels - 1) // num_channels < TAIL_DONE_BIT,
                 f"V2 dispatch takes fewer than {TAIL_DONE_BIT} tokens per channel",
             )
+            _check(
+                dispatch_v2_recv_warps(num_ranks, num_channels) == 0 or num_recv_tokens <= DISPATCH_FLAG_ROWS,
+                f"V2 dispatch receives {num_recv_tokens} tokens > its {DISPATCH_FLAG_ROWS} row flags",
+            )
             self.dispatch_epoch = self.dispatch_epoch % MAX_EPOCH + 1
+            self.dispatch_flag_epoch = self.dispatch_flag_epoch % (2**31 - 1) + 1
             self.combine_needs_barrier = False
             dummy_i32 = rank_prefix_matrix
             dummy_f32 = dummy_i32.view(torch.float32)
@@ -471,6 +479,7 @@ class FlyDSLIntranodeRuntime:
                 scale_hidden_stride,
                 rank,
                 self.dispatch_epoch,
+                self.dispatch_flag_epoch,
                 num_ranks,
                 num_channels,
                 hidden_bytes,

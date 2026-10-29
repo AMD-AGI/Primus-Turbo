@@ -25,7 +25,10 @@ indices (also returned as ``send_head``), then each warp loads a token's row onc
 every rank the token goes to -- our own rank's straight into the outputs, the others' into their
 heap. When its rows are visible, the block tells each rank how many rows its channel sent there;
 then it copies, from our heap into the outputs, the rows the same channel of every other rank sent
-us, as soon as that rank's count is in.
+us, as soon as that rank's count is in. With TDM and enough channels (``dispatch_v2_recv_warps``)
+the copy overlaps the send: a sender also raises each row's flag on the peer once the row has
+landed, and one warp per source rank of every block copies that source's rows as their flags come
+up, while the block's other warps send; the block copies whatever is left after its send.
 
 Combine. The rows ``x`` of the dispatch's receive order go back to their source rank, each with
 its top-k weights, into a compact region laid out as [destination rank][index in the source's
@@ -44,9 +47,9 @@ Ordering is the V1 cheap fence: the heap is uncached, payload stores carry SCOPE
 the readers load with ``SYS_LOAD``.
 
 Heap layout (byte offsets, the same on every rank): ``[0, META_BYTES)`` the notify's scratch, then
-the received channel offsets, the dispatch row counts and the combine's row flags, then from
-``DATA_OFFSET`` the dispatch region in the first half of the rest and the combine region in the
-second half.
+the received channel offsets, the dispatch row counts, the combine's and the dispatch's row flags,
+then from ``DATA_OFFSET`` the dispatch region in the first half of the rest and the combine region
+in the second half.
 """
 
 import functools
@@ -114,7 +117,13 @@ TAILS_OFFSET = 128 * 1024
 # int32 per combine slot: the epoch of the combine whose row has landed there
 COMBINE_FLAGS_OFFSET = 256 * 1024
 COMBINE_FLAGS_BYTES = 4 << 20
-DATA_OFFSET = COMBINE_FLAGS_OFFSET + COMBINE_FLAGS_BYTES
+# i64 per dispatch receive row, ``call << 15 | source rank << 10 | channel`` once the row and its
+# metadata have landed; zeroed with the rest of the metadata, so no value of an earlier process or
+# layout matches, and the source and channel keep a stream from taking the next stream's rows
+DISPATCH_FLAGS_OFFSET = COMBINE_FLAGS_OFFSET + COMBINE_FLAGS_BYTES
+DISPATCH_FLAGS_BYTES = 4 << 20
+DISPATCH_FLAG_ROWS = DISPATCH_FLAGS_BYTES // 8
+DATA_OFFSET = DISPATCH_FLAGS_OFFSET + DISPATCH_FLAGS_BYTES
 assert RECV_CHANNEL_OFFSET_OFFSET + 8 * MAX_CHANNELS * 4 <= TAILS_OFFSET
 assert TAILS_OFFSET + 8 * MAX_CHANNELS * 4 <= 192 * 1024
 # PRIMUS_TURBO_DEEPEP_V2_PHASE_TIMING=1: thread 0 of every block stores realtime-counter stamps (100 MHz)
@@ -138,6 +147,20 @@ MAX_LDS_BYTES = 320 * 1024
 # 34 to 12 us at EP2 / 160 CUs (PRIMUS_TURBO_DEEPEP_V2_REDUCE_GRAB_TOKENS for experiments;
 # REDUCE_GRAB_TOKENS x num_ranks lanes must fit a wave)
 REDUCE_GRAB_TOKENS = int(os.environ.get("PRIMUS_TURBO_DEEPEP_V2_REDUCE_GRAB_TOKENS", "1"))
+# dispatch: from this many channels on (PRIMUS_TURBO_DEEPEP_V2_DISPATCH_RECV_MIN_CHANNELS for experiments;
+# 64 is a first guess), num_ranks - 1 warps of each block receive while the others send: the
+# per-CU send rate bounds a narrower grid, so there every warp sends
+DISPATCH_RECV_MIN_CHANNELS = int(os.environ.get("PRIMUS_TURBO_DEEPEP_V2_DISPATCH_RECV_MIN_CHANNELS", "64"))
+
+
+def dispatch_v2_recv_warps(num_ranks, num_channels):
+    """Warps of each dispatch block that copy the channel's received rows out of the heap while the
+    rest of the block sends, one per source rank; 0: the block copies them after its send. With TDM
+    only: the VGPR copy overlaps a row's stores with the next row's loads, which the per-row flag
+    would serialize."""
+    if not USE_TDM or num_ranks < 2 or num_channels < DISPATCH_RECV_MIN_CHANNELS:
+        return 0
+    return num_ranks - 1
 
 
 def _tdm_row(lds_addr, global_addr, num_bytes):
@@ -333,12 +356,73 @@ def _poll_tails(
                 prev = arith.select(thread_id > fx.Int32(0), prev, fx.Int32(0))
                 st_lds(lds, fx.Int32(lds_recv + 3 * num_ranks) + thread_id, prev + offset)
                 buffer_store(offset, recv_channel_offset_res, idx)
-            st_lds(lds, fx.Int32(lds_recv + num_ranks) + thread_id, value & fx.Int32(TAIL_ROWS_MASK))
+            # the receive warps may have copied rows of the stream before its count came in
+            rows = value & fx.Int32(TAIL_ROWS_MASK)
+            copied = ld_lds(lds, fx.Int32(lds_recv) + thread_id)
+            st_lds(lds, fx.Int32(lds_recv + num_ranks) + thread_id, arith.select(rows > copied, rows, copied))
             st_lds(
                 lds,
                 fx.Int32(lds_recv + 2 * num_ranks) + thread_id,
                 arith.select((value & fx.Int32(TAIL_DONE_BIT)) != fx.Int32(0), fx.Int32(1), fx.Int32(0)),
             )
+
+
+@ASTRewriter.transform
+def _copy_received_row(
+    local,
+    layout,
+    outputs,
+    row,
+    hidden_bytes: int,
+    num_topk: int,
+    num_scales: int,
+    idx_dtype,
+    row_lds,
+    row_buffer_bytes: int,
+):
+    """The warp copies received row ``row``, with its metadata, from the heap into the outputs."""
+    lane_id = fx.thread_idx.x % fx.Int32(WARP_SIZE)
+    if fx.const_expr(row_lds is not None):
+        for p in range_constexpr(0, hidden_bytes, row_buffer_bytes):
+            piece = min(row_buffer_bytes, hidden_bytes - p)
+            tdm_ops.tensor_wait(0)
+            tdm_ops.tensor_load_2d(
+                _tdm_row(row_lds, _uniform_i64(_addr(local, layout["x"] + p, row, hidden_bytes)), piece),
+                cache_policy=SYS_LOAD,
+            )
+            tdm_ops.tensor_wait(0)
+            tdm_ops.tensor_store_2d(
+                _tdm_row(row_lds, _uniform_i64(_addr(outputs["x"], p, row, hidden_bytes)), piece)
+            )
+    else:
+        _copy_row(
+            _addr(outputs["x"], 0, row, hidden_bytes),
+            _addr(local, layout["x"], row, hidden_bytes),
+            hidden_bytes,
+            FANOUT_PIECE_BYTES,
+            load_cache_modifier=SYS_LOAD,
+        )
+    if lane_id == fx.Int32(0):
+        _st_sys(outputs["src_idx"], row, _ld_sys(local + fx.Int64(layout["src_idx"]), row))
+    if fx.const_expr(num_topk > 0):
+        if lane_id < fx.Int32(num_topk):
+            elem = row * fx.Int32(num_topk) + lane_id
+            _st_sys(
+                outputs["topk_idx"],
+                elem,
+                _ld_sys(local + fx.Int64(layout["topk_idx"]), elem, dtype=idx_dtype),
+            )
+            _st_sys(
+                outputs["topk_weights"],
+                elem,
+                _ld_sys(local + fx.Int64(layout["topk_weights"]), elem, dtype=fx.T.f32),
+            )
+    if fx.const_expr(num_scales > 0):
+        for u in range_constexpr((num_scales + WARP_SIZE - 1) // WARP_SIZE):
+            scale_idx = lane_id + fx.Int32(u * WARP_SIZE)
+            if scale_idx < fx.Int32(num_scales):
+                elem = row * fx.Int32(num_scales) + scale_idx
+                _st_sys(outputs["x_scales"], elem, _ld_sys(local + fx.Int64(layout["x_scales"]), elem))
 
 
 @ASTRewriter.transform
@@ -359,7 +443,6 @@ def _copy_received(
     """The block copies the rows that have arrived and it has not copied yet, with their metadata,
     from the heap into the outputs."""
     thread_id = fx.thread_idx.x
-    lane_id = thread_id % fx.Int32(WARP_SIZE)
     warp_id = thread_id // fx.Int32(WARP_SIZE)
     cums = []
     pendings = []
@@ -379,47 +462,18 @@ def _copy_received(
         row = starts[0] + j
         for s in range_constexpr(1, num_ranks):
             row = arith.select(j >= cums[s], starts[s] + j - cums[s], row)
-        if fx.const_expr(row_lds is not None):
-            for p in range_constexpr(0, hidden_bytes, row_buffer_bytes):
-                piece = min(row_buffer_bytes, hidden_bytes - p)
-                tdm_ops.tensor_wait(0)
-                tdm_ops.tensor_load_2d(
-                    _tdm_row(row_lds, _uniform_i64(_addr(local, layout["x"] + p, row, hidden_bytes)), piece),
-                    cache_policy=SYS_LOAD,
-                )
-                tdm_ops.tensor_wait(0)
-                tdm_ops.tensor_store_2d(
-                    _tdm_row(row_lds, _uniform_i64(_addr(outputs["x"], p, row, hidden_bytes)), piece)
-                )
-        else:
-            _copy_row(
-                _addr(outputs["x"], 0, row, hidden_bytes),
-                _addr(local, layout["x"], row, hidden_bytes),
-                hidden_bytes,
-                FANOUT_PIECE_BYTES,
-                load_cache_modifier=SYS_LOAD,
-            )
-        if lane_id == fx.Int32(0):
-            _st_sys(outputs["src_idx"], row, _ld_sys(local + fx.Int64(layout["src_idx"]), row))
-        if fx.const_expr(num_topk > 0):
-            if lane_id < fx.Int32(num_topk):
-                elem = row * fx.Int32(num_topk) + lane_id
-                _st_sys(
-                    outputs["topk_idx"],
-                    elem,
-                    _ld_sys(local + fx.Int64(layout["topk_idx"]), elem, dtype=idx_dtype),
-                )
-                _st_sys(
-                    outputs["topk_weights"],
-                    elem,
-                    _ld_sys(local + fx.Int64(layout["topk_weights"]), elem, dtype=fx.T.f32),
-                )
-        if fx.const_expr(num_scales > 0):
-            for u in range_constexpr((num_scales + WARP_SIZE - 1) // WARP_SIZE):
-                scale_idx = lane_id + fx.Int32(u * WARP_SIZE)
-                if scale_idx < fx.Int32(num_scales):
-                    elem = row * fx.Int32(num_scales) + scale_idx
-                    _st_sys(outputs["x_scales"], elem, _ld_sys(local + fx.Int64(layout["x_scales"]), elem))
+        _copy_received_row(
+            local,
+            layout,
+            outputs,
+            row,
+            hidden_bytes,
+            num_topk,
+            num_scales,
+            idx_dtype,
+            row_lds,
+            row_buffer_bytes,
+        )
         j = j + fx.Int32(NUM_WARPS)
     fx.gpu.barrier()
     if thread_id < fx.Int32(num_ranks):
@@ -428,6 +482,92 @@ def _copy_received(
             arrived = arith.select(thread_id == fx.Int32(s), pendings[s] + copieds[s], arrived)
         st_lds(lds, fx.Int32(lds_recv) + thread_id, arrived)
     fx.gpu.barrier()
+
+
+@ASTRewriter.transform
+def _receive_while_sending(
+    lds,
+    lds_recv: int,
+    lds_send_done: int,
+    num_ranks: int,
+    num_channels: int,
+    send_warps: int,
+    is_receiver,
+    source,
+    tile_no,
+    channel,
+    local,
+    rank,
+    epoch,
+    flag,
+    rank_prefix_res,
+    recv_channel_offset_res,
+    layout,
+    outputs,
+    hidden_bytes: int,
+    num_topk: int,
+    num_scales: int,
+    idx_dtype,
+    row_lds,
+    row_buffer_bytes: int,
+):
+    """A receive warp copies, in order, the rows of ``source``'s stream of this channel whose flags
+    read ``flag``, until every send warp of the block is done with tile ``tile_no``; the block's
+    receive loop takes the rest from the count it leaves in LDS."""
+    lane_id = fx.thread_idx.x % fx.Int32(WARP_SIZE)
+    idx = source * fx.Int32(num_channels) + channel
+    lds_copied = fx.Int32(lds_recv) + source
+    lds_first = fx.Int32(lds_recv + 3 * num_ranks) + source
+    flags = local + fx.Int64(DISPATCH_FLAGS_OFFSET)
+    prev = _uniform_load_i32(
+        rank_prefix_res,
+        arith.select(source > fx.Int32(0), (source - fx.Int32(1)) * fx.Int32(num_ranks), fx.Int32(0)) + rank,
+    )
+    prev = arith.select(source > fx.Int32(0), prev, fx.Int32(0))
+    copied = _readfirstlane_i32(ld_lds(lds, lds_copied))
+    running = arith.select(is_receiver, fx.Int32(1), fx.Int32(0))
+    while running > fx.Int32(0):
+        done = ld_lds(
+            lds, fx.Int32(lds_send_done) + arith.select(lane_id < fx.Int32(send_warps), lane_id, fx.Int32(0))
+        )
+        senders_busy = _popc(_ballot((lane_id < fx.Int32(send_warps)) & (done != tile_no)))
+        # where the stream starts, from the count its sender publishes before its first row
+        if (lane_id == fx.Int32(0)) & (ld_lds(lds, lds_first) < fx.Int32(0)):
+            value = _ld_sys(local + fx.Int64(TAILS_OFFSET), idx)
+            if (value >> fx.Int32(TAIL_EPOCH_SHIFT)) == epoch:
+                offset = _ld_sys(local + fx.Int64(RECV_CHANNEL_OFFSET_OFFSET), idx)
+                st_lds(lds, lds_first, prev + offset)
+                buffer_store(offset, recv_channel_offset_res, idx)
+        first = _readfirstlane_i32(ld_lds(lds, lds_first))
+        landed = _ld_sys(
+            flags, arith.select(first >= fx.Int32(0), first + copied, fx.Int32(0)), dtype=fx.T.i64
+        )
+        ready = _readfirstlane_i32(
+            arith.select(
+                (senders_busy > fx.Int32(0)) & (first >= fx.Int32(0)) & (landed == flag),
+                fx.Int32(1),
+                fx.Int32(0),
+            )
+        )
+        if ready > fx.Int32(0):
+            _copy_received_row(
+                local,
+                layout,
+                outputs,
+                first + copied,
+                hidden_bytes,
+                num_topk,
+                num_scales,
+                idx_dtype,
+                row_lds,
+                row_buffer_bytes,
+            )
+        copied = copied + ready
+        if (ready == fx.Int32(0)) & (senders_busy > fx.Int32(0)):
+            fx.rocdl.s_sleep(fx.Int32(1))
+        running = arith.select(senders_busy > fx.Int32(0), fx.Int32(1), fx.Int32(0))
+    if is_receiver & (lane_id == fx.Int32(0)):
+        st_lds(lds, lds_copied, copied)
 
 
 def _make_dispatch_v2(
@@ -453,7 +593,11 @@ def _make_dispatch_v2(
     lds_warp = 2 * num_ranks
     lds_slot = lds_warp + NUM_WARPS * num_ranks
     lds_recv = lds_slot + tile * num_ranks
-    lds_words = lds_recv + 4 * num_ranks
+    # [NUM_WARPS] the last tile each send warp is done with, for the receive warps
+    lds_send_done = lds_recv + 4 * num_ranks
+    lds_words = lds_send_done + NUM_WARPS
+    recv_warps = dispatch_v2_recv_warps(num_ranks, num_channels)
+    send_warps = NUM_WARPS - recv_warps
     # with TDM, a row buffer per warp; a row that does not fit moves through it in pieces
     lds_rows = _align(lds_words * 4, 128)
     row_buffer_bytes = min(_align(hidden_bytes, 128), (MAX_LDS_BYTES - lds_rows) // NUM_WARPS // 128 * 128)
@@ -485,6 +629,7 @@ def _make_dispatch_v2(
         scale_hidden_stride: fx.Int32,
         rank: fx.Int32,
         epoch: fx.Int32,
+        flag_epoch: fx.Int32,
     ):
         thread_id = fx.thread_idx.x
         channel = fx.block_idx.x
@@ -493,6 +638,8 @@ def _make_dispatch_v2(
         lds = lds_base()
         buffer_ptrs_res = create_buffer_resource(BUFFER_PTRS, max_size=True)
         local = _load_ptr(buffer_ptrs_res, rank)
+        # the flag of a row of this call's stream from ``source`` in this channel
+        flag_call = _i64(flag_epoch) << fx.Int64(15)
         in_rank_res = create_buffer_resource(IS_TOKEN_IN_RANK, max_size=True)
         send_head_res = create_buffer_resource(SEND_HEAD, max_size=True)
         rank_prefix_res = create_buffer_resource(RANK_PREFIX_MATRIX, max_size=True)
@@ -516,11 +663,12 @@ def _make_dispatch_v2(
             if thread_id == rank:
                 buffer_store(start, recv_channel_offset_res, idx)
             else:
-                _st_sys(
-                    _load_lane_ptr(buffer_ptrs_res, thread_id) + fx.Int64(RECV_CHANNEL_OFFSET_OFFSET),
-                    idx,
-                    start,
-                )
+                peer_heap = _load_lane_ptr(buffer_ptrs_res, thread_id)
+                _st_sys(peer_heap + fx.Int64(RECV_CHANNEL_OFFSET_OFFSET), idx, start)
+                if fx.const_expr(recv_warps > 0):
+                    # no rows yet: the receive warps learn where the stream starts before its first row
+                    wait_mem_all()
+                    _st_sys(peer_heap + fx.Int64(TAILS_OFFSET), idx, epoch << fx.Int32(TAIL_EPOCH_SHIFT))
             st_lds(lds, fx.Int32(lds_recv) + thread_id, fx.Int32(0))
             st_lds(lds, fx.Int32(lds_recv + num_ranks) + thread_id, fx.Int32(0))
             st_lds(
@@ -529,11 +677,18 @@ def _make_dispatch_v2(
                 arith.select(thread_id == rank, fx.Int32(1), fx.Int32(0)),
             )
             st_lds(lds, fx.Int32(lds_recv + 3 * num_ranks) + thread_id, fx.Int32(-1))
+        if fx.const_expr(recv_warps > 0):
+            if thread_id < fx.Int32(NUM_WARPS):
+                st_lds(lds, fx.Int32(lds_send_done) + thread_id, fx.Int32(0))
         fx.gpu.barrier()
 
         # per destination: where our rank's tokens start in its receive order, and where each
         # output goes -- its heap, or for our own rank the output tensors themselves
         rank_offsets = []
+        dst_flags = [
+            _load_ptr(buffer_ptrs_res, fx.Int32(d)) + fx.Int64(DISPATCH_FLAGS_OFFSET)
+            for d in range(num_ranks if recv_warps > 0 else 0)
+        ]
         dst_bases = {name: [] for name in ("x", "src_idx", "topk_idx", "topk_weights", "x_scales")}
         outputs = {
             "x": tensor_addr(RECV_X),
@@ -562,8 +717,18 @@ def _make_dispatch_v2(
             )
         tail_base = (epoch << fx.Int32(TAIL_EPOCH_SHIFT)) - ld_lds(lds, fx.Int32(lds_chan_start) + thread_id)
 
+        # receive warp r copies the stream of the r-th other rank
+        is_receiver = warp_id >= fx.Int32(send_warps)
+        recv_source = warp_id - fx.Int32(send_warps)
+        recv_source = arith.select(
+            is_receiver,
+            recv_source + arith.select(recv_source >= rank, fx.Int32(1), fx.Int32(0)),
+            fx.Int32(0),
+        )
+        tile_no = fx.Int32(0)
         tile_start = token_start
         while tile_start < token_end:
+            tile_no = tile_no + fx.Int32(1)
             # ---- the stream index of each token of the tile, per destination ----
             token = tile_start + thread_id
             is_valid = token < token_end
@@ -600,7 +765,7 @@ def _make_dispatch_v2(
             num_tile_tokens = arith.select(
                 token_end - tile_start < fx.Int32(tile), token_end - tile_start, fx.Int32(tile)
             )
-            i = warp_id
+            i = arith.select(is_receiver, num_tile_tokens, warp_id)
             while i < num_tile_tokens:
                 t = tile_start + i
                 rows = []
@@ -682,7 +847,50 @@ def _make_dispatch_v2(
                                         rows[d] * fx.Int32(num_scales) + scale_idx,
                                         value,
                                     )
-                i = i + fx.Int32(NUM_WARPS)
+                if fx.const_expr(recv_warps > 0):
+                    # the row and its metadata have landed on every peer: raise its flags there. The
+                    # next row's load waits for these stores anyway (one row buffer per warp)
+                    if fx.const_expr(USE_TDM):
+                        tdm_ops.tensor_wait(0)
+                    wait_mem_all()
+                    if lane_id == fx.Int32(0):
+                        for d in range_constexpr(num_ranks):
+                            if routed[d] & (rank != fx.Int32(d)):
+                                _st_sys(
+                                    dst_flags[d],
+                                    rows[d],
+                                    flag_call | _i64(rank * fx.Int32(1 << 10) + channel),
+                                )
+                i = i + fx.Int32(send_warps)
+            if fx.const_expr(recv_warps > 0):
+                if (lane_id == fx.Int32(0)) & (warp_id < fx.Int32(send_warps)):
+                    st_lds(lds, fx.Int32(lds_send_done) + warp_id, tile_no)
+                _receive_while_sending(
+                    lds,
+                    lds_recv,
+                    lds_send_done,
+                    num_ranks,
+                    num_channels,
+                    send_warps,
+                    is_receiver,
+                    recv_source,
+                    tile_no,
+                    channel,
+                    local,
+                    rank,
+                    epoch,
+                    flag_call | _i64(recv_source * fx.Int32(1 << 10) + channel),
+                    rank_prefix_res,
+                    recv_channel_offset_res,
+                    layout,
+                    outputs,
+                    hidden_bytes,
+                    num_topk,
+                    num_scales,
+                    idx_dtype,
+                    row_lds,
+                    row_buffer_bytes,
+                )
             tile_start = tile_start + fx.Int32(tile)
 
         # every warp's rows are visible: our streams are done
@@ -798,6 +1006,7 @@ def launch_dispatch_v2(
     scale_hidden_stride: fx.Int32,
     rank: fx.Int32,
     epoch: fx.Int32,
+    flag_epoch: fx.Int32,
     num_ranks: fx.Constexpr[int],
     num_channels: fx.Constexpr[int],
     hidden_bytes: fx.Constexpr[int],
@@ -840,6 +1049,7 @@ def launch_dispatch_v2(
         scale_hidden_stride,
         rank,
         epoch,
+        flag_epoch,
     ).launch(grid=(num_channels, 1, 1), block=(NUM_THREADS, 1, 1), stream=stream, smem=lds_words * 4)
 
 
