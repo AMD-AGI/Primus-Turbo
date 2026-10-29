@@ -1,0 +1,15 @@
+r10w_pr: 1420 cycles per step; phases [682.4, 272.8, 135.3, 171.1]
+W  0..W  9:   114.6 cycles   11.5 per WMMA  (floor   80, excess   34.6)
+W 10..W 19:    89.2 cycles    8.9 per WMMA  (floor   80, excess    9.2)
+W 20..W 29:    92.3 cycles    9.2 per WMMA  (floor   80, excess   12.3)
+W 30..W 39:   152.3 cycles   15.2 per WMMA  (floor   80, excess   72.3)
+W 40..W 49:   127.7 cycles   12.8 per WMMA  (floor   80, excess   47.7)
+W 50..W 59:   167.6 cycles   16.8 per WMMA  (floor   80, excess   87.6)
+W 60..W 69:   103.9 cycles   10.4 per WMMA  (floor   80, excess   23.9)
+W 70..W 79:   132.9 cycles   13.3 per WMMA  (floor   80, excess   52.9)
+W 80..W 89:    76.4 cycles    7.6 per WMMA  (floor   80, excess   -3.6)
+W 90..W 99:    29.2 cycles    2.9 per WMMA  (floor   80, excess  -50.8)
+W100..W109:    81.3 cycles    8.1 per WMMA  (floor   80, excess    1.3)
+W110..W118:    75.2 cycles    8.4 per WMMA  (floor   72, excess    3.2)
+W119..W119:    53.1 cycles   53.1 per WMMA  (floor    8, excess   45.1)
+per-rung step totals: {'r10w_pr': 1420, 'r10w_t1': 1496, 'r10w_t2': 1534, 'r10w_t3': 1520, 'r10w_t4': 1496}

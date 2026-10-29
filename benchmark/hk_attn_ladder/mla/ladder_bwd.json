@@ -3584,6 +3584,198 @@
    "side": true
   },
   {
+   "id": "r10w_t1",
+   "parent": "r10w",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--probe-pts",
+      "10,20,30"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10w_pr with probe points after WMMAs 10,20,30 of the step (micro.k3_probe --abc: cumulative cycles)",
+   "side": true
+  },
+  {
+   "id": "r10w_t2",
+   "parent": "r10w",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--probe-pts",
+      "40,50,60"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10w_pr with probe points after WMMAs 40,50,60 of the step (micro.k3_probe --abc: cumulative cycles)",
+   "side": true
+  },
+  {
+   "id": "r10w_t3",
+   "parent": "r10w",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--probe-pts",
+      "70,80,90"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10w_pr with probe points after WMMAs 70,80,90 of the step (micro.k3_probe --abc: cumulative cycles)",
+   "side": true
+  },
+  {
+   "id": "r10w_t4",
+   "parent": "r10w",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--probe-pts",
+      "100,110,119"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10w_pr with probe points after WMMAs 100,110,119 of the step (micro.k3_probe --abc: cumulative cycles)",
+   "side": true
+  },
+  {
    "id": "r10x_ps2",
    "parent": "r10x",
    "kernels": {

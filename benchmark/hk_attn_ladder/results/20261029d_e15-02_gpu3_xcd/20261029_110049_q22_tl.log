@@ -1,0 +1,42 @@
+[2026-10-29T11:00:49 UTC] gpu 3 (0004:01:00.0) lhz-hkl-g3: sh -c for r in r10w_pr r10w_t1 r10w_t2 r10w_t3 r10w_t4; do echo == $r; python3 -m micro.k3_probe mla/ladder_bwd.json $r --abc --calls 20 --shape b=2 sq=4224 skv=4224 | sed -n 1,7p; done
+== r10w_pr
+wave 0: 132 steps, 1420 cycles per iteration
+   start -> signal (B + C)      682.4
+   signal -> wait (barrier)     272.8
+   wait -> C end                135.3
+   C end -> end (A)             171.1
+   prologue 8213 cycles, epilogue 4222 cycles, loop 175009 cycles (1326 per step incl. headers)
+wave 1: 132 steps, 1420 cycles per iteration
+== r10w_t1
+wave 0: 132 steps, 1496 cycles per iteration
+   start -> signal (B + C)      114.6
+   signal -> wait (barrier)      89.2
+   wait -> C end                 92.3
+   C end -> end (A)            1030.9
+   prologue 7604 cycles, epilogue 7177 cycles, loop 182757 cycles (1385 per step incl. headers)
+wave 1: 132 steps, 1497 cycles per iteration
+== r10w_t2
+wave 0: 132 steps, 1534 cycles per iteration
+   start -> signal (B + C)      448.4
+   signal -> wait (barrier)     127.7
+   wait -> C end                167.6
+   C end -> end (A)             620.7
+   prologue 9362 cycles, epilogue 5800 cycles, loop 187308 cycles (1419 per step incl. headers)
+wave 1: 132 steps, 1534 cycles per iteration
+== r10w_t3
+wave 0: 132 steps, 1520 cycles per iteration
+   start -> signal (B + C)      847.6
+   signal -> wait (barrier)     132.9
+   wait -> C end                 76.4
+   C end -> end (A)             292.4
+   prologue 8653 cycles, epilogue 6838 cycles, loop 185088 cycles (1402 per step incl. headers)
+wave 1: 132 steps, 1520 cycles per iteration
+== r10w_t4
+wave 0: 132 steps, 1496 cycles per iteration
+   start -> signal (B + C)     1086.1
+   signal -> wait (barrier)      81.3
+   wait -> C end                 75.2
+   C end -> end (A)              53.1
+   prologue 9916 cycles, epilogue 8028 cycles, loop 179552 cycles (1360 per step incl. headers)
+wave 1: 132 steps, 1496 cycles per iteration
+[11:01:01 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261029_110049_q22_tl.log

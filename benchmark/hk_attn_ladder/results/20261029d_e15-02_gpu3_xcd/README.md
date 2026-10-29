@@ -155,7 +155,16 @@ in a median 1186-1203 cycles against the 1152-cycle WMMA floor (97%), the same o
 stores per wave). Prologue + epilogue are ~14% of a dQ workgroup; dK/dV's FINAL showed that a shorter epilogue does
 not free the slot earlier (r10w), so it is not pursued.
 
-## 12. Next
+## 12. Where r10w / r10x's step still loses cycles (r10w_t1..t4: probe points every 10 WMMAs, b2 s4224)
+
+`micro/timeline.py` (r10w_timeline.txt; probe overhead ~80-110 cycles per step, derived segments +-50): W0-29 (hh0's
+S / dP) and W80-118 (the end of dV, dK) run at ~8 cycles per WMMA; the excess sits in W30-79 -- hh1's S / dP with
+hh0's softmax in its windows (~200 cycles), the start of dV waiting for P / dO^T (~75) -- plus ~35 at the step's start
+and ~45 at its end. The ablations put ~105 cycles per step on the softmax VALU (144 instructions, already the
+minimum) and ~60 on the LDS operand loads: what is left is their placement around hh1, i.e. fine-grained schedule
+work worth a few % of loop cycles (~1% of time at the cap).
+
+## 13. Next
 
 r10t is landed on Primus-Turbo b1 (d10b4db8: bwd 2.361 -> 2.336 ms hot). A persistent dK/dV kernel would also
 hide the ticket latency (~1.9% of a workgroup),
