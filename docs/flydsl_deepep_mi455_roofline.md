@@ -278,8 +278,8 @@ DeepSeek-V3 routing (top-8 of 128 experts in the top 4 of 8 groups), T = 8192; l
 | 256 | combine | 285.4 | 972 | 54% | 60% | 64% |
 
 Kernel time alone (rocprofv3), 160 / 256 CUs: dispatch kernel 242.4 / 239.1 µs (71% / 72% of 1.62 TB/s),
-combine kernel 284.3 / 274.8 µs (60% / 62%); notify kernels 12.5 µs (cached path) and 29.4 µs (with the
-count exchange). RCCL's alltoall of the same rows: 413 µs (dispatch), 413 µs (combine); 339 / 337 µs
+combine kernel 284.3 / 274.8 µs (60% / 62%), 251.6 / 239.8 µs with one-token claims (68% / 71%); notify
+kernels 12.5 µs (cached path) and 29.4 µs (with the count exchange). RCCL's alltoall of the same rows: 413 µs (dispatch), 413 µs (combine); 339 / 337 µs
 after tuning ([Tuned RCCL](#tuned-rccl-all-to-all-against-flydsl_v2)).
 
 Uniform routing (top-8 of 256 experts, PR #583's EP4 case), T = 8192; link bytes 320.0 MB:
@@ -471,6 +471,53 @@ the last push from 34 to 12 µs at 160 CUs. At EP4 (DeepSeek-V3 routing) the com
 260.6 µs at 160 CUs and from 285.4 to 248.1 µs at 256 (`ut_logs/grab1_validate_20261029_105409/`);
 `test_intranode.py` passes on 2 and 4 GPUs (21 tests, 2 skipped: C++ only).
 
+### EP4
+
+The same stamps at EP4 (DeepSeek-V3 routing, T = 8192, one-token claims; 2026-10-29,
+`ut_logs/ep4_open_20261029_141533/`, a complete run after a warm-up; a second run of 160 / 256 CUs agrees
+within 6 µs):
+
+| CUs | dispatch: every block has sent | receive copy done | after the last send | combine: warp 0 of every block has pushed | median block | every block done | after the last push |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 327.9 | 408.5 | 80.6 | 542.3 | 514.6 | 654.1 | 111.8 |
+| 80 | 211.5 | 255.3 | 43.8 | 238.1 | 223.4 | 299.6 | 61.5 |
+| 160 | 215.1 | 244.9 | 29.8 | 213.0 | 185.8 | 249.8 | 36.8 |
+| 256 | 216.8 | 241.1 | 24.3 | 220.3 | 166.8 | 237.5 | 17.2 |
+
+The copy kernel moves the EP4 link bytes (277.5 MB) in about 197–200 µs at 160 blocks (size fit
+17.6–19.8 µs + 1544–1550 GB/s), so at 160 CUs:
+
+- **Dispatch**: the send ends at 211–215 µs, 11–18 µs over the copy kernel, then the receive copy runs
+  30–34 µs past the last send (14 µs at EP2): the largest single item at EP4.
+- **Combine** (kernel 252 µs alone): the push ends at 213–215 µs, 92–93% of the copy kernel's rate for the
+  same bytes, with 26–27 µs between the median and the slowest block; the reduce then runs 36–37 µs past the
+  last push.
+- **The combine's 22 push warps are not the limit**: the copy kernel with 22 warps per block (a whole row
+  of LDS each, as the combine; `COPY_WARPS=22`) moves 1453 GB/s at 160 blocks and 8192 rows per peer
+  against 1455 with 32 warps, and more at 80 blocks (EP4 1449 against 1320, EP2 1278 against 1088).
+
+The two knobs at EP4 (combine µs; the default without stamps, the knobs with stamps on, which move the
+times by under 1%):
+
+| | 80 CUs | 160 CUs | 256 CUs |
+|---|---:|---:|---:|
+| default (22 push warps, claims of 1) | 310.9 | 262.3 | 248.0 |
+| claims of 2 | 317.9 | 269.6 | 266.8 |
+| 16 push warps (claims of 1) | 326.3 | 254.2 | 249.1 |
+
+One-token claims stay the best claim size at EP4. With one-token claims, 16 push warps take 8 µs off the
+combine at 160 CUs (the reduce tail after the last push 37 → 21 µs), cost 15 µs at 80 CUs and change
+nothing at 256; at EP2, 16 push warps were measured only with claims of four.
+
+Kernel time alone at EP4 with one-token claims (rocprofv3, slowest rank): combine kernel 300.9 / 251.6 /
+239.8 µs at 80 / 160 / 256 CUs (before: 284.3 µs at 160, 274.8 at 256).
+
+**One unexplained fault**: the first EP4 run with stamps on hit an illegal memory access at the first
+160-CU call, after the 32- and 80-CU runs had passed; it compiled its kernels from an empty cache. Ten
+further stamps-on runs (three from an empty cache) and ten stamps-off runs (three from an empty cache),
+every CU count with the outputs checked, passed. The stamps are experiment-only code, but a race in the kernels cannot be ruled
+out from this (see [Next measurements](#next-measurements)).
+
 ## What could still be gained
 
 EP2, 160 CUs; modelled from the terms above, not yet measured:
@@ -501,14 +548,17 @@ same case as the cached dispatch here (58%).
 
 1. ~~EP2 on this branch's head, kernel times and counters~~: done 2026-10-29 (above).
 2. ~~EP4~~: measured 2026-10-29 (above), with the ceilings, the phase model and the write counters.
-3. **Per-phase timing** inside the kernels (`s_memrealtime` per block: send start and end, counts
-   published, receive copy start and end; combine push end and reduce end) to split the local writes
-   between the send and the receive copy, and the combine's 40–60 µs.
-4. The copy kernel with 22 warps per block (the combine's pushers), to see whether the push alone reaches
-   the harness ceiling.
+3. ~~Per-phase timing inside the kernels~~: EP2 and EP4 measured 2026-10-29
+   ([Inside the kernels](#inside-the-kernels-phase-stamps)).
+4. ~~The copy kernel with 22 warps per block~~: as fast as with 32 from 160 blocks, faster below
+   ([EP4](#ep4)).
 5. ~~Tuned RCCL at EP4~~: measured 2026-10-29 ([Tuned RCCL](#tuned-rccl-all-to-all-against-flydsl_v2)).
 6. ~~`06-rccl`'s RCCL build (`105dd4f`) here~~: not done; the baseline stays the container's RCCL
    (user, 2026-10-29).
+7. The EP4 illegal memory access ([EP4](#ep4)): many back-to-back `test_intranode.py` and `bench_ops.py`
+   runs at EP4 with stamps off, from empty caches, to tell a kernel race from the stamp code.
+8. 16 push warps with one-token claims at EP2 (2 GPUs), to decide whether the combine should use fewer
+   pushers from 160 CUs up.
 
 ## References
 
