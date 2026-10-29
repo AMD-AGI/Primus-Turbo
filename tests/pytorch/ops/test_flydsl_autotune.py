@@ -39,6 +39,7 @@ from primus_turbo.flydsl.autotune.policies import (
     Stage,
 )
 from primus_turbo.pytorch.core.backend import GlobalBackendManager
+from primus_turbo.pytorch.core.utils import is_gfx950
 
 
 @pytest.fixture(autouse=True)
@@ -707,7 +708,9 @@ def test_op_entry_races_on_a_miss_only(enabled):
 # ── op level ────────────────────────────────────────────────────────────────
 
 
-requires_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+requires_gfx950 = pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_gfx950(), reason="FlyDSL fp8 GEMM is gfx950-only"
+)
 
 
 def _fp8_gemm(M, N, K, layout="NT", out=None):
@@ -834,7 +837,7 @@ OP_CASES = [
 ]
 
 
-@requires_gpu
+@requires_gfx950
 @pytest.mark.parametrize("shape, layout, op", OP_CASES)
 def test_op_untuned_entry_is_tuned_once_enabled(shape, layout, op):
     run, ref = _fp8_gemm(*shape, layout)
@@ -847,7 +850,7 @@ def test_op_untuned_entry_is_tuned_once_enabled(shape, layout, op):
     assert [r["op"] for r in rt.report()] == [op]
 
 
-@requires_gpu
+@requires_gfx950
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("shape, layout, op", OP_CASES)
 def test_op_capture_takes_base(shape, layout, op, enabled):
@@ -861,7 +864,7 @@ def test_op_capture_takes_base(shape, layout, op, enabled):
 
 # A launch is called raw by its compile only: every later run, eager or captured, takes the
 # compiled object.
-@requires_gpu
+@requires_gfx950
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("shape, layout, op", OP_CASES)
 def test_op_launch_is_called_raw_once(shape, layout, op, enabled, raw_calls):
@@ -873,7 +876,7 @@ def test_op_launch_is_called_raw_once(shape, layout, op, enabled, raw_calls):
 
 
 # Once an op has run a shape, no later call -- eager or captured -- calls a launch raw.
-@requires_gpu
+@requires_gfx950
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize(
     "make", [_grouped_fp8, lambda: _fp8_wgrad()[0], _mxfp8_gemm], ids=["np", "wgrad", "mxfp8"]
@@ -890,7 +893,7 @@ def test_op_steady_state_never_calls_raw(make, enabled, raw_calls):
     assert raw_calls == {}
 
 
-@requires_gpu
+@requires_gfx950
 @pytest.mark.parametrize("enabled", [False, True])
 def test_op_accumulate_folds_in_once(enabled):
     rt.force(enabled)
@@ -904,7 +907,7 @@ def test_op_accumulate_folds_in_once(enabled):
 
 # A clear() drops the compiles with the picks, so the re-tune compiles each launch again: a
 # second raw call, and with a fresh flydsl cache a second trace.
-@requires_gpu
+@requires_gfx950
 @pytest.mark.parametrize("shape, layout, op", OP_CASES)
 def test_op_retunes_after_clear(shape, layout, op, raw_calls, monkeypatch, tmp_path):
     from primus_turbo.flydsl.autotune import op as op_mod
@@ -931,7 +934,7 @@ def test_op_retunes_after_clear(shape, layout, op, raw_calls, monkeypatch, tmp_p
 _WHOLE_LOOP_LAUNCHES = {"launch_dense_wave4", "launch_dense_tn_wave4", "launch_grouped_tn_wgrad_4wave"}
 
 
-@requires_gpu
+@requires_gfx950
 def test_no_launch_reads_a_mutable_global():
     from flydsl.compiler.jit_function import JitFunction
 
