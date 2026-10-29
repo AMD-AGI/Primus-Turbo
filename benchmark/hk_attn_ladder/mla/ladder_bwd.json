@@ -1199,6 +1199,995 @@
    "side": true
   },
   {
+   "id": "r9a",
+   "parent": "r8a",
+   "patch": "patches/r9a.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness"
+     ],
+     "asm_patch": "asm/k_dkdv96ds_r9a.s.patch",
+     "asm_input_sha256": "c4299068af063025a05dc0f138ac4acb665abefa82cfb830a5bc89e5b648f842"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "dslayout v2 (fragment-native dS blocks): k_dkdv96ds stores each dK operand's two 16-B halves at lane*16 / 512+lane*16 (no DPP regroup: -24 DPP -24 moves per iteration); k_dqds_c's tr16 lane addresses follow (ds_lane / ds_half)",
+   "bitwise_with": "r8a"
+  },
+  {
+   "id": "r10a",
+   "parent": "r9a",
+   "patch": "patches/r10a.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "generated dK/dV loop (r8gen: r8a structure re-scheduled by a slot model, static VGPR plan, WAR-V waits, dslayout v2 export) for the 96-row blocks and the 64-row tail blocks (markers nkv=3 / nkv=2); bitwise == r9a at every shape",
+   "bitwise_with": "r9a",
+   "side": true
+  },
+  {
+   "id": "r10b",
+   "parent": "r9a",
+   "patch": "patches/r10b.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10a re-planned: bf16 P / dS in place of hh0's raw S / dP, dedicated dO^T tuples (loaded any time), Q^T into the hh1 operand slots + D[0..1], hh1 S/dP kh-major (P[0] early), readback in first-use order, one VALU drain per step, K/V waited before the loop, barrier signal when its LDS reads are done (bar_gap 12); asmkit: s_set_vgpr_msb no XCNT barrier",
+   "bitwise_with": "r9a",
+   "side": true
+  },
+  {
+   "id": "r10c",
+   "parent": "r9a",
+   "patch": "patches/r10b.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--bdo-after-hh1"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b + the dO^T loads issue after every hh1 operand load",
+   "bitwise_with": "r9a",
+   "side": true
+  },
+  {
+   "id": "r10d",
+   "parent": "r9a",
+   "patch": "patches/r10b.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--bdo-after-hh1",
+      "--hh1-split",
+      "3"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10c + hh1 S/dP dt outer for dt 0..2, kh-major for dt 3..5",
+   "bitwise_with": "r9a",
+   "side": true
+  },
+  {
+   "id": "r10e",
+   "parent": "r9a",
+   "patch": "patches/r10b.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--bdo-after-hh1",
+      "--hh1-split",
+      "6"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10c + hh1 S/dP dt outer (r10a's order)",
+   "bitwise_with": "r9a",
+   "side": true
+  },
+  {
+   "id": "r10a_pr",
+   "parent": "r10a",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10a + loop cycle probe (micro.k3_probe --abc)",
+   "side": true
+  },
+  {
+   "id": "r10b_pr",
+   "parent": "r10b",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b + loop cycle probe (micro.k3_probe --abc)",
+   "side": true
+  },
+  {
+   "id": "r10b_pa",
+   "parent": "r10b",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--probe-pts",
+      "10,20,30"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b + loop cycle probe at WMMA counts 10,20,30 (timeline)",
+   "side": true
+  },
+  {
+   "id": "r10b_pb",
+   "parent": "r10b",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--probe-pts",
+      "40,50,60"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b + loop cycle probe at WMMA counts 40,50,60 (timeline)",
+   "side": true
+  },
+  {
+   "id": "r10b_pc",
+   "parent": "r10b",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--probe-pts",
+      "70,80,90"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b + loop cycle probe at WMMA counts 70,80,90 (timeline)",
+   "side": true
+  },
+  {
+   "id": "r10b_pd",
+   "parent": "r10b",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--probe-pts",
+      "100,110,115"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b + loop cycle probe at WMMA counts 100,110,115 (timeline)",
+   "side": true
+  },
+  {
+   "id": "r10b_pe",
+   "parent": "r10b",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--probe-pts",
+      "5,15,25"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b + loop cycle probe at WMMA counts 5,15,25 (timeline)",
+   "side": true
+  },
+  {
+   "id": "r10b_pf",
+   "parent": "r10b",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--probe-pts",
+      "35,45,55"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b + loop cycle probe at WMMA counts 35,45,55 (timeline)",
+   "side": true
+  },
+  {
+   "id": "r10b_pg",
+   "parent": "r10b",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--probe-pts",
+      "65,75,85"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b + loop cycle probe at WMMA counts 65,75,85 (timeline)",
+   "side": true
+  },
+  {
+   "id": "r10b_ph",
+   "parent": "r10b",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--probe-pts",
+      "95,105,118"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b + loop cycle probe at WMMA counts 95,105,118 (timeline)",
+   "side": true
+  },
+  {
+   "id": "r10y_nosoft",
+   "parent": "r10b_pr",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--abl",
+      "nosoft"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b_pr timing ablation --abl nosoft (garbage numerics)",
+   "side": true
+  },
+  {
+   "id": "r10y_nolds",
+   "parent": "r10b_pr",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--abl",
+      "nolds"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b_pr timing ablation --abl nolds (garbage numerics)",
+   "side": true
+  },
+  {
+   "id": "r10y_notdm",
+   "parent": "r10b_pr",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--abl",
+      "notdm"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b_pr timing ablation --abl notdm (garbage numerics)",
+   "side": true
+  },
+  {
+   "id": "r10y_nonl",
+   "parent": "r10b_pr",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--abl",
+      "nonl"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b_pr timing ablation --abl nonl (garbage numerics)",
+   "side": true
+  },
+  {
+   "id": "r10y_nosoft_nolds",
+   "parent": "r10b_pr",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--abl",
+      "nosoft,nolds"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b_pr timing ablation --abl nosoft,nolds (garbage numerics)",
+   "side": true
+  },
+  {
+   "id": "r10y_nosoft_nolds_notdm_nonl",
+   "parent": "r10b_pr",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--abl",
+      "nosoft,nolds,notdm,nonl"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10b_pr timing ablation --abl nosoft,nolds,notdm,nonl (garbage numerics)",
+   "side": true
+  },
+  {
+   "id": "r10x_nosoft",
+   "parent": "r10a_pr",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--abl",
+      "nosoft"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10a_pr timing ablation --abl nosoft (garbage numerics)",
+   "side": true
+  },
+  {
+   "id": "r10x_nolds",
+   "parent": "r10a_pr",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--abl",
+      "nolds"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10a_pr timing ablation --abl nolds (garbage numerics)",
+   "side": true
+  },
+  {
+   "id": "r10x_none",
+   "parent": "r10a_pr",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--abl",
+      "nosoft,nolds"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10a_pr timing ablation --abl nosoft,nolds (garbage numerics)",
+   "side": true
+  },
+  {
+   "id": "r10x_nonl",
+   "parent": "r10a_pr",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "-D",
+      "HKGEN_PROBE=1",
+      "--abl",
+      "nonl"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r10a_pr timing ablation --abl nonl (garbage numerics)",
+   "side": true
+  },
+  {
+   "id": "r9b",
+   "parent": "r9a",
+   "patch": "patches/r9b.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness",
+      "-DHKL_DO_MID=1"
+     ],
+     "asm_patch": "asm/k_dkdv96ds_r9b.s.patch",
+     "asm_input_sha256": "5fe77986ec95a662cb79b08d7607436781db4cb1e275e9d1f98fd92dd564bd22"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r9a + the dO^T tr16 burst between hh0's and hh1's S/dP (its LDS latency under hh1's S/dP + softmax)",
+   "side": true,
+   "bitwise_with": "r8a"
+  },
+  {
+   "id": "r9c",
+   "parent": "r9a",
+   "patch": "patches/r9c.patch",
+   "kernels": {
+    "k_dkdv96ds": {
+     "src": "src/k_dkdv96ds.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-mllvm",
+      "-amdgpu-enable-delay-alu=false",
+      "-mllvm",
+      "-greedy-regclass-priority-trumps-globalness",
+      "-DHKL_XS=12"
+     ],
+     "asm_patch": "asm/k_dkdv96ds_r9c.s.patch",
+     "asm_input_sha256": "b44aa00530957c4cdd615e9e7d45bef1ab0dbf2c57a0e8722772f2e95d87657a"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "src/k_delta.hip",
+     "extra_flags": [],
+     "sha256": "c43070f9a637f63e2449facb978c9c90711ae98b2f64f03daa22e95dfd613d0f"
+    }
+   },
+   "launch": {
+    "module": "bwd_hk"
+   },
+   "feature": "r9a + split-barrier window 12 dK WMMAs (12 after the wait cover the hh0 readback latency)",
+   "side": true,
+   "bitwise_with": "r8a"
+  },
+  {
    "id": "abcsk_l",
    "parent": "abc0",
    "patch": "patches/abcsk.patch",

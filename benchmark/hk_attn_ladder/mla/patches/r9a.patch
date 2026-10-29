@@ -1,0 +1,644 @@
+diff -ruN a/asm/k_dkdv96ds_r9a.s.patch b/asm/k_dkdv96ds_r9a.s.patch
+--- a/asm/k_dkdv96ds_r9a.s.patch	1970-01-01 00:00:00.000000000 +0000
++++ b/asm/k_dkdv96ds_r9a.s.patch	2026-10-29 04:40:17.830544069 +0000
+@@ -0,0 +1,268 @@
++--- k_dkdv96ds.s
+++++ k_dkdv96ds.s
++@@ -4110,6 +4110,7 @@
++ 	s_lshl_b32 s2, s2, 7
++ 	s_add_co_i32 s2, s2, s12
++ 	s_set_vgpr_msb 0xcc3                    ;  msbs: dst=3 src0=3 src1=0 src2=0
+++	s_wait_alu depctr_va_vdst(0)
++ 	s_clause 0x1
++ 	buffer_load_b128 v[202:205] /*v[970:973]*/, v233 /*v1001*/, s[60:63], s2 offen
++ 	buffer_load_b128 v[198:201] /*v[966:969]*/, v238 /*v1006*/, s[60:63], s2 offen
++@@ -4117,7 +4118,6 @@
++ 	buffer_load_b128 v[210:213] /*v[978:981]*/, v233 /*v1001*/, s[64:67], s2 offen
++ 	buffer_load_b128 v[206:209] /*v[974:977]*/, v238 /*v1006*/, s[64:67], s2 offen
++ 	buffer_load_b128 v[194:197] /*v[962:965]*/, v239 /*v1007*/, s[60:63], s2 offen
++-	s_wait_alu depctr_va_vdst(0)
++ 	buffer_load_b128 v[190:193] /*v[958:961]*/, v240 /*v1008*/, s[60:63], s2 offen
++ 	s_clause 0x2
++ 	buffer_load_b128 v[186:189] /*v[954:957]*/, v239 /*v1007*/, s[64:67], s2 offen
++@@ -4125,6 +4125,7 @@
++ 	buffer_load_b128 v[250:253], v240 /*v1008*/, s[64:67], s2 offen
++ 	; sched_barrier mask(0x00000406)
++ 	s_set_vgpr_msb 0x300                    ;  msbs: dst=0 src0=0 src1=0 src2=0
+++	s_wait_alu depctr_vm_vsrc(6)
++ 	ds_load_b128 v[58:61], v34 offset:15104
++ 	ds_load_b128 v[62:65], v34 offset:15136
++ 	s_set_vgpr_msb 0xc0                     ;  msbs: dst=3 src0=0 src1=0 src2=0
++@@ -4147,9 +4148,9 @@
++ 	ds_load_b128 v[170:173] /*v[938:941]*/, v35 offset:4544
++ 	ds_load_b128 v[174:177] /*v[942:945]*/, v35 offset:4576
++ 	; sched_barrier mask(0x00000406)
++-	s_wait_alu depctr_vm_vsrc(0)
++ 	s_set_vgpr_msb 0xc00f                   ;  msbs: dst=0 src0=3 src1=3 src2=0
++ 	s_wait_loadcnt_dscnt 0x3e26
+++	s_wait_alu depctr_vm_vsrc(0)
++ 	v_wmma_f32_16x16x32_bf16 v[34:41], v[98:105] /*v[866:873]*/, v[18:25] /*v[786:793]*/, 0
++ 	tensor_load_to_lds s[68:71], s[36:43]
++ 	s_wait_tensorcnt 0xa
++@@ -4626,10 +4627,9 @@
++ 	s_set_vgpr_msb 0xc350                   ;  msbs: dst=1 src0=0 src1=0 src2=1
++ 	s_wait_dscnt 0xd
++ 	v_wmma_f32_16x16x32_bf16 v[98:105] /*v[354:361]*/, v[10:17], v[50:57], v[98:105] /*v[354:361]*/
++-	s_wait_alu depctr_va_vdst(0)
++ 	s_set_vgpr_msb 0x50c3                   ;  msbs: dst=3 src0=3 src1=0 src2=0
++-	ds_load_tr16_b128 v[78:81] /*v[846:849]*/, v139 /*v907*/ offset:15104
++-	ds_load_tr16_b128 v[74:77] /*v[842:845]*/, v139 /*v907*/ offset:8704
+++	ds_load_tr16_b128 v[246:249] /*v[1014:1017]*/, v139 /*v907*/ offset:15104
+++	ds_load_tr16_b128 v[242:245] /*v[1010:1013]*/, v139 /*v907*/ offset:8704
++ 	s_add_co_i32 s80, s30, -1
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++ 	; sched_group_barrier mask(0x00000100) size(2) SyncID(0)
++@@ -4638,6 +4638,7 @@
++ 	s_set_vgpr_msb 0xc300                   ;  msbs: dst=0 src0=0 src1=0 src2=0
++ 	v_wmma_f32_16x16x32_bf16 v[242:249], v[10:17], v[2:9], v[242:249] matrix_a_reuse
++ 	s_set_vgpr_msb 0xc3                     ;  msbs: dst=3 src0=3 src1=0 src2=0
+++	s_wait_alu depctr_va_vdst(0)
++ 	ds_load_tr16_b128 v[82:85] /*v[850:853]*/, v139 /*v907*/ offset:8736
++ 	ds_load_tr16_b128 v[86:89] /*v[854:857]*/, v139 /*v907*/ offset:15136
++ 	s_add_co_i32 s2, s2, s28
++@@ -4794,7 +4795,7 @@
++ 	; sched_barrier mask(0x00000000)
++ 	s_set_vgpr_msb 0xfa3                    ;  msbs: dst=2 src0=3 src1=0 src2=2
++ 	s_wait_dscnt 0x16
++-	v_wmma_f32_16x16x32_bf16 v[34:41] /*v[546:553]*/, v[74:81] /*v[842:849]*/, v[34:41], v[34:41] /*v[546:553]*/
+++	v_wmma_f32_16x16x32_bf16 v[34:41] /*v[546:553]*/, v[242:249] /*v[1010:1017]*/, v[34:41], v[34:41] /*v[546:553]*/
++ 	s_wait_dscnt 0x14
++ 	v_wmma_f32_16x16x32_bf16 v[26:33] /*v[538:545]*/, v[82:89] /*v[850:857]*/, v[34:41], v[26:33] /*v[538:545]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0xa3a0                   ;  msbs: dst=2 src0=0 src1=0 src2=2
++@@ -4830,7 +4831,7 @@
++ 	s_barrier_signal -1
++ 	; sched_barrier mask(0x00000000)
++ 	s_set_vgpr_msb 0x5053                   ;  msbs: dst=1 src0=3 src1=0 src2=1
++-	v_wmma_f32_16x16x32_bf16 v[194:201] /*v[450:457]*/, v[74:81] /*v[842:849]*/, v[42:49], v[194:201] /*v[450:457]*/
+++	v_wmma_f32_16x16x32_bf16 v[194:201] /*v[450:457]*/, v[242:249] /*v[1010:1017]*/, v[42:49], v[194:201] /*v[450:457]*/
++ 	v_wmma_f32_16x16x32_bf16 v[186:193] /*v[442:449]*/, v[82:89] /*v[850:857]*/, v[42:49], v[186:193] /*v[442:449]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x5350                   ;  msbs: dst=1 src0=0 src1=0 src2=1
++ 	v_wmma_f32_16x16x32_bf16 v[178:185] /*v[434:441]*/, v[10:17], v[42:49], v[178:185] /*v[434:441]*/ matrix_b_reuse
++@@ -4850,7 +4851,7 @@
++ 	s_set_vgpr_msb 0x5350                   ;  msbs: dst=1 src0=0 src1=0 src2=1
++ 	v_wmma_f32_16x16x32_bf16 v[58:65] /*v[314:321]*/, v[58:65], v[42:49], v[58:65] /*v[314:321]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x505f                   ;  msbs: dst=1 src0=3 src1=3 src2=1
++-	v_wmma_f32_16x16x32_bf16 v[34:41] /*v[290:297]*/, v[74:81] /*v[842:849]*/, v[26:33] /*v[794:801]*/, v[34:41] /*v[290:297]*/
+++	v_wmma_f32_16x16x32_bf16 v[34:41] /*v[290:297]*/, v[242:249] /*v[1010:1017]*/, v[26:33] /*v[794:801]*/, v[34:41] /*v[290:297]*/
++ 	v_wmma_f32_16x16x32_bf16 v[26:33] /*v[282:289]*/, v[82:89] /*v[850:857]*/, v[26:33] /*v[794:801]*/, v[26:33] /*v[282:289]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x5f5c                   ;  msbs: dst=1 src0=0 src1=3 src2=1
++ 	v_wmma_f32_16x16x32_bf16 v[18:25] /*v[274:281]*/, v[10:17], v[26:33] /*v[794:801]*/, v[18:25] /*v[274:281]*/ matrix_b_reuse
++@@ -4872,9 +4873,10 @@
++ 	; sched_barrier mask(0x00000000)
++ 	s_barrier_wait -1
++ 	; sched_barrier mask(0x00000000)
++-	s_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)
+++	s_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(1)
++ 	s_set_vgpr_msb 0xcc3                    ;  msbs: dst=3 src0=3 src1=0 src2=0
++ 	ds_load_b128 v[26:29] /*v[794:797]*/, v138 /*v906*/ offset:8896
+++	s_wait_alu depctr_vm_vsrc(0)
++ 	ds_load_b128 v[30:33] /*v[798:801]*/, v138 /*v906*/ offset:8928
++ 	ds_load_b128 v[34:37] /*v[802:805]*/, v138 /*v906*/ offset:8960
++ 	ds_load_b128 v[38:41] /*v[806:809]*/, v138 /*v906*/ offset:8992
++@@ -4934,7 +4936,7 @@
++ 	ds_load_b128 v[126:129] /*v[894:897]*/, v138 /*v906*/ offset:15456
++ 	ds_load_b128 v[130:133] /*v[898:901]*/, v158 /*v926*/ offset:4352
++ 	ds_load_b128 v[134:137] /*v[902:905]*/, v158 /*v926*/ offset:4384
++-	s_wait_alu depctr_vm_vsrc(0)
+++	s_wait_alu depctr_vm_vsrc(2)
++ 	ds_load_b128 v[138:141] /*v[906:909]*/, v158 /*v926*/ offset:4416
++ 	ds_load_b128 v[142:145] /*v[910:913]*/, v158 /*v926*/ offset:4448
++ 	ds_load_b128 v[146:149] /*v[914:917]*/, v158 /*v926*/ offset:4480
++@@ -5418,8 +5420,8 @@
++ 	v_wmma_f32_16x16x32_bf16 v[98:105] /*v[354:361]*/, v[26:33] /*v[794:801]*/, v[162:169] /*v[930:937]*/, v[98:105] /*v[354:361]*/
++ 	s_wait_alu depctr_va_vdst(0)
++ 	s_set_vgpr_msb 0x5fc0                   ;  msbs: dst=3 src0=0 src1=0 src2=0
++-	ds_load_tr16_b128 v[110:113] /*v[878:881]*/, v50 offset:15104
++-	ds_load_tr16_b128 v[106:109] /*v[874:877]*/, v50 offset:8704
+++	ds_load_tr16_b128 v[220:223] /*v[988:991]*/, v50 offset:15104
+++	ds_load_tr16_b128 v[216:219] /*v[984:987]*/, v50 offset:8704
++ 	s_min_i32 s2, s30, s22
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++ 	; sched_group_barrier mask(0x00000100) size(2) SyncID(0)
++@@ -5437,10 +5439,9 @@
++ 	; sched_group_barrier mask(0x00000004) size(2) SyncID(0)
++ 	s_set_vgpr_msb 0xc00f                   ;  msbs: dst=0 src0=3 src1=3 src2=0
++ 	v_wmma_f32_16x16x32_bf16 v[122:129], v[26:33] /*v[794:801]*/, v[98:105] /*v[866:873]*/, v[122:129] matrix_a_reuse
++-	s_wait_alu depctr_va_vdst(0)
++ 	s_set_vgpr_msb 0xfc0                    ;  msbs: dst=3 src0=0 src1=0 src2=0
++-	ds_load_tr16_b128 v[26:29] /*v[794:797]*/, v50 offset:8768
++-	ds_load_tr16_b128 v[30:33] /*v[798:801]*/, v50 offset:15168
+++	ds_load_tr16_b128 v[242:245] /*v[1010:1013]*/, v50 offset:8768
+++	ds_load_tr16_b128 v[246:249] /*v[1014:1017]*/, v50 offset:15168
++ 	s_add_nc_u64 s[70:71], s[6:7], s[94:95]
++ 	s_add_co_i32 s69, s33, s29
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++@@ -5469,10 +5470,9 @@
++ 	; sched_group_barrier mask(0x00000004) size(2) SyncID(0)
++ 	s_set_vgpr_msb 0xc00f                   ;  msbs: dst=0 src0=3 src1=3 src2=0
++ 	v_wmma_f32_16x16x32_bf16 v[114:121], v[34:41] /*v[802:809]*/, v[98:105] /*v[866:873]*/, v[114:121] matrix_a_reuse
++-	s_wait_alu depctr_va_vdst(0)
++ 	s_set_vgpr_msb 0xfc0                    ;  msbs: dst=3 src0=0 src1=0 src2=0
++-	ds_load_tr16_b128 v[34:37] /*v[802:805]*/, v50 offset:8864
++-	ds_load_tr16_b128 v[38:41] /*v[806:809]*/, v50 offset:15264
+++	ds_load_tr16_b128 v[206:209] /*v[974:977]*/, v50 offset:8864
+++	ds_load_tr16_b128 v[210:213] /*v[978:981]*/, v50 offset:15264
++ 	s_add_nc_u64 s[78:79], s[2:3], s[90:91]
++ 	s_bitset1_b32 s75, 31
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++@@ -5499,10 +5499,9 @@
++ 	; sched_group_barrier mask(0x00000004) size(2) SyncID(0)
++ 	s_set_vgpr_msb 0xc00f                   ;  msbs: dst=0 src0=3 src1=3 src2=0
++ 	v_wmma_f32_16x16x32_bf16 v[106:113], v[42:49] /*v[810:817]*/, v[98:105] /*v[866:873]*/, v[106:113] matrix_a_reuse
++-	s_wait_alu depctr_va_vdst(0)
++ 	s_set_vgpr_msb 0xfc0                    ;  msbs: dst=3 src0=0 src1=0 src2=0
++-	ds_load_tr16_b128 v[42:45] /*v[810:813]*/, v50 offset:8960
++-	ds_load_tr16_b128 v[46:49] /*v[814:817]*/, v50 offset:15360
+++	ds_load_tr16_b128 v[190:193] /*v[958:961]*/, v50 offset:8960
+++	ds_load_tr16_b128 v[194:197] /*v[962:965]*/, v50 offset:15360
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++ 	; sched_group_barrier mask(0x00000100) size(2) SyncID(0)
++ 	; sched_group_barrier mask(0x00000004) size(2) SyncID(0)
++@@ -5525,10 +5524,9 @@
++ 	; sched_group_barrier mask(0x00000004) size(2) SyncID(0)
++ 	s_set_vgpr_msb 0xc00f                   ;  msbs: dst=0 src0=3 src1=3 src2=0
++ 	v_wmma_f32_16x16x32_bf16 v[98:105], v[58:65] /*v[826:833]*/, v[98:105] /*v[866:873]*/, v[98:105] matrix_a_reuse
++-	s_wait_alu depctr_va_vdst(0)
++ 	s_set_vgpr_msb 0xfc0                    ;  msbs: dst=3 src0=0 src1=0 src2=0
++-	ds_load_tr16_b128 v[58:61] /*v[826:829]*/, v50 offset:9056
++-	ds_load_tr16_b128 v[62:65] /*v[830:833]*/, v50 offset:15456
+++	ds_load_tr16_b128 v[182:185] /*v[950:953]*/, v50 offset:9056
+++	ds_load_tr16_b128 v[186:189] /*v[954:957]*/, v50 offset:15456
++ 	; sched_group_barrier mask(0x00000008) size(1) SyncID(0)
++ 	; sched_group_barrier mask(0x00000100) size(2) SyncID(0)
++ 	; sched_group_barrier mask(0x00000004) size(2) SyncID(0)
++@@ -5587,62 +5585,62 @@
++ 	; sched_barrier mask(0x00000000)
++ 	s_set_vgpr_msb 0xfa3                    ;  msbs: dst=2 src0=3 src1=0 src2=2
++ 	s_wait_dscnt 0x16
++-	v_wmma_f32_16x16x32_bf16 v[34:41] /*v[546:553]*/, v[106:113] /*v[874:881]*/, v[34:41], v[34:41] /*v[546:553]*/
+++	v_wmma_f32_16x16x32_bf16 v[34:41] /*v[546:553]*/, v[216:223] /*v[984:991]*/, v[34:41], v[34:41] /*v[546:553]*/
++ 	s_wait_dscnt 0x14
++ 	v_wmma_f32_16x16x32_bf16 v[26:33] /*v[538:545]*/, v[114:121] /*v[882:889]*/, v[34:41], v[26:33] /*v[538:545]*/ matrix_b_reuse
++ 	s_wait_dscnt 0x12
++-	v_wmma_f32_16x16x32_bf16 v[18:25] /*v[530:537]*/, v[26:33] /*v[794:801]*/, v[34:41], v[18:25] /*v[530:537]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[18:25] /*v[530:537]*/, v[242:249] /*v[1010:1017]*/, v[34:41], v[18:25] /*v[530:537]*/ matrix_b_reuse
++ 	s_wait_dscnt 0x10
++ 	v_wmma_f32_16x16x32_bf16 v[10:17] /*v[522:529]*/, v[122:129] /*v[890:897]*/, v[34:41], v[10:17] /*v[522:529]*/ matrix_b_reuse
++ 	s_wait_dscnt 0xe
++ 	v_wmma_f32_16x16x32_bf16 v[2:9] /*v[514:521]*/, v[130:137] /*v[898:905]*/, v[34:41], v[2:9] /*v[514:521]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0xa353                   ;  msbs: dst=1 src0=3 src1=0 src2=1
++ 	s_wait_dscnt 0xc
++-	v_wmma_f32_16x16x32_bf16 v[250:257] /*v[506:513]*/, v[34:41] /*v[802:809]*/, v[34:41], v[250:257] /*v[506:513]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[250:257] /*v[506:513]*/, v[206:213] /*v[974:981]*/, v[34:41], v[250:257] /*v[506:513]*/ matrix_b_reuse
++ 	s_wait_dscnt 0xa
++ 	v_wmma_f32_16x16x32_bf16 v[242:249] /*v[498:505]*/, v[138:145] /*v[906:913]*/, v[34:41], v[242:249] /*v[498:505]*/ matrix_b_reuse
++ 	s_wait_dscnt 0x8
++ 	v_wmma_f32_16x16x32_bf16 v[226:233] /*v[482:489]*/, v[146:153] /*v[914:921]*/, v[34:41], v[226:233] /*v[482:489]*/ matrix_b_reuse
++ 	s_wait_dscnt 0x6
++-	v_wmma_f32_16x16x32_bf16 v[234:241] /*v[490:497]*/, v[42:49] /*v[810:817]*/, v[34:41], v[234:241] /*v[490:497]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[234:241] /*v[490:497]*/, v[190:197] /*v[958:965]*/, v[34:41], v[234:241] /*v[490:497]*/ matrix_b_reuse
++ 	s_wait_dscnt 0x4
++ 	v_wmma_f32_16x16x32_bf16 v[218:225] /*v[474:481]*/, v[154:161] /*v[922:929]*/, v[34:41], v[218:225] /*v[474:481]*/ matrix_b_reuse
++ 	s_wait_dscnt 0x2
++ 	v_wmma_f32_16x16x32_bf16 v[210:217] /*v[466:473]*/, v[170:177] /*v[938:945]*/, v[34:41], v[210:217] /*v[466:473]*/ matrix_b_reuse
++ 	s_wait_dscnt 0x0
++-	v_wmma_f32_16x16x32_bf16 v[202:209] /*v[458:465]*/, v[58:65] /*v[826:833]*/, v[34:41], v[202:209] /*v[458:465]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[202:209] /*v[458:465]*/, v[182:189] /*v[950:957]*/, v[34:41], v[202:209] /*v[458:465]*/ matrix_b_reuse
++ 	; sched_barrier mask(0x00000000)
++ 	s_wait_tensorcnt 0x3
++ 	; sched_barrier mask(0x00000000)
++ 	s_barrier_signal -1
++ 	; sched_barrier mask(0x00000000)
++ 	s_set_vgpr_msb 0x535f                   ;  msbs: dst=1 src0=3 src1=3 src2=1
++-	v_wmma_f32_16x16x32_bf16 v[194:201] /*v[450:457]*/, v[106:113] /*v[874:881]*/, v[50:57] /*v[818:825]*/, v[194:201] /*v[450:457]*/
+++	v_wmma_f32_16x16x32_bf16 v[194:201] /*v[450:457]*/, v[216:223] /*v[984:991]*/, v[50:57] /*v[818:825]*/, v[194:201] /*v[450:457]*/
++ 	v_wmma_f32_16x16x32_bf16 v[186:193] /*v[442:449]*/, v[114:121] /*v[882:889]*/, v[50:57] /*v[818:825]*/, v[186:193] /*v[442:449]*/ matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[178:185] /*v[434:441]*/, v[26:33] /*v[794:801]*/, v[50:57] /*v[818:825]*/, v[178:185] /*v[434:441]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[178:185] /*v[434:441]*/, v[242:249] /*v[1010:1017]*/, v[50:57] /*v[818:825]*/, v[178:185] /*v[434:441]*/ matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[170:177] /*v[426:433]*/, v[122:129] /*v[890:897]*/, v[50:57] /*v[818:825]*/, v[170:177] /*v[426:433]*/ matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[154:161] /*v[410:417]*/, v[130:137] /*v[898:905]*/, v[50:57] /*v[818:825]*/, v[154:161] /*v[410:417]*/ matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[138:145] /*v[394:401]*/, v[34:41] /*v[802:809]*/, v[50:57] /*v[818:825]*/, v[138:145] /*v[394:401]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[138:145] /*v[394:401]*/, v[206:213] /*v[974:981]*/, v[50:57] /*v[818:825]*/, v[138:145] /*v[394:401]*/ matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[122:129] /*v[378:385]*/, v[138:145] /*v[906:913]*/, v[50:57] /*v[818:825]*/, v[122:129] /*v[378:385]*/ matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[106:113] /*v[362:369]*/, v[146:153] /*v[914:921]*/, v[50:57] /*v[818:825]*/, v[106:113] /*v[362:369]*/ matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[82:89] /*v[338:345]*/, v[42:49] /*v[810:817]*/, v[50:57] /*v[818:825]*/, v[82:89] /*v[338:345]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[82:89] /*v[338:345]*/, v[190:197] /*v[958:965]*/, v[50:57] /*v[818:825]*/, v[82:89] /*v[338:345]*/ matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[74:81] /*v[330:337]*/, v[154:161] /*v[922:929]*/, v[50:57] /*v[818:825]*/, v[74:81] /*v[330:337]*/ matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[66:73] /*v[322:329]*/, v[170:177] /*v[938:945]*/, v[50:57] /*v[818:825]*/, v[66:73] /*v[322:329]*/ matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[58:65] /*v[314:321]*/, v[58:65] /*v[826:833]*/, v[50:57] /*v[818:825]*/, v[58:65] /*v[314:321]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[58:65] /*v[314:321]*/, v[182:189] /*v[950:957]*/, v[50:57] /*v[818:825]*/, v[58:65] /*v[314:321]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x5f53                   ;  msbs: dst=1 src0=3 src1=0 src2=1
++-	v_wmma_f32_16x16x32_bf16 v[34:41] /*v[290:297]*/, v[106:113] /*v[874:881]*/, v[54:61], v[34:41] /*v[290:297]*/
+++	v_wmma_f32_16x16x32_bf16 v[34:41] /*v[290:297]*/, v[216:223] /*v[984:991]*/, v[54:61], v[34:41] /*v[290:297]*/
++ 	v_wmma_f32_16x16x32_bf16 v[26:33] /*v[282:289]*/, v[114:121] /*v[882:889]*/, v[54:61], v[26:33] /*v[282:289]*/ matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[18:25] /*v[274:281]*/, v[26:33] /*v[794:801]*/, v[54:61], v[18:25] /*v[274:281]*/ matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[18:25] /*v[274:281]*/, v[242:249] /*v[1010:1017]*/, v[54:61], v[18:25] /*v[274:281]*/ matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[10:17] /*v[266:273]*/, v[122:129] /*v[890:897]*/, v[54:61], v[10:17] /*v[266:273]*/ matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[2:9] /*v[258:265]*/, v[130:137] /*v[898:905]*/, v[54:61], v[2:9] /*v[258:265]*/ matrix_b_reuse
++ 	s_set_vgpr_msb 0x5303                   ;  msbs: dst=0 src0=3 src1=0 src2=0
++-	v_wmma_f32_16x16x32_bf16 v[234:241], v[34:41] /*v[802:809]*/, v[54:61], v[234:241] matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[234:241], v[206:213] /*v[974:981]*/, v[54:61], v[234:241] matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[218:225], v[138:145] /*v[906:913]*/, v[54:61], v[218:225] matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[186:193], v[146:153] /*v[914:921]*/, v[54:61], v[186:193] matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[194:201], v[42:49] /*v[810:817]*/, v[54:61], v[194:201] matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[194:201], v[190:197] /*v[958:965]*/, v[54:61], v[194:201] matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[178:185], v[154:161] /*v[922:929]*/, v[54:61], v[178:185] matrix_b_reuse
++ 	v_wmma_f32_16x16x32_bf16 v[170:177], v[170:177] /*v[938:945]*/, v[54:61], v[170:177] matrix_b_reuse
++-	v_wmma_f32_16x16x32_bf16 v[146:153], v[58:65] /*v[826:833]*/, v[54:61], v[146:153] matrix_b_reuse
+++	v_wmma_f32_16x16x32_bf16 v[146:153], v[182:189] /*v[950:957]*/, v[54:61], v[146:153] matrix_b_reuse
++ 	; sched_barrier mask(0x00000000)
++ 	s_barrier_wait -1
++ 	; sched_barrier mask(0x00000000)
++@@ -5652,10 +5650,10 @@
++ 	ds_load_b128 v[102:105] /*v[870:873]*/, v51 offset:8736
++ 	ds_load_b128 v[66:69] /*v[834:837]*/, v51 offset:8768
++ 	ds_load_b128 v[70:73] /*v[838:841]*/, v51 offset:8800
++-	s_wait_alu depctr_va_vdst(12) depctr_vm_vsrc(0)
+++	s_wait_alu depctr_va_vdst(12) depctr_vm_vsrc(3)
++ 	ds_load_b128 v[50:53] /*v[818:821]*/, v51 offset:8832
+++	s_wait_alu depctr_vm_vsrc(2)
++ 	ds_load_b128 v[54:57] /*v[822:825]*/, v51 offset:8864
++-	s_wait_alu depctr_va_vdst(3)
++ 	ds_load_b128 v[42:45] /*v[810:813]*/, v51 offset:8896
++ 	ds_load_b128 v[46:49] /*v[814:817]*/, v51 offset:8928
++ 	ds_load_b128 v[34:37] /*v[802:805]*/, v51 offset:8960
++@@ -5668,7 +5666,6 @@
++ 	ds_load_b128 v[86:89] /*v[854:857]*/, v52 offset:96
++ 	ds_load_b128 v[74:77] /*v[842:845]*/, v52 offset:128
++ 	ds_load_b128 v[78:81] /*v[846:849]*/, v52 offset:160
++-	s_wait_alu depctr_va_vdst(0)
++ 	ds_load_b128 v[58:61] /*v[826:829]*/, v52 offset:192
++ 	ds_load_b128 v[62:65] /*v[830:833]*/, v52 offset:224
++ 	; sched_barrier mask(0x00000000)
+diff -ruN a/include/dqds/dqds_impl.h b/include/dqds/dqds_impl.h
+--- a/include/dqds/dqds_impl.h	2026-10-29 02:00:41.494409728 +0000
++++ b/include/dqds/dqds_impl.h	2026-10-29 04:39:34.136837759 +0000
+@@ -7,7 +7,7 @@
+ // dqds/dqds_impl.h (bwd_hk_dqds2) -- the recompute-free dQ kernel of the S1 line in HIP, 384-query
+ // tiles:
+ //
+-//   dQ[q, :] = sum_{kv attended by q} dS[q, kv] K[kv, :]      (dS from the S1 scratch, dslayout v1,
++//   dQ[q, :] = sum_{kv attended by q} dS[q, kv] K[kv, :]      (dS from the S1 scratch, dslayout v2,
+ //   scale included)
+ //
+ // bwd_hk_dqds's k_dqds_b with the workgroup doubled to 4 waves (block 128, 1 wave per SIMD, one
+@@ -54,8 +54,8 @@
+ #include "../q1/prims.h"
+ #include "idx.h" // arm root (build.py: -Iinclude -I.)
+ 
+-static_assert(DSL_VERSION == 1 && DSL_SCALED == 1,
+-              "bwd_hk_dqds2 reads dslayout v1 with the scale included");
++static_assert(DSL_VERSION == 2 && DSL_SCALED == 1,
++              "bwd_hk_dqds2 reads dslayout v2 with the scale included");
+ 
+ static_assert(dq::lds_bytes() <= 327680 && 2 * dq::lds_bytes() > 327680,
+               "one workgroup per CU, inside the 320-KiB LDS");
+@@ -152,7 +152,7 @@
+         const int d1 = r1 + ds_lane(lane);
+         sfor<0, NQW>([&](auto Q) DQ_INL {
+             constexpr int h  = decltype(Q)::value;
+-            const int     po = wave_pair(wv, h / 2, NQW) * DSI_BLK_B + (h % 2) * 32;
++            const int     po = wave_pair(wv, h / 2, NQW) * DSI_BLK_B + ds_half(h % 2);
+             S.ds[h]          = cat16(tr16(lds, d0 + po), tr16(lds, d1 + po));
+         });
+     };
+@@ -389,7 +389,7 @@
+                 constexpr int h = decltype(Q)::value, k = h / 2;
+                 static_assert(wave_pair(0, 2, MAIN_NQW) - wave_pair(0, 0, MAIN_NQW) == 8, "pair 2 = pair 0 + 8");
+                 const int     base = k == 1 ? db1[s] : db[s];
+-                constexpr int po   = (k == 2 ? 8 * DSI_BLK_B : 0) + (h % 2) * 32;
++                constexpr int po   = (k == 2 ? 8 * DSI_BLK_B : 0) + ds_half(h % 2);
+                 Sx.ds[h] = cat16(tr16(lds, base + so + po), tr16(lds, base + so + r1 + po));
+             });
+         };
+diff -ruN a/include/dqds/dslayout.h b/include/dqds/dslayout.h
+--- a/include/dqds/dslayout.h	2026-10-27 06:06:58.496000660 +0000
++++ b/include/dqds/dslayout.h	2026-10-29 04:39:34.136012318 +0000
+@@ -4,7 +4,7 @@
+  * See LICENSE for license information.
+  **************************************************************************************************/
+ 
+-// dslayout.h -- the S1 dS^T scratch contract, version 1.
++// dslayout.h -- the S1 dS^T scratch contract, version 2 (v1 + fragment-native blocks).
+ //
+ // Owner: bwd_hk_k1ds (writer, k_dkdv64ds). Consumer: bwd_hk_dqds (reader, k_dqds), which carries a
+ // BYTE-IDENTICAL copy of this file and checks its sha256 against the writer's. Any change is a new
+@@ -29,10 +29,13 @@
+ //     qp = dsl_qp_first(kt) .. Sq/32 - 1 in order ("packed causal": the leading q pairs of a row
+ //     are fully masked for all 16 kv rows and are NOT stored; non-causal: dsl_qp_first == 0, a
+ //     dense rectangle);
+-//   * a block (bh, kt, qp) is the [16 kv][32 q] bf16 tile, row-major: element (kv, q) with kv = kv
+-//   row - 16 kt
+-//     in [0, 16) and q = query - 32 qp in [0, 32) sits at block byte kv * 64 + q * 2; 1024 B per
+-//     block, so a 128-B line of a block holds kv rows 2l and 2l + 1.
++//   * a block (bh, kt, qp) is the [16 kv][32 q] bf16 tile in the order of the writer's dK B operand
++//     (version 2, "fragment-native"): 64 chunks of 16 B, chunk (kv, c) = the 8 queries [8 c, 8 c + 8) of kv
++//     row kv (kv = kv row - 16 kt in [0, 16), c in [0, 4)) at block byte dsl_chunk(kv, c) = (c / 2) * 512 +
++//     ((c % 2) * 16 + kv) * 16, so element (kv, q), q = query - 32 qp in [0, 32), sits at dsl_chunk(kv, q / 8)
++//     + (q % 8) * 2. A writer lane (kv row r = lane % 16, half h = lane / 16) holds chunks (r, h) and (r, h + 2)
++//     in its dK operand (dwords 0..3, 4..7) and stores them at lane * 16 and 512 + lane * 16: two whole 512-B
++//     stores per block, no cross-lane regroup. 1024 B per block. (v1: row-major, element at kv * 64 + q * 2.)
+ //   dsl_qp_first(kt) = causal ? max(0, floor(kt / 2) - cshift / 32) : 0 is the first q pair with an
+ //   attended entry (16 kt <= 32 qp + 31 + cshift); it is <= Sq/32 - 1 for every kt < Skv/16, so
+ //   every row is non-empty. Size per region (prod s4096 causal): 16512 blocks = 16.9 MB; b2
+@@ -52,11 +55,11 @@
+ #endif
+ #define DSL_FN static inline constexpr __host__ __device__
+ 
+-#define DSL_VERSION 1
++#define DSL_VERSION 2
+ #define DSL_SCALED 1   // dS carries the softmax scale (the dK operand as k_dkdv64 consumes it)
+ #define DSL_KV 16      // kv rows per block
+ #define DSL_Q 32       // queries per block (one q pair of 16-row tiles)
+-#define DSL_ROW_B 64   // bytes of one block row (32 bf16)
++#define DSL_ROW_B 64   // bytes of 4 chunks (the readers' TDM pad interval; v1: one kv row of 32 bf16)
+ #define DSL_BLK_B 1024 // bytes of one block
+ 
+ DSL_FN int dsl_nqp(int Sq) {
+@@ -101,11 +104,15 @@
+     return bh * dsl_nblk_bh(Sq, Skv, causal) + dsl_row_off(kt, Sq, Skv - Sq, causal) +
+            (int64_t) (qp - dsl_qp_first(kt, Skv - Sq, causal));
+ }
++// block byte of chunk (kv row kv in [0, 16), query chunk c in [0, 4): queries [8 c, 8 c + 8))
++DSL_FN int dsl_chunk(int kv, int c) {
++    return (c >> 1) * 512 + ((c & 1) * 16 + kv) * 16;
++}
+ // byte of element (kv row kvr, query qr) of head bh (kvr in row kt = kvr / 16, qr in pair qp = qr /
+ // 32)
+ DSL_FN int64_t dsl_byte(int64_t bh, int kvr, int qr, int Sq, int Skv, int causal) {
+     return dsl_blk(bh, kvr / DSL_KV, qr / DSL_Q, Sq, Skv, causal) * DSL_BLK_B +
+-           (int64_t) (kvr % DSL_KV) * DSL_ROW_B + (int64_t) (qr % DSL_Q) * 2;
++           (int64_t) dsl_chunk(kvr % DSL_KV, (qr % DSL_Q) / 8) + (int64_t) (qr % 8) * 2;
+ }
+ // is (kv16 row kt, q pair qp) stored?
+ DSL_FN bool dsl_stored(int kt, int qp, int Sq, int Skv, int causal) {
+diff -ruN a/include/dqds/idx.h b/include/dqds/idx.h
+--- a/include/dqds/idx.h	2026-10-29 02:00:41.490949392 +0000
++++ b/include/dqds/idx.h	2026-10-29 04:39:34.136675779 +0000
+@@ -7,7 +7,7 @@
+ // idx.h -- every index formula of bwd_hk_dqds2's recompute-free dQ kernel k_dqds_c (main 384-query
+ // tiles + the merged 256-query head tile), in ONE place.
+ //
+-//   dQ[q, :] = sum_kv dS[q, kv] K[kv, :]   (dS read from the S1 scratch in the dslayout v1
++//   dQ[q, :] = sum_kv dS[q, kv] K[kv, :]   (dS read from the S1 scratch in the dslayout v2
+ //   contract, scale included)
+ //
+ // constexpr __host__ __device__ functions: the HIP kernel (src/k_dqds_c.hip via
+@@ -79,7 +79,7 @@
+ constexpr int HEAD_ROWS = 16 * HEAD_NQW * NWAVE; // 256
+ constexpr int DS_BLK_EL = DSL_BLK_B / 2;         // 512 bf16 per dslayout block [16 kv][32 q]
+ constexpr int DSI_ROW_B =
+-    DSL_ROW_B + 16; // LDS row of a dS block image: 64 B data + 16 B pad (80 B)
++    DSL_ROW_B + 16; // LDS row of a dS block image: 64 B data (4 dslayout v2 chunks) + 16 B pad (80 B)
+ constexpr int       DSI_BLK_B    = DSL_KV * DSI_ROW_B; // one block image (1280 B)
+ constexpr unsigned  TDIM0        = 0x7FFFFFFFu; // inner extent: never clamps (bwd_hk_q1's TDM_DIM0)
+ constexpr int       DQ_IMG_ROW_B = 400; // dQ epilogue image row (bwd_hk_q1: 384 B data + 16 B pad)
+@@ -360,7 +360,8 @@
+ // LDS byte of element (block row rr in {0,1}, stored block j, kv k, q c) of an op landing at L
+ // (stream pad model: destination byte b -> b + (b / 64) * 16)
+ DQ_HD constexpr int dsop_elem_lds(int L, int nv, int rr, int j, int k, int c) {
+-    return L + ((rr * nv + j) * DSL_BLK_B + k * DSL_ROW_B + 2 * c) / 64 * 80 + (2 * c) % 64;
++    return L + ((rr * nv + j) * DSL_BLK_B + dsl_chunk(k, c / 8) + 2 * (c % 8)) / 64 * 80 +
++           (dsl_chunk(k, c / 8) + 2 * (c % 8)) % 64;
+ }
+ 
+ // ---- K TDM ops
+@@ -427,13 +428,21 @@
+     return dt * 32 + (dt / 4) * 32 + h * 16 * C_KROW_B;
+ #endif
+ }
++// dslayout v2: the tr16 lane reads chunk (kv row lane_r, query chunk 2 qhalf + lane_c / 8) of a block image,
++// at dsl_chunk = qhalf * 512 + g * 16 with g = (lane_c / 8) * 16 + lane_r, i.e. image byte qhalf * 640 + (g / 4) * 80 +
++// (g % 4) * 16 (the TDM pads 16 B after every 64 B): ds_lane(lane) + ds_half(qhalf)
+ DQ_HD constexpr int ds_lane(int lane) {
+-    return lane_r(lane) * DSI_ROW_B + lane_c(lane) * 2;
++    const int g = (lane_c(lane) / 8) * 16 + lane_r(lane);
++    return (g / 4) * DSI_ROW_B + (g % 4) * 16;
++}
++// image offset of the 16-query half qhalf of a block (its second 512 data bytes = 8 padded 64-B groups)
++DQ_HD constexpr int ds_half(int qhalf) {
++    return qhalf * 8 * DSI_ROW_B;
+ }
+ // operand of query sub-tile qh (q pair lb = qh / 2 relative to the reader's first block, 16-query
+ // half qh % 2)
+ DQ_HD constexpr int ds_imm(int qh) {
+-    return (qh / 2) * DSI_BLK_B + (qh % 2) * 32;
++    return (qh / 2) * DSI_BLK_B + ds_half(qh % 2);
+ }
+ // row-1 image base of a slot whose op landed with shift sh (nbs blocks per row)
+ DQ_HD constexpr int ds_row1(int slot, int nbs, int sh) {
+diff -ruN a/include/dslayout.h b/include/dslayout.h
+--- a/include/dslayout.h	2026-10-27 06:06:58.496032860 +0000
++++ b/include/dslayout.h	2026-10-29 04:39:34.135873628 +0000
+@@ -4,7 +4,7 @@
+  * See LICENSE for license information.
+  **************************************************************************************************/
+ 
+-// dslayout.h -- the S1 dS^T scratch contract, version 1.
++// dslayout.h -- the S1 dS^T scratch contract, version 2 (v1 + fragment-native blocks).
+ //
+ // Owner: bwd_hk_k1ds (writer, k_dkdv64ds). Consumer: bwd_hk_dqds (reader, k_dqds), which carries a
+ // BYTE-IDENTICAL copy of this file and checks its sha256 against the writer's. Any change is a new
+@@ -29,10 +29,13 @@
+ //     qp = dsl_qp_first(kt) .. Sq/32 - 1 in order ("packed causal": the leading q pairs of a row
+ //     are fully masked for all 16 kv rows and are NOT stored; non-causal: dsl_qp_first == 0, a
+ //     dense rectangle);
+-//   * a block (bh, kt, qp) is the [16 kv][32 q] bf16 tile, row-major: element (kv, q) with kv = kv
+-//   row - 16 kt
+-//     in [0, 16) and q = query - 32 qp in [0, 32) sits at block byte kv * 64 + q * 2; 1024 B per
+-//     block, so a 128-B line of a block holds kv rows 2l and 2l + 1.
++//   * a block (bh, kt, qp) is the [16 kv][32 q] bf16 tile in the order of the writer's dK B operand
++//     (version 2, "fragment-native"): 64 chunks of 16 B, chunk (kv, c) = the 8 queries [8 c, 8 c + 8) of kv
++//     row kv (kv = kv row - 16 kt in [0, 16), c in [0, 4)) at block byte dsl_chunk(kv, c) = (c / 2) * 512 +
++//     ((c % 2) * 16 + kv) * 16, so element (kv, q), q = query - 32 qp in [0, 32), sits at dsl_chunk(kv, q / 8)
++//     + (q % 8) * 2. A writer lane (kv row r = lane % 16, half h = lane / 16) holds chunks (r, h) and (r, h + 2)
++//     in its dK operand (dwords 0..3, 4..7) and stores them at lane * 16 and 512 + lane * 16: two whole 512-B
++//     stores per block, no cross-lane regroup. 1024 B per block. (v1: row-major, element at kv * 64 + q * 2.)
+ //   dsl_qp_first(kt) = causal ? max(0, floor(kt / 2) - cshift / 32) : 0 is the first q pair with an
+ //   attended entry (16 kt <= 32 qp + 31 + cshift); it is <= Sq/32 - 1 for every kt < Skv/16, so
+ //   every row is non-empty. Size per region (prod s4096 causal): 16512 blocks = 16.9 MB; b2
+@@ -52,11 +55,11 @@
+ #endif
+ #define DSL_FN static inline constexpr __host__ __device__
+ 
+-#define DSL_VERSION 1
++#define DSL_VERSION 2
+ #define DSL_SCALED 1   // dS carries the softmax scale (the dK operand as k_dkdv64 consumes it)
+ #define DSL_KV 16      // kv rows per block
+ #define DSL_Q 32       // queries per block (one q pair of 16-row tiles)
+-#define DSL_ROW_B 64   // bytes of one block row (32 bf16)
++#define DSL_ROW_B 64   // bytes of 4 chunks (the readers' TDM pad interval; v1: one kv row of 32 bf16)
+ #define DSL_BLK_B 1024 // bytes of one block
+ 
+ DSL_FN int dsl_nqp(int Sq) {
+@@ -101,11 +104,15 @@
+     return bh * dsl_nblk_bh(Sq, Skv, causal) + dsl_row_off(kt, Sq, Skv - Sq, causal) +
+            (int64_t) (qp - dsl_qp_first(kt, Skv - Sq, causal));
+ }
++// block byte of chunk (kv row kv in [0, 16), query chunk c in [0, 4): queries [8 c, 8 c + 8))
++DSL_FN int dsl_chunk(int kv, int c) {
++    return (c >> 1) * 512 + ((c & 1) * 16 + kv) * 16;
++}
+ // byte of element (kv row kvr, query qr) of head bh (kvr in row kt = kvr / 16, qr in pair qp = qr /
+ // 32)
+ DSL_FN int64_t dsl_byte(int64_t bh, int kvr, int qr, int Sq, int Skv, int causal) {
+     return dsl_blk(bh, kvr / DSL_KV, qr / DSL_Q, Sq, Skv, causal) * DSL_BLK_B +
+-           (int64_t) (kvr % DSL_KV) * DSL_ROW_B + (int64_t) (qr % DSL_Q) * 2;
++           (int64_t) dsl_chunk(kvr % DSL_KV, (qr % DSL_Q) / 8) + (int64_t) (qr % 8) * 2;
+ }
+ // is (kv16 row kt, q pair qp) stored?
+ DSL_FN bool dsl_stored(int kt, int qp, int Sq, int Skv, int causal) {
+diff -ruN a/include/k1ds_idx.h b/include/k1ds_idx.h
+--- a/include/k1ds_idx.h	2026-10-27 06:06:58.496069580 +0000
++++ b/include/k1ds_idx.h	2026-10-29 04:39:34.136069538 +0000
+@@ -8,7 +8,7 @@
+ // constexpr
+ // __host__ __device__ functions of scalars. The kernel calls exactly these; bounds_proof.py
+ // compiles this file for the host and replays them over every launched shape. The layout is
+-// dslayout.h v1.
++// dslayout.h v2.
+ //
+ // Per wave (kv block bid, wave wv): kv16 rows kt0 = (64 bid + 32 wv) / 16 (kv sub-tile kh = 0) and
+ // kt0 + 1 (kh = 1). One wave-iteration (query pair qt, q head gh of the group) exports two blocks
+@@ -116,12 +116,11 @@
+     return gh * k1ds_hstride(Sq, Skv, causal) + qt * DSL_BLK_B +
+            k1ds_rowc(kh, bid, wv, Sq, Skv, causal);
+ }
+-// voffset of lane `lane` (loop-invariant): after the DPP regroup lane (r = lane % 16, h = lane /
+-// 16) holds block row 8t + (r & 7), 16-B chunk h + 2 (r >> 3) of store t; its 16 B go to row*64 +
+-// chunk*16 (store t adds 512 t)
++// voffset of lane `lane` (loop-invariant, dslayout v2): lane (r = lane % 16, h = lane / 16) stores its dK
++// operand's dwords 0..3 = chunk (r, h) at dsl_chunk(r, h) = lane * 16 and dwords 4..7 = chunk (r, h + 2) at
++// dsl_chunk(r, h + 2) = 512 + lane * 16 (store t adds 512 t)
+ K1DS_FN int k1ds_voff(int lane) {
+-    const int r = lane % 16, h = lane / 16;
+-    return (r & 7) * DSL_ROW_B + (h + 2 * (r >> 3)) * 16;
++    return dsl_chunk(lane % 16, lane / 16);
+ }
+ // counters (query pair, q head) after the peeled full iteration 0: k1_wrap_q / k1_wrap_g (0, 0, G)
+ // in integer form (G >= 1): gh = min(G - 1, 1), qi = 1 - gh. The select form made clang carry (G >
+diff -ruN a/include/k3ds_idx.h b/include/k3ds_idx.h
+--- a/include/k3ds_idx.h	2026-10-27 06:06:58.496082750 +0000
++++ b/include/k3ds_idx.h	2026-10-29 04:40:09.767703209 +0000
+@@ -8,7 +8,7 @@
+ // constexpr
+ // __host__ __device__ functions of scalars. The kernel calls exactly these; bounds_proof.py
+ // compiles this file for the host and replays them over every launched shape. The layout is
+-// dslayout.h v1.
++// dslayout.h v2.
+ //
+ // k1ds_idx.h (bwd_hk_k1ds, byte-identical here) indexes a wave by (64-row block bid, wave wv), i.e.
+ // kv16 rows kt0 = 4 bid + 2 wv and kt0 + 1. A k_dkdv96ds wave owns nkv kv16 rows starting at kt0 =
+diff -ruN a/src/k_dkdv96ds.hip b/src/k_dkdv96ds.hip
+--- a/src/k_dkdv96ds.hip	2026-10-29 02:00:41.493967337 +0000
++++ b/src/k_dkdv96ds.hip	2026-10-29 04:39:34.136519268 +0000
+@@ -6,19 +6,19 @@
+ 
+ // k_dkdv96ds (bwd_hk_k3ds): bwd_hk_k3's k_dkdv96
+ // PLUS the S1 write side of bwd_hk_k1ds: every wave-iteration exports the bf16 dS^T it feeds the dK WMMA (a_dsk)
+-// into the scratch DS in dslayout.h v1. The dK/dV computation is k3's, instruction for instruction in operands and
++// into the scratch DS in dslayout.h v2. The dK/dV computation is k3's, instruction for instruction in operands and
+ // per-accumulator WMMA order, so dk / dv stay bitwise equal to bwd_hk_k3's (and bwd_r10_c's); the exported bytes are
+ // k1ds's (same S/dP chains in the same lanes, same layout).
+ //
+ // Export:
+-//   * regroup (k1ds's DPP recipe): a_dsk[kh] lane (row r, half h) holds 16-B chunks h and h + 2 of kv row 16 kh + r;
+-//     per dword k < 4, X[k] = DPP row_ror:8 (a[4+k] -> lanes r >= 8, bank mask 0xC; old a[k]), Y[k] = DPP row_ror:8
+-//     (a[k] -> lanes r < 8, bank mask 0x3; old a[4+k]); each buffer_store_b128 is 512 contiguous bytes = 4 whole
+-//     128-B lines; 2 stores per kv16 block.
++//   * dslayout v2 (fragment-native): a_dsk[kh] lane (row r, half h) holds the 16-B chunks (r, h) and (r, h + 2) of
++//     the block of kv rows 16 kh .. 16 kh + 15; it stores dwords 0..3 at lane * 16 and dwords 4..7 at 512 + lane *
++//     16 (dslayout.h dsl_chunk): each buffer_store_b128 is 512 contiguous bytes = 4 whole 128-B lines, 2 stores per
++//     kv16 block, no cross-lane regroup (v1 needed 8 DPP + 8 moves per block).
+ //   * descriptor per wave: 64-bit base = scratch + region bh0 = bat*Hq + hkv*G, row kt0 = kv0 / 16 (int64 math,
+ //     k3ds_idx.h), num_records = the wave's TRUE extent (its NKV kv16 rows over the G q heads; route dsw0: ds_mode 0
+ //     -> num_records 0, every store dropped at the address stage); soffset = gh * hstride + 1024 qt + rowc(kh)
+-//     (SGPR), voffset per lane, loop-invariant (k1ds_voff; +512 for Y).
++//     (SGPR), voffset per lane, loop-invariant (k1ds_voff; +512 for the second store).
+ //   * placement, 96-row body (NKV 3): full loop -> this iteration's 3 blocks right after the dO^T tr16 burst, at the
+ //     head of the DS-free dV WMMA run (24 WMMAs before the Q^T burst); no payload crosses the back edge (k3 holds 998
+ //     VGPRs; k1ds's deferred payload would add 24 at the S/dP peak). Masked loop -> at the end of the body, a block
+@@ -79,7 +79,7 @@
+ 
+ using namespace hk1;
+ 
+-static_assert(DSL_VERSION == 1 && DSL_SCALED == 1, "k_dkdv96ds writes dslayout v1 with the scale inside dS");
++static_assert(DSL_VERSION == 2 && DSL_SCALED == 1, "k_dkdv96ds writes dslayout v2 with the scale inside dS");
+ 
+ namespace {
+ constexpr int NDT_QK = K1_D_QK / 32;   // 6: WMMA k-steps of S = Q K^T
+@@ -90,7 +90,10 @@
+ constexpr int NHB = NQE + 2 * NDT_V;   // 20 entries per hh
+ constexpr int NRB = 2 * NHB;           // 40 readback entries of a stage
+ constexpr int NLD = 8;                 // carried NL/ND vec4 entries
+-constexpr int KH0_SALU = 2;            // SALU per WMMA of the TDM-prep run (FlyDSL KH0_SALU)
++constexpr int KH0_SALU = 2;
++// the two 16-B halves of a v16 operand: a dK operand's dwords 0..3 / 4..7 = its two dslayout v2 chunks
++HK1_INLINE bf16x8 lo8(bf16x16 v) { return __builtin_shufflevector(v, v, 0, 1, 2, 3, 4, 5, 6, 7); }
++HK1_INLINE bf16x8 hi8(bf16x16 v) { return __builtin_shufflevector(v, v, 8, 9, 10, 11, 12, 13, 14, 15); }            // SALU per WMMA of the TDM-prep run (FlyDSL KH0_SALU)
+ // sched_barrier masks (llvm.amdgcn.sched.barrier): what may cross the fence
+ constexpr int SB_ALU = 0x002 | 0x004 | 0x400;   // VALU, SALU, transcendental
+ }  // namespace
+@@ -232,22 +235,18 @@
+       sched_barrier<0>();
+     }
+ 
+-    // ---- dS^T export (k3ds_idx.h over k1ds_idx.h, dslayout.h v1): per-wave descriptor, row constants, voffset --
++    // ---- dS^T export (k3ds_idx.h over k1ds_idx.h, dslayout.h v2): per-wave descriptor, row constants, voffset --
+     const int kt0 = k3ds_kt0(kv0);
+     const int64_t ds_base = k3ds_base(bat, Hq, hkv, G, kt0, Sq, Skv, causal);
+     const auto r_ds = rsrc64((const unsigned char*)DS + ds_base, k3ds_nrec(ds_mode, G, kt0, NKV, Sq, Skv, causal));
+     int ds_rc[NKV];
+     static_for<NKV>([&](auto kh) { ds_rc[kh] = k3ds_rowc(kh, kt0, Sq, Skv, causal); });
+     const int vds = k1ds_voff(lane);
+-    // the two stores of one kv16 block: DPP row_ror:8 regroup of a_dsk[kh] (X -> block rows 0..7, Y -> 8..15)
++    // the two stores of one kv16 block, dslayout v2: a_dsk[kh]'s dwords 0..3 (queries 0..15) at vds = lane * 16,
++    // dwords 4..7 (queries 16..31) at 512 + lane * 16 -- the operand's own bytes, no cross-lane regroup
+     auto ds_store = [&](const bf16x16& a, int so) {
+-      const u32x8 w = __builtin_bit_cast(u32x8, a);
+-      const u32x4 x = {dpp_ror8<0xC>(w[0], w[4]), dpp_ror8<0xC>(w[1], w[5]), dpp_ror8<0xC>(w[2], w[6]),
+-                       dpp_ror8<0xC>(w[3], w[7])};
+-      const u32x4 y = {dpp_ror8<0x3>(w[4], w[0]), dpp_ror8<0x3>(w[5], w[1]), dpp_ror8<0x3>(w[6], w[2]),
+-                       dpp_ror8<0x3>(w[7], w[3])};
+-      buf_store_u32x4(x, r_ds, vds, so);
+-      buf_store_u32x4(y, r_ds, vds + K1DS_ST_B, so);
++      buf_store_b128(lo8(a), r_ds, vds, so);
++      buf_store_b128(hi8(a), r_ds, vds + K1DS_ST_B, so);
+     };
+ 
+     // ---- S/dP + softmax/dS of one (hh, kh): S = Q K^T and dP = dO V^T (A = the Q / dO rows of hh, B = K / V of
+@@ -531,19 +530,10 @@
+         // k3ds: this iteration's dS^T (all NKV blocks) at the head of the DS-free dV WMMA run, 24 WMMAs before the
+         // Q^T burst; the soffset from this iteration's counters (they advance only at the end of full_iter)
+         const int so_c = k3ds_sq(qt0 + qi, gh, Sq, Skv, causal);
+-        // X1b1s: regroup all NKV blocks first (distinct staging registers), then the 2*NKV stores
+-        u32x4 dsx[NKV], dsy[NKV];
++        // dslayout v2: the 2*NKV stores straight from the a_dsk operands (no regroup)
+         static_for<NKV>([&](auto kh) {
+-          const u32x8 w = __builtin_bit_cast(u32x8, a_dsk[kh]);
+-          dsx[kh] = u32x4{dpp_ror8<0xC>(w[0], w[4]), dpp_ror8<0xC>(w[1], w[5]), dpp_ror8<0xC>(w[2], w[6]),
+-                          dpp_ror8<0xC>(w[3], w[7])};
+-          dsy[kh] = u32x4{dpp_ror8<0x3>(w[4], w[0]), dpp_ror8<0x3>(w[5], w[1]), dpp_ror8<0x3>(w[6], w[2]),
+-                          dpp_ror8<0x3>(w[7], w[3])};
+-        });
+-        sched_barrier<0>();
+-        static_for<NKV>([&](auto kh) {
+-          buf_store_u32x4(dsx[kh], r_ds, vds, so_c + ds_rc[kh]);
+-          buf_store_u32x4(dsy[kh], r_ds, vds + K1DS_ST_B, so_c + ds_rc[kh]);
++          buf_store_b128(lo8(a_dsk[kh]), r_ds, vds, so_c + ds_rc[kh]);
++          buf_store_b128(hi8(a_dsk[kh]), r_ds, vds + K1DS_ST_B, so_c + ds_rc[kh]);
+         });
+         // X1b1: the export is pinned here, under the dO^T tr16 latency, ahead of the first dV WMMA (in the
+         // non-expert mode a store issued inside the WMMA run waits for every earlier WMMA)
+diff -ruN a/src/k_dqds_c.hip b/src/k_dqds_c.hip
+--- a/src/k_dqds_c.hip	2026-10-27 06:06:58.496169590 +0000
++++ b/src/k_dqds_c.hip	2026-10-29 04:40:09.768098123 +0000
+@@ -4,7 +4,7 @@
+  * See LICENSE for license information.
+  **************************************************************************************************/
+ 
+-// k_dqds_c -- bwd_hk_dqds2: the recompute-free dQ kernel of the S1 line (dQ = dS K from the S1 scratch, dslayout v1)
++// k_dqds_c -- bwd_hk_dqds2: the recompute-free dQ kernel of the S1 line (dQ = dS K from the S1 scratch, dslayout v2)
+ // with 384-query workgroups: 4 waves (1 per SIMD, one workgroup per CU, LDS 276480 B) share ONE K ring (K bytes per
+ // call / 2 vs bwd_hk_dqds's k_dqds_b); role-split TDM issue (waves 0 / 3 the dS of kv32 rows 2u / 2u + 1 for all 12 q
+ // pairs, waves 1 / 2 the two 32-row K halves: one op per wave per 64-kv unit, the two TDM engines balanced), K and dS
