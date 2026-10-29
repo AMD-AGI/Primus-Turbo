@@ -58,7 +58,7 @@ Note: JAX support is under active development. Optim support is planned but not 
 | -------------| --------------------|
 | GFX942       | ✅MI300X, ✅MI325X |
 | GFX950       | ✅MI350X, ✅MI355X |
-| GFX1250      | ✅MI455X (preview) |
+| GFX1250      | ✅MI455X |
 
 > See [AMD GPU Architecture](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html#supported-gpus) to find the architecture for your GPU.
 

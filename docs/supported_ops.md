@@ -37,9 +37,8 @@ Operators are available as `turbo.ops.<name>` (`import primus_turbo.pytorch as t
 
 Every operator below implements backward unless marked "fwd only".
 
-Legend: ✅ supported · — not supported or not validated. MI455X (gfx1250) is in preview: ✅ means the
-code path is enabled, with thinner test coverage than gfx942 / gfx950. Shape and layout limits are
-listed in the notes; the kernel backend behind each cell is in
+Legend: ✅ supported · — not supported or not validated. Shape and layout limits are listed in the
+notes; the kernel backend behind each cell is in
 [Appendix: backends per operator](#5-appendix-backends-per-operator).
 
 ### 2.1 GEMM
