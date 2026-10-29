@@ -517,8 +517,8 @@ nothing at 256. Fewer pushers with one-token claims, stamps off (combine µs):
 | 16 | 375.5 | 173.2 | 131.1 | 120.7 | 713.6 | 324.6 | 255.0 | 248.5 |
 | 12 | 386.6 | 179.5 | 127.5 | 118.0 | 756.3 | 340.3 | 253.8 | 252.3 |
 
-Fewer pushers gain 3% only at EP4 / 160 CUs and lose at EP2 below 256 CUs and everywhere below 160 CUs
-(ten repeats of the EP4 default spread 2–6 µs), so the default stays at 22.
+Fewer pushers gain 2–3% only at EP4 / 160 CUs (and 12 warps at EP2 / 256 CUs), and lose at EP2 below 256
+CUs and everywhere below 160 CUs (ten repeats of the EP4 default spread 4–6 µs), so the default stays at 22.
 
 Kernel time alone at EP4 with one-token claims (rocprofv3, slowest rank): combine kernel 300.9 / 251.6 /
 239.8 µs at 80 / 160 / 256 CUs (before: 284.3 µs at 160, 274.8 at 256).
@@ -568,8 +568,8 @@ same case as the cached dispatch here (58%).
 6. ~~`06-rccl`'s RCCL build (`105dd4f`) here~~: not done; the baseline stays the container's RCCL
    (user, 2026-10-29).
 7. The EP4 illegal memory access ([EP4](#ep4)): 20 stamps-on and 20 stamps-off runs plus `test_intranode.py`
-   twice did not reproduce it (2026-10-29). Open; a `HSA_TOOLS_REPORT_LOAD_FAILURE` / address-sanitizer
-   build would be the next step if it shows again.
+   twice did not reproduce it (2026-10-29). Open; if it shows again, keep that run's core dump (the
+   benchmark runs set `prlimit --core=0`) and the faulting address from the kernel log.
 8. ~~Fewer push warps with one-token claims~~: measured at EP2 and EP4; the default stays at 22 ([EP4](#ep4)).
 
 ## References
