@@ -24,7 +24,8 @@
 #
 # env: HIDDEN (7168), BLOCKS_LIST (8,16,32,48,64,80,96,128,160,192,224,256), ROWS_LIST (8192,32768; rows per
 #      peer for the block sweep), SIZE_BLOCKS (80,256), SIZE_ROWS (256,1024,2048,4096,8192,16384,32768),
-#      CHECK (1), ITERS, ROUNDS, FLUSH_MB, OUT_JSON, TAG
+#      METHODS (all copy-kernel methods), REFS (1: the references too), COPY_WARPS (copy_kernel.py), CHECK (1),
+#      ITERS, ROUNDS, FLUSH_MB, OUT_JSON, TAG
 import os
 
 import torch
@@ -33,7 +34,7 @@ from common import RANK, WORLD, Results, bench, finish, init
 
 group = init()
 
-from copy_kernel import NUM_THREADS, launch_copy  # noqa: E402
+from copy_kernel import COPY_WARPS, NUM_THREADS, launch_copy  # noqa: E402
 
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher  # noqa: E402
 from primus_turbo.pytorch.core.pyhip_runtime_wrapper import hipMemcpyKindEnum  # noqa: E402
@@ -50,6 +51,7 @@ SIZE_ROWS = [
     int(r) for r in os.environ.get("SIZE_ROWS", "256,1024,2048,4096,8192,16384,32768").split(",") if r
 ]
 CHECK = os.environ.get("CHECK", "1") == "1"
+REFS = os.environ.get("REFS", "1") == "1"
 MAX_ROWS = max(ROWS_LIST + SIZE_ROWS)
 REGION_BYTES = MAX_ROWS * ROW_BYTES
 PEERS = WORLD - 1
@@ -71,6 +73,7 @@ results = Results(
         size_blocks=SIZE_BLOCKS,
         size_rows=SIZE_ROWS,
         num_threads=NUM_THREADS,
+        copy_warps=COPY_WARPS,
         tag=os.environ.get("TAG", ""),
     )
 )
@@ -94,6 +97,8 @@ METHODS = {
     "tdm_cached": ("cached", 1, 0),
     "tdm_self": ("uncached", 1, 1),
 }
+if os.environ.get("METHODS"):
+    METHODS = {m: METHODS[m] for m in os.environ["METHODS"].split(",")}
 
 
 def copy_fn(method, blocks, rows, direction):
@@ -227,19 +232,19 @@ def hipmemcpy_fn(kind, rows, direction):
     return fn
 
 
-for kind in MEMCPY_KINDS:
+for kind in MEMCPY_KINDS if REFS else ():
     for rows in sorted(set(ROWS_LIST + SIZE_ROWS)):
         for direction in ("bi", "uni"):
             add(kind, direction, 0, rows, bench(hipmemcpy_fn(kind, rows, direction), pre=barrier))
 
-for rows in sorted(set(ROWS_LIST + SIZE_ROWS)):
+for rows in sorted(set(ROWS_LIST + SIZE_ROWS)) if REFS else ():
     inp = torch.empty(WORLD * rows, H, dtype=torch.bfloat16, device="cuda")
     out = torch.empty_like(inp)
     add("rccl_a2a", "bi", 0, rows, bench(lambda out=out, inp=inp: dist.all_to_all_single(out, inp)))
     del inp, out
 
 dst_local = torch.empty_like(src)
-for rows in ROWS_LIST:
+for rows in ROWS_LIST if REFS else ():
     add("torch_copy", "bi", 0, rows, bench(lambda rows=rows: dst_local[:rows].copy_(src[:rows])))
 
 finish(results)
