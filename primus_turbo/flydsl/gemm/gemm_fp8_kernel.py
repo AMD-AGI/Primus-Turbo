@@ -1334,46 +1334,54 @@ def _tn4_handoff_wait(flag, off, want, rows):
     return fx.Int32(_llvm.extractvalue(T.i32, r, [2]))
 
 
-# Accumulators a lane hands over per request; the slot is lane-contiguous so a pair rides one.
-_TN4_HAND_PACK = 2
+def _tn4_hand_ty(out_fp16):
+    """Element type of the handoff slot. The partial is unscaled, and raw fp8 products summed
+    over half of K outgrow fp16's range, so fp16 output hands over in f32; bf16 already has
+    f32's exponent range."""
+    return fx.Float32 if out_fp16 else fx.BFloat16
 
 
-def _tn4_frag_off(wave_id, lane_id, q, nacc):
-    """Element offset of accumulator ``q``'s pack in a tile's handoff scratch slot; C's own
-    layout would scatter a lane's four values over four rows instead."""
-    lane_elems = 4 * _TN4_HAND_PACK
-    return (wave_id * fx.Int32(nacc) + fx.Int32(q)) * fx.Int32(256) + lane_id * fx.Int32(lane_elems)
+def _tn4_hand_pack(hand_ty):
+    """Accumulators a lane hands over per b128 request; the slot is lane-contiguous so a
+    2-byte pair rides one."""
+    return 16 // (4 * (hand_ty.width // 8))
 
 
-def _tn4_publish_frag(frag, rsrc, wave_id, lane_id, q0, nacc, out_ty, aux):
+def _tn4_frag_off(wave_id, lane_id, q, nacc, n):
+    """Element offset of accumulator ``q``'s pack of ``n`` in a tile's handoff scratch slot;
+    C's own layout would scatter a lane's four values over four rows instead."""
+    return (wave_id * fx.Int32(nacc) + fx.Int32(q)) * fx.Int32(256) + lane_id * fx.Int32(4 * n)
+
+
+def _tn4_publish_frag(frag, rsrc, wave_id, lane_id, q0, nacc, hand_ty, aux):
     """Hand this slice's accumulators to the tile's scratch slot, unscaled: the folding slice
     adds them to its own and its store is what applies the per-tensor scale, once. A slice
     that owns no slot takes a zero-record descriptor and its stores drop."""
-    n = _TN4_HAND_PACK
+    n = _tn4_hand_pack(hand_ty)
     assert len(frag) % n == 0 and q0 % n == 0, "handoff pack must divide the accumulator run"
     for i in range_constexpr(len(frag) // n):
-        vals = [frag[n * i + h].to(out_ty) for h in range(n)]
+        vals = [frag[n * i + h].to(hand_ty) for h in range(n)]
         _buffer_ops.buffer_store(
-            Vec.from_elements([v[j] for v in vals for j in range(4)], out_ty),
+            Vec.from_elements([v[j] for v in vals for j in range(4)], hand_ty),
             rsrc,
-            _tn4_frag_off(wave_id, lane_id, q0 + n * i, nacc),
+            _tn4_frag_off(wave_id, lane_id, q0 + n * i, nacc, n),
             cache_modifier=aux,
         )
 
 
-def _tn4_fold_frag(frag, rsrc, wave_id, lane_id, q0, nacc, out_ty, aux):
+def _tn4_fold_frag(frag, rsrc, wave_id, lane_id, q0, nacc, hand_ty, aux):
     """Add the predecessor slice's published accumulators into this one's. A non-folding
     slice reads a zero-record descriptor, which returns zero and leaves its own values."""
-    n = _TN4_HAND_PACK
+    n = _tn4_hand_pack(hand_ty)
     assert len(frag) % n == 0 and q0 % n == 0, "handoff pack must divide the accumulator run"
     out = []
     for i in range_constexpr(len(frag) // n):
         got = Vec(
             _buffer_ops.buffer_load(
                 rsrc,
-                _tn4_frag_off(wave_id, lane_id, q0 + n * i, nacc),
+                _tn4_frag_off(wave_id, lane_id, q0 + n * i, nacc, n),
                 vec_width=4 * n,
-                dtype=out_ty.ir_type,
+                dtype=hand_ty.ir_type,
                 cache_modifier=aux,
             )
         ).to(fx.Float32)
@@ -1616,7 +1624,8 @@ def _dense_tn_wave4_tile(
         ki = fx.Int32(_readfirstlane_i32(ki))
         if handoff:
             # Which side of the protocol this id is on; a tile below the window issues neither.
-            slot = geom.bm * geom.bn * 2
+            hand_ty = _tn4_hand_ty(out_ty is fx.Float16)
+            slot = geom.bm * geom.bn * (hand_ty.width // 8)
             pub = sid == fx.Int32(0)
             fold = sid == fx.Int32(1)
             fold_rec = fx.Int32(_readfirstlane_i32(arith.select(fold, fx.Int32(slot), fx.Int32(0))))
@@ -1791,7 +1800,7 @@ def _dense_tn_wave4_tile(
         _lds_barrier()
 
     if handoff:
-        _tn4_publish_frag(res, hand_st, wave_id, lane_id, 0, nacc, out_ty, handoff)
+        _tn4_publish_frag(res, hand_st, wave_id, lane_id, 0, nacc, hand_ty, handoff)
         # The raise trails this tile's stores; the second barrier keeps a wave past the poll
         # from resetting the flag under one still spinning.
         wait_barrier(0)
@@ -1818,7 +1827,7 @@ def _dense_tn_wave4_tile(
             col_q = bn_off + wave_n * fx.Int32(pb.tiles * 16)
             frag = res[q : q + n]
             if handoff:
-                frag = _tn4_fold_frag(frag, hand_ld, wave_id, lane_id, q, nacc, out_ty, handoff)
+                frag = _tn4_fold_frag(frag, hand_ld, wave_id, lane_id, q, nacc, hand_ty, handoff)
             store_c[pb.tiles].store(frag, base_row + pa.gcol, col_q + pb.gcol)
             q += n
     for s in store_c.values():
@@ -3247,30 +3256,31 @@ def _tn4_rounds(M, N, ncu, geom):
     return ceildiv(ceildiv(M, geom.bm) * ceildiv(N, geom.bn), ncu)
 
 
-def _tn4_grid(M, N, K, ncu, geom):
+def _tn4_grid(M, N, K, ncu, geom, out_fp16=False):
     """Workgroups one geometry launches, plus ``(bands, flags)`` in units of the M x N scratch
-    band: the reduce route needs s-1 bands, the handoff one fragment-ordered slot and one flag
-    per window tile."""
+    band of 2-byte out_ty: the reduce route needs s-1 bands, the handoff one fragment-ordered
+    slot of _tn4_hand_ty elements and one flag per window tile."""
     tiles = ceildiv(M, geom.bm) * ceildiv(N, geom.bn)
     split = _tn4_geom_split(M, N, K, ncu, geom)
     if split is None:
         return tiles, 0, 0
     grid = tiles + split[1] * (split[2] - 1)
     if _tn4_handoff(split):
-        return grid, ceildiv(split[1] * geom.bm * geom.bn, M * N), split[1]
+        slot_bytes = geom.bm * geom.bn * (_tn4_hand_ty(out_fp16).width // 8)
+        return grid, ceildiv(split[1] * slot_bytes, M * N * 2), split[1]
     return grid, split[2] - 1, 0
 
 
-def _tn4_plan(M, N, K, ncu):
+def _tn4_plan(M, N, K, ncu, out_fp16=False):
     """Whole-loop macro tiles for one TN shape, most promising first, with the scratch bands and
     flags the widest needs. The CU passes they occupy order them; that only orders the race,
     which is what picks one. Memoised because every launch reads it."""
-    key = (M, N, K, ncu)
+    key = (M, N, K, ncu, out_fp16)
     plan = _TN4_PLAN_CACHE.get(key)
     if plan is None:
         scored = []
         for rank, g in enumerate(_TN4_GEOMS):
-            _grid, bands, flags = _tn4_grid(M, N, K, ncu, g)
+            _grid, bands, flags = _tn4_grid(M, N, K, ncu, g, out_fp16)
             scored.append((_tn4_rounds(M, N, ncu, g), rank, bands, flags, g))
         scored.sort(key=lambda s: s[:2])
         plan = (
@@ -3432,7 +3442,7 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         # The split writes a workspace a later pass reduces, so an accumulate on the tile
         # store would be folded in twice; beta=1 takes the 8-wave epilogue instead.
         if _tn_wave4_supported(N, K, i64_tr) and not beta_is_one:
-            geoms, bands, flags = _tn4_plan(M, N, K, _dense_num_cus())
+            geoms, bands, flags = _tn4_plan(M, N, K, _dense_num_cus(), out_fp16)
             wargs = (
                 _dense_operand(a),
                 _dense_operand(b),
