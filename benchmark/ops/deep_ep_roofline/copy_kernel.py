@@ -10,8 +10,10 @@
 # on gfx1250; else the warp copy through VGPRs of V2's non-TDM path.
 #
 # COPY_WARPS=n: only n warps per block copy, each with MAX_LDS_BYTES / n of LDS for its row (the V2 combine
-# pushes with 22 warps at hidden 7168, a whole row per warp; 32 warps move a row in two pieces). Read once per
-# process, so give each value its own FLYDSL_RUNTIME_CACHE_DIR.
+# pushes with 22 warps at hidden 7168, a whole row per warp; 32 warps move a row in two pieces).
+# COPY_WARP_MAJOR=1: rows dealt warp-major (row = warp x blocks + block), so a last, partial round spreads over
+# every block, as the V2 combine's push deals them; default block-major. Both are read once per process, so give
+# each value its own FLYDSL_RUNTIME_CACHE_DIR.
 import os
 
 import flydsl.compiler as flyc
@@ -32,6 +34,7 @@ from primus_turbo.flydsl.utils.buffer_ops import create_buffer_resource, create_
 from primus_turbo.flydsl.utils.prims import _i64, _readfirstlane_i32
 
 COPY_WARPS = min(int(os.environ.get("COPY_WARPS", NUM_WARPS)), NUM_WARPS)
+COPY_WARP_MAJOR = os.environ.get("COPY_WARP_MAJOR", "0") == "1"
 
 
 def _make_copy(world, num_blocks, row_bytes, region_bytes, use_tdm, to_self):
@@ -52,7 +55,10 @@ def _make_copy(world, num_blocks, row_bytes, region_bytes, use_tdm, to_self):
             row_lds = fx.arith.ArithValue(lds_base(), signed=True) + _readfirstlane_i32(warp_id) * fx.Int32(
                 row_buffer_bytes
             )
-        row = fx.block_idx.x * fx.Int32(COPY_WARPS) + warp_id
+        if fx.const_expr(COPY_WARP_MAJOR):
+            row = warp_id * fx.Int32(num_blocks) + fx.block_idx.x
+        else:
+            row = fx.block_idx.x * fx.Int32(COPY_WARPS) + warp_id
         row = arith.select(warp_id < fx.Int32(COPY_WARPS), row, num_rows)
         while row < num_rows:
             if fx.const_expr(use_tdm):

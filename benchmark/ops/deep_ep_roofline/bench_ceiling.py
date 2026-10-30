@@ -24,7 +24,8 @@
 #
 # env: HIDDEN (7168), BLOCKS_LIST (8,16,32,48,64,80,96,128,160,192,224,256), ROWS_LIST (8192,32768; rows per
 #      peer for the block sweep), SIZE_BLOCKS (80,256), SIZE_ROWS (256,1024,2048,4096,8192,16384,32768),
-#      METHODS (all copy-kernel methods), REFS (1: the references too), COPY_WARPS (copy_kernel.py), CHECK (1),
+#      METHODS (all copy-kernel methods), REFS (1: the references too), COPY_WARPS / COPY_WARP_MAJOR (copy_kernel.py),
+#      CHECK (1),
 #      ITERS, ROUNDS, FLUSH_MB, OUT_JSON, TAG
 import os
 
@@ -34,7 +35,7 @@ from common import RANK, WORLD, Results, bench, finish, init
 
 group = init()
 
-from copy_kernel import COPY_WARPS, NUM_THREADS, launch_copy  # noqa: E402
+from copy_kernel import COPY_WARP_MAJOR, COPY_WARPS, NUM_THREADS, launch_copy  # noqa: E402
 
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher  # noqa: E402
 from primus_turbo.pytorch.core.pyhip_runtime_wrapper import hipMemcpyKindEnum  # noqa: E402
@@ -74,6 +75,7 @@ results = Results(
         size_rows=SIZE_ROWS,
         num_threads=NUM_THREADS,
         copy_warps=COPY_WARPS,
+        copy_warp_major=COPY_WARP_MAJOR,
         tag=os.environ.get("TAG", ""),
     )
 )
