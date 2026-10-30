@@ -49,6 +49,7 @@ from primus_turbo.flydsl.deep_ep.intranode_v2_kernel import (
     TAIL_DONE_BIT,
     combine_v2_grabs,
     combine_v2_layout,
+    combine_v2_reduce_chunks,
     combine_v2_slot_bytes,
     dispatch_v2_layout,
     dispatch_v2_recv_warps,
@@ -727,7 +728,10 @@ class FlyDSLIntranodeRuntime:
             )
             self.combine_epoch = self.combine_epoch % (2**31 - 1) + 1
             grab_base = self.reduce_grabs
-            self.reduce_grabs += combine_v2_grabs(num_recv_tokens, num_channels)
+            chunks = combine_v2_reduce_chunks(
+                num_ranks, hidden, x.element_size(), bias_0 is not None, bias_1 is not None
+            )
+            self.reduce_grabs += combine_v2_grabs(num_recv_tokens, num_channels, chunks)
             if self.combine_needs_barrier:
                 run_launcher(launch_barrier, self.barrier_ptrs, rank, num_ranks, launch_stream)
             self.combine_needs_barrier = True

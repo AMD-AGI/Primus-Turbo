@@ -1124,10 +1124,33 @@ def combine_v2_push_warps(num_channels):
     return NUM_WARPS * 11 // 16 if num_channels >= 96 else NUM_WARPS
 
 
-def combine_v2_grabs(num_recv_tokens, num_channels):
-    """How far one combine advances the reduce queue counter: every claim of tokens, plus the one
-    claim per warp that finds the queue empty."""
-    return (num_recv_tokens + REDUCE_GRAB_TOKENS - 1) // REDUCE_GRAB_TOKENS + num_channels * NUM_WARPS
+# combine: with one-token claims, a token's reduce is claimed in column chunks of one load pass each,
+# so the queue's last tokens are done one pass, not a whole row, after their rows land
+# (PRIMUS_TURBO_DEEPEP_V2_REDUCE_CHUNKS for experiments: 0 = one chunk per pass, n = at most n)
+REDUCE_CHUNKS = int(os.environ.get("PRIMUS_TURBO_DEEPEP_V2_REDUCE_CHUNKS", "0"))
+
+
+def _combine_v2_steps(num_ranks, hidden, elem_bytes, has_bias_0, has_bias_1):
+    """(WARP_SIZE-lane steps of 16 bytes in a row, steps a reducer loads per pass)."""
+    num_steps = (hidden * elem_bytes // 16 + WARP_SIZE - 1) // WARP_SIZE
+    steps_per_pass = max(1, TRAITS.combine_loads_in_flight // (num_ranks + int(has_bias_0) + int(has_bias_1)))
+    return num_steps, steps_per_pass
+
+
+def combine_v2_reduce_chunks(num_ranks, hidden, elem_bytes, has_bias_0, has_bias_1):
+    """Column chunks a combine token's reduce is claimed in."""
+    if REDUCE_GRAB_TOKENS > 1:
+        return 1
+    num_steps, steps_per_pass = _combine_v2_steps(num_ranks, hidden, elem_bytes, has_bias_0, has_bias_1)
+    passes = (num_steps + steps_per_pass - 1) // steps_per_pass
+    return passes if REDUCE_CHUNKS <= 0 else min(REDUCE_CHUNKS, passes)
+
+
+def combine_v2_grabs(num_recv_tokens, num_channels, chunks=1):
+    """How far one combine advances the reduce queue counter: every claim of tokens (or of token
+    chunks), plus the one claim per warp that finds the queue empty."""
+    items = num_recv_tokens * chunks
+    return (items + REDUCE_GRAB_TOKENS - 1) // REDUCE_GRAB_TOKENS + num_channels * NUM_WARPS
 
 
 def _make_combine_v2(
@@ -1148,9 +1171,10 @@ def _make_combine_v2(
     grid_push_warps = num_channels * push_warps
     assert grid_push_warps >= num_ranks and REDUCE_GRAB_TOKENS * num_ranks <= WARP_SIZE
     vec_elems = 16 // elem_bytes
-    num_vecs = hidden_bytes // 16
-    num_steps = (num_vecs + WARP_SIZE - 1) // WARP_SIZE
-    steps_per_pass = max(1, TRAITS.combine_loads_in_flight // (num_ranks + int(has_bias_0) + int(has_bias_1)))
+    num_steps, steps_per_pass = _combine_v2_steps(num_ranks, hidden, elem_bytes, has_bias_0, has_bias_1)
+    chunks = combine_v2_reduce_chunks(num_ranks, hidden, elem_bytes, has_bias_0, has_bias_1)
+    # the steps of one chunk; the last chunk's steps past the row load 0 and store nothing
+    chunk_steps = (num_steps + chunks - 1) // chunks
     row_buffer_bytes = slot_bytes
     lds_grab = (push_warps * row_buffer_bytes if USE_TDM else 0) // 4
     smem_bytes = lds_grab * 4 + NUM_WARPS * 4
@@ -1322,17 +1346,25 @@ def _make_combine_v2(
         in_dtype = X.element_type
         f32_vec = fx.T.vec(vec_elems, fx.T.f32)
         in_vec = fx.T.vec(vec_elems, in_dtype.ir_type)
+        num_items = num_recv_tokens * fx.Int32(chunks)
         first = _grab_tokens(counter, lds, lds_slot, grab_base)
-        while first < num_recv_tokens:
+        while first < num_items:
+            # with chunks, the claim is chunk ``first % chunks`` of token ``first / chunks``
+            claim_first = first
+            chunk_col = fx.Int32(0)
+            if fx.const_expr(chunks > 1):
+                claim_first = first // fx.Int32(chunks)
+                chunk_col = (first % fx.Int32(chunks)) * fx.Int32(chunk_steps * WARP_SIZE)
             token_end = arith.select(
-                first + fx.Int32(REDUCE_GRAB_TOKENS) < num_recv_tokens,
-                first + fx.Int32(REDUCE_GRAB_TOKENS),
+                claim_first + fx.Int32(REDUCE_GRAB_TOKENS) < num_recv_tokens,
+                claim_first + fx.Int32(REDUCE_GRAB_TOKENS),
                 num_recv_tokens,
             )
             # the claim's send_head entries in one load, and its rows' flags in one wait
-            in_claim = lane_id < (token_end - first) * fx.Int32(num_ranks)
+            in_claim = lane_id < (token_end - claim_first) * fx.Int32(num_ranks)
             index = load_i32(
-                send_head_res, arith.select(in_claim, first * fx.Int32(num_ranks) + lane_id, fx.Int32(0))
+                send_head_res,
+                arith.select(in_claim, claim_first * fx.Int32(num_ranks) + lane_id, fx.Int32(0)),
             )
             index = arith.select(in_claim, index, fx.Int32(-1))
             waits = (lane_r != rank) & (index >= fx.Int32(0))
@@ -1342,11 +1374,11 @@ def _make_combine_v2(
                 waits,
                 epoch,
                 rank,
-                first,
+                claim_first,
             )
-            token = first
+            token = claim_first
             while token < token_end:
-                claim_lane = (token - first) * fx.Int32(num_ranks)
+                claim_lane = (token - claim_first) * fx.Int32(num_ranks)
                 row_resources = []
                 is_routed = []
                 weight_addrs = []
@@ -1395,9 +1427,17 @@ def _make_combine_v2(
                 out_res = create_buffer_resource_from_addr(
                     _addr(recv_x_base, 0, token, hidden_bytes), num_records_bytes=hidden_bytes
                 )
-                for first_step in range_constexpr(0, num_steps, steps_per_pass):
-                    steps = range(first_step, min(first_step + steps_per_pass, num_steps))
-                    cols = [(lane_id + fx.Int32(step * WARP_SIZE)) * fx.Int32(vec_elems) for step in steps]
+                for first_step in range_constexpr(0, chunk_steps, steps_per_pass):
+                    steps = range(first_step, min(first_step + steps_per_pass, chunk_steps))
+                    if fx.const_expr(chunks > 1):
+                        cols = [
+                            (lane_id + fx.Int32(step * WARP_SIZE) + chunk_col) * fx.Int32(vec_elems)
+                            for step in steps
+                        ]
+                    else:
+                        cols = [
+                            (lane_id + fx.Int32(step * WARP_SIZE)) * fx.Int32(vec_elems) for step in steps
+                        ]
                     sums = [None] * len(cols)
                     sources = [(res, 0) for res in bias_resources]
                     sources += [(row_resources[r], SYS_LOAD) for r in range(num_ranks)]
@@ -1415,7 +1455,7 @@ def _make_combine_v2(
                         out = sums[k] if fx.const_expr(elem_bytes == 4) else fx.arith.trunc_f(in_vec, sums[k])
                         buffer_store(out, out_res, col)
                 if fx.const_expr(num_topk > 0):
-                    if lane_id < fx.Int32(num_topk):
+                    if (lane_id < fx.Int32(num_topk)) & (chunk_col == fx.Int32(0)):
                         weight = fx.Float32(0.0)
                         for r in range_constexpr(num_ranks):
                             value = _ld_sys(weight_addrs[r], lane_id, dtype=fx.T.f32)
