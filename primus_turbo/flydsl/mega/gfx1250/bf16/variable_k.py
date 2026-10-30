@@ -1236,7 +1236,9 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     # unlike MI355X's 8. Correctness does not depend on the value.
     num_xcd: int = 1,
     xcd_band: int = 32,
-    wmma_b2b: int = 0,
+    # 1 = `disable_xdl_arb_stall` at kernel entry. -1 = auto: on for the three-buffer ring
+    # (`_pick_variable_k_config`), where it measured -2.2% / -2.1% on DeepSeek-V3's dW1 / dW2.
+    wmma_b2b: int = -1,
     frag_pipeline: int = 1,
     # 1 = run the k-tile's last sub-step of WMMA inside the workgroup barrier's
     # signal-to-wait window. Same knob as on the NT/NN entry.
@@ -1390,6 +1392,8 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
         wave_grid = _vk_wave_grid(m_warp, n_warp)
     if wave_grid not in (0, 1):
         raise ValueError(f"wave_grid must be 0 or 1 (or -1 for auto), got {wave_grid}")
+    if wmma_b2b == -1:
+        wmma_b2b = int((tile_k, num_buffers) == (64, 3))
     if split_bar == -1:
         # Resolved against the effective tile, so an explicit BLOCK_*/num_buffers
         # override is judged on what it actually produces rather than on the pick.
