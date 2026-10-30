@@ -165,6 +165,7 @@ def _make_swiglu_bwd(
     with_act_w: bool,
     act: tuple,
     with_bias: bool = False,
+    rows: int = 1,
 ):
     alpha, glu_offset, gate_lo, gate_hi, up_clamp = act
     two_I = 2 * I
@@ -172,8 +173,10 @@ def _make_swiglu_bwd(
     wave = WAVE
     if with_gate:
         assert block_threads % wave == 0, f"block_threads must be a multiple of {wave}, got {block_threads}"
+        assert rows <= block_threads, f"rows={rows} needs a thread per row to fold the gate sums"
     cols_per_block = _VEC * block_threads
     assert I % _VEC == 0, f"I={I} not divisible by vec width {_VEC}"
+    assert rows >= 1, f"rows must be >= 1, got {rows}"
     # constexpr: ceil-tile columns; last tile is partial and needs lane guards.
     n_col_tiles = (I + cols_per_block - 1) // cols_per_block
     partial_tail = I % cols_per_block != 0
@@ -212,7 +215,7 @@ def _make_swiglu_bwd(
         zero = fx.arith.constant_vector(0.0, f32v)
         neg1 = fx.arith.constant_vector(-1.0, f32v)
 
-        def compute_tile(m, col, gate_parts=None, guard=False):
+        def load_tile(m, col, guard=False):
             row_base = m * fx.Int32(two_I)
             # fx predicate for the partial tail (None when the tile is fully in bounds).
             in_bounds = (col < fx.Int32(I)) if guard else None
@@ -225,9 +228,14 @@ def _make_swiglu_bwd(
             d = fx.arith.extf(
                 f32v, buffer_load(dact_rsrc, m * fx.Int32(I) + ld_col, vec_width=_VEC, dtype=fx.T.bf16)
             )
+            sc = buffer_load(scale_rsrc, m, vec_width=1, dtype=fx.T.f32) if with_scale else None
+            return in_bounds, gate, up, d, sc
+
+        def compute_tile(m, col, gate_parts=None, guard=False, loaded=None):
+            row_base = m * fx.Int32(two_I)
+            in_bounds, gate, up, d, sc = load_tile(m, col, guard) if loaded is None else loaded
             d_raw = d
             if with_scale:
-                sc = buffer_load(scale_rsrc, m, vec_width=1, dtype=fx.T.f32)
                 d = fx.arith.mulf(d, _vector.broadcast(f32v, sc))
 
             gc = _clampv(gate, g_lo, g_hi)
@@ -303,11 +311,71 @@ def _make_swiglu_bwd(
                     guard=partial_tail,
                 )
 
+        def compute_rows(m):
+            # `rows` rows a pass, every row's loads issued before the first row's math. The gate
+            # path's two barriers per row are what one row a pass waits on most: here the rows'
+            # warp sums share one barrier pair, and thread r folds row r's in thread 0's order.
+            ms = [m + fx.Int32(r * grid_x) for r in fx.range_constexpr(rows)]
+            if with_gate:
+                col0 = thread_index * fx.Int32(_VEC)
+                cols = [fx.Int32(ct * cols_per_block) + col0 for ct in fx.range_constexpr(n_col_tiles)]
+                guards = [partial_tail and (ct == n_col_tiles - 1) for ct in fx.range_constexpr(n_col_tiles)]
+                loaded = [
+                    [load_tile(mr, cols[ct], guards[ct]) for ct in fx.range_constexpr(n_col_tiles)]
+                    for mr in ms
+                ]
+                partials = []
+                for r in fx.range_constexpr(rows):
+                    gate_parts = []
+                    for ct in fx.range_constexpr(n_col_tiles):
+                        compute_tile(ms[r], cols[ct], gate_parts, guard=guards[ct], loaded=loaded[r][ct])
+                    partial = gate_parts[0]
+                    for p in gate_parts[1:]:
+                        partial = partial.addf(p)
+                    wave_off = 1
+                    while wave_off < wave:
+                        partial = partial.addf(fx.arith.ArithValue(partial.shuffle_xor(wave_off, wave)))
+                        wave_off = wave_off * 2
+                    partials.append(partial)
+                if thread_index % fx.Int32(wave) == fx.Int32(0):
+                    for r in fx.range_constexpr(rows):
+                        st(
+                            lds_base,
+                            fx.Int32(r * n_warps) + thread_index // fx.Int32(wave),
+                            partials[r],
+                            scope="workgroup",
+                            space=3,
+                        )
+                fx.gpu.barrier()
+                if thread_index < fx.Int32(rows):
+                    slot = thread_index * fx.Int32(n_warps)
+                    total = fx.arith.ArithValue(
+                        ld(lds_base, slot, scope="workgroup", space=3, dtype=fx.T.f32)
+                    )
+                    for w in range(1, n_warps):
+                        total = total.addf(
+                            fx.arith.ArithValue(
+                                ld(lds_base, slot + fx.Int32(w), scope="workgroup", space=3, dtype=fx.T.f32)
+                            )
+                        )
+                    buffer_store(total, grad_gate_rsrc, m + thread_index * fx.Int32(grid_x))
+                fx.gpu.barrier()
+            else:
+                col = block_index_y * fx.Int32(cols_per_block) + thread_index * fx.Int32(_VEC)
+                loaded = [load_tile(mr, col, partial_tail) for mr in ms]
+                for r in fx.range_constexpr(rows):
+                    compute_tile(ms[r], col, guard=partial_tail, loaded=loaded[r])
+
         # grid-stride over real pool rows only (NUM_TILE_BLOCKS * BM); skip the unused tail.
         m_real = buffer_load(
             create_buffer_resource(NUM_TILE_BLOCKS, max_size=True), 0, vec_width=1, dtype=fx.T.i32
         ) * fx.Int32(BM)
         m = block_index_x
+        if rows > 1:
+            # passes whose `rows` rows are all in the pool; the rest one row at a time, below
+            while m + fx.Int32((rows - 1) * grid_x) < m_real:
+                compute_rows(m)
+                m = m + fx.Int32(rows * grid_x)
         while m < m_real:
             compute_row(m)
             m = m + fx.Int32(grid_x)
@@ -351,8 +419,8 @@ def _compiled_swiglu(
 
 @autotune(
     configs=[
-        Config(grid_x=grid_x, block_threads=block_threads)
-        for grid_x, block_threads in itertools.product((2048, 4096), (256, 512))
+        Config(grid_x=grid_x, block_threads=block_threads, rows=rows)
+        for grid_x, block_threads, rows in itertools.product((2048, 4096), (256, 512), (1, 4))
     ],
     rep=5,
     key=["I", "with_scale", "BM", "with_gate", "with_act_w", "with_bias"],
@@ -378,6 +446,7 @@ def _compiled_swiglu_bwd(
     grid_x: fx.Constexpr[int],
     block_threads: fx.Constexpr[int],
     stream: fx.Stream,
+    rows: fx.Constexpr[int] = 1,
 ):
     cols_per_block = _VEC * block_threads
     n_col_tiles = (I + cols_per_block - 1) // cols_per_block
@@ -391,10 +460,11 @@ def _compiled_swiglu_bwd(
         bool(with_act_w),
         activation,
         bool(with_bias),
+        rows,
     )
     grid_y = 1 if with_gate else n_col_tiles
-    # One f32 LDS slot per warp for cross-warp gate reduction.
-    smem = (block_threads // WAVE) * 4 if with_gate else 0
+    # One f32 LDS slot per warp and row for cross-warp gate reduction.
+    smem = rows * (block_threads // WAVE) * 4 if with_gate else 0
     kernel(DACT, ACC1, DACC1, SCALE, NUM_TILE_BLOCKS, GRAD_GATE, ACT_W, BIAS, TILE_TO_EXPERT).launch(
         grid=(grid_x, grid_y, 1),
         block=(block_threads, 1, 1),
