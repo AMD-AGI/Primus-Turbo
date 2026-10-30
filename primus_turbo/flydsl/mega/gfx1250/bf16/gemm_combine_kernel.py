@@ -39,7 +39,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, rocdl
+from flydsl.expr import arith, const_expr, rocdl
 from flydsl.expr.typing import Constexpr, T
 
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
@@ -139,6 +139,8 @@ def _launch_gemm_combine_nt(
     num_xcd: Constexpr[int],
     xcd_band: Constexpr[int],
     issue_first: Constexpr[int],
+    wmma_b2b: Constexpr[int],
+    lds_cosched: Constexpr[int],
 ):
     block = m_warp * n_warp * WAVE
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
@@ -194,6 +196,8 @@ def _launch_gemm_combine_nt(
         arg_bias_scale: fx.Pointer,
         sym_buffer,
     ):
+        if const_expr(wmma_b2b):
+            rocdl.disable_xdl_arb_stall()
         arena = fx.SharedAllocator(static=False)
         arena.allocate(arena_bytes)
         base_ptr = arena.base_ptr
@@ -281,6 +285,7 @@ def _launch_gemm_combine_nt(
             c_cache_modifier=CPOL_DEVICE_STREAM,  # read by combine workgroups on other CUs
             b_nn=B_NN,
             issue_first=bool(issue_first),
+            lds_cosched=bool(lds_cosched),
             i32_n=fx.Int32(N),
         )
         # every wave's C stores retire before the flag; two rendezvous, which LLVM would fold
@@ -516,6 +521,8 @@ def gemm_combine_nt_gfx1250(
     num_xcd: int | None = None,
     xcd_band: int | None = None,
     issue_first: int | None = None,
+    wmma_b2b: int | None = None,
+    lds_cosched: int | None = None,
 ):
     """``act`` [pool rows, K] (pool order, as the L1 + activation left it) -> ``[tokens, N]`` combined,
     ``tokens = topk_idx.shape[0]``.
@@ -529,9 +536,12 @@ def gemm_combine_nt_gfx1250(
     ``bias`` [experts, N] adds ``bias[e(p)] * bias_scale[p]`` to every pool row before the sum,
     ``bias_scale`` being the rows' f32 routing weight. ``tile_k`` 0 is 128 when it divides K, else 64.
     ``num_lead_combine`` (0), ``num_tail_combine`` (0: every CU), ``lead_gemm_percent`` (25), ``num_xcd``
-    (1: launch order), ``xcd_band`` (32) and ``issue_first`` (1) default to PRIMUS_TURBO_MEGA_COMBINE_LEAD
-    / _COMBINE_TAIL / _LEAD_GEMM_PCT / _NUM_XCD / _XCD_BAND / _ISSUE_FIRST when set (see ``knobs``);
-    ``issue_first`` issues each k-tile's prefetch at the top of the previous one; ``num_xcd`` > 1 deals runs of
+    (1: launch order), ``xcd_band`` (32), ``issue_first`` (1), ``wmma_b2b`` (1 NT, 0 NN) and
+    ``lds_cosched`` (1) default to PRIMUS_TURBO_MEGA_COMBINE_LEAD / _COMBINE_TAIL / _LEAD_GEMM_PCT /
+    _NUM_XCD / _XCD_BAND / _ISSUE_FIRST / _WMMA_B2B / _LDS_COSCHED when set (see ``knobs``);
+    ``issue_first`` issues each k-tile's prefetch at the top of the previous one, ``lds_cosched``
+    interleaves the fragment reads with the matrix ops, ``wmma_b2b`` turns the WMMA arbitration stall
+    off; ``num_xcd`` > 1 deals runs of
     ``xcd_band`` GEMM tiles to one XCD (``gemm_nt_tile.xcd_band_remap``), which keeps the XCD a GEMM
     workgroup lands on only while ``num_lead_combine`` is a multiple of ``num_xcd``."""
     if num_lead_combine is None:
@@ -546,6 +556,10 @@ def gemm_combine_nt_gfx1250(
         xcd_band = env_int("PRIMUS_TURBO_MEGA_XCD_BAND", 32, nn=b_nn)
     if issue_first is None:
         issue_first = env_int("PRIMUS_TURBO_MEGA_ISSUE_FIRST", 1, nn=b_nn)
+    if wmma_b2b is None:
+        wmma_b2b = env_int("PRIMUS_TURBO_MEGA_WMMA_B2B", 0 if b_nn else 1, nn=b_nn)
+    if lds_cosched is None:
+        lds_cosched = env_int("PRIMUS_TURBO_MEGA_LDS_COSCHED", 1, nn=b_nn)
     _require_gfx1250(act.device)
     symm = get_symm_buffer_for_mega_moe()
     G, N, K = w2.shape
@@ -638,6 +652,8 @@ def gemm_combine_nt_gfx1250(
         num_xcd,
         xcd_band,
         issue_first,
+        wmma_b2b,
+        lds_cosched,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)

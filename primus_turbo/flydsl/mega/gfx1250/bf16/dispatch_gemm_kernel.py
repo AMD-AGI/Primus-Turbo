@@ -113,6 +113,8 @@ def _launch_dispatch_gemm_nt(
     num_xcd: Constexpr[int],
     xcd_band: Constexpr[int],
     issue_first: Constexpr[int],
+    wmma_b2b: Constexpr[int],
+    lds_cosched: Constexpr[int],
 ):
     block = m_warp * n_warp * WAVE
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
@@ -152,6 +154,8 @@ def _launch_dispatch_gemm_nt(
         arg_expected: fx.Pointer,
         sym_buffer,
     ):
+        if const_expr(wmma_b2b):
+            rocdl.disable_xdl_arb_stall()
         arena = fx.SharedAllocator(static=False)
         arena.allocate(arena_bytes)
         base_ptr = arena.base_ptr
@@ -275,6 +279,7 @@ def _launch_dispatch_gemm_nt(
             idx_bits=idx_bits,
             b_nn=B_NN,
             issue_first=bool(issue_first),
+            lds_cosched=bool(lds_cosched),
             i32_n=fx.Int32(N),
         )
 
@@ -320,6 +325,8 @@ def dispatch_gemm_nt_gfx1250(
     num_xcd: int | None = None,
     xcd_band: int | None = None,
     issue_first: int | None = None,
+    wmma_b2b: int | None = None,
+    lds_cosched: int | None = None,
 ) -> torch.Tensor:
     """Dispatch ``x`` by ``handle`` and return the L1 output over this rank's pool rows.
 
@@ -327,11 +334,12 @@ def dispatch_gemm_nt_gfx1250(
     buffer; the output is ``[pool rows, N]`` in pool order, padding rows undefined. ``w1`` is
     ``[experts, N, hidden]``, or ``[experts, hidden, N]`` with ``b_nn`` (``out = x @ w1[e]``).
     ``tile_k`` 0 is 128 when it divides hidden, else 64. ``num_dispatch_cu`` (64), ``group_m`` (16),
-    ``num_xcd`` (1: launch order), ``xcd_band`` (32) and ``issue_first`` (1) default to
-    PRIMUS_TURBO_MEGA_DISPATCH_CU / _GROUP_M / _NUM_XCD / _XCD_BAND / _ISSUE_FIRST when set (see
-    ``knobs``); ``num_xcd`` > 1 deals runs of ``xcd_band`` GEMM tiles to one XCD
-    (``gemm_nt_tile.xcd_band_remap``), ``issue_first`` issues each k-tile's prefetch at the top of
-    the previous one (``nt_gemm_tile``)."""
+    ``num_xcd`` (1: launch order), ``xcd_band`` (32), ``issue_first`` (1), ``wmma_b2b`` (0) and
+    ``lds_cosched`` (1) default to PRIMUS_TURBO_MEGA_DISPATCH_CU / _GROUP_M / _NUM_XCD / _XCD_BAND /
+    _ISSUE_FIRST / _WMMA_B2B / _LDS_COSCHED when set (see ``knobs``); ``num_xcd`` > 1 deals runs of
+    ``xcd_band`` GEMM tiles to one XCD (``gemm_nt_tile.xcd_band_remap``), ``issue_first`` issues each
+    k-tile's prefetch at the top of the previous one, ``lds_cosched`` interleaves the fragment reads
+    with the matrix ops (``nt_gemm_tile``) and ``wmma_b2b`` turns the WMMA arbitration stall off."""
     if num_dispatch_cu is None:
         num_dispatch_cu = env_int("PRIMUS_TURBO_MEGA_DISPATCH_CU", 64, nn=b_nn)
     if group_m is None:
@@ -342,6 +350,10 @@ def dispatch_gemm_nt_gfx1250(
         xcd_band = env_int("PRIMUS_TURBO_MEGA_XCD_BAND", 32, nn=b_nn)
     if issue_first is None:
         issue_first = env_int("PRIMUS_TURBO_MEGA_ISSUE_FIRST", 1, nn=b_nn)
+    if wmma_b2b is None:
+        wmma_b2b = env_int("PRIMUS_TURBO_MEGA_WMMA_B2B", 0, nn=b_nn)
+    if lds_cosched is None:
+        lds_cosched = env_int("PRIMUS_TURBO_MEGA_LDS_COSCHED", 1, nn=b_nn)
     return _run(
         x,
         w1,
@@ -358,6 +370,8 @@ def dispatch_gemm_nt_gfx1250(
         num_xcd,
         xcd_band,
         issue_first,
+        wmma_b2b,
+        lds_cosched,
     )
 
 
@@ -373,7 +387,7 @@ def dispatch_only_gfx1250(
     G = handle.expert_send_dst_rank.numel() // int(symm.num_ranks)
     # only the GEMM's shape is read: the launch holds the comm workgroups alone
     shape_only = x.new_empty(x.shape[1]).as_strided((G, 256, x.shape[1]), (0, 0, 1))
-    _run(x, shape_only, handle, True, False, num_dispatch_cu, 256, 256, 0, 4, 2, 16, 1, 32, 0)
+    _run(x, shape_only, handle, True, False, num_dispatch_cu, 256, 256, 0, 4, 2, 16, 1, 32, 0, 0, 0)
     return symm.dispatch_token_buffer
 
 
@@ -393,6 +407,8 @@ def _run(
     num_xcd,
     xcd_band,
     issue_first,
+    wmma_b2b,
+    lds_cosched,
 ):
     _require_gfx1250(x.device)
     symm = get_symm_buffer_for_mega_moe()
@@ -461,6 +477,8 @@ def _run(
         num_xcd,
         xcd_band,
         issue_first,
+        wmma_b2b,
+        lds_cosched,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)
