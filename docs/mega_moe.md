@@ -110,6 +110,13 @@ BF16 takes a hidden / intermediate that leaves a 64- or 128-column tail of the 2
 shapes run zero-padded up to that grid (2880 runs as 3072), which is exact, and aligned shapes are
 untouched.
 
+The BF16 staged ops also take `fuse_wgrad_accum_pattern="megatron"`, the switch the grouped GEMM
+ops have. On gfx1250 the expert wgrads then add dW1 / dW2 straight into the weights' bf16
+`main_grad` (one rounding, no dW buffer, no separate add), and the op returns a dummy gradient with
+`grad_added_to_main_grad` set, so Megatron's DDP hook skips its own add. Weights the kernel cannot
+serve (a `main_grad` that is not a contiguous bf16 tensor of the weight's shape, or an output shape
+that is not a whole number of the wgrad's output tiles) keep the ordinary gradient.
+
 ## Performance
 
 ### Test Configuration
