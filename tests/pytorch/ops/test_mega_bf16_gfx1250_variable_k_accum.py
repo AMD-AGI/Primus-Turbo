@@ -46,7 +46,9 @@ def _problem(out_m, out_n, counts, gather, seed=0, num_src=3000):
     index = torch.zeros(m_total + _POOL_BLOCK, dtype=torch.int32, device="cuda")
     for e, c in enumerate(counts):
         start = int(offsets[e])
-        index[start : start + c] = torch.randint(0, num_src, (c,), device="cuda", generator=g, dtype=torch.int32)
+        index[start : start + c] = torch.randint(
+            0, num_src, (c,), device="cuda", generator=g, dtype=torch.int32
+        )
     kwargs = {}
     if gather == "a":
         a, b = rnd(num_src, out_m), rnd(m_total, out_n)
@@ -79,28 +81,39 @@ CASES = [
     (512, 768, [2048, 2048], "none"),
     (512, 512, [100, 0, 50, 0], "a"),  # 128 pool rows per expert: 64-deep k-tiles, C loaded after the k-loop
 ]
+# the shipped two-buffer tile, and the three-buffer ring the DeepSeek-V3 shapes take at >= 1024 rows per
+# expert, whose accumulate loads the old C as two row halves during the last two k-tiles
+CFGS = [pytest.param({}, id="shipped"), pytest.param({"BLOCK_K": 64, "num_buffers": 3}, id="ring3")]
 
 
+@pytest.mark.parametrize("cfg", CFGS)
 @pytest.mark.parametrize("out_m, out_n, counts, gather", CASES)
-def test_round_first_matches_separate_add(out_m, out_n, counts, gather):
+def test_round_first_matches_separate_add(out_m, out_n, counts, gather, cfg):
     vk = _vk()
     a, b, offs, masked_k, kw, _ = _problem(out_m, out_n, counts, gather)
+    kw = {**kw, **cfg}
     old = _old_out((len(counts), out_m, out_n))
     separate = old.clone()
     separate.add_(vk.grouped_gemm_bf16_variable_k_flydsl_kernel(a, b, offs, masked_k=masked_k, **kw))
     fused = old.clone()
-    vk.grouped_gemm_bf16_variable_k_flydsl_kernel(a, b, offs, masked_k=masked_k, out=fused, accumulate=2, **kw)
+    vk.grouped_gemm_bf16_variable_k_flydsl_kernel(
+        a, b, offs, masked_k=masked_k, out=fused, accumulate=2, **kw
+    )
     torch.testing.assert_close(fused, separate, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("cfg", CFGS)
 @pytest.mark.parametrize("out_m, out_n, counts, gather", CASES)
-def test_single_rounding_accuracy_and_repeats(out_m, out_n, counts, gather):
+def test_single_rounding_accuracy_and_repeats(out_m, out_n, counts, gather, cfg):
     vk = _vk()
     a, b, offs, masked_k, kw, ref = _problem(out_m, out_n, counts, gather)
+    kw = {**kw, **cfg}
     old = _old_out((len(counts), out_m, out_n))
     out = old.clone()
     for _ in range(3):
-        vk.grouped_gemm_bf16_variable_k_flydsl_kernel(a, b, offs, masked_k=masked_k, out=out, accumulate=1, **kw)
+        vk.grouped_gemm_bf16_variable_k_flydsl_kernel(
+            a, b, offs, masked_k=masked_k, out=out, accumulate=1, **kw
+        )
     expected = old.float() + 3 * ref
     # each call rounds once, so three calls are within three bf16 roundings of the exact sum
     scale = expected.abs().amax(dim=(1, 2), keepdim=True).clamp_min(1.0)
@@ -111,13 +124,42 @@ def test_single_rounding_accuracy_and_repeats(out_m, out_n, counts, gather):
             assert torch.equal(out[e], old[e])
     # one call: at least as close to fp32 as the separate path (bf16 dW, then a bf16 add)
     single = old.clone()
-    vk.grouped_gemm_bf16_variable_k_flydsl_kernel(a, b, offs, masked_k=masked_k, out=single, accumulate=1, **kw)
+    vk.grouped_gemm_bf16_variable_k_flydsl_kernel(
+        a, b, offs, masked_k=masked_k, out=single, accumulate=1, **kw
+    )
     separate = old.clone()
     separate.add_(vk.grouped_gemm_bf16_variable_k_flydsl_kernel(a, b, offs, masked_k=masked_k, **kw))
     exact = old.float() + ref
     err_single = (single.float() - exact).abs().sum()
     err_separate = (separate.float() - exact).abs().sum()
     assert err_single <= err_separate * 1.001
+
+
+@pytest.mark.parametrize("out_m, out_n, counts, gather", CASES)
+def test_ring3_matches_two_buffers(out_m, out_n, counts, gather):
+    """The three-buffer ring runs the same WMMA k-steps in the same order: bit-identical, gathered or not,
+    overwriting and accumulating."""
+    vk = _vk()
+    a, b, offs, masked_k, kw, _ = _problem(out_m, out_n, counts, gather)
+    ring3 = {"BLOCK_K": 64, "num_buffers": 3}
+    two = vk.grouped_gemm_bf16_variable_k_flydsl_kernel(a, b, offs, masked_k=masked_k, **kw)
+    three = vk.grouped_gemm_bf16_variable_k_flydsl_kernel(a, b, offs, masked_k=masked_k, **kw, **ring3)
+    assert torch.equal(two, three)
+    old = _old_out((len(counts), out_m, out_n))
+    acc2, acc3 = old.clone(), old.clone()
+    vk.grouped_gemm_bf16_variable_k_flydsl_kernel(a, b, offs, masked_k=masked_k, out=acc2, accumulate=1, **kw)
+    vk.grouped_gemm_bf16_variable_k_flydsl_kernel(
+        a, b, offs, masked_k=masked_k, out=acc3, accumulate=1, **kw, **ring3
+    )
+    assert torch.equal(acc2, acc3)
+
+
+def test_deepseek_v3_wgrads_pick_the_ring():
+    vk = _vk()
+    assert vk._pick_variable_k_config(4096, 7168, 2048)[2:] == (64, 2, 2, 3)
+    assert vk._pick_variable_k_config(7168, 2048, 1024)[2:] == (64, 2, 2, 3)
+    assert vk._pick_variable_k_config(7168, 2048, 512)[2:] == (128, 2, 2, 2)
+    assert vk._pick_variable_k_config(5760, 2880, 2048)[2:] == (128, 2, 2, 2)
 
 
 def test_refuses_partial_tiles_and_bad_out():
