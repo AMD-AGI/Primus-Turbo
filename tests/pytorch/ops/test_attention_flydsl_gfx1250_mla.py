@@ -35,9 +35,11 @@ from primus_turbo.pytorch.ops import flash_attn_func
 from primus_turbo.pytorch.ops.attention import flash_attn_interface
 from tests.pytorch.test_utils import compute_snr, pinned_backend_takes
 
-_KERNELS = "primus_turbo.flydsl.attention.gfx1250_mla"
+_KERNELS = ("primus_turbo.flydsl.attention.gfx1250_mla", "primus_turbo.hipkittens.gfx1250_mla")
 # Taken when pytest imports this module, before any test runs.
-_KERNEL_MODULES_AT_IMPORT = sorted(m for m in sys.modules if m == _KERNELS or m.startswith(_KERNELS + "."))
+_KERNEL_MODULES_AT_IMPORT = sorted(
+    m for m in sys.modules if any(m == p or m.startswith(p + ".") for p in _KERNELS)
+)
 
 needs_gfx1250 = pytest.mark.skipif(
     not (torch.cuda.is_available() and is_gfx1250()), reason="needs a gfx1250 (MI455X) GPU"
@@ -596,3 +598,27 @@ def test_torch_compile_fullgraph():
     _check(got, _reference(q, k, v, dout, MLA_SCALE))
     for a, b in zip(got, eager):
         assert torch.equal(a, b)
+
+
+@needs_gfx1250
+def test_persistent_forward_under_cuda_graphs():
+    """Two graphs captured on torch's shared capture stream, the second replayed first: every captured launch of the
+    persistent forward has its own ticket counters, zero-filled by its graph, so both replays give the eager bits and
+    no counter buffer of the capture stream is cached."""
+    from primus_turbo.flydsl.attention.gfx1250_mla import fwd
+
+    q, k, v = (t.cuda() for t in _inputs(1, 4096, 4096, 32, layout="bshd")[:3])
+    assert fwd.persist_mode(q, k)[1], "not a persistent shape"
+    eager = fwd.flash_attn_mla_fwd(q, k, v, MLA_SCALE)
+    cached = set(fwd._COUNTERS)
+    graphs, outs = [], []
+    for _ in range(2):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outs.append(fwd.flash_attn_mla_fwd(q, k, v, MLA_SCALE))
+        graphs.append(graph)
+    assert set(fwd._COUNTERS) == cached
+    for graph, got in zip(graphs[::-1], outs[::-1]):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert all(torch.equal(a, b) for a, b in zip(got, eager))

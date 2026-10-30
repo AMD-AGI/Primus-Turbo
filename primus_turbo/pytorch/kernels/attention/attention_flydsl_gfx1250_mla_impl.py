@@ -4,24 +4,56 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""FlyDSL flash attention for gfx1250 (MI455X) at the DeepSeek-V3 MLA head dims.
+"""Flash attention for gfx1250 (MI455X) at the DeepSeek-V3 MLA head dims, on FlyDSL or HIP kernels.
 
 q/k head dim 192, v head dim 128, bf16, MHA, bottom-right causal, any softmax scale; no dropout,
 bias, alibi, sink or sliding window. The kernels take contiguous [b, s, h, d] tensors. b > 1 SBHD
 storage (Megatron's layout) is handed over as [1, s, b*h, d], the same bytes with the batch folded
 into the heads, so it is not copied. Dispatch and autograd wiring belong to the caller.
+
+Implementations (``PRIMUS_TURBO_MLA_FWD_IMPL`` / ``PRIMUS_TURBO_MLA_BWD_IMPL``, read at import): ``flydsl``
+(default) or ``hk``, the HIP kernels of ``primus_turbo/hipkittens/gfx1250_mla`` (same layouts; the ``hk`` forward is
+bitwise equal to the FlyDSL one, so either backward takes either forward's out / lse). A pass ``hk`` cannot take
+(``hk_mla_fwd_unsupported_reason`` / ``hk_mla_bwd_unsupported_reason``) runs on FlyDSL, with one warning per reason.
 """
 
+import os
 from typing import Optional, Tuple
 
 import torch
 
+from primus_turbo.common.logger import logger
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
     _eager_custom_op,
 )
 
 D_QK = 192
 D_V = 128
+
+MLA_IMPLS = ("flydsl", "hk")
+MLA_FWD_IMPL_ENV = "PRIMUS_TURBO_MLA_FWD_IMPL"
+MLA_BWD_IMPL_ENV = "PRIMUS_TURBO_MLA_BWD_IMPL"
+# Read once at import, like the kernels' other switches: the passes route on module constants, which
+# torch.compile traces without a guard on the environment.
+MLA_FWD_IMPL_SETTING = os.environ.get(MLA_FWD_IMPL_ENV, "")
+MLA_BWD_IMPL_SETTING = os.environ.get(MLA_BWD_IMPL_ENV, "")
+
+
+def _impl(env: str, setting: str) -> str:
+    impl = setting.strip().lower() or "flydsl"
+    if impl not in MLA_IMPLS:
+        raise ValueError(f"{env}={setting!r}: expected one of {MLA_IMPLS}")
+    return impl
+
+
+def mla_fwd_impl() -> str:
+    """The MLA forward implementation: "flydsl" (default, also for an empty setting) or "hk"."""
+    return _impl(MLA_FWD_IMPL_ENV, MLA_FWD_IMPL_SETTING)
+
+
+def mla_bwd_impl() -> str:
+    """The MLA backward implementation: "flydsl" (default, also for an empty setting) or "hk"."""
+    return _impl(MLA_BWD_IMPL_ENV, MLA_BWD_IMPL_SETTING)
 
 
 def _fwd():
@@ -68,6 +100,73 @@ def flydsl_gfx1250_mla_unsupported_reason(
     return _bwd().shape_unsupported_reason(b, sq, skv, h)
 
 
+@torch.compiler.assume_constant_result
+def _hk_unavailable_reason(pass_: str) -> Optional[str]:
+    """None when the HIP kernels of ``pass_`` ("fwd" / "bwd") are built, byte-identical to the ones
+    ``manifest.json`` pins, and the HIP runtime torch loaded can launch them; else why not, said once in the log.
+    Marked constant for torch.compile, whose Dynamo then calls it instead of tracing it (the gate runs inside
+    compiled regions): the answer cannot change within a process, and the file reads and the log line are not
+    traceable."""
+    from primus_turbo.hipkittens.gfx1250_mla import hiprt, hsaco
+
+    reason = hsaco.unavailable_reason(hsaco.FWD_KERNELS if pass_ == "fwd" else hsaco.BWD_KERNELS)
+    reason = reason or hiprt.runtime_unavailable_reason()
+    if reason is not None:
+        logger.warning(f"the gfx1250 HIP MLA {pass_} kernels are unavailable: {reason}", once=True)
+    return reason
+
+
+def _hk_unsupported_reason(q, k, v, causal, pass_, softmax_scale=None):
+    """The FlyDSL MLA rules (a training step needs both passes, on either implementation), then the HIP kernels'
+    shape (and, backward, scale) rules, then their code objects."""
+    reason = flydsl_gfx1250_mla_unsupported_reason(q, k, v, causal)
+    if reason is not None:
+        return reason
+    from primus_turbo.hipkittens.gfx1250_mla import limits
+
+    b, sq, h, _ = q.shape
+    skv, hkv = k.shape[1], k.shape[2]
+    if pass_ == "fwd":
+        reason = limits.fwd_shape_unsupported_reason(b, sq, skv, h, hkv, causal)
+    else:
+        reason = limits.bwd_shape_unsupported_reason(b, sq, skv, h, hkv, causal)
+        reason = reason or limits.bwd_scale_unsupported_reason(_scale(softmax_scale))
+    return reason if reason is not None else _hk_unavailable_reason(pass_)
+
+
+def hk_mla_fwd_unsupported_reason(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool
+) -> Optional[str]:
+    """Why the HIP MLA forward (``hk``) cannot take these [b, s, h, d]-shaped tensors, or None."""
+    return _hk_unsupported_reason(q, k, v, causal, "fwd")
+
+
+def hk_mla_bwd_unsupported_reason(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool, softmax_scale: Optional[float] = None
+) -> Optional[str]:
+    """Why the HIP MLA backward (``hk``) cannot take these [b, s, h, d]-shaped tensors and scale, or None."""
+    return _hk_unsupported_reason(q, k, v, causal, "bwd", softmax_scale)
+
+
+def _warn_hk_fallback(env: str, pass_name: str, reason: str) -> None:
+    """Say once that ``hk`` could not take a pass. Skipped under torch.compile: Dynamo cannot trace a
+    logging.Logger call (unavailable kernels are still logged, by _hk_unavailable_reason)."""
+    if not torch.compiler.is_compiling():
+        logger.warning(f"{env}=hk: this {pass_name} runs on FlyDSL ({reason})", once=True)
+
+
+def _hk_fwd():
+    from primus_turbo.hipkittens.gfx1250_mla import fwd
+
+    return fwd
+
+
+def _hk_bwd():
+    from primus_turbo.hipkittens.gfx1250_mla import bwd
+
+    return bwd
+
+
 @_eager_custom_op("primus_turbo::flash_attn_flydsl_gfx1250_mla_forward")
 def _forward_op(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: float, causal: bool
@@ -79,6 +178,18 @@ def _forward_op(
 def _forward_op_fake(q, k, v, softmax_scale, causal):
     b, sq, h, _ = q.shape
     return q.new_empty((b, sq, h, D_V)), q.new_empty((b, h, sq), dtype=torch.float32)
+
+
+@_eager_custom_op("primus_turbo::flash_attn_hk_gfx1250_mla_forward")
+def _forward_hk_op(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: float, causal: bool
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _hk_fwd().hk_attn_fwd(q, k, v, softmax_scale, causal)
+
+
+@_forward_hk_op.register_fake
+def _forward_hk_op_fake(q, k, v, softmax_scale, causal):
+    return _forward_op_fake(q, k, v, softmax_scale, causal)
 
 
 @_eager_custom_op("primus_turbo::flash_attn_flydsl_gfx1250_mla_backward")
@@ -97,6 +208,25 @@ def _backward_op(
 
 @_backward_op.register_fake
 def _backward_op_fake(dout, q, k, v, out, lse, softmax_scale, causal):
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+
+@_eager_custom_op("primus_turbo::flash_attn_hk_gfx1250_mla_backward")
+def _backward_hk_op(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _hk_bwd().hk_attn_bwd(dout, q, k, v, out, lse, softmax_scale, causal)
+
+
+@_backward_hk_op.register_fake
+def _backward_hk_op_fake(dout, q, k, v, out, lse, softmax_scale, causal):
     return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
 
@@ -124,23 +254,35 @@ def flash_attn_flydsl_gfx1250_mla_forward_impl(q, k, v, softmax_scale=None, caus
     """Returns (out [b, sq, h, 128], lse [b, h, sq] fp32 natural log, saved).
 
     ``saved`` is the kernel-layout (q, k, v, out, lse) the backward impl takes; out and lse are
-    views of its last two.
+    views of its last two. ``mla_fwd_impl()`` picks the kernels.
     """
     b, sq, h, _ = q.shape
     fold = b > 1 and q.transpose(0, 1).is_contiguous()
     qk, kk, vk = (_to_kernel_layout(t, fold) for t in (q, k, v))
-    out, lse = _forward_op(qk, kk, vk, _scale(softmax_scale), bool(causal))
+    forward = _forward_op
+    if mla_fwd_impl() == "hk":
+        reason = hk_mla_fwd_unsupported_reason(qk, kk, vk, bool(causal))
+        if reason is None:
+            forward = _forward_hk_op
+        else:
+            _warn_hk_fallback(MLA_FWD_IMPL_ENV, "forward", reason)
+    out, lse = forward(qk, kk, vk, _scale(softmax_scale), bool(causal))
     return _from_kernel_layout(out, b), lse.view(b, h, sq), (qk, kk, vk, out, lse)
 
 
 def flash_attn_flydsl_gfx1250_mla_backward_impl(dout, q, k, v, out, lse, softmax_scale=None, causal=True):
     """q/k/v/out/lse are the forward impl's ``saved``; dout is [b, sq, h, 128] in any byte order.
 
-    Returns (dq, dk, dv) shaped like the forward's q/k/v.
+    Returns (dq, dk, dv) shaped like the forward's q/k/v. ``mla_bwd_impl()`` picks the kernels.
     """
     batch = dout.shape[0]
     fold = q.shape[0] != batch  # the forward folded the batch into the heads
-    grads = _backward_op(
-        _to_kernel_layout(dout, fold), q, k, v, out, lse, _scale(softmax_scale), bool(causal)
-    )
+    backward = _backward_op
+    if mla_bwd_impl() == "hk":
+        reason = hk_mla_bwd_unsupported_reason(q, k, v, bool(causal), softmax_scale)
+        if reason is None:
+            backward = _backward_hk_op
+        else:
+            _warn_hk_fallback(MLA_BWD_IMPL_ENV, "backward", reason)
+    grads = backward(_to_kernel_layout(dout, fold), q, k, v, out, lse, _scale(softmax_scale), bool(causal))
     return tuple(_from_kernel_layout(g, batch) for g in grads)
