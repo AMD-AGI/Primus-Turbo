@@ -101,6 +101,10 @@ def _check(cond: bool, msg: str = "") -> None:
 
 # the widest top-k index the dispatch takes (int64)
 _V2_TOPK_IDX_BYTES = 8
+# a cached V2 dispatch needs only a barrier (no peer still copies out of its dispatch region): V2 reads
+# neither the notify's heap copy of the rank prefix matrix nor cleared channel queues. 1: the V1 cached
+# notify (two barriers and that copy), for comparison
+_V2_CACHED_NOTIFY = os.environ.get("PRIMUS_TURBO_DEEPEP_V2_CACHED_NOTIFY", "0") == "1"
 
 
 def v2_heap_bytes(num_max_tokens_per_rank: int, num_ranks: int, hidden_bytes: int, num_topk: int) -> int:
@@ -366,16 +370,19 @@ class FlyDSLIntranodeRuntime:
                 num_recv_tokens = cached_num_recv_tokens
                 rank_prefix_matrix = cached_rank_prefix_matrix
                 channel_prefix_matrix = cached_channel_prefix_matrix
-                run_launcher(
-                    launch_cached_notify_dispatch,
-                    rank_prefix_matrix,
-                    self.buffer_ptrs,
-                    self.barrier_ptrs,
-                    rank,
-                    num_ranks,
-                    num_memset_int,
-                    launch_stream,
-                )
+                if self.version == 2 and not _V2_CACHED_NOTIFY:
+                    run_launcher(launch_barrier, self.barrier_ptrs, rank, num_ranks, launch_stream)
+                else:
+                    run_launcher(
+                        launch_cached_notify_dispatch,
+                        rank_prefix_matrix,
+                        self.buffer_ptrs,
+                        self.barrier_ptrs,
+                        rank,
+                        num_ranks,
+                        num_memset_int,
+                        launch_stream,
+                    )
             else:
                 rank_prefix_matrix = torch.empty((num_ranks, num_ranks), dtype=torch.int32, device=device)
                 channel_prefix_matrix = torch.empty(
