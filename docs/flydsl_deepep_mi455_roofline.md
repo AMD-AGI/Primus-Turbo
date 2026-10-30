@@ -556,6 +556,23 @@ EP2, 160 CUs; modelled from the terms above, not yet measured:
 The 84–86% of DeepEP V1 on H800 is its cached dispatch (the counts known) at the best chunk size, the
 same case as the cached dispatch here (58%).
 
+## Changes after the study (not yet measured)
+
+Each targets a term measured above and has a switch that restores the previous behaviour, so one run
+compares them (`roofline_opt/queue/01_validate.sh`: all on, all off, each off on its own, with and
+without stamps):
+
+| change | commit | targets (EP4 / 160 CUs unless noted) | off with |
+|---|---|---|---|
+| dispatch: from 64 channels (TDM), one warp per source rank copies that source's rows out of the heap as their per-row flags come up, while the other warps send; the block's receive loop copies what is left | `8e3d509f` | the receive copy 30–34 µs past the last send (EP2: 14.8 µs) | `PRIMUS_TURBO_DEEPEP_V2_DISPATCH_RECV_MIN_CHANNELS=100000` |
+| combine: with one-token claims, a token's reduce is claimed in column chunks of one load pass each (4 at EP4, 2 at EP2, 7 at EP8), chunk 0 also sums the top-k weights | `1c28f4e7` | the reduce 36–37 µs past the last push: the last tokens took four passes (EP4) after their rows landed | `PRIMUS_TURBO_DEEPEP_V2_REDUCE_CHUNKS=1` |
+| cached dispatch: the V2 barrier kernel instead of the V1 cached notify (two barriers and a heap copy of the rank prefix matrix that V2 never reads) | `8858f91b` | part of the 12.5 µs between the cached dispatch's kernel and its timed call | `PRIMUS_TURBO_DEEPEP_V2_CACHED_NOTIFY=1` |
+| combine: the pushers' rows dealt warp-major, so the last, partial round of rows spreads over every block instead of the first ones | `61784118` | the push spread between the median and the slowest block (27 µs; EP2: 33 µs) | `PRIMUS_TURBO_DEEPEP_V2_COMBINE_PUSH_BLOCK_MAJOR=1` |
+
+The first two compile for gfx1250 at EP2 / 4 / 8 (32, 64, 160 channels; with and without biases);
+the third is host-side; the fourth was committed while the node's GPU driver was wedged (the compile
+check needs the device) and is compiled by the batch's first `test_intranode.py`.
+
 ## Next measurements
 
 1. ~~EP2 on this branch's head, kernel times and counters~~: done 2026-10-29 (above).
@@ -571,11 +588,11 @@ same case as the cached dispatch here (58%).
    twice did not reproduce it (2026-10-29). Open; if it shows again, keep that run's core dump (the
    benchmark runs set `prlimit --core=0`) and the faulting address from the kernel log.
 8. ~~Fewer push warps with one-token claims~~: measured at EP2 and EP4; the default stays at 22 ([EP4](#ep4)).
-9. The dispatch receive overlap (`8e3d509f`: from 64 channels, one receive warp per source rank copies
-   rows as their per-row flags come up while the other warps send): `test_intranode.py` on 2 and 4 GPUs,
-   then `bench_ops.py` at EP2 / EP4 with it on and off (`PRIMUS_TURBO_DEEPEP_V2_DISPATCH_RECV_MIN_CHANNELS`),
-   with and without stamps, and at 32 / 48 channels; script `ut_logs/recv_overlap_validate/run.sh`.
-   Compiled for gfx1250 at EP2 / 4 / 8, not yet run on a GPU.
+9. The [changes after the study](#changes-after-the-study-not-yet-measured): `test_intranode.py` on 2 and 4
+   GPUs (it includes `test_flydsl_v2_receive_overlaps_send`, 160 channels), then `bench_ops.py` at EP2 /
+   EP4, all on / all off / each off, with and without stamps, the overlap at 32 / 48 channels
+   (`roofline_opt/queue/01_validate.sh`); then token sweeps, kernel times and ten runs from empty caches
+   (`02_followup.sh`).
 
 ## References
 
