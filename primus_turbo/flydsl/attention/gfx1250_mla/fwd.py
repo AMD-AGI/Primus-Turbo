@@ -18,9 +18,78 @@ from typing import Tuple
 import flydsl.compiler as flyc
 import torch
 
-from .fwd_kernel import D_QK, D_V, launch_mla_fwd
+from .fwd_kernel import BLOCK_M, D_QK, D_V, launch_mla_fwd
 
 _COMPILED = {}
+_NUM_CUS = {}
+# Ticket counters of the persistent schedule per (device, stream): 8 group counters and a done counter,
+# int32s 256 B apart, all 0 between calls (the last workgroup to finish resets them), so calls on one
+# stream share them and calls on two streams never do. (A CUDA graph keeps the buffer of the capturing
+# stream: replays of one graph must not overlap.)
+_COUNTERS = {}
+# Persistent workgroups (at most one per CU, taking q blocks from counters) where the grid allows them.
+PERSIST = True
+
+
+def persist_mode(q: torch.Tensor, k: torch.Tensor) -> Tuple[int, int]:
+    """(persist_hb, workgroups) of the persistent schedule for q [B, Sq, H, 192] and k [B, Skv, H, 192],
+    or (0, 0) for one workgroup per q block. Persistent mode needs full q blocks, seqlen_q == seqlen_kv
+    (the kernel takes the next ticket at a fixed tile of the causal block), q blocks and heads * batch
+    in multiples of 16 (the grouped dispatch order), a CU count that is a multiple of the 8 ticket
+    groups and at least two blocks per CU."""
+    b, sq, h, _ = q.shape
+    if not PERSIST or sq % BLOCK_M or k.shape[1] != sq or h >= 1 << 16 or b >= 1 << 15:
+        return 0, 0
+    if q.device.type != "cuda":  # COMPILE_ONLY
+        return h | (b << 16), 256
+    idx = q.device.index
+    if idx not in _NUM_CUS:
+        _NUM_CUS[idx] = torch.cuda.get_device_properties(q.device).multi_processor_count
+    blocks = (sq // BLOCK_M) * h * b
+    if blocks < 2 * _NUM_CUS[idx] or (sq // BLOCK_M) % 16 or (b * h) % 16 or _NUM_CUS[idx] % 8:
+        return 0, 0
+    return h | (b << 16), _NUM_CUS[idx]
+
+
+def _counter(q: torch.Tensor) -> torch.Tensor:
+    if q.device.type != "cuda":  # COMPILE_ONLY
+        return torch.zeros(4, dtype=torch.int32)
+    key = (q.device.index, torch.cuda.current_stream(q.device).cuda_stream)
+    c = _COUNTERS.get(key)
+    if c is None:
+        c = torch.zeros(9 * 64, dtype=torch.int32, device=q.device)
+        _COUNTERS[key] = c
+    return c
+
+
+def launch_args(q, k, v, out, lse, softmax_scale):
+    """The arguments of ``launch_mla_fwd`` for contiguous q/k/v and out [B, Sq, H, 128], lse [B, H, Sq]."""
+    b, sq, h, _ = q.shape
+    strides = (
+        *(t.stride(1) for t in (q, k, v, out)),
+        *(t.stride(2) for t in (q, k, v, out)),
+        *(lse.stride(i) for i in (2, 1, 0)),
+    )
+    persist_hb, wgs = persist_mode(q, k)
+    # The counter fills the unused tensor slot; window_right = 0 (plain causal).
+    return (
+        out,
+        q,
+        k,
+        v,
+        lse,
+        _counter(q),
+        float(softmax_scale),
+        *strides,
+        persist_hb,
+        0,
+        sq,
+        k.shape[1],
+        h,
+        b,
+        wgs,
+        torch.cuda.current_stream(),
+    )
 
 
 def flash_attn_mla_fwd(
@@ -54,29 +123,7 @@ def flash_attn_mla_fwd(
 
     out = torch.empty((b, sq, h, D_V), dtype=q.dtype, device=q.device)
     lse = torch.empty((b, h, sq), dtype=torch.float32, device=q.device)
-    strides = (
-        *(t.stride(1) for t in (q, k, v, out)),
-        *(t.stride(2) for t in (q, k, v, out)),
-        *(lse.stride(i) for i in (2, 1, 0)),
-    )
-    # q fills the unused tensor slot; unused_i32 = 0 and window_right = 0 (plain causal).
-    args = (
-        out,
-        q,
-        k,
-        v,
-        lse,
-        q,
-        float(softmax_scale),
-        *strides,
-        0,
-        0,
-        sq,
-        skv,
-        h,
-        b,
-        torch.cuda.current_stream(),
-    )
+    args = launch_args(q, k, v, out, lse, softmax_scale)
     fn = _COMPILED.get(q.device.index)
     if fn is not None:
         fn(*args)
