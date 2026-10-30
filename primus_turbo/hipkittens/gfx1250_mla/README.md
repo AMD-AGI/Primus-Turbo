@@ -127,9 +127,9 @@ calls (with the L2 flushed before every call: within 1%):
 
 | | FlyDSL (ms) | HIP (ms) | speedup |
 |---|---|---|---|
-| forward | 0.800 | 0.801 | 1.00x |
-| backward | 3.512 | 2.287 | 1.54x |
-| forward + backward (autograd) | 4.325 | 3.115 | 1.39x |
+| forward | 0.794 | 0.777 | 1.02x |
+| backward | 3.493 | 2.281 | 1.53x |
+| forward + backward (autograd) | 4.302 | 3.082 | 1.40x |
 
-HIP backward per launch: `k_delta` 0.057, ticket fill 0.006, `k_dkdv96ds` 1.606, `k_dqds_c` 0.498 ms. The kernels are
+HIP backward per launch: `k_delta` 0.058, ticket fill 0.005, `k_dkdv96ds` 1.609, `k_dqds_c` 0.493 ms. The kernels are
 power-capped at this shape: a saved cycle converts to about a third of a cycle of time.

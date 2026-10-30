@@ -14,7 +14,10 @@ CPU only. Steps:
  2. read the HKGEN markers (inline asm) and the registers LLVM gave their operands; the generated code lives
     at and above 1 + the highest VGPR the shell's code or a marker operand references;
  3. generate every region (fwdgen) and let asmkit.emit derive its s_set_vgpr_msb, expert-mode waits and hazard
-    v_nops; a re-walk of the result must find no open hazard and complete parse coverage;
+    v_nops (va_vdst: LLVM's rule, but the per-class bound for a write that only an in-flight WMMA still
+    reads, as the backward's); a RESC node (O *= corr under a branch) splits a region into blocks, each
+    emitted from the joined flows of its predecessors; a re-walk of the result must find no open hazard and
+    complete parse coverage;
  4. splice the regions in place of the marker bodies, raise the VGPR allocation to 1024: DIR/k_mla_fwd.s;
  5. assemble with the clang driver's own cc1as / lld commands: DIR/k_mla_fwd.hsaco (+ .notes, .objdump.s); the
     code object must hold the intended instructions (asmkit.verify_obj) and use no spills or scratch;
@@ -84,6 +87,7 @@ ALLOWED = (
     "s_mov_b32",
     "s_cmp_lg_u32",
     "s_cselect_b32",
+    "s_cbranch_scc0",
     "s_barrier_signal",
     "s_wait_dscnt",
     "s_wait_tensorcnt",
@@ -243,24 +247,52 @@ def xcnt_entry(scalars):
     return xs
 
 
-def walk_check(lines, scalars):
-    """Open hazards and parse-coverage errors of emitted region lines, walked from the region entry state."""
+def walk_block_check(lines, flow):
+    """Open hazards and parse-coverage errors of one emitted block walked from its entry flow."""
     ins = parse([l if l.startswith("\t") else "\t" + l.strip() for l in lines])
-    flow = M.Flow([E.State(unknown=True)], [xcnt_entry(scalars)], [[]])
+    fl = flow.copy()
     found = []
-    M.walk_block(ins, flow, lambda k, f, n: found.append((k, f, ins[k].text.strip())))
+    M.walk_block(ins, fl, lambda k, f, n: found.append((k, f, ins[k].text.strip())))
     return found + [("coverage", (k, e)) for k, x in enumerate(ins) for e in coverage_errors(x)]
 
 
-def emit_region(texts, fmap, scalars):
-    """asmkit.emit on one straight-line region: (lines, what walk_check finds in them, which must be nothing).
-    Entry state: anything may be in flight (unknown), XCNT as xcnt_entry, no VALU history."""
-    items = [M.make_item("\t" + t) for t in texts]
-    for k, it in enumerate(items):
-        it.pos = k
+RESC_LABELS = [0]  # unique labels of the RESC blocks across the regions
+
+
+def emit_region(texts, fmap, scalars, L):
+    """asmkit.emit on one region: (lines, what the re-walk finds in them, which must be nothing). Entry
+    state: anything may be in flight (unknown), XCNT as xcnt_entry, no VALU history. A RESC pseudo-line splits
+    the region: the block before it ends in s_cmp + s_cbranch over the conditional O *= corr block, and the
+    block after it is entered from both (joined flows)."""
+    segs, cur = [], []
+    for x in texts:
+        if x.startswith("HKRESC"):
+            segs.append((cur, x))
+            cur = []
+        else:
+            cur.append(x)
     flow = M.Flow([E.State(unknown=True)], [xcnt_entry(scalars)], [[]])
-    lines, _ = M.emit_block(items, flow, fmap, va_rule="llvm")
-    return lines, walk_check(lines, scalars)
+
+    def emit(tx, fl):
+        items = [M.make_item("\t" + x) for x in tx]
+        for k, it in enumerate(items):
+            it.pos = k
+        lines, ex = M.emit_block(items, fl, fmap, va_rule="llvm_war_xdl")
+        return lines, ex, walk_block_check(lines, fl)
+
+    out, found, lead = [], [], []
+    for tx, rline in segs:
+        label = f".LHKR{RESC_LABELS[0]}"
+        RESC_LABELS[0] += 1
+        head, body, lab = G.resc_block(L, rline, label)
+        lines, ex_a, f1 = emit(tx + head, flow)
+        lines_b, ex_b, f2 = emit(body, ex_a)
+        out += lead + lines + lines_b
+        lead = [lab]
+        found += f1 + f2
+        flow = M.Flow.join([ex_a, ex_b])
+    lines, _, f3 = emit(cur, flow)
+    return out + lead + lines, found + f3
 
 
 def main():
@@ -305,7 +337,7 @@ def main():
         "qb": L.qb,
         "qbuf": L.qbuf,
         "O": [L.o, L.o + 255],
-        "V": [L.v, L.v + 127],
+        "V": [[L.V(0, 0), L.V(3, 1) + 7], [L.V(4, 0), L.V(7, 1) + 7]],
         "S": [L.s, L.s + 127],
         "K": [L.k, L.k + 191],
         "PR": [L.pr, L.pr + 63],
@@ -345,8 +377,8 @@ def main():
             pre = ["\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"] + ["\tv_nop"] * 4
             # the shell's LDS stores read the outputs, and LLVM puts no va_vdst wait after an inline-asm def
             post = ["\ts_wait_alu depctr_va_vdst(0)"]
-        msb_defaults(fmap, texts)
-        lines, open_ = emit_region(texts, fmap, scalars)
+        msb_defaults(fmap, [x for x in texts if not x.startswith("HKRESC")] + G.resc_lines(L, 0))
+        lines, open_ = emit_region(texts, fmap, scalars, L)
         if open_:
             fail.append(f"{name}: {len(open_)} hazards / coverage errors after emission, e.g. {open_[:3]}")
         regions[name] = pre + lines + post

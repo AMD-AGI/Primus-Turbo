@@ -23,7 +23,7 @@ over k-steps 0..5 from +0; [mask: s = -inf where kv > q]; lm = max over the lane
 exact), lm = max(lm, peer(lm)); need = fma(lm, c, -m) > fp32(log2 e); ballot over the wave;
 m' = any ? max(m, fp32(c lm)) : m; corr = exp2(m - m'); p = exp2(fma(s, c, -m')); P = bf16_rne(p); FlyDSL's
 3-ary sum tree over the lane's 32 p (kv16 tile major, then the 8 rows), packed over the q tile pairs (0, 1)
-and (2, 3); d = fma(corr, d, ls + peer(ls)); O *= corr (always: corr is exactly 1 when m did not move);
+and (2, 3); d = fma(corr, d, ls + peer(ls)); O *= corr (when m moved: corr is exactly 1 otherwise);
 O += P V as WMMA chains over the two 32-kv halves.
 
 The TILE regions are software-pipelined across tiles. The region of tile t opens with a prefix that finishes
@@ -36,9 +36,14 @@ Every q tile keeps its sequence of operations: the pipelining changes no result 
 tile i leaves the next prefix a no-op for it, as INIT does for the first prefix: P(i) = 0 for i < 2,
 S(i) = -inf for i >= 2 (corr = 1, p = +0, d = fma(1, d, +0), O += V * 0).
 
+O *= corr runs only when m moved: per q tile a wave-uniform branch (s_cmp + s_cbranch over its 32 v_pk_mul, as
+FlyDSL's _rescale_if); corr is exactly 1 otherwise and x * 1.0 is x, so no result bit changes. The scheduler
+places the conditional block as one node (RESC); build.py splits the region there into blocks.
+
 Program order (the order of the node lists) is the semantics: the scheduler reorders only along the dependence
 graph (RAW / WAR / WAW on every VGPR, SGPR, scc, vcc) and the added order edges. The output is real
-instructions only; asmkit.emit derives s_set_vgpr_msb, the expert-mode waits and the hazard v_nops."""
+instructions (and the RESC pseudo-lines build.py expands); asmkit.emit derives s_set_vgpr_msb, the expert-mode
+waits and the hazard v_nops."""
 
 import re
 
@@ -67,8 +72,9 @@ DS_MAX = 56  # LDS loads in flight at most (the dscnt field is 6 bits)
 WORDER = ("PV0p", "PV1p", "PV2p", "PV3p", "QK0", "QK1", "QK2", "QK3")  # the in-order WMMA stream, by node tag
 # latency of a dependence edge by producer kind (it ranks nodes by critical path), and result latency by kind
 # in the issue model
-LAT = {"WMMA": 20, "VALU": 5, "TRANS": 8, "PERM": 8, "DS": DS_LAT, "SALU": 2}
-SLOT_LAT = {"WMMA": 20, "VALU": 3, "TRANS": 8, "PERM": 6, "SALU": 2}
+LAT = {"WMMA": 20, "VALU": 5, "TRANS": 8, "PERM": 8, "DS": DS_LAT, "SALU": 2, "RESC": 2}
+SLOT_LAT = {"WMMA": 20, "VALU": 3, "TRANS": 8, "PERM": 6, "SALU": 2, "RESC": 2}
+RESC_COST = 6  # modelled cycles of a RESC block's s_cmp + s_cbranch when the branch skips it
 
 
 def vr(r, n=1):
@@ -85,6 +91,10 @@ def vr(r, n=1):
 class Layout:
     """VGPR map of the generated code (true register numbers): block 0 from `base` up, blocks 1..3 whole.
 
+    The softmax's registers share block 2 (S, the sum-tree leaves PR, the scratch, (m', -) and (corr, -), m,
+    d, the mask bounds), so the softmax VALU runs in one s_set_vgpr_msb mode; O fills block 1; block 3 holds
+    K and the V fragments of d tiles 0..3, block 0 (after the shell's VGPRs) the Q fragments and the V
+    fragments of d tiles 4..7.
     Live across regions: m, d, (c, c), the Q bases and O; from one TILE region to the next (and into FINAL_0)
     also V, P(0), P(1), S(2), S(3) and the resident Q fragments of q tiles 1, 2."""
 
@@ -98,32 +108,42 @@ class Layout:
                 raise ValueError(f"block 0 overflows (base {base})")
             return r
 
+        b2 = [704]
+
+        def take2(n, align=1):
+            r = b2[0] + ((-b2[0]) % align)
+            b2[0] = r + n
+            if b2[0] > 768:
+                raise ValueError("block 2 overflows")
+            return r
+
         self.base = base
-        self.m = [take(1, 1) for _ in range(QT)]
-        self.d = [take(1, 1) for _ in range(QT)]
         self.cc = take(2)  # (c, c)
         self.qa, self.qb = take(1, 1), take(1, 1)  # Q fragment bases of q tiles 0, 1 and 2, 3
-        self.dl = [None] + [take(1, 1) for _ in range(3)]  # mask bound of q tile i: dl + 64 i
-        self.corr = [take(2) for _ in range(QT)]  # (corr, unused): packed ops broadcast the low half
-        self.mn = [take(2) for _ in range(QT)]  # (m', unused)
-        self.qbuf = [take(48, 8) for _ in range(3)]  # Q fragments, see Q()
-        self.sm = [[take(1, 1) for _ in range(18)] for _ in range(2)]  # softmax scratch per q tile parity
         self.tot = [take(1, 1) for _ in range(4)]  # (peer sum, total) of the two q tiles of a sum tree
+        self.qbuf = [take(48, 8) for _ in range(3)]  # Q fragments, see Q()
+        self.vhi = take(64, 8)  # V[dt][kt] of d tiles 4..7
         self.end0 = nxt[0]
+        self.s = 512  # block 2: S[i][j] = 512 + 32 i + 8 j
+        self.pr = 640  #          PR: leaf x of q tile i at 640 + 2 x + (i % 2)
+        self.sm = [[take2(1) for _ in range(18)] for _ in range(2)]  # softmax scratch per q tile parity
+        self.mn = [take2(2, 2) for _ in range(QT)]  # (m', unused)
+        self.corr = [take2(2, 2) for _ in range(QT)]  # (corr, unused): packed ops broadcast the low half
+        self.m = [take2(1) for _ in range(QT)]
+        self.d = [take2(1) for _ in range(QT)]
+        self.dl = [None] + [take2(1) for _ in range(3)]  # mask bound of q tile i: dl + 64 i
         # FINAL scratch and the (inv, unused) pair: qbuf[0] is dead once the last tile's QK has read it
         self.fin = [self.qbuf[0] + k for k in range(11)]
         self.inv = self.qbuf[0] + 14
         self.o = 256  # block 1: O[i][dt] = 256 + 64 i + 8 dt
-        self.v = 512  # block 2: V[dt][kt] = 512 + 16 dt + 8 kt
-        self.s = 640  #          S[i][j] = 640 + 32 i + 8 j
-        self.k = 768  # block 3: K[j][ks] = 768 + 48 j + 8 ks
-        self.pr = 960  #          PR: leaf x of q tile i at 960 + 2 x + (i % 2)
+        self.k = 768  # block 3: K[j][ks] = 768 + 48 j + 8 ks, then V of d tiles 0..3 from 960
+        self.vlo = 960
 
     def O(self, i, dt):
         return self.o + 64 * i + 8 * dt
 
     def V(self, dt, kt):
-        return self.v + 16 * dt + 8 * kt
+        return (self.vlo + 16 * dt if dt < 4 else self.vhi + 16 * (dt - 4)) + 8 * kt
 
     def S(self, i, j):
         return self.s + 32 * i + 8 * j
@@ -219,6 +239,12 @@ def mk(text, kind, tag=""):
     n = Node(text, kind, tag)
     if kind == "BAR":
         return n
+    if kind == "RESC":  # "HKRESC i o corr sany": the block O(i) *= corr(i) under S_ANY[i]
+        _, _, o, corr, sany = text.split()
+        n.vdefs = set(range(int(o), int(o) + 64))
+        n.vuses = n.vdefs | {int(corr)}
+        n.suses = {sany}
+        return n
     mn, _, rest = text.strip().partition(" ")
     ops = _split_ops(rest)
     if mn.startswith("ds_load"):
@@ -303,10 +329,12 @@ def schedule(nodes):
     WMMAs issue in WORDER (program order within a tag), one per 8 cycles at most (XDL occupancy). Within 8
     cycles of a WMMA, a VALU / TRANS issues only at offsets 2, 3, 6, 7 and v_permlanex16 only at 8; other
     nodes issue at any offset but 0. A TRANS blocks VALU / TRANS / permlane the next cycle; a permlane takes 2
-    cycles and goes before a ready WMMA (else a dense WMMA stream starves it); one SALU issues per 2 cycles.
+    cycles and goes before a ready WMMA (else a dense WMMA stream starves it); one SALU issues per 2 cycles; a
+    RESC block (its s_cmp + s_cbranch) blocks the wave for RESC_COST cycles.
     LDS loads issue one per DS_RATE cycles and complete in order DS_LAT cycles after issue, at most DS_MAX in
-    flight: a consumer of a load retires it and every older one, the arrive (s_barrier_signal behind
-    s_wait_dscnt 0) retires all. Other results are ready SLOT_LAT cycles after issue. Among the ready nodes:
+    flight (not yet complete; a consumer of a load retires it and every older one, the arrive
+    (s_barrier_signal behind s_wait_dscnt 0) retires all). Other results are ready SLOT_LAT cycles after
+    issue. Among the ready nodes:
     a VALU at offsets 2, 6, a TRANS at 3, 7, an LDS load elsewhere first; then the arrive, the earliest
     deadline (the first WMMA of the stream that needs the node), the longest critical path (LAT), program
     order. An s_wait_dscnt goes in where a load would exceed DS_MAX."""
@@ -344,10 +372,11 @@ def schedule(nodes):
             return (not 0 <= o <= 8 or o in (2, 3, 6, 7)) and t != trans_at + 1 and t > perm_busy
         if k == "PERM":
             return o >= 8 and t != trans_at + 1 and t > perm_busy
-        if k == "DS":
-            return o != 0 and t >= ds_next and len(issued_ds) - retired_ds < DS_MAX
-        if k == "SALU":
-            return o != 0 and t >= salu_free
+        if k == "DS":  # loads in flight: neither retired by a consumer nor complete in the model
+            inflight = sum(1 for p in issued_ds[retired_ds:] if ds_done[p] > t)
+            return o != 0 and t >= ds_next and inflight < DS_MAX
+        if k in ("SALU", "RESC"):
+            return o != 0 and t >= salu_free and (k == "SALU" or t > perm_busy)
         return o != 0
 
     while done < n:
@@ -399,6 +428,10 @@ def schedule(nodes):
             perm_busy = t + 1
         elif k == "SALU":
             salu_free = t + 2
+        elif k == "RESC":  # s_cmp + s_cbranch: the wave issues nothing else meanwhile
+            salu_free = t + RESC_COST
+            perm_busy = t + RESC_COST - 1
+            ds_next = max(ds_next, t + RESC_COST)
         for s, lat in succ[pick]:
             if k == "DS":
                 e = ds_done[pick] if nd.vdefs & nodes[s].vuses else t + 1
@@ -469,7 +502,9 @@ def region_init(L, ops):
     # the first prefix is a no-op: S(2), S(3) = -inf; P(0), P(1) = 0; V = 0
     out += [f"v_mov_b32_e32 {vr(r)}, 0x{NEG_INF:x}" for i in (2, 3) for r in range(L.S(i, 0), L.S(i, 0) + 32)]
     out += [f"v_mov_b32_e32 {vr(L.P(i, kt) + e)}, 0" for i in (0, 1) for kt in range(2) for e in range(8)]
-    out += [f"v_mov_b32_e32 {vr(r)}, 0" for r in range(L.v, L.v + 128)]
+    out += [
+        f"v_mov_b32_e32 {vr(L.V(dt, kt) + e)}, 0" for dt in range(NDT) for kt in range(2) for e in range(8)
+    ]
     out.append("s_wait_dscnt 0x0")
     return out
 
@@ -538,10 +573,26 @@ def softmax_nodes(L, i, add, c_sgpr):
             j, e = 2 * kt + r // 4, 2 * (r % 4)
             lo, hi = L.PR(i, 8 * j + e), L.PR(i, 8 * j + e + 1)
             add(f"v_cvt_pk_bf16_f32 {vr(L.P(i, kt) + r)}, {vr(lo)}, {vr(hi)}", "VALU", f"cvt{i}")
-    for dt in range(NDT):  # O *= corr
+    # O *= corr under a wave-uniform branch (one schedule node; build.py expands it with resc_block)
+    add(f"HKRESC {i} {L.O(i, 0)} {corr} {S_ANY[i]}", "RESC", f"resc{i}")
+
+
+def resc_lines(L, i):
+    """O(i) *= corr(i): 32 packed multiplies."""
+    out = []
+    for dt in range(NDT):
         for r in range(0, 8, 2):
             o = vr(L.O(i, dt) + r, 2)
-            add(f"v_pk_mul_f32 {o}, {o}, {vr(corr, 2)} op_sel_hi:[1,0]", "VALU", f"resc{i}")
+            out.append(f"v_pk_mul_f32 {o}, {o}, {vr(L.corr[i], 2)} op_sel_hi:[1,0]")
+    return out
+
+
+def resc_block(L, line, label):
+    """A RESC pseudo-line's expansion: (the lines ending the block before it: s_cmp + s_cbranch over the
+    conditional block when S_ANY[i] is 0, the conditional block, the label line starting the block after
+    it)."""
+    _, i, _, _, sany = line.split()
+    return [f"s_cmp_lg_u32 {sany}, 0", f"s_cbranch_scc0 {label}"], resc_lines(L, int(i)), f"{label}:"
 
 
 def sum_nodes(L, i0, add, upd):
