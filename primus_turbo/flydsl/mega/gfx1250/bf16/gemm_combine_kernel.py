@@ -61,6 +61,7 @@ from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (
     spin_until_flag_reaches,
     topk_reduce_bf16_tile,
 )
+from primus_turbo.flydsl.mega.gfx1250.knobs import env_int
 from primus_turbo.flydsl.mega.gfx1250.prims import (
     CPOL_DEVICE_STREAM,
     atomic_add,
@@ -494,9 +495,9 @@ def gemm_combine_nt_gfx1250(
     handle: DispatchHandle,
     topk_idx: torch.Tensor,
     *,
-    num_lead_combine: int = 0,
-    num_tail_combine: int = 0,
-    lead_gemm_percent: int = 25,
+    num_lead_combine: int | None = None,
+    num_tail_combine: int | None = None,
+    lead_gemm_percent: int | None = None,
     tile_m: int = 256,
     tile_n: int = 256,
     tile_k: int = 0,
@@ -517,7 +518,15 @@ def gemm_combine_nt_gfx1250(
     this rank's token ``t``, on whichever rank holds them. No routing weight is applied here.
     ``w2`` is ``[experts, N, K]``, or ``[experts, K, N]`` with ``b_nn`` (``act[p] @ w2[e(p)]``).
     ``bias`` [experts, N] adds ``bias[e(p)] * bias_scale[p]`` to every pool row before the sum,
-    ``bias_scale`` being the rows' f32 routing weight. ``tile_k`` 0 is 128 when it divides K, else 64."""
+    ``bias_scale`` being the rows' f32 routing weight. ``tile_k`` 0 is 128 when it divides K, else 64.
+    ``num_lead_combine`` (0), ``num_tail_combine`` (0: every CU) and ``lead_gemm_percent`` (25) default
+    to PRIMUS_TURBO_MEGA_COMBINE_LEAD / _COMBINE_TAIL / _LEAD_GEMM_PCT when set (see ``knobs``)."""
+    if num_lead_combine is None:
+        num_lead_combine = env_int("PRIMUS_TURBO_MEGA_COMBINE_LEAD", 0, nn=b_nn)
+    if num_tail_combine is None:
+        num_tail_combine = env_int("PRIMUS_TURBO_MEGA_COMBINE_TAIL", 0, nn=b_nn)
+    if lead_gemm_percent is None:
+        lead_gemm_percent = env_int("PRIMUS_TURBO_MEGA_LEAD_GEMM_PCT", 25, nn=b_nn)
     _require_gfx1250(act.device)
     symm = get_symm_buffer_for_mega_moe()
     G, N, K = w2.shape

@@ -55,6 +55,7 @@ from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (
     dispatch_bf16_tile,
     spin_until_flag_reaches,
 )
+from primus_turbo.flydsl.mega.gfx1250.knobs import env_int
 from primus_turbo.flydsl.mega.gfx1250.prims import cast, ld, st
 from primus_turbo.flydsl.mega.gfx1250.symm_buffer import (
     BLOCK_M,
@@ -302,13 +303,13 @@ def dispatch_gemm_nt_gfx1250(
     w1: torch.Tensor,
     handle: DispatchHandle,
     *,
-    num_dispatch_cu: int = 64,
+    num_dispatch_cu: int | None = None,
     tile_m: int = 256,
     tile_n: int = 256,
     tile_k: int = 0,
     m_warp: int = 4,
     n_warp: int = 2,
-    group_m: int = 16,
+    group_m: int | None = None,
     b_nn: bool = False,
 ) -> torch.Tensor:
     """Dispatch ``x`` by ``handle`` and return the L1 output over this rank's pool rows.
@@ -316,7 +317,12 @@ def dispatch_gemm_nt_gfx1250(
     ``handle`` comes from ``dispatch_prologue_flydsl_kernel`` on the active Mega symmetric
     buffer; the output is ``[pool rows, N]`` in pool order, padding rows undefined. ``w1`` is
     ``[experts, N, hidden]``, or ``[experts, hidden, N]`` with ``b_nn`` (``out = x @ w1[e]``).
-    ``tile_k`` 0 is 128 when it divides hidden, else 64."""
+    ``tile_k`` 0 is 128 when it divides hidden, else 64. ``num_dispatch_cu`` (64) and ``group_m`` (16)
+    default to PRIMUS_TURBO_MEGA_DISPATCH_CU / PRIMUS_TURBO_MEGA_GROUP_M when set (see ``knobs``)."""
+    if num_dispatch_cu is None:
+        num_dispatch_cu = env_int("PRIMUS_TURBO_MEGA_DISPATCH_CU", 64, nn=b_nn)
+    if group_m is None:
+        group_m = env_int("PRIMUS_TURBO_MEGA_GROUP_M", 16, nn=b_nn)
     return _run(x, w1, handle, False, b_nn, num_dispatch_cu, tile_m, tile_n, tile_k, m_warp, n_warp, group_m)
 
 
