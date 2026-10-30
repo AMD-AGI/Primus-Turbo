@@ -17,6 +17,8 @@ import math
 from typing import Optional
 
 D_QK, D_V = 192, 128
+# The backward accumulates dV from bf16(scale * P): below this scale it would reach the denormal range.
+MIN_BWD_SCALE = 2.0**-100
 FWD_ROWS = 256  # k_mla_fwd queries per workgroup
 FWD_KV_TILE = 64  # k_mla_fwd kv rows per ring stage
 K3_ROWS = 96  # k_dkdv96ds kv rows per (two-wave) workgroup
@@ -109,9 +111,14 @@ def bwd_shape_unsupported_reason(b: int, sq: int, skv: int, hq: int, hkv: int, c
     return None
 
 
+def softmax_scale(scale: Optional[float]) -> float:
+    """The softmax scale of a call: ``scale``, or D_QK ** -0.5 when it is None."""
+    return D_QK**-0.5 if scale is None else float(scale)
+
+
 def bwd_scale_unsupported_reason(scale: float) -> Optional[str]:
     """Why the backward kernels cannot take this softmax scale (its log2 is folded into the row constants), or None.
     Comparisons only (NaN fails both), so torch.compile can trace it for a symbolic scale."""
-    if not 0 < scale < math.inf:
-        return f"softmax_scale must be positive and finite, got {scale}"
+    if not MIN_BWD_SCALE <= scale < math.inf:
+        return f"softmax_scale must be finite and at least {MIN_BWD_SCALE}, got {scale}"
     return None

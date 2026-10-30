@@ -119,39 +119,63 @@ _REFUSED = {
 
 @pytest.mark.parametrize(("pass_", "dims"), [(p, d) for p, ds in _ACCEPTED.items() for d in ds])
 def test_hk_gate_accepts(monkeypatch, pass_, dims):
-    monkeypatch.setattr(mla_impl, "_hk_code_objects_reason", lambda p: None)
+    monkeypatch.setattr(mla_impl, "_hk_unavailable_reason", lambda p: None)
     gate = getattr(mla_impl, f"hk_mla_{pass_}_unsupported_reason")
     assert gate(*_meta(*dims), True) is None
 
 
 @pytest.mark.parametrize(("pass_", "dims", "match"), [(p, d, m) for p, ds in _REFUSED.items() for d, m in ds])
 def test_hk_gate_refuses(monkeypatch, pass_, dims, match):
-    monkeypatch.setattr(mla_impl, "_hk_code_objects_reason", lambda p: None)
+    monkeypatch.setattr(mla_impl, "_hk_unavailable_reason", lambda p: None)
     reason = getattr(mla_impl, f"hk_mla_{pass_}_unsupported_reason")(*_meta(*dims), True)
     assert reason is not None and match in reason
 
 
 @pytest.mark.parametrize("pass_", ["fwd", "bwd"])
 def test_hk_gate_refuses_without_the_code_objects(monkeypatch, pass_):
-    monkeypatch.setattr(mla_impl, "_hk_code_objects_reason", lambda p: f"{p}: k.hsaco is not built")
+    monkeypatch.setattr(mla_impl, "_hk_unavailable_reason", lambda p: f"{p}: k.hsaco is not built")
     gate = getattr(mla_impl, f"hk_mla_{pass_}_unsupported_reason")
     assert gate(*_meta(1, 256, 256, 2), True) == f"{pass_}: k.hsaco is not built"
     assert gate(*_meta(1, 256, 256, 2), False) == "causal only"  # the shape rules come first
 
 
-@pytest.mark.parametrize("scale", [0.0, -0.1, float("inf"), float("nan")])
+@pytest.mark.parametrize("scale", [0.0, -0.1, 2.0**-101, float("inf"), float("nan")])
 def test_hk_bwd_gate_refuses_scales_it_cannot_fold(monkeypatch, scale):
-    """The backward folds log2(scale) into its row constants: a scale that is not positive and finite goes to
-    FlyDSL (the forward takes any scale, like FlyDSL's), and a direct call refuses it."""
-    monkeypatch.setattr(mla_impl, "_hk_code_objects_reason", lambda p: None)
+    """The backward folds log2(scale) into its row constants and accumulates dV from bf16(scale * P): a scale that is
+    not finite or below 2^-100 goes to FlyDSL (the forward takes any scale, like FlyDSL's), and a direct call
+    refuses it."""
+    monkeypatch.setattr(mla_impl, "_hk_unavailable_reason", lambda p: None)
     q, k, v = _meta(1, 256, 256, 2)
-    assert "softmax_scale must be positive and finite" in mla_impl.hk_mla_bwd_unsupported_reason(
+    assert "softmax_scale must be finite and at least" in mla_impl.hk_mla_bwd_unsupported_reason(
         q, k, v, True, scale
     )
-    assert mla_impl.hk_mla_bwd_unsupported_reason(q, k, v, True, MLA_SCALE) is None
+    for ok in (MLA_SCALE, 2.0**-100):
+        assert mla_impl.hk_mla_bwd_unsupported_reason(q, k, v, True, ok) is None
     assert mla_impl.hk_mla_fwd_unsupported_reason(q, k, v, True) is None
     with pytest.raises(NotImplementedError, match="softmax_scale"):
         _hk("bwd")._plan(*(_meta_problem(1, 256, 2)[i] for i in (3, 0, 1, 2, 3, 4)), scale, True)
+
+
+def test_hk_gate_refuses_an_unusable_hip_runtime(monkeypatch):
+    """Two HIP runtimes mapped in the process: hiprt cannot launch, so the gate sends both passes to FlyDSL."""
+    hiprt, hsaco = _hk("hiprt"), _hk("hsaco")
+    monkeypatch.setattr(hsaco, "unavailable_reason", lambda names, bin_dir=None: None)
+    monkeypatch.setattr(hiprt, "_LIB", None)
+    monkeypatch.setattr(hiprt, "_RUNTIME_REASON", [])
+    monkeypatch.setattr(
+        hiprt, "_mapped_libhip", lambda: (["/a/libamdhip64.so", "/b/libamdhip64.so"], {"/a", "/b"})
+    )
+    for pass_ in ("fwd", "bwd"):
+        reason = getattr(mla_impl, f"hk_mla_{pass_}_unsupported_reason")(*_meta(1, 256, 256, 2), True)
+        assert "more than one libamdhip64" in reason, reason
+
+
+def test_flydsl_fallback_refuses_what_flydsl_cannot_take():
+    """A HIP-only shape (seqlen_kv % 64 == 32) cannot fall back: a clear error instead of FlyDSL's."""
+    bwd = _hk("bwd")
+    q, k, v, o, lse = _meta_problem(1, 4096, 4, skv=4128)
+    with pytest.raises(bwd.ScratchBudgetError, match="the FlyDSL backward cannot take this call either"):
+        bwd._flydsl_bwd("no scratch", o, q, k, v, o, lse, MLA_SCALE, True)
 
 
 def test_entries_validate_their_tensors():
@@ -193,25 +217,26 @@ def test_limits():
 
 
 @pytest.mark.parametrize(
-    ("dims", "npw"),
+    ("dims", "cus", "npw"),
     [
-        ((1, 4096, 256), 256),  # DeepSeek-V3 MBS 2, SBHD folded
-        ((2, 4096, 128), 256),  # the same, BSHD
-        ((1, 1024, 128), 256),
-        ((1, 4096, 16), 0),  # one step per group: odd
-        ((1, 256, 8), 0),  # a group's heads are not a whole number of steps
-        ((1, 640, 8), 0),  # seqlen not a multiple of 256
-        ((1, 4096, 12), 0),  # heads not a multiple of 8
-        ((1, 2560, 256), 0),  # 10 q blocks do not divide a group of 32 workgroups
+        ((1, 4096, 256), 256, 256),  # DeepSeek-V3 MBS 2, SBHD folded
+        ((2, 4096, 128), 256, 256),  # the same, BSHD
+        ((1, 1024, 128), 256, 256),
+        ((1, 4096, 128), 128, 128),  # a part with 128 CUs
+        ((1, 4096, 128), 252, 0),  # CUs not a multiple of the 8 groups
+        ((1, 4096, 16), 256, 0),  # one step per group: odd
+        ((1, 256, 8), 256, 0),  # a group's heads are not a whole number of steps
+        ((1, 640, 8), 256, 0),  # seqlen not a multiple of 256
+        ((1, 4096, 12), 256, 0),  # heads not a multiple of 8
+        ((1, 2560, 256), 256, 0),  # 10 q blocks do not divide a group of 32 workgroups
     ],
 )
-def test_persistent_workgroups(dims, npw):
-    fwd = _hk("fwd")
-    assert fwd.persistent_workgroups(*dims) == npw
+def test_persistent_workgroups(dims, cus, npw):
+    assert _hk("fwd").persistent_workgroups(*dims, cus) == npw
     if npw:  # the static schedule: every (q block, head-batch) exactly once, equal tiles per step pair
         b, s, h = dims
-        nqb, groups = s // 256, npw // 8
-        r_heads = groups // nqb
+        nqb = s // 256
+        r_heads = npw // 8 // nqb
         steps = b * h // 8 // r_heads
         seen, tiles = {}, []
         for wg in range(npw):
@@ -252,7 +277,7 @@ def _stub_kernels(monkeypatch, calls):
 
         return run
 
-    monkeypatch.setattr(mla_impl, "_hk_code_objects_reason", lambda p: None)
+    monkeypatch.setattr(mla_impl, "_hk_unavailable_reason", lambda p: None)
     monkeypatch.setattr(mla_impl, "_forward_op", fwd("flydsl"))
     monkeypatch.setattr(mla_impl, "_forward_hk_op", fwd("hk"))
     monkeypatch.setattr(mla_impl, "_backward_op", bwd("flydsl"))
@@ -304,7 +329,7 @@ def test_torch_compile_traces_the_hk_ops(monkeypatch, dims, ops, dynamic):
 
     _on_gfx1250(monkeypatch)
     _settings(monkeypatch, "hk", "hk")
-    monkeypatch.setattr(mla_impl, "_hk_code_objects_reason", lambda p: None)
+    monkeypatch.setattr(mla_impl, "_hk_unavailable_reason", lambda p: None)
     monkeypatch.setattr(mla_impl.logger, "_log_once_cache", set())
     seen = {"fw": [], "bw": []}
 
@@ -529,8 +554,9 @@ def test_code_object_checks(monkeypatch, tmp_path):
 
 
 def test_build_never_fails_and_keeps_good_code_objects(monkeypatch, tmp_path):
-    """hsaco.build with a compiler that is not there, or one that emits other bytes, returns False without raising,
-    and leaves the code objects already in place untouched (a new one only replaces them when it is the pinned one)."""
+    """hsaco.build with a compiler that is not there, one that is not the pinned toolchain (skipped before compiling),
+    or one that emits other bytes, returns False without raising and leaves the code objects already in place
+    untouched (a new one replaces them only when it is the pinned one)."""
     hsaco = _hk("hsaco")
     monkeypatch.setattr(hsaco, "_REASONS", {})
     bin_dir = tmp_path / "bin"
@@ -542,12 +568,19 @@ def test_build_never_fails_and_keeps_good_code_objects(monkeypatch, tmp_path):
     fake = tmp_path / "fake-clang"
     fake.write_text('#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && echo junk > "$2"; shift; done\n')
     fake.chmod(0o755)
-    logs = []
-    for cxx in (str(tmp_path / "missing-clang"), str(fake)):
-        assert hsaco.build(cxx=cxx, bin_dir=bin_dir, force=True, log=logs.append) is False
+    toolchain = hsaco.load_manifest()["toolchain"]
+    for cxx, version, want in (
+        (tmp_path / "missing-clang", None, "not found"),
+        (fake, None, "not the validated"),
+        (fake, toolchain, "not built: RuntimeError"),
+    ):
+        if version is not None:
+            monkeypatch.setattr(hsaco, "compiler_version", lambda c, v=version: v)
+        logs = []
+        assert hsaco.build(cxx=str(cxx), bin_dir=bin_dir, force=True, log=logs.append) is False
+        assert any(want in m for m in logs), logs
         assert {n: (bin_dir / f"{n}.hsaco").read_bytes() for n in before} == before
         assert not list(bin_dir.glob("*.tmp"))
-    assert any("not found" in m for m in logs) and any("not built" in m for m in logs)
 
 
 _ASM_HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@$")
@@ -778,6 +811,22 @@ def test_hk_bwd_head_chunks_are_bitwise_equal(monkeypatch):
     chunked = bwd.hk_attn_bwd(dout, q, k, v, out, lse, MLA_SCALE, True, max_scratch_bytes=budget)
     for a, b in zip(full, chunked):
         assert torch.isfinite(a).all() and torch.equal(a, b)
+
+
+@needs_hk_bwd
+def test_hk_bwd_falls_back_when_the_scratch_does_not_fit(monkeypatch):
+    """Out of memory for the dS scratch: the call runs the FlyDSL backward (same gradients as FlyDSL's)."""
+    bwd = _hk("bwd")
+
+    def oom(nbytes, device):
+        raise torch.OutOfMemoryError(f"cannot allocate {nbytes} bytes")
+
+    q, k, v, dout = (t.cuda() for t in _inputs(1, 256, 256, 4, layout="bshd"))
+    out, lse = mla_impl._forward_op(q, k, v, MLA_SCALE, True)
+    fly = mla_impl._backward_op(dout, q, k, v, out, lse, MLA_SCALE, True)
+    monkeypatch.setattr(bwd, "_ds_scratch", oom)
+    for a, b in zip(bwd.hk_attn_bwd(dout, q, k, v, out, lse, MLA_SCALE, True), fly):
+        assert torch.equal(a, b)
 
 
 def _delta_inputs(b, s, h, special, seed=0):

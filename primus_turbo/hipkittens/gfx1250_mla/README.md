@@ -21,15 +21,16 @@ reason (not under torch.compile, which cannot trace a log call). A call must pas
 1. the FlyDSL MLA rules (one device, bf16, 4-D, qk 192 / v 128, MHA, causal, seqlen_q and seqlen_kv multiples of 64,
    seqlen_q <= seqlen_kv, 32-bit descriptor extents);
 2. the HIP kernels' rules (`limits.py`): forward: seqlen_q == seqlen_kv and q / k smaller than 2 GiB; backward:
-   seqlen_q % 384 in {0, 256}, seqlen_kv % 96 in {0, 32, 64}, batch * heads * seqlen <= 512 * 4096, and a positive,
-   finite softmax scale (its log2 is folded into the row constants);
-3. the pass's code objects: built, and byte-identical to the ones `manifest.json` pins.
+   seqlen_q % 384 in {0, 256}, seqlen_kv % 96 in {0, 32, 64}, batch * heads * seqlen <= 512 * 4096, and a finite
+   softmax scale of at least 2^-100 (its log2 is folded into the row constants, and dV accumulates bf16(scale * P));
+3. the pass's code objects: built and byte-identical to the ones `manifest.json` pins, and a HIP runtime `hiprt` can
+   use (the one torch loaded, mapped once).
 
 ## Kernels
 
 | pass | kernel | work |
 |---|---|---|
-| forward | `k_mla_fwd` | 256-query workgroups (4 waves, one per SIMD) over a 4-stage TDM ring of 64-row K / V tiles; QK, online softmax, PV per tile, the diagonal tiles specialized. One q block per workgroup, longest first; or, when its static schedule covers the shape, 256 persistent workgroups (`fwd.persistent_workgroups`) |
+| forward | `k_mla_fwd` | 256-query workgroups (4 waves, one per SIMD) over a 4-stage TDM ring of 64-row K / V tiles; QK, online softmax, PV per tile, the diagonal tiles specialized. One q block per workgroup, longest first; or, when its static schedule covers the shape, one persistent workgroup per CU (`fwd.persistent_workgroups`) |
 | backward | `k_delta` | delta = rowsum(dO * O) and the row constants of the dK / dV kernel: NL = -log2(e) * lse + log2(scale), ND = -delta |
 | backward | `k_dkdv96ds` | dK, dV over 96-row kv blocks (two 48-row waves on a 3-stage Q / dO TDM ring), then 64-row tail blocks; stores every bf16 dS^T tile it feeds the dK WMMA into the dS scratch; workgroups take their blocks from a ticket counter (zeroed on the host before each launch), longest first |
 | backward | `k_dqds_c` | dQ = dS K from that scratch: 384-query workgroups (4 waves sharing one K ring) plus one merged 256-query head tile |
@@ -44,8 +45,8 @@ deterministic.
 **dS scratch.** One block per backward call from the torch caching allocator, on the current stream: guard | layout
 (`hip/include/dslayout.h`, `limits.ds_layout_bytes`) | guard, 4.33 GB at b2 s4096 h128. Over the budget the call runs
 `k_delta` once, then the dK / dV and dQ kernels per chunk of heads, every chunk on the same scratch (bitwise equal to
-the unchunked call; two chunks at b2 s4096 h128: 2.16 GB, 0.75% slower). When not even one head group fits, the call
-runs the FlyDSL backward.
+the unchunked call; two chunks at b2 s4096 h128: 2.16 GB, 0.75% slower). When not even one head group fits, or the
+scratch cannot be allocated, the call runs the FlyDSL backward (one warning).
 
 ## Build
 
@@ -63,7 +64,8 @@ are self-contained (the HIP runtime and the package's own headers: they share no
 **Fail-closed.** `manifest.json` pins the sha256 of every code object as validated with its `toolchain`. A build that
 produces other bytes is discarded (a code object replaces the one in `bin/` only when it is the pinned one), a missing
 or foreign code object is never loaded (`hsaco.unavailable_reason`, checked again by `hiprt` before loading), and that
-pass runs on FlyDSL. A failed build never fails the install. The wheel ships `hip/` with the code objects, so an
+pass runs on FlyDSL. Another compiler than `toolchain` builds nothing (it cannot reproduce the pins), and a failed
+build never fails the install. The wheel ships `hip/` with the code objects, so an
 installed package can rebuild them in place.
 
 **Generated kernels.** `k_mla_fwd` and `k_dkdv96ds` are marker shells: compiled with their manifest flags, the HIP
@@ -91,8 +93,9 @@ the VGPR-MSB operand fields from.
 
    `--check` verifies that the committed patches and sha256 values are current, byte for byte.
 3. For the other kernels, `python primus_turbo/hipkittens/gfx1250_mla/hsaco.py --force` prints the sha256 of a code
-   object that does not match; update `hsaco_sha256` (and `args` / `kernarg_size` / `lds` / `vgpr` if an interface
-   changed), then `hsaco.py --force --strict` must pass.
+   object that does not match (with a new compiler, set `toolchain` to its `--version` line first); update
+   `hsaco_sha256` (and `args` / `kernarg_size` / `lds` / `vgpr` if an interface changed), then
+   `hsaco.py --force --strict` must pass.
 4. On an MI455X, check that `hsaco.py --check` prints `ok` for both passes, then run
 
    ```

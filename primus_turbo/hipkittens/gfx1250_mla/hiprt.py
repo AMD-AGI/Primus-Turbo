@@ -22,7 +22,15 @@ import threading
 
 from . import hsaco
 
-__all__ = ["HipError", "Kernel", "Module", "check_device", "load_kernels", "pack_args"]
+__all__ = [
+    "HipError",
+    "Kernel",
+    "Module",
+    "check_device",
+    "load_kernels",
+    "pack_args",
+    "runtime_unavailable_reason",
+]
 
 
 class HipError(RuntimeError):
@@ -81,6 +89,20 @@ def _lib():
         lib.hipGetErrorString.restype = ctypes.c_char_p
         _LIB = lib
         return lib
+
+
+_RUNTIME_REASON = []
+
+
+def runtime_unavailable_reason():
+    """None when the HIP runtime torch loaded can be used here, else why not (checked once per process)."""
+    if not _RUNTIME_REASON:
+        try:
+            _lib()
+            _RUNTIME_REASON.append(None)
+        except HipError as e:
+            _RUNTIME_REASON.append(str(e))
+    return _RUNTIME_REASON[0]
 
 
 def _check(rc, what):

@@ -27,7 +27,8 @@ budget (``max_scratch_bytes``, default ``$PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BY
 "delta" once, then ("ticket", "dkdv", "dq") per chunk of consecutive heads of one batch, every chunk on the same
 scratch: a chunk launch is the full launch with B = 1, the grid's z cut to the chunk and the tensors offset to its
 first (batch, head), so the gradients are bitwise those of the unchunked call (two chunks at b2 s4096 h128: 2.16 GB,
-+0.75% time). When not even one head group fits, the call runs the FlyDSL backward.
++0.75% time). When not even one head group fits, or the scratch cannot be allocated, the call runs the FlyDSL
+backward.
 """
 
 import math
@@ -142,8 +143,6 @@ def _check(do, q, k, v, o, lse):
             raise ValueError(f"{name} is on {t.device}, q on {q.device}")
         if name != "lse" and (not t.is_contiguous() or t.dtype != torch.bfloat16):
             raise ValueError(f"{name} must be a contiguous bfloat16 tensor")
-    if b * sq * hq * limits.D_V * 2 >= 1 << 31:
-        raise ValueError("o/do byte extent overflows k_delta's int32 offsets")
     return b, sq, skv, hq, hkv
 
 
@@ -181,7 +180,7 @@ def _plan(do, q, k, v, o, lse, softmax_scale, causal, head_group=None, max_scrat
     tensors."""
     b, sq, skv, hq, hkv = _check(do, q, k, v, o, lse)
     c = int(bool(causal))
-    scale = limits.D_QK**-0.5 if softmax_scale is None else float(softmax_scale)
+    scale = limits.softmax_scale(softmax_scale)
     reason = limits.bwd_shape_unsupported_reason(b, sq, skv, hq, hkv, bool(causal))
     reason = reason or limits.bwd_scale_unsupported_reason(scale)
     if reason is not None:
@@ -269,6 +268,18 @@ def _plan(do, q, k, v, o, lse, softmax_scale, causal, head_group=None, max_scrat
     }
 
 
+def _flydsl_bwd(reason, do, q, k, v, o, lse, softmax_scale, causal):
+    """The FlyDSL backward in place of a call the HIP kernels could not run (``reason``)."""
+    from primus_turbo.flydsl.attention.gfx1250_mla import bwd as fly
+
+    b, sq, hq, _ = q.shape
+    why = fly.shape_unsupported_reason(b, sq, k.shape[1], hq)
+    if why is not None:
+        raise ScratchBudgetError(f"{reason}; the FlyDSL backward cannot take this call either: {why}")
+    logger.warning(f"{reason}: this backward runs on FlyDSL", once=True)
+    return fly.flash_attn_mla_bwd(do, q, k, v, o, lse, limits.softmax_scale(softmax_scale), causal)
+
+
 def hk_attn_bwd(
     do, q, k, v, o, lse, softmax_scale=None, causal=True, head_group=None, max_scratch_bytes=None
 ):
@@ -277,19 +288,23 @@ def hk_attn_bwd(
     Same contract as ``primus_turbo.flydsl.attention.gfx1250_mla.bwd.flash_attn_mla_bwd``: q [B, Sq, H, 192],
     o / do [B, Sq, H, 128], k [B, Skv, H, 192], v [B, Skv, H, 128], bf16 contiguous; lse [B, H, Sq] fp32 natural log.
     Returns (dq, dk, dv) laid out like q / k / v. The shapes must pass ``limits.bwd_shape_unsupported_reason``.
-    max_scratch_bytes: dS scratch budget of this call (module docstring)."""
+    max_scratch_bytes: dS scratch budget of this call (module docstring). When no head group fits the budget, or the
+    scratch cannot be allocated, the call runs the FlyDSL backward."""
     hiprt.check_device(q.device)
     lse = lse.contiguous().float()
     table = kernels()
     with torch.cuda.device(q.device):
         try:
-            plan = _plan(do, q, k, v, o, lse, softmax_scale, causal, head_group, max_scratch_bytes)
+            plan, reason = (
+                _plan(do, q, k, v, o, lse, softmax_scale, causal, head_group, max_scratch_bytes),
+                None,
+            )
         except ScratchBudgetError as e:
-            from primus_turbo.flydsl.attention.gfx1250_mla import bwd as fly
-
-            logger.warning(f"{e}: this backward runs on FlyDSL", once=True)
-            scale = limits.D_QK**-0.5 if softmax_scale is None else float(softmax_scale)
-            return fly.flash_attn_mla_bwd(do, q, k, v, o, lse, scale, causal)
+            reason = str(e)
+        except torch.OutOfMemoryError:
+            reason = f"hk_attn_bwd: out of memory for the dS scratch (cap it with {MAX_SCRATCH_BYTES_ENV})"
+        if reason is not None:  # outside the except clause: the failed allocations are freed by now
+            return _flydsl_bwd(reason, do, q, k, v, o, lse, softmax_scale, causal)
         stream = torch.cuda.current_stream(q.device)
         for _, fn, args in plan["launches"]:
             if isinstance(fn, str):

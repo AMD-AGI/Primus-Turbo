@@ -70,13 +70,14 @@ def kernel_unavailable_reason(name: str, bin_dir: Path = BIN_DIR) -> Optional[st
     if key not in _REASONS:
         path = binary_path(name, bin_dir)
         want = load_manifest()["kernels"][name]["hsaco_sha256"]
+        got = _sha256(path) if path.is_file() else None
         reason = None
-        if not path.is_file():
+        if got is None:
             reason = f"{path.name} is not built (build Primus-Turbo with GPU_ARCHS=gfx1250, or run hsaco.py)"
-        elif _sha256(path) != want:
+        elif got != want:
             reason = (
-                f"{path.name} sha256 {_sha256(path)[:16]} != {want[:16]}: built by another toolchain or from "
-                f"edited sources (validated with: {load_manifest()['toolchain']})"
+                f"{path.name} sha256 {got[:16]} != {want[:16]}: built by another toolchain or from edited sources "
+                f"(validated with: {load_manifest()['toolchain']})"
             )
         _REASONS[key] = reason
     return _REASONS[key]
@@ -198,8 +199,8 @@ def build(cxx: Optional[str] = None, bin_dir: Path = BIN_DIR, force: bool = Fals
 
     A code object already present with the manifest's sha256 is kept (unless ``force``). A new one replaces it only
     when it has the manifest's sha256; one with other bytes is discarded, and that pass runs on FlyDSL. No compiler,
-    or one that cannot compile the kernels: nothing is built (the same fallback). Never raises for a kernel, so it
-    cannot fail an install."""
+    or another one than the manifest's ``toolchain`` (it cannot reproduce the pinned bytes): nothing is built (the
+    same fallback). Never raises for a kernel, so it cannot fail an install."""
     bin_dir = Path(bin_dir)
     kernels = load_manifest()["kernels"]
     todo = [n for n, k in kernels.items() if force or kernel_unavailable_reason(n, bin_dir) is not None]
@@ -212,6 +213,12 @@ def build(cxx: Optional[str] = None, bin_dir: Path = BIN_DIR, force: bool = Fals
     if cxx is None:
         log(f"[gfx1250_mla] WARNING: amdclang++ not found (set {CXX_ENV}); HIP MLA kernels not built")
         return False
+    version, toolchain = compiler_version(cxx), load_manifest()["toolchain"]
+    if version != toolchain:
+        log(
+            f"[gfx1250_mla] WARNING: {cxx} is {version!r}, not the validated {toolchain!r}; HIP MLA kernels not built"
+        )
+        return False
     ok = True
     for name in todo:
         out = binary_path(name, bin_dir)
@@ -220,10 +227,7 @@ def build(cxx: Optional[str] = None, bin_dir: Path = BIN_DIR, force: bool = Fals
             compile_kernel(cxx, name, tmp)
             got, want = _sha256(tmp), kernels[name]["hsaco_sha256"]
             if got != want:
-                raise RuntimeError(
-                    f"sha256 {got[:16]} != manifest {want[:16]} with {compiler_version(cxx)} (validated with: "
-                    f"{load_manifest()['toolchain']})"
-                )
+                raise RuntimeError(f"sha256 {got} != manifest {want[:16]}")
             os.replace(tmp, out)
             log(f"[gfx1250_mla] built {out.name} ({got[:16]})")
         except Exception as e:  # noqa: BLE001 -- a kernel that does not build must not fail the install

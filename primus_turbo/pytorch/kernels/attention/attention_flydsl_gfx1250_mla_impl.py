@@ -101,15 +101,16 @@ def flydsl_gfx1250_mla_unsupported_reason(
 
 
 @torch.compiler.assume_constant_result
-def _hk_code_objects_reason(pass_: str) -> Optional[str]:
-    """None when the HIP kernels of ``pass_`` ("fwd" / "bwd") are built and byte-identical to the ones
-    ``manifest.json`` pins, else why not; said once in the log. Marked constant for torch.compile, whose Dynamo
-    then calls it instead of tracing it (the gate runs inside compiled regions): the answer cannot change within
-    a process, and the file reads and the log line are not traceable."""
-    # stdlib-only module: no torch / flydsl / HIP runtime work
-    from primus_turbo.hipkittens.gfx1250_mla import hsaco
+def _hk_unavailable_reason(pass_: str) -> Optional[str]:
+    """None when the HIP kernels of ``pass_`` ("fwd" / "bwd") are built, byte-identical to the ones
+    ``manifest.json`` pins, and the HIP runtime torch loaded can launch them; else why not, said once in the log.
+    Marked constant for torch.compile, whose Dynamo then calls it instead of tracing it (the gate runs inside
+    compiled regions): the answer cannot change within a process, and the file reads and the log line are not
+    traceable."""
+    from primus_turbo.hipkittens.gfx1250_mla import hiprt, hsaco
 
     reason = hsaco.unavailable_reason(hsaco.FWD_KERNELS if pass_ == "fwd" else hsaco.BWD_KERNELS)
+    reason = reason or hiprt.runtime_unavailable_reason()
     if reason is not None:
         logger.warning(f"the gfx1250 HIP MLA {pass_} kernels are unavailable: {reason}", once=True)
     return reason
@@ -130,7 +131,7 @@ def _hk_unsupported_reason(q, k, v, causal, pass_, softmax_scale=None):
     else:
         reason = limits.bwd_shape_unsupported_reason(b, sq, skv, h, hkv, causal)
         reason = reason or limits.bwd_scale_unsupported_reason(_scale(softmax_scale))
-    return reason if reason is not None else _hk_code_objects_reason(pass_)
+    return reason if reason is not None else _hk_unavailable_reason(pass_)
 
 
 def hk_mla_fwd_unsupported_reason(
@@ -149,7 +150,7 @@ def hk_mla_bwd_unsupported_reason(
 
 def _warn_hk_fallback(env: str, pass_name: str, reason: str) -> None:
     """Say once that ``hk`` could not take a pass. Skipped under torch.compile: Dynamo cannot trace a
-    logging.Logger call (a missing code object is still logged, by _hk_code_objects_reason)."""
+    logging.Logger call (unavailable kernels are still logged, by _hk_unavailable_reason)."""
     if not torch.compiler.is_compiling():
         logger.warning(f"{env}=hk: this {pass_name} runs on FlyDSL ({reason})", once=True)
 
