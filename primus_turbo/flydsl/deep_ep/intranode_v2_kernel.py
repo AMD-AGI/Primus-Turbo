@@ -1112,6 +1112,8 @@ def _wait_rows(flags, flag_idx, waits, epoch, rank, token):
 
 # PRIMUS_TURBO_DEEPEP_V2_COMBINE_PUSH_WARPS=n: n push warps per block at every grid size (experiments)
 COMBINE_PUSH_WARPS = int(os.environ.get("PRIMUS_TURBO_DEEPEP_V2_COMBINE_PUSH_WARPS", "0"))
+# PRIMUS_TURBO_DEEPEP_V2_COMBINE_PUSH_BLOCK_MAJOR=1: the pushers' rows dealt block-major, as before (experiments)
+COMBINE_PUSH_BLOCK_MAJOR = os.environ.get("PRIMUS_TURBO_DEEPEP_V2_COMBINE_PUSH_BLOCK_MAJOR", "0") == "1"
 
 
 def combine_v2_push_warps(num_channels):
@@ -1231,7 +1233,12 @@ def _make_combine_v2(
         # rows are grouped by source, so a warp sticks to one source: walking them in order would
         # have the whole GPU writing to one peer, over one link, at a time
         x_base = tensor_addr(X)
-        global_warp = block_id * fx.Int32(push_warps) + warp_id
+        # numbered warp-major, so the last, partial round of rows spreads over every block instead of
+        # filling the first ones
+        if fx.const_expr(COMBINE_PUSH_BLOCK_MAJOR):
+            global_warp = block_id * fx.Int32(push_warps) + warp_id
+        else:
+            global_warp = warp_id * fx.Int32(num_channels) + block_id
         num_peers = num_ranks - 1
         warps_per_peer = grid_push_warps // num_peers
         warp_source = global_warp % fx.Int32(num_peers)
