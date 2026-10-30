@@ -508,7 +508,15 @@ def _build_mxfp8_nt_kernel(
 
         a1_frag = a_s2r.load(a_cur1)
         a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
-        rocdl.s_barrier()
+        # b_next0 (read below) and the last step's a_cur0 hold the final refill, which the
+        # loop's vmcnt leaves in flight. Each wave reads rows and columns other waves loaded,
+        # so every wave must drain that refill before a barrier all of them cross ahead of
+        # both reads; under the wave_m barrier skew this is the last barrier that does. Only
+        # b_cur1's refill and the a_next1 above may stay outstanding: the count relies on
+        # LDS-DMA loads retiring in issue order, and the sched_barrier keeps a_next1 issued
+        # before the wait, which the asm does not order on its own.
+        rocdl.sched_barrier(0)
+        wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
 
         rocdl.s_setprio(1)
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0)
