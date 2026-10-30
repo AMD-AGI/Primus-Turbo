@@ -24,8 +24,8 @@ _COMPILED = {}
 _NUM_CUS = {}
 # Ticket counters of the persistent schedule per (device, stream): 8 group counters and a done counter,
 # int32s 256 B apart, all 0 between calls (the last workgroup to finish resets them), so calls on one
-# stream share them and calls on two streams never do. (A CUDA graph keeps the buffer of the capturing
-# stream: replays of one graph must not overlap.)
+# stream share them and calls on two streams never do. A launch captured into a CUDA graph gets a buffer
+# of its own, zero-filled by the graph before the kernel (graphs share their capture stream).
 _COUNTERS = {}
 # Persistent workgroups (at most one per CU, taking q blocks from counters) where the grid allows them.
 PERSIST = True
@@ -51,10 +51,12 @@ def persist_mode(q: torch.Tensor, k: torch.Tensor) -> Tuple[int, int]:
     return h | (b << 16), _NUM_CUS[idx]
 
 
-def _counter(q: torch.Tensor) -> torch.Tensor:
+def _counter(q: torch.Tensor, stream) -> torch.Tensor:
     if q.device.type != "cuda":  # COMPILE_ONLY
         return torch.zeros(4, dtype=torch.int32)
-    key = (q.device.index, torch.cuda.current_stream(q.device).cuda_stream)
+    if torch.cuda.is_current_stream_capturing():
+        return torch.zeros(9 * 64, dtype=torch.int32, device=q.device)
+    key = (q.device.index, stream.cuda_stream)
     c = _COUNTERS.get(key)
     if c is None:
         c = torch.zeros(9 * 64, dtype=torch.int32, device=q.device)
@@ -71,6 +73,7 @@ def launch_args(q, k, v, out, lse, softmax_scale):
         *(lse.stride(i) for i in (2, 1, 0)),
     )
     persist_hb, wgs = persist_mode(q, k)
+    stream = torch.cuda.current_stream()
     # The counter fills the unused tensor slot; window_right = 0 (plain causal).
     return (
         out,
@@ -78,7 +81,7 @@ def launch_args(q, k, v, out, lse, softmax_scale):
         k,
         v,
         lse,
-        _counter(q),
+        _counter(q, stream),
         float(softmax_scale),
         *strides,
         persist_hb,
@@ -88,7 +91,7 @@ def launch_args(q, k, v, out, lse, softmax_scale):
         h,
         b,
         wgs,
-        torch.cuda.current_stream(),
+        stream,
     )
 
 

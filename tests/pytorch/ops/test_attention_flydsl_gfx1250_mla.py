@@ -598,3 +598,27 @@ def test_torch_compile_fullgraph():
     _check(got, _reference(q, k, v, dout, MLA_SCALE))
     for a, b in zip(got, eager):
         assert torch.equal(a, b)
+
+
+@needs_gfx1250
+def test_persistent_forward_under_cuda_graphs():
+    """Two graphs captured on torch's shared capture stream, the second replayed first: every captured launch of the
+    persistent forward has its own ticket counters, zero-filled by its graph, so both replays give the eager bits and
+    no counter buffer of the capture stream is cached."""
+    from primus_turbo.flydsl.attention.gfx1250_mla import fwd
+
+    q, k, v = (t.cuda() for t in _inputs(1, 4096, 4096, 32, layout="bshd")[:3])
+    assert fwd.persist_mode(q, k)[1], "not a persistent shape"
+    eager = fwd.flash_attn_mla_fwd(q, k, v, MLA_SCALE)
+    cached = set(fwd._COUNTERS)
+    graphs, outs = [], []
+    for _ in range(2):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outs.append(fwd.flash_attn_mla_fwd(q, k, v, MLA_SCALE))
+        graphs.append(graph)
+    assert set(fwd._COUNTERS) == cached
+    for graph, got in zip(graphs[::-1], outs[::-1]):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert all(torch.equal(a, b) for a, b in zip(got, eager))
