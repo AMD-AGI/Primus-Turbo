@@ -35,9 +35,11 @@ from primus_turbo.pytorch.ops import flash_attn_func
 from primus_turbo.pytorch.ops.attention import flash_attn_interface
 from tests.pytorch.test_utils import compute_snr, pinned_backend_takes
 
-_KERNELS = "primus_turbo.flydsl.attention.gfx1250_mla"
+_KERNELS = ("primus_turbo.flydsl.attention.gfx1250_mla", "primus_turbo.hipkittens.gfx1250_mla")
 # Taken when pytest imports this module, before any test runs.
-_KERNEL_MODULES_AT_IMPORT = sorted(m for m in sys.modules if m == _KERNELS or m.startswith(_KERNELS + "."))
+_KERNEL_MODULES_AT_IMPORT = sorted(
+    m for m in sys.modules if any(m == p or m.startswith(p + ".") for p in _KERNELS)
+)
 
 needs_gfx1250 = pytest.mark.skipif(
     not (torch.cuda.is_available() and is_gfx1250()), reason="needs a gfx1250 (MI455X) GPU"

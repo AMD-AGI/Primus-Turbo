@@ -1,0 +1,419 @@
+{
+  "schema": 1,
+  "arch": "gfx1250",
+  "toolchain": "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git 862306352beb9946c78b3e355d0d5201bbccfa3a)",
+  "flags": [
+    "-x",
+    "hip",
+    "--offload-arch=gfx1250",
+    "--cuda-device-only",
+    "--no-gpu-bundle-output",
+    "-O3",
+    "-std=c++20",
+    "-DNDEBUG",
+    "-Iinclude",
+    "-save-temps=obj"
+  ],
+  "kernels": {
+    "k_mla_fwd": {
+      "src": "src/k_mla_fwd.hip",
+      "extra_flags": [
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "hsaco_sha256": "1d95fa84354e3d436584e359a09117f90741c2ebbb5c4c6d86893d02298438b5",
+      "asm_patch": "asm/k_mla_fwd.s.patch",
+      "asm_input_sha256": "f8d5c01d42f52ef1614ae48a68afa8034ba77c14b227f184b40a121d5fcf40a4",
+      "block": 128,
+      "kernarg_size": 68,
+      "lds": 310272,
+      "vgpr": 1024,
+      "args": [
+        {
+          "name": "Q",
+          "kind": "ptr",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "K",
+          "kind": "ptr",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "V",
+          "kind": "ptr",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "O",
+          "kind": "ptr",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "LSE",
+          "kind": "ptr",
+          "offset": 32,
+          "size": 8
+        },
+        {
+          "name": "scale",
+          "kind": "f32",
+          "offset": 40,
+          "size": 4
+        },
+        {
+          "name": "Sq",
+          "kind": "i32",
+          "offset": 44,
+          "size": 4
+        },
+        {
+          "name": "Skv",
+          "kind": "i32",
+          "offset": 48,
+          "size": 4
+        },
+        {
+          "name": "H",
+          "kind": "i32",
+          "offset": 52,
+          "size": 4
+        },
+        {
+          "name": "B",
+          "kind": "i32",
+          "offset": 56,
+          "size": 4
+        },
+        {
+          "name": "nqb",
+          "kind": "i32",
+          "offset": 60,
+          "size": 4
+        },
+        {
+          "name": "npw",
+          "kind": "i32",
+          "offset": 64,
+          "size": 4
+        }
+      ]
+    },
+    "k_delta": {
+      "src": "src/k_delta.hip",
+      "extra_flags": [],
+      "hsaco_sha256": "61d3bc136087a0160a26ae139f0701cc74d8775091d972ff8c15651473dfff89",
+      "block": 256,
+      "kernarg_size": 60,
+      "lds": 256,
+      "vgpr": 48,
+      "args": [
+        {
+          "name": "DO",
+          "kind": "ptr",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "O",
+          "kind": "ptr",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "DEL",
+          "kind": "ptr",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "LSE",
+          "kind": "ptr",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "NL",
+          "kind": "ptr",
+          "offset": 32,
+          "size": 8
+        },
+        {
+          "name": "ND",
+          "kind": "ptr",
+          "offset": 40,
+          "size": 8
+        },
+        {
+          "name": "scale",
+          "kind": "f32",
+          "offset": 48,
+          "size": 4
+        },
+        {
+          "name": "S",
+          "kind": "i32",
+          "offset": 52,
+          "size": 4
+        },
+        {
+          "name": "H",
+          "kind": "i32",
+          "offset": 56,
+          "size": 4
+        }
+      ]
+    },
+    "k_dkdv96ds": {
+      "src": "src/k_dkdv96ds.hip",
+      "extra_flags": [
+        "-mllvm",
+        "-structurizecfg-skip-uniform-regions",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode",
+        "-mllvm",
+        "-amdgpu-enable-delay-alu=false",
+        "-mllvm",
+        "-greedy-regclass-priority-trumps-globalness",
+        "-DHKGEN=1"
+      ],
+      "hsaco_sha256": "abeea38ec402459872df2c8640f5249e817d9df31d5b40326903426d20bbffbe",
+      "asm_patch": "asm/k_dkdv96ds.s.patch",
+      "asm_input_sha256": "9d987c934625c1b2d9d33b8553a2716841060a654c85288ea58ff62447372feb",
+      "block": 64,
+      "kernarg_size": 120,
+      "lds": 129028,
+      "vgpr": 1024,
+      "args": [
+        {
+          "name": "Q",
+          "kind": "ptr",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "K",
+          "kind": "ptr",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "V",
+          "kind": "ptr",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "DO",
+          "kind": "ptr",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "NL",
+          "kind": "ptr",
+          "offset": 32,
+          "size": 8
+        },
+        {
+          "name": "ND",
+          "kind": "ptr",
+          "offset": 40,
+          "size": 8
+        },
+        {
+          "name": "DV",
+          "kind": "ptr",
+          "offset": 48,
+          "size": 8
+        },
+        {
+          "name": "DK",
+          "kind": "ptr",
+          "offset": 56,
+          "size": 8
+        },
+        {
+          "name": "DS",
+          "kind": "ptr",
+          "offset": 64,
+          "size": 8
+        },
+        {
+          "name": "scale",
+          "kind": "f32",
+          "offset": 72,
+          "size": 4
+        },
+        {
+          "name": "Sq",
+          "kind": "i32",
+          "offset": 76,
+          "size": 4
+        },
+        {
+          "name": "Skv",
+          "kind": "i32",
+          "offset": 80,
+          "size": 4
+        },
+        {
+          "name": "Hq",
+          "kind": "i32",
+          "offset": 84,
+          "size": 4
+        },
+        {
+          "name": "Hkv",
+          "kind": "i32",
+          "offset": 88,
+          "size": 4
+        },
+        {
+          "name": "G",
+          "kind": "i32",
+          "offset": 92,
+          "size": 4
+        },
+        {
+          "name": "nqt",
+          "kind": "i32",
+          "offset": 96,
+          "size": 4
+        },
+        {
+          "name": "cshift",
+          "kind": "i32",
+          "offset": 100,
+          "size": 4
+        },
+        {
+          "name": "causal",
+          "kind": "i32",
+          "offset": 104,
+          "size": 4
+        },
+        {
+          "name": "B",
+          "kind": "i32",
+          "offset": 108,
+          "size": 4
+        },
+        {
+          "name": "HG",
+          "kind": "i32",
+          "offset": 112,
+          "size": 4
+        },
+        {
+          "name": "ds_mode",
+          "kind": "i32",
+          "offset": 116,
+          "size": 4
+        }
+      ]
+    },
+    "k_dqds_c": {
+      "src": "src/k_dqds_c.hip",
+      "extra_flags": [
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "hsaco_sha256": "c182284e1ed7d0c1530e24f433ce719cdb950aea2fb7fd2020149e4921051b67",
+      "block": 128,
+      "kernarg_size": 68,
+      "lds": 274432,
+      "vgpr": 934,
+      "args": [
+        {
+          "name": "DS",
+          "kind": "ptr",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "K",
+          "kind": "ptr",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "DQ",
+          "kind": "ptr",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "Sq",
+          "kind": "i32",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "Skv",
+          "kind": "i32",
+          "offset": 28,
+          "size": 4
+        },
+        {
+          "name": "Hq",
+          "kind": "i32",
+          "offset": 32,
+          "size": 4
+        },
+        {
+          "name": "Hkv",
+          "kind": "i32",
+          "offset": 36,
+          "size": 4
+        },
+        {
+          "name": "G",
+          "kind": "i32",
+          "offset": 40,
+          "size": 4
+        },
+        {
+          "name": "nkvt",
+          "kind": "i32",
+          "offset": 44,
+          "size": 4
+        },
+        {
+          "name": "cshift",
+          "kind": "i32",
+          "offset": 48,
+          "size": 4
+        },
+        {
+          "name": "causal",
+          "kind": "i32",
+          "offset": 52,
+          "size": 4
+        },
+        {
+          "name": "q_off",
+          "kind": "i32",
+          "offset": 56,
+          "size": 4
+        },
+        {
+          "name": "ntile",
+          "kind": "i32",
+          "offset": 60,
+          "size": 4
+        },
+        {
+          "name": "HG",
+          "kind": "i32",
+          "offset": 64,
+          "size": 4
+        }
+      ]
+    }
+  }
+}
