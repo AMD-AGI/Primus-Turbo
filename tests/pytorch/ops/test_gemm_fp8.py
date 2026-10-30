@@ -25,6 +25,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
 )
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.ops import gemm_fp8
+from primus_turbo.pytorch.ops.gemm_fp8 import _deter_use_nt_layout_gemm_in_bwd
 from tests.pytorch.ops.gemm_shapes_helper import (
     GEMM_FP8_BLOCKWISE_SHAPES,
     GEMM_FP8_BLOCKWISE_SHAPES_SMALL,
@@ -591,6 +592,9 @@ def test_gemm_fp8_blockwise_quantized_tensor(m, n, k, layout, format, dtype, bac
 )
 @pytest.mark.deterministic
 def test_gemm_fp8_tensorwise_deterministic(m, n, k, layout, format, dtype, backend):
+    trans_a, trans_b = layout[0] == "T", layout[1] == "T"
+    if backend == BackendType.CK and m % 32 != 0 and _deter_use_nt_layout_gemm_in_bwd(trans_a, trans_b):
+        pytest.skip("CK backend requires m to be a multiple of 32 for the NT-layout wgrad")
     _run_gemm_fp8_deterministic_test(
         m=m,
         n=n,
