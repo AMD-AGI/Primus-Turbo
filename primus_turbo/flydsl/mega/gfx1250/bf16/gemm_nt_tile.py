@@ -227,6 +227,7 @@ def nt_gemm_tile(
     c_cache_modifier: int = 0,
     b_nn: bool = False,
     i32_n=None,
+    issue_first: bool = False,
 ):
     """One ``tile_m x tile_n`` block; must be called by all ``m_warp * n_warp`` waves.
 
@@ -239,7 +240,9 @@ def nt_gemm_tile(
     read. C is written at byte address ``c_addr`` with row stride
     ``ldc``, ``m_rows`` rows and ``n_valid`` columns kept. ``live`` (wave-uniform i1) turns the
     tile into a no-op. ``c_cache_modifier`` is the C stores' cache policy (``CPOL_DEVICE_STREAM``
-    when another workgroup consumes C in the same launch).
+    when another workgroup consumes C in the same launch). ``issue_first`` issues the next
+    k-tile's loads at the top of the k-tile body, ahead of its fragment reads (Turbo #578's
+    ``issue_first``); the buffer they fill was drained by the previous k-tile's fence.
     """
     KB = tile_k * EB
     KSB = WMMA_K * EB
@@ -494,12 +497,16 @@ def nt_gemm_tile(
     def compute_ktile(buf, prefetch_kt):
         """K_WS sub-steps; the last one is returned to run inside the barrier window."""
         ring = [None] * R
+        if const_expr(issue_first and prefetch_kt is not None):
+            rocdl.sched_barrier(0)
+            issue(prefetch_kt % NUM_BUFFERS, prefetch_kt)
+            rocdl.sched_barrier(0)
         ring[0] = _load_ks(buf, 0)
         for ks in range_constexpr(K_WS):
             if const_expr(ks + 1 < K_WS):
                 ring[(ks + 1) % R] = _load_ks(buf, ks + 1)
             rocdl.s_wait_dscnt(min(K_WS - 1 - ks, R - 1) * KS_DS)
-            if const_expr(ks == 0 and prefetch_kt is not None):
+            if const_expr(ks == 0 and prefetch_kt is not None and not issue_first):
                 rocdl.sched_barrier(0)
                 issue(prefetch_kt % NUM_BUFFERS, prefetch_kt)
                 rocdl.sched_barrier(0)
