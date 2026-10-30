@@ -194,3 +194,51 @@ def test_fused_mega_moe_staged_bias_ep1(ep1_group, num_tokens, hidden, inter, nu
             ("dx", "d topk_w", "dW1", "dW2", "d fc1_bias", "d fc2_bias"), leaves, refs
         ):
             assert (snr := _snr(got.grad, want.grad)) > 40, f"{name} SNR {snr:.1f} dB"
+
+
+@pytest.mark.parametrize(
+    "num_tokens, hidden, inter, num_experts, num_topk, fused",
+    [
+        (1024, 7168, 2048, 32, 8, (True, True)),  # DeepSeek-V3: dW1 [32, 4096, 7168], dW2 [32, 7168, 2048]
+        # dW1 [16, 2816, 2048] is whole 256-wide tiles, dW2 [16, 2048, 1408] is not: one of each path
+        (333, 2048, 1408, 16, 4, (True, False)),
+    ],
+)
+def test_fused_mega_moe_staged_wgrad_accum_ep1(ep1_group, num_tokens, hidden, inter, num_experts, num_topk, fused):
+    """``fuse_wgrad_accum_pattern="megatron"``: dW1 / dW2 land in the weights' bf16 ``main_grad`` across
+    micro-batches and autograd gets a dummy, the way Megatron's DDP expects; shapes the kernel cannot
+    serve keep the ordinary gradient and leave ``main_grad`` to DDP."""
+    from primus_turbo.pytorch.ops.moe.fused_mega_moe import (
+        fused_mega_moe_stage1,
+        fused_mega_moe_stage2,
+    )
+
+    torch.manual_seed(num_tokens)
+    w1 = (torch.randn(num_experts, 2 * inter, hidden, device="cuda") * 2 / hidden**0.5).to(torch.bfloat16)
+    w2 = (torch.randn(num_experts, hidden, inter, device="cuda") * 2 / inter**0.5).to(torch.bfloat16)
+    params = [w.clone().requires_grad_() for w in (w1, w2)]
+    for p in params:
+        p.main_grad = (torch.randn_like(p, dtype=torch.float32) * 1e-2).to(torch.bfloat16)
+        p.grad_added_to_main_grad = False
+    start = [p.main_grad.float().clone() for p in params]
+    want = [s.clone() for s in start]
+    for _ in range(2):  # two micro-batches accumulate
+        x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+        topk_w, topk_idx = torch.randn(num_tokens, num_experts, device="cuda").softmax(-1).topk(num_topk, dim=-1)
+        dy = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+        lw1, lw2 = params
+        l1_out, dwib, handle = fused_mega_moe_stage1(x, topk_idx, topk_w, lw1, ep1_group, fuse_wgrad_accum_pattern="megatron")
+        y = fused_mega_moe_stage2(l1_out, dwib, handle, topk_idx, topk_w, lw2, ep1_group, fuse_wgrad_accum_pattern="megatron")
+        y.backward(dy)
+        refs = [w.detach().float().requires_grad_() for w in (w1, w2)]
+        _reference(x.float(), topk_idx, topk_w.float(), *refs, None).backward(dy.float())
+        for i, p in enumerate(params):
+            want[i] += refs[i].grad
+            assert p.grad is not None and p.grad.shape == p.shape and p.grad.dtype == p.dtype
+            if not fused[i]:  # DDP's own add, which this test stands in for
+                p.main_grad.add_(p.grad)
+            p.grad = None
+    for name, p, f, s, w in zip(("dW1", "dW2"), params, fused, start, want):
+        assert p.grad_added_to_main_grad is f, f"{name}: grad_added_to_main_grad"
+        # compare the accumulated gradient alone; main_grad's starting value would hide its error
+        assert (snr := _snr(p.main_grad.float() - s, w - s)) > 40, f"{name} SNR {snr:.1f} dB"

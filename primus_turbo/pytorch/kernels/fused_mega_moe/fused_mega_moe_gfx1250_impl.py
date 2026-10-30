@@ -24,6 +24,9 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_combine_kernel import (
     gemm_combine_nt_gfx1250,
 )
 from primus_turbo.flydsl.mega.gfx1250.bf16.variable_k import (
+    grouped_gemm_bf16_variable_k_accum_supported,
+)
+from primus_turbo.flydsl.mega.gfx1250.bf16.variable_k import (
     grouped_gemm_bf16_variable_k_flydsl_kernel as _variable_k,
 )
 from primus_turbo.flydsl.mega.gfx1250.bf16.x_redispatch_kernel import get_x_redispatch
@@ -49,6 +52,12 @@ def gfx1250_supports(w1: torch.Tensor, w2: torch.Tensor, layout: str = "nt") -> 
     """Whether the gfx1250 stages serve these ``[E, 2I, H]`` / ``[E, H, I]`` weights."""
     hidden, inter = w1.shape[2], w2.shape[2]
     return layout == "nt" and all(k % _MIN_TILE_K == 0 and k >= 2 * _MIN_TILE_K for k in (hidden, inter))
+
+
+def wgrad_accum_supported(w: torch.Tensor) -> bool:
+    """Whether the wgrad of this ``[E, out, in]`` expert weight can accumulate straight into a bf16
+    ``main_grad`` (whole output tiles at any routing; see ``variable_k``'s ``accumulate``)."""
+    return w.dim() == 3 and grouped_gemm_bf16_variable_k_accum_supported(w.shape[1], w.shape[2])
 
 
 def stage1_forward(x, w1, group, topk_idx, topk_weights):
@@ -88,10 +97,12 @@ def stage2_backward(
     activation=None,
     fc1_bias: Optional[torch.Tensor] = None,
     fc2_bias: Optional[torch.Tensor] = None,
+    dw2_out: Optional[torch.Tensor] = None,
 ):
     """dispatch dy + L2 dgrad + activation backward + dW2 (+ the bias grads).
 
-    Returns ``(grad_l1, grad_gate, dW2, d_fc1_bias, d_fc2_bias)``, a bias grad None without its bias."""
+    Returns ``(grad_l1, grad_gate, dW2, d_fc1_bias, d_fc2_bias)``, a bias grad None without its bias.
+    With ``dw2_out`` (bf16, w2's shape, e.g. its ``main_grad``) dW2 is added into it and returned as None."""
     dy = grad_y.contiguous().to(torch.bfloat16)
     grad_act = dispatch_gemm_nt_gfx1250(dy, w2, handle, b_nn=True)
     grad_l1, grad_gate, act_weighted = swiglu_backward_flydsl_kernel(
@@ -110,7 +121,13 @@ def stage2_backward(
     prefix, counts = handle.num_tokens_per_expert_prefix, handle.num_tokens_per_expert
     # dW2[e] = dy_pool[e].T @ act_w[e] -> [E, hidden, inter]
     dW2 = _variable_k(
-        token_buffer, act_weighted, prefix, masked_k=counts, a_index=handle.pool_row_to_recv_token
+        token_buffer,
+        act_weighted,
+        prefix,
+        masked_k=counts,
+        a_index=handle.pool_row_to_recv_token,
+        out=dw2_out,
+        accumulate=int(dw2_out is not None),
     )
     d_fc2_bias = (
         None
@@ -118,13 +135,14 @@ def stage2_backward(
         else fc2_bias_backward(token_buffer, handle, dispatch_weights, fc2_bias, grad_gate)
     )
     d_fc1_bias = None if fc1_bias is None else fc1_bias_backward(grad_l1, handle, fc1_bias.dtype)
-    return grad_l1, grad_gate, dW2.to(w2.dtype), d_fc1_bias, d_fc2_bias
+    return grad_l1, grad_gate, None if dw2_out is not None else dW2.to(w2.dtype), d_fc1_bias, d_fc2_bias
 
 
-def stage1_backward(grad_l1, saved_x, w1, handle, topk_idx, grad_gate):
+def stage1_backward(grad_l1, saved_x, w1, handle, topk_idx, grad_gate, dw1_out=None):
     """L1 dgrad + combine + reduce with the routing-weight gradient, then dW1.
 
-    Returns ``(dx, grad_topk_weights [tokens, topk], dW1)``."""
+    Returns ``(dx, grad_topk_weights [tokens, topk], dW1)``. With ``dw1_out`` (bf16, w1's shape, e.g.
+    its ``main_grad``) dW1 is added into it and returned as None."""
     # dW1 reads x again, at every rank: peer copies on a side stream land it in a second receive
     # buffer while the L1 dgrad + combine below runs, instead of a dispatch exposed after it
     x_redispatch = get_x_redispatch(get_symm_buffer_for_mega_moe())
@@ -135,5 +153,13 @@ def stage1_backward(grad_l1, saved_x, w1, handle, topk_idx, grad_gate):
     # dW1[e] = grad_l1[e].T @ x_pool[e] -> [E, 2 * inter, hidden]
     x_recv = x_redispatch.wait()
     prefix, counts = handle.num_tokens_per_expert_prefix, handle.num_tokens_per_expert
-    dW1 = _variable_k(grad_l1, x_recv, prefix, masked_k=counts, b_index=handle.pool_row_to_recv_token)
-    return dx, grad_topk_weights, dW1.to(w1.dtype)
+    dW1 = _variable_k(
+        grad_l1,
+        x_recv,
+        prefix,
+        masked_k=counts,
+        b_index=handle.pool_row_to_recv_token,
+        out=dw1_out,
+        accumulate=int(dw1_out is not None),
+    )
+    return dx, grad_topk_weights, None if dw1_out is not None else dW1.to(w1.dtype)

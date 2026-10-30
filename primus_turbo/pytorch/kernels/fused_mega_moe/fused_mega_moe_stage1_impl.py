@@ -48,18 +48,20 @@ def fused_mega_moe_stage1_backward_impl(
     grad_gate: torch.Tensor,
     num_tokens: int,
     num_topk: int,
+    dw1_out: torch.Tensor = None,
 ):
     """L1 dgrad combine + dW1 (variable-K tn wgrad).
 
     Returns ``(dx, grad_topk_weights, dW1)``. ``grad_gate`` (from stage2's
     SwiGLU^T) is scattered into ``grad_topk_weights`` by the combine kernel.
+    With ``dw1_out``, dW1 is added into it and returned as None.
     """
     if is_gfx1250():
         from primus_turbo.pytorch.kernels.fused_mega_moe import (
             fused_mega_moe_gfx1250_impl as gfx1250,
         )
 
-        return gfx1250.stage1_backward(grad_l1, saved_x, w1, handle, topk_idx, grad_gate)
+        return gfx1250.stage1_backward(grad_l1, saved_x, w1, handle, topk_idx, grad_gate, dw1_out=dw1_out)
     topk_indices_flat = topk_idx.contiguous().view(-1)
 
     # L1 dgrad (grad_l1 @ w1, nn) + combine PUSH + dx reduce + grad_gate scatter
@@ -82,4 +84,7 @@ def fused_mega_moe_stage1_backward_impl(
         trans_c=True,
     )
 
+    if dw1_out is not None:
+        dw1_out.add_(dW1)
+        dW1 = None
     return dx, grad_topk_weights_flat.view(num_tokens, num_topk), dW1
