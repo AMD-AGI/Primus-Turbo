@@ -569,9 +569,8 @@ without stamps):
 | cached dispatch: the V2 barrier kernel instead of the V1 cached notify (two barriers and a heap copy of the rank prefix matrix that V2 never reads) | `8858f91b` | part of the 12.5 µs between the cached dispatch's kernel and its timed call | `PRIMUS_TURBO_DEEPEP_V2_CACHED_NOTIFY=1` |
 | combine: the pushers' rows dealt warp-major, so the last, partial round of rows spreads over every block instead of the first ones | `61784118` | the push spread between the median and the slowest block (27 µs; EP2: 33 µs) | `PRIMUS_TURBO_DEEPEP_V2_COMBINE_PUSH_BLOCK_MAJOR=1` |
 
-The first two compile for gfx1250 at EP2 / 4 / 8 (32, 64, 160 channels; with and without biases);
-the third is host-side; the fourth was committed while the node's GPU driver was wedged (the compile
-check needs the device) and is compiled by the batch's first `test_intranode.py`.
+All compile for gfx1250 at EP2 / 4 / 8 (32, 64, 160 channels; with and without biases; the third is
+host-side), checked in a container without GPU devices while the node's GPU driver was wedged.
 
 ## Next measurements
 
