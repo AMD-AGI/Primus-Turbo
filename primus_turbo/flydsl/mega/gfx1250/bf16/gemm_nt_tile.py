@@ -105,6 +105,25 @@ def tile_geometry(tile_m: int, tile_n: int, tile_k: int, b_nn: bool = False):
     return lds_row, stage, pitch, arena
 
 
+def xcd_band_remap(idx, total, num_xcd: int, band: int):
+    """The tile a launch's ``idx``-th GEMM workgroup computes, dealing runs of ``band`` consecutive
+    tiles to one XCD.
+
+    Workgroups go to the XCDs round-robin (workgroup ``i`` on XCD ``i % num_xcd``; GEMM workgroups
+    start at a multiple of ``num_xcd``), so in launch order neighbouring tiles -- which share an
+    operand block -- land on different XCDs and every XCD's L2 pulls that block. The grouped
+    kernel's ``_xcd_band_remap`` with the tile count ``total`` known only at run time: a bijection
+    within each full span of ``band * num_xcd`` tiles, the ragged tail passed through.
+    ``num_xcd`` 1 is the identity.
+    """
+    if const_expr(num_xcd <= 1 or band <= 0):
+        return idx
+    span = fx.Int32(band * num_xcd)
+    r = idx % span
+    remapped = (idx - r) + (r % fx.Int32(num_xcd)) * fx.Int32(band) + r // fx.Int32(num_xcd)
+    return (idx < (total // span) * span).select(remapped, idx)
+
+
 def check_gather_rows(a_rows: int, lda: int, tile_m: int, tile_k: int):
     """The async A gather's limits: some row to read, and 32-bit byte offsets into A."""
     assert a_rows > 0, "a gathered A needs a row"

@@ -54,6 +54,7 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     WAVE,
     nt_gemm_tile,
     tile_geometry,
+    xcd_band_remap,
 )
 from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
 from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (
@@ -135,6 +136,8 @@ def _launch_gemm_combine_nt(
     HAS_GRAD_GATE: Constexpr[bool],
     B_NN: Constexpr[bool],
     HAS_BIAS: Constexpr[bool],
+    num_xcd: Constexpr[int],
+    xcd_band: Constexpr[int],
 ):
     block = m_warp * n_warp * WAVE
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
@@ -243,6 +246,7 @@ def _launch_gemm_combine_nt(
         is_gemm = arith.select(is_combine, fx.Int32(0), fx.Int32(1)) == fx.Int32(1)
         live = is_gemm & (gemm_block_idx < num_tiles_m * fx.Int32(N_BLOCKS_N))
         gemm_block_idx = live.select(gemm_block_idx, fx.Int32(0))
+        gemm_block_idx = xcd_band_remap(gemm_block_idx, num_tiles_m * fx.Int32(N_BLOCKS_N), num_xcd, xcd_band)
         block_m = rocdl.readfirstlane(T.i32, gemm_block_idx // fx.Int32(N_BLOCKS_N))
         block_n = rocdl.readfirstlane(T.i32, gemm_block_idx % fx.Int32(N_BLOCKS_N))
         expert = rocdl.readfirstlane(T.i32, _i32_table(arg_tile_to_expert)[block_m])
@@ -507,6 +511,8 @@ def gemm_combine_nt_gfx1250(
     b_nn: bool = False,
     bias: torch.Tensor | None = None,
     bias_scale: torch.Tensor | None = None,
+    num_xcd: int | None = None,
+    xcd_band: int | None = None,
 ):
     """``act`` [pool rows, K] (pool order, as the L1 + activation left it) -> ``[tokens, N]`` combined,
     ``tokens = topk_idx.shape[0]``.
@@ -519,14 +525,21 @@ def gemm_combine_nt_gfx1250(
     ``w2`` is ``[experts, N, K]``, or ``[experts, K, N]`` with ``b_nn`` (``act[p] @ w2[e(p)]``).
     ``bias`` [experts, N] adds ``bias[e(p)] * bias_scale[p]`` to every pool row before the sum,
     ``bias_scale`` being the rows' f32 routing weight. ``tile_k`` 0 is 128 when it divides K, else 64.
-    ``num_lead_combine`` (0), ``num_tail_combine`` (0: every CU) and ``lead_gemm_percent`` (25) default
-    to PRIMUS_TURBO_MEGA_COMBINE_LEAD / _COMBINE_TAIL / _LEAD_GEMM_PCT when set (see ``knobs``)."""
+    ``num_lead_combine`` (0), ``num_tail_combine`` (0: every CU), ``lead_gemm_percent`` (25), ``num_xcd``
+    (1: launch order) and ``xcd_band`` (32) default to PRIMUS_TURBO_MEGA_COMBINE_LEAD / _COMBINE_TAIL /
+    _LEAD_GEMM_PCT / _NUM_XCD / _XCD_BAND when set (see ``knobs``); ``num_xcd`` > 1 deals runs of
+    ``xcd_band`` GEMM tiles to one XCD (``gemm_nt_tile.xcd_band_remap``), which keeps the XCD a GEMM
+    workgroup lands on only while ``num_lead_combine`` is a multiple of ``num_xcd``."""
     if num_lead_combine is None:
         num_lead_combine = env_int("PRIMUS_TURBO_MEGA_COMBINE_LEAD", 0, nn=b_nn)
     if num_tail_combine is None:
         num_tail_combine = env_int("PRIMUS_TURBO_MEGA_COMBINE_TAIL", 0, nn=b_nn)
     if lead_gemm_percent is None:
         lead_gemm_percent = env_int("PRIMUS_TURBO_MEGA_LEAD_GEMM_PCT", 25, nn=b_nn)
+    if num_xcd is None:
+        num_xcd = env_int("PRIMUS_TURBO_MEGA_NUM_XCD", 1, nn=b_nn)
+    if xcd_band is None:
+        xcd_band = env_int("PRIMUS_TURBO_MEGA_XCD_BAND", 32, nn=b_nn)
     _require_gfx1250(act.device)
     symm = get_symm_buffer_for_mega_moe()
     G, N, K = w2.shape
@@ -616,6 +629,8 @@ def gemm_combine_nt_gfx1250(
         has_grad_gate,
         b_nn,
         has_bias,
+        num_xcd,
+        xcd_band,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)

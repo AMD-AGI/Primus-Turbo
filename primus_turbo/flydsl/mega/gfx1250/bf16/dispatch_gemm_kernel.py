@@ -49,6 +49,7 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     check_gather_rows,
     nt_gemm_tile,
     tile_geometry,
+    xcd_band_remap,
 )
 from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
 from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (
@@ -109,6 +110,8 @@ def _launch_dispatch_gemm_nt(
     DISPATCH_ONLY: Constexpr[bool],
     B_NN: Constexpr[bool],
     EXPERTS_PER_PUBLISH: Constexpr[int],
+    num_xcd: Constexpr[int],
+    xcd_band: Constexpr[int],
 ):
     block = m_warp * n_warp * WAVE
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
@@ -212,6 +215,7 @@ def _launch_dispatch_gemm_nt(
             real_tiles = fx.Int32(0)
         live = (pid >= fx.Int32(0)) & (pid < real_tiles * fx.Int32(N_BLOCKS_N))
         pid = live.select(pid, fx.Int32(0))
+        pid = xcd_band_remap(pid, real_tiles * fx.Int32(N_BLOCKS_N), num_xcd, xcd_band)
         num_pid_in_group = fx.Int32(group_m * N_BLOCKS_N)
         first_pid_m = (pid // num_pid_in_group) * fx.Int32(group_m)
         remaining_m = real_tiles - first_pid_m
@@ -311,19 +315,42 @@ def dispatch_gemm_nt_gfx1250(
     n_warp: int = 2,
     group_m: int | None = None,
     b_nn: bool = False,
+    num_xcd: int | None = None,
+    xcd_band: int | None = None,
 ) -> torch.Tensor:
     """Dispatch ``x`` by ``handle`` and return the L1 output over this rank's pool rows.
 
     ``handle`` comes from ``dispatch_prologue_flydsl_kernel`` on the active Mega symmetric
     buffer; the output is ``[pool rows, N]`` in pool order, padding rows undefined. ``w1`` is
     ``[experts, N, hidden]``, or ``[experts, hidden, N]`` with ``b_nn`` (``out = x @ w1[e]``).
-    ``tile_k`` 0 is 128 when it divides hidden, else 64. ``num_dispatch_cu`` (64) and ``group_m`` (16)
-    default to PRIMUS_TURBO_MEGA_DISPATCH_CU / PRIMUS_TURBO_MEGA_GROUP_M when set (see ``knobs``)."""
+    ``tile_k`` 0 is 128 when it divides hidden, else 64. ``num_dispatch_cu`` (64), ``group_m`` (16),
+    ``num_xcd`` (1: launch order) and ``xcd_band`` (32) default to PRIMUS_TURBO_MEGA_DISPATCH_CU /
+    _GROUP_M / _NUM_XCD / _XCD_BAND when set (see ``knobs``); ``num_xcd`` > 1 deals runs of ``xcd_band``
+    GEMM tiles to one XCD (``gemm_nt_tile.xcd_band_remap``)."""
     if num_dispatch_cu is None:
         num_dispatch_cu = env_int("PRIMUS_TURBO_MEGA_DISPATCH_CU", 64, nn=b_nn)
     if group_m is None:
         group_m = env_int("PRIMUS_TURBO_MEGA_GROUP_M", 16, nn=b_nn)
-    return _run(x, w1, handle, False, b_nn, num_dispatch_cu, tile_m, tile_n, tile_k, m_warp, n_warp, group_m)
+    if num_xcd is None:
+        num_xcd = env_int("PRIMUS_TURBO_MEGA_NUM_XCD", 1, nn=b_nn)
+    if xcd_band is None:
+        xcd_band = env_int("PRIMUS_TURBO_MEGA_XCD_BAND", 32, nn=b_nn)
+    return _run(
+        x,
+        w1,
+        handle,
+        False,
+        b_nn,
+        num_dispatch_cu,
+        tile_m,
+        tile_n,
+        tile_k,
+        m_warp,
+        n_warp,
+        group_m,
+        num_xcd,
+        xcd_band,
+    )
 
 
 def dispatch_only_gfx1250(
@@ -338,12 +365,25 @@ def dispatch_only_gfx1250(
     G = handle.expert_send_dst_rank.numel() // int(symm.num_ranks)
     # only the GEMM's shape is read: the launch holds the comm workgroups alone
     shape_only = x.new_empty(x.shape[1]).as_strided((G, 256, x.shape[1]), (0, 0, 1))
-    _run(x, shape_only, handle, True, False, num_dispatch_cu, 256, 256, 0, 4, 2, 16)
+    _run(x, shape_only, handle, True, False, num_dispatch_cu, 256, 256, 0, 4, 2, 16, 1, 32)
     return symm.dispatch_token_buffer
 
 
 def _run(
-    x, w1, handle, dispatch_only, b_nn, num_dispatch_cu, tile_m, tile_n, tile_k, m_warp, n_warp, group_m
+    x,
+    w1,
+    handle,
+    dispatch_only,
+    b_nn,
+    num_dispatch_cu,
+    tile_m,
+    tile_n,
+    tile_k,
+    m_warp,
+    n_warp,
+    group_m,
+    num_xcd,
+    xcd_band,
 ):
     _require_gfx1250(x.device)
     symm = get_symm_buffer_for_mega_moe()
@@ -409,6 +449,8 @@ def _run(
         # GEMM tiles start on their expert's flag; with no tile to wait, a comm block publishes
         # once, sparing a remote store-retire round trip per expert
         G if dispatch_only else 1,
+        num_xcd,
+        xcd_band,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)
