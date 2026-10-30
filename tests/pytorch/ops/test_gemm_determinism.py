@@ -43,6 +43,7 @@ from primus_turbo.pytorch.ops import (
     grouped_gemm_fp8,
 )
 from tests.pytorch.ops.determinism_helper import (
+    DET_REPEATS,
     case_seed,
     check_determinism,
     make_generator,
@@ -227,6 +228,50 @@ def test_det_grouped_gemm(request, seed, B, M, N, K, dtype, trans_b, backend, re
 
     check_determinism(
         request.node.nodeid, run_once, _grouped_ref(a0, b0, group_lens, trans_b, g), snr_floor=40
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2b. Grouped MXFP8 FlyDSL NT (fwd, dgrad) on both grids, plus its variable-K wgrad.
+# ---------------------------------------------------------------------------
+# num_cu=None launches one workgroup per tile; any num_cu > 0 takes the persistent grid (sized
+# from the device's CU count, not from num_cu), where each workgroup loops over tiles with no
+# wave_m barrier skew. A K-loop tail race on that path failed about 5-8% of runs at
+# 8 x 4096 x 6144 x 4096 (3120 tiles) with no other load, so the persistent cells run enough
+# repeats to catch a regression most of the time.
+GROUPED_MX_SHAPES = [(8, 4096, 6144, 4096)]
+GROUPED_MX_PERSISTENT_REPEATS = 32
+
+
+@pytest.mark.parametrize("B, M, N, K", GROUPED_MX_SHAPES)
+@pytest.mark.parametrize("fmt", [Format.E4M3, Format.HYBRID], ids=["E4M3", "HYBRID"])
+@pytest.mark.parametrize("persistent", [False, True], ids=["grid", "persistent"])
+def test_det_grouped_gemm_fp8_mx(request, seed, B, M, N, K, fmt, persistent):
+    _require_gfx950("FlyDSL MXFP8 grouped GEMM")
+    _require_mxfp8()
+    GlobalBackendManager.set_grouped_gemm_backend(BackendType.FLYDSL)
+    num_cu = torch.cuda.get_device_properties("cuda").multi_processor_count if persistent else None
+    gen = make_generator(seed)
+    group_lens = unbalanced_group_lens(B, M, seed)
+    a0 = randn((B * M, K), BF16, gen, normalize=True)
+    b0 = randn((B, N, K), BF16, gen, normalize=True)
+    g = randn((B * M, N), BF16, gen)
+    config = _mx8_config(fmt)
+
+    def run_once(mid):
+        a = a0.clone().requires_grad_(True)
+        b = b0.clone().requires_grad_(True)
+        out = grouped_gemm_fp8(a, b, group_lens, trans_b=True, config=config, num_cu=num_cu)
+        mid()
+        out.backward(g)
+        return {"out": out, "dgrad": a.grad, "wgrad": b.grad}
+
+    check_determinism(
+        request.node.nodeid,
+        run_once,
+        _grouped_ref(a0, b0, group_lens, True, g),
+        snr_floor=25 if fmt == Format.E4M3 else 20,
+        repeats=GROUPED_MX_PERSISTENT_REPEATS if persistent else DET_REPEATS,
     )
 
 
