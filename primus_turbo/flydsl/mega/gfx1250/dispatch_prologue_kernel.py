@@ -732,13 +732,20 @@ def dispatch_prologue_flydsl_kernel(symm, topk_idx, topk_weight):
         num_max_tokens_per_rank=symm.num_max_tokens_per_rank,
         stream=torch.cuda.current_stream(),
     )
+    # The receive tables and weights live in the shared heap, which the next prologue overwrites, so
+    # the handle keeps copies. They are taken whole, before the sync below: queued behind the
+    # prologue while the host waits on it, rather than issued one by one after it while the GPU
+    # idles. A few MB at most; the handle keeps the rows of this call.
+    pool_row_to_route = symm.pool_row_to_route.clone()
+    pool_row_to_recv_token = symm.pool_row_to_recv_token.clone()
+    recv_token_to_pool_rows = symm.recv_token_to_pool_rows.clone()
+    dispatch_weights = symm.weight_recv_buf.clone()
     # One D2H, like DeepEP's notify: the receive tables below, and every row-indexed tensor the
     # dispatch, SwiGLU and combine allocate for this call, span the block_m-padded rows actually
     # dispatched to this rank instead of the worst-case pool. The sync keeps the op out of CUDA graphs.
     rows = int(num_tokens_per_expert_prefix[-1].item())
     if rows > num_max_pool_tokens:  # only reachable with repeated experts in topk_idx
         raise RuntimeError(f"mega MoE dispatch: {rows} pool rows exceed the capacity {num_max_pool_tokens}")
-    # the receive tables and weights live in the shared heap, which the next prologue overwrites
     handle = DispatchHandle(
         expert_send_dst_rank=expert_send_dst_rank,
         expert_send_count=expert_send_count,
@@ -751,12 +758,12 @@ def dispatch_prologue_flydsl_kernel(symm, topk_idx, topk_weight):
         combine_recv_dst_rank=combine_recv_dst_rank,
         combine_recv_start_row=combine_recv_start_row,
         combine_recv_fold_count=combine_recv_fold_count,
-        pool_row_to_route=symm.pool_row_to_route[:rows].clone(),
+        pool_row_to_route=pool_row_to_route[:rows],
         # BLOCK_M rows past the last real one, which the gather prefetch reads
-        pool_row_to_recv_token=symm.pool_row_to_recv_token[: rows + BLOCK_M].clone(),
-        recv_token_to_pool_rows=symm.recv_token_to_pool_rows.clone(),
+        pool_row_to_recv_token=pool_row_to_recv_token[: rows + BLOCK_M],
+        recv_token_to_pool_rows=recv_token_to_pool_rows,
     )
-    return handle, symm.weight_recv_buf[:rows].clone()
+    return handle, dispatch_weights[:rows]
 
 
 def run_dispatch_prologue(x, w1, group, topk_idx, topk_weights):
