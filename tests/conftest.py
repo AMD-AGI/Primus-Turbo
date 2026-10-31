@@ -61,6 +61,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_bf16_gfx1250_prologue_prefetch.py",
     # The fused Mega L2 GEMM + combine, single GPU (EP1).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_gemm_combine.py",
+    # grad_ownership's first-write claims, which the Mega wgrad makes (host-side only).
+    "tests/pytorch/core/test_grad_ownership_first_write.py",
     # The fused_mega_moe op (forward and backward) on the gfx1250 kernels, single GPU (EP1).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe.py",
     # The same op across every visible GPU (EP2+).

@@ -16,6 +16,13 @@ checked by :func:`validate_overwritten` before gradient communication, so a
 missing producer fails instead of silently reducing stale gradients. A reset
 that is abandoned without communication (for example, synthetic-warmup
 cleanup) is safely discarded by the next :func:`begin_step`.
+
+A producer that runs once per micro-batch (the Mega MoE wgrad) asks
+:func:`claim_first_write` instead: it overwrites only on the slice's first
+write of the iteration and accumulates on the others, so its slices
+(:func:`previous_first_writes`) may stay uncleared whatever the number of
+micro-batches. The beta=0 MXFP4 producer overwrites on every call, so its
+claims hold only for single-micro-batch steps.
 """
 
 from typing import FrozenSet, Iterable, Set, Tuple
@@ -24,9 +31,11 @@ import torch
 
 __all__ = [
     "record_overwrite",
+    "claim_first_write",
     "note_skipped",
     "validate_overwritten",
     "begin_step",
+    "previous_first_writes",
     "was_enabled",
 ]
 
@@ -36,6 +45,11 @@ _written: Set[Slice] = set()
 _skipped: Set[Slice] = set()
 _previous: FrozenSet[Slice] = frozenset()
 _ever_recorded = False
+# slices claimed by first-write producers this iteration / the last one
+_first_writes: Set[Slice] = set()
+_previous_first_writes: FrozenSet[Slice] = frozenset()
+# a consumer rotates the log every iteration (claims mean nothing before that)
+_stepping = False
 
 
 def record_overwrite(main_grad: torch.Tensor) -> None:
@@ -43,6 +57,26 @@ def record_overwrite(main_grad: torch.Tensor) -> None:
     global _ever_recorded
     _ever_recorded = True
     _written.add((main_grad.data_ptr(), main_grad.numel(), main_grad.dtype))
+
+
+def claim_first_write(main_grad: torch.Tensor) -> bool:
+    """Whether a wgrad producer should overwrite ``main_grad`` (beta=0) instead of adding into it.
+
+    True for the slice's first write of the iteration, which is then logged as an
+    overwrite: the producer must replace the whole slice. False for later writes,
+    and always False until a consumer calls :func:`begin_step` every iteration, so
+    without one the producer keeps accumulating into the cleared buffer.
+    """
+    global _ever_recorded
+    if not _stepping:
+        return False
+    key = (main_grad.data_ptr(), main_grad.numel(), main_grad.dtype)
+    if key in _written:
+        return False
+    _ever_recorded = True
+    _written.add(key)
+    _first_writes.add(key)
+    return True
 
 
 def note_skipped(slices: Iterable[Slice]) -> None:
@@ -70,11 +104,19 @@ def validate_overwritten(slices: Iterable[Slice]) -> None:
 
 def begin_step() -> FrozenSet[Slice]:
     """Rotate the producer log and return slices overwritten in the prior step."""
-    global _written, _skipped, _previous
+    global _written, _skipped, _previous, _first_writes, _previous_first_writes, _stepping
     _previous = frozenset(_written)
+    _previous_first_writes = frozenset(_first_writes)
     _written = set()
     _skipped = set()
+    _first_writes = set()
+    _stepping = True
     return _previous
+
+
+def previous_first_writes() -> FrozenSet[Slice]:
+    """The prior step's slices overwritten by first-write producers (:func:`claim_first_write`)."""
+    return _previous_first_writes
 
 
 def was_enabled() -> bool:

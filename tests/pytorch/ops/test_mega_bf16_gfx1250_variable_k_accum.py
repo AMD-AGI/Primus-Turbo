@@ -197,3 +197,24 @@ def test_refuses_partial_tiles_and_bad_out():
     out32 = torch.zeros(1, 512, 512, dtype=torch.float32, device="cuda")
     with pytest.raises(ValueError, match="contiguous"):
         vk.grouped_gemm_bf16_variable_k_flydsl_kernel(a, b, offs, masked_k=masked_k, out=out32, accumulate=1)
+
+
+@pytest.mark.parametrize("cfg", CFGS)
+@pytest.mark.parametrize("out_m, out_n, counts, gather", CASES)
+def test_overwrite_matches_accumulating_into_zeros(out_m, out_n, counts, gather, cfg):
+    """accumulate=0 into a given ``out`` (Mega's first wgrad of an iteration into an uncleared
+    ``main_grad``) replaces all of it, empty experts with zeros, bit for bit what accumulating into a
+    zeroed ``out`` gives."""
+    vk = _vk()
+    a, b, offs, masked_k, kw, _ = _problem(out_m, out_n, counts, gather)
+    kw = {**kw, **cfg}
+    shape = (len(counts), out_m, out_n)
+    zeroed = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
+    vk.grouped_gemm_bf16_variable_k_flydsl_kernel(
+        a, b, offs, masked_k=masked_k, out=zeroed, accumulate=1, **kw
+    )
+    stale = torch.full(shape, float("nan"), dtype=torch.bfloat16, device="cuda")
+    vk.grouped_gemm_bf16_variable_k_flydsl_kernel(
+        a, b, offs, masked_k=masked_k, out=stale, accumulate=0, **kw
+    )
+    assert torch.equal(stale.view(torch.int16), zeroed.view(torch.int16))

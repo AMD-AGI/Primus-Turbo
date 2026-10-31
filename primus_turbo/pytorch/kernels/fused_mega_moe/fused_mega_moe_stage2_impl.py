@@ -86,18 +86,29 @@ def fused_mega_moe_stage2_backward_impl(
     fc1_bias: Optional[torch.Tensor] = None,
     fc2_bias: Optional[torch.Tensor] = None,
     dw2_out: Optional[torch.Tensor] = None,
+    dw2_overwrite: bool = False,
 ):
     """L2 dgrad (nn) + SwiGLU^T + dW2 (+ the bias grads).
 
     Returns ``(grad_l1, grad_gate, dW2, d_fc1_bias, d_fc2_bias)``; a bias grad is None without its bias.
-    With ``dw2_out``, dW2 is added into it and returned as None."""
+    With ``dw2_out``, dW2 is added into it (written over it with ``dw2_overwrite``) and
+    returned as None."""
     if is_gfx1250():
         from primus_turbo.pytorch.kernels.fused_mega_moe import (
             fused_mega_moe_gfx1250_impl as gfx1250,
         )
 
         return gfx1250.stage2_backward(
-            grad_y, l1_out, dispatch_weights, w2, handle, activation, fc1_bias, fc2_bias, dw2_out=dw2_out
+            grad_y,
+            l1_out,
+            dispatch_weights,
+            w2,
+            handle,
+            activation,
+            fc1_bias,
+            fc2_bias,
+            dw2_out=dw2_out,
+            dw2_overwrite=dw2_overwrite,
         )
     dy = grad_y.contiguous().to(torch.bfloat16)
 
@@ -140,6 +151,6 @@ def fused_mega_moe_stage2_backward_impl(
     )
     d_fc1_bias = None if fc1_bias is None else fc1_bias_backward(grad_l1, handle, fc1_bias.dtype)
     if dw2_out is not None:
-        dw2_out.add_(dW2)
+        (dw2_out.copy_ if dw2_overwrite else dw2_out.add_)(dW2)
         dW2 = None
     return grad_l1, grad_gate, dW2, d_fc1_bias, d_fc2_bias

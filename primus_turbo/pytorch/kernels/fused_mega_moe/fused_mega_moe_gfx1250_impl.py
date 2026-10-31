@@ -98,11 +98,14 @@ def stage2_backward(
     fc1_bias: Optional[torch.Tensor] = None,
     fc2_bias: Optional[torch.Tensor] = None,
     dw2_out: Optional[torch.Tensor] = None,
+    dw2_overwrite: bool = False,
 ):
     """dispatch dy + L2 dgrad + activation backward + dW2 (+ the bias grads).
 
     Returns ``(grad_l1, grad_gate, dW2, d_fc1_bias, d_fc2_bias)``, a bias grad None without its bias.
-    With ``dw2_out`` (bf16, w2's shape, e.g. its ``main_grad``) dW2 is added into it and returned as None."""
+    With ``dw2_out`` (bf16, w2's shape, e.g. its ``main_grad``) dW2 is added into it and returned as None;
+    ``dw2_overwrite`` writes it over ``dw2_out`` instead (the same bits as adding into zeros: the same
+    kernel config and k order, rounded once)."""
     dy = grad_y.contiguous().to(torch.bfloat16)
     grad_act = dispatch_gemm_nt_gfx1250(dy, w2, handle, b_nn=True)
     grad_l1, grad_gate, act_weighted = swiglu_backward_flydsl_kernel(
@@ -127,7 +130,7 @@ def stage2_backward(
         masked_k=counts,
         a_index=handle.pool_row_to_recv_token,
         out=dw2_out,
-        accumulate=int(dw2_out is not None),
+        accumulate=int(dw2_out is not None and not dw2_overwrite),
     )
     d_fc2_bias = (
         None
@@ -138,11 +141,12 @@ def stage2_backward(
     return grad_l1, grad_gate, None if dw2_out is not None else dW2.to(w2.dtype), d_fc1_bias, d_fc2_bias
 
 
-def stage1_backward(grad_l1, saved_x, w1, handle, topk_idx, grad_gate, dw1_out=None):
+def stage1_backward(grad_l1, saved_x, w1, handle, topk_idx, grad_gate, dw1_out=None, dw1_overwrite=False):
     """L1 dgrad + combine + reduce with the routing-weight gradient, then dW1.
 
     Returns ``(dx, grad_topk_weights [tokens, topk], dW1)``. With ``dw1_out`` (bf16, w1's shape, e.g.
-    its ``main_grad``) dW1 is added into it and returned as None."""
+    its ``main_grad``) dW1 is added into it and returned as None; ``dw1_overwrite`` writes it over
+    ``dw1_out`` instead."""
     # dW1 reads x again, at every rank: peer copies on a side stream land it in a second receive
     # buffer while the L1 dgrad + combine below runs, instead of a dispatch exposed after it
     x_redispatch = get_x_redispatch(get_symm_buffer_for_mega_moe())
@@ -160,6 +164,6 @@ def stage1_backward(grad_l1, saved_x, w1, handle, topk_idx, grad_gate, dw1_out=N
         masked_k=counts,
         b_index=handle.pool_row_to_recv_token,
         out=dw1_out,
-        accumulate=int(dw1_out is not None),
+        accumulate=int(dw1_out is not None and not dw1_overwrite),
     )
     return dx, grad_topk_weights, None if dw1_out is not None else dW1.to(w1.dtype)

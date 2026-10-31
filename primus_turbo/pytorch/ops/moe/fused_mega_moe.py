@@ -212,6 +212,17 @@ def _wgrad_accum_target(w: torch.Tensor, pattern: Optional[str], needs_grad: boo
     return main_grad
 
 
+def _first_write(main_grad: Optional[torch.Tensor]) -> bool:
+    """Whether this backward's dW replaces ``main_grad`` instead of adding into it: its first write of
+    the iteration, while a gradient-buffer consumer (Primus' grad ownership) leaves such slices
+    uncleared. Decided here, in backward order, so recompute or staged forwards cannot claim it."""
+    if main_grad is None:
+        return False
+    from primus_turbo.pytorch.core import grad_ownership
+
+    return grad_ownership.claim_first_write(main_grad)
+
+
 def _fused_wgrad(dW: Optional[torch.Tensor], main_grad: Optional[torch.Tensor], w: torch.Tensor):
     """The gradient autograd gets for ``w``: dW itself, or with ``main_grad`` a dummy after dW went in."""
     if main_grad is None:
@@ -278,6 +289,7 @@ class FusedMegaMoEStage1Function(torch.autograd.Function):
                 ctx.num_tokens,
                 ctx.num_topk,
                 dw1_out=ctx.w1_main_grad,
+                dw1_overwrite=_first_write(ctx.w1_main_grad),
             )
             # grads for (x, topk_idx, topk_weights, w1, group, fuse_wgrad_accum_pattern)
             return dx, None, grad_topk_weights, _fused_wgrad(dW1, ctx.w1_main_grad, w1), None, None
@@ -343,6 +355,7 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
                 fc1_bias,
                 fc2_bias,
                 dw2_out=ctx.w2_main_grad,
+                dw2_overwrite=_first_write(ctx.w2_main_grad),
             )
 
             # grads for (l1_out, dispatch_weights, topk_idx, topk_weights, w2, fc1_bias, fc2_bias, group,

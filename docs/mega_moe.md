@@ -115,7 +115,10 @@ ops have. On gfx1250 the expert wgrads then add dW1 / dW2 straight into the weig
 `main_grad` (one rounding, no dW buffer, no separate add), and the op returns a dummy gradient with
 `grad_added_to_main_grad` set, so Megatron's DDP hook skips its own add. Weights the kernel cannot
 serve (a `main_grad` that is not a contiguous bf16 tensor of the weight's shape, or an output shape
-that is not a whole number of the wgrad's output tiles) keep the ordinary gradient.
+that is not a whole number of the wgrad's output tiles) keep the ordinary gradient. When a
+gradient-buffer consumer rotates `primus_turbo.pytorch.core.grad_ownership` every iteration, the
+first of these wgrads in an iteration overwrites `main_grad` instead of adding into it (bit for bit
+what adding into a cleared buffer gives), so the consumer may leave those slices uncleared.
 
 On gfx1250, `prefetch_fused_mega_moe_dispatch(x, topk_idx, topk_weights, w1, group)` issues the
 dispatch prologue of the next `fused_mega_moe_stage1` call ahead of it, with an asynchronous copy of
