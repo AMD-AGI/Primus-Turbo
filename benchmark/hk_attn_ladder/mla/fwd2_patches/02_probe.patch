@@ -1,0 +1,241 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 13:15:21.459934711 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 13:15:21.455218604 +0000
+@@ -66,6 +66,17 @@
+ #ifndef HKGEN_REF
+ #define HKGEN_REF 0
+ #endif
++// HKGEN_PROBE 1 (diagnostic builds only): stamps of the shader cycle counter (and the 100 MHz realtime counter) stored
++// as they are taken -- no accumulator lives across a block, so the shell's SGPR / VGPR use and the generated code's
++// register plan stay as they are -- into the extra kernel argument PRB: block s of wave w of the workgroup with linear
++// id li has the 16 words at ((li * 4 + w) * PR_MAXB + s) * 16:
++//   0 loop top, 1 after B_0, 2 after INIT, 3 after the TILE_C loop, 4 sum of the TILE_C regions (marker to marker),
++//   5 ncc, 6..9 after TILE_D0..3 (0: not run), 10 sum of the TILE_D regions, 11 epilogue end (loop bottom),
++//   12 sum of the FINAL regions, 13 realtime at the loop top, 14 realtime at the loop bottom, 15 n (tiles)
++#ifndef HKGEN_PROBE
++#define HKGEN_PROBE 0
++#endif
++#define PR_MAXB 64
+ 
+ // the SGPRs the generated code uses as temporaries (with vcc / scc; fwdgen.CLOBBERED): clobbered at every marker
+ #define HKGEN_CLOBBERS "memory", "vcc", "scc", "s90", "s91", "s92", "s93", "s94", "s95", "s96", "s97", "s98", \
+@@ -191,15 +202,39 @@
+   float* LSE;
+   float scale;
+   int Sq, Skv, H, B, nqb, npw;
++#if HKGEN_PROBE
++  unsigned* PRB;
++#endif
+ };
+-static_assert(sizeof(KArgs) == 72 && __builtin_offsetof(KArgs, npw) == 64, "kernarg layout");
++static_assert(sizeof(KArgs) == (HKGEN_PROBE ? 80 : 72) && __builtin_offsetof(KArgs, npw) == 64, "kernarg layout");
+ 
+ extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+ void k_mla_fwd(const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf16* __restrict__ V,
+                bf16* __restrict__ O, float* __restrict__ LSE, float scale, int Sq, int Skv, int H, int B, int nqb,
+-               int npw) {
++               int npw
++#if HKGEN_PROBE
++               , unsigned* __restrict__ PRB
++#endif
++               ) {
+   __shared__ __attribute__((aligned(1024))) unsigned char smem[LDS_B];
+   lock_simd();
++#if HKGEN_PROBE
++  (void)PRB;
++#define PR_CYC() __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readcyclecounter())
++#define PR_RT() __builtin_amdgcn_readfirstlane((unsigned int)__builtin_readsteadycounter())
++// store word w of this wave's record of block s (a fresh argument view: nothing probe-related lives across a block)
++#define PR_PUT(s_, w_, v_)                                                                                         \
++  do {                                                                                                             \
++    HKF_BLOCK(0)                                                                                                   \
++    const unsigned int li_ = (unsigned int)__builtin_amdgcn_workgroup_id_x() +                                    \
++                             (unsigned int)nqb_ * ((unsigned int)__builtin_amdgcn_workgroup_id_y() +              \
++                                                   (unsigned int)H_ * (unsigned int)__builtin_amdgcn_workgroup_id_z()); \
++    const unsigned int nwg_ = npw_ > 0 ? (unsigned int)npw_ : (unsigned int)(nqb_ * H_ * B_);                      \
++    const auto r_ = rsrc(reinterpret_cast<const unsigned char*>(ka.PRB), (int)(nwg_ * 4 * PR_MAXB * 16 * 4));    \
++    __builtin_amdgcn_raw_buffer_store_b32((unsigned int)(v_), r_, 0,                                              \
++        (int)((((li_ * 4 + (unsigned int)wv) * PR_MAXB + (unsigned int)(s_)) * 16 + (w_)) * 4), 0);               \
++  } while (0)
++#endif
+   const uint32_t lds0k = lds_addr(smem);
+   const int wvk = wave_id((int)__builtin_amdgcn_workitem_id_x());
+   // the arguments are read through KArgs (HKF_BLOCK)
+@@ -294,6 +329,13 @@
+   // ---- one block per iteration: only s and sb (the stage of the block's tile 0) carry over to the next --------------
+   int sb = 0;
+   for (int s = 0;; ++s) {
++#if HKGEN_PROBE
++    {
++      const unsigned int pr_top = PR_CYC(), pr_rt = PR_RT();
++      PR_PUT(s, 0, pr_top);
++      PR_PUT(s, 13, pr_rt);
++    }
++#endif
+     HKF_BLOCK(s >> 30)
+     const float c2 = ka.scale * LOG2E;
+     int qb, hh, bb;
+@@ -314,6 +356,10 @@
+     tensor_wait<0>();
+     bar_signal();
+     bar_wait();
++#if HKGEN_PROBE
++    PR_PUT(s, 1, PR_CYC());
++    PR_PUT(s, 15, n);
++#endif
+ 
+     // per-lane LDS bases of the fragment reads (FlyDSL's lane patterns): Q B operands (q tiles 0, 1 from qa, 2, 3 from
+     // qb2, + 64 rows for q tiles 1, 3), K A operands (+ kv16 * 16 * XK + ks * 64 + {0, 32}), V^T A operands via
+@@ -414,33 +460,58 @@
+ #else
+     asm volatile("; HKGEN INIT qa=%0 qb=%1 c2=%2" ::"v"(qa), "v"(qb2), "s"(c2) : HKGEN_CLOBBERS);
+ #endif
++#if HKGEN_PROBE
++    PR_PUT(s, 2, PR_CYC());
++    unsigned int pr_creg = 0;
++#endif
+ 
+     // ---- tiles [0, ncc): below the diagonal, no mask ----------------------------------------------------------------
+     int t = 0;  // outside the for statement: the for-init form compiles to another .s (asm_input_sha256)
+     for (; t < ncc; ++t) {
+       issue_slot(t + 3, n, sb, gk0, gv0);
+       const unsigned st = lds0 + (unsigned)(((sb + t) & (NSTG - 1)) * STG_B);
++#if HKGEN_PROBE
++      const unsigned int pr_c1 = PR_CYC();
++#endif
+ #if HKGEN_REF
+       tile(st + k_lane, st + K_B + v_lane, 0, -1);
+ #else
+       asm volatile("; HKGEN TILE_C kb=%0 vb=%1 c2=%2" ::"v"(st + k_lane), "v"(st + K_B + v_lane), "s"(c2)
+                    : HKGEN_CLOBBERS);
+ #endif
++#if HKGEN_PROBE
++      pr_creg += PR_CYC() - pr_c1;
++#endif
+       bar_wait();  // B_{t+1}
+     }
++#if HKGEN_PROBE
++    PR_PUT(s, 3, PR_CYC());
++    PR_PUT(s, 4, pr_creg);
++    PR_PUT(s, 5, ncc);
++    unsigned int pr_dreg = 0;
++#endif
+     // ---- the diagonal tiles ncc + k, k < 4 (Sq == Skv) --------------------------------------------------------------
+     static_for<4>([&](auto k) {
+       if (ncc + k < n) {
+         const int t2 = ncc + k;
+         issue_slot(t2 + 3, n, sb, gk0, gv0);
+         const unsigned st = lds0 + (unsigned)(((sb + t2) & (NSTG - 1)) * STG_B);
++#if HKGEN_PROBE
++        const unsigned int pr_c1 = PR_CYC();
++#endif
+ #if HKGEN_REF
+         tile(st + k_lane, st + K_B + v_lane, dl0 - NB * t2, k);
+ #else
+         asm volatile("; HKGEN TILE_D%c4 kb=%0 vb=%1 dl=%2 c2=%3" ::"v"(st + k_lane), "v"(st + K_B + v_lane),
+                      "v"(dl0 - NB * t2), "s"(c2), "n"((int)k) : HKGEN_CLOBBERS);
+ #endif
++#if HKGEN_PROBE
++        pr_dreg += PR_CYC() - pr_c1;
++#endif
+         bar_wait();  // B_{t2+1}
++#if HKGEN_PROBE
++        PR_PUT(s, 6 + (int)k, PR_CYC());
++#endif
+       }
+     });
+ 
+@@ -459,6 +530,10 @@
+     // (build.py's writeback check). A wave's LDS ops execute in order: the staging needs no counter wait, only the
+     // compiler barrier (wave_lds_order).
+     bool nxt;
++#if HKGEN_PROBE
++    PR_PUT(s, 10, pr_dreg);
++    unsigned int pr_fin = 0;
++#endif
+     {
+       HKF_BLOCK(n >> 30)
+       int qbn, hhn, bbn;
+@@ -486,7 +561,13 @@
+         });
+         lse = (m[i] + __builtin_log2f(d[i])) * LN2;
+ #else
++#if HKGEN_PROBE
++        const unsigned int pr_f0 = PR_CYC();
++#endif
+         asm volatile("; HKGEN FINAL_%c2 o=%0 lse=%1" : "=v"(ob), "=v"(lse) : "n"((int)i) : HKGEN_CLOBBERS);
++#if HKGEN_PROBE
++        pr_fin += PR_CYC() - pr_f0;
++#endif
+ #endif
+         const unsigned tb = (i < 2 ? sga : sgb) + (unsigned)((i & 1) * 4 * SQT);
+         lds_u8w* const wp = lds_wptr(tb + wl);
+@@ -541,6 +622,14 @@
+       sched_barrier<0>();
+     }
+ 
++#if HKGEN_PROBE
++    {
++      const unsigned int pr_e = PR_CYC(), pr_rt = PR_RT();
++      PR_PUT(s, 11, pr_e);
++      PR_PUT(s, 12, pr_fin);
++      PR_PUT(s, 14, pr_rt);
++    }
++#endif
+     if (!nxt) break;
+     sb = (sb + n) & (NSTG - 1);
+   }
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 13:15:21.460012591 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 13:16:02.093702725 +0000
+@@ -116,7 +116,7 @@
+     hsaco = _hsaco()
+     shutil.rmtree(out_dir, ignore_errors=True)
+     out_dir.mkdir(parents=True)
+-    extra = list(hsaco.load_manifest()["kernels"][KERNEL]["extra_flags"])
++    extra = list(hsaco.load_manifest()["kernels"][KERNEL]["extra_flags"]) + [f"-D{d}" for d in DEFINES]
+     if ref:
+         extra = [f for f in extra if not f.startswith("-DHKGEN_REF=")] + ["-DHKGEN_REF=1"]
+     cmd = hsaco.compile_command(cxx, KERNEL, out_dir / f"{KERNEL}.cc.hsaco", extra)
+@@ -253,6 +253,7 @@
+ 
+ 
+ VA_RULE = "llvm"  # --va-rule: asmkit's va_vdst rule for the generated regions (expert.va_need)
++DEFINES = []  # -D NAME=VALUE: extra macros of the shell and the reference compile (e.g. HKGEN_PROBE=1)
+ 
+ 
+ def emit_region(texts, fmap, scalars):
+@@ -275,9 +276,13 @@
+                          "in-flight WMMA, as the backward)")
+     ap.add_argument("--no-group-edges", action="store_true",
+                     help="no order edges grouping the V / Q(3) reads behind the last PV / QK(0) WMMA")
++    ap.add_argument("-D", dest="defines", action="append", default=[],
++                    help="extra macro of both compiles, e.g. -D HKGEN_PROBE=1 (diagnostic builds: the probe's stamp "
++                         "stores are store phases of their own, which the writeback check then allows)")
+     a = ap.parse_args()
+     global VA_RULE
+     VA_RULE = a.va_rule
++    DEFINES[:] = a.defines
+     G.GROUP_EDGES = not a.no_group_edges
+     out = Path(a.out).resolve()
+     out.mkdir(parents=True, exist_ok=True)
+@@ -329,7 +334,9 @@
+             fail.append(f"marker {name} may run with a narrowed exec")
+     cb = clobber_check(shell, ins, markers)
+     rec["checks"]["clobbers"] = cb or "ok"
+-    fail += cb
++    probe = any(d.startswith("HKGEN_PROBE=") and d != "HKGEN_PROBE=0" for d in DEFINES)
++    if not probe:  # a probe build's extra SGPR pressure may put shell temporaries in s90.. between markers:
++        fail += cb  # legal (LLVM keeps nothing there across a marker; the emitter's XCNT entry state covers them)
+     log(f"shell: highest VGPR v{hi}, generated base v{base}, block 0 up to v{L.end0 - 1}")
+ 
+     # 3. regions
+@@ -391,7 +398,7 @@
+ 
+     # 6., 7. the listing
+     rec["checks"]["contract"] = contract_checks(spl, objdump, markers, L, fail)
+-    rec["checks"]["writeback"] = writeback_check(objdump, fail)
++    rec["checks"]["writeback"] = writeback_check(objdump, fail if not probe else [])  # probe: stamps add phases
+ 
+     for f in fail:
+         log("FAIL:", f)

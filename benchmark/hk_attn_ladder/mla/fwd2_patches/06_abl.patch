@@ -1,0 +1,100 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 13:42:06.639371690 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 13:42:06.651812609 +0000
+@@ -86,6 +86,10 @@
+ #ifndef HKGEN_TICKET
+ #define HKGEN_TICKET 0
+ #endif
++// HKGEN_ABL_NOTDM 1 (timing-only ablation, wrong results): no K / V tile is copied (every wave issues NULL descriptors)
++#ifndef HKGEN_ABL_NOTDM
++#define HKGEN_ABL_NOTDM 0
++#endif
+ #define PR_MAXB 64
+ 
+ // the SGPRs the generated code uses as temporaries (with vcc / scc; fwdgen.CLOBBERED): clobbered at every marker
+@@ -358,7 +362,7 @@
+   const int Sq_ = ka.Sq, Skv_ = ka.Skv, H_ = ka.H, B_ = ka.B, nqb_ = ka.nqb, npw_ = ka.npw;                          \
+   const uint32_t lds0 = lds0k + (unsigned)(z);                                                                       \
+   const int wv = wvk + (z);                                                                                          \
+-  const int cnt0 = wv == 0 ? 1 : 0;                                                                                  \
++  const int cnt0 = (wv == 0 && !HKGEN_ABL_NOTDM) ? 1 : 0;                                                           \
+   const int cshift = Skv_ - Sq_;                                                                                     \
+   const unsigned long long krow = (unsigned long long)H_ * D_QK;                                                     \
+   const unsigned long long vrow = (unsigned long long)H_ * D_V;                                                      \
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 13:42:06.639459590 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 13:42:06.651711759 +0000
+@@ -335,6 +335,8 @@
+                          "the whole rescale decision and O *= corr out of line behind a not-taken branch")
+     ap.add_argument("--resc-threshold", type=float, default=None,
+                     help="rescale threshold in log2 units (default log2 e: FlyDSL's, bitwise); e.g. 8 (FA4)")
++    ap.add_argument("--abl", action="append", default=[], choices=("nosoft", "nolds"),
++                    help="timing-only ablation (wrong results)")
+     ap.add_argument("-D", dest="defines", action="append", default=[],
+                     help="extra macro of both compiles, e.g. -D HKGEN_PROBE=1 (diagnostic builds: the probe's stamp "
+                          "stores are store phases of their own, which the writeback check then allows)")
+@@ -344,6 +346,7 @@
+     DEFINES[:] = a.defines
+     G.GROUP_EDGES = not a.no_group_edges
+     G.RESC = a.resc
++    G.ABL = set(a.abl)
+     if a.resc_threshold is not None:
+         import struct
+         G.THRESH = struct.unpack("<I", struct.pack("<f", a.resc_threshold))[0]
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 13:42:06.639476470 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 13:42:06.651572559 +0000
+@@ -81,6 +81,9 @@
+ # region's main path). The running max then lives in the low half of the (mn, unused) pair.
+ THRESH = LOG2E  # --resc-threshold: the rescale threshold in log2 units (FlyDSL: one nat = log2 e)
+ RARE_COST = 3  # modelled cycles of the not-taken s_cmp + s_cbranch
++# --abl (timing-only ablations, wrong results): "nosoft" -- the softmax is P = bf16(S) only (no max, decision, exp,
++# sum, rescale); "nolds" -- no LDS read in the tile regions (the fragments keep stale values)
++ABL = set()
+ 
+ 
+ def vr(r, n=1):
+@@ -521,6 +524,13 @@
+ def softmax_nodes(L, i, add, c_sgpr):
+     """The softmax of q tile i up to P and O *= corr: scores in S(i), p into the leaves PR(i). c from the SGPR
+     pair S_C (c_sgpr: the packed fma then has two VGPR sources, not three) or from the VGPR pair L.cc."""
++    if "nosoft" in ABL:  # P = bf16(S): the PV operands only
++        for kt in range(2):
++            for r in range(8):
++                j, e = 2 * kt + r // 4, 2 * (r % 4)
++                lo, hi = L.S(i, j) + e, L.S(i, j) + e + 1
++                add(f"v_cvt_pk_bf16_f32 {vr(L.P(i, kt) + r)}, {vr(lo)}, {vr(hi)}", "VALU", f"cvt{i}")
++        return
+     S = [[L.S(i, j) + e for e in range(8)] for j in range(NKV)]
+     sc = L.sm[i % 2]
+     # row max over the lane's 32 values (exact; any tree): 32 -> 11 -> 4 -> 2 -> 1 in scratch sc[0..10]
+@@ -645,6 +655,12 @@
+ 
+ 
+ def sum_nodes(L, i0, add, upd):
++    if "nosoft" in ABL:
++        return
++    _sum_nodes(L, i0, add, upd)
++
++
++def _sum_nodes(L, i0, add, upd):
+     """FlyDSL's sum tree over the 32 leaves of q tiles (i0, i0 + 1), packed (low half i0), in place in the
+     leaves (the cvts have read them); then d of the q tiles in upd (one outside it has stale leaves here)."""
+     leaves = [L.pr + 2 * x for x in range(32)]
+@@ -682,6 +698,16 @@
+ 
+ 
+ def tile_nodes(L, ops, k=None):
++    nodes = _tile_nodes(L, ops, k)
++    if "nolds" not in ABL:
++        return nodes
++    keep = [nd for nd in nodes if nd.kind != "DS"]
++    for nd in keep:
++        nd.preds, nd.idx = [], -1
++    return build_dag(keep)
++
++
++def _tile_nodes(L, ops, k=None):
+     """The nodes of a TILE region in program order. ops: kb / vb (VGPRs: the K / V fragment bases of the
+     stage), c2 (SGPR: c), and for a diagonal tile dl (VGPR: q + Skv - Sq - kv0 - 8 (lane / 16) of q tile 0).
+     k: None for TILE_C, else the diagonal tile k (q tiles below k skipped, the mask on q tile k only)."""

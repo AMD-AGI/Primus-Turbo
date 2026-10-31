@@ -1,0 +1,183 @@
+{
+ "meta": {
+  "ladder": "mla_fwd2",
+  "shape": "b4 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+  "device": "gfx1250",
+  "cus": 256,
+  "torch": "2.14.0+rocm10.2.0a20261011",
+  "rounds": 6,
+  "iters": 10,
+  "settle_s": 1.0,
+  "flush_mb": 512,
+  "hip_visible_devices": null,
+  "host": "534baaaa14ae",
+  "time": "2026-10-30 13:32:41",
+  "useful_flops": 2749450158080,
+  "data": "randn",
+  "mode": "cold",
+  "gap_ms": null
+ },
+ "rows": [
+  {
+   "arm": "flydsl",
+   "ms": 1.5883249640464783,
+   "mean": 1.5891630748907726,
+   "ci95": 0.0033379019927987853,
+   "tflops": 1731.0375523377747,
+   "sclk": 1402.5,
+   "mcyc": 2.228130618274212,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    1.5862424969673157,
+    1.590228021144867,
+    1.5870234966278076,
+    1.589506983757019,
+    1.5948345065116882,
+    1.5871429443359375
+   ],
+   "sclk_rounds": [
+    1402.0,
+    1402.0,
+    1403.0,
+    1403.0,
+    1401.0,
+    1403.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ]
+  },
+  {
+   "arm": "f3a",
+   "ms": 1.5501279830932617,
+   "mean": 1.5523280799388885,
+   "ci95": 0.007049644970069993,
+   "tflops": 1773.6923583519247,
+   "sclk": 1407.0,
+   "mcyc": 2.182183158278465,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    1.5460820198059082,
+    1.5495070219039917,
+    1.5471840500831604,
+    1.5507489442825317,
+    1.5566779971122742,
+    1.563768446445465
+   ],
+   "sclk_rounds": [
+    1407.0,
+    1409.0,
+    1407.0,
+    1407.0,
+    1402.0,
+    1402.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "lazy rescale: O(i) *= corr(i) under a per-q-tile wave-uniform branch (FlyDSL's _rescale_if; bitwise)",
+   "ref_ms_a08": null
+  },
+  {
+   "arm": "f4a",
+   "ms": 1.5589909851551056,
+   "mean": 1.5579995612303417,
+   "ci95": 0.007211243842117458,
+   "tflops": 1763.6087599354876,
+   "sclk": 1388.5,
+   "mcyc": 2.1615347658991815,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    1.547884464263916,
+    1.5527519583702087,
+    1.563587486743927,
+    1.5564969778060913,
+    1.5614849925041199,
+    1.5657914876937866
+   ],
+   "sclk_rounds": [
+    1388.0,
+    1389.0,
+    1389.0,
+    1389.0,
+    1384.0,
+    1383.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "persistent workgroups on ticket counters (FlyDSL 917e240b's per-XCD groups, stealing, shortest blocks last, self-reset)",
+   "ref_ms_a08": null,
+   "step": {
+    "over": "f3a",
+    "median": 0.997415863051583,
+    "mean": 0.9963652362288113,
+    "ci95": 0.0036736073883826756
+   },
+   "step_cyc": {
+    "median": 1.0110831129390982,
+    "ci95": 0.00410399388501856
+   }
+  },
+  {
+   "arm": "f4a#null",
+   "ms": 1.5544242560863495,
+   "mean": 1.554918348789215,
+   "ci95": 0.0061421632810207865,
+   "tflops": 1768.7900502803693,
+   "sclk": 1385.0,
+   "mcyc": 2.155980293720961,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    1.5591415166854858,
+    1.5513495206832886,
+    1.5494465231895447,
+    1.5489065051078796,
+    1.5574989914894104,
+    1.5631670355796814
+   ],
+   "sclk_rounds": [
+    1389.0,
+    1389.0,
+    1385.0,
+    1385.0,
+    1385.0,
+    1383.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "persistent workgroups on ticket counters (FlyDSL 917e240b's per-XCD groups, stealing, shortest blocks last, self-reset)",
+   "ref_ms_a08": null
+  }
+ ],
+ "null_control": {
+  "median": 1.0021190822276016,
+  "mean": 1.0019915234930217,
+  "ci95": 0.005666158293232078
+ }
+}

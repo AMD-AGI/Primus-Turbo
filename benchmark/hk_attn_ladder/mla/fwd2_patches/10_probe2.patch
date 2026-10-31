@@ -1,0 +1,40 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 14:03:18.757670993 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 14:03:18.769906938 +0000
+@@ -595,6 +595,9 @@
+ #if HKGEN_PROBE
+     PR_PUT(s, 2, PR_CYC());
+     unsigned int pr_creg = 0;
++#if HKGEN_PROBE >= 2
++    unsigned int pr_cbw = 0;  // HKGEN_PROBE 2: the TILE_C barrier waits, in word 12 instead of the FINAL regions
++#endif
+ #endif
+ 
+ #if HKGEN2 && !HKGEN_REF
+@@ -643,9 +646,13 @@
+                    : HKGEN_CLOBBERS);
+ #endif
+ #if HKGEN_PROBE
+-      pr_creg += PR_CYC() - pr_c1;
++      const unsigned int pr_c2 = PR_CYC();
++      pr_creg += pr_c2 - pr_c1;
+ #endif
+       bar_wait();  // B_{t+1}
++#if HKGEN_PROBE >= 2
++      pr_cbw += PR_CYC() - pr_c2;
++#endif
+     }
+ #if HKGEN_PROBE
+     PR_PUT(s, 3, PR_CYC());
+@@ -806,7 +813,11 @@
+     {
+       const unsigned int pr_e = PR_CYC(), pr_rt = PR_RT();
+       PR_PUT(s, 11, pr_e);
++#if HKGEN_PROBE >= 2
++      PR_PUT(s, 12, pr_cbw);
++#else
+       PR_PUT(s, 12, pr_fin);
++#endif
+       PR_PUT(s, 14, pr_rt);
+     }
+ #endif

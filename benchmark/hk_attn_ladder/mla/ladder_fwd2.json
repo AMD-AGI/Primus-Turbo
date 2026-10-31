@@ -1,0 +1,3186 @@
+{
+ "name": "mla_fwd2",
+ "title": "DeepSeek-V3 MLA attention forward, second campaign (2026-10-30, GPU2): from Primus-Turbo dev/lhz/dsv3-attn-hk-merge a95dd334",
+ "tree": "fwd2",
+ "flags": [
+  "-x",
+  "hip",
+  "--offload-arch=gfx1250",
+  "--cuda-device-only",
+  "--no-gpu-bundle-output",
+  "-O3",
+  "-std=c++20",
+  "-DNDEBUG",
+  "-Iinclude",
+  "-save-temps=obj"
+ ],
+ "notes": [
+  "fwd2/gfx1250_mla is the Primus-Turbo package primus_turbo/hipkittens/gfx1250_mla at a95dd334, forward part only: marker shell hip/src/k_mla_fwd.hip + hip/include/hkf.h, generator tools/fwdgen + tools/asmkit, hsaco.py + manifest.json (the compile flags). gen/build.py adapts hkl.build's generator call to tools/fwdgen/build.py.",
+  "f0 rebuilds the shipped k_mla_fwd (1d95fa84 = a08-1 E2 4d63d400 minus 3 redundant s_wait_xcnt) byte for byte; every later rung is a patch in fwd2_patches/ (paths gfx1250_mla/...) and/or generator args.",
+  "Baseline flydsl: the FlyDSL MLA forward of the Primus-Turbo checkout in HKL_TURBO_DIR -- run this ladder with HKL_TURBO_DIR=/home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-fwd (FlyDSL 917e240b kernel + 7d8d69a3 host counters).",
+  "Numerics (user decision 2026-10-30): rungs need not stay bitwise equal to FlyDSL; the gate is SNR of o / lse not below flydsl's by more than 0.1 dB, determinism, finite outputs. bitwise_with marks the rungs that still are."
+ ],
+ "baselines": [
+  {
+   "id": "flydsl",
+   "lab_module": "flydsl_fwd",
+   "fwd": "flash_attn_fwd",
+   "kwargs": {
+    "impl": "main",
+    "layout": "sbhd"
+   },
+   "note": "FlyDSL gfx1250 MLA forward of $HKL_TURBO_DIR (Primus-Turbo-hk-fwd: 917e240b + 7d8d69a3) behind fwd_hk's SBHD folding"
+  }
+ ],
+ "problem": {
+  "kind": "mla",
+  "b": 2,
+  "sq": 4096,
+  "skv": 4096,
+  "hq": 128,
+  "hkv": 128,
+  "d": 192,
+  "dv": 128,
+  "causal": true,
+  "layout": "sbhd"
+ },
+ "direction": "fwd",
+ "exact_outputs": [
+  "o",
+  "lse"
+ ],
+ "rungs": [
+  {
+   "id": "f0",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "1d95fa84354e3d436584e359a09117f90741c2ebbb5c4c6d86893d02298438b5"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "the shipped HK forward of dev/lhz/dsv3-attn-hk-merge (a08-1 E2: persistent static schedule, 4-stage ring, generated tile regions)",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f0_ref",
+   "parent": "f0",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [],
+     "gen_pkg": "gfx1250_mla",
+     "gen_ref": true
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f0's shell with the per-tile math in HIP (HKGEN_REF=1)",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f1_null",
+   "parent": "f0",
+   "patch": "fwd2_patches/01_va_rule.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "1d95fa84354e3d436584e359a09117f90741c2ebbb5c4c6d86893d02298438b5"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 01 (generator options --va-rule / --no-group-edges) at their defaults: f0 byte for byte",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f1a",
+   "parent": "f1_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "va_vdst rule llvm_war_xdl (the backward's): a WAR against an in-flight WMMA waits for its own class count, not va_vdst(0)",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f1b",
+   "parent": "f1a",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--no-group-edges"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "+ no order edges grouping the V / Q(3) reads behind the last PV / QK(0) WMMA",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f2_null",
+   "parent": "f1_null",
+   "patch": "fwd2_patches/02_probe.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "1d95fa84354e3d436584e359a09117f90741c2ebbb5c4c6d86893d02298438b5"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 02 (HKGEN_PROBE shell instrumentation, -D passthrough) with the probe off: f0 byte for byte",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f0p",
+   "parent": "f2_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "-D",
+      "HKGEN_PROBE=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true,
+     "probe": true
+    }
+   },
+   "feature": "f0 + probe (per-phase shader cycles per wave, entry/exit realtime per workgroup)",
+   "side": true
+  },
+  {
+   "id": "f1ap",
+   "parent": "f2_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "-D",
+      "HKGEN_PROBE=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true,
+     "probe": true
+    }
+   },
+   "feature": "f1a + probe",
+   "side": true
+  },
+  {
+   "id": "f3_null",
+   "parent": "f2_null",
+   "patch": "fwd2_patches/03_resc.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "1d95fa84354e3d436584e359a09117f90741c2ebbb5c4c6d86893d02298438b5"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 03 (--resc always|branch) at its defaults: f0 byte for byte",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f3a",
+   "parent": "f3_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "lazy rescale: O(i) *= corr(i) under a per-q-tile wave-uniform branch (FlyDSL's _rescale_if; bitwise)",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f3ap",
+   "parent": "f3_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "-D",
+      "HKGEN_PROBE=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true,
+     "probe": true
+    }
+   },
+   "feature": "f3a + probe",
+   "side": true
+  },
+  {
+   "id": "f4_null",
+   "parent": "f3_null",
+   "patch": "fwd2_patches/04_ticket.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "1d95fa84354e3d436584e359a09117f90741c2ebbb5c4c6d86893d02298438b5"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 04 (HKGEN_TICKET) off: f0 byte for byte",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f4a",
+   "parent": "f4_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "-D",
+      "HKGEN_TICKET=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true,
+     "ticket": true
+    }
+   },
+   "feature": "persistent workgroups on ticket counters (FlyDSL 917e240b's per-XCD groups, stealing, shortest blocks last, self-reset)",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f4ap",
+   "parent": "f4_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_PROBE=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true,
+     "ticket": true,
+     "probe": true
+    }
+   },
+   "feature": "f4a + probe",
+   "side": true
+  },
+  {
+   "id": "f5_null",
+   "parent": "f4_null",
+   "patch": "fwd2_patches/05_rare.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "1d95fa84354e3d436584e359a09117f90741c2ebbb5c4c6d86893d02298438b5"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 05 (--resc ool, --resc-threshold) at its defaults: f0 byte for byte",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f5a",
+   "parent": "f5_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "ool"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "rescale decision from the lane's half max (no permlane), corr = 1 on the common path; full max, m', corr, O *= corr out of line behind a not-taken branch (bitwise)",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f5b",
+   "parent": "f5a",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "ool",
+      "--resc-threshold",
+      "8"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "+ rescale threshold 8 (log2 units, FA4's): the running max may lag by a factor 256 (not bitwise; SNR gate)"
+  },
+  {
+   "id": "f5ap",
+   "parent": "f5_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "ool",
+      "-D",
+      "HKGEN_PROBE=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true,
+     "probe": true
+    }
+   },
+   "feature": "f5a + probe",
+   "side": true
+  },
+  {
+   "id": "f5bp",
+   "parent": "f5_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "ool",
+      "--resc-threshold",
+      "8",
+      "-D",
+      "HKGEN_PROBE=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true,
+     "probe": true
+    }
+   },
+   "feature": "f5b + probe",
+   "side": true
+  },
+  {
+   "id": "f6_null",
+   "parent": "f5_null",
+   "patch": "fwd2_patches/06_abl.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "1d95fa84354e3d436584e359a09117f90741c2ebbb5c4c6d86893d02298438b5"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 06 (ablation switches) off: f0 byte for byte",
+   "side": true
+  },
+  {
+   "id": "f3x",
+   "parent": "f6_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f3a rebuilt on the patch-06 tree (must equal f3a)",
+   "side": true
+  },
+  {
+   "id": "a_nosoft",
+   "parent": "f6_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--abl",
+      "nosoft"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "ablation: softmax = P = bf16(S) only",
+   "side": true
+  },
+  {
+   "id": "a_nolds",
+   "parent": "f6_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--abl",
+      "nolds"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "ablation: no LDS reads in the tile regions",
+   "side": true
+  },
+  {
+   "id": "a_notdm",
+   "parent": "f6_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "-D",
+      "HKGEN_ABL_NOTDM=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "ablation: no K/V tile TDM copies",
+   "side": true
+  },
+  {
+   "id": "a_none",
+   "parent": "f6_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--abl",
+      "nosoft",
+      "--abl",
+      "nolds",
+      "-D",
+      "HKGEN_ABL_NOTDM=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "ablation: all three",
+   "side": true
+  },
+  {
+   "id": "f7_null",
+   "parent": "f6_null",
+   "patch": "fwd2_patches/07_worder.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "1d95fa84354e3d436584e359a09117f90741c2ebbb5c4c6d86893d02298438b5"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 07 (--worder) off: f0 byte for byte",
+   "side": true
+  },
+  {
+   "id": "f7w1",
+   "parent": "f7_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--worder",
+      "PV0p,PV1p,QK0,PV2p,QK1,PV3p,QK2,QK3"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f3a with the WMMA stream order PV0p,PV1p,QK0,PV2p,QK1,PV3p,QK2,QK3",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f7w2",
+   "parent": "f7_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--worder",
+      "PV0p,QK0,PV1p,QK1,PV2p,QK2,PV3p,QK3"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f3a with the WMMA stream order PV0p,QK0,PV1p,QK1,PV2p,QK2,PV3p,QK3",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f7w3",
+   "parent": "f7_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--worder",
+      "PV0p,PV1p,QK0,QK1,PV2p,PV3p,QK2,QK3"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f3a with the WMMA stream order PV0p,PV1p,QK0,QK1,PV2p,PV3p,QK2,QK3",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f7w4",
+   "parent": "f7_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--worder",
+      "PV0p,PV1p,PV2p,QK0,PV3p,QK1,QK2,QK3"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f3a with the WMMA stream order PV0p,PV1p,PV2p,QK0,PV3p,QK1,QK2,QK3",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f7w5",
+   "parent": "f7_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--worder",
+      "PV0p,QK0,PV1p,PV2p,QK1,PV3p,QK2,QK3"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f3a with the WMMA stream order PV0p,QK0,PV1p,PV2p,QK1,PV3p,QK2,QK3",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f8_null",
+   "parent": "f7_null",
+   "patch": "fwd2_patches/08_loop.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "1d95fa84354e3d436584e359a09117f90741c2ebbb5c4c6d86893d02298438b5"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 08 (--loop, HKGEN2) off: f0 byte for byte",
+   "side": true
+  },
+  {
+   "id": "f8x",
+   "parent": "f8_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f3a's flags on the patch-08 tree: the scheduler's LDS-in-flight model now retires loads at completion (new schedule)",
+   "side": true,
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f8a",
+   "parent": "f8_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--loop"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "fwdgen2: one generated LOOP region per block -- TDM issue, tile barriers and the tile counter in generated code, no shell code between tiles",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f8b",
+   "parent": "f8a",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--loop",
+      "--kprefetch"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "+ K / Q(0) of the next tile read right after the barrier wait (cross-tile prefetch)",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f8bw1",
+   "parent": "f8b",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--loop",
+      "--kprefetch",
+      "--worder",
+      "PV0p,PV1p,QK0,PV2p,QK1,PV3p,QK2,QK3"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f8b with the WMMA order PV0p,PV1p,QK0,PV2p,QK1,PV3p,QK2,QK3",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f8bw3",
+   "parent": "f8b",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--loop",
+      "--kprefetch",
+      "--worder",
+      "PV0p,PV1p,QK0,QK1,PV2p,PV3p,QK2,QK3"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f8b with the WMMA order PV0p,PV1p,QK0,QK1,PV2p,PV3p,QK2,QK3",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f8bw6",
+   "parent": "f8b",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--loop",
+      "--kprefetch",
+      "--worder",
+      "QK0,PV0p,PV1p,QK1,PV2p,PV3p,QK2,QK3"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f8b with the WMMA order QK0,PV0p,PV1p,QK1,PV2p,PV3p,QK2,QK3",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f9a",
+   "parent": "f8a",
+   "patch": "fwd2_patches/09_drain.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--loop"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "+ one drain at the LOOP prologue's end: a known state at the loop entry, so the tile body's join waits only for its back edge",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f8xp2",
+   "parent": "f9a",
+   "patch": "fwd2_patches/10_probe2.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "-D",
+      "HKGEN_PROBE=2"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true,
+     "probe": true
+    }
+   },
+   "feature": "f8x + probe 2 (word 12 = the TILE_C barrier waits)",
+   "side": true
+  },
+  {
+   "id": "f11_null",
+   "parent": "f8xp2",
+   "patch": "fwd2_patches/11_pad.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 11 (--pad) on f8x's flags: must equal f8x",
+   "side": true
+  },
+  {
+   "id": "pad_msb",
+   "parent": "f11_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--pad",
+      "msb:1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "timing probe: TILE_C + 1 redundant msb per s_set_vgpr_msb",
+   "side": true
+  },
+  {
+   "id": "pad_salu",
+   "parent": "f11_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--pad",
+      "salu:64"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "timing probe: TILE_C + 64 redundant salu",
+   "side": true
+  },
+  {
+   "id": "pad_valu",
+   "parent": "f11_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--pad",
+      "valu:64"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "timing probe: TILE_C + 64 redundant valu",
+   "side": true
+  },
+  {
+   "id": "pad_nop",
+   "parent": "f11_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--pad",
+      "nop:64"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "timing probe: TILE_C + 64 redundant nop",
+   "side": true
+  },
+  {
+   "id": "f12_null",
+   "parent": "f11_null",
+   "patch": "fwd2_patches/12_plan2.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 12 (--plan) at plan 1: must equal f8x",
+   "side": true
+  },
+  {
+   "id": "f12a",
+   "parent": "f12_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "VGPR plan 2: S, PR, softmax scratch, m / d / corr / m' in one block (block 2); V split over blocks 3 and 0",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f13_null",
+   "parent": "f12_null",
+   "patch": "fwd2_patches/13_msbsched.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 13 (--msb-sched) off on plan 2: must equal f12a",
+   "side": true
+  },
+  {
+   "id": "f13b2",
+   "parent": "f13_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2",
+      "--msb-sched",
+      "2"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "plan 2 + MSB-aware tie-break (deadline buckets of 2 WMMAs)",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f13b4",
+   "parent": "f13_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2",
+      "--msb-sched",
+      "4"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "plan 2 + MSB-aware tie-break (deadline buckets of 4 WMMAs)",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f13b8",
+   "parent": "f13_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2",
+      "--msb-sched",
+      "8"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "plan 2 + MSB-aware tie-break (deadline buckets of 8 WMMAs)",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f13b16",
+   "parent": "f13_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2",
+      "--msb-sched",
+      "16"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "plan 2 + MSB-aware tie-break (deadline buckets of 16 WMMAs)",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f14_null",
+   "parent": "f13_null",
+   "patch": "fwd2_patches/14_xblk.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2"
+     ],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "3a874052dc0fdf640d50be1cafc30a9eb5c00f767543ffcafce8dc3b6267681a"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 14 (HKGEN_XBLK) off: must equal f12a",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f14a",
+   "parent": "f14_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "XBLK: ring slots n..n+2 load the next block's tiles 0..2 (no 1-row copies); the epilogue issues only the next Q",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f14ap",
+   "parent": "f14_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "-D",
+      "HKGEN_PROBE=2"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true,
+     "probe": true
+    }
+   },
+   "feature": "f14a with the HKGEN_PROBE=2 stamps (timing-only)",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f15_null",
+   "parent": "f14_null",
+   "patch": "fwd2_patches/15_issue_hw.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1"
+     ],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "cf5467a5a88ab0a651703b458c753e70861e2fc4b8c2d5fd16392ecc7c13f66c"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 15 (--issue) at model1: must equal f14a",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f15a",
+   "parent": "f15_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--issue",
+      "hw"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "--issue hw: the ATT-measured issue model (1 issue/cycle, LDS op holds others 4 cycles, WMMA 8 apart, RESC 30); DS_MAX on consumer-retired loads",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f15b",
+   "parent": "f15_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--issue",
+      "hw",
+      "--hw",
+      "4:4:30:290:1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f15a with the DS_MAX bound on modelled completion (+ s_wait_dscnt where the consumer count needs it)",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f15c",
+   "parent": "f15_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--issue",
+      "hw",
+      "--hw",
+      "4:8:30:290:1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f15b with LDS loads completing 8 cycles apart at the most (shared LDS bandwidth)",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f16_null",
+   "parent": "f15_null",
+   "patch": "fwd2_patches/16_m1ds.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1"
+     ],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "cf5467a5a88ab0a651703b458c753e70861e2fc4b8c2d5fd16392ecc7c13f66c"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 16 (--issue m1ds) at model1: must equal f14a",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f16a",
+   "parent": "f16_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--issue",
+      "m1ds",
+      "--hw",
+      "4:6:30:290"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "--issue m1ds: model1 + an LDS op holds the next non-LDS issue 4 cycles (no LDS op that pushes a ready WMMA)",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f16b",
+   "parent": "f16_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--issue",
+      "m1ds",
+      "--hw",
+      "4:4:30:290"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f16a with DS_RATE 4",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f16c",
+   "parent": "f16_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--issue",
+      "m1ds",
+      "--hw",
+      "4:8:30:290"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f16a with DS_RATE 8",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f16d",
+   "parent": "f16_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--issue",
+      "m1ds",
+      "--hw",
+      "3:6:30:290"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f16a with an LDS block of 3 cycles",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f17_null",
+   "parent": "f16_null",
+   "patch": "fwd2_patches/17_sgprlat.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1"
+     ],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "cf5467a5a88ab0a651703b458c753e70861e2fc4b8c2d5fd16392ecc7c13f66c"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 17 (--sgpr-lat, --resc branch2, --resc-cost) off: must equal f14a",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f17a",
+   "parent": "f17_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "--sgpr-lat 20 (VALU-written SGPR to SALU: 20 cycles) + --resc branch2 (the RESC s_cmp scheduled 9 cycles ahead)",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f17b",
+   "parent": "f17_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f14a + --sgpr-lat 20 only",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f17c",
+   "parent": "f17_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f14a + --resc branch2 only",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f17d",
+   "parent": "f17_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--resc-cost",
+      "25"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f17a with RESC_COST 25",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f18_null",
+   "parent": "f17_null",
+   "patch": "fwd2_patches/18_waitmerge.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 18 (--wait-merge, --ds-max) off: must equal f17a",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f18a",
+   "parent": "f18_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--wait-merge",
+      "2"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f17a + --wait-merge 2 (pairs of s_wait_dscnt merged)",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f18b",
+   "parent": "f18_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--wait-merge",
+      "4"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f17a + --wait-merge 4",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f18c",
+   "parent": "f18_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--wait-merge",
+      "8"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f17a + --wait-merge 8",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f18d",
+   "parent": "f18_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f17a + DS_MAX 63",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f18e",
+   "parent": "f18_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--wait-merge",
+      "4",
+      "--ds-max",
+      "63"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f17a + --wait-merge 4 + DS_MAX 63",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f19_null",
+   "parent": "f18_null",
+   "patch": "fwd2_patches/19_lat.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 19 (--lat) off: must equal f18d",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f19a",
+   "parent": "f19_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "--lat",
+      "WMMA=32"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f18d + WMMA result latency 32 in the scheduler",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f19b",
+   "parent": "f19_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "--lat",
+      "DS=400"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f18d + LDS load latency 400",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f19c",
+   "parent": "f19_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "--lat",
+      "DS=220"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f18d + LDS load latency 220",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f19d",
+   "parent": "f19_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "--lat",
+      "WMMA=32,DS=400"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f18d + WMMA 32 + LDS 400",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f19e",
+   "parent": "f19_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "--lat",
+      "VALU=8"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f18d + VALU result latency 8",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f19f",
+   "parent": "f19_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "--lat",
+      "WMMA=32,VALU=8"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f18d + WMMA 32 + VALU 8",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f20_null",
+   "parent": "f19_null",
+   "patch": "fwd2_patches/20_incdesc.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 20 (HKGEN_INCDESC) off: must equal f18d",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f20a",
+   "parent": "f20_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_INCDESC=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f18d + incremental TDM descriptors in the TILE_C loop",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f21_null",
+   "parent": "f20_null",
+   "patch": "fwd2_patches/21_ftile.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 21 (HKGEN_FTILE) off: must equal f18d",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f21a",
+   "parent": "f21_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_FTILE=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "TILE_F: tile 0 of a block with ncc > 0 = INIT's set-up + the body, no no-op prefix; the TILE_C loop from tile 1",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f21b",
+   "parent": "f21_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_FTILE=1",
+      "--lat",
+      "VALU=8"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f21a + VALU result latency 8",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f21c",
+   "parent": "f21_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_FTILE=1",
+      "--lat",
+      "WMMA=32,VALU=8"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f21a + WMMA 32 + VALU 8",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f22_null",
+   "parent": "f21_null",
+   "patch": "fwd2_patches/22_ores.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 22 (HKGEN_ORES) off: must equal f18d",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f22a",
+   "parent": "f22_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f19f + per-q-tile O resources with 32-bit bounds (no 64-bit clamp chains in the epilogue)",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f22b",
+   "parent": "f22_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "-D",
+      "HKGEN_FTILE=1",
+      "--lat",
+      "WMMA=32,VALU=8"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f22a + TILE_F",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f23_null",
+   "parent": "f22_null",
+   "patch": "fwd2_patches/23_pad.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 23 (--pad-start / --pad-end) off: must equal f22a",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f23s",
+   "parent": "f23_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "--pad-start",
+      "1800"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "diagnostic: f22a with 7.2 KB of dead s_nop at the kernel start (code shifted)",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f23e",
+   "parent": "f23_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "--pad-end",
+      "1800"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "diagnostic: f22a with 7.2 KB of dead s_nop at the kernel end",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f23s2",
+   "parent": "f23_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "--pad-start",
+      "600"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "diagnostic: f22a with 2.4 KB of dead s_nop at the kernel start",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f24_null",
+   "parent": "f23_null",
+   "patch": "fwd2_patches/24_fmerge.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 24 (HKGEN_FMERGE) off: must equal f22a",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f24a",
+   "parent": "f24_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_FMERGE=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "FINAL_A: one scheduled region -- the last prefix, then out / lse of all 4 q tiles stored to the staging by the generated code",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f24b",
+   "parent": "f24_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "-D",
+      "HKGEN_FTILE=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f24a + TILE_F",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f24c",
+   "parent": "f24_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "--issue",
+      "m1ds",
+      "--hw",
+      "4:1:30:290"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f22a + m1ds with DS_RATE 1 (LDS bursts; an LDS op holds non-LDS 4 cycles)",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f24d",
+   "parent": "f24_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "--issue",
+      "m1ds",
+      "--hw",
+      "4:2:30:290"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f22a + m1ds with DS_RATE 2",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f24e",
+   "parent": "f24_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "--issue",
+      "m1ds",
+      "--hw",
+      "3:1:30:290"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f22a + m1ds DS_BLOCK 3 DS_RATE 1",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f25_null",
+   "parent": "f24_null",
+   "patch": "fwd2_patches/25_rows64.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 25 (HKGEN_ROWS64) off: must equal f22a",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f25a",
+   "parent": "f25_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f22a + K / V slot descriptors bounded at the tile's 64 rows (fewer SALU per TDM op)",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f25b",
+   "parent": "f25_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "branch2",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f25a + FINAL_A",
+   "bitwise_with": "flydsl",
+   "side": true
+  }
+ ]
+}

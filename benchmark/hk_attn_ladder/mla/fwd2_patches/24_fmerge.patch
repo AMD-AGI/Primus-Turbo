@@ -1,0 +1,212 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 15:41:49.854299360 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 15:57:03.046981409 +0000
+@@ -120,6 +120,12 @@
+ #ifndef HKGEN_ORES
+ #define HKGEN_ORES 0
+ #endif
++// HKGEN_FMERGE 1: one generated FINAL_A region instead of FINAL_0..3: the last tile's prefix, then out / lse of all 4 q
++// tiles written by the generated code straight into this wave's staging slots (ds_store from its own VGPRs; operands:
++// the slot bases of q tiles 0, 1 / 2, 3 plus the lane's row offset wl / lse offset wls)
++#ifndef HKGEN_FMERGE
++#define HKGEN_FMERGE 0
++#endif
+ #if HKGEN_FTILE && (HKGEN2 || HKGEN_INCDESC)
+ #error "HKGEN_FTILE needs the shell's tile loop and the per-tile descriptors"
+ #endif
+@@ -851,6 +857,10 @@
+       const unsigned sgb = lds0 + TAIL + (unsigned)(wv * SQT);
+       const unsigned wl = (unsigned)((lane2 & 15) * XO + (lane2 >> 4) * 16);
+       const unsigned wls = (unsigned)(LSE_SLOT + 4 * lane2);
++#if HKGEN_FMERGE && !HKGEN_REF
++      asm volatile("; HKGEN FINAL_A wa=%0 wb=%1 la=%2 lb=%3" ::"v"(sga + wl), "v"(sgb + wl), "v"(sga + wls),
++                   "v"(sgb + wls) : HKGEN_CLOBBERS);
++#else
+       static_for<QT>([&](auto i) {
+         i32x32 ob;
+         float lse;
+@@ -880,6 +890,7 @@
+         lds_store_b32(lds_wptr(tb + wls), 0, __builtin_bit_cast(unsigned, lse));
+         sched_barrier<0>();
+       });
++#endif
+       wave_lds_order();
+ 
+       // Phase 2 addresses (all before the first global store):
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 15:54:08.869961052 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 15:59:18.256546870 +0000
+@@ -56,6 +56,8 @@
+ ALLOWED = (
+     "v_wmma_f32_16x16x32_bf16",
+     "ds_load_b128",
++    "ds_store_b128",  # FINAL_A (HKGEN_FMERGE): the staging stores
++    "ds_store_b32",
+     "ds_load_tr16_b128",
+     "v_max3_num_f32",
+     "v_max_num_f32",
+@@ -239,6 +241,8 @@
+     fmap = M.merge_msb_maps(*(M.learn_msb_map(parse(t)) for t in texts))
+     for mn in ("ds_load_b128", "ds_load_tr16_b128"):
+         fmap[(mn, 0)], fmap[(mn, 1)] = {"dst"}, {"src0"}
++    for mn in ("ds_store_b128", "ds_store_b32"):  # DS (addr, data0, data1, vdst): addr in src0, data0 in src1
++        fmap[(mn, 0)], fmap[(mn, 1)] = {"src0"}, {"src1"}
+     for p, f in ((0, "dst"), (2, "src0"), (3, "src1"), (4, "src2")):  # operand 1: the scalar carry-out
+         fmap[("v_div_scale_f32", p)] = {f}
+     return fmap
+@@ -615,6 +619,8 @@
+     want = MARKERS_LOOP if G.LOOP else MARKERS
+     if "HKGEN_FTILE=1" in DEFINES:
+         want = (*want, "TILE_F")
++    if "HKGEN_FMERGE=1" in DEFINES:
++        want = (*(x for x in want if not x.startswith("FINAL_")), "FINAL_A")
+     if sorted(names) != sorted(want):
+         raise RuntimeError(f"markers {names}, want {list(want)}")
+     hi, wmma_trans, scalars = scan_shell(ins)
+@@ -684,6 +690,11 @@
+             if name == "TILE_F":
+                 o["qa"], o["qb"] = vfirst(ops["qa"]), vfirst(ops["qb"])
+             texts, cycles[name] = G.region_tile(L, o, k, ftile=name == "TILE_F")
++        elif name == "FINAL_A":
++            texts = G.region_final_all(L, {k: vfirst(ops[k]) for k in ("wa", "wb", "la", "lb")})
++            pre = ["\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"] + ["\tv_nop"] * 4
++            # the shell reads the staging back and rewrites the address VGPRs: every LDS op done, sources read
++            post = ["\ts_wait_dscnt 0x0", "\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"]
+         else:
+             if vcount(ops["o"]) != 32 or vcount(ops["lse"]) != 1:
+                 raise RuntimeError(f"{name}: unexpected output operands {ops}")
+@@ -873,7 +884,7 @@
+     out_regs = {
+         name: set(range(vfirst(ops["o"]), vfirst(ops["o"]) + 32)) | {vfirst(ops["lse"])}
+         for name, ops in ops_of.items()
+-        if name.startswith("FINAL")
++        if name.startswith("FINAL") and "o" in ops
+     }
+     gen_regs = L.all_regs()
+     # the largest LDS offsets of the layout: Q (from qa / qb), K (kb), V^T (vb)
+@@ -907,8 +918,12 @@
+                 ok_base |= {L.kb, L.vb}
+             if name.startswith("TILE"):
+                 ok_base |= {vfirst(ops_of[name]["kb"]), vfirst(ops_of[name]["vb"])}
+-            if not set(x.uses) <= ok_base:
+-                fail.append(f"{name}: LDS read from an unexpected base: {x.text.strip()}")
++            if name == "FINAL_A":  # the staging stores only
++                ok_base = {vfirst(ops_of[name][k]) for k in ("wa", "wb", "la", "lb")}
++                if not x.mn.startswith("ds_store"):
++                    fail.append(f"{name}: an LDS op other than the staging stores: {x.text.strip()}")
++            if not (set(x.uses[:1]) if x.mn.startswith("ds_store") else set(x.uses)) <= ok_base:
++                fail.append(f"{name}: LDS access from an unexpected base: {x.text.strip()}")
+             mo = re.search(r"offset:(\d+)", x.text)
+             off = int(mo.group(1)) if mo else 0
+             b = x.uses[0] if x.uses else None
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 15:38:51.552559231 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 15:59:02.088701358 +0000
+@@ -87,9 +87,11 @@
+ WORDER = ("PV0p", "PV1p", "PV2p", "PV3p", "QK0", "QK1", "QK2", "QK3")  # the in-order WMMA stream, by node tag
+ # latency of a dependence edge by producer kind (it ranks nodes by critical path), and result latency by kind
+ # in the issue model
+-LAT = {"WMMA": 20, "VALU": 5, "TRANS": 8, "PERM": 8, "DS": DS_LAT, "SALU": 2, "RESC": 2, "RARE": 2, "TDM": 2,
++SQT_B = 4480  # k_mla_fwd.hip SQT: the staging slot bytes per wave and q tile
++LAT = {"WMMA": 20, "VALU": 5, "TRANS": 8, "PERM": 8, "DS": DS_LAT, "SALU": 2, "RESC": 2, "RARE": 2, "TDM": 2, "DSST": 1,
+        "BARW": 40}
+-SLOT_LAT = {"WMMA": 20, "VALU": 3, "TRANS": 8, "PERM": 6, "SALU": 2, "RESC": 2, "RARE": 2, "TDM": 2, "BARW": 40}
++SLOT_LAT = {"WMMA": 20, "VALU": 3, "TRANS": 8, "PERM": 6, "SALU": 2, "RESC": 2, "RARE": 2, "TDM": 2, "BARW": 40,
++            "DSST": 1}
+ BARW_LAT = 40  # modelled cycles from a barrier wait to the reads it releases
+ # build.py --issue hw: the issue model measured with ATT on the TILE regions (f12a / f14a): every instruction issues in
+ # one cycle (VALU / TRANS / permlane at any offset from a WMMA); after an LDS instruction the next non-LDS one issues
+@@ -349,6 +351,8 @@
+     ops = _split_ops(rest)
+     if mn.startswith("ds_load"):
+         n.vdefs, n.vuses = set(_vregs(ops[0])), set(_vregs(ops[1]))
++    elif mn.startswith("ds_store"):  # address, data: uses only
++        n.vuses = set(_vregs(ops[0])) | set(_vregs(ops[1]))
+     elif mn.startswith("s_cmp"):
+         n.sdefs, n.suses = {"scc"}, set(_sregs(ops[0])) | set(_sregs(ops[1]))
+     elif mn.startswith("s_cselect"):
+@@ -362,6 +366,11 @@
+         if not mn.startswith(("s_mul_i32", "s_add_nc_u64", "s_bitset1_b32")):
+             n.sdefs.add("scc")
+         n.suses = {r for o in ops[1:] for r in _sregs(o)}
++    elif mn.startswith("v_div_scale"):  # vdst, sdst (vcc_lo or null), sources
++        n.vdefs = set(_vregs(ops[0]))
++        n.sdefs = {"vcc"} if "vcc" in ops[1] else set()
++        n.vuses = {r for o in ops[2:] for r in _vregs(o)}
++        n.suses = {r for o in ops[2:] for r in _sregs(o)}
+     elif mn.startswith("v_"):
+         if mn.startswith("v_cmp"):
+             n.sdefs = set(_sregs(ops[0]))
+@@ -369,6 +378,8 @@
+             n.vdefs = set(_vregs(ops[0]))
+         n.vuses = {r for o in ops[1:] for r in _vregs(o)}
+         n.suses = {r for o in ops[1:] for r in _sregs(o)}
++        if mn.startswith("v_div_fmas"):  # reads vcc implicitly
++            n.suses.add("vcc")
+     else:
+         raise ValueError(f"unmodelled instruction {text}")
+     return n
+@@ -1157,6 +1168,62 @@
+     return out
+ 
+ 
++def region_final_all(L, ops):
++    """FINAL_A (HKGEN_FMERGE; scheduled): the last tile's prefix, then per q tile i: 1 / d (d > 0, else 0), out =
++    bf16(O(i) / d) into the dead K registers (K + 32 i), lse = (m + log2 d) ln 2, and their ds_stores into the
++    staging slot: out rows at (i < 2 ? wa : wb) + (i & 1) 4 SQT + 32 dt, lse at (i < 2 ? la : lb) + (i & 1) 4 SQT.
++    Per q tile its own scratch (12 VGPRs of the dead Q buffers) and SGPRs, so the four overlap."""
++    nodes, add = node_list()
++    add(f"s_mov_b32 {S_SEL}, 0x{SEL_LO:x}", "SALU", "sel")
++    prefix_nodes(L, add, c_sgpr=False)
++    for i in range(QT):
++        d, m = L.d[i], L.m[i]
++        a, b, rc, e1, q, e2, sh, sub, x, lg, inv = (L.qbuf[0] + 12 * i + k for k in range(11))  # inv: even (pairs)
++        sv = lg
++        s1, s2 = S_NEED[i], S_ANY[i]
++        tag = f"fin{i}"
++        for t in (
++            f"v_div_scale_f32 {vr(a)}, null, {vr(d)}, {vr(d)}, 1.0",
++            f"v_div_scale_f32 {vr(b)}, vcc_lo, 1.0, {vr(d)}, 1.0",
++            f"v_rcp_f32_e32 {vr(rc)}, {vr(a)}",
++            f"v_fma_f32 {vr(e1)}, -{vr(a)}, {vr(rc)}, 1.0",
++            f"v_fmac_f32_e32 {vr(rc)}, {vr(e1)}, {vr(rc)}",
++            f"v_mul_f32_e32 {vr(q)}, {vr(b)}, {vr(rc)}",
++            f"v_fma_f32 {vr(e2)}, -{vr(a)}, {vr(q)}, {vr(b)}",
++            f"v_fmac_f32_e32 {vr(q)}, {vr(e2)}, {vr(rc)}",
++            f"v_fma_f32 {vr(a)}, -{vr(a)}, {vr(q)}, {vr(b)}",
++            f"v_div_fmas_f32 {vr(a)}, {vr(a)}, {vr(rc)}, {vr(q)}",
++            f"v_div_fixup_f32 {vr(a)}, {vr(a)}, {vr(d)}, 1.0",
++            f"v_cmp_lt_f32_e64 {s1}, 0, {vr(d)}",
++            f"v_cndmask_b32_e64 {vr(inv)}, 0, {vr(a)}, {s1}",
++        ):
++            add(t, "TRANS" if t.startswith("v_rcp") else "VALU", tag)
++        out = L.k + 32 * i
++        base = ops["wa"] if i < 2 else ops["wb"]
++        for dt in range(NDT):
++            for r in range(0, 8, 2):
++                o = vr(L.O(i, dt) + r, 2)
++                add(f"v_pk_mul_f32 {o}, {o}, {vr(inv, 2)} op_sel_hi:[1,0]", "VALU", tag)
++                add(f"v_cvt_pk_bf16_f32 {vr(out + 4 * dt + r // 2)}, {vr(L.O(i, dt) + r)}, {vr(L.O(i, dt) + r + 1)}",
++                    "VALU", tag)
++            add(f"ds_store_b128 {vr(base)}, {vr(out + 4 * dt, 4)} offset:{(i & 1) * 4 * SQT_B + 32 * dt}", "DSST", tag)
++        for t in (
++            f"v_cmp_gt_f32_e64 {s2}, 0x800000, {vr(d)}",
++            f"v_cndmask_b32_e64 {vr(sh)}, 0, 32, {s2}",
++            f"v_cndmask_b32_e64 {vr(sub)}, 0, 0x42000000, {s2}",
++            f"v_ldexp_f32 {vr(x)}, {vr(d)}, {vr(sh)}",
++            f"v_log_f32_e32 {vr(x)}, {vr(x)}",
++            f"v_sub_f32_e32 {vr(lg)}, {vr(x)}, {vr(sub)}",
++            f"v_add_f32_e32 {vr(sv)}, {vr(m)}, {vr(lg)}",
++            f"v_mul_f32_e32 {vr(sv)}, 0x{LN2:x}, {vr(sv)}",
++        ):
++            add(t, "TRANS" if t.startswith("v_log") else "VALU", tag)
++        lbase = ops["la"] if i < 2 else ops["lb"]
++        add(f"ds_store_b32 {vr(lbase)}, {vr(sv)} offset:{(i & 1) * 4 * SQT_B}", "DSST", tag)
++    order, _ = schedule(build_dag(nodes))
++    return [nd.text for nd in order]
++
++
+ # ------------------------------------------------------------------------------------------------------------
+ # LOOP (HKGEN2, build.py --loop): every tile of a block in generated code
+ # ------------------------------------------------------------------------------------------------------------
+Binary files a/gfx1250_mla/tools/fwdgen/__pycache__/fwdgen.cpython-312.pyc and b/gfx1250_mla/tools/fwdgen/__pycache__/fwdgen.cpython-312.pyc differ

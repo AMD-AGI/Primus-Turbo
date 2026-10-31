@@ -1,0 +1,677 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip ../f9/a/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 13:50:56.984549273 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 14:01:49.430512212 +0000
+@@ -86,6 +86,12 @@
+ #ifndef HKGEN_TICKET
+ #define HKGEN_TICKET 0
+ #endif
++// HKGEN2 1 (tools/fwdgen --loop): one LOOP marker runs every tile of a block -- the generated code issues the ring's
++// TDM ops, waits at the tile barriers and counts the tiles itself (no shell code between the tiles); the TILE_C /
++// TILE_Dk markers are not used
++#ifndef HKGEN2
++#define HKGEN2 0
++#endif
+ // HKGEN_ABL_NOTDM 1 (timing-only ablation, wrong results): no K / V tile is copied (every wave issues NULL descriptors)
+ #ifndef HKGEN_ABL_NOTDM
+ #define HKGEN_ABL_NOTDM 0
+@@ -95,6 +101,10 @@
+ // the SGPRs the generated code uses as temporaries (with vcc / scc; fwdgen.CLOBBERED): clobbered at every marker
+ #define HKGEN_CLOBBERS "memory", "vcc", "scc", "s90", "s91", "s92", "s93", "s94", "s95", "s96", "s97", "s98", \
+                        "s99", "s100", "s101", "s102", "s103"
++// HKGEN2's LOOP keeps its TDM descriptors, tile counter and scalars in s48..s89 as well
++#define HKGEN_LOOP_CLOBBERS HKGEN_CLOBBERS, "s48", "s49", "s50", "s51", "s52", "s53", "s54", "s55", "s56", "s57", \
++    "s58", "s59", "s60", "s61", "s62", "s63", "s64", "s65", "s66", "s67", "s68", "s69", "s70", "s71", "s72", "s73",  \
++    "s74", "s75", "s76", "s77", "s78", "s79", "s80", "s81", "s82", "s83", "s84", "s85", "s86", "s87", "s88", "s89"
+ 
+ namespace {
+ constexpr int D_QK = 192, D_V = 128;
+@@ -587,6 +597,37 @@
+     unsigned int pr_creg = 0;
+ #endif
+ 
++#if HKGEN2 && !HKGEN_REF
++    {
++      typedef int32_t i32x16 __attribute__((ext_vector_type(16)));
++      // LOOP: every tile t = 0 .. n - 1 of the block in generated code: tiles [0, ncc) in one loop body, then the
++      // diagonal tiles ncc + k (k < n - ncc) straight-line. Tile t issues ring slot t + 3 (wave 0's 3 TDM ops into the
++      // stage of tile t - 1, a 1-row copy of tile n - 1 past the last tile; NULL descriptors on the other waves), reads
++      // its stage's K / V and the Q fragments, arrives after its last LDS read (s_wait_tensorcnt 6: slot t + 1 landed)
++      // and waits at B_{t+1} before tile t + 1. tdm: K / V global bytes of tile 0 (lo, hi, lo, hi), bytes per K / V
++      // tile, the K / V row strides (elements), Skv, n, ncc, sb (the stage of tile 0), the LDS byte of stage 0, cnt0
++      // (1 on wave 0), 0, 0. kb / vb: the lane's K / V^T fragment bases in stage 0; dl: dl0.
++      i32x16 tdmv;
++      tdmv[0] = (int)(unsigned)gk0;
++      tdmv[1] = (int)(unsigned)(gk0 >> 32);
++      tdmv[2] = (int)(unsigned)gv0;
++      tdmv[3] = (int)(unsigned)(gv0 >> 32);
++      tdmv[4] = (int)(2ull * NB * krow);
++      tdmv[5] = (int)(2ull * NB * vrow);
++      tdmv[6] = (int)krow;
++      tdmv[7] = (int)vrow;
++      tdmv[8] = Skv_;
++      tdmv[9] = n;
++      tdmv[10] = ncc;
++      tdmv[11] = sb;
++      tdmv[12] = (int)lds0;
++      tdmv[13] = cnt0;
++      tdmv[14] = 0;
++      tdmv[15] = 0;
++      asm volatile("; HKGEN LOOP kb=%0 vb=%1 dl=%2 c2=%3 tdm=%4 qa=%5 qb=%6" ::"v"(lds0 + k_lane),
++                   "v"(lds0 + K_B + v_lane), "v"(dl0), "s"(c2), "s"(tdmv), "v"(qa), "v"(qb2) : HKGEN_LOOP_CLOBBERS);
++    }
++#else
+     // ---- tiles [0, ncc): below the diagonal, no mask ----------------------------------------------------------------
+     int t = 0;  // outside the for statement: the for-init form compiles to another .s (asm_input_sha256)
+     for (; t < ncc; ++t) {
+@@ -652,6 +693,7 @@
+ #endif
+       }
+     });
++#endif  // HKGEN2
+ 
+     // ---- epilogue, in its own scope (its own argument view: nothing of it is live across the tiles) -----------------
+     // First the next block's prologue loads, right after B_n, overlapping the output: every wave's reads of the ring
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py ../f9/a/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 13:50:56.984642593 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 14:01:49.430577572 +0000
+@@ -46,6 +46,7 @@
+ 
+ KERNEL = "k_mla_fwd"
+ MARKERS = ("INIT", "TILE_C", *(f"TILE_D{k}" for k in range(4)), *(f"FINAL_{i}" for i in range(4)))
++MARKERS_LOOP = ("INIT", "LOOP", *(f"FINAL_{i}" for i in range(4)))  # --loop (HKGEN2)
+ MARK = re.compile(r";\s*HKGEN\s+(\w+)\s*(.*)$")
+ LABEL = re.compile(r"^[.\w$]+:")
+ EXEC_RESTORE = re.compile(r"s_or_b32\s+exec_lo,\s*exec_lo|s_mov_b32\s+exec_lo,\s*-1")
+@@ -87,6 +88,22 @@
+     "s_cbranch_scc0",
+     "s_cbranch_scc1",
+     "s_branch",
++    # LOOP (--loop): the ring's TDM ops, the tile barrier and counter, the descriptors' scalar arithmetic
++    "tensor_load_to_lds",
++    "s_barrier_wait",
++    "s_cmp_ge_i32",
++    "s_cmp_lt_i32",
++    "s_add_co_i32",
++    "s_sub_co_i32",
++    "s_min_i32",
++    "s_and_b32",
++    "s_or_b32",
++    "s_lshl_b32",
++    "s_lshr_b32",
++    "s_mul_i32",
++    "s_add_nc_u64",
++    "s_bitset1_b32",
++    "v_subrev_nc_u32",
+     "s_barrier_signal",
+     "s_wait_dscnt",
+     "s_wait_tensorcnt",
+@@ -321,6 +338,78 @@
+     return out + lead + lines, found + f3
+ 
+ 
++def split_resc(blocks, L):
++    """Blocks with HKRESC pseudo-lines (--resc branch) split at them: the block before ends in s_cmp + s_cbranch over
++    the conditional O *= corr block, which falls through to the block after; that one takes the original
++    successors."""
++    out = []
++    for name, label, texts, succ in blocks:
++        parts, cur = [], []
++        for x in texts:
++            if x.startswith("HKRESC"):
++                parts.append((cur, x))
++                cur = []
++            else:
++                cur.append(x)
++        if not parts:
++            out.append((name, label, texts, succ))
++            continue
++        lab, nm = label, name
++        for k, (tx, rline) in enumerate(parts):
++            n = RESC_LABELS[0]
++            RESC_LABELS[0] += 1
++            head, body, after = G.resc_block(L, rline, f".LHKR{n}")
++            nb, nc = f"{name}.r{k}", f"{name}.c{k}"
++            out.append((nm, lab, tx + head, [nb, nc]))
++            out.append((nb, f".LHKRB{n}", body, [nc]))
++            lab, nm = after[:-1], nc
++        out.append((nm, lab, cur, succ))
++    return out
++
++
++def emit_loop(blocks, fmap, scalars, L):
++    """The LOOP region's lines: its blocks [(name, label, texts, successors)] in layout order, each emitted from the
++    join of its predecessors' exit flows (the region entry for the first block), iterated to a fixed point (the loop
++    body is its own predecessor). Returns (lines, open hazards / coverage errors, iterations)."""
++    names = [b[0] for b in blocks]
++    by = {b[0]: b for b in blocks}
++    preds = {n: [] for n in names}
++    for name, _, _, succ in blocks:
++        for s_ in succ:
++            preds[s_].append(name)
++    entry0 = M.Flow([E.State(unknown=True)], [xcnt_entry(scalars)], [[]])
++    items = {}
++    for name, _, texts, _ in blocks:
++        its = [M.make_item("\t" + x) for x in texts]
++        for k, it in enumerate(its):
++            it.pos = k
++        items[name] = its
++    exits, sig, lines, entry = {}, {}, {}, {}
++    for it in range(64):
++        changed = False
++        for n in names:
++            ins_fl = ([entry0] if n == names[0] else []) + [exits[p] for p in preds[n] if p in exits]
++            if not ins_fl:
++                continue
++            fl_in = M.Flow.join(ins_fl)
++            sg = fl_in.sig()
++            if sig.get(n) == sg:
++                continue
++            sig[n], entry[n] = sg, fl_in
++            lines[n], exits[n] = M.emit_block(items[n], fl_in, fmap, va_rule=VA_RULE)
++            changed = True
++        if not changed:
++            break
++    else:
++        raise RuntimeError("LOOP entry states did not converge")
++    out, found = [], []
++    for name, label, _, _ in blocks:
++        out.append(f"{label}:")
++        out += lines.get(name, [])
++        found += walk_block_check(lines.get(name, []), entry[name]) if name in entry else []
++    return out, found, it + 1
++
++
+ def main():
+     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+     ap.add_argument("--out", required=True, help="output directory")
+@@ -330,6 +419,10 @@
+                          "in-flight WMMA, as the backward)")
+     ap.add_argument("--no-group-edges", action="store_true",
+                     help="no order edges grouping the V / Q(3) reads behind the last PV / QK(0) WMMA")
++    ap.add_argument("--kprefetch", action="store_true",
++                    help="(--loop) a tile reads the next tile's K and Q(0) right after its barrier wait")
++    ap.add_argument("--loop", action="store_true",
++                    help="HKGEN2: one generated LOOP region runs every tile of a block (TDM, barriers, tile counter)")
+     ap.add_argument("--resc", default="always", choices=("always", "branch", "ool"),
+                     help="O *= corr on every tile, under a per-q-tile wave-uniform branch (FlyDSL's _rescale_if), or "
+                          "the whole rescale decision and O *= corr out of line behind a not-taken branch")
+@@ -349,6 +442,10 @@
+     DEFINES[:] = a.defines
+     G.GROUP_EDGES = not a.no_group_edges
+     G.RESC = a.resc
++    G.LOOP = a.loop
++    G.PREFETCH = a.kprefetch
++    if a.loop:
++        DEFINES.append("HKGEN2=1")
+     G.ABL = set(a.abl)
+     if a.worder:
+         tags = tuple(a.worder.split(","))
+@@ -379,8 +476,9 @@
+     ins = parse(shell)
+     markers = parse_markers(shell)
+     names = [m[0] for m in markers]
+-    if sorted(names) != sorted(MARKERS):
+-        raise RuntimeError(f"markers {names}, want {list(MARKERS)}")
++    want = MARKERS_LOOP if G.LOOP else MARKERS
++    if sorted(names) != sorted(want):
++        raise RuntimeError(f"markers {names}, want {list(want)}")
+     hi, wmma_trans, scalars = scan_shell(ins)
+     ends = [vfirst(v) + vcount(v) for _, ops, *_ in markers for v in ops.values() if v.startswith("v")]
+     base = max([hi + 1, *ends])
+@@ -419,6 +517,24 @@
+         pre, post = [], []
+         if name == "INIT":
+             texts = G.region_init(L, {"qa": vfirst(ops["qa"]), "qb": vfirst(ops["qb"]), "c2": ops["c2"]})
++        elif name == "LOOP":
++            o = {"kb": vfirst(ops["kb"]), "vb": vfirst(ops["vb"]), "dl": vfirst(ops["dl"]), "c2": ops["c2"],
++                 "tdm": ops["tdm"], "qa": vfirst(ops["qa"]), "qb": vfirst(ops["qb"])}
++            blocks, lcyc = G.region_loop(L, o, f".LHKL{RESC_LABELS[0]}")
++            RESC_LABELS[0] += 1
++            for kname, c in lcyc.items():
++                cycles[f"LOOP_{kname}"] = c
++            blocks = split_resc(blocks, L)
++            texts = [x for _, _, tx, _ in blocks for x in tx]
++            msb_defaults(fmap, texts + G.resc_lines(L, 0))
++            lines, open_, iters = emit_loop(blocks, fmap, scalars, L)
++            rec["checks"]["loop_fixed_point_iterations"] = iters
++            if open_:
++                fail.append(f"LOOP: {len(open_)} hazards / coverage errors after emission, e.g. {open_[:3]}")
++            regions[name] = lines
++            log(f"LOOP: {len(blocks)} blocks, {len(texts)} instructions -> {len(lines)} lines, fixed point after "
++                f"{iters} iterations, modelled {lcyc}")
++            continue
+         elif name.startswith("TILE"):
+             c2 = ops.get("c2", "")
+             if not re.fullmatch(r"s\d+", c2) or c2 in G.CLOBBERED:
+@@ -467,7 +583,11 @@
+     rec["checks"]["verify_obj"] = [str(b) for b in bad] or "ok"
+     if bad:
+         fail.append(f"verify_obj: {bad[:3]}")
+-    if any(meta.get(k, 0) for k in ("vgpr_spill_count", "sgpr_spill_count", "private_segment_fixed_size")):
++    # SGPR spills go to VGPR lanes (no memory traffic; the --loop shell spills around its LOOP marker): tolerated, as
++    # by hkl.build and in the shipped dK / dV kernel; VGPR spills and scratch fail
++    if any(meta.get(k, 0) for k in ("vgpr_spill_count", "private_segment_fixed_size")) or (
++        meta.get("sgpr_spill_count", 0) and not G.LOOP
++    ):
+         fail.append(f"spills / scratch: {meta}")
+ 
+     # 6., 7. the listing
+@@ -626,13 +746,16 @@
+         if set(x.defs) - gen_regs - out_regs.get(name, set()):
+             fail.append(f"{name}: writes VGPRs outside the generated range: {x.text.strip()}")
+         sd, _ = sgpr_defs_uses(x)
+-        if set(sd) - G.CLOBBERED:
++        if set(sd) - (G.LOOP_CLOBBERED if name == "LOOP" else G.CLOBBERED):
+             fail.append(f"{name}: writes scalars outside the clobbered set: {sd} {x.text.strip()}")
+         if x.mn.startswith("ds_"):
+             st["ds"] += 1
+             if st["signal"]:
+                 st["ds_after_signal"] += 1
+-            ok_base = {L.qa, L.qb}
++            q_base = {vfirst(ops_of[name][q]) for q in ("qa", "qb") if q in ops_of[name]} if G.LOOP else {L.qa, L.qb}
++            ok_base = set(q_base)
++            if name == "LOOP":
++                ok_base |= {L.kb, L.vb}
+             if name.startswith("TILE"):
+                 ok_base |= {vfirst(ops_of[name]["kb"]), vfirst(ops_of[name]["vb"])}
+             if not set(x.uses) <= ok_base:
+@@ -640,7 +763,7 @@
+             mo = re.search(r"offset:(\d+)", x.text)
+             off = int(mo.group(1)) if mo else 0
+             b = x.uses[0] if x.uses else None
+-            lim = q_lim if b in (L.qa, L.qb) else (v_lim if x.mn == "ds_load_tr16_b128" else k_lim)
++            lim = q_lim if b in q_base else (v_lim if x.mn == "ds_load_tr16_b128" else k_lim)
+             if off > lim or off % 16:
+                 fail.append(f"{name}: LDS offset {off} out of the layout: {x.text.strip()}")
+         if x.mn == "s_barrier_signal":
+@@ -649,12 +772,12 @@
+             st["wmma"] += 1
+     for name in ops_of:
+         st = stats.get(name, {})
+-        want = 1 if name.startswith("TILE") else 0
++        want = 1 if name.startswith("TILE") else (5 if name == "LOOP" else 0)
+         if st.get("signal", 0) != want:
+             fail.append(f"{name}: {st.get('signal', 0)} s_barrier_signal, want {want}")
+         if msb_mode.get(name, 0) != 0:
+             fail.append(f"{name}: MSB mode {msb_mode[name]:#x} at the region end")
+-        if st.get("ds_after_signal", 0):
++        if st.get("ds_after_signal", 0) and name != "LOOP":  # LOOP: the next tile reads after its barrier wait
+             fail.append(f"{name}: {st['ds_after_signal']} LDS reads after the s_barrier_signal")
+     return stats
+ 
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py ../f9/a/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 13:50:56.984668213 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 14:01:49.441595196 +0000
+@@ -59,6 +59,20 @@
+ S_MASK = ("s99", "s100", "s101")  # causal-mask compares, in rotation
+ S_C = ("s102", "s103")  # (c, c) in the TILE regions, copied from the marker's c2 operand
+ CLOBBERED = {f"s{i}" for i in range(90, 104)} | {"vcc", "scc"}
++# HKGEN2 / --loop: the LOOP region's own SGPRs (the shell declares s48..s89 clobbered at the LOOP marker): the group-0
++# (4 SGPRs) and group-1 (8 SGPRs) TDM descriptors of the 3 ops of a ring slot (K columns 0..127, K columns 128..191,
++# V), the tile index t, three temporaries and the pair (offset, 0) of the 64-bit address adds
++LOOP_CLOBBERED = CLOBBERED | {f"s{i}" for i in range(48, 90)}
++LOOP = False  # build.py --loop
++PREFETCH = False  # build.py --kprefetch (with --loop): a tile reads the next tile's K and Q(0) after its barrier wait
++S_G0 = (48, 52, 56)
++S_G1 = (60, 68, 76)
++S_T = "s84"
++S_TMP = ("s85", "s86", "s87")
++S_PAIR = 88
++TDM_W0 = (0x47510000, 0x87110000, 0x07510000)  # k_mla_fwd.hip W0_A / W0_B / W0_V
++TDM_TILE0 = (128, 64, 128)
++STG_B, K_B_OFF, NB = 43008, 25600, 64
+ 
+ # Scheduler model (cycles)
+ DS_LAT = 290  # LDS load-to-use latency
+@@ -67,8 +81,10 @@
+ WORDER = ("PV0p", "PV1p", "PV2p", "PV3p", "QK0", "QK1", "QK2", "QK3")  # the in-order WMMA stream, by node tag
+ # latency of a dependence edge by producer kind (it ranks nodes by critical path), and result latency by kind
+ # in the issue model
+-LAT = {"WMMA": 20, "VALU": 5, "TRANS": 8, "PERM": 8, "DS": DS_LAT, "SALU": 2, "RESC": 2, "RARE": 2}
+-SLOT_LAT = {"WMMA": 20, "VALU": 3, "TRANS": 8, "PERM": 6, "SALU": 2, "RESC": 2, "RARE": 2}
++LAT = {"WMMA": 20, "VALU": 5, "TRANS": 8, "PERM": 8, "DS": DS_LAT, "SALU": 2, "RESC": 2, "RARE": 2, "TDM": 2,
++       "BARW": 40}
++SLOT_LAT = {"WMMA": 20, "VALU": 3, "TRANS": 8, "PERM": 6, "SALU": 2, "RESC": 2, "RARE": 2, "TDM": 2, "BARW": 40}
++BARW_LAT = 40  # modelled cycles from a barrier wait to the reads it releases
+ GROUP_EDGES = True  # build.py --no-group-edges: the V / Q(3) reads may go anywhere the dependences allow
+ # build.py --resc: "always" -- O *= corr on every tile (corr is exactly 1 when m did not move); "branch" -- per q tile a
+ # wave-uniform branch around its 32 v_pk_mul (FlyDSL's _rescale_if: taken only when S_ANY[i] says m moved; skipping
+@@ -117,8 +133,13 @@
+         self.m = [take(1, 1) for _ in range(QT)]
+         self.d = [take(1, 1) for _ in range(QT)]
+         self.cc = take(2)  # (c, c)
+-        self.qa, self.qb = take(1, 1), take(1, 1)  # Q fragment bases of q tiles 0, 1 and 2, 3
++        if LOOP:  # the Q fragment bases are the INIT / LOOP markers' own operands (set per region)
++            self.qa = self.qb = None
++        else:
++            self.qa, self.qb = take(1, 1), take(1, 1)  # Q fragment bases of q tiles 0, 1 and 2, 3
+         self.dl = [None] + [take(1, 1) for _ in range(3)]  # mask bound of q tile i: dl + 64 i
++        if LOOP:  # this tile's K / V bases (a diagonal tile's dl goes to dl[1]: D0 needs no dl[k], D1..3 no dl)
++            self.kb, self.vb = take(1, 1), take(1, 1)
+         self.corr = [take(2) for _ in range(QT)]  # (corr, unused): packed ops broadcast the low half
+         self.mn = [take(2) for _ in range(QT)]  # (m', unused)
+         if RESC == "ool":  # the running max in place: the pk_fma's src2 pair (mn) holds it
+@@ -234,7 +255,7 @@
+     (vdst, vaddr), s_mov / s_cmp / s_cselect, v_cmp_*_e64 with an SGPR destination, and VALU / WMMA ops whose
+     first operand is their only destination and that read no implicit operand."""
+     n = Node(text, kind, tag)
+-    if kind == "BAR":
++    if kind in ("BAR", "BARW"):
+         return n
+     if kind == "RARE":  # "HKRARE i o corr m sneed lmx c sc0 sc1 ...": the out-of-line rare path of q tile i
+         f = text.split()
+@@ -260,6 +281,13 @@
+         n.sdefs, n.suses = set(_sregs(ops[0])), {"scc"}
+     elif mn.startswith("s_mov"):
+         n.sdefs, n.suses = set(_sregs(ops[0])), set(_sregs(ops[1]))
++    elif mn.startswith("tensor_load_to_lds"):
++        n.suses = set(_sregs(ops[0])) | set(_sregs(ops[1]))
++    elif mn.startswith("s_"):  # other SALU: the first operand is the destination; scc unless it is known not to
++        n.sdefs = set(_sregs(ops[0]))
++        if not mn.startswith(("s_mul_i32", "s_add_nc_u64", "s_bitset1_b32")):
++            n.sdefs.add("scc")
++        n.suses = {r for o in ops[1:] for r in _sregs(o)}
+     elif mn.startswith("v_"):
+         if mn.startswith("v_cmp"):
+             n.sdefs = set(_sregs(ops[0]))
+@@ -375,9 +403,10 @@
+             return (not 0 <= o <= 8 or o in (2, 3, 6, 7)) and t != trans_at + 1 and t > perm_busy
+         if k == "PERM":
+             return o >= 8 and t != trans_at + 1 and t > perm_busy
+-        if k == "DS":
+-            return o != 0 and t >= ds_next and len(issued_ds) - retired_ds < DS_MAX
+-        if k in ("SALU", "RESC", "RARE"):
++        if k == "DS":  # loads still in flight: not retired by a consumer and not yet complete in the model
++            inflight = sum(1 for p in issued_ds[retired_ds:] if ds_done[p] > t)
++            return o != 0 and t >= ds_next and inflight < DS_MAX
++        if k in ("SALU", "RESC", "RARE", "TDM", "BARW"):
+             return o != 0 and t >= salu_free and (k != "RESC" or t > perm_busy)
+         return o != 0
+ 
+@@ -428,7 +457,7 @@
+             trans_at = t
+         elif k == "PERM":
+             perm_busy = t + 1
+-        elif k == "SALU":
++        elif k in ("SALU", "TDM", "BARW"):
+             salu_free = t + 2
+         elif k == "RARE":  # s_cmp + a not-taken s_cbranch
+             salu_free = t + RARE_COST
+@@ -498,8 +527,11 @@
+         out.append(f"v_mov_b32_e32 {vr(L.d[i])}, 0")
+     out.append(f"v_mov_b32_e32 {vr(L.cc)}, {ops['c2']}")
+     out.append(f"v_mov_b32_e32 {vr(L.cc + 1)}, {ops['c2']}")
+-    out.append(f"v_mov_b32_e32 {vr(L.qa)}, {vr(ops['qa'])}")
+-    out.append(f"v_mov_b32_e32 {vr(L.qb)}, {vr(ops['qb'])}")
++    if LOOP:
++        L.qa, L.qb = ops["qa"], ops["qb"]
++    else:
++        out.append(f"v_mov_b32_e32 {vr(L.qa)}, {vr(ops['qa'])}")
++        out.append(f"v_mov_b32_e32 {vr(L.qb)}, {vr(ops['qb'])}")
+     out += [f"v_mov_b32_e32 {vr(r)}, 0" for r in range(L.o, L.o + 256)]
+     # the resident Q fragments of q tiles 1, 2: the Q staging area does not change until the block's last tile
+     out += [q_load(L, i, ks, h) for i in (1, 2) for ks in range(NKS) for h in range(2)]
+@@ -697,8 +729,8 @@
+                 )
+ 
+ 
+-def tile_nodes(L, ops, k=None):
+-    nodes = _tile_nodes(L, ops, k)
++def tile_nodes(L, ops, k=None, pre=None, post=None):
++    nodes = _tile_nodes(L, ops, k, pre, post)
+     if "nolds" not in ABL:
+         return nodes
+     keep = [nd for nd in nodes if nd.kind != "DS"]
+@@ -707,24 +739,30 @@
+     return build_dag(keep)
+ 
+ 
+-def _tile_nodes(L, ops, k=None):
++def _tile_nodes(L, ops, k=None, pre=None, post=None):
+     """The nodes of a TILE region in program order. ops: kb / vb (VGPRs: the K / V fragment bases of the
+     stage), c2 (SGPR: c), and for a diagonal tile dl (VGPR: q + Skv - Sq - kv0 - 8 (lane / 16) of q tile 0).
+     k: None for TILE_C, else the diagonal tile k (q tiles below k skipped, the mask on q tile k only)."""
+     first = 0 if k is None else k
+     nodes, add = node_list()
+-    add(f"s_mov_b32 {S_SEL}, 0x{SEL_LO:x}", "SALU", "sel")
+-    for r in S_C:
+-        add(f"s_mov_b32 {r}, {ops['c2']}", "SALU", "c2")
++    if pre is None:
++        add(f"s_mov_b32 {S_SEL}, 0x{SEL_LO:x}", "SALU", "sel")
++        for r in S_C:
++            add(f"s_mov_b32 {r}, {ops['c2']}", "SALU", "c2")
++    else:  # LOOP: S_SEL / S_C set once in the prologue; the tile's scalars, TDM ops and fragment bases first
++        pre(add)
+     # the K (k-step major: FlyDSL's issue order) and Q(0) reads first; the prefix reads neither K nor qbuf[0]
+-    loads = [
+-        add(k_load(L, ops["kb"], j, ks, h), "DS", f"K{j}.{ks}.{h}")
+-        for ks in range(NKS)
+-        for j in range(NKV)
+-        for h in range(2)
+-    ]
+-    if first == 0:
+-        loads += [add(q_load(L, 0, ks, h), "DS", f"Q0.{ks}.{h}") for ks in range(NKS) for h in range(2)]
++    # (--kprefetch: the previous tile, or the LOOP prologue, read them)
++    loads = []
++    if post is None:
++        loads = [
++            add(k_load(L, ops["kb"], j, ks, h), "DS", f"K{j}.{ks}.{h}")
++            for ks in range(NKS)
++            for j in range(NKV)
++            for h in range(2)
++        ]
++        if first == 0:
++            loads += [add(q_load(L, 0, ks, h), "DS", f"Q0.{ks}.{h}") for ks in range(NKS) for h in range(2)]
+     prefix_nodes(L, add, c_sgpr=True)
+     for i in range(first):  # the next prefix must be a no-op for the q tiles this body skips
+         if i < 2:
+@@ -734,7 +772,7 @@
+         else:
+             for r in range(L.S(i, 0), L.S(i, 0) + 32):
+                 add(f"v_mov_b32_e32 {vr(r)}, 0x{NEG_INF:x}", "VALU", f"skip{i}")
+-    if k:
++    if k and pre is None:  # (LOOP: slot_nodes computed dl[k])
+         add(f"v_add_nc_u32_e32 {vr(L.dl[k])}, {64 * k}, {vr(ops['dl'])}", "VALU", "dl")
+     # the V^T fragments, after the prefix's PV WMMAs have read the previous tile's
+     loads += [
+@@ -761,9 +799,23 @@
+     # the arrive, after every LDS read of the region and one LDS latency after the last (its s_wait_dscnt 0
+     # then does not stall); no LDS read follows it, as the next block's Q may then overwrite the staging area
+     bar = add("s_barrier_signal -1", "BAR", "arrive")
++    tail = []
++    if post is not None:  # the barrier wait and the next tile's reads
++        n0 = len(nodes)
++        post(add)
++        tail = nodes[n0:]
+     build_dag(nodes)
+     for nd in loads:
+         add_order(nodes, nd.idx, bar.idx, DS_LAT)
++    for nd in nodes:
++        if nd.kind == "TDM":
++            add_order(nodes, nd.idx, bar.idx)
++    for nd in tail:
++        if nd.kind == "BARW":
++            add_order(nodes, bar.idx, nd.idx)
++            for nd2 in tail:
++                if nd2.kind == "DS":
++                    add_order(nodes, nd.idx, nd2.idx, BARW_LAT)
+     # an LDS load that overwrites a source of a WMMA in flight waits for va_vdst(0) (expert mode, more than
+     # one VALU class in flight): the V reads go after the last prefix PV WMMA, the Q(3) reads after the last
+     # QK(0) WMMA, so each group waits once instead of once per buffer slice
+@@ -775,7 +827,8 @@
+         if nd.tag.startswith("Q3") and "QK0" in last:
+             add_order(nodes, last["QK0"], nd.idx)
+     # the first read goes before the first WMMA: the va_vdst(0) wait at the region entry then drains no WMMA
+-    add_order(nodes, loads[0].idx, min(nd.idx for nd in nodes if nd.kind == "WMMA"))
++    if post is None:
++        add_order(nodes, loads[0].idx, min(nd.idx for nd in nodes if nd.kind == "WMMA"))
+     return nodes
+ 
+ 
+@@ -836,3 +889,166 @@
+         f"v_mul_f32_e32 {vr(ops['lse'])}, 0x{LN2:x}, {vr(s)}",
+     ]
+     return out
++
++
++# ------------------------------------------------------------------------------------------------------------
++# LOOP (HKGEN2, build.py --loop): every tile of a block in generated code
++# ------------------------------------------------------------------------------------------------------------
++def tdm_op(ops, i):
++    """The i-th SGPR of the LOOP marker's tdm operand (k_mla_fwd.hip): 0, 1 K tile 0 bytes; 2, 3 V; 4, 5 bytes per K /
++    V tile; 6, 7 K / V row strides (elements); 8 Skv; 9 n; 10 ncc; 11 sb; 12 LDS of stage 0; 13 cnt0."""
++    base = int(re.match(r"s\[(\d+):", ops["tdm"]).group(1))
++    return f"s{base + i}"
++
++
++def loop_prologue(ops, L=None):
++    """S_SEL, (c, c), the per-block words of the 3 TDM descriptors, t = 0."""
++    out = [f"s_mov_b32 {S_SEL}, 0x{SEL_LO:x}"] + [f"s_mov_b32 {r}, {ops['c2']}" for r in S_C]
++    for o in range(3):
++        g0, g1 = S_G0[o], S_G1[o]
++        out += [
++            f"s_mov_b32 s{g0}, {tdm_op(ops, 13)}",
++            f"s_mov_b32 s{g1}, 0x{TDM_W0[o]:x}",
++            f"s_mov_b32 s{g1 + 1}, 0xffff0000",
++            f"s_mov_b32 s{g1 + 5}, {tdm_op(ops, 6 if o < 2 else 7)}",
++            f"s_mov_b32 s{g1 + 6}, 0",
++            f"s_mov_b32 s{g1 + 7}, 0",
++        ]
++    out += [f"s_mov_b32 {S_T}, 0", f"s_mov_b32 s{S_PAIR + 1}, 0"]
++    if PREFETCH:  # tile 0's fragment bases and its K / Q(0) reads (B_0 made its stage visible)
++        nodes, add = node_list()
++        stage_bases(L, ops, add, 0)
++        next_reads(L, add)
++        out += [nd.text for nd in nodes]
++    return out
++
++
++def slot_nodes(L, ops, add, diag=None):
++    """Tile t's scalars and ops: its fragment bases (stage (sb + t) & 3), [its dl], and ring slot j = t + 3 -- the
++    clamped tile jc = min(j, n - 1), 64 or 1 rows (j < n), tdim1 = Skv - 64 jc, the stage of j, the global bytes
++    tile 0 + jc * bytes per tile -- and its 3 TDM ops."""
++    T0, T1, T2 = S_TMP
++    n, skv, sb, lds0 = tdm_op(ops, 9), tdm_op(ops, 8), tdm_op(ops, 11), tdm_op(ops, 12)
++    pr = f"s[{S_PAIR}:{S_PAIR + 1}]"
++    if not PREFETCH:
++        add(f"s_add_co_i32 {T0}, {sb}, {S_T}", "SALU", "stg")
++        add(f"s_and_b32 {T0}, {T0}, 3", "SALU", "stg")
++        add(f"s_mul_i32 {T0}, {T0}, {STG_B}", "SALU", "stg")
++        add(f"v_add_nc_u32_e32 {vr(L.kb)}, {T0}, {vr(ops['kb'])}", "VALU", "stg")
++        add(f"v_add_nc_u32_e32 {vr(L.vb)}, {T0}, {vr(ops['vb'])}", "VALU", "stg")
++    if diag is not None:  # the mask bound of q tile k: dl0 - 64 t + 64 k (D0: into dl[1], its tile_nodes' dl)
++        add(f"s_lshl_b32 {T1}, {S_T}, 6", "SALU", "dl")
++        if diag:
++            add(f"s_sub_co_i32 {T1}, {T1}, {64 * diag}", "SALU", "dl")
++        add(f"v_subrev_nc_u32_e32 {vr(L.dl[max(diag, 1)])}, {T1}, {vr(ops['dl'])}", "VALU", "dl")
++    add(f"s_add_co_i32 {T0}, {S_T}, 3", "SALU", "slot")
++    add(f"s_add_co_i32 {T1}, {n}, -1", "SALU", "slot")
++    add(f"s_min_i32 {T1}, {T0}, {T1}", "SALU", "slot")
++    add(f"s_cmp_lt_i32 {T0}, {n}", "SALU", "slot")
++    add(f"s_cselect_b32 {T2}, {NB}, 1", "SALU", "slot")
++    for o in range(3):
++        add(f"s_mov_b32 s{S_G1[o] + 4}, {T2}", "SALU", "slot")
++    add(f"s_lshl_b32 {T2}, {T1}, 6", "SALU", "slot")
++    add(f"s_sub_co_i32 {T2}, {skv}, {T2}", "SALU", "slot")  # tdim1
++    for o in range(3):
++        add(f"s_lshr_b32 s{S_G1[o] + 3}, {T2}, 16", "SALU", "slot")
++        add(f"s_or_b32 s{S_G1[o] + 3}, s{S_G1[o] + 3}, 0x{TDM_TILE0[o] << 16:x}", "SALU", "slot")
++    add(f"s_lshl_b32 {T2}, {T2}, 16", "SALU", "slot")
++    add(f"s_or_b32 {T2}, {T2}, 0x7fff", "SALU", "slot")
++    for o in range(3):
++        add(f"s_mov_b32 s{S_G1[o] + 2}, {T2}", "SALU", "slot")
++    add(f"s_add_co_i32 {T0}, {sb}, {T0}", "SALU", "slot")
++    add(f"s_and_b32 {T0}, {T0}, 3", "SALU", "slot")
++    add(f"s_mul_i32 {T0}, {T0}, {STG_B}", "SALU", "slot")
++    add(f"s_add_co_i32 {T0}, {lds0}, {T0}", "SALU", "slot")
++    add(f"s_mov_b32 s{S_G0[0] + 1}, {T0}", "SALU", "slot")
++    add(f"s_add_co_i32 s{S_G0[1] + 1}, {T0}, 0x100", "SALU", "slot")
++    add(f"s_add_co_i32 s{S_G0[2] + 1}, {T0}, 0x{K_B_OFF:x}", "SALU", "slot")
++    add(f"s_mul_i32 s{S_PAIR}, {T1}, {tdm_op(ops, 4)}", "SALU", "slot")
++    gk = int(tdm_op(ops, 0)[1:])
++    gv = int(tdm_op(ops, 2)[1:])
++    add(f"s_add_nc_u64 s[{S_G0[0] + 2}:{S_G0[0] + 3}], s[{gk}:{gk + 1}], {pr}", "SALU", "slot")
++    add(f"s_bitset1_b32 s{S_G0[0] + 3}, 31", "SALU", "slot")
++    add(f"s_add_nc_u64 s[{S_G0[1] + 2}:{S_G0[1] + 3}], s[{S_G0[0] + 2}:{S_G0[0] + 3}], 0x100", "SALU", "slot")
++    add(f"s_mul_i32 s{S_PAIR}, {T1}, {tdm_op(ops, 5)}", "SALU", "slot")
++    add(f"s_add_nc_u64 s[{S_G0[2] + 2}:{S_G0[2] + 3}], s[{gv}:{gv + 1}], {pr}", "SALU", "slot")
++    add(f"s_bitset1_b32 s{S_G0[2] + 3}, 31", "SALU", "slot")
++    for o in range(3):
++        add(f"tensor_load_to_lds s[{S_G0[o]}:{S_G0[o] + 3}], s[{S_G1[o]}:{S_G1[o] + 7}]", "TDM", "tdm")
++
++
++def stage_bases(L, ops, add, nxt):
++    """kb / vb of tile t + nxt (stage (sb + t + nxt) & 3)."""
++    T0 = S_TMP[0]
++    add(f"s_add_co_i32 {T0}, {tdm_op(ops, 11)}, {S_T}", "SALU", "stg")
++    if nxt:
++        add(f"s_add_co_i32 {T0}, {T0}, {nxt}", "SALU", "stg")
++    add(f"s_and_b32 {T0}, {T0}, 3", "SALU", "stg")
++    add(f"s_mul_i32 {T0}, {T0}, {STG_B}", "SALU", "stg")
++    add(f"v_add_nc_u32_e32 {vr(L.kb)}, {T0}, {vr(ops['kb'])}", "VALU", "stg")
++    add(f"v_add_nc_u32_e32 {vr(L.vb)}, {T0}, {vr(ops['vb'])}", "VALU", "stg")
++
++
++def next_reads(L, add, q0=True):
++    """K of the tile at kb (k-step major) and Q(0) into qbuf[0]."""
++    for ks in range(NKS):
++        for j in range(NKV):
++            for h in range(2):
++                add(k_load(L, L.kb, j, ks, h), "DS", f"nK{j}.{ks}.{h}")
++    if q0:
++        for ks in range(NKS):
++            for h in range(2):
++                add(q_load(L, 0, ks, h), "DS", f"nQ0.{ks}.{h}")
++
++
++def loop_tail(L, ops, last):
++    """--kprefetch: a tile's tail after its arrive -- the barrier wait, then (unless it is the block's last tile)
++    the next tile's fragment bases and K / Q(0) reads."""
++    def post(add):
++        add("s_barrier_wait -1", "BARW", "wait")
++        if not last:
++            stage_bases(L, ops, add, 1)
++            next_reads(L, add)
++    return post
++
++
++def loop_body(L, ops, k=None):
++    """(texts, modelled cycles) of one tile of the LOOP: the scheduled tile (slot scalars, TDM, fragment bases, the
++    region's prefix + body, the arrive), then the barrier wait."""
++    L.qa, L.qb = ops["qa"], ops["qb"]
++    o = dict(ops, kb=L.kb, vb=L.vb, c2=S_C[0])
++    if k is not None:
++        o["dl"] = L.dl[1]
++    post = loop_tail(L, ops, k == 3) if PREFETCH else None
++    nodes = tile_nodes(L, o, k, pre=lambda add: slot_nodes(L, ops, add, k), post=post)
++    order, cycles = schedule(nodes)
++    out = []
++    for nd in order:
++        if nd.kind == "BAR":
++            out += ["s_wait_dscnt 0x0", "s_wait_tensorcnt 0x6"]
++        out.append(nd.text)
++    return out + ([] if PREFETCH else ["s_barrier_wait -1"]), cycles
++
++
++def region_loop(L, ops, lp):
++    """(blocks, modelled cycles): blocks = [(name, label, texts, successors)] in layout order: RB (prologue) -> H
++    (t < ncc ? U : D0h); U (a tile below the diagonal; t += 1, back to U while t < ncc); D<k>h (t < n ? D<k>b : X),
++    D<k>b (diagonal tile k; t += 1); X (the exit, an empty block)."""
++    ncc, n = tdm_op(ops, 10), tdm_op(ops, 9)
++    cyc = {}
++    tu, cyc["U"] = loop_body(L, ops)
++    blocks = [
++        ("RB", loop_prologue(ops, L), ["H"]),
++        ("H", [f"s_cmp_ge_i32 {S_T}, {ncc}", f"s_cbranch_scc1 {lp}_D0h"], ["U", "D0h"]),
++        ("U", tu + [f"s_add_co_i32 {S_T}, {S_T}, 1", f"s_cmp_lt_i32 {S_T}, {ncc}", f"s_cbranch_scc1 {lp}_U"],
++         ["U", "D0h"]),
++    ]
++    for kk in range(4):
++        td, cyc[f"D{kk}"] = loop_body(L, ops, kk)
++        nxt = f"D{kk + 1}h" if kk < 3 else "X"
++        blocks += [
++            (f"D{kk}h", [f"s_cmp_ge_i32 {S_T}, {n}", f"s_cbranch_scc1 {lp}_X"], [f"D{kk}b", "X"]),
++            (f"D{kk}b", td + [f"s_add_co_i32 {S_T}, {S_T}, 1"], [nxt]),
++        ]
++    blocks.append(("X", [], []))
++    return [(name, f"{lp}_{name}", texts, succ) for name, texts, succ in blocks], cyc

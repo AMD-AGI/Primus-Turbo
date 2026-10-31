@@ -1,0 +1,39 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 15:38:38.632430821 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 15:41:49.854299360 +0000
+@@ -115,6 +115,11 @@
+ #ifndef HKGEN_FTILE
+ #define HKGEN_FTILE 0
+ #endif
++// HKGEN_ORES 1: the epilogue's per-q-tile O buffer resources with 32-bit bounds (O is below 2 GiB: q is, and O has
++// 128 of q's 192 columns) instead of a 64-bit clamp (64-bit compares as VALU -> SGPR -> SALU chains)
++#ifndef HKGEN_ORES
++#define HKGEN_ORES 0
++#endif
+ #if HKGEN_FTILE && (HKGEN2 || HKGEN_INCDESC)
+ #error "HKGEN_FTILE needs the shell's tile loop and the per-tile descriptors"
+ #endif
+@@ -886,6 +891,15 @@
+       const long long o_bytes = (long long)B_ * Sq_ * H_ * D_V * 2;
+       const unsigned rsb = (unsigned)H_ * (unsigned)(D_V * 2);  // bytes per q row
+       __amdgpu_buffer_rsrc_t r_o[QT];
++#if HKGEN_ORES
++      const unsigned long long off0 = (((unsigned long long)bb * Sq_ + q0) * H_ + hh) * (D_V * 2);
++      static_for<QT>([&](auto i) {
++        const bool ok = q0 + 64 * i < Sq_;
++        const unsigned offi = (unsigned)off0 + (unsigned)(64 * i) * rsb;
++        r_o[i] = rsrc((const unsigned char*)ka.O + (ok ? off0 + (unsigned long long)(64 * i) * rsb : 0ull),
++                      ok ? (int)((unsigned)o_bytes - offi) : 0);
++      });
++#else
+       static_for<QT>([&](auto i) {
+         const bool ok = q0 + 64 * i < Sq_;
+         const long long off = (((long long)bb * Sq_ + q0 + 64 * i) * H_ + hh) * (D_V * 2);
+@@ -894,6 +908,7 @@
+         const int nrec = ok ? (int)rem : 0;
+         r_o[i] = rsrc((const unsigned char*)ka.O + off2, nrec);
+       });
++#endif
+       const auto r_l = rsrc(ka.LSE, (int)min((long long)B_ * H_ * Sq_ * 4, 0x7FFFFFFFll));
+       const int ln = (int)__builtin_amdgcn_mbcnt_lo(~0u, (unsigned)(ncc >> 30));
+       const int hl = ln >> 4, rl = ln & 15, lt = ln >> 3, lk = ln & 7;

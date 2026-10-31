@@ -1,0 +1,39 @@
+{
+ "ladder": "mla_fwd2",
+ "results": [
+  {
+   "arm": "flydsl",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.64,
+    "lse": 145.86
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": null,
+   "bitwise": null
+  },
+  {
+   "arm": "f14a",
+   "shape": "toy",
+   "desc": "b1 sq384 skv384 hq16 hkv16 d192/128 causal sbhd",
+   "status": "PASS",
+   "snr": {
+    "o": 54.64,
+    "lse": 145.86
+   },
+   "finite": true,
+   "det": {
+    "o": true,
+    "lse": true
+   },
+   "bitwise_with": "flydsl",
+   "bitwise": true
+  }
+ ]
+}

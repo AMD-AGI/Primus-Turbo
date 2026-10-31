@@ -1,0 +1,120 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 14:10:06.899651738 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 14:10:39.201460206 +0000
+@@ -456,6 +456,8 @@
+                     help="no order edges grouping the V / Q(3) reads behind the last PV / QK(0) WMMA")
+     ap.add_argument("--kprefetch", action="store_true",
+                     help="(--loop) a tile reads the next tile's K and Q(0) right after its barrier wait")
++    ap.add_argument("--plan", type=int, default=1, choices=(1, 2),
++                    help="VGPR plan: 1 (E2's), 2 (the softmax's registers in one block: fewer MSB switches)")
+     ap.add_argument("--loop", action="store_true",
+                     help="HKGEN2: one generated LOOP region runs every tile of a block (TDM, barriers, tile counter)")
+     ap.add_argument("--resc", default="always", choices=("always", "branch", "ool"),
+@@ -482,6 +484,7 @@
+     G.GROUP_EDGES = not a.no_group_edges
+     G.RESC = a.resc
+     G.LOOP = a.loop
++    G.PLAN = a.plan
+     G.PREFETCH = a.kprefetch
+     if a.loop:
+         DEFINES.append("HKGEN2=1")
+@@ -536,7 +539,7 @@
+         "qb": L.qb,
+         "qbuf": L.qbuf,
+         "O": [L.o, L.o + 255],
+-        "V": [L.v, L.v + 127],
++        "V": [L.V(0, 0), L.V(7, 1) + 7],
+         "S": [L.s, L.s + 127],
+         "K": [L.k, L.k + 191],
+         "PR": [L.pr, L.pr + 63],
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 14:10:06.899629309 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 14:10:39.201258566 +0000
+@@ -64,6 +64,10 @@
+ # V), the tile index t, three temporaries and the pair (offset, 0) of the 64-bit address adds
+ LOOP_CLOBBERED = CLOBBERED | {f"s{i}" for i in range(48, 90)}
+ LOOP = False  # build.py --loop
++# build.py --plan 2: the softmax's registers in one 256-register block (fewer s_set_vgpr_msb switches): block 2 holds
++# S, the sum-tree leaves PR, the softmax scratch, (m', corr) pairs, m, d and dl; V is split over block 3 (d tiles
++# 0..3, after K) and block 0 (d tiles 4..7, after the Q fragments)
++PLAN = 1
+ PREFETCH = False  # build.py --kprefetch (with --loop): a tile reads the next tile's K and Q(0) after its barrier wait
+ S_G0 = (48, 52, 56)
+ S_G1 = (60, 68, 76)
+@@ -120,6 +124,9 @@
+     also V, P(0), P(1), S(2), S(3) and the resident Q fragments of q tiles 1, 2."""
+ 
+     def __init__(self, base):
++        if PLAN == 2:
++            self._plan2(base)
++            return
+         nxt = [base + (base % 2)]
+ 
+         def take(n, align=2):
+@@ -157,10 +164,57 @@
+         self.k = 768  # block 3: K[j][ks] = 768 + 48 j + 8 ks
+         self.pr = 960  #          PR: leaf x of q tile i at 960 + 2 x + (i % 2)
+ 
++    def _plan2(self, base):
++        if LOOP:
++            raise ValueError("--plan 2 does not support --loop")
++        nxt = [base + (base % 2)]
++
++        def take(n, align=2):
++            r = nxt[0] + ((-nxt[0]) % align)
++            nxt[0] = r + n
++            if nxt[0] > 256:
++                raise ValueError(f"block 0 overflows (base {base})")
++            return r
++
++        b2 = [704]
++
++        def take2(n, align=1):
++            r = b2[0] + ((-b2[0]) % align)
++            b2[0] = r + n
++            if b2[0] > 768:
++                raise ValueError("block 2 overflows")
++            return r
++
++        self.base = base
++        self.cc = take(2)
++        self.qa, self.qb = take(1, 1), take(1, 1)
++        self.tot = [take(1, 1) for _ in range(4)]
++        self.qbuf = [take(48, 8) for _ in range(3)]
++        self.vhi = take(64, 8)  # V[dt][kt] of d tiles 4..7
++        self.end0 = nxt[0]
++        self.s = 512  # block 2: S[i][j] = 512 + 32 i + 8 j
++        self.pr = 640  #          PR leaves
++        self.sm = [[take2(1) for _ in range(18)] for _ in range(2)]
++        self.mn = [take2(2, 2) for _ in range(QT)]
++        self.corr = [take2(2, 2) for _ in range(QT)]
++        self.m = [take2(1) for _ in range(QT)]
++        if RESC == "ool":
++            self.m = list(self.mn)
++        self.d = [take2(1) for _ in range(QT)]
++        self.dl = [None] + [take2(1) for _ in range(3)]
++        self.fin = [self.qbuf[0] + k for k in range(11)]
++        self.inv = self.qbuf[0] + 14
++        self.o = 256  # block 1
++        self.k = 768  # block 3: K, then V d tiles 0..3
++        self.vlo = 960
++        self.v = None
++
+     def O(self, i, dt):
+         return self.o + 64 * i + 8 * dt
+ 
+     def V(self, dt, kt):
++        if PLAN == 2:
++            return (self.vlo + 16 * dt if dt < 4 else self.vhi + 16 * (dt - 4)) + 8 * kt
+         return self.v + 16 * dt + 8 * kt
+ 
+     def S(self, i, j):
+@@ -538,7 +592,7 @@
+     # the first prefix is a no-op: S(2), S(3) = -inf; P(0), P(1) = 0; V = 0
+     out += [f"v_mov_b32_e32 {vr(r)}, 0x{NEG_INF:x}" for i in (2, 3) for r in range(L.S(i, 0), L.S(i, 0) + 32)]
+     out += [f"v_mov_b32_e32 {vr(L.P(i, kt) + e)}, 0" for i in (0, 1) for kt in range(2) for e in range(8)]
+-    out += [f"v_mov_b32_e32 {vr(r)}, 0" for r in range(L.v, L.v + 128)]
++    out += [f"v_mov_b32_e32 {vr(r)}, 0" for dt in range(NDT) for kt in range(2) for r in range(L.V(dt, kt), L.V(dt, kt) + 8)]
+     out.append("s_wait_dscnt 0x0")
+     return out
+ 

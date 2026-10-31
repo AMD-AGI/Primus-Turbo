@@ -1,0 +1,45 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 15:38:51.552703001 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 15:54:08.869961052 +0000
+@@ -324,6 +324,7 @@
+ 
+ 
+ WAIT_MERGE = 0  # --wait-merge W
++PAD_START = PAD_END = 0  # --pad-start / --pad-end N: N dead s_nop at the kernel's start (jumped over) / end
+ 
+ 
+ def merge_ds_waits(lines, window):
+@@ -521,6 +522,8 @@
+                     help="scheduler latency of a VALU-written SGPR read by SALU (fwdgen.SGPR_LAT; 0: off)")
+     ap.add_argument("--resc-cost", type=int, default=None, help="modelled cycles of a RESC block (fwdgen.RESC_COST)")
+     ap.add_argument("--wait-merge", type=int, default=0, help="merge each s_wait_dscnt with the next W - 1 of its block")
++    ap.add_argument("--pad-start", type=int, default=0, help="diagnostic: N dead s_nop at the kernel start")
++    ap.add_argument("--pad-end", type=int, default=0, help="diagnostic: N dead s_nop at the kernel end")
+     ap.add_argument("--ds-max", type=int, default=None, help="LDS loads in flight at most (fwdgen.DS_MAX, default 56)")
+     ap.add_argument("--lat", default=None,
+                     help="scheduler latencies KIND=N[,KIND=N...] for LAT and SLOT_LAT (e.g. WMMA=32,DS=330)")
+@@ -548,8 +551,9 @@
+     G.GROUP_EDGES = not a.no_group_edges
+     G.RESC = a.resc
+     G.SGPR_LAT = a.sgpr_lat
+-    global WAIT_MERGE
++    global WAIT_MERGE, PAD_START, PAD_END
+     WAIT_MERGE = a.wait_merge
++    PAD_START, PAD_END = a.pad_start, a.pad_end
+     if a.ds_max is not None:
+         G.DS_MAX = a.ds_max
+     if a.lat:
+@@ -707,6 +711,13 @@
+     for name, _, i, s0, s1 in sorted(markers, key=lambda m: -m[2]):
+         new[s0 + 1 : s1] = [new[i]] + regions[name]
+     new = B.set_vgpr_count(new, 1024)
++    if PAD_START or PAD_END:  # diagnostic layouts: dead s_nop padding at the kernel's start (jumped over) or end
++        k0 = next(k for k, x in enumerate(new) if x.startswith(f"{KERNEL}:"))
++        kend = next(k for k, x in enumerate(new) if x.startswith(".Lfunc_end0:"))
++        if PAD_END:
++            new[kend:kend] = ["\ts_nop 0"] * PAD_END
++        if PAD_START:
++            new[k0 + 1 : k0 + 1] = ["\ts_branch .LHKPAD"] + ["\ts_nop 0"] * PAD_START + [".LHKPAD:"]
+     spl = out / f"{KERNEL}.s"
+     spl.write_text("\n".join(new) + "\n")
+ 

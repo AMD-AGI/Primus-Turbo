@@ -1,0 +1,25 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 15:27:13.279480137 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 15:29:04.568442654 +0000
+@@ -522,6 +522,8 @@
+     ap.add_argument("--resc-cost", type=int, default=None, help="modelled cycles of a RESC block (fwdgen.RESC_COST)")
+     ap.add_argument("--wait-merge", type=int, default=0, help="merge each s_wait_dscnt with the next W - 1 of its block")
+     ap.add_argument("--ds-max", type=int, default=None, help="LDS loads in flight at most (fwdgen.DS_MAX, default 56)")
++    ap.add_argument("--lat", default=None,
++                    help="scheduler latencies KIND=N[,KIND=N...] for LAT and SLOT_LAT (e.g. WMMA=32,DS=330)")
+     ap.add_argument("--resc", default="always", choices=("always", "branch", "branch2", "ool"),
+                     help="O *= corr on every tile, under a per-q-tile wave-uniform branch (FlyDSL's _rescale_if), or "
+                          "the whole rescale decision and O *= corr out of line behind a not-taken branch")
+@@ -550,6 +552,12 @@
+     WAIT_MERGE = a.wait_merge
+     if a.ds_max is not None:
+         G.DS_MAX = a.ds_max
++    if a.lat:
++        for kv in a.lat.split(","):
++            kind, val = kv.split("=")
++            G.LAT[kind] = G.SLOT_LAT[kind] = int(val)
++            if kind == "DS":
++                G.DS_LAT = int(val)
+     if a.resc_cost is not None:
+         G.RESC_COST = a.resc_cost
+     G.LOOP = a.loop

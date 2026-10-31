@@ -1,0 +1,12 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 14:01:49.441595196 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 14:01:49.429752311 +0000
+@@ -920,6 +920,8 @@
+         stage_bases(L, ops, add, 0)
+         next_reads(L, add)
+         out += [nd.text for nd in nodes]
++    else:  # a known state at the loop's entry: the tile body's join then waits only for what its back edge leaves
++        out += ["s_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)", "s_wait_dscnt 0x0", "s_wait_xcnt 0x0"]
+     return out
+ 
+ 

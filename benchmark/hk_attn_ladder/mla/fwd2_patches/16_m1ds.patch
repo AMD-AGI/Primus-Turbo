@@ -1,0 +1,81 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 14:59:33.969716789 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 15:14:10.081248891 +0000
+@@ -458,10 +458,11 @@
+                     help="(--loop) a tile reads the next tile's K and Q(0) right after its barrier wait")
+     ap.add_argument("--msb-sched", type=int, default=0,
+                     help="scheduler: prefer candidates needing no MSB switch among deadlines in the same N-WMMA bucket")
+-    ap.add_argument("--issue", default="model1", choices=("model1", "hw"),
++    ap.add_argument("--issue", default="model1", choices=("model1", "m1ds", "hw"),
+                     help="the scheduler's issue model (fwdgen.ISSUE): model1, or hw (the ATT-measured one)")
+     ap.add_argument("--hw", default=None,
+-                    help="--issue hw parameters DS_BLOCK:DS_GAP:RESC:DS_LAT[:DSLIM] (default 4:4:30:290:0)")
++                    help="--issue hw parameters DS_BLOCK:DS_GAP:RESC:DS_LAT[:DSLIM] (default 4:4:30:290:0); m1ds: "
++                         "DS_BLOCK (and DS_RATE as the 2nd field)")
+     ap.add_argument("--plan", type=int, default=1, choices=(1, 2),
+                     help="VGPR plan: 1 (E2's), 2 (the softmax's registers in one block: fewer MSB switches)")
+     ap.add_argument("--loop", action="store_true",
+@@ -497,6 +498,8 @@
+         hw = [int(x) for x in a.hw.split(":")]
+         G.HW_DS_BLOCK, G.HW_DS_GAP, G.HW_RESC, G.DS_LAT = hw[:4]
+         G.HW_DSLIM = hw[4] if len(hw) > 4 else 0
++        if a.issue == "m1ds":
++            G.DS_RATE = hw[1]
+         G.LAT["DS"] = G.DS_LAT
+     G.PREFETCH = a.kprefetch
+     if a.loop:
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 14:59:33.969562659 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 15:14:10.081078901 +0000
+@@ -96,7 +96,8 @@
+ # HW_DS_BLOCK cycles later (an LDS one the next cycle); a WMMA issues HW_WMMA cycles after the previous WMMA at the
+ # earliest (XDL occupancy); a RESC block (s_cmp, SCC latency, the taken branch around it) holds the wave HW_RESC
+ # cycles. LDS loads complete in order, DS_LAT after issue and HW_DS_GAP after the previous load at the earliest.
+-ISSUE = "model1"
++ISSUE = "model1"  # "m1ds": model1, but an LDS op holds the next non-LDS issue (WMMA included) HW_DS_BLOCK cycles, and
++                  # an LDS op that would push a ready WMMA past its cadence waits
+ HW_DS_BLOCK = 4
+ HW_DS_GAP = 4
+ HW_RESC = 30
+@@ -484,6 +485,7 @@
+     issued_ds, retired_ds, last_done = [], 0, 0
+     out = []
+     t, last_w, wk, trans_at, perm_busy, salu_free, ds_next, done = 0, -100, 0, -100, -1, 0, 0, 0
++    ds_block = 0
+     mreq = [msb_req(nd) for nd in nodes] if MSB_BUCKET else None
+     mode = [None, None, None, None]
+ 
+@@ -494,6 +496,8 @@
+         k = nodes[i].kind
+         if earliest[i] > t:
+             return False
++        if ISSUE == "m1ds" and k != "DS" and t < ds_block:
++            return False
+         o = t - last_w
+         if k in ("VALU", "TRANS"):
+             return (not 0 <= o <= 8 or o in (2, 3, 6, 7)) and t != trans_at + 1 and t > perm_busy
+@@ -512,10 +516,14 @@
+         perms = [i for i in ready if nodes[i].kind == "PERM" and avail(i)]
+         if perms:
+             pick = max(perms, key=lambda i: (-deadline[i], cp[i], -i))
+-        elif nw is not None and nw in ready and earliest[nw] <= t and t >= last_w + 8 and t > perm_busy:
++        elif nw is not None and nw in ready and earliest[nw] <= t and t >= last_w + 8 and t > perm_busy and (
++            ISSUE != "m1ds" or t >= ds_block
++        ):
+             pick = nw
+         else:
+             cand = [i for i in ready if nodes[i].kind != "WMMA" and avail(i)]
++            if ISSUE == "m1ds" and nw is not None and nw in ready and earliest[nw] <= last_w + 8:
++                cand = [i for i in cand if nodes[i].kind != "DS" or t + HW_DS_BLOCK <= last_w + 8]
+             if cand:
+                 o = t - last_w
+                 if o in (2, 3, 6, 7):
+@@ -546,6 +554,7 @@
+             ds_done[pick] = last_done
+             issued_ds.append(pick)
+             ds_next = t + DS_RATE
++            ds_block = t + HW_DS_BLOCK
+         elif k == "BAR":
+             retired_ds = len(issued_ds)
+         for p, _ in nd.preds:
+Binary files a/gfx1250_mla/tools/fwdgen/__pycache__/fwdgen.cpython-312.pyc and b/gfx1250_mla/tools/fwdgen/__pycache__/fwdgen.cpython-312.pyc differ

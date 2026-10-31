@@ -1,0 +1,25 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 13:46:52.814763032 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 13:46:52.827363811 +0000
+@@ -335,6 +335,9 @@
+                          "the whole rescale decision and O *= corr out of line behind a not-taken branch")
+     ap.add_argument("--resc-threshold", type=float, default=None,
+                     help="rescale threshold in log2 units (default log2 e: FlyDSL's, bitwise); e.g. 8 (FA4)")
++    ap.add_argument("--worder", default=None,
++                    help="the TILE regions' WMMA stream order, comma-separated tags (default PV0p,PV1p,PV2p,PV3p,"
++                         "QK0,QK1,QK2,QK3); a tag of a q tile a region does not run is skipped")
+     ap.add_argument("--abl", action="append", default=[], choices=("nosoft", "nolds"),
+                     help="timing-only ablation (wrong results)")
+     ap.add_argument("-D", dest="defines", action="append", default=[],
+@@ -347,6 +350,11 @@
+     G.GROUP_EDGES = not a.no_group_edges
+     G.RESC = a.resc
+     G.ABL = set(a.abl)
++    if a.worder:
++        tags = tuple(a.worder.split(","))
++        if sorted(tags) != sorted(G.WORDER):
++            raise SystemExit(f"--worder must permute {G.WORDER}")
++        G.WORDER = tags
+     if a.resc_threshold is not None:
+         import struct
+         G.THRESH = struct.unpack("<I", struct.pack("<f", a.resc_threshold))[0]

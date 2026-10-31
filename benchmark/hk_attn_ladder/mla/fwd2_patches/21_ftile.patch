@@ -1,0 +1,150 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 15:30:11.367747221 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 15:38:38.632430821 +0000
+@@ -109,6 +109,15 @@
+ #ifndef HKGEN_INCDESC
+ #define HKGEN_INCDESC 0
+ #endif
++// HKGEN_FTILE 1: a block whose tile 0 is below the diagonal (ncc > 0) runs it as TILE_F -- the block's set-up (INIT's
++// m / d / O / constants / resident Q) and tile 0's body without the no-op prefix INIT prepares for TILE_C -- and the
++// TILE_C loop starts at tile 1; a block without such a tile runs INIT as before
++#ifndef HKGEN_FTILE
++#define HKGEN_FTILE 0
++#endif
++#if HKGEN_FTILE && (HKGEN2 || HKGEN_INCDESC)
++#error "HKGEN_FTILE needs the shell's tile loop and the per-tile descriptors"
++#endif
+ #if HKGEN_XBLK && (HKGEN_TICKET || HKGEN2)
+ #error "HKGEN_XBLK needs the static schedule and the shell's tile loop"
+ #endif
+@@ -633,7 +642,10 @@
+       });
+     };
+ #else
+-    asm volatile("; HKGEN INIT qa=%0 qb=%1 c2=%2" ::"v"(qa), "v"(qb2), "s"(c2) : HKGEN_CLOBBERS);
++#if HKGEN_FTILE
++    if (ncc == 0)
++#endif
++      asm volatile("; HKGEN INIT qa=%0 qb=%1 c2=%2" ::"v"(qa), "v"(qb2), "s"(c2) : HKGEN_CLOBBERS);
+ #endif
+ #if HKGEN_PROBE
+     PR_PUT(s, 2, PR_CYC());
+@@ -676,6 +688,16 @@
+ #else
+     // ---- tiles [0, ncc): below the diagonal, no mask ----------------------------------------------------------------
+     int t = 0;  // outside the for statement: the for-init form compiles to another .s (asm_input_sha256)
++#if HKGEN_FTILE && !HKGEN_REF
++    if (ncc > 0) {  // tile 0: TILE_F
++      issue_slot(3, n, sb, gk0, gv0);
++      const unsigned st = lds0 + (unsigned)((sb & (NSTG - 1)) * STG_B);
++      asm volatile("; HKGEN TILE_F kb=%0 vb=%1 c2=%2 qa=%3 qb=%4" ::"v"(st + k_lane), "v"(st + K_B + v_lane), "s"(c2),
++                   "v"(qa), "v"(qb2) : HKGEN_CLOBBERS);
++      bar_wait();  // B_1
++      t = 1;
++    }
++#endif
+ #if HKGEN_INCDESC
+     // ring slot t + 3: its tile (or, past tile n - 1, a 1-row copy of it), K / V addresses and stage, carried
+     unsigned long long gki = gk0 + 2ull * (unsigned long long)(min(3, n - 1) * NB) * krow;
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 15:29:04.568442654 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 15:38:51.552703001 +0000
+@@ -609,6 +609,8 @@
+     markers = parse_markers(shell)
+     names = [m[0] for m in markers]
+     want = MARKERS_LOOP if G.LOOP else MARKERS
++    if "HKGEN_FTILE=1" in DEFINES:
++        want = (*want, "TILE_F")
+     if sorted(names) != sorted(want):
+         raise RuntimeError(f"markers {names}, want {list(want)}")
+     hi, wmma_trans, scalars = scan_shell(ins)
+@@ -675,7 +677,9 @@
+             k = None
+             if name.startswith("TILE_D"):
+                 k, o["dl"] = int(name[-1]), vfirst(ops["dl"])
+-            texts, cycles[name] = G.region_tile(L, o, k)
++            if name == "TILE_F":
++                o["qa"], o["qb"] = vfirst(ops["qa"]), vfirst(ops["qb"])
++            texts, cycles[name] = G.region_tile(L, o, k, ftile=name == "TILE_F")
+         else:
+             if vcount(ops["o"]) != 32 or vcount(ops["lse"]) != 1:
+                 raise RuntimeError(f"{name}: unexpected output operands {ops}")
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 15:21:54.092434627 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 15:38:51.552559231 +0000
+@@ -980,8 +980,8 @@
+                 )
+ 
+ 
+-def tile_nodes(L, ops, k=None, pre=None, post=None):
+-    nodes = _tile_nodes(L, ops, k, pre, post)
++def tile_nodes(L, ops, k=None, pre=None, post=None, ftile=False):
++    nodes = _tile_nodes(L, ops, k, pre, post, ftile)
+     if "nolds" not in ABL:
+         return nodes
+     keep = [nd for nd in nodes if nd.kind != "DS"]
+@@ -990,12 +990,24 @@
+     return build_dag(keep)
+ 
+ 
+-def _tile_nodes(L, ops, k=None, pre=None, post=None):
++def _tile_nodes(L, ops, k=None, pre=None, post=None, ftile=False):
+     """The nodes of a TILE region in program order. ops: kb / vb (VGPRs: the K / V fragment bases of the
+     stage), c2 (SGPR: c), and for a diagonal tile dl (VGPR: q + Skv - Sq - kv0 - 8 (lane / 16) of q tile 0).
+-    k: None for TILE_C, else the diagonal tile k (q tiles below k skipped, the mask on q tile k only)."""
++    k: None for TILE_C, else the diagonal tile k (q tiles below k skipped, the mask on q tile k only).
++    ftile (TILE_F, ops also qa / qb): the block's first tile -- INIT's set-up (m, d, (c, c), the Q bases, O = 0, the
++    resident Q fragments) as scheduled nodes, then the body; no prefix (nothing precedes tile 0)."""
+     first = 0 if k is None else k
+     nodes, add = node_list()
++    if ftile:
++        for i in range(QT):
++            add(f"v_mov_b32_e32 {vr(L.m[i])}, 0x{BIG_NEG:x}", "VALU", "init")
++            add(f"v_mov_b32_e32 {vr(L.d[i])}, 0", "VALU", "init")
++        add(f"v_mov_b32_e32 {vr(L.cc)}, {ops['c2']}", "VALU", "init")
++        add(f"v_mov_b32_e32 {vr(L.cc + 1)}, {ops['c2']}", "VALU", "init")
++        add(f"v_mov_b32_e32 {vr(L.qa)}, {vr(ops['qa'])}", "VALU", "init")
++        add(f"v_mov_b32_e32 {vr(L.qb)}, {vr(ops['qb'])}", "VALU", "init")
++        for r in range(L.o, L.o + 256):
++            add(f"v_mov_b32_e32 {vr(r)}, 0", "VALU", "init")
+     if pre is None:
+         add(f"s_mov_b32 {S_SEL}, 0x{SEL_LO:x}", "SALU", "sel")
+         for r in S_C:
+@@ -1014,7 +1026,10 @@
+         ]
+         if first == 0:
+             loads += [add(q_load(L, 0, ks, h), "DS", f"Q0.{ks}.{h}") for ks in range(NKS) for h in range(2)]
+-    prefix_nodes(L, add, c_sgpr=True)
++    if ftile:  # the resident Q fragments of q tiles 1, 2 (INIT's)
++        loads += [add(q_load(L, i, ks, h), "DS", f"Q{i}.{ks}.{h}") for i in (1, 2) for ks in range(NKS) for h in range(2)]
++    else:
++        prefix_nodes(L, add, c_sgpr=True)
+     for i in range(first):  # the next prefix must be a no-op for the q tiles this body skips
+         if i < 2:
+             for kt in range(2):
+@@ -1071,9 +1086,9 @@
+     # one VALU class in flight): the V reads go after the last prefix PV WMMA, the Q(3) reads after the last
+     # QK(0) WMMA, so each group waits once instead of once per buffer slice
+     last = {nd.tag: nd.idx for nd in nodes if nd.kind == "WMMA"}
+-    lpv = max(last[f"PV{i}p"] for i in range(QT))
++    lpv = max(last[f"PV{i}p"] for i in range(QT)) if not ftile else None
+     for nd in loads if GROUP_EDGES else ():
+-        if nd.tag.startswith("V"):
++        if nd.tag.startswith("V") and lpv is not None:
+             add_order(nodes, lpv, nd.idx)
+         if nd.tag.startswith("Q3") and "QK0" in last:
+             add_order(nodes, last["QK0"], nd.idx)
+@@ -1083,9 +1098,9 @@
+     return nodes
+ 
+ 
+-def region_tile(L, ops, k=None):
+-    """(lines, modelled cycles) of TILE_C (k None) or TILE_Dk."""
+-    order, cycles = schedule(tile_nodes(L, ops, k))
++def region_tile(L, ops, k=None, ftile=False):
++    """(lines, modelled cycles) of TILE_C (k None), TILE_Dk or TILE_F (ftile)."""
++    order, cycles = schedule(tile_nodes(L, ops, k, ftile=ftile))
+     out = []
+     for nd in order:
+         if nd.kind == "BAR":  # this wave's LDS reads done, wave 0's TDM ops of the next stage landed
+Binary files a/gfx1250_mla/tools/fwdgen/__pycache__/fwdgen.cpython-312.pyc and b/gfx1250_mla/tools/fwdgen/__pycache__/fwdgen.cpython-312.pyc differ

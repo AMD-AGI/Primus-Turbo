@@ -1,0 +1,33 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 15:57:03.046981409 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 16:02:55.713423127 +0000
+@@ -126,6 +126,11 @@
+ #ifndef HKGEN_FMERGE
+ #define HKGEN_FMERGE 0
+ #endif
++// HKGEN_ROWS64 1: the K / V slot descriptors bound the tensor at the tile's own 64 rows (every K / V tile is inside
++// Skv, Skv % 64 == 0; a 1-row copy reads its first row) instead of at Skv: fewer descriptor words to compute per op
++#ifndef HKGEN_ROWS64
++#define HKGEN_ROWS64 0
++#endif
+ #if HKGEN_FTILE && (HKGEN2 || HKGEN_INCDESC)
+ #error "HKGEN_FTILE needs the shell's tile loop and the per-tile descriptors"
+ #endif
+@@ -447,7 +452,7 @@
+     const unsigned long long gk = gk0 + 2ull * (unsigned long long)kv0 * krow;                                       \
+     const unsigned long long gv = gv0 + 2ull * (unsigned long long)kv0 * vrow;                                       \
+     const unsigned th = real ? NB : 1;                                                                               \
+-    const unsigned rows = (unsigned)(Skv_ - kv0);                                                                    \
++    const unsigned rows = HKGEN_ROWS64 ? (unsigned)NB : (unsigned)(Skv_ - kv0);                                      \
+     const unsigned st = lds0 + (unsigned)(((sb + t) & (NSTG - 1)) * STG_B);                                          \
+     tdm_load(tdm_g0(st, gk, cnt0), tdm_g1(W0_A, rows, 128, th, krow));                                              \
+     tdm_load(tdm_g0(st + 256, gk + 256, cnt0), tdm_g1(W0_B, rows, 64, th, krow));                                    \
+@@ -464,7 +469,7 @@
+     const unsigned long long gk = (own ? gk0 : gkn) + 2ull * (unsigned long long)kv0 * krow;                         \
+     const unsigned long long gv = (own ? gv0 : gvn) + 2ull * (unsigned long long)kv0 * vrow;                         \
+     const unsigned th = real ? NB : 1;                                                                               \
+-    const unsigned rows = (unsigned)(Skv_ - kv0);                                                                    \
++    const unsigned rows = HKGEN_ROWS64 ? (unsigned)NB : (unsigned)(Skv_ - kv0);                                      \
+     const unsigned st = lds0 + (unsigned)(((sb + t) & (NSTG - 1)) * STG_B);                                          \
+     tdm_load(tdm_g0(st, gk, cnt0), tdm_g1(W0_A, rows, 128, th, krow));                                              \
+     tdm_load(tdm_g0(st + 256, gk + 256, cnt0), tdm_g1(W0_B, rows, 64, th, krow));                                    \

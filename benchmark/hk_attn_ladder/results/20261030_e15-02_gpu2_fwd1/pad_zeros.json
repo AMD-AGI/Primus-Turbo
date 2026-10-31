@@ -1,0 +1,249 @@
+{
+ "meta": {
+  "ladder": "mla_fwd2",
+  "shape": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+  "device": "gfx1250",
+  "cus": 256,
+  "torch": "2.14.0+rocm10.2.0a20261011",
+  "rounds": 6,
+  "iters": 20,
+  "settle_s": 1.0,
+  "flush_mb": 512,
+  "hip_visible_devices": null,
+  "host": "534baaaa14ae",
+  "time": "2026-10-30 14:09:35",
+  "useful_flops": 1374725079040,
+  "data": "zeros",
+  "mode": "cold",
+  "gap_ms": null
+ },
+ "rows": [
+  {
+   "arm": "f8x",
+   "ms": 0.5544522404670715,
+   "mean": 0.5546194165945053,
+   "ci95": 0.0005531943433106567,
+   "tflops": 2479.429207251339,
+   "sclk": 1932.5,
+   "mcyc": 1.0714789348244667,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    0.5555539727210999,
+    0.5548935234546661,
+    0.5541725158691406,
+    0.5541920065879822,
+    0.5544919967651367,
+    0.5544124841690063
+   ],
+   "sclk_rounds": [
+    1934.0,
+    1932.0,
+    1932.0,
+    1933.0,
+    1932.0,
+    1933.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "f3a's flags on the patch-08 tree: the scheduler's LDS-in-flight model now retires loads at completion (new schedule)",
+   "ref_ms_a08": null
+  },
+  {
+   "arm": "pad_msb",
+   "ms": 0.6108574867248535,
+   "mean": 0.6103266576925913,
+   "ci95": 0.0011354606115530292,
+   "tflops": 2250.484129138967,
+   "sclk": 1959.75,
+   "mcyc": 1.196669816493988,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    0.6085339784622192,
+    0.6110374927520752,
+    0.6094554960727692,
+    0.6109575033187866,
+    0.6112180054187775,
+    0.6107574701309204
+   ],
+   "sclk_rounds": [
+    1968.0,
+    1970.5,
+    1960.5,
+    1959.0,
+    1954.0,
+    1959.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "timing probe: TILE_C + 1 redundant msb per s_set_vgpr_msb",
+   "ref_ms_a08": null
+  },
+  {
+   "arm": "pad_salu",
+   "ms": 0.5618939846754074,
+   "mean": 0.561790406703949,
+   "ci95": 0.0006935132972258198,
+   "tflops": 2446.591557363166,
+   "sclk": 1935.5,
+   "mcyc": 1.0873615975677966,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    0.561843991279602,
+    0.5619439780712128,
+    0.5606220066547394,
+    0.5626649856567383,
+    0.5617235004901886,
+    0.5619439780712128
+   ],
+   "sclk_rounds": [
+    1936.0,
+    1935.0,
+    1936.0,
+    1937.0,
+    1933.0,
+    1935.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "timing probe: TILE_C + 64 redundant salu",
+   "ref_ms_a08": null
+  },
+  {
+   "arm": "pad_valu",
+   "ms": 0.5838967263698578,
+   "mean": 0.5840003242095312,
+   "ci95": 0.0007111313486466906,
+   "tflops": 2354.397647657315,
+   "sclk": 1940.0,
+   "mcyc": 1.1323902359008788,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    0.5835365056991577,
+    0.5837764739990234,
+    0.5852589905261993,
+    0.5840169787406921,
+    0.5833359956741333,
+    0.584077000617981
+   ],
+   "sclk_rounds": [
+    1940.0,
+    1940.0,
+    1940.0,
+    1938.0,
+    1941.0,
+    1939.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "timing probe: TILE_C + 64 redundant valu",
+   "ref_ms_a08": null
+  },
+  {
+   "arm": "pad_nop",
+   "ms": 0.5551637560129166,
+   "mean": 0.5553107510010401,
+   "ci95": 0.0004617126516439643,
+   "tflops": 2476.2514918355287,
+   "sclk": 1933.0,
+   "mcyc": 1.073370843335986,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    0.5549939870834351,
+    0.5550335049629211,
+    0.5549935102462769,
+    0.5561349987983704,
+    0.5554144978523254,
+    0.555294007062912
+   ],
+   "sclk_rounds": [
+    1934.0,
+    1932.0,
+    1934.0,
+    1933.0,
+    1933.0,
+    1933.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "timing probe: TILE_C + 64 redundant nop",
+   "ref_ms_a08": null
+  },
+  {
+   "arm": "pad_nop#null",
+   "ms": 0.5558950006961823,
+   "mean": 0.5560050010681152,
+   "ci95": 0.0005996119181961126,
+   "tflops": 2472.994139753632,
+   "sclk": 1934.0,
+   "mcyc": 1.0751009313464164,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    0.5553340017795563,
+    0.5557345151901245,
+    0.5567160248756409,
+    0.5555540025234222,
+    0.5566359758377075,
+    0.55605548620224
+   ],
+   "sclk_rounds": [
+    1934.0,
+    1934.0,
+    1935.0,
+    1934.0,
+    1933.0,
+    1934.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "timing probe: TILE_C + 64 redundant nop",
+   "ref_ms_a08": null
+  }
+ ],
+ "null_control": {
+  "median": 0.9986845788958646,
+  "mean": 0.998752371209448,
+  "ci95": 0.0014826165233399
+ }
+}

@@ -1,0 +1,58 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 13:08:21.183360770 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 13:08:38.164011847 +0000
+@@ -252,6 +252,9 @@
+     return found + [("coverage", (k, e)) for k, x in enumerate(ins) for e in coverage_errors(x)]
+ 
+ 
++VA_RULE = "llvm"  # --va-rule: asmkit's va_vdst rule for the generated regions (expert.va_need)
++
++
+ def emit_region(texts, fmap, scalars):
+     """asmkit.emit on one straight-line region: (lines, what walk_check finds in them, which must be nothing).
+     Entry state: anything may be in flight (unknown), XCNT as xcnt_entry, no VALU history."""
+@@ -259,7 +262,7 @@
+     for k, it in enumerate(items):
+         it.pos = k
+     flow = M.Flow([E.State(unknown=True)], [xcnt_entry(scalars)], [[]])
+-    lines, _ = M.emit_block(items, flow, fmap, va_rule="llvm")
++    lines, _ = M.emit_block(items, flow, fmap, va_rule=VA_RULE)
+     return lines, walk_check(lines, scalars)
+ 
+ 
+@@ -267,7 +270,15 @@
+     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+     ap.add_argument("--out", required=True, help="output directory")
+     ap.add_argument("--cxx", default="amdclang++", help="compiler (the manifest's toolchain)")
++    ap.add_argument("--va-rule", default="llvm", choices=E.VA_RULES,
++                    help="va_vdst rule of the generated regions (llvm_war_xdl: per-class bound for a WAR against an "
++                         "in-flight WMMA, as the backward)")
++    ap.add_argument("--no-group-edges", action="store_true",
++                    help="no order edges grouping the V / Q(3) reads behind the last PV / QK(0) WMMA")
+     a = ap.parse_args()
++    global VA_RULE
++    VA_RULE = a.va_rule
++    G.GROUP_EDGES = not a.no_group_edges
+     out = Path(a.out).resolve()
+     out.mkdir(parents=True, exist_ok=True)
+     rec = {"recipe": {}, "checks": {}, "fail": []}
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 13:08:21.183378760 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 13:08:38.164157417 +0000
+@@ -69,6 +69,7 @@
+ # in the issue model
+ LAT = {"WMMA": 20, "VALU": 5, "TRANS": 8, "PERM": 8, "DS": DS_LAT, "SALU": 2}
+ SLOT_LAT = {"WMMA": 20, "VALU": 3, "TRANS": 8, "PERM": 6, "SALU": 2}
++GROUP_EDGES = True  # build.py --no-group-edges: the V / Q(3) reads may go anywhere the dependences allow
+ 
+ 
+ def vr(r, n=1):
+@@ -643,7 +644,7 @@
+     # QK(0) WMMA, so each group waits once instead of once per buffer slice
+     last = {nd.tag: nd.idx for nd in nodes if nd.kind == "WMMA"}
+     lpv = max(last[f"PV{i}p"] for i in range(QT))
+-    for nd in loads:
++    for nd in loads if GROUP_EDGES else ():
+         if nd.tag.startswith("V"):
+             add_order(nodes, lpv, nd.idx)
+         if nd.tag.startswith("Q3") and "QK0" in last:

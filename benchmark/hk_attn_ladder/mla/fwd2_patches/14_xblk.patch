@@ -1,0 +1,106 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 14:12:15.726678744 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 14:43:17.662079999 +0000
+@@ -96,6 +96,17 @@
+ #ifndef HKGEN_ABL_NOTDM
+ #define HKGEN_ABL_NOTDM 0
+ #endif
++// HKGEN_XBLK 1: the ring slots n..n + 2 of a block load the next block's tiles 0..2 (its ring slots 0..2: the same
++// stages) instead of 1-row copies of tile n - 1, so the epilogue issues only the next block's Q (2 TDM ops instead of
++// 11: no wave stalls on the TDM in-flight bound there, and the next block's K / V land before its B_0). The static
++// schedule only (the next block is known three tiles before the block ends); it relies on the persistent schedule's
++// Sq % 256 == 0 (fwd.persistent_workgroups): every block has 4 diagonal tiles, which issue the slots n - 1..n + 2.
++#ifndef HKGEN_XBLK
++#define HKGEN_XBLK 0
++#endif
++#if HKGEN_XBLK && (HKGEN_TICKET || HKGEN2)
++#error "HKGEN_XBLK needs the static schedule and the shell's tile loop"
++#endif
+ #define PR_MAXB 64
+ 
+ // the SGPRs the generated code uses as temporaries (with vcc / scc; fwdgen.CLOBBERED): clobbered at every marker
+@@ -417,6 +428,33 @@
+     tdm_load(tdm_g0(st + 256, gk + 256, cnt0), tdm_g1(W0_B, rows, 64, th, krow));                                    \
+     tdm_load(tdm_g0(st + K_B, gv, cnt0), tdm_g1(W0_V, rows, 128, th, vrow));                                         \
+   };                                                                                                                 \
++  /* HKGEN_XBLK: slot t >= n of a block that has a next block (nn tiles, K / V bases gkn, gvn) loads the next      */ \
++  /* block's tile t - n, or a 1-row copy of its tile nn - 1 past it; otherwise as issue_slot                       */ \
++  auto issue_slot_x = [&](int t, int n, int sb, unsigned long long gk0, unsigned long long gv0, bool nx, int nn,      \
++                          unsigned long long gkn, unsigned long long gvn) {                                          \
++    const bool own = t < n || !nx;                                                                                   \
++    const int tt = own ? min(t, n - 1) : min(t - n, nn - 1);                                                         \
++    const bool real = own ? t < n : t - n < nn;                                                                      \
++    const int kv0 = tt * NB;                                                                                         \
++    const unsigned long long gk = (own ? gk0 : gkn) + 2ull * (unsigned long long)kv0 * krow;                         \
++    const unsigned long long gv = (own ? gv0 : gvn) + 2ull * (unsigned long long)kv0 * vrow;                         \
++    const unsigned th = real ? NB : 1;                                                                               \
++    const unsigned rows = (unsigned)(Skv_ - kv0);                                                                    \
++    const unsigned st = lds0 + (unsigned)(((sb + t) & (NSTG - 1)) * STG_B);                                          \
++    tdm_load(tdm_g0(st, gk, cnt0), tdm_g1(W0_A, rows, 128, th, krow));                                              \
++    tdm_load(tdm_g0(st + 256, gk + 256, cnt0), tdm_g1(W0_B, rows, 64, th, krow));                                    \
++    tdm_load(tdm_g0(st + K_B, gv, cnt0), tdm_g1(W0_V, rows, 128, th, vrow));                                         \
++  };                                                                                                                 \
++  /* HKGEN_XBLK: the next block's Q only (its tiles 0..2 came with this block's slots n..n + 2)                   */ \
++  auto issue_q = [&](int qb, int hh, int bb) {                                                                       \
++    const int q0 = qb * BM;                                                                                          \
++    const unsigned long long gq =                                                                                    \
++        (unsigned long long)(uintptr_t)ka.Q + 2ull * ((((unsigned long long)bb * Sq_ + q0) * H_ + hh) * D_QK);       \
++    tdm_load(tdm_g0(lds0 + Q_OFF, gq, wv == 1 ? 1 : 0), tdm_g1(W0_A, (unsigned)(Sq_ - q0), 128, BM, krow));          \
++    tdm_load(tdm_g0(lds0 + Q_OFF + 256, gq + 256, wv == 2 ? 1 : 0),                                                  \
++             tdm_g1(W0_B, (unsigned)(Sq_ - q0), 64, BM, krow));                                                      \
++  };                                                                                                                 \
++  (void)issue_slot_x, (void)issue_q;                                                                                 \
+   /* a block's prologue loads, branch-free (every wave issues the same 11 TDM ops, NULL descriptors where the op */ \
+   /* is not its own): Q columns 0..127 (wave 1) and 128..191 (wave 2) into the Q area, then the block's tiles     */ \
+   /* 0..2 = ring slots 0..2 (wave 0)                                                                              */ \
+@@ -664,6 +702,20 @@
+ #if HKGEN_TICKET
+     int tk_raw = 0;  // wave 0, lane 0: the next block's raw ticket, in flight over the first three diagonal tiles
+ #endif
++#if HKGEN_XBLK
++    // the next block (static schedule), whose tiles 0..2 the diagonal tiles' slots n..n + 2 load; its own argument
++    // view from t (= ncc here), so LLVM cannot hoist this math into the TILE_C loop
++    bool xb;
++    int nnx;
++    unsigned long long gkx, gvx;
++    {
++      HKF_BLOCK(t >> 30)
++      int qbx, hhx, bbx;
++      xb = block_at(s + 1, qbx, hhx, bbx);
++      nnx = ntiles(qbx);
++      kv_base(hhx, bbx, gkx, gvx);
++    }
++#endif
+     static_for<4>([&](auto k) {
+ #if HKGEN_TICKET
+       if constexpr (k == 0) {
+@@ -680,7 +732,11 @@
+ #endif
+       if (ncc + k < n) {
+         const int t2 = ncc + k;
++#if HKGEN_XBLK
++        issue_slot_x(t2 + 3, n, sb, gk0, gv0, xb, nnx, gkx, gvx);
++#else
+         issue_slot(t2 + 3, n, sb, gk0, gv0);
++#endif
+         const unsigned st = lds0 + (unsigned)(((sb + t2) & (NSTG - 1)) * STG_B);
+ #if HKGEN_PROBE
+         const unsigned int pr_c1 = PR_CYC();
+@@ -725,10 +781,14 @@
+       HKF_BLOCK(n >> 30)
+       int qbn, hhn, bbn;
+       nxt = block_at(s + 1, qbn, hhn, bbn);
++#if HKGEN_XBLK
++      if (nxt) issue_q(qbn, hhn, bbn);  // its tiles 0..2 are in flight (slots n..n + 2): only its Q, into the free Q area
++#else
+       if (nxt) {
+         tensor_wait<0>();
+         issue_block(qbn, hhn, bbn, (sb + n) & (NSTG - 1));
+       }
++#endif
+       sched_barrier<0>();
+ 
+       // fresh lane ids (lane2, ln), for the same reason as lane
+Only in b/gfx1250_mla: __pycache__
+Only in b/gfx1250_mla/tools/asmkit: __pycache__
+Only in b/gfx1250_mla/tools/fwdgen: __pycache__

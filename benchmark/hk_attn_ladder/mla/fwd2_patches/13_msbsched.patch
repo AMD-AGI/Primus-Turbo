@@ -1,0 +1,95 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 14:12:15.725854532 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 14:12:15.738329126 +0000
+@@ -456,6 +456,8 @@
+                     help="no order edges grouping the V / Q(3) reads behind the last PV / QK(0) WMMA")
+     ap.add_argument("--kprefetch", action="store_true",
+                     help="(--loop) a tile reads the next tile's K and Q(0) right after its barrier wait")
++    ap.add_argument("--msb-sched", type=int, default=0,
++                    help="scheduler: prefer candidates needing no MSB switch among deadlines in the same N-WMMA bucket")
+     ap.add_argument("--plan", type=int, default=1, choices=(1, 2),
+                     help="VGPR plan: 1 (E2's), 2 (the softmax's registers in one block: fewer MSB switches)")
+     ap.add_argument("--loop", action="store_true",
+@@ -485,6 +487,7 @@
+     G.RESC = a.resc
+     G.LOOP = a.loop
+     G.PLAN = a.plan
++    G.MSB_BUCKET = a.msb_sched
+     G.PREFETCH = a.kprefetch
+     if a.loop:
+         DEFINES.append("HKGEN2=1")
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 14:12:15.725832492 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 14:12:15.738181035 +0000
+@@ -68,6 +68,8 @@
+ # S, the sum-tree leaves PR, the softmax scratch, (m', corr) pairs, m, d and dl; V is split over block 3 (d tiles
+ # 0..3, after K) and block 0 (d tiles 4..7, after the Q fragments)
+ PLAN = 1
++MSB_BUCKET = 0  # build.py --msb-sched B: among ready candidates whose deadlines fall in the same B-WMMA bucket, prefer
++                # one that needs no s_set_vgpr_msb switch (0: off)
+ PREFETCH = False  # build.py --kprefetch (with --loop): a tile reads the next tile's K and Q(0) after its barrier wait
+ S_G0 = (48, 52, 56)
+ S_G1 = (60, 68, 76)
+@@ -410,6 +412,27 @@
+ # ------------------------------------------------------------------------------------------------------------
+ # scheduler
+ # ------------------------------------------------------------------------------------------------------------
++_MSB_FIELDS = ("dst", "src0", "src1", "src2")
++
++
++def msb_req(nd):
++    """{field index: VGPR block} the node's VGPR operands need (VOP: dst src0 src1 src2 in operand order; DS load:
++    vdst, addr; v_cmp: its sources); {} for scalar / barrier / pseudo nodes."""
++    if nd.kind in ("BAR", "BARW", "SALU", "TDM", "RESC", "RARE"):
++        return {}
++    mn, _, rest = nd.text.strip().partition(" ")
++    ops = _split_ops(rest)
++    fields = (0, 1) if mn.startswith("ds_load") else ((None, 1, 2) if mn.startswith("v_cmp") else (0, 1, 2, 3))
++    out = {}
++    for f, op in zip(fields, ops):
++        if f is None:
++            continue
++        r = _vregs(op)
++        if r:
++            out[f] = r[0] // 256
++    return out
++
++
+ def schedule(nodes):
+     """(ordered nodes, modelled cycles): a cycle-stepped list scheduler on an issue model of one wave.
+ 
+@@ -447,6 +470,11 @@
+     issued_ds, retired_ds, last_done = [], 0, 0
+     out = []
+     t, last_w, wk, trans_at, perm_busy, salu_free, ds_next, done = 0, -100, 0, -100, -1, 0, 0, 0
++    mreq = [msb_req(nd) for nd in nodes] if MSB_BUCKET else None
++    mode = [None, None, None, None]
++
++    def compat(i):
++        return all(mode[f] is None or mode[f] == v for f, v in mreq[i].items())
+ 
+     def avail(i):
+         k = nodes[i].kind
+@@ -483,7 +511,11 @@
+                         cand = [i for i in vt if nodes[i].kind == want] or vt
+                 elif any(nodes[i].kind == "DS" for i in cand):
+                     cand = [i for i in cand if nodes[i].kind in ("DS", "BAR")]
+-                pick = max(cand, key=lambda i: (nodes[i].kind == "BAR", -deadline[i], cp[i], -i))
++                if MSB_BUCKET:
++                    pick = max(cand, key=lambda i: (nodes[i].kind == "BAR", -(deadline[i] // MSB_BUCKET), compat(i),
++                                                    -deadline[i], cp[i], -i))
++                else:
++                    pick = max(cand, key=lambda i: (nodes[i].kind == "BAR", -deadline[i], cp[i], -i))
+         if pick is None:
+             t += 1
+             if t > 10**6:
+@@ -491,6 +523,9 @@
+             continue
+         nd = nodes[pick]
+         ready.discard(pick)
++        if MSB_BUCKET:
++            for f, v in mreq[pick].items():
++                mode[f] = v
+         k = nd.kind
+         if k == "DS":
+             last_done = max(t + DS_LAT, last_done)

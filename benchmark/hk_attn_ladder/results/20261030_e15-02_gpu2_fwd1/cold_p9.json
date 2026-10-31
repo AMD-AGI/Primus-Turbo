@@ -1,0 +1,233 @@
+{
+ "meta": {
+  "ladder": "mla_fwd2",
+  "shape": "b2 sq4096 skv4096 hq128 hkv128 d192/128 causal sbhd",
+  "device": "gfx1250",
+  "cus": 256,
+  "torch": "2.14.0+rocm10.2.0a20261011",
+  "rounds": 10,
+  "iters": 20,
+  "settle_s": 1.0,
+  "flush_mb": 512,
+  "hip_visible_devices": null,
+  "host": "534baaaa14ae",
+  "time": "2026-10-30 14:04:40",
+  "useful_flops": 1374725079040,
+  "data": "randn",
+  "mode": "cold",
+  "gap_ms": null
+ },
+ "rows": [
+  {
+   "arm": "f8x",
+   "ms": 0.7782607525587082,
+   "mean": 0.7799829453229904,
+   "ci95": 0.002942641051360231,
+   "tflops": 1766.4067917086666,
+   "sclk": 1423.25,
+   "mcyc": 1.112596175685525,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    0.7785514891147614,
+    0.7745244801044464,
+    0.7841995060443878,
+    0.7775689959526062,
+    0.7839784920215607,
+    0.777970016002655,
+    0.7850404977798462,
+    0.7773094773292542,
+    0.7850404977798462,
+    0.7756460011005402
+   ],
+   "sclk_rounds": [
+    1436.0,
+    1427.0,
+    1423.0,
+    1427.0,
+    1423.0,
+    1423.0,
+    1424.0,
+    1421.0,
+    1423.5,
+    1423.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "f3a's flags on the patch-08 tree: the scheduler's LDS-in-flight model now retires loads at completion (new schedule)",
+   "ref_ms_a08": null
+  },
+  {
+   "arm": "f8a",
+   "ms": 0.7882754951715469,
+   "mean": 0.7877526015043259,
+   "ci95": 0.0024483530250180973,
+   "tflops": 1743.9652601922226,
+   "sclk": 1432.5,
+   "mcyc": 1.1284733785241843,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    0.7837589979171753,
+    0.7890065014362335,
+    0.7858214974403381,
+    0.7847200036048889,
+    0.7844395041465759,
+    0.7878249883651733,
+    0.7888660132884979,
+    0.795556515455246,
+    0.7888059914112091,
+    0.7887260019779205
+   ],
+   "sclk_rounds": [
+    1436.0,
+    1432.0,
+    1423.0,
+    1433.0,
+    1434.0,
+    1432.0,
+    1435.0,
+    1431.0,
+    1431.0,
+    1434.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "fwdgen2: one generated LOOP region per block -- TDM issue, tile barriers and the tile counter in generated code, no shell code between tiles",
+   "ref_ms_a08": null
+  },
+  {
+   "arm": "f9a",
+   "ms": 0.7852209955453873,
+   "mean": 0.7854874461889267,
+   "ci95": 0.0017551315489105445,
+   "tflops": 1750.7492627412025,
+   "sclk": 1433.5,
+   "mcyc": 1.1246170050948858,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    0.7848004996776581,
+    0.7887060046195984,
+    0.783158004283905,
+    0.7811749875545502,
+    0.785020500421524,
+    0.7854214906692505,
+    0.7892069816589355,
+    0.7864429950714111,
+    0.7869639992713928,
+    0.7839789986610413
+   ],
+   "sclk_rounds": [
+    1433.0,
+    1435.0,
+    1436.0,
+    1434.0,
+    1428.0,
+    1435.0,
+    1432.0,
+    1423.0,
+    1430.0,
+    1434.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "+ one drain at the LOOP prologue's end: a known state at the loop entry, so the tile body's join waits only for its back edge",
+   "ref_ms_a08": null,
+   "step": {
+    "over": "f8a",
+    "median": 1.0027003840887079,
+    "mean": 1.0028864847620669,
+    "ci95": 0.0027911756964157566
+   },
+   "step_cyc": {
+    "median": 1.0023517979969552,
+    "ci95": 0.0042783695916282114
+   }
+  },
+  {
+   "arm": "f9a#null",
+   "ms": 0.7843694984912872,
+   "mean": 0.784535950422287,
+   "ci95": 0.0009093029681827096,
+   "tflops": 1752.6498438353929,
+   "sclk": 1433.0,
+   "mcyc": 1.124149338155985,
+   "watts": null,
+   "mj": null,
+   "rounds": [
+    0.7836180031299591,
+    0.7860625088214874,
+    0.7832779884338379,
+    0.7862224876880646,
+    0.7847805023193359,
+    0.7861624956130981,
+    0.7846400141716003,
+    0.7826375067234039,
+    0.7840989828109741,
+    0.7838590145111084
+   ],
+   "sclk_rounds": [
+    1434.0,
+    1433.0,
+    1433.0,
+    1431.0,
+    1433.0,
+    1427.0,
+    1435.0,
+    1434.0,
+    1433.0,
+    1437.0
+   ],
+   "watt_rounds": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+   ],
+   "feature": "+ one drain at the LOOP prologue's end: a known state at the loop entry, so the tile body's join waits only for its back edge",
+   "ref_ms_a08": null
+  }
+ ],
+ "null_control": {
+  "median": 1.000907418623517,
+  "mean": 1.0012151932276085,
+  "ci95": 0.0025204118568340895
+ }
+}

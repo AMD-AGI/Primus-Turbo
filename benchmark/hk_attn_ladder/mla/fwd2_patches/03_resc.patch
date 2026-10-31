@@ -1,0 +1,192 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 13:19:15.682368342 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 13:20:09.459331253 +0000
+@@ -84,6 +84,7 @@
+     "s_mov_b32",
+     "s_cmp_lg_u32",
+     "s_cselect_b32",
++    "s_cbranch_scc0",
+     "s_barrier_signal",
+     "s_wait_dscnt",
+     "s_wait_tensorcnt",
+@@ -243,6 +244,15 @@
+     return xs
+ 
+ 
++def walk_block_check(lines, flow):
++    """Open hazards and parse-coverage errors of one emitted block walked from its entry flow."""
++    ins = parse([l if l.startswith("\t") else "\t" + l.strip() for l in lines])
++    fl = flow.copy()
++    found = []
++    M.walk_block(ins, fl, lambda k, f, n: found.append((k, f, ins[k].text.strip())))
++    return found + [("coverage", (k, e)) for k, x in enumerate(ins) for e in coverage_errors(x)]
++
++
+ def walk_check(lines, scalars):
+     """Open hazards and parse-coverage errors of emitted region lines, walked from the region entry state."""
+     ins = parse([l if l.startswith("\t") else "\t" + l.strip() for l in lines])
+@@ -256,15 +266,42 @@
+ DEFINES = []  # -D NAME=VALUE: extra macros of the shell and the reference compile (e.g. HKGEN_PROBE=1)
+ 
+ 
+-def emit_region(texts, fmap, scalars):
+-    """asmkit.emit on one straight-line region: (lines, what walk_check finds in them, which must be nothing).
+-    Entry state: anything may be in flight (unknown), XCNT as xcnt_entry, no VALU history."""
+-    items = [M.make_item("\t" + t) for t in texts]
+-    for k, it in enumerate(items):
+-        it.pos = k
++RESC_LABELS = [0]  # unique labels of the RESC blocks across the regions
++
++
++def emit_region(texts, fmap, scalars, L=None):
++    """asmkit.emit on one region: (lines, what walk_check finds in them, which must be nothing). Entry state:
++    anything may be in flight (unknown), XCNT as xcnt_entry, no VALU history. A RESC pseudo-line (fwdgen --resc
++    branch) splits the region: the block before it ends in s_cmp + s_cbranch over the conditional O *= corr block,
++    and the block after it is entered from both (joined flows; forward edges only)."""
++    segs, cur = [], []
++    for t in texts:
++        if t.startswith("HKRESC"):
++            segs.append((cur, t))
++            cur = []
++        else:
++            cur.append(t)
+     flow = M.Flow([E.State(unknown=True)], [xcnt_entry(scalars)], [[]])
+-    lines, _ = M.emit_block(items, flow, fmap, va_rule=VA_RULE)
+-    return lines, walk_check(lines, scalars)
++
++    def emit(tx, fl):
++        items = [M.make_item("\t" + t) for t in tx]
++        for k, it in enumerate(items):
++            it.pos = k
++        lines, ex = M.emit_block(items, fl, fmap, va_rule=VA_RULE)
++        return lines, ex, walk_block_check(lines, fl)
++
++    out, found = [], []
++    for tx, rline in segs:
++        label = f".LHKR{RESC_LABELS[0]}"
++        RESC_LABELS[0] += 1
++        head, body, lab = G.resc_block(L, rline, label)
++        lines, ex_a, f1 = emit(tx + head, flow)
++        lines_b, ex_b, f2 = emit(body, ex_a)
++        out += lines + lines_b + [lab]
++        found += f1 + f2
++        flow = M.Flow.join([ex_a, ex_b])
++    lines, _, f3 = emit(cur, flow)
++    return out + lines, found + f3
+ 
+ 
+ def main():
+@@ -276,6 +313,8 @@
+                          "in-flight WMMA, as the backward)")
+     ap.add_argument("--no-group-edges", action="store_true",
+                     help="no order edges grouping the V / Q(3) reads behind the last PV / QK(0) WMMA")
++    ap.add_argument("--resc", default="always", choices=("always", "branch"),
++                    help="O *= corr on every tile, or under a per-q-tile wave-uniform branch (FlyDSL's _rescale_if)")
+     ap.add_argument("-D", dest="defines", action="append", default=[],
+                     help="extra macro of both compiles, e.g. -D HKGEN_PROBE=1 (diagnostic builds: the probe's stamp "
+                          "stores are store phases of their own, which the writeback check then allows)")
+@@ -284,6 +323,7 @@
+     VA_RULE = a.va_rule
+     DEFINES[:] = a.defines
+     G.GROUP_EDGES = not a.no_group_edges
++    G.RESC = a.resc
+     out = Path(a.out).resolve()
+     out.mkdir(parents=True, exist_ok=True)
+     rec = {"recipe": {}, "checks": {}, "fail": []}
+@@ -363,8 +403,8 @@
+             pre = ["\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"] + ["\tv_nop"] * 4
+             # the shell's LDS stores read the outputs, and LLVM puts no va_vdst wait after an inline-asm def
+             post = ["\ts_wait_alu depctr_va_vdst(0)"]
+-        msb_defaults(fmap, texts)
+-        lines, open_ = emit_region(texts, fmap, scalars)
++        msb_defaults(fmap, [t for t in texts if not t.startswith("HKRESC")] + G.resc_lines(L, 0))
++        lines, open_ = emit_region(texts, fmap, scalars, L)
+         if open_:
+             fail.append(f"{name}: {len(open_)} hazards / coverage errors after emission, e.g. {open_[:3]}")
+         regions[name] = pre + lines + post
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 13:19:15.682384722 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 13:20:09.459094012 +0000
+@@ -67,9 +67,14 @@
+ WORDER = ("PV0p", "PV1p", "PV2p", "PV3p", "QK0", "QK1", "QK2", "QK3")  # the in-order WMMA stream, by node tag
+ # latency of a dependence edge by producer kind (it ranks nodes by critical path), and result latency by kind
+ # in the issue model
+-LAT = {"WMMA": 20, "VALU": 5, "TRANS": 8, "PERM": 8, "DS": DS_LAT, "SALU": 2}
+-SLOT_LAT = {"WMMA": 20, "VALU": 3, "TRANS": 8, "PERM": 6, "SALU": 2}
++LAT = {"WMMA": 20, "VALU": 5, "TRANS": 8, "PERM": 8, "DS": DS_LAT, "SALU": 2, "RESC": 2}
++SLOT_LAT = {"WMMA": 20, "VALU": 3, "TRANS": 8, "PERM": 6, "SALU": 2, "RESC": 2}
+ GROUP_EDGES = True  # build.py --no-group-edges: the V / Q(3) reads may go anywhere the dependences allow
++# build.py --resc: "always" -- O *= corr on every tile (corr is exactly 1 when m did not move); "branch" -- per q tile a
++# wave-uniform branch around its 32 v_pk_mul (FlyDSL's _rescale_if: taken only when S_ANY[i] says m moved; skipping
++# x * 1.0 changes no bit). A RESC node stands for the whole block in the schedule; build.py expands it (resc_block).
++RESC = "always"
++RESC_COST = 6  # modelled cycles of the s_cmp + s_cbranch of a RESC block that is not taken
+ 
+ 
+ def vr(r, n=1):
+@@ -220,6 +225,12 @@
+     n = Node(text, kind, tag)
+     if kind == "BAR":
+         return n
++    if kind == "RESC":  # "HKRESC i o corr sany": the block O(i) *= corr(i) under S_ANY[i]
++        _, _, o, corr, sany = text.split()
++        n.vdefs = set(range(int(o), int(o) + 64))
++        n.vuses = n.vdefs | {int(corr)}
++        n.suses = {sany}
++        return n
+     mn, _, rest = text.strip().partition(" ")
+     ops = _split_ops(rest)
+     if mn.startswith("ds_load"):
+@@ -347,8 +358,8 @@
+             return o >= 8 and t != trans_at + 1 and t > perm_busy
+         if k == "DS":
+             return o != 0 and t >= ds_next and len(issued_ds) - retired_ds < DS_MAX
+-        if k == "SALU":
+-            return o != 0 and t >= salu_free
++        if k in ("SALU", "RESC"):
++            return o != 0 and t >= salu_free and (k == "SALU" or t > perm_busy)
+         return o != 0
+ 
+     while done < n:
+@@ -400,6 +411,10 @@
+             perm_busy = t + 1
+         elif k == "SALU":
+             salu_free = t + 2
++        elif k == "RESC":  # s_cmp + s_cbranch: the wave issues nothing else meanwhile
++            salu_free = t + RESC_COST
++            perm_busy = t + RESC_COST - 1
++            ds_next = max(ds_next, t + RESC_COST)
+         for s, lat in succ[pick]:
+             if k == "DS":
+                 e = ds_done[pick] if nd.vdefs & nodes[s].vuses else t + 1
+@@ -539,10 +554,28 @@
+             j, e = 2 * kt + r // 4, 2 * (r % 4)
+             lo, hi = L.PR(i, 8 * j + e), L.PR(i, 8 * j + e + 1)
+             add(f"v_cvt_pk_bf16_f32 {vr(L.P(i, kt) + r)}, {vr(lo)}, {vr(hi)}", "VALU", f"cvt{i}")
+-    for dt in range(NDT):  # O *= corr
++    if RESC == "branch":
++        add(f"HKRESC {i} {L.O(i, 0)} {corr} {S_ANY[i]}", "RESC", f"resc{i}")
++    else:
++        for t in resc_lines(L, i):  # O *= corr
++            add(t, "VALU", f"resc{i}")
++
++
++def resc_lines(L, i):
++    """O(i) *= corr(i): 32 packed multiplies."""
++    out = []
++    for dt in range(NDT):
+         for r in range(0, 8, 2):
+             o = vr(L.O(i, dt) + r, 2)
+-            add(f"v_pk_mul_f32 {o}, {o}, {vr(corr, 2)} op_sel_hi:[1,0]", "VALU", f"resc{i}")
++            out.append(f"v_pk_mul_f32 {o}, {o}, {vr(L.corr[i], 2)} op_sel_hi:[1,0]")
++    return out
++
++
++def resc_block(L, line, label):
++    """The expansion of a RESC pseudo-line: (lines ending the block before it, the conditional block's lines,
++    the label line starting the block after it)."""
++    _, i, _, _, sany = line.split()
++    return ([f"s_cmp_lg_u32 {sany}, 0", f"s_cbranch_scc0 {label}"], resc_lines(L, int(i)), f"{label}:")
+ 
+ 
+ def sum_nodes(L, i0, add, upd):

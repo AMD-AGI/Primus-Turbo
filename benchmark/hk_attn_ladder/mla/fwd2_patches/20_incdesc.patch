@@ -1,0 +1,47 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 14:43:17.662079999 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 15:30:11.367747221 +0000
+@@ -104,6 +104,11 @@
+ #ifndef HKGEN_XBLK
+ #define HKGEN_XBLK 0
+ #endif
++// HKGEN_INCDESC 1: the TILE_C loop carries the K / V global addresses and the stage of its next ring slot and advances
++// them by constants per tile, instead of recomputing the 3 TDM descriptors from the tile index (fewer SALU per tile)
++#ifndef HKGEN_INCDESC
++#define HKGEN_INCDESC 0
++#endif
+ #if HKGEN_XBLK && (HKGEN_TICKET || HKGEN2)
+ #error "HKGEN_XBLK needs the static schedule and the shell's tile loop"
+ #endif
+@@ -671,8 +676,30 @@
+ #else
+     // ---- tiles [0, ncc): below the diagonal, no mask ----------------------------------------------------------------
+     int t = 0;  // outside the for statement: the for-init form compiles to another .s (asm_input_sha256)
++#if HKGEN_INCDESC
++    // ring slot t + 3: its tile (or, past tile n - 1, a 1-row copy of it), K / V addresses and stage, carried
++    unsigned long long gki = gk0 + 2ull * (unsigned long long)(min(3, n - 1) * NB) * krow;
++    unsigned long long gvi = gv0 + 2ull * (unsigned long long)(min(3, n - 1) * NB) * vrow;
++    unsigned sti = (unsigned)(((sb + 3) & (NSTG - 1)) * STG_B);
++#endif
+     for (; t < ncc; ++t) {
++#if HKGEN_INCDESC
++      {
++        const bool real = t + 3 < n;
++        const unsigned rows = (unsigned)(Skv_ - (real ? t + 3 : n - 1) * NB);
++        const unsigned th = real ? NB : 1;
++        const unsigned st = lds0 + sti;
++        tdm_load(tdm_g0(st, gki, cnt0), tdm_g1(W0_A, rows, 128, th, krow));
++        tdm_load(tdm_g0(st + 256, gki + 256, cnt0), tdm_g1(W0_B, rows, 64, th, krow));
++        tdm_load(tdm_g0(st + K_B, gvi, cnt0), tdm_g1(W0_V, rows, 128, th, vrow));
++        const bool adv = t + 4 < n;
++        gki += adv ? 2ull * NB * krow : 0ull;
++        gvi += adv ? 2ull * NB * vrow : 0ull;
++        sti = sti == (NSTG - 1) * STG_B ? 0u : sti + STG_B;
++      }
++#else
+       issue_slot(t + 3, n, sb, gk0, gv0);
++#endif
+       const unsigned st = lds0 + (unsigned)(((sb + t) & (NSTG - 1)) * STG_B);
+ #if HKGEN_PROBE
+       const unsigned int pr_c1 = PR_CYC();
+Binary files a/gfx1250_mla/tools/fwdgen/__pycache__/fwdgen.cpython-312.pyc and b/gfx1250_mla/tools/fwdgen/__pycache__/fwdgen.cpython-312.pyc differ

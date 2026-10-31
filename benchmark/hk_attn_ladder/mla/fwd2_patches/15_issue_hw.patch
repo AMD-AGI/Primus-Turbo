@@ -1,0 +1,186 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 14:12:15.738329126 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 14:59:33.969716789 +0000
+@@ -458,6 +458,10 @@
+                     help="(--loop) a tile reads the next tile's K and Q(0) right after its barrier wait")
+     ap.add_argument("--msb-sched", type=int, default=0,
+                     help="scheduler: prefer candidates needing no MSB switch among deadlines in the same N-WMMA bucket")
++    ap.add_argument("--issue", default="model1", choices=("model1", "hw"),
++                    help="the scheduler's issue model (fwdgen.ISSUE): model1, or hw (the ATT-measured one)")
++    ap.add_argument("--hw", default=None,
++                    help="--issue hw parameters DS_BLOCK:DS_GAP:RESC:DS_LAT[:DSLIM] (default 4:4:30:290:0)")
+     ap.add_argument("--plan", type=int, default=1, choices=(1, 2),
+                     help="VGPR plan: 1 (E2's), 2 (the softmax's registers in one block: fewer MSB switches)")
+     ap.add_argument("--loop", action="store_true",
+@@ -488,6 +492,12 @@
+     G.LOOP = a.loop
+     G.PLAN = a.plan
+     G.MSB_BUCKET = a.msb_sched
++    G.ISSUE = a.issue
++    if a.hw:
++        hw = [int(x) for x in a.hw.split(":")]
++        G.HW_DS_BLOCK, G.HW_DS_GAP, G.HW_RESC, G.DS_LAT = hw[:4]
++        G.HW_DSLIM = hw[4] if len(hw) > 4 else 0
++        G.LAT["DS"] = G.DS_LAT
+     G.PREFETCH = a.kprefetch
+     if a.loop:
+         DEFINES.append("HKGEN2=1")
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 14:12:15.738181035 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 14:59:33.969562659 +0000
+@@ -91,6 +91,18 @@
+        "BARW": 40}
+ SLOT_LAT = {"WMMA": 20, "VALU": 3, "TRANS": 8, "PERM": 6, "SALU": 2, "RESC": 2, "RARE": 2, "TDM": 2, "BARW": 40}
+ BARW_LAT = 40  # modelled cycles from a barrier wait to the reads it releases
++# build.py --issue hw: the issue model measured with ATT on the TILE regions (f12a / f14a): every instruction issues in
++# one cycle (VALU / TRANS / permlane at any offset from a WMMA); after an LDS instruction the next non-LDS one issues
++# HW_DS_BLOCK cycles later (an LDS one the next cycle); a WMMA issues HW_WMMA cycles after the previous WMMA at the
++# earliest (XDL occupancy); a RESC block (s_cmp, SCC latency, the taken branch around it) holds the wave HW_RESC
++# cycles. LDS loads complete in order, DS_LAT after issue and HW_DS_GAP after the previous load at the earliest.
++ISSUE = "model1"
++HW_DS_BLOCK = 4
++HW_DS_GAP = 4
++HW_RESC = 30
++HW_WMMA = 8
++HW_DSLIM = 0  # the DS_MAX bound on: 0 -- the loads not yet retired by a consumer (no s_wait_dscnt for it); 1 -- the loads
++              # not yet complete in the model (the post-pass then adds the s_wait_dscnt the consumer count needs)
+ GROUP_EDGES = True  # build.py --no-group-edges: the V / Q(3) reads may go anywhere the dependences allow
+ # build.py --resc: "always" -- O *= corr on every tile (corr is exactly 1 when m did not move); "branch" -- per q tile a
+ # wave-uniform branch around its 32 v_pk_mul (FlyDSL's _rescale_if: taken only when S_ANY[i] says m moved; skipping
+@@ -445,7 +457,9 @@
+     s_wait_dscnt 0) retires all. Other results are ready SLOT_LAT cycles after issue. Among the ready nodes:
+     a VALU at offsets 2, 6, a TRANS at 3, 7, an LDS load elsewhere first; then the arrive, the earliest
+     deadline (the first WMMA of the stream that needs the node), the longest critical path (LAT), program
+-    order. An s_wait_dscnt goes in where a load would exceed DS_MAX."""
++    order. An s_wait_dscnt goes in where a load would exceed DS_MAX. --issue hw: schedule_hw."""
++    if ISSUE == "hw":
++        return schedule_hw(nodes)
+     n = len(nodes)
+     succ = [[] for _ in range(n)]
+     for i, nd in enumerate(nodes):
+@@ -587,6 +601,124 @@
+     return res, max(t, last_w + 8)
+ 
+ 
++def schedule_hw(nodes):
++    """schedule() on the --issue hw model: one issue per cycle; an LDS op holds other kinds HW_DS_BLOCK cycles; WMMAs
++    in WORDER, HW_WMMA apart at least; while the next WMMA can issue on cadence, a node issues only if it does not
++    push that WMMA later. Among the issuable nodes: the arrive, the earliest deadline, the longest critical path,
++    program order."""
++    n = len(nodes)
++    succ = [[] for _ in range(n)]
++    for i, nd in enumerate(nodes):
++        for p, lat in nd.preds:
++            succ[p].append((i, lat))
++    wmmas = [i for i in range(n) if nodes[i].kind == "WMMA"]
++    wseq = [i for tag in WORDER for i in wmmas if nodes[i].tag == tag]
++    if sorted(wseq) != wmmas:
++        raise ValueError("WORDER does not cover the WMMAs")
++    wpos = {i: k for k, i in enumerate(wseq)}
++    deadline = [10**6] * n
++    for i in range(n - 1, -1, -1):
++        for s, _ in succ[i]:
++            deadline[i] = min(deadline[i], wpos[s] if s in wpos else deadline[s])
++    cp = [0] * n
++    for i in range(n - 1, -1, -1):
++        cp[i] = (HW_WMMA if nodes[i].kind == "WMMA" else 1) + max((lat + cp[s] for s, lat in succ[i]), default=0)
++    npred = [len(nd.preds) for nd in nodes]
++    earliest = [0] * n
++    ready = {i for i in range(n) if npred[i] == 0}
++    ds_done = {}  # LDS load -> modelled completion cycle
++    issued_ds, retired_ds, last_done = [], 0, -(10**6)
++    out = []
++    t, last_w, wk, done = 0, -100, 0, 0
++    next_any, ds_block, salu_free = 0, 0, 0
++
++    def can(i):
++        k = nodes[i].kind
++        if earliest[i] > t or (k != "DS" and t < ds_block):
++            return False
++        if k == "DS":
++            if HW_DSLIM:
++                return sum(1 for p in issued_ds[retired_ds:] if ds_done[p] > t) < DS_MAX
++            return len(issued_ds) - retired_ds < DS_MAX
++        if k in ("SALU", "RESC", "RARE", "TDM", "BARW"):
++            return t >= salu_free
++        return True
++
++    while done < n:
++        pick = None
++        if t >= next_any:
++            nw = wseq[wk] if wk < len(wseq) else None
++            if nw is not None and nw in ready and t >= last_w + HW_WMMA and can(nw):
++                pick = nw
++            else:
++                cand = [i for i in ready if nodes[i].kind != "WMMA" and can(i)]
++                if nw is not None and nw in ready and earliest[nw] <= last_w + HW_WMMA:
++                    due = max(last_w + HW_WMMA, earliest[nw])
++                    cand = [i for i in cand if t + (HW_DS_BLOCK if nodes[i].kind == "DS" else 1) <= due]
++                if cand:
++                    pick = max(cand, key=lambda i: (nodes[i].kind == "BAR", -deadline[i], cp[i], -i))
++        if pick is None:
++            t += 1
++            if t > 10**6:
++                raise RuntimeError("scheduler deadlock")
++            continue
++        nd = nodes[pick]
++        ready.discard(pick)
++        k = nd.kind
++        next_any = t + 1
++        if k == "DS":
++            last_done = max(t + DS_LAT, last_done + HW_DS_GAP)
++            ds_done[pick] = last_done
++            issued_ds.append(pick)
++            ds_block = t + HW_DS_BLOCK
++        elif k == "BAR":
++            retired_ds = len(issued_ds)
++        elif k == "WMMA":
++            last_w = t
++            wk += 1
++        elif k in ("SALU", "TDM", "BARW"):
++            salu_free = t + 1
++        elif k == "RARE":
++            next_any = salu_free = t + RARE_COST
++        elif k == "RESC":
++            next_any = salu_free = t + HW_RESC
++        for p, _ in nd.preds:
++            if nodes[p].kind == "DS" and k != "DS" and p in ds_done and nodes[p].vdefs & nd.vuses:
++                retired_ds = max(retired_ds, issued_ds.index(p) + 1)
++        out.append(nd)
++        done += 1
++        for s, lat in succ[pick]:
++            if k == "DS":
++                e = ds_done[pick] if nd.vdefs & nodes[s].vuses else t + 1
++                if lat > 1 and nodes[s].kind == "BAR":
++                    e = max(e, ds_done[pick])
++            elif lat <= 1:
++                e = t + 1
++            else:
++                e = t + SLOT_LAT[k]
++            earliest[s] = max(earliest[s], e)
++            npred[s] -= 1
++            if npred[s] == 0:
++                ready.add(s)
++        t += 1
++    res, nds, ret, seqn = [], 0, 0, {}
++    for nd in out:
++        if nd.kind == "DS":
++            if nds - ret >= DS_MAX:
++                res.append(Node(f"s_wait_dscnt 0x{DS_MAX - 1:x}", "WAIT", "dsmax"))
++                ret = nds - (DS_MAX - 1)
++            seqn[nd.idx] = nds
++            nds += 1
++        elif nd.kind == "BAR":
++            ret = nds
++        else:
++            for p, _ in nd.preds:
++                if p in seqn and nodes[p].vdefs & nd.vuses:
++                    ret = max(ret, seqn[p] + 1)
++        res.append(nd)
++    return res, max(t, last_w + HW_WMMA)
++
++
+ # ------------------------------------------------------------------------------------------------------------
+ # regions
+ # ------------------------------------------------------------------------------------------------------------
+Binary files a/gfx1250_mla/tools/fwdgen/__pycache__/fwdgen.cpython-312.pyc and b/gfx1250_mla/tools/fwdgen/__pycache__/fwdgen.cpython-312.pyc differ

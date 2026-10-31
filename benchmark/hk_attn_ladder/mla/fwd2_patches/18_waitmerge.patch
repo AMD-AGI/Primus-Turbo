@@ -1,0 +1,87 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 15:21:54.092610307 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 15:27:13.279480137 +0000
+@@ -323,6 +323,55 @@
+     return out
+ 
+ 
++WAIT_MERGE = 0  # --wait-merge W
++
++
++def merge_ds_waits(lines, window):
++    """Fewer s_wait_dscnt (each costs ~4 issue cycles even when it does not stall, ATT): a wait takes the strictest
++    count of the next window - 1 waits of its block (adjusted for the LDS ops issued in between) and they go. A wait
++    for 0 and the waits after a label, branch or barrier op stay. The re-walk (walk_block_check) checks the result."""
++    if window <= 1:
++        return lines
++    txt = [x.strip().split(";")[0].strip() for x in lines]
++    n = len(lines)
++    keep, newn = [True] * n, {}
++    k = 0
++    while k < n:
++        if not txt[k].startswith("s_wait_dscnt"):
++            k += 1
++            continue
++        best = int(txt[k].split()[1], 0)
++        if best == 0:
++            k += 1
++            continue
++        d, merged, j = 0, [], k + 1
++        while j < n and len(merged) < window - 1:
++            t = txt[j]
++            if not t or t.endswith(":") or t.startswith(("s_barrier", "s_cbranch", "s_branch")):
++                break
++            if t.startswith("ds_"):
++                d += 1
++            if t.startswith("s_wait_dscnt"):
++                nj = int(t.split()[1], 0)
++                if nj - d < 0:
++                    break
++                best = min(best, nj - d)
++                merged.append(j)
++            j += 1
++        if merged:
++            newn[k] = best
++            for x in merged:
++                keep[x] = False
++            k = merged[-1] + 1
++        else:
++            k += 1
++    out = []
++    for i, x in enumerate(lines):
++        if keep[i]:
++            out.append(x.replace(txt[i], f"s_wait_dscnt 0x{newn[i]:x}") if i in newn else x)
++    return out
++
++
+ def emit_region(texts, fmap, scalars, L=None):
+     """asmkit.emit on one region: (lines, what walk_check finds in them, which must be nothing). Entry state:
+     anything may be in flight (unknown), XCNT as xcnt_entry, no VALU history. Pseudo-lines split the region into
+@@ -344,6 +393,7 @@
+         for k, it in enumerate(items):
+             it.pos = k
+         lines, ex = M.emit_block(items, fl, fmap, va_rule=VA_RULE)
++        lines = merge_ds_waits(lines, WAIT_MERGE)
+         return lines, ex, walk_block_check(lines, fl)
+ 
+     out, found, ool, lead = [], [], [], []
+@@ -470,6 +520,8 @@
+     ap.add_argument("--sgpr-lat", type=int, default=0,
+                     help="scheduler latency of a VALU-written SGPR read by SALU (fwdgen.SGPR_LAT; 0: off)")
+     ap.add_argument("--resc-cost", type=int, default=None, help="modelled cycles of a RESC block (fwdgen.RESC_COST)")
++    ap.add_argument("--wait-merge", type=int, default=0, help="merge each s_wait_dscnt with the next W - 1 of its block")
++    ap.add_argument("--ds-max", type=int, default=None, help="LDS loads in flight at most (fwdgen.DS_MAX, default 56)")
+     ap.add_argument("--resc", default="always", choices=("always", "branch", "branch2", "ool"),
+                     help="O *= corr on every tile, under a per-q-tile wave-uniform branch (FlyDSL's _rescale_if), or "
+                          "the whole rescale decision and O *= corr out of line behind a not-taken branch")
+@@ -494,6 +546,10 @@
+     G.GROUP_EDGES = not a.no_group_edges
+     G.RESC = a.resc
+     G.SGPR_LAT = a.sgpr_lat
++    global WAIT_MERGE
++    WAIT_MERGE = a.wait_merge
++    if a.ds_max is not None:
++        G.DS_MAX = a.ds_max
+     if a.resc_cost is not None:
+         G.RESC_COST = a.resc_cost
+     G.LOOP = a.loop

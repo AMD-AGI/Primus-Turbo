@@ -1,0 +1,84 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 15:14:10.081248891 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 15:21:54.092610307 +0000
+@@ -467,7 +467,10 @@
+                     help="VGPR plan: 1 (E2's), 2 (the softmax's registers in one block: fewer MSB switches)")
+     ap.add_argument("--loop", action="store_true",
+                     help="HKGEN2: one generated LOOP region runs every tile of a block (TDM, barriers, tile counter)")
+-    ap.add_argument("--resc", default="always", choices=("always", "branch", "ool"),
++    ap.add_argument("--sgpr-lat", type=int, default=0,
++                    help="scheduler latency of a VALU-written SGPR read by SALU (fwdgen.SGPR_LAT; 0: off)")
++    ap.add_argument("--resc-cost", type=int, default=None, help="modelled cycles of a RESC block (fwdgen.RESC_COST)")
++    ap.add_argument("--resc", default="always", choices=("always", "branch", "branch2", "ool"),
+                     help="O *= corr on every tile, under a per-q-tile wave-uniform branch (FlyDSL's _rescale_if), or "
+                          "the whole rescale decision and O *= corr out of line behind a not-taken branch")
+     ap.add_argument("--resc-threshold", type=float, default=None,
+@@ -490,6 +493,9 @@
+     DEFINES[:] = a.defines
+     G.GROUP_EDGES = not a.no_group_edges
+     G.RESC = a.resc
++    G.SGPR_LAT = a.sgpr_lat
++    if a.resc_cost is not None:
++        G.RESC_COST = a.resc_cost
+     G.LOOP = a.loop
+     G.PLAN = a.plan
+     G.MSB_BUCKET = a.msb_sched
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 15:14:10.081078901 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-10-30 15:21:54.092434627 +0000
+@@ -110,6 +110,11 @@
+ # x * 1.0 changes no bit). A RESC node stands for the whole block in the schedule; build.py expands it (resc_block).
+ RESC = "always"
+ RESC_COST = 6  # modelled cycles of the s_cmp + s_cbranch of a RESC block that is not taken
++# --resc branch2: the RESC block's s_cmp is a node of its own (SALU, writes scc), so the scheduler can issue it BR_LAT
++# cycles ahead of the s_cbranch (ATT: s_cmp -> s_cbranch 9 cycles; a taken branch costs ~25 more)
++BR_LAT = 9
++# --sgpr-lat N: the latency of a VALU-written SGPR to a SALU reader (ATT: v_cmp_lt sX -> s_cmp_lg sX ~20 cycles); 0: off
++SGPR_LAT = 0
+ # --resc ool: the rescale decision from the lane's half-row max (any lane's fma(lmx, c, -m) > T <=> any row's: fma is
+ # monotone in lmx), corr = 1 on the common path, and the rare path -- full row max (permlane), m' = max(m, c lm),
+ # corr = exp2(m - m'), O *= corr -- out of line behind a not-taken branch (HKRARE node; build.py lays it out after the
+@@ -384,6 +389,13 @@
+             if k in last_w:
+                 p = last_w[k]
+                 lat = 8 if nodes[p].kind == n.kind == "WMMA" else LAT[nodes[p].kind]  # 8: accumulator chain
++                pk = nodes[p].kind
++                if SGPR_LAT and k[0] == "s" and r not in ("scc", "vcc") and pk in ("VALU", "TRANS", "PERM") and (
++                    n.kind in ("SALU", "RESC", "RARE")
++                ):
++                    lat = SGPR_LAT
++                if r == "scc" and pk == "SALU" and n.kind == "RESC":
++                    lat = BR_LAT
+                 preds[p] = max(preds.get(p, 0), lat)
+         for r in list(n.vdefs) + list(n.sdefs):
+             k = _key(r)
+@@ -584,6 +596,10 @@
+                     e = max(e, ds_done[pick])
+             elif lat <= 1:
+                 e = t + 1  # WAR / WAW / order edge
++            elif (SGPR_LAT and lat == SGPR_LAT and k in ("VALU", "TRANS", "PERM")) or (
++                lat == BR_LAT and nodes[s].kind == "RESC"
++            ):
++                e = t + lat  # a VALU-written SGPR read by SALU; scc to the RESC branch
+             else:
+                 e = t + SLOT_LAT[k]
+             earliest[s] = max(earliest[s], e)
+@@ -894,6 +910,9 @@
+             add(f"v_cvt_pk_bf16_f32 {vr(L.P(i, kt) + r)}, {vr(lo)}, {vr(hi)}", "VALU", f"cvt{i}")
+     if RESC == "branch":
+         add(f"HKRESC {i} {L.O(i, 0)} {corr} {S_ANY[i]}", "RESC", f"resc{i}")
++    elif RESC == "branch2":  # the s_cmp as its own node; the RESC node reads its scc
++        add(f"s_cmp_lg_u32 {S_ANY[i]}, 0", "SALU", f"resc{i}")
++        add(f"HKRESC {i} {L.O(i, 0)} {corr} scc", "RESC", f"resc{i}")
+     elif RESC == "always":
+         for t in resc_lines(L, i):  # O *= corr
+             add(t, "VALU", f"resc{i}")
+@@ -913,6 +932,8 @@
+     """The expansion of a RESC pseudo-line: (lines ending the block before it, the conditional block's lines,
+     the label line starting the block after it)."""
+     _, i, _, _, sany = line.split()
++    if sany == "scc":  # --resc branch2: the s_cmp is a scheduled node of its own
++        return ([f"s_cbranch_scc0 {label}"], resc_lines(L, int(i)), f"{label}:")
+     return ([f"s_cmp_lg_u32 {sany}, 0", f"s_cbranch_scc0 {label}"], resc_lines(L, int(i)), f"{label}:")
+ 
+ 

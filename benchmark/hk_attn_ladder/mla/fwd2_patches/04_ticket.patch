@@ -1,0 +1,230 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 13:24:11.552896556 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-10-30 13:29:36.090652240 +0000
+@@ -76,6 +76,16 @@
+ #ifndef HKGEN_PROBE
+ #define HKGEN_PROBE 0
+ #endif
++// HKGEN_TICKET 1: the persistent workgroups take their q blocks from ticket counters (the extra argument CTR, int32s
++// 256 B apart: 8 group counters and a done counter, all 0 between calls) instead of the static schedule: FlyDSL's
++// dynamic per-XCD scheme (917e240b). Workgroup w takes the tickets of group w % 8 (two of every 16 consecutive
++// dispatch ranks, head lanes g and 15 - g, the 2 shortest q blocks of every head chunk last), then steals from the
++// other groups; a workgroup that finds none left counts itself done and the last one resets every counter. Wave 0
++// takes the next block's ticket before the block's first diagonal tile and stores it into an LDS slot before the
++// block's last tile, whose barrier B_n makes it visible to the other waves.
++#ifndef HKGEN_TICKET
++#define HKGEN_TICKET 0
++#endif
+ #define PR_MAXB 64
+ 
+ // the SGPRs the generated code uses as temporaries (with vcc / scc; fwdgen.CLOBBERED): clobbered at every marker
+@@ -103,9 +113,11 @@
+ constexpr int LSE_SLOT = 16 * XO;          // 4352
+ constexpr int SQT = LSE_SLOT + 32 * 4;     // 4480
+ constexpr int LDS_B = TAIL + 2 * 4 * SQT;  // 310272
++constexpr int TKT = LDS_B;                                     // HKGEN_TICKET: the next block's ticket (int32)
++constexpr int LDS_ALLOC = LDS_B + (HKGEN_TICKET ? 16 : 0);
+ static_assert(2 * 4 * SQT <= STG_B, "the staging of q tiles 0, 1 fits in one ring stage");
+ static_assert(SQT % 16 == 0 && STG_B % 16 == 0, "16-byte aligned staging slots");
+-static_assert(LDS_B <= 327680 && 2 * LDS_B > 327680, "one workgroup per CU");
++static_assert(LDS_ALLOC <= 327680 && 2 * LDS_B > 327680, "one workgroup per CU");
+ constexpr unsigned OOB = 0x80000000u;  // > every num_records (< 2^31) and + soffset < 2^32: dropped, no wrap
+ constexpr unsigned W0_A = 0x47510000u;  // 128 columns, pad 72 elements -> 400-B rows
+ constexpr unsigned W0_B = 0x87110000u;  // 64 columns, pad 136 elements -> 400-B rows
+@@ -144,6 +156,80 @@
+   bz = rem / gy;
+ }
+ 
++#if HKGEN_TICKET
++// block_ids on dispatch rank lin (FlyDSL's _remap of a ticket)
++HKF_INLINE void remap(int lin, int gx, int gy, int gz, int& bx, int& by, int& bz) {
++  const int gyz = gy * gz;
++  int rank = lin / gyz;
++  int rem = lin - rank * gyz;
++  const int r = (rank & 15) * gyz + rem;
++  const int c = r & 255;
++  const bool grouped = ((gx & 15) | (gyz & 15)) == 0;
++  const int lin2 = grouped ? ((rank & -16) + (c >> 4)) * gyz + ((r >> 8) << 4) + (c & 15) : lin;
++  rank = lin2 / gyz;
++  rem = lin2 - rank * gyz;
++  bx = gx - 1 - rank;
++  by = rem % gy;
++  bz = rem / gy;
++}
++typedef __attribute__((address_space(1))) unsigned gu32;  // global atomics: a flat one would count in DScnt too, and
++                                                          // the tile regions' s_wait_dscnt would wait for it
++constexpr int TG = 8;         // ticket groups: one per XCD under the round-robin dispatch
++constexpr int CSTRIDE = 64;   // int32s from one counter to the next (256 B); the done counter after the 8 groups
++constexpr int HOLD_BACK = 2;  // the shortest q blocks of every head chunk go to the end of each group's sequence
++// FlyDSL's _group_ticket: the k-th ticket (dispatch rank) of group g
++HKF_INLINE int group_ticket(int g, int k, int gx, int gyz) {
++  const int lane = (k & 1) == 0 ? g : 15 - g;
++  const int i = k >> 1;
++  const int hc = gyz >> 4;
++  const int reg = (gx - 16) * hc;
++  const int main = reg + hc * (16 - HOLD_BACK);
++  const int j = i - reg, jt = i - main;
++  const int p_main = reg + (j / (16 - HOLD_BACK)) * 16 + j % (16 - HOLD_BACK);
++  const int p_tail = reg + (jt / HOLD_BACK) * 16 + (16 - HOLD_BACK) + jt % HOLD_BACK;
++  const int p = i < reg ? i : (i < main ? p_main : p_tail);
++  return (p << 4) + lane;
++}
++// lane 0: the raw ticket of the workgroup's own group (a wrapping increment, so LLVM's atomic optimizer leaves the
++// result unwaited until its use)
++HKF_INLINE int take_ticket(int* ctr, int lane) {
++  int r = 0;
++  if (lane == 0)
++    r = (int)__builtin_amdgcn_atomic_inc32(
++        (volatile gu32*)(ctr + ((int)__builtin_amdgcn_workgroup_id_x() & (TG - 1)) * CSTRIDE), 0x7FFFFFFFu,
++        __ATOMIC_RELAXED, "agent");
++  return r;
++}
++// wave 0: the ticket from take_ticket's lane-0 result, else stolen from the other groups; with none left (>= total)
++// the workgroup counts itself done and the last one done resets every counter
++HKF_INLINE int finish_ticket(int* ctr, int raw, int lane, int total, int gx, int gyz, int npw) {
++  const int g = (int)__builtin_amdgcn_workgroup_id_x() & (TG - 1);
++  const int kmax = total >> 3;
++  const int k = __builtin_amdgcn_readfirstlane(raw);
++  int t = k < kmax ? group_ticket(g, k, gx, gyz) : total;
++  for (int h = 1; h < TG && t >= total; ++h) {
++    const int gh = (g + h) & (TG - 1);
++    int r = 0;
++    if (lane == 0)
++      r = (int)__builtin_amdgcn_atomic_inc32((volatile gu32*)(ctr + gh * CSTRIDE), 0x7FFFFFFFu, __ATOMIC_RELAXED,
++                                             "agent");
++    r = __builtin_amdgcn_readfirstlane(r);
++    t = r < kmax ? group_ticket(gh, r, gx, gyz) : total;
++  }
++  if (t >= total) {
++    int d = 0;
++    if (lane == 0)
++      d = (int)__builtin_amdgcn_atomic_inc32((volatile gu32*)(ctr + TG * CSTRIDE), 0x7FFFFFFFu, __ATOMIC_RELAXED,
++                                             "agent");
++    d = __builtin_amdgcn_readfirstlane(d);
++    if (d == npw - 1 && lane == 0)
++      for (int i = 0; i <= TG; ++i)
++        __hip_atomic_store((gu32*)(ctr + i * CSTRIDE), 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
++  }
++  return t;
++}
++#endif
++
+ #if HKGEN_REF
+ HKF_INLINE f32x8 zero8() { return f32x8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}; }
+ HKF_INLINE float fmax2(float a, float b) { return __builtin_fmaxf(a, b); }
+@@ -202,21 +288,28 @@
+   float* LSE;
+   float scale;
+   int Sq, Skv, H, B, nqb, npw;
++#if HKGEN_TICKET
++  int* CTR;
++#endif
+ #if HKGEN_PROBE
+   unsigned* PRB;
+ #endif
+ };
+-static_assert(sizeof(KArgs) == (HKGEN_PROBE ? 80 : 72) && __builtin_offsetof(KArgs, npw) == 64, "kernarg layout");
++static_assert(sizeof(KArgs) == 72 + 8 * (HKGEN_TICKET + (HKGEN_PROBE ? 1 : 0)) && __builtin_offsetof(KArgs, npw) == 64,
++              "kernarg layout");
+ 
+ extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+ void k_mla_fwd(const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf16* __restrict__ V,
+                bf16* __restrict__ O, float* __restrict__ LSE, float scale, int Sq, int Skv, int H, int B, int nqb,
+                int npw
++#if HKGEN_TICKET
++               , int* __restrict__ CTR
++#endif
+ #if HKGEN_PROBE
+                , unsigned* __restrict__ PRB
+ #endif
+                ) {
+-  __shared__ __attribute__((aligned(1024))) unsigned char smem[LDS_B];
++  __shared__ __attribute__((aligned(1024))) unsigned char smem[LDS_ALLOC];
+   lock_simd();
+ #if HKGEN_PROBE
+   (void)PRB;
+@@ -254,6 +347,11 @@
+   // the loop counter (LLVM cannot prove it 0) and the arguments are re-read from the kernarg segment at offset 48 z
+   // (16-byte aligned and not a multiple of the load size: an unscaled SGPR soffset), so LLVM hoists nothing
+   // argument-derived out of the loop: the shell's state fits in the SGPRs the markers leave it, without spills.
++#if HKGEN_TICKET
++#define HKF_REMAP(t, gx, gy, gz, bx, by, bz) remap(t, gx, gy, gz, bx, by, bz)
++#else
++#define HKF_REMAP(t, gx, gy, gz, bx, by, bz) (void)(bx = by = bz = 0)
++#endif
+ #define HKF_BLOCK(z)                                                                                                 \
+   const KArgs ka = *(const __attribute__((address_space(4))) KArgs*)(                                                \
+       (const __attribute__((address_space(4))) unsigned char*)__builtin_amdgcn_kernarg_segment_ptr() + 48 * (z));    \
+@@ -265,6 +363,12 @@
+   const unsigned long long krow = (unsigned long long)H_ * D_QK;                                                     \
+   const unsigned long long vrow = (unsigned long long)H_ * D_V;                                                      \
+   auto block_at = [&](int s_, int& qb, int& hh, int& bb) -> bool {                                                   \
++    if (HKGEN_TICKET && npw_ > 0) { /* the ticket in the LDS slot (static schedule: s_ unused) */                    \
++      const int t_ = __builtin_amdgcn_readfirstlane((int)*(const lds_u32*)lds_ptr(lds0 + TKT));                       \
++      const bool ok = t_ < nqb_ * H_ * B_;                                                                           \
++      HKF_REMAP(ok ? t_ : 0, nqb_, H_, B_, qb, hh, bb);                                                              \
++      return ok;                                                                                                     \
++    }                                                                                                                \
+     if (npw_ > 0) {                                                                                                  \
+       const int wg = (int)__builtin_amdgcn_workgroup_id_x();                                                         \
+       const int pr = (wg >> 3) / nqb_, pq = (wg >> 3) - pr * nqb_, pR = (npw_ >> 3) / nqb_;                          \
+@@ -319,6 +423,20 @@
+   (void)cshift, (void)npw_, (void)nqb_, (void)B_;
+ 
+   // ---- the first block's prologue loads -----------------------------------------------------------------------------
++#if HKGEN_TICKET
++  {
++    HKF_BLOCK(0)
++    if (npw_ > 0) {  // wave 0 takes the first ticket; the barrier publishes it (every wave of the workgroup runs this)
++      if (wv == 0) {
++        const int ln = (int)__builtin_amdgcn_mbcnt_lo(~0u, 0u);
++        const int t = finish_ticket(ka.CTR, take_ticket(ka.CTR, ln), ln, nqb_ * H_ * B_, nqb_, H_ * B_, npw_);
++        lds_store_b32(lds_wptr(lds0 + TKT), 0, (unsigned)t);
++      }
++      bar_signal();
++      bar_wait();
++    }
++  }
++#endif
+   {
+     HKF_BLOCK(0)
+     int qb, hh, bb;
+@@ -491,7 +609,23 @@
+     unsigned int pr_dreg = 0;
+ #endif
+     // ---- the diagonal tiles ncc + k, k < 4 (Sq == Skv) --------------------------------------------------------------
++#if HKGEN_TICKET
++    int tk_raw = 0;  // wave 0, lane 0: the next block's raw ticket, in flight over the first three diagonal tiles
++#endif
+     static_for<4>([&](auto k) {
++#if HKGEN_TICKET
++      if constexpr (k == 0) {
++        HKF_BLOCK(ncc >> 30)
++        if (npw_ > 0 && wv == 0) tk_raw = take_ticket(ka.CTR, lane);
++      }
++      if constexpr (k == 3) {  // the slot's ticket (this block's) was read by every wave at the loop top
++        HKF_BLOCK(ncc >> 30)
++        if (npw_ > 0 && wv == 0) {
++          const int t = finish_ticket(ka.CTR, tk_raw, lane, nqb_ * H_ * B_, nqb_, H_ * B_, npw_);
++          lds_store_b32(lds_wptr(lds0 + TKT), 0, (unsigned)t);
++        }
++      }
++#endif
+       if (ncc + k < n) {
+         const int t2 = ncc + k;
+         issue_slot(t2 + 3, n, sb, gk0, gv0);
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 13:24:11.552988976 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 13:28:40.924514929 +0000
+@@ -438,7 +438,10 @@
+ 
+     # 6., 7. the listing
+     rec["checks"]["contract"] = contract_checks(spl, objdump, markers, L, fail)
+-    rec["checks"]["writeback"] = writeback_check(objdump, fail if not probe else [])  # probe: stamps add phases
++    # the writeback check guards the static schedule's hand-arranged store phase (E1/E2); the probe's stamps and the
++    # ticket code (atomics, a per-lane branch, the slot read) put LLVM's own control flow into it: report only
++    relaxed = probe or any(d.startswith("HKGEN_TICKET=") and d != "HKGEN_TICKET=0" for d in DEFINES)
++    rec["checks"]["writeback"] = writeback_check(objdump, fail if not relaxed else [])
+ 
+     for f in fail:
+         log("FAIL:", f)

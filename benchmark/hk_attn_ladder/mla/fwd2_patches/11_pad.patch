@@ -1,0 +1,76 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 14:05:14.860042736 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-10-30 14:06:36.999720444 +0000
+@@ -286,6 +286,41 @@
+ 
+ 
+ RESC_LABELS = [0]  # unique labels of the RESC blocks across the regions
++PAD = None  # --pad (kind, n)
++
++
++def pad_lines(lines, L):
++    """--pad: the region with redundant instructions (semantics unchanged; waits / hazards unaffected: the added
++    VALU writes a scratch VGPR with its own value, in MSB mode 0 only)."""
++    kind, n = PAD
++    if kind == "msb":
++        out = []
++        for l in lines:
++            out.append(l)
++            x = l.strip()
++            if x.startswith("s_set_vgpr_msb"):
++                new = int(x.split()[1], 0) & 0xFF  # a repeat: the same mode, its previous-mode byte = that mode
++                out += [f"\ts_set_vgpr_msb 0x{(new << 8) | new:x}"] * n
++        return out
++    body = [k for k, l in enumerate(lines) if l.strip() and not l.strip().startswith((".", ";"))]
++    # VALU pads only where the MSB mode is 0 (after an s_set_vgpr_msb ... 0 or before any), SALU / nop anywhere
++    mode0, cur = [], 0
++    for k, l in enumerate(lines):
++        x = l.strip()
++        if x.startswith("s_set_vgpr_msb"):
++            cur = int(x.split()[1], 0) & 0xFF
++        if cur == 0:
++            mode0.append(k)
++    cand = mode0 if kind == "valu" else body
++    step = max(1, len(cand) // n)
++    at = set(cand[i] for i in range(0, len(cand), step)[:n])
++    ins = {"salu": "\ts_mov_b32 s101, s101", "nop": "\ts_nop 0", "valu": f"\tv_mov_b32_e32 v{L.sm[0][17]}, v{L.sm[0][17]}"}[kind]
++    out = []
++    for k, l in enumerate(lines):
++        out.append(l)
++        if k in at:
++            out.append(ins)
++    return out
+ 
+ 
+ def emit_region(texts, fmap, scalars, L=None):
+@@ -431,6 +466,10 @@
+     ap.add_argument("--worder", default=None,
+                     help="the TILE regions' WMMA stream order, comma-separated tags (default PV0p,PV1p,PV2p,PV3p,"
+                          "QK0,QK1,QK2,QK3); a tag of a q tile a region does not run is skipped")
++    ap.add_argument("--pad", default=None,
++                    help="timing-only probe of marginal issue costs: KIND:N adds N redundant instructions spread over "
++                         "each TILE region (msb: every s_set_vgpr_msb repeated N times; salu: s_mov_b32 s101, s101; "
++                         "valu: v_mov_b32 of a softmax scratch VGPR onto itself; nop: s_nop 0)")
+     ap.add_argument("--abl", action="append", default=[], choices=("nosoft", "nolds"),
+                     help="timing-only ablation (wrong results)")
+     ap.add_argument("-D", dest="defines", action="append", default=[],
+@@ -447,6 +486,10 @@
+     if a.loop:
+         DEFINES.append("HKGEN2=1")
+     G.ABL = set(a.abl)
++    global PAD
++    if a.pad:
++        kd, nn = a.pad.split(":")
++        PAD = (kd, int(nn))
+     if a.worder:
+         tags = tuple(a.worder.split(","))
+         if sorted(tags) != sorted(G.WORDER):
+@@ -557,6 +600,8 @@
+         lines, open_ = emit_region(texts, fmap, scalars, L)
+         if open_:
+             fail.append(f"{name}: {len(open_)} hazards / coverage errors after emission, e.g. {open_[:3]}")
++        if PAD and name == "TILE_C":
++            lines = pad_lines(lines, L)
+         regions[name] = pre + lines + post
+         log(
+             f"{name}: {len(texts)} instructions -> {len(pre) + len(lines)} lines"
