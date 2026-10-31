@@ -29,6 +29,7 @@ import os
 import sys
 from pathlib import Path
 
+from . import ref as R
 from .build import DEFAULT_OUT, ladder_name, load_ladder
 
 __all__ = ["Baseline", "Rung", "baseline_ids", "load", "load_baseline", "rung_ids"]
@@ -55,11 +56,11 @@ class Rung:
 
     def fwd(self, q, k, v, softmax_scale=None, causal=True):
         # explicit scale: fwd_pp has no default for it
-        scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+        scale = R.default_scale(q.shape[-1]) if softmax_scale is None else softmax_scale
         return self.module.flash_attn_fwd(q, k, v, scale, causal)
 
     def bwd(self, do, q, k, v, o, lse, softmax_scale=None, causal=True):
-        scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+        scale = R.default_scale(q.shape[-1]) if softmax_scale is None else softmax_scale
         return self.module.flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=scale, causal=causal)
 
     def plan(self, *args, **kw):
@@ -103,11 +104,11 @@ class Baseline:
         return f"Baseline({self.ladder}:{self.id})"
 
     def fwd(self, q, k, v, softmax_scale=None, causal=True):
-        scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+        scale = R.default_scale(q.shape[-1]) if softmax_scale is None else softmax_scale
         return self._fwd(q, k, v, softmax_scale=scale, causal=causal, **self.kwargs)
 
     def bwd(self, do, q, k, v, o, lse, softmax_scale=None, causal=True):
-        scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+        scale = R.default_scale(q.shape[-1]) if softmax_scale is None else softmax_scale
         return self._bwd(do, q, k, v, o, lse, softmax_scale=scale, causal=causal, **self.kwargs)
 
 

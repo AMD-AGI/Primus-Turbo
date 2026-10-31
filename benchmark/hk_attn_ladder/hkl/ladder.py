@@ -139,10 +139,25 @@ def settle(call, flush, seconds, minimum=2):
         n += 1
 
 
-def cell(call, flush, iters):
+def cell(call, flush, iters, mode="cold", gap_s=0.02):
+    """Per-call ms of one cell. cold: a flush before every call, each call its own event pair; hot: the iters
+    calls back to back (no flush) inside one event pair, their mean (the Primus-Turbo README method); burst:
+    each call alone after gap_s seconds of idle GPU (then a flush), its own event pair -- the clock has not
+    been pulled down by this arm's own power draw, as for a kernel inside a training step."""
+    if mode == "hot":
+        beg, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        beg.record()
+        for _ in range(iters):
+            call()
+        end.record()
+        torch.cuda.synchronize()
+        return [beg.elapsed_time(end) / iters]
     beg = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     end = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     for i in range(iters):
+        if mode == "burst":
+            torch.cuda.synchronize()
+            time.sleep(gap_s)
         flush.fill_(0)
         beg[i].record()
         call()
@@ -183,6 +198,10 @@ def main(argv=None):
     ap.add_argument("--min-snr", type=float, default=40.0)
     ap.add_argument("--data", choices=("randn", "zeros"), default=os.environ.get("HKL_DATA", "randn"),
                     help="input data; zeros (no verification) shows the clock without the power cap's pull")
+    ap.add_argument("--mode", choices=("cold", "hot", "burst"), default="cold",
+                    help="cold: flush before every call (default); hot: back-to-back calls, one event pair; burst: "
+                         "every call after --gap-ms of idle (no settle; sclk / cycles then mostly idle samples)")
+    ap.add_argument("--gap-ms", type=float, default=20.0, help="burst mode: idle time before every call")
     ap.add_argument("--json")
     ap.add_argument("--md")
     a = ap.parse_args(argv)
@@ -241,9 +260,13 @@ def main(argv=None):
         if rnd % 2:
             order = order[::-1]
         for i in order:
-            settle(calls[i], flush, a.settle_s)
+            if a.mode == "burst":
+                torch.cuda.synchronize()
+                time.sleep(0.3)  # the previous arm's draw fades; no settle: the point is an unsettled clock
+            else:
+                settle(calls[i], flush, a.settle_s)
             t0 = time.monotonic()
-            ms = cell(calls[i], flush, a.iters)
+            ms = cell(calls[i], flush, a.iters, a.mode, a.gap_ms / 1e3)
             t1 = time.monotonic()
             samples[i].append(statistics.median(ms))
             clocks[i].append(sclk.median(t0, t1))
@@ -312,12 +335,13 @@ def main(argv=None):
     meta = {"ladder": spec["name"], "shape": repr(sh), "device": props.gcnArchName, "cus": props.multi_processor_count,
             "torch": torch.__version__, "rounds": a.rounds, "iters": a.iters, "settle_s": a.settle_s, "flush_mb": a.flush_mb,
             "hip_visible_devices": os.environ.get("HIP_VISIBLE_DEVICES"), "host": os.uname().nodename,
-            "time": time.strftime("%Y-%m-%d %H:%M:%S"), "useful_flops": flops, "data": a.data}  # fmt: skip
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"), "useful_flops": flops, "data": a.data,
+            "mode": a.mode, "gap_ms": a.gap_ms if a.mode == "burst" else None}  # fmt: skip
     if a.json:
         with open(a.json, "w") as f:
             json.dump({"meta": meta, "rows": rows, "null_control": null_ctl}, f, indent=1)
     if a.md:
-        md = [f"{spec.get('title', spec['name'])}, {sh}, {a.data} inputs, {meta['host']} GPU {meta['hip_visible_devices']}, {meta['time']}",
+        md = [f"{spec.get('title', spec['name'])}, {sh}, {a.data} inputs, {a.mode} timing, {meta['host']} GPU {meta['hip_visible_devices']}, {meta['time']}",
               "", "| Rung | ms | TFLOP/s | Over | Step | Step (cycles) | sclk MHz | Mcycles | W | mJ/call | Feature |",
               "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"]  # fmt: skip
         for row in rows:

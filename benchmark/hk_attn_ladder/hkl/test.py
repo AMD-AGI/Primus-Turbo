@@ -47,7 +47,10 @@ SHAPES = {
         # causal with (Skv - Sq) % 64 == 32: the steady-loop region-C read of the dQ kernel from 5c20de7e (r2d) on
         # is suspected to take the wrong half-block for row 2 nf here (CPU replay of its idx.h); FlyDSL skips it
         ("rect32", dict(b=1, sq=4096, skv=4128, hq=4, hkv=4)),
+        # the smallest persistent shapes of the forward's ticket schedule (512 blocks = 2 per CU at 256 CUs)
+        ("b1_h32", dict(b=1, sq=4096, skv=4096, hq=32, hkv=32)),
         ("prod", dict()),
+        ("prod_b4", dict(b=4)),
     ],
 }
 

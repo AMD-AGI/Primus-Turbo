@@ -13,3 +13,5 @@ micro/warv_stress
 micro/wmma_mix
 micro/wmma_mix_w*
 micro/lds_lat
+# rocprofv3 working files (tools/att.sh, tools/ktrace.sh)
+.rocprofv3/

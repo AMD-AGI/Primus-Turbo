@@ -39,18 +39,22 @@ _A11 = [("Q", "ptr"), ("K", "ptr"), ("V", "ptr"), ("O", "ptr"), ("LSE", "ptr"), 
 
 NARGS = 11
 PERSISTENT = False
+TICKET = False  # HKGEN_TICKET builds: persistent workgroups on ticket counters (argument CTR before PRB)
+_CTR = {}
+PROBE = False  # HKGEN_PROBE builds: one more argument, PRB (16 words per wave and block), kept in LAST_PROBE
+LAST_PROBE = None
 LAYOUT = "sbhd"
 HSACO_DIR = None
 _KERNEL = None
 _LOCK = threading.Lock()
 
 
-def configure(nargs=11, persistent=False, layout="sbhd"):
-    global NARGS, PERSISTENT, LAYOUT, _KERNEL
+def configure(nargs=11, persistent=False, layout="sbhd", probe=False, ticket=False):
+    global NARGS, PERSISTENT, LAYOUT, _KERNEL, PROBE, TICKET
     if nargs not in (11, 12) or (persistent and nargs != 12) or layout not in ("sbhd", "bshd"):
         raise ValueError(f"bad configuration nargs={nargs} persistent={persistent} layout={layout}")
     with _LOCK:
-        NARGS, PERSISTENT, LAYOUT, _KERNEL = int(nargs), bool(persistent), layout, None
+        NARGS, PERSISTENT, LAYOUT, _KERNEL, PROBE, TICKET = int(nargs), bool(persistent), layout, None, bool(probe), bool(ticket)
 
 
 def set_hsaco_dir(path):
@@ -77,9 +81,28 @@ def _kernel():
         t = codeobj.kernels(path).get(NAME)
         if t is None or t["scratch"] or t["vgpr_spill"]:
             raise hiprt.HipError(f"{path}: {NAME} missing, or uses scratch / spills")
-        args = _A11 + ([("npw", "i32")] if NARGS == 12 else [])
+        args = (_A11 + ([("npw", "i32")] if NARGS == 12 else []) + ([("CTR", "ptr")] if TICKET else [])
+                + ([("PRB", "ptr")] if PROBE else []))
         _KERNEL = hiprt.load_hsaco(path, {NAME: {"block": 128, "args": args}}, sha256=sha)[NAME]
         return _KERNEL
+
+
+def ticket_npw(kb, sq, skv, kh, cus=256):
+    """FlyDSL 917e240b's persist_mode for the ticket schedule: full q blocks, Sq == Skv, q blocks and B * H multiples
+    of 16, the CU count a multiple of 8, at least two blocks per CU; else 0."""
+    nqb = sq // BM
+    if sq != skv or sq % BM or nqb % 16 or (kb * kh) % 16 or cus % 8 or nqb * kb * kh < 2 * cus:
+        return 0
+    return cus
+
+
+def _counters(device):
+    """The ticket counters of a device (int32s 256 B apart: 8 groups + done), 0 between calls (the kernel resets)."""
+    c = _CTR.get(device)
+    if c is None:
+        c = torch.zeros(9 * 64, device=device, dtype=torch.int32)
+        _CTR[device] = c
+    return c
 
 
 def persist_npw(kb, sq, skv, kh):
@@ -126,10 +149,20 @@ def flash_attn_fwd(q, k, v, softmax_scale=None, causal=True):
     args = [qk, kk, vk, o, lse, scale, sq, skv, kh, kb, nqb]
     grid = (nqb, kh, kb)
     if NARGS == 12:
-        npw = persist_npw(kb, sq, skv, kh) if PERSISTENT else 0
+        if TICKET:
+            npw = ticket_npw(kb, sq, skv, kh, torch.cuda.get_device_properties(q.device).multi_processor_count) if PERSISTENT else 0
+        else:
+            npw = persist_npw(kb, sq, skv, kh) if PERSISTENT else 0
         args.append(npw)
         if npw:
             grid = (npw, 1, 1)
+    if TICKET:
+        args.append(_counters(q.device))
+    if PROBE:
+        global LAST_PROBE
+        # k_mla_fwd.hip HKGEN_PROBE: 16 words per wave and block, PR_MAXB (64) blocks per wave
+        LAST_PROBE = torch.zeros(grid[0] * grid[1] * grid[2] * 4 * 64 * 16, device=q.device, dtype=torch.int32)
+        args.append(LAST_PROBE)
     _kernel().call(grid, (128, 1, 1), tuple(args), torch.cuda.current_stream(q.device))
     if LAYOUT == "bshd":
         return o, lse

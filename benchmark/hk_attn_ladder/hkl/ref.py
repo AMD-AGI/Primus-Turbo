@@ -15,6 +15,7 @@ below ~1 GiB, from the same bf16 inputs the kernels get.
 """
 
 import math
+import os
 
 import torch
 
@@ -79,9 +80,16 @@ def _mask(sh, device):
     return kv > p + (sh.skv - sh.sq)  # True = masked
 
 
+def default_scale(d):
+    """The softmax scale when a caller passes none: $HKL_SCALE if set (e.g. DeepSeek-V3's yarn
+    0.1352337788608801), else d^-0.5."""
+    v = os.environ.get("HKL_SCALE")
+    return float(v) if v else d**-0.5
+
+
 def ref_fwd(sh, q, k, v, scale=None):
     """(o fp32 in the problem's layout, lse fp32 [B, Hq, Sq])."""
-    scale = sh.d ** -0.5 if scale is None else scale
+    scale = default_scale(sh.d) if scale is None else scale
     qb, kb, vb = _bshd(q, sh.layout), _bshd(k, sh.layout), _bshd(v, sh.layout)
     g = sh.hq // sh.hkv
     o = torch.empty((sh.b, sh.sq, sh.hq, sh.dv), device=q.device, dtype=torch.float32)
@@ -107,7 +115,7 @@ def ref_fwd(sh, q, k, v, scale=None):
 
 def ref_bwd(sh, q, k, v, do, scale=None):
     """(dq, dk, dv) fp32 in the problem's layout (dk / dv with Hkv heads)."""
-    scale = sh.d ** -0.5 if scale is None else scale
+    scale = default_scale(sh.d) if scale is None else scale
     qb, kb, vb, dob = (_bshd(t, sh.layout) for t in (q, k, v, do))
     g = sh.hq // sh.hkv
     dq = torch.zeros((sh.b, sh.sq, sh.hq, sh.d), device=q.device, dtype=torch.float32)
