@@ -13,8 +13,10 @@
 
 """Fused MoE dispatch-prologue kernel (FlyDSL)."""
 
+import ctypes
 import functools
 import itertools
+import time
 from typing import NamedTuple
 
 import flydsl.compiler as flyc
@@ -156,6 +158,8 @@ def _make_dispatch_prologue(
         COMBINE_RECV_DST_RANK: fx.Tensor,
         COMBINE_RECV_START_ROW: fx.Tensor,
         COMBINE_RECV_FOLD_COUNT: fx.Tensor,
+        HOST_NOTIFY: fx.Tensor,
+        notify_epoch: fx.Int32,
     ):
         thread_index = fx.thread_idx.x
         block_index, _, _ = fx.block_idx
@@ -440,6 +444,14 @@ def _make_dispatch_prologue(
                         num_tokens_per_expert_prefix_resource,
                         fx.Int32(num_experts_per_rank),
                     )
+                    # the host sizes this call's tensors by the row count: hand it over now, one
+                    # system-scope (epoch, rows) word, while phases D-E still run
+                    st(
+                        extract_base_index(HOST_NOTIFY),
+                        fx.Int32(0),
+                        (_ext_i64(notify_epoch) << fx.Int64(32)) | _ext_i64(total_rows),
+                        scope="sys",
+                    )
 
         grid_sync(workspace, thread_index, block_index, grid_blocks, rank, "dispatch_prologue/C:table-built")
 
@@ -586,6 +598,62 @@ def get_dispatch_prologue_scratch(num_experts, device="cuda"):
     return _dispatch_prologue_scratch_cached(int(num_experts), dev)
 
 
+class _HostNotify:
+    """One i64 of coherent, device-mapped host memory the prologue posts ``(epoch << 32) | rows`` to."""
+
+    _MAPPED, _PORTABLE, _COHERENT = 0x2, 0x1, 0x40000000
+    # the host is often a whole step ahead of the GPU; past this it blocks on the kernel instead
+    _SPIN_SECONDS = 1.0
+
+    def __init__(self, device):
+        hip = ctypes.CDLL("libamdhip64.so")
+        host = ctypes.c_void_p()
+        flags = self._MAPPED | self._PORTABLE | self._COHERENT
+        if hip.hipHostMalloc(ctypes.byref(host), ctypes.c_size_t(8), ctypes.c_uint(flags)) != 0:
+            raise RuntimeError("hipHostMalloc of the dispatch prologue notify word failed")
+        dev_ptr = ctypes.c_void_p()
+        if hip.hipHostGetDevicePointer(ctypes.byref(dev_ptr), host, ctypes.c_uint(0)) != 0:
+            raise RuntimeError("hipHostGetDevicePointer of the dispatch prologue notify word failed")
+        self._word = ctypes.c_int64.from_address(host.value)
+        self._word.value = 0
+        self._epoch = 0
+        self.device_view = torch.as_tensor(_DeviceArray(dev_ptr.value), device=device)
+
+    def next_epoch(self) -> int:
+        self._epoch = self._epoch % 0x7FFFFFFF + 1
+        return self._epoch
+
+    def wait(self, epoch: int):
+        """The rows posted for ``epoch``, or None if not posted within the spin budget."""
+        word = self._word
+        deadline = time.perf_counter() + self._SPIN_SECONDS
+        while True:
+            for _ in range(256):
+                value = word.value
+                if value >> 32 == epoch:
+                    return value & 0xFFFFFFFF
+            if time.perf_counter() > deadline:
+                return None
+            time.sleep(0)  # let other Python threads run
+
+
+class _DeviceArray:
+    def __init__(self, ptr):
+        self.__cuda_array_interface__ = dict(shape=(1,), typestr="<i8", data=(ptr, False), version=3)
+
+
+@functools.lru_cache(maxsize=None)
+def _host_notify_cached(device):
+    return _HostNotify(device)
+
+
+def _host_notify(device):
+    dev = torch.device(device)
+    if dev.index is None:
+        dev = torch.device("cuda", torch.cuda.current_device())
+    return _host_notify_cached(dev)
+
+
 @autotune(
     configs=[
         Config(num_cu=num_cu, num_threads=num_threads)
@@ -623,6 +691,8 @@ def _compiled_dispatch_prologue(
     combine_recv_dst_rank,
     combine_recv_start_row,
     combine_recv_fold_count,
+    host_notify,
+    notify_epoch: fx.Int32,
     num_tokens: fx.Constexpr[int],
     num_topk: fx.Constexpr[int],
     num_experts: fx.Constexpr[int],
@@ -667,6 +737,8 @@ def _compiled_dispatch_prologue(
         combine_recv_dst_rank,
         combine_recv_start_row,
         combine_recv_fold_count,
+        host_notify,
+        notify_epoch,
     ).launch(
         grid=(num_cu, 1, 1),
         block=(num_threads, 1, 1),
@@ -703,6 +775,8 @@ def dispatch_prologue_flydsl_kernel(symm, topk_idx, topk_weight):
         topk_weight_flat = topk_weight.to(torch.float32).contiguous().view(-1)
     else:
         topk_weight_flat = torch.zeros(num_tokens * num_topk, dtype=torch.float32, device=dev)
+    notify = _host_notify(dev)
+    epoch = notify.next_epoch()
 
     _compiled_dispatch_prologue(
         topk_idx_flat=topk_idx_flat,
@@ -728,14 +802,20 @@ def dispatch_prologue_flydsl_kernel(symm, topk_idx, topk_weight):
         num_experts_per_rank=num_experts_per_rank,
         block_m=BLOCK_M,
         num_max_pool_tokens=num_max_pool_tokens,
+        host_notify=notify.device_view,
+        notify_epoch=epoch,
         hidden=symm.hidden,
         num_max_tokens_per_rank=symm.num_max_tokens_per_rank,
         stream=torch.cuda.current_stream(),
     )
-    # One D2H, like DeepEP's notify: the receive tables below, and every row-indexed tensor the
-    # dispatch, SwiGLU and combine allocate for this call, span the block_m-padded rows actually
-    # dispatched to this rank instead of the worst-case pool. The sync keeps the op out of CUDA graphs.
-    rows = int(num_tokens_per_expert_prefix[-1].item())
+    # One device-to-host count, as DeepEP's notify: the receive tables below, and every
+    # row-indexed tensor the dispatch, SwiGLU and combine allocate for this call, span the
+    # block_m-padded rows actually dispatched to this rank instead of the worst-case pool. The
+    # kernel posts it mid-launch, so this call's next launches queue while it still runs. The
+    # host wait keeps the op out of CUDA graphs.
+    rows = notify.wait(epoch)
+    if rows is None:  # not posted yet (the host is far ahead of the GPU): wait for the kernel
+        rows = int(num_tokens_per_expert_prefix[-1].item())
     if rows > num_max_pool_tokens:  # only reachable with repeated experts in topk_idx
         raise RuntimeError(f"mega MoE dispatch: {rows} pool rows exceed the capacity {num_max_pool_tokens}")
     # the receive tables and weights live in the shared heap, which the next prologue overwrites
