@@ -208,6 +208,8 @@ def nt_gemm_tile(
     c_cache_modifier: int = 0,
     b_nn: bool = False,
     i32_n=None,
+    issue_first: bool = False,
+    lds_cosched: bool = False,
 ):
     """One ``tile_m x tile_n`` block; must be called by all ``m_warp * n_warp`` waves.
 
@@ -220,7 +222,11 @@ def nt_gemm_tile(
     read. C is written at byte address ``c_addr`` with row stride
     ``ldc``, ``m_rows`` rows and ``n_valid`` columns kept. ``live`` (wave-uniform i1) turns the
     tile into a no-op. ``c_cache_modifier`` is the C stores' cache policy (``CPOL_DEVICE_STREAM``
-    when another workgroup consumes C in the same launch).
+    when another workgroup consumes C in the same launch). ``issue_first`` issues the next
+    k-tile's loads at the top of the k-tile body, ahead of its fragment reads; the buffer they fill
+    was drained by the previous k-tile's fence. ``lds_cosched`` (needs ``issue_first``) issues each
+    sub-step's fragment reads one per matrix op of the previous sub-step, one scheduling region per
+    sub-step, holding the running sub-step's fragments live to its end.
     """
     KB = tile_k * EB
     KSB = WMMA_K * EB
@@ -238,6 +244,10 @@ def nt_gemm_tile(
     OPS = tile_m // ROWS_PER_OP
     assert OPS % num_waves == 0, "gather ops must split evenly over the waves"
     OPS_PER_WAVE = OPS // num_waves
+    assert not lds_cosched or (issue_first and 2 * (wmma_m_rep + wmma_n_rep) < n_acc), (
+        f"lds_cosched=1 needs issue_first=1 and fewer fragment reads per sub-step than matrix ops, got "
+        f"issue_first={int(issue_first)} and {2 * (wmma_m_rep + wmma_n_rep)} reads for {n_acc} matrix ops"
+    )
     assert ldc % 2 == 0, "the epilogue stores whole i32 words"
 
     tid = fx.Int32(fx.thread_idx.x)
@@ -472,15 +482,44 @@ def nt_gemm_tile(
                 idx = wm * wmma_n_rep + wn
                 fx.gemm(wmma_atom, c_frags[idx], wt[wn], act[wm], c_frags[idx])
 
+    def _hold_live(state):
+        # `llvm.fake.use` emits nothing; it keeps the running sub-step's fragments allocated until its
+        # last matrix op, so the interleaved reads of the next sub-step get other registers
+        act, wt = state
+        for t in act + wt:
+            _llvm.call_intrinsic(None, "llvm.fake.use", [_raw(t.load())], [], [])
+
     def compute_ktile(buf, prefetch_kt):
         """K_WS sub-steps; the last one is returned to run inside the barrier window."""
         ring = [None] * R
+        if const_expr(issue_first and prefetch_kt is not None):
+            rocdl.sched_barrier(0)
+            issue(prefetch_kt % NUM_BUFFERS, prefetch_kt)
+            rocdl.sched_barrier(0)
         ring[0] = _load_ks(buf, 0)
+        if const_expr(lds_cosched):
+            rocdl.sched_dsrd(KS_DS)
+            rocdl.sched_barrier(0)
+            for ks in range_constexpr(K_WS):
+                # only this sub-step's reads are in flight here (R = 2)
+                rocdl.s_wait_dscnt(0)
+                if const_expr(ks + 1 < K_WS):
+                    ring[(ks + 1) % R] = _load_ks(buf, ks + 1)
+                if const_expr(ks < K_WS - 1):
+                    _mma_ks(ring[ks % R])
+                    for _j in range_constexpr(KS_DS):
+                        rocdl.sched_dsrd(1)
+                        rocdl.sched_mfma(1)
+                    rocdl.sched_mfma(n_acc - KS_DS)
+                    # after the group hints: placed before them, the hints are ignored
+                    _hold_live(ring[ks % R])
+                rocdl.sched_barrier(0)
+            return ring[(K_WS - 1) % R]
         for ks in range_constexpr(K_WS):
             if const_expr(ks + 1 < K_WS):
                 ring[(ks + 1) % R] = _load_ks(buf, ks + 1)
             rocdl.s_wait_dscnt(min(K_WS - 1 - ks, R - 1) * KS_DS)
-            if const_expr(ks == 0 and prefetch_kt is not None):
+            if const_expr(ks == 0 and prefetch_kt is not None and not issue_first):
                 rocdl.sched_barrier(0)
                 issue(prefetch_kt % NUM_BUFFERS, prefetch_kt)
                 rocdl.sched_barrier(0)
