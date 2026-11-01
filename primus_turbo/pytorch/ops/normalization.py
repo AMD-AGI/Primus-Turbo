@@ -8,13 +8,14 @@
 
 Public API:
     - ``rmsnorm(x, gamma, eps=1e-6, zero_centered=False) -> y``
-    - ``rmsnorm_residual(x, residual, gamma, eps=1e-6) -> (y, x_plus_r)``
+    - ``rmsnorm_residual(x, residual, gamma, eps=1e-6) -> (y, x_plus_r)``, optionally with a
+      second summand, one alias of ``y`` per consumer and exact rounding (see its docstring)
     - ``rmsnorm_residual_fp4(...) -> (y, x_plus_r, QuantizedTensorPair)``
 """
 
 from __future__ import annotations
 
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -123,6 +124,70 @@ class _RMSNormResidualFunction(torch.autograd.Function):
         return dx_out, dx_out, dg, None
 
 
+class _RMSNormResidualMultiFunction(torch.autograd.Function):
+    """``(x [+ x_extra] + residual) -> rmsnorm`` returning ``num_outputs`` aliases of ``y``.
+
+    Each consumer of ``y`` gets its own alias, so autograd hands the backward one gradient per
+    consumer instead of adding them first; the kernel sums them while it reads them. With
+    ``exact`` every partial sum is rounded as the unfused graph rounds it.
+    """
+
+    @staticmethod
+    def forward(ctx, x, x_extra, residual, gamma, eps, num_outputs, exact):
+        assert x.is_cuda and residual.is_cuda and gamma.is_cuda, (
+            "rmsnorm_residual: x, residual and gamma must be CUDA tensors"
+        )
+        assert x.shape == residual.shape, (
+            f"rmsnorm_residual: shape mismatch {tuple(x.shape)} vs {tuple(residual.shape)}"
+        )
+        assert x_extra is None or x_extra.shape == x.shape, (
+            f"rmsnorm_residual: x_extra shape {tuple(x_extra.shape)} vs x {tuple(x.shape)}"
+        )
+        assert 1 <= num_outputs <= 3, "rmsnorm_residual: num_outputs must be 1, 2 or 3"
+        orig_shape = x.shape
+        assert orig_shape[-1] == gamma.shape[0]
+
+        y, x_plus_r, rstd, *_ = rmsnorm_fwd_residual_impl(
+            x, residual, gamma, eps, x_extra=x_extra, round_sum=exact
+        )
+
+        ctx.save_for_backward(x_plus_r, gamma, rstd)
+        # An output nobody consumed (x_plus_r into a final norm, an unused alias) gets None, not a
+        # materialized zero tensor: the kernel skips it, which saves the fill, and adding a zero
+        # residual gradient would turn -0.0 into +0.0.
+        ctx.set_materialize_grads(False)
+        ctx.has_extra = x_extra is not None
+        ctx.exact = exact
+        ctx.orig_shape = orig_shape
+        y = y.reshape(orig_shape)
+        ys = (y,) + tuple(y.view_as(y) for _ in range(num_outputs - 1))
+        return (*ys, x_plus_r.reshape(orig_shape))
+
+    @staticmethod
+    def backward(ctx, *grads):
+        *grad_ys, grad_xpr = grads
+        x_plus_r, gamma, rstd = ctx.saved_tensors
+        dys = [g for g in grad_ys if g is not None]
+        if not dys:
+            dys = [torch.zeros(ctx.orig_shape, device=x_plus_r.device, dtype=x_plus_r.dtype)]
+        # the backward launcher picks its own config: no forward launch parameters to pass on
+        dx, dg = rmsnorm_bwd_residual_impl(
+            dys[0],
+            grad_xpr,
+            x_plus_r,
+            gamma,
+            rstd,
+            0,
+            0,
+            0,
+            0,
+            dy_extra=tuple(dys[1:]),
+            round_grad=ctx.exact,
+        )
+        dx_out = dx.reshape(ctx.orig_shape)
+        return dx_out, (dx_out if ctx.has_extra else None), dx_out, dg, None, None, None
+
+
 class _RMSNormResidualWithRstdFunction(torch.autograd.Function):
     """Same as residual RMSNorm but also returns Triton's ``rstd`` (f32, non-diff).
 
@@ -204,8 +269,26 @@ def rmsnorm_residual(
     residual: torch.Tensor,
     gamma: torch.Tensor,
     eps: float = 1e-6,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    return _RMSNormResidualFunction.apply(x, residual, gamma, eps)
+    *,
+    x_extra: Optional[torch.Tensor] = None,
+    num_outputs: int = 1,
+    exact: bool = False,
+) -> Tuple[torch.Tensor, ...]:
+    """Fused ``x_plus_r = x + residual; y = rmsnorm(x_plus_r)``. Returns ``(y, x_plus_r)``.
+
+    Args:
+        x_extra: a second summand, ``x_plus_r = (x + x_extra) + residual``.
+        num_outputs: return this many aliases of ``y``, ``(y_0, ..., y_{n-1}, x_plus_r)``, one
+            per consumer. Autograd then passes the backward each consumer's gradient instead of
+            their sum, and the kernel adds them as ``(dy_0 + dy_1) + dy_2``: give the consumers the
+            aliases in the order autograd would have accumulated their gradients.
+        exact: round every partial sum to the storage dtype as the unfused graph does (separate
+            adds, then :func:`rmsnorm`, autograd's gradient accumulation and residual add), so
+            all outputs and gradients match it bitwise for the same kernel configuration.
+    """
+    if x_extra is None and num_outputs == 1 and not exact:
+        return _RMSNormResidualFunction.apply(x, residual, gamma, eps)
+    return _RMSNormResidualMultiFunction.apply(x, x_extra, residual, gamma, eps, num_outputs, exact)
 
 
 class _RMSNormFP4STE(torch.autograd.Function):

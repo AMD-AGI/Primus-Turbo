@@ -19,6 +19,14 @@ For the residual variant the bwd additionally folds the gradient flowing through
 function returns the same gradient for both ``x`` and ``residual`` since their
 sum has Jacobian ``[I, I]``.
 
+The residual variant also takes a second summand ``x_extra`` in the forward (``x + x_extra +
+residual``) and up to three incoming gradients ``dy`` in the backward (one per consumer
+of ``y``), summed in the kernel. ``ROUND_SUM`` / ``ROUND_GRAD`` round every partial sum
+to the storage dtype, in the order an unfused graph would: ``(x + x_extra)``, then
+``+ residual``, normalizing the stored sum; ``(dy0 + dy1) + dy2``; ``dx_norm`` before
+adding the residual gradient. The result is then bitwise that of the separate adds
+followed by the plain kernels.
+
 A 2-stage bwd is used. The multi-row variants reduce ``dgamma`` *inside* each
 program over its ``ROWS_PER_BLOCK`` rows, so the partial buffer is
 ``(num_programs, H)`` instead of ``(B, H)``. This is essential at small-H,
@@ -129,6 +137,7 @@ def rmsnorm_fwd_kernel_multi_row(
 @triton.jit
 def rmsnorm_fwd_residual_kernel(
     X_ptr,
+    XE_ptr,
     R_ptr,
     G_ptr,
     Y_ptr,
@@ -136,6 +145,8 @@ def rmsnorm_fwd_residual_kernel(
     RSTD_ptr,
     stride_xb,
     stride_xh,
+    stride_xeb,
+    stride_xeh,
     stride_rb,
     stride_rh,
     stride_yb,
@@ -146,6 +157,8 @@ def rmsnorm_fwd_residual_kernel(
     eps,
     BLOCK_H: tl.constexpr,
     SKIP_Y_STORE: tl.constexpr = False,
+    HAS_X_EXTRA: tl.constexpr = False,
+    ROUND_SUM: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_H)
@@ -157,9 +170,17 @@ def rmsnorm_fwd_residual_kernel(
     mask = offs < H
 
     x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+    if HAS_X_EXTRA:
+        x = x + tl.load(XE_ptr + row * stride_xeb + offs * stride_xeh, mask=mask, other=0.0).to(tl.float32)
+        if ROUND_SUM:
+            x = x.to(XPR_ptr.dtype.element_ty).to(tl.float32)
     r = tl.load(r_ptrs, mask=mask, other=0.0).to(tl.float32)
     xpr = x + r
-    tl.store(xpr_ptrs, xpr.to(XPR_ptr.dtype.element_ty), mask=mask)
+    xpr_lp = xpr.to(XPR_ptr.dtype.element_ty)
+    tl.store(xpr_ptrs, xpr_lp, mask=mask)
+    if ROUND_SUM:
+        # normalize the stored sum, as a separate add followed by the plain kernel does
+        xpr = xpr_lp.to(tl.float32)
 
     var = tl.sum(xpr * xpr, axis=0) / H
     rstd = tl.rsqrt(var + eps)
@@ -180,6 +201,7 @@ def rmsnorm_fwd_residual_kernel(
 @triton.jit
 def rmsnorm_fwd_residual_kernel_multi_row(
     X_ptr,
+    XE_ptr,
     R_ptr,
     G_ptr,
     Y_ptr,
@@ -187,6 +209,8 @@ def rmsnorm_fwd_residual_kernel_multi_row(
     RSTD_ptr,
     stride_xb,
     stride_xh,
+    stride_xeb,
+    stride_xeh,
     stride_rb,
     stride_rh,
     stride_yb,
@@ -199,6 +223,8 @@ def rmsnorm_fwd_residual_kernel_multi_row(
     BLOCK_H: tl.constexpr,
     ROWS_PER_BLOCK: tl.constexpr,
     SKIP_Y_STORE: tl.constexpr = False,
+    HAS_X_EXTRA: tl.constexpr = False,
+    ROUND_SUM: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     row_start = pid * ROWS_PER_BLOCK
@@ -216,10 +242,18 @@ def rmsnorm_fwd_residual_kernel_multi_row(
 
     full_mask = row_mask[:, None] & h_mask[None, :]
     x = tl.load(x_ptrs, mask=full_mask, other=0.0).to(tl.float32)
+    if HAS_X_EXTRA:
+        xe_ptrs = XE_ptr + row_offs[:, None] * stride_xeb + h_offs[None, :] * stride_xeh
+        x = x + tl.load(xe_ptrs, mask=full_mask, other=0.0).to(tl.float32)
+        if ROUND_SUM:
+            x = x.to(XPR_ptr.dtype.element_ty).to(tl.float32)
     r = tl.load(r_ptrs, mask=full_mask, other=0.0).to(tl.float32)
 
     xpr = x + r
-    tl.store(xpr_ptrs, xpr.to(XPR_ptr.dtype.element_ty), mask=full_mask)
+    xpr_lp = xpr.to(XPR_ptr.dtype.element_ty)
+    tl.store(xpr_ptrs, xpr_lp, mask=full_mask)
+    if ROUND_SUM:
+        xpr = xpr_lp.to(tl.float32)
 
     var = tl.sum(xpr * xpr, axis=1) / H
     rstd = tl.rsqrt(var + eps)
@@ -352,12 +386,67 @@ def rmsnorm_bwd_kernel_grid_stride(
 
 
 # ---------------------------------------------------------------------------
-# Backward — persistent grid-stride, fused residual variant.
+# Backward — fused residual variant: helpers of the grid-stride and 2D-tile kernels.
 # ---------------------------------------------------------------------------
-@triton.autotune(configs=_GRID_STRIDE_BWD_CONFIGS, key=["BLOCK_H", "B", "num_programs"])
+@triton.jit
+def _bwd_residual_dy(
+    dy_ptrs,
+    dy1_ptrs,
+    dy2_ptrs,
+    mask,
+    NUM_DY: tl.constexpr,
+    ROUND_GRAD: tl.constexpr,
+):
+    """The gradient of y: ``(dy + dy1) + dy2``, each partial sum rounded under ROUND_GRAD."""
+    dy = tl.load(dy_ptrs, mask=mask, other=0.0).to(tl.float32)
+    if NUM_DY >= 2:
+        dy = dy + tl.load(dy1_ptrs, mask=mask, other=0.0).to(tl.float32)
+        if ROUND_GRAD:
+            dy = dy.to(dy_ptrs.dtype.element_ty).to(tl.float32)
+    if NUM_DY >= 3:
+        dy = dy + tl.load(dy2_ptrs, mask=mask, other=0.0).to(tl.float32)
+        if ROUND_GRAD:
+            dy = dy.to(dy_ptrs.dtype.element_ty).to(tl.float32)
+    return dy
+
+
+@triton.jit
+def _bwd_residual_dx(
+    xpr,
+    dy,
+    dxpr,
+    rstd,
+    g,
+    H: tl.constexpr,
+    ROUND_GRAD: tl.constexpr,
+    HAS_DXPR: tl.constexpr,
+    DX_TY: tl.constexpr,
+):
+    """``dx`` of one row in fp32 (the RMSNorm part rounded to ``DX_TY`` first under ROUND_GRAD) and its
+    normalized input, for the dgamma partial."""
+    x_hat = xpr * rstd
+    dxhat = dy * g
+    m = tl.sum(dxhat * x_hat, axis=0) / H
+    dx = (dxhat - x_hat * m) * rstd
+    if HAS_DXPR:
+        if ROUND_GRAD:
+            dx = dx.to(DX_TY).to(tl.float32)
+        dx = dx + dxpr
+    return dx, x_hat
+
+
+# ---------------------------------------------------------------------------
+# Backward — persistent grid-stride, fused residual variant.
+# ROWS_PER_ITER=2 issues the loads of rows r and r + num_programs before reducing
+# either, so a program has two rows of reads in flight, and folds them into dgamma
+# in row order: dx and the partials are bit-identical to one row a pass.
+# ---------------------------------------------------------------------------
+@triton.autotune(configs=_GRID_STRIDE_BWD_CONFIGS, key=["BLOCK_H", "B", "num_programs", "ROWS_PER_ITER"])
 @triton.jit
 def rmsnorm_bwd_residual_kernel_grid_stride(
     DY_ptr,
+    DY1_ptr,
+    DY2_ptr,
     DXPR_ptr,
     XPR_ptr,
     G_ptr,
@@ -368,6 +457,10 @@ def rmsnorm_bwd_residual_kernel_grid_stride(
     stride_xprh,
     stride_dyb,
     stride_dyh,
+    stride_dy1b,
+    stride_dy1h,
+    stride_dy2b,
+    stride_dy2h,
     stride_dxprb,
     stride_dxprh,
     stride_dxb,
@@ -377,33 +470,87 @@ def rmsnorm_bwd_residual_kernel_grid_stride(
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     num_programs: tl.constexpr,
+    NUM_DY: tl.constexpr = 1,
+    ROUND_GRAD: tl.constexpr = False,
+    HAS_DXPR: tl.constexpr = True,
+    ROWS_PER_ITER: tl.constexpr = 1,
 ):
     pid = tl.program_id(0)
     h_offs = tl.arange(0, BLOCK_H)
     h_mask = h_offs < H
+    dx_ty = DX_ptr.dtype.element_ty
 
     g = tl.load(G_ptr + h_offs, mask=h_mask, other=0.0).to(tl.float32)
     dg_acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
 
-    for row in range(pid, B, num_programs):
-        xpr_ptrs = XPR_ptr + row * stride_xprb + h_offs * stride_xprh
-        dy_ptrs = DY_ptr + row * stride_dyb + h_offs * stride_dyh
-        dxpr_ptrs = DXPR_ptr + row * stride_dxprb + h_offs * stride_dxprh
-        dx_ptrs = DX_ptr + row * stride_dxb + h_offs * stride_dxh
+    if ROWS_PER_ITER == 2:
+        for row in range(pid, B, 2 * num_programs):
+            row1 = row + num_programs
+            ok1 = row1 < B
+            mask1 = h_mask & ok1
+            xpr = tl.load(XPR_ptr + row * stride_xprb + h_offs * stride_xprh, mask=h_mask, other=0.0).to(
+                tl.float32
+            )
+            dy = _bwd_residual_dy(
+                DY_ptr + row * stride_dyb + h_offs * stride_dyh,
+                DY1_ptr + row * stride_dy1b + h_offs * stride_dy1h,
+                DY2_ptr + row * stride_dy2b + h_offs * stride_dy2h,
+                h_mask,
+                NUM_DY,
+                ROUND_GRAD,
+            )
+            rstd = tl.load(RSTD_ptr + row).to(tl.float32)
+            xpr1 = tl.load(XPR_ptr + row1 * stride_xprb + h_offs * stride_xprh, mask=mask1, other=0.0).to(
+                tl.float32
+            )
+            dy1 = _bwd_residual_dy(
+                DY_ptr + row1 * stride_dyb + h_offs * stride_dyh,
+                DY1_ptr + row1 * stride_dy1b + h_offs * stride_dy1h,
+                DY2_ptr + row1 * stride_dy2b + h_offs * stride_dy2h,
+                mask1,
+                NUM_DY,
+                ROUND_GRAD,
+            )
+            rstd1 = tl.load(RSTD_ptr + row1, mask=ok1, other=0.0).to(tl.float32)
+            dxpr = 0.0
+            dxpr1 = 0.0
+            if HAS_DXPR:
+                dxpr = tl.load(
+                    DXPR_ptr + row * stride_dxprb + h_offs * stride_dxprh, mask=h_mask, other=0.0
+                ).to(tl.float32)
+                dxpr1 = tl.load(
+                    DXPR_ptr + row1 * stride_dxprb + h_offs * stride_dxprh, mask=mask1, other=0.0
+                ).to(tl.float32)
 
-        xpr = tl.load(xpr_ptrs, mask=h_mask, other=0.0).to(tl.float32)
-        dy = tl.load(dy_ptrs, mask=h_mask, other=0.0).to(tl.float32)
-        dxpr = tl.load(dxpr_ptrs, mask=h_mask, other=0.0).to(tl.float32)
-        rstd = tl.load(RSTD_ptr + row).to(tl.float32)
+            dx, x_hat = _bwd_residual_dx(xpr, dy, dxpr, rstd, g, H, ROUND_GRAD, HAS_DXPR, dx_ty)
+            tl.store(DX_ptr + row * stride_dxb + h_offs * stride_dxh, dx.to(dx_ty), mask=h_mask)
+            dg_acc += dy * x_hat
 
-        x_hat = xpr * rstd
-        dxhat = dy * g
-        m = tl.sum(dxhat * x_hat, axis=0) / H
-        dx_norm = (dxhat - x_hat * m) * rstd
-        dx = dx_norm + dxpr
-        tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=h_mask)
-
-        dg_acc += dy * x_hat
+            dx1, x_hat1 = _bwd_residual_dx(xpr1, dy1, dxpr1, rstd1, g, H, ROUND_GRAD, HAS_DXPR, dx_ty)
+            tl.store(DX_ptr + row1 * stride_dxb + h_offs * stride_dxh, dx1.to(dx_ty), mask=mask1)
+            dg_acc = tl.where(ok1, dg_acc + dy1 * x_hat1, dg_acc)
+    else:
+        for row in range(pid, B, num_programs):
+            xpr = tl.load(XPR_ptr + row * stride_xprb + h_offs * stride_xprh, mask=h_mask, other=0.0).to(
+                tl.float32
+            )
+            dy = _bwd_residual_dy(
+                DY_ptr + row * stride_dyb + h_offs * stride_dyh,
+                DY1_ptr + row * stride_dy1b + h_offs * stride_dy1h,
+                DY2_ptr + row * stride_dy2b + h_offs * stride_dy2h,
+                h_mask,
+                NUM_DY,
+                ROUND_GRAD,
+            )
+            rstd = tl.load(RSTD_ptr + row).to(tl.float32)
+            dxpr = 0.0
+            if HAS_DXPR:
+                dxpr = tl.load(
+                    DXPR_ptr + row * stride_dxprb + h_offs * stride_dxprh, mask=h_mask, other=0.0
+                ).to(tl.float32)
+            dx, x_hat = _bwd_residual_dx(xpr, dy, dxpr, rstd, g, H, ROUND_GRAD, HAS_DXPR, dx_ty)
+            tl.store(DX_ptr + row * stride_dxb + h_offs * stride_dxh, dx.to(dx_ty), mask=h_mask)
+            dg_acc += dy * x_hat
 
     dgp_ptrs = DG_PART_ptr + pid * stride_dgp + h_offs
     tl.store(dgp_ptrs, dg_acc, mask=h_mask)
@@ -441,6 +588,8 @@ def rmsnorm_bwd_finalize_kernel(
 @triton.jit
 def rmsnorm_bwd_residual_kernel_multi_row(
     DY_ptr,
+    DY1_ptr,
+    DY2_ptr,
     DXPR_ptr,
     XPR_ptr,
     G_ptr,
@@ -451,6 +600,10 @@ def rmsnorm_bwd_residual_kernel_multi_row(
     stride_xprh,
     stride_dyb,
     stride_dyh,
+    stride_dy1b,
+    stride_dy1h,
+    stride_dy2b,
+    stride_dy2h,
     stride_dxprb,
     stride_dxprh,
     stride_dxb,
@@ -460,6 +613,9 @@ def rmsnorm_bwd_residual_kernel_multi_row(
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     ROWS_PER_BLOCK: tl.constexpr,
+    NUM_DY: tl.constexpr = 1,
+    ROUND_GRAD: tl.constexpr = False,
+    HAS_DXPR: tl.constexpr = True,
 ):
     pid = tl.program_id(0)
     row_start = pid * ROWS_PER_BLOCK
@@ -477,16 +633,25 @@ def rmsnorm_bwd_residual_kernel_multi_row(
 
     full_mask = row_mask[:, None] & h_mask[None, :]
     xpr = tl.load(xpr_ptrs, mask=full_mask, other=0.0).to(tl.float32)
-    dy = tl.load(dy_ptrs, mask=full_mask, other=0.0).to(tl.float32)
-    dxpr = tl.load(dxpr_ptrs, mask=full_mask, other=0.0).to(tl.float32)
+    dy = _bwd_residual_dy(
+        dy_ptrs,
+        DY1_ptr + row_offs[:, None] * stride_dy1b + h_offs[None, :] * stride_dy1h,
+        DY2_ptr + row_offs[:, None] * stride_dy2b + h_offs[None, :] * stride_dy2h,
+        full_mask,
+        NUM_DY,
+        ROUND_GRAD,
+    )
     g = tl.load(g_ptrs, mask=h_mask, other=0.0).to(tl.float32)
     rstd = tl.load(RSTD_ptr + row_offs, mask=row_mask, other=0.0).to(tl.float32)
 
     x_hat = xpr * rstd[:, None]
     dxhat = dy * g[None, :]
     m = tl.sum(dxhat * x_hat, axis=1) / H
-    dx_norm = (dxhat - x_hat * m[:, None]) * rstd[:, None]
-    dx = dx_norm + dxpr
+    dx = (dxhat - x_hat * m[:, None]) * rstd[:, None]
+    if HAS_DXPR:
+        if ROUND_GRAD:
+            dx = dx.to(DX_ptr.dtype.element_ty).to(tl.float32)
+        dx = dx + tl.load(dxpr_ptrs, mask=full_mask, other=0.0).to(tl.float32)
 
     tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=full_mask)
 

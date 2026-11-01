@@ -67,6 +67,9 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe.py",
     # The same op across every visible GPU (EP2+).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe_ep.py",
+    # Residual RMSNorm with a second summand, per-consumer gradients and exact rounding: the
+    # DeepSeek-V3 layer's fused residual adds, bit for bit against the unfused graph.
+    "tests/pytorch/ops/test_rmsnorm_residual_exact.py",
 )
 
 

@@ -13,6 +13,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from primus_turbo.pytorch.core.utils import is_gfx1250
 from primus_turbo.triton.normalization.rmsnorm_kernel import (
     rmsnorm_bwd_finalize_kernel,
     rmsnorm_bwd_kernel_grid_stride,
@@ -244,8 +245,10 @@ def rmsnorm_fwd_residual_impl(
     gamma: torch.Tensor,
     eps: float,
     skip_y_store: bool = False,
+    x_extra: Optional[torch.Tensor] = None,
+    round_sum: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, int]:
-    """Fused (x + residual) -> rmsnorm forward.
+    """Fused (x [+ x_extra] + residual) -> rmsnorm forward.
 
     Returns ``(y, x_plus_r, rstd, BLOCK_H, ROWS, num_warps, num_stages)``. Both
     ``y`` and ``x_plus_r`` are returned in [B, H] layout (caller is expected to
@@ -253,10 +256,16 @@ def rmsnorm_fwd_residual_impl(
 
     ``skip_y_store``: R3 path. Do not write BF16 ``y`` (GEMM consumes MXFP4).
     ``y`` is still allocated so the autograd Function can return a tensor.
+
+    ``x_extra``: a second summand, added to ``x`` before ``residual``.
+    ``round_sum``: round ``x + x_extra`` and ``x_plus_r`` to the storage dtype and normalize
+    the rounded sum, so ``y`` and ``x_plus_r`` are bitwise those of separate adds followed by
+    :func:`rmsnorm_fwd_impl`.
     """
     H = gamma.shape[0]
     x2 = _reshape_batch_hidden(x, H)
     r2 = _reshape_batch_hidden(residual, H)
+    xe2 = x2 if x_extra is None else _reshape_batch_hidden(x_extra, H)
     B = x2.shape[0]
     y = torch.empty_like(x2)
     x_plus_r = torch.empty_like(x2)
@@ -265,6 +274,7 @@ def rmsnorm_fwd_residual_impl(
     if ROWS == 1:
         rmsnorm_fwd_residual_kernel[(B,)](
             x2,
+            xe2,
             r2,
             gamma,
             y,
@@ -272,6 +282,8 @@ def rmsnorm_fwd_residual_impl(
             rstd,
             x2.stride(0),
             x2.stride(1),
+            xe2.stride(0),
+            xe2.stride(1),
             r2.stride(0),
             r2.stride(1),
             y.stride(0),
@@ -282,6 +294,8 @@ def rmsnorm_fwd_residual_impl(
             eps=eps,
             BLOCK_H=BLOCK_H,
             SKIP_Y_STORE=skip_y_store,
+            HAS_X_EXTRA=x_extra is not None,
+            ROUND_SUM=round_sum,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -289,6 +303,7 @@ def rmsnorm_fwd_residual_impl(
         grid = ((B + ROWS - 1) // ROWS,)
         rmsnorm_fwd_residual_kernel_multi_row[grid](
             x2,
+            xe2,
             r2,
             gamma,
             y,
@@ -296,6 +311,8 @@ def rmsnorm_fwd_residual_impl(
             rstd,
             x2.stride(0),
             x2.stride(1),
+            xe2.stride(0),
+            xe2.stride(1),
             r2.stride(0),
             r2.stride(1),
             y.stride(0),
@@ -308,6 +325,8 @@ def rmsnorm_fwd_residual_impl(
             BLOCK_H=BLOCK_H,
             ROWS_PER_BLOCK=ROWS,
             SKIP_Y_STORE=skip_y_store,
+            HAS_X_EXTRA=x_extra is not None,
+            ROUND_SUM=round_sum,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -324,21 +343,29 @@ def rmsnorm_bwd_residual_impl(
     ROWS: int,
     num_warps: int,
     num_stages: int,
+    dy_extra: Tuple[torch.Tensor, ...] = (),
+    round_grad: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Backward launcher for the residual variant. Returns ``(dx [B, H], dgamma [H])``.
 
     Caller is expected to return the same ``dx`` for both ``x`` and ``residual``
     inputs because the upstream ``+`` has Jacobian ``[I, I]``.
+
+    ``dy_extra``: up to two more gradients of ``y`` (from its other consumers), summed in the
+    kernel as ``(dy + dy_extra[0]) + dy_extra[1]``. ``round_grad``: round each partial sum and
+    the RMSNorm part of ``dx`` to the storage dtype before the next add, which is what autograd's
+    accumulation of separate gradients and a separate residual add do.
     """
+    assert len(dy_extra) <= 2, "rmsnorm_bwd_residual_impl: at most three gradients of y"
     H = gamma.shape[0]
     B = x_plus_r.shape[0]
     dy2 = _reshape_batch_hidden(dy, H)
-    if dxpr is None:
-        # When ``x_plus_r`` is unused downstream, autograd may hand us None.
-        # Substitute zeros so the kernel sees a valid pointer.
-        dxpr2 = torch.zeros_like(x_plus_r)
-    else:
-        dxpr2 = _reshape_batch_hidden(dxpr, H)
+    dye = [_reshape_batch_hidden(d, H) for d in dy_extra]
+    dye1 = dye[0] if len(dye) > 0 else dy2
+    dye2 = dye[1] if len(dye) > 1 else dy2
+    # When ``x_plus_r`` is unused downstream, autograd hands us None: the kernel skips the add
+    # (any tensor serves as the unread pointer).
+    dxpr2 = dy2 if dxpr is None else _reshape_batch_hidden(dxpr, H)
     dx = torch.empty_like(x_plus_r)
     mode, BLOCK_H, GR, num_warps, num_stages = _pick_bwd_config(H, B)
     if mode == "multi":
@@ -347,6 +374,8 @@ def rmsnorm_bwd_residual_impl(
         dg_partial = torch.empty(num_programs, H, device=x_plus_r.device, dtype=torch.float32)
         rmsnorm_bwd_residual_kernel_multi_row[(num_programs,)](
             dy2,
+            dye1,
+            dye2,
             dxpr2,
             x_plus_r,
             gamma,
@@ -357,6 +386,10 @@ def rmsnorm_bwd_residual_impl(
             x_plus_r.stride(1),
             dy2.stride(0),
             dy2.stride(1),
+            dye1.stride(0),
+            dye1.stride(1),
+            dye2.stride(0),
+            dye2.stride(1),
             dxpr2.stride(0),
             dxpr2.stride(1),
             dx.stride(0),
@@ -366,6 +399,9 @@ def rmsnorm_bwd_residual_impl(
             H=H,
             BLOCK_H=BLOCK_H,
             ROWS_PER_BLOCK=ROWS,
+            NUM_DY=1 + len(dye),
+            ROUND_GRAD=round_grad,
+            HAS_DXPR=dxpr is not None,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -374,6 +410,8 @@ def rmsnorm_bwd_residual_impl(
         dg_partial = torch.empty(num_programs, H, device=x_plus_r.device, dtype=torch.float32)
         rmsnorm_bwd_residual_kernel_grid_stride[(num_programs,)](
             dy2,
+            dye1,
+            dye2,
             dxpr2,
             x_plus_r,
             gamma,
@@ -384,6 +422,10 @@ def rmsnorm_bwd_residual_impl(
             x_plus_r.stride(1),
             dy2.stride(0),
             dy2.stride(1),
+            dye1.stride(0),
+            dye1.stride(1),
+            dye2.stride(0),
+            dye2.stride(1),
             dxpr2.stride(0),
             dxpr2.stride(1),
             dx.stride(0),
@@ -393,6 +435,12 @@ def rmsnorm_bwd_residual_impl(
             H=H,
             BLOCK_H=BLOCK_H,
             num_programs=num_programs,
+            NUM_DY=1 + len(dye),
+            ROUND_GRAD=round_grad,
+            HAS_DXPR=dxpr is not None,
+            # two rows of reads in flight per program for wide rows; bit-identical to one row a pass.
+            # Measured on gfx1250 only, so other architectures keep one row a pass.
+            ROWS_PER_ITER=2 if is_gfx1250() and B >= 2 * num_programs and BLOCK_H >= 4096 else 1,
         )
     dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg
