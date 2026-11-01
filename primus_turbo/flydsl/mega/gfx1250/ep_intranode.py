@@ -17,6 +17,7 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import vector as _vector
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr
+from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.utils.arith import ArithValue
 
 from primus_turbo.flydsl.mega.gfx1250.prims import (
@@ -32,6 +33,8 @@ from primus_turbo.flydsl.mega.gfx1250.prims import (
     read_clock,
     spin_timed_out,
     st,
+    tdm_row,
+    uniform_i64,
     wait_mem_all,
 )
 from primus_turbo.flydsl.mega.gfx1250.symm_buffer import BLOCK_M as POOL_BLOCK_M
@@ -122,16 +125,29 @@ def dispatch_bf16_tile(
     rank: int,
     block_threads: int = _BLOCK_THREADS,
     experts_per_publish: int = 1,
+    input_address: Optional[ArithValue] = None,
+    lds_base: Optional[ArithValue] = None,
+    lds_bytes: int = 0,
 ):
     """Push this block's chunk of every expert's task to one dst rank, in ascending expert order.
 
     ``experts_per_publish`` experts share one store retire + barrier before their flags go out (in
-    ascending order, so the single-flag wait still holds); it must divide ``num_experts_per_rank``."""
+    ascending order, so the single-flag wait still holds); it must divide ``num_experts_per_rank``.
+
+    With ``lds_base`` (the LDS byte address of ``lds_bytes`` this block may use) and
+    ``input_address``, every wave moves its rows by TDM: one load of the row into its own LDS row
+    buffer, one system-scope store of it to the peer. Otherwise 64-lane warps copy through VGPRs."""
     assert num_experts_per_rank % experts_per_publish == 0, "publish groups tile the local experts"
     hidden_bytes = hidden_size * 2
     assert hidden_bytes % 16 == 0, "hidden*2 must be a multiple of 16 bytes -> hidden % 8 == 0"
-    assert block_threads % _WARP == 0, "a block is a whole number of 64-lane copy warps"
-    num_warps = block_threads // _WARP
+    use_tdm = lds_base is not None
+    warp_lanes = WAVE if use_tdm else _WARP
+    assert block_threads % warp_lanes == 0, "a block is a whole number of copy warps"
+    num_warps = block_threads // warp_lanes
+    row_lds_bytes = ceildiv(hidden_bytes, 128) * 128
+    if use_tdm:
+        assert input_address is not None, "a TDM dispatch reads the input by address"
+        assert num_warps * row_lds_bytes <= lds_bytes, "every wave needs an LDS row buffer"
     hidden_i32 = hidden_bytes // 4  # row stride in i32 words
     row_stride = num_chunks * num_warps
     num_max_pool_blocks = int(workspace.num_max_pool_blocks)
@@ -142,7 +158,11 @@ def dispatch_bf16_tile(
 
     block_dst_rank = block_index % fx.Int32(num_ranks)
     chunk_index = block_index // fx.Int32(num_ranks)
-    warp_id = chunk_index * fx.Int32(num_warps) + thread_index // fx.Int32(_WARP)
+    warp_in_block = _readfirstlane_i32(thread_index // fx.Int32(warp_lanes))
+    warp_id = chunk_index * fx.Int32(num_warps) + warp_in_block
+    row_lds = None
+    if const_expr(use_tdm):
+        row_lds = lds_base + warp_in_block * fx.Int32(row_lds_bytes)
 
     # ascending expert order: flag[g] complete implies every expert <= g landed (single-flag wait)
     for expert_group in range(fx.Int32(num_experts_per_rank // experts_per_publish)):
@@ -163,17 +183,37 @@ def dispatch_bf16_tile(
                     vec_width=1,
                     dtype=fx.T.i32,
                 )
-                # dst = peer dispatch_token_buffer row of this recv token, src = local input; offsets in i32 words
-                copy_warp(
-                    token_buffer_address,
-                    input_res,
-                    hidden_bytes,
-                    dst_off=(fx.Int32(recv_token_base) + token_idx) * fx.Int32(hidden_i32),
-                    src_off=token_idx * fx.Int32(hidden_i32),
-                    load_cache_modifier=CPOL_DEVICE_STREAM,  # read data produced by the same agent
-                    store_cache_modifier=CPOL_SYSTEM_STREAM,
-                )
+                if const_expr(use_tdm):
+                    token_idx = _readfirstlane_i32(token_idx)
+                    src_address = input_address + cast(token_idx, fx.T.i64) * fx.Int64(hidden_bytes)
+                    dst_address = token_buffer_address + cast(
+                        fx.Int32(recv_token_base) + token_idx, fx.T.i64
+                    ) * fx.Int64(hidden_bytes)
+                    # the previous row's store is done reading the buffer
+                    tdm_ops.tensor_wait(0)
+                    tdm_ops.tensor_load_2d(
+                        tdm_row(row_lds, uniform_i64(src_address), hidden_bytes),
+                        cache_policy=CPOL_DEVICE_STREAM,
+                    )
+                    tdm_ops.tensor_wait(0)
+                    tdm_ops.tensor_store_2d(
+                        tdm_row(row_lds, uniform_i64(dst_address), hidden_bytes),
+                        cache_policy=CPOL_SYSTEM_STREAM,
+                    )
+                else:
+                    # dst = peer dispatch_token_buffer row of this recv token, src = local input; offsets in i32 words
+                    copy_warp(
+                        token_buffer_address,
+                        input_res,
+                        hidden_bytes,
+                        dst_off=(fx.Int32(recv_token_base) + token_idx) * fx.Int32(hidden_i32),
+                        src_off=token_idx * fx.Int32(hidden_i32),
+                        load_cache_modifier=CPOL_DEVICE_STREAM,  # read data produced by the same agent
+                        store_cache_modifier=CPOL_SYSTEM_STREAM,
+                    )
 
+        if const_expr(use_tdm):
+            tdm_ops.tensor_wait(0)
         wait_mem_all()
         fx.gpu.barrier()
         if thread_index == fx.Int32(0):

@@ -25,7 +25,8 @@ workgroups, pool blocks past this call's tile count): a dynamic branch over the 
 is what the grouped kernel's ``dead_tile_exit`` found to fault intermittently.
 
 Every workgroup is ``m_warp * n_warp`` wave32 waves; the comm role runs the shared
-``dispatch_bf16_tile`` on that many threads (64-lane copy warps).
+``dispatch_bf16_tile`` on that many threads, each wave moving its rows by TDM through its own
+row buffer in the (otherwise idle) GEMM arena.
 """
 
 from __future__ import annotations
@@ -190,6 +191,9 @@ def _launch_dispatch_gemm_nt(
                 rank=RANK,
                 block_threads=block,
                 experts_per_publish=EXPERTS_PER_PUBLISH,
+                input_address=_addr(arg_x),
+                lds_base=fx.Int32(_addr(base_ptr)),
+                lds_bytes=arena_bytes,
             )
 
         # ---- GEMM role: straight-line for every workgroup, masked by `live` ----

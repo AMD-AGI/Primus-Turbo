@@ -20,8 +20,10 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as std_arith
 from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import vector as _vector
 from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr.arith import _to_raw as _raw
+from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.utils.arith import ArithValue
 
 from primus_turbo.flydsl.utils.buffer_ops import (
@@ -308,3 +310,28 @@ def _readfirstlane_i32(v):
     waterfall. Pinning the value collapses the SRD to scalar regs and drops the waterfall."""
     op = rocdl.readfirstlane(res=_raw(v).type, src=_raw(v))
     return ArithValue(op.result if hasattr(op, "result") else op)
+
+
+def uniform_i64(v) -> ArithValue:
+    """``_readfirstlane_i32`` for a wave-uniform i64 (an address), one half at a time."""
+    v = ArithValue(fx.as_ir_value(v), signed=True)
+    lo = _readfirstlane_i32(cast(v, fx.T.i32))
+    hi = _readfirstlane_i32(cast(v >> fx.Int64(32), fx.T.i32))
+    return (cast(hi, fx.T.i64) << fx.Int64(32)) | (cast(lo, fx.T.i64) & fx.Int64(0xFFFFFFFF))
+
+
+def tdm_row(lds_addr: ArithValue, global_addr: ArithValue, nbytes: int) -> tdm_ops.TDMDescriptor2D:
+    """TDM descriptor moving one ``nbytes`` row between LDS byte address ``lds_addr`` (i32) and
+    ``global_addr`` (i64), as a 1 x n tile of 8-byte elements; both must be wave-uniform."""
+    elems = nbytes // 8
+    assert nbytes % 8 == 0 and elems < (1 << 16), "a TDM row is < 64 Ki 8-byte elements"
+    i32 = fx.T.i32
+    addr = ArithValue(fx.as_ir_value(global_addr), signed=False)
+    lo = fx.arith.trunci(i32, fx.as_ir_value(addr))
+    hi = ArithValue(fx.arith.trunci(i32, fx.as_ir_value(addr >> fx.Int64(32))), signed=False)
+    hi = hi | fx.Int32(-(1 << 31))  # descriptor type 2 in [31:30]
+    group0 = _vector.from_elements(fx.T.vec(4, i32), [fx.as_ir_value(v) for v in (fx.Int32(1), lds_addr, lo, hi)])
+    # 8-byte elements; tensor and tile both 1 x elems; dim-0 stride elems
+    words = (3 << 16, (elems & 0xFFFF) << 16, (elems >> 16) | (1 << 16), elems << 16, 1, elems, 0, 0)
+    group1 = _vector.from_elements(fx.T.vec(8, i32), [fx.as_ir_value(fx.Int32(w)) for w in words])
+    return tdm_ops.TDMDescriptor2D(dgroup0=group0, dgroup1=group1)
