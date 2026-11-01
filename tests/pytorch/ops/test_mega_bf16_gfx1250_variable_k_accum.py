@@ -81,12 +81,17 @@ CASES = [
     (512, 768, [2048, 2048], "none"),
     (512, 512, [100, 0, 50, 0], "a"),  # 128 pool rows per expert: 64-deep k-tiles, C loaded after the k-loop
 ]
+# the shipped two-buffer tile, and the three-buffer ring the DeepSeek-V3 shapes take at >= 1024 rows per
+# expert, whose accumulate loads the old C as two row halves during the last two k-tiles
+CFGS = [pytest.param({}, id="shipped"), pytest.param({"BLOCK_K": 64, "num_buffers": 3}, id="ring3")]
 
 
+@pytest.mark.parametrize("cfg", CFGS)
 @pytest.mark.parametrize("out_m, out_n, counts, gather", CASES)
-def test_round_first_matches_separate_add(out_m, out_n, counts, gather):
+def test_round_first_matches_separate_add(out_m, out_n, counts, gather, cfg):
     vk = _vk()
     a, b, offs, masked_k, kw, _ = _problem(out_m, out_n, counts, gather)
+    kw = {**kw, **cfg}
     old = _old_out((len(counts), out_m, out_n))
     separate = old.clone()
     separate.add_(vk.grouped_gemm_bf16_variable_k_flydsl_kernel(a, b, offs, masked_k=masked_k, **kw))
@@ -97,10 +102,12 @@ def test_round_first_matches_separate_add(out_m, out_n, counts, gather):
     torch.testing.assert_close(fused, separate, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("cfg", CFGS)
 @pytest.mark.parametrize("out_m, out_n, counts, gather", CASES)
-def test_single_rounding_accuracy_and_repeats(out_m, out_n, counts, gather):
+def test_single_rounding_accuracy_and_repeats(out_m, out_n, counts, gather, cfg):
     vk = _vk()
     a, b, offs, masked_k, kw, ref = _problem(out_m, out_n, counts, gather)
+    kw = {**kw, **cfg}
     old = _old_out((len(counts), out_m, out_n))
     out = old.clone()
     for _ in range(3):
@@ -126,6 +133,53 @@ def test_single_rounding_accuracy_and_repeats(out_m, out_n, counts, gather):
     err_single = (single.float() - exact).abs().sum()
     err_separate = (separate.float() - exact).abs().sum()
     assert err_single <= err_separate * 1.001
+
+
+@pytest.mark.parametrize("out_m, out_n, counts, gather", CASES)
+def test_ring3_matches_two_buffers(out_m, out_n, counts, gather):
+    """The three-buffer ring runs the same WMMA k-steps in the same order: bit-identical, gathered or not,
+    overwriting and accumulating."""
+    vk = _vk()
+    a, b, offs, masked_k, kw, _ = _problem(out_m, out_n, counts, gather)
+    ring3 = {"BLOCK_K": 64, "num_buffers": 3}
+    two = vk.grouped_gemm_bf16_variable_k_flydsl_kernel(a, b, offs, masked_k=masked_k, **kw)
+    three = vk.grouped_gemm_bf16_variable_k_flydsl_kernel(a, b, offs, masked_k=masked_k, **kw, **ring3)
+    assert torch.equal(two, three)
+    old = _old_out((len(counts), out_m, out_n))
+    acc2, acc3 = old.clone(), old.clone()
+    vk.grouped_gemm_bf16_variable_k_flydsl_kernel(a, b, offs, masked_k=masked_k, out=acc2, accumulate=1, **kw)
+    vk.grouped_gemm_bf16_variable_k_flydsl_kernel(
+        a, b, offs, masked_k=masked_k, out=acc3, accumulate=1, **kw, **ring3
+    )
+    assert torch.equal(acc2, acc3)
+
+
+def test_group_m_does_not_change_the_result():
+    """The super-tile height only reorders tiles: dW2's pick (14) against the old 16 and 4, accumulating."""
+    vk = _vk()
+    out_m, out_n, counts, gather = CASES[1]
+    a, b, offs, masked_k, kw, _ = _problem(out_m, out_n, counts, gather)
+    ring3 = {"BLOCK_K": 64, "num_buffers": 3}
+    old = _old_out((len(counts), out_m, out_n))
+    outs = []
+    for gm in (-1, 16, 4):
+        out = old.clone()
+        vk.grouped_gemm_bf16_variable_k_flydsl_kernel(
+            a, b, offs, masked_k=masked_k, out=out, accumulate=1, group_m=gm, **kw, **ring3
+        )
+        outs.append(out)
+    assert torch.equal(outs[0], outs[1]) and torch.equal(outs[0], outs[2])
+
+
+def test_deepseek_v3_wgrads_pick_the_ring():
+    vk = _vk()
+    assert vk._vk_group_m(7168, 2048, (256, 256, 64, 2, 2, 3)) == 14
+    assert vk._vk_group_m(4096, 7168, (256, 256, 64, 2, 2, 3)) == 16
+    assert vk._vk_group_m(7168, 2048, (256, 256, 128, 2, 2, 2)) == 16
+    assert vk._pick_variable_k_config(4096, 7168, 2048)[2:] == (64, 2, 2, 3)
+    assert vk._pick_variable_k_config(7168, 2048, 1024)[2:] == (64, 2, 2, 3)
+    assert vk._pick_variable_k_config(7168, 2048, 512)[2:] == (128, 2, 2, 2)
+    assert vk._pick_variable_k_config(5760, 2880, 2048)[2:] == (128, 2, 2, 2)
 
 
 def test_refuses_partial_tiles_and_bad_out():
