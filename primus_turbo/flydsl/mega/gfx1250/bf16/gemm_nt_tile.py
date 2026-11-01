@@ -103,7 +103,7 @@ def tile_geometry(tile_m: int, tile_n: int, tile_k: int, b_nn: bool = False):
     b_rows, b_row = (tile_k, tile_n * EB + _nn_b_pad(tile_n, EB)) if b_nn else (tile_n, lds_row)
     stage_b = ((b_rows * b_row + 15) // 16) * 16
     pitch = ((stage + stage_b + 1023) // 1024) * 1024
-    arena = max(NUM_BUFFERS * pitch, tile_m * tile_n * EB)
+    arena = max(NUM_BUFFERS * pitch, tile_m * (tile_n * EB + LDS_PAD))
     return lds_row, stage, pitch, arena
 
 
@@ -566,6 +566,9 @@ def nt_gemm_tile(
 
     # ---- epilogue: accumulators -> LDS (row-major tile) -> 16 B buffer stores ----
     chunks_per_row = tile_n * EB // 16
+    # the 16 lanes of a half-wave store one column block of 16 rows: padded rows land them on
+    # 16 different bank groups instead of one
+    c_lds_row = tile_n * EB + LDS_PAD
     rows_out = None
     if const_expr(c_rows is not None):
         assert tile_m == num_waves * WAVE and WAVE % _SCATTER_ROWS == 0, (
@@ -601,35 +604,41 @@ def nt_gemm_tile(
                 term = std_arith.MulFOp(bias, vector.broadcast(f32x8, _raw(bias_scales[wm]))).result
                 acc = Vec(std_arith.AddFOp(as_ir_value(acc), term).result)
             h = acc.to(fx.BFloat16)
-            fx.ptr_store(h.bitcast(fx.Int8), base_ptr + (row_rel * tile_n + col_rel) * EB)
+            fx.ptr_store(h.bitcast(fx.Int8), base_ptr + row_rel * c_lds_row + col_rel * EB)
     _workgroup_barrier()
     lds_c = fx.Int32(_bidx(base_ptr))
     if const_expr(c_rows is not None):
         row_rank, row_idx, row_ok, _extra = rows_out
+        # a store whose tile is wider than its column bound loses every row when the row bound's
+        # low 16 bits are zero (65536 routes), so the bound sits a row or two past the last one
+        row_bound = c_num_rows + (1 if (c_num_rows + 1) & 0xFFFF else 2)
         # per destination rank, the lane's row index, or past the rows (dropped) when it goes elsewhere
         rank_rows = [
-            (row_ok & (row_rank == fx.Int32(r))).select(row_idx, fx.Int32(c_num_rows))
+            (row_ok & (row_rank == fx.Int32(r))).select(row_idx, fx.Int32(row_bound))
             for r in range_constexpr(len(c_rank_bases))
         ]
         rank_bit = row_ok.select(
             ArithValue(std_arith.ShLIOp(_raw(fx.Int32(1)), _raw(row_rank)).result), zero32
         )
         rank_bases = [base + fx.Int64(blk_n) * fx.Int64(EB) for base in c_rank_bases]
+        # TDM stores ignore the LDS pad fields: each store reads whole padded rows and drops the
+        # pad columns as out of bounds, past the tile's last column
+        c_cols = (n_ext < fx.Int32(tile_n)).select(n_ext, fx.Int32(tile_n))
         for j in range_constexpr(tile_m // num_waves // _SCATTER_ROWS):
             lanes = [j * _SCATTER_ROWS + i for i in range(_SCATTER_ROWS)]
             ranks_hit = _readlane_i32(rank_bit, lanes[0])
             for group_lane in lanes[1:]:
                 ranks_hit = ranks_hit | _readlane_i32(rank_bit, group_lane)
             lds_row = fx.Int32(_SCATTER_ROWS) * (wave + fx.Int32(j * num_waves))
-            lds_addr = lds_c + lds_row * fx.Int32(tile_n * EB)
+            lds_addr = lds_c + lds_row * fx.Int32(c_lds_row)
             # a pool block holds its rows by source rank, so most groups go to one rank
             for r in range_constexpr(len(c_rank_bases)):
                 if (ranks_hit & fx.Int32(1 << r)) != zero32:
                     dgroup1, dgroup2, dgroup3 = _scatter_dgroups(
                         [_readlane_i32(rank_rows[r], group_lane) for group_lane in lanes],
-                        n_ext,
-                        c_num_rows,
-                        tile_n,
+                        c_cols,
+                        row_bound,
+                        c_lds_row // EB,
                         ldc,
                     )
                     tdm_ops.tensor_store_gather(
@@ -644,7 +653,7 @@ def nt_gemm_tile(
             chunk = tid + fx.Int32(i * block)
             row = chunk // fx.Int32(chunks_per_row)
             c16 = chunk % fx.Int32(chunks_per_row)
-            v = lds_load_b128(lds_c, row * fx.Int32(tile_n * EB) + c16 * fx.Int32(16))
+            v = lds_load_b128(lds_c, row * fx.Int32(c_lds_row) + c16 * fx.Int32(16))
             word = row * fx.Int32(ldc // 2) + c16 * fx.Int32(4)
             word = (c16 * fx.Int32(8) < n_ext).select(word, dropped)
             buffer_store(v, c_res, word, cache_modifier=c_cache_modifier)
