@@ -58,6 +58,7 @@ __all__ = [
     "fused_mega_moe",
     "fused_mega_moe_stage1",
     "fused_mega_moe_stage2",
+    "prefetch_fused_mega_moe_dispatch",
 ]
 
 
@@ -360,6 +361,29 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
                 None,
                 *((None,) * len(handle)),
             )
+
+
+def prefetch_fused_mega_moe_dispatch(
+    x: torch.Tensor,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w1: torch.Tensor,
+    group: ProcessGroup,
+) -> bool:
+    """Issue the dispatch prologue of the next ``fused_mega_moe_stage1`` call, which must pass the same
+    ``x``, ``topk_idx``, ``topk_weights`` and ``group`` (and a ``w1`` of the same shape), and run before
+    any other Mega MoE call. Work queued in between runs while that call waits for the prologue's row
+    count and launches the dispatch, instead of the GPU idling there. gfx1250 bf16 only: returns
+    whether it was issued (if not, the stage1 call runs its own prologue as usual). An int32 ``topk_idx``
+    is not prefetched: stage1 converts it to a tensor of its own."""
+    if not is_gfx1250() or topk_idx.dtype != torch.int64:
+        return False
+    from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
+        prefetch_dispatch_prologue,
+    )
+
+    prefetch_dispatch_prologue(x, w1, group, topk_idx, topk_weights)
+    return True
 
 
 def fused_mega_moe_stage1(

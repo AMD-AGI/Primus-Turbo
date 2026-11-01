@@ -57,6 +57,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_bf16_gfx1250_swiglu_rows.py",
     # The fused Mega dispatch + L1 GEMM, single GPU (EP1).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_dispatch_gemm.py",
+    # A Mega dispatch prologue issued ahead of its stage1 forward, against an inline one (EP1).
+    "tests/pytorch/ops/test_mega_bf16_gfx1250_prologue_prefetch.py",
     # The fused Mega L2 GEMM + combine, single GPU (EP1).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_gemm_combine.py",
     # The fused_mega_moe op (forward and backward) on the gfx1250 kernels, single GPU (EP1).

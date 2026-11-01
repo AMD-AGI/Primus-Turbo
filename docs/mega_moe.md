@@ -117,6 +117,13 @@ ops have. On gfx1250 the expert wgrads then add dW1 / dW2 straight into the weig
 serve (a `main_grad` that is not a contiguous bf16 tensor of the weight's shape, or an output shape
 that is not a whole number of the wgrad's output tiles) keep the ordinary gradient.
 
+On gfx1250, `prefetch_fused_mega_moe_dispatch(x, topk_idx, topk_weights, w1, group)` issues the
+dispatch prologue of the next `fused_mega_moe_stage1` call ahead of it, with an asynchronous copy of
+its row count to the host. Work queued in between (for example the layer's shared expert) then runs
+while that stage1 call waits for the count, instead of the GPU idling there. The stage1 call must
+come next with the same tensors, or it raises; an int32 `topk_idx` is not prefetched (the call
+returns False and stage1 runs its own prologue).
+
 ## Performance
 
 ### Test Configuration
