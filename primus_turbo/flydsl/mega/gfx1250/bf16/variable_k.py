@@ -284,7 +284,10 @@ def _launch_grouped_bf16_variable_k(
     STAGE_B = ((tile_k * LDS_B_ROW + 15) // 16) * 16
     PITCH = ((STAGE_A + STAGE_B + 1023) // 1024) * 1024
     elem_cls = fx.Float16 if is_f16 else fx.BFloat16
-    C_STORE_B = ((tile_m * tile_n * EB + 127) // 128) * 128
+    # C staging rows 16 B apart: the 16 lanes of a half-wave store one column block of 16 rows,
+    # which on 2^k-byte rows all land on one bank group
+    C_LDS_ROW = tile_n * EB + 16
+    C_STORE_B = ((tile_m * C_LDS_ROW + 127) // 128) * 128
     ARENA_B = max(num_buffers * PITCH, C_STORE_B)
     # Cross-tile prefetch precondition, COMPILE-TIME. The epilogue stages C at the
     # arena base and the prefetch of the next tile's first stage targets buffer 1, so
@@ -293,7 +296,7 @@ def _launch_grouped_bf16_variable_k(
     #     PREFETCH_OK  <=>  C_STORE_B <= PITCH
     #
     # ⚠️ This inequality CHANGES SIGN with tile_k: `PITCH` is proportional to tile_k
-    # while `C_STORE_B` is tile_m * tile_n * EB and does not contain tile_k at all, so
+    # while `C_STORE_B` is tile_m * C_LDS_ROW and does not contain tile_k at all, so
     # verifying it on one tile says nothing about another. Where it does not hold the
     # prefetch lands inside the staging the epilogue is still using and the output is
     # garbage -- hence an assertion in code rather than a note. A tile that fails it
@@ -839,22 +842,26 @@ def _launch_grouped_bf16_variable_k(
                 for wn in range_constexpr(wmma_n_rep):
                     col_rel = wnb + wn * WMMA_N + kgrp * 8
                     h = accs[wm * wmma_n_rep + wn].to(elem_cls)
-                    fx.ptr_store(h.bitcast(fx.Int8), base_ptr + (row_rel * tile_n + col_rel) * EB)
+                    fx.ptr_store(h.bitcast(fx.Int8), base_ptr + row_rel * C_LDS_ROW + col_rel * EB)
             gpu.barrier()
             c_off = fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS) + fx.Int64(blk_n) * ldc64 + fx.Int64(blk_k)
-            gtC = _gv(gC_base, c_off, (tile_m, tile_n), (tile_n, 1))
+            # TDM stores ignore the LDS pad fields: the store moves whole padded rows and the
+            # pad columns, past the clamped column extent, are dropped
+            c_row = C_LDS_ROW // EB
+            gtC = _gv(gC_base, c_off, (tile_m, c_row), (c_row, 1))
+            c_cols = (k_valid < fx.Int32(tile_n)).select(k_valid, fx.Int32(tile_n))
             # Store side: dim-0 bounds addressing and dim-1 bounds a store's addressing
             # too (sentinel-verified), so the backed-off rows written above are dropped
             # here rather than reaching memory.
             atomC = fx.rocdl.make_tdm_atom(
                 gtC,
-                [n_valid, k_valid],
+                [n_valid, c_cols],
                 strides=[ldc64, None],
                 num_warps=num_waves,
                 cache_modifier=tdm_store_cache,
                 early_timeout=False,
             )
-            fx.copy(atomC, _lv(fx.recast_iter(elem_cls, base_ptr), (tile_m, tile_n), (tile_n, 1)), gtC)
+            fx.copy(atomC, _lv(fx.recast_iter(elem_cls, base_ptr), (tile_m, c_row), (c_row, 1)), gtC)
             tdm_ops.tensor_wait(0)
             # ⛔⛔ THE SEAM BARRIER. Without it the persistent path is NOT REENTRANT,
             # and the cost of that is a device reset:
