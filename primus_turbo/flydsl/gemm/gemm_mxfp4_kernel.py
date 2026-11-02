@@ -652,7 +652,7 @@ _MXFP4_ROWSPLIT = False
 # call and the scalar globals those read -- not this class, so the code MfmaScaleFp4 emits
 # reaches that key only through this value, which every kernel that builds one reads. Bump it
 # with any change to the emitted code, or a warm cache keeps serving the old kernel.
-MXFP4_CODEGEN_REV = 1
+MXFP4_CODEGEN_REV = 2
 
 
 class MfmaScaleFp4:
@@ -1396,9 +1396,10 @@ class MfmaScaleFp4:
         # s_nop: keeps the first post-barrier issue off the cycle every wave leaves the barrier on.
         _ipend = f"s_waitcnt vmcnt(0) lgkmcnt({_ELGK})\ns_barrier\ns_nop 0"
 
-        # The boundary body never reads the B right half, whose g2s issue last (A, BL, BR),
-        # so those alone may stay in flight past its barrier.
-        _WLVQ = min(_WLV, nsb)
+        # Under half_g2s the boundary body's B right half is a dead copy no ds_read touches,
+        # and its g2s issue last (A, BL, BR), so those alone may stay in flight past its
+        # barrier. A caller that points a wave at that pool (half_g2s=False) drains it all.
+        _WLVQ = min(_WLV, nsb) if half_g2s else 0
         _ipend_q = f"s_waitcnt vmcnt({_WLVQ}) lgkmcnt({_ELGK})\ns_barrier\ns_nop 0"
 
         def _ip(half):

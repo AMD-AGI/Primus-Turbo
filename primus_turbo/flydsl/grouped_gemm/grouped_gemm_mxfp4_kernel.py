@@ -1976,7 +1976,9 @@ def _build_grouped_mxfp4_wgrad_kernel(
                 sc_buf_stride=(_SCBUF * 4),
                 half_n=_half_n,
                 quarter_n=_QUARTER_N,
-                half_g2s=True,
+                # The quarter-M re-tile reads wave_m 1's column band out of the BR pool, so
+                # that block needs the R half staged for real, not as a copy of the L half.
+                half_g2s=not _QUARTER_M,
                 cst=_cst,
                 cst_gap=LDS_BN_HALF * 2,
                 cst_ilv=_BILV,
