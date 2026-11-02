@@ -404,14 +404,11 @@ def _make_dispatch_prologue(
                 buffer_store(
                     _ext_i64(expert_pool_base), num_tokens_per_expert_prefix_resource, local_expert_idx
                 )
-                num_expert_blocks = padded_count // fx.Int32(block_m)
-                base_block_idx = expert_pool_base // fx.Int32(block_m)
-                pool_block_offset = fx.Int32(0)
-                while pool_block_offset < num_expert_blocks:
-                    buffer_store(
-                        local_expert_idx, tile_to_expert_resource, base_block_idx + pool_block_offset
-                    )
-                    pool_block_offset = pool_block_offset + fx.Int32(1)
+                # phase D's row bases are free until its reserve step: they hand the expert's rows to
+                # the block-wide fills below
+                store_lds(LDS_FOLD_ROWS_BASE, local_expert_idx, expert_pool_base)
+                store_lds(LDS_OTHER_ROWS_BASE, local_expert_idx, expert_total_count)
+                store_lds(LDS_SEND_ROWS_BASE, local_expert_idx, padded_count)
                 within_expert_offset = fx.Int32(0)
                 for source_rank in fx.range_constexpr(num_ranks):
                     count_value = source_counts[source_rank]
@@ -426,16 +423,6 @@ def _make_dispatch_prologue(
                     )
                     within_expert_offset = within_expert_offset + count_value
                 is_last_expert = local_expert_idx == fx.Int32(num_experts_per_rank - 1)
-                # padding rows, plus BLOCK_M rows past the last expert, gather out of bounds and read 0
-                sentinel_end = (
-                    expert_pool_base
-                    + padded_count
-                    + fx.arith.select(is_last_expert, fx.Int32(block_m), fx.Int32(0))
-                )
-                sentinel_row = expert_pool_base + expert_total_count
-                while sentinel_row < sentinel_end:
-                    buffer_store(fx.Int32(num_max_recv_tokens), pool_row_to_recv_token_resource, sentinel_row)
-                    sentinel_row = sentinel_row + fx.Int32(1)
                 if is_last_expert:
                     total_rows = expert_pool_base + padded_count
                     buffer_store(total_rows // fx.Int32(block_m), num_tile_blocks_resource, fx.Int32(0))
@@ -452,6 +439,31 @@ def _make_dispatch_prologue(
                         (_ext_i64(notify_epoch) << fx.Int64(32)) | _ext_i64(total_rows),
                         scope="sys",
                     )
+            fx.gpu.barrier()
+            # the whole block fills each expert's pool-block entries and padding rows, consecutive
+            # threads on consecutive words
+            for local_expert_idx in range(num_experts_per_rank):
+                expert_pool_base = load_lds(LDS_FOLD_ROWS_BASE, fx.Int32(local_expert_idx))
+                expert_total_count = load_lds(LDS_OTHER_ROWS_BASE, fx.Int32(local_expert_idx))
+                padded_count = load_lds(LDS_SEND_ROWS_BASE, fx.Int32(local_expert_idx))
+                base_block_idx = expert_pool_base // fx.Int32(block_m)
+                pool_block_offset = fx.Int32(thread_index)
+                while pool_block_offset < padded_count // fx.Int32(block_m):
+                    buffer_store(
+                        fx.Int32(local_expert_idx), tile_to_expert_resource, base_block_idx + pool_block_offset
+                    )
+                    pool_block_offset = pool_block_offset + fx.Int32(block_threads)
+                is_last_expert = fx.Int32(local_expert_idx) == fx.Int32(num_experts_per_rank - 1)
+                # padding rows, plus BLOCK_M rows past the last expert, gather out of bounds and read 0
+                sentinel_end = (
+                    expert_pool_base
+                    + padded_count
+                    + fx.arith.select(is_last_expert, fx.Int32(block_m), fx.Int32(0))
+                )
+                sentinel_row = expert_pool_base + expert_total_count + fx.Int32(thread_index)
+                while sentinel_row < sentinel_end:
+                    buffer_store(fx.Int32(num_max_recv_tokens), pool_row_to_recv_token_resource, sentinel_row)
+                    sentinel_row = sentinel_row + fx.Int32(block_threads)
 
         grid_sync(workspace, thread_index, block_index, grid_blocks, rank, "dispatch_prologue/C:table-built")
 
