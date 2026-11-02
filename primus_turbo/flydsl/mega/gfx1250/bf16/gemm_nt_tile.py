@@ -105,6 +105,28 @@ def tile_geometry(tile_m: int, tile_n: int, tile_k: int, b_nn: bool = False):
     return lds_row, stage, pitch, arena
 
 
+def resolve_lds_cosched(
+    lds_cosched: int, issue_first: int, tile_m: int, tile_n: int, m_warp: int, n_warp: int
+):
+    """``lds_cosched`` as ``nt_gemm_tile`` takes it: -1 turns it on where the tile allows it.
+
+    It issues one fragment read per matrix op of the previous sub-step, so it needs ``issue_first``
+    and fewer reads per sub-step (two per fragment row and column) than matrix ops."""
+    m_rep, n_rep = tile_m // m_warp // WMMA_M, tile_n // n_warp // WMMA_N
+    allowed = bool(issue_first) and 2 * (m_rep + n_rep) < m_rep * n_rep
+    if lds_cosched == -1:
+        return int(allowed)
+    if lds_cosched not in (0, 1):
+        raise ValueError(f"lds_cosched must be -1 (auto), 0 or 1, got {lds_cosched}")
+    if lds_cosched and not allowed:
+        raise ValueError(
+            f"lds_cosched=1 needs issue_first=1 and fewer fragment reads per sub-step than matrix ops, "
+            f"got issue_first={int(issue_first)} and {2 * (m_rep + n_rep)} reads for {m_rep * n_rep} "
+            f"matrix ops (tile {tile_m}x{tile_n}, {m_warp}x{n_warp} waves)"
+        )
+    return lds_cosched
+
+
 def check_gather_rows(a_rows: int, lda: int, tile_m: int, tile_k: int):
     """The async A gather's limits: some row to read, and 32-bit byte offsets into A."""
     assert a_rows > 0, "a gathered A needs a row"
@@ -244,10 +266,9 @@ def nt_gemm_tile(
     OPS = tile_m // ROWS_PER_OP
     assert OPS % num_waves == 0, "gather ops must split evenly over the waves"
     OPS_PER_WAVE = OPS // num_waves
-    assert not lds_cosched or (issue_first and 2 * (wmma_m_rep + wmma_n_rep) < n_acc), (
-        f"lds_cosched=1 needs issue_first=1 and fewer fragment reads per sub-step than matrix ops, got "
-        f"issue_first={int(issue_first)} and {2 * (wmma_m_rep + wmma_n_rep)} reads for {n_acc} matrix ops"
-    )
+    # Not an assert: without issue_first the co-scheduled loop never issues the next k-tile's
+    # loads, so `python -O` would turn a bad combination into stale LDS reads.
+    resolve_lds_cosched(int(lds_cosched), issue_first, tile_m, tile_n, m_warp, n_warp)
     assert ldc % 2 == 0, "the epilogue stores whole i32 words"
 
     tid = fx.Int32(fx.thread_idx.x)

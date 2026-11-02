@@ -48,6 +48,7 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     WAVE,
     check_gather_rows,
     nt_gemm_tile,
+    resolve_lds_cosched,
     tile_geometry,
 )
 from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
@@ -319,7 +320,7 @@ def dispatch_gemm_nt_gfx1250(
     b_nn: bool = False,
     issue_first: int = 1,
     wmma_b2b: int = 0,
-    lds_cosched: int = 1,
+    lds_cosched: int = -1,
 ) -> torch.Tensor:
     """Dispatch ``x`` by ``handle`` and return the L1 output over this rank's pool rows.
 
@@ -328,7 +329,8 @@ def dispatch_gemm_nt_gfx1250(
     ``[experts, N, hidden]``, or ``[experts, hidden, N]`` with ``b_nn`` (``out = x @ w1[e]``).
     ``tile_k`` 0 is 128 when it divides hidden, else 64. ``issue_first`` issues each k-tile's prefetch
     at the top of the previous one, ``lds_cosched`` interleaves the fragment reads with the matrix ops
-    (``nt_gemm_tile``) and ``wmma_b2b`` turns the WMMA arbitration stall off."""
+    (``nt_gemm_tile``; -1: wherever the tile and ``issue_first`` allow it) and ``wmma_b2b`` turns the
+    WMMA arbitration stall off."""
     return _run(
         x,
         w1,
@@ -344,7 +346,7 @@ def dispatch_gemm_nt_gfx1250(
         group_m=group_m,
         issue_first=issue_first,
         wmma_b2b=wmma_b2b,
-        lds_cosched=lds_cosched,
+        lds_cosched=resolve_lds_cosched(lds_cosched, issue_first, tile_m, tile_n, m_warp, n_warp),
     )
 
 

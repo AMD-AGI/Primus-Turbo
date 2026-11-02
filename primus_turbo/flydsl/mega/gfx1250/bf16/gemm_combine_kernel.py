@@ -53,6 +53,7 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     NUM_BUFFERS,
     WAVE,
     nt_gemm_tile,
+    resolve_lds_cosched,
     tile_geometry,
 )
 from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
@@ -515,7 +516,7 @@ def gemm_combine_nt_gfx1250(
     bias_scale: torch.Tensor | None = None,
     issue_first: int = 1,
     wmma_b2b: int | None = None,
-    lds_cosched: int = 1,
+    lds_cosched: int = -1,
 ):
     """``act`` [pool rows, K] (pool order, as the L1 + activation left it) -> ``[tokens, N]`` combined,
     ``tokens = topk_idx.shape[0]``.
@@ -529,10 +530,12 @@ def gemm_combine_nt_gfx1250(
     ``bias`` [experts, N] adds ``bias[e(p)] * bias_scale[p]`` to every pool row before the sum,
     ``bias_scale`` being the rows' f32 routing weight. ``tile_k`` 0 is 128 when it divides K, else 64.
     ``issue_first`` issues each k-tile's prefetch at the top of the previous one, ``lds_cosched``
-    interleaves the fragment reads with the matrix ops (``nt_gemm_tile``) and ``wmma_b2b`` turns the
-    WMMA arbitration stall off (None: on for NT, off with ``b_nn``)."""
+    interleaves the fragment reads with the matrix ops (``nt_gemm_tile``; -1: wherever the tile and
+    ``issue_first`` allow it) and ``wmma_b2b`` turns the WMMA arbitration stall off (None: on for NT,
+    off with ``b_nn``)."""
     if wmma_b2b is None:
         wmma_b2b = 0 if b_nn else 1
+    lds_cosched = resolve_lds_cosched(lds_cosched, issue_first, tile_m, tile_n, m_warp, n_warp)
     _require_gfx1250(act.device)
     symm = get_symm_buffer_for_mega_moe()
     G, N, K = w2.shape
