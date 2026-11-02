@@ -258,14 +258,16 @@ void k_mla_fwd(const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf1
   };                                                                                                                 \
   /* wave 0's 3 TDM ops of ring slot t of a block (stage (sb + t) % 4): its tile t, or past its last tile a 1-row */ \
   /* copy of tile n - 1 into that (free) stage; branch-free: waves 1..3 issue NULL descriptors, so wave 0 keeps   */ \
-  /* exactly 3 ops per tile in flight and its tensor waits stay static                                           */ \
+  /* exactly 3 ops per tile in flight and its tensor waits stay static. The descriptors bound the tensor at the   */ \
+  /* tile's own 64 rows (every tile is inside Skv: Skv % 64 == 0; a 1-row copy reads the tile's first row), not  */ \
+  /* at Skv: fewer descriptor words to compute per op                                                             */ \
   auto issue_slot = [&](int t, int n, int sb, unsigned long long gk0, unsigned long long gv0) {                      \
     const bool real = t < n;                                                                                         \
     const int kv0 = (real ? t : n - 1) * NB;                                                                         \
     const unsigned long long gk = gk0 + 2ull * (unsigned long long)kv0 * krow;                                       \
     const unsigned long long gv = gv0 + 2ull * (unsigned long long)kv0 * vrow;                                       \
     const unsigned th = real ? NB : 1;                                                                               \
-    const unsigned rows = (unsigned)(Skv_ - kv0);                                                                    \
+    const unsigned rows = (unsigned)NB;                                                                              \
     const unsigned st = lds0 + (unsigned)(((sb + t) & (NSTG - 1)) * STG_B);                                          \
     tdm_load(tdm_g0(st, gk, cnt0), tdm_g1(W0_A, rows, 128, th, krow));                                              \
     tdm_load(tdm_g0(st + 256, gk + 256, cnt0), tdm_g1(W0_B, rows, 64, th, krow));                                    \
@@ -282,7 +284,7 @@ void k_mla_fwd(const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf1
     const unsigned long long gk = (own ? gk0 : gkn) + 2ull * (unsigned long long)kv0 * krow;                         \
     const unsigned long long gv = (own ? gv0 : gvn) + 2ull * (unsigned long long)kv0 * vrow;                         \
     const unsigned th = real ? NB : 1;                                                                               \
-    const unsigned rows = (unsigned)(Skv_ - kv0);                                                                    \
+    const unsigned rows = (unsigned)NB;                                                                              \
     const unsigned st = lds0 + (unsigned)(((sb + t) & (NSTG - 1)) * STG_B);                                          \
     tdm_load(tdm_g0(st, gk, cnt0), tdm_g1(W0_A, rows, 128, th, krow));                                              \
     tdm_load(tdm_g0(st + 256, gk + 256, cnt0), tdm_g1(W0_B, rows, 64, th, krow));                                    \

@@ -1,9 +1,9 @@
---- k_mla_fwd.s	sha256 21ac48136f4750ff751d1e3598cc0548a93e846c85d3bc865ce998696a18d648
+--- k_mla_fwd.s	sha256 5a2da96e19897c4ed99b03be6183c76340b9003492316a00c7739c475bc46f48
 +++ k_mla_fwd.s	generated
-@@ -960,6 +960,533 @@
+@@ -927,6 +927,533 @@
  	s_wait_alu depctr_va_vdst(0)
  	;;#ASMSTART
- 	; HKGEN INIT qa=v4 qb=v5 c2=s69
+ 	; HKGEN INIT qa=v4 qb=v5 c2=s17
 +	s_set_vgpr_msb 0x80                   ;  msbs: dst=2 src0=0 src1=0 src2=0
 +	s_wait_alu depctr_vm_vsrc(0)
 +	s_wait_dscnt 0x0
@@ -16,8 +16,8 @@
 +	v_mov_b32_e32 v247 /*v759*/, 0xf149f2ca
 +	v_mov_b32_e32 v251 /*v763*/, 0
 +	s_set_vgpr_msb 0x8000                   ;  msbs: dst=0 src0=0 src1=0 src2=0
-+	v_mov_b32_e32 v38, s69
-+	v_mov_b32_e32 v39, s69
++	v_mov_b32_e32 v38, s17
++	v_mov_b32_e32 v39, s17
 +	v_mov_b32_e32 v40, v4
 +	v_mov_b32_e32 v41, v5
 +	s_set_vgpr_msb 0x40                   ;  msbs: dst=1 src0=0 src1=0 src2=0
@@ -532,12 +532,12 @@
 +	v_mov_b32_e32 v255, 0
 +	s_wait_dscnt 0x0
  	;;#ASMEND
- 	s_cmp_lt_i32 s67, 1
+ 	s_cmp_lt_i32 s68, 1
  	v_mad_u32_u24 v0, 0x110, v0, v7
-@@ -1032,6 +1559,1314 @@
+@@ -991,6 +1518,1314 @@
  	s_wait_alu depctr_va_vdst(0)
  	;;#ASMSTART
- 	; HKGEN TILE_C kb=v5 vb=v6 c2=s69
+ 	; HKGEN TILE_C kb=v5 vb=v6 c2=s17
 +	s_set_vgpr_msb 0xc0                   ;  msbs: dst=3 src0=0 src1=0 src2=0
 +	s_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)
 +	s_wait_dscnt 0x0
@@ -548,7 +548,7 @@
 +	s_set_vgpr_msb 0x5baa                   ;  msbs: dst=2 src0=2 src1=2 src2=2
 +	v_max3_num_f32 v192 /*v704*/, v64 /*v576*/, v65 /*v577*/, v66 /*v578*/
 +	v_max3_num_f32 v193 /*v705*/, v67 /*v579*/, v68 /*v580*/, v69 /*v581*/
-+	s_mov_b32 s102, s69
++	s_mov_b32 s102, s17
 +	s_set_vgpr_msb 0xaa28                   ;  msbs: dst=0 src0=0 src1=2 src2=2
 +	ds_load_b128 v[48:51], v40 offset:0
 +	s_set_vgpr_msb 0x28aa                   ;  msbs: dst=2 src0=2 src1=2 src2=2
@@ -556,7 +556,7 @@
 +	v_max3_num_f32 v195 /*v707*/, v73 /*v585*/, v74 /*v586*/, v75 /*v587*/
 +	s_set_vgpr_msb 0xaa5b                   ;  msbs: dst=1 src0=3 src1=2 src2=1
 +	v_wmma_f32_16x16x32_bf16 v[8:15] /*v[264:271]*/, v[208:215] /*v[976:983]*/, v[0:7] /*v[512:519]*/, v[8:15] /*v[264:271]*/
-+	s_mov_b32 s103, s69
++	s_mov_b32 s103, s17
 +	s_set_vgpr_msb 0x5baa                   ;  msbs: dst=2 src0=2 src1=2 src2=2
 +	v_max3_num_f32 v196 /*v708*/, v76 /*v588*/, v77 /*v589*/, v78 /*v590*/
 +	v_max3_num_f32 v197 /*v709*/, v79 /*v591*/, v80 /*v592*/, v81 /*v593*/
@@ -1849,10 +1849,10 @@
  	;;#ASMEND
  	; sched_barrier mask(0x00000000)
  	s_barrier_wait -1
-@@ -1394,6 +3229,1394 @@
+@@ -1345,6 +3180,1394 @@
  	s_wait_alu depctr_va_vdst(0)
  	;;#ASMSTART
- 	; HKGEN TILE_D0 kb=v3 vb=v4 dl=v5 c2=s69
+ 	; HKGEN TILE_D0 kb=v3 vb=v4 dl=v5 c2=s17
 +	s_set_vgpr_msb 0xc0                   ;  msbs: dst=3 src0=0 src1=0 src2=0
 +	s_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)
 +	s_wait_dscnt 0x0
@@ -1863,7 +1863,7 @@
 +	s_set_vgpr_msb 0x5baa                   ;  msbs: dst=2 src0=2 src1=2 src2=2
 +	v_max3_num_f32 v192 /*v704*/, v64 /*v576*/, v65 /*v577*/, v66 /*v578*/
 +	v_max3_num_f32 v193 /*v705*/, v67 /*v579*/, v68 /*v580*/, v69 /*v581*/
-+	s_mov_b32 s102, s69
++	s_mov_b32 s102, s17
 +	s_set_vgpr_msb 0xaa28                   ;  msbs: dst=0 src0=0 src1=2 src2=2
 +	ds_load_b128 v[48:51], v40 offset:0
 +	s_set_vgpr_msb 0x28aa                   ;  msbs: dst=2 src0=2 src1=2 src2=2
@@ -1871,7 +1871,7 @@
 +	v_max3_num_f32 v195 /*v707*/, v73 /*v585*/, v74 /*v586*/, v75 /*v587*/
 +	s_set_vgpr_msb 0xaa5b                   ;  msbs: dst=1 src0=3 src1=2 src2=1
 +	v_wmma_f32_16x16x32_bf16 v[8:15] /*v[264:271]*/, v[208:215] /*v[976:983]*/, v[0:7] /*v[512:519]*/, v[8:15] /*v[264:271]*/
-+	s_mov_b32 s103, s69
++	s_mov_b32 s103, s17
 +	s_set_vgpr_msb 0x5baa                   ;  msbs: dst=2 src0=2 src1=2 src2=2
 +	v_max3_num_f32 v196 /*v708*/, v76 /*v588*/, v77 /*v589*/, v78 /*v590*/
 +	v_max3_num_f32 v197 /*v709*/, v79 /*v591*/, v80 /*v592*/, v81 /*v593*/
@@ -3244,10 +3244,10 @@
  	;;#ASMEND
  	; sched_barrier mask(0x00000000)
  	s_barrier_wait -1
-@@ -1503,6 +4726,1189 @@
+@@ -1446,6 +4669,1189 @@
  	s_wait_alu depctr_va_vdst(0)
  	;;#ASMSTART
- 	; HKGEN TILE_D1 kb=v3 vb=v4 dl=v5 c2=s69
+ 	; HKGEN TILE_D1 kb=v3 vb=v4 dl=v5 c2=s17
 +	s_set_vgpr_msb 0xc0                   ;  msbs: dst=3 src0=0 src1=0 src2=0
 +	s_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)
 +	s_wait_dscnt 0x0
@@ -3258,7 +3258,7 @@
 +	s_set_vgpr_msb 0x5baa                   ;  msbs: dst=2 src0=2 src1=2 src2=2
 +	v_max3_num_f32 v192 /*v704*/, v64 /*v576*/, v65 /*v577*/, v66 /*v578*/
 +	v_max3_num_f32 v193 /*v705*/, v67 /*v579*/, v68 /*v580*/, v69 /*v581*/
-+	s_mov_b32 s102, s69
++	s_mov_b32 s102, s17
 +	s_set_vgpr_msb 0xaae8                   ;  msbs: dst=3 src0=0 src1=2 src2=2
 +	ds_load_b128 v[4:7] /*v[772:775]*/, v3 offset:32
 +	s_set_vgpr_msb 0xe8aa                   ;  msbs: dst=2 src0=2 src1=2 src2=2
@@ -3266,7 +3266,7 @@
 +	v_max3_num_f32 v195 /*v707*/, v73 /*v585*/, v74 /*v586*/, v75 /*v587*/
 +	s_set_vgpr_msb 0xaa5b                   ;  msbs: dst=1 src0=3 src1=2 src2=1
 +	v_wmma_f32_16x16x32_bf16 v[8:15] /*v[264:271]*/, v[208:215] /*v[976:983]*/, v[0:7] /*v[512:519]*/, v[8:15] /*v[264:271]*/
-+	s_mov_b32 s103, s69
++	s_mov_b32 s103, s17
 +	s_set_vgpr_msb 0x5baa                   ;  msbs: dst=2 src0=2 src1=2 src2=2
 +	v_max3_num_f32 v196 /*v708*/, v76 /*v588*/, v77 /*v589*/, v78 /*v590*/
 +	v_max3_num_f32 v197 /*v709*/, v79 /*v591*/, v80 /*v592*/, v81 /*v593*/
@@ -4434,10 +4434,10 @@
  	;;#ASMEND
  	; sched_barrier mask(0x00000000)
  	s_barrier_wait -1
-@@ -1612,6 +6018,959 @@
+@@ -1547,6 +5953,959 @@
  	s_wait_alu depctr_va_vdst(0)
  	;;#ASMSTART
- 	; HKGEN TILE_D2 kb=v3 vb=v4 dl=v5 c2=s69
+ 	; HKGEN TILE_D2 kb=v3 vb=v4 dl=v5 c2=s17
 +	s_set_vgpr_msb 0xc0                   ;  msbs: dst=3 src0=0 src1=0 src2=0
 +	s_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)
 +	s_wait_dscnt 0x0
@@ -4448,7 +4448,7 @@
 +	s_set_vgpr_msb 0x5baa                   ;  msbs: dst=2 src0=2 src1=2 src2=2
 +	v_max3_num_f32 v192 /*v704*/, v64 /*v576*/, v65 /*v577*/, v66 /*v578*/
 +	v_max3_num_f32 v193 /*v705*/, v67 /*v579*/, v68 /*v580*/, v69 /*v581*/
-+	s_mov_b32 s102, s69
++	s_mov_b32 s102, s17
 +	s_set_vgpr_msb 0xaae8                   ;  msbs: dst=3 src0=0 src1=2 src2=2
 +	ds_load_b128 v[4:7] /*v[772:775]*/, v3 offset:32
 +	s_set_vgpr_msb 0xe8aa                   ;  msbs: dst=2 src0=2 src1=2 src2=2
@@ -4456,7 +4456,7 @@
 +	v_max3_num_f32 v195 /*v707*/, v73 /*v585*/, v74 /*v586*/, v75 /*v587*/
 +	s_set_vgpr_msb 0xaa5b                   ;  msbs: dst=1 src0=3 src1=2 src2=1
 +	v_wmma_f32_16x16x32_bf16 v[8:15] /*v[264:271]*/, v[208:215] /*v[976:983]*/, v[0:7] /*v[512:519]*/, v[8:15] /*v[264:271]*/
-+	s_mov_b32 s103, s69
++	s_mov_b32 s103, s17
 +	s_set_vgpr_msb 0x5baa                   ;  msbs: dst=2 src0=2 src1=2 src2=2
 +	v_max3_num_f32 v196 /*v708*/, v76 /*v588*/, v77 /*v589*/, v78 /*v590*/
 +	v_max3_num_f32 v197 /*v709*/, v79 /*v591*/, v80 /*v592*/, v81 /*v593*/
@@ -5394,10 +5394,10 @@
  	;;#ASMEND
  	; sched_barrier mask(0x00000000)
  	s_barrier_wait -1
-@@ -1719,6 +7078,924 @@
+@@ -1646,6 +7005,924 @@
  	s_wait_alu depctr_va_vdst(0)
  	;;#ASMSTART
- 	; HKGEN TILE_D3 kb=v1 vb=v0 dl=v2 c2=s69
+ 	; HKGEN TILE_D3 kb=v1 vb=v0 dl=v2 c2=s17
 +	s_set_vgpr_msb 0xc0                   ;  msbs: dst=3 src0=0 src1=0 src2=0
 +	s_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)
 +	s_wait_dscnt 0x0
@@ -5408,7 +5408,7 @@
 +	s_set_vgpr_msb 0x5baa                   ;  msbs: dst=2 src0=2 src1=2 src2=2
 +	v_max3_num_f32 v192 /*v704*/, v64 /*v576*/, v65 /*v577*/, v66 /*v578*/
 +	v_max3_num_f32 v193 /*v705*/, v67 /*v579*/, v68 /*v580*/, v69 /*v581*/
-+	s_mov_b32 s102, s69
++	s_mov_b32 s102, s17
 +	s_set_vgpr_msb 0xaae8                   ;  msbs: dst=3 src0=0 src1=2 src2=2
 +	ds_load_b128 v[4:7] /*v[772:775]*/, v1 offset:32
 +	s_set_vgpr_msb 0xe8aa                   ;  msbs: dst=2 src0=2 src1=2 src2=2
@@ -5416,7 +5416,7 @@
 +	v_max3_num_f32 v195 /*v707*/, v73 /*v585*/, v74 /*v586*/, v75 /*v587*/
 +	s_set_vgpr_msb 0xaa5b                   ;  msbs: dst=1 src0=3 src1=2 src2=1
 +	v_wmma_f32_16x16x32_bf16 v[8:15] /*v[264:271]*/, v[208:215] /*v[976:983]*/, v[0:7] /*v[512:519]*/, v[8:15] /*v[264:271]*/
-+	s_mov_b32 s103, s69
++	s_mov_b32 s103, s17
 +	s_set_vgpr_msb 0x5baa                   ;  msbs: dst=2 src0=2 src1=2 src2=2
 +	v_max3_num_f32 v196 /*v708*/, v76 /*v588*/, v77 /*v589*/, v78 /*v590*/
 +	v_max3_num_f32 v197 /*v709*/, v79 /*v591*/, v80 /*v592*/, v81 /*v593*/
@@ -6319,7 +6319,7 @@
  	;;#ASMEND
  	; sched_barrier mask(0x00000000)
  	s_barrier_wait -1
-@@ -1856,6 +8133,993 @@
+@@ -1778,6 +8055,993 @@
  	s_wait_alu depctr_va_vdst(0)
  	;;#ASMSTART
  	; HKGEN FINAL_A wa=v1 wb=v2 la=v0 lb=v3
@@ -7313,7 +7313,7 @@
  	;;#ASMEND
  	; sched_barrier mask(0x00000000)
  	; sched_barrier mask(0x00000000)
-@@ -2124,7 +9388,7 @@
+@@ -2046,7 +9310,7 @@
  		.amdhsa_system_sgpr_workgroup_id_z 1
  		.amdhsa_system_sgpr_workgroup_info 0
  		.amdhsa_system_vgpr_workitem_id 0
@@ -7322,7 +7322,7 @@
  		.amdhsa_next_free_sgpr 104
  		.amdhsa_named_barrier_count 0
  		.amdhsa_reserve_vcc 1
-@@ -2266,7 +9530,7 @@
+@@ -2188,7 +9452,7 @@
      .symbol:         k_mla_fwd.kd
      .uniform_work_group_size: 1
      .uses_dynamic_stack: false
