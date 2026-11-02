@@ -11,7 +11,8 @@ markers; build.py compiles it, reads the registers LLVM gave each marker operand
 every region:
 
   INIT     once per q block: m = fp32(-1e30), d = 0, O = 0, the (c, c) pair, copies of the Q fragment bases,
-           the resident Q fragments of q tiles 1, 2 and the state that makes the first tile's prefix a no-op
+           the Q fragments of all four q tiles (resident for the whole block: the tiles read no Q) and the
+           state that makes the first tile's prefix a no-op
   TILE_C   a 64-kv tile below the diagonal (no mask); it also issues ring slot t + 3, tile t + 3's TDM ops (tdm_nodes)
   TILE_Dk  diagonal tile k = 0..3 (Sq == Skv): q tiles below k skipped, the causal mask on q tile k only
   FINAL_A  the prefix of the last tile, then per q tile i: inv = d > 0 ? 1 / d : 0 (LLVM's IEEE division
@@ -30,9 +31,9 @@ O += P V as WMMA chains over the two 32-kv halves.
 The TILE regions are software-pipelined across tiles. The region of tile t opens with a prefix that finishes
 tile t - 1: the softmax of q tiles 2, 3 (their masked scores are live in S(2), S(3)), their sum tree and
 O *= corr, then the PV WMMAs of all four q tiles (P(0), P(1) come from region t - 1). Its body reads the
-tile's K / V / Q fragments and runs QK(0..3), the full softmax of q tiles 0, 1 (P in place of their scores)
-with their sum tree, and only the mask of q tiles 2, 3. The K / Q(0) reads issued at the region start thus
-land while the prefix's 64 WMMAs and its softmax run, and the softmax VALU spreads over the whole region.
+tile's K / V fragments and runs QK(0..3), the full softmax of q tiles 0, 1 (P in place of their scores)
+with their sum tree, and only the mask of q tiles 2, 3. The K reads issued at the region start thus land
+while the prefix's 64 WMMAs and its softmax run, and the softmax VALU spreads over the whole region.
 Every q tile keeps its sequence of operations: the pipelining changes no result bit. A body that skips q
 tile i leaves the next prefix a no-op for it, as INIT does for the first prefix: P(i) = 0 for i < 2,
 S(i) = -inf for i >= 2 (corr = 1, p = +0, d = fma(1, d, +0), O += V * 0). The prefix after a diagonal tile
@@ -78,9 +79,9 @@ DS_RATE = 6  # one LDS load issued per DS_RATE cycles
 DS_MAX = 63  # LDS loads in flight at most (the dscnt field is 6 bits)
 WORDER = ("PV0p", "PV1p", "PV2p", "PV3p", "QK0", "QK1", "QK2", "QK3")  # the in-order WMMA stream, by node tag
 # latency of a dependence edge by producer kind (it ranks nodes by critical path), and result latency by kind
-# in the issue model (WMMA 32 and VALU 8: the values that scheduled the TILE regions best on MI455X)
-LAT = {"WMMA": 32, "VALU": 8, "TRANS": 8, "PERM": 8, "DS": DS_LAT, "SALU": 2, "RESC": 2, "TDM": 2, "DSST": 1}
-SLOT_LAT = {"WMMA": 32, "VALU": 8, "TRANS": 8, "PERM": 6, "SALU": 2, "RESC": 2, "TDM": 2, "DSST": 1}
+# in the issue model (WMMA 28 and VALU 6: the values that scheduled the TILE regions best on MI455X)
+LAT = {"WMMA": 28, "VALU": 6, "TRANS": 8, "PERM": 8, "DS": DS_LAT, "SALU": 2, "RESC": 2, "TDM": 2, "DSST": 1}
+SLOT_LAT = {"WMMA": 28, "VALU": 6, "TRANS": 8, "PERM": 6, "SALU": 2, "RESC": 2, "TDM": 2, "DSST": 1}
 RESC_COST = 6  # modelled cycles of a RESC node (its s_cbranch over the block) when the branch skips it
 BR_LAT = 9  # a RESC node's s_cmp -> s_cbranch (ATT: 9 cycles; a taken branch costs ~25 more)
 SGPR_LAT = 20  # a VALU-written SGPR to a SALU / RESC reader (ATT: v_cmp_lt sX -> s_cmp_lg sX ~20 cycles)
@@ -103,13 +104,17 @@ def vr(r, n=1):
 class Layout:
     """VGPR map of the generated code (true register numbers): block 0 from `base` up, blocks 1..3 whole.
 
-    The softmax's registers share block 2 (S, the sum-tree leaves PR, the scratch, (m', -) and (corr, -), m,
-    d, the mask bounds), so the softmax VALU runs in one s_set_vgpr_msb mode; O fills block 1; block 3 holds
-    K and the V fragments of d tiles 0..3, block 0 (after the shell's VGPRs) the Q fragments and the V
-    fragments of d tiles 4..7.
-    Live across regions: m, d, (c, c), the Q bases and O; from one TILE region to the next (and into FINAL_A)
-    also V, P(0), P(1), S(2), S(3) and the resident Q fragments of q tiles 1, 2. FINAL_A's scratch: the dead
-    qbuf[0] (12 VGPRs per q tile) and K (the bf16 outputs, 32 VGPRs per q tile)."""
+    The softmax's registers share block 2 (S, the sum-tree leaves PR, the (m', d) and (corr, m) pairs: the
+    packed ops read their low halves only), so the softmax VALU runs in one s_set_vgpr_msb mode; its scratch
+    is the parity's sum-tree leaves 0..17 (dead from the sum tree that consumed them to the q tile's exps that
+    write them), the (peer sum, total) pairs of a sum tree two leaf pairs it consumed (sum_nodes). O fills
+    block 1; block 3 holds K and the V fragments of d tiles 0..3; block 0 (after the shell's VGPRs) the mask
+    bounds, the Q fragments of q tiles 0..2 and the V fragments of d tiles 4..7; block 2 after the pairs the Q
+    fragments of q tile 3.
+    Live across regions: m, d, (c, c), the Q bases and O; through a block's tiles the Q fragments of all four
+    q tiles (INIT reads them); from one TILE region to the next (and into FINAL_A /
+    FINAL_A3) also V, P(0), P(1), S(2), S(3). FINAL_A's scratch: qbuf[0] (12 VGPRs per q tile: Q(0) is dead
+    after the block's last QK) and K (the bf16 outputs, 32 VGPRs per q tile)."""
 
     def __init__(self, base):
         nxt = [base + (base % 2)]
@@ -133,18 +138,18 @@ class Layout:
         self.base = base
         self.cc = take(2)  # (c, c)
         self.qa, self.qb = take(1, 1), take(1, 1)  # Q fragment bases of q tiles 0, 1 and 2, 3
-        self.tot = [take(1, 1) for _ in range(4)]  # (peer sum, total) of the two q tiles of a sum tree
-        self.qbuf = [take(48, 8) for _ in range(3)]  # Q fragments, see Q()
+        self.dl = [None] + [take(1, 1) for _ in range(3)]  # mask bound of q tile i: dl + 64 i
+        self.qbuf = [take(48, 8) for _ in range(3)]  # Q fragments of q tiles 0..2, see Q()
         self.vhi = take(64, 8)  # V[dt][kt] of d tiles 4..7
         self.end0 = nxt[0]
         self.s = 512  # block 2: S[i][j] = 512 + 32 i + 8 j
         self.pr = 640  #          PR: leaf x of q tile i at 640 + 2 x + (i % 2)
-        self.sm = [[take2(1) for _ in range(18)] for _ in range(2)]  # softmax scratch per q tile parity
-        self.mn = [take2(2, 2) for _ in range(QT)]  # (m', unused)
-        self.corr = [take2(2, 2) for _ in range(QT)]  # (corr, unused): packed ops broadcast the low half
-        self.m = [take2(1) for _ in range(QT)]
-        self.d = [take2(1) for _ in range(QT)]
-        self.dl = [None] + [take2(1) for _ in range(3)]  # mask bound of q tile i: dl + 64 i
+        self.sm = [[self.pr + 2 * k + p for k in range(18)] for p in range(2)]  # softmax scratch of parity p
+        self.mn = [take2(2, 2) for _ in range(QT)]  # (m', d)
+        self.corr = [take2(2, 2) for _ in range(QT)]  # (corr, m): packed ops broadcast the low half
+        self.d = [self.mn[i] + 1 for i in range(QT)]
+        self.m = [self.corr[i] + 1 for i in range(QT)]
+        self.qbuf.append(take2(48, 8))  # Q fragments of q tile 3
         self.o = 256  # block 1: O[i][dt] = 256 + 64 i + 8 dt
         self.k = 768  # block 3: K[j][ks] = 768 + 48 j + 8 ks, then V of d tiles 0..3 from 960
         self.vlo = 960
@@ -162,8 +167,8 @@ class Layout:
         return self.k + 48 * j + 8 * ks
 
     def Q(self, i, ks):
-        """Q fragments of q tile i: 1 and 2 resident in qbuf[1], qbuf[2]; 0 and 3 share qbuf[0]."""
-        return self.qbuf[(0, 1, 2, 0)[i]] + 8 * ks
+        """Q fragments of q tile i, k-step ks (resident in qbuf[i] through the block)."""
+        return self.qbuf[i] + 8 * ks
 
     def PR(self, i, leaf):
         """p of q tile i, leaf 8 j + e; a pair's two q tiles interleave, the sum tree adds both at once."""
@@ -549,8 +554,8 @@ def region_init(L, ops):
     out.append(f"v_mov_b32_e32 {vr(L.qa)}, {vr(ops['qa'])}")
     out.append(f"v_mov_b32_e32 {vr(L.qb)}, {vr(ops['qb'])}")
     out += [f"v_mov_b32_e32 {vr(r)}, 0" for r in range(L.o, L.o + 256)]
-    # the resident Q fragments of q tiles 1, 2: the Q staging area does not change until the block's last tile
-    out += [q_load(L, i, ks, h) for i in (1, 2) for ks in range(NKS) for h in range(2)]
+    # the resident Q fragments of all four q tiles: the Q staging area does not change until the block's last tile
+    out += [q_load(L, i, ks, h) for i in range(QT) for ks in range(NKS) for h in range(2)]
     # the first prefix is a no-op: S(2), S(3) = -inf; P(0), P(1) = 0; V = 0
     out += [f"v_mov_b32_e32 {vr(r)}, 0x{NEG_INF:x}" for i in (2, 3) for r in range(L.S(i, 0), L.S(i, 0) + 32)]
     out += [f"v_mov_b32_e32 {vr(L.P(i, kt) + e)}, 0" for i in (0, 1) for kt in range(2) for e in range(8)]
@@ -672,7 +677,8 @@ def _bank_pair(r):
 
 def sum_nodes(L, i0, add, upd):
     """FlyDSL's sum tree over the 32 leaves of q tiles (i0, i0 + 1), packed (low half i0), in place in the
-    leaves (the cvts have read them); then d of the q tiles in upd (one outside it has stale leaves here).
+    leaves (the cvts have read them); then d of the q tiles in upd (one outside it has stale leaves here), the
+    (peer sum, total) of each in two leaf pairs the tree consumed (the last two but its result pair).
     A group's partial sum goes to the leaf register whose VGPR banks differ from the other members' (a + b
     computed as b + a into b, then + c: the same additions, IEEE-commutative, so the same bits): an
     accumulate-form v_pk_add whose other source shares a bank with the accumulated pair costs a cycle."""
@@ -692,11 +698,13 @@ def sum_nodes(L, i0, add, upd):
                 add(f"v_pk_add_f32 {vr(acc, 2)}, {vr(acc, 2)}, {vr(y, 2)}", "VALU", f"sum{i0}")
             nxt.append(acc)
         leaves = nxt
+    spare = [y for y in reversed([L.pr + 2 * x for x in range(32)]) if y != leaves[0]][:2]
+    tots = [spare[0], spare[1], spare[0] + 1, spare[1] + 1]
     for x in range(2):
         qi = i0 + x
         if qi not in upd:
             continue
-        pl, tot = L.tot[2 * x], L.tot[2 * x + 1]
+        pl, tot = tots[2 * x], tots[2 * x + 1]
         add(f"v_permlanex16_b32 {vr(pl)}, {vr(leaves[0] + x)}, {S_SEL}, 0x{SEL_HI:x}", "PERM", f"sum{qi}")
         add(f"v_add_f32_e32 {vr(tot)}, {vr(leaves[0] + x)}, {vr(pl)}", "VALU", f"sum{qi}")
         add(f"v_fma_f32 {vr(L.d[qi])}, {vr(L.corr[qi])}, {vr(L.d[qi])}, {vr(tot)}", "VALU", f"sum{qi}")
@@ -738,15 +746,13 @@ def tile_nodes(L, ops, k=None):
         add(f"s_mov_b32 {r}, {ops['c2']}", "SALU", "c2")
     if k is None:
         tdm_nodes(ops, add)
-    # the K (k-step major: FlyDSL's issue order) and Q(0) reads first; the prefix reads neither K nor qbuf[0]
+    # the K reads first (k-step major: FlyDSL's issue order); the prefix reads no K. The Q fragments are resident
     loads = [
         add(k_load(L, ops["kb"], j, ks, h), "DS", f"K{j}.{ks}.{h}")
         for ks in range(NKS)
         for j in range(NKV)
         for h in range(2)
     ]
-    if first == 0:
-        loads += [add(q_load(L, 0, ks, h), "DS", f"Q0.{ks}.{h}") for ks in range(NKS) for h in range(2)]
     prefix_nodes(L, add, c_sgpr=True, skip=max(first - 1, 0))  # the q tiles TILE_D(k - 1) skipped
     # the next prefix must be a no-op for the q tiles this body skips. The next diagonal tile's prefix skips them;
     # only FINAL_A, the last region of a block ending after TILE_D1 / D2, reads the P of q tile first - 1 (the P
@@ -769,8 +775,6 @@ def tile_nodes(L, ops, k=None):
         for h in range(2)
     ]
     for i in range(first, QT):
-        if i == 3:  # into qbuf[0], after QK(0) has read Q(0)
-            loads += [add(q_load(L, 3, ks, h), "DS", f"Q3.{ks}.{h}") for ks in range(NKS) for h in range(2)]
         for ks in range(NKS):  # QK(i): S[i][j] = sum_ks K[j][ks] Q[i][ks], chains from +0
             for j in range(NKV):
                 s = vr(L.S(i, j), 8)
@@ -797,15 +801,13 @@ def tile_nodes(L, ops, k=None):
         if nd.kind == "TDM":
             add_order(nodes, nd.idx, bar.idx)
     # an LDS load that overwrites a source of a WMMA in flight waits for va_vdst(0) (expert mode, more than
-    # one VALU class in flight): the V reads go after the last prefix PV WMMA, the Q(3) reads after the last
-    # QK(0) WMMA, so each group waits once instead of once per buffer slice
+    # one VALU class in flight): the V reads go after the last prefix PV WMMA, so the group waits once instead of
+    # once per buffer slice
     last = {nd.tag: nd.idx for nd in nodes if nd.kind == "WMMA"}
     lpv = max(last[x] for x in (f"PV{i}p" for i in range(QT)) if x in last)
     for nd in loads:
         if nd.tag.startswith("V"):
             add_order(nodes, lpv, nd.idx)
-        if nd.tag.startswith("Q3") and "QK0" in last:
-            add_order(nodes, last["QK0"], nd.idx)
     # the first read goes before the first WMMA: the va_vdst(0) wait at the region entry then drains no WMMA
     add_order(nodes, loads[0].idx, min(nd.idx for nd in nodes if nd.kind == "WMMA"))
     return nodes
