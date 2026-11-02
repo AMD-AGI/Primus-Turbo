@@ -65,6 +65,16 @@ from primus_turbo.flydsl.deep_ep.common import (
     SYS_LOAD,
     SYS_STORE,
     WARP_SIZE,
+    _addr,
+    _channel_task_range,
+    _copy_row,
+    _ld_sys,
+    _load_lane_ptr,
+    _load_ptr,
+    _load_u8,
+    _st_sys,
+    _uniform_i64,
+    barrier_block,
     ld_lds,
     lds_base,
     load_i32,
@@ -76,21 +86,7 @@ from primus_turbo.flydsl.deep_ep.common import (
     timeout_hit,
     wait_mem_all,
 )
-from primus_turbo.flydsl.deep_ep.intranode_kernel import (
-    NOTIFY_THREADS,
-    NUM_THREADS,
-    NUM_WARPS,
-    _addr,
-    _channel_task_range,
-    _copy_row,
-    _ld_sys,
-    _load_lane_ptr,
-    _load_ptr,
-    _load_u8,
-    _st_sys,
-    _uniform_i64,
-    barrier_block,
-)
+from primus_turbo.flydsl.deep_ep.notify_kernel import NOTIFY_THREADS
 from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_load,
     buffer_store,
@@ -103,6 +99,9 @@ from primus_turbo.flydsl.utils.prims import (
     _readlane_i32,
     atomic_add,
 )
+
+NUM_THREADS = 1024
+NUM_WARPS = NUM_THREADS // WARP_SIZE
 
 META_BYTES = 64 * 1024
 # int32 [num_ranks][num_channels]: where each source's channel starts in its receive block

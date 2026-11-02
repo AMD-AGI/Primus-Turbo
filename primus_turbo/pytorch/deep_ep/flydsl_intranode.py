@@ -29,15 +29,13 @@ import torch.distributed as dist
 
 import primus_turbo.common.envs as envs
 from primus_turbo.flydsl.deep_ep.arch import CPP_DEEPEP_ARCHS, default_intranode_backend
-from primus_turbo.flydsl.deep_ep.intranode_kernel import (
+from primus_turbo.flydsl.deep_ep.intranode_v1_kernel import (
     combine_buffer_layout,
     combine_min_recv_buffer_tokens,
     dispatch_buffer_layout,
     launch_cached_notify_combine,
-    launch_cached_notify_dispatch,
     launch_combine,
     launch_dispatch,
-    launch_notify_dispatch,
 )
 from primus_turbo.flydsl.deep_ep.intranode_v2_kernel import (
     COMBINE_FLAGS_BYTES,
@@ -55,6 +53,7 @@ from primus_turbo.flydsl.deep_ep.intranode_v2_kernel import (
 )
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
 from primus_turbo.flydsl.deep_ep.layout_kernel import get_dispatch_layout_flydsl
+from primus_turbo.flydsl.deep_ep.notify_kernel import launch_cached_notify_dispatch, launch_notify_dispatch
 from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
 
 from ._compat import NUM_MAX_NVL_PEERS, EventHandle
