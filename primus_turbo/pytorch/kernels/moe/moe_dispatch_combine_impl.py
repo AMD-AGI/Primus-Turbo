@@ -50,11 +50,19 @@ class EPBufferConfig:
             ``ep_size`` is used (``Buffer.get_dispatch_config(ep_size)``).
         combine_config: Optional user-provided combine config.  Same fallback
             behaviour as *dispatch_config*.
+        num_max_tokens_per_rank: Tokens per rank to allocate up front for a
+            backend whose buffer holds whole batches (``flydsl_v2``). ``0``
+            sizes it from the group's largest first dispatch and grows it
+            when a larger dispatch comes, as Megatron does for DeepEP V2.
+            Ranks may dispatch different numbers of tokens, but a growth
+            waits for every rank to grow; for counts that change per step,
+            set this to their maximum.
     """
 
     num_sms: int = 32
     dispatch_config: Any = None
     combine_config: Any = None
+    num_max_tokens_per_rank: int = 0
 
 
 _DEFAULT_BUFFER_CONFIG = EPBufferConfig(
@@ -69,6 +77,7 @@ _buffer_config: EPBufferConfig = _DEFAULT_BUFFER_CONFIG
 def set_buffer_global_config(
     num_use_cu: int = 32,
     autotune_config: Optional[tuple] = None,
+    num_max_tokens_per_rank: int = 0,
 ) -> None:
     """Store the SM count and optional per-operation configs.
 
@@ -86,6 +95,7 @@ def set_buffer_global_config(
         autotune_config: Legacy parameter — a ``(dispatch_config, combine_config)``
             tuple obtained from offline benchmarking.  ``None`` means use the
             backend's built-in defaults for the current EP group size.
+        num_max_tokens_per_rank: See ``EPBufferConfig``.
     """
     global _buffer_config
     dispatch_cfg, combine_cfg = autotune_config if autotune_config is not None else (None, None)
@@ -93,6 +103,7 @@ def set_buffer_global_config(
         num_sms=num_use_cu,
         dispatch_config=dispatch_cfg,
         combine_config=combine_cfg,
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
     )
     if new_config != _buffer_config:
         for name, backend in _backend_instances.items():
@@ -195,6 +206,9 @@ class _DeepEPLikeBackend:
 
     def __init__(self) -> None:
         self._buffer = None
+        # the largest dispatch seen so far, for buffers that hold whole batches
+        self._num_max_tokens = 0
+        self._num_topk = 0
 
     # ------------------------------------------------------------------
     # Subclass hooks
@@ -225,7 +239,11 @@ class _DeepEPLikeBackend:
         group: dist.ProcessGroup,
         hidden_bytes: int,
         config: EPBufferConfig,
+        num_tokens: int = 0,
+        num_topk: int = 0,
     ) -> None:
+        """``num_tokens`` / ``num_topk`` describe the dispatch about to run (0 when unknown, e.g. for
+        combine); backends whose buffer holds whole batches are sized from the largest seen."""
         mod = self._get_module()
         BufferClass = mod.Buffer
 
@@ -248,6 +266,16 @@ class _DeepEPLikeBackend:
             except (RuntimeError, AttributeError):
                 pass
 
+        token_size_hint = getattr(BufferClass, "get_token_buffer_size_hint", None)
+        num_token_bytes = 0
+        if token_size_hint is not None:
+            self._num_max_tokens = max(self._num_max_tokens, config.num_max_tokens_per_rank, num_tokens)
+            self._num_topk = max(self._num_topk, num_topk)
+            num_token_bytes = token_size_hint(
+                self._num_max_tokens, hidden_bytes, group.size(), self._num_topk
+            )
+            num_nvl_bytes = max(num_nvl_bytes, num_token_bytes)
+
         buf_kwargs = self._make_buffer_kwargs(group)
 
         if (
@@ -257,6 +285,30 @@ class _DeepEPLikeBackend:
             or self._buffer.num_nvl_bytes < num_nvl_bytes
             or self._buffer.num_rdma_bytes < num_rdma_bytes
         ):
+            if self._buffer is not None and self._buffer.group == group:
+                if self._buffer.num_nvl_bytes < num_token_bytes:
+                    warnings.warn(
+                        f"the DeepEP buffer grows for {self._num_max_tokens} tokens per rank and waits for "
+                        "every rank of the group to grow it too, which a rank does when it dispatches more "
+                        "tokens than its buffer holds; where ranks dispatch different numbers of tokens, "
+                        "set_buffer_global_config(num_max_tokens_per_rank=...) allocates up front"
+                    )
+                # peers may still have kernels writing into this rank's old buffer
+                torch.cuda.synchronize()
+                dist.barrier(group=group)
+            if num_token_bytes > 0:
+                # every rank sizes its buffer from the group's largest dispatch: its peers write into it
+                agreed = torch.tensor(
+                    [self._num_max_tokens, self._num_topk],
+                    dtype=torch.int64,
+                    device=torch.cuda.current_device(),
+                )
+                dist.all_reduce(agreed, op=dist.ReduceOp.MAX, group=group)
+                self._num_max_tokens, self._num_topk = agreed.tolist()
+                num_token_bytes = token_size_hint(
+                    self._num_max_tokens, hidden_bytes, group.size(), self._num_topk
+                )
+                num_nvl_bytes = max(num_nvl_bytes, num_token_bytes)
             self._buffer = BufferClass(group, num_nvl_bytes, num_rdma_bytes, **buf_kwargs)
 
     # ----- helpers ------------------------------------------------------
@@ -520,6 +572,8 @@ def _ensure_buffer(
     group: dist.ProcessGroup,
     hidden_bytes: int,
     backend: EPBackend,
+    num_tokens: int = 0,
+    num_topk: int = 0,
 ) -> None:
     """Make sure the backend's buffer is initialized."""
     if _buffer_config is None:
@@ -527,7 +581,10 @@ def _ensure_buffer(
             "set_buffer_global_config() must be called before dispatch/combine. "
             "This is typically done by the token dispatcher during __init__."
         )
-    backend.init_buffer(group, hidden_bytes, _buffer_config)
+    if isinstance(backend, _DeepEPLikeBackend):
+        backend.init_buffer(group, hidden_bytes, _buffer_config, num_tokens=num_tokens, num_topk=num_topk)
+    else:
+        backend.init_buffer(group, hidden_bytes, _buffer_config)
 
 
 # =========================================================================
@@ -548,7 +605,14 @@ def moe_dispatch_impl(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
     name = _resolve_backend_name()
     backend = _get_backend_instance(name)
-    _ensure_buffer(group, get_hidden_bytes(x), backend)
+    inp = x if isinstance(x, torch.Tensor) else x[0]
+    _ensure_buffer(
+        group,
+        get_hidden_bytes(x),
+        backend,
+        num_tokens=inp.size(0),
+        num_topk=topk_idx.size(1) if topk_idx is not None else 0,
+    )
     return backend.dispatch(
         x,
         handle=handle,
