@@ -26,6 +26,20 @@ from primus_turbo.pytorch.core.quantized_tensor import (
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.ops import gemm_fp8
 from primus_turbo.pytorch.ops.gemm_fp8 import _deter_use_nt_layout_gemm_in_bwd
+from tests.pytorch.ops.determinism_helper import (  # noqa: F401  (_det_seed: fixture)
+    ACCUM_DENSE_SHAPE,
+    DET_DTYPES,
+    _det_seed,
+    check_determinism,
+    check_fused_grad_accum,
+    dense_ref,
+    make_generator,
+    mx8_config,
+    randn,
+    require_gfx950,
+    require_mxfp8,
+    skip_flydsl_on_gfx942,
+)
 from tests.pytorch.ops.gemm_shapes_helper import (
     GEMM_FP8_BLOCKWISE_SHAPES,
     GEMM_FP8_BLOCKWISE_SHAPES_SMALL,
@@ -813,4 +827,93 @@ def test_gemm_fp8_mx_fused_grad_accum(dtype, format, backend):
         granularity=ScalingGranularity.MX_BLOCKWISE,
         block_size=MXFP8_BLOCK_SIZE,
         scale_dtype=ScaleDtype.E8M0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Determinism (--deterministic-only): bit-exact across repeats on determinism_helper's harness.
+# ---------------------------------------------------------------------------
+def _check_gemm_fp8_det(nodeid, seed, m, n, k, layout, fmt, dtype, config, normalize=False):
+    trans_a, trans_b = layout[0] == "T", layout[1] == "T"
+    gen = make_generator(seed)
+    a0 = randn((k, m) if trans_a else (m, k), dtype, gen, normalize=normalize)
+    b0 = randn((n, k) if trans_b else (k, n), dtype, gen, normalize=normalize)
+    g = randn((m, n), dtype, gen)
+
+    def run_once(mid):
+        a = a0.clone().requires_grad_(True)
+        b = b0.clone().requires_grad_(True)
+        c = gemm_fp8(a, b, trans_a, trans_b, dtype, config)
+        mid()
+        c.backward(g)
+        return {"out": c, "dgrad": a.grad, "wgrad": b.grad}
+
+    check_determinism(
+        nodeid,
+        run_once,
+        dense_ref(a0, b0, g, trans_a, trans_b),
+        snr_floor=25 if fmt == Format.E4M3 else 20,
+    )
+
+
+# (1024, 2048, 1536) fits one dispatch round. (4096, 6144, 4096) is 384 256x256 tiles = 1.5
+# rounds on 256 CUs. FlyDSL has a k_split=2 candidate for that tail round in fwd and wgrad, but
+# only the timed autotune (PRIMUS_TURBO_AUTO_TUNE=1) picks it; by default this runs unsplit.
+DET_MX_SHAPES = [(1024, 2048, 1536), (4096, 6144, 4096)]
+
+
+@pytest.mark.parametrize("m, n, k", DET_MX_SHAPES)
+@pytest.mark.parametrize("fmt", [Format.E4M3, Format.HYBRID], ids=["E4M3", "HYBRID"])
+@pytest.mark.parametrize("dtype", DET_DTYPES)
+@pytest.mark.parametrize(
+    "backend",
+    [None, BackendType.HIPBLASLT, BackendType.TURBO, BackendType.FLYDSL],
+    ids=["default", "HIPBLASLT", "TURBO", "FLYDSL"],
+)
+@pytest.mark.deterministic
+def test_det_gemm_fp8_mx(request, det_seed, m, n, k, fmt, dtype, backend):
+    skip_flydsl_on_gfx942(backend)
+    if backend == BackendType.TURBO:
+        pytest.skip("TURBO backend is not deterministic")
+    require_mxfp8()
+    GlobalBackendManager.set_gemm_backend(backend)
+    _check_gemm_fp8_det(
+        request.node.nodeid, det_seed, m, n, k, "NT", fmt, dtype, mx8_config(fmt), normalize=True
+    )
+
+
+_TW = Float8QuantConfig(format=Format.E4M3, granularity=ScalingGranularity.TENSORWISE)
+
+
+# (granularity, backend, main_grad dtype). FlyDSL's 16-bit accumulate epilogue takes main_grad in
+# the output dtype.
+@pytest.mark.parametrize("microbatches", [1, 2], ids=["mb1", "mb2"])
+@pytest.mark.parametrize(
+    "granularity, backend, main_grad_dtype",
+    [
+        pytest.param("tw", BackendType.HIPBLASLT, torch.float32, id="gemm_fp8-tw-HIPBLASLT"),
+        pytest.param("tw", BackendType.TRITON, torch.float32, id="gemm_fp8-tw-TRITON"),
+        pytest.param("tw", BackendType.FLYDSL, torch.bfloat16, id="gemm_fp8-tw-FLYDSL"),
+        pytest.param("mx", None, torch.float32, id="gemm_fp8-mx-default"),
+        pytest.param("mx", BackendType.FLYDSL, torch.bfloat16, id="gemm_fp8-mx-FLYDSL"),
+    ],
+)
+@pytest.mark.deterministic
+def test_det_fused_grad_accum(request, det_seed, granularity, backend, main_grad_dtype, microbatches):
+    if granularity == "mx":
+        require_mxfp8()
+    if backend == BackendType.FLYDSL:
+        require_gfx950("FlyDSL")
+    GlobalBackendManager.set_gemm_backend(backend)
+    config = mx8_config() if granularity == "mx" else _TW
+    check_fused_grad_accum(
+        request.node.nodeid,
+        det_seed,
+        lambda a, b, _: gemm_fp8(
+            a, b, False, True, torch.bfloat16, config, fuse_bgrad_accum_pattern="megatron"
+        ),
+        ACCUM_DENSE_SHAPE,
+        main_grad_dtype,
+        25,
+        microbatches,
     )

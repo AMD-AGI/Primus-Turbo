@@ -29,6 +29,21 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp4_impl import (
 )
 from primus_turbo.pytorch.ops.grouped_gemm_fp4 import grouped_gemm_fp4
 from primus_turbo.pytorch.ops.quantization import grouped_quantize_fp4_with_trans
+from tests.pytorch.ops.determinism_helper import (  # noqa: F401  (_det_seed: fixture)
+    ACCUM_GROUPED_SHAPE,
+    DET_DTYPES,
+    _det_seed,
+    check_determinism,
+    check_fused_grad_accum,
+    fp4_config,
+    grouped_ref,
+    make_generator,
+    randn,
+    require_gfx950,
+    require_mxfp4,
+    skip_flydsl_on_gfx942,
+    unbalanced_group_lens,
+)
 from tests.pytorch.ops.gemm_shapes_helper import (
     GROUPED_GEMM_SHAPES,
     GROUPED_GEMM_SHAPES_SMALL,
@@ -820,3 +835,62 @@ def test_grouped_gemm_fp4_mx_blockwise_deterministic(B, M, N, K, dtype, backend)
     if backend == BackendType.FLYDSL and N % 64 != 0:
         pytest.skip("FlyDSL grouped MXFP4 backend requires N % 64 == 0")
     _run_grouped_gemm_fp4_deterministic_test(B, M, N, K, dtype, backend=backend)
+
+
+# ---------------------------------------------------------------------------
+# Determinism (--deterministic-only): bit-exact across repeats on determinism_helper's harness.
+# ---------------------------------------------------------------------------
+# A single group, a deep K, 64- but not 256-aligned free dims (2880 / 320) that need scale
+# padding.
+DET_SHAPES = [(1, 1024, 2048, 1536), (8, 256, 4096, 7168), (8, 1024, 2880, 2048), (8, 256, 256, 320)]
+
+
+@pytest.mark.parametrize("B, M, N, K", DET_SHAPES)
+@pytest.mark.parametrize("dtype", DET_DTYPES)
+@pytest.mark.parametrize(
+    "backend", [None, BackendType.TRITON, BackendType.FLYDSL], ids=["default", "TRITON", "FLYDSL"]
+)
+@pytest.mark.deterministic
+def test_det_grouped_gemm_fp4(request, det_seed, B, M, N, K, dtype, backend):
+    skip_flydsl_on_gfx942(backend)
+    require_mxfp4()
+    if backend == BackendType.FLYDSL:
+        require_gfx950("FlyDSL grouped MXFP4")
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    gen = make_generator(det_seed)
+    group_lens = unbalanced_group_lens(B, M, det_seed)
+    a0 = randn((B * M, K), dtype, gen, normalize=True)
+    b0 = randn((B, N, K), dtype, gen, normalize=True)
+    g = randn((B * M, N), dtype, gen)
+    config = fp4_config()
+
+    def run_once(mid):
+        a = a0.clone().requires_grad_(True)
+        b = b0.clone().requires_grad_(True)
+        out = grouped_gemm_fp4(a, b, group_lens, trans_b=True, config=config)
+        mid()
+        out.backward(g)
+        return {"out": out, "dgrad": a.grad, "wgrad": b.grad}
+
+    check_determinism(request.node.nodeid, run_once, grouped_ref(a0, b0, group_lens, True, g), snr_floor=8)
+
+
+@pytest.mark.parametrize("microbatches", [1, 2], ids=["mb1", "mb2"])
+@pytest.mark.parametrize("backend", [pytest.param(BackendType.FLYDSL, id="grouped_fp4-FLYDSL")])
+@pytest.mark.deterministic
+def test_det_fused_grad_accum(request, det_seed, backend, microbatches):
+    require_mxfp4()
+    require_gfx950("FlyDSL")
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    config = fp4_config()
+    check_fused_grad_accum(
+        request.node.nodeid,
+        det_seed,
+        lambda a, b, group_lens: grouped_gemm_fp4(
+            a, b, group_lens, trans_b=True, config=config, fuse_bgrad_accum_pattern="megatron"
+        ),
+        ACCUM_GROUPED_SHAPE,
+        torch.bfloat16,
+        8,
+        microbatches,
+    )

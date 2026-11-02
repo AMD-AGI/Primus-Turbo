@@ -22,6 +22,19 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
 )
 from primus_turbo.pytorch.ops.gemm_fp4 import FP4GemmMXFunction, gemm_fp4
+from tests.pytorch.ops.determinism_helper import (  # noqa: F401  (_det_seed: fixture)
+    ACCUM_DENSE_SHAPE,
+    _det_seed,
+    check_determinism,
+    check_fused_grad_accum,
+    fp4_config,
+    fp32_leaves,
+    glu,
+    make_generator,
+    randn,
+    require_gfx950,
+    require_mxfp4,
+)
 from tests.pytorch.ops.gemm_shapes_helper import GEMM_MX_SHAPES, GEMM_MX_SHAPES_SMALL
 from tests.pytorch.test_utils import compute_snr
 
@@ -900,3 +913,77 @@ def test_rmsnorm_residual_fp4_feeds_mlp_fp4():
     for name, t in (("x", x), ("residual", residual), ("gamma", gamma)):
         assert t.grad is not None, f"{name} got no gradient through the quantized pair"
         assert torch.isfinite(t.grad).all(), f"{name} gradient is not finite"
+
+
+# ---------------------------------------------------------------------------
+# Determinism (--deterministic-only): bit-exact across repeats on determinism_helper's harness.
+# ---------------------------------------------------------------------------
+# MXFP4 FlyDSL beta=1: the wgrad contracts over M. M=1024 keeps the accumulating epilogue
+# (K//256 = 4 per slice is too short to split); M=4096 gives 16 K-blocks -> 2 slices of 8 over
+# 8x6 = 48 output tiles, which fits one round, so it takes the 2-way split-K + fold.
+_DET_ACCUM_EPI = (1024, 2048, 1536)
+_DET_ACCUM_SPLIT = (4096, 2048, 1536)
+
+
+# (backend, main_grad dtype, shape). FlyDSL's 16-bit accumulate epilogue takes main_grad in
+# the output dtype.
+@pytest.mark.parametrize("microbatches", [1, 2], ids=["mb1", "mb2"])
+@pytest.mark.parametrize(
+    "backend, main_grad_dtype, shape",
+    [
+        pytest.param(BackendType.HIPBLASLT, torch.float32, ACCUM_DENSE_SHAPE, id="gemm_fp4-HIPBLASLT"),
+        pytest.param(BackendType.FLYDSL, torch.bfloat16, _DET_ACCUM_EPI, id="gemm_fp4-FLYDSL-M1024"),
+        pytest.param(BackendType.FLYDSL, torch.bfloat16, _DET_ACCUM_SPLIT, id="gemm_fp4-FLYDSL-M4096"),
+    ],
+)
+@pytest.mark.deterministic
+def test_det_fused_grad_accum(request, det_seed, backend, main_grad_dtype, shape, microbatches):
+    require_mxfp4()
+    if backend == BackendType.FLYDSL:
+        require_gfx950("FlyDSL")
+    GlobalBackendManager.set_gemm_backend(backend)
+    config = fp4_config()
+    check_fused_grad_accum(
+        request.node.nodeid,
+        det_seed,
+        lambda a, b, _: gemm_fp4(
+            a, b, trans_b=True, out_dtype=torch.bfloat16, config=config, fuse_bgrad_accum_pattern="megatron"
+        ),
+        shape,
+        main_grad_dtype,
+        8,
+        microbatches,
+    )
+
+
+# (M, K, I): the dense GLU quant epilogue needs M % 256, I % 64 and K // 256 >= 4.
+DET_MLP_SHAPES = [(512, 1024, 1024), (2048, 1024, 1024)]
+
+
+@pytest.mark.parametrize("m, k, i", DET_MLP_SHAPES)
+@pytest.mark.parametrize(
+    "activation, clamp_limit", [("silu", None), ("gelu", 1.0)], ids=["silu", "gelu-clamp"]
+)
+@pytest.mark.deterministic
+def test_det_mlp_fp4(request, det_seed, m, k, i, activation, clamp_limit):
+    from primus_turbo.pytorch.ops import mlp_fp4
+
+    require_mxfp4()
+    gen = make_generator(det_seed)
+    x0 = randn((m, k), torch.bfloat16, gen)
+    w10 = randn((2 * i, k), torch.bfloat16, gen, scale=0.02)
+    w20 = randn((k, i), torch.bfloat16, gen, scale=0.02)
+    g = randn((m, k), torch.bfloat16, gen, scale=0.1)
+
+    def run_once(mid):
+        x, w1, w2 = [t.clone().requires_grad_(True) for t in (x0, w10, w20)]
+        out = mlp_fp4(x, w1, w2, activation=activation, clamp_limit=clamp_limit)
+        mid()
+        out.backward(g)
+        return {"out": out, "grad_x": x.grad, "grad_w1": w1.grad, "grad_w2": w2.grad}
+
+    x, w1, w2 = fp32_leaves(x0, w10, w20)
+    out = glu(x @ w1.t(), activation, clamp_limit) @ w2.t()
+    out.backward(g.float())
+    ref = {"out": out.detach(), "grad_x": x.grad, "grad_w1": w1.grad, "grad_w2": w2.grad}
+    check_determinism(request.node.nodeid, run_once, ref, snr_floor=6)

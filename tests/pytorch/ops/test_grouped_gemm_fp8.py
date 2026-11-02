@@ -22,6 +22,20 @@ from primus_turbo.pytorch.core.low_precision import (
 from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.ops import grouped_gemm_fp8
+from tests.pytorch.ops.determinism_helper import (  # noqa: F401  (_det_seed: fixture)
+    ACCUM_GROUPED_SHAPE,
+    DET_REPEATS,
+    _det_seed,
+    check_determinism,
+    check_fused_grad_accum,
+    grouped_ref,
+    make_generator,
+    mx8_config,
+    randn,
+    require_gfx950,
+    require_mxfp8,
+    unbalanced_group_lens,
+)
 from tests.pytorch.ops.gemm_shapes_helper import (
     GROUPED_GEMM_SHAPES,
     GROUPED_GEMM_SHAPES_SMALL,
@@ -1271,4 +1285,105 @@ def test_grouped_gemm_fp8_mx_fused_grad_accum(ori_dtype, backend):
         trans_b=True,
         backend=backend,
         main_grad_dtype=main_grad_dtype,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Determinism (--deterministic-only): bit-exact across repeats on determinism_helper's harness.
+# ---------------------------------------------------------------------------
+def _check_grouped_gemm_fp8_det(
+    nodeid, seed, B, M, N, K, dtype, trans_b, config, num_cu=None, repeats=DET_REPEATS
+):
+    """fwd, dgrad and the variable-K wgrad on unbalanced, non-empty groups."""
+    gen = make_generator(seed)
+    group_lens = unbalanced_group_lens(B, M, seed)
+    a0 = randn((B * M, K), dtype, gen, normalize=True)
+    b0 = randn((B, N, K) if trans_b else (B, K, N), dtype, gen, normalize=True)
+    g = randn((B * M, N), dtype, gen)
+
+    def run_once(mid):
+        a = a0.clone().requires_grad_(True)
+        b = b0.clone().requires_grad_(True)
+        out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config, num_cu=num_cu)
+        mid()
+        out.backward(g)
+        return {"out": out, "dgrad": a.grad, "wgrad": b.grad}
+
+    check_determinism(
+        nodeid,
+        run_once,
+        grouped_ref(a0, b0, group_lens, trans_b, g),
+        snr_floor=25 if config.format == Format.E4M3 else 20,
+        repeats=repeats,
+    )
+
+
+# Grouped MXFP8 FlyDSL NT (fwd, dgrad) on both grids, plus its variable-K wgrad.
+# num_cu=None launches one workgroup per tile; any num_cu > 0 takes the persistent grid (sized
+# from the device's CU count, not from num_cu), where each workgroup loops over tiles with no
+# wave_m barrier skew. A K-loop tail race on that path failed about 5-8% of runs at
+# 8 x 4096 x 6144 x 4096 (3120 tiles) with no other load, so the persistent cells run enough
+# repeats to catch a regression most of the time.
+DET_MX_SHAPES = [(8, 4096, 6144, 4096)]
+DET_MX_PERSISTENT_REPEATS = 32
+
+
+@pytest.mark.parametrize("B, M, N, K", DET_MX_SHAPES)
+@pytest.mark.parametrize("fmt", [Format.E4M3, Format.HYBRID], ids=["E4M3", "HYBRID"])
+@pytest.mark.parametrize("persistent", [False, True], ids=["grid", "persistent"])
+@pytest.mark.deterministic
+def test_det_grouped_gemm_fp8_mx(request, det_seed, B, M, N, K, fmt, persistent):
+    require_gfx950("FlyDSL MXFP8 grouped GEMM")
+    require_mxfp8()
+    GlobalBackendManager.set_grouped_gemm_backend(BackendType.FLYDSL)
+    num_cu = torch.cuda.get_device_properties("cuda").multi_processor_count if persistent else None
+    _check_grouped_gemm_fp8_det(
+        request.node.nodeid,
+        det_seed,
+        B,
+        M,
+        N,
+        K,
+        torch.bfloat16,
+        True,
+        mx8_config(fmt),
+        num_cu=num_cu,
+        repeats=DET_MX_PERSISTENT_REPEATS if persistent else DET_REPEATS,
+    )
+
+
+_TW = Float8QuantConfig(format=Format.E4M3, granularity=ScalingGranularity.TENSORWISE)
+
+
+# (granularity, backend, main_grad dtype). FlyDSL's 16-bit MX accumulate epilogue takes
+# main_grad in the output dtype; the tensorwise grouped FlyDSL one writes fp32.
+@pytest.mark.parametrize("microbatches", [1, 2], ids=["mb1", "mb2"])
+@pytest.mark.parametrize(
+    "granularity, backend, main_grad_dtype",
+    [
+        pytest.param("tw", BackendType.HIPBLASLT, torch.float32, id="grouped_fp8-tw-HIPBLASLT"),
+        pytest.param("tw", BackendType.TRITON, torch.float32, id="grouped_fp8-tw-TRITON"),
+        pytest.param("tw", BackendType.FLYDSL, torch.float32, id="grouped_fp8-tw-FLYDSL"),
+        pytest.param("mx", None, torch.float32, id="grouped_fp8-mx-default"),
+        pytest.param("mx", BackendType.FLYDSL, torch.bfloat16, id="grouped_fp8-mx-FLYDSL"),
+    ],
+)
+@pytest.mark.deterministic
+def test_det_fused_grad_accum(request, det_seed, granularity, backend, main_grad_dtype, microbatches):
+    if granularity == "mx":
+        require_mxfp8()
+    if backend == BackendType.FLYDSL:
+        require_gfx950("FlyDSL")
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    config = mx8_config() if granularity == "mx" else _TW
+    check_fused_grad_accum(
+        request.node.nodeid,
+        det_seed,
+        lambda a, b, group_lens: grouped_gemm_fp8(
+            a, b, group_lens, trans_b=True, config=config, fuse_bgrad_accum_pattern="megatron"
+        ),
+        ACCUM_GROUPED_SHAPE,
+        main_grad_dtype,
+        25,
+        microbatches,
     )

@@ -9,6 +9,11 @@ import torch
 
 import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
+from tests.pytorch.ops.determinism_helper import (  # noqa: F401  (_det_seed: fixture)
+    ACCUM_DENSE_SHAPE,
+    _det_seed,
+    check_fused_grad_accum,
+)
 from tests.pytorch.ops.gemm_shapes_helper import GEMM_SHAPES
 from tests.pytorch.test_utils import get_tolerances
 
@@ -304,3 +309,30 @@ def test_gemm_deterministic_subview(m, n, k, layout, dtype):
     torch.testing.assert_close(outs[0], c_ref, **get_tolerances(dtype))
 
     GlobalBackendManager.reset()
+
+
+# ---------------------------------------------------------------------------
+# Determinism (--deterministic-only): bit-exact across repeats on determinism_helper's harness.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("microbatches", [1, 2], ids=["mb1", "mb2"])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param(BackendType.HIPBLASLT, id="gemm-bf16-HIPBLASLT"),
+        pytest.param(BackendType.TRITON, id="gemm-bf16-TRITON"),
+    ],
+)
+@pytest.mark.deterministic
+def test_det_fused_grad_accum(request, det_seed, backend, microbatches):
+    GlobalBackendManager.set_gemm_backend(backend)
+    check_fused_grad_accum(
+        request.node.nodeid,
+        det_seed,
+        lambda a, b, _: turbo.ops.gemm(
+            a, b, False, True, torch.bfloat16, fuse_bgrad_accum_pattern="megatron"
+        ),
+        ACCUM_DENSE_SHAPE,
+        torch.float32,
+        40,
+        microbatches,
+    )
