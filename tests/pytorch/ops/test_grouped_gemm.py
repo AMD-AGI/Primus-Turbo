@@ -145,80 +145,6 @@ def test_grouped_gemm_func(B, M, N, K, dtype, trans_b, backend, auto_tune, reduc
     GlobalBackendManager.reset()
 
 
-@pytest.mark.parametrize("B, M, N, K", [(1, 4096, 2048, 1536), (2, 2048, 4096, 7168)])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("trans_b", [True, False])
-@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
-@pytest.mark.deterministic
-def test_grouped_gemm_deterministic(B, M, N, K, dtype, trans_b, backend):
-    seed = 42
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-
-    # Keep CI stable: reuse known gfx942 hipBLASLt flake skip for M <= 512.
-    if M <= 512 and backend is BackendType.HIPBLASLT and get_device_compute_capability() == (9, 4):
-        pytest.skip("Intermittent flake on gfx942 with hipBLASLt when M <= 512; skip temporarily")
-
-    # Keep deterministic test focused: fixed backend / no autotune / no CU reduction.
-    GlobalBackendManager.set_grouped_gemm_backend(backend)
-    GlobalBackendManager.set_auto_tune(False)
-
-    device = "cuda"
-    props = torch.cuda.get_device_properties(device)
-    num_cu = props.multi_processor_count
-
-    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
-    print(
-        f"\n[deterministic] B={B}, M={M}, N={N}, K={K}, dtype={dtype}, trans_b={trans_b}, backend={backend}"
-    )
-
-    b_shape = (B, N, K) if trans_b else (B, K, N)
-    a0 = torch.randn((B * M, K), dtype=torch.float32, device=device).to(dtype)
-    b0 = torch.randn(b_shape, dtype=torch.float32, device=device).to(dtype)
-    a0 = (a0 / a0.abs().max()).detach()
-    b0 = (b0 / b0.abs().max()).detach()
-
-    # Reference (correctness)
-    a_ref = a0.clone().requires_grad_(True)
-    b_ref = b0.clone().requires_grad_(True)
-    out_ref = grouped_gemm_ref(a_ref, b_ref, group_lens.clone(), trans_b)
-    grad_out = torch.randn_like(out_ref)
-    out_ref.backward(grad_out)
-    torch.cuda.synchronize()
-
-    def _run_once():
-        a = a0.clone().requires_grad_(True)
-        b = b0.clone().requires_grad_(True)
-        out = grouped_gemm(a, b, group_lens, trans_b=trans_b, num_cu=num_cu)
-        out.backward(grad_out)
-        return out.detach(), a.grad.detach(), b.grad.detach()
-
-    repeats = 3
-    outs = []
-    for _ in range(repeats):
-        outs.append(_run_once())
-        torch.cuda.synchronize()
-
-    out0, da0, db0 = outs[0]
-    # Determinism (bitwise identical across runs)
-    for i in range(1, repeats):
-        out_i, da_i, db_i = outs[i]
-        torch.testing.assert_close(out0, out_i, rtol=0, atol=0)
-        torch.testing.assert_close(da0, da_i, rtol=0, atol=0)
-        torch.testing.assert_close(db0, db_i, rtol=0, atol=0)
-
-    # Correctness
-    torch.testing.assert_close(out0, out_ref.detach(), **get_tolerances(dtype))
-    torch.testing.assert_close(da0, a_ref.grad.detach(), **get_tolerances(dtype))
-    torch.testing.assert_close(db0, b_ref.grad.detach(), **get_tolerances(dtype))
-
-    GlobalBackendManager.reset()
-
-
 def generate_grouped_gemm_group_lens_with_zeros(b, m, num_zero):
     assert num_zero < b, f"num_zero ({num_zero}) must be less than b ({b})"
 
@@ -720,8 +646,16 @@ def _check_grouped_gemm_det(nodeid, seed, B, M, N, K, dtype, trans_b, **kwargs):
     check_determinism(nodeid, run_once, grouped_ref(a0, b0, group_lens, trans_b, g), snr_floor=40)
 
 
-# Ragged groups; N=320 off the tile grid; 8 experts with a deeper K; G=64 at the expert cap.
-DET_SHAPES = [(4, 1024, 2048, 1536), (8, 256, 320, 2880), (8, 512, 2048, 1536), (64, 256, 2048, 1536)]
+# Ragged groups; N=320 off the tile grid; 8 experts with a deeper K; G=64 at the expert cap; a
+# single group; two large groups with K=7168.
+DET_SHAPES = [
+    (4, 1024, 2048, 1536),
+    (8, 256, 320, 2880),
+    (8, 512, 2048, 1536),
+    (64, 256, 2048, 1536),
+    (1, 4096, 2048, 1536),
+    (2, 2048, 4096, 7168),
+]
 
 # (backend, reduce_num_cu). A reduced CU budget only where the backend acts on it: CK and
 # Triton size their persistent grid from num_cu, FlyDSL turns it into cap_cu; hipBLASLt
@@ -745,6 +679,8 @@ _DET_BACKEND_CU = [
 @pytest.mark.deterministic
 def test_det_grouped_gemm(request, det_seed, B, M, N, K, dtype, trans_b, backend, reduce_num_cu):
     skip_flydsl_on_gfx942(backend)
+    if M <= 512 and backend is BackendType.HIPBLASLT and get_device_compute_capability() == (9, 4):
+        pytest.skip("Intermittent flake on gfx942 with hipBLASLt when M <= 512; skip temporarily")
     GlobalBackendManager.set_grouped_gemm_backend(backend)
     num_cu = torch.cuda.get_device_properties("cuda").multi_processor_count - reduce_num_cu
     _check_grouped_gemm_det(request.node.nodeid, det_seed, B, M, N, K, dtype, trans_b, num_cu=num_cu)

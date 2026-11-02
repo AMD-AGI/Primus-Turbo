@@ -193,224 +193,6 @@ def _run_grouped_gemm_fp8_test(
     GlobalBackendManager.reset()
 
 
-def _run_grouped_gemm_fp8_deterministic_test(
-    B: int,
-    M: int,
-    N: int,
-    K: int,
-    ori_dtype: torch.dtype,
-    format: Format,
-    granularity: ScalingGranularity,
-    trans_b: bool,
-    backend: BackendType,
-    block_size: int | None = None,
-    repeats: int = 3,
-):
-    """Determinism + correctness check for grouped_gemm_fp8 on a selected set of configs."""
-    seed = 42
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    # Skip invalid granularity/block_size combinations
-    if granularity == ScalingGranularity.BLOCKWISE and block_size is None:
-        pytest.skip("BLOCKWISE granularity requires block_size to be set.")
-    if (
-        granularity != ScalingGranularity.BLOCKWISE
-        and granularity != ScalingGranularity.MX_BLOCKWISE
-        and block_size is not None
-    ):
-        pytest.skip("Only BLOCKWISE / MX_BLOCKWISE granularity supports block_size.")
-    if _check_hit_int32_limit(B, M, N, K):
-        pytest.skip("Shape hits int32 indexing limit (numel >= 2**31).")
-
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-
-    # gfx942: hipBLASLt path can hang/flake when M <= 512 (known issue).
-    if (
-        get_device_compute_capability() == (9, 4)
-        and M <= 512
-        and backend is BackendType.HIPBLASLT
-        and granularity == ScalingGranularity.TENSORWISE
-    ):
-        pytest.skip("gfx942: hipBLASLt path can hang/flake when M <= 512 (deterministic)")
-
-    # Deterministic suite: fixed backend / no autotune.
-    GlobalBackendManager.set_grouped_gemm_backend(backend)
-    GlobalBackendManager.set_auto_tune(False)
-
-    device = "cuda:0"
-    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
-    print(
-        f"\n[deterministic] B={B}, M={M}, N={N}, K={K}, ori_dtype={ori_dtype}, format={format}, "
-        f"granularity={granularity}, block_size={block_size}, trans_b={trans_b}, backend={backend}"
-    )
-
-    b_shape = (B, N, K) if trans_b else (B, K, N)
-    a0 = torch.randn((B * M, K), dtype=ori_dtype, device=device)
-    b0 = torch.randn(b_shape, dtype=ori_dtype, device=device)
-    a0 = a0 / a0.abs().max()
-    b0 = b0 / b0.abs().max()
-
-    # Reference (correctness)
-    a_ref = a0.detach().clone().requires_grad_(True)
-    b_ref = b0.detach().clone().requires_grad_(True)
-    out_ref = grouped_gemm_ref(a_ref, b_ref, group_lens, trans_b)
-    grad_out = torch.randn_like(out_ref)
-    out_ref.backward(grad_out)
-    torch.cuda.synchronize()
-
-    # MX_BLOCKWISE requires E8M0 scale dtype; others use FP32 (default).
-    if granularity == ScalingGranularity.MX_BLOCKWISE:
-        config = Float8QuantConfig(
-            format=format, granularity=granularity, block_size=block_size, scale_dtype=ScaleDtype.E8M0
-        )
-    else:
-        config = Float8QuantConfig(format=format, granularity=granularity, block_size=block_size)
-
-    def _run_once():
-        # Prevent buffer-alias race across pytest cases: the caching allocator
-        # can hand a fresh tensor the same physical GPU memory still being
-        # written by a pending op from a previous test case.  Force full sync
-        # + cache release so each _run_once gets clean memory.
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        a = a0.detach().clone().requires_grad_(True)
-        b = b0.detach().clone().requires_grad_(True)
-        out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
-        out.backward(grad_out)
-        return out.detach(), a.grad.detach(), b.grad.detach()
-
-    outs = []
-    for _ in range(repeats):
-        outs.append(_run_once())
-        torch.cuda.synchronize()
-
-    out0, da0, db0 = outs[0]
-    for i in range(1, repeats):
-        out_i, da_i, db_i = outs[i]
-        torch.testing.assert_close(out0, out_i, rtol=0, atol=0)
-        torch.testing.assert_close(da0, da_i, rtol=0, atol=0)
-        torch.testing.assert_close(db0, db_i, rtol=0, atol=0)
-
-    # Correctness (SNR thresholds consistent with existing FP8 tests)
-    snr_threshold = 25 if format == Format.E4M3 else 20
-    out_snr = compute_snr(out_ref, out0)
-    a_grad_snr = compute_snr(a_ref.grad, da0)
-    b_grad_snr = compute_snr(b_ref.grad, db0)
-    print(
-        f"deterministic grouped fp8: Out-SNR={out_snr:.2f} dB, AGrad-SNR={a_grad_snr:.2f} dB, BGrad-SNR={b_grad_snr:.2f} dB"
-    )
-    assert out_snr > snr_threshold, "out_snr too low"
-    assert a_grad_snr > snr_threshold, "a_grad_snr too low"
-    assert b_grad_snr > snr_threshold, "b_grad_snr too low"
-
-    GlobalBackendManager.reset()
-
-
-# Keep deterministic coverage smaller than the full sweep; deterministic tests only run with --deterministic-only.
-_DET_SHAPES = [(1, 1024, 4096, 7168), (8, 256, 2048, 1536)]
-
-
-@pytest.mark.parametrize("B, M, N, K", _DET_SHAPES)
-@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
-@pytest.mark.parametrize("format", FORMAT_VALUES)
-@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
-@pytest.mark.parametrize(
-    "backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
-)
-@pytest.mark.deterministic
-def test_grouped_gemm_fp8_tensorwise_deterministic(B, M, N, K, ori_dtype, format, trans_b, backend):
-    if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
-        pytest.skip("FlyDSL fp8 grouped GEMM is gfx950-only")
-    _run_grouped_gemm_fp8_deterministic_test(
-        B=B,
-        M=M,
-        N=N,
-        K=K,
-        ori_dtype=ori_dtype,
-        format=format,
-        granularity=ScalingGranularity.TENSORWISE,
-        trans_b=trans_b,
-        backend=backend,
-        block_size=None,
-    )
-
-
-@pytest.mark.parametrize("B, M, N, K", _DET_SHAPES)
-@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
-@pytest.mark.parametrize("format", FORMAT_VALUES)
-@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
-@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.TRITON])
-@pytest.mark.deterministic
-def test_grouped_gemm_fp8_rowwise_deterministic(B, M, N, K, ori_dtype, format, trans_b, backend):
-    _run_grouped_gemm_fp8_deterministic_test(
-        B=B,
-        M=M,
-        N=N,
-        K=K,
-        ori_dtype=ori_dtype,
-        format=format,
-        granularity=ScalingGranularity.ROWWISE,
-        trans_b=trans_b,
-        backend=backend,
-        block_size=None,
-    )
-
-
-@pytest.mark.parametrize("B, M, N, K", _DET_SHAPES)
-@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
-@pytest.mark.parametrize("format", FORMAT_VALUES)
-@pytest.mark.parametrize("block_size", [128])
-@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
-@pytest.mark.parametrize("backend", [BackendType.TRITON])
-@pytest.mark.deterministic
-def test_grouped_gemm_fp8_blockwise_deterministic(
-    B, M, N, K, ori_dtype, format, block_size, trans_b, backend
-):
-    _run_grouped_gemm_fp8_deterministic_test(
-        B=B,
-        M=M,
-        N=N,
-        K=K,
-        ori_dtype=ori_dtype,
-        format=format,
-        granularity=ScalingGranularity.BLOCKWISE,
-        trans_b=trans_b,
-        backend=backend,
-        block_size=block_size,
-    )
-
-
-# MX_BLOCKWISE deterministic — triton + flydsl backends; only runs on gfx950.
-# Limited to trans_b=True: the TT-layout path routes through a Python-level
-# transpose+pad layer whose downstream allocator non-determinism is out of
-# scope for the kernel determinism test.
-@pytest.mark.parametrize("B, M, N, K", _DET_SHAPES)
-@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
-@pytest.mark.parametrize("format", FORMAT_VALUES)
-@pytest.mark.parametrize("trans_b", [True])
-@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.FLYDSL], ids=["TRITON", "FLYDSL"])
-@pytest.mark.deterministic
-def test_grouped_gemm_fp8_mx_blockwise_deterministic(B, M, N, K, ori_dtype, format, trans_b, backend):
-    mxfp8_supported, reason = check_mxfp8_support()
-    if not mxfp8_supported:
-        pytest.skip(reason)
-    _run_grouped_gemm_fp8_deterministic_test(
-        B=B,
-        M=M,
-        N=N,
-        K=K,
-        ori_dtype=ori_dtype,
-        format=format,
-        granularity=ScalingGranularity.MX_BLOCKWISE,
-        trans_b=trans_b,
-        backend=backend,
-        block_size=32,
-    )
-
-
 @pytest.mark.parametrize("B, M, N, K", GROUPED_GEMM_SHAPES)
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
 @pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
@@ -1349,6 +1131,72 @@ def test_det_grouped_gemm_fp8_mx(request, det_seed, B, M, N, K, fmt, persistent)
         mx8_config(fmt),
         num_cu=num_cu,
         repeats=DET_MX_PERSISTENT_REPEATS if persistent else DET_REPEATS,
+    )
+
+
+_DET_SHAPES = [(1, 1024, 4096, 7168), (8, 256, 2048, 1536)]
+
+
+@pytest.mark.parametrize("B, M, N, K", _DET_SHAPES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize(
+    "backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
+)
+@pytest.mark.deterministic
+def test_det_grouped_gemm_fp8_tensorwise(request, det_seed, B, M, N, K, ori_dtype, format, trans_b, backend):
+    if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 grouped GEMM is gfx950-only")
+    if get_device_compute_capability() == (9, 4) and M <= 512 and backend is BackendType.HIPBLASLT:
+        pytest.skip("gfx942: hipBLASLt path can hang/flake when M <= 512 (deterministic)")
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    config = Float8QuantConfig(format=format, granularity=ScalingGranularity.TENSORWISE)
+    _check_grouped_gemm_fp8_det(request.node.nodeid, det_seed, B, M, N, K, ori_dtype, trans_b, config)
+
+
+@pytest.mark.parametrize("B, M, N, K", _DET_SHAPES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.TRITON])
+@pytest.mark.deterministic
+def test_det_grouped_gemm_fp8_rowwise(request, det_seed, B, M, N, K, ori_dtype, format, trans_b, backend):
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    config = Float8QuantConfig(format=format, granularity=ScalingGranularity.ROWWISE)
+    _check_grouped_gemm_fp8_det(request.node.nodeid, det_seed, B, M, N, K, ori_dtype, trans_b, config)
+
+
+@pytest.mark.parametrize("B, M, N, K", _DET_SHAPES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize("backend", [BackendType.TRITON])
+@pytest.mark.deterministic
+def test_det_grouped_gemm_fp8_blockwise(
+    request, det_seed, B, M, N, K, ori_dtype, format, block_size, trans_b, backend
+):
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    config = Float8QuantConfig(format=format, granularity=ScalingGranularity.BLOCKWISE, block_size=block_size)
+    _check_grouped_gemm_fp8_det(request.node.nodeid, det_seed, B, M, N, K, ori_dtype, trans_b, config)
+
+
+# NT only: the TT-layout path routes through a Python-level transpose+pad layer whose
+# downstream allocator non-determinism is out of scope for the kernel determinism test.
+@pytest.mark.parametrize("B, M, N, K", _DET_SHAPES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("trans_b", [True])
+@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.FLYDSL], ids=["TRITON", "FLYDSL"])
+@pytest.mark.deterministic
+def test_det_grouped_gemm_fp8_mx_blockwise(
+    request, det_seed, B, M, N, K, ori_dtype, format, trans_b, backend
+):
+    require_mxfp8()
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    _check_grouped_gemm_fp8_det(
+        request.node.nodeid, det_seed, B, M, N, K, ori_dtype, trans_b, mx8_config(format)
     )
 
 

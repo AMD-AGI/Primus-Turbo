@@ -12,7 +12,12 @@ from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from tests.pytorch.ops.determinism_helper import (  # noqa: F401  (_det_seed: fixture)
     ACCUM_DENSE_SHAPE,
     _det_seed,
+    check_determinism,
     check_fused_grad_accum,
+    dense_ref,
+    fp32_leaves,
+    make_generator,
+    randn,
 )
 from tests.pytorch.ops.gemm_shapes_helper import GEMM_SHAPES
 from tests.pytorch.test_utils import get_tolerances
@@ -69,90 +74,6 @@ def test_gemm(m, n, k, layout, dtype):
     c.backward(grad_c)
     torch.testing.assert_close(a.grad, a_ref.grad, **get_tolerances(dtype))
     torch.testing.assert_close(b.grad, b_ref.grad, **get_tolerances(dtype))
-
-
-# Triton has no float32 kernel.
-_DET_BACKEND_DTYPES = [
-    (backend, dtype)
-    for backend in (None, BackendType.TRITON, BackendType.HIPBLASLT)
-    for dtype in (torch.float32, torch.float16, torch.bfloat16)
-    if not (backend is BackendType.TRITON and dtype == torch.float32)
-]
-
-
-@pytest.mark.parametrize("m, n, k", [(1, 4096, 2048), (128, 129, 127), (1024, 1024, 512), (2048, 4096, 2048)])
-@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
-@pytest.mark.parametrize("backend, dtype", _DET_BACKEND_DTYPES)
-@pytest.mark.deterministic
-def test_gemm_deterministic(m, n, k, layout, backend, dtype):
-    trans_a = layout[0] == "T"
-    trans_b = layout[1] == "T"
-
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-
-    if backend is BackendType.TRITON and min(m, n, k) < 64:
-        pytest.skip(
-            "Triton persistent kernel uses BLOCK_K=64 / BLOCK_M=256 / BLOCK_N=256; "
-            "small dimensions cause illegal memory access in pytest environment"
-        )
-
-    GlobalBackendManager.set_gemm_backend(backend)
-    GlobalBackendManager.set_auto_tune(False)
-
-    device = "cuda"
-    torch.manual_seed(42)
-
-    print(
-        f"\n[deterministic] M={m}, N={n}, K={k}, trans_a={trans_a}, trans_b={trans_b}, "
-        f"dtype={dtype}, backend={backend}"
-    )
-
-    a_shape = (m, k) if not trans_a else (k, m)
-    b_shape = (k, n) if not trans_b else (n, k)
-
-    a0 = torch.randn(a_shape, dtype=dtype, device=device)
-    b0 = torch.randn(b_shape, dtype=dtype, device=device)
-    a0 = a0 / a0.abs().max()
-    b0 = b0 / b0.abs().max()
-
-    # Reference output (correctness)
-    a_ref = a0.detach().clone().requires_grad_()
-    b_ref = b0.detach().clone().requires_grad_()
-    a_mat = a_ref.T if trans_a else a_ref
-    b_mat = b_ref.T if trans_b else b_ref
-    c_ref = a_mat @ b_mat
-    grad_c = torch.randn_like(c_ref)
-    c_ref.backward(grad_c)
-    torch.cuda.synchronize()
-
-    def _run_once():
-        a = a0.detach().clone().requires_grad_()
-        b = b0.detach().clone().requires_grad_()
-        c = turbo.ops.gemm(a, b, trans_a, trans_b, dtype)
-        c.backward(grad_c)
-        return c.detach(), a.grad.detach(), b.grad.detach()
-
-    repeats = 3
-    outs = []
-    for _ in range(repeats):
-        outs.append(_run_once())
-        torch.cuda.synchronize()
-
-    c0, da0, db0 = outs[0]
-    # Determinism (bitwise identical across runs)
-    for i in range(1, repeats):
-        ci, dai, dbi = outs[i]
-        torch.testing.assert_close(c0, ci, rtol=0, atol=0)
-        torch.testing.assert_close(da0, dai, rtol=0, atol=0)
-        torch.testing.assert_close(db0, dbi, rtol=0, atol=0)
-
-    # Correctness (close to reference)
-    torch.testing.assert_close(c0, c_ref.detach(), **get_tolerances(dtype))
-    torch.testing.assert_close(da0, a_ref.grad.detach(), **get_tolerances(dtype))
-    torch.testing.assert_close(db0, b_ref.grad.detach(), **get_tolerances(dtype))
-
-    GlobalBackendManager.reset()
 
 
 @pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
@@ -228,6 +149,46 @@ def test_gemm_fused_grad_accum(layout, dtype, main_grad_dtype, backend):
     GlobalBackendManager.reset()
 
 
+# ---------------------------------------------------------------------------
+# Determinism (--deterministic-only): bit-exact across repeats on determinism_helper's harness.
+# ---------------------------------------------------------------------------
+# Triton has no float32 kernel.
+_DET_BACKEND_DTYPES = [
+    (backend, dtype)
+    for backend in (None, BackendType.TRITON, BackendType.HIPBLASLT)
+    for dtype in (torch.float32, torch.float16, torch.bfloat16)
+    if not (backend is BackendType.TRITON and dtype == torch.float32)
+]
+
+
+@pytest.mark.parametrize("m, n, k", [(1, 4096, 2048), (128, 129, 127), (1024, 1024, 512), (2048, 4096, 2048)])
+@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
+@pytest.mark.parametrize("backend, dtype", _DET_BACKEND_DTYPES)
+@pytest.mark.deterministic
+def test_det_gemm(request, det_seed, m, n, k, layout, backend, dtype):
+    if backend is BackendType.TRITON and min(m, n, k) < 64:
+        pytest.skip(
+            "Triton persistent kernel uses BLOCK_K=64 / BLOCK_M=256 / BLOCK_N=256; "
+            "small dimensions cause illegal memory access in pytest environment"
+        )
+    GlobalBackendManager.set_gemm_backend(backend)
+    trans_a, trans_b = layout[0] == "T", layout[1] == "T"
+    gen = make_generator(det_seed)
+    a0 = randn((k, m) if trans_a else (m, k), dtype, gen, normalize=True)
+    b0 = randn((n, k) if trans_b else (k, n), dtype, gen, normalize=True)
+    g = randn((m, n), dtype, gen)
+
+    def run_once(mid):
+        a = a0.clone().requires_grad_(True)
+        b = b0.clone().requires_grad_(True)
+        c = turbo.ops.gemm(a, b, trans_a, trans_b, dtype)
+        mid()
+        c.backward(g)
+        return {"out": c, "dgrad": a.grad, "wgrad": b.grad}
+
+    check_determinism(request.node.nodeid, run_once, dense_ref(a0, b0, g, trans_a, trans_b), snr_floor=40)
+
+
 @pytest.mark.parametrize(
     "m, n, k, layout",
     [
@@ -238,7 +199,7 @@ def test_gemm_fused_grad_accum(layout, dtype, main_grad_dtype, backend):
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.deterministic
-def test_gemm_deterministic_subview(m, n, k, layout, dtype):
+def test_det_gemm_subview(request, det_seed, m, n, k, layout, dtype):
     """Regression: misaligned storage_offset with aligned strides.
 
     Simulates TP/MoE weight slicing where a subview has aligned strides but
@@ -246,74 +207,34 @@ def test_gemm_deterministic_subview(m, n, k, layout, dtype):
     the kernel launcher, tl.multiple_of would generate misaligned vector
     loads, producing garbage data and potential NaN in training.
     """
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-
     GlobalBackendManager.set_gemm_backend(BackendType.TRITON)
-    GlobalBackendManager.set_auto_tune(False)
-
-    trans_a = layout[0] == "T"
-    trans_b = layout[1] == "T"
-    device = "cuda"
-    torch.manual_seed(42)
-
-    elem_bytes = torch.tensor([], dtype=dtype).element_size()
-
-    # Build subviews with 16-aligned strides but misaligned base pointers.
-    # Use as_strided to place data at a storage_offset that is NOT a
-    # multiple of 16, while keeping row stride 16-aligned.
-    # Normalize the underlying buffer BEFORE creating the view so that the
-    # view's data_ptr stays misaligned (out-of-place ops would materialize
-    # a new dense tensor and lose the misalignment).
+    trans_a, trans_b = layout[0] == "T", layout[1] == "T"
+    gen = make_generator(det_seed)
     misalign = 3
-    cols_a = k if not trans_a else m
-    rows_a = m if not trans_a else k
-    stride_a = (cols_a + 15) // 16 * 16
-    buf_a = torch.randn(misalign + rows_a * stride_a, dtype=dtype, device=device)
-    buf_a /= buf_a.abs().max()
-    a0 = torch.as_strided(buf_a, (rows_a, cols_a), (stride_a, 1), storage_offset=misalign)
 
-    cols_b = n if not trans_b else k
-    rows_b = k if not trans_b else n
-    stride_b = (cols_b + 15) // 16 * 16
-    buf_b = torch.randn(misalign + rows_b * stride_b, dtype=dtype, device=device)
-    buf_b /= buf_b.abs().max()
-    b0 = torch.as_strided(buf_b, (rows_b, cols_b), (stride_b, 1), storage_offset=misalign)
+    # The buffer is normalized before the view is taken: an out-of-place op on the view would
+    # materialize a dense, aligned copy.
+    def subview(rows, cols):
+        stride = (cols + 15) // 16 * 16
+        buf = randn((misalign + rows * stride,), dtype, gen, normalize=True)
+        return torch.as_strided(buf, (rows, cols), (stride, 1), storage_offset=misalign)
 
-    assert a0.data_ptr() % (16 * elem_bytes) != 0, (
+    a0 = subview(k, m) if trans_a else subview(m, k)
+    b0 = subview(n, k) if trans_b else subview(k, n)
+    assert a0.data_ptr() % (16 * a0.element_size()) != 0, (
         "test setup: a0 base pointer must NOT be 16-element-aligned"
     )
     assert a0.stride(0) % 16 == 0, "test setup: a0 stride must be 16-aligned"
 
-    # Reference output (correctness baseline uses contiguous copies)
-    a_ref = a0.clone()
-    b_ref = b0.clone()
-    a_mat = a_ref.T if trans_a else a_ref
-    b_mat = b_ref.T if trans_b else b_ref
-    c_ref = a_mat @ b_mat
+    # The kernel gets the subviews themselves, never a copy. Forward only.
+    def run_once(mid):
+        return {"out": turbo.ops.gemm(a0, b0, trans_a, trans_b, dtype)}
 
-    # Pass the SUBVIEW directly — no clone() — so the kernel sees the
-    # misaligned data_ptr and must handle it correctly.
-    repeats = 5
-    outs = []
-    for _ in range(repeats):
-        c = turbo.ops.gemm(a0, b0, trans_a, trans_b, dtype)
-        outs.append(c.detach())
-        torch.cuda.synchronize()
-
-    # Determinism (bitwise identical across runs)
-    for i in range(1, repeats):
-        torch.testing.assert_close(outs[0], outs[i], rtol=0, atol=0)
-
-    # Correctness (close to PyTorch reference)
-    torch.testing.assert_close(outs[0], c_ref, **get_tolerances(dtype))
-
-    GlobalBackendManager.reset()
+    a, b = fp32_leaves(a0, b0)
+    ref = (a.t() if trans_a else a) @ (b.t() if trans_b else b)
+    check_determinism(request.node.nodeid, run_once, {"out": ref.detach()}, snr_floor=40, repeats=5)
 
 
-# ---------------------------------------------------------------------------
-# Determinism (--deterministic-only): bit-exact across repeats on determinism_helper's harness.
-# ---------------------------------------------------------------------------
 @pytest.mark.parametrize("microbatches", [1, 2], ids=["mb1", "mb2"])
 @pytest.mark.parametrize(
     "backend",
