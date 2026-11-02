@@ -630,6 +630,10 @@ _MXFP4_MID_SYNC = 0
 # Phase traversal as (A rows, N columns) per block; a fragment refills at its last consumer.
 _MXFP4_MBLK = (4, 8)
 
+# Leading share of a phase's free MFMA slots its g2s spread over: the phase barrier drains
+# every g2s, so the MFMAs after the last one hide that drain.
+_MXFP4_G2S_SPAN = 0.7
+
 # Parity-split LDS staging for a fp4 row pitch of 64 (mod 128), where every odd row starts
 # mid-line: the skewed rows get their own g2s stream and a deeper ring (see `_ROWSPLIT`).
 # OFF -- the skewed stream races. It lands a wrong 128-wide k-slab in row groups the width of
@@ -758,7 +762,7 @@ class MfmaScaleFp4:
         nbuf_b = len(bl_base)  # B pool size (= 2)
         _nscbuf = nbuf_b  # scale LDS pool (unused under VGPR-direct, but operand slots are reserved)
         NSET = 1
-        _WLV = self.wlv  # vmcnt kept in flight at the phase barrier (deep g2s pipeline)
+        _WLV = self.wlv  # cap on the unread g2s a boundary body's phase barrier leaves in flight
         _ELGK = self.elgk  # lgkmcnt left at the phase barrier (late refills stay in flight)
         # Cooperative LDS scale staging (vs per-wave VGPR-direct): 4 waves co-load the 4 groups once.
         _COOP = self.coop
@@ -1315,6 +1319,7 @@ class MfmaScaleFp4:
                 _g0 = _pbar + 1 if _pre else 0
                 _free = [mi for mi in range(_g0, len(mlist)) if mi not in _rfslot]
                 _n = len(g2sl)
+                _free = _free[: max(_n, int(len(_free) * _MXFP4_G2S_SPAN))]
                 _fgap = max(len(_free) // max(_n, 1), 1)
                 for _k, _fi in enumerate(_free):
                     if (_k % _fgap == 0) and len(_gset) < _n:
@@ -1374,13 +1379,14 @@ class MfmaScaleFp4:
                 out += _CST_HAZ + cstq.flush()
             return out
 
-        # Keeps the first post-barrier issue off the cycle every wave leaves the barrier on.
-        _ipend = f"s_waitcnt vmcnt({_WLV}) lgkmcnt({_ELGK})\ns_barrier\ns_nop 0"
+        # With a 2-slot ring the next phase ds_reads the block this phase's g2s staged, from
+        # chunks other waves issued, and nothing after the barrier waits on vmcnt: drain them all.
+        # s_nop: keeps the first post-barrier issue off the cycle every wave leaves the barrier on.
+        _ipend = f"s_waitcnt vmcnt(0) lgkmcnt({_ELGK})\ns_barrier\ns_nop 0"
 
-        # Every boundary body's phase is shorter than the full one _WLV was tuned on,
-        # so that timing slack no longer covers the g2s: the drain has to reach each
-        # stream the body READS, leaving only the B right half it skips in flight.
-        _WLVQ = min(_WLV, nsb)
+        # Under half_g2s the boundary body's BR g2s (issued last) fill a copy no ds_read touches,
+        # so only they may stay in flight past its barrier.
+        _WLVQ = min(_WLV, nsb) if half_g2s else 0
         _ipend_q = f"s_waitcnt vmcnt({_WLVQ}) lgkmcnt({_ELGK})\ns_barrier\ns_nop 0"
 
         def _ip(half):

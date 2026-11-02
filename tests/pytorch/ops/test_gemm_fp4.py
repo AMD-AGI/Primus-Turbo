@@ -22,6 +22,20 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
 )
 from primus_turbo.pytorch.ops.gemm_fp4 import FP4GemmMXFunction, gemm_fp4
+from tests.pytorch.ops.determinism_helper import (  # noqa: F401  (_det_seed: fixture)
+    ACCUM_DENSE_SHAPE,
+    _det_seed,
+    check_determinism,
+    check_fused_grad_accum,
+    dense_ref,
+    fp4_config,
+    fp32_leaves,
+    glu,
+    make_generator,
+    randn,
+    require_gfx950,
+    require_mxfp4,
+)
 from tests.pytorch.ops.gemm_shapes_helper import GEMM_MX_SHAPES, GEMM_MX_SHAPES_SMALL
 from tests.pytorch.test_utils import compute_snr
 
@@ -493,109 +507,6 @@ def test_gemm_fp4_mx_blockwise_torch_compile_backward(m, n, k, dtype):
     GlobalBackendManager.reset()
 
 
-# ----------------------------------------------------------------------------
-# Determinism suite (run with --deterministic-only): bit-exact across repeats.
-# ----------------------------------------------------------------------------
-_DET_GEMM_FP4_MNK = [
-    (256, 256, 256),
-    (512, 512, 256),
-    (1024, 1024, 512),
-    # Grids whose N tile is the narrow one, and whose body therefore takes the schedule
-    # without the folded C store -- the one that was returning a different answer each call.
-    (4096, 6144, 8192),
-    (4096, 5760, 8192),
-]
-# AITER is bf16-only.
-_DET_GEMM_FP4_BACKEND_DTYPES = [
-    pytest.param(BackendType.AITER, torch.bfloat16, id="AITER-bf16"),
-    pytest.param(BackendType.HIPBLASLT, torch.bfloat16, id="HIPBLASLT-bf16"),
-    pytest.param(BackendType.HIPBLASLT, torch.float16, id="HIPBLASLT-fp16"),
-    pytest.param(BackendType.FLYDSL, torch.bfloat16, id="FLYDSL-bf16"),
-    pytest.param(BackendType.FLYDSL, torch.float16, id="FLYDSL-fp16"),
-]
-
-
-@pytest.mark.parametrize("mnk", _DET_GEMM_FP4_MNK)
-@pytest.mark.parametrize("backend, dtype", _DET_GEMM_FP4_BACKEND_DTYPES)
-@pytest.mark.deterministic
-def test_gemm_fp4_deterministic(mnk, backend, dtype):
-    """Dense MXFP4 GEMM fwd + bwd are bit-exact across 3 repeats (SR off), and
-    match a high-precision reference (SNR)."""
-    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
-
-    supported, reason = check_mxfp4_support()
-    if not supported:
-        pytest.skip(reason)
-
-    m, n, k = mnk
-    if backend == BackendType.FLYDSL and not (m % 64 == 0 and n % 64 == 0 and k % 64 == 0):
-        pytest.skip("FlyDSL MXFP4 backend requires M/N/K all multiples of 64")
-
-    GlobalBackendManager.set_gemm_backend(backend)
-    GlobalBackendManager.set_auto_tune(False)
-
-    device = "cuda:0"
-    torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
-
-    # NT layout (a: [m, k], b: [n, k]) -- the production FP4 GEMM usage.
-    trans_a, trans_b = False, True
-    config = Float4QuantConfig(
-        granularity=ScalingGranularity.MX_BLOCKWISE,
-        format=Format.E2M1_X2,
-        block_size=32,
-        scale_dtype=ScaleDtype.E8M0,
-    )
-    print(f"\n[deterministic] M={m}, N={n}, K={k}, dtype={dtype}, backend={backend}")
-
-    a0 = torch.randn((m, k), dtype=dtype, device=device)
-    b0 = torch.randn((n, k), dtype=dtype, device=device)
-    a0 = a0 / a0.abs().max()
-    b0 = b0 / b0.abs().max()
-
-    # Reference (high precision)
-    a_ref = a0.detach().clone().requires_grad_()
-    b_ref = b0.detach().clone().requires_grad_()
-    c_ref = a_ref @ b_ref.T
-    grad_c = torch.randn_like(c_ref)
-    c_ref.backward(grad_c)
-    torch.cuda.synchronize()
-
-    def _run_once():
-        # Clean memory each iter so the caching allocator can't alias a buffer
-        # still being written by a pending op from a prior case.
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        a = a0.detach().clone().requires_grad_()
-        b = b0.detach().clone().requires_grad_()
-        c = gemm_fp4(a, b, trans_a, trans_b, dtype, config)
-        c.backward(grad_c)
-        return c.detach(), a.grad.detach(), b.grad.detach()
-
-    try:
-        repeats = 3
-        outs = []
-        for _ in range(repeats):
-            outs.append(_run_once())
-            torch.cuda.synchronize()
-
-        c0, da0, db0 = outs[0]
-        # Determinism (bitwise identical across runs)
-        for i in range(1, repeats):
-            ci, dai, dbi = outs[i]
-            torch.testing.assert_close(c0, ci, rtol=0, atol=0)
-            torch.testing.assert_close(da0, dai, rtol=0, atol=0)
-            torch.testing.assert_close(db0, dbi, rtol=0, atol=0)
-
-        # Correctness (close to reference)
-        snr_threshold = 10
-        assert compute_snr(c_ref.detach(), c0) > snr_threshold, "c_snr too low"
-        assert compute_snr(a_ref.grad.detach(), da0) > snr_threshold, "a_grad_snr too low"
-        assert compute_snr(b_ref.grad.detach(), db0) > snr_threshold, "b_grad_snr too low"
-    finally:
-        GlobalBackendManager.reset()
-
-
 # ---------------------------------------------------------------------------
 # AITER preshuffle fast-path coverage
 # ---------------------------------------------------------------------------
@@ -900,3 +811,121 @@ def test_rmsnorm_residual_fp4_feeds_mlp_fp4():
     for name, t in (("x", x), ("residual", residual), ("gamma", gamma)):
         assert t.grad is not None, f"{name} got no gradient through the quantized pair"
         assert torch.isfinite(t.grad).all(), f"{name} gradient is not finite"
+
+
+# ---------------------------------------------------------------------------
+# Determinism (--deterministic-only): bit-exact across repeats on determinism_helper's harness.
+# ---------------------------------------------------------------------------
+_DET_GEMM_FP4_MNK = [
+    (256, 256, 256),
+    (512, 512, 256),
+    (1024, 1024, 512),
+    # Grids whose N tile is the narrow 192-wide one, at two and one tiles per workgroup.
+    (4096, 6144, 8192),
+    (4096, 5760, 8192),
+]
+# AITER is bf16-only.
+_DET_GEMM_FP4_BACKEND_DTYPES = [
+    pytest.param(BackendType.AITER, torch.bfloat16, id="AITER-bf16"),
+    pytest.param(BackendType.HIPBLASLT, torch.bfloat16, id="HIPBLASLT-bf16"),
+    pytest.param(BackendType.HIPBLASLT, torch.float16, id="HIPBLASLT-fp16"),
+    pytest.param(BackendType.FLYDSL, torch.bfloat16, id="FLYDSL-bf16"),
+    pytest.param(BackendType.FLYDSL, torch.float16, id="FLYDSL-fp16"),
+]
+
+
+@pytest.mark.parametrize("mnk", _DET_GEMM_FP4_MNK)
+@pytest.mark.parametrize("backend, dtype", _DET_GEMM_FP4_BACKEND_DTYPES)
+@pytest.mark.deterministic
+def test_det_gemm_fp4(request, det_seed, mnk, backend, dtype):
+    """Dense MXFP4 NT GEMM fwd + bwd with SR off."""
+    require_mxfp4()
+    m, n, k = mnk
+    if backend == BackendType.FLYDSL and not (m % 64 == 0 and n % 64 == 0 and k % 64 == 0):
+        pytest.skip("FlyDSL MXFP4 backend requires M/N/K all multiples of 64")
+    GlobalBackendManager.set_gemm_backend(backend)
+    gen = make_generator(det_seed)
+    a0 = randn((m, k), dtype, gen, normalize=True)
+    b0 = randn((n, k), dtype, gen, normalize=True)
+    g = randn((m, n), dtype, gen)
+    config = fp4_config()
+
+    def run_once(mid):
+        a = a0.clone().requires_grad_(True)
+        b = b0.clone().requires_grad_(True)
+        c = gemm_fp4(a, b, False, True, dtype, config)
+        mid()
+        c.backward(g)
+        return {"out": c, "dgrad": a.grad, "wgrad": b.grad}
+
+    check_determinism(request.node.nodeid, run_once, dense_ref(a0, b0, g), snr_floor=10)
+
+
+# MXFP4 FlyDSL beta=1 wgrad (contracting over M): M=1024 runs the accumulating epilogue
+# unsplit, M=4096 takes the 2-way split-K + fold.
+_DET_ACCUM_EPI = (1024, 2048, 1536)
+_DET_ACCUM_SPLIT = (4096, 2048, 1536)
+
+
+# (backend, main_grad dtype, shape). FlyDSL's 16-bit accumulate epilogue takes main_grad in
+# the output dtype.
+@pytest.mark.parametrize("microbatches", [1, 2], ids=["mb1", "mb2"])
+@pytest.mark.parametrize(
+    "backend, main_grad_dtype, shape",
+    [
+        pytest.param(BackendType.HIPBLASLT, torch.float32, ACCUM_DENSE_SHAPE, id="gemm_fp4-HIPBLASLT"),
+        pytest.param(BackendType.FLYDSL, torch.bfloat16, _DET_ACCUM_EPI, id="gemm_fp4-FLYDSL-M1024"),
+        pytest.param(BackendType.FLYDSL, torch.bfloat16, _DET_ACCUM_SPLIT, id="gemm_fp4-FLYDSL-M4096"),
+    ],
+)
+@pytest.mark.deterministic
+def test_det_fused_grad_accum(request, det_seed, backend, main_grad_dtype, shape, microbatches):
+    require_mxfp4()
+    if backend == BackendType.FLYDSL:
+        require_gfx950("FlyDSL")
+    GlobalBackendManager.set_gemm_backend(backend)
+    config = fp4_config()
+    check_fused_grad_accum(
+        request.node.nodeid,
+        det_seed,
+        lambda a, b, _: gemm_fp4(
+            a, b, trans_b=True, out_dtype=torch.bfloat16, config=config, fuse_bgrad_accum_pattern="megatron"
+        ),
+        shape,
+        main_grad_dtype,
+        8,
+        microbatches,
+    )
+
+
+# (M, K, I): the dense GLU quant epilogue needs M % 256, I % 64 and K // 256 >= 4.
+DET_MLP_SHAPES = [(512, 1024, 1024), (2048, 1024, 1024)]
+
+
+@pytest.mark.parametrize("m, k, i", DET_MLP_SHAPES)
+@pytest.mark.parametrize(
+    "activation, clamp_limit", [("silu", None), ("gelu", 1.0)], ids=["silu", "gelu-clamp"]
+)
+@pytest.mark.deterministic
+def test_det_mlp_fp4(request, det_seed, m, k, i, activation, clamp_limit):
+    from primus_turbo.pytorch.ops import mlp_fp4
+
+    require_mxfp4()
+    gen = make_generator(det_seed)
+    x0 = randn((m, k), torch.bfloat16, gen)
+    w10 = randn((2 * i, k), torch.bfloat16, gen, scale=0.02)
+    w20 = randn((k, i), torch.bfloat16, gen, scale=0.02)
+    g = randn((m, k), torch.bfloat16, gen, scale=0.1)
+
+    def run_once(mid):
+        x, w1, w2 = [t.clone().requires_grad_(True) for t in (x0, w10, w20)]
+        out = mlp_fp4(x, w1, w2, activation=activation, clamp_limit=clamp_limit)
+        mid()
+        out.backward(g)
+        return {"out": out, "grad_x": x.grad, "grad_w1": w1.grad, "grad_w2": w2.grad}
+
+    x, w1, w2 = fp32_leaves(x0, w10, w20)
+    out = glu(x @ w1.t(), activation, clamp_limit) @ w2.t()
+    out.backward(g.float())
+    ref = {"out": out.detach(), "grad_x": x.grad, "grad_w1": w1.grad, "grad_w2": w2.grad}
+    check_determinism(request.node.nodeid, run_once, ref, snr_floor=6)
