@@ -588,8 +588,8 @@ _ASM_ALLOC = re.compile(r"\s*(\.amdhsa_next_free_vgpr\s+|\.vgpr_count:\s+)(\d+)$
 # the markers each generated region goes behind, every one exactly once
 _ASM_REGIONS = {
     "k_mla_fwd": (
-        re.compile(r";\s*HKGEN (INIT|TILE_C|TILE_D[0-3]|FINAL_[0-3])\b"),
-        ["INIT", "TILE_C"] + [f"TILE_D{i}" for i in range(4)] + [f"FINAL_{i}" for i in range(4)],
+        re.compile(r";\s*HKGEN (INIT|TILE_C|TILE_D[0-3]|FINAL_A)\b"),
+        ["INIT", "TILE_C"] + [f"TILE_D{i}" for i in range(4)] + ["FINAL_A"],
     ),
     "k_dkdv96ds": (
         re.compile(r";\s*HKGEN (INIT|LOOP|FINAL) nkv=(\d)\b"),

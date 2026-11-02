@@ -29,12 +29,17 @@
 // epilogue staging. Ring slot t of a block is its tile t, in stage (sb + t) % 4; the ring runs on across the blocks
 // of a workgroup. Wave 0 issues the 3 TDM ops of every slot (K columns 0..127 and 128..191, V); waves 1..3 issue the
 // same ops with NULL descriptors, so every wave runs the same code and waits on static counts. Per block:
-//   prologue  Q (waves 1, 2) and slots 0..2 (wave 0); B_0: every wave s_wait_tensorcnt 0, then the barrier
+//   prologue  the first block only: Q (waves 1, 2) and slots 0..2 (wave 0); B_0: every wave s_wait_tensorcnt 0,
+//             then the barrier
 //   tile t    issue slot t + 3 into the stage of tile t - 1; read the K / V / Q fragments, then s_wait_dscnt 0,
 //             s_wait_tensorcnt 6 (slot t + 1 landed) and s_barrier_signal, the tile's math around them;
 //             s_barrier_wait. This barrier, B_{t+1}, makes tile t + 1 visible to every wave and frees the stage of
-//             tile t. Slots past the last tile n - 1 are 1-row copies of it, so wave 0 issues 3 ops in every tile.
-//   epilogue  after B_n: the next block's prologue loads, then the output (staged at TAIL and in tile n - 1's stage)
+//             tile t. Slots n..n + 2 past the last tile n - 1 load the next block's tiles 0..2 (its ring slots 0..2:
+//             the same stages) when there is one, else 1-row copies of tile n - 1, so wave 0 issues 3 ops in every
+//             tile. The next block is known three tiles before the block ends on the persistent static schedule only;
+//             that schedule needs Sq % 256 == 0 (fwd.persistent_workgroups), so every block has 4 diagonal tiles,
+//             which issue the slots n - 1..n + 2. One block per workgroup (npw == 0) has no next block.
+//   epilogue  after B_n: the next block's Q, then the output (staged at TAIL and in tile n - 1's stage)
 // No LDS read follows a tile's s_barrier_signal: right after B_n the next block's Q overwrites the Q area.
 //
 // Marker shell (HKGEN_REF 0, the production build): LLVM compiles the prologue, the TDM descriptors and issue, the
@@ -45,14 +50,16 @@
 //            q tiles 0, 1 and 2, 3 (+ 64 rows for q tiles 1, 3); c2 = scale * log2(e) (SGPR)
 //   TILE_C   a tile below the diagonal; kb, vb: the lane's K / V^T fragment bases in the tile's stage; c2
 //   TILE_Dk  the diagonal tile ncc + k, k = 0..3; kb, vb, c2 and dl, the causal bound of q tile 0 (see dl0)
-//   FINAL_i  q tile i: o, 32 VGPRs, lane l: the bf16 out of row l % 16, d columns 16 dt + 8 (l / 16) .. + 7 in
-//            o[4 dt .. 4 dt + 3]; lse: the lse of row l % 16
+//   FINAL_A  the last tile's prefix, then out / lse of all 4 q tiles, stored by the generated code into this wave's
+//            staging slots (lane l: the bf16 out of row l % 16, d columns 16 dt + 8 (l / 16) .. + 7, and the lse of
+//            row l % 16); wa, wb: the lane's out row in the slots of q tiles 0 and 2 (+ 4 SQT for q tiles 1, 3);
+//            la, lb: its lse slot there
 // The generated code writes only the VGPRs above every VGPR the shell's code references (its state lives there
-// across the markers), the FINAL outputs and the clobbered s90..s103 / vcc / scc; reads LDS only at the marker
-// bases plus constant offsets; makes no other memory access; ends in VGPR-MSB mode 0; and each TILE region issues
-// its s_barrier_signal once, after its last LDS read. The shell's code has no WMMA or transcendental instruction,
-// keeps nothing in the clobbered registers across a marker and reaches every marker with all lanes active.
-// tools/fwdgen/build.py checks both sides.
+// across the markers) and the clobbered s90..s103 / vcc / scc; reads LDS only at the marker bases plus constant
+// offsets; writes LDS only in FINAL_A, at the staging bases plus constant offsets; makes no other memory access; ends
+// in VGPR-MSB mode 0; and each TILE region issues its s_barrier_signal once, after its last LDS read. The shell's
+// code has no WMMA or transcendental instruction, keeps nothing in the clobbered registers across a marker and
+// reaches every marker with all lanes active. tools/fwdgen/build.py checks both sides.
 //
 // -DHKGEN_REF=1 compiles the per-tile math from the HIP below instead of the markers: a complete kernel with the
 // same arithmetic, whose .s also gives the generator the VGPR-MSB operand fields of the instructions it emits.
@@ -264,9 +271,36 @@ void k_mla_fwd(const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf1
     tdm_load(tdm_g0(st + 256, gk + 256, cnt0), tdm_g1(W0_B, rows, 64, th, krow));                                    \
     tdm_load(tdm_g0(st + K_B, gv, cnt0), tdm_g1(W0_V, rows, 128, th, vrow));                                         \
   };                                                                                                                 \
-  /* a block's prologue loads, branch-free (every wave issues the same 11 TDM ops, NULL descriptors where the op */ \
-  /* is not its own): Q columns 0..127 (wave 1) and 128..191 (wave 2) into the Q area, then the block's tiles     */ \
-  /* 0..2 = ring slots 0..2 (wave 0)                                                                              */ \
+  /* the same for the slots of the diagonal tiles: slot t >= n of a block that has a next block (nn tiles, K / V   */ \
+  /* bases gkn, gvn) loads the next block's tile t - n, or a 1-row copy of its tile nn - 1 past it                 */ \
+  auto issue_slot_x = [&](int t, int n, int sb, unsigned long long gk0, unsigned long long gv0, bool nx, int nn,      \
+                          unsigned long long gkn, unsigned long long gvn) {                                          \
+    const bool own = t < n || !nx;                                                                                   \
+    const int tt = own ? min(t, n - 1) : min(t - n, nn - 1);                                                         \
+    const bool real = own ? t < n : t - n < nn;                                                                      \
+    const int kv0 = tt * NB;                                                                                         \
+    const unsigned long long gk = (own ? gk0 : gkn) + 2ull * (unsigned long long)kv0 * krow;                         \
+    const unsigned long long gv = (own ? gv0 : gvn) + 2ull * (unsigned long long)kv0 * vrow;                         \
+    const unsigned th = real ? NB : 1;                                                                               \
+    const unsigned rows = (unsigned)(Skv_ - kv0);                                                                    \
+    const unsigned st = lds0 + (unsigned)(((sb + t) & (NSTG - 1)) * STG_B);                                          \
+    tdm_load(tdm_g0(st, gk, cnt0), tdm_g1(W0_A, rows, 128, th, krow));                                              \
+    tdm_load(tdm_g0(st + 256, gk + 256, cnt0), tdm_g1(W0_B, rows, 64, th, krow));                                    \
+    tdm_load(tdm_g0(st + K_B, gv, cnt0), tdm_g1(W0_V, rows, 128, th, vrow));                                         \
+  };                                                                                                                 \
+  /* the next block's Q only, from the epilogue (its tiles 0..2 came with this block's slots n..n + 2)           */ \
+  auto issue_q = [&](int qb, int hh, int bb) {                                                                       \
+    const int q0 = qb * BM;                                                                                          \
+    const unsigned long long gq =                                                                                    \
+        (unsigned long long)(uintptr_t)ka.Q + 2ull * ((((unsigned long long)bb * Sq_ + q0) * H_ + hh) * D_QK);       \
+    tdm_load(tdm_g0(lds0 + Q_OFF, gq, wv == 1 ? 1 : 0), tdm_g1(W0_A, (unsigned)(Sq_ - q0), 128, BM, krow));          \
+    tdm_load(tdm_g0(lds0 + Q_OFF + 256, gq + 256, wv == 2 ? 1 : 0),                                                  \
+             tdm_g1(W0_B, (unsigned)(Sq_ - q0), 64, BM, krow));                                                      \
+  };                                                                                                                 \
+  (void)issue_slot_x, (void)issue_q;                                                                                 \
+  /* the first block's prologue loads, branch-free (every wave issues the same 11 TDM ops, NULL descriptors where  */ \
+  /* the op is not its own): Q columns 0..127 (wave 1) and 128..191 (wave 2) into the Q area, then the block's     */ \
+  /* tiles 0..2 = ring slots 0..2 (wave 0)                                                                         */ \
   auto issue_block = [&](int qb, int hh, int bb, int sb) {                                                           \
     const int q0 = qb * BM;                                                                                          \
     const unsigned long long gq =                                                                                    \
@@ -309,8 +343,8 @@ void k_mla_fwd(const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf1
 
     // B_0: Q (waves 1, 2) and tiles 0..2 (wave 0) landed and visible; every wave's reads of the previous block's
     // staging (in the stage this block's tile 3 goes to) retired. Every wave waits for all its TDM ops: the same code
-    // on every wave, correct whether or not NULL descriptors count in TENSORcnt. Wave 0 thus waits for tiles 1, 2 as
-    // well; issued with the Q one epilogue (~5k cycles) earlier, they have landed by then.
+    // on every wave, correct whether or not NULL descriptors count in TENSORcnt. Tiles 0..2 were issued by the
+    // previous block's last three tiles (the first block's with its Q), so they have landed by then.
     tensor_wait<0>();
     bar_signal();
     bar_wait();
@@ -429,10 +463,22 @@ void k_mla_fwd(const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf1
       bar_wait();  // B_{t+1}
     }
     // ---- the diagonal tiles ncc + k, k < 4 (Sq == Skv) --------------------------------------------------------------
+    // the next block (static schedule), whose tiles 0..2 the diagonal tiles' slots n..n + 2 load; its own argument
+    // view from t (= ncc here), so LLVM cannot hoist this math into the TILE_C loop
+    bool xb;
+    int nnx;
+    unsigned long long gkx, gvx;
+    {
+      HKF_BLOCK(t >> 30)
+      int qbx, hhx, bbx;
+      xb = block_at(s + 1, qbx, hhx, bbx);
+      nnx = ntiles(qbx);
+      kv_base(hhx, bbx, gkx, gvx);
+    }
     static_for<4>([&](auto k) {
       if (ncc + k < n) {
         const int t2 = ncc + k;
-        issue_slot(t2 + 3, n, sb, gk0, gv0);
+        issue_slot_x(t2 + 3, n, sb, gk0, gv0, xb, nnx, gkx, gvx);
         const unsigned st = lds0 + (unsigned)(((sb + t2) & (NSTG - 1)) * STG_B);
 #if HKGEN_REF
         tile(st + k_lane, st + K_B + v_lane, dl0 - NB * t2, k);
@@ -445,11 +491,10 @@ void k_mla_fwd(const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf1
     });
 
     // ---- epilogue, in its own scope (its own argument view: nothing of it is live across the tiles) -----------------
-    // First the next block's prologue loads, right after B_n, overlapping the output: every wave's reads of the ring
-    // and of the Q area retired before B_n, and the next block's tiles 0..2 go to the three stages other than the one
-    // of tile n - 1, which holds the staging below. Each wave first waits for its TDM ops in flight: wave 0's 1-row
-    // copies of slots n..n + 2 target those three stages.
-    // Phase 1, per q tile i: out and lse (FINAL_i, or the HKGEN_REF code) into this wave's SQT-byte staging slot:
+    // First the next block's Q, right after B_n, overlapping the output: every wave's reads of the Q area retired
+    // before B_n; the next block's tiles 0..2 are in flight already (this block's slots n..n + 2, in the three stages
+    // other than the one of tile n - 1, which holds the staging below).
+    // Phase 1, per q tile i: out and lse (FINAL_A, or the HKGEN_REF code) into this wave's SQT-byte staging slot:
     // q tiles 0, 1 in the stage of tile n - 1 (the next block's tile 3 goes there only after its B_0), q tiles 2, 3 at
     // TAIL; O row r at XO r (FlyDSL's 272-B staging stride), the lse of lane l at LSE_SLOT + 4 l.
     // Phase 2: per q tile 8 row-contiguous buffer stores (store j, lane l: row 2 j + l / 16, bytes 16 (l % 16) .. + 15
@@ -463,10 +508,8 @@ void k_mla_fwd(const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf1
       HKF_BLOCK(n >> 30)
       int qbn, hhn, bbn;
       nxt = block_at(s + 1, qbn, hhn, bbn);
-      if (nxt) {
-        tensor_wait<0>();
-        issue_block(qbn, hhn, bbn, (sb + n) & (NSTG - 1));
-      }
+      // its tiles 0..2 are in flight (this block's slots n..n + 2): only its Q, into the free Q area
+      if (nxt) issue_q(qbn, hhn, bbn);
       sched_barrier<0>();
 
       // fresh lane ids (lane2, ln), for the same reason as lane
@@ -475,19 +518,16 @@ void k_mla_fwd(const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf1
       const unsigned sgb = lds0 + TAIL + (unsigned)(wv * SQT);
       const unsigned wl = (unsigned)((lane2 & 15) * XO + (lane2 >> 4) * 16);
       const unsigned wls = (unsigned)(LSE_SLOT + 4 * lane2);
+#if HKGEN_REF
       static_for<QT>([&](auto i) {
         i32x32 ob;
         float lse;
-#if HKGEN_REF
         const float inv = d[i] > 0.f ? 1.0f / d[i] : 0.f;
         static_for<NDT>([&](auto dt) {
           const u32x4 w = __builtin_bit_cast(u32x4, to_bf16x8(o[i][dt] * inv));
           static_for<4>([&](auto r) { ob[4 * dt + (int)r] = (int)w[(int)r]; });
         });
         lse = (m[i] + __builtin_log2f(d[i])) * LN2;
-#else
-        asm volatile("; HKGEN FINAL_%c2 o=%0 lse=%1" : "=v"(ob), "=v"(lse) : "n"((int)i) : HKGEN_CLOBBERS);
-#endif
         const unsigned tb = (i < 2 ? sga : sgb) + (unsigned)((i & 1) * 4 * SQT);
         lds_u8w* const wp = lds_wptr(tb + wl);
         static_for<NDT>([&](auto dt) {
@@ -498,24 +538,30 @@ void k_mla_fwd(const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf1
         lds_store_b32(lds_wptr(tb + wls), 0, __builtin_bit_cast(unsigned, lse));
         sched_barrier<0>();
       });
+#else
+      // the generated code's ds_stores, from its own registers (the four q tiles' math overlaps in one schedule)
+      asm volatile("; HKGEN FINAL_A wa=%0 wb=%1 la=%2 lb=%3" ::"v"(sga + wl), "v"(sgb + wl), "v"(sga + wls),
+                   "v"(sgb + wls) : HKGEN_CLOBBERS);
+#endif
       wave_lds_order();
 
       // Phase 2 addresses (all before the first global store):
       //   O, q tile i: buffer resource r_o[i] based at its first row q0 + 64 i, soffset 2 j * row bytes (store j:
       //     rows 2 j, 2 j + 1), voffset vo_l (the lane's row 16 wv + l / 16 and 16-B column l % 16). The 64 rows
       //     q0 + 64 i .. + 63 are all < Sq or all >= Sq (Sq % 64 == 0): past Sq, num_records 0 drops the stores.
+      //     Offsets and bounds in 32 bits (no 64-bit compares: VALU -> SGPR -> SALU chains): O is below 2 GiB, as q
+      //     is (limits.fwd_shape_unsupported_reason) and O has 128 of q's 192 columns.
       //   lse: one ds_load_b64 + one buffer_store_b64 for the wave's 64 rows (lane l: q tile l / 8, rows 2 (l % 8)
       //     and 2 (l % 8) + 1 = the slots of lanes 2 (l % 8), + 1); a row past Sq gets voffset OOB (soffset null).
       const long long o_bytes = (long long)B_ * Sq_ * H_ * D_V * 2;
       const unsigned rsb = (unsigned)H_ * (unsigned)(D_V * 2);  // bytes per q row
       __amdgpu_buffer_rsrc_t r_o[QT];
+      const unsigned long long off0 = (((unsigned long long)bb * Sq_ + q0) * H_ + hh) * (D_V * 2);
       static_for<QT>([&](auto i) {
         const bool ok = q0 + 64 * i < Sq_;
-        const long long off = (((long long)bb * Sq_ + q0 + 64 * i) * H_ + hh) * (D_V * 2);
-        const long long rem = min(o_bytes - off, 0x7FFFFFFFll);
-        const long long off2 = ok ? off : 0ll;
-        const int nrec = ok ? (int)rem : 0;
-        r_o[i] = rsrc((const unsigned char*)ka.O + off2, nrec);
+        const unsigned offi = (unsigned)off0 + (unsigned)(64 * i) * rsb;
+        r_o[i] = rsrc((const unsigned char*)ka.O + (ok ? off0 + (unsigned long long)(64 * i) * rsb : 0ull),
+                      ok ? (int)((unsigned)o_bytes - offi) : 0);
       });
       const auto r_l = rsrc(ka.LSE, (int)min((long long)B_ * H_ * Sq_ * 4, 0x7FFFFFFFll));
       const int ln = (int)__builtin_amdgcn_mbcnt_lo(~0u, (unsigned)(ncc >> 30));

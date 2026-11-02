@@ -14,9 +14,9 @@ every region:
            the resident Q fragments of q tiles 1, 2 and the state that makes the first tile's prefix a no-op
   TILE_C   a 64-kv tile below the diagonal (no mask)
   TILE_Dk  diagonal tile k = 0..3 (Sq == Skv): q tiles below k skipped, the causal mask on q tile k only
-  FINAL_i  q tile i: inv = d > 0 ? 1 / d : 0 (LLVM's IEEE division sequence), lse = (m + log2 d) ln 2 (LLVM's
-           log2 expansion), out = bf16(O inv) into the marker's output registers; FINAL_0 first runs the
-           prefix of the last tile
+  FINAL_A  the prefix of the last tile, then per q tile i: inv = d > 0 ? 1 / d : 0 (LLVM's IEEE division
+           sequence), out = bf16(O inv), lse = (m + log2 d) ln 2 (LLVM's log2 expansion), and their ds_stores
+           into this wave's staging slots; one schedule, so the four q tiles' math and stores overlap
 
 A wave owns four 16-row q tiles; c = scale log2 e. The math is FlyDSL's forward, op for op: the QK WMMA chains
 over k-steps 0..5 from +0; [mask: s = -inf where kv > q]; lm = max over the lane's 32 values (any tree: max is
@@ -37,8 +37,9 @@ tile i leaves the next prefix a no-op for it, as INIT does for the first prefix:
 S(i) = -inf for i >= 2 (corr = 1, p = +0, d = fma(1, d, +0), O += V * 0).
 
 O *= corr runs only when m moved: per q tile a wave-uniform branch (s_cmp + s_cbranch over its 32 v_pk_mul, as
-FlyDSL's _rescale_if); corr is exactly 1 otherwise and x * 1.0 is x, so no result bit changes. The scheduler
-places the conditional block as one node (RESC); build.py splits the region there into blocks.
+FlyDSL's _rescale_if); corr is exactly 1 otherwise and x * 1.0 is x, so no result bit changes. The s_cmp is a
+node of its own, so the scheduler can issue it ahead of the branch; the branch and the conditional block are one
+node (RESC), and build.py splits the region there into blocks.
 
 Program order (the order of the node lists) is the semantics: the scheduler reorders only along the dependence
 graph (RAW / WAR / WAW on every VGPR, SGPR, scc, vcc) and the added order edges. The output is real
@@ -68,13 +69,16 @@ CLOBBERED = {f"s{i}" for i in range(90, 104)} | {"vcc", "scc"}
 # Scheduler model (cycles)
 DS_LAT = 290  # LDS load-to-use latency
 DS_RATE = 6  # one LDS load issued per DS_RATE cycles
-DS_MAX = 56  # LDS loads in flight at most (the dscnt field is 6 bits)
+DS_MAX = 63  # LDS loads in flight at most (the dscnt field is 6 bits)
 WORDER = ("PV0p", "PV1p", "PV2p", "PV3p", "QK0", "QK1", "QK2", "QK3")  # the in-order WMMA stream, by node tag
 # latency of a dependence edge by producer kind (it ranks nodes by critical path), and result latency by kind
-# in the issue model
-LAT = {"WMMA": 20, "VALU": 5, "TRANS": 8, "PERM": 8, "DS": DS_LAT, "SALU": 2, "RESC": 2}
-SLOT_LAT = {"WMMA": 20, "VALU": 3, "TRANS": 8, "PERM": 6, "SALU": 2, "RESC": 2}
-RESC_COST = 6  # modelled cycles of a RESC block's s_cmp + s_cbranch when the branch skips it
+# in the issue model (WMMA 32 and VALU 8: the values that scheduled the TILE regions best on MI455X)
+LAT = {"WMMA": 32, "VALU": 8, "TRANS": 8, "PERM": 8, "DS": DS_LAT, "SALU": 2, "RESC": 2, "DSST": 1}
+SLOT_LAT = {"WMMA": 32, "VALU": 8, "TRANS": 8, "PERM": 6, "SALU": 2, "RESC": 2, "DSST": 1}
+RESC_COST = 6  # modelled cycles of a RESC node (its s_cbranch over the block) when the branch skips it
+BR_LAT = 9  # a RESC node's s_cmp -> s_cbranch (ATT: 9 cycles; a taken branch costs ~25 more)
+SGPR_LAT = 20  # a VALU-written SGPR to a SALU / RESC reader (ATT: v_cmp_lt sX -> s_cmp_lg sX ~20 cycles)
+SQT_B = 4480  # k_mla_fwd.hip SQT: the staging slot bytes per wave and q tile
 
 
 def vr(r, n=1):
@@ -95,8 +99,9 @@ class Layout:
     d, the mask bounds), so the softmax VALU runs in one s_set_vgpr_msb mode; O fills block 1; block 3 holds
     K and the V fragments of d tiles 0..3, block 0 (after the shell's VGPRs) the Q fragments and the V
     fragments of d tiles 4..7.
-    Live across regions: m, d, (c, c), the Q bases and O; from one TILE region to the next (and into FINAL_0)
-    also V, P(0), P(1), S(2), S(3) and the resident Q fragments of q tiles 1, 2."""
+    Live across regions: m, d, (c, c), the Q bases and O; from one TILE region to the next (and into FINAL_A)
+    also V, P(0), P(1), S(2), S(3) and the resident Q fragments of q tiles 1, 2. FINAL_A's scratch: the dead
+    qbuf[0] (12 VGPRs per q tile) and K (the bf16 outputs, 32 VGPRs per q tile)."""
 
     def __init__(self, base):
         nxt = [base + (base % 2)]
@@ -132,9 +137,6 @@ class Layout:
         self.m = [take2(1) for _ in range(QT)]
         self.d = [take2(1) for _ in range(QT)]
         self.dl = [None] + [take2(1) for _ in range(3)]  # mask bound of q tile i: dl + 64 i
-        # FINAL scratch and the (inv, unused) pair: qbuf[0] is dead once the last tile's QK has read it
-        self.fin = [self.qbuf[0] + k for k in range(11)]
-        self.inv = self.qbuf[0] + 14
         self.o = 256  # block 1: O[i][dt] = 256 + 64 i + 8 dt
         self.k = 768  # block 3: K[j][ks] = 768 + 48 j + 8 ks, then V of d tiles 0..3 from 960
         self.vlo = 960
@@ -234,8 +236,9 @@ def _split_ops(s):
 
 def mk(text, kind, tag=""):
     """A node with the registers its text defines and uses. Covers the forms the regions schedule: ds_load
-    (vdst, vaddr), s_mov / s_cmp / s_cselect, v_cmp_*_e64 with an SGPR destination, and VALU / WMMA ops whose
-    first operand is their only destination and that read no implicit operand."""
+    (vdst, vaddr), ds_store (vaddr, data), s_mov / s_cmp / s_cselect, v_cmp_*_e64 with an SGPR destination,
+    v_div_scale (vdst, sdst vcc or null), v_div_fmas (reads vcc), and VALU / WMMA ops whose first operand is
+    their only destination and that read no implicit operand."""
     n = Node(text, kind, tag)
     if kind == "BAR":
         return n
@@ -249,12 +252,19 @@ def mk(text, kind, tag=""):
     ops = _split_ops(rest)
     if mn.startswith("ds_load"):
         n.vdefs, n.vuses = set(_vregs(ops[0])), set(_vregs(ops[1]))
+    elif mn.startswith("ds_store"):  # address, data: uses only
+        n.vuses = set(_vregs(ops[0])) | set(_vregs(ops[1]))
     elif mn.startswith("s_cmp"):
         n.sdefs, n.suses = {"scc"}, set(_sregs(ops[0])) | set(_sregs(ops[1]))
     elif mn.startswith("s_cselect"):
         n.sdefs, n.suses = set(_sregs(ops[0])), {"scc"}
     elif mn.startswith("s_mov"):
         n.sdefs, n.suses = set(_sregs(ops[0])), set(_sregs(ops[1]))
+    elif mn.startswith("v_div_scale"):  # vdst, sdst (vcc_lo or null), sources
+        n.vdefs = set(_vregs(ops[0]))
+        n.sdefs = {"vcc"} if "vcc" in ops[1] else set()
+        n.vuses = {r for o in ops[2:] for r in _vregs(o)}
+        n.suses = {r for o in ops[2:] for r in _sregs(o)}
     elif mn.startswith("v_"):
         if mn.startswith("v_cmp"):
             n.sdefs = set(_sregs(ops[0]))
@@ -262,6 +272,8 @@ def mk(text, kind, tag=""):
             n.vdefs = set(_vregs(ops[0]))
         n.vuses = {r for o in ops[1:] for r in _vregs(o)}
         n.suses = {r for o in ops[1:] for r in _sregs(o)}
+        if mn.startswith("v_div_fmas"):  # reads vcc implicitly
+            n.suses.add("vcc")
     else:
         raise ValueError(f"unmodelled instruction {text}")
     return n
@@ -272,7 +284,8 @@ def _key(r):
 
 
 def build_dag(nodes):
-    """RAW (producer latency), WAR / WAW (latency 1) edges in list order: node.preds = [(index, latency)]."""
+    """RAW (producer latency; SGPR_LAT for a VALU-written SGPR read by SALU / RESC, BR_LAT for the scc of a
+    RESC node's s_cmp), WAR / WAW (latency 1) edges in list order: node.preds = [(index, latency)]."""
     last_w, readers = {}, {}
     for i, n in enumerate(nodes):
         n.idx = i
@@ -282,6 +295,16 @@ def build_dag(nodes):
             if k in last_w:
                 p = last_w[k]
                 lat = 8 if nodes[p].kind == n.kind == "WMMA" else LAT[nodes[p].kind]  # 8: accumulator chain
+                pk = nodes[p].kind
+                if (
+                    k[0] == "s"
+                    and r not in ("scc", "vcc")
+                    and pk in ("VALU", "TRANS", "PERM")
+                    and (n.kind in ("SALU", "RESC"))
+                ):
+                    lat = SGPR_LAT
+                if r == "scc" and pk == "SALU" and n.kind == "RESC":
+                    lat = BR_LAT
                 preds[p] = max(preds.get(p, 0), lat)
         for r in list(n.vdefs) + list(n.sdefs):
             k = _key(r)
@@ -334,7 +357,7 @@ def schedule(nodes):
     LDS loads issue one per DS_RATE cycles and complete in order DS_LAT cycles after issue, at most DS_MAX in
     flight (not yet complete; a consumer of a load retires it and every older one, the arrive
     (s_barrier_signal behind s_wait_dscnt 0) retires all). Other results are ready SLOT_LAT cycles after
-    issue. Among the ready nodes:
+    issue (an SGPR_LAT / BR_LAT edge: that many cycles). Among the ready nodes:
     a VALU at offsets 2, 6, a TRANS at 3, 7, an LDS load elsewhere first; then the arrive, the earliest
     deadline (the first WMMA of the stream that needs the node), the longest critical path (LAT), program
     order. An s_wait_dscnt goes in where a load would exceed DS_MAX."""
@@ -439,6 +462,10 @@ def schedule(nodes):
                     e = max(e, ds_done[pick])
             elif lat <= 1:
                 e = t + 1  # WAR / WAW / order edge
+            elif (lat == SGPR_LAT and k in ("VALU", "TRANS", "PERM")) or (
+                lat == BR_LAT and nodes[s].kind == "RESC"
+            ):
+                e = t + lat  # a VALU-written SGPR read by SALU; scc to the RESC branch
             else:
                 e = t + SLOT_LAT[k]
             earliest[s] = max(earliest[s], e)
@@ -573,8 +600,10 @@ def softmax_nodes(L, i, add, c_sgpr):
             j, e = 2 * kt + r // 4, 2 * (r % 4)
             lo, hi = L.PR(i, 8 * j + e), L.PR(i, 8 * j + e + 1)
             add(f"v_cvt_pk_bf16_f32 {vr(L.P(i, kt) + r)}, {vr(lo)}, {vr(hi)}", "VALU", f"cvt{i}")
-    # O *= corr under a wave-uniform branch (one schedule node; build.py expands it with resc_block)
-    add(f"HKRESC {i} {L.O(i, 0)} {corr} {S_ANY[i]}", "RESC", f"resc{i}")
+    # O *= corr under a wave-uniform branch: the s_cmp is a node of its own (the scheduler may issue it ahead of
+    # the branch), the branch and the block one node (RESC, reading its scc; build.py expands it with resc_block)
+    add(f"s_cmp_lg_u32 {S_ANY[i]}, 0", "SALU", f"resc{i}")
+    add(f"HKRESC {i} {L.O(i, 0)} {corr} scc", "RESC", f"resc{i}")
 
 
 def resc_lines(L, i):
@@ -588,11 +617,13 @@ def resc_lines(L, i):
 
 
 def resc_block(L, line, label):
-    """A RESC pseudo-line's expansion: (the lines ending the block before it: s_cmp + s_cbranch over the
-    conditional block when S_ANY[i] is 0, the conditional block, the label line starting the block after
+    """A RESC pseudo-line's expansion: (the line ending the block before it: s_cbranch over the conditional
+    block when its s_cmp found S_ANY[i] 0, the conditional block, the label line starting the block after
     it)."""
-    _, i, _, _, sany = line.split()
-    return [f"s_cmp_lg_u32 {sany}, 0", f"s_cbranch_scc0 {label}"], resc_lines(L, int(i)), f"{label}:"
+    _, i, _, _, cond = line.split()
+    if cond != "scc":
+        raise ValueError(f"RESC node without its own s_cmp: {line}")
+    return [f"s_cbranch_scc0 {label}"], resc_lines(L, int(i)), f"{label}:"
 
 
 def sum_nodes(L, i0, add, upd):
@@ -715,49 +746,67 @@ def region_tile(L, ops, k=None):
     return out, cycles
 
 
-def region_final(L, ops, i):
-    """FINAL_i (program order). FINAL_0 starts with the scheduled prefix of the last tile, c from the VGPR
-    pair (the SGPRs are clobbered across markers). ops: o (the first of the 32 output VGPRs), lse (VGPR)."""
-    out = []
-    if i == 0:
-        nodes, add = node_list()
-        add(f"s_mov_b32 {S_SEL}, 0x{SEL_LO:x}", "SALU", "sel")
-        prefix_nodes(L, add, c_sgpr=False)
-        out = [nd.text for nd in schedule(build_dag(nodes))[0]]
-    d, m = L.d[i], L.m[i]
-    a, b, rc, e1, q, e2, sh, sub, x, lg, s = L.fin
-    inv = L.inv
-    out += [  # LLVM's fp32 1.0 / d (denormals on: no mode switches), then d > 0 ? . : 0
-        f"v_div_scale_f32 {vr(a)}, null, {vr(d)}, {vr(d)}, 1.0",
-        f"v_div_scale_f32 {vr(b)}, vcc_lo, 1.0, {vr(d)}, 1.0",
-        f"v_rcp_f32_e32 {vr(rc)}, {vr(a)}",
-        f"v_fma_f32 {vr(e1)}, -{vr(a)}, {vr(rc)}, 1.0",
-        f"v_fmac_f32_e32 {vr(rc)}, {vr(e1)}, {vr(rc)}",
-        f"v_mul_f32_e32 {vr(q)}, {vr(b)}, {vr(rc)}",
-        f"v_fma_f32 {vr(e2)}, -{vr(a)}, {vr(q)}, {vr(b)}",
-        f"v_fmac_f32_e32 {vr(q)}, {vr(e2)}, {vr(rc)}",
-        f"v_fma_f32 {vr(a)}, -{vr(a)}, {vr(q)}, {vr(b)}",
-        f"v_div_fmas_f32 {vr(a)}, {vr(a)}, {vr(rc)}, {vr(q)}",
-        f"v_div_fixup_f32 {vr(a)}, {vr(a)}, {vr(d)}, 1.0",
-        f"v_cmp_lt_f32_e64 {S_NEED[0]}, 0, {vr(d)}",
-        f"v_cndmask_b32_e64 {vr(inv)}, 0, {vr(a)}, {S_NEED[0]}",
-    ]
-    for dt in range(NDT):
-        for r in range(0, 8, 2):
-            o = vr(L.O(i, dt) + r, 2)
-            out.append(f"v_pk_mul_f32 {o}, {o}, {vr(inv, 2)} op_sel_hi:[1,0]")
-            out.append(
-                f"v_cvt_pk_bf16_f32 {vr(ops['o'] + 4 * dt + r // 2)}, {vr(L.O(i, dt) + r)}, "
-                f"{vr(L.O(i, dt) + r + 1)}"
+def region_final_all(L, ops):
+    """FINAL_A (scheduled): the last tile's prefix (c from the VGPR pair: the SGPRs are clobbered across
+    markers), then per q tile i: inv = d > 0 ? 1 / d : 0 (LLVM's fp32 1.0 / d, denormals on: no mode switches),
+    out = bf16(O(i) inv) into the dead K registers (K + 32 i), lse = (m + log2 d) ln 2 (LLVM's log2: v_log_f32 of
+    d scaled by 2^32 below 2^-126), and their ds_stores into the staging slot: out rows at (i < 2 ? wa : wb) +
+    (i & 1) 4 SQT + 32 dt, lse at (i < 2 ? la : lb) + (i & 1) 4 SQT. Per q tile its own scratch (12 VGPRs of the
+    dead qbuf[0]) and SGPRs, so the four overlap. ops: wa, wb, la, lb (VGPRs: the lane's staging addresses)."""
+    nodes, add = node_list()
+    add(f"s_mov_b32 {S_SEL}, 0x{SEL_LO:x}", "SALU", "sel")
+    prefix_nodes(L, add, c_sgpr=False)
+    for i in range(QT):
+        d, m = L.d[i], L.m[i]
+        # 12 scratch VGPRs of the dead qbuf[0] per q tile (inv at an even register: a pair operand)
+        a, b, rc, e1, q, e2, sh, sub, x, lg, inv = (L.qbuf[0] + 12 * i + k for k in range(11))
+        sv = lg
+        s1, s2 = S_NEED[i], S_ANY[i]
+        tag = f"fin{i}"
+        for t in (
+            f"v_div_scale_f32 {vr(a)}, null, {vr(d)}, {vr(d)}, 1.0",
+            f"v_div_scale_f32 {vr(b)}, vcc_lo, 1.0, {vr(d)}, 1.0",
+            f"v_rcp_f32_e32 {vr(rc)}, {vr(a)}",
+            f"v_fma_f32 {vr(e1)}, -{vr(a)}, {vr(rc)}, 1.0",
+            f"v_fmac_f32_e32 {vr(rc)}, {vr(e1)}, {vr(rc)}",
+            f"v_mul_f32_e32 {vr(q)}, {vr(b)}, {vr(rc)}",
+            f"v_fma_f32 {vr(e2)}, -{vr(a)}, {vr(q)}, {vr(b)}",
+            f"v_fmac_f32_e32 {vr(q)}, {vr(e2)}, {vr(rc)}",
+            f"v_fma_f32 {vr(a)}, -{vr(a)}, {vr(q)}, {vr(b)}",
+            f"v_div_fmas_f32 {vr(a)}, {vr(a)}, {vr(rc)}, {vr(q)}",
+            f"v_div_fixup_f32 {vr(a)}, {vr(a)}, {vr(d)}, 1.0",
+            f"v_cmp_lt_f32_e64 {s1}, 0, {vr(d)}",
+            f"v_cndmask_b32_e64 {vr(inv)}, 0, {vr(a)}, {s1}",
+        ):
+            add(t, "TRANS" if t.startswith("v_rcp") else "VALU", tag)
+        out = L.k + 32 * i
+        base = ops["wa"] if i < 2 else ops["wb"]
+        for dt in range(NDT):
+            for r in range(0, 8, 2):
+                o = vr(L.O(i, dt) + r, 2)
+                add(f"v_pk_mul_f32 {o}, {o}, {vr(inv, 2)} op_sel_hi:[1,0]", "VALU", tag)
+                add(
+                    f"v_cvt_pk_bf16_f32 {vr(out + 4 * dt + r // 2)}, {vr(L.O(i, dt) + r)}, {vr(L.O(i, dt) + r + 1)}",
+                    "VALU",
+                    tag,
+                )
+            add(
+                f"ds_store_b128 {vr(base)}, {vr(out + 4 * dt, 4)} offset:{(i & 1) * 4 * SQT_B + 32 * dt}",
+                "DSST",
+                tag,
             )
-    out += [  # LLVM's log2: v_log_f32 of d scaled by 2^32 below 2^-126
-        f"v_cmp_gt_f32_e64 {S_NEED[1]}, 0x800000, {vr(d)}",
-        f"v_cndmask_b32_e64 {vr(sh)}, 0, 32, {S_NEED[1]}",
-        f"v_cndmask_b32_e64 {vr(sub)}, 0, 0x42000000, {S_NEED[1]}",
-        f"v_ldexp_f32 {vr(x)}, {vr(d)}, {vr(sh)}",
-        f"v_log_f32_e32 {vr(x)}, {vr(x)}",
-        f"v_sub_f32_e32 {vr(lg)}, {vr(x)}, {vr(sub)}",
-        f"v_add_f32_e32 {vr(s)}, {vr(m)}, {vr(lg)}",
-        f"v_mul_f32_e32 {vr(ops['lse'])}, 0x{LN2:x}, {vr(s)}",
-    ]
-    return out
+        for t in (
+            f"v_cmp_gt_f32_e64 {s2}, 0x800000, {vr(d)}",
+            f"v_cndmask_b32_e64 {vr(sh)}, 0, 32, {s2}",
+            f"v_cndmask_b32_e64 {vr(sub)}, 0, 0x42000000, {s2}",
+            f"v_ldexp_f32 {vr(x)}, {vr(d)}, {vr(sh)}",
+            f"v_log_f32_e32 {vr(x)}, {vr(x)}",
+            f"v_sub_f32_e32 {vr(lg)}, {vr(x)}, {vr(sub)}",
+            f"v_add_f32_e32 {vr(sv)}, {vr(m)}, {vr(lg)}",
+            f"v_mul_f32_e32 {vr(sv)}, 0x{LN2:x}, {vr(sv)}",
+        ):
+            add(t, "TRANS" if t.startswith("v_log") else "VALU", tag)
+        lbase = ops["la"] if i < 2 else ops["lb"]
+        add(f"ds_store_b32 {vr(lbase)}, {vr(sv)} offset:{(i & 1) * 4 * SQT_B}", "DSST", tag)
+    order, _ = schedule(build_dag(nodes))
+    return [nd.text for nd in order]

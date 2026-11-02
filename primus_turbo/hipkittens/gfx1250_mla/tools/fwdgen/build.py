@@ -15,9 +15,9 @@ CPU only. Steps:
     at and above 1 + the highest VGPR the shell's code or a marker operand references;
  3. generate every region (fwdgen) and let asmkit.emit derive its s_set_vgpr_msb, expert-mode waits and hazard
     v_nops (va_vdst: LLVM's rule, but the per-class bound for a write that only an in-flight WMMA still
-    reads, as the backward's); a RESC node (O *= corr under a branch) splits a region into blocks, each
-    emitted from the joined flows of its predecessors; a re-walk of the result must find no open hazard and
-    complete parse coverage;
+    reads, as the backward's); a RESC node (O *= corr under a branch on the scc of its own, separately
+    scheduled s_cmp) splits a region into blocks, each emitted from the joined flows of its predecessors; a
+    re-walk of the result must find no open hazard and complete parse coverage;
  4. splice the regions in place of the marker bodies, raise the VGPR allocation to 1024: DIR/k_mla_fwd.s;
  5. assemble with the clang driver's own cc1as / lld commands: DIR/k_mla_fwd.hsaco (+ .notes, .objdump.s); the
     code object must hold the intended instructions (asmkit.verify_obj) and use no spills or scratch;
@@ -48,7 +48,7 @@ from asmkit import verify_obj as VO  # noqa: E402
 from asmkit.isa import coverage_errors, load_any, parse, parse_line, regs_of, sgpr_defs_uses  # noqa: E402
 
 KERNEL = "k_mla_fwd"
-MARKERS = ("INIT", "TILE_C", *(f"TILE_D{k}" for k in range(4)), *(f"FINAL_{i}" for i in range(4)))
+MARKERS = ("INIT", "TILE_C", *(f"TILE_D{k}" for k in range(4)), "FINAL_A")
 MARK = re.compile(r";\s*HKGEN\s+(\w+)\s*(.*)$")
 LABEL = re.compile(r"^[.\w$]+:")
 EXEC_RESTORE = re.compile(r"s_or_b32\s+exec_lo,\s*exec_lo|s_mov_b32\s+exec_lo,\s*-1")
@@ -59,6 +59,8 @@ ALLOWED = (
     "v_wmma_f32_16x16x32_bf16",
     "ds_load_b128",
     "ds_load_tr16_b128",
+    "ds_store_b128",  # FINAL_A: the staging stores
+    "ds_store_b32",
     "v_max3_num_f32",
     "v_max_num_f32",
     "v_permlanex16_b32",
@@ -223,6 +225,8 @@ def msb_field_map(*texts):
     fmap = M.merge_msb_maps(*(M.learn_msb_map(parse(t)) for t in texts))
     for mn in ("ds_load_b128", "ds_load_tr16_b128"):
         fmap[(mn, 0)], fmap[(mn, 1)] = {"dst"}, {"src0"}
+    for mn in ("ds_store_b128", "ds_store_b32"):  # DS (addr, data0, data1, vdst): addr in src0, data0 in src1
+        fmap[(mn, 0)], fmap[(mn, 1)] = {"src0"}, {"src1"}
     for p, f in ((0, "dst"), (2, "src0"), (3, "src1"), (4, "src2")):  # operand 1: the scalar carry-out
         fmap[("v_div_scale_f32", p)] = {f}
     return fmap
@@ -368,15 +372,13 @@ def main():
             if name.startswith("TILE_D"):
                 k, o["dl"] = int(name[-1]), vfirst(ops["dl"])
             texts, cycles[name] = G.region_tile(L, o, k)
-        else:
-            if vcount(ops["o"]) != 32 or vcount(ops["lse"]) != 1:
-                raise RuntimeError(f"{name}: unexpected output operands {ops}")
-            texts = G.region_final(L, {"o": vfirst(ops["o"]), "lse": vfirst(ops["lse"])}, int(name[-1]))
+        else:  # FINAL_A
+            texts = G.region_final_all(L, {k: vfirst(ops[k]) for k in ("wa", "wb", "la", "lb")})
             # WMMAs of the preceding region may still be in flight: retire every VALU, then the WMMA -> VALU
             # wait states
             pre = ["\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"] + ["\tv_nop"] * 4
-            # the shell's LDS stores read the outputs, and LLVM puts no va_vdst wait after an inline-asm def
-            post = ["\ts_wait_alu depctr_va_vdst(0)"]
+            # the shell reads the staging back and rewrites the address VGPRs: every LDS op done, sources read
+            post = ["\ts_wait_dscnt 0x0", "\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"]
         msb_defaults(fmap, [x for x in texts if not x.startswith("HKRESC")] + G.resc_lines(L, 0))
         lines, open_ = emit_region(texts, fmap, scalars, L)
         if open_:
@@ -428,13 +430,13 @@ def writeback_check(objdump, fail):
     exactly one phase, and in it:
       * no other VMEM / FLAT op, no EXEC / M0 write, no s_set_vgpr_msb (the shell's code references VGPRs
         below 256 only and never switches the MSB mode, so one here would mean a generated region inside the
-        phase, which must come after the last FINAL region);
+        phase, which must come after FINAL_A);
       * no write of a register an earlier store of the phase reads (data, address VGPR, resource / offset
         SGPRs) unless an s_wait_xcnt N has retired that store (XCNT retires in order: at most N younger
         stores are pending); `early_waits` counts the writes other than data reloads (ds_load) that needed
         such a wait;
-      * between the last s_barrier_wait before the phase and its first store, every ds_store (the staging of
-        the FINAL outputs) precedes every ds_load (their read-back).
+      * between the last s_barrier_wait before the phase and its first store, every ds_store (FINAL_A's
+        staging of the outputs) precedes every ds_load (their read-back).
     Returns per-phase statistics; failures go to `fail`."""
     _, ins, _ = load_any(objdump)
     seq = [x for x in ins if x.mn and x.cls not in ("LABEL", "DIR")]
@@ -509,11 +511,12 @@ def writeback_check(objdump, fail):
 
 def contract_checks(spl, objdump, markers, L, fail):
     """The generated regions on the code object's listing (found by instruction ordinal in the intended .s):
-    only ALLOWED mnemonics; VGPR writes only in the generated range (L.all_regs) or the FINAL outputs; scalar
-    writes only in G.CLOBBERED; LDS reads only at the marker bases plus 16-byte aligned offsets inside the
-    layout; one s_barrier_signal per TILE region and no LDS read after it (the next block's Q TDM, issued
-    right after the block's last barrier, overwrites the whole Q staging area); MSB mode 0 at every region
-    end. Returns per-region statistics; failures go to `fail`."""
+    only ALLOWED mnemonics; VGPR writes only in the generated range (L.all_regs); scalar writes only in
+    G.CLOBBERED; LDS reads only at the marker bases plus 16-byte aligned offsets inside the layout; LDS writes
+    only in FINAL_A, at its staging bases plus 16-byte aligned offsets inside the staging slots; one
+    s_barrier_signal per TILE region and no LDS read after it (the next block's Q TDM, issued right after the
+    block's last barrier, overwrites the whole Q staging area); MSB mode 0 at every region end. Returns
+    per-region statistics; failures go to `fail`."""
     s_lines = spl.read_text().split("\n")
     mnre = re.compile(r"^[a-z][a-z0-9_]*(::[a-z][a-z0-9_]*)?$")
 
@@ -538,16 +541,12 @@ def contract_checks(spl, objdump, markers, L, fail):
     _, o_ins, _ = load_any(objdump)
     seq = [x for x in o_ins if counted(x)]
     ops_of = {m[0]: m[1] for m in markers}
-    out_regs = {
-        name: set(range(vfirst(ops["o"]), vfirst(ops["o"]) + 32)) | {vfirst(ops["lse"])}
-        for name, ops in ops_of.items()
-        if name.startswith("FINAL")
-    }
     gen_regs = L.all_regs()
-    # the largest LDS offsets of the layout: Q (from qa / qb), K (kb), V^T (vb)
+    # the largest LDS offsets of the layout: Q (from qa / qb), K (kb), V^T (vb), FINAL_A's staging stores
     q_lim = G.QOFF1 + (G.NKS - 1) * 64 + 32
     k_lim = (G.NKV - 1) * 16 * G.XK + (G.NKS - 1) * 64 + 32
     v_lim = 48 * G.XV + (G.NDT - 1) * 32
+    st_lim = 4 * G.SQT_B + (G.NDT - 1) * 32
     stats, msb_mode = {}, {}
     for k, x in enumerate(seq):
         name = region_of.get(k)
@@ -560,7 +559,7 @@ def contract_checks(spl, objdump, markers, L, fail):
             fail.append(f"{name}: instruction outside the whitelist: {x.text.strip()}")
         if mn == "s_set_vgpr_msb":
             msb_mode[name] = int(x.ops[0], 0) & 0xFF
-        if set(x.defs) - gen_regs - out_regs.get(name, set()):
+        if set(x.defs) - gen_regs:
             fail.append(f"{name}: writes VGPRs outside the generated range: {x.text.strip()}")
         sd, _ = sgpr_defs_uses(x)
         if set(sd) - G.CLOBBERED:
@@ -569,15 +568,26 @@ def contract_checks(spl, objdump, markers, L, fail):
             st["ds"] += 1
             if st["signal"]:
                 st["ds_after_signal"] += 1
-            ok_base = {L.qa, L.qb}
-            if name.startswith("TILE"):
-                ok_base |= {vfirst(ops_of[name]["kb"]), vfirst(ops_of[name]["vb"])}
-            if not set(x.uses) <= ok_base:
-                fail.append(f"{name}: LDS read from an unexpected base: {x.text.strip()}")
+            store = x.mn.startswith("ds_store")
+            if name == "FINAL_A":  # the staging stores only
+                ok_base = {vfirst(ops_of[name][k]) for k in ("wa", "wb", "la", "lb")}
+                if not store:
+                    fail.append(f"{name}: an LDS op other than the staging stores: {x.text.strip()}")
+            else:
+                ok_base = {L.qa, L.qb}
+                if name.startswith("TILE"):
+                    ok_base |= {vfirst(ops_of[name]["kb"]), vfirst(ops_of[name]["vb"])}
+                if store:
+                    fail.append(f"{name}: an LDS store outside FINAL_A: {x.text.strip()}")
+            if not (set(x.uses[:1]) if store else set(x.uses)) <= ok_base:  # a store's base: its address VGPR
+                fail.append(f"{name}: LDS access from an unexpected base: {x.text.strip()}")
             mo = re.search(r"offset:(\d+)", x.text)
             off = int(mo.group(1)) if mo else 0
             b = x.uses[0] if x.uses else None
-            lim = q_lim if b in (L.qa, L.qb) else (v_lim if x.mn == "ds_load_tr16_b128" else k_lim)
+            if store:
+                lim = st_lim
+            else:
+                lim = q_lim if b in (L.qa, L.qb) else (v_lim if x.mn == "ds_load_tr16_b128" else k_lim)
             if off > lim or off % 16:
                 fail.append(f"{name}: LDS offset {off} out of the layout: {x.text.strip()}")
         if x.mn == "s_barrier_signal":

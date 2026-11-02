@@ -30,7 +30,7 @@ reason (not under torch.compile, which cannot trace a log call). A call must pas
 
 | pass | kernel | work |
 |---|---|---|
-| forward | `k_mla_fwd` | 256-query workgroups (4 waves, one per SIMD) over a 4-stage TDM ring of 64-row K / V tiles; QK, online softmax, PV per tile, the diagonal tiles specialized. One q block per workgroup, longest first; or, when its static schedule covers the shape, one persistent workgroup per CU (`fwd.persistent_workgroups`) |
+| forward | `k_mla_fwd` | 256-query workgroups (4 waves, one per SIMD) over a 4-stage TDM ring of 64-row K / V tiles; QK, online softmax, PV per tile, the diagonal tiles specialized; out / lse of the block's 4 q tiles computed and staged by one scheduled region. One q block per workgroup, longest first; or, when its static schedule covers the shape, one persistent workgroup per CU (`fwd.persistent_workgroups`), whose ring runs on across its blocks: the last three tiles of a block load the next block's first three |
 | backward | `k_delta` | delta = rowsum(dO * O) and the row constants of the dK / dV kernel: NL = -log2(e) * lse + log2(scale), ND = -delta |
 | backward | `k_dkdv96ds` | dK, dV over 96-row kv blocks (two 48-row waves on a 3-stage Q / dO TDM ring), then 64-row tail blocks; stores every bf16 dS^T tile it feeds the dK WMMA into the dS scratch; workgroups take their blocks from a ticket counter (zeroed on the host before each launch), longest first |
 | backward | `k_dqds_c` | dQ = dS K from that scratch: 384-query workgroups (4 waves sharing one K ring) plus one merged 256-query head tile |
@@ -127,9 +127,11 @@ calls (with the L2 flushed before every call: within 1%):
 
 | | FlyDSL (ms) | HIP (ms) | speedup |
 |---|---|---|---|
-| forward | 0.794 | 0.777 | 1.02x |
-| backward | 3.493 | 2.281 | 1.53x |
-| forward + backward (autograd) | 4.302 | 3.082 | 1.40x |
+| forward | 0.796 | 0.740 | 1.08x |
+| backward | 3.502 | 2.291 | 1.53x |
+| forward + backward (autograd) | 4.329 | 3.074 | 1.41x |
 
-HIP backward per launch: `k_delta` 0.058, ticket fill 0.005, `k_dkdv96ds` 1.609, `k_dqds_c` 0.493 ms. The kernels are
-power-capped at this shape: a saved cycle converts to about a third of a cycle of time.
+HIP backward per launch: `k_delta` 0.057, ticket fill 0.006, `k_dkdv96ds` 1.608, `k_dqds_c` 0.500 ms. The kernels are
+power-capped at this shape: a saved cycle converts to about a third of a cycle of time. With 20 ms of idle GPU before
+every call (the clocks of a training step), the forward takes 0.652 ms against FlyDSL's 0.711 and the backward 1.891
+against 3.221.
