@@ -15,7 +15,7 @@ from typing import Any, Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from ._compat import EventHandle
+from primus_turbo.pytorch._C.deep_ep import EventHandle
 
 
 class EventOverlap:
