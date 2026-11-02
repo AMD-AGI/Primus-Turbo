@@ -39,6 +39,11 @@ _GFX1250_ENABLED_TESTS = (
     # from the suite above because most of it is host-only: it checks that the published
     # shape gates and the entry points cannot disagree, which needs no GPU.
     "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_shapes.py",
+    # The shape key table of the same kernel: which shapes get the tuned persistent-cluster
+    # stack, what the cluster and head_pipe gates refuse, and what a caller who switches the
+    # stack off is left with. Mostly host-only as well; its numeric cases are the DeepSeek-V3
+    # delivery shapes, which are the only shapes in this suite that take the keyed path.
+    "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_keys.py",
     # FlyDSL attention at the DeepSeek-V3 MLA head dims (primus_turbo/flydsl/attention/gfx1250_mla).
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla.py",
     # Dense FlyDSL attention (primus_turbo/flydsl/attention/gfx1250), bf16 head_dim 128.
