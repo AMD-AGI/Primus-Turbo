@@ -127,11 +127,13 @@ calls (with the L2 flushed before every call: within 1%):
 
 | | FlyDSL (ms) | HIP (ms) | speedup |
 |---|---|---|---|
-| forward | 0.796 | 0.740 | 1.08x |
-| backward | 3.502 | 2.291 | 1.53x |
-| forward + backward (autograd) | 4.329 | 3.074 | 1.41x |
+| forward | 0.794 | 0.728 | 1.09x |
+| backward | 3.498 | 2.288 | 1.53x |
+| forward + backward (autograd) | 4.326 | 3.045 | 1.42x |
 
-HIP backward per launch: `k_delta` 0.057, ticket fill 0.006, `k_dkdv96ds` 1.608, `k_dqds_c` 0.500 ms. The kernels are
+HIP backward per launch: `k_delta` 0.055, ticket fill 0.006, `k_dkdv96ds` 1.597, `k_dqds_c` 0.496 ms. The kernels are
 power-capped at this shape: a saved cycle converts to about a third of a cycle of time. With 20 ms of idle GPU before
-every call (the clocks of a training step), the forward takes 0.652 ms against FlyDSL's 0.711 and the backward 1.891
-against 3.221.
+every call (the clocks of a training step), the forward takes 0.633 ms against FlyDSL's 0.708 and the backward 1.891
+against 3.221. The FlyDSL forward here is this package's persistent one; against the forward of Primus-Turbo main
+(ff4898e4) in the same process the HIP forward runs 1.15x (0.729 vs 0.842 ms, L2 flushed before every call) and 1.20x
+(0.640 vs 0.765 ms, 20 ms idle before every call).

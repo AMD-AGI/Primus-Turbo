@@ -21,9 +21,9 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "hsaco_sha256": "208c5989852dfbf71c898f22cb1473ad4d98bc9aa104f0dc3977730359394e75",
+      "hsaco_sha256": "0c795a7d48b9c578c7ecaed8b2341088f1125732395981a6b8c0842a4c5b8f5f",
       "asm_patch": "asm/k_mla_fwd.s.patch",
-      "asm_input_sha256": "5a2da96e19897c4ed99b03be6183c76340b9003492316a00c7739c475bc46f48",
+      "asm_input_sha256": "2bb5492039a87de3074268eec12d448beaaa955bf00ccd7b4e824d40600fa7ef",
       "block": 128,
       "kernarg_size": 68,
       "lds": 310272,

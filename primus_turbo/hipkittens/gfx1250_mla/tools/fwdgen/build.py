@@ -15,9 +15,9 @@ CPU only. Steps:
     at and above 1 + the highest VGPR the shell's code or a marker operand references;
  3. generate every region (fwdgen) and let asmkit.emit derive its s_set_vgpr_msb, expert-mode waits and hazard
     v_nops (va_vdst: LLVM's rule, but the per-class bound for a write that only an in-flight WMMA still
-    reads, as the backward's); a RESC node (O *= corr under a branch on the scc of its own, separately
-    scheduled s_cmp) splits a region into blocks, each emitted from the joined flows of its predecessors; a
-    re-walk of the result must find no open hazard and complete parse coverage;
+    reads, as the backward's); a RESC node (O *= corr of one q tile or a q-tile pair under a branch on the scc
+    of its own, separately scheduled s_cmp / s_or) splits a region into blocks, each emitted from the joined
+    flows of its predecessors; a re-walk of the result must find no open hazard and complete parse coverage;
  4. splice the regions in place of the marker bodies, raise the VGPR allocation to 1024: DIR/k_mla_fwd.s;
  5. assemble with the clang driver's own cc1as / lld commands: DIR/k_mla_fwd.hsaco (+ .notes, .objdump.s); the
     code object must hold the intended instructions (asmkit.verify_obj) and use no spills or scratch;
@@ -48,18 +48,19 @@ from asmkit import verify_obj as VO  # noqa: E402
 from asmkit.isa import coverage_errors, load_any, parse, parse_line, regs_of, sgpr_defs_uses  # noqa: E402
 
 KERNEL = "k_mla_fwd"
-MARKERS = ("INIT", "TILE_C", *(f"TILE_D{k}" for k in range(4)), "FINAL_A")
+MARKERS = ("INIT", "TILE_C", *(f"TILE_D{k}" for k in range(4)), "FINAL_A", "FINAL_A3")
 MARK = re.compile(r";\s*HKGEN\s+(\w+)\s*(.*)$")
 LABEL = re.compile(r"^[.\w$]+:")
 EXEC_RESTORE = re.compile(r"s_or_b32\s+exec_lo,\s*exec_lo|s_mov_b32\s+exec_lo,\s*-1")
 EXEC_NARROW = re.compile(r"v_cmpx_|s_and_saveexec|s_and(n2)?_b32\s+exec_lo|s_mov_b32\s+exec_lo")
 EXEC_M0 = {"exec", "exec_lo", "exec_hi", "m0"}
-# the mnemonics generated code may contain (prefixes; no global / buffer / flat / scratch / SMEM / TDM access)
+# the mnemonics generated code may contain (prefixes; no global / buffer / flat / scratch / SMEM access; TDM only for
+# TILE_C's ring slot)
 ALLOWED = (
     "v_wmma_f32_16x16x32_bf16",
     "ds_load_b128",
     "ds_load_tr16_b128",
-    "ds_store_b128",  # FINAL_A: the staging stores
+    "ds_store_b128",  # FINAL_A / FINAL_A3: the staging stores
     "ds_store_b32",
     "v_max3_num_f32",
     "v_max_num_f32",
@@ -89,6 +90,14 @@ ALLOWED = (
     "s_mov_b32",
     "s_cmp_lg_u32",
     "s_cselect_b32",
+    "s_or_b32",  # a q-tile pair's RESC branch condition
+    "tensor_load_to_lds",  # TILE_C: its ring slot, and the descriptors' advance
+    "s_lshl_b64",
+    "s_cmp_lt_i32",
+    "s_cselect_b64",
+    "s_add_nc_u64",
+    "s_cmp_eq_u32",
+    "s_add_co_i32",
     "s_cbranch_scc0",
     "s_barrier_signal",
     "s_wait_dscnt",
@@ -242,10 +251,11 @@ def msb_defaults(fmap, texts):
 
 
 def xcnt_entry(scalars):
-    """XCNT state at a region entry: known, holding every scalar register the shell's code references. The
-    regions issue no VMEM / FLAT / TDM op, so the memory ops in flight at a region entry are the shell's and
-    their scalar sources are among these registers; the emitter waits for XCNT before a region write to any of
-    them. The SGPRs the regions write, s90..s103, are not among them (clobber_check)."""
+    """XCNT state at a region entry: known, holding every scalar register the shell's code references. The memory
+    ops in flight at a region entry are the shell's (TILE_C's own TDM ops are tracked by the emitter from their
+    issue) and their scalar sources are among these registers; the emitter waits for XCNT before a region write
+    to any of them. The SGPRs the regions write are s90..s103 (not among them: clobber_check) and TILE_C's
+    descriptor quads (in-out operands of its marker)."""
     xs = M.XState(False)
     xs.regs = set(scalars)
     return xs
@@ -371,9 +381,12 @@ def main():
             k = None
             if name.startswith("TILE_D"):
                 k, o["dl"] = int(name[-1]), vfirst(ops["dl"])
+            else:  # TILE_C: its ring slot's descriptors and the advance's scalars
+                o.update({x: ops[x] for x in ("qk", "qb", "qv", "g1a", "g1b", "g1v", "t", "n4", "l3")})
             texts, cycles[name] = G.region_tile(L, o, k)
-        else:  # FINAL_A
-            texts = G.region_final_all(L, {k: vfirst(ops[k]) for k in ("wa", "wb", "la", "lb")})
+        else:  # FINAL_A, FINAL_A3
+            texts = G.region_final_all(L, {k: vfirst(ops[k]) for k in ("wa", "wb", "la", "lb")},
+                                       skip=3 if name == "FINAL_A3" else 0)
             # WMMAs of the preceding region may still be in flight: retire every VALU, then the WMMA -> VALU
             # wait states
             pre = ["\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"] + ["\tv_nop"] * 4
@@ -430,13 +443,13 @@ def writeback_check(objdump, fail):
     exactly one phase, and in it:
       * no other VMEM / FLAT op, no EXEC / M0 write, no s_set_vgpr_msb (the shell's code references VGPRs
         below 256 only and never switches the MSB mode, so one here would mean a generated region inside the
-        phase, which must come after FINAL_A);
+        phase, which must come after FINAL_A / FINAL_A3);
       * no write of a register an earlier store of the phase reads (data, address VGPR, resource / offset
         SGPRs) unless an s_wait_xcnt N has retired that store (XCNT retires in order: at most N younger
         stores are pending); `early_waits` counts the writes other than data reloads (ds_load) that needed
         such a wait;
-      * between the last s_barrier_wait before the phase and its first store, every ds_store (FINAL_A's
-        staging of the outputs) precedes every ds_load (their read-back).
+      * between the last s_barrier_wait before the phase and its first store, every ds_store (FINAL_A's or
+        FINAL_A3's staging of the outputs) precedes every ds_load (their read-back).
     Returns per-phase statistics; failures go to `fail`."""
     _, ins, _ = load_any(objdump)
     seq = [x for x in ins if x.mn and x.cls not in ("LABEL", "DIR")]
@@ -512,11 +525,11 @@ def writeback_check(objdump, fail):
 def contract_checks(spl, objdump, markers, L, fail):
     """The generated regions on the code object's listing (found by instruction ordinal in the intended .s):
     only ALLOWED mnemonics; VGPR writes only in the generated range (L.all_regs); scalar writes only in
-    G.CLOBBERED; LDS reads only at the marker bases plus 16-byte aligned offsets inside the layout; LDS writes
-    only in FINAL_A, at its staging bases plus 16-byte aligned offsets inside the staging slots; one
-    s_barrier_signal per TILE region and no LDS read after it (the next block's Q TDM, issued right after the
-    block's last barrier, overwrites the whole Q staging area); MSB mode 0 at every region end. Returns
-    per-region statistics; failures go to `fail`."""
+    G.CLOBBERED (and TILE_C's descriptor quads); LDS reads only at the marker bases plus 16-byte aligned offsets
+    inside the layout; LDS writes only in FINAL_A / FINAL_A3, at their staging bases plus 16-byte aligned offsets
+    inside the staging slots; one s_barrier_signal per TILE region and no LDS read after it (the next block's Q
+    TDM, issued right after the block's last barrier, overwrites the whole Q staging area); MSB mode 0 at every
+    region end. Returns per-region statistics; failures go to `fail`."""
     s_lines = spl.read_text().split("\n")
     mnre = re.compile(r"^[a-z][a-z0-9_]*(::[a-z][a-z0-9_]*)?$")
 
@@ -562,14 +575,17 @@ def contract_checks(spl, objdump, markers, L, fail):
         if set(x.defs) - gen_regs:
             fail.append(f"{name}: writes VGPRs outside the generated range: {x.text.strip()}")
         sd, _ = sgpr_defs_uses(x)
-        if set(sd) - G.CLOBBERED:
+        s_ok = G.CLOBBERED
+        if name == "TILE_C":  # and its in-out descriptor quads
+            s_ok = s_ok | {f"s{G._sbase(ops_of[name][q]) + j}" for q in ("qk", "qb", "qv") for j in range(4)}
+        if set(sd) - s_ok:
             fail.append(f"{name}: writes scalars outside the clobbered set: {sd} {x.text.strip()}")
         if x.mn.startswith("ds_"):
             st["ds"] += 1
             if st["signal"]:
                 st["ds_after_signal"] += 1
             store = x.mn.startswith("ds_store")
-            if name == "FINAL_A":  # the staging stores only
+            if name in ("FINAL_A", "FINAL_A3"):  # the staging stores only
                 ok_base = {vfirst(ops_of[name][k]) for k in ("wa", "wb", "la", "lb")}
                 if not store:
                     fail.append(f"{name}: an LDS op other than the staging stores: {x.text.strip()}")
@@ -578,7 +594,7 @@ def contract_checks(spl, objdump, markers, L, fail):
                 if name.startswith("TILE"):
                     ok_base |= {vfirst(ops_of[name]["kb"]), vfirst(ops_of[name]["vb"])}
                 if store:
-                    fail.append(f"{name}: an LDS store outside FINAL_A: {x.text.strip()}")
+                    fail.append(f"{name}: an LDS store outside FINAL_A / FINAL_A3: {x.text.strip()}")
             if not (set(x.uses[:1]) if store else set(x.uses)) <= ok_base:  # a store's base: its address VGPR
                 fail.append(f"{name}: LDS access from an unexpected base: {x.text.strip()}")
             mo = re.search(r"offset:(\d+)", x.text)

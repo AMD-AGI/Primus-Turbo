@@ -12,11 +12,12 @@ every region:
 
   INIT     once per q block: m = fp32(-1e30), d = 0, O = 0, the (c, c) pair, copies of the Q fragment bases,
            the resident Q fragments of q tiles 1, 2 and the state that makes the first tile's prefix a no-op
-  TILE_C   a 64-kv tile below the diagonal (no mask)
+  TILE_C   a 64-kv tile below the diagonal (no mask); it also issues ring slot t + 3, tile t + 3's TDM ops (tdm_nodes)
   TILE_Dk  diagonal tile k = 0..3 (Sq == Skv): q tiles below k skipped, the causal mask on q tile k only
   FINAL_A  the prefix of the last tile, then per q tile i: inv = d > 0 ? 1 / d : 0 (LLVM's IEEE division
            sequence), out = bf16(O inv), lse = (m + log2 d) ln 2 (LLVM's log2 expansion), and their ds_stores
            into this wave's staging slots; one schedule, so the four q tiles' math and stores overlap
+  FINAL_A3 FINAL_A after TILE_D3, whose prefix skips q tiles 0..2 (see below)
 
 A wave owns four 16-row q tiles; c = scale log2 e. The math is FlyDSL's forward, op for op: the QK WMMA chains
 over k-steps 0..5 from +0; [mask: s = -inf where kv > q]; lm = max over the lane's 32 values (any tree: max is
@@ -34,12 +35,17 @@ with their sum tree, and only the mask of q tiles 2, 3. The K / Q(0) reads issue
 land while the prefix's 64 WMMAs and its softmax run, and the softmax VALU spreads over the whole region.
 Every q tile keeps its sequence of operations: the pipelining changes no result bit. A body that skips q
 tile i leaves the next prefix a no-op for it, as INIT does for the first prefix: P(i) = 0 for i < 2,
-S(i) = -inf for i >= 2 (corr = 1, p = +0, d = fma(1, d, +0), O += V * 0).
+S(i) = -inf for i >= 2 (corr = 1, p = +0, d = fma(1, d, +0), O += V * 0). The prefix after a diagonal tile
+leaves out what is a no-op there: TILE_D2's prefix the PVs of q tile 0 (skipped by TILE_D1), TILE_D3's those of
+q tiles 0, 1, FINAL_A3's (the region after TILE_D3) those of q tiles 0..2 and the softmax of q tile 2. A block
+ending before TILE_D3 ends with the full FINAL_A, so TILE_D1 / D2 still zero the P of the q tile they skip.
 
-O *= corr runs only when m moved: per q tile a wave-uniform branch (s_cmp + s_cbranch over its 32 v_pk_mul, as
-FlyDSL's _rescale_if); corr is exactly 1 otherwise and x * 1.0 is x, so no result bit changes. The s_cmp is a
-node of its own, so the scheduler can issue it ahead of the branch; the branch and the conditional block are one
-node (RESC), and build.py splits the region there into blocks.
+O *= corr runs only when m moved, under a wave-uniform branch per q-tile pair -- (2, 3) in the prefix, (0, 1) in
+the body -- taken when either q tile's m moved (FlyDSL's _rescale_if per q tile; the other one's corr is then
+exactly 1, and x * 1.0 is x): no result bit changes. The pair's s_or_b32 sets scc, the scheduler may issue it
+ahead of the branch; the branch and the conditional block are one node (RESC), and build.py splits the region
+there into blocks. A q tile without its pair partner in a region (q tile 1 in TILE_D1's body, q tile 3 in
+FINAL_A3's prefix) has a branch of its own.
 
 Program order (the order of the node lists) is the semantics: the scheduler reorders only along the dependence
 graph (RAW / WAR / WAW on every VGPR, SGPR, scc, vcc) and the added order edges. The output is real
@@ -73,12 +79,14 @@ DS_MAX = 63  # LDS loads in flight at most (the dscnt field is 6 bits)
 WORDER = ("PV0p", "PV1p", "PV2p", "PV3p", "QK0", "QK1", "QK2", "QK3")  # the in-order WMMA stream, by node tag
 # latency of a dependence edge by producer kind (it ranks nodes by critical path), and result latency by kind
 # in the issue model (WMMA 32 and VALU 8: the values that scheduled the TILE regions best on MI455X)
-LAT = {"WMMA": 32, "VALU": 8, "TRANS": 8, "PERM": 8, "DS": DS_LAT, "SALU": 2, "RESC": 2, "DSST": 1}
-SLOT_LAT = {"WMMA": 32, "VALU": 8, "TRANS": 8, "PERM": 6, "SALU": 2, "RESC": 2, "DSST": 1}
+LAT = {"WMMA": 32, "VALU": 8, "TRANS": 8, "PERM": 8, "DS": DS_LAT, "SALU": 2, "RESC": 2, "TDM": 2, "DSST": 1}
+SLOT_LAT = {"WMMA": 32, "VALU": 8, "TRANS": 8, "PERM": 6, "SALU": 2, "RESC": 2, "TDM": 2, "DSST": 1}
 RESC_COST = 6  # modelled cycles of a RESC node (its s_cbranch over the block) when the branch skips it
 BR_LAT = 9  # a RESC node's s_cmp -> s_cbranch (ATT: 9 cycles; a taken branch costs ~25 more)
 SGPR_LAT = 20  # a VALU-written SGPR to a SALU / RESC reader (ATT: v_cmp_lt sX -> s_cmp_lg sX ~20 cycles)
+TDM_SLAT = 10  # a SALU-written SGPR to a TDM op reading it (ATT: ~9 cycles)
 SQT_B = 4480  # k_mla_fwd.hip SQT: the staging slot bytes per wave and q tile
+STG_B = 43008  # k_mla_fwd.hip STG_B: the bytes of a ring stage
 
 
 def vr(r, n=1):
@@ -236,11 +244,18 @@ def _split_ops(s):
 
 def mk(text, kind, tag=""):
     """A node with the registers its text defines and uses. Covers the forms the regions schedule: ds_load
-    (vdst, vaddr), ds_store (vaddr, data), s_mov / s_cmp / s_cselect, v_cmp_*_e64 with an SGPR destination,
-    v_div_scale (vdst, sdst vcc or null), v_div_fmas (reads vcc), and VALU / WMMA ops whose first operand is
-    their only destination and that read no implicit operand."""
+    (vdst, vaddr), ds_store (vaddr, data), s_mov / s_cmp / s_cselect, tensor_load_to_lds (reads its two
+    descriptor groups), other SALU (first operand the destination, scc written unless the op is known not to),
+    v_cmp_*_e64 with an SGPR destination, v_div_scale (vdst, sdst vcc or null), v_div_fmas (reads vcc), and
+    VALU / WMMA ops whose first operand is their only destination and that read no implicit operand."""
     n = Node(text, kind, tag)
     if kind == "BAR":
+        return n
+    if kind == "RESC" and text.startswith("HKRESC2"):  # "HKRESC2 a b oa ob corra corrb scc": O(a), O(b), one branch
+        _, _, _, oa, ob, ca, cb, sany = text.split()
+        n.vdefs = set(range(int(oa), int(oa) + 64)) | set(range(int(ob), int(ob) + 64))
+        n.vuses = n.vdefs | {int(ca), int(cb)}
+        n.suses = {sany}
         return n
     if kind == "RESC":  # "HKRESC i o corr sany": the block O(i) *= corr(i) under S_ANY[i]
         _, _, o, corr, sany = text.split()
@@ -257,9 +272,16 @@ def mk(text, kind, tag=""):
     elif mn.startswith("s_cmp"):
         n.sdefs, n.suses = {"scc"}, set(_sregs(ops[0])) | set(_sregs(ops[1]))
     elif mn.startswith("s_cselect"):
-        n.sdefs, n.suses = set(_sregs(ops[0])), {"scc"}
+        n.sdefs, n.suses = set(_sregs(ops[0])), {"scc"} | {r for o in ops[1:] for r in _sregs(o)}
     elif mn.startswith("s_mov"):
         n.sdefs, n.suses = set(_sregs(ops[0])), set(_sregs(ops[1]))
+    elif mn.startswith("tensor_load_to_lds"):
+        n.suses = set(_sregs(ops[0])) | set(_sregs(ops[1]))
+    elif mn.startswith("s_"):  # other SALU: the first operand is the destination; scc unless it is known not to
+        n.sdefs = set(_sregs(ops[0]))
+        if not mn.startswith(("s_mul_i32", "s_add_nc_u64", "s_bitset1_b32")):
+            n.sdefs.add("scc")
+        n.suses = {r for o in ops[1:] for r in _sregs(o)}
     elif mn.startswith("v_div_scale"):  # vdst, sdst (vcc_lo or null), sources
         n.vdefs = set(_vregs(ops[0]))
         n.sdefs = {"vcc"} if "vcc" in ops[1] else set()
@@ -285,7 +307,8 @@ def _key(r):
 
 def build_dag(nodes):
     """RAW (producer latency; SGPR_LAT for a VALU-written SGPR read by SALU / RESC, BR_LAT for the scc of a
-    RESC node's s_cmp), WAR / WAW (latency 1) edges in list order: node.preds = [(index, latency)]."""
+    RESC node's s_cmp, at least TDM_SLAT for a SALU-written SGPR read by a TDM op), WAR / WAW (latency 1) edges
+    in list order: node.preds = [(index, latency)]."""
     last_w, readers = {}, {}
     for i, n in enumerate(nodes):
         n.idx = i
@@ -305,6 +328,8 @@ def build_dag(nodes):
                     lat = SGPR_LAT
                 if r == "scc" and pk == "SALU" and n.kind == "RESC":
                     lat = BR_LAT
+                if n.kind == "TDM" and pk == "SALU":
+                    lat = max(lat, TDM_SLAT)
                 preds[p] = max(preds.get(p, 0), lat)
         for r in list(n.vdefs) + list(n.sdefs):
             k = _key(r)
@@ -352,8 +377,8 @@ def schedule(nodes):
     WMMAs issue in WORDER (program order within a tag), one per 8 cycles at most (XDL occupancy). Within 8
     cycles of a WMMA, a VALU / TRANS issues only at offsets 2, 3, 6, 7 and v_permlanex16 only at 8; other
     nodes issue at any offset but 0. A TRANS blocks VALU / TRANS / permlane the next cycle; a permlane takes 2
-    cycles and goes before a ready WMMA (else a dense WMMA stream starves it); one SALU issues per 2 cycles; a
-    RESC block (its s_cmp + s_cbranch) blocks the wave for RESC_COST cycles.
+    cycles and goes before a ready WMMA (else a dense WMMA stream starves it); one SALU or TDM op issues per 2
+    cycles; a RESC block (its s_cmp + s_cbranch) blocks the wave for RESC_COST cycles.
     LDS loads issue one per DS_RATE cycles and complete in order DS_LAT cycles after issue, at most DS_MAX in
     flight (not yet complete; a consumer of a load retires it and every older one, the arrive
     (s_barrier_signal behind s_wait_dscnt 0) retires all). Other results are ready SLOT_LAT cycles after
@@ -398,8 +423,8 @@ def schedule(nodes):
         if k == "DS":  # loads in flight: neither retired by a consumer nor complete in the model
             inflight = sum(1 for p in issued_ds[retired_ds:] if ds_done[p] > t)
             return o != 0 and t >= ds_next and inflight < DS_MAX
-        if k in ("SALU", "RESC"):
-            return o != 0 and t >= salu_free and (k == "SALU" or t > perm_busy)
+        if k in ("SALU", "RESC", "TDM"):
+            return o != 0 and t >= salu_free and (k != "RESC" or t > perm_busy)
         return o != 0
 
     while done < n:
@@ -449,7 +474,7 @@ def schedule(nodes):
             trans_at = t
         elif k == "PERM":
             perm_busy = t + 1
-        elif k == "SALU":
+        elif k in ("SALU", "TDM"):
             salu_free = t + 2
         elif k == "RESC":  # s_cmp + s_cbranch: the wave issues nothing else meanwhile
             salu_free = t + RESC_COST
@@ -546,9 +571,10 @@ def mask_nodes(L, i, dl, add):
             add(f"v_cndmask_b32_e64 {s}, {s}, 0x{NEG_INF:x}, {sm}", "VALU", f"mask{i}")
 
 
-def softmax_nodes(L, i, add, c_sgpr):
+def softmax_nodes(L, i, add, c_sgpr, resc=True):
     """The softmax of q tile i up to P and O *= corr: scores in S(i), p into the leaves PR(i). c from the SGPR
-    pair S_C (c_sgpr: the packed fma then has two VGPR sources, not three) or from the VGPR pair L.cc."""
+    pair S_C (c_sgpr: the packed fma then has two VGPR sources, not three) or from the VGPR pair L.cc. resc
+    False: no branch of q tile i's own (resc_pair_nodes covers it)."""
     S = [[L.S(i, j) + e for e in range(8)] for j in range(NKV)]
     sc = L.sm[i % 2]
     # row max over the lane's 32 values (exact; any tree): 32 -> 11 -> 4 -> 2 -> 1 in scratch sc[0..10]
@@ -600,6 +626,8 @@ def softmax_nodes(L, i, add, c_sgpr):
             j, e = 2 * kt + r // 4, 2 * (r % 4)
             lo, hi = L.PR(i, 8 * j + e), L.PR(i, 8 * j + e + 1)
             add(f"v_cvt_pk_bf16_f32 {vr(L.P(i, kt) + r)}, {vr(lo)}, {vr(hi)}", "VALU", f"cvt{i}")
+    if not resc:
+        return
     # O *= corr under a wave-uniform branch: the s_cmp is a node of its own (the scheduler may issue it ahead of
     # the branch), the branch and the block one node (RESC, reading its scc; build.py expands it with resc_block)
     add(f"s_cmp_lg_u32 {S_ANY[i]}, 0", "SALU", f"resc{i}")
@@ -616,26 +644,54 @@ def resc_lines(L, i):
     return out
 
 
+def resc_pair_nodes(L, a, b, add):
+    """One branch for q tiles a, b: O(a) *= corr(a) and O(b) *= corr(b) when either needs it (the other's corr is
+    exactly 1 then: x * 1.0 is x, the same bits). S_ANY[a] |= S_ANY[b] sets scc (S_ANY[a] is dead after its
+    v_cndmask)."""
+    add(f"s_or_b32 {S_ANY[a]}, {S_ANY[a]}, {S_ANY[b]}", "SALU", f"resc{a}{b}")
+    add(f"HKRESC2 {a} {b} {L.O(a, 0)} {L.O(b, 0)} {L.corr[a]} {L.corr[b]} scc", "RESC", f"resc{a}{b}")
+
+
 def resc_block(L, line, label):
     """A RESC pseudo-line's expansion: (the line ending the block before it: s_cbranch over the conditional
-    block when its s_cmp found S_ANY[i] 0, the conditional block, the label line starting the block after
-    it)."""
+    block when the scc of its s_cmp / s_or found S_ANY 0, the conditional block, the label line starting the
+    block after it)."""
+    if line.startswith("HKRESC2"):
+        _, a, b = line.split()[:3]
+        return [f"s_cbranch_scc0 {label}"], resc_lines(L, int(a)) + resc_lines(L, int(b)), f"{label}:"
     _, i, _, _, cond = line.split()
     if cond != "scc":
         raise ValueError(f"RESC node without its own s_cmp: {line}")
     return [f"s_cbranch_scc0 {label}"], resc_lines(L, int(i)), f"{label}:"
 
 
+def _bank_pair(r):
+    """The two VGPR banks (register % 4) a 64-bit pair starting at r reads."""
+    return {r % 4, (r + 1) % 4}
+
+
 def sum_nodes(L, i0, add, upd):
     """FlyDSL's sum tree over the 32 leaves of q tiles (i0, i0 + 1), packed (low half i0), in place in the
-    leaves (the cvts have read them); then d of the q tiles in upd (one outside it has stale leaves here)."""
+    leaves (the cvts have read them); then d of the q tiles in upd (one outside it has stale leaves here).
+    A group's partial sum goes to the leaf register whose VGPR banks differ from the other members' (a + b
+    computed as b + a into b, then + c: the same additions, IEEE-commutative, so the same bits): an
+    accumulate-form v_pk_add whose other source shares a bank with the accumulated pair costs a cycle."""
     leaves = [L.pr + 2 * x for x in range(32)]
     while len(leaves) > 1:  # (a + b) + c per group of 3; a trailing pair a + b, a trailing single passed on
         groups = [leaves[a : a + 3] for a in range(0, len(leaves), 3)]
+        nxt = []
         for g in groups:
-            for y in g[1:]:
-                add(f"v_pk_add_f32 {vr(g[0], 2)}, {vr(g[0], 2)}, {vr(y, 2)}", "VALU", f"sum{i0}")
-        leaves = [g[0] for g in groups]
+            acc = g[0]
+            if len(g) >= 2:
+                # the accumulator must be one of the first two (the first add is a + b); prefer the one whose banks
+                # differ from every other member, then the second (keeps the partial sums' banks alternating)
+                def clash(c):
+                    return sum(1 for y in g if y != c and _bank_pair(y) & _bank_pair(c))
+                acc = min((g[1], g[0]), key=clash)
+            for y in (y for y in g if y != acc):
+                add(f"v_pk_add_f32 {vr(acc, 2)}, {vr(acc, 2)}, {vr(y, 2)}", "VALU", f"sum{i0}")
+            nxt.append(acc)
+        leaves = nxt
     for x in range(2):
         qi = i0 + x
         if qi not in upd:
@@ -646,13 +702,20 @@ def sum_nodes(L, i0, add, upd):
         add(f"v_fma_f32 {vr(L.d[qi])}, {vr(L.corr[qi])}, {vr(L.d[qi])}, {vr(tot)}", "VALU", f"sum{qi}")
 
 
-def prefix_nodes(L, add, c_sgpr):
-    """The tail of the previous tile: the softmax of q tiles 2, 3 (masked scores in S(2), S(3)), their sum
-    tree, then the PV WMMAs of all four q tiles (V of the previous tile), tags PV{i}p."""
-    softmax_nodes(L, 2, add, c_sgpr)
-    softmax_nodes(L, 3, add, c_sgpr)
-    sum_nodes(L, 2, add, (2, 3))
-    for i in range(QT):
+def prefix_nodes(L, add, c_sgpr, skip=0):
+    """The tail of the previous tile: the softmax of q tiles 2, 3 (masked scores in S(2), S(3)) with one RESC
+    branch for both, their sum tree, then the PV WMMAs of all four q tiles (V of the previous tile), tags
+    PV{i}p. skip: the previous tile skipped q tiles 0 .. skip - 1 (P 0, S(2) -inf): none of their PVs, no
+    softmax of q tile 2 (q tile 3 then has its own RESC branch; the sum tree's q tile 2 half adds stale
+    leaves into nothing)."""
+    soft = [i for i in (2, 3) if i >= skip]
+    pair = len(soft) == 2
+    for i in soft:
+        softmax_nodes(L, i, add, c_sgpr, resc=not pair)
+    if pair:
+        resc_pair_nodes(L, 2, 3, add)
+    sum_nodes(L, 2, add, tuple(soft))
+    for i in range(skip, QT):
         for kt in range(2):
             for dt in range(NDT):
                 o = vr(L.O(i, dt), 8)
@@ -665,13 +728,16 @@ def prefix_nodes(L, add, c_sgpr):
 
 def tile_nodes(L, ops, k=None):
     """The nodes of a TILE region in program order. ops: kb / vb (VGPRs: the K / V fragment bases of the
-    stage), c2 (SGPR: c), and for a diagonal tile dl (VGPR: q + Skv - Sq - kv0 - 8 (lane / 16) of q tile 0).
-    k: None for TILE_C, else the diagonal tile k (q tiles below k skipped, the mask on q tile k only)."""
+    stage), c2 (SGPR: c), for a diagonal tile dl (VGPR: q + Skv - Sq - kv0 - 8 (lane / 16) of q tile 0), for
+    TILE_C its ring slot's descriptors (tdm_nodes). k: None for TILE_C, else the diagonal tile k (q tiles below
+    k skipped, the mask on q tile k only)."""
     first = 0 if k is None else k
     nodes, add = node_list()
     add(f"s_mov_b32 {S_SEL}, 0x{SEL_LO:x}", "SALU", "sel")
     for r in S_C:
         add(f"s_mov_b32 {r}, {ops['c2']}", "SALU", "c2")
+    if k is None:
+        tdm_nodes(ops, add)
     # the K (k-step major: FlyDSL's issue order) and Q(0) reads first; the prefix reads neither K nor qbuf[0]
     loads = [
         add(k_load(L, ops["kb"], j, ks, h), "DS", f"K{j}.{ks}.{h}")
@@ -681,8 +747,11 @@ def tile_nodes(L, ops, k=None):
     ]
     if first == 0:
         loads += [add(q_load(L, 0, ks, h), "DS", f"Q0.{ks}.{h}") for ks in range(NKS) for h in range(2)]
-    prefix_nodes(L, add, c_sgpr=True)
-    for i in range(first):  # the next prefix must be a no-op for the q tiles this body skips
+    prefix_nodes(L, add, c_sgpr=True, skip=max(first - 1, 0))  # the q tiles TILE_D(k - 1) skipped
+    # the next prefix must be a no-op for the q tiles this body skips. The next diagonal tile's prefix skips them;
+    # only FINAL_A, the last region of a block ending after TILE_D1 / D2, reads the P of q tile first - 1 (the P
+    # of the q tiles before it are 0 since an earlier diagonal tile); FINAL_A3 (always after TILE_D3) none
+    for i in (first - 1,) if first in (1, 2) else ():
         if i < 2:
             for kt in range(2):
                 for e in range(8):
@@ -711,7 +780,11 @@ def tile_nodes(L, ops, k=None):
         if i == k:
             mask_nodes(L, i, ops["dl"] if i == 0 else L.dl[i], add)
         if i < 2:  # the rest of q tiles 2, 3 runs in the next region's prefix
-            softmax_nodes(L, i, add, c_sgpr=True)
+            # q tile 0's RESC waits for q tile 1's (one branch for both); a body that skips q tile 0 (TILE_D1)
+            # keeps q tile 1's own
+            softmax_nodes(L, i, add, c_sgpr=True, resc=i == 1 and first == 1)
+        if i == 1 and first == 0:
+            resc_pair_nodes(L, 0, 1, add)
         if i == 1:
             sum_nodes(L, 0, add, range(first, 2))
     # the arrive, after every LDS read of the region and one LDS latency after the last (its s_wait_dscnt 0
@@ -720,11 +793,14 @@ def tile_nodes(L, ops, k=None):
     build_dag(nodes)
     for nd in loads:
         add_order(nodes, nd.idx, bar.idx, DS_LAT)
+    for nd in nodes:  # the ring slot's TDM ops before the arrive (its s_wait_tensorcnt counts them)
+        if nd.kind == "TDM":
+            add_order(nodes, nd.idx, bar.idx)
     # an LDS load that overwrites a source of a WMMA in flight waits for va_vdst(0) (expert mode, more than
     # one VALU class in flight): the V reads go after the last prefix PV WMMA, the Q(3) reads after the last
     # QK(0) WMMA, so each group waits once instead of once per buffer slice
     last = {nd.tag: nd.idx for nd in nodes if nd.kind == "WMMA"}
-    lpv = max(last[f"PV{i}p"] for i in range(QT))
+    lpv = max(last[x] for x in (f"PV{i}p" for i in range(QT)) if x in last)
     for nd in loads:
         if nd.tag.startswith("V"):
             add_order(nodes, lpv, nd.idx)
@@ -733,6 +809,40 @@ def tile_nodes(L, ops, k=None):
     # the first read goes before the first WMMA: the va_vdst(0) wait at the region entry then drains no WMMA
     add_order(nodes, loads[0].idx, min(nd.idx for nd in nodes if nd.kind == "WMMA"))
     return nodes
+
+
+def _sbase(x):
+    """First SGPR of an SGPR-tuple operand (s[40:43])."""
+    m = re.fullmatch(r"s\[(\d+):(\d+)\]", x.strip())
+    if not m:
+        raise ValueError(f"not an SGPR tuple: {x}")
+    return int(m.group(1))
+
+
+def tdm_nodes(ops, add):
+    """TILE_C issues its ring slot t + 3 from the carried group-0 quads qk, qb, qv (K columns 0..127, 128..191,
+    V) and the loop-invariant group-1 octets g1a, g1b, g1v, then advances the quads: global address += one tile
+    (64 rows of the row stride in elements that group 1 holds in words 5, 6: stride << 7 bytes) while t < n4
+    (= n - 4; past it the slot is a copy of the block's last tile), LDS address += one stage, from the last stage
+    (l3) back to the first. Scratch: s99 (the stage step) and s[100:101] (the address step): S_MASK, which TILE_C
+    does not use."""
+    qk, qb, qv = (_sbase(ops[x]) for x in ("qk", "qb", "qv"))
+    for q, g in ((qk, "g1a"), (qb, "g1b"), (qv, "g1v")):
+        add(f"tensor_load_to_lds s[{q}:{q + 3}], {ops[g]}", "TDM", "tdm")
+    for g, qs in (("g1a", (qk, qb)), ("g1v", (qv,))):
+        s5 = _sbase(ops[g]) + 5  # odd: copied to the aligned pair first
+        add(f"s_mov_b32 s100, s{s5}", "SALU", "tdmadv")
+        add(f"s_mov_b32 s101, s{s5 + 1}", "SALU", "tdmadv")
+        add("s_lshl_b64 s[100:101], s[100:101], 7", "SALU", "tdmadv")
+        add(f"s_cmp_lt_i32 {ops['t']}, {ops['n4']}", "SALU", "tdmadv")
+        add("s_cselect_b64 s[100:101], s[100:101], 0", "SALU", "tdmadv")
+        for q in qs:
+            add(f"s_add_nc_u64 s[{q + 2}:{q + 3}], s[{q + 2}:{q + 3}], s[100:101]", "SALU", "tdmadv")
+    add(f"s_mov_b32 s99, 0x{STG_B:x}", "SALU", "tdmadv")
+    add(f"s_cmp_eq_u32 s{qk + 1}, {ops['l3']}", "SALU", "tdmadv")
+    add(f"s_cselect_b32 s99, 0x{(-3 * STG_B) & 0xFFFFFFFF:x}, s99", "SALU", "tdmadv")
+    for q in (qk, qb, qv):
+        add(f"s_add_co_i32 s{q + 1}, s{q + 1}, s99", "SALU", "tdmadv")
 
 
 def region_tile(L, ops, k=None):
@@ -746,16 +856,17 @@ def region_tile(L, ops, k=None):
     return out, cycles
 
 
-def region_final_all(L, ops):
+def region_final_all(L, ops, skip=0):
     """FINAL_A (scheduled): the last tile's prefix (c from the VGPR pair: the SGPRs are clobbered across
     markers), then per q tile i: inv = d > 0 ? 1 / d : 0 (LLVM's fp32 1.0 / d, denormals on: no mode switches),
     out = bf16(O(i) inv) into the dead K registers (K + 32 i), lse = (m + log2 d) ln 2 (LLVM's log2: v_log_f32 of
     d scaled by 2^32 below 2^-126), and their ds_stores into the staging slot: out rows at (i < 2 ? wa : wb) +
     (i & 1) 4 SQT + 32 dt, lse at (i < 2 ? la : lb) + (i & 1) 4 SQT. Per q tile its own scratch (12 VGPRs of the
-    dead qbuf[0]) and SGPRs, so the four overlap. ops: wa, wb, la, lb (VGPRs: the lane's staging addresses)."""
+    dead qbuf[0]) and SGPRs, so the four overlap. ops: wa, wb, la, lb (VGPRs: the lane's staging addresses).
+    skip 3: FINAL_A3, the region after TILE_D3, whose prefix skips q tiles 0..2 (prefix_nodes)."""
     nodes, add = node_list()
     add(f"s_mov_b32 {S_SEL}, 0x{SEL_LO:x}", "SALU", "sel")
-    prefix_nodes(L, add, c_sgpr=False)
+    prefix_nodes(L, add, c_sgpr=False, skip=skip)
     for i in range(QT):
         d, m = L.d[i], L.m[i]
         # 12 scratch VGPRs of the dead qbuf[0] per q tile (inv at an even register: a pair operand)
