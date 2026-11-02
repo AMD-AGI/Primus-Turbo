@@ -64,6 +64,7 @@ from primus_turbo.flydsl.utils.gemm_epilogue_helper import (
 from primus_turbo.flydsl.gemm.gemm_mxfp4_kernel import (
     _MXFP4_PRESHUF_BLK,
     _MXFP4_PRESHUF_FO,
+    MXFP4_CODEGEN_REV,
     MfmaScaleFp4,
     S2RLoaderFp4,
     S2RLoaderFp4Split,
@@ -515,6 +516,7 @@ def _build_grouped_mxfp4_nt_kernel(
         wave_n = wave_id % 2
         I32 = fx.Int32
 
+        _ = MXFP4_CODEGEN_REV
         mfma = MfmaScaleFp4(N_TILES_A, N_TILES_BH, packed=True, wlv=wlv, elgk=elgk)
         gl_b_e = fp4_g2s_offsets_split(lane_id, wave_id, _KR, NSB_H, 0, 0, ilv=_BILV, wm=_WMB)
         gl_b_o = fp4_g2s_offsets_split(lane_id, wave_id, _KR, NSB_H, 1, _SK, ilv=_BILV, wm=_WMB)
@@ -1705,6 +1707,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
         # Transposed accumulator (acc = C^T) whenever the standalone epilogue runs (always
         # under beta_is_one): store_tacc_wide then takes a dwordx4 permlane16_swap path
         # instead of 128 scalar 2-byte read-back+store pairs per accumulator half.
+        _ = MXFP4_CODEGEN_REV
         mfma = MfmaScaleFp4(N_TILES_A, N_TILES_BH, packed=True, wlv=wlv, elgk=elgk, tacc=not _CSTORE)
         gl_off_a = fp4_g2s_offsets(lane_id, wave_id, m_total, N_LDS_STEPS_A, BPR, swizzle=swizzle, wm=_WMA)
         gl_off_b = fp4_g2s_offsets(
