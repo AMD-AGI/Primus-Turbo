@@ -1,6 +1,6 @@
 # Primus-Turbo History
 
-Every What's New entry, newest first. The [README](../README.md#-whats-new) shows only the latest few; each new entry goes both there and here. Each release links to its GitHub release page, which lists every merged pull request.
+Every What's New entry, newest first. The [README](../README.md#-whats-new) shows the latest eight; each new entry goes both there and here. Each release links to its GitHub release page, which lists every merged pull request.
 
 ## 2026
 
