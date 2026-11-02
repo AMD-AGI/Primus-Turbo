@@ -392,7 +392,7 @@ class IntranodeBackendSelectionTestCase(TestCase):
                 RuntimeError, "does not run on gfx942 / gfx950; leave intranode_backend unset.*'cpp'"
             ),
         ):
-            flydsl_intranode.FlyDSLIntranodeRuntime(None, 0, None, version=2)
+            flydsl_intranode.FlyDSLIntranodeV2Runtime(None, 0, None)
 
 
 class ArchDependentHostTestCase(TestCase):
