@@ -115,7 +115,10 @@ ops have. On gfx1250 the expert wgrads then add dW1 / dW2 straight into the weig
 `main_grad` (one rounding, no dW buffer, no separate add), and the op returns a dummy gradient with
 `grad_added_to_main_grad` set, so Megatron's DDP hook skips its own add. Weights the kernel cannot
 serve (a `main_grad` that is not a contiguous bf16 tensor of the weight's shape, or an output shape
-that is not a whole number of the wgrad's output tiles) keep the ordinary gradient.
+that is not a whole number of the wgrad's output tiles) keep the ordinary gradient. This follows
+Megatron DDP's contract, which clears `grad_added_to_main_grad` once per step; Megatron-FSDP
+clears it before every backward and may overwrite or swap `main_grad`, so do not pass the pattern
+under FSDP.
 
 ## Performance
 

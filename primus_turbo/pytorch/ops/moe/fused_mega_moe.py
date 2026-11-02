@@ -31,6 +31,11 @@ grouped GEMM ops: on gfx1250 the wgrad then adds dW straight into the weight's b
 (one rounding, no dW buffer, no separate add) and the op returns a dummy gradient, with
 ``grad_added_to_main_grad`` set so Megatron's DDP hook skips its own add. Weights the kernel cannot
 serve keep the ordinary gradient.
+
+That is Megatron DDP's contract: ``main_grad`` is a persistent buffer, and ``grad_added_to_main_grad``
+is cleared once per step (``zero_grad_buffer``), so setting it in forward holds until the grad hook.
+Megatron-FSDP clears the flag before every backward and may overwrite or swap ``main_grad``, so under
+FSDP the pattern must stay None: its hook would add the dummy gradient into ``main_grad``.
 """
 
 from typing import Optional, Tuple
