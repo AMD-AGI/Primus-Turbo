@@ -24,11 +24,8 @@ from primus_turbo.pytorch.core.low_precision import (
 from primus_turbo.pytorch.ops.grouped_mlp_fp4 import grouped_mlp_fp4
 from tests.pytorch.test_utils import compute_snr
 
-# The op measures 10.15-10.88 dB across these shapes and tensors, the same band a
-# single MXFP4 grouped GEMM sits in; grad_probs on the last shape is the tightest.
-# The threshold sits just under that rather than at the fp4 GEMM suite's 8 dB, so a
-# regression in the fused epilogue's rounding shows up instead of being absorbed --
-# which leaves it only ~0.15 dB of headroom.
+# The op measures 10.15-10.88 dB here (grad_probs on the last shape is the tightest): just above
+# this, rather than the fp4 GEMM suite's 8 dB, so a fused-epilogue rounding regression shows up.
 SNR_THRESHOLD = 10.0
 
 # (M, K, I, G). MX needs every GEMM dim to be a 32-multiple; the uneven split
@@ -104,10 +101,12 @@ def test_grouped_mlp_fp4(shape, activation, clamp_limit, scale_rounding_mode):
     M, K, I, G = shape
     if scale_rounding_mode == 2:
         from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp4_glu_kernel import (
-            _GMXFP4_GLU_CACHE,
+            _GROUPED_GEMM_MXFP4_EPI_DGLU_QUANT,
+            _GROUPED_GEMM_MXFP4_EPI_GLU_QUANT,
         )
 
-        _GMXFP4_GLU_CACHE.clear()
+        _GROUPED_GEMM_MXFP4_EPI_GLU_QUANT.clear()
+        _GROUPED_GEMM_MXFP4_EPI_DGLU_QUANT.clear()
     offs, group_lens, leaves = _mlp_leaves(M, K, I, G)
     gen = torch.Generator(device="cuda").manual_seed(7)
     # Random rather than ones: a cotangent that varies keeps a per-row term like
@@ -145,6 +144,7 @@ def test_grouped_mlp_fp4(shape, activation, clamp_limit, scale_rounding_mode):
 
     if scale_rounding_mode == 2:
         expected_bias = 3 << 19
-        keys = tuple(_GMXFP4_GLU_CACHE)
-        assert any(key[13] and key[-1] == expected_bias for key in keys), "fused GLU mode"
-        assert any(key[14] and key[-1] == expected_bias for key in keys), "fused dGLU mode"
+        glu_keys = tuple(_GROUPED_GEMM_MXFP4_EPI_GLU_QUANT.entries)
+        dglu_keys = tuple(_GROUPED_GEMM_MXFP4_EPI_DGLU_QUANT.entries)
+        assert any(key[12] and key[-1] == expected_bias for key in glu_keys), "fused GLU mode"
+        assert any(key[13] and key[-1] == expected_bias for key in dglu_keys), "fused dGLU mode"

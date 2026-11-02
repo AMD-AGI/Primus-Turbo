@@ -22,7 +22,6 @@ import torch
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -41,6 +40,9 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     xcd_band_remap_pid,
     xcd_remap_pid,
 )
+from primus_turbo.flydsl.autotune import Compile, Op, Reference, staged
+from primus_turbo.flydsl.autotune.engine import Entry
+from primus_turbo.flydsl.autotune.policies import NoArgs
 from primus_turbo.flydsl.utils.prims import (
     ceildiv,
     ceildiv_pow2,
@@ -80,7 +82,6 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
     _grouped_block_mn,
     _wgrad_block_mn,
 )
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_kernel import run_eager_or_capture
 
 # isort: on
 
@@ -101,20 +102,11 @@ _GMXFP4_SCHED_HINTS = {
 }
 
 
-_GMXFP4_SKEW_CUS = 128  # skew ranks: ranks >= this get zero delay, not a capped one (round 7
-# round-robin sweep of {0,64,128,192,256}, 6 rounds x 5 configs interleaved in round-robin
-# order within one measurement pass (needed: a same-config check found ~2% drift between two
-# separate, non-interleaved probe.py sessions, i.e. session-level DVFS/thermal drift is large
-# enough to flip the ranking of nearby CUS values if each is measured in its own session) --
-# per-round-paired vs that round's own CUS=256 sample, n=6: CUS=128 has the best worst-case
-# (NT total improves in all 6/6 rounds, worst round -0.17%) and is statistically tied for best
-# mean NT total (-0.88%, vs 64's -0.89%, 0's -0.84%, 192's only -0.24%); uniquely among the
-# sweep it also improves dgrad_gate_up in 6/6 rounds (mean -1.12%, never positive) AND improves
-# dgrad_down on average (mean -0.22%, vs +0.34%/+0.45% regression at CUS=0/64). These paired
-# measurements replace the earlier non-interleaved sweep that was confounded by session drift.
-_GMXFP4_SKEW_STEP = 2  # s_sleep units (~64 clocks) per skew rank; round 7 swept {0,1,2,4} at
-# CUS=256 and found STEP alone does not reproduce the CUS win (it softens the same ramp for all
-# 256 ranks rather than dropping the long high-rank tail), so STEP is left at its prior value.
+_GMXFP4_SKEW_CUS = 128  # skew ranks: ranks >= this get zero delay, not a capped one. Of
+# {0,64,128,192,256}, 128 has the best worst case and a tied-best mean NT total (-0.88% vs 256),
+# and is the only value that also improves both dgrad GEMMs on average.
+_GMXFP4_SKEW_STEP = 2  # s_sleep units (~64 clocks) per skew rank; STEP alone does not reproduce
+# the CUS win (it softens the ramp for all ranks rather than dropping the high-rank tail).
 
 
 def _emit_launch_skew(bid):
@@ -130,15 +122,9 @@ def _emit_launch_skew(bid):
     )
 
 
-def _run_mxfp4_sched(entry, args, compiled_idx):
-    """run_eager_or_capture with the mxfp4 grouped NT schedule hints applied."""
-    if torch.cuda.is_current_stream_capturing():
-        entry[0](*args)
-        return
-    if entry[compiled_idx] is None:
-        with CompilationContext.compile_hints(_GMXFP4_SCHED_HINTS):
-            entry[compiled_idx] = flyc.compile(entry[0], *args)
-    entry[compiled_idx](*args)
+# How the NT launches (plain and GLU) compile: under the schedule hints.
+_GMXFP4_COMPILE = Compile(hints=_GMXFP4_SCHED_HINTS)
+_COMPILE = Compile()
 
 
 _PADZ_BM = 256  # C rows one pad-zero work item clears
@@ -281,8 +267,8 @@ def _build_grouped_mxfp4_ab_preshuffle(
         # Third segment: zero C's rows past the last group -- the rows an over-allocated
         # grouped output leaves uncovered, which the caller's ``[:total_m]`` slice must not
         # expose. No GEMM tile writes them (every tile's store SRD stops at its group's
-        # end), so clearing them here, ahead of the GEMM, is equivalent to the separate
-        # post-pass dispatch it replaces, and the group table is already in registers.
+        # end), so clearing them here, ahead of the GEMM, saves a dispatch, and the group
+        # table is already in registers.
         # One work item takes a (row band, column band) of the tail and every thread one of
         # its rows; a band runs past the last column into the next row's first ones, which
         # are tail as well, and the row-band SRD drops whatever runs past ``total_M``. The
@@ -427,8 +413,6 @@ def _build_grouped_mxfp4_nt_kernel(
     # with nothing but padding columns: half its MFMAs compute columns past N. Re-tile
     # the four waves 4x1 over M for that block -- each takes half the M sub-tiles of the
     # 64 VALID columns -- so the boundary body issues half the MFMAs of the half-N one.
-    # The trigger is the tail width against a wave's band (16*N_TILES_BH), not any
-    # particular N, so it follows the geometry rather than a shape literal.
     _QUARTER_N = _HALF_N and _CSTORE and (N % BLOCK_N <= 16 * N_TILES_BH)
     _QN_ROWS = (N_TILES_A // 2) * 16  # M rows one wave owns under the 4x1 re-tile
     _COL_SAFE = (N % _NCB == 0) if glu else (N % BLOCK_N == 0)
@@ -1080,78 +1064,36 @@ def _build_grouped_mxfp4_nt_kernel(
     return kern, attrs, NBK, _BILV
 
 
-_GMXFP4_LAUNCH_CACHE: dict = {}
 _GMXFP4_WS_CACHE: dict = {}
-_GMXFP4_AT_CACHE: dict = {}  # (N, K, G, gm, xcd, gn, span, nt, out_fp16, k_real) -> [raw, compiled]
-# One tile per NT workgroup, measured, not assumed. Two tiles per workgroup was tried
-# twice: once unrolled (module 2797 -> 5355 instructions) and once as a real runtime
-# scf.for that keeps a SINGLE emitted body -- the second grew the module by only 30
-# instructions with v_mfma / buffer_load / buffer_store counts identical, and bit-exact
-# output at m_per=4096 on both distributions, so code size is not the mechanism. It still
-# lost, in a 4-arm round-robin against a base-vs-base spread of 0.2-1.0%: fc2_fwd@bal
-# +2.0/+2.7%, fc1_dgrad@bal +2.3/+1.1%, fc2_fwd@skew +2.7/+1.7%, fc1_dgrad@skew +3.6/+3.7%
-# (the two arms are an lgkmcnt-only and a vmcnt(0) inter-tile fence, so the fold-store
-# drain is not the mechanism either). What does move is .amdhsa_next_free_vgpr 480 -> 512:
-# the tile loop's live values take the last 32 arch registers. Amortising the per-tile head
-# chain (launch guard, group-table load, lane scan) is worth less than the workgroup-per-tile
-# grid, whose dispatch the hardware balances for free -- the same verdict round 3 reached
-# from the opposite side on the variable-K path (wg_tiles 2 -> 1 was a win there).
+# One tile per NT workgroup: a runtime two-tile loop (same emitted body) loses 1-4% on every
+# NT cell and pushes VGPRs 480 -> 512; amortising the per-tile head chain is worth less than a
+# workgroup-per-tile grid, whose dispatch the hardware balances for free.
 _GMXFP4_NT_CFG = (4, 8, 0, 16, False)
-# Thin groups: the write-only C stream evicts re-read weights, so non-temporal buys them back.
+# Thin groups: the write-only C stream evicts re-read weights, so non-temporal buys them back
+# (turning cst_nt off costs fc2_fwd 3-4%).
 _GMXFP4_NT_CFG_THIN = (4, 8, 0, 16, True)
-# group_n=0 now measured on the NT path too, not just on wgrad_gate_up below. A banded
-# group_n=6 halves the resident B panel (the gm=4 x full-N working set is ~6.0 MB against
-# 4 MB of L2 per XCD, and a 6-wide band brings it to ~3.8 MB), so the footprint argument
-# says it should win -- it loses, on all four NT cells at once and far outside the floor:
-# fc2_fwd 100.64/100.85 -> 99.53/99.05, fc1_dgrad 100.56/101.07 -> 99.67/99.40, while the
-# four variable-K wgrad cells (their own tuple, untouched) stay inside +-0.35. Sweeping the
-# full N range for each row-band, so the just-loaded A row-panel is reused 12x back to back,
-# is worth more than keeping B resident. Same verdict the wgrad sweep reached, now on both
-# paths. cst_nt is likewise re-confirmed and is large: flipping it off costs a full gm point
-# (fc2_fwd -3.3/-4.0), so the C stream really does evict the weights it shares L2 with.
-# wg_tiles=1 in all three tuples. A variable-K tile's cost tracks its own group's token count,
-# so tiles are NOT equivalent, and with one tile per workgroup the hardware dispatcher is itself
-# the list scheduler -- it hands the next tile to whichever CU finished first. Pairing tiles at
-# build time (wg_tiles>1) gives that up for a launch/decode saving that does not cover it.
-# In-process ABBA, 9 reps x 40 iters after a 60 s clock ramp, wg_tiles 1 vs the previous 2:
-# fc1_wgrad +1.37% bal / +1.69% skew, fc2_wgrad -1.05% bal / +2.68% skew; the scored bench
-# then moved those four cells +1.18 / +1.23 / -1.57 / +2.10 points against a same-run A-vs-A
-# floor of +-0.5, while the two untouched cells drifted -0.11 and +0.16. wg_tiles 4 and 8 fall
-# off a cliff (fc2_wgrad skew -0.2% / -7.5%, bal -4.6% / -11.9%) as the pairing gets coarser,
-# and the loss concentrates in skew -- where tile costs actually differ, the mechanism's own
-# signature. The axis is kept: it wins whenever tiles ARE equivalent and the grid is short.
+# group_n=0 on NT: sweeping the full N range per row-band reuses the just-loaded A row-panel back
+# to back, which beats a banded group_n that keeps the B panel L2-resident (~1% on every NT cell).
+# wg_tiles=1 in all three tuples: a variable-K tile's cost tracks its group's token count, and
+# with one tile per workgroup the hardware dispatcher hands the next tile to whichever CU frees
+# first. Pairing tiles (wg_tiles>1) loses up to ~2.7% at 2 and ~12% at 8, worst under skew; the
+# axis stays for grids of equivalent tiles that are short.
 _GMXFP4_WGRAD_CFG = (2, 1, 4, False, 1)
 _GMXFP4_WGRAD_CFG_SHORT = (4, 1, 6, True, 1)  # short per-group contraction: see selector
-# When a group's tiles outnumber the CUs (wgrad_gate_up: N_BLOCKS_M=23 x N_BLOCKS_N=12=276 >
-# _N_CU), a 2D group_n band walks all group_m row-blocks across ONE N-band before advancing to
-# the next N-band -- reusing the B column-panel across many tiles but only touching each A
-# row-panel once per band, far apart in launch order. group_n=0 (plain group_m=2 row-major
-# clustering, same as the NT path's own already-proven _GMXFP4_NT_CFG) instead sweeps the FULL
-# N range for each row-pair immediately, reusing the just-loaded A row-panel 12x in a row. Round
-# 11 screened group_m in {1,2,4,8} x group_n in {0,4,6,8,12} (the plan's full grid) for this cell
-# only: every banded group_n>0 point measured worse than group_n=0, confirmed over 6 round-robin
-# rounds (isolated wgrad_gate_up mean -3.693%, 0/6 regressions; group_n=12, which takes the
-# identical "banding disabled" code path since N_BLOCKS_N(12) is not > 12, round-robins to a
-# statistically indistinguishable -3.757%, the built-in control that rules out session drift).
-# TCC_HIT_sum+TCC_MISS_sum request count and SQ_INSTS_MFMA are IDENTICAL between the two tuples
-# (107.8M and 69.337M respectively) but L2 hit rate rises 57.9%->62.7% and HBM read bytes fall
-# 12.8% (2.861->2.494 GB) -- the win is L2 locality/latency, not less issued work. wgrad_down's
-# own _GMXFP4_WGRAD_CFG_SHORT tuple is untouched and was confirmed byte-identical throughout.
-# num_xcds stays at 1 on all three tuples, and wgrad_down's group_m stays at 1. Both were
-# tried together and BOTH LOST once priced against the tree without them, which is the only
-# comparison that answers "is this worth its lines":
-#   group_m 1 -> 8 on wgrad_down          -0.78 gm   (fc2_wgrad@bal -1.08)
-#   num_xcds=8 slice, runtime-gated        -0.16 gm   (helps skew, loses more elsewhere)
-#   the two together                       +0.01 gm  = the 0.01 pp base-to-base drift
-# Each was measured to help while the other was present, which is how they survived the
-# campaign: the slice's gain is almost entirely it undoing the harm group_m=8 does, so
-# ablating either one alone bills the other's damage to it. Only turning both off at once
-# shows the pair is worth nothing. Do not reintroduce one without the other -- and there is
-# no reason to reintroduce both.
+# When a group's tiles outnumber the CUs (wgrad_gate_up: 23 x 12 = 276 > _N_CU), a group_n band
+# touches each A row-panel once per band, far apart in launch order; group_n=0 reuses the
+# just-loaded A row-panel 12x in a row. Same issued work, but L2 hit rate 57.9% -> 62.7% and
+# HBM reads -12.8% (~3.7% faster than any banded group_n).
+# num_xcds stays at 1 on all three tuples: an 8-XCD slice measured slower on wgrad_down.
 _GMXFP4_WGRAD_CFG_SHORT_SPAN = (2, 1, 0, True, 1)
 _GMXFP4_WGRAD_SHORT_MG = 8192  # per-group contraction at/below which the short-M blocking applies
-_GMXFP4_CACHE_CAP = 32  # drop caches past this; real MoE uses few shapes, a test sweep many
+_GMXFP4_CACHE_CAP = 32  # drop workspaces past this; real MoE uses few shapes, a test sweep many
 _N_CU = 256  # gfx950 compute units, i.e. the width of one dispatch generation
+
+
+# The blockings below are picked from the call's shape by the selectors; nothing is raced.
+_GROUPED_GEMM_MXFP4 = Op("grouped_gemm_mxfp4", compile=_GMXFP4_COMPILE)
+_GROUPED_GEMM_MXFP4_VARIABLE_K = Op("grouped_gemm_mxfp4_variable_k", compile=_COMPILE)
 
 
 def _bound_caches(*caches):
@@ -1192,9 +1134,7 @@ def _compile_grouped_mxfp4_nt_fused(
     )
     # pad_zero: this launch also clears C's uncovered tail, so the plain path needs no
     # separate zeroing dispatch after the GEMM (see grouped_gemm_fp4_impl).
-    ab_pre_shuf = _build_grouped_mxfp4_ab_preshuffle(
-        K128, G, N, k128_rd, b_ilv=b_ilv, pad_zero=True
-    )  # 1 launch
+    ab_pre_shuf = _build_grouped_mxfp4_ab_preshuffle(K128, G, N, k128_rd, b_ilv=b_ilv, pad_zero=True)
     b_pre_grid = ceildiv(G * N_SCALE * K128, _PRESHUF_FO * _PRESHUF_BLK)
 
     @flyc.jit
@@ -1224,6 +1164,22 @@ def _compile_grouped_mxfp4_nt_fused(
     return launch, NBK
 
 
+def _gmxfp4_nt_entry(cfg, K, G, N, wlv, elgk, out_fp16, k_real, tuned=True):
+    gm, xcd, gn, span, nt = cfg
+    launch, _nbk = _compile_grouped_mxfp4_nt_fused(
+        K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k_real=k_real, span=span, cst_nt=nt
+    )
+    return Entry(cfg, launch, tuned=tuned)
+
+
+def _pick_gmxfp4_nt(key, cfg, K, G, N, wlv, elgk, out_fp16, k_real):
+    """``cfg``, the selector's blocking, is the pick."""
+    space = staged(Reference(lambda _prev: [cfg], check=None), base=cfg)
+    build = _GROUPED_GEMM_MXFP4.build(lambda c: _gmxfp4_nt_entry(c, K, G, N, wlv, elgk, out_fp16, k_real))
+    res = _GROUPED_GEMM_MXFP4.pick(key, space, probe=NoArgs(), build=build)
+    return build.winner(res)
+
+
 def _compile_grouped_mxfp4_nt_glu(
     K,
     G,
@@ -1250,12 +1206,8 @@ def _compile_grouped_mxfp4_nt_glu(
     clamp_limit=None,
     epi_scale_rounding_bias=1 << 21,
 ):
-    """The NT compile of :func:`_compile_grouped_mxfp4_nt_fused` with a fused GLU epilogue.
-
-    Kept apart from the plain entry rather than folded into it: the fused kernels carry
-    three more tensor arguments and a stride, and the plain launch is the tuned production
-    path whose argument list should not move for them.
-    """
+    """The NT compile of :func:`_compile_grouped_mxfp4_nt_fused` with a fused GLU epilogue,
+    kept separate so the fused kernels' extra tensors and stride stay off the plain launch."""
     K128 = K // 128
     N_b = 2 * glu_i if glu else N  # B rows per expert: gate||up under glu
     N_SCALE = ceildiv(N_b, 256) * 256
@@ -1607,10 +1559,6 @@ def grouped_gemm_mxfp4_flydsl_kernel(
     K = K256
     K128 = K // 128
 
-    # au/asu/bu/bsu are already contiguous from the .contiguous() calls just above (a
-    # dtype-only .view() of a contiguous tensor stays contiguous), so a second
-    # .contiguous() here is a provable no-op (Tensor.contiguous() returns self when
-    # is_contiguous() already holds) that still pays a Python/dispatcher call per launch.
     a_raw = asu.view(torch.int32).reshape(-1)
     b_raw = bsu.view(torch.int32).reshape(-1)
     a8 = au.view(torch.int8)  # keep multi-dim: 1D view of >2^31-elem MoE tensor overflows CABI
@@ -1624,9 +1572,7 @@ def grouped_gemm_mxfp4_flydsl_kernel(
     grid_upper = (ceildiv(total_M, 256) + G) * n_blocks
     a_pre_grid = ceildiv(slab_rows * K128, _PRESHUF_FO * _PRESHUF_BLK)
 
-    # current_stream(dev) (gemm_helper.py) is the same live per-call stream lookup used by the
-    # WGRAD path below. It returns the raw stream pointer FlyDSL's launch/args tuple accepts,
-    # skipping the ~2us Python torch.cuda.Stream wrapper that torch.cuda.current_stream() builds.
+    # the raw stream pointer, skipping the ~2us torch.cuda.Stream wrapper current_stream() builds
     stream = current_stream(dev)
     wlv, elgk = 10, 9
     args = (
@@ -1646,24 +1592,13 @@ def grouped_gemm_mxfp4_flydsl_kernel(
         stream,
     )
 
-    def _entry(cfg):
-        gm, xcd, gn, span, nt = cfg
-        lk = (K, G, N, gm, xcd, gn, span, nt, wlv, elgk, out_fp16, k_real)
-        ent = _GMXFP4_LAUNCH_CACHE.get(lk)
-        if ent is None:
-            ent = _compile_grouped_mxfp4_nt_fused(
-                K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k_real=k_real, span=span, cst_nt=nt
-            )
-            _GMXFP4_LAUNCH_CACHE[lk] = ent
-        atk = (N, K, G, gm, xcd, gn, span, nt, out_fp16, k_real)  # same K256 diff real K must not collide
-        e2 = _GMXFP4_AT_CACHE.get(atk)
-        if e2 is None:
-            e2 = [ent[0], None]
-            _GMXFP4_AT_CACHE[atk] = e2
-        return e2
-
-    _run_mxfp4_sched(_entry(_select_gmxfp4_nt_cfg(total_M, G)), args, 1)
-    _bound_caches(_GMXFP4_LAUNCH_CACHE, _GMXFP4_AT_CACHE, _GMXFP4_WS_CACHE)
+    cfg = _select_gmxfp4_nt_cfg(total_M, G)
+    key = (N, K, G, out_fp16, k_real, cfg)  # same K256 diff real K must not collide
+    entry = _GROUPED_GEMM_MXFP4.entry(
+        key, lambda: _pick_gmxfp4_nt(key, cfg, K, G, N, wlv, elgk, out_fp16, k_real)
+    )
+    _GROUPED_GEMM_MXFP4.launch(entry, args)
+    _bound_caches(_GMXFP4_WS_CACHE)
     return out[:, :N_out] if N_out != N else out
 
 
@@ -1717,8 +1652,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
     # fit inside the re-tile's row band the other three quarters of the block are padding.
     # The quarter-N body is already a 64-row x 64-column quad, so it serves that block
     # too if the four waves re-tile 1x4 over N on the first row band -- no second boundary
-    # variant. Both conditions are geometry (a wave's band, the re-tile's band), not a
-    # shape literal, and a block ragged in BOTH keeps the N re-tile, which wastes less.
+    # variant. A block ragged in BOTH keeps the N re-tile, which wastes less.
     _QUARTER_M = _QUARTER_N and (OUT_M % BLOCK_M != 0) and (OUT_M % BLOCK_M <= _QN_ROWS)
     TOTAL = G * TILES_PER_GROUP
     # One WG walks WGT tiles from opposite ends; backfires once the halved grid under-covers.
@@ -1768,12 +1702,9 @@ def _build_grouped_mxfp4_wgrad_kernel(
         k128m = m_total // I32(128)
         m2_idx = arith.index_cast(T.index, m2)
 
-        # H1a: transposed accumulator (acc = C^T) whenever the standalone (non-fused)
-        # epilogue runs -- the beta=1 scored contract always takes this path, since
-        # _CSTORE is unconditionally False once beta_is_one=True. tacc lets the store
-        # below use store_tacc_wide's dwordx4 permlane16_swap path instead of 128
-        # scalar 2-byte read-back+store pairs per accumulator half (see StoreCPlain in
-        # gemm_mxfp4_kernel.py). Mirrors the sibling dense MXFP4 kernel's taccw axis.
+        # Transposed accumulator (acc = C^T) whenever the standalone epilogue runs (always
+        # under beta_is_one): store_tacc_wide then takes a dwordx4 permlane16_swap path
+        # instead of 128 scalar 2-byte read-back+store pairs per accumulator half.
         mfma = MfmaScaleFp4(N_TILES_A, N_TILES_BH, packed=True, wlv=wlv, elgk=elgk, tacc=not _CSTORE)
         gl_off_a = fp4_g2s_offsets(lane_id, wave_id, m_total, N_LDS_STEPS_A, BPR, swizzle=swizzle, wm=_WMA)
         gl_off_b = fp4_g2s_offsets(
@@ -2051,7 +1982,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
                 kstep_val=KSTEP,
             )
             if const_expr(not _CSTORE):
-                # H1a: wide transposed-accumulator store (paired with tacc=True above).
+                # wide transposed-accumulator store (paired with tacc=True above)
                 store_c.store_tacc_wide(accL, base_row, base_col_l, n_valid=_NV)
                 store_c.store_tacc_wide(accR, base_row, base_col_r, n_valid=_NV)
 
@@ -2060,9 +1991,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
     return kern, attrs, GRID, _BILV
 
 
-_GMXFP4_WGRAD_LAUNCH_CACHE: dict = {}
 _GMXFP4_WGRAD_WS_CACHE: dict = {}
-_GMXFP4_WGRAD_AT_CACHE: dict = {}  # (OUT_M, OUT_N, G, cfg..., out_fp16, beta1) -> [raw, compiled]
 
 
 def _get_grouped_mxfp4_wgrad_ws(OUT_M, OUT_N, K128m, device):
@@ -2151,6 +2080,23 @@ def _compile_grouped_mxfp4_wgrad_fused(
     return launch, GRID
 
 
+def _gmxfp4_wgrad_entry(cfg, OUT_M, OUT_N, G, wlv, elgk, out_fp16, beta_is_one, tuned=True):
+    launch, _grid = _compile_grouped_mxfp4_wgrad_fused(
+        OUT_M, OUT_N, G, *cfg, wlv, elgk, out_fp16, beta_is_one
+    )
+    return Entry(cfg, launch, tuned=tuned)
+
+
+def _pick_gmxfp4_wgrad(key, cfg, OUT_M, OUT_N, G, wlv, elgk, out_fp16):
+    """``cfg``, the selector's blocking, is the pick."""
+    space = staged(Reference(lambda _prev: [cfg], check=None), base=cfg)
+    build = _GROUPED_GEMM_MXFP4_VARIABLE_K.build(
+        lambda c: _gmxfp4_wgrad_entry(c, OUT_M, OUT_N, G, wlv, elgk, out_fp16, False)
+    )
+    res = _GROUPED_GEMM_MXFP4_VARIABLE_K.pick(key, space, probe=NoArgs(), build=build)
+    return build.winner(res)
+
+
 def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
     lhs,
     lhs_scale,
@@ -2192,37 +2138,28 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
     beta_is_one = beta == 1.0
 
     stream = current_stream(dev)
-    # elgk=0: the phase barrier has to drain lgkmcnt fully here.  A non-zero budget is
-    # calibrated against how many ds_reads the body issues, and the split A staging issues a
-    # different count than the 9 was tuned for -- reads left in flight let the next
-    # buffer_load_lds overwrite the LDS under them (WAR), surfacing as a rare wgrad mismatch
-    # on the partial last M tile.
-    # The lgkmcnt budget at the phase barrier is per-schedule, not a global constant: it is
-    # calibrated against how many ds_reads the body leaves in flight.  The bf16 path fuses the
-    # C store into the loop, which reorders those reads enough that a non-zero budget lets the
-    # next buffer_load_lds overwrite LDS under them (a WAR hazard, seen as a rare wgrad
-    # mismatch on the partial last M tile); it needs a full drain.  The fp16 path keeps the
-    # standalone store and the 9 it was tuned with -- draining it there costs correctness.
+    # The lgkmcnt budget at the phase barrier is per-schedule: it is calibrated against how
+    # many ds_reads the body leaves in flight. The bf16 path fuses the C store into the loop,
+    # which reorders those reads enough that a non-zero budget lets the next buffer_load_lds
+    # overwrite LDS under them (a WAR hazard, seen as a rare wgrad mismatch on the partial
+    # last M tile); it needs a full drain. The fp16 path keeps the standalone store, whose
+    # read count the budget of 9 is calibrated for, so it skips the full drain.
     wlv = 10
     elgk = 9 if out_fp16 else 0
     args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go_pad, M_total, stream)
 
-    def _entry(cfg):
-        gm, xcd, gn, nt, wgt = cfg
-        lk = (OUT_M, OUT_N, G, gm, xcd, gn, nt, wgt, wlv, elgk, out_fp16, beta_is_one)
-        ent = _GMXFP4_WGRAD_LAUNCH_CACHE.get(lk)
-        if ent is None:
-            ent = _compile_grouped_mxfp4_wgrad_fused(
-                OUT_M, OUT_N, G, gm, xcd, gn, nt, wgt, wlv, elgk, out_fp16, beta_is_one
-            )
-            _GMXFP4_WGRAD_LAUNCH_CACHE[lk] = ent
-        atk = (OUT_M, OUT_N, G, gm, xcd, gn, nt, wgt, out_fp16, beta_is_one)
-        e2 = _GMXFP4_WGRAD_AT_CACHE.get(atk)
-        if e2 is None:
-            e2 = [ent[0], None]
-            _GMXFP4_WGRAD_AT_CACHE[atk] = e2
-        return e2
-
-    run_eager_or_capture(_entry(_select_gmxfp4_wgrad_cfg(M_total, G, OUT_M, OUT_N)), args, 1)
-    _bound_caches(_GMXFP4_WGRAD_LAUNCH_CACHE, _GMXFP4_WGRAD_AT_CACHE, _GMXFP4_WGRAD_WS_CACHE)
+    cfg = _select_gmxfp4_wgrad_cfg(M_total, G, OUT_M, OUT_N)
+    key = (OUT_M, OUT_N, G, out_fp16, cfg)
+    entry = _GROUPED_GEMM_MXFP4_VARIABLE_K.entry(
+        key, lambda: _pick_gmxfp4_wgrad(key, cfg, OUT_M, OUT_N, G, wlv, elgk, out_fp16)
+    )
+    if beta_is_one:
+        entry = _GROUPED_GEMM_MXFP4_VARIABLE_K.derived(
+            key,
+            True,
+            entry,
+            lambda e: _gmxfp4_wgrad_entry(e.config, OUT_M, OUT_N, G, wlv, elgk, out_fp16, True, e.tuned),
+        )
+    _GROUPED_GEMM_MXFP4_VARIABLE_K.launch(entry, args)
+    _bound_caches(_GMXFP4_WGRAD_WS_CACHE)
     return out

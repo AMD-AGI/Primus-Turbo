@@ -83,18 +83,6 @@ def resolve_accum_out(out, beta, shape, device, out_dtype):
     return out
 
 
-def compile_with_scratch_out(launch, args, out_index=2):
-    """``flyc.compile`` the launch, with the output argument pointed at a scratch buffer.
-
-    Compilation builds its artifact by running the kernel once (see ``_compile_impl``),
-    which an accumulate (beta=1) build would fold into the caller's buffer as a second
-    GEMM. The artifact is keyed on shapes, not pointers, so compiling against a scratch
-    of the same shape and then calling it on the real buffer runs exactly once.
-    """
-    scratch = torch.zeros_like(args[out_index])
-    return flyc.compile(launch, *args[:out_index], scratch, *args[out_index + 1 :])
-
-
 _PRESHUF_KT = 16  # scale-preshuffle k-tile (rows*KT dwords staged in LDS per workgroup)
 _PRESHUF_WIDE = 3  # opt-in wide repack forms; bit 0 = vector staging, bit 1 = perm_b32 packing
 
@@ -180,10 +168,11 @@ def make_bf16_buffer_tensor_rebased(arg, bf16_ir_t, base_bytes, num_records_byte
 
 def make_bf16_fp16_tile_tensor(base_i64, byte_offset, elems):
     """Per-tile 2-byte (bf16/fp16) global view with base rebased by ``byte_offset`` in
-    int64 (keeps per-lane voffset int32 past a >4GB pool). Returns a plain global view;
-    the caller feeds it straight to gemm_tile, so the nt_tile API stays unchanged."""
+    int64 (keeps per-lane voffset int32 past a >4GB pool). Returns a plain global view
+    the caller feeds straight to gemm_tile."""
     ptr_ty = PointerType.get(elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16)
-    # A VMEM-loaded base reads as divergent even though it is wave-uniform, which would wrap every `buffer_load ... lds` in a per-lane waterfall.
+    # A VMEM-loaded base reads as divergent even though it is wave-uniform, which would wrap
+    # every `buffer_load ... lds` in a per-lane waterfall.
     tile_ptr = fx.inttoptr(ptr_ty, _readfirstlane_i32(base_i64 + byte_offset))
     return fx.make_view(tile_ptr, fx.make_layout(elems, 1))
 
@@ -208,9 +197,8 @@ def lds_row_swizzle(row, chunks):
 
 
 def swizzle_128(row, col, width=128):
-    """XOR bank-swizzle over a `width`=2**k logical row (width=128 is byte-identical to the
-    original fixed-128 form). The key only permutes the width//16 chunks inside one row, so
-    the row index passes through unchanged."""
+    """XOR bank-swizzle over a `width`=2**k logical row. The key only permutes the width//16
+    chunks inside one row, so the row index passes through unchanged."""
     return row, col ^ (lds_row_swizzle(row, width // 16) * 16)
 
 
@@ -278,8 +266,8 @@ def g2s_lds_imm(step, lds_step, n_grp=0):
     """Part of a wave-major g2s step's LDS offset that fits the buffer instruction's 12-bit
     immediate; the rest still has to go through M0.  ``n_grp`` is how many steps share one M0
     write, defaulting to the whole 4096-byte immediate window -- a stream whose source rows
-    cannot pay for that window takes a narrower one.  ``lds_step`` 0 marks the legacy
-    step-major fill, where every step needs its own M0 write."""
+    cannot pay for that window takes a narrower one.  ``lds_step`` 0 selects the step-major
+    fill, where every step needs its own M0 write."""
     if not lds_step:
         return 0
     return (step % (n_grp or (4096 // lds_step))) * lds_step
@@ -306,7 +294,8 @@ class G2SLoader:
         self.n_load_steps = n_load_steps
         self.wave_id = wave_id
         self.n_waves = fx.block_dim.x // 64
-        # Padding the per-wave chunk stride moves a transposed read's four lane groups off one bank half; reader and LDS pool must agree.
+        # Padding the per-wave chunk stride moves a transposed read's four lane groups off one
+        # bank half; reader and LDS pool must agree.
         self.chunk_stride = chunk_stride
         # Wave-major mode (steps per M0 window, 0 = step-major). The wave's chunks are
         # contiguous and ``gl_offsets`` carries the asm's 12-bit immediate pre-subtracted,
@@ -370,7 +359,6 @@ class G2SLoader:
 
 
 def pack_i32x4_i32x8(lo, hi):
-    # Pack two i32x4 as one i32x8
     return lo.shuffle(hi, list(range(8)))
 
 
@@ -609,7 +597,7 @@ class ScaleBComb:
         # grp = (col//256)*4 + wn is block-strided, so the buffer holds cdiv(dim,256)*4
         # groups (matches the C++ preshuffle B sizing). A partial last 256-block reads
         # only its valid wn groups; OOB-col reads clamp to 0 and StoreC drops them.
-        # dim%256==0 -> cdiv(dim,256)*4 == dim//64 (no change for aligned shapes).
+        # dim%256==0 -> cdiv(dim,256)*4 == dim//64.
         # n_slabs>1 (grouped): b_sp stacks G per-group slabs; load(slab=g) indexes group g.
         self.slab_elems = ((dim + 255) // 256) * 4 * self.K128p * 64 * 4  # i32 per group
         nbytes = self.slab_elems * n_slabs * 4  # int32 records
@@ -667,7 +655,6 @@ class ScaleS2R:
 #    remap, LDS-ptr/transpose loaders, swizzle), shared by dense and grouped.
 
 
-# gfx9 DPP controls: ROW_SHR|n shifts right by n within a 16-lane row; ROW_BCAST15/31 feed a row's last lane into following rows.
 def wave_rank_desc_stable(v, lane, n_entries):
     """Descending, tie-stable rank of a wave-resident i32 table (lane i holds entry i):
     ``rank_j = #{i: v_i > v_j} + #{i < j: v_i == v_j}``, the permutation a stable descending
@@ -720,7 +707,8 @@ def _sgpr_tbl_pick(bounds, key, tables):
     return outs
 
 
-# Lane-resident int32 table (entry i in lane i%64 of chunk i//64): avoids SGPR overflow past ~64 entries and LDS publish-barrier/ds_read; lookup = one v_readlane, prefix sum = one wave scan.
+# Lane-resident int32 table (entry i in lane i%64 of chunk i//64): avoids SGPR overflow past
+# ~64 entries and an LDS publish barrier; lookup = one v_readlane, prefix sum = one wave scan.
 def _lane_tbl_load(rsrc, lane, n_entries, stride=1, first=0):
     """Gather entries [0, n_entries) of an i32 buffer view into lane-resident chunks. Entry i
     is read from i32 element ``(i + first) * stride``; lanes past the buffer bound read 0."""
@@ -792,7 +780,8 @@ class StoreCPerTensor:
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.col_safe = col_safe
-        # trans: transposed scalar store for the A/B-swapped wgrad swap_n boundary body (frag row=N, col=M, written C[m,n]); square OUT_M==OUT_N tiles only.
+        # trans: transposed scalar store for the A/B-swapped wgrad swap_n boundary body
+        # (frag row=N, col=M, written C[m,n]); square OUT_M==OUT_N tiles only.
         self.trans = trans
         self.store_aux = store_aux
         self.lane_id = fx.thread_idx.x % 64
@@ -1065,7 +1054,8 @@ class StoreCPerTensorPairCol(StoreCPerTensor):
             row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
             row_off = [((row_local + i) * self.c_cols + col0) * 2 for i in range_constexpr(4)]
             for p in range_constexpr(self.n_tiles_b // 2):
-                # base_col is 32-aligned, so an even c_cols makes a pair's two columns valid or invalid together.
+                # base_col is 32-aligned, so an even c_cols makes a pair's two columns valid or
+                # invalid together.
                 pair_ok = None if self.col_safe else (col0 + p * 32 + 1) < self.c_cols
                 vecs = [
                     (Vec(c_frag[self.c_idx_fn(ti, 2 * p + h)]) * scale)
@@ -1250,8 +1240,7 @@ class StoreCPerTensorQuadN(StoreCPerTensorPairN):
 
     def prefetch(self, base_row, base_col):
         """The fold gives a lane a contiguous run, so the beta=1 read-back rides the run the
-        store writes: one vector load per four columns instead of one per column, which fetched
-        the same line four times over."""
+        store writes: one vector load per four columns, not four loads of the same line."""
         if not const_expr(self.beta_is_one):
             return None
         if self.rd_base is not None or self.rd_shift is not None:
@@ -1316,9 +1305,9 @@ class StoreCPerTensorQuadN(StoreCPerTensorPairN):
 
 
 class StoreCPerTensorCShuffle:
-    """CShuffle output store: same value->global-address mapping as StoreCPerTensor
-    (byte-identical) but stages each 16-row sub-tile through per-wave LDS, re-reads it
-    N-contiguous, and emits one vectorized 128b global store per lane. Assumes BLOCK_N=256."""
+    """CShuffle output store: same value->global-address mapping as StoreCPerTensor but stages
+    each 16-row sub-tile through per-wave LDS, re-reads it N-contiguous, and emits one
+    vectorized 128b global store per lane. Assumes BLOCK_N=256."""
 
     def __init__(
         self,
@@ -1375,7 +1364,8 @@ class StoreCPerTensorCShuffle:
         # C addressed via i64 per-band re-basing (handles OUT_M*OUT_N > 2^31 / >4GB);
         # the final 128b store re-bases at each 16-row sub-tile band (see store()).
         self.c_base = _buffer_ops.extract_base_index(C)
-        # A_scale/B_scale None -> scale already folded into the accumulator by the scaled MMA (mxfp8), so the store is plain.
+        # A_scale/B_scale None -> scale already folded into the accumulator by the scaled MMA
+        # (mxfp8), so the store is plain.
         self.scaled = A_scale is not None
         if self.scaled:
             gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)
@@ -1674,7 +1664,8 @@ def expert_group_tile_decode(group_offs, lane, tile, G, n_blocks_n, block_m_size
         n_tail = fx.Int32(arith.select(hit, v // w, n_tail))
     full = u < n_full * n_blocks_n
     block_m = m_base + fx.Int32(arith.select(full, m_full, n_full + m_tail))
-    # Serpentine columns: an odd super-tile row walks the column blocks backwards so neighbouring rows meet on the same B block.  Tile order only.
+    # Serpentine columns: an odd super-tile row walks the column blocks backwards so
+    # neighbouring rows meet on the same B block. Tile order only.
     band = fx.Int32(arith.select(full, row_of, floordiv_pow2(n_full, group_m)))
     block_n = fx.Int32(arith.select(full, in_group // group_m, n_tail))
     flipped = fx.Int32(n_blocks_n - 1) - block_n
@@ -1682,9 +1673,9 @@ def expert_group_tile_decode(group_offs, lane, tile, G, n_blocks_n, block_m_size
 
 
 def xcd_remap_pid_u(pid, total_pids, num_xcd):
-    """``xcd_remap_pid`` on ids proven non-negative: same bijection, unsigned divides (a mask
-    and a shift for pow2 num_xcd, vs a floor-div fixup each), a separate entry point so signed
-    callers keep byte-identical ISA, and a host-known ``total_pids`` folds the slice math away."""
+    """``xcd_remap_pid`` on ids proven non-negative: same bijection with unsigned divides (a mask
+    and a shift for pow2 num_xcd, vs a floor-div fixup each); a host-known ``total_pids`` folds
+    the slice math away. Kept separate so signed callers' ISA does not change."""
     if num_xcd <= 1:
         return pid
     xcd = umod(pid, num_xcd)
@@ -1735,16 +1726,12 @@ def xcd_remap_pid_blocked(pid, total_pids, num_xcd, blk):
 
 
 def xcd_remap_pid_blocked_dyn(pid, total_pids, num_xcd, blk):
-    """``xcd_remap_pid_blocked`` for a ``total_pids`` only known at runtime (a kernel argument,
-    not a folded constant). A separate entry point so the constant callers keep byte-identical
-    ISA: this one cannot take their two Python-level shortcuts -- the `full == 0` bail-out and
-    the `full == total_pids` select-free path -- because both branch on a value that no longer
-    folds, so it always emits the select.
+    """``xcd_remap_pid_blocked`` for a ``total_pids`` only known at runtime. It cannot take the
+    constant version's `full == 0` and `full == total_pids` shortcuts, so it always emits the
+    select; a separate entry point keeps the constant callers' ISA free of it.
 
-    Same bijection over [0, total_pids) as the constant version wherever that one takes its
-    general path. They differ only for a grid shorter than one num_xcd*blk round (full == 0),
-    where the constant version falls back to ``xcd_remap_pid`` and this one is the identity;
-    still a bijection, and at that size no hand-out spreads work any better."""
+    Same bijection as the constant version except for a grid shorter than one num_xcd*blk
+    round (full == 0), where this one is the identity instead of ``xcd_remap_pid``."""
     if num_xcd <= 1 or blk <= 1:
         return xcd_remap_pid(pid, total_pids, num_xcd)
     full = (total_pids // (num_xcd * blk)) * (num_xcd * blk)
@@ -1792,9 +1779,9 @@ def _packed_ds_read_tr_offsets(base_ptr, byte_offsets, vmcnt_hint=None):
 def compute_global_swizzle_nn(lane_id, wave_id, N_out, n_rounds, width=128, wswz=False):
     """Per-lane global-load offsets for NN B [K_inner, N_out] row-major, via
     swizzle_128(k_row, n_col, width) over the flat [K, N] byte view. `width` must equal
-    the destination buffer's LDS column span (e.g. LDS_BLOCK_N; defaults to 128,
-    byte-identical there) or reads overlap. chunks=width//16 lanes cooperate per K-row,
-    the remaining 64/chunks lanes per wave span distinct K-rows."""
+    the destination buffer's LDS column span (e.g. LDS_BLOCK_N) or reads overlap.
+    chunks=width//16 lanes cooperate per K-row, the remaining 64/chunks lanes per wave span
+    distinct K-rows."""
     offsets = []
     n_waves = fx.block_dim.x // 64
     chunks = width // 16
@@ -1860,9 +1847,8 @@ class S2RLoaderTr:
         coord_start = self.wave_idx * self.tile_stride + tile_i * 16
         j_chunk = (coord_start // 16) ^ (swz_K // 16)
         if self.wswz:
-            # XOR (W<<1) into j_chunk: address bit shift W*32, matching the write
-            # side's compute_global_swizzle_nn(wswz=True) -- drops LDSBankConflict
-            # conflicts drop to 0 at _CS=1024 (2-pool).
+            # XOR (W<<1) into j_chunk (address shift W*32), matching the write side's
+            # compute_global_swizzle_nn(wswz=True): no LDS bank conflicts at chunk_stride=1024.
             j_chunk = j_chunk ^ ((W << 1) & (chunks - 1))
         return (
             W * self.chunk_stride
@@ -2032,17 +2018,13 @@ def make_row_band_resource_div(c_base, base_row, c_rows, c_cols, elem_bytes):
 def run_compiled(cache: dict, key, launch, *args):
     """``flyc.compile`` the launch once per ``key``, then call the compiled object.
 
-    Calling a ``@flyc.jit`` launch directly re-pays its dispatch on every launch: signature bind over
-    the launch's arguments, cache-key build from the bound values, and a globals-drift check. That is
-    host time on the critical path, and it is not small -- for the fp8 combine's ~24-argument launch
-    it measures 180 us per call against 37 us through the compiled object, and a training step makes
-    that call twice per MoE layer. ``flyc.compile`` resolves all of it once; the object it returns
-    only forwards to the call state.
+    Calling a ``@flyc.jit`` launch directly re-pays signature bind, cache-key build and a
+    globals-drift check on every call (180 us vs 37 us for the fp8 combine's ~24-argument launch);
+    ``flyc.compile`` resolves them once.
 
-    The key belongs to the caller because it cannot be derived here. It has to cover everything the
-    compiled artifact depends on, which is the launch's own identity (usually an ``lru_cache``d
-    builder, but not always -- some callers build the closure per call) PLUS any argument value the
-    compile bakes in, such as an ``M`` that is not part of the builder's key.
+    The caller owns the key: it must cover the launch's identity (some callers build the closure
+    per call) plus any argument value the compile bakes in, such as an ``M`` outside the
+    builder's key.
     """
     compiled = cache.get(key)
     if compiled is None:
@@ -2051,59 +2033,13 @@ def run_compiled(cache: dict, key, launch, *args):
     compiled(*args)
 
 
-def _robust_time(launch, args, warmup=250, reps=5, iters=50):
-    """Median-of-`reps` timing of launch(*args) after `warmup` iters.
-    The long warmup reaches boost clock; short-K kernels mis-pick configs otherwise."""
-    for _ in range(warmup):
-        launch(*args)
-    torch.cuda.synchronize()
-    ts = []
-    for _ in range(reps):
-        e0 = torch.cuda.Event(enable_timing=True)
-        e1 = torch.cuda.Event(enable_timing=True)
-        e0.record()
-        for _ in range(iters):
-            launch(*args)
-        e1.record()
-        torch.cuda.synchronize()
-        ts.append(e0.elapsed_time(e1) / iters)
-    ts.sort()
-    return ts[len(ts) // 2]
-
-
-def _robust_ab_ratio(base, cand, args, warmup=125, reps=3, iters=50):
-    """Median of per-rep cand/base time ratios, both timed inside ONE measurement window: separate
-    windows make whichever runs first pay the DVFS ramp, which outruns the adoption margin. Each rep
-    is a palindrome (base, cand, cand, base) because the ramp term is odd in the slot index."""
-    for _ in range(warmup):
-        base(*args)
-        cand(*args)
-    torch.cuda.synchronize()
-    rs = []
-    for _ in range(reps):
-        ts = []
-        for launch in (base, cand, cand, base):
-            e0 = torch.cuda.Event(enable_timing=True)
-            e1 = torch.cuda.Event(enable_timing=True)
-            e0.record()
-            for _ in range(iters):
-                launch(*args)
-            e1.record()
-            torch.cuda.synchronize()
-            ts.append(e0.elapsed_time(e1) / iters)
-        rs.append((ts[1] + ts[2]) / (ts[0] + ts[3]))
-    rs.sort()
-    return rs[len(rs) // 2]
-
-
 # E8M0 scale preshuffle (FlyDSL, LDS-tiled): raw E8M0 [DIM,K//32] -> preshuffled int32.
 # Tile by k: coalesced load of 64 rows x KT cols into LDS, coalesced dwordx4 store of the
 # [KT,64,4] block (wave-lane transpose via LDS, both DRAM sides coalesced). n_tiles=4.
 #
-# The preshuffle is NOT a standalone launch: ``build_preshuffle_ab_kernel`` returns the
-# bare @flyc.kernel so the mxfp8 GEMM can launch it + the gemm kernel from ONE @flyc.jit
-# host stub (turbo-style single dispatch, scales repacked into a caller-owned workspace
-# in stream order right before the gemm reads them -- no separate Python/launch dispatch).
+# ``build_preshuffle_ab_kernel`` returns the bare @flyc.kernel so the mxfp8 GEMM launches it
+# and the gemm kernel from one @flyc.jit host stub, repacking scales into a caller-owned
+# workspace in stream order right before the gemm reads them.
 
 
 def emit_if_then(cond, then_fn):
@@ -2143,28 +2079,23 @@ def _emit_lds_repack(
     pack=1,
     kbound=None,
     k128p=None,
-    comb=None,
     wide=0,
     bperm=False,
 ):
     # LDS-tiled transpose body (one workgroup, one (grp,k-chunk)). rd_base/wr_base
     # (default 0) shift the flat read/write offset to a group's slab (0 = dense).
-    # kbound (default K128) bounds this chunk's k index; k128p (default ceildiv(K128,pack)) is the output k-stride, so the variable-K wgrad packs each group from its own k0.
-    # comb (B only, default (256,128)) is the (tile-block, second-half) row stride pair: a
-    # group already interleaves the block's two 128-column halves, which is what lets the
-    # reader split one ScaleBComb load in two. Widening the second stride past the block
-    # makes those halves two distant bands -- the fused GLU's gate and up.
+    # kbound (default K128) bounds this chunk's k index; k128p (default ceildiv(K128,pack)) is
+    # the output k-stride, so the variable-K wgrad packs each group from its own k0.
+    # B rows: a 256-row tile block whose two 128-column halves a group interleaves, which is
+    # what lets the reader split one ScaleBComb load in two.
     NT = 4
-    CB_BLK, CB_HALF = comb if comb is not None else (256, 128)
+    CB_BLK, CB_HALF = 256, 128
     TILE = 64 * KT
     assert KT % pack == 0 and TILE % BLK == 0 and ((KT // pack) * 64) % BLK == 0
     # A vector-staged lane run spans one row under one bound, so the variable-K callers,
     # which pass their own, keep the scalar form.
     assert not (wide & 1) or (TILE % (BLK * pack) == 0 and kbound is None)
     assert not (wide & 2) or pack == 4
-    # The row pairing is an involution inside a 32-row block of the packed B layout, so it
-    # only holds while the two halves stay adjacent inside the block.
-    assert not bperm or (CB_BLK, CB_HALF) == (256, 128)
     KBND = K128 if kbound is None else kbound
     VW = pack if (wide & 1) else 1
     for i in range_constexpr(TILE // (BLK * VW)):
@@ -2670,8 +2601,7 @@ class StoreCBf16:
                 self._store_masked(acc[r], row_base + m, valid)
 
 
-# MXFP4 kernel helpers: lane-table group search (with its DPP scan primitives),
-# power-of-two ceildiv/floordiv, and the XCD band remap.
+# MXFP4 kernel helpers: the XCD band remap and the packed scale layout.
 
 
 def xcd_band_remap_pid(pid, total_pids, num_xcd, band):
@@ -2692,6 +2622,9 @@ def xcd_band_remap_pid(pid, total_pids, num_xcd, band):
 _MXFP4_PRESHUF_BLK = 256
 _MXFP4_PRESHUF_NG = 4  # g bytes packed by one thread
 _MXFP4_PRESHUF_ND = 4  # (r_region, K sub-block) cells packed by one thread
+# Adjacent packed cells (same rows, next 256-K block) repacked together: batching KU
+# of them turns KU narrow reads into one wide one, cutting read sectors by KU for the
+# same bytes. The store side is untouched and the grid still covers every CU.
 _MXFP4_PRESHUF_KU = 2
 _MXFP4_PRESHUF_FO = _MXFP4_PRESHUF_NG * _MXFP4_PRESHUF_ND  # output dwords per thread
 
@@ -2712,11 +2645,10 @@ def _mxfp4_preshuf_geom(k128):
 def mxfp4_packed_scale_byte(row, kblk, *, k128, b_ilv, is_b, kk=None, b_nt=4, a_nt=4):
     """Byte offset of a canonical E8M0 scale (``row``, ``kblk`` = k // 32) in the packed layout.
 
-    The scatter counterpart of the gather in ``_build_mxfp4_preshuffle_kernel_ab``. That pass
-    is a pure byte permutation -- ``_mxfp4_pack_cell`` only transposes bytes, it never
-    arithmetics them -- so a producer already holding one scale byte can store it straight into
-    its packed slot and skip the repacking pass altogether. Accepts Python ints or traced
-    values; the divisors are all compile-time.
+    The scatter counterpart of the gather in ``_build_mxfp4_preshuffle_kernel_ab``, which is a
+    pure byte permutation, so a producer holding one scale byte can store it straight into its
+    packed slot and skip the repack. Accepts Python ints or traced values; the divisors are all
+    compile-time.
 
     ``b_nt`` is how many 16-column n-fragments B's tile packs into one dword (BLOCK_N // 64),
     ``a_nt`` the same for A's 16-row m-fragments (BLOCK_M // 64). A narrower tile groups fewer
