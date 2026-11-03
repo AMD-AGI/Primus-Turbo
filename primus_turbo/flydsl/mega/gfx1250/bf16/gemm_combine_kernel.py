@@ -54,8 +54,10 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     EB,
     GFX1250_LDS_BYTES,
     NUM_BUFFERS,
+    NUM_XCD,
     WAVE,
     nt_gemm_tile,
+    pool_tile_order,
     tile_geometry,
 )
 from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
@@ -139,6 +141,8 @@ def _launch_gemm_combine_nt(
     B_NN: Constexpr[bool],
     HAS_BIAS: Constexpr[bool],
     SCATTER: Constexpr[bool],
+    group_m: Constexpr[int],
+    num_xcd: Constexpr[int],
 ):
     block = m_warp * n_warp * WAVE
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
@@ -249,8 +253,10 @@ def _launch_gemm_combine_nt(
         is_gemm = arith.select(is_combine, fx.Int32(0), fx.Int32(1)) == fx.Int32(1)
         live = is_gemm & (gemm_block_idx < num_tiles_m * fx.Int32(N_BLOCKS_N))
         gemm_block_idx = live.select(gemm_block_idx, fx.Int32(0))
-        block_m = rocdl.readfirstlane(T.i32, gemm_block_idx // fx.Int32(N_BLOCKS_N))
-        block_n = rocdl.readfirstlane(T.i32, gemm_block_idx % fx.Int32(N_BLOCKS_N))
+        # the flags count a pool block's N blocks in any order, so the order is free
+        tile_m_idx, tile_n_idx = pool_tile_order(gemm_block_idx, num_tiles_m, N_BLOCKS_N, group_m, num_xcd)
+        block_m = rocdl.readfirstlane(T.i32, tile_m_idx)
+        block_n = rocdl.readfirstlane(T.i32, tile_n_idx)
         expert = rocdl.readfirstlane(T.i32, _i32_table(arg_tile_to_expert)[block_m])
         expert = live.select(expert, fx.Int32(0))
         blk_n = block_n * fx.Int32(tile_n)
@@ -594,6 +600,7 @@ def gemm_combine_nt_gfx1250(
     tile_k: int = 0,
     m_warp: int = 4,
     n_warp: int = 2,
+    group_m: int = 16,
     grad_gate: torch.Tensor | None = None,
     b_nn: bool = False,
     bias: torch.Tensor | None = None,
@@ -641,6 +648,8 @@ def gemm_combine_nt_gfx1250(
     # lead combine workgroups spin on GEMM tiles, so they must leave CUs for the GEMM to finish
     assert 0 <= num_lead_combine < num_cu
     num_tail_combine = num_tail_combine or num_cu - num_lead_combine
+    # the XCD bands need the GEMM tiles' bids past the lead combines to stay on XCD boundaries
+    num_xcd = NUM_XCD if num_lead_combine % NUM_XCD == 0 else 1
     out = torch.empty(int(symm.num_max_tokens_per_rank), N, dtype=torch.bfloat16, device=act.device)
     has_grad_gate = grad_gate is not None
     if has_grad_gate:
@@ -706,6 +715,8 @@ def gemm_combine_nt_gfx1250(
         b_nn,
         has_bias,
         scatter,
+        group_m,
+        num_xcd,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)

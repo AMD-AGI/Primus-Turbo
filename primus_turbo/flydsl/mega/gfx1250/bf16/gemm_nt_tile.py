@@ -89,6 +89,8 @@ EB = 2  # bf16
 LDS_PAD = 16  # bytes after every LDS row: keeps rows 4 dwords apart for conflict-free b128 reads
 NUM_BUFFERS = 2
 GFX1250_LDS_BYTES = 320 * 1024
+NUM_XCD = 8  # a workgroup runs on XCD bid % NUM_XCD
+XCD_BAND = 16
 # the TDM gather repro switch (see the module docstring); a FlyDSL cache built without it keeps
 # serving the async kernels
 TDM_GATHER_A = os.environ.get("MEGA_TDM_GATHER", "0") == "1"
@@ -111,6 +113,31 @@ def check_gather_rows(a_rows: int, lda: int, tile_m: int, tile_k: int):
     """The async A gather's limits: some row to read, and 32-bit byte offsets into A."""
     assert a_rows > 0, "a gathered A needs a row"
     assert a_rows * lda * EB + tile_m * (tile_k * EB + LDS_PAD) < 2**32, "A too big for 32-bit row offsets"
+
+
+def pool_tile_order(pid, n_blocks_m, n_blocks_n: int, group_m: int, num_xcd: int):
+    """``(block_m, block_n)`` of grid tile ``pid`` over ``n_blocks_m`` (device-side) x ``n_blocks_n``.
+
+    ``group_m`` pool blocks share each N block in turn, and with ``num_xcd`` > 1 every
+    ``XCD_BAND`` consecutive tiles of that order go to one XCD (workgroup ``pid`` runs on XCD
+    ``pid % num_xcd``, so ``pid`` must start on an XCD boundary): an XCD reads few of an expert's
+    weight columns."""
+    if num_xcd > 1:
+        span = fx.Int32(XCD_BAND * num_xcd)
+        n_full = (n_blocks_m * fx.Int32(n_blocks_n)) // span * span
+        r = pid % span
+        banded = pid // span * span + r % fx.Int32(num_xcd) * fx.Int32(XCD_BAND) + r // fx.Int32(num_xcd)
+        pid = (pid < n_full).select(banded, pid)
+    if group_m <= 1:
+        return pid // fx.Int32(n_blocks_n), pid % fx.Int32(n_blocks_n)
+    num_pid_in_group = fx.Int32(group_m * n_blocks_n)
+    first_m = pid // num_pid_in_group * fx.Int32(group_m)
+    size_m = n_blocks_m - first_m
+    size_m = (size_m < fx.Int32(group_m)).select(size_m, fx.Int32(group_m))
+    # a dead tile past the pool decodes to some block; it is masked anyway
+    size_m = (size_m > fx.Int32(0)).select(size_m, fx.Int32(1))
+    pid_in_group = pid % num_pid_in_group
+    return first_m + pid_in_group % size_m, pid_in_group // size_m
 
 
 # ── TDM gather descriptors ───────────────────────────────────────────────────
@@ -761,20 +788,13 @@ def _launch_mega_nt(
         arena.allocate(arena_bytes)
         base_ptr = arena.base_ptr
 
-        # Mega's tile order: GROUP_M super-tiles over the pool blocks that are live this call
+        # Mega's tile order over the pool blocks that are live this call
         pid = fx.Int32(fx.block_idx.x)
         real_tiles = rocdl.readfirstlane(T.i32, _i32_table(arg_num_tile_blocks)[fx.Int32(0)])
         live = pid < real_tiles * fx.Int32(N_BLOCKS_N)
-        num_pid_in_group = fx.Int32(group_m * N_BLOCKS_N)
-        first_pid_m = (pid // num_pid_in_group) * fx.Int32(group_m)
-        remaining_m = real_tiles - first_pid_m
-        group_size_m = (remaining_m < fx.Int32(group_m)).select(remaining_m, fx.Int32(group_m))
-        group_size_m = (group_size_m > fx.Int32(0)).select(group_size_m, fx.Int32(1))
-        pid_in_group = pid % num_pid_in_group
-        block_m = live.select(first_pid_m + pid_in_group % group_size_m, fx.Int32(0))
-        block_n = live.select(pid_in_group // group_size_m, fx.Int32(0))
-        block_m = rocdl.readfirstlane(T.i32, block_m)
-        block_n = rocdl.readfirstlane(T.i32, block_n)
+        tile_m_idx, tile_n_idx = pool_tile_order(pid, real_tiles, N_BLOCKS_N, group_m, NUM_XCD)
+        block_m = rocdl.readfirstlane(T.i32, live.select(tile_m_idx, fx.Int32(0)))
+        block_n = rocdl.readfirstlane(T.i32, live.select(tile_n_idx, fx.Int32(0)))
         expert = rocdl.readfirstlane(T.i32, _i32_table(arg_tile_to_expert)[block_m])
 
         blk_n = block_n * fx.Int32(tile_n)

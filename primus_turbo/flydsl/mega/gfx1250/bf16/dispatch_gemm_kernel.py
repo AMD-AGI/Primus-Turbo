@@ -46,9 +46,11 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     EB,
     GFX1250_LDS_BYTES,
     NUM_BUFFERS,
+    NUM_XCD,
     WAVE,
     check_gather_rows,
     nt_gemm_tile,
+    pool_tile_order,
     tile_geometry,
 )
 from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
@@ -109,6 +111,7 @@ def _launch_dispatch_gemm_nt(
     DISPATCH_ONLY: Constexpr[bool],
     B_NN: Constexpr[bool],
     EXPERTS_PER_PUBLISH: Constexpr[int],
+    num_xcd: Constexpr[int],
 ):
     block = m_warp * n_warp * WAVE
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
@@ -215,16 +218,9 @@ def _launch_dispatch_gemm_nt(
             real_tiles = fx.Int32(0)
         live = (pid >= fx.Int32(0)) & (pid < real_tiles * fx.Int32(N_BLOCKS_N))
         pid = live.select(pid, fx.Int32(0))
-        num_pid_in_group = fx.Int32(group_m * N_BLOCKS_N)
-        first_pid_m = (pid // num_pid_in_group) * fx.Int32(group_m)
-        remaining_m = real_tiles - first_pid_m
-        group_size_m = (remaining_m < fx.Int32(group_m)).select(remaining_m, fx.Int32(group_m))
-        group_size_m = (group_size_m > fx.Int32(0)).select(group_size_m, fx.Int32(1))
-        pid_in_group = pid % num_pid_in_group
-        block_m = rocdl.readfirstlane(
-            T.i32, live.select(first_pid_m + pid_in_group % group_size_m, fx.Int32(0))
-        )
-        block_n = rocdl.readfirstlane(T.i32, live.select(pid_in_group // group_size_m, fx.Int32(0)))
+        tile_m_idx, tile_n_idx = pool_tile_order(pid, real_tiles, N_BLOCKS_N, group_m, num_xcd)
+        block_m = rocdl.readfirstlane(T.i32, live.select(tile_m_idx, fx.Int32(0)))
+        block_n = rocdl.readfirstlane(T.i32, live.select(tile_n_idx, fx.Int32(0)))
         expert = rocdl.readfirstlane(T.i32, _i32_table(arg_tile_to_expert)[block_m])
         expert = live.select(expert, fx.Int32(0))
 
@@ -363,6 +359,8 @@ def _run(
     check_gather_rows(a_rows, K, tile_m, tile_k)
     # the prologue marks padding rows with a_rows, out of range for the A gather
     idx_bits = 16 if a_rows < 0xFFFF else 32
+    # the XCD bands need the GEMM tiles' pid to start on an XCD boundary
+    num_xcd = NUM_XCD if num_dispatch_cu % NUM_XCD == 0 else 1
     out = x.new_empty((0, N) if dispatch_only else (handle.pool_row_to_route.numel(), N))
     n_blocks_n = (N + tile_n - 1) // tile_n
     args = (
@@ -407,6 +405,7 @@ def _run(
         # GEMM tiles start on their expert's flag; with no tile to wait, a comm block publishes
         # once, sparing a remote store-retire round trip per expert
         G if dispatch_only else 1,
+        num_xcd,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)
