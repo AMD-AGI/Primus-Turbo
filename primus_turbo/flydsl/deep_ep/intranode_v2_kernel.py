@@ -155,6 +155,36 @@ def _tdm_row(lds_addr, global_addr, num_bytes):
     return tdm_ops.TDMDescriptor2D(dgroup0=group0, dgroup1=group1)
 
 
+def _tdm_desc_wait(desc, asm_string):
+    """``asm_string`` with ``desc`` as its operands: the descriptor's SGPRs hold it at that point."""
+    llvm.inline_asm(
+        res=None,
+        operands_=[fx.as_ir_value(desc.dgroup0), fx.as_ir_value(desc.dgroup1)],
+        asm_string=asm_string,
+        constraints="s,s,~{memory}",
+        has_side_effects=True,
+    )
+
+
+def _tdm_op(op, lds_addr, global_addr, num_bytes, **kwargs):
+    """TDM ``op`` (load or store) of one ``num_bytes`` row between LDS ``lds_addr`` and ``global_addr``
+    (``_tdm_row``), then an ``s_wait_xcnt 0`` until the op has read its descriptor. The compiler emits none
+    after a TDM op, and the dispatch rewrote a descriptor's SGPRs within a few instructions of the op that
+    reads them, which faulted about once in 6000 cached dispatches at EP4 on an address twice a row's (none
+    in about 96000 with the wait, at no measured cost)."""
+    desc = _tdm_row(lds_addr, global_addr, num_bytes)
+    op(desc, **kwargs)
+    _tdm_desc_wait(desc, "s_wait_xcnt 0x0")
+
+
+def _tdm_load(lds_addr, global_addr, num_bytes, **kwargs):
+    _tdm_op(tdm_ops.tensor_load_2d, lds_addr, global_addr, num_bytes, **kwargs)
+
+
+def _tdm_store(lds_addr, global_addr, num_bytes, **kwargs):
+    _tdm_op(tdm_ops.tensor_store_2d, lds_addr, global_addr, num_bytes, **kwargs)
+
+
 def _align(value, alignment):
     return (value + alignment - 1) // alignment * alignment
 
@@ -284,6 +314,42 @@ MAX_EPOCH = (1 << 11) - 1
 
 
 @ASTRewriter.transform
+def _tdm_copy_received_x(local, layout, outputs, row, hidden_bytes: int, row_lds, row_buffer_bytes: int):
+    """Received row ``row``'s data from the heap into the output through the warp's LDS row buffer."""
+    for p in range_constexpr(0, hidden_bytes, row_buffer_bytes):
+        piece = min(row_buffer_bytes, hidden_bytes - p)
+        tdm_ops.tensor_wait(0)
+        _tdm_load(
+            row_lds,
+            _uniform_i64(_addr(local, layout["x"] + p, row, hidden_bytes)),
+            piece,
+            cache_policy=SYS_LOAD,
+        )
+        tdm_ops.tensor_wait(0)
+        _tdm_store(row_lds, _uniform_i64(_addr(outputs["x"], p, row, hidden_bytes)), piece)
+
+
+@ASTRewriter.transform
+def _tdm_send_row(row_lds, x_base, t, hidden_bytes: int, row_buffer_bytes: int, dst_x, rows, routed):
+    """Token ``t``'s row of x, loaded once a piece at a time into the warp's LDS row buffer and stored from
+    there to row ``rows[d]`` of every destination ``d`` it is ``routed`` to."""
+    for p in range_constexpr(0, hidden_bytes, row_buffer_bytes):
+        piece = min(row_buffer_bytes, hidden_bytes - p)
+        # the previous stores are done with the buffer
+        tdm_ops.tensor_wait(0)
+        _tdm_load(row_lds, _uniform_i64(_addr(x_base, p, t, hidden_bytes)), piece)
+        tdm_ops.tensor_wait(0)
+        for d in range_constexpr(len(rows)):
+            if routed[d]:
+                _tdm_store(
+                    row_lds,
+                    _uniform_i64(_addr(dst_x[d], p, rows[d], hidden_bytes)),
+                    piece,
+                    cache_policy=SYS_STORE,
+                )
+
+
+@ASTRewriter.transform
 def _poll_tails(
     lds,
     lds_recv: int,
@@ -361,17 +427,7 @@ def _copy_received(
         for s in range_constexpr(1, num_ranks):
             row = arith.select(j >= cums[s], starts[s] + j - cums[s], row)
         if fx.const_expr(row_lds is not None):
-            for p in range_constexpr(0, hidden_bytes, row_buffer_bytes):
-                piece = min(row_buffer_bytes, hidden_bytes - p)
-                tdm_ops.tensor_wait(0)
-                tdm_ops.tensor_load_2d(
-                    _tdm_row(row_lds, _uniform_i64(_addr(local, layout["x"] + p, row, hidden_bytes)), piece),
-                    cache_policy=SYS_LOAD,
-                )
-                tdm_ops.tensor_wait(0)
-                tdm_ops.tensor_store_2d(
-                    _tdm_row(row_lds, _uniform_i64(_addr(outputs["x"], p, row, hidden_bytes)), piece)
-                )
+            _tdm_copy_received_x(local, layout, outputs, row, hidden_bytes, row_lds, row_buffer_bytes)
         else:
             _copy_row(
                 _addr(outputs["x"], 0, row, hidden_bytes),
@@ -589,24 +645,16 @@ def _make_dispatch_v2(
                     rows.append(rank_offsets[d] + arith.select(is_routed, slot, fx.Int32(0)))
                     routed.append(is_routed)
                 if fx.const_expr(USE_TDM):
-                    for p in range_constexpr(0, hidden_bytes, row_buffer_bytes):
-                        piece = min(row_buffer_bytes, hidden_bytes - p)
-                        # the previous stores are done with the buffer
-                        tdm_ops.tensor_wait(0)
-                        tdm_ops.tensor_load_2d(
-                            _tdm_row(row_lds, _uniform_i64(_addr(x_base, p, t, hidden_bytes)), piece)
-                        )
-                        tdm_ops.tensor_wait(0)
-                        for d in range_constexpr(num_ranks):
-                            if routed[d]:
-                                tdm_ops.tensor_store_2d(
-                                    _tdm_row(
-                                        row_lds,
-                                        _uniform_i64(_addr(dst_bases["x"][d], p, rows[d], hidden_bytes)),
-                                        piece,
-                                    ),
-                                    cache_policy=SYS_STORE,
-                                )
+                    _tdm_send_row(
+                        row_lds,
+                        x_base,
+                        t,
+                        hidden_bytes,
+                        row_buffer_bytes,
+                        dst_bases["x"],
+                        rows,
+                        routed,
+                    )
                 else:
                     dst_resources = [
                         create_buffer_resource_from_addr(
@@ -1003,16 +1051,16 @@ def _make_combine_v2(
                     dtype=fx.T.f32,
                 )
             if fx.const_expr(USE_TDM):
-                tdm_ops.tensor_load_2d(
-                    _tdm_row(row_lds, _uniform_i64(_addr(x_base, 0, row, hidden_bytes)), hidden_bytes)
-                )
+                _tdm_load(row_lds, _uniform_i64(_addr(x_base, 0, row, hidden_bytes)), hidden_bytes)
                 if fx.const_expr(num_topk > 0):
                     if lane_id < fx.Int32(num_topk):
                         st_lds(row_lds, fx.Int32(hidden_bytes // 4) + lane_id, weight)
                     _wait_lds()
                 tdm_ops.tensor_wait(0)
-                tdm_ops.tensor_store_2d(
-                    _tdm_row(row_lds, _uniform_i64(_addr(peer, layout["x"], slot, slot_bytes)), push_bytes),
+                _tdm_store(
+                    row_lds,
+                    _uniform_i64(_addr(peer, layout["x"], slot, slot_bytes)),
+                    push_bytes,
                     cache_policy=SYS_STORE,
                 )
             else:
