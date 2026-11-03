@@ -379,7 +379,7 @@ def _build_launcher():
         buf: fx.Array[fx.Int32, _BR * _TCW, 16]  # 16 KiB y tile
         gam: fx.Array[fx.Int32, _GAMW, 16]  # 6 KiB gamma row
 
-    @flyc.kernel(known_block_size=[_BLK, 1, 1])
+    @flyc.kernel(name="rmsnorm_mxfp4_fused_kernel", known_block_size=[_BLK, 1, 1])
     def rmsnorm_mxfp4_fused_kernel(
         X: fx.Tensor,
         RES: fx.Tensor,

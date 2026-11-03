@@ -165,7 +165,7 @@ def build_sparse_mla_bwd_gfx1250(
     if KT % CTG:
         raise ValueError(f"ct_group {CTG} must divide the {KT} slot sub-tiles")
 
-    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    @flyc.kernel(name="sparse_mla_bwd_gfx1250_kernel", known_block_size=[BLOCK, 1, 1])
     def sparse_mla_bwd_gfx1250_kernel(
         Q: fx.Tensor,
         KV: fx.Tensor,
@@ -586,7 +586,7 @@ def build_sparse_mla_bwd_gfx1250_w1(
     # with fewer heads (smaller dQ accumulator) they fit in registers for the whole token.
     CT_RES = H < 128 if ct_resident is None else ct_resident
 
-    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    @flyc.kernel(name="sparse_mla_bwd_gfx1250_w1_kernel", known_block_size=[BLOCK, 1, 1])
     def sparse_mla_bwd_gfx1250_w1_kernel(
         Q: fx.Tensor,
         KV: fx.Tensor,
@@ -1012,7 +1012,7 @@ def build_sparse_mla_bwd_gfx1250_swa(
     # Row tiles whose shifted dS / P rows can fall outside the 128 slots (read as zeros).
     edge = [r * 16 - (BT - 1) < 0 or r * 16 + 15 >= W for r in range(NR)]
 
-    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    @flyc.kernel(name="sparse_mla_bwd_gfx1250_swa_kernel", known_block_size=[BLOCK, 1, 1])
     def sparse_mla_bwd_gfx1250_swa_kernel(
         Q: fx.Tensor,
         KV: fx.Tensor,
@@ -1532,7 +1532,7 @@ def build_swa_dkv_reduce(num_heads, block_t=16, pool_p=0):
     PG = BLOCK // PQ  # thread groups
     PU = 16
 
-    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    @flyc.kernel(name="swa_dkv_reduce_kernel", known_block_size=[BLOCK, 1, 1])
     def swa_dkv_reduce_kernel(PART: fx.Tensor, PPART: fx.Tensor, DKV: fx.Tensor, NKV: fx.Int32, NB: fx.Int32):
         tid = fx.Int32(fx.thread_idx.x)
         j = fx.Int32(fx.block_idx.x)

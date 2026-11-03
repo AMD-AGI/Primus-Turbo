@@ -143,7 +143,7 @@ def _make_epoch_bump(add_dispatch, add_ps):
     host synchronize()+barrier(), no cross-call reset race). Mirrors the bf16 dispatch epoch bump,
     plus a second (preshuffle) counter for the fp8-only preshuffle role."""
 
-    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    @flyc.kernel(name="mega_fp8_dispatch_epoch_bump_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
     def epoch_bump_kernel(PARITY: fx.Tensor, DISP_EXP: fx.Tensor, PS_EXP: fx.Tensor):
         if fx.thread_idx.x == fx.Int32(0):
             parity_res = create_buffer_resource(PARITY, max_size=True)
@@ -344,7 +344,7 @@ def _compile(
     _ps_bytes_per_row = K128 * 64 * 4 * 4 // 64
     _ps_rounds = 0 if _no_ps else (worst_case_tiles + num_preshuffle_cu - 1) // num_preshuffle_cu
 
-    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    @flyc.kernel(name="dispatch_grouped_gemm_mxfp8_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
     def dispatch_grouped_gemm_mxfp8_kernel(
         XQ: fx.Tensor,  # fp8 tokens int32 view [T, K//4] flattened (comm reads)
         XS: fx.Tensor,  # raw E8M0 scales int32 view [T, K//128] (comm reads)

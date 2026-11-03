@@ -318,7 +318,7 @@ def _launch_grouped_bf16_variable_k(
         raise ValueError(f"LDS arena {ARENA_B} B exceeds the gfx1250 budget {_GFX1250_LDS_BYTES} B")
     _check_smem(ARENA_B, str(_get_arch()))
 
-    @flyc.kernel(known_block_size=[block, 1, 1])
+    @flyc.kernel(name="mega_gfx1250_grouped_variable_k", known_block_size=[block, 1, 1])
     def kernel_grouped_variable_k(
         arg_c: fx.Pointer,
         arg_a: fx.Pointer,

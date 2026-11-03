@@ -39,7 +39,7 @@ def _make_layout_kernel(num_topk: int, num_ranks: int, num_experts: int):
     rank_expert_end = num_ranks * num_experts_per_rank
     pack_words = num_ranks % 4 == 0
 
-    @flyc.kernel(known_block_size=[_THREADS, 1, 1])
+    @flyc.kernel(name="deep_ep_dispatch_layout_kernel", known_block_size=[_THREADS, 1, 1])
     def dispatch_layout_kernel(
         TOPK_IDX: fx.Tensor,
         COUNTS: fx.Tensor,

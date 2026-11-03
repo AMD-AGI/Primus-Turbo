@@ -400,7 +400,7 @@ def _compile_grouped_bf16_wgrad(
     MASK_M = N_BLOCKS_M * BLOCK_M > OUT_M
     SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N, chunk_stride=lds_chunk_stride)
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name="kernel_grouped_bf16_variable_k", known_block_size=[512, 1, 1])
     def kernel_grouped_variable_k(
         A: fx.Tensor,
         B: fx.Tensor,
@@ -626,7 +626,7 @@ def _compile_grouped_bf16_nt(
     assert GROUP_M >= 1 and GROUP_M & (GROUP_M - 1) == 0, "GROUP_M must be a power of two"
     SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N)
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name="kernel_grouped_bf16_nt", known_block_size=[512, 1, 1])
     def kernel_grouped_nt(
         A: fx.Tensor,
         B: fx.Tensor,
@@ -796,7 +796,7 @@ def _compile_grouped_bf16_nn(
     B_GRP = N * K  # elements of one expert's weight slab
     SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N)
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name="kernel_grouped_bf16_nn", known_block_size=[512, 1, 1])
     def kernel_grouped_nn(
         A: fx.Tensor,
         B: fx.Tensor,

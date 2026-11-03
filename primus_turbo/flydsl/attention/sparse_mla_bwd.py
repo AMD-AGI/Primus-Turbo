@@ -82,7 +82,7 @@ def build_delta():
     lds_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_off + DELTA_THREADS * 4  # 64 fp32 partials
 
-    @flyc.kernel(known_block_size=[DELTA_THREADS, 1, 1])
+    @flyc.kernel(name="sparse_mla_bwd_delta", known_block_size=[DELTA_THREADS, 1, 1])
     def k_fn(O: fx.Tensor, DO: fx.Tensor, DELTA: fx.Tensor, NROWS: fx.Int32):
         lds = SmemPtr(allocator.get_base(), lds_off, fx.Float32.ir_type, shape=(DELTA_THREADS,)).get()
         row = fx.Index(gpu.block_idx.x)
@@ -151,7 +151,7 @@ def build_dsink_split(T_LEN, H, tb=DSINK_TB):
     lds_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_off + DSINK_THREADS * 4
 
-    @flyc.kernel(known_block_size=[DSINK_THREADS, 1, 1])
+    @flyc.kernel(name="sparse_mla_bwd_dsink_split", known_block_size=[DSINK_THREADS, 1, 1])
     def k_fn(
         LSE: fx.Tensor, DELTA: fx.Tensor, SINK: fx.Tensor, PARTIAL: fx.Tensor, T: fx.Int32, NBLK: fx.Int32
     ):
@@ -219,7 +219,7 @@ def build_dsink_reduce(NBLK, H):
     DSINK_THREADS; thread tid (< H) sums the NBLK block-partials of head tid, then negates."""
     allocator = SmemAllocator(None, arch=get_hip_arch(), global_sym_name="mla_bwd_dsink_p2_smem")
 
-    @flyc.kernel(known_block_size=[DSINK_THREADS, 1, 1])
+    @flyc.kernel(name="sparse_mla_bwd_dsink_reduce", known_block_size=[DSINK_THREADS, 1, 1])
     def k_fn(PARTIAL: fx.Tensor, DSINK: fx.Tensor):
         tid = fx.Index(gpu.thread_idx.x)
         Hn = fx.Index(H)
@@ -287,7 +287,7 @@ def build_bwd_dq(topk_len, scale, qk_prefetch=4, num_heads=None, pv_prefetch=8):
     mask_off = allocator._align(kv_off + KVBUF * LDS_ELEMS * 2, 16)
     allocator.ptr = allocator._align(mask_off + KVBUF * TILE_K * 4, 16)
 
-    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name="sparse_mla_bwd_dq", known_block_size=[THREADS, 1, 1])
     def k_fn(
         Q: fx.Tensor,
         KV: fx.Tensor,
@@ -699,7 +699,7 @@ def build_bwd_dq_pv2x(topk_len, scale, num_heads=None, qk_prefetch=6, pv_prefetc
     allocator.ptr = allocator._align(mask_off + KVBUF * TILE_K * 4, 16)
     _QK4 = 1 if ((num_heads is not None and num_heads > 64) or topk_len >= 512) else 0
 
-    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name="sparse_mla_bwd_dq_pv2x", known_block_size=[THREADS, 1, 1])
     def k_fn(
         Q: fx.Tensor,
         KV: fx.Tensor,
@@ -1054,7 +1054,7 @@ def build_interm_regtr(topk_len, num_heads, BD=512):
     p_off = allocator._align(ds_off + DBUF * DS_LDS * 2, 16)
     allocator.ptr = allocator._align(p_off + DBUF * DS_LDS * 2, 16)
 
-    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name="sparse_mla_bwd_interm_regtr", known_block_size=[THREADS, 1, 1])
     def k_fn(Q: fx.Tensor, DO: fx.Tensor, DS: fx.Tensor, PP: fx.Tensor, INTERM: fx.Tensor, T: fx.Int32):
         v4 = Vec.make_type(4, elem)
         v4f = Vec.make_type(4, fx.Float32)
@@ -1394,7 +1394,7 @@ def build_interm_blocked(topk_len, num_heads, BD, qpad=16, spad=8):
     p_off = allocator._align(ds_off + DS_LDS * 2, 16)
     allocator.ptr = allocator._align(p_off + DS_LDS * 2, 16)
 
-    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name="sparse_mla_bwd_interm_blocked", known_block_size=[THREADS, 1, 1])
     def k_fn(Q: fx.Tensor, DO: fx.Tensor, DS: fx.Tensor, PP: fx.Tensor, INTERM: fx.Tensor, T: fx.Int32):
         v4 = Vec.make_type(4, elem)
         v4f = Vec.make_type(4, fx.Float32)
@@ -1613,7 +1613,7 @@ def build_gather(num_waves=8):
     red_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = allocator._align(red_off + RED_ELEMS * 4, 16)
 
-    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name="sparse_mla_bwd_gather", known_block_size=[THREADS, 1, 1])
     def k_fn(
         Interm: fx.Tensor,
         InvPtr: fx.Tensor,
@@ -1694,7 +1694,7 @@ def build_partial_reduce(num_splits):
     pool kv, 64 lanes x EPL cols. Companion pass-2 for build_gather_pool (num_splits-split)."""
 
     def _b():
-        @flyc.kernel(known_block_size=[LANES, 1, 1])
+        @flyc.kernel(name="sparse_mla_bwd_partial_reduce", known_block_size=[LANES, 1, 1])
         def k_fn(Partial: fx.Tensor, dKV: fx.Tensor, NKV: fx.Int32, KV_BASE: fx.Int32, NPOOL: fx.Int32):
             pidx = fx.Index(gpu.block_idx.x)
             kv = pidx + fx.Index(KV_BASE)
@@ -1748,7 +1748,7 @@ def build_gather_banded(num_waves=8, row_chunk=None):
     red_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = allocator._align(red_off + RED_ELEMS * 4, 16)
 
-    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name="sparse_mla_bwd_gather_banded", known_block_size=[THREADS, 1, 1])
     def k_fn(Interm: fx.Tensor, dKV: fx.Tensor, NKV: fx.Int32, T: fx.Int32):
         v4f_ty = ir.VectorType.get([4], fx.Float32.ir_type)
         lds_red = SmemPtr(allocator.get_base(), red_off, fx.Float32.ir_type, shape=(RED_ELEMS,)).get()
@@ -1828,7 +1828,7 @@ def build_gather_pool(num_waves=16, num_splits=32):
     red_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = allocator._align(red_off + RED_ELEMS * 4, 16)
 
-    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name="sparse_mla_bwd_gather_pool", known_block_size=[THREADS, 1, 1])
     def k_fn(
         Interm: fx.Tensor,
         Partial: fx.Tensor,
@@ -1958,7 +1958,7 @@ def build_bwd_fused(topk_len, scale, num_heads=64):
     mask_off = allocator._align(pp_off + KB * num_heads * TILE_K * 2, 16)
     allocator.ptr = allocator._align(mask_off + KB * TILE_K * 4, 16)
 
-    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name="sparse_mla_bwd_fused", known_block_size=[THREADS, 1, 1])
     def k_fn(
         Q: fx.Tensor,
         KV: fx.Tensor,

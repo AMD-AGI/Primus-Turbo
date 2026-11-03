@@ -118,7 +118,7 @@ def _make_dispatch_prologue(
     WS_SEND, WS_WITHIN = 0, num_experts
     WS_START, WS_SROFF, WS_POOLBASE = 2 * num_experts, 3 * num_experts, 4 * num_experts
 
-    @flyc.kernel(known_block_size=[block_threads, 1, 1])
+    @flyc.kernel(name="mega_fp8_dispatch_prologue_kernel", known_block_size=[block_threads, 1, 1])
     def dispatch_prologue_kernel(
         TOPK_INDICES: fx.Tensor,
         WORKSPACE: fx.Tensor,
