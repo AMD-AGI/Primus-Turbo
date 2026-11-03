@@ -9,7 +9,6 @@
 ###############################################################################
 
 import inspect
-import os
 import warnings
 from dataclasses import dataclass
 from typing import (
@@ -27,7 +26,7 @@ from typing import (
 import torch
 import torch.distributed as dist
 
-from primus_turbo.common.constants import ENV_MOE_DISPATCH_COMBINE_BACKEND
+import primus_turbo.common.envs as envs
 from primus_turbo.pytorch.core.backend import (
     BackendType,
     GlobalBackendManager,
@@ -544,7 +543,7 @@ def _resolve_backend_name() -> str:
         user_backend = user_backend_choice.backend
         return _BACKEND_TYPE_TO_NAME.get(user_backend, user_backend.name)
 
-    env_val = os.environ.get(ENV_MOE_DISPATCH_COMBINE_BACKEND)
+    env_val = envs.PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND
     if env_val is not None:
         return env_val.strip().upper()
 

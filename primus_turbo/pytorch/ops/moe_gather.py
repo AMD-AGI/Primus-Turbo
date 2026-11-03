@@ -11,7 +11,6 @@ wrappers materialize the original gather when an ordinary tensor consumer needs
 values, retaining alias and in-place mutation semantics.
 """
 
-import os
 import weakref
 
 import torch
@@ -81,12 +80,6 @@ def lookup_permuted_activation_seam(x, include_plan=False):
 # materialized storage once any ordinary tensor operation needs its values.
 
 _BACKWARD_GATHER_OUTPUTS = {}
-_BACKWARD_GATHER_AUDIT = {}
-
-
-def _gather_count(name):
-    if os.environ.get("GPTOSS_BACKWARD_GATHER_AUDIT") == "1":
-        _BACKWARD_GATHER_AUDIT[name] = _BACKWARD_GATHER_AUDIT.get(name, 0) + 1
 
 
 def _gather_signature(x):
@@ -158,7 +151,6 @@ def enroll_backward_gather_output(out, plan, owner):
 
     ref = weakref.ref(owner, cleanup)
     _BACKWARD_GATHER_OUTPUTS[key] = (ref, _gather_signature(out), plan)
-    _gather_count("enrolled")
 
 
 def claim_backward_gather_output(inp, rowmap, probs, padding, tokens, experts, hidden):
@@ -180,7 +172,6 @@ def claim_backward_gather_output(inp, rowmap, probs, padding, tokens, experts, h
     ):
         return None
     plan.validate()
-    _gather_count("claimed")
     return plan
 
 
@@ -204,7 +195,6 @@ class _BackwardGatherState:
             self.materialized = torch.ops.te_moe.unpermute_mask_map_bwd_no_probs(
                 self.source, p.rowmap, None, p.src_shape[0], 32, p.shape[0], p.shape[1]
             )
-            _gather_count("materialized")
         return self.materialized
 
 
@@ -289,7 +279,6 @@ def make_backward_gather(source, plan):
     ):
         return None
     plan.validate()
-    _gather_count("created")
     return _BackwardGatherTensor(_BackwardGatherState(source, plan))
 
 
@@ -304,5 +293,4 @@ def resolve_backward_gather(grad, plan):
     stream = torch.cuda.current_stream(state.source.device)
     state.source.record_stream(stream)
     plan.d2s.record_stream(stream)
-    _gather_count("consumed")
     return state.source, {"dest2src": plan.d2s, "permuted_probs": None, "total_m": plan.shape[0]}
