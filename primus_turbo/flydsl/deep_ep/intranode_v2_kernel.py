@@ -83,6 +83,7 @@ from primus_turbo.flydsl.deep_ep.common import (
     st_lds,
     tensor_addr,
     timed_out,
+    timed_out_at,
     timeout_hit,
     wait_mem_all,
 )
@@ -112,6 +113,10 @@ TAILS_OFFSET = 128 * 1024
 # int32 per combine slot: the epoch of the combine whose row has landed there
 COMBINE_FLAGS_OFFSET = 256 * 1024
 COMBINE_FLAGS_BYTES = 4 << 20
+# combine push-done marks: int32 [source rank][push warp of the source for this rank], in the end of the
+# combine flags: the epoch of the combine in which that warp's rows have all landed
+COMBINE_DONE_BYTES = 8 * 32768 * 4
+COMBINE_DONE_OFFSET = COMBINE_FLAGS_OFFSET + COMBINE_FLAGS_BYTES - COMBINE_DONE_BYTES
 DATA_OFFSET = COMBINE_FLAGS_OFFSET + COMBINE_FLAGS_BYTES
 assert RECV_CHANNEL_OFFSET_OFFSET + 8 * MAX_CHANNELS * 4 <= TAILS_OFFSET
 assert TAILS_OFFSET + 8 * MAX_CHANNELS * 4 <= 192 * 1024
@@ -1017,6 +1022,48 @@ def _wait_rows(flags, flag_idx, waits, epoch, rank, token):
         value = _ld_sys(flags, flag_idx)
 
 
+# a push warp, its last row landed and nothing of it in flight, also marks itself done on its destination
+# (COMBINE_DONE_OFFSET), and a reducer that has waited long for a row takes that warp's mark for the row's
+# flag. When a rank's call starts seconds after its peers' (a first call, compiled at different speeds)
+# while their queues are evicted, a few flags they write into it in its next call never show, in memory
+# either (a system-scope atomic reads the old epoch): the combine hung there. Where the marks do not fit
+# (more than 32768 push warps a source, or a flag region full of slots), only the flags count
+# a reducer reads the done marks only after this many realtime ticks (100 MHz) of waiting for a row: 1 ms
+COMBINE_DONE_AFTER_TICKS = 100_000
+
+
+def _done_index(waits, lane_r, index, warps_per_peer: int):
+    """The push-done mark of a waiting lane: that of source lane_r's warp index % warps_per_peer."""
+    return arith.select(
+        waits, lane_r * fx.Int32(warps_per_peer) + index % fx.Int32(warps_per_peer), fx.Int32(0)
+    )
+
+
+@ASTRewriter.transform
+def _wait_rows_or_done(flags, flag_idx, waits, epoch, rank, token, done, lane_r, index, warps_per_peer: int):
+    """``_wait_rows``, where the done mark of the warp that pushed a lane's row counts as the row's flag;
+    read only once the wait is past COMBINE_DONE_AFTER_TICKS, far beyond a flag's usual wait."""
+    spin_start = read_clock()
+    wait_start = spin_start
+    value = _ld_sys(flags, flag_idx)
+    while _popc(_ballot(waits & (value != epoch))) > fx.Int32(0):
+        now = read_clock()
+        if timed_out_at(now, spin_start):
+            fx.printf(
+                "[DeepEP FlyDSL V2 combine] row timeout: rank={} token={} flag={} epoch={}\n",
+                rank,
+                token,
+                value,
+                epoch,
+            )
+            timeout_hit()
+            spin_start = read_clock()
+        value = _ld_sys(flags, flag_idx)
+        if (now - wait_start) > fx.Int64(COMBINE_DONE_AFTER_TICKS):
+            mark = _ld_sys(done, _done_index(waits, lane_r, index, warps_per_peer))
+            value = arith.select(mark == epoch, epoch, value)
+
+
 def combine_v2_push_warps(num_channels):
     """Warps of each block that push before they reduce; the others reduce from the start. A grid
     of 96+ blocks saturates the links with about 2/3 of its warps pushing, and the rest overlap
@@ -1047,6 +1094,11 @@ def _make_combine_v2(
         push_warps = min(push_warps, (MAX_LDS_BYTES - NUM_WARPS * 4) // slot_bytes)
     grid_push_warps = num_channels * push_warps
     assert grid_push_warps >= num_ranks and REDUCE_GRAB_TOKENS * num_ranks <= WARP_SIZE
+    push_done = (
+        grid_push_warps * 4 * 8 <= COMBINE_DONE_BYTES
+        and combine_v2_layout(num_nvl_bytes, hidden_bytes, num_topk)[1] * 4
+        <= COMBINE_FLAGS_BYTES - COMBINE_DONE_BYTES
+    )
     vec_elems = 16 // elem_bytes
     num_vecs = hidden_bytes // 16
     num_steps = (num_vecs + WARP_SIZE - 1) // WARP_SIZE
@@ -1203,6 +1255,15 @@ def _make_combine_v2(
             _tdm_push_again(pushed, pushed_row, pushed_start, *push_args)
         if (pushed >= fx.Int32(0)) & (lane_id == fx.Int32(0)):
             _st_sys(peer_flags, pushed, epoch)
+        if fx.const_expr(push_done):
+            # nothing of this warp is in flight any more: a reducer that waits too long for one of its
+            # rows takes this mark for the row's flag
+            if is_pusher & (lane_id == fx.Int32(0)):
+                _st_sys(
+                    peer + fx.Int64(COMBINE_DONE_OFFSET),
+                    rank * fx.Int32(warps_per_peer) + global_warp // fx.Int32(num_peers),
+                    epoch,
+                )
 
         # ---- reduce: each of our tokens over the ranks it went to, as soon as its rows are in;
         # warps claim tokens in order from a queue, the pushers once they are done ----
@@ -1250,14 +1311,29 @@ def _make_combine_v2(
             )
             index = arith.select(in_claim, index, fx.Int32(-1))
             waits = (lane_r != rank) & (index >= fx.Int32(0))
-            _wait_rows(
-                local_flags,
-                arith.select(waits, lane_base + index, fx.Int32(0)),
-                waits,
-                epoch,
-                rank,
-                first,
-            )
+            if fx.const_expr(push_done):
+                # source lane_r's warp index % warps_per_peer pushed the row
+                _wait_rows_or_done(
+                    local_flags,
+                    arith.select(waits, lane_base + index, fx.Int32(0)),
+                    waits,
+                    epoch,
+                    rank,
+                    first,
+                    local + fx.Int64(COMBINE_DONE_OFFSET),
+                    lane_r,
+                    index,
+                    warps_per_peer,
+                )
+            else:
+                _wait_rows(
+                    local_flags,
+                    arith.select(waits, lane_base + index, fx.Int32(0)),
+                    waits,
+                    epoch,
+                    rank,
+                    first,
+                )
             token = first
             while token < token_end:
                 claim_lane = (token - first) * fx.Int32(num_ranks)

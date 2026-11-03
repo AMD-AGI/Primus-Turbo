@@ -71,7 +71,12 @@ def read_clock():
 
 def timed_out(spin_start):
     """The spin-wait watchdog's predicate, after ``ArchTraits.spin_timeout_cycles``."""
-    return (read_clock() - spin_start) > fx.Int64(TRAITS.spin_timeout_cycles)
+    return timed_out_at(read_clock(), spin_start)
+
+
+def timed_out_at(now, spin_start):
+    """``timed_out`` at ``now``, a ``read_clock()`` already read."""
+    return (now - spin_start) > fx.Int64(TRAITS.spin_timeout_cycles)
 
 
 def wait_mem_all():
