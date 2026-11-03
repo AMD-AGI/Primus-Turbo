@@ -108,7 +108,7 @@ def build_fwd(
     # The QK/PV operand-swap removes the per-tile P-repack, so no lds_p region.
     allocator.ptr = allocator._align(mask_off + NBUF * TILE_K * 4, 16)
 
-    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name="sparse_mla_fwd", known_block_size=[THREADS, 1, 1])
     def k_fn(
         Q: fx.Tensor,
         KV: fx.Tensor,

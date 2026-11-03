@@ -147,7 +147,7 @@ def _compile_dense_nt(
         B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
         B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name="kernel_dense_nt", known_block_size=[512, 1, 1])
     def kernel_dense_nt(
         A: fx.Tensor,
         B_T: fx.Tensor,
@@ -495,7 +495,7 @@ def _compile_dense_nn(
         B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
         B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name="kernel_dense_nn", known_block_size=[512, 1, 1])
     def kernel_dense_nn(
         A: fx.Tensor,
         B: fx.Tensor,
@@ -855,7 +855,7 @@ def _compile_dense_tn(
         gsm = arith.select(rem_m < GM, rem_m, fx.Int32(GM))
         return fpm + (pig % gsm), pig // gsm
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name="kernel_dense_tn", known_block_size=[512, 1, 1])
     def kernel_dense_tn(
         A: fx.Tensor,
         B: fx.Tensor,
@@ -1922,7 +1922,7 @@ def _compile_dense_tn_wave4(
         )
     )
 
-    @flyc.kernel(known_block_size=[256, 1, 1])
+    @flyc.kernel(name="kernel_dense_tn_wave4", known_block_size=[256, 1, 1])
     def kernel_dense_tn_wave4(
         A: fx.Tensor,
         B: fx.Tensor,
@@ -1984,7 +1984,7 @@ def _compile_dense_tn_wave4(
     _RED_GRID = 0 if _hand else _NWIN * _TN4_RED_WPT
     _RED_ROWS = BM // _TN4_RED_WPT
 
-    @flyc.kernel(known_block_size=[256, 1, 1])
+    @flyc.kernel(name="kernel_dense_tn_wave4_reduce", known_block_size=[256, 1, 1])
     def kernel_dense_tn_wave4_reduce(C: fx.Tensor, WS: fx.Tensor):
         """Fold the split-K window's slice bands into C, one row slab per workgroup. It runs
         the whole grid, so the fold spreads over every CU instead of only the window's."""
@@ -2831,7 +2831,7 @@ def _compile_dense_wave4(
         )
     )
 
-    @flyc.kernel(known_block_size=[NTHR, 1, 1])
+    @flyc.kernel(name="kernel_dense_wave4", known_block_size=[NTHR, 1, 1])
     def kernel_dense_wave4(
         A: fx.Tensor,
         B: fx.Tensor,

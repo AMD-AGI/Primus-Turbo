@@ -575,7 +575,7 @@ def _launch_mega_nt(
     if arena_bytes > GFX1250_LDS_BYTES:
         raise ValueError(f"LDS arena {arena_bytes} B exceeds {GFX1250_LDS_BYTES} B")
 
-    @flyc.kernel(known_block_size=[block, 1, 1])
+    @flyc.kernel(name="kernel_mega_nt", known_block_size=[block, 1, 1])
     def kernel_mega_nt(
         arg_c: fx.Pointer,
         arg_a: fx.Pointer,

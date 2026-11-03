@@ -326,7 +326,7 @@ def _compile_grouped_nn(
         if _cshuf_lds:
             C_lds_shuffle: fx.Array[_cshuf_ty, _cshuf_n, 16]
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name="kernel_grouped_nn_persistent", known_block_size=[512, 1, 1])
     def kernel_grouped_nn_persistent(
         A: fx.Tensor,
         B: fx.Tensor,
@@ -1093,7 +1093,7 @@ def _compile_grouped_nt(
     }
     SharedStorage = fx.struct(type("SharedStorage", (), {"__annotations__": _ss_anns}))
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name="kernel_grouped_nt_persistent", known_block_size=[512, 1, 1])
     def kernel_grouped_nt_persistent(
         A: fx.Tensor,
         B_T: fx.Tensor,
@@ -2121,7 +2121,7 @@ def _compile_grouped_tn_wgrad_masked(
         B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
         C_lds_shuffle: fx.Array[_cshuf_ty, _cshuf_n, 16]
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name="kernel_grouped_tn_masked", known_block_size=[512, 1, 1])
     def kernel_grouped_tn_masked(
         A: fx.Tensor,
         B: fx.Tensor,
@@ -3959,7 +3959,7 @@ def _compile_grouped_tn_wgrad_4wave(
         cshuf_n=16,
     )
 
-    @flyc.kernel(known_block_size=[256, 1, 1])
+    @flyc.kernel(name="kernel_grouped_tn_wgrad_4wave", known_block_size=[256, 1, 1])
     def kernel_grouped_tn_wgrad_4wave(
         A: fx.Tensor,
         B: fx.Tensor,
@@ -4381,7 +4381,7 @@ def _compile_grouped_tn_wgrad_4wave(
             else:
                 _emit_tile(d, {})
 
-    @flyc.kernel(known_block_size=[256, 1, 1])
+    @flyc.kernel(name="kernel_grouped_tn_wgrad_reduce", known_block_size=[256, 1, 1])
     def kernel_grouped_tn_wgrad_reduce(C: fx.Tensor, group_offs: fx.Tensor, WS: fx.Tensor, m_total: fx.Int32):
         """Fold the deep-K scratch bands back into C: work item (tile q, sub) sums the banked groups'
         bands into its tile in ascending chunk order, in fp32 (no atomics, bit-reproducible). The

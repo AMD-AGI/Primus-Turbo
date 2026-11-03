@@ -349,7 +349,7 @@ def _make_notify_dispatch(
     every rank's receive order); otherwise only this rank's column is valid, as in the HIP kernel."""
     num_experts_per_rank = num_experts // num_ranks
 
-    @flyc.kernel(known_block_size=[NOTIFY_THREADS, 1, 1])
+    @flyc.kernel(name="deep_ep_notify_dispatch_kernel", known_block_size=[NOTIFY_THREADS, 1, 1])
     def notify_dispatch_kernel(
         NUM_TOKENS_PER_RANK: fx.Tensor,
         NUM_TOKENS_PER_EXPERT: fx.Tensor,
@@ -501,7 +501,7 @@ def launch_notify_dispatch(
 
 
 def _make_cached_notify_dispatch(num_ranks, num_memset_int):
-    @flyc.kernel(known_block_size=[NOTIFY_THREADS, 1, 1])
+    @flyc.kernel(name="deep_ep_cached_notify_dispatch_kernel", known_block_size=[NOTIFY_THREADS, 1, 1])
     def cached_notify_dispatch_kernel(
         RANK_PREFIX_MATRIX: fx.Tensor,
         BUFFER_PTRS: fx.Tensor,
@@ -569,7 +569,7 @@ def _make_dispatch(
     # LDS: [num_ranks] group barrier counters, then [num_ranks] shared queue tails
     lds_shared_tail = num_ranks
 
-    @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
+    @flyc.kernel(name="deep_ep_dispatch_kernel", known_block_size=[NUM_THREADS, 1, 1])
     def dispatch_kernel(
         RECV_X: fx.Tensor,
         RECV_X_SCALES: fx.Tensor,
@@ -922,7 +922,7 @@ def _make_cached_notify_combine(num_ranks, num_channels, num_memset_int, num_thr
     # far past any queue position: what a token with no later route to a rank waits for
     num_heuristic_head = 1 << 25
 
-    @flyc.kernel(known_block_size=[num_threads, 1, 1])
+    @flyc.kernel(name="deep_ep_cached_notify_combine_kernel", known_block_size=[num_threads, 1, 1])
     def cached_notify_combine_kernel(
         SEND_HEAD: fx.Tensor,
         BUFFER_PTRS: fx.Tensor,
@@ -1028,7 +1028,7 @@ def _make_combine(
     num_steps = (num_vecs + WARP_SIZE - 1) // WARP_SIZE
     steps_per_pass = max(1, TRAITS.combine_loads_in_flight // (num_ranks + int(has_bias_0) + int(has_bias_1)))
 
-    @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
+    @flyc.kernel(name="deep_ep_combine_kernel", known_block_size=[NUM_THREADS, 1, 1])
     def combine_kernel(
         RECV_X: fx.Tensor,
         RECV_TOPK_WEIGHTS: fx.Tensor,

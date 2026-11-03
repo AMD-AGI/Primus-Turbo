@@ -2940,7 +2940,7 @@ def _build_mxfp4_gemm_kernel(
 
     if glu_act_quant:
 
-        @flyc.kernel(known_block_size=[256, 1, 1])
+        @flyc.kernel(name="kernel_gemm_4w_glu_quant", known_block_size=[256, 1, 1])
         def kernel_gemm_4w(
             A: fx.Tensor,
             B_T: fx.Tensor,
@@ -2980,7 +2980,7 @@ def _build_mxfp4_gemm_kernel(
 
     elif dglu_act_quant:
 
-        @flyc.kernel(known_block_size=[256, 1, 1])
+        @flyc.kernel(name="kernel_gemm_4w_dglu_quant", known_block_size=[256, 1, 1])
         def kernel_gemm_4w(
             A: fx.Tensor,
             B_T: fx.Tensor,
@@ -3021,7 +3021,7 @@ def _build_mxfp4_gemm_kernel(
 
     else:
 
-        @flyc.kernel(known_block_size=[256, 1, 1])
+        @flyc.kernel(name="kernel_gemm_4w", known_block_size=[256, 1, 1])
         def kernel_gemm_4w(
             A: fx.Tensor,
             B_T: fx.Tensor,
@@ -3665,7 +3665,7 @@ def _build_mxfp4_preshuffle_kernel_ab(
     _KK = None if k128 is None else k128 // n_sub  # K/256, host-known -> folds the decode divides
     _KH = None if _KK is None else _KK // KU  # cell BATCHES along K
 
-    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    @flyc.kernel(name="mxfp4_scale_preshuffle_ab", known_block_size=[BLK, 1, 1])
     def kern(
         a_raw: fx.Tensor,
         a_out: fx.Tensor,

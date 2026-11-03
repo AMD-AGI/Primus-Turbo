@@ -142,7 +142,7 @@ def _launch_gemm_combine_nt(
     NUM_COMBINE = NUM_LEAD_COMBINE + NUM_TAIL_COMBINE
     num_experts_per_rank = NUM_EXPERTS // NUM_RANKS
 
-    @flyc.kernel(known_block_size=[64, 1, 1])
+    @flyc.kernel(name="mega_gfx1250_combine_epoch_bump", known_block_size=[64, 1, 1])
     def epoch_bump(
         arg_parity: fx.Pointer,
         arg_combine_expected: fx.Pointer,
@@ -163,7 +163,7 @@ def _launch_gemm_combine_nt(
             st(combine_addr, bank, ld(combine_addr, bank, dtype=fx.T.i64) + fx.Int64(N_BLOCKS_N))
             st(reduce_addr, bank, ld(reduce_addr, bank, dtype=fx.T.i64) + fx.Int64(1))
 
-    @flyc.kernel(known_block_size=[block, 1, 1])
+    @flyc.kernel(name="gemm_combine_nt", known_block_size=[block, 1, 1])
     def gemm_combine_nt(
         arg_out: fx.Pointer,
         arg_act: fx.Pointer,

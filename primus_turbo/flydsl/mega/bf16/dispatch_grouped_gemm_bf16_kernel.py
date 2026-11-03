@@ -128,7 +128,7 @@ def _make_kernel(
     num_pool_blocks = num_max_pool_tokens // BLOCK_M
     row_idx_ptr_ty = PointerType.get(elem_ty=fx.T.i32, address_space=AddressSpace.Global, alignment=4)
 
-    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    @flyc.kernel(name="dispatch_grouped_gemm_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
     def dispatch_grouped_gemm_kernel(
         INPUT_TOKENS: fx.Tensor,
         EXPERT_SEND_DST_RANK: fx.Tensor,
@@ -341,7 +341,7 @@ def _make_kernel(
 def _make_epoch_bump(addend):
     """Single-block kernel: flip parity, bump the new bank's expected by addend."""
 
-    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    @flyc.kernel(name="mega_bf16_dispatch_epoch_bump_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
     def epoch_bump_kernel(PARITY: fx.Tensor, EXPECTED: fx.Tensor):
         if fx.thread_idx.x == fx.Int32(0):
             parity_res = create_buffer_resource(PARITY, max_size=True)

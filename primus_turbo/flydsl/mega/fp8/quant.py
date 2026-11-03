@@ -190,7 +190,7 @@ def _compile_quant(K: int, BT: int = 256):
     K_fp8_i32 = K // 4
     blk_i32 = MXFP8_BLOCK // 4
 
-    @flyc.kernel(known_block_size=[BT, 1, 1])
+    @flyc.kernel(name="mega_fp8_rowwise_quant", known_block_size=[BT, 1, 1])
     def kern(X: fx.Tensor, Q: fx.Tensor, S: fx.Tensor, c_m: fx.Int32):
         tid = fx.thread_idx.x
         row = fx.block_idx.x
@@ -308,7 +308,7 @@ def _compile_colwise_quant_grouped(F: int, is_e5m2: bool, BT: int = 256):
     round_add = 1 << (22 - mbits)
     target_pow2 = 15 if is_e5m2 else 8
 
-    @flyc.kernel(known_block_size=[BT, 1, 1])
+    @flyc.kernel(name="mega_fp8_colwise_quant_grouped", known_block_size=[BT, 1, 1])
     def kern(
         X: fx.Tensor,
         Q: fx.Tensor,
@@ -478,7 +478,7 @@ def _compile_colwise_requant_grouped_fp8in(F: int, is_e5m2_out: bool, BT: int = 
         outq: fx.Array[fx.Int32, TILE_I32, 16]  # [BT col][MB*8 i32] fp8 output tile (for coalesced write)
         scale: fx.Array[fx.Int32, SC_N, 16]  # [MROWS][SCPT] staged rowwise E8M0 (cut 32x reload)
 
-    @flyc.kernel(known_block_size=[BT, 1, 1])
+    @flyc.kernel(name="mega_fp8_colwise_requant_grouped", known_block_size=[BT, 1, 1])
     def kern(
         XQ: fx.Tensor,
         XS: fx.Tensor,
@@ -806,7 +806,7 @@ def compile_rowcol_dual_pack_grouped(F: int, BT: int = 256):
     n_row_pack_slots = MXFP8_BLOCK * n_out_pack
     n_pack_rounds = (n_row_pack_slots + BT - 1) // BT
 
-    @flyc.kernel(known_block_size=[BT, 1, 1])
+    @flyc.kernel(name="mega_fp8_rowcol_dual_pack_grouped", known_block_size=[BT, 1, 1])
     def pack_kern(
         ASP: fx.Tensor,
         SRAW: fx.Tensor,

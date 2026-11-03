@@ -46,7 +46,7 @@ def _launch_x_copy_signal(
     NUM_RANKS: Constexpr[int],
     RANK: Constexpr[int],
 ):
-    @flyc.kernel(known_block_size=[64, 1, 1])
+    @flyc.kernel(name="x_copy_signal", known_block_size=[64, 1, 1])
     def x_copy_signal(arg_peer_flags: fx.Pointer, arg_local_flags: fx.Pointer):
         lane = fx.Int32(fx.thread_idx.x)
         if lane < fx.Int32(NUM_RANKS):
@@ -66,7 +66,7 @@ def _launch_x_copy_wait(
     NUM_RANKS: Constexpr[int],
     RANK: Constexpr[int],
 ):
-    @flyc.kernel(known_block_size=[64, 1, 1])
+    @flyc.kernel(name="x_copy_wait", known_block_size=[64, 1, 1])
     def x_copy_wait(arg_local_flags: fx.Pointer):
         lane = fx.Int32(fx.thread_idx.x)
         if lane < fx.Int32(NUM_RANKS):

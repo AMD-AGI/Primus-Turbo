@@ -2193,7 +2193,7 @@ def build_preshuffle_ab_kernel(
     class Smem:
         tile: fx.Array[fx.Int32, TILE, 16]
 
-    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    @flyc.kernel(name="mxfp8_scale_preshuffle_ab", known_block_size=[BLK, 1, 1])
     def kern(
         a_raw: fx.Tensor,
         b_raw: fx.Tensor,

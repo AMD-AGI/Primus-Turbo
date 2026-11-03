@@ -157,7 +157,7 @@ def _build_mxfp8_fold_kernel(k_split, BLOCK_M, BLOCK_N, GROUP_M, group_n, cstore
     TILE_I32 = BLOCK_M * BLOCK_N // 2
     assert N_VECS % _FOLD_BLK == 0
 
-    @flyc.kernel(known_block_size=[_FOLD_BLK, 1, 1])
+    @flyc.kernel(name="kernel_mxfp8_fold", known_block_size=[_FOLD_BLK, 1, 1])
     def kernel_mxfp8_fold(
         WS: fx.Tensor,
         C: fx.Tensor,
@@ -277,7 +277,7 @@ def _build_mxfp8_nt_kernel(
         B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
         B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name="kernel_mxfp8_nt", known_block_size=[512, 1, 1])
     def kernel_mxfp8_nt(
         A: fx.Tensor,
         B_T: fx.Tensor,

@@ -150,7 +150,7 @@ def _wmma(a, b, c, reuse_a=False):
 
 
 # ================================================================== delta ==========
-@flyc.kernel(known_block_size=[DELTA_THREADS, 1, 1])
+@flyc.kernel(name="k_flash_attn_bwd_delta_bshd", known_block_size=[DELTA_THREADS, 1, 1])
 def k_delta_bshd(DO: fx.Tensor, O: fx.Tensor, DEL: fx.Tensor, S: fx.Int32, H: fx.Int32, n_rows: fx.Int32):
     """delta[b, h, s] = sum_d dO[b, s, h, d] * O[b, s, h, d], fp32, written [B, H, S]."""
     tid = fx.Int32(fx.thread_idx.x)
@@ -751,7 +751,7 @@ def _dkdv_impl(
                 _stv([kk[e] for e in range_constexpr(8)], g_dk8, t, fx.BFloat16)
 
 
-@flyc.kernel(known_block_size=[32, 1, 1])
+@flyc.kernel(name="k_flash_attn_bwd_dkdv", known_block_size=[32, 1, 1])
 def k_dkdv(
     Q: fx.Tensor,
     K: fx.Tensor,
@@ -796,7 +796,7 @@ def k_dkdv(
     )
 
 
-@flyc.kernel(known_block_size=[32, 1, 1])
+@flyc.kernel(name="k_flash_attn_bwd_dkdv_sp", known_block_size=[32, 1, 1])
 def k_dkdv_sp(
     Q: fx.Tensor,
     K: fx.Tensor,
@@ -1136,7 +1136,7 @@ def _dq_sp_impl(Q, K, V, DO, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G, nkvt, csh
                 _st1(ov[si], g_dq, base_o + q_i * Hq * D + dtile * 16 + row, fx.Float32)
 
 
-@flyc.kernel(known_block_size=[32, 1, 1])
+@flyc.kernel(name="k_flash_attn_bwd_dq_sp", known_block_size=[32, 1, 1])
 def k_dq_sp(
     Q: fx.Tensor,
     K: fx.Tensor,
@@ -1512,7 +1512,7 @@ def _dqg_impl(Q, K, V, DO, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G, nkvt, cshif
                 _st1(ov[si].to(fx.BFloat16), g_dq, base_o + q_i * Hq * D + dtile * 16 + row, fx.BFloat16)
 
 
-@flyc.kernel(known_block_size=[32, 1, 1])
+@flyc.kernel(name="k_flash_attn_bwd_dqg", known_block_size=[32, 1, 1])
 def k_dqg(
     Q: fx.Tensor,
     K: fx.Tensor,
@@ -1577,7 +1577,7 @@ RED_THREADS = 256
 RED_VEC = 4  # fp32 dwordx4 in, bf16 x4 out
 
 
-@flyc.kernel(known_block_size=[RED_THREADS, 1, 1])
+@flyc.kernel(name="k_flash_attn_bwd_redsp", known_block_size=[RED_THREADS, 1, 1])
 def k_redsp(DKP: fx.Tensor, DVP: fx.Tensor, DK: fx.Tensor, DV: fx.Tensor, n_vec: fx.Int32, nsp: fx.Int32):
     """dk[i] = sum_{sp<nsp} dkp[sp, i], dv likewise; fp32 in, bf16 out, one pass."""
     tid = fx.Int32(fx.thread_idx.x)
@@ -1631,7 +1631,7 @@ def launch_redsp(DKP, DVP, DK, DV, n_vec: fx.Int32, nsp: fx.Int32, nblk: fx.Int3
 # ascending order `sp = 0, 1, .. nsp-1`; since k_dq_sp keeps the masked tail whole on the
 # LAST split (see _dq_sp_impl), folding ascending in sp adds each query's kv blocks in
 # ascending kv order.
-@flyc.kernel(known_block_size=[RED_THREADS, 1, 1])
+@flyc.kernel(name="k_flash_attn_bwd_redsp_q", known_block_size=[RED_THREADS, 1, 1])
 def k_redsp_q(DQP: fx.Tensor, DQ: fx.Tensor, n_vec: fx.Int32, nsp: fx.Int32):
     """dq[i] = sum_{sp<nsp} dqp[sp, i]; fp32 in, bf16 out, one pass."""
     tid = fx.Int32(fx.thread_idx.x)

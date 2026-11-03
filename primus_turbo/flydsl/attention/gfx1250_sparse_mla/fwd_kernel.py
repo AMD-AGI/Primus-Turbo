@@ -287,7 +287,7 @@ def build_sparse_mla_fwd_gfx1250(
     if persist is None:
         persist = NT <= _PERSIST_MAX_TILES
 
-    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    @flyc.kernel(name="sparse_mla_fwd_gfx1250_kernel", known_block_size=[BLOCK, 1, 1])
     def sparse_mla_fwd_gfx1250_kernel(
         Q: fx.Tensor,
         KV: fx.Tensor,
@@ -734,7 +734,7 @@ def build_sparse_mla_fwd_gfx1250_swa(
     STAGE = (WR + NPP + 16 * WAVES) * ROW <= _LDS_MAX
     c_log2 = float(scale) * LOG2E
 
-    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    @flyc.kernel(name="sparse_mla_fwd_gfx1250_swa_kernel", known_block_size=[BLOCK, 1, 1])
     def sparse_mla_fwd_gfx1250_swa_kernel(
         Q: fx.Tensor,
         KV: fx.Tensor,

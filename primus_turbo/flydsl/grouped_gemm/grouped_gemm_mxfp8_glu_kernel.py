@@ -96,7 +96,7 @@ def _compile_grouped_glu_qdual(
     COL_SCALE_BAND = col_scale_band
     XN = 2 * N
 
-    @flyc.kernel(known_block_size=[NTHv, 1, 1])
+    @flyc.kernel(name="mxfp8_grouped_glu_quant_dual", known_block_size=[NTHv, 1, 1])
     def kern(
         X: fx.Tensor,
         P: fx.Tensor,
@@ -526,7 +526,7 @@ def _compile_grouped_dglu_qdual(
     COL_SCALE_BAND = col_scale_band
     XN = I2
 
-    @flyc.kernel(known_block_size=[NTHv, 1, 1])
+    @flyc.kernel(name="mxfp8_grouped_dglu_quant_dual", known_block_size=[NTHv, 1, 1])
     def kern(
         DACT: fx.Tensor,
         L1: fx.Tensor,
