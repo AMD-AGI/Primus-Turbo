@@ -274,7 +274,8 @@ def nt_gemm_tile(
 
     ``lds_cosched`` is the grouped kernel's ``lds_cosched = 3`` with ``issue_first``: each k-tile
     issues the next one's loads first, and each sub-step is one scheduling region that waits for
-    its own fragments only and reads the next sub-step's one per matrix op. Same results.
+    its own fragments only and reads the next sub-step's one per matrix op. A gathered A keeps
+    the WMMA arbitration stall on. Same results.
     """
     KB = tile_k * EB
     KSB = WMMA_K * EB
@@ -593,10 +594,13 @@ def nt_gemm_tile(
         rocdl.sched_barrier(0)
         rocdl.s_barrier_wait(_WG_BARRIER)
 
-    if const_expr(cosched):
+    if const_expr(cosched and not async_a):
         # SCHED_MODE bit 2: no arbitration stall after a WMMA, without which a read placed between
         # two WMMAs cannot issue until the first has executed. After the index-table reads (placed
         # ahead of them it turns their scalar loads into vector loads), ahead of every matrix op.
+        # Not with the async A gather: with the stall off, a wave's last async loads of a k-tile
+        # now and then land in LDS after the barrier that covers them, and the tile reads the
+        # buffer's previous k-tile (an NN launch in ~25000 at EP4).
         rocdl.disable_xdl_arb_stall()
     issue(0, 0, prologue=True)
     if const_expr(async_a):
