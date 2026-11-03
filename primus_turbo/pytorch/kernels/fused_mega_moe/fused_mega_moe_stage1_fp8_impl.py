@@ -14,13 +14,13 @@ from typing import Optional, Tuple
 
 import torch
 
+import primus_turbo.common.envs as envs
 from primus_turbo.flydsl.mega.fp8 import (
     colwise_grouped_meta,
     colwise_requant_mxfp8_grouped_fp8in_flydsl,
     combine_l1_dgrad_mxfp8_flydsl_kernel,
     dispatch_l1_fwd_mxfp8_flydsl_kernel,
 )
-from primus_turbo.flydsl.mega.fp8.combine_autotune import env_combine_cu
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity
 from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_fp8_weights import (
@@ -85,7 +85,7 @@ def _mxfp8_variable_k_wgrad_dw1(
 # L1 dgrad combine CU split: 28 was unified w/ fwd L2 (task-based push; T=8192) on DSv3. Like
 # ``_L2_NUM_COMBINE_CU`` this optimum moves with the expert shape, so ``None`` lets the combine's
 # online autotune pick it; the env pins a value and skips tuning.
-_L1_NUM_COMBINE_CU = env_combine_cu("PT_MEGA_FP8_L1_COMBINE_CU")
+_L1_NUM_COMBINE_CU = envs.PT_MEGA_FP8_L1_COMBINE_CU
 
 
 def _l1_dgrad_combine_mxfp8_flydsl_kernel(

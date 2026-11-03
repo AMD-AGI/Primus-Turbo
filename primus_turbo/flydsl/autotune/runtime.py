@@ -18,7 +18,6 @@ The switch is ``PRIMUS_TURBO_AUTO_TUNE`` (default off), read through
 well. When it is off a tuner times nothing and returns its base config (see ``Tuner``'s ``off``).
 """
 
-import os
 import threading
 import time
 import weakref
@@ -26,7 +25,7 @@ from typing import Any, Callable, List, Optional
 
 import torch
 
-from primus_turbo.common.constants import ENV_AUTO_TUNE
+import primus_turbo.common.envs as envs
 from primus_turbo.common.logger import logger
 
 __all__ = [
@@ -52,7 +51,7 @@ _clear_hooks: List[Callable[[], None]] = []
 
 
 def _env_switch() -> bool:
-    return os.environ.get(ENV_AUTO_TUNE, "0") == "1"
+    return envs.PRIMUS_TURBO_AUTO_TUNE
 
 
 def enabled() -> bool:

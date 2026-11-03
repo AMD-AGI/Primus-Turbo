@@ -17,10 +17,9 @@ The forward op over-allocates the output to the (padded) input rows and the
 caller slices ``[:total_m]``; ``group_offs_out`` packs each group tight.
 """
 
-import os
-
 import torch
 
+import primus_turbo.common.envs as envs
 from primus_turbo.pytorch.core.backend import (
     BackendChoice,
     BackendEntry,
@@ -393,7 +392,7 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
         overwrite_out = (
             inplace_add_to_out
             and allow_overwrite
-            and os.environ.get("PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT", "0") == "1"
+            and envs.PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT
             and not GroupedGEMMFP4VariableKKernelDispatcher._is_graph_capturing()
         )
         result = grouped_gemm_mxfp4_variable_k_flydsl_kernel(

@@ -22,13 +22,12 @@ writes into fixed slots instead of channel rings. Its outputs match V1's; its ha
 """
 
 import contextlib
-import os
 from typing import Optional
 
 import torch
 import torch.distributed as dist
 
-from primus_turbo.common.constants import ENV_EP_FORCE_CURRENT_STREAM
+import primus_turbo.common.envs as envs
 from primus_turbo.flydsl.deep_ep.arch import CPP_DEEPEP_ARCHS, default_intranode_backend
 from primus_turbo.flydsl.deep_ep.intranode_kernel import (
     combine_buffer_layout,
@@ -137,7 +136,7 @@ class FlyDSLIntranodeRuntime:
         _check(num_nvl_bytes > 0, "the FlyDSL intranode backend needs num_nvl_bytes > 0")
         self.num_nvl_bytes = num_nvl_bytes
         self.comm_stream = comm_stream
-        self.force_current_stream = int(os.environ.get(ENV_EP_FORCE_CURRENT_STREAM, "0")) != 0
+        self.force_current_stream = envs.PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM
 
         # The channel protocol leans on every heap access bypassing L2, as the C++
         # buffer's hipDeviceMallocUncached does; the barrier signals likewise.

@@ -20,6 +20,8 @@ import os
 
 import pytest
 
+import primus_turbo.common.envs as envs
+
 # Assign each xdist worker to a separate GPU
 _worker_id = os.environ.get("PYTEST_XDIST_WORKER")
 if _worker_id is not None:
@@ -77,6 +79,15 @@ def _gfx1250_enabled(item) -> bool:
         if path.endswith(suffix) and test_id.startswith(prefix):
             return True
     return False
+
+
+@pytest.fixture(autouse=True)
+def _fresh_envs_cache():
+    """``primus_turbo.common.envs`` caches each variable at its first read, so a test that sets one
+    would otherwise see the value an earlier test left in the cache."""
+    envs.reset_cache()
+    yield
+    envs.reset_cache()
 
 
 def pytest_addoption(parser):
