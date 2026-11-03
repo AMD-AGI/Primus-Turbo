@@ -17,8 +17,8 @@
 One workgroup computes one ``tile_m x tile_n`` block of one 256-row pool block, the unit Mega
 schedules on. The pipeline is the shipped configuration of
 ``grouped_gemm_bf16_kernel_gfx1250._launch_grouped_gemm_bf16_nt`` (TDM global -> LDS, two
-buffers, WMMA 16x16x32, ``split_bar`` with one deferred sub-step, a two-deep fragment ring),
-with two changes Mega needs:
+buffers, WMMA 16x16x32, ``split_bar`` with one deferred sub-step, a two-deep fragment ring,
+its keyed ``lds_cosched = 3`` / ``issue_first`` schedule), with two changes Mega needs:
 
 * **A can be gathered.** In ``gather`` mode the A rows come from a row-index table (pool row ->
   dispatched token). Every lane copies 16-byte chunks of them straight into LDS with
@@ -247,6 +247,7 @@ def nt_gemm_tile(
     c_rank_bases=None,
     c_num_rows: int = 0,
     c_bias=None,
+    lds_cosched: bool = True,
 ):
     """One ``tile_m x tile_n`` block; must be called by all ``m_warp * n_warp`` waves.
 
@@ -270,6 +271,10 @@ def nt_gemm_tile(
     returns that tuple, so the caller can reuse ``extra`` without loading it again. ``c_bias``
     ``(addr, scale)`` adds ``bias * scale(tile row)`` in f32 before the bf16 rounding, ``addr``
     the i64 address of the expert's bias row.
+
+    ``lds_cosched`` is the grouped kernel's ``lds_cosched = 3`` with ``issue_first``: each k-tile
+    issues the next one's loads first, and each sub-step is one scheduling region that waits for
+    its own fragments only and reads the next sub-step's one per matrix op. Same results.
     """
     KB = tile_k * EB
     KSB = WMMA_K * EB
@@ -521,9 +526,43 @@ def nt_gemm_tile(
                 idx = wm * wmma_n_rep + wn
                 fx.gemm(wmma_atom, c_frags[idx], wt[wn], act[wm], c_frags[idx])
 
+    # the co-schedule interleaves one fragment read per matrix op, so it needs more ops than reads
+    cosched = lds_cosched and KS_DS < n_acc
+
+    def _hold_live(state):
+        # Otherwise the allocator hands the next sub-step's reads registers an in-flight WMMA still
+        # reads, and expert scheduling covers each such overwrite with a full VALU-dependency wait.
+        # `llvm.fake.use` emits nothing.
+        act, wt = state
+        for t in act + wt:
+            _llvm.call_intrinsic(None, "llvm.fake.use", [_raw(t.load())], [], [])
+
     def compute_ktile(buf, prefetch_kt):
         """K_WS sub-steps; the last one is returned to run inside the barrier window."""
         ring = [None] * R
+        if const_expr(cosched):
+            if const_expr(prefetch_kt is not None):
+                rocdl.sched_barrier(0)
+                issue(prefetch_kt % NUM_BUFFERS, prefetch_kt)
+                rocdl.sched_barrier(0)
+            ring[0] = _load_ks(buf, 0)
+            rocdl.sched_dsrd(KS_DS)
+            rocdl.sched_barrier(0)
+            for ks in range_constexpr(K_WS):
+                # only this sub-step's reads are in flight here
+                rocdl.s_wait_dscnt(0)
+                if const_expr(ks + 1 < K_WS):
+                    ring[(ks + 1) % R] = _load_ks(buf, ks + 1)
+                if const_expr(ks < K_WS - 1):
+                    _mma_ks(ring[ks % R])
+                    for _j in range_constexpr(KS_DS):
+                        rocdl.sched_dsrd(1)
+                        rocdl.sched_mfma(1)
+                    rocdl.sched_mfma(n_acc - KS_DS)
+                    # must follow the group hints: placed before them, the hints are ignored
+                    _hold_live(ring[ks % R])
+                rocdl.sched_barrier(0)
+            return ring[(K_WS - 1) % R]
         ring[0] = _load_ks(buf, 0)
         for ks in range_constexpr(K_WS):
             if const_expr(ks + 1 < K_WS):
@@ -554,6 +593,11 @@ def nt_gemm_tile(
         rocdl.sched_barrier(0)
         rocdl.s_barrier_wait(_WG_BARRIER)
 
+    if const_expr(cosched):
+        # SCHED_MODE bit 2: no arbitration stall after a WMMA, without which a read placed between
+        # two WMMAs cannot issue until the first has executed. After the index-table reads (placed
+        # ahead of them it turns their scalar loads into vector loads), ahead of every matrix op.
+        rocdl.disable_xdl_arb_stall()
     issue(0, 0, prologue=True)
     if const_expr(async_a):
         _rocdl.s_wait_asynccnt(0)
@@ -690,6 +734,7 @@ def _launch_mega_nt(
     gather: Constexpr[int],
     idx_bits: Constexpr[int],
     b_nn: Constexpr[int],
+    lds_cosched: Constexpr[int],
 ):
     block = m_warp * n_warp * WAVE
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k, bool(b_nn))[3]
@@ -762,6 +807,7 @@ def _launch_mega_nt(
             idx_bits=idx_bits,
             b_nn=bool(b_nn),
             i32_n=i32_n,
+            lds_cosched=bool(lds_cosched),
         )
 
     kernel_mega_nt(
@@ -791,6 +837,7 @@ def mega_grouped_gemm_nt_gfx1250(
     group_m: int = 16,
     idx_bits: int = 0,
     b_nn: bool = False,
+    lds_cosched: bool = True,
 ) -> torch.Tensor:
     """``out[p] = a[row_idx[p]] @ b[e(p)].T`` per pool row ``p`` (``a[p]`` when ``row_idx`` is None);
     ``b`` is ``[G, N, K]``, or ``[G, K, N]`` with ``b_nn`` (``out[p] = a[...] @ b[e(p)]``).
@@ -846,6 +893,7 @@ def mega_grouped_gemm_nt_gfx1250(
         int(gather),
         idx_bits,
         int(b_nn),
+        int(lds_cosched),
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)
