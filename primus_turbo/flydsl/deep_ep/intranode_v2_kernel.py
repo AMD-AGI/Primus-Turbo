@@ -121,6 +121,15 @@ FANOUT_PIECE_BYTES = 8 * 1024
 # rows move global -> LDS -> global through the Tensor Data Mover: a warp copy of the row
 # through VGPRs caps how much each CU keeps in flight, and with it the bandwidth per CU
 USE_TDM = IS_GFX1250
+# A TDM op in flight when the queue is evicted (a context save and restore; the KFD evicts every queue of
+# a process e.g. when NUMA balancing unmaps host pages registered with the GPU, every few seconds) can be
+# lost: the wave resumes past it with nothing outstanding, s_wait_tensorcnt does not wait for it, a load
+# leaves the LDS buffer as it was and a store never lands. The dispatch and the combine's push move a row
+# again when its TDM ops took more than TDM_REDO_CYCLES shader cycles: an eviction takes milliseconds, a row
+# tens of microseconds, and a wave restored on another XCD reads another counter. Sources do not change
+# during a call and nobody reads a row before its flag or the channel's count is published, so moving it
+# twice is harmless; the combine checks each row before its flag goes up.
+TDM_REDO_CYCLES = 1 << 20
 # LDS a block can allocate on gfx1250
 MAX_LDS_BYTES = 320 * 1024
 # combine: tokens a warp claims from the reduce queue at a time
@@ -183,6 +192,21 @@ def _tdm_load(lds_addr, global_addr, num_bytes, **kwargs):
 
 def _tdm_store(lds_addr, global_addr, num_bytes, **kwargs):
     _tdm_op(tdm_ops.tensor_store_2d, lds_addr, global_addr, num_bytes, **kwargs)
+
+
+def _shader_cycles():
+    """The free-running shader cycle counter (gfx1250), for the TDM redo; unsigned so deltas compare right."""
+    op = llvm.inline_asm(fx.T.i64, [], "s_get_shader_cycles_u64 $0", "=s,~{memory}", has_side_effects=True)
+    return fx.arith.ArithValue(op, signed=False)
+
+
+def _tdm_moved(start):
+    """After a tensor_wait(0): 1 if the TDM ops issued since ``_shader_cycles()`` read ``start`` cannot
+    have been lost to an eviction (see TDM_REDO_CYCLES), else 0. A wave restored on another XCD can read a
+    smaller count than ``start``: the range test holds whether the compares come out signed or not."""
+    delta = _shader_cycles() - start
+    in_time = (delta >= fx.Int64(0)) & (delta <= fx.Int64(TDM_REDO_CYCLES))
+    return arith.select(in_time, fx.Int32(1), fx.Int32(0))
 
 
 def _align(value, alignment):
@@ -314,6 +338,17 @@ MAX_EPOCH = (1 << 11) - 1
 
 
 @ASTRewriter.transform
+def _copy_received_x(local, layout, outputs, row, hidden_bytes: int, row_lds, row_buffer_bytes: int):
+    """``_tdm_copy_received_x``, repeated until a pass of it was in time (see TDM_REDO_CYCLES)."""
+    moved = fx.Int32(0)
+    while moved == fx.Int32(0):
+        start = _shader_cycles()
+        _tdm_copy_received_x(local, layout, outputs, row, hidden_bytes, row_lds, row_buffer_bytes)
+        tdm_ops.tensor_wait(0)
+        moved = _tdm_moved(start)
+
+
+@ASTRewriter.transform
 def _tdm_copy_received_x(local, layout, outputs, row, hidden_bytes: int, row_lds, row_buffer_bytes: int):
     """Received row ``row``'s data from the heap into the output through the warp's LDS row buffer."""
     for p in range_constexpr(0, hidden_bytes, row_buffer_bytes):
@@ -327,6 +362,17 @@ def _tdm_copy_received_x(local, layout, outputs, row, hidden_bytes: int, row_lds
         )
         tdm_ops.tensor_wait(0)
         _tdm_store(row_lds, _uniform_i64(_addr(outputs["x"], p, row, hidden_bytes)), piece)
+
+
+@ASTRewriter.transform
+def _send_x_row(row_lds, x_base, t, hidden_bytes: int, row_buffer_bytes: int, dst_x, rows, routed):
+    """``_tdm_send_row``, repeated until a pass of it was in time (see TDM_REDO_CYCLES)."""
+    moved = fx.Int32(0)
+    while moved == fx.Int32(0):
+        start = _shader_cycles()
+        _tdm_send_row(row_lds, x_base, t, hidden_bytes, row_buffer_bytes, dst_x, rows, routed)
+        tdm_ops.tensor_wait(0)
+        moved = _tdm_moved(start)
 
 
 @ASTRewriter.transform
@@ -427,7 +473,7 @@ def _copy_received(
         for s in range_constexpr(1, num_ranks):
             row = arith.select(j >= cums[s], starts[s] + j - cums[s], row)
         if fx.const_expr(row_lds is not None):
-            _tdm_copy_received_x(local, layout, outputs, row, hidden_bytes, row_lds, row_buffer_bytes)
+            _copy_received_x(local, layout, outputs, row, hidden_bytes, row_lds, row_buffer_bytes)
         else:
             _copy_row(
                 _addr(outputs["x"], 0, row, hidden_bytes),
@@ -645,7 +691,7 @@ def _make_dispatch_v2(
                     rows.append(rank_offsets[d] + arith.select(is_routed, slot, fx.Int32(0)))
                     routed.append(is_routed)
                 if fx.const_expr(USE_TDM):
-                    _tdm_send_row(
+                    _send_x_row(
                         row_lds,
                         x_base,
                         t,
@@ -893,6 +939,57 @@ def _wait_lds():
 
 
 @ASTRewriter.transform
+def _tdm_push_row(
+    row,
+    slot,
+    row_lds,
+    x_base,
+    hidden_bytes: int,
+    num_topk: int,
+    topk_weights_res,
+    peer,
+    x_offset: int,
+    slot_bytes: int,
+    push_bytes: int,
+):
+    """Combine: row ``row`` of x with its top-k weights, through the warp's LDS row buffer, into slot
+    ``slot`` of the peer's heap."""
+    lane_id = fx.thread_idx.x % fx.Int32(WARP_SIZE)
+    weight = fx.Float32(0.0)
+    if fx.const_expr(num_topk > 0):
+        weight = buffer_load(
+            topk_weights_res,
+            row * fx.Int32(num_topk) + arith.select(lane_id < fx.Int32(num_topk), lane_id, fx.Int32(0)),
+            vec_width=1,
+            dtype=fx.T.f32,
+        )
+    _tdm_load(row_lds, _uniform_i64(_addr(x_base, 0, row, hidden_bytes)), hidden_bytes)
+    if fx.const_expr(num_topk > 0):
+        if lane_id < fx.Int32(num_topk):
+            st_lds(row_lds, fx.Int32(hidden_bytes // 4) + lane_id, weight)
+        _wait_lds()
+    tdm_ops.tensor_wait(0)
+    _tdm_store(
+        row_lds,
+        _uniform_i64(_addr(peer, x_offset, slot, slot_bytes)),
+        push_bytes,
+        cache_policy=SYS_STORE,
+    )
+
+
+@ASTRewriter.transform
+def _tdm_push_again(pushed, row, start, *push_args):
+    """Combine, after a tensor_wait(0): row ``row``'s push into slot ``pushed`` (none if < 0), issued after
+    ``_shader_cycles()`` read ``start``, done again until a pass is in time (see TDM_REDO_CYCLES)."""
+    moved = arith.select(pushed >= fx.Int32(0), _tdm_moved(start), fx.Int32(1))
+    while moved == fx.Int32(0):
+        again = _shader_cycles()
+        _tdm_push_row(row, pushed, *push_args)
+        tdm_ops.tensor_wait(0)
+        moved = _tdm_moved(again)
+
+
+@ASTRewriter.transform
 def _grab_tokens(counter, lds, lds_slot, base):
     """First of the warp's next ``REDUCE_GRAB_TOKENS`` tokens from the reduce queue."""
     lane_id = fx.thread_idx.x % fx.Int32(WARP_SIZE)
@@ -1034,6 +1131,19 @@ def _make_combine_v2(
             row_lds = lds + _readfirstlane_i32(warp_id) * fx.Int32(row_buffer_bytes)
         pushed = fx.Int32(-1)
         topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
+        push_args = (
+            row_lds,
+            x_base,
+            hidden_bytes,
+            num_topk,
+            topk_weights_res,
+            peer,
+            layout["x"],
+            slot_bytes,
+            push_bytes,
+        )
+        pushed_row = row
+        pushed_start = _shader_cycles() if USE_TDM else fx.Int64(0)
         while row < row_end:
             slot = row - row_begin + base
             # the previous row has landed, and is done with the LDS buffer
@@ -1041,6 +1151,10 @@ def _make_combine_v2(
                 tdm_ops.tensor_wait(0)
             else:
                 wait_mem_all()
+            if fx.const_expr(USE_TDM):
+                # before its flag goes up
+                _tdm_push_again(pushed, pushed_row, pushed_start, *push_args)
+                pushed_start = _shader_cycles()
             weight = fx.Float32(0.0)
             if fx.const_expr(num_topk > 0):
                 weight = buffer_load(
@@ -1079,11 +1193,14 @@ def _make_combine_v2(
             if (pushed >= fx.Int32(0)) & (lane_id == fx.Int32(0)):
                 _st_sys(peer_flags, pushed, epoch)
             pushed = slot
+            pushed_row = row
             row = row + fx.Int32(warps_per_peer)
         if fx.const_expr(USE_TDM):
             tdm_ops.tensor_wait(0)
         else:
             wait_mem_all()
+        if fx.const_expr(USE_TDM):
+            _tdm_push_again(pushed, pushed_row, pushed_start, *push_args)
         if (pushed >= fx.Int32(0)) & (lane_id == fx.Int32(0)):
             _st_sys(peer_flags, pushed, epoch)
 
