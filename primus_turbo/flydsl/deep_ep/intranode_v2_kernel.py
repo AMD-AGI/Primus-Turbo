@@ -137,8 +137,10 @@ USE_TDM = IS_GFX1250
 TDM_REDO_CYCLES = 1 << 20
 # LDS a block can allocate on gfx1250
 MAX_LDS_BYTES = 320 * 1024
-# combine: tokens a warp claims from the reduce queue at a time
-REDUCE_GRAB_TOKENS = 4
+# combine: tokens a warp claims from the reduce queue at a time. A claim waits for the rows of all its
+# tokens, which come from different source ranks whose pushes do not end together, so one late row holds
+# up the whole claim: one token a claim. REDUCE_GRAB_TOKENS x num_ranks lanes must fit a wave
+REDUCE_GRAB_TOKENS = 1
 
 
 def _tdm_row(lds_addr, global_addr, num_bytes):

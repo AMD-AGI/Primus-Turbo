@@ -153,7 +153,7 @@ fence; only their waits take the gfx12 form.
   source rank, laid out as [destination rank][index in the stream sent to it], so the slot of (rank
   `r`, token `t`) is `base_r + send_head[t, r]`; this rank's own rows stay in `x`. Only the rows a
   rank actually received are pushed, also under a `num_worst_tokens` allocation. Once a row has
-  landed, the pushing warp sets its flag to the epoch of this combine. Reduce warps take 4 tokens at
+  landed, the pushing warp sets its flag to the epoch of this combine. Reduce warps take one token at
   a time, in token order, from an atomic queue and add them as their flags arrive (bias first, then
   ranks in ascending order, the summation order of HIP / V1), so push and reduce overlap.
 - **TDM**: rows go through LDS (one load, then one store per destination rank); wide rows (e.g.
