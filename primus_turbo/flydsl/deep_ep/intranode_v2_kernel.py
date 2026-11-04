@@ -1104,8 +1104,10 @@ def _make_combine_v2(
     layout, _ = combine_v2_layout(num_nvl_bytes, hidden_bytes, num_topk)
     slot_bytes = combine_v2_slot_bytes(hidden_bytes, num_topk)
     weights_offset = layout["x"] + hidden_bytes
-    # the row and its weights, in whole 8-byte TDM elements
-    push_bytes = _align(hidden_bytes + num_topk * 4, 8)
+    # the whole slot, its padding included, so that no store ends inside a cache line: over XGMI a partial
+    # line costs about as much as a full one (hidden 7168 bf16 and top-8 end 96 bytes into the slot's last
+    # line). The padding comes from the warp's LDS buffer and is never read
+    push_bytes = slot_bytes
     push_warps = combine_v2_push_warps(num_channels)
     if USE_TDM:
         # each pusher holds a whole slot in LDS: the weights go with the row's store
