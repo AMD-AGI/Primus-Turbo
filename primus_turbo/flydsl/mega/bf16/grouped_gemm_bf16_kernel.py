@@ -432,7 +432,7 @@ def _compile_grouped_bf16_wgrad(
         num_lds_row_idx_entries=NUM_LDS_ROW_IDX_ENTRIES if has_row_idx else 0,
     )
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name="mega_bf16_grouped_variable_k", known_block_size=[512, 1, 1])
     def kernel_grouped_variable_k(
         A: fx.Tensor,
         B: fx.Tensor,

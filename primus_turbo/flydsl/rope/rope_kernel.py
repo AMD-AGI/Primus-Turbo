@@ -109,7 +109,7 @@ def _make_rope_kernel(
 
     if do_rotate:
 
-        @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+        @flyc.kernel(name="rope_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
         def rope_kernel(PACKED: fx.Tensor, FREQS: fx.Tensor, OUT: fx.Tensor):
             f32ty = _vec_type(fx.T.f32, _VEC)
             bf16ty = _vec_type(fx.T.bf16, _VEC)
@@ -160,7 +160,7 @@ def _make_rope_kernel(
 
     else:
 
-        @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+        @flyc.kernel(name="rope_v_copy_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
         def rope_kernel(PACKED: fx.Tensor, OUT: fx.Tensor):
             thread_index = fx.thread_idx.x
             block_index_x, block_index_y, _ = fx.block_idx
@@ -230,7 +230,7 @@ def _make_kv_merged_kernel(NG: int, B: int, total_rows: int, npg: int, grid_x: i
     hk_k = npg  # K's head-slot index within the (npg+2) D-wide slots per group.
     hk_v = npg + 1  # V's head-slot index (the last one).
 
-    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    @flyc.kernel(name="rope_kv_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
     def rope_kv_kernel(PACKED: fx.Tensor, K_FREQS: fx.Tensor, K_OUT: fx.Tensor, V_OUT: fx.Tensor):
         f32ty = _vec_type(fx.T.f32, _VEC)
         bf16ty = _vec_type(fx.T.bf16, _VEC)
@@ -626,7 +626,7 @@ def _make_rope_bwd_kernel(
 
     if do_rotate:
 
-        @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+        @flyc.kernel(name="rope_bwd_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
         def rope_bwd_kernel(DSPLIT: fx.Tensor, FREQS: fx.Tensor, DPACKED: fx.Tensor):
             f32ty = _vec_type(fx.T.f32, _VEC)
             bf16ty = _vec_type(fx.T.bf16, _VEC)
@@ -678,7 +678,7 @@ def _make_rope_bwd_kernel(
 
     else:
 
-        @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+        @flyc.kernel(name="rope_bwd_v_copy_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
         def rope_bwd_kernel(DSPLIT: fx.Tensor, DPACKED: fx.Tensor):
             thread_index = fx.thread_idx.x
             block_index_x, block_index_y, _ = fx.block_idx

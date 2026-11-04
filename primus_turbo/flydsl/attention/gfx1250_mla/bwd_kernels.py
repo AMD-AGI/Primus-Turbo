@@ -170,7 +170,7 @@ def _tdm_rows(src, off, d, rows, valid, rs_el, lds_row0, lds_ty, num_warps=1):
 
 
 # ---------------------------------------------------------------------------------------- delta
-@flyc.kernel(known_block_size=[DELTA_THREADS, 1, 1])
+@flyc.kernel(name="k_mla_bwd_delta_bshd", known_block_size=[DELTA_THREADS, 1, 1])
 def k_delta_bshd(
     DO: fx.Tensor,
     O: fx.Tensor,
@@ -820,7 +820,7 @@ def _dkdv_impl(
             )
 
 
-@flyc.kernel(known_block_size=[32, 1, 1])
+@flyc.kernel(name="k_mla_bwd_dkdv", known_block_size=[32, 1, 1])
 def k_dkdv(
     Q: fx.Tensor,
     K: fx.Tensor,
@@ -876,7 +876,7 @@ def launch_dkdv(
 
 # Two waves per workgroup (one per SIMD) fetch 64 kv rows' worth of Q/dO once: half the TDM bytes
 # and LDS writes per dK/dV FLOP of k_dkdv.
-@flyc.kernel(known_block_size=[WAVE * DKDV_NW, 1, 1])
+@flyc.kernel(name="k_mla_bwd_dkdv64", known_block_size=[WAVE * DKDV_NW, 1, 1])
 def k_dkdv64(
     Q: fx.Tensor,
     K: fx.Tensor,
@@ -1401,7 +1401,7 @@ def _dqg_impl(
             )
 
 
-@flyc.kernel(known_block_size=[32, 1, 1])
+@flyc.kernel(name="k_mla_bwd_dqg", known_block_size=[32, 1, 1])
 def k_dqg(
     Q: fx.Tensor,
     K: fx.Tensor,
@@ -1482,7 +1482,7 @@ def launch_dqg(
     ).launch(grid=(hg, ntile, ngz), block=(32, 1, 1), stream=stream)
 
 
-@flyc.kernel(known_block_size=[DQ_NWAVE * WAVE, 1, 1])
+@flyc.kernel(name="k_mla_bwd_dqg96", known_block_size=[DQ_NWAVE * WAVE, 1, 1])
 def k_dqg96(
     Q: fx.Tensor,
     K: fx.Tensor,

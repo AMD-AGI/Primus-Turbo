@@ -115,7 +115,7 @@ def _make_grouped_gemm_combine(
     num_gemm_blocks = worst_case_tiles * num_tiles_n
     combine_token_bytes = num_max_routes * out_features * 2
 
-    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    @flyc.kernel(name="grouped_gemm_combine_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
     def grouped_gemm_combine_kernel(
         ACT: fx.Tensor,
         WEIGHTS: fx.Tensor,
@@ -355,7 +355,7 @@ def _make_grouped_gemm_combine(
 def _make_epoch_bump(add_combine, add_reduce):
     """Single-block kernel: flip parity, bump combine and reduce expected."""
 
-    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    @flyc.kernel(name="mega_bf16_combine_epoch_bump_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
     def epoch_bump_kernel(PARITY: fx.Tensor, COMBINE_EXP: fx.Tensor, REDUCE_EXP: fx.Tensor):
         if fx.thread_idx.x == fx.Int32(0):
             parity_res = create_buffer_resource(PARITY, max_size=True)

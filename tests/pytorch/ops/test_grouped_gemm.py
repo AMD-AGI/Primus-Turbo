@@ -17,6 +17,19 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
     grouped_gemm_variable_k_impl,
 )
 from primus_turbo.pytorch.ops import grouped_gemm
+from tests.pytorch.ops.determinism_helper import (  # noqa: F401  (_det_seed: fixture)
+    ACCUM_GROUPED_SHAPE,
+    DET_DTYPES,
+    _det_seed,
+    check_determinism,
+    check_fused_grad_accum,
+    grouped_ref,
+    make_generator,
+    randn,
+    require_gfx950,
+    skip_flydsl_on_gfx942,
+    unbalanced_group_lens,
+)
 from tests.pytorch.ops.gemm_shapes_helper import GROUPED_GEMM_SHAPES
 from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
@@ -133,80 +146,6 @@ def test_grouped_gemm_func(B, M, N, K, dtype, trans_b, backend, auto_tune, reduc
     torch.testing.assert_close(b_ref.grad, b.grad, **get_tolerances(dtype))
 
     # Reset config and caches
-    GlobalBackendManager.reset()
-
-
-@pytest.mark.parametrize("B, M, N, K", [(1, 4096, 2048, 1536), (2, 2048, 4096, 7168)])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("trans_b", [True, False])
-@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
-@pytest.mark.deterministic
-def test_grouped_gemm_deterministic(B, M, N, K, dtype, trans_b, backend):
-    seed = 42
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-
-    # Keep CI stable: reuse known gfx942 hipBLASLt flake skip for M <= 512.
-    if M <= 512 and backend is BackendType.HIPBLASLT and get_device_compute_capability() == (9, 4):
-        pytest.skip("Intermittent flake on gfx942 with hipBLASLt when M <= 512; skip temporarily")
-
-    # Keep deterministic test focused: fixed backend / no autotune / no CU reduction.
-    GlobalBackendManager.set_grouped_gemm_backend(backend)
-    GlobalBackendManager.set_auto_tune(False)
-
-    device = "cuda"
-    props = torch.cuda.get_device_properties(device)
-    num_cu = props.multi_processor_count
-
-    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
-    print(
-        f"\n[deterministic] B={B}, M={M}, N={N}, K={K}, dtype={dtype}, trans_b={trans_b}, backend={backend}"
-    )
-
-    b_shape = (B, N, K) if trans_b else (B, K, N)
-    a0 = torch.randn((B * M, K), dtype=torch.float32, device=device).to(dtype)
-    b0 = torch.randn(b_shape, dtype=torch.float32, device=device).to(dtype)
-    a0 = (a0 / a0.abs().max()).detach()
-    b0 = (b0 / b0.abs().max()).detach()
-
-    # Reference (correctness)
-    a_ref = a0.clone().requires_grad_(True)
-    b_ref = b0.clone().requires_grad_(True)
-    out_ref = grouped_gemm_ref(a_ref, b_ref, group_lens.clone(), trans_b)
-    grad_out = torch.randn_like(out_ref)
-    out_ref.backward(grad_out)
-    torch.cuda.synchronize()
-
-    def _run_once():
-        a = a0.clone().requires_grad_(True)
-        b = b0.clone().requires_grad_(True)
-        out = grouped_gemm(a, b, group_lens, trans_b=trans_b, num_cu=num_cu)
-        out.backward(grad_out)
-        return out.detach(), a.grad.detach(), b.grad.detach()
-
-    repeats = 3
-    outs = []
-    for _ in range(repeats):
-        outs.append(_run_once())
-        torch.cuda.synchronize()
-
-    out0, da0, db0 = outs[0]
-    # Determinism (bitwise identical across runs)
-    for i in range(1, repeats):
-        out_i, da_i, db_i = outs[i]
-        torch.testing.assert_close(out0, out_i, rtol=0, atol=0)
-        torch.testing.assert_close(da0, da_i, rtol=0, atol=0)
-        torch.testing.assert_close(db0, db_i, rtol=0, atol=0)
-
-    # Correctness
-    torch.testing.assert_close(out0, out_ref.detach(), **get_tolerances(dtype))
-    torch.testing.assert_close(da0, a_ref.grad.detach(), **get_tolerances(dtype))
-    torch.testing.assert_close(db0, b_ref.grad.detach(), **get_tolerances(dtype))
-
     GlobalBackendManager.reset()
 
 
@@ -709,3 +648,102 @@ def test_grouped_gemm_variable_k_backend(B, M, N, K, dtype, trans_c, backend):
     snr = compute_snr(ref, out)
     assert snr > 45.0, f"snr {snr:.2f} dB too low"
     torch.testing.assert_close(out, ref, **get_tolerances(dtype))
+
+
+# ---------------------------------------------------------------------------
+# Determinism (--deterministic-only): bit-exact across repeats on determinism_helper's harness.
+# ---------------------------------------------------------------------------
+def _check_grouped_gemm_det(nodeid, seed, B, M, N, K, dtype, trans_b, **kwargs):
+    """fwd, dgrad and the variable-K wgrad; ``kwargs`` go to ``grouped_gemm``."""
+    gen = make_generator(seed)
+    group_lens = unbalanced_group_lens(B, M, seed)
+    a0 = randn((B * M, K), dtype, gen, normalize=True)
+    b0 = randn((B, N, K) if trans_b else (B, K, N), dtype, gen, normalize=True)
+    g = randn((B * M, N), dtype, gen)
+
+    def run_once(mid):
+        a = a0.clone().requires_grad_(True)
+        b = b0.clone().requires_grad_(True)
+        out = grouped_gemm(a, b, group_lens, trans_b=trans_b, **kwargs)
+        mid()
+        out.backward(g)
+        return {"out": out, "dgrad": a.grad, "wgrad": b.grad}
+
+    check_determinism(nodeid, run_once, grouped_ref(a0, b0, group_lens, trans_b, g), snr_floor=40)
+
+
+# Ragged groups; N=320 off the tile grid; 8 experts with a deeper K; G=64 at the expert cap; a
+# single group; two large groups with K=7168.
+DET_SHAPES = [
+    (4, 1024, 2048, 1536),
+    (8, 256, 320, 2880),
+    (8, 512, 2048, 1536),
+    (64, 256, 2048, 1536),
+    (1, 4096, 2048, 1536),
+    (2, 2048, 4096, 7168),
+]
+
+# (backend, reduce_num_cu): a reduced CU budget only for backends that act on num_cu (CK and
+# Triton size their persistent grid from it, FlyDSL caps its CUs with it).
+_DET_BACKEND_CU = [
+    pytest.param(None, 0, id="default-fullcu"),
+    pytest.param(BackendType.HIPBLASLT, 0, id="HIPBLASLT-fullcu"),
+    pytest.param(BackendType.CK, 0, id="CK-fullcu"),
+    pytest.param(BackendType.CK, 32, id="CK-cu-32"),
+    pytest.param(BackendType.TRITON, 0, id="TRITON-fullcu"),
+    pytest.param(BackendType.TRITON, 32, id="TRITON-cu-32"),
+    pytest.param(BackendType.FLYDSL, 0, id="FLYDSL-fullcu"),
+    pytest.param(BackendType.FLYDSL, 32, id="FLYDSL-cu-32"),
+]
+
+
+@pytest.mark.parametrize("B, M, N, K", DET_SHAPES)
+@pytest.mark.parametrize("dtype", DET_DTYPES)
+@pytest.mark.parametrize("trans_b", [True, False], ids=["NT", "NN"])
+@pytest.mark.parametrize("backend, reduce_num_cu", _DET_BACKEND_CU)
+@pytest.mark.deterministic
+def test_det_grouped_gemm(request, det_seed, B, M, N, K, dtype, trans_b, backend, reduce_num_cu):
+    skip_flydsl_on_gfx942(backend)
+    if M <= 512 and backend is BackendType.HIPBLASLT and get_device_compute_capability() == (9, 4):
+        pytest.skip("Intermittent flake on gfx942 with hipBLASLt when M <= 512; skip temporarily")
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    num_cu = torch.cuda.get_device_properties("cuda").multi_processor_count - reduce_num_cu
+    _check_grouped_gemm_det(request.node.nodeid, det_seed, B, M, N, K, dtype, trans_b, num_cu=num_cu)
+
+
+@pytest.mark.parametrize("B, M, N, K", [(4, 4096, 2048, 1536), (8, 1024, 4096, 7168), (8, 512, 2048, 1536)])
+@pytest.mark.parametrize("trans_b", [True, False], ids=["NT", "NN"])
+@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.CK], ids=["TRITON", "CK"])
+@pytest.mark.deterministic
+def test_det_grouped_gemm_work_steal(request, det_seed, B, M, N, K, trans_b, backend):
+    """The same work_steal configuration, run repeatedly, must reproduce itself."""
+    if backend == BackendType.CK:
+        require_gfx950("CK schedule='work_steal'")
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    _check_grouped_gemm_det(
+        request.node.nodeid, det_seed, B, M, N, K, torch.bfloat16, trans_b, schedule="work_steal"
+    )
+
+
+@pytest.mark.parametrize("microbatches", [1, 2], ids=["mb1", "mb2"])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param(BackendType.HIPBLASLT, id="grouped-bf16-HIPBLASLT"),
+        pytest.param(BackendType.TRITON, id="grouped-bf16-TRITON"),
+    ],
+)
+@pytest.mark.deterministic
+def test_det_fused_grad_accum(request, det_seed, backend, microbatches):
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    check_fused_grad_accum(
+        request.node.nodeid,
+        det_seed,
+        lambda a, b, group_lens: grouped_gemm(
+            a, b, group_lens, trans_b=True, fuse_bgrad_accum_pattern="megatron"
+        ),
+        ACCUM_GROUPED_SHAPE,
+        torch.float32,
+        40,
+        microbatches,
+    )

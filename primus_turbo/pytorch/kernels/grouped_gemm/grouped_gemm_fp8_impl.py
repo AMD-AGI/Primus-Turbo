@@ -1242,20 +1242,21 @@ def _check_mx_glu_dispatch(config: Float8QuantConfig, trans_a: bool, trans_b: bo
 
 
 def _check_mx_out_recipes(row: ScalingRecipe, col: ScalingRecipe) -> None:
-    """Hold the caller's recipes against the geometry the fused MXFP8 epilogue is built on.
+    """Hold the caller's recipes against what the fused MXFP8 GLU / dGLU quant supports.
 
-    The epilogue is not a general quantiser. It has no RHT, no stochastic rounding and no
-    shuffled layouts -- MXFP8's recipe surface for this path is ``use_2d_block`` alone, so
-    the other four are contract checks rather than knobs, and shapes wanting them belong
-    on the standalone quantiser.
+    The quant is the second stage of ``grouped_gemm_mxfp8_epi_(d)glu_quant_flydsl_kernel``
+    (``_compile_grouped_glu_qdual`` / ``_compile_grouped_dglu_qdual``): it reads the bf16 GEMM
+    output, applies the GLU or its gradient, and writes the row-wise (1x32) and col-wise (32x1)
+    operands with E8M0 scales, unshuffled. It is not a general quantiser. It has no RHT, no
+    stochastic rounding and no shuffled layouts, so those four fields are contract checks
+    rather than knobs, and shapes wanting them belong on the standalone quantiser.
 
-    ``use_2d_block`` is the one field the epilogue's band *could* express -- a 32x32 chunk
-    is exactly one col-wise half-band by the whole row span, so the 2-D amax is a reduction
-    over amaxes it already computes -- but it is not implemented:
-    ``MXFP8DualQuantStore.store_band`` still asserts against it, and there is no grouped
-    reference to be byte-exact against either, since ``compile_grouped_qdual`` has no 2-D
-    path. Rejecting it here is what keeps that assert honest; the alternative is an op that
-    accepts the flag and silently emits 1-D scales.
+    ``use_2d_block`` is the one field the quant *could* express -- ``_GQD_BM`` and ``_GQD_BK``
+    are multiples of 32, so a 32x32 chunk lies inside one workgroup's tile and its 2-D amax is
+    a reduction over the 1x32 amaxes the kernel already computes -- but it is not implemented:
+    the kernel has no 2-D path, and neither does ``compile_grouped_qdual``, the grouped
+    reference it has to match byte for byte. Rejecting it here keeps the op from accepting the
+    flag and silently emitting 1-D scales.
 
     Net effect today: both recipes must be the default. The signature carries them per
     operand because the epilogue does quantise the two on their own terms, and that is

@@ -919,7 +919,7 @@ def _build_dual_kernel(
     ``padded`` sizes the outputs on CP/RP and masks the ragged tail, as in the 3D path."""
     _DualSS = _make_dual_struct(bool(row_2d or col_2d))
 
-    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    @flyc.kernel(name="mxfp4_quant_dual", known_block_size=[BLK, 1, 1])
     def _dual_kernel(
         X: fx.Tensor,  # int32 view [R, C/2]
         ROW_OUT: fx.Tensor,  # int32 view [R, CP/8]
@@ -1219,7 +1219,7 @@ def _build_rmsnorm_dual_kernel(row_rht, col_rht, col_locality=False):
 
     _DualSS = _RmsDualSS
 
-    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    @flyc.kernel(name="mxfp4_rmsnorm_quant_dual", known_block_size=[BLK, 1, 1])
     def _rmsnorm_dual_kernel(
         X: fx.Tensor,
         ROW_OUT: fx.Tensor,
@@ -1392,7 +1392,7 @@ def _build_dual3_kernel(
 ):
     _DualSS = _make_dual_struct(bool(row_2d or col_2d))
 
-    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    @flyc.kernel(name="mxfp4_quant_dual3", known_block_size=[BLK, 1, 1])
     def _dual3_kernel(
         X: fx.Tensor,  # int32 view [G, R, C/2] (real)
         ROW_OUT: fx.Tensor,  # int32 view [G, R, CP/8]

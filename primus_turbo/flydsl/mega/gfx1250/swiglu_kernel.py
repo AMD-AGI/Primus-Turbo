@@ -104,7 +104,7 @@ def _make_swiglu(
 
     partial_tail = I % cols_per_block != 0
 
-    @flyc.kernel(known_block_size=[block_threads, 1, 1])
+    @flyc.kernel(name="mega_gfx1250_swiglu_kernel", known_block_size=[block_threads, 1, 1])
     def swiglu_kernel(
         ACC1: fx.Tensor,
         ACT: fx.Tensor,
@@ -179,7 +179,7 @@ def _make_swiglu_bwd(
     partial_tail = I % cols_per_block != 0
     n_warps = block_threads // wave
 
-    @flyc.kernel(known_block_size=[block_threads, 1, 1])
+    @flyc.kernel(name="mega_gfx1250_swiglu_bwd_kernel", known_block_size=[block_threads, 1, 1])
     def swiglu_bwd_kernel(
         DACT: fx.Tensor,
         ACC1: fx.Tensor,

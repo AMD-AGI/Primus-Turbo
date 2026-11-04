@@ -4,7 +4,6 @@
 # See LICENSE for license information.
 ###############################################################################
 
-import os
 import statistics
 import warnings
 from abc import ABC, abstractmethod
@@ -15,14 +14,7 @@ from typing import Any, Dict, Hashable, List, Optional, Type
 
 import torch
 
-from primus_turbo.common.constants import (
-    ENV_ATTN_BACKEND,
-    ENV_AUTO_TUNE,
-    ENV_GEMM_BACKEND,
-    ENV_GROUPED_GEMM_BACKEND,
-    ENV_MOE_DISPATCH_COMBINE_BACKEND,
-    ENV_SPARSE_ATTN_BACKEND,
-)
+import primus_turbo.common.envs as envs
 from primus_turbo.common.logger import logger
 from primus_turbo.triton.utils.origami import origami_clear_caches
 
@@ -210,10 +202,10 @@ class GlobalBackendManager:
         None instead of raising, for ops whose backends are not all modelled by the
         enum (MoE dispatch/combine accepts custom EP names such as ``UCCL_EP``).
         """
-        env_value = os.environ.get(env_key, None)
-        # Treat an empty / whitespace-only env var as missing (else
+        # envs reads an empty / whitespace-only value as None (else
         # _extract_backend_from_env raises KeyError on BackendType['']).
-        if env_value is None or not env_value.strip():
+        env_value = getattr(envs, env_key)
+        if env_value is None:
             return None
 
         try:
@@ -280,14 +272,14 @@ class GlobalBackendManager:
         if cls._gemm_backend is not None:
             # .get(): setting one precision leaves the others unconfigured.
             return cls._gemm_backend.get(precision)
-        return cls._backend_from_env(ENV_GEMM_BACKEND, precision)
+        return cls._backend_from_env("PRIMUS_TURBO_GEMM_BACKEND", precision)
 
     @classmethod
     def get_grouped_gemm_backend(cls, precision: PrecisionType) -> Optional[BackendChoice]:
         """Get the Grouped GEMM backend configuration. Returns None if not set."""
         if cls._grouped_gemm_backend is not None:
             return cls._grouped_gemm_backend.get(precision)
-        return cls._backend_from_env(ENV_GROUPED_GEMM_BACKEND, precision)
+        return cls._backend_from_env("PRIMUS_TURBO_GROUPED_GEMM_BACKEND", precision)
 
     @classmethod
     def set_attn_backend(
@@ -312,7 +304,7 @@ class GlobalBackendManager:
         if cls._attn_backend is not None:
             return cls._attn_backend.get(precision)
         # env parsing yields BackendChoice; attn dispatch consumes the bare enum.
-        choice = cls._backend_from_env(ENV_ATTN_BACKEND, precision)
+        choice = cls._backend_from_env("PRIMUS_TURBO_ATTN_BACKEND", precision)
         return choice.backend if choice is not None else None
 
     @classmethod
@@ -337,7 +329,7 @@ class GlobalBackendManager:
         """
         if cls._sparse_attn_backend is not None:
             return cls._sparse_attn_backend.get(precision)
-        return cls._backend_from_env(ENV_SPARSE_ATTN_BACKEND, precision)
+        return cls._backend_from_env("PRIMUS_TURBO_SPARSE_ATTN_BACKEND", precision)
 
     @classmethod
     def get_moe_dispatch_combine_backend(cls, precision: PrecisionType) -> Optional[BackendChoice]:
@@ -351,7 +343,7 @@ class GlobalBackendManager:
             return cls._moe_dispatch_combine_backend.get(precision)
 
         choice = cls._backend_from_env(
-            ENV_MOE_DISPATCH_COMBINE_BACKEND, precision, allow_unknown_backend=True
+            "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND", precision, allow_unknown_backend=True
         )
         if choice is None:
             return None
@@ -359,7 +351,7 @@ class GlobalBackendManager:
         # Dispatch/combine picks an EP backend that owns persistent communication
         # buffers, so there is nothing to profile and swap per call.
         assert not choice.auto_tune, (
-            f"{ENV_MOE_DISPATCH_COMBINE_BACKEND}=AUTOTUNE is not supported: "
+            "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND=AUTOTUNE is not supported: "
             "MoE dispatch/combine has no auto-tune path."
         )
 
@@ -378,11 +370,14 @@ class GlobalBackendManager:
         """
         if cls._auto_tune is not None:
             return cls._auto_tune
-        return os.environ.get(ENV_AUTO_TUNE, "0") == "1"
+        return envs.PRIMUS_TURBO_AUTO_TUNE
 
     @classmethod
     def reset(cls) -> None:
-        """Reset all backend settings and clear all dispatcher caches."""
+        """Reset all backend settings and clear all dispatcher caches.
+
+        The backend and auto-tune environment variables are read again at their next use.
+        """
         cls._gemm_backend = None
         cls._grouped_gemm_backend = None
         cls._moe_dispatch_combine_backend = None
@@ -390,6 +385,14 @@ class GlobalBackendManager:
         cls._sparse_attn_backend = None
         cls._auto_tune = None
         cls._env_cache = {}
+        envs.reset_cache(
+            "PRIMUS_TURBO_GEMM_BACKEND",
+            "PRIMUS_TURBO_GROUPED_GEMM_BACKEND",
+            "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND",
+            "PRIMUS_TURBO_ATTN_BACKEND",
+            "PRIMUS_TURBO_SPARSE_ATTN_BACKEND",
+            "PRIMUS_TURBO_AUTO_TUNE",
+        )
         AutoKernelDispatcher.clear_all_caches()
         origami_clear_caches()
 

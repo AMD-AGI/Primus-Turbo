@@ -22,13 +22,19 @@ from primus_turbo.pytorch.core.low_precision import (
     check_mxfp4_support,
 )
 from primus_turbo.pytorch.ops.grouped_mlp_fp4 import grouped_mlp_fp4
+from tests.pytorch.ops.determinism_helper import (  # noqa: F401  (_det_seed: fixture)
+    _det_seed,
+    check_grouped_mlp,
+    grouped_mlp_ref,
+    make_generator,
+    randn,
+    require_mxfp4,
+    unbalanced_group_lens,
+)
 from tests.pytorch.test_utils import compute_snr
 
-# The op measures 10.15-10.88 dB across these shapes and tensors, the same band a
-# single MXFP4 grouped GEMM sits in; grad_probs on the last shape is the tightest.
-# The threshold sits just under that rather than at the fp4 GEMM suite's 8 dB, so a
-# regression in the fused epilogue's rounding shows up instead of being absorbed --
-# which leaves it only ~0.15 dB of headroom.
+# The op measures 10.15-10.88 dB here (grad_probs on the last shape is the tightest): just above
+# this, rather than the fp4 GEMM suite's 8 dB, so a fused-epilogue rounding regression shows up.
 SNR_THRESHOLD = 10.0
 
 # (M, K, I, G). MX needs every GEMM dim to be a 32-multiple; the uneven split
@@ -104,10 +110,12 @@ def test_grouped_mlp_fp4(shape, activation, clamp_limit, scale_rounding_mode):
     M, K, I, G = shape
     if scale_rounding_mode == 2:
         from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp4_glu_kernel import (
-            _GMXFP4_GLU_CACHE,
+            _GROUPED_GEMM_MXFP4_EPI_DGLU_QUANT,
+            _GROUPED_GEMM_MXFP4_EPI_GLU_QUANT,
         )
 
-        _GMXFP4_GLU_CACHE.clear()
+        _GROUPED_GEMM_MXFP4_EPI_GLU_QUANT.clear()
+        _GROUPED_GEMM_MXFP4_EPI_DGLU_QUANT.clear()
     offs, group_lens, leaves = _mlp_leaves(M, K, I, G)
     gen = torch.Generator(device="cuda").manual_seed(7)
     # Random rather than ones: a cotangent that varies keeps a per-row term like
@@ -145,6 +153,51 @@ def test_grouped_mlp_fp4(shape, activation, clamp_limit, scale_rounding_mode):
 
     if scale_rounding_mode == 2:
         expected_bias = 3 << 19
-        keys = tuple(_GMXFP4_GLU_CACHE)
-        assert any(key[13] and key[-1] == expected_bias for key in keys), "fused GLU mode"
-        assert any(key[14] and key[-1] == expected_bias for key in keys), "fused dGLU mode"
+        glu_keys = tuple(_GROUPED_GEMM_MXFP4_EPI_GLU_QUANT.entries)
+        dglu_keys = tuple(_GROUPED_GEMM_MXFP4_EPI_DGLU_QUANT.entries)
+        assert any(key[12] and key[-1] == expected_bias for key in glu_keys), "fused GLU mode"
+        assert any(key[13] and key[-1] == expected_bias for key in dglu_keys), "fused dGLU mode"
+
+
+# ---------------------------------------------------------------------------
+# Determinism (--deterministic-only): bit-exact across repeats on determinism_helper's harness.
+# ---------------------------------------------------------------------------
+# (M, K, I, G); K must be an odd multiple of 128 for the fused GLU quant epilogue.
+DET_SHAPES = [(2048, 896, 512, 4), (2048, 1408, 320, 4)]
+_DET_CASES = [
+    pytest.param(shape, act, clamp, 0, id=f"{'x'.join(map(str, shape))}-{act}{'-clamp' if clamp else ''}")
+    for shape in DET_SHAPES
+    for act, clamp in [("silu", None), ("gelu", 0.10)]
+] + [pytest.param(DET_SHAPES[0], "silu", None, 2, id="uos-mode2")]
+
+
+@pytest.mark.parametrize("shape, activation, clamp_limit, scale_rounding_mode", _DET_CASES)
+@pytest.mark.deterministic
+def test_det_grouped_mlp_fp4(request, det_seed, shape, activation, clamp_limit, scale_rounding_mode):
+    require_mxfp4()
+    M, K, I, G = shape
+    gen = make_generator(det_seed)
+    group_lens = unbalanced_group_lens(G, M // G, det_seed)
+    x0 = randn((M, K), torch.bfloat16, gen, scale=0.1)
+    w10 = randn((G, 2 * I, K), torch.bfloat16, gen, scale=0.02)
+    w20 = randn((G, K, I), torch.bfloat16, gen, scale=0.02)
+    probs0 = torch.rand(M, device="cuda", dtype=torch.float32, generator=gen) + 0.25
+    cotangent = randn((M, K), torch.float32, gen)
+    config = Float4QuantConfig(scale_rounding_mode=scale_rounding_mode)
+
+    def fn(x, w1, w2, probs):
+        return grouped_mlp_fp4(
+            x,
+            w1,
+            w2,
+            group_lens,
+            probs=probs,
+            trans_w1=True,
+            trans_w2=True,
+            config=config,
+            activation=activation,
+            clamp_limit=clamp_limit,
+        )
+
+    ref = grouped_mlp_ref(x0, w10, w20, probs0, group_lens, activation, clamp_limit, cotangent)
+    check_grouped_mlp(request.node.nodeid, fn, x0, w10, w20, probs0, cotangent, ref, 8)

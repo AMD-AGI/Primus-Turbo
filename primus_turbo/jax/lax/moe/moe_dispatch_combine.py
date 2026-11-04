@@ -39,7 +39,6 @@ saves ~5–10 µs per trace.
 
 from __future__ import annotations
 
-import os
 import warnings
 from dataclasses import dataclass
 from functools import partial
@@ -49,6 +48,7 @@ import jax
 import jax.core
 import jax.numpy as jnp
 
+import primus_turbo.common.envs as envs
 from primus_turbo.jax.deep_ep import runtime as deep_ep_runtime
 from primus_turbo.jax.deep_ep.runtime import (
     MODE_INPROC,  # noqa: F401  re-exported for callers that introspect mode (e.g. tests)
@@ -195,7 +195,7 @@ def reset_runtime() -> None:
     _frozen = None
     _default_num_sms = 64
     # Clear PRIMUS_TURBO_JAX_DEEPEP_MODE so auto_detect_mode rediscovers from scratch
-    os.environ.pop(deep_ep_runtime._MODE_ENV_VAR, None)
+    envs.set_env(deep_ep_runtime._MODE_ENV_VAR, None)
     deep_ep_runtime.reset_runtime()
 
 
@@ -313,7 +313,7 @@ def setup(
 
     # ----- Mode resolution: env var > explicit mode > heuristic -----
     if mode is not None:
-        os.environ[deep_ep_runtime._MODE_ENV_VAR] = mode
+        envs.set_env(deep_ep_runtime._MODE_ENV_VAR, mode)
     deep_ep_runtime.auto_detect_mode()
     locked_mode = deep_ep_runtime.get_mode(lock=True)
 

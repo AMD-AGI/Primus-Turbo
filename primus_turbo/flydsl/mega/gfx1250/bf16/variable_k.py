@@ -345,7 +345,7 @@ def _launch_grouped_bf16_variable_k(
     if accum and C_LDS_B > ARENA_B:
         raise ValueError(f"accum: the C tile takes {C_LDS_B} B of LDS, more than the {ARENA_B} B arena")
 
-    @flyc.kernel(known_block_size=[block, 1, 1])
+    @flyc.kernel(name="mega_gfx1250_grouped_variable_k", known_block_size=[block, 1, 1])
     def kernel_grouped_variable_k(
         arg_c: fx.Pointer,
         arg_a: fx.Pointer,

@@ -15,6 +15,7 @@ from typing import Optional
 
 import torch
 
+import primus_turbo.common.envs as envs
 from primus_turbo.flydsl.mega.fp8 import (
     colwise_grouped_meta,
     colwise_requant_fp8in_and_quant_bf16_grouped_flydsl,
@@ -23,7 +24,6 @@ from primus_turbo.flydsl.mega.fp8 import (
     swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl,
     swiglu_mxfp8_flydsl_kernel,
 )
-from primus_turbo.flydsl.mega.fp8.combine_autotune import env_combine_cu
 from primus_turbo.flydsl.utils.glu_activation import GLUActivation
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity
@@ -52,7 +52,7 @@ _H_NUM_TILE_BLOCKS = 11  # fp8 dispatch handle index of num_tile_blocks (device 
 # now tunes it per shape online (``flydsl/mega/fp8/combine_autotune.py``). ``None`` hands it that
 # choice; setting the env pins a value instead and skips tuning entirely, which is what the sweeps
 # and any shape with a known-good split use.
-_L2_NUM_COMBINE_CU = env_combine_cu("PT_MEGA_FP8_L2_COMBINE_CU")
+_L2_NUM_COMBINE_CU = envs.PT_MEGA_FP8_L2_COMBINE_CU
 
 __all__ = [
     "fused_mega_moe_stage2_forward_fp8_impl",

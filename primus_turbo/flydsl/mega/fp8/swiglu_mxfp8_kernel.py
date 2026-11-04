@@ -154,7 +154,7 @@ def _compile_swiglu_mxfp8(
         # n_work is ~BT, so this is ~1 KB and does not constrain occupancy.
         raw: fx.Array[fx.Int32, n_work, 16]
 
-    @flyc.kernel(known_block_size=[BT, 1, 1])
+    @flyc.kernel(name="swiglu_mxfp8_fwd_kern", known_block_size=[BT, 1, 1])
     def kern(
         ACC1: fx.Tensor,
         Q: fx.Tensor,
@@ -337,7 +337,7 @@ def swiglu_mxfp8_flydsl_kernel(
 def _compile_gate_partial_reduce(n_part: int, BT: int = 256):
     """Fold the ``[n_part, P]`` per-i-tile gate partials into ``grad_gate [P]``."""
 
-    @flyc.kernel(known_block_size=[BT, 1, 1])
+    @flyc.kernel(name="gate_partial_reduce_kern", known_block_size=[BT, 1, 1])
     def gate_partial_reduce_kern(GG: fx.Tensor, GP: fx.Tensor, P_i32: fx.Int32):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -401,7 +401,7 @@ def _compile_swiglu_bwd_rowcol_dual(
 
     # Named, not `kern`: every FlyDSL kernel lowers to its Python function name, so a generic
     # name collides with a dozen others in a profile and cannot be selected by ATT regex.
-    @flyc.kernel(known_block_size=[BT, 1, 1])
+    @flyc.kernel(name="swiglu_bwd_dual_kern", known_block_size=[BT, 1, 1])
     def swiglu_bwd_dual_kern(
         L1: fx.Tensor,
         DACT: fx.Tensor,

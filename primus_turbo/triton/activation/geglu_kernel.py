@@ -182,7 +182,7 @@ def geglu_fwd_kernel(
 
     half_stride_x_token = stride_x_token // 2
 
-    row_idx = pid
+    row_idx = pid.to(tl.int64)
     row_mask = row_idx < num_tokens
     col_off = tl.arange(0, LOAD_WIDTH)
     col_mask = col_off < half_stride_x_token
@@ -239,7 +239,7 @@ def geglu_bwd_kernel(
 
     half_stride_x_token = stride_x_token // 2
 
-    row_idx = pid
+    row_idx = pid.to(tl.int64)
     row_mask = row_idx < num_tokens
     col_off = tl.arange(0, LOAD_WIDTH)
     col_mask = col_off < half_stride_x_token
