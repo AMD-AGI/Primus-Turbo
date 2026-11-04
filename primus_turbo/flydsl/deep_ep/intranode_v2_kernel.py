@@ -214,6 +214,31 @@ def _tdm_moved(start):
     return arith.select(in_time, fx.Int32(1), fx.Int32(0))
 
 
+@ASTRewriter.transform
+def _tdm_load_checked(lds_addr, global_addr, num_bytes: int, sys_load: bool):
+    """``_tdm_load`` of ``num_bytes`` from ``global_addr`` into LDS ``lds_addr`` and a tensor_wait(0), issued
+    again until LDS holds what ``global_addr`` does at 32 words from the first to the last (a lane each, read
+    beside the load; ``sys_load``: system scope, for a heap the peers write). An eviction can drop a queued
+    TDM load, all of it or a part, after s_wait_tensorcnt; with no long stall the cycle check
+    (TDM_REDO_CYCLES) passes it, and the warp would store its buffer's previous contents. A TDM load that
+    follows outstanding stores is lost far more often."""
+    lane_id = fx.thread_idx.x % fx.Int32(WARP_SIZE)
+    check_word = (lane_id * fx.Int32(num_bytes // 4 - 1)) // fx.Int32(WARP_SIZE - 1)
+    landed = fx.Int32(0)
+    while landed == fx.Int32(0):
+        if fx.const_expr(sys_load):
+            _tdm_load(lds_addr, global_addr, num_bytes, cache_policy=SYS_LOAD)
+            expected = _ld_sys(global_addr, check_word)
+        else:
+            _tdm_load(lds_addr, global_addr, num_bytes)
+            expected = load_i32(
+                create_buffer_resource_from_addr(global_addr, num_records_bytes=num_bytes), check_word
+            )
+        tdm_ops.tensor_wait(0)
+        stale = _popc(_ballot(ld_lds(lds_addr, check_word) != expected)) > fx.Int32(0)
+        landed = arith.select(stale, fx.Int32(0), fx.Int32(1))
+
+
 def _align(value, alignment):
     return (value + alignment - 1) // alignment * alignment
 
@@ -359,13 +384,9 @@ def _tdm_copy_received_x(local, layout, outputs, row, hidden_bytes: int, row_lds
     for p in range_constexpr(0, hidden_bytes, row_buffer_bytes):
         piece = min(row_buffer_bytes, hidden_bytes - p)
         tdm_ops.tensor_wait(0)
-        _tdm_load(
-            row_lds,
-            _uniform_i64(_addr(local, layout["x"] + p, row, hidden_bytes)),
-            piece,
-            cache_policy=SYS_LOAD,
+        _tdm_load_checked(
+            row_lds, _uniform_i64(_addr(local, layout["x"] + p, row, hidden_bytes)), piece, True
         )
-        tdm_ops.tensor_wait(0)
         _tdm_store(row_lds, _uniform_i64(_addr(outputs["x"], p, row, hidden_bytes)), piece)
 
 
@@ -388,8 +409,7 @@ def _tdm_send_row(row_lds, x_base, t, hidden_bytes: int, row_buffer_bytes: int, 
         piece = min(row_buffer_bytes, hidden_bytes - p)
         # the previous stores are done with the buffer
         tdm_ops.tensor_wait(0)
-        _tdm_load(row_lds, _uniform_i64(_addr(x_base, p, t, hidden_bytes)), piece)
-        tdm_ops.tensor_wait(0)
+        _tdm_load_checked(row_lds, _uniform_i64(_addr(x_base, p, t, hidden_bytes)), piece, False)
         for d in range_constexpr(len(rows)):
             if routed[d]:
                 _tdm_store(
@@ -968,12 +988,11 @@ def _tdm_push_row(
             vec_width=1,
             dtype=fx.T.f32,
         )
-    _tdm_load(row_lds, _uniform_i64(_addr(x_base, 0, row, hidden_bytes)), hidden_bytes)
+    _tdm_load_checked(row_lds, _uniform_i64(_addr(x_base, 0, row, hidden_bytes)), hidden_bytes, False)
     if fx.const_expr(num_topk > 0):
         if lane_id < fx.Int32(num_topk):
             st_lds(row_lds, fx.Int32(hidden_bytes // 4) + lane_id, weight)
         _wait_lds()
-    tdm_ops.tensor_wait(0)
     _tdm_store(
         row_lds,
         _uniform_i64(_addr(peer, x_offset, slot, slot_bytes)),
@@ -1217,12 +1236,13 @@ def _make_combine_v2(
                     dtype=fx.T.f32,
                 )
             if fx.const_expr(USE_TDM):
-                _tdm_load(row_lds, _uniform_i64(_addr(x_base, 0, row, hidden_bytes)), hidden_bytes)
+                _tdm_load_checked(
+                    row_lds, _uniform_i64(_addr(x_base, 0, row, hidden_bytes)), hidden_bytes, False
+                )
                 if fx.const_expr(num_topk > 0):
                     if lane_id < fx.Int32(num_topk):
                         st_lds(row_lds, fx.Int32(hidden_bytes // 4) + lane_id, weight)
                     _wait_lds()
-                tdm_ops.tensor_wait(0)
                 _tdm_store(
                     row_lds,
                     _uniform_i64(_addr(peer, layout["x"], slot, slot_bytes)),
