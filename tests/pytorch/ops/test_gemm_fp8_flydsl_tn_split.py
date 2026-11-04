@@ -105,8 +105,17 @@ def test_gemm_fp8_flydsl_tn_split_window(monkeypatch, format):
         assert torch.isfinite(b.grad).all(), "wgrad has non-finite values"
         threshold = 25 if format == Format.E4M3 else 20
         b_grad_snr = compute_snr(b_ref.grad, b.grad)
-        print(f"split {split}, BGrad-SNR: {b_grad_snr:.2f} dB")
+        # A misassigned window drops slices of one tile in 192: the whole-output SNR barely
+        # moves, that tile's does.
+        g = kern._TN4_RECT
+        tile_snr = min(
+            compute_snr(b_ref.grad[i : i + g.bm, j : j + g.bn], b.grad[i : i + g.bm, j : j + g.bn])
+            for i in range(0, k, g.bm)
+            for j in range(0, n, g.bn)
+        )
+        print(f"split {split}, BGrad-SNR: {b_grad_snr:.2f} dB, worst tile: {tile_snr:.2f} dB")
         assert b_grad_snr > threshold, "b_grad_snr too low"
+        assert tile_snr > threshold - 5, "a wgrad tile's SNR is too low"
     finally:
         GlobalBackendManager.reset()
         rt.clear()
