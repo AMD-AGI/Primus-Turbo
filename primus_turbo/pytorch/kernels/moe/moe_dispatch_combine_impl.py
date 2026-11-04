@@ -318,6 +318,13 @@ class _DeepEPLikeBackend:
         EventHandleClass = mod.utils.EventHandle if hasattr(mod, "utils") else mod.EventHandle
         return EventOverlapClass, EventHandleClass
 
+    def _new_event(self, EventOverlapClass, EventHandleClass):
+        """The event the communication stream waits for before it reads the inputs.
+
+        Recorded on the current stream (DeepEP / Turbo: the no-argument ``EventHandle()``).
+        """
+        return EventOverlapClass(EventHandleClass())
+
     # ----- dispatch / combine -------------------------------------------
 
     def dispatch(
@@ -335,7 +342,7 @@ class _DeepEPLikeBackend:
         buffer = self._buffer
         assert buffer is not None, "init_buffer() must be called before dispatch()"
 
-        previous_event = EventOverlapClass(EventHandleClass()) if async_finish else None
+        previous_event = self._new_event(EventOverlapClass, EventHandleClass) if async_finish else None
 
         if handle is None:
             assert topk_idx is not None
@@ -402,7 +409,7 @@ class _DeepEPLikeBackend:
         buffer = self._buffer
         assert buffer is not None, "init_buffer() must be called before combine()"
 
-        previous_event = EventOverlapClass(EventHandleClass()) if async_finish else None
+        previous_event = self._new_event(EventOverlapClass, EventHandleClass) if async_finish else None
 
         combined_x, combined_topk_weights, after_event = buffer.combine(
             x,
@@ -466,6 +473,16 @@ class DeepEPBackend(_DeepEPLikeBackend):
             # uccl-ep special handle
             return {"is_intranode": group.size() <= 8}
         return {}
+
+    def _new_event(self, EventOverlapClass, EventHandleClass):
+        # uccl-ep's no-argument EventHandle() records on the legacy default stream, which does not order
+        # the work queued on a non-default current stream; uccl-ep takes the stream to record on.
+        # DeepEP's EventHandle takes no argument (TypeError) and records on the current stream.
+        try:
+            handle = EventHandleClass(torch.cuda.current_stream().cuda_stream)
+        except TypeError:
+            handle = EventHandleClass()
+        return EventOverlapClass(handle)
 
 
 # =========================================================================
