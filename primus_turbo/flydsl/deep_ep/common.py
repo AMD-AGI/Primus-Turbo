@@ -138,10 +138,16 @@ def copy_warp(dst, src, nbytes, dst_off=0, src_off=0, load_cache_modifier=0, sto
         buffer_store(v, dst, dst_off + o, cache_modifier=store_cache_modifier)
 
 
-def timeout_hit():
-    """After a watchdog's report: abort the queue where ``ArchTraits.trap_on_timeout`` says so."""
+def watchdog_report(message, *args):
+    """A spin wait past ``ArchTraits.spin_timeout_cycles``: trap where ``ArchTraits.trap_on_timeout`` says
+    so, else ``fx.printf(message, *args)``. A trapping wave prints nothing: a printf waits for the host to
+    take it, and when the host does not, the wave spins in the printf for good and never reaches the trap (a
+    queue torn down mid-spin can leave MES unrecoverable on MI455X). The ROCm debug agent
+    (``HSA_TOOLS_LIB=librocm-debug-agent.so.2``) reports a trapped wave's kernel and PC."""
     if TRAITS.trap_on_timeout:
         _asm("s_trap 2")
+    else:
+        fx.printf(message, *args)
 
 
 def load_index(res, elem_idx, element_type):
@@ -255,13 +261,12 @@ def barrier_block(barrier_ptrs_res, rank, num_ranks: int, sync_only: bool, tag: 
         value = _ld_sys(own_signal, thread_id)
         while value > fx.Int32(0):
             if timed_out(spin_start):
-                fx.printf(
+                watchdog_report(
                     "[DeepEP FlyDSL " + tag + "] barrier timeout: rank={} thread={} value={}\n",
                     rank,
                     thread_id,
                     value,
                 )
-                timeout_hit()
                 spin_start = read_clock()
             value = _ld_sys(own_signal, thread_id)
     fx.gpu.barrier()

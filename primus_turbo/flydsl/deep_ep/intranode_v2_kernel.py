@@ -84,8 +84,8 @@ from primus_turbo.flydsl.deep_ep.common import (
     tensor_addr,
     timed_out,
     timed_out_at,
-    timeout_hit,
     wait_mem_all,
+    watchdog_report,
 )
 from primus_turbo.flydsl.deep_ep.notify_kernel import NOTIFY_THREADS
 from primus_turbo.flydsl.utils.buffer_ops import (
@@ -835,13 +835,12 @@ def _make_dispatch_v2(
                     - ld_lds(lds, fx.Int32(lds_recv + s))
                 )
             if (thread_id == fx.Int32(0)) & timed_out(spin_start):
-                fx.printf(
+                watchdog_report(
                     "[DeepEP FlyDSL V2 dispatch] receive timeout: rank={} channel={} remaining={}\n",
                     rank,
                     channel,
                     remaining,
                 )
-                timeout_hit()
                 spin_start = read_clock()
             # everyone has read the counts before the next poll rewrites them
             fx.gpu.barrier()
@@ -1029,14 +1028,13 @@ def _wait_rows(flags, flag_idx, waits, epoch, rank, token):
     value = _ld_sys(flags, flag_idx)
     while _popc(_ballot(waits & (value != epoch))) > fx.Int32(0):
         if timed_out(spin_start):
-            fx.printf(
+            watchdog_report(
                 "[DeepEP FlyDSL V2 combine] row timeout: rank={} token={} flag={} epoch={}\n",
                 rank,
                 token,
                 value,
                 epoch,
             )
-            timeout_hit()
             spin_start = read_clock()
         value = _ld_sys(flags, flag_idx)
 
@@ -1068,14 +1066,13 @@ def _wait_rows_or_done(flags, flag_idx, waits, epoch, rank, token, done, lane_r,
     while _popc(_ballot(waits & (value != epoch))) > fx.Int32(0):
         now = read_clock()
         if timed_out_at(now, spin_start):
-            fx.printf(
+            watchdog_report(
                 "[DeepEP FlyDSL V2 combine] row timeout: rank={} token={} flag={} epoch={}\n",
                 rank,
                 token,
                 value,
                 epoch,
             )
-            timeout_hit()
             spin_start = read_clock()
         value = _ld_sys(flags, flag_idx)
         if (now - wait_start) > fx.Int64(COMBINE_DONE_AFTER_TICKS):

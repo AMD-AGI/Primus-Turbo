@@ -56,8 +56,8 @@ from primus_turbo.flydsl.deep_ep.common import (
     st_lds,
     tensor_addr,
     timed_out,
-    timeout_hit,
     wait_mem_all,
+    watchdog_report,
 )
 from primus_turbo.flydsl.utils.attn_helper import _wave_any
 from primus_turbo.flydsl.utils.buffer_ops import (
@@ -211,8 +211,7 @@ def wait_nonzero_sys(addr, rank, channel, tag: str):
     value = _ld_sys(addr)
     while value == fx.Int32(0):
         if timed_out(spin_start):
-            fx.printf("[DeepEP FlyDSL " + tag + "] timeout: rank={} channel={}\n", rank, channel)
-            timeout_hit()
+            watchdog_report("[DeepEP FlyDSL " + tag + "] timeout: rank={} channel={}\n", rank, channel)
             spin_start = read_clock()
         value = _ld_sys(addr)
     return value
@@ -225,8 +224,7 @@ def wait_free_slots(head_addr, tail, num_needed, num_recv_buffer_tokens: int, ra
     head = _ld_sys(head_addr)
     while fx.Int32(num_recv_buffer_tokens) - (tail - head) < num_needed:
         if timed_out(spin_start):
-            fx.printf("[DeepEP FlyDSL " + tag + "] sender timeout: rank={} channel={}\n", rank, channel)
-            timeout_hit()
+            watchdog_report("[DeepEP FlyDSL " + tag + "] sender timeout: rank={} channel={}\n", rank, channel)
             spin_start = read_clock()
         head = _ld_sys(head_addr)
     return head
@@ -240,8 +238,9 @@ def wait_new_tail(tail_addr, head, rank, channel, tag: str):
     tail = _ld_sys(tail_addr)
     while tail == head:
         if timed_out(spin_start):
-            fx.printf("[DeepEP FlyDSL " + tag + "] receiver timeout: rank={} channel={}\n", rank, channel)
-            timeout_hit()
+            watchdog_report(
+                "[DeepEP FlyDSL " + tag + "] receiver timeout: rank={} channel={}\n", rank, channel
+            )
             spin_start = read_clock()
         wait_mem_all()
         tail = _ld_sys(tail_addr)
@@ -904,13 +903,12 @@ def _make_combine(
                     while _wave_any(pending):
                         if timed_out(spin_start):
                             if lane_id == fx.Int32(0):
-                                fx.printf(
+                                watchdog_report(
                                     "[DeepEP FlyDSL combine] receiver timeout: rank={} channel={} token={}\n",
                                     rank,
                                     channel,
                                     token,
                                 )
-                            timeout_hit()
                             spin_start = read_clock()
                         pending = _waits_on_tail(lds, lds_tail, lane_rank, expected_head)
 
