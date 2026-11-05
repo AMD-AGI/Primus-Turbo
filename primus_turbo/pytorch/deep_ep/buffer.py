@@ -25,7 +25,8 @@ from primus_turbo.flydsl.deep_ep.arch import (
 from ._compat import Config, EventHandle, deep_ep_cpp
 from .flydsl_intranode import (
     SUPPORTED_NUM_RANKS,
-    FlyDSLIntranodeRuntime,
+    FlyDSLIntranodeV1Runtime,
+    FlyDSLIntranodeV2Runtime,
     get_intranode_backend,
     v2_heap_bytes,
 )
@@ -163,12 +164,12 @@ class Buffer:
             self.num_rdma_ranks = 1
             # like the C++ runtime's comm stream, a high-priority one from the pool
             self._comm_stream = torch.cuda.Stream(priority=-1)
-            self.intranode_runtime = FlyDSLIntranodeRuntime(
-                group,
-                num_nvl_bytes,
-                self._comm_stream,
-                version=2 if self.intranode_backend == "flydsl_v2" else 1,
+            runtime_cls = (
+                FlyDSLIntranodeV2Runtime
+                if self.intranode_backend == "flydsl_v2"
+                else FlyDSLIntranodeV1Runtime
             )
+            self.intranode_runtime = runtime_cls(group, num_nvl_bytes, self._comm_stream)
             return
 
         self.runtime = _require_deep_ep_cpp("the 'cpp' DeepEP backend").Buffer(
