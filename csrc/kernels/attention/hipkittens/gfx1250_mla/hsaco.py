@@ -7,11 +7,10 @@
 """Build the gfx1250 MLA attention code objects into ``primus_turbo/lib/hk_gfx1250_mla/<kernel>.hsaco``.
 
 Each kernel is one device-only code object compiled from ``src/`` with exactly ``manifest.json``'s flags (not the
-csrc extension's). The manifest pins every code object's sha256 for its ``toolchain``: only a code object with the
-pinned bytes is installed, and one that is not (an older build) is removed, so the runtime loads whatever is present
-and a pass whose code objects are missing runs on FlyDSL. ``-cuid=<kernel>`` makes the build byte-identical in any
-directory. A kernel with an ``asm_patch`` is assembled from the compiler's ``.s`` (``-save-temps=obj``) with the
-patch applied, and only from the ``.s`` whose sha256 is ``asm_input_sha256`` (``tools/regen_asm_patch.py``).
+csrc extension's); a kernel with a ``generator`` (``tools/fwdgen``, ``tools/bwdgen``) is that generator's output: it
+compiles the kernel's marker shell, generates the per-tile code and assembles the result. The manifest pins every code
+object's sha256 for its ``toolchain``: only a code object with the pinned bytes is installed, and one that is not (an
+older build) is removed. ``-cuid=<kernel>`` makes the build byte-identical in any directory.
 
     python csrc/kernels/attention/hipkittens/gfx1250_mla/hsaco.py [--check] [--force] [--strict] [--cxx PATH]
 
@@ -22,8 +21,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -31,7 +28,7 @@ import tempfile
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
-HIP_DIR = Path(__file__).resolve().parent  # compile cwd: src/, include/, asm/
+HIP_DIR = Path(__file__).resolve().parent  # compile cwd: src/, include/
 MANIFEST_PATH = HIP_DIR / "manifest.json"
 BIN_DIR = HIP_DIR.parents[4] / "primus_turbo" / "lib" / "hk_gfx1250_mla"
 CXX_ENV = "PRIMUS_TURBO_HK_CXX"
@@ -93,70 +90,20 @@ def compile_command(cxx: str, name: str, obj: Path, extra_flags: Optional[Sequen
     return [cxx, *m["flags"], f"-cuid={name}", *extra, "-c", k["src"], "-o", str(obj)]
 
 
-def apply_unified_diff(text: str, patch: str) -> str:
-    """Apply a one-file unified diff with exact context (no fuzz); raises ValueError on any mismatch."""
-    src, out, pos = text.split("\n"), [], 0
-    lines, i = patch.split("\n"), 0
-    while i < len(lines) and not lines[i].startswith("@@"):
-        i += 1
-    while i < len(lines):
-        m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", lines[i])
-        i += 1
-        if not m:
-            continue
-        start = int(m.group(1)) - 1 if int(m.group(2) or 1) > 0 else int(m.group(1))
-        out.extend(src[pos:start])
-        pos = start
-        while i < len(lines) and not lines[i].startswith("@@"):
-            line = lines[i]
-            if line[:1] in (" ", "-"):
-                if pos >= len(src) or src[pos] != line[1:]:
-                    raise ValueError(f"asm patch does not apply at line {pos + 1}")
-                if line[0] == " ":
-                    out.append(src[pos])
-                pos += 1
-            elif line[:1] == "+":
-                out.append(line[1:])
-            i += 1
-    out.extend(src[pos:])
-    return "\n".join(out)
-
-
-def patch_and_reassemble(name: str, k: dict, cmd: list, tmp: Path) -> None:
-    """``cmd`` (-save-temps=obj) left the compiler's .s in ``tmp``; it must have ``asm_input_sha256``. Applies the
-    patch and reruns the driver's own assembler and linker (from ``cmd -###``) into ``cmd``'s output."""
-    s_files = list(tmp.glob(f"{name}-hip-*.s"))
-    if len(s_files) != 1:
-        raise RuntimeError(f"{name}: expected one saved .s, found {s_files}")
-    got = _sha256(s_files[0])
-    if got != k["asm_input_sha256"]:
-        raise RuntimeError(
-            f"{name}: compiler .s sha256 {got[:16]} != asm_input_sha256 {k['asm_input_sha256'][:16]}"
-        )
-    try:
-        patched = apply_unified_diff(s_files[0].read_text(), (HIP_DIR / k["asm_patch"]).read_text())
-    except ValueError as e:
-        raise RuntimeError(f"{name}: {e}") from e
-    s_files[0].write_text(patched)
-    dry = subprocess.run(cmd + ["-###"], cwd=HIP_DIR, capture_output=True, text=True).stderr
-    steps = [shlex.split(line) for line in dry.splitlines() if line.startswith(' "')]
-    for step in (next(s for s in steps if "-cc1as" in s), next(s for s in steps if s[0].endswith("lld"))):
-        r = subprocess.run(step, cwd=HIP_DIR, capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError(f"{name}: {' '.join(step)} failed ({r.returncode}):\n{r.stderr[-4000:]}")
-
-
 def compile_kernel(cxx: str, name: str, out_path: Path) -> None:
     """One kernel -> one device-only code object at ``out_path``."""
     k = load_manifest()["kernels"][name]
     with tempfile.TemporaryDirectory() as tmp:
         obj = Path(tmp) / f"{name}.hsaco"
-        cmd = compile_command(cxx, name, obj)
+        if "generator" in k:
+            cmd = [sys.executable, str(HIP_DIR / k["generator"]), "--out", tmp, "--cxx", cxx]
+        else:
+            cmd = compile_command(cxx, name, obj)
         r = subprocess.run(cmd, cwd=HIP_DIR, capture_output=True, text=True)
         if r.returncode != 0:
-            raise RuntimeError(f"{name}: {' '.join(cmd)} failed ({r.returncode}):\n{r.stderr[-4000:]}")
-        if "asm_patch" in k:
-            patch_and_reassemble(name, k, cmd, Path(tmp))
+            raise RuntimeError(
+                f"{name}: {' '.join(cmd)} failed ({r.returncode}):\n{(r.stdout + r.stderr)[-4000:]}"
+            )
         out_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(obj, out_path)
 
@@ -185,7 +132,7 @@ def build(cxx: Optional[str] = None, bin_dir: Path = BIN_DIR, force: bool = Fals
                     compile_kernel(cxx, name, tmp)
                     got, pin = _sha256(tmp), kernels[name]["hsaco_sha256"]
                     if got != pin:
-                        raise RuntimeError(f"sha256 {got[:16]} is not the pinned {pin[:16]}")
+                        raise RuntimeError(f"sha256 {got} is not the pinned {pin}")
                     os.replace(tmp, out)
                     log(f"[gfx1250_mla] built {out.name}")
                 except Exception as e:  # noqa: BLE001 -- a kernel that does not build must not fail the install

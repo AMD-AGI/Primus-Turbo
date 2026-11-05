@@ -30,7 +30,7 @@
 //   1 (manifest: the shipped code object): the marker shell. LLVM compiles the work-item fetch, the descriptors,
 //     the first two ring tiles, the barriers around the tile loop and the epilogue's addressing; inline-asm markers
 //     (; HKGEN INIT / LOOP / FINAL nkv=...) stand where the per-tile work goes, which tools/bwdgen generates
-//     (numerics: tools/bwdgen/bwdgen.py) and asm/k_dkdv96ds.s.patch splices in.
+//     (numerics: tools/bwdgen/bwdgen.py) and splices into the compiler's .s.
 //   0: the reference, the whole kernel in HIP. tools/bwdgen compiles it to learn the VGPR-MSB operand-field map;
 //     it is not shipped. Its softmax, P = exp2(c1 S + NL) and dS = P (scale dP + ND), expects the unfolded row
 //     constants NL = -log2(e) lse and ND = -scale delta; the shipped k_delta folds them for the generated code
@@ -410,8 +410,8 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
     f32x8 acc[NST];
     static_for<NST>([&](auto i) { acc[i] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; });
 #if HKGEN
-    // ---- marker shell: the per-tile work as generated regions at inline-asm markers (tools/bwdgen; the asm patch
-    // splices them into this shell's .s). The generated loop assumes G == 1 (the host admits MHA only): tile k is
+    // ---- marker shell: the per-tile work as generated regions at inline-asm markers (tools/bwdgen; spliced into
+    // this shell's .s at build time). The generated loop assumes G == 1 (the host admits MHA only): tile k is
     // q pair qp_start + k, in stage k mod 3. Marker contract (checked by tools/bwdgen/build.py): the generated code
     // writes only VGPRs above every VGPR this shell references between INIT and FINAL, the clobbered SGPRs, vcc and
     // scc; one workgroup barrier per tile.
@@ -430,8 +430,8 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
       const uint32_t rdq_l = lds0 + (uint32_t)k1_rd_lane(1, lane), rdv_l = lds0 + (uint32_t)k1_rd_lane(0, lane);
       const uint32_t trv_l = lds0 + (uint32_t)k1_tr_lane(0, lane), trk_l = lds0 + (uint32_t)k1_tr_lane(1, lane);
       // vk / vv / sk / sv (the K / V fragment byte offsets: lane part, kv sub-tile part) are unused since INIT loads
-      // K / V by TDM. They stay until the next asm-patch regeneration: dropping them renumbers an IR block name in
-      // the compiler's .s, which asm_input_sha256 pins.
+      // K / V by TDM. They stay until the kernel is next validated: dropping them renumbers an IR block name in
+      // the compiler's .s, and so changes the generated code object.
       const int vk = 16 * k1_kfrag(0, Hkv, 0, 0, 0, 0, lane), vv = 16 * k1_vfrag(0, Hkv, 0, 0, 0, 0, lane);
       int sk[NKV], sv[NKV];
       static_for<NKV>([&](auto kh) {

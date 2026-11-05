@@ -69,31 +69,23 @@ fails the install.
 
 **Generated kernels.** `k_mla_fwd` and `k_dkdv96ds` are marker shells: the HIP source keeps the workgroup set-up, the
 TDM descriptors and the uniform control flow, and inline-asm markers (`; HKGEN <region>`) stand where the per-tile
-work goes. `hsaco.py` checks the sha256 of the compiler's own `.s` (`asm_input_sha256`), applies
-`asm/<kernel>.s.patch` (exact context, no fuzz) and reruns the driver's own assembler and linker. The patch is what the
-generators write (`tools/fwdgen`, `tools/bwdgen` on `tools/asmkit`): software-pipelined WMMA / LDS / softmax
-schedules on a static register plan, with `s_set_vgpr_msb`, the expert-mode dependency waits and the hazard `v_nop`s
-derived from the instruction stream. A generator checks its regions against the shell (VGPR writes only above every
-VGPR the shell references, SGPR writes only in the declared clobbers, no open hazard on any path) and compares the code
-object with the intended instructions. Without the generator's switch (`-DHKGEN_REF=1` / `-DHKGEN=0`) the same source
-compiles the per-tile work in HIP.
+work goes. Their manifest `generator` (`tools/fwdgen`, `tools/bwdgen`, on `tools/asmkit`) compiles the shell and
+generates those regions: software-pipelined WMMA / LDS / softmax schedules on a static register plan, with
+`s_set_vgpr_msb`, the expert-mode dependency waits and the hazard `v_nop`s derived from the instruction stream. It checks
+them against the shell (VGPR writes only above every VGPR the shell references, SGPR writes only in the declared
+clobbers, no open hazard on any path), assembles the kernel with the driver's own assembler and linker and compares the
+code object with the intended instructions; `hsaco.py` installs it when it is the pinned one. A generator run takes a
+few seconds of CPU; `tools/<generator>/build.py --out DIR --cxx CXX` keeps its `.s`. Without the generator's switch
+(`-DHKGEN_REF=1` / `-DHKGEN=0`) the same source compiles the per-tile work in HIP.
 
 ## Changing a kernel
 
-1. Edit `src/` / `include/`, or a kernel's flags in `manifest.json`.
-2. When `k_mla_fwd` or `k_dkdv96ds` (or a header, flag or the toolchain they depend on) changed, regenerate their
-   patches; this also writes their `asm_input_sha256` / `hsaco_sha256` (`--check` verifies that the committed ones are
-   current, byte for byte):
-
-   ```
-   python csrc/kernels/attention/hipkittens/gfx1250_mla/tools/regen_asm_patch.py [k_mla_fwd] [k_dkdv96ds] [--check]
-   ```
-
-3. For the other kernels, `hsaco.py --force` prints the sha256 of a code object that does not match (with a new
-   compiler, set `toolchain` to its `--version` line first); update `hsaco_sha256` (and `args` / `kernarg_size` /
-   `block` if an interface changed), then `hsaco.py --force --strict` must pass.
-4. Copy every changed `hsaco_sha256` (and interface) into `_MLA_KERNELS` in `attention_hipkittens_impl.py`.
-5. On an MI455X, `hsaco.py --check` must print `ok` for both passes, then run
+1. Edit `src/`, `include/` or `tools/`, or a kernel's flags in `manifest.json` (for a new compiler, set `toolchain` to
+   its `--version` line first).
+2. `hsaco.py --force` reports the sha256 of every code object that changed. Set it as the kernel's `hsaco_sha256` in
+   `manifest.json` and in `_MLA_KERNELS` of `attention_hipkittens_impl.py` (with its block size and argument layout if
+   the interface changed); `hsaco.py --force --strict` must then pass.
+3. On an MI455X, `hsaco.py --check` must print `ok` for both passes, then run
 
    ```
    pytest tests/pytorch/ops/test_attention_hipkittens_gfx1250_mla.py tests/pytorch/ops/test_attention_flydsl_gfx1250_mla.py

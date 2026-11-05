@@ -510,30 +510,48 @@ def test_bwd_does_not_retry_a_scratch_that_did_not_fit(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Build: manifest, code objects, assembly patches
+# Build: manifest, sources, code objects
 # ---------------------------------------------------------------------------
 
 
-def test_kernel_arguments_match_the_manifest():
-    """The launch layouts and pins are the manifest's kernel signatures (packed, in order) and sha256s, and the flags
-    are a hermetic device-only gfx1250 build: relative include paths inside the kernel directory only."""
+def _kernel_signature(source: str, name: str):
+    """(workgroup size, struct format) of kernel ``name`` from its HIP source: pointers Q, float f, int i."""
+    m = re.search(
+        r"(?:__launch_bounds__\((\d+)\)|amdgpu_flat_work_group_size\((\d+),[^)]*\))[^{;]*?\bvoid\s+"
+        + name
+        + r"\s*\(([^)]*)\)",
+        source,
+    )
+    params = [p.strip() for p in m.group(3).split(",")]
+    assert all("*" in p or p.split()[0] in ("float", "int") for p in params), params
+    return int(m.group(1) or m.group(2)), "".join("Q" if "*" in p else p[0] for p in params)
+
+
+def test_kernel_table_matches_the_sources_and_the_pins():
+    """_MLA_KERNELS has each kernel's workgroup size and argument layout as its HIP source declares them, and the
+    manifest's sha256 pin; the flags are a hermetic device-only gfx1250 build (include paths inside this directory)."""
     m = _hsaco().load_manifest()
     assert m["arch"] == "gfx1250" and {"--offload-arch=gfx1250", "--cuda-device-only"} <= set(m["flags"])
     assert set(m["kernels"]) == set(hk._MLA_KERNELS)
-    kinds = {"ptr": "Q", "f32": "f", "i32": "i"}
     for name, (block, layout, pin) in hk._MLA_KERNELS.items():
         k = m["kernels"][name]
         assert pin == k["hsaco_sha256"], f"{name}: copy the manifest's hsaco_sha256 into _MLA_KERNELS"
         assert all(f == "-Iinclude" for f in m["flags"] + k["extra_flags"] if f.startswith("-I")), name
-        assert (KERNEL_DIR / k["src"]).is_file() and k["block"] == block, name
-        assert struct.calcsize(layout) == k["kernarg_size"], name
-        expanded = "<" + "".join(kinds[a["kind"]] for a in k["args"])
-        assert struct.Struct(expanded).format == "<" + re.sub(
-            r"(\d+)(\w)", lambda x: x[2] * int(x[1]), layout[1:]
-        )
-        assert [a["offset"] for a in k["args"]] == [
-            struct.calcsize(expanded[: i + 1]) for i in range(len(k["args"]))
-        ]
+        expanded = re.sub(r"(\d+)(\w)", lambda x: x[2] * int(x[1]), layout[1:])
+        assert _kernel_signature((KERNEL_DIR / k["src"]).read_text(), name) == (block, expanded), name
+        assert "generator" not in k or (KERNEL_DIR / k["generator"]).is_file(), name
+
+
+def test_build_reproduces_the_pinned_code_objects(tmp_path):
+    """With the pinned toolchain (the amdprimus/amdprimus:tas-20261019 image), a clean build, generators included,
+    gives every pinned code object byte for byte. CPU only."""
+    hsaco = _hsaco()
+    cxx = hsaco.find_compiler()
+    if cxx is None or hsaco.compiler_version(cxx) != hsaco.load_manifest()["toolchain"]:
+        pytest.skip("the pinned toolchain is not installed here")
+    logs = []
+    assert hsaco.build(cxx, tmp_path, log=logs.append), logs
+    assert hsaco.unavailable_reason(hsaco.FWD_KERNELS + hsaco.BWD_KERNELS, tmp_path) is None
 
 
 def test_build_never_fails_and_installs_only_pinned_code_objects(monkeypatch, tmp_path):
@@ -581,89 +599,6 @@ def test_code_objects_are_built_where_the_pinned_toolchain_is():
     if cxx is None or hsaco.compiler_version(cxx) != hsaco.load_manifest()["toolchain"]:
         pytest.skip("the pinned toolchain is not installed here")
     assert hsaco.unavailable_reason(hsaco.FWD_KERNELS + hsaco.BWD_KERNELS, hk._MLA_HSACO_DIR) is None
-
-
-_ASM_HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@$")
-_ASM_ALLOC = re.compile(r"\s*(\.amdhsa_next_free_vgpr\s+|\.vgpr_count:\s+)(\d+)$")
-# the markers each generated region goes behind, every one exactly once
-_ASM_REGIONS = {
-    "k_mla_fwd": (
-        re.compile(r";\s*HKGEN (INIT|TILE_C|TILE_D[0-3]|FINAL_A3?)\b"),
-        ["INIT", "TILE_C"] + [f"TILE_D{i}" for i in range(4)] + ["FINAL_A", "FINAL_A3"],
-    ),
-    "k_dkdv96ds": (
-        re.compile(r";\s*HKGEN (INIT|LOOP|FINAL) nkv=(\d)\b"),
-        [f"{r} nkv={n}" for r in ("INIT", "LOOP", "FINAL") for n in (3, 2)],
-    ),
-}
-
-
-def _asm_patch_hunks(patch):
-    """[(old start, new start, [(tag, line)])] of a one-file unified diff, each hunk's counts checked."""
-    hunks = []
-    for block in patch.split("\n@@ ")[1:]:
-        header, *body = ("@@ " + block).rstrip("\n").split("\n")
-        m = _ASM_HUNK.match(header)
-        assert m and all(line[:1] in (" ", "-", "+") for line in body), header
-        ops = [(line[0], line[1:]) for line in body]
-        assert sum(t != "+" for t, _ in ops) == int(m.group(2) or 1), header
-        assert sum(t != "-" for t, _ in ops) == int(m.group(4) or 1), header
-        hunks.append((int(m.group(1)), int(m.group(3)), ops))
-    return hunks
-
-
-@pytest.mark.parametrize("name", sorted(_ASM_REGIONS))
-def test_asm_patch(tmp_path, name):
-    """The committed patch (tools/regen_asm_patch.py) inserts each generated region right behind its marker line
-    (every region once; no s_endpgm or PC change inside, branches only to the region's own labels) and raises the
-    VGPR allocation to 1024. hsaco.py applies it to its exact context only, and only to the pinned compiler .s."""
-    hsaco = _hsaco()
-    k = hsaco.load_manifest()["kernels"][name]
-    marker_re, want_regions = _ASM_REGIONS[name]
-    patch = (hsaco.HIP_DIR / k["asm_patch"]).read_text()
-    src, want, shift, regions, allocs = [], [], 0, [], 0
-    for old_start, new_start, ops in _asm_patch_hunks(patch):
-        assert old_start > len(src) and new_start == old_start + shift, old_start
-        fill = [f"\t; line {n + 1}" for n in range(len(src), old_start - 1)]
-        src += fill + [t for tag, t in ops if tag != "+"]
-        want += fill + [t for tag, t in ops if tag != "-"]
-        shift += sum(t == "+" for t, _ in ops) - sum(t == "-" for t, _ in ops)
-        old = [t for tag, t in ops if tag == "-"]
-        new = [t for tag, t in ops if tag == "+"]
-        if old:  # the VGPR allocation, one line
-            mo, mn = _ASM_ALLOC.fullmatch(old[0]), _ASM_ALLOC.fullmatch(new[0])
-            assert (
-                len(old) == len(new) == 1
-                and mo
-                and mn
-                and mo.group(1) == mn.group(1)
-                and mn.group(2) == "1024"
-            )
-            allocs += 1
-            continue
-        first_new = next(j for j, (tag, _) in enumerate(ops) if tag == "+")
-        marker = marker_re.search(ops[first_new - 1][1]) if first_new else None
-        assert marker and all(tag == "+" for tag, _ in ops[first_new : first_new + len(new)]), old_start
-        labels = {t.strip()[:-1] for t in new if re.fullmatch(r"\s*\.L\w+:", t)}
-        for t in new:
-            ins = t.split(";")[0].strip()
-            assert not re.match(r"s_(endpgm|setpc|swappc|getpc|rfe)", ins), t
-            if re.match(r"s_(c)?branch", ins):
-                assert ins.split()[-1] in labels, t
-        regions.append(
-            marker.group(1) if marker.lastindex == 1 else f"{marker.group(1)} nkv={marker.group(2)}"
-        )
-    assert sorted(regions) == sorted(want_regions) and allocs == 2
-    text = "\n".join(src + ["\ts_endpgm"]) + "\n"
-    assert hsaco.apply_unified_diff(text, patch) == "\n".join(want + ["\ts_endpgm"]) + "\n"
-    first = _asm_patch_hunks(patch)[0][0] - 1  # the first hunk's first (context) line
-    bad = "\n".join(src[:first] + [src[first] + " "] + src[first + 1 :] + ["\ts_endpgm"]) + "\n"
-    with pytest.raises(ValueError, match="does not apply"):
-        hsaco.apply_unified_diff(bad, patch)
-    saved = tmp_path / f"{name}-hip-amdgpu12.50-amd-amdhsa-gfx1250.s"  # as -save-temps=obj names it
-    saved.write_text(text)
-    with pytest.raises(RuntimeError, match="asm_input_sha256"):
-        hsaco.patch_and_reassemble(name, k, [], tmp_path)
 
 
 # ---------------------------------------------------------------------------
