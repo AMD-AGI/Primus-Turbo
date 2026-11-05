@@ -2,6 +2,7 @@
 
 [![Primus-Turbo-CI](https://github.com/AMD-AGI/Primus-Turbo/actions/workflows/ci.yaml/badge.svg)](https://github.com/AMD-AGI/Primus-Turbo/actions/workflows/ci.yaml)
 [![Primus-Turbo-Benchmark](https://github.com/AMD-AGI/Primus-Turbo/actions/workflows/benchmark.yaml/badge.svg)](https://github.com/AMD-AGI/Primus-Turbo/actions/workflows/benchmark.yaml)
+[![Latest Release](https://img.shields.io/github/v/release/AMD-AGI/Primus-Turbo?label=latest%20release)](https://github.com/AMD-AGI/Primus-Turbo/releases/latest)
 
 [What's Primus-Turbo?](#-whats-primus-turbo) | [What's New](#-whats-new) | [Quick Start](#-quick-start) | [Example](#-example) | [Performance](#-performance) | [Roadmap](#-roadmap) | [Primus Ecosystem](#-primus-ecosystem) | [Acknowledgements](#-acknowledgements) | [License](#-license)
 
@@ -31,18 +32,16 @@ Note: JAX support is under active development. Optim support is planned but not 
 
 ## 🚀 What's New
 
+- **[2026/11/02]** 🔥 **DeepEP on MI455X (gfx1250)** — FlyDSL intranode dispatch / combine: the V1 kernels ported to gfx1250 and a new TDM-based V2 backend (`flydsl_v2`, the default on gfx1250). EP4 training on 4× MI455X is 1.08–1.10× faster than Megatron's alltoall dispatcher on a DeepSeek-V3 proxy and 1.04–1.07× on GPT-OSS 20B, with 12–16 GB less memory per GPU ([#583](https://github.com/AMD-AGI/Primus-Turbo/pull/583), [guide](./primus_turbo/pytorch/deep_ep/README.md), [design](./docs/flydsl_deepep_mi455.md)).
 - **[2026/10/28]** 🔥 **MegaMoE on MI455X (gfx1250)** — BF16 fused MegaMoE forward and backward on gfx1250, including the staged op with per-expert biases for GPT-OSS shapes; validated on 4× MI455X (EP4) ([#582](https://github.com/AMD-AGI/Primus-Turbo/pull/582), [overview](./docs/mega_moe.md)).
-- **[2026/10/21]** 🔥 **Release [v0.6.1](https://github.com/AMD-AGI/Primus-Turbo/releases/tag/v0.6.1)** (patch over [v0.6.0](https://github.com/AMD-AGI/Primus-Turbo/releases/tag/v0.6.0)) — MegaMoE ownership and MXFP8 combine fixes, MXFP4 gather fusion into quantization, tensorwise FP8 from the TURBO permute, head_dim-128 fused QK RMSNorm + RoPE, DeepEP cheap-fence default, and FlyDSL attention / GEMM correctness on gfx950 ([changes since v0.5.0](https://github.com/AMD-AGI/Primus-Turbo/compare/v0.5.0...v0.6.1)).
-- **[2026/10/19–10/21]** 🔥 **MegaMoE: dispatch-sized buffers & GPT-OSS** — size BF16 / MXFP8 MegaMoE memory to the rows dispatched to each rank (#566, #568); support GPT-OSS shapes (H/I=2880) and per-expert biases (#571) ([overview](./docs/mega_moe.md)).
-- **[2026/10/19]** 🔥 **FlyDSL 0.3.4.1 / AITER v0.1.24.post1** — port kernels to FlyDSL 0.3 and bump the pinned AITER release (#544).
-- **[2026/09/16]** 🔥 **Release v0.5.0** — MegaMoE / GroupedMLP MXFP8 maturity, FlyDSL grouped GEMM BF16, and operator auto-tune on MI355X ([changes since v0.4.0](https://github.com/AMD-AGI/Primus-Turbo/compare/v0.4.0...v0.5.0)).
-- **[2026/08/25–09/14]** 🔥 **Fused GroupedMLP (FP8 / MXFP8)** — expert MLP with SwiGLU folded into grouped GEMM; pad-aware paths for GPT-OSS-20B-style MoE (#476, #488, #503).
-- **[2026/08/18]** 🔥 **MegaMoE (MXFP8)** — fused forward and backward in the MXFP8 MegaMoE path: dispatch+FC1 and FC2+combine with intra-node EP (#456).
-- **[2026/07/15]** 🔥 **MegaMoE (BF16)** — FlyDSL fused MoE layer with comm–compute overlap inside the grouped GEMMs ([overview](./docs/mega_moe.md)) (#412).
-- **[2026/07]** 🔥 **MXFP4 GEMM & grouped GEMM** — FlyDSL and hipBLASLt stacks for dense and expert GEMMs in low-precision training (#424, #483).
-- **[2026/07/30]** 🔥 **Release v0.4.0** — grouped GEMM autotune, MXFP4 correctness, and MegaMoE stability fixes on gfx950.
-- **[2026/06/10]** 🔥 **DeepEP** — JAX intranode/internode token dispatch (#344); PyTorch `DeepEPTokenDispatcher` (introduced in #114). The separate rocSHMEM backend integration is tracked in #409 ([guide](./primus_turbo/pytorch/deep_ep/README.md)).
-- **[2025/12/16]** 🔥 [MoE training best practices on AMD GPUs](https://rocm.blogs.amd.com/software-tools-optimization/primus-moe-package/README.html) — DeepEP, grouped GEMM, and Primus recipes end to end.
+- **[2026/10/19–10/27]** 🔥 **Attention on MI455X (gfx1250)** — FlyDSL MLA attention for DeepSeek-V3 (qk 192 / v 128) ([#567](https://github.com/AMD-AGI/Primus-Turbo/pull/567)); FlyDSL flash attention for head dim 128 (Llama-3.1-8B) and sparse-MLA for DeepSeek-V4 ([#580](https://github.com/AMD-AGI/Primus-Turbo/pull/580)).
+- **[2026/10/08]** 🔥 **MiniMax-M3 in MegaMoE** — MiniMax-M3's SwiGLU-OAI activation in the BF16 and MXFP8 MegaMoE kernels ([#538](https://github.com/AMD-AGI/Primus-Turbo/pull/538)).
+- **[2026/09/21]** 🔥 **Grouped GEMM on MI455X (gfx1250)** — FlyDSL BF16 grouped GEMM for MoE, the first grouped GEMM on gfx1250 ([#508](https://github.com/AMD-AGI/Primus-Turbo/pull/508)).
+- **[2026/09/17]** 🔥 **`mlp_fp4` and `rmsnorm_residual_fp4`** — MXFP4 dense MLP with SwiGLU fused into its GEMMs, and RMSNorm + residual in the MXFP4 path ([#509](https://github.com/AMD-AGI/Primus-Turbo/pull/509)).
+- **[2026/08/25–09/14]** 🔥 **Fused GroupedMLP (FP8 / MXFP8)** — expert MLP with SwiGLU folded into grouped GEMM; pad-aware paths for GPT-OSS-20B-style MoE ([#476](https://github.com/AMD-AGI/Primus-Turbo/pull/476), [#488](https://github.com/AMD-AGI/Primus-Turbo/pull/488), [#503](https://github.com/AMD-AGI/Primus-Turbo/pull/503)).
+- **[2026/08/18]** 🔥 **MegaMoE (MXFP8)** — fused forward and backward in the MXFP8 MegaMoE path: dispatch+FC1 and FC2+combine with intra-node EP ([#456](https://github.com/AMD-AGI/Primus-Turbo/pull/456)).
+
+👉 **[Full history](./docs/history.md)** — every update, grouped by the release it shipped in.
 
 ## 📦 Quick Start
 
