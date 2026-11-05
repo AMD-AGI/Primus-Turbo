@@ -49,8 +49,10 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     NUM_XCD,
     WAVE,
     check_gather_rows,
+    check_wmma_b2b,
     nt_gemm_tile,
     pool_tile_order,
+    resolve_lds_cosched,
     tile_geometry,
 )
 from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
@@ -112,6 +114,9 @@ def _launch_dispatch_gemm_nt(
     B_NN: Constexpr[bool],
     EXPERTS_PER_PUBLISH: Constexpr[int],
     num_xcd: Constexpr[int],
+    issue_first: Constexpr[int],
+    wmma_b2b: Constexpr[int],
+    lds_cosched: Constexpr[int],
 ):
     block = m_warp * n_warp * WAVE
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
@@ -268,6 +273,9 @@ def _launch_dispatch_gemm_nt(
             gather=True,
             idx_bits=idx_bits,
             b_nn=B_NN,
+            issue_first=bool(issue_first),
+            lds_cosched=bool(lds_cosched),
+            wmma_b2b=bool(wmma_b2b),
             i32_n=fx.Int32(N),
         )
 
@@ -310,14 +318,37 @@ def dispatch_gemm_nt_gfx1250(
     n_warp: int = 2,
     group_m: int = 16,
     b_nn: bool = False,
+    issue_first: int = 1,
+    wmma_b2b: int = 0,
+    lds_cosched: int = -1,
 ) -> torch.Tensor:
     """Dispatch ``x`` by ``handle`` and return the L1 output over this rank's pool rows.
 
     ``handle`` comes from ``dispatch_prologue_flydsl_kernel`` on the active Mega symmetric
     buffer; the output is ``[pool rows, N]`` in pool order, padding rows undefined. ``w1`` is
     ``[experts, N, hidden]``, or ``[experts, hidden, N]`` with ``b_nn`` (``out = x @ w1[e]``).
-    ``tile_k`` 0 is 128 when it divides hidden, else 64."""
-    return _run(x, w1, handle, False, b_nn, num_dispatch_cu, tile_m, tile_n, tile_k, m_warp, n_warp, group_m)
+    ``tile_k`` 0 is 128 when it divides hidden, else 64. ``issue_first`` issues each k-tile's prefetch
+    at the top of the previous one, ``lds_cosched`` interleaves the fragment reads with the matrix ops
+    (``nt_gemm_tile``; -1: wherever the tile and ``issue_first`` allow it). ``wmma_b2b`` (the WMMA
+    arbitration stall off) stays 0: the A rows are gathered (``check_wmma_b2b``)."""
+    check_wmma_b2b(wmma_b2b, gather=True)
+    return _run(
+        x,
+        w1,
+        handle,
+        dispatch_only=False,
+        b_nn=b_nn,
+        num_dispatch_cu=num_dispatch_cu,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        m_warp=m_warp,
+        n_warp=n_warp,
+        group_m=group_m,
+        issue_first=issue_first,
+        wmma_b2b=wmma_b2b,
+        lds_cosched=resolve_lds_cosched(lds_cosched, issue_first, tile_m, tile_n, m_warp, n_warp),
+    )
 
 
 def dispatch_only_gfx1250(
@@ -332,12 +363,44 @@ def dispatch_only_gfx1250(
     G = handle.expert_send_dst_rank.numel() // int(symm.num_ranks)
     # only the GEMM's shape is read: the launch holds the comm workgroups alone
     shape_only = x.new_empty(x.shape[1]).as_strided((G, 256, x.shape[1]), (0, 0, 1))
-    _run(x, shape_only, handle, True, False, num_dispatch_cu, 256, 256, 0, 4, 2, 16)
+    _run(
+        x,
+        shape_only,
+        handle,
+        dispatch_only=True,
+        b_nn=False,
+        num_dispatch_cu=num_dispatch_cu,
+        tile_m=256,
+        tile_n=256,
+        tile_k=0,
+        m_warp=4,
+        n_warp=2,
+        group_m=16,
+        # no GEMM tile runs, so the tile's scheduling options are moot
+        issue_first=0,
+        wmma_b2b=0,
+        lds_cosched=0,
+    )
     return symm.dispatch_token_buffer
 
 
 def _run(
-    x, w1, handle, dispatch_only, b_nn, num_dispatch_cu, tile_m, tile_n, tile_k, m_warp, n_warp, group_m
+    x,
+    w1,
+    handle,
+    *,
+    dispatch_only,
+    b_nn,
+    num_dispatch_cu,
+    tile_m,
+    tile_n,
+    tile_k,
+    m_warp,
+    n_warp,
+    group_m,
+    issue_first,
+    wmma_b2b,
+    lds_cosched,
 ):
     _require_gfx1250(x.device)
     symm = get_symm_buffer_for_mega_moe()
@@ -406,6 +469,9 @@ def _run(
         # once, sparing a remote store-retire round trip per expert
         G if dispatch_only else 1,
         num_xcd,
+        issue_first,
+        wmma_b2b,
+        lds_cosched,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)

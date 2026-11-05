@@ -105,6 +105,40 @@ def tile_geometry(tile_m: int, tile_n: int, tile_k: int, b_nn: bool = False):
     return lds_row, stage, pitch, arena
 
 
+def resolve_lds_cosched(
+    lds_cosched: int, issue_first: int, tile_m: int, tile_n: int, m_warp: int, n_warp: int
+):
+    """``lds_cosched`` as ``nt_gemm_tile`` takes it: -1 turns it on where the tile allows it.
+
+    It issues one fragment read per matrix op of the previous sub-step, so it needs ``issue_first``
+    and fewer reads per sub-step (two per fragment row and column) than matrix ops."""
+    m_rep, n_rep = tile_m // m_warp // WMMA_M, tile_n // n_warp // WMMA_N
+    allowed = bool(issue_first) and 2 * (m_rep + n_rep) < m_rep * n_rep
+    if lds_cosched == -1:
+        return int(allowed)
+    if lds_cosched not in (0, 1):
+        raise ValueError(f"lds_cosched must be -1 (auto), 0 or 1, got {lds_cosched}")
+    if lds_cosched and not allowed:
+        raise ValueError(
+            f"lds_cosched=1 needs issue_first=1 and fewer fragment reads per sub-step than matrix ops, "
+            f"got issue_first={int(issue_first)} and {2 * (m_rep + n_rep)} reads for {m_rep * n_rep} "
+            f"matrix ops (tile {tile_m}x{tile_n}, {m_warp}x{n_warp} waves)"
+        )
+    return lds_cosched
+
+
+def check_wmma_b2b(wmma_b2b: int, gather: bool):
+    """``wmma_b2b`` (the WMMA arbitration stall off) is for a dense A only.
+
+    With the stall off and the async A gather issued at the k-tile head, a wave's last async loads
+    of a k-tile now and then land in LDS after the barrier that covers them, and the tile reads
+    the buffer's previous k-tile: about one NN dispatch GEMM launch in 25000 at EP4."""
+    if wmma_b2b not in (0, 1):
+        raise ValueError(f"wmma_b2b must be 0 or 1, got {wmma_b2b}")
+    if wmma_b2b and gather:
+        raise ValueError("wmma_b2b=1 needs a dense A: with the async A gather it races the k-tile barrier")
+
+
 def check_gather_rows(a_rows: int, lda: int, tile_m: int, tile_k: int):
     """The async A gather's limits: some row to read, and 32-bit byte offsets into A."""
     assert a_rows > 0, "a gathered A needs a row"
@@ -232,7 +266,9 @@ def nt_gemm_tile(
     c_rank_bases=None,
     c_num_rows: int = 0,
     c_bias=None,
-    lds_cosched: bool = True,
+    issue_first: bool = False,
+    lds_cosched: bool = False,
+    wmma_b2b: bool = False,
 ):
     """One ``tile_m x tile_n`` block; must be called by all ``m_warp * n_warp`` waves.
 
@@ -257,10 +293,13 @@ def nt_gemm_tile(
     ``(addr, scale)`` adds ``bias * scale(tile row)`` in f32 before the bf16 rounding, ``addr``
     the i64 address of the expert's bias row.
 
-    ``lds_cosched`` is the grouped kernel's ``lds_cosched = 3`` with ``issue_first``: each k-tile
-    issues the next one's loads first, and each sub-step is one scheduling region that waits for
-    its own fragments only and reads the next sub-step's one per matrix op. A gathered A keeps
-    the WMMA arbitration stall on. Same results.
+    ``issue_first`` issues the next k-tile's loads at the top of the k-tile body, ahead of its
+    fragment reads; the buffer they fill was drained by the previous k-tile's fence.
+    ``lds_cosched`` (needs ``issue_first``; ``resolve_lds_cosched``) is the grouped kernel's
+    ``lds_cosched = 3``: each sub-step is one scheduling region that waits for its own fragments
+    only and reads the next sub-step's one per matrix op, holding the running sub-step's
+    fragments live to its end. ``wmma_b2b`` turns the WMMA arbitration stall off; not with a
+    gathered A. Same results with any of them.
     """
     KB = tile_k * EB
     KSB = WMMA_K * EB
@@ -274,6 +313,10 @@ def nt_gemm_tile(
     LDS_B_ROW = tile_n * EB + _nn_b_pad(tile_n, EB)
     B_DELTA = STAGE_A
     R = 2  # fragment ring depth
+    # Not an assert: without issue_first the co-scheduled loop never issues the next k-tile's
+    # loads, so `python -O` would turn a bad combination into stale LDS reads.
+    resolve_lds_cosched(int(lds_cosched), issue_first, tile_m, tile_n, m_warp, n_warp)
+    check_wmma_b2b(wmma_b2b, gather)
     assert ldc % 2 == 0, "the epilogue stores whole i32 words"
 
     tid = fx.Int32(fx.thread_idx.x)
@@ -488,9 +531,6 @@ def nt_gemm_tile(
                 idx = wm * wmma_n_rep + wn
                 fx.gemm(wmma_atom, c_frags[idx], wt[wn], act[wm], c_frags[idx])
 
-    # the co-schedule interleaves one fragment read per matrix op, so it needs more ops than reads
-    cosched = lds_cosched and KS_DS < n_acc
-
     def _hold_live(state):
         # Otherwise the allocator hands the next sub-step's reads registers an in-flight WMMA still
         # reads, and expert scheduling covers each such overwrite with a full VALU-dependency wait.
@@ -502,16 +542,16 @@ def nt_gemm_tile(
     def compute_ktile(buf, prefetch_kt):
         """K_WS sub-steps; the last one is returned to run inside the barrier window."""
         ring = [None] * R
-        if const_expr(cosched):
-            if const_expr(prefetch_kt is not None):
-                rocdl.sched_barrier(0)
-                issue(prefetch_kt % NUM_BUFFERS, prefetch_kt)
-                rocdl.sched_barrier(0)
-            ring[0] = _load_ks(buf, 0)
+        if const_expr(issue_first and prefetch_kt is not None):
+            rocdl.sched_barrier(0)
+            issue(prefetch_kt % NUM_BUFFERS, prefetch_kt)
+            rocdl.sched_barrier(0)
+        ring[0] = _load_ks(buf, 0)
+        if const_expr(lds_cosched):
             rocdl.sched_dsrd(KS_DS)
             rocdl.sched_barrier(0)
             for ks in range_constexpr(K_WS):
-                # only this sub-step's reads are in flight here
+                # only this sub-step's reads are in flight here (R = 2)
                 rocdl.s_wait_dscnt(0)
                 if const_expr(ks + 1 < K_WS):
                     ring[(ks + 1) % R] = _load_ks(buf, ks + 1)
@@ -521,16 +561,15 @@ def nt_gemm_tile(
                         rocdl.sched_dsrd(1)
                         rocdl.sched_mfma(1)
                     rocdl.sched_mfma(n_acc - KS_DS)
-                    # must follow the group hints: placed before them, the hints are ignored
+                    # after the group hints: placed before them, the hints are ignored
                     _hold_live(ring[ks % R])
                 rocdl.sched_barrier(0)
             return ring[(K_WS - 1) % R]
-        ring[0] = _load_ks(buf, 0)
         for ks in range_constexpr(K_WS):
             if const_expr(ks + 1 < K_WS):
                 ring[(ks + 1) % R] = _load_ks(buf, ks + 1)
             rocdl.s_wait_dscnt(min(K_WS - 1 - ks, R - 1) * KS_DS)
-            if const_expr(ks == 0 and prefetch_kt is not None):
+            if const_expr(ks == 0 and prefetch_kt is not None and not issue_first):
                 rocdl.sched_barrier(0)
                 issue(prefetch_kt % NUM_BUFFERS, prefetch_kt)
                 rocdl.sched_barrier(0)
@@ -555,13 +594,10 @@ def nt_gemm_tile(
         rocdl.sched_barrier(0)
         rocdl.s_barrier_wait(_WG_BARRIER)
 
-    if const_expr(cosched and not gather):
+    if const_expr(wmma_b2b):
         # SCHED_MODE bit 2: no arbitration stall after a WMMA, without which a read placed between
         # two WMMAs cannot issue until the first has executed. After the index-table reads (placed
         # ahead of them it turns their scalar loads into vector loads), ahead of every matrix op.
-        # Not with the async A gather: with the stall off, a wave's last async loads of a k-tile
-        # now and then land in LDS after the barrier that covers them, and the tile reads the
-        # buffer's previous k-tile (an NN launch in ~25000 at EP4).
         rocdl.disable_xdl_arb_stall()
     issue(0, 0, prologue=True)
     if const_expr(gather):
@@ -699,7 +735,9 @@ def _launch_mega_nt(
     gather: Constexpr[int],
     idx_bits: Constexpr[int],
     b_nn: Constexpr[int],
+    issue_first: Constexpr[int],
     lds_cosched: Constexpr[int],
+    wmma_b2b: Constexpr[int],
 ):
     block = m_warp * n_warp * WAVE
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k, bool(b_nn))[3]
@@ -765,7 +803,9 @@ def _launch_mega_nt(
             idx_bits=idx_bits,
             b_nn=bool(b_nn),
             i32_n=i32_n,
+            issue_first=bool(issue_first),
             lds_cosched=bool(lds_cosched),
+            wmma_b2b=bool(wmma_b2b),
         )
 
     kernel_mega_nt(
@@ -795,7 +835,9 @@ def mega_grouped_gemm_nt_gfx1250(
     group_m: int = 16,
     idx_bits: int = 0,
     b_nn: bool = False,
-    lds_cosched: bool = True,
+    issue_first: int = 1,
+    lds_cosched: int = -1,
+    wmma_b2b: int | None = None,
 ) -> torch.Tensor:
     """``out[p] = a[row_idx[p]] @ b[e(p)].T`` per pool row ``p`` (``a[p]`` when ``row_idx`` is None);
     ``b`` is ``[G, N, K]``, or ``[G, K, N]`` with ``b_nn`` (``out[p] = a[...] @ b[e(p)]``).
@@ -803,7 +845,9 @@ def mega_grouped_gemm_nt_gfx1250(
     ``out`` is the pool, ``[num_pool_rows, N]`` with ``num_pool_rows`` a multiple of ``tile_m``;
     pool block ``t`` belongs to expert ``tile_to_expert[t]``, and only the first
     ``num_tile_blocks[0]`` blocks are computed. ``row_idx`` entries < 0 mark padding rows.
-    ``tile_k`` 0 is 128 when it divides K, else 64.
+    ``tile_k`` 0 is 128 when it divides K, else 64. ``issue_first``, ``lds_cosched`` (-1: wherever
+    the tile and ``issue_first`` allow it) and ``wmma_b2b`` (None: with a co-scheduled dense A) are
+    ``nt_gemm_tile``'s.
     """
     _require_gfx1250(a.device)
     G, N, K = b.shape
@@ -825,6 +869,10 @@ def mega_grouped_gemm_nt_gfx1250(
         check_gather_rows(a.shape[0], K, tile_m, tile_k)
     else:
         row_idx = tile_to_expert  # unread
+    lds_cosched = resolve_lds_cosched(lds_cosched, issue_first, tile_m, tile_n, m_warp, n_warp)
+    if wmma_b2b is None:
+        wmma_b2b = int(lds_cosched and not gather)
+    check_wmma_b2b(wmma_b2b, gather)
     args = (
         _as_ptr(out),
         _as_ptr(a),
@@ -851,7 +899,9 @@ def mega_grouped_gemm_nt_gfx1250(
         int(gather),
         idx_bits,
         int(b_nn),
+        int(issue_first),
         int(lds_cosched),
+        int(wmma_b2b),
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)

@@ -91,6 +91,7 @@ class FusedMegaMoEGfx1250EPTest(MultiProcContinuousTest):
         enable_torch_compile=False,
         l1_gain=2.0,
         calls=2,
+        wgrad_accum=None,
     ):
         torch.cuda.set_device(self.device)
         torch._dynamo.reset()
@@ -109,11 +110,17 @@ class FusedMegaMoEGfx1250EPTest(MultiProcContinuousTest):
             (randn(experts_per_rank, 2 * inter), randn(experts_per_rank, hidden)) if bias else (None, None)
         )
 
+        # Megatron's gradient accumulation fusion; `wgrad_accum` says, per weight (w1, w2), whether its
+        # wgrad goes into its main_grad in the kernel (True) or takes the ordinary gradient (False)
+        accum = {"fuse_wgrad_accum_pattern": "megatron"} if wgrad_accum else {}
+
         def run(x, topk_idx, topk_w, w1, w2, b1, b2):
             if staged:
-                l1_out, dispatch_weights, handle = fused_mega_moe_stage1(x, topk_idx, topk_w, w1, group)
+                l1_out, dispatch_weights, handle = fused_mega_moe_stage1(
+                    x, topk_idx, topk_w, w1, group, **accum
+                )
                 return fused_mega_moe_stage2(
-                    l1_out, dispatch_weights, handle, topk_idx, topk_w, w2, group, activation, b1, b2
+                    l1_out, dispatch_weights, handle, topk_idx, topk_w, w2, group, activation, b1, b2, **accum
                 )
             return fused_mega_moe(group, x, topk_idx, topk_w, w1, w2, activation=activation)
 
@@ -122,6 +129,9 @@ class FusedMegaMoEGfx1250EPTest(MultiProcContinuousTest):
         weights = [w for w in (w1, w2, b1, b2) if w is not None]
         full_weights = [self._gather_rows(w)[0].float() for w in weights]
         experts = slice(rank * experts_per_rank, (rank + 1) * experts_per_rank)
+        # one main_grad per weight across the calls, like a step's microbatches; the reference sums them
+        main_grads = [torch.zeros_like(w) for w in (w1, w2)] if wgrad_accum else None
+        ref_sums = [torch.zeros(w.shape, device=self.device) for w in (w1, w2)] if wgrad_accum else None
         for _ in range(calls):
             x = randn(num_tokens, hidden)
             logits = torch.randn(num_tokens, num_experts, device=self.device, generator=gen)
@@ -129,9 +139,17 @@ class FusedMegaMoEGfx1250EPTest(MultiProcContinuousTest):
             topk_w, topk_idx = logits.softmax(-1).topk(num_topk, dim=-1)
             dy = randn(num_tokens, hidden)
             leaves = [t.clone().requires_grad_() for t in [x, topk_w] + weights]
+            if wgrad_accum:
+                for leaf, mg in zip(leaves[2:4], main_grads):
+                    leaf.main_grad, leaf.grad_added_to_main_grad = mg, False
             lb1, lb2 = (leaves[4], leaves[5]) if bias else (None, None)
             y = run(leaves[0], topk_idx, leaves[1], leaves[2], leaves[3], lb1, lb2)
             y.backward(dy)
+            if wgrad_accum:
+                for leaf, mg, fused in zip(leaves[2:4], main_grads, wgrad_accum):
+                    self.assertIs(leaf.grad_added_to_main_grad, fused)
+                    if not fused:  # DDP's own add, which this test stands in for
+                        mg.add_(leaf.grad)
 
             gx, row0 = self._gather_rows(x)
             refs = [
@@ -143,8 +161,13 @@ class FusedMegaMoEGfx1250EPTest(MultiProcContinuousTest):
             rows = slice(row0, row0 + num_tokens)
             names = ["dx", "d topk_w", "dW1", "dW2", "d fc1_bias", "d fc2_bias"]
             results = [("y", y, yr.detach()[rows])]
-            for name, got, want, own in zip(names, leaves, refs, [rows, rows] + [experts] * 4):
-                results.append((name, got.grad, want.grad[own]))
+            owners = [rows, rows] + [experts] * 4
+            for i, (name, got, want, own) in enumerate(zip(names, leaves, refs, owners)):
+                if wgrad_accum and i in (2, 3):
+                    ref_sums[i - 2] += want.grad[own]
+                    results.append((f"{name} in main_grad", main_grads[i - 2], ref_sums[i - 2]))
+                else:
+                    results.append((name, got.grad, want.grad[own]))
             self._assert_snr(results)
 
     @skip_if_lt_x_gpu(2)
@@ -167,6 +190,19 @@ class FusedMegaMoEGfx1250EPTest(MultiProcContinuousTest):
     def test_staged_bias_gpt_oss(self):
         # GPT-OSS-20B: 64-wide k-tiles, ragged N; wide L1 weights put the clamp in play
         self._run(1024, 2880, 2880, 8, 4, activation="swigluoai", staged=True, bias=True, l1_gain=5.0)
+
+    @skip_if_lt_x_gpu(2)
+    def test_staged_wgrad_accum_deepseek_v3(self):
+        # whole output tiles: both wgrads add into main_grad in the variable-K epilogue, three microbatches
+        self._run(1024, 7168, 2048, 32, 8, staged=True, wgrad_accum=(True, True), calls=3)
+
+    @skip_if_lt_x_gpu(2)
+    def test_staged_wgrad_accum_ragged(self):
+        # dW1 [2816, 2048] is whole tiles, dW2's 1408-wide output is not (the ordinary gradient);
+        # skewed, ragged token counts
+        self._run(
+            333, 2048, 1408, 4, 4, staged=True, wgrad_accum=(True, False), token_step=7, skew=3.0, calls=3
+        )
 
 
 if __name__ == "__main__":

@@ -56,8 +56,10 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     NUM_BUFFERS,
     NUM_XCD,
     WAVE,
+    check_wmma_b2b,
     nt_gemm_tile,
     pool_tile_order,
+    resolve_lds_cosched,
     tile_geometry,
 )
 from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
@@ -143,6 +145,9 @@ def _launch_gemm_combine_nt(
     SCATTER: Constexpr[bool],
     group_m: Constexpr[int],
     num_xcd: Constexpr[int],
+    issue_first: Constexpr[int],
+    wmma_b2b: Constexpr[int],
+    lds_cosched: Constexpr[int],
 ):
     block = m_warp * n_warp * WAVE
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
@@ -328,6 +333,9 @@ def _launch_gemm_combine_nt(
             # combine workgroups on other CUs
             c_cache_modifier=CPOL_SYSTEM_STREAM if SCATTER else CPOL_DEVICE_STREAM,
             b_nn=B_NN,
+            issue_first=bool(issue_first),
+            lds_cosched=bool(lds_cosched),
+            wmma_b2b=bool(wmma_b2b),
             i32_n=fx.Int32(N),
             c_rows=c_rows,
             c_rank_bases=c_rank_bases,
@@ -606,6 +614,9 @@ def gemm_combine_nt_gfx1250(
     bias: torch.Tensor | None = None,
     bias_scale: torch.Tensor | None = None,
     scatter: bool = True,
+    issue_first: int = 1,
+    wmma_b2b: int | None = None,
+    lds_cosched: int = -1,
 ):
     """``act`` [pool rows, K] (pool order, as the L1 + activation left it) -> ``[tokens, N]`` combined,
     ``tokens = topk_idx.shape[0]``.
@@ -622,7 +633,16 @@ def gemm_combine_nt_gfx1250(
     ``scatter`` stores every GEMM row straight into its route's combine row on the token's source
     rank, and the reduce sums all of a token's routes; without it the GEMM stages the rows locally
     and the combine workgroups push one sum per (token, rank), which waits for the token's last
-    local expert."""
+    local expert.
+
+    ``issue_first`` issues each k-tile's prefetch at the top of the previous one, ``lds_cosched``
+    interleaves the fragment reads with the matrix ops (``nt_gemm_tile``; -1: wherever the tile and
+    ``issue_first`` allow it) and ``wmma_b2b`` turns the WMMA arbitration stall off (None: wherever
+    the tile is co-scheduled)."""
+    lds_cosched = resolve_lds_cosched(lds_cosched, issue_first, tile_m, tile_n, m_warp, n_warp)
+    if wmma_b2b is None:
+        wmma_b2b = lds_cosched
+    check_wmma_b2b(wmma_b2b, gather=False)
     _require_gfx1250(act.device)
     symm = get_symm_buffer_for_mega_moe()
     G, N, K = w2.shape
@@ -717,6 +737,9 @@ def gemm_combine_nt_gfx1250(
         scatter,
         group_m,
         num_xcd,
+        issue_first,
+        wmma_b2b,
+        lds_cosched,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)

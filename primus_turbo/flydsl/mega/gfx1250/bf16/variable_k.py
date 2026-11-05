@@ -245,6 +245,12 @@ def _launch_grouped_bf16_variable_k(
     # tensor, loaded with TDM gather ops.
     gather: Constexpr[int] = 0,
     gather_rows: Constexpr[int] = 0,
+    # 1: out[g] += a^T b. The epilogue TDM-loads the C tile into its staging and adds it to the
+    # fp32 accumulator before the one rounding. The C load's dim-1 extent clamps data, not
+    # addressing, so the entry point only sets it on whole tiles.
+    # 2: the same, with the accumulator rounded to the output dtype before the add, which
+    #    reproduces the separate `out.add_(dW)` bit for bit (tests).
+    accumulate: Constexpr[int] = 0,
 ):
     WMMA_M = WMMA_N = 16
     WMMA_K = 32
@@ -386,6 +392,19 @@ def _launch_grouped_bf16_variable_k(
             f"gather splits tile_k={tile_k} rows over {num_waves} waves into whole ops of "
             f"{GATHER_ROWS_PER_OP}, at most one row per lane"
         )
+    # Epilogue chunk ch stages rows [i * warp_tile_m + ch * EPI_ROWS_G, + EPI_ROWS_G) of every warp
+    # row i. Under `accumulate` the n_warp waves on a warp row load ACC_ROWS rows of it each, one
+    # TDM op per wave per chunk.
+    EPI_ROWS_G = warp_tile_m // epi_chunk
+    ACC_ROWS = EPI_ROWS_G // n_warp
+    if accumulate and (EPI_ROWS_G % n_warp or ACC_ROWS == 0):
+        raise ValueError(f"accumulate splits {EPI_ROWS_G}-row chunk bands over n_warp={n_warp} waves")
+    # The C loads go ahead of the next tile's prefetch when every wave issues the same number of
+    # prefetch ops (dealt or gathered); ACC_TAIL of them are then younger than the C loads. The
+    # two-wave issue leaves the other waves with none, so there the C loads go behind it.
+    ACC_FIRST = bool(gather or tdm_deal or not PREFETCH_OK)
+    ACC_TAIL = PRE_KT * ((1 + GATHER_OPS) if gather else 1) if (ACC_FIRST and PREFETCH_OK) else 0
+    STORE_OPS_CH = m_warp if epi_chunk > 1 else 1
 
     @flyc.kernel(name="mega_gfx1250_grouped_variable_k", known_block_size=[block, 1, 1])
     def kernel_grouped_variable_k(
@@ -575,6 +594,7 @@ def _launch_grouped_bf16_variable_k(
             gA_base = fx.recast_iter(fx.Int8, arg_a)
             gB_base = fx.recast_iter(fx.Int8, arg_b)
             gC_base = fx.recast_iter(fx.PointerType.get(elem_cls.ir_type, arg_c.address_space), arg_c)
+            gC8_base = fx.recast_iter(fx.Int8, arg_c)
 
             if const_expr(gather):
                 ridx = _i32_table(arg_ridx)
@@ -1165,12 +1185,48 @@ def _launch_grouped_bf16_variable_k(
             _fence(outstanding=0)
             if const_expr(MC > 1 and mc_epi_sync):
                 _cluster.cluster_barrier()
+            c_off = fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS) + fx.Int64(blk_n) * ldc64 + fx.Int64(blk_k)
+
+            def _acc_load(ch):
+                # The staging is free: the fence above retired every k-tile that sat in it.
+                r0 = (wave // fx.Int32(n_warp)) * fx.Int32(warp_tile_m) + fx.Int32(ch * EPI_ROWS_G)
+                r0 = r0 + (wave % fx.Int32(n_warp)) * fx.Int32(ACC_ROWS)
+                ext0 = n_valid - r0
+                ext0 = (ext0 > fx.Int32(0)).select(ext0, fx.Int32(0))
+                ldc_b = ldc64 * EB
+                gt = _gv(gC8_base, (c_off + fx.Int64(r0) * ldc64) * EB, (ACC_ROWS, tile_n * EB), (ldc_b, 1))
+                atom = fx.rocdl.make_tdm_atom(
+                    gt,
+                    [ext0, fx.Int32(tile_n * EB)],
+                    strides=[ldc_b, None],
+                    num_warps=1,
+                    pad_interval=tile_n * EB,
+                    pad_amount=C_PAD_E * EB,
+                    cache_modifier=tdm_load_cache,
+                    early_timeout=True,
+                )
+                dst = fx.add_offset(base_ptr, r0 * fx.Int32(C_ROW_E * EB))
+                fx.copy(atom, gt, _lv(dst, (ACC_ROWS, tile_n * EB), (C_ROW_E * EB, 1)))
+
+            def _acc_wait(ch, stores_issued):
+                # In-order TENSORcnt: what may still be in flight is younger than chunk ch's load.
+                tdm_ops.tensor_wait((epi_chunk - 1 - ch) + ACC_TAIL + stores_issued * STORE_OPS_CH)
+
+            if const_expr(accumulate and ACC_FIRST):
+                for ch in range_constexpr(epi_chunk):
+                    _acc_load(ch)
             if PREFETCH_OK:
                 dec2 = nxt_dec if const_expr(nxt_dec is not None) else _next_dec()
                 # Ahead of the store ops, so the next tile can wait for these alone (in-order TENSORcnt).
                 for pk in range_constexpr(PRE_KT):
                     issue(_slot(pk), pk, dec=dec2)
-            c_off = fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS) + fx.Int64(blk_n) * ldc64 + fx.Int64(blk_k)
+            if const_expr(accumulate and not ACC_FIRST):
+                for ch in range_constexpr(epi_chunk):
+                    _acc_load(ch)
+            if const_expr(accumulate):
+                _acc_wait(0, 0)
+                gpu.barrier()
+                c_lds0 = fx.Int32(_bidx(base_ptr))
 
             def _epi_stage(wm_lo, wm_hi):
                 for wm in range_constexpr(wm_hi - wm_lo):
@@ -1178,8 +1234,15 @@ def _launch_grouped_bf16_variable_k(
                     row_rel = wmb + wmg * WMMA_M + lane16
                     for wn in range_constexpr(wmma_n_rep):
                         col_rel = wnb + wn * WMMA_N + kgrp * 8
-                        h = accs[wmg * wmma_n_rep + wn].to(elem_cls)
-                        fx.ptr_store(h.bitcast(fx.Int8), base_ptr + (row_rel * C_ROW_E + col_rel) * EB)
+                        c_byte = (row_rel * C_ROW_E + col_rel) * EB
+                        acc = accs[wmg * wmma_n_rep + wn]
+                        if const_expr(accumulate):
+                            if const_expr(accumulate == 2):
+                                acc = acc.to(elem_cls).to(fx.Float32)
+                            c_ptr = _llvm.inttoptr(_PTR3, _raw(c_lds0 + c_byte))
+                            acc = acc + Vec(_llvm.load(vec8, c_ptr, alignment=16)).to(fx.Float32)
+                        h = acc.to(elem_cls)
+                        fx.ptr_store(h.bitcast(fx.Int8), base_ptr + c_byte)
 
             def _epi_store(r0, rows):
                 if const_expr(r0):
@@ -1209,6 +1272,9 @@ def _launch_grouped_bf16_variable_k(
                 EPI_ROWS = EPI_REP * WMMA_M
                 for ch in range_constexpr(epi_chunk):
                     _epi_stage(ch * EPI_REP, (ch + 1) * EPI_REP)
+                    if const_expr(accumulate and ch + 1 < epi_chunk):
+                        # the barrier below publishes the next chunk's C rows as well
+                        _acc_wait(ch + 1, ch)
                     gpu.barrier()
                     for i in range_constexpr(m_warp):
                         _epi_store(i * warp_tile_m + ch * EPI_ROWS, EPI_ROWS)
@@ -1261,12 +1327,13 @@ def _vk_launch(args: tuple):
     """Same pre-bound CallState shortcut as ``_nt_launch``, for the variable-K kernel."""
     key = args[_VK_CONSTEXPR0:]
     fn = _VK_COMPILED.get(key)
-    if fn is None:
-        fn = flyc.compile(_launch_grouped_bf16_variable_k, *args)
-        if fn is None:  # COMPILE_ONLY: nothing was executed, nothing to cache
-            return None
+    if fn is not None:
+        return fn(*args)
+    # Compiles and issues this launch; running it again would add twice under `accumulate`.
+    fn = flyc.compile(_launch_grouped_bf16_variable_k, *args)
+    if fn is not None:  # None under COMPILE_ONLY: nothing was executed, nothing to cache
         _VK_COMPILED[key] = fn
-    return fn(*args)
+    return None
 
 
 @functools.lru_cache(maxsize=64)
@@ -1325,6 +1392,17 @@ def grouped_gemm_bf16_variable_k_supported(OUT_M: int, OUT_N: int, avg_m: int = 
     """
     tile_m, tile_n = _pick_variable_k_config(OUT_M, OUT_N, avg_m)[:2]
     return OUT_M >= tile_m and OUT_N >= tile_n
+
+
+def grouped_gemm_bf16_variable_k_accum_supported(OUT_M: int, OUT_N: int) -> bool:
+    """Whether ``accumulate=1`` can serve this shape at any token count: whole output tiles of every
+    tile the entry can pick for it (the grouped GEMM's variable-K group on its weight shapes, else
+    ``_pick_variable_k_config``, whose tile depends on the shape alone)."""
+    tiles = {_pick_variable_k_config(OUT_M, OUT_N, avg_m)[:2] for avg_m in (128, 1024)}
+    key = _VK_STACK_KEY.get((OUT_M, OUT_N))
+    if key is not None:
+        tiles.add(tuple(_v3_pick_variable_k_config(*key, True)[:2]))
+    return all(OUT_M >= tm and OUT_N >= tn and OUT_M % tm == 0 and OUT_N % tn == 0 for tm, tn in tiles)
 
 
 # Back-compat alias for the bring-up scripts, which know this kernel as "wgrad_tn".
@@ -1428,6 +1506,13 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     # passed, which may then hold any number of rows. At most one of the two.
     a_index: torch.Tensor | None = None,
     b_index: torch.Tensor | None = None,
+    # 1: ``out[g] += a[rows_g].T @ b[rows_g]`` into the given ``out`` (contiguous
+    # [G, OUT_M, OUT_N] in the operand dtype), in the epilogue, rounded once from the fp32 sum.
+    # Whole output tiles only (``grouped_gemm_bf16_variable_k_accum_supported``).
+    accumulate: int = 0,
+    # Tests only: with ``accumulate``, round the product before the add, as a separate
+    # ``out.add_(dW)`` does.
+    _round_first: bool = False,
 ) -> torch.Tensor:
     """Variable-K grouped wgrad: ``out[g] = a[rows_g].T @ b[rows_g]``.
 
@@ -1616,6 +1701,20 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     if (tdm_deal & 2) and (not head_pipe or hp_burst):
         tdm_deal &= 1
 
+    if accumulate:
+        if out is None or out_ldc:
+            raise ValueError("accumulate=1 needs out= (the tensor to add into), without out_ldc")
+        if tuple(out.shape) != (G, OUT_M, OUT_N) or not out.is_contiguous() or out.dtype != a.dtype:
+            raise ValueError(
+                f"accumulate=1 needs a contiguous {a.dtype} out of shape {(G, OUT_M, OUT_N)}, got "
+                f"{out.dtype} {tuple(out.shape)} contiguous={out.is_contiguous()}"
+            )
+        if OUT_M % tile_m or OUT_N % tile_n:
+            raise ValueError(
+                f"accumulate=1 needs whole output tiles: [{OUT_M}, {OUT_N}] on {tile_m} x {tile_n} "
+                f"(grouped_gemm_bf16_variable_k_accum_supported)"
+            )
+
     # The store walks `g*OUT_M*ldc + blk_n*ldc + blk_k`, so the allocation has to be
     # OUT_M*ldc per expert, not OUT_M*OUT_N. Checked rather than assumed: this is the
     # one place in this entry where a mismatch is an out-of-bounds device write.
@@ -1691,6 +1790,7 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
             vk_ovl,
             gather,
             gather_rows,
+            (2 if _round_first else 1) if accumulate else 0,
         )
     )
     # The caller asked for [G, OUT_M, OUT_N]; the padding is this function's business.

@@ -7,7 +7,11 @@
 import pytest
 import torch
 
-from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+    GlobalBackendManager,
+    PrecisionType,
+)
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
     grouped_gemm_variable_k_impl,
@@ -177,13 +181,36 @@ def test_grouped_gemm_fused_grad_accum(dtype, trans_b, num_zero, backend):
     an empty group's slice is right for a fresh output buffer but would wipe the
     caller's running sum here.
     """
-    B, M, N, K = 4, 256, 512, 256
-    device = "cuda"
-
     # A pinned backend exercises that backend's beta=1 accumulate epilogue; ``None``
     # leaves the dispatcher to resolve one, which is how training actually runs.
     GlobalBackendManager.set_grouped_gemm_backend(backend)
     GlobalBackendManager.set_auto_tune(False)
+    _check_fused_grad_accum(dtype, trans_b, num_zero)
+    GlobalBackendManager.reset()
+
+
+@pytest.mark.parametrize("auto_tune", ["per_op", "global"])
+def test_grouped_gemm_fused_grad_accum_auto_tune(auto_tune, request):
+    """Auto-tuning the accumulating wgrad must leave ``main_grad`` holding previous + wgrad.
+
+    The tuner launches every candidate repeatedly, so timing them on the caller's buffer
+    would add the wgrad once per launch. The baseline backward runs first and tunes the
+    same shapes for an overwriting wgrad; that choice must not reach the accumulating
+    call either, since the backend picked to overwrite may be unable to accumulate.
+    """
+    GlobalBackendManager.reset()
+    request.addfinalizer(GlobalBackendManager.reset)
+    if auto_tune == "per_op":
+        GlobalBackendManager.set_grouped_gemm_backend(precision=PrecisionType.BF16_FP16_FP32, auto_tune=True)
+    else:
+        GlobalBackendManager.set_auto_tune(True)
+    _check_fused_grad_accum(torch.bfloat16, trans_b=True, num_zero=0)
+
+
+def _check_fused_grad_accum(dtype, trans_b, num_zero):
+    """Ordinary backward, then the fused one on a copy: ``main_grad`` must move by the wgrad."""
+    B, M, N, K = 4, 256, 512, 256
+    device = "cuda"
     torch.manual_seed(42)
 
     if num_zero:
@@ -223,7 +250,6 @@ def test_grouped_gemm_fused_grad_accum(dtype, trans_b, num_zero, backend):
     # baseline wgrad was rounded to it before autograd stored it.
     expected = previous + b.grad.float()
     torch.testing.assert_close(b_fused.main_grad, expected, **get_tolerances(dtype))
-    GlobalBackendManager.reset()
 
 
 @pytest.mark.parametrize("B", [8])
