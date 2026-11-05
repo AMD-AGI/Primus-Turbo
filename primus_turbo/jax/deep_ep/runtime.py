@@ -9,11 +9,12 @@ from __future__ import annotations
 import atexit
 import hashlib
 import logging
-import os
 from enum import IntEnum
 from typing import List, Optional, Sequence, Tuple
 
 import jax
+
+import primus_turbo.common.envs as envs
 
 _MODE_ENV_VAR = "PRIMUS_TURBO_JAX_DEEPEP_MODE"
 
@@ -246,7 +247,7 @@ _locked_mode: Optional[LaunchMode] = None
 
 
 def _get_env_mode() -> LaunchMode:
-    return LaunchMode.from_str(os.environ.get(_MODE_ENV_VAR))
+    return LaunchMode.from_str(envs.PRIMUS_TURBO_JAX_DEEPEP_MODE)
 
 
 def _check_locked_mode(mode: LaunchMode) -> None:
@@ -277,10 +278,10 @@ def auto_detect_mode() -> None:
     or whether the EP communication domain is a strict subset of the
     JAX world (see ``set_ep_group``).
     """
-    if os.environ.get(_MODE_ENV_VAR) is not None:
+    if envs.PRIMUS_TURBO_JAX_DEEPEP_MODE is not None:
         return
     if jax.local_device_count() == 1 and jax.process_count() > 1:
-        os.environ[_MODE_ENV_VAR] = "per_process"
+        envs.set_env(_MODE_ENV_VAR, "per_process")
         log.info(
             "Auto-detected per_process mode (1 GPU per process, %d JAX processes, ep_group_size=%d)",
             jax.process_count(),

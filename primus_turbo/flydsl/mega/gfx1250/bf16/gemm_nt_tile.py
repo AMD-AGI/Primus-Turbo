@@ -30,8 +30,8 @@ with two changes Mega needs:
   loads (``tensor_load_to_lds`` gather mode, 16 rows per instruction) need no VMEM issue slots
   and are about 2.5% faster, but on gfx1250 they now and
   then corrupt the LDS writes of neighbouring workgroups -- silently, about one fused launch in
-  500, triggered by gathers that barely touch memory (out-of-range, repeated or hot rows).
-  ``MEGA_TDM_GATHER=1`` at trace time brings them back to reproduce that.
+  500, triggered by gathers that barely touch memory (out-of-range, repeated or hot rows) --
+  so the tile does not use them.
 * **B can be NN.** With ``b_nn`` the B stage is ``[tile_k, tile_n]`` as stored and its fragments
   come out of the hardware LDS transpose read ``ds_load_tr16_b128``, the native NN path of the
   grouped kernel: no transposed copy of the weight.
@@ -48,7 +48,6 @@ gathered A's prologue loads sit behind a uniform ``live`` branch, the one branch
 from __future__ import annotations
 
 import functools
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -57,12 +56,11 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as std_arith
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import rocdl as _rocdl
-from flydsl._mlir.dialects import vector
 from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import tdm_ops
-from flydsl.expr.typing import Constexpr, T, as_ir_value
+from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
@@ -87,9 +85,6 @@ EB = 2  # bf16
 LDS_PAD = 16  # bytes after every LDS row: keeps rows 4 dwords apart for conflict-free b128 reads
 NUM_BUFFERS = 2
 GFX1250_LDS_BYTES = 320 * 1024
-# the TDM gather repro switch (see the module docstring); a FlyDSL cache built without it keeps
-# serving the async kernels
-TDM_GATHER_A = os.environ.get("MEGA_TDM_GATHER", "0") == "1"
 
 
 def tile_geometry(tile_m: int, tile_n: int, tile_k: int, b_nn: bool = False):
@@ -105,74 +100,32 @@ def tile_geometry(tile_m: int, tile_n: int, tile_k: int, b_nn: bool = False):
     return lds_row, stage, pitch, arena
 
 
+def resolve_lds_cosched(
+    lds_cosched: int, issue_first: int, tile_m: int, tile_n: int, m_warp: int, n_warp: int
+):
+    """``lds_cosched`` as ``nt_gemm_tile`` takes it: -1 turns it on where the tile allows it.
+
+    It issues one fragment read per matrix op of the previous sub-step, so it needs ``issue_first``
+    and fewer reads per sub-step (two per fragment row and column) than matrix ops."""
+    m_rep, n_rep = tile_m // m_warp // WMMA_M, tile_n // n_warp // WMMA_N
+    allowed = bool(issue_first) and 2 * (m_rep + n_rep) < m_rep * n_rep
+    if lds_cosched == -1:
+        return int(allowed)
+    if lds_cosched not in (0, 1):
+        raise ValueError(f"lds_cosched must be -1 (auto), 0 or 1, got {lds_cosched}")
+    if lds_cosched and not allowed:
+        raise ValueError(
+            f"lds_cosched=1 needs issue_first=1 and fewer fragment reads per sub-step than matrix ops, "
+            f"got issue_first={int(issue_first)} and {2 * (m_rep + n_rep)} reads for {m_rep * n_rep} "
+            f"matrix ops (tile {tile_m}x{tile_n}, {m_warp}x{n_warp} waves)"
+        )
+    return lds_cosched
+
+
 def check_gather_rows(a_rows: int, lda: int, tile_m: int, tile_k: int):
     """The async A gather's limits: some row to read, and 32-bit byte offsets into A."""
     assert a_rows > 0, "a gathered A needs a row"
     assert a_rows * lda * EB + tile_m * (tile_k * EB + LDS_PAD) < 2**32, "A too big for 32-bit row offsets"
-
-
-# ── TDM gather descriptors ───────────────────────────────────────────────────
-# Built by hand rather than through tdm_ops.make_tensor_gather_descriptor, which wants the LDS
-# side as a memref; this tile's LDS is a pointer arena. Field layout per CDNA5 ISA 4.10.3.2,
-# the same bits tdm_ops packs.
-
-
-def _c32(v):
-    return arith.constant(v, type=T.i32)
-
-
-def _pad_encoding(row_bytes: int, pad_bytes: int):
-    interval_dw, amount_dw = row_bytes // 4, pad_bytes // 4
-    assert interval_dw & (interval_dw - 1) == 0, "TDM pad interval must be a power of two dwords"
-    return interval_dw.bit_length() - 2, amount_dw - 1
-
-
-def _gather_static_groups(
-    row_indices, idx_bits: int, row_width: int, tensor_dim0: int, tensor_dim1, stride: int
-):
-    """dgroup1..3: element size, padding, OOB dims, row width, row stride and the row indices."""
-    enc_interval, enc_amount = _pad_encoding(row_width * EB, LDS_PAD)
-    data_size_code = EB.bit_length() - 1
-    s0 = _c32((data_size_code << 16) | (1 << 20) | (enc_interval << 22) | (enc_amount << 25))
-    s1 = _c32((tensor_dim0 & 0xFFFF) << 16)
-    td1 = _raw(tensor_dim1)
-    s2 = arith.ori(_c32((tensor_dim0 >> 16) & 0xFFFF), arith.shli(arith.andi(td1, _c32(0xFFFF)), _c32(16)))
-    s3 = arith.ori(arith.andi(arith.shrui(td1, _c32(16)), _c32(0xFFFF)), _c32(row_width << 16))
-    s4 = _c32(len(row_indices))
-    s5 = _c32(stride)
-    zero = _c32(0)
-    dgroup1 = vector.from_elements(
-        T.vec(8, T.i32), [as_ir_value(v) for v in (s0, s1, s2, s3, s4, s5, zero, zero)]
-    )
-    if idx_bits == 32:
-        words = list(row_indices)
-    else:
-        words = [
-            arith.ori(
-                arith.andi(_raw(row_indices[2 * w]), _c32(0xFFFF)),
-                arith.shli(arith.andi(_raw(row_indices[2 * w + 1]), _c32(0xFFFF)), _c32(16)),
-            )
-            for w in range(len(row_indices) // 2)
-        ]
-    dgroup2 = vector.from_elements(T.vec(4, T.i32), [as_ir_value(_raw(w)) for w in words[:4]])
-    dgroup3 = vector.from_elements(T.vec(4, T.i32), [as_ir_value(_raw(w)) for w in words[4:8]])
-    return dgroup1, dgroup2, dgroup3
-
-
-def _gather_dgroup0(lds_addr_i32, global_addr_i64, idx_bits: int):
-    """dgroup0: gather-mode predicate, LDS byte address and the 57-bit global base."""
-    i32 = ir.IntegerType.get_signless(32)
-    g = _raw(global_addr_i64)
-    lo = std_arith.TruncIOp(i32, g).result
-    hi = std_arith.TruncIOp(i32, std_arith.ShRUIOp(g, _raw(fx.Int64(32))).result).result
-    hi = arith.ori(hi, _c32(1 << 31))
-    pred = _c32(1 | ((1 if idx_bits == 32 else 0) << 30) | (1 << 31))
-    return vector.from_elements(T.vec(4, T.i32), [as_ir_value(v) for v in (pred, _raw(lds_addr_i32), lo, hi)])
-
-
-class _GatherDesc:
-    def __init__(self, dgroup0, dgroup1, dgroup2, dgroup3):
-        self.dgroup0, self.dgroup1, self.dgroup2, self.dgroup3 = dgroup0, dgroup1, dgroup2, dgroup3
 
 
 # ── the tile ─────────────────────────────────────────────────────────────────
@@ -208,6 +161,8 @@ def nt_gemm_tile(
     c_cache_modifier: int = 0,
     b_nn: bool = False,
     i32_n=None,
+    issue_first: bool = False,
+    lds_cosched: bool = False,
 ):
     """One ``tile_m x tile_n`` block; must be called by all ``m_warp * n_warp`` waves.
 
@@ -220,7 +175,11 @@ def nt_gemm_tile(
     read. C is written at byte address ``c_addr`` with row stride
     ``ldc``, ``m_rows`` rows and ``n_valid`` columns kept. ``live`` (wave-uniform i1) turns the
     tile into a no-op. ``c_cache_modifier`` is the C stores' cache policy (``CPOL_DEVICE_STREAM``
-    when another workgroup consumes C in the same launch).
+    when another workgroup consumes C in the same launch). ``issue_first`` issues the next
+    k-tile's loads at the top of the k-tile body, ahead of its fragment reads; the buffer they fill
+    was drained by the previous k-tile's fence. ``lds_cosched`` (needs ``issue_first``) issues each
+    sub-step's fragment reads one per matrix op of the previous sub-step, one scheduling region per
+    sub-step, holding the running sub-step's fragments live to its end.
     """
     KB = tile_k * EB
     KSB = WMMA_K * EB
@@ -234,10 +193,9 @@ def nt_gemm_tile(
     LDS_B_ROW = tile_n * EB + _nn_b_pad(tile_n, EB)
     B_DELTA = STAGE_A
     R = 2  # fragment ring depth
-    ROWS_PER_OP = 16 if idx_bits == 16 else 8
-    OPS = tile_m // ROWS_PER_OP
-    assert OPS % num_waves == 0, "gather ops must split evenly over the waves"
-    OPS_PER_WAVE = OPS // num_waves
+    # Not an assert: without issue_first the co-scheduled loop never issues the next k-tile's
+    # loads, so `python -O` would turn a bad combination into stale LDS reads.
+    resolve_lds_cosched(int(lds_cosched), issue_first, tile_m, tile_n, m_warp, n_warp)
     assert ldc % 2 == 0, "the epilogue stores whole i32 words"
 
     tid = fx.Int32(fx.thread_idx.x)
@@ -291,8 +249,7 @@ def nt_gemm_tile(
     else:
         gt_b = _gv(gB_base, b_slab + fx.Int64(blk_n) * ldb_b, (tile_n, KB), (KB, 1))
         atom_b = _tdm(gt_b, n_ext, ldb_b)
-    async_a = gather and not TDM_GATHER_A
-    if const_expr(async_a):
+    if const_expr(gather):
         # lane tid copies chunk tid % CH of row tid // CH, and RPI rows further per instruction
         CH = KB // 16
         RPI = block // CH
@@ -323,19 +280,6 @@ def nt_gemm_tile(
             if const_expr(i == 0):
                 fallback = row
             a_off.append(row * fx.Int32(lda * EB) + c16 * fx.Int32(16) + fx.Int32(A_BIAS - i * RPI * LDS_ROW))
-    elif const_expr(gather):
-        a_addr = fx.Int64(fx.ptrtoint(gA_base))
-        # descriptors for this wave's ops: indices are K-invariant, so groups 1-3 are built once
-        a_dim1 = live.select(a_rows, zero32)
-        gather_groups = []
-        for q in range_constexpr(OPS_PER_WAVE):
-            first = (wave * fx.Int32(OPS_PER_WAVE) + fx.Int32(q)) * fx.Int32(ROWS_PER_OP)
-            rows = [
-                rocdl.readfirstlane(T.i32, row_idx_table[row_idx_base + first + fx.Int32(i)])
-                for i in range_constexpr(ROWS_PER_OP)
-            ]
-            groups = _gather_static_groups(rows, idx_bits, tile_k, tile_k, a_dim1, lda)
-            gather_groups.append((first * fx.Int32(LDS_ROW), groups))
     else:
         gt_a = _gv(gA_base, fx.Int64(a_row0) * lda_b, (tile_m, KB), (KB, 1))
         atom_a = _tdm(gt_a, m_ext, lda_b)
@@ -343,7 +287,7 @@ def nt_gemm_tile(
     def issue(s, kt, prologue=False):
         pa = _buf_ptr(s)
         koff = fx.Int64(kt) * fx.Int64(KB)
-        if const_expr(async_a):
+        if const_expr(gather):
             # k goes into the 32-bit offset so its zext stays in the loop and the loads keep the
             # SADDR form; a hoisted 64-bit offset costs a v_add_u64 per load and twice the VGPRs.
             # No per-row branch around a load either: that serializes them
@@ -367,12 +311,6 @@ def nt_gemm_tile(
                     _a_loads()
             else:
                 _a_loads()
-        elif const_expr(gather):
-            lds_base = fx.Int32(_bidx(pa))
-            for q in range_constexpr(OPS_PER_WAVE):
-                lds_off, (dg1, dg2, dg3) = gather_groups[q]
-                dg0 = _gather_dgroup0(lds_base + lds_off, a_addr + koff, idx_bits)
-                tdm_ops.tensor_load_gather(_GatherDesc(dg0, dg1, dg2, dg3))
         else:
             if wave == fx.Int32(0):
                 fx.copy(atom_a, gt_a, _lv(pa, (tile_m, KB), (LDS_ROW, 1)), imm_offset=koff)
@@ -472,15 +410,44 @@ def nt_gemm_tile(
                 idx = wm * wmma_n_rep + wn
                 fx.gemm(wmma_atom, c_frags[idx], wt[wn], act[wm], c_frags[idx])
 
+    def _hold_live(state):
+        # `llvm.fake.use` emits nothing; it keeps the running sub-step's fragments allocated until its
+        # last matrix op, so the interleaved reads of the next sub-step get other registers
+        act, wt = state
+        for t in act + wt:
+            _llvm.call_intrinsic(None, "llvm.fake.use", [_raw(t.load())], [], [])
+
     def compute_ktile(buf, prefetch_kt):
         """K_WS sub-steps; the last one is returned to run inside the barrier window."""
         ring = [None] * R
+        if const_expr(issue_first and prefetch_kt is not None):
+            rocdl.sched_barrier(0)
+            issue(prefetch_kt % NUM_BUFFERS, prefetch_kt)
+            rocdl.sched_barrier(0)
         ring[0] = _load_ks(buf, 0)
+        if const_expr(lds_cosched):
+            rocdl.sched_dsrd(KS_DS)
+            rocdl.sched_barrier(0)
+            for ks in range_constexpr(K_WS):
+                # only this sub-step's reads are in flight here (R = 2)
+                rocdl.s_wait_dscnt(0)
+                if const_expr(ks + 1 < K_WS):
+                    ring[(ks + 1) % R] = _load_ks(buf, ks + 1)
+                if const_expr(ks < K_WS - 1):
+                    _mma_ks(ring[ks % R])
+                    for _j in range_constexpr(KS_DS):
+                        rocdl.sched_dsrd(1)
+                        rocdl.sched_mfma(1)
+                    rocdl.sched_mfma(n_acc - KS_DS)
+                    # after the group hints: placed before them, the hints are ignored
+                    _hold_live(ring[ks % R])
+                rocdl.sched_barrier(0)
+            return ring[(K_WS - 1) % R]
         for ks in range_constexpr(K_WS):
             if const_expr(ks + 1 < K_WS):
                 ring[(ks + 1) % R] = _load_ks(buf, ks + 1)
             rocdl.s_wait_dscnt(min(K_WS - 1 - ks, R - 1) * KS_DS)
-            if const_expr(ks == 0 and prefetch_kt is not None):
+            if const_expr(ks == 0 and prefetch_kt is not None and not issue_first):
                 rocdl.sched_barrier(0)
                 issue(prefetch_kt % NUM_BUFFERS, prefetch_kt)
                 rocdl.sched_barrier(0)
@@ -496,7 +463,7 @@ def nt_gemm_tile(
 
     def split_fence(tail):
         tdm_ops.tensor_wait(0)
-        if const_expr(async_a):
+        if const_expr(gather):
             _rocdl.s_wait_asynccnt(0)
         rocdl.sched_barrier(0)
         rocdl.s_barrier_signal(_WG_BARRIER)
@@ -506,7 +473,7 @@ def nt_gemm_tile(
         rocdl.s_barrier_wait(_WG_BARRIER)
 
     issue(0, 0, prologue=True)
-    if const_expr(async_a):
+    if const_expr(gather):
         _rocdl.s_wait_asynccnt(0)
     _pipeline_fence(outstanding=0)
     for kt in range(n_steady):
@@ -575,7 +542,7 @@ def _launch_mega_nt(
     if arena_bytes > GFX1250_LDS_BYTES:
         raise ValueError(f"LDS arena {arena_bytes} B exceeds {GFX1250_LDS_BYTES} B")
 
-    @flyc.kernel(known_block_size=[block, 1, 1])
+    @flyc.kernel(name="kernel_mega_nt", known_block_size=[block, 1, 1])
     def kernel_mega_nt(
         arg_c: fx.Pointer,
         arg_a: fx.Pointer,

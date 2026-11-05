@@ -4,7 +4,6 @@
 # See LICENSE for license information.
 ###############################################################################
 
-import os
 import warnings
 from abc import abstractmethod
 from typing import Optional, Tuple
@@ -12,8 +11,8 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 
+import primus_turbo.common.envs as envs
 import primus_turbo.pytorch as turbo
-from primus_turbo.common.constants import ENV_EP_FORCE_CURRENT_STREAM
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.deep_ep import Config
 from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
@@ -173,19 +172,19 @@ class DeepEPTokenDispatcher(TokenDispatcher):
 
         if not deepep_use_comm_stream:
             if DeepEPTokenDispatcher._ep_force_current_stream_locked:
-                if os.environ.get(ENV_EP_FORCE_CURRENT_STREAM) != "1":
+                if not envs.PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM:
                     warnings.warn(
                         "deepep_use_comm_stream=False requested on a later dispatcher, but a "
                         "prior dispatcher already locked the current-stream setting. The C++ "
                         "helper caches the env value once per process — set "
-                        f"{ENV_EP_FORCE_CURRENT_STREAM}=1 before constructing any dispatcher "
+                        "PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM=1 before constructing any dispatcher "
                         "to apply this setting consistently.",
                         stacklevel=2,
                     )
             else:
-                if os.environ.get(ENV_EP_FORCE_CURRENT_STREAM) != "1":
+                if not envs.PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM:
                     clear_backend_instances()
-                    os.environ[ENV_EP_FORCE_CURRENT_STREAM] = "1"
+                    envs.set_env("PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM", "1")
                 DeepEPTokenDispatcher._ep_force_current_stream_locked = True
 
         self.capacity_factor = expert_capacity_factor

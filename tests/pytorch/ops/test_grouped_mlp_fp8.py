@@ -36,6 +36,17 @@ from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
 from primus_turbo.pytorch.core.utils import is_gfx942, is_gfx950
 from primus_turbo.pytorch.ops.grouped_mlp_fp8 import grouped_mlp_fp8
 from primus_turbo.pytorch.ops.utils import _get_fp8_dtype
+from tests.pytorch.ops.determinism_helper import (  # noqa: F401  (_det_seed: fixture)
+    _det_seed,
+    check_grouped_mlp,
+    grouped_mlp_ref,
+    make_generator,
+    mx8_config,
+    randn,
+    require_gfx950,
+    require_mxfp8,
+    unbalanced_group_lens,
+)
 from tests.pytorch.test_utils import compute_snr
 
 # fp8 puts a floor of ~55 dB on a single GEMM; stacking two of them and their
@@ -237,3 +248,52 @@ def test_grouped_mlp_fp8_prequantized_input_and_grad(fmt):
     assert torch.equal(got, want), "out"
     for name, g, w in zip(("grad_x", "grad_w1", "grad_w2", "grad_probs"), got_grads, want_grads):
         assert torch.equal(g, w), name
+
+
+# ---------------------------------------------------------------------------
+# Determinism (--deterministic-only): bit-exact across repeats on determinism_helper's harness.
+# ---------------------------------------------------------------------------
+# (M, K, I, G); I=320 leaves a masked column tail.
+DET_SHAPES = [(2048, 1024, 512, 4), (2048, 1024, 320, 4)]
+
+
+@pytest.mark.parametrize("shape", DET_SHAPES, ids=lambda s: "x".join(map(str, s)))
+@pytest.mark.parametrize(
+    "activation, clamp_limit", [("silu", None), ("gelu", 1.0)], ids=["silu", "gelu-clamp"]
+)
+@pytest.mark.parametrize("granularity", ["TW", "MX"])
+@pytest.mark.deterministic
+def test_det_grouped_mlp_fp8(request, det_seed, shape, activation, clamp_limit, granularity):
+    if is_gfx942():
+        pytest.skip("grouped_mlp_fp8 is not supported on gfx942")
+    if granularity == "MX":
+        require_mxfp8()
+        require_gfx950("the fused MXFP8 GLU epilogues")
+    config = mx8_config() if granularity == "MX" else Float8QuantConfig()
+    M, K, I, G = shape
+    gen = make_generator(det_seed)
+    group_lens = unbalanced_group_lens(G, M // G, det_seed)
+    x0 = randn((M, K), torch.bfloat16, gen, scale=0.1)
+    w10 = randn((G, 2 * I, K), torch.bfloat16, gen, scale=0.3)
+    w20 = randn((G, K, I), torch.bfloat16, gen, scale=0.02)
+    probs0 = torch.rand(M, device="cuda", dtype=torch.float32, generator=gen) + 0.25
+    cotangent = randn((M, K), torch.float32, gen)
+
+    def fn(x, w1, w2, probs):
+        return grouped_mlp_fp8(
+            x,
+            w1,
+            w2,
+            group_lens,
+            probs=probs,
+            trans_w1=True,
+            trans_w2=True,
+            config=config,
+            activation=activation,
+            clamp_limit=clamp_limit,
+        )
+
+    ref = grouped_mlp_ref(x0, w10, w20, probs0, group_lens, activation, clamp_limit, cotangent)
+    check_grouped_mlp(
+        request.node.nodeid, fn, x0, w10, w20, probs0, cotangent, ref, 20 if clamp_limit is None else 12
+    )

@@ -316,7 +316,7 @@ def compile_grouped_mxfp4_qdual(
     _PRE_BLK = 256
     _PRE_GRID = (NBM + _PRE_BLK - 1) // _PRE_BLK
 
-    @flyc.kernel(known_block_size=[_PRE_BLK, 1, 1])
+    @flyc.kernel(name="mxfp4_grouped_quant_meta", known_block_size=[_PRE_BLK, 1, 1])
     def pre(
         GO: fx.Tensor,  # tight per-group offs (int32 view of int64 [G+1])
         LC: fx.Tensor,  # OUT: 512-aligned per-group lens (int64 [G])
@@ -378,7 +378,7 @@ def compile_grouped_mxfp4_qdual(
         buffer_ops.buffer_store(in_rebase, m_r, _MW * tid)
         buffer_ops.buffer_store(in_end, m_r, _MW * tid + I32(1))
 
-    @flyc.kernel(known_block_size=[nth, 1, 1])
+    @flyc.kernel(name="mxfp4_grouped_quant_dual", known_block_size=[nth, 1, 1])
     def kern(
         X: fx.Tensor,  # int32 view of bf16/fp16 [src_M, N] when gather else [total_M, N]
         D2S: fx.Tensor,  # int32 [total_M] dest row -> source row (gather only)

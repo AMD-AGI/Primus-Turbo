@@ -951,7 +951,7 @@ def _attention(
     run_blocks()
 
 
-@flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+@flyc.kernel(name="mla_fwd_kernel", known_block_size=[BLOCK_SIZE, 1, 1])
 def mla_fwd_kernel(
     o: fx.Tensor,
     q: fx.Tensor,

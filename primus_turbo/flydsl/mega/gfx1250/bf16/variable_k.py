@@ -216,8 +216,13 @@ def _launch_grouped_bf16_variable_k(
     # matrix of `gather_rows` rows with the same row stride. 0 = both dense (`arg_ridx` unread).
     gather: Constexpr[int] = 0,
     gather_rows: Constexpr[int] = 0,
+    # beta = 1. 0 = overwrite `arg_c` (shipped). 1 = add the old C tile to the fp32 accumulators and
+    # round once, so `out += sum` replaces a separate dW plus `main_grad.add_(dW)`. 2 = round the
+    # accumulators to the operand dtype first and then add, which reproduces that separate path bit
+    # for bit (the entry's `_round_first` test hook).
+    accum: Constexpr[int] = 0,
 ):
-    """``out[g][n, k] = sum_{m in g} A[m, n] * B[m, k]``.
+    """``out[g][n, k] = sum_{m in g} A[m, n] * B[m, k]`` (``+=`` with ``accum``).
 
     ``arg_a`` is ``A[M_total, OUT_M]``, ``arg_b`` is ``B[M_total, OUT_N]``, both
     token-major and **not** pre-transposed; ``arg_c`` is ``[G, OUT_M, OUT_N]``.
@@ -305,10 +310,10 @@ def _launch_grouped_bf16_variable_k(
     GATHER_ROWS_PER_OP = 16 if IDX_BITS == 16 else 8
     GATHER_ROWS_PER_WAVE = tile_k // num_waves
     if gather:
-        # Every wave issues the same number of gather ops per k-tile, and with two buffers each
-        # fence drains them all, so the per-wave TDM budget (TDM_PW) never has to count them.
-        if num_buffers != 2 or persist:
-            raise ValueError("gather needs num_buffers == 2 and persist == 0")
+        # Every wave issues the same number of gather ops per k-tile, the dense operand's loader one
+        # TDM load more; with more than two buffers the fences count both per wave (`_tdm_wait`).
+        if persist:
+            raise ValueError("gather needs persist == 0")
         if GATHER_ROWS_PER_WAVE % GATHER_ROWS_PER_OP or GATHER_ROWS_PER_WAVE > WAVE:
             raise ValueError(
                 f"gather splits tile_k={tile_k} rows over {num_waves} waves into whole ops of "
@@ -318,7 +323,29 @@ def _launch_grouped_bf16_variable_k(
         raise ValueError(f"LDS arena {ARENA_B} B exceeds the gfx1250 budget {_GFX1250_LDS_BYTES} B")
     _check_smem(ARENA_B, str(_get_arch()))
 
-    @flyc.kernel(known_block_size=[block, 1, 1])
+    # ---- beta = 1 (`accum`): the old C tile comes through LDS, its rows padded like the stage rows.
+    # When it fits one stage buffer it is loaded during the last k-tile into the buffer that k-tile
+    # does not read -- free by the same argument as the steady-state prefetch's target -- so its
+    # latency hides behind that k-tile. Otherwise it is loaded at the arena base once the k-loop has
+    # drained, exposed.
+    if accum not in (0, 1, 2):
+        raise ValueError(f"accum must be 0, 1 or 2, got {accum}")
+    C_LDS_ROW = tile_n * EB + LDS_PAD
+    C_LDS_B = tile_m * C_LDS_ROW
+    C_EARLY = bool(accum) and C_LDS_B <= PITCH
+    # A C tile too big for one stage buffer, with three or more buffers: each of the last two k-tiles
+    # frees one, so the old C comes in as two row halves, one per k-tile, as early as the single
+    # load. The two warp rows split the tile along the same line, so every wave reads, adds and
+    # stages within one half; it stages in place (each lane overwrites the 16 bytes it read) and the
+    # halves are stored from there, two TDM stores reading the padded rows.
+    C_HALF = tile_m // 2
+    C_SPLIT = bool(accum) and not C_EARLY and num_buffers >= 3 and m_warp == 2 and C_HALF * C_LDS_ROW <= PITCH
+    if accum and (persist or out_ldc or wpath_only):
+        raise ValueError("accum needs persist == 0, out_ldc == 0 and wpath_only == 0")
+    if accum and C_LDS_B > ARENA_B:
+        raise ValueError(f"accum: the C tile takes {C_LDS_B} B of LDS, more than the {ARENA_B} B arena")
+
+    @flyc.kernel(name="mega_gfx1250_grouped_variable_k", known_block_size=[block, 1, 1])
     def kernel_grouped_variable_k(
         arg_c: fx.Pointer,
         arg_a: fx.Pointer,
@@ -469,6 +496,29 @@ def _launch_grouped_bf16_variable_k(
             gB_base = fx.recast_iter(fx.Int8, arg_b)  # B [M_total, OUT_N]
             gC_base = fx.recast_iter(fx.PointerType.get(elem_cls.ir_type, arg_c.address_space), arg_c)
 
+            if const_expr(accum):
+                gC8_base = fx.recast_iter(fx.Int8, arg_c)
+                ldc_b = ldc64 * EB
+
+                def _issue_c_load(dst, row0=0, rows=tile_m):
+                    """One TDM load of rows ``row0 .. row0 + rows`` of this tile's old C into LDS at
+                    ``dst``, rows ``C_LDS_ROW`` apart.
+
+                    The entry point admits whole tiles only, so the window lies inside the
+                    allocation by construction (a dim-1 extent on a load clamps the data, not the
+                    addressing). The last wave issues it; that wave's ``tensor_wait(0)`` in the
+                    epilogue's entry fence plus the fence's barrier make it visible to every wave.
+                    """
+                    if wave == num_waves - 1:
+                        c_off_b = (
+                            fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS)
+                            + fx.Int64(blk_n + row0) * ldc64
+                            + fx.Int64(blk_k)
+                        ) * fx.Int64(EB)
+                        gt = _gv(gC8_base, c_off_b, (rows, tile_n * EB), (ldc_b, 1))
+                        atom = _tdm(gt, fx.Int32(rows), fx.Int32(tile_n * EB), ldc_b, tile_n * EB)
+                        fx.copy(atom, gt, _lv(dst, (rows, tile_n * EB), (C_LDS_ROW, 1)))
+
             if const_expr(gather):
                 ridx = _i32_table(arg_ridx)
                 has_rows = m_len > fx.Int32(0)
@@ -611,7 +661,18 @@ def _launch_grouped_bf16_variable_k(
                         # B is the instruction's A operand: the accumulator's fast dim is N.
                         fx.gemm(wmma_atom, c_frags[idx], wt[wn], act[wm], c_frags[idx])
 
-            def compute_ktile(buf, prefetch_kt, defer_last=False):
+            def _ks0_loads(prefetch_kt, c_load_dst):
+                """The TDM loads a k-tile issues at its first sub-step: the next stage, then the old C."""
+                if const_expr(prefetch_kt is not None):
+                    rocdl.sched_barrier(0)
+                    issue(_slot(prefetch_kt), prefetch_kt)
+                    rocdl.sched_barrier(0)
+                if const_expr(c_load_dst is not None):
+                    rocdl.sched_barrier(0)
+                    _issue_c_load(*c_load_dst)
+                    rocdl.sched_barrier(0)
+
+            def compute_ktile(buf, prefetch_kt, defer_last=False, c_load_dst=None):
                 # One address VGPR per operand for the whole tile; every fragment load
                 # is then that register plus a compile-time offset.
                 #
@@ -645,10 +706,8 @@ def _launch_grouped_bf16_variable_k(
                             else None
                         )
                         rocdl.s_wait_dscnt(wmma_m_rep * DS_A if const_expr(nxt_a is not None) else 0)
-                        if const_expr(ks == 0 and prefetch_kt is not None):
-                            rocdl.sched_barrier(0)
-                            issue(_slot(prefetch_kt), prefetch_kt)
-                            rocdl.sched_barrier(0)
+                        if const_expr(ks == 0):
+                            _ks0_loads(prefetch_kt, c_load_dst)
                         _mma_ks((cur_a, cur_b))
                         if const_expr(ks + 1 < K_WS):
                             cur_a = nxt_a
@@ -662,10 +721,8 @@ def _launch_grouped_bf16_variable_k(
                     for ks in range_constexpr(K_WS):
                         nxt = _load_ks(addrs, ks + 1) if const_expr(ks + 1 < K_WS) else None
                         rocdl.s_wait_dscnt(KS_DS if const_expr(nxt is not None) else 0)
-                        if const_expr(ks == 0 and prefetch_kt is not None):
-                            rocdl.sched_barrier(0)
-                            issue(_slot(prefetch_kt), prefetch_kt)
-                            rocdl.sched_barrier(0)
+                        if const_expr(ks == 0):
+                            _ks0_loads(prefetch_kt, c_load_dst)
                         if const_expr(ks < n_mma):
                             _mma_ks(cur)
                         if const_expr(nxt is not None):
@@ -674,32 +731,13 @@ def _launch_grouped_bf16_variable_k(
                     for ks in range_constexpr(K_WS):
                         cur = _load_ks(addrs, ks)
                         rocdl.s_wait_dscnt(0)
-                        if const_expr(ks == 0 and prefetch_kt is not None):
-                            rocdl.sched_barrier(0)
-                            issue(_slot(prefetch_kt), prefetch_kt)
-                            rocdl.sched_barrier(0)
+                        if const_expr(ks == 0):
+                            _ks0_loads(prefetch_kt, c_load_dst)
                         if const_expr(ks < n_mma):
                             _mma_ks(cur)
                 rocdl.sched_barrier(0)
                 # The caller runs this inside the barrier window when deferring.
                 return cur if const_expr(defer_last) else None
-
-            def _vk_split_fence(tail, outstanding):
-                """Run the deferred sub-step inside the barrier's signal-to-wait window.
-
-                Identical in shape to the NT/NN launcher's `_split_fence`: what it
-                adds is the work moved *into* the window, not the split itself. The
-                `sched_barrier(0)` fences are load-bearing -- without them the
-                compiler sinks the matrix ops back out of the window and the answer
-                stays correct, so the loss would be silent.
-                """
-                tdm_ops.tensor_wait(outstanding)
-                rocdl.sched_barrier(0)
-                rocdl.s_barrier_signal(_WG_BARRIER)
-                rocdl.sched_barrier(0)
-                _mma_ks(tail)
-                rocdl.sched_barrier(0)
-                rocdl.s_barrier_wait(_WG_BARRIER)
 
             # ---- CORRECTNESS: the TDM outstanding budget is counted PER WAVE, not
             # per workgroup.
@@ -710,9 +748,40 @@ def _launch_grouped_bf16_variable_k(
             # pipeline then reads LDS the DMA has not filled yet; the symptom is most
             # of the output NaN rather than a loss of precision.
             TDM_PW = 1
+            # A gathered operand is loaded by every wave, G_OPS gather ops per k-tile each, and the
+            # dense one by its loader wave alone: that wave has one TDM op per k-tile more in flight.
+            G_OPS = GATHER_ROWS_PER_WAVE // GATHER_ROWS_PER_OP if gather else 0
+            DENSE_LOADER = (1 if gather == 1 else 0) % num_waves
 
-            def _fence(outstanding):
-                tdm_ops.tensor_wait(outstanding)
+            def _tdm_wait(ktiles):
+                """Wait until at most ``ktiles`` k-tiles of this wave's TDM loads are still in flight."""
+                if const_expr(gather and ktiles > 0):
+                    if wave == fx.Int32(DENSE_LOADER):
+                        tdm_ops.tensor_wait((G_OPS + 1) * ktiles)
+                    else:
+                        tdm_ops.tensor_wait(G_OPS * ktiles)
+                else:
+                    tdm_ops.tensor_wait(TDM_PW * ktiles)
+
+            def _vk_split_fence(tail, ktiles):
+                """Run the deferred sub-step inside the barrier's signal-to-wait window.
+
+                Identical in shape to the NT/NN launcher's `_split_fence`: what it
+                adds is the work moved *into* the window, not the split itself. The
+                `sched_barrier(0)` fences are load-bearing -- without them the
+                compiler sinks the matrix ops back out of the window and the answer
+                stays correct, so the loss would be silent.
+                """
+                _tdm_wait(ktiles)
+                rocdl.sched_barrier(0)
+                rocdl.s_barrier_signal(_WG_BARRIER)
+                rocdl.sched_barrier(0)
+                _mma_ks(tail)
+                rocdl.sched_barrier(0)
+                rocdl.s_barrier_wait(_WG_BARRIER)
+
+            def _fence(ktiles):
+                _tdm_wait(ktiles)
                 gpu.barrier()
 
             # Reduction length is per-expert, so K_TILES is a runtime value. Clamp it up
@@ -753,7 +822,7 @@ def _launch_grouped_bf16_variable_k(
                 # and gives one back on the last k-tile, where the epilogue's entry fence
                 # is already the next rendezvous.
                 if const_expr(split_bar):
-                    _fence(outstanding=TDM_PW * (num_buffers - 2))
+                    _fence(num_buffers - 2)
 
                 def _steady_ktile(kt):
                     buf = _bidx(_buf_ptr(_slot(kt)))
@@ -761,9 +830,9 @@ def _launch_grouped_bf16_variable_k(
                         tail = compute_ktile(buf, kt + NB1, defer_last=True)
                         # Guards the next k-tile's stage, so it carries the outstanding
                         # count that k-tile's own fence used to carry.
-                        _vk_split_fence(tail, TDM_PW * (num_buffers - 2))
+                        _vk_split_fence(tail, num_buffers - 2)
                     else:
-                        _fence(outstanding=TDM_PW * (num_buffers - 2))
+                        _fence(num_buffers - 2)
                         compute_ktile(buf, kt + NB1)
 
                 # Two spellings of one loop. `range_constexpr` is reachable only on the
@@ -779,15 +848,25 @@ def _launch_grouped_bf16_variable_k(
                 for j in range_constexpr(NB1):
                     kt = n_steady + j
                     buf = _bidx(_buf_ptr(_slot(kt)))
+                    # `accum`, early load: the last k-tile's fence (or the split fence before it)
+                    # proved the other buffer consumed, exactly as for the steady prefetch. Split:
+                    # half h during k-tile K-2+h into slot kt+2, which k-tile K-3+h freed and nothing
+                    # is prefetched into past the steady loop.
+                    if const_expr(C_EARLY and j == NB1 - 1):
+                        c_dst = (_buf_ptr(_slot(kt + 1)), 0, tile_m)
+                    elif const_expr(C_SPLIT and j >= NB1 - 2):
+                        c_dst = (_buf_ptr(_slot(kt + 2)), (j - (NB1 - 2)) * C_HALF, C_HALF)
+                    else:
+                        c_dst = None
                     if const_expr(split_bar):
-                        tail = compute_ktile(buf, None, defer_last=True)
+                        tail = compute_ktile(buf, None, defer_last=True, c_load_dst=c_dst)
                         if const_expr(j < num_buffers - 2):
-                            _vk_split_fence(tail, TDM_PW * (num_buffers - 3 - j))
+                            _vk_split_fence(tail, num_buffers - 3 - j)
                         else:
                             _mma_ks(tail)  # no successor stage to guard
                     else:
-                        _fence(outstanding=TDM_PW * (num_buffers - 2 - j))
-                        compute_ktile(buf, None)
+                        _fence(num_buffers - 2 - j)
+                        compute_ktile(buf, None, c_load_dst=c_dst)
 
             # ---- epilogue: out[g] tile, both output axes clamped ------------------
             accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
@@ -795,7 +874,7 @@ def _launch_grouped_bf16_variable_k(
                 # an empty expert has no row to re-read: its gathered LDS rows can be stale
                 zero_acc = Vec.filled(8, 0.0, fx.Float32)
                 accs = [Vec((m_len > fx.Int32(0)).select(acc, zero_acc)) for acc in accs]
-            _fence(outstanding=0)
+            _fence(0)
             if PREFETCH_OK:
                 # ---- fetch the NEXT tile's first stage, here -------------------------
                 # WHERE: immediately after the entry fence, which is `tensor_wait(0) +
@@ -834,27 +913,139 @@ def _launch_grouped_bf16_variable_k(
                 bne2 = (bn2 > (i32_n - fx.Int32(tile_m))).select(i32_n - fx.Int32(tile_m), bn2)
                 bke2 = (bk2 > (i32_k - fx.Int32(tile_n))).select(i32_k - fx.Int32(tile_n), bk2)
                 issue(_slot(0), 0, dec=(ms2, ml2, bne2, bke2))
+            if const_expr(accum):
+                if const_expr(C_EARLY):
+                    # where the last k-tile put the old C; the entry fence above drained that load
+                    c_base = fx.Int32(_bidx(_buf_ptr(_slot(K_TILES))))
+                    # Stage in the other buffer -- the last k-tile's operands, consumed by the entry
+                    # fence -- so the old C can be read, added and staged in one pass, no barrier.
+                    # A runtime offset loses the pointer's alignment, so the staging goes through
+                    # explicitly aligned LDS stores and the TDM store recasts before offsetting.
+                    stage_slot = _slot(K_TILES + 1)
+                    stage_base = fx.Int32(_bidx(base_ptr)) + fx.Int32(stage_slot) * fx.Int32(PITCH)
+                elif const_expr(C_SPLIT):
+                    # the halves the last two k-tiles put into slots K_TILES and K_TILES + 1 (the entry
+                    # fence drained both); a wave's rows lie in one, and the second half's base is
+                    # backed off by its first row so the row offsets stay the tile's
+                    half0 = fx.Int32(_bidx(_buf_ptr(_slot(K_TILES))))
+                    half1 = fx.Int32(_bidx(_buf_ptr(_slot(K_TILES + 1)))) - fx.Int32(C_HALF * C_LDS_ROW)
+                    c_base = (wave_m == fx.Int32(0)).select(half0, half1)
+                else:
+                    _issue_c_load(base_ptr)
+                    _fence(0)
+                    c_base = fx.Int32(_bidx(base_ptr))
+
+                def _load_old_c(wm):
+                    """One fragment row of the old C (bf16), as this lane's accumulators hold it."""
+                    row_rel = wmb + wm * WMMA_M + lane16
+                    return [
+                        Vec(
+                            _llvm.load(
+                                vec8,
+                                _llvm.inttoptr(
+                                    _PTR3,
+                                    _raw(
+                                        c_base
+                                        + row_rel * fx.Int32(C_LDS_ROW)
+                                        + (wnb + wn * WMMA_N + kgrp * 8) * fx.Int32(EB)
+                                    ),
+                                ),
+                            )
+                        )
+                        for wn in range_constexpr(wmma_n_rep)
+                    ]
+
+                def _add_old_c(idx, old):
+                    acc = accs[idx]
+                    if const_expr(accum == 2):
+                        acc = acc.to(elem_cls).to(fx.Float32)
+                    accs[idx] = acc + old.to(fx.Float32)
+
+                if const_expr(not C_EARLY and not C_SPLIT):
+                    # The old C sits under the staging: add all of it, then let every wave finish
+                    # reading before anyone stages. Reads run one fragment row ahead of the adds,
+                    # and a fence per row bounds them -- hoisted all at once they need 256 more
+                    # VGPRs than the 1024 there are.
+                    olds = _load_old_c(0)
+                    for wm in range_constexpr(wmma_m_rep):
+                        nxt = _load_old_c(wm + 1) if const_expr(wm + 1 < wmma_m_rep) else None
+                        for wn in range_constexpr(wmma_n_rep):
+                            _add_old_c(wm * wmma_n_rep + wn, olds[wn])
+                        olds = nxt
+                        rocdl.sched_barrier(0)
+                    rocdl.s_wait_dscnt(0)
+                    gpu.barrier()
+            # read the old C, add and stage in one pass: into the other buffer (early load), or in
+            # place over the old C (split load: each lane overwrites the 16 bytes it read)
+            ONE_PASS = C_EARLY or C_SPLIT
+            if const_expr(ONE_PASS):
+                # Reads of the old C run one fragment row ahead of the add + stage that consume them,
+                # so their LDS latency overlaps the previous row's ALU work and stores.
+                olds = _load_old_c(0)
             for wm in range_constexpr(wmma_m_rep):
                 row_rel = wmb + wm * WMMA_M + lane16
+                if const_expr(ONE_PASS):
+                    nxt = _load_old_c(wm + 1) if const_expr(wm + 1 < wmma_m_rep) else None
                 for wn in range_constexpr(wmma_n_rep):
                     col_rel = wnb + wn * WMMA_N + kgrp * 8
-                    h = accs[wm * wmma_n_rep + wn].to(elem_cls)
-                    fx.ptr_store(h.bitcast(fx.Int8), base_ptr + (row_rel * tile_n + col_rel) * EB)
+                    if const_expr(ONE_PASS):
+                        _add_old_c(wm * wmma_n_rep + wn, olds[wn])
+                        h = accs[wm * wmma_n_rep + wn].to(elem_cls)
+                        if const_expr(C_SPLIT):
+                            st_addr = c_base + row_rel * fx.Int32(C_LDS_ROW) + col_rel * fx.Int32(EB)
+                        else:
+                            st_addr = stage_base + (row_rel * tile_n + col_rel) * EB
+                        st_ptr = _llvm.inttoptr(_PTR3, _raw(st_addr))
+                        _llvm.store(h.ir_value(), st_ptr, alignment=16)
+                    else:
+                        h = accs[wm * wmma_n_rep + wn].to(elem_cls)
+                        fx.ptr_store(h.bitcast(fx.Int8), base_ptr + (row_rel * tile_n + col_rel) * EB)
+                if const_expr(ONE_PASS):
+                    olds = nxt
+                    rocdl.sched_barrier(0)  # two fragment rows of old-C reads live at most
             gpu.barrier()
-            c_off = fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS) + fx.Int64(blk_n) * ldc64 + fx.Int64(blk_k)
-            gtC = _gv(gC_base, c_off, (tile_m, tile_n), (tile_n, 1))
-            # Store side: dim-0 bounds addressing and dim-1 bounds a store's addressing
-            # too (sentinel-verified), so the backed-off rows written above are dropped
-            # here rather than reaching memory.
-            atomC = fx.rocdl.make_tdm_atom(
-                gtC,
-                [n_valid, k_valid],
-                strides=[ldc64, None],
-                num_warps=num_waves,
-                cache_modifier=tdm_store_cache,
-                early_timeout=False,
-            )
-            fx.copy(atomC, _lv(fx.recast_iter(elem_cls, base_ptr), (tile_m, tile_n), (tile_n, 1)), gtC)
+            if const_expr(C_SPLIT):
+                # Each half from where it was staged. A TDM store does not apply the LDS row padding
+                # (a cooperative store's slices come out right on their first row only), so the
+                # padded rows are stored as global rows of C_LDS_ROW bytes whose dim-1 extent stops at
+                # the tile's tile_n * EB: the pad bytes fall outside it and are dropped, as the
+                # store side bounds addressing on dim 1 too (see below).
+                for hh in range_constexpr(2):
+                    c_off_b = (
+                        fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS)
+                        + fx.Int64(blk_n + hh * C_HALF) * ldc64
+                        + fx.Int64(blk_k)
+                    ) * fx.Int64(EB)
+                    gt_h = _gv(gC8_base, c_off_b, (C_HALF, C_LDS_ROW), (ldc_b, 1))
+                    atom_h = fx.rocdl.make_tdm_atom(
+                        gt_h,
+                        [n_valid - fx.Int32(hh * C_HALF), fx.Int32(tile_n * EB)],
+                        strides=[ldc_b, None],
+                        num_warps=num_waves,
+                        cache_modifier=tdm_store_cache,
+                        early_timeout=False,
+                    )
+                    src = fx.add_offset(base_ptr, _slot(K_TILES + hh) * PITCH)
+                    fx.copy(atom_h, _lv(src, (C_HALF, C_LDS_ROW), (C_LDS_ROW, 1)), gt_h)
+            else:
+                c_off = fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS) + fx.Int64(blk_n) * ldc64 + fx.Int64(blk_k)
+                gtC = _gv(gC_base, c_off, (tile_m, tile_n), (tile_n, 1))
+                # Store side: dim-0 bounds addressing and dim-1 bounds a store's addressing
+                # too (sentinel-verified), so the backed-off rows written above are dropped
+                # here rather than reaching memory.
+                atomC = fx.rocdl.make_tdm_atom(
+                    gtC,
+                    [n_valid, k_valid],
+                    strides=[ldc64, None],
+                    num_warps=num_waves,
+                    cache_modifier=tdm_store_cache,
+                    early_timeout=False,
+                )
+                if const_expr(C_EARLY):
+                    c_stage = fx.add_offset(fx.recast_iter(elem_cls, base_ptr), stage_slot * (PITCH // EB))
+                else:
+                    c_stage = fx.recast_iter(elem_cls, base_ptr)
+                fx.copy(atomC, _lv(c_stage, (tile_m, tile_n), (tile_n, 1)), gtC)
             tdm_ops.tensor_wait(0)
             # ⛔⛔ THE SEAM BARRIER. Without it the persistent path is NOT REENTRANT,
             # and the cost of that is a device reset:
@@ -914,11 +1105,20 @@ def _vk_launch(args: tuple):
     key = args[_VK_CONSTEXPR0:]
     fn = _VK_COMPILED.get(key)
     if fn is None:
+        # flyc.compile traces through a real call of the launcher, so that call already did this
+        # launch's work. Calling `fn` as well would run the kernel twice: harmless while it
+        # overwrites `out`, a double count once it accumulates into it (`accumulate`).
         fn = flyc.compile(_launch_grouped_bf16_variable_k, *args)
-        if fn is None:  # COMPILE_ONLY: nothing was executed, nothing to cache
-            return None
-        _VK_COMPILED[key] = fn
+        if fn is not None:  # None under COMPILE_ONLY: nothing was executed, nothing to cache
+            _VK_COMPILED[key] = fn
+        return None
     return fn(*args)
+
+
+# The three-buffer ring: a 64-deep tile on three buffers keeps two k-tiles in flight. Picked for
+# DeepSeek-V3's dW1 and dW2, the (OUT_M, OUT_N) below, at a thousand rows per expert and more.
+_VK_RING_CFG = (256, 256, 64, 2, 2, 3)
+_VK_DEEP_RING_SHAPES = {(4096, 7168), (7168, 2048)}
 
 
 @functools.lru_cache(maxsize=64)
@@ -964,7 +1164,20 @@ def _pick_variable_k_config(OUT_M: int, OUT_N: int, avg_m: int):
     # down for the NN path (see `_nn_native_launch`): `issue()` assigns the
     # global->LDS copies by RAW WAVE ID, so the relabelling re-pairs which loader
     # wave feeds which output sub-tile. That is a hypothesis, recorded as one.
+    #
+    # DeepSeek-V3's dW1 / dW2 at a thousand rows per expert and more: the ring, which measured
+    # faster there than the two-buffer tile, gathered and accumulating into a bf16 main_grad as Mega
+    # runs them.
+    if (OUT_M, OUT_N) in _VK_DEEP_RING_SHAPES and avg_m >= 1024:
+        return _VK_RING_CFG
     return (256, 256, 128, 2, 2, 2)
+
+
+def _vk_group_m(OUT_M: int, OUT_N: int, cfg) -> int:
+    """``group_m=-1``: 16, except on the ring for DeepSeek-V3's dW2, whose 28 tile rows take 14: 16
+    leaves a ragged last super-tile, which measured slower. The tile order changes no output's k-step
+    sequence, so every value gives the same result."""
+    return 14 if (OUT_M, OUT_N) == (7168, 2048) and tuple(cfg) == _VK_RING_CFG else 16
 
 
 def grouped_gemm_bf16_variable_k_supported(OUT_M: int, OUT_N: int, avg_m: int = 0) -> bool:
@@ -977,6 +1190,14 @@ def grouped_gemm_bf16_variable_k_supported(OUT_M: int, OUT_N: int, avg_m: int = 
     """
     tile_m, tile_n = _pick_variable_k_config(OUT_M, OUT_N, avg_m)[:2]
     return OUT_M >= tile_m and OUT_N >= tile_n
+
+
+def grouped_gemm_bf16_variable_k_accum_supported(OUT_M: int, OUT_N: int) -> bool:
+    """Whether ``accumulate=1`` can serve this shape: whole output tiles of the picked config, at any
+    token count (the picked tile shrinks to 64 x 64 for narrow outputs; only its k-depth depends on
+    the token count)."""
+    tile_m, tile_n = _pick_variable_k_config(OUT_M, OUT_N, 0)[:2]
+    return OUT_M >= tile_m and OUT_N >= tile_n and OUT_M % tile_m == 0 and OUT_N % tile_n == 0
 
 
 # Back-compat alias for the bring-up scripts, which know this kernel as "wgrad_tn".
@@ -1003,13 +1224,16 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     num_buffers: int = 0,
     # Super-tile width in output blocks: co-resident workgroups share a column
     # slice. 16, not the gfx950 default of 4; re-measured after `split_bar` was
-    # wired onto the same resource and it still holds.
-    group_m: int = 16,
+    # wired onto the same resource and it still holds. -1 = `_vk_group_m`: 16,
+    # except DeepSeek-V3's dW2 ring, whose 28 tile rows take 14.
+    group_m: int = -1,
     # XCD band-cyclic remap. Off by default -- the MI455X XCD count is unconfirmed,
     # unlike MI355X's 8. Correctness does not depend on the value.
     num_xcd: int = 1,
     xcd_band: int = 32,
-    wmma_b2b: int = 0,
+    # 1 = `disable_xdl_arb_stall` at kernel entry. -1 = auto: on for the three-buffer ring
+    # (`_pick_variable_k_config`), where it measured faster on DeepSeek-V3's dW1 / dW2.
+    wmma_b2b: int = -1,
     frag_pipeline: int = 1,
     # 1 = run the k-tile's last sub-step of WMMA inside the workgroup barrier's
     # signal-to-wait window. Same knob as on the NT/NN entry.
@@ -1062,8 +1286,16 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     # passed, which may then hold any number of rows. At most one of the two.
     a_index: torch.Tensor | None = None,
     b_index: torch.Tensor | None = None,
+    # 1 = accumulate: ``out[g] += a[rows_g].T @ b[rows_g]``, the old ``out`` added to the fp32
+    # accumulators and rounded once (e.g. straight into a weight's ``main_grad``). Needs ``out``
+    # of the operand dtype, contiguous [G, OUT_M, OUT_N], and whole output tiles (see
+    # ``grouped_gemm_bf16_variable_k_accum_supported``).
+    accumulate: int = 0,
+    # Test hook for ``accumulate``: round the accumulators to the operand dtype before adding the old
+    # ``out``, which matches a separate ``out.add_(dW)`` bit for bit.
+    _round_first: bool = False,
 ) -> torch.Tensor:
-    """Variable-K grouped wgrad: ``out[g] = a[rows_g].T @ b[rows_g]``.
+    """Variable-K grouped wgrad: ``out[g] = a[rows_g].T @ b[rows_g]`` (``+=`` with ``accumulate``).
 
     Drop-in for the gfx950 entry point of the same name. ``a`` is
     ``[M_total, OUT_M]`` and ``b`` is ``[M_total, OUT_N]`` with the groups
@@ -1157,12 +1389,17 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
         wave_grid = _vk_wave_grid(m_warp, n_warp)
     if wave_grid not in (0, 1):
         raise ValueError(f"wave_grid must be 0 or 1 (or -1 for auto), got {wave_grid}")
+    if wmma_b2b == -1:
+        wmma_b2b = int((tile_k, num_buffers) == (64, 3))
     if split_bar == -1:
         # Resolved against the effective tile, so an explicit BLOCK_*/num_buffers
         # override is judged on what it actually produces rather than on the pick.
         split_bar = _vk_auto_split_bar(
             (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers), OUT_M, OUT_N, _avg_m
         )
+
+    if group_m == -1:
+        group_m = _vk_group_m(OUT_M, OUT_N, (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers))
 
     # The store walks `g*OUT_M*ldc + blk_n*ldc + blk_k`, so the allocation has to be
     # OUT_M*ldc per expert, not OUT_M*OUT_N. Checked rather than assumed: this is the
@@ -1182,7 +1419,28 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
             )
         assert out.numel() >= G * OUT_M * out_ldc, "out too small for the padded stride"
     elif out is None:
+        if accumulate:
+            raise ValueError("accumulate needs out=, the tensor to add into")
         out = torch.empty(G, OUT_M, OUT_N, device=a.device, dtype=out_dtype)
+    elif out.dtype != a.dtype or tuple(out.shape) != (G, OUT_M, OUT_N) or not out.is_contiguous():
+        # the kernel writes rows of OUT_N elements of the operand dtype, whatever `out` is
+        raise ValueError(
+            f"out must be a contiguous {a.dtype} tensor of shape {(G, OUT_M, OUT_N)}, got "
+            f"{out.dtype} {tuple(out.shape)} contiguous={out.is_contiguous()}"
+        )
+    if accumulate:
+        # the old C is read through a whole-tile TDM window: a partial tile could read past the allocation
+        if accumulate != 1:
+            raise ValueError(f"accumulate must be 0 or 1, got {accumulate}")
+        if out_ldc or persist or wpath_only:
+            raise ValueError("accumulate needs out_ldc == 0, persist == 0 and wpath_only == 0")
+        if OUT_M % tile_m or OUT_N % tile_n:
+            raise ValueError(
+                f"accumulate needs whole output tiles: [{OUT_M}, {OUT_N}] is not a multiple of "
+                f"({tile_m}, {tile_n}); see grouped_gemm_bf16_variable_k_accum_supported()"
+            )
+    elif _round_first:
+        raise ValueError("_round_first needs accumulate=1")
     if expert_table is not None:
         check_prebuilt(expert_table, group_k_offsets, 0, G, 2 * G, "expert_table", masked_k=masked_k)
         etab = expert_table.reshape(-1)
@@ -1226,6 +1484,7 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
             wpath_only,
             gather,
             gather_rows,
+            2 if _round_first else accumulate,
         )
     )
     # The caller asked for [G, OUT_M, OUT_N]; the padding is this function's business.

@@ -6,9 +6,8 @@
 
 """Shared plumbing for the grouped-GEMM Triton persistent kernels.
 
-The persistent grouped-GEMM kernels (plain BF16/FP16, the fused GLU-activation
-epilogue variant, FP8, FP4) all wrap the same scaffolding around their
-per-tile compute body:
+The persistent grouped-GEMM kernels (plain BF16/FP16, FP8, FP4) all wrap the
+same scaffolding around their per-tile compute body:
 
   - map the AMD round-robin ``program_id`` onto XCD-contiguous chunks,
   - count how many output tiles the whole batch of groups needs,
@@ -19,9 +18,7 @@ scaffolding lives here and every kernel module imports it. The same goes for
 the post-pass that zeroes an over-allocated output's padding tail, which every
 dtype's dispatcher runs and none of them implement differently.
 
-Anything specific to one kernel stays in that kernel's module -- the fused GLU
-epilogue's pair-tile addressing, register-tile surgery and activation math all
-live in ``grouped_gemm_fp8_glu_kernel``, since it is their only consumer.
+Anything specific to one kernel stays in that kernel's module.
 
 Contains:
   - NUM_XCDS                        -- MI300/MI350 chiplet count

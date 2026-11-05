@@ -20,6 +20,8 @@ import os
 
 import pytest
 
+import primus_turbo.common.envs as envs
+
 # Assign each xdist worker to a separate GPU
 _worker_id = os.environ.get("PYTEST_XDIST_WORKER")
 if _worker_id is not None:
@@ -32,6 +34,10 @@ if _worker_id is not None:
 # pytest_collection_modifyitems. Paths are matched as suffixes of the test file path; an
 # optional "::<prefix>" narrows an entry to the test ids starting with that prefix.
 _GFX1250_ENABLED_TESTS = (
+    # FlyDSL intranode DeepEP (primus_turbo/flydsl/deep_ep); the C++ DeepEP is not loaded here.
+    "tests/pytorch/deep_ep/test_intranode.py",
+    # Source-only: the imports between the FlyDSL DeepEP modules, the same on every GPU.
+    "tests/pytorch/deep_ep/test_module_layering.py",
     # bf16 grouped GEMM through the backend registry: Triton, plus the FlyDSL
     # WMMA/TDM kernels in grouped_gemm_bf16_kernel_gfx1250.py.
     "tests/pytorch/ops/test_grouped_gemm.py",
@@ -39,6 +45,11 @@ _GFX1250_ENABLED_TESTS = (
     # from the suite above because most of it is host-only: it checks that the published
     # shape gates and the entry points cannot disagree, which needs no GPU.
     "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_shapes.py",
+    # The shape key table of the same kernel: which shapes get the tuned persistent-cluster
+    # stack, what the cluster and head_pipe gates refuse, and what a caller who switches the
+    # stack off is left with. Mostly host-only as well; its numeric cases are the DeepSeek-V3
+    # delivery shapes, which are the only shapes in this suite that take the keyed path.
+    "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_keys.py",
     # FlyDSL attention at the DeepSeek-V3 MLA head dims (primus_turbo/flydsl/attention/gfx1250_mla).
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla.py",
     # HIP kernels of the same attention (primus_turbo/hipkittens/gfx1250_mla).
@@ -53,6 +64,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_bf16_gfx1250_prims.py",
     # The BF16 Mega NT GEMM tile (gathered A, LDS-staged buffer-store epilogue).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_gemm.py",
+    # beta = 1 on the BF16 Mega variable-K wgrad (dW1 / dW2 straight into main_grad).
+    "tests/pytorch/ops/test_mega_bf16_gfx1250_variable_k_accum.py",
     # The fused Mega dispatch + L1 GEMM, single GPU (EP1).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_dispatch_gemm.py",
     # The fused Mega L2 GEMM + combine, single GPU (EP1).
@@ -72,6 +85,15 @@ def _gfx1250_enabled(item) -> bool:
         if path.endswith(suffix) and test_id.startswith(prefix):
             return True
     return False
+
+
+@pytest.fixture(autouse=True)
+def _fresh_envs_cache():
+    """``primus_turbo.common.envs`` caches each variable at its first read, so a test that sets one
+    would otherwise see the value an earlier test left in the cache."""
+    envs.reset_cache()
+    yield
+    envs.reset_cache()
 
 
 def pytest_addoption(parser):

@@ -369,7 +369,7 @@ def compile_qdual(
     SP_A_BYTES = PB_A_BYTES * B
     SP_AT_BYTES = PB_AT_BYTES * B
 
-    @flyc.kernel(known_block_size=[NTHv, 1, 1])
+    @flyc.kernel(name="mxfp8_quant_dual", known_block_size=[NTHv, 1, 1])
     def kern(X: fx.Tensor, Qr: fx.Tensor, ASp: fx.Tensor, AtQd: fx.Tensor, AtSp: fx.Tensor):
         I32 = fx.Int32
         BF = elt.ir_type
@@ -907,7 +907,7 @@ def compile_grouped_qdual(
     COL_DATA_BAND = col_data_band
     COL_SCALE_BAND = col_scale_band
 
-    @flyc.kernel(known_block_size=[NTHv, 1, 1])
+    @flyc.kernel(name="mxfp8_grouped_quant_dual", known_block_size=[NTHv, 1, 1])
     def kern(
         X: fx.Tensor,
         Qr: fx.Tensor,

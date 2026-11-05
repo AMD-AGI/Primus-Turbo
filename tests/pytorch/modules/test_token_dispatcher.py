@@ -5,6 +5,7 @@
 ###############################################################################
 
 import os
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import torch
@@ -16,11 +17,28 @@ from torch.testing._internal.common_utils import (
     run_tests,
 )
 
+import primus_turbo.common.envs as envs
 import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
     set_buffer_global_config,
 )
+
+
+@contextmanager
+def _patch_env(values):
+    """``patch.dict(os.environ, values)`` that also drops the cached ``envs`` reads of ``values``.
+
+    The test bodies run in the persistent worker processes of ``MultiProcContinuousTest``, outside
+    the pytest fixture that resets the ``envs`` cache around each test.
+    """
+    with patch.dict(os.environ, values):
+        envs.reset_cache(*values)
+        try:
+            yield
+        finally:
+            envs.reset_cache(*values)
+
 
 NUM_TOKENS = 4096
 HIDDEN_SIZE = 4096
@@ -293,7 +311,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
         self, backend, deepep_use_cuda_num_tokens_per_expert, expert_capacity_factor, permute_backend
     ):
         self._bind_device()
-        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+        with _patch_env({"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
                 dist.group.WORLD,
@@ -311,7 +329,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     @parametrize("permute_backend", ["TURBO", "TRITON"])
     def test_worst_tokens(self, backend, permute_max_token_num, permute_backend):
         self._bind_device()
-        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+        with _patch_env({"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
                 dist.group.WORLD,
@@ -330,7 +348,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     @parametrize("deepep_num_worst_tokens", [0, NUM_TOKENS * 8])
     def test_fp8_permute(self, backend, pad_multiple, deepep_num_worst_tokens):
         self._bind_device()
-        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+        with _patch_env({"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_fp8_permute(self.rank, dist.group.WORLD, pad_multiple, deepep_num_worst_tokens)
 
     # ------------------------------------------------------------------
@@ -342,7 +360,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     @parametrize("deepep_use_cuda_num_tokens_per_expert", [False, True])
     def test_pad_multiple(self, backend, pad_multiple, deepep_use_cuda_num_tokens_per_expert):
         self._bind_device()
-        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+        with _patch_env({"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
                 dist.group.WORLD,
@@ -357,8 +375,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     @parametrize("backend", _get_backends())
     def test_autotune(self, backend):
         self._bind_device()
-        with patch.dict(
-            os.environ,
+        with _patch_env(
             {
                 "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend,
                 "PRIMUS_TURBO_AUTO_TUNE": "1",
@@ -378,7 +395,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
         if dist.get_world_size() < 2:
             self.skipTest("requires world_size >= 2")
         self._bind_device()
-        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+        with _patch_env({"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
                 None,
@@ -401,7 +418,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
         # for every token (pre-TP-expansion expert id space).
         routing_map = torch.zeros((num_tokens, num_experts), dtype=torch.bool, device="cuda")
         routing_map[:, :router_topk] = True
-        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+        with _patch_env({"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
                 None,
@@ -425,7 +442,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
         # is expected to TP-expand them internally.
         probs = torch.ones((num_tokens, num_experts), dtype=torch.float32, device="cuda") / router_topk
         _, token_indices = torch.topk(probs, router_topk, dim=-1)
-        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+        with _patch_env({"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
                 None,
@@ -481,8 +498,7 @@ class TestTokenDispatcherCudaGraph(MultiProcContinuousTest):
         from primus_turbo.pytorch.kernels.moe import moe_dispatch_combine_impl
 
         self._bind_device()
-        with patch.dict(
-            os.environ,
+        with _patch_env(
             {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend},
         ):
             num_worst_tokens = NUM_TOKENS * 8

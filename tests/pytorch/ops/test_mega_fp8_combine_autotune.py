@@ -29,6 +29,7 @@ from primus_turbo.pytorch.core.utils import is_gfx1250
 if is_gfx1250():
     pytest.skip("mega_moe_fused is not supported on gfx1250", allow_module_level=True)
 
+import primus_turbo.common.envs as envs  # noqa: E402
 import primus_turbo.flydsl.mega.fp8.combine_autotune as combine_autotune  # noqa: E402
 from primus_turbo.flydsl.mega.fp8.grouped_gemm_combine_fp8_kernel import (  # noqa: E402
     _compile,
@@ -185,6 +186,7 @@ def test_env_pin_parses_or_stays_unset(monkeypatch):
     monkeypatch.setenv("PT_MEGA_FP8_L2_COMBINE_CU", "64")
     assert combine_autotune.env_combine_cu("PT_MEGA_FP8_L2_COMBINE_CU") == 64
     monkeypatch.delenv("PT_MEGA_FP8_L2_COMBINE_CU")
+    envs.reset_cache("PT_MEGA_FP8_L2_COMBINE_CU")
     assert combine_autotune.env_combine_cu("PT_MEGA_FP8_L2_COMBINE_CU") is None
 
 
@@ -194,7 +196,7 @@ def test_candidate_list_must_be_positive_and_non_empty(monkeypatch, raw):
     # and an empty list leaves nothing to choose from.
     monkeypatch.setenv("PT_MEGA_FP8_COMBINE_CU_CANDIDATES", raw)
     with pytest.raises(ValueError, match="PT_MEGA_FP8_COMBINE_CU_CANDIDATES"):
-        combine_autotune._env_int_list("PT_MEGA_FP8_COMBINE_CU_CANDIDATES", (16,))
+        _ = envs.PT_MEGA_FP8_COMBINE_CU_CANDIDATES
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "x"])
@@ -202,14 +204,15 @@ def test_tune_reps_must_be_positive(monkeypatch, raw):
     # 0 reps is an empty schedule, which would lock in an unmeasured candidate on the first call.
     monkeypatch.setenv("PT_MEGA_FP8_COMBINE_TUNE_REPS", raw)
     with pytest.raises(ValueError, match="PT_MEGA_FP8_COMBINE_TUNE_REPS"):
-        combine_autotune._env_positive_int("PT_MEGA_FP8_COMBINE_TUNE_REPS", 3)
+        _ = envs.PT_MEGA_FP8_COMBINE_TUNE_REPS
 
 
 def test_tune_reps_parses_or_defaults(monkeypatch):
     monkeypatch.setenv("PT_MEGA_FP8_COMBINE_TUNE_REPS", "5")
-    assert combine_autotune._env_positive_int("PT_MEGA_FP8_COMBINE_TUNE_REPS", 3) == 5
+    assert envs.PT_MEGA_FP8_COMBINE_TUNE_REPS == 5
     monkeypatch.delenv("PT_MEGA_FP8_COMBINE_TUNE_REPS")
-    assert combine_autotune._env_positive_int("PT_MEGA_FP8_COMBINE_TUNE_REPS", 3) == 3
+    envs.reset_cache("PT_MEGA_FP8_COMBINE_TUNE_REPS")
+    assert envs.PT_MEGA_FP8_COMBINE_TUNE_REPS == 3
 
 
 _COMPILE_SHAPE = dict(

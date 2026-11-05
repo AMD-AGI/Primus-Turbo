@@ -360,7 +360,7 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, D: int, eps: float, cycl
     k_slots = (B * NG) // _ROWS_PER_WAVE  # 2
     slots = q_slots + k_slots  # 18
 
-    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    @flyc.kernel(name="qk_rmsnorm_rope_fwd_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
     def kernel(
         PACKED: fx.Tensor,
         QG: fx.Tensor,
@@ -573,7 +573,7 @@ def _make_fold_kernel(fold_waves_q: int, fold_waves_k: int, rows_per_wave: int, 
     assert total_waves % _WAVES == 0
     assert _D % _WARP == 0
 
-    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    @flyc.kernel(name="qk_rmsnorm_rope_fold_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
     def kernel(DQG_PART: fx.Tensor, DKG_PART: fx.Tensor, DQG_SMALL: fx.Tensor, DKG_SMALL: fx.Tensor):
         tid = fx.thread_idx.x
         block_x, _, _ = fx.block_idx
@@ -621,7 +621,7 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int, D: int, cycles: int):
     nwg = cycles * slots // _WAVES
     xcd_chunk = slots // _WAVES  # one cycle = 5 workgroups
 
-    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    @flyc.kernel(name="qk_rmsnorm_rope_bwd_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
     def kernel(
         DQ: fx.Tensor,
         DK: fx.Tensor,
