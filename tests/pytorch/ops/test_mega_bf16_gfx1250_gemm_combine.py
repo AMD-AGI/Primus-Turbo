@@ -84,3 +84,44 @@ def test_gemm_combine_nt_ep1(ep1_group, num_tokens, hidden, inter, num_experts, 
                 l2 = (act[rows].float() @ w2[e].float().T).to(torch.bfloat16).float()
                 ref.index_add_(0, token[rows], l2)
         torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=3e-2)
+
+
+# the plain schedule first, then issue_first alone, then every option on (lds_cosched needs issue_first)
+_SCHEDULES = [
+    dict(issue_first=0, lds_cosched=0, wmma_b2b=0),
+    dict(issue_first=1, lds_cosched=0, wmma_b2b=0),
+    dict(issue_first=1, lds_cosched=1, wmma_b2b=1),
+]
+
+
+@pytest.mark.parametrize("b_nn", [False, True], ids=["nt", "nn"])
+def test_gemm_combine_scheduling_is_bit_identical(ep1_group, b_nn):
+    """``issue_first``, ``lds_cosched`` and ``wmma_b2b`` reorder each k-tile's loads and matrix ops, not any
+    output's k-step sequence: every schedule gives the bits of the plain one, for the forward L2 (NT) and
+    the backward's L1 dgrad against w1 (``b_nn``)."""
+    from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_combine_kernel import (
+        gemm_combine_nt_gfx1250,
+    )
+    from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
+        run_dispatch_prologue,
+    )
+
+    num_tokens, hidden, inter, num_experts, num_topk = 1024, 7168, 2048, 32, 8
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    topk_w, topk_idx = torch.randn(num_tokens, num_experts, device="cuda").softmax(-1).topk(num_topk, dim=-1)
+    w1 = (torch.randn(num_experts, 2 * inter, hidden, device="cuda") / hidden**0.5).to(torch.bfloat16)
+    handle, _ = run_dispatch_prologue(x, w1, ep1_group, topk_idx, topk_w)
+    # NT: act [pool rows, inter] against w2 [experts, hidden, inter]; NN: grad_l1 [pool rows, 2 * inter]
+    # against w1 [experts, 2 * inter, hidden]
+    k, w = 2 * inter, w1
+    if not b_nn:
+        k = inter
+        w = (torch.randn(num_experts, hidden, inter, device="cuda") / inter**0.5).to(torch.bfloat16)
+    act = torch.randn(handle.pool_row_to_route.numel(), k, device="cuda", dtype=torch.bfloat16)
+    # the output may live in a buffer the next call reuses
+    outs = [
+        gemm_combine_nt_gfx1250(act, w, handle, topk_idx, b_nn=b_nn, **opts).clone() for opts in _SCHEDULES
+    ]
+    for opts, out in zip(_SCHEDULES[1:], outs[1:]):
+        assert torch.equal(out, outs[0]), f"{opts} changed the result"

@@ -697,7 +697,18 @@ class GroupedGEMMVariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatc
 
     @classmethod
     def make_key(
-        cls, a, b, group_lens, group_offs, trans_a, trans_b, trans_c, num_cu, maybe_pre_sync, **kwargs
+        cls,
+        a,
+        b,
+        group_lens,
+        group_offs,
+        trans_a,
+        trans_b,
+        trans_c,
+        num_cu,
+        maybe_pre_sync,
+        inplace_add_to_out=False,
+        **kwargs,
     ):
         bs = group_lens.shape[0]
         m = a.shape[1] if trans_a else a.shape[0]
@@ -705,7 +716,22 @@ class GroupedGEMMVariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatc
         k = a.shape[0] if trans_a else a.shape[1]
         if trans_c:
             m, n = n, m
-        return (bs, m, n, k, a.dtype, b.dtype, a.dtype, trans_a, trans_b, trans_c, maybe_pre_sync)
+        # CK and FlyDSL cannot accumulate while Triton and hipBLASLt can. A cache hit skips
+        # can_handle, so overwrite and beta=1 calls must never share a backend choice.
+        return (
+            bs,
+            m,
+            n,
+            k,
+            a.dtype,
+            b.dtype,
+            a.dtype,
+            trans_a,
+            trans_b,
+            trans_c,
+            maybe_pre_sync,
+            inplace_add_to_out,
+        )
 
 
 _torch_custom_op_wrapper = torch.library.custom_op
@@ -840,16 +866,27 @@ def grouped_gemm_variable_k_accum_impl(
         out=out,
     )
 
-    # The tuner benchmarks a backend by launching it repeatedly, so letting it tune on
-    # the caller's buffer would accumulate the wgrad once per warmup and timing
-    # iteration.
-    if (
-        GlobalBackendManager.auto_tune_enabled()
-        and not GroupedGEMMVariableKKernelDispatcher._is_graph_capturing()
-    ):
-        GroupedGEMMVariableKKernelDispatcher.tune(**{**kwargs, "out": torch.zeros_like(out)})
+    # The tuner launches each candidate repeatedly, so tuning on the caller's buffer would add
+    # the wgrad once per warmup and timing launch. Whichever switch asks for auto-tune (per op
+    # or global), the first lookup of an accumulation key tunes against scratch instead.
+    user_selected_backend = user_backend_choice is not None and user_backend_choice.backend is not None
+    should_autotune = not user_selected_backend and (
+        (user_backend_choice is not None and user_backend_choice.auto_tune)
+        or default_backend_choice.auto_tune
+        or GlobalBackendManager.auto_tune_enabled()
+    )
+    tuning_kwargs = None
+    if should_autotune and not GroupedGEMMVariableKKernelDispatcher._is_graph_capturing():
+        key = GroupedGEMMVariableKKernelDispatcher.make_key(**kwargs)
+        if key not in GroupedGEMMVariableKKernelDispatcher._cache:
+            tuning_kwargs = {**kwargs, "out": torch.zeros_like(out)}
 
-    GroupedGEMMVariableKKernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
+    GroupedGEMMVariableKKernelDispatcher.dispatch(
+        default_backend_choice,
+        user_backend_choice,
+        tuning_kwargs=tuning_kwargs,
+        **kwargs,
+    )
 
 
 @grouped_gemm_variable_k_accum_impl.register_fake
