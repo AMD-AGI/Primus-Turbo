@@ -49,8 +49,13 @@ not even one head group fits, or the scratch cannot be allocated, the call runs 
 objects go to `primus_turbo/lib/hk_gfx1250_mla` and ship in the wheel. By hand:
 
 ```
-python csrc/kernels/attention/hipkittens/gfx1250_mla/hsaco.py [--check] [--force] [--strict] [--cxx PATH]
+python csrc/kernels/attention/hipkittens/gfx1250_mla/hsaco.py [--check] [--force] [--strict] [--cxx PATH] [--bin-dir DIR]
 ```
+
+It builds into this checkout's `primus_turbo/lib/hk_gfx1250_mla`, which an in-place or editable build uses; for an
+installed package, pass that package's `primus_turbo/lib/hk_gfx1250_mla` as `--bin-dir`. The runtime loads a code
+object only when its sha256 is the pin `_MLA_KERNELS` in `attention_hipkittens_impl.py` holds (the manifest's, kept equal
+by a test), so a stale one left by an older build runs nothing: that pass runs on FlyDSL.
 
 The compiler is `--cxx`, `$PRIMUS_TURBO_HK_CXX`, `amdclang++` on `PATH`, or `$ROCM_PATH` / `$ROCM_HOME` / `/opt/rocm`
 `llvm/bin/amdclang++`. Each kernel is one device-only code object built with exactly the manifest's flags from this
@@ -86,9 +91,9 @@ compiles the per-tile work in HIP.
 
 3. For the other kernels, `hsaco.py --force` prints the sha256 of a code object that does not match (with a new
    compiler, set `toolchain` to its `--version` line first); update `hsaco_sha256` (and `args` / `kernarg_size` /
-   `block`, with `_MLA_KERNELS` in `attention_hipkittens_impl.py`, if an interface changed), then
-   `hsaco.py --force --strict` must pass.
-4. On an MI455X, `hsaco.py --check` must print `ok` for both passes, then run
+   `block` if an interface changed), then `hsaco.py --force --strict` must pass.
+4. Copy every changed `hsaco_sha256` (and interface) into `_MLA_KERNELS` in `attention_hipkittens_impl.py`.
+5. On an MI455X, `hsaco.py --check` must print `ok` for both passes, then run
 
    ```
    pytest tests/pytorch/ops/test_attention_hipkittens_gfx1250_mla.py tests/pytorch/ops/test_attention_flydsl_gfx1250_mla.py

@@ -114,10 +114,11 @@ HK_MLA_HSACO = PROJECT_ROOT / "csrc" / "kernels" / "attention" / "hipkittens" / 
 
 
 def build_hk_mla_hsaco(offload_arch_list):
+    """Build the code objects for a gfx1250 build; the package_data patterns of what it built."""
     if "--offload-arch=gfx1250" not in offload_arch_list:
-        return
+        return []
     if os.environ.get("PRIMUS_TURBO_BUILD_HK_MLA", "1") == "0":
-        return
+        return []
     try:
         spec = importlib.util.spec_from_file_location("_hk_mla_hsaco", HK_MLA_HSACO)
         mod = importlib.util.module_from_spec(spec)
@@ -125,6 +126,8 @@ def build_hk_mla_hsaco(offload_arch_list):
         mod.build(log=lambda msg: print(f"[Primus-Turbo Setup] {msg}"))
     except Exception as e:  # noqa: BLE001 -- optional kernels: never fail the install
         print(f"[Primus-Turbo Setup] WARNING: gfx1250 MLA HIP kernels not built: {type(e).__name__}: {e}")
+        return []
+    return ["lib/hk_gfx1250_mla/*.hsaco"]
 
 
 def get_extras_require():
@@ -549,7 +552,7 @@ if __name__ == "__main__":
     ]
 
     offload_arch_list, _ = get_offload_archs()
-    build_hk_mla_hsaco(offload_arch_list)
+    hk_mla_package_data = build_hk_mla_hsaco(offload_arch_list)
 
     # flydsl 0.3.4.1 does support gfx1250: the four symbols the gfx1250 kernels need
     # (rocdl.WMMA, rocdl.make_tdm_atom, rocdl.tdm_ops, rocdl.ds_load_tr16_b128) are all
@@ -580,7 +583,7 @@ if __name__ == "__main__":
         long_description=(PROJECT_ROOT / "README.md").read_text(encoding="utf-8"),
         long_description_content_type="text/markdown",
         packages=find_packages(exclude=["tests", "tests.*"]),
-        package_data={"primus_turbo": ["lib/*.so", "lib/hk_gfx1250_mla/*.hsaco"]},
+        package_data={"primus_turbo": ["lib/*.so", *hk_mla_package_data]},
         ext_modules=ext_modules,
         cmdclass={"build_ext": TurboBuildExt.with_options(use_ninja=True)},
         entry_points=entry_points,

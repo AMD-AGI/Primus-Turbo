@@ -8,7 +8,7 @@
 //   DEL = delta = rowsum(dO * O)
 //   ND  = -delta                     (k_dkdv96ds starts its dP chains from it)
 //   NL  = lse * -log2(e) + l2s       (its softmax exp2(scale * log2(e) * S + NL) then yields scale * P)
-// l2s = log2(softmax scale) rounded to fp32 on the host (bwd.log2_scale_fp32) comes in as the `scale` argument.
+// l2s = log2(softmax scale) rounded to fp32 on the host (hk_mla_bwd packs it) comes in as the `scale` argument.
 // DEL is bitwise FlyDSL's k_delta_bshd delta (same per-row arithmetic); NL / ND are FlyDSL's NL (lse * -log2(e)) /
 // delta after one fp32 add / a negation.
 // dO / O: [B, S, H, 128] bf16 contiguous; lse [B, H, S] fp32 contiguous (natural log).

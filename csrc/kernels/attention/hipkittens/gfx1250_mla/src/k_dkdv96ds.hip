@@ -30,7 +30,7 @@
 //   1 (manifest: the shipped code object): the marker shell. LLVM compiles the work-item fetch, the descriptors,
 //     the first two ring tiles, the barriers around the tile loop and the epilogue's addressing; inline-asm markers
 //     (; HKGEN INIT / LOOP / FINAL nkv=...) stand where the per-tile work goes, which tools/bwdgen generates
-//     (numerics: tools/bwdgen/bwdgen.py) and hip/asm/k_dkdv96ds.s.patch splices in.
+//     (numerics: tools/bwdgen/bwdgen.py) and asm/k_dkdv96ds.s.patch splices in.
 //   0: the reference, the whole kernel in HIP. tools/bwdgen compiles it to learn the VGPR-MSB operand-field map;
 //     it is not shipped. Its softmax, P = exp2(c1 S + NL) and dS = P (scale dP + ND), expects the unfolded row
 //     constants NL = -log2(e) lse and ND = -scale delta; the shipped k_delta folds them for the generated code

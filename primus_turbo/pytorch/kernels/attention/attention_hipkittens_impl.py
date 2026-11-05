@@ -19,6 +19,7 @@ gfx1250 (MI455X): DeepSeek-V3 MLA attention (head dims qk 192 / v 128), forward 
 
 import ctypes
 import functools
+import hashlib
 import math
 import os
 import struct
@@ -306,16 +307,17 @@ _MLA_HEAD_GROUP = 32  # head-group target of the k_dkdv96ds / k_dqds_c grids
 _MLA_DS_GUARD = 65536  # bytes before and after the dS layout; the ticket counter ends the front guard
 _MLA_MAX_BH_S = 512 * 4096  # largest batch * heads * seqlen the backward's index arithmetic is verified for
 _MLA_MIN_BWD_SCALE = 2.0**-100  # the backward accumulates dV from bf16(scale * P)
-# kernel: (workgroup size, packed arguments), the signatures csrc/.../gfx1250_mla/manifest.json lists:
+# kernel: (workgroup size, packed arguments, sha256 of the code object), the signatures and pins of
+# csrc/.../gfx1250_mla/manifest.json (a test keeps them equal); only a code object with its pin is loaded:
 #   k_mla_fwd   Q K V O LSE, scale, Sq Skv H B nqb npw
 #   k_delta     DO O DELTA LSE NL ND, log2(scale), S H
 #   k_dkdv96ds  Q K V DO NL ND DV DK DS, scale, Sq Skv Hq Hkv G nqt cshift causal B HG ds_mode
 #   k_dqds_c    DS K DQ, Sq Skv Hq Hkv G nkvt cshift causal q_off ntile HG
 _MLA_KERNELS = {
-    "k_mla_fwd": (128, "<5Qf6i"),
-    "k_delta": (256, "<6Qf2i"),
-    "k_dkdv96ds": (64, "<9Qf11i"),
-    "k_dqds_c": (128, "<3Q11i"),
+    "k_mla_fwd": (128, "<5Qf6i", "c29ac43ff14eed04d201fb458c0064ce5771ed25678e262524e4a48dfe364553"),
+    "k_delta": (256, "<6Qf2i", "61d3bc136087a0160a26ae139f0701cc74d8775091d972ff8c15651473dfff89"),
+    "k_dkdv96ds": (64, "<9Qf11i", "abeea38ec402459872df2c8640f5249e817d9df31d5b40326903426d20bbffbe"),
+    "k_dqds_c": (128, "<3Q11i", "c182284e1ed7d0c1530e24f433ce719cdb950aea2fb7fd2020149e4921051b67"),
 }
 _MLA_PASS_KERNELS = {"fwd": ("k_mla_fwd",), "bwd": ("k_delta", "k_dkdv96ds", "k_dqds_c")}
 _MLA_HSACO_DIR = Path(__file__).resolve().parents[3] / "lib" / "hk_gfx1250_mla"
@@ -403,18 +405,26 @@ def _hip_check(rc: int, what: str) -> None:
 
 
 class _HipKernel:
-    """A code object of _MLA_HSACO_DIR, loaded once per device, launched on a torch stream."""
+    """The pinned code object of a kernel in _MLA_HSACO_DIR, loaded once per device, launched on a torch stream."""
 
     _lock = threading.Lock()
 
     def __init__(self, name: str):
         self.name = name
-        self.block, layout = _MLA_KERNELS[name]
+        self.block, layout, pin = _MLA_KERNELS[name]
+        path = _MLA_HSACO_DIR / f"{name}.hsaco"
+        if not path.is_file():
+            raise RuntimeError(
+                f"{path} is not built (GPU_ARCHS=gfx1250 and the toolchain manifest.json pins)"
+            )
+        image = path.read_bytes()
+        if hashlib.sha256(image).hexdigest() != pin:
+            raise RuntimeError(f"{path} is not the pinned code object: stale or foreign, rebuild it")
         self.args = struct.Struct(layout)
-        self.image = ctypes.create_string_buffer((_MLA_HSACO_DIR / f"{name}.hsaco").read_bytes())
+        self.image = ctypes.create_string_buffer(image)
         self.functions = {}  # device index -> hipFunction_t
 
-    def _function(self, device: int) -> ctypes.c_void_p:
+    def load(self, device: int) -> ctypes.c_void_p:
         with self._lock:
             if device not in self.functions:
                 module, fn = ctypes.c_void_p(), ctypes.c_void_p()
@@ -427,7 +437,7 @@ class _HipKernel:
     def __call__(self, grid: Tuple[int, int, int], values: tuple, stream: torch.cuda.Stream) -> None:
         fn = self.functions.get(stream.device_index)
         if fn is None:
-            fn = self._function(stream.device_index)
+            fn = self.load(stream.device_index)
         args = self.args.pack(*(x.data_ptr() if isinstance(x, torch.Tensor) else x for x in values))
         buf, size = ctypes.create_string_buffer(args, len(args)), ctypes.c_size_t(len(args))
         # HIP_LAUNCH_PARAM_BUFFER_POINTER, buf, HIP_LAUNCH_PARAM_BUFFER_SIZE, &size, HIP_LAUNCH_PARAM_END
@@ -438,9 +448,14 @@ class _HipKernel:
         _hip_check(rc, f"launching {self.name}")
 
 
-@functools.lru_cache(maxsize=None)
+_MLA_LOADED = {}  # kernel name -> _HipKernel
+
+
 def _mla_kernel(name: str) -> _HipKernel:
-    return _HipKernel(name)
+    kernel = _MLA_LOADED.get(name)
+    if kernel is None:
+        kernel = _MLA_LOADED[name] = _HipKernel(name)
+    return kernel
 
 
 _MLA_UNAVAILABLE = {}
@@ -448,20 +463,15 @@ _MLA_UNAVAILABLE = {}
 
 @torch.compiler.assume_constant_result  # the gate runs in compiled regions; the answer is fixed per process
 def hk_mla_unavailable_reason(pass_: str) -> Optional[str]:
-    """None when the code objects of ``pass_`` ("fwd" / "bwd") are built and the HIP runtime is usable, else why
-    not (logged once)."""
+    """None when the code objects of ``pass_`` ("fwd" / "bwd") are the pinned ones and load on the current device,
+    else why not."""
     if pass_ not in _MLA_UNAVAILABLE:
-        missing = [n for n in _MLA_PASS_KERNELS[pass_] if not (_MLA_HSACO_DIR / f"{n}.hsaco").is_file()]
         reason = None
-        if missing:
-            reason = f"{', '.join(missing)} not built in {_MLA_HSACO_DIR}"
-        else:
-            try:
-                _hip_runtime()
-            except (OSError, RuntimeError) as e:
-                reason = str(e)
-        if reason is not None:
-            logger.warning(f"the gfx1250 HIP MLA {pass_} kernels are unavailable: {reason}", once=True)
+        try:
+            for name in _MLA_PASS_KERNELS[pass_]:
+                _mla_kernel(name).load(torch.cuda.current_device())
+        except (OSError, RuntimeError) as e:
+            reason = f"the HipKittens MLA {pass_} kernels are unavailable: {e}"
         _MLA_UNAVAILABLE[pass_] = reason
     return _MLA_UNAVAILABLE[pass_]
 
@@ -540,6 +550,24 @@ class _MlaScratchError(RuntimeError):
     pass
 
 
+_MLA_SCRATCH_OOM_BYTES = math.inf  # the smallest dS scratch whose allocation failed
+
+
+def _mla_scratch(nbytes: int, device: torch.device) -> torch.Tensor:
+    """The dS scratch from the caching allocator, on the current stream. A failed allocation costs the allocator a
+    synchronize and its whole cache, so after one, a scratch at least as large is refused without trying again."""
+    global _MLA_SCRATCH_OOM_BYTES
+    if nbytes < _MLA_SCRATCH_OOM_BYTES:
+        try:
+            return torch.empty((nbytes // 2,), device=device, dtype=torch.bfloat16)
+        except torch.OutOfMemoryError:
+            _MLA_SCRATCH_OOM_BYTES = nbytes
+    raise _MlaScratchError(
+        f"no memory for a {_MLA_SCRATCH_OOM_BYTES}-byte dS scratch, so none that large is tried again "
+        "(PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES splits the call by heads instead)"
+    )
+
+
 def _mla_head_group(nh: int) -> int:
     """Heads per k_dkdv96ds / k_dqds_c grid group: nh when nh <= _MLA_HEAD_GROUP, else the largest multiple of 8 (one
     head's workgroups on one XCD) that divides nh and is at most _MLA_HEAD_GROUP, else nh."""
@@ -572,6 +600,8 @@ def _hk_mla_bwd_plan(do, q, k, v, o, lse, scale, causal, max_scratch_bytes):
         if not fits:
             raise _MlaScratchError(f"the dS scratch of {step} heads exceeds {max_scratch_bytes} bytes")
         heads = fits[0]
+    nbytes = scratch_bytes(1 if chunked else b, heads)
+    scratch = _mla_scratch(nbytes, q.device)  # first: no other allocation when it does not fit
     delta, nl, nd = (torch.empty((b, hq, sq), device=q.device, dtype=torch.float32) for _ in range(3))
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
     if not chunked:
@@ -584,8 +614,6 @@ def _hk_mla_bwd_plan(do, q, k, v, o, lse, scale, causal, max_scratch_bytes):
                 bhs = (slice(bi, bi + 1), slice(h0, h0 + heads))  # [b, h, s] tensors
                 ins = tuple(t[bshd] for t in (q, k, v, do)) + (nl[bhs], nd[bhs])
                 parts.append((ins + tuple(t[bshd] for t in (dv, dk, dq)), 1))
-    nbytes = scratch_bytes(parts[0][1], heads)
-    scratch = torch.empty((nbytes // 2,), device=q.device, dtype=torch.bfloat16)
     ds = scratch[_MLA_DS_GUARD // 2 : (nbytes - _MLA_DS_GUARD) // 2]
     q_off, nhead, ntile = _mla_dq_split(sq)
     # k_delta also writes NL = -log2(e) * lse + log2(scale) and ND = -delta: k_dkdv96ds starts its dP chains from ND and
@@ -606,8 +634,8 @@ def hk_mla_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, max_scratch
 
     The dS scratch (4.33 GB at b2 s4096 h128) comes from the caching allocator on the current stream; over
     ``max_scratch_bytes`` (default $PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES, unset: no limit) the call is split by
-    heads (see _hk_mla_bwd_plan). When not even one head group fits, or the scratch cannot be allocated, the call runs
-    the FlyDSL backward."""
+    heads (see _hk_mla_bwd_plan). When not even one head group fits, or the scratch cannot be allocated (_mla_scratch),
+    the call runs the FlyDSL backward."""
     scale = _mla_scale(softmax_scale)
     if max_scratch_bytes is None:
         max_scratch_bytes = envs.PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES
@@ -616,8 +644,6 @@ def hk_mla_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, max_scratch
             launches, scratch, grads = _hk_mla_bwd_plan(do, q, k, v, o, lse, scale, causal, max_scratch_bytes)
         except _MlaScratchError as e:
             reason = str(e)
-        except torch.OutOfMemoryError:
-            reason = "no memory for the dS scratch (PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES caps it)"
         else:
             stream = torch.cuda.current_stream()
             ticket = scratch.view(torch.int32)[(_MLA_DS_GUARD - 64) // 4 : _MLA_DS_GUARD // 4]

@@ -63,9 +63,22 @@ needs_hk = pytest.mark.skipif(
 )
 
 
+_IMPL_VARS = ("PRIMUS_TURBO_MLA_FWD_IMPL", "PRIMUS_TURBO_MLA_BWD_IMPL")
+
+
 def _settings(monkeypatch, fwd="flydsl", bwd="flydsl"):
-    monkeypatch.setattr(mla_impl, "MLA_FWD_IMPL", fwd)
-    monkeypatch.setattr(mla_impl, "MLA_BWD_IMPL", bwd)
+    """The impl settings, through the environment: mla_impls reads them at every eager MLA pass."""
+    for name, value in zip(_IMPL_VARS, (fwd, bwd)):
+        monkeypatch.setenv(name, value)
+    envs.reset_cache(*_IMPL_VARS)
+
+
+def _record_warnings(monkeypatch):
+    """The fallback warnings logged from now on (each pass's first one: mla_impl._FALLBACKS_LOGGED starts empty)."""
+    warnings = []
+    monkeypatch.setattr(mla_impl, "_FALLBACKS_LOGGED", set())
+    monkeypatch.setattr(mla_impl.logger, "warning", lambda msg, *args, **kwargs: warnings.append(msg))
+    return warnings
 
 
 def _meta_bwd(b, s, h, skv=None):
@@ -119,6 +132,21 @@ def test_max_scratch_bytes_setting(monkeypatch):
         getattr(envs, name)
 
 
+def test_settings_are_read_at_the_first_mla_pass(monkeypatch):
+    """Not at import: a setting made after primus_turbo is imported takes effect, and a bad value (or a bad scratch
+    budget with an hk backward) raises at the first MLA pass instead of breaking ``import primus_turbo``."""
+    _settings(monkeypatch, "hk", "flydsl")
+    assert mla_impl.mla_impls() == ("hk", "flydsl")
+    _settings(monkeypatch, "flydsl", "hipkittens")
+    with pytest.raises(ValueError, match="PRIMUS_TURBO_MLA_BWD_IMPL"):
+        mla_impl.mla_impls()
+    _settings(monkeypatch, "flydsl", "hk")
+    monkeypatch.setenv("PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES", "0")
+    envs.reset_cache("PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES")
+    with pytest.raises(ValueError, match="PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES"):
+        mla_impl.mla_impls()
+
+
 _ACCEPTED = {
     "fwd": [
         (2, 4096, 4096, 128),
@@ -168,6 +196,7 @@ def test_gate_refuses(monkeypatch, pass_, dims, match):
 def test_gate_refuses_without_the_code_objects(monkeypatch, tmp_path, pass_):
     monkeypatch.setattr(hk, "_MLA_HSACO_DIR", tmp_path)
     monkeypatch.setattr(hk, "_MLA_UNAVAILABLE", {})
+    monkeypatch.setattr(hk, "_MLA_LOADED", {})
     q, k, v = _meta(1, 256, 256, 2)
     assert "not built" in hk.hk_mla_unsupported_reason(pass_, q, k, v, True)
     assert hk.hk_mla_unsupported_reason(pass_, q, k, v, False) == "causal only"  # the shape rules come first
@@ -182,6 +211,36 @@ def test_bwd_gate_refuses_scales_it_cannot_fold(monkeypatch, scale):
     assert "softmax_scale must be finite" in hk.hk_mla_unsupported_reason("bwd", q, k, v, True, scale)
     assert hk.hk_mla_unsupported_reason("bwd", q, k, v, True, 2.0**-100) is None
     assert hk.hk_mla_unsupported_reason("fwd", q, k, v, True, scale) is None
+
+
+def test_runtime_loads_only_pinned_code_objects(monkeypatch, tmp_path):
+    """A missing, stale (not the pinned bytes, e.g. left by an older build) or unloadable code object makes its pass
+    unavailable, so it runs on FlyDSL, instead of being launched with this version's kernel arguments."""
+    monkeypatch.setattr(hk, "_MLA_HSACO_DIR", tmp_path)
+
+    def reason():
+        monkeypatch.setattr(hk, "_MLA_UNAVAILABLE", {})
+        monkeypatch.setattr(hk, "_MLA_LOADED", {})
+        return hk.hk_mla_unavailable_reason("fwd")
+
+    assert "k_mla_fwd.hsaco is not built" in reason()
+    (tmp_path / "k_mla_fwd.hsaco").write_bytes(b"an older code object")
+    assert "is not the pinned code object" in reason()
+
+    class RejectingHip:
+        @staticmethod
+        def hipModuleLoadData(module, image):
+            return 200
+
+        @staticmethod
+        def hipGetErrorString(rc):
+            return b"hipErrorInvalidImage"
+
+    block, layout, _ = hk._MLA_KERNELS["k_mla_fwd"]
+    pin = hashlib.sha256(b"an older code object").hexdigest()
+    monkeypatch.setitem(hk._MLA_KERNELS, "k_mla_fwd", (block, layout, pin))
+    monkeypatch.setattr(hk, "_hip_runtime", lambda: RejectingHip)
+    assert "loading k_mla_fwd failed: hipErrorInvalidImage" in reason()
 
 
 def test_entry_points_validate_their_tensors():
@@ -314,6 +373,25 @@ def test_routes_and_falls_back(monkeypatch, dims, fwd, bwd, expected):
         assert compute_snr(r, x.detach().float()) > 40, name
 
 
+def test_fallback_is_logged_once_per_pass(monkeypatch):
+    """Two calls the HipKittens forward refuses (seqlen_q != seqlen_kv) log it once; the second call's backward
+    (seqlen_q % 384 == 128) logs the backward's first fallback."""
+    _on_gfx1250(monkeypatch)
+    _settings(monkeypatch, "hk", "hk")
+    _stub_kernels(monkeypatch, [])
+    warnings = _record_warnings(monkeypatch)
+    for sq in (256, 512):
+        q, k, v, dout = _inputs(1, sq, sq + 128, 2, layout="bshd")
+        qg, kg, vg = (t.clone().requires_grad_() for t in (q, k, v))
+        with _pinned_flydsl():
+            flash_attn_func(qg, kg, vg, softmax_scale=MLA_SCALE, causal=True).backward(dout)
+    assert [w.split(",")[0] for w in warnings] == [
+        "PRIMUS_TURBO_MLA_FWD_IMPL=hk",
+        "PRIMUS_TURBO_MLA_BWD_IMPL=hk",
+    ]
+    assert "seqlen_q must equal seqlen_kv" in warnings[0] and "seqlen_q % 384" in warnings[1]
+
+
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize(
     ("dims", "ops"),
@@ -322,14 +400,14 @@ def test_routes_and_falls_back(monkeypatch, dims, fwd, bwd, expected):
 )
 def test_torch_compile_traces_the_hk_ops(monkeypatch, dims, ops, dynamic):
     """torch.compile(fullgraph=True) on meta tensors with both settings on hk: each graph holds the custom op its
-    pass routes to; a pass that falls back does not break the graph."""
+    pass routes to; a pass that falls back does not break the graph, and its warning is logged while tracing."""
     from functorch.compile import make_boxed_func
     from torch._dynamo.backends.common import aot_autograd
 
     _on_gfx1250(monkeypatch)
     _settings(monkeypatch, "hk", "hk")
     monkeypatch.setattr(hk, "hk_mla_unavailable_reason", lambda p: None)
-    monkeypatch.setattr(mla_impl.logger, "_log_once_cache", set())
+    warnings = _record_warnings(monkeypatch)
     seen = {"fw": [], "bw": []}
 
     def record(kind):
@@ -362,6 +440,8 @@ def test_torch_compile_traces_the_hk_ops(monkeypatch, dims, ops, dynamic):
         "bw": [f"primus_turbo.flash_attn_{ops[1]}_gfx1250_mla_backward.default"],
     }
     assert out.shape == (b, s, h, D_V) and lse.shape == (b, h, s) and q.grad.shape == q.shape
+    fell_back = [f"PRIMUS_TURBO_MLA_{p}_IMPL=hk" for p, op in zip(("FWD", "BWD"), ops) if op == "flydsl"]
+    assert [w.split(",")[0] for w in warnings] == fell_back
 
 
 # ---------------------------------------------------------------------------
@@ -404,20 +484,46 @@ def test_bwd_plan_splits_heads_under_a_scratch_budget():
         hk._hk_mla_bwd_plan(*args, MLA_SCALE, True, hk._mla_ds_bytes(1, 4096, 4096, 32, True) + guard - 1)
 
 
+def test_bwd_does_not_retry_a_scratch_that_did_not_fit(monkeypatch):
+    """A failed dS scratch allocation (the allocator has then emptied its cache and synchronized) is not tried again
+    for a scratch at least as large: those calls go to FlyDSL at once. A smaller, head-split scratch is still tried."""
+    args = _meta_bwd(2, 4096, 128)
+    attempts, empty = [], torch.empty
+
+    def scratchless_empty(*shape, **kwargs):
+        if kwargs.get("dtype") is torch.bfloat16 and len(shape) == 1 and len(shape[0]) == 1:  # the dS scratch
+            attempts.append(shape[0][0] * 2)
+            raise torch.OutOfMemoryError("no memory")
+        return empty(*shape, **kwargs)
+
+    monkeypatch.setattr(hk, "_MLA_SCRATCH_OOM_BYTES", math.inf)
+    monkeypatch.setattr(torch, "empty", scratchless_empty)
+    whole = hk._mla_ds_bytes(2, 4096, 4096, 128, True) + 2 * hk._MLA_DS_GUARD
+    for _ in range(2):
+        with pytest.raises(hk._MlaScratchError, match=f"no memory for a {whole}-byte dS scratch"):
+            hk._hk_mla_bwd_plan(*args, MLA_SCALE, True, None)
+    assert attempts == [whole]
+    one_batch = hk._mla_ds_bytes(1, 4096, 4096, 128, True) + 2 * hk._MLA_DS_GUARD
+    with pytest.raises(hk._MlaScratchError, match=f"no memory for a {one_batch}-byte dS scratch"):
+        hk._hk_mla_bwd_plan(*args, MLA_SCALE, True, one_batch)
+    assert attempts == [whole, one_batch]
+
+
 # ---------------------------------------------------------------------------
 # Build: manifest, code objects, assembly patches
 # ---------------------------------------------------------------------------
 
 
 def test_kernel_arguments_match_the_manifest():
-    """The launch layouts are the manifest's kernel signatures (packed, in order), and the flags are a hermetic
-    device-only gfx1250 build: relative include paths inside the kernel directory only."""
+    """The launch layouts and pins are the manifest's kernel signatures (packed, in order) and sha256s, and the flags
+    are a hermetic device-only gfx1250 build: relative include paths inside the kernel directory only."""
     m = _hsaco().load_manifest()
     assert m["arch"] == "gfx1250" and {"--offload-arch=gfx1250", "--cuda-device-only"} <= set(m["flags"])
     assert set(m["kernels"]) == set(hk._MLA_KERNELS)
     kinds = {"ptr": "Q", "f32": "f", "i32": "i"}
-    for name, (block, layout) in hk._MLA_KERNELS.items():
+    for name, (block, layout, pin) in hk._MLA_KERNELS.items():
         k = m["kernels"][name]
+        assert pin == k["hsaco_sha256"], f"{name}: copy the manifest's hsaco_sha256 into _MLA_KERNELS"
         assert all(f == "-Iinclude" for f in m["flags"] + k["extra_flags"] if f.startswith("-I")), name
         assert (KERNEL_DIR / k["src"]).is_file() and k["block"] == block, name
         assert struct.calcsize(layout) == k["kernarg_size"], name
@@ -464,6 +570,17 @@ def test_build_never_fails_and_installs_only_pinned_code_objects(monkeypatch, tm
         ]
     assert hsaco.unavailable_reason(hsaco.FWD_KERNELS, bin_dir) is None
     assert "k_delta.hsaco is not built" == hsaco.unavailable_reason(hsaco.BWD_KERNELS, bin_dir)
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() and is_gfx1250()), reason="needs a gfx1250 (MI455X) GPU")
+def test_code_objects_are_built_where_the_pinned_toolchain_is():
+    """With the pinned toolchain installed, the build must have produced the pinned code objects: otherwise every
+    HipKittens numeric test here skips and both passes quietly run on FlyDSL."""
+    hsaco = _hsaco()
+    cxx = hsaco.find_compiler()
+    if cxx is None or hsaco.compiler_version(cxx) != hsaco.load_manifest()["toolchain"]:
+        pytest.skip("the pinned toolchain is not installed here")
+    assert hsaco.unavailable_reason(hsaco.FWD_KERNELS + hsaco.BWD_KERNELS, hk._MLA_HSACO_DIR) is None
 
 
 _ASM_HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@$")
@@ -688,6 +805,23 @@ def test_hk_bwd_head_chunks_are_bitwise_equal():
 
 
 @needs_hk
+def test_hk_under_cuda_graphs():
+    """Forward and backward captured into a CUDA graph after an eager warm-up (which loads the code objects), then
+    replayed: the eager bits. The kernel arguments, the dS scratch and the ticket reset are all part of the graph."""
+    q, k, v, dout = (t.cuda() for t in _inputs(1, 1024, 1024, 8, layout="bshd"))
+    eager = hk.hk_mla_fwd(q, k, v, MLA_SCALE, True)
+    eager += hk.hk_mla_bwd(dout, q, k, v, *eager, MLA_SCALE, True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = hk.hk_mla_fwd(q, k, v, MLA_SCALE, True)
+        got += hk.hk_mla_bwd(dout, q, k, v, *got, MLA_SCALE, True)
+    graph.replay()
+    torch.cuda.synchronize()
+    for name, a, b in zip(("out", "lse", "dq", "dk", "dv"), got, eager):
+        assert torch.equal(a, b), name
+
+
+@needs_hk
 def test_hk_bwd_falls_back_to_flydsl(monkeypatch):
     """Out of memory for the dS scratch: the call runs the FlyDSL backward; a shape FlyDSL cannot take either is
     refused."""
@@ -696,7 +830,7 @@ def test_hk_bwd_falls_back_to_flydsl(monkeypatch):
     fly = mla_impl._backward_op(dout, q, k, v, out, lse, MLA_SCALE, True)
 
     def oom(*args):
-        raise torch.OutOfMemoryError("no memory for the scratch")
+        raise hk._MlaScratchError("no memory for a dS scratch")
 
     monkeypatch.setattr(hk, "_hk_mla_bwd_plan", oom)
     for a, b in zip(hk.hk_mla_bwd(dout, q, k, v, out, lse, MLA_SCALE, True), fly):

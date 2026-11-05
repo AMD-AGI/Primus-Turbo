@@ -12,9 +12,9 @@ storage (Megatron's layout) is handed over as [1, s, b*h, d], the same bytes wit
 into the heads, so it is not copied. Dispatch and autograd wiring belong to the caller.
 
 Each pass runs on FlyDSL, or on the HipKittens kernels (``attention_hipkittens_impl.hk_mla_*``) when
-PRIMUS_TURBO_MLA_FWD_IMPL / PRIMUS_TURBO_MLA_BWD_IMPL is ``hk`` and they take the call; a pass they
-cannot take runs on FlyDSL, with one warning per reason. The HipKittens forward is bitwise equal to
-the FlyDSL one, so either backward takes either forward's out / lse.
+PRIMUS_TURBO_MLA_FWD_IMPL / PRIMUS_TURBO_MLA_BWD_IMPL is ``hk`` (``mla_impls``) and they take the
+call; a pass they cannot take runs on FlyDSL, with one warning per pass. The HipKittens forward is
+bitwise equal to the FlyDSL one, so either backward takes either forward's out / lse.
 """
 
 from typing import Optional, Tuple
@@ -30,10 +30,6 @@ from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
 
 D_QK = 192
 D_V = 128
-# Read once, at import: the passes route on module constants, which torch.compile traces without a
-# guard on the environment.
-MLA_FWD_IMPL = envs.PRIMUS_TURBO_MLA_FWD_IMPL
-MLA_BWD_IMPL = envs.PRIMUS_TURBO_MLA_BWD_IMPL
 
 
 def _fwd():
@@ -139,17 +135,40 @@ def _backward_hk_op(
 _backward_hk_op.register_fake(_backward_op_fake)
 
 
-def _pick(impl: str, pass_: str, flydsl_op, hk_op, q, k, v, causal: bool, softmax_scale: float):
-    """``hk_op`` when ``impl`` is "hk" and the HipKittens kernels take the call, else ``flydsl_op``."""
-    if impl != "hk":
+@torch.compiler.assume_constant_result
+def mla_impls() -> Tuple[str, str]:
+    """The (forward, backward) kernels, "flydsl" or "hk": PRIMUS_TURBO_MLA_FWD_IMPL / _BWD_IMPL through envs,
+    so at the first MLA pass, not at import (an invalid value raises ValueError there, and so does an invalid
+    PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES with an "hk" backward). torch.compile runs this while tracing: a
+    compiled graph keeps the settings it was traced with."""
+    fwd, bwd = envs.PRIMUS_TURBO_MLA_FWD_IMPL, envs.PRIMUS_TURBO_MLA_BWD_IMPL
+    if bwd == "hk":
+        _ = envs.PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES  # parsed now rather than in the first backward
+    return fwd, bwd
+
+
+_FALLBACKS_LOGGED = set()
+
+
+@torch.compiler.assume_constant_result  # runs while torch.compile traces, which cannot trace a logger call
+def _log_fallback(pass_: str, reason: str) -> bool:
+    if pass_ not in _FALLBACKS_LOGGED:
+        _FALLBACKS_LOGGED.add(pass_)
+        logger.warning(
+            f"PRIMUS_TURBO_MLA_{pass_.upper()}_IMPL=hk, but this pass runs on FlyDSL: {reason} "
+            "(the pass's later fallbacks are not logged)"
+        )
+    return True
+
+
+def _pick(pass_: str, flydsl_op, hk_op, q, k, v, causal: bool, softmax_scale: float):
+    """``hk_op`` when the setting of ``pass_`` is "hk" and the HipKittens kernels take the call, else ``flydsl_op``."""
+    if mla_impls()[0 if pass_ == "fwd" else 1] != "hk":
         return flydsl_op
     reason = hk.hk_mla_unsupported_reason(pass_, q, k, v, causal, softmax_scale)
     if reason is None:
         return hk_op
-    if not torch.compiler.is_compiling():  # Dynamo cannot trace a logger call
-        logger.warning(
-            f"PRIMUS_TURBO_MLA_{pass_.upper()}_IMPL=hk: this pass runs on FlyDSL ({reason})", once=True
-        )
+    _log_fallback(pass_, reason)
     return flydsl_op
 
 
@@ -183,7 +202,7 @@ def flash_attn_flydsl_gfx1250_mla_forward_impl(q, k, v, softmax_scale=None, caus
     fold = b > 1 and q.transpose(0, 1).is_contiguous()
     qk, kk, vk = (_to_kernel_layout(t, fold) for t in (q, k, v))
     scale, causal = _scale(softmax_scale), bool(causal)
-    forward = _pick(MLA_FWD_IMPL, "fwd", _forward_op, _forward_hk_op, qk, kk, vk, causal, scale)
+    forward = _pick("fwd", _forward_op, _forward_hk_op, qk, kk, vk, causal, scale)
     out, lse = forward(qk, kk, vk, scale, causal)
     return _from_kernel_layout(out, b), lse.view(b, h, sq), (qk, kk, vk, out, lse)
 
@@ -196,6 +215,6 @@ def flash_attn_flydsl_gfx1250_mla_backward_impl(dout, q, k, v, out, lse, softmax
     batch = dout.shape[0]
     fold = q.shape[0] != batch  # the forward folded the batch into the heads
     scale, causal = _scale(softmax_scale), bool(causal)
-    backward = _pick(MLA_BWD_IMPL, "bwd", _backward_op, _backward_hk_op, q, k, v, causal, scale)
+    backward = _pick("bwd", _backward_op, _backward_hk_op, q, k, v, causal, scale)
     grads = backward(_to_kernel_layout(dout, fold), q, k, v, out, lse, scale, causal)
     return tuple(_from_kernel_layout(g, batch) for g in grads)

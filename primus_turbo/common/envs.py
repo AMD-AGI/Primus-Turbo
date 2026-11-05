@@ -183,12 +183,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PRIMUS_TURBO_SPARSE_ATTN_BACKEND": backend_spec("PRIMUS_TURBO_SPARSE_ATTN_BACKEND"),
     # Kernels of the gfx1250 DeepSeek-V3 MLA attention (qk 192 / v 128) forward / backward under the
     # FLYDSL backend: "flydsl" (unset or blank) or "hk", the HipKittens kernels, which hand a pass they
-    # cannot take to FlyDSL. Read once, when attention_flydsl_gfx1250_mla_impl is imported; another value
-    # raises ValueError there.
+    # cannot take to FlyDSL. Read at the first MLA pass (attention_flydsl_gfx1250_mla_impl.mla_impls); another
+    # value raises ValueError there.
     "PRIMUS_TURBO_MLA_FWD_IMPL": _mla_impl("PRIMUS_TURBO_MLA_FWD_IMPL"),
     "PRIMUS_TURBO_MLA_BWD_IMPL": _mla_impl("PRIMUS_TURBO_MLA_BWD_IMPL"),
     # Byte budget of the "hk" MLA backward's dS scratch (4.33 GB at DeepSeek-V3's b2 s4096 h128); over it
-    # the call is split by heads. Unset: no limit. Read at the first "hk" MLA backward.
+    # the call is split by heads. Unset: no limit. Read at the first MLA pass when the backward is "hk".
     "PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES": env_positive_int(
         "PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES", None, "must be a positive byte count"
     ),
