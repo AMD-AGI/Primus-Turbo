@@ -677,15 +677,17 @@ def _launch_grouped_bf16_variable_k(
         raise ValueError("split_bar is not supported with frag_pipeline=2")
     if lds_cosched not in (0, 1, 2):
         raise ValueError(f"lds_cosched must be 0, 1 or 2 on the variable-K path, got {lds_cosched}")
-    if lds_cosched and frag_pipeline != 1:
-        raise ValueError(f"lds_cosched={lds_cosched} needs frag_pipeline=1, got {frag_pipeline}")
-    if lds_cosched >= 2 and 2 * (warp_tile_m // WMMA_M + warp_tile_n // WMMA_N) >= n_acc:
-        raise ValueError(f"lds_cosched={lds_cosched} needs fewer fragment reads per sub-step than matrix ops")
+    if not _vk_lds_cosched_ok(lds_cosched, wmma_m_rep, wmma_n_rep, frag_pipeline):
+        raise ValueError(
+            f"lds_cosched={lds_cosched} needs frag_pipeline=1 and, from level 2, fewer fragment reads per "
+            f"sub-step ({2 * (wmma_m_rep + wmma_n_rep)}) than matrix ops ({n_acc}); "
+            f"got frag_pipeline={frag_pipeline}"
+        )
     if head_pipe and (lds_cosched != 2 or not split_bar or issue_first or k_tiles_const):
         raise ValueError(
             f"head_pipe={head_pipe} needs lds_cosched=2, split_bar=1, issue_first=0 and k_tiles_const=0"
         )
-    if head_pipe < 0 or head_pipe + 2 * (warp_tile_m // WMMA_M + warp_tile_n // WMMA_N) > n_acc:
+    if head_pipe < 0 or not _head_pipe_fits(head_pipe, wmma_m_rep, wmma_n_rep):
         raise ValueError(f"head_pipe={head_pipe} leaves too few deferred matrix ops for the head reads")
     if (hp_burst or hp_opaque) and not head_pipe:
         raise ValueError("hp_burst / hp_opaque need head_pipe")
@@ -1602,6 +1604,46 @@ def _pick_lds_cosched(kind: str, N: int, K: int, avg_m: int, stack: bool = False
     return _LDS_COSCHED_KEYS[kind].get(key, 0)
 
 
+# The launchers raise on these and the entry points lower a keyed level with them, so both read one
+# rule. The tables above name a shape, but the tile also follows the expert count: one expert at a
+# keyed avg_m=2048 gets 128x128 (`_pick_config_shape`), whose 4x4 warp tile has as many fragment
+# reads per sub-step (16) as matrix ops.
+def _nt_lds_cosched_ok(
+    lds_cosched: int, wmma_m_rep: int, wmma_n_rep: int, frag_ring: int, sched_style: int, issue_first: int
+) -> bool:
+    # From level 2 a sub-step's fragment reads are issued one per matrix op of the previous sub-step.
+    return lds_cosched < 2 or bool(
+        frag_ring == 2
+        and not sched_style
+        and issue_first
+        and 2 * (wmma_m_rep + wmma_n_rep) < wmma_m_rep * wmma_n_rep
+    )
+
+
+def _vk_lds_cosched_ok(lds_cosched: int, wmma_m_rep: int, wmma_n_rep: int, frag_pipeline: int) -> bool:
+    return not lds_cosched or bool(
+        frag_pipeline == 1 and (lds_cosched < 2 or 2 * (wmma_m_rep + wmma_n_rep) < wmma_m_rep * wmma_n_rep)
+    )
+
+
+def _pick_nt_lds_cosched(kind, N, K, avg_m, cfg, frag_ring, sched_style, issue_first) -> int:
+    """The keyed level of an NT or native-NN launch on ``cfg``, lowered to the highest one it can build."""
+    wm, wn = cfg[0] // cfg[3] // 16, cfg[1] // cfg[4] // 16
+    level = _pick_lds_cosched(kind, N, K, avg_m)
+    while level and not _nt_lds_cosched_ok(level, wm, wn, frag_ring, sched_style, issue_first):
+        level -= 1
+    return level
+
+
+def _pick_vk_lds_cosched(OUT_M, OUT_N, avg_m, stack, cfg, frag_pipeline) -> int:
+    """`_pick_nt_lds_cosched` for the variable-K launcher."""
+    wm, wn = cfg[0] // cfg[3] // 16, cfg[1] // cfg[4] // 16
+    level = _pick_lds_cosched("vk", OUT_M, OUT_N, avg_m, stack)
+    while level and not _vk_lds_cosched_ok(level, wm, wn, frag_pipeline):
+        level -= 1
+    return level
+
+
 # The persistent-cluster stack: `persist` and the knobs that exist only under it. Its members are
 # interdependent -- `ntp_flags`, `nt_ovl`, `vk_ovl` and `tdm_deal` bit 1 each need another one --
 # so the group is resolved in one step: a call that sets ANY of them gets exactly what it passed
@@ -1968,14 +2010,15 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     _auto_cosched = lds_cosched < 0
     _auto_buffers = not num_buffers
     _auto_sbar = split_bar == -1
-    if _auto_cosched:
-        lds_cosched = _pick_lds_cosched("vk", OUT_M, OUT_N, _avg_m, _want) if _keyed else 0
     tile_m = BLOCK_M or cfg[0]
     tile_n = BLOCK_N or cfg[1]
     tile_k = BLOCK_K or cfg[2]
     m_warp = m_warp or cfg[3]
     n_warp = n_warp or cfg[4]
     num_buffers = num_buffers or cfg[5]
+    _tile = (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
+    if _auto_cosched:
+        lds_cosched = _pick_vk_lds_cosched(OUT_M, OUT_N, _avg_m, _want, _tile, frag_pipeline) if _keyed else 0
     assert OUT_M >= tile_m, f"OUT_M={OUT_M} must be >= tile_m={tile_m} for the descriptor back-off"
     assert OUT_N >= tile_n, f"OUT_N={OUT_N} must be >= tile_n={tile_n} for the descriptor back-off"
     lds_pad = lds_pad or _vk_lds_pad(tile_m, tile_n, 2)
@@ -2013,7 +2056,7 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
         # then refused. Put its two advanced knobs back on the ungrouped values: with no
         # `head_pipe` / `tdm_deal` / `vk_ovl` riding them they are cost and nothing else.
         if _auto_cosched:
-            lds_cosched = _pick_lds_cosched("vk", OUT_M, OUT_N, _avg_m)
+            lds_cosched = _pick_vk_lds_cosched(OUT_M, OUT_N, _avg_m, False, _tile, frag_pipeline)
         if _auto_buffers:
             num_buffers = _pick_variable_k_config(OUT_M, OUT_N, _avg_m)[5]
             if _auto_sbar:
@@ -2305,9 +2348,7 @@ def _launch_grouped_gemm_bf16_nt(
         raise ValueError(f"epi_chunk must divide wmma_m_rep={wmma_m_rep}, got {epi_chunk}")
     if lds_cosched not in (0, 1, 2, 3):
         raise ValueError(f"lds_cosched must be 0, 1, 2 or 3, got {lds_cosched}")
-    if lds_cosched >= 2 and (
-        frag_ring != 2 or sched_style or not issue_first or 2 * (wmma_m_rep + wmma_n_rep) >= n_acc
-    ):
+    if not _nt_lds_cosched_ok(lds_cosched, wmma_m_rep, wmma_n_rep, frag_ring, sched_style, issue_first):
         raise ValueError(
             f"lds_cosched={lds_cosched} needs frag_ring=2, sched_style=0, issue_first=1 and fewer "
             f"fragment reads per sub-step ({2 * (wmma_m_rep + wmma_n_rep)}) than matrix ops ({n_acc}); "
@@ -2320,7 +2361,7 @@ def _launch_grouped_gemm_bf16_nt(
             f"head_pipe={head_pipe} needs lds_cosched>=2, split_bar=1, split_bar_depth=1, num_buffers=2, "
             f"k_tail=0 and half_n_skip=0"
         )
-    if head_pipe < 0 or head_pipe + 2 * (wmma_m_rep + wmma_n_rep) > n_acc:
+    if head_pipe < 0 or not _head_pipe_fits(head_pipe, wmma_m_rep, wmma_n_rep):
         raise ValueError(f"head_pipe={head_pipe} leaves too few deferred matrix ops for the head reads")
     if (hp_opaque or hp_epi) and not head_pipe:
         raise ValueError("hp_opaque / hp_epi need head_pipe")
@@ -3710,6 +3751,12 @@ def _pick_config_shape(N: int, K: int, avg_m: int, n_groups: int = 0, b_lds_tran
     return (256, 256, 64, 2, 2, 3)
 
 
+def _head_pipe_fits(head_pipe: int, wmma_m_rep: int, wmma_n_rep: int) -> bool:
+    # The next sub-step 0's 2 * (wm + wn) fragment reads go one per matrix op between the wm * wn -
+    # head_pipe deferred ones left after the barrier wait; with the chain off there are none.
+    return not head_pipe or head_pipe + 2 * (wmma_m_rep + wmma_n_rep) <= wmma_m_rep * wmma_n_rep
+
+
 def _head_pipe_ok(head_pipe, cfg, lds_cosched, split_bar, split_bar_depth, k_tail, half_n_skip) -> bool:
     # Performance-only knob: where the resolved schedule cannot carry it (e.g. off the exact keys,
     # where lds_cosched stays 0), it is dropped rather than raised, like the keyed knobs.
@@ -3723,7 +3770,7 @@ def _head_pipe_ok(head_pipe, cfg, lds_cosched, split_bar, split_bar_depth, k_tai
         and num_buffers == 2
         and not k_tail
         and not half_n_skip
-        and head_pipe + 2 * (wm + wn) <= wm * wn
+        and _head_pipe_fits(head_pipe, wm, wn)
     )
 
 
@@ -3830,14 +3877,19 @@ def grouped_gemm_bf16_nt_flydsl_kernel(
         tdm_balance, tdm_assign = 1, 1
     if issue_first < 0:
         issue_first = _pick_issue_first("nt", N, K, avg_m) if _keyed else 0
-    if lds_cosched < 0:
-        lds_cosched = _pick_lds_cosched("nt", N, K, avg_m) if _keyed else 0
     tile_m = BLOCK_M or cfg[0]
     tile_n = BLOCK_N or cfg[1]
     tile_k = BLOCK_K or cfg[2]
     m_warp = m_warp or cfg[3]
     n_warp = n_warp or cfg[4]
     num_buffers = num_buffers or cfg[5]
+    _tile = (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
+    if lds_cosched < 0:
+        lds_cosched = (
+            _pick_nt_lds_cosched("nt", N, K, avg_m, _tile, frag_ring, sched_style, issue_first)
+            if _keyed
+            else 0
+        )
     k_tail = K % tile_k
     ragged_ok = allow_ragged_k == 1 or (allow_ragged_k < 0 and not BLOCK_K)
     why = _nt_unsupported_reason(
@@ -3882,7 +3934,6 @@ def grouped_gemm_bf16_nt_flydsl_kernel(
         nt_ovl,
         tt_dec,
     )
-    _tile = (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
     (
         _stack,
         (
@@ -4359,7 +4410,11 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
             if wmma_b2b < 0:
                 wmma_b2b = _pick_wmma_b2b("nn", N, Kb, avg_m) if keyed else 0
             if lds_cosched < 0:
-                lds_cosched = _pick_lds_cosched("nn", N, Kb, avg_m) if keyed else 0
+                lds_cosched = (
+                    _pick_nt_lds_cosched("nn", N, Kb, avg_m, cfg, frag_ring, sched_style, issue_first)
+                    if keyed
+                    else 0
+                )
             # The native path pins seg_split, half_n_skip, dead_tile_exit and split_bar_depth, so
             # `persist` only has `epi_fence` left to clash with; the span decode needs the map.
             _passed = (
