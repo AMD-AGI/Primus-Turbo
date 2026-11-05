@@ -6,7 +6,7 @@
 
 """bwdgen -- the generated regions of k_dkdv96ds (HK MLA backward: dK, dV and the dS^T scratch).
 
-The shell (hip/src/k_dkdv96ds.hip, -DHKGEN=1) keeps the workgroup set-up, the first two TDM tiles and the barriers
+The shell (src/k_dkdv96ds.hip, -DHKGEN=1) keeps the workgroup set-up, the first two TDM tiles and the barriers
 before and after the tile loop, and marks three regions per block height (nkv = 3: the 96-row blocks, nkv = 2: the
 64-row tail; 16 nkv kv rows per wave). build.py reads the registers LLVM gave the marker operands; this module returns
 the instructions of every region:

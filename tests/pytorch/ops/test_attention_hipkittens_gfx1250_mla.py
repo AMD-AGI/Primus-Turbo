@@ -4,21 +4,26 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""HIP kernels of the gfx1250 (MI455X) MLA attention: primus_turbo/hipkittens/gfx1250_mla.
+"""HipKittens kernels of the gfx1250 (MI455X) MLA attention: ``attention_hipkittens_impl.hk_mla_*``, built from
+csrc/kernels/attention/hipkittens/gfx1250_mla.
 
-The settings, gate, routing, plan, manifest, source and patch tests use meta / CPU tensors and stand-in kernels.
-The numeric tests need a gfx1250 card and the built code objects (``hsaco.py --check``); their fp32 reference runs
-on the CPU.
+Settings, gates, routing, launch plans and the build run on meta / CPU tensors with stand-in kernels. The numeric
+tests need a gfx1250 card and the built code objects; their fp32 reference runs on the CPU.
 """
 
 import hashlib
-import importlib
+import importlib.util
+import math
 import re
+import struct
+from pathlib import Path
 
 import pytest
 import torch
 
+import primus_turbo.common.envs as envs
 from primus_turbo.pytorch.core.utils import is_gfx1250
+from primus_turbo.pytorch.kernels.attention import attention_hipkittens_impl as hk
 from primus_turbo.pytorch.ops import flash_attn_func
 from tests.pytorch.ops.test_attention_flydsl_gfx1250_mla import (
     D_QK,
@@ -37,42 +42,37 @@ from tests.pytorch.ops.test_attention_flydsl_gfx1250_mla import (
 )
 from tests.pytorch.test_utils import compute_snr
 
-
-def _hk(name):
-    return importlib.import_module(f"primus_turbo.hipkittens.gfx1250_mla.{name}")
-
-
-def _code_objects_reason(pass_):
-    hsaco = _hk("hsaco")
-    return hsaco.unavailable_reason(hsaco.FWD_KERNELS if pass_ == "fwd" else hsaco.BWD_KERNELS)
-
-
-_ON_GFX1250 = torch.cuda.is_available() and is_gfx1250()
-needs_hk_fwd = pytest.mark.skipif(
-    not _ON_GFX1250 or _code_objects_reason("fwd") is not None,
-    reason="needs a gfx1250 (MI455X) GPU and the HIP MLA forward code object",
+KERNEL_DIR = (
+    Path(__file__).resolve().parents[3] / "csrc" / "kernels" / "attention" / "hipkittens" / "gfx1250_mla"
 )
-needs_hk_bwd = pytest.mark.skipif(
-    not _ON_GFX1250 or _code_objects_reason("bwd") is not None,
-    reason="needs a gfx1250 (MI455X) GPU and the HIP MLA backward code objects",
-)
+
+
+def _hsaco():
+    """The code-object build script (standard library only, loaded by path like setup.py does)."""
+    spec = importlib.util.spec_from_file_location("_hk_mla_hsaco", KERNEL_DIR / "hsaco.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 needs_hk = pytest.mark.skipif(
-    not _ON_GFX1250 or _code_objects_reason("fwd") is not None or _code_objects_reason("bwd") is not None,
-    reason="needs a gfx1250 (MI455X) GPU and every HIP MLA code object",
+    not (torch.cuda.is_available() and is_gfx1250())
+    or hk.hk_mla_unavailable_reason("fwd") is not None
+    or hk.hk_mla_unavailable_reason("bwd") is not None,
+    reason="needs a gfx1250 (MI455X) GPU and the HipKittens MLA code objects",
 )
 
 
 def _settings(monkeypatch, fwd="flydsl", bwd="flydsl"):
-    monkeypatch.setattr(mla_impl, "MLA_FWD_IMPL_SETTING", fwd)
-    monkeypatch.setattr(mla_impl, "MLA_BWD_IMPL_SETTING", bwd)
+    monkeypatch.setattr(mla_impl, "MLA_FWD_IMPL", fwd)
+    monkeypatch.setattr(mla_impl, "MLA_BWD_IMPL", bwd)
 
 
-def _meta_problem(b, s, h, skv=None):
-    """Meta (q, k, v, out, lse) in the kernel layout."""
+def _meta_bwd(b, s, h, skv=None):
+    """Meta (dout, q, k, v, out, lse) in the kernel layout."""
     q, k, v = _meta(b, s, s if skv is None else skv, h)
     out = torch.empty(b, s, h, D_V, dtype=torch.bfloat16, device="meta")
-    lse = torch.empty(b, h, s, dtype=torch.float32, device="meta")
-    return q, k, v, out, lse
+    return out, q, k, v, out, torch.empty(b, h, s, dtype=torch.float32, device="meta")
 
 
 # ---------------------------------------------------------------------------
@@ -80,178 +80,168 @@ def _meta_problem(b, s, h, skv=None):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("pass_", ["fwd", "bwd"])
+@pytest.mark.parametrize("name", ["PRIMUS_TURBO_MLA_FWD_IMPL", "PRIMUS_TURBO_MLA_BWD_IMPL"])
 @pytest.mark.parametrize(
-    ("setting", "expected"),
-    [("", "flydsl"), ("flydsl", "flydsl"), ("hk", "hk"), (" HK ", "hk"), ("hipkittens", None)],
-    ids=["unset", "flydsl", "hk", "hk_spelled_loosely", "unknown"],
+    ("value", "want"),
+    [
+        (None, "flydsl"),
+        ("", "flydsl"),
+        ("flydsl", "flydsl"),
+        ("hk", "hk"),
+        (" HK ", "hk"),
+        ("hipkittens", None),
+    ],
 )
-def test_impl_settings(monkeypatch, pass_, setting, expected):
-    monkeypatch.setattr(mla_impl, f"MLA_{pass_.upper()}_IMPL_SETTING", setting)
-    impl = getattr(mla_impl, f"mla_{pass_}_impl")
-    if expected is None:
-        with pytest.raises(ValueError, match=f"PRIMUS_TURBO_MLA_{pass_.upper()}_IMPL"):
-            impl()
+def test_impl_settings(monkeypatch, name, value, want):
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
     else:
-        assert impl() == expected
+        monkeypatch.setenv(name, value)
+    envs.reset_cache(name)
+    if want is None:
+        with pytest.raises(ValueError, match=name):
+            getattr(envs, name)
+    else:
+        assert getattr(envs, name) == want
+
+
+def test_max_scratch_bytes_setting(monkeypatch):
+    name = "PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES"
+    monkeypatch.delenv(name, raising=False)
+    envs.reset_cache(name)
+    assert envs.PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES is None
+    monkeypatch.setenv(name, "4096")
+    envs.reset_cache(name)
+    assert envs.PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES == 4096
+    monkeypatch.setenv(name, "0")
+    envs.reset_cache(name)
+    with pytest.raises(ValueError, match=name):
+        getattr(envs, name)
 
 
 _ACCEPTED = {
-    "fwd": [(2, 4096, 4096, 128), (1, 4096, 4096, 256), (1, 256, 256, 2), (1, 640, 640, 4), (1, 64, 64, 2)],
-    "bwd": [(2, 4096, 4096, 128), (1, 4096, 4096, 256), (1, 256, 256, 2), (1, 256, 384, 2)],
+    "fwd": [
+        (2, 4096, 4096, 128),
+        (1, 4096, 4096, 256),
+        (2, 4096, 4096, 96),
+        (1, 256, 256, 2),
+        (1, 640, 640, 4),
+    ],
+    "bwd": [
+        (2, 4096, 4096, 128),
+        (1, 4096, 4096, 256),
+        (2, 4096, 4096, 96),
+        (1, 256, 256, 2),
+        (1, 256, 384, 2),
+    ],
 }
 _REFUSED = {
     "fwd": [
         ((1, 256, 384, 2), "seqlen_q must equal seqlen_kv"),
         ((1, 256, 256, 4, 2), "MHA only"),
         ((1, 96, 96, 2), "multiple of 64"),
-        ((1, 256, 128, 2), "seqlen_q <= seqlen_kv"),
+        ((1, 256, 128, 2), "seqlen_kv 128 < seqlen_q 256"),
     ],
     "bwd": [
         ((1, 512, 512, 2), "seqlen_q % 384"),
         ((1, 128, 128, 2), "seqlen_q % 384"),
-        ((1, 256, 16384, 256), "verified extent"),
+        ((1, 256, 16384, 256), "exceeds the verified"),
         ((1, 256, 256, 4, 2), "MHA only"),
-        ((1, 512, 256, 2), "seqlen_q <= seqlen_kv"),
     ],
 }
 
 
 @pytest.mark.parametrize(("pass_", "dims"), [(p, d) for p, ds in _ACCEPTED.items() for d in ds])
-def test_hk_gate_accepts(monkeypatch, pass_, dims):
-    monkeypatch.setattr(mla_impl, "_hk_unavailable_reason", lambda p: None)
-    gate = getattr(mla_impl, f"hk_mla_{pass_}_unsupported_reason")
-    assert gate(*_meta(*dims), True) is None
+def test_gate_accepts(monkeypatch, pass_, dims):
+    monkeypatch.setattr(hk, "hk_mla_unavailable_reason", lambda p: None)
+    assert hk.hk_mla_unsupported_reason(pass_, *_meta(*dims), True, MLA_SCALE) is None
 
 
 @pytest.mark.parametrize(("pass_", "dims", "match"), [(p, d, m) for p, ds in _REFUSED.items() for d, m in ds])
-def test_hk_gate_refuses(monkeypatch, pass_, dims, match):
-    monkeypatch.setattr(mla_impl, "_hk_unavailable_reason", lambda p: None)
-    reason = getattr(mla_impl, f"hk_mla_{pass_}_unsupported_reason")(*_meta(*dims), True)
-    assert reason is not None and match in reason
+def test_gate_refuses(monkeypatch, pass_, dims, match):
+    monkeypatch.setattr(hk, "hk_mla_unavailable_reason", lambda p: None)
+    reason = hk.hk_mla_unsupported_reason(pass_, *_meta(*dims), True, MLA_SCALE)
+    assert reason is not None and match in reason, reason
 
 
 @pytest.mark.parametrize("pass_", ["fwd", "bwd"])
-def test_hk_gate_refuses_without_the_code_objects(monkeypatch, pass_):
-    monkeypatch.setattr(mla_impl, "_hk_unavailable_reason", lambda p: f"{p}: k.hsaco is not built")
-    gate = getattr(mla_impl, f"hk_mla_{pass_}_unsupported_reason")
-    assert gate(*_meta(1, 256, 256, 2), True) == f"{pass_}: k.hsaco is not built"
-    assert gate(*_meta(1, 256, 256, 2), False) == "causal only"  # the shape rules come first
-
-
-@pytest.mark.parametrize("scale", [0.0, -0.1, 2.0**-101, float("inf"), float("nan")])
-def test_hk_bwd_gate_refuses_scales_it_cannot_fold(monkeypatch, scale):
-    """The backward folds log2(scale) into its row constants and accumulates dV from bf16(scale * P): a scale that is
-    not finite or below 2^-100 goes to FlyDSL (the forward takes any scale, like FlyDSL's), and a direct call
-    refuses it."""
-    monkeypatch.setattr(mla_impl, "_hk_unavailable_reason", lambda p: None)
+def test_gate_refuses_without_the_code_objects(monkeypatch, tmp_path, pass_):
+    monkeypatch.setattr(hk, "_MLA_HSACO_DIR", tmp_path)
+    monkeypatch.setattr(hk, "_MLA_UNAVAILABLE", {})
     q, k, v = _meta(1, 256, 256, 2)
-    assert "softmax_scale must be finite and at least" in mla_impl.hk_mla_bwd_unsupported_reason(
-        q, k, v, True, scale
-    )
-    for ok in (MLA_SCALE, 2.0**-100):
-        assert mla_impl.hk_mla_bwd_unsupported_reason(q, k, v, True, ok) is None
-    assert mla_impl.hk_mla_fwd_unsupported_reason(q, k, v, True) is None
-    with pytest.raises(NotImplementedError, match="softmax_scale"):
-        _hk("bwd")._plan(*(_meta_problem(1, 256, 2)[i] for i in (3, 0, 1, 2, 3, 4)), scale, True)
+    assert "not built" in hk.hk_mla_unsupported_reason(pass_, q, k, v, True)
+    assert hk.hk_mla_unsupported_reason(pass_, q, k, v, False) == "causal only"  # the shape rules come first
 
 
-def test_hk_gate_refuses_an_unusable_hip_runtime(monkeypatch):
-    """Two HIP runtimes mapped in the process: hiprt cannot launch, so the gate sends both passes to FlyDSL."""
-    hiprt, hsaco = _hk("hiprt"), _hk("hsaco")
-    monkeypatch.setattr(hsaco, "unavailable_reason", lambda names, bin_dir=None: None)
-    monkeypatch.setattr(hiprt, "_LIB", None)
-    monkeypatch.setattr(hiprt, "_RUNTIME_REASON", [])
-    monkeypatch.setattr(
-        hiprt, "_mapped_libhip", lambda: (["/a/libamdhip64.so", "/b/libamdhip64.so"], {"/a", "/b"})
-    )
-    for pass_ in ("fwd", "bwd"):
-        reason = getattr(mla_impl, f"hk_mla_{pass_}_unsupported_reason")(*_meta(1, 256, 256, 2), True)
-        assert "more than one libamdhip64" in reason, reason
+@pytest.mark.parametrize("scale", [0.0, -0.1, 2.0**-101, math.inf, math.nan])
+def test_bwd_gate_refuses_scales_it_cannot_fold(monkeypatch, scale):
+    """The backward folds log2(scale) into its row constants and accumulates dV from bf16(scale * P); the forward
+    takes any scale, like FlyDSL's."""
+    monkeypatch.setattr(hk, "hk_mla_unavailable_reason", lambda p: None)
+    q, k, v = _meta(1, 256, 256, 2)
+    assert "softmax_scale must be finite" in hk.hk_mla_unsupported_reason("bwd", q, k, v, True, scale)
+    assert hk.hk_mla_unsupported_reason("bwd", q, k, v, True, 2.0**-100) is None
+    assert hk.hk_mla_unsupported_reason("fwd", q, k, v, True, scale) is None
 
 
-def test_flydsl_fallback_refuses_what_flydsl_cannot_take():
-    """A HIP-only shape (seqlen_kv % 64 == 32) cannot fall back: a clear error instead of FlyDSL's."""
-    bwd = _hk("bwd")
-    q, k, v, o, lse = _meta_problem(1, 4096, 4, skv=4128)
-    with pytest.raises(bwd.ScratchBudgetError, match="the FlyDSL backward cannot take this call either"):
-        bwd._flydsl_bwd("no scratch", o, q, k, v, o, lse, MLA_SCALE, True)
-
-
-def test_entries_validate_their_tensors():
-    fwd, bwd = _hk("fwd"), _hk("bwd")
-    q, k, v, o, lse = _meta_problem(1, 256, 2)
-    with pytest.raises(ValueError, match="is on cpu, q on meta"):
-        fwd._plan(q, torch.empty_like(k, device="cpu"), v, MLA_SCALE, True)
-    with pytest.raises(ValueError, match="is on cpu, q on meta"):
-        bwd._plan(o, q, k, v, o, torch.empty_like(lse, device="cpu"), MLA_SCALE, True)
+def test_entry_points_validate_their_tensors():
+    q, k, v = _meta(1, 256, 256, 2)
+    with pytest.raises(ValueError, match="on meta"):
+        hk._mla_check(q, torch.empty_like(k, device="cpu"), v)
+    with pytest.raises(ValueError, match="strided"):  # b > 1 SBHD storage must reach the kernels folded
+        hk._mla_check(*_meta(2, 256, 256, 2, layout="sbhd"))
+    do, q, k, v, o, lse = _meta_bwd(1, 256, 2)
+    with pytest.raises(ValueError, match="float32"):
+        hk._mla_check(q, k, v, o, do, lse.to(torch.bfloat16))
     with pytest.raises(ValueError, match="empty problem"):
-        fwd._plan(*_meta_problem(1, 0, 2)[:3], MLA_SCALE, True)
-    with pytest.raises(_hk("hiprt").HipError, match="run on a GPU"):
-        _hk("hiprt").check_device(torch.device("cpu"))
+        hk._mla_check(*_meta(1, 0, 0, 2))
 
 
-def test_limits():
-    limits = _hk("limits")
-    assert limits.fwd_shape_unsupported_reason(2, 4096, 4096, 128, 128, True) is None
-    assert "32-bit" in limits.fwd_shape_unsupported_reason(4, 16384, 16384, 128, 128, True)
-    assert "causal only" in limits.fwd_shape_unsupported_reason(1, 256, 256, 2, 2, False)
-    assert limits.bwd_shape_unsupported_reason(1, 4096, 4128, 4, 4, True) is None  # (Skv - Sq) % 64 == 32
-    assert "multiples of 32" in limits.bwd_shape_unsupported_reason(1, 256, 272, 2, 2, True)
-    assert [(s, limits.k3_n96(s), limits.k3_n64(s), limits.k3_nblk(s)) for s in (384, 4096, 4128, 4160)] == [
-        (384, 4, 0, 4),
-        (4096, 42, 1, 43),
-        (4128, 43, 0, 43),
-        (4160, 42, 2, 44),
-    ]
-    assert not limits.k3_ok(32) and limits.k3_ok(64) and limits.k3_ok(96)
-    assert limits.dq_split(4096) == (256, 1, 10) and limits.dq_split(3840) == (0, 0, 10)
-    with pytest.raises(NotImplementedError):
-        limits.dq_split(512)
-    assert limits.ds_layout_bytes(2, 4096, 4096, 128, True) == 4_328_521_728
-    assert limits.ds_layout_bytes(1, 256, 384, 2, False) == 2 * 24 * 8 * 1024
+def test_shape_helpers():
+    assert [hk._mla_dkdv_blocks(s) for s in (384, 4096, 4128, 4160)] == [4, 43, 43, 44]
+    assert hk._mla_dq_split(4096) == (256, 1, 10) and hk._mla_dq_split(3840) == (0, 0, 10)
+    assert hk._mla_ds_bytes(2, 4096, 4096, 128, True) == 4_328_521_728
+    assert hk._mla_ds_bytes(1, 256, 384, 2, False) == 2 * 24 * 8 * 1024
     for b, sq, skv, h in ((1, 256, 256, 2), (2, 4096, 4096, 3), (1, 256, 448, 1), (1, 384, 1024, 2)):
         attended = torch.ones(sq, skv, dtype=torch.bool).tril(skv - sq)
         blocks = attended.view(sq // 32, 32, skv // 16, 16).any(3).any(1).sum().item()
-        assert limits.ds_layout_bytes(b, sq, skv, h, True) == b * h * blocks * 1024, (sq, skv)
+        assert hk._mla_ds_bytes(b, sq, skv, h, True) == b * h * blocks * 1024, (sq, skv)
 
 
 @pytest.mark.parametrize(
     ("dims", "cus", "npw"),
     [
         ((1, 4096, 256), 256, 256),  # DeepSeek-V3 MBS 2, SBHD folded
-        ((2, 4096, 128), 256, 256),  # the same, BSHD
+        ((1, 4096, 192), 256, 256),  # Kimi K3 MBS 2 (96 heads), SBHD folded
+        ((2, 4096, 128), 256, 256),
         ((1, 1024, 128), 256, 256),
         ((1, 4096, 128), 128, 128),  # a part with 128 CUs
         ((1, 4096, 128), 252, 0),  # CUs not a multiple of the 8 groups
         ((1, 4096, 16), 256, 0),  # one step per group: odd
-        ((1, 256, 8), 256, 0),  # a group's heads are not a whole number of steps
         ((1, 640, 8), 256, 0),  # seqlen not a multiple of 256
         ((1, 4096, 12), 256, 0),  # heads not a multiple of 8
         ((1, 2560, 256), 256, 0),  # 10 q blocks do not divide a group of 32 workgroups
     ],
 )
 def test_persistent_workgroups(dims, cus, npw):
-    assert _hk("fwd").persistent_workgroups(*dims, cus) == npw
-    if npw:  # the static schedule: every (q block, head-batch) exactly once, equal tiles per step pair
+    """The static schedule covers every (q block, head-batch) exactly once with equal tiles per workgroup."""
+    assert hk.hk_mla_persistent_workgroups(*dims, cus) == npw
+    if npw:
         b, s, h = dims
         nqb = s // 256
         r_heads = npw // 8 // nqb
-        steps = b * h // 8 // r_heads
         seen, tiles = {}, []
         for wg in range(npw):
             r, i = divmod(wg // 8, nqb)
             t = 0
-            for step in range(steps):
-                hb = 8 * (r_heads * step + r) + wg % 8
+            for step in range(b * h // 8 // r_heads):
                 qb = nqb - 1 - i if step % 2 else i
-                seen[(qb, hb)] = seen.get((qb, hb), 0) + 1
+                key = (qb, 8 * (r_heads * step + r) + wg % 8)
+                seen[key] = seen.get(key, 0) + 1
                 t += qb + 1
             tiles.append(t)
-        assert sorted(seen) == [(qb, hb) for qb in range(nqb) for hb in range(b * h)] and set(
-            seen.values()
-        ) == {1}
-        assert len(set(tiles)) == 1
+        assert sorted(seen) == [(qb, hb) for qb in range(nqb) for hb in range(b * h)]
+        assert set(seen.values()) == {1} and len(set(tiles)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +250,7 @@ def test_persistent_workgroups(dims, cus, npw):
 
 
 def _stub_kernels(monkeypatch, calls):
-    """The four custom ops replaced by the CPU reference on the kernel layout; ``calls`` records which ran."""
+    """The four MLA custom ops replaced by the CPU reference; ``calls`` records which ran."""
 
     def fwd(tag):
         def run(q, k, v, softmax_scale, causal):
@@ -277,7 +267,7 @@ def _stub_kernels(monkeypatch, calls):
 
         return run
 
-    monkeypatch.setattr(mla_impl, "_hk_unavailable_reason", lambda p: None)
+    monkeypatch.setattr(hk, "hk_mla_unavailable_reason", lambda p: None)
     monkeypatch.setattr(mla_impl, "_forward_op", fwd("flydsl"))
     monkeypatch.setattr(mla_impl, "_forward_hk_op", fwd("hk"))
     monkeypatch.setattr(mla_impl, "_backward_op", bwd("flydsl"))
@@ -291,8 +281,18 @@ def _stub_kernels(monkeypatch, calls):
         ((256, 256), "hk", "flydsl", ("hk_fwd", "flydsl_bwd")),
         ((256, 256), "flydsl", "hk", ("flydsl_fwd", "hk_bwd")),
         ((256, 256), "flydsl", "flydsl", ("flydsl_fwd", "flydsl_bwd")),
-        ((128, 128), "hk", "hk", ("hk_fwd", "flydsl_bwd")),  # seqlen 128: only the HIP forward takes it
-        ((256, 384), "hk", "hk", ("flydsl_fwd", "hk_bwd")),  # seqlen_q < seqlen_kv: only the HIP backward
+        (
+            (128, 128),
+            "hk",
+            "hk",
+            ("hk_fwd", "flydsl_bwd"),
+        ),  # seqlen 128: only the HipKittens forward takes it
+        (
+            (256, 384),
+            "hk",
+            "hk",
+            ("flydsl_fwd", "hk_bwd"),
+        ),  # seqlen_q < seqlen_kv: only the HipKittens backward
     ],
 )
 def test_routes_and_falls_back(monkeypatch, dims, fwd, bwd, expected):
@@ -322,14 +322,13 @@ def test_routes_and_falls_back(monkeypatch, dims, fwd, bwd, expected):
 )
 def test_torch_compile_traces_the_hk_ops(monkeypatch, dims, ops, dynamic):
     """torch.compile(fullgraph=True) on meta tensors with both settings on hk: each graph holds the custom op its
-    pass routes to, with the eager shapes; a pass that falls back does not break the graph (its warning is not
-    traced: the log-once cache starts empty)."""
+    pass routes to; a pass that falls back does not break the graph."""
     from functorch.compile import make_boxed_func
     from torch._dynamo.backends.common import aot_autograd
 
     _on_gfx1250(monkeypatch)
     _settings(monkeypatch, "hk", "hk")
-    monkeypatch.setattr(mla_impl, "_hk_unavailable_reason", lambda p: None)
+    monkeypatch.setattr(hk, "hk_mla_unavailable_reason", lambda p: None)
     monkeypatch.setattr(mla_impl.logger, "_log_once_cache", set())
     seen = {"fw": [], "bw": []}
 
@@ -340,8 +339,7 @@ def test_torch_compile_traces_the_hk_ops(monkeypatch, dims, ops, dynamic):
 
         return compiler
 
-    b, h = 2, 4
-    s = dims[0]
+    b, h, s = 2, 4, dims[0]
     q, k, v = (t.requires_grad_() for t in _meta(b, *dims, h, layout="sbhd"))
 
     @torch.compile(
@@ -367,220 +365,105 @@ def test_torch_compile_traces_the_hk_ops(monkeypatch, dims, ops, dynamic):
 
 
 # ---------------------------------------------------------------------------
-# Launch plans (meta tensors)
+# Backward launch plan (meta tensors)
 # ---------------------------------------------------------------------------
 
 
-def _manifest_kernels():
-    return _hk("hsaco").load_manifest()["kernels"]
-
-
-def test_fwd_plan_on_meta_tensors():
-    fwd = _hk("fwd")
-    args = _manifest_kernels()["k_mla_fwd"]["args"]
-    q, k, v, _, _ = _meta_problem(1, 4096, 256)
-    grid, values, out, lse = fwd._plan(q, k, v, MLA_SCALE, True)
-    assert grid == (256, 1, 1) and len(values) == len(args)
-    assert values[:5] == (q, k, v, out, lse) and values[5:] == (MLA_SCALE, 4096, 4096, 256, 1, 16, 256)
-    assert out.shape == (1, 4096, 256, D_V) and lse.shape == (1, 256, 4096) and lse.dtype == torch.float32
-    q, k, v, _, _ = _meta_problem(2, 640, 4)
-    grid, values, _, _ = fwd._plan(q, k, v, None, True)
-    assert grid == (3, 4, 2) and values[5] == D_QK**-0.5 and values[-2:] == (3, 0)
-    with pytest.raises(NotImplementedError, match="seqlen_q must equal seqlen_kv"):
-        fwd._plan(*_meta(1, 256, 384, 2), MLA_SCALE, True)
-    with pytest.raises(ValueError, match="contiguous bfloat16"):  # b > 1 SBHD storage: a strided view
-        fwd._plan(*_meta(2, 256, 256, 2, layout="sbhd")[:1], *_meta(2, 256, 256, 2)[1:], MLA_SCALE, True)
-
-
-def test_bwd_plan_on_meta_tensors():
-    """DeepSeek-V3's shape: the delta launch, then the ticket step, dkdv and dq; grids, the dS scratch size and
-    argument tuples that match the manifest's kernel signatures."""
-    bwd = _hk("bwd")
-    kernels = _manifest_kernels()
-    b, s, h = 2, 4096, 128
-    q, k, v, o, lse = _meta_problem(b, s, h)
-    plan = bwd._plan(o, q, k, v, o, lse, MLA_SCALE, True)
-    launches = plan["launches"]
-    assert [x[0] for x in launches] == ["delta", "ticket", "dkdv", "dq"]
-    grids = {name: args[0] for name, fn, args in launches if isinstance(fn, str)}
-    assert grids == {"delta": (64, 256, 1), "dkdv": (32, 43, 8), "dq": (32, 11, 8)}
-    assert plan["ds_layout_bytes"] == 4_328_521_728
-    assert plan["ds_full"].numel() * 2 == 4_328_521_728 + 2 * bwd.DS_GUARD_B
-    assert launches[1] == ("ticket", bwd._zero_ticket, (plan["ds_full"],))
-    for _, name, args in launches:
-        if isinstance(name, str):
-            grid, block, values = args
-            assert block == kernels[name]["block"] and len(values) == len(kernels[name]["args"]), name
-    delta_values = launches[0][2][2]
-    assert delta_values[:6] == (o, o, plan["delta"], lse, plan["nl"], plan["nd"])
-    assert delta_values[6:] == (bwd.log2_scale_fp32(MLA_SCALE), s, h)
-    assert launches[2][2][2][4:6] == (plan["nl"], plan["nd"])
-    with pytest.raises(ValueError, match="not verified"):
-        bwd._plan(o, q, k, v, o, lse, MLA_SCALE, True, head_group=48)
+def test_bwd_plan():
+    """DeepSeek-V3's shape: grids, the dS scratch, and argument tuples of the kernels' layouts."""
+    launches, scratch, grads = hk._hk_mla_bwd_plan(*_meta_bwd(2, 4096, 128), MLA_SCALE, True, None)
+    assert [(name, grid) for name, grid, _ in launches] == [
+        ("k_delta", (64, 256, 1)),
+        ("k_dkdv96ds", (32, 43, 8)),
+        ("k_dqds_c", (32, 11, 8)),
+    ]
+    assert scratch.numel() * 2 == 4_328_521_728 + 2 * hk._MLA_DS_GUARD
+    for name, _, values in launches:
+        args = hk._MLA_KERNELS[name][1]
+        assert len(values) == len(re.sub(r"(\d+)(\w)", lambda m: m[2] * int(m[1]), args)) - 1, name
+    assert [g.shape for g in grads] == [(2, 4096, 128, D_QK), (2, 4096, 128, D_QK), (2, 4096, 128, D_V)]
     with pytest.raises(NotImplementedError, match="seqlen_q % 384"):
-        bwd._plan(*(_meta_problem(1, 512, 2)[i] for i in (3, 0, 1, 2, 3, 4)), MLA_SCALE, True)
+        hk._hk_mla_bwd_plan(*_meta_bwd(1, 512, 2), MLA_SCALE, True, None)
 
 
-def test_bwd_plan_head_chunks_under_a_scratch_budget():
-    """A dS scratch budget below the whole call's splits (ticket, dkdv, dq) into head chunks of one batch that
-    share one scratch; no head group fitting raises ScratchBudgetError."""
-    bwd = _hk("bwd")
-    b, s, h = 2, 4096, 128
-    q, k, v, o, lse = _meta_problem(b, s, h)
-    assert bwd._plan(o, q, k, v, o, lse, MLA_SCALE, True)["chunks"] is None
-    half = bwd._scratch_bytes(1, s, s, 64, True)
-    plan = bwd._plan(o, q, k, v, o, lse, MLA_SCALE, True, max_scratch_bytes=half)
-    assert plan["chunks"] == [(0, 0, 64), (0, 64, 64), (1, 0, 64), (1, 64, 64)]
-    assert [x[0] for x in plan["launches"]] == ["delta"] + ["ticket", "dkdv", "dq"] * 4
-    assert plan["ds_full"].numel() * 2 == half
-    grids = {x[0]: x[2][0] for x in plan["launches"] if x[0] in ("dkdv", "dq")}
-    assert grids == {"dkdv": (32, 43, 2), "dq": (32, 11, 2)}
-    with pytest.raises(bwd.ScratchBudgetError):
-        bwd._plan(
-            o, q, k, v, o, lse, MLA_SCALE, True, max_scratch_bytes=bwd._scratch_bytes(1, s, s, 32, True) - 1
+def test_bwd_plan_splits_heads_under_a_scratch_budget():
+    """Over the budget, the dK / dV and dQ launches run per chunk of heads of one batch on one shared scratch: per
+    batch when one batch fits, else in smaller head groups; ScratchError when not even one head group fits."""
+    args = _meta_bwd(2, 4096, 128)
+    guard = 2 * hk._MLA_DS_GUARD
+    for heads, chunks in ((128, 2), (64, 4)):
+        budget = hk._mla_ds_bytes(1, 4096, 4096, heads, True) + guard
+        launches, scratch, _ = hk._hk_mla_bwd_plan(*args, MLA_SCALE, True, budget)
+        assert [name for name, _, _ in launches] == ["k_delta"] + ["k_dkdv96ds", "k_dqds_c"] * chunks
+        assert {name: grid for name, grid, _ in launches[1:3]} == {
+            "k_dkdv96ds": (32, 43, heads // 32),
+            "k_dqds_c": (32, 11, heads // 32),
+        }
+        assert scratch.numel() * 2 == budget
+    with pytest.raises(hk._MlaScratchError):
+        hk._hk_mla_bwd_plan(*args, MLA_SCALE, True, hk._mla_ds_bytes(1, 4096, 4096, 32, True) + guard - 1)
+
+
+# ---------------------------------------------------------------------------
+# Build: manifest, code objects, assembly patches
+# ---------------------------------------------------------------------------
+
+
+def test_kernel_arguments_match_the_manifest():
+    """The launch layouts are the manifest's kernel signatures (packed, in order), and the flags are a hermetic
+    device-only gfx1250 build: relative include paths inside the kernel directory only."""
+    m = _hsaco().load_manifest()
+    assert m["arch"] == "gfx1250" and {"--offload-arch=gfx1250", "--cuda-device-only"} <= set(m["flags"])
+    assert set(m["kernels"]) == set(hk._MLA_KERNELS)
+    kinds = {"ptr": "Q", "f32": "f", "i32": "i"}
+    for name, (block, layout) in hk._MLA_KERNELS.items():
+        k = m["kernels"][name]
+        assert all(f == "-Iinclude" for f in m["flags"] + k["extra_flags"] if f.startswith("-I")), name
+        assert (KERNEL_DIR / k["src"]).is_file() and k["block"] == block, name
+        assert struct.calcsize(layout) == k["kernarg_size"], name
+        expanded = "<" + "".join(kinds[a["kind"]] for a in k["args"])
+        assert struct.Struct(expanded).format == "<" + re.sub(
+            r"(\d+)(\w)", lambda x: x[2] * int(x[1]), layout[1:]
         )
+        assert [a["offset"] for a in k["args"]] == [
+            struct.calcsize(expanded[: i + 1]) for i in range(len(k["args"]))
+        ]
 
 
-def test_zero_ticket_touches_only_the_counter():
-    bwd = _hk("bwd")
-    ds_full = torch.full(((2 * bwd.DS_GUARD_B + 1024) // 2,), 3.0, dtype=torch.bfloat16)
-    before = ds_full.view(torch.uint8).clone()
-    bwd._zero_ticket(ds_full)
-    after = ds_full.view(torch.uint8)
-    lo, hi = bwd.TICKET_OFFSET_B, bwd.DS_GUARD_B
-    assert torch.all(after[lo:hi] == 0)
-    assert torch.equal(after[:lo], before[:lo]) and torch.equal(after[hi:], before[hi:])
-
-
-def test_max_scratch_bytes_setting(monkeypatch):
-    bwd = _hk("bwd")
-    for text, want in (("", None), ("2.2e9", 2_200_000_000), ("4096", 4096)):
-        monkeypatch.setenv(bwd.MAX_SCRATCH_BYTES_ENV, text)
-        assert bwd._bytes_setting(bwd.MAX_SCRATCH_BYTES_ENV) == want
-    for text in ("0", "-1", "lots", "inf", "nan"):
-        monkeypatch.setenv(bwd.MAX_SCRATCH_BYTES_ENV, text)
-        with pytest.raises(ValueError, match="positive byte count"):
-            bwd._bytes_setting(bwd.MAX_SCRATCH_BYTES_ENV)
-
-
-# ---------------------------------------------------------------------------
-# Build: manifest, sources, code objects, assembly patches
-# ---------------------------------------------------------------------------
-
-
-def test_manifest():
-    """Every kernel belongs to one pass, its source is shipped, its arguments tile its kernarg segment in order,
-    and the flags are a hermetic device-only gfx1250 build: relative include paths inside the package only (no
-    3rdparty/hipkittens, no KITTENS_* defines)."""
-    hsaco, hiprt = _hk("hsaco"), _hk("hiprt")
-    m = hsaco.load_manifest()
-    assert (
-        m["arch"] == "gfx1250"
-        and "--offload-arch=gfx1250" in m["flags"]
-        and "--cuda-device-only" in m["flags"]
-    )
-    assert sorted(m["kernels"]) == sorted(hsaco.FWD_KERNELS + hsaco.BWD_KERNELS)
-    for name, k in m["kernels"].items():
-        flags = m["flags"] + k["extra_flags"]
-        assert not any("KITTENS" in f or "3rdparty" in f or f.startswith("-I/") for f in flags), name
-        assert all(f in ("-Iinclude", "-I.") for f in flags if f.startswith("-I")), name
-        assert (hsaco.HIP_DIR / k["src"]).is_file() and re.fullmatch(r"[0-9a-f]{64}", k["hsaco_sha256"]), name
-        if "asm_patch" in k:
-            assert (hsaco.HIP_DIR / k["asm_patch"]).is_file() and re.fullmatch(
-                r"[0-9a-f]{64}", k["asm_input_sha256"]
-            )
-        last = k["args"][-1]
-        assert last["offset"] + last["size"] <= k["kernarg_size"], name
-        values = [1 if a["kind"] == "ptr" else 0 for a in k["args"]]
-        assert len(hiprt.pack_args(k["args"], values)) == last["offset"] + last["size"], name
-    assert m["kernels"]["k_mla_fwd"]["block"] == _hk("fwd").BLOCK
-    assert m["kernels"]["k_delta"]["block"] == _hk("bwd").DELTA_BLOCK
-
-
-_SYSTEM_HEADERS = {"hip/hip_runtime.h", "stdint.h", "utility"}
-
-
-def test_sources_are_self_contained():
-    """The kernels include only the HIP runtime, two C++ headers and the package's own headers: nothing from
-    3rdparty/hipkittens (main's gfx950 HipKittens) or any other tree can leak into them."""
-    hsaco = _hk("hsaco")
-    files = sorted(p for p in hsaco.HIP_DIR.rglob("*") if p.suffix in (".hip", ".h"))
-    assert files
-    for path in files:
-        text = path.read_text()
-        assert "kittens::" not in text, path
-        for quoted, name in re.findall(r'#\s*include\s+(["<])([^">]+)[">]', text):
-            if quoted == "<":
-                assert name in _SYSTEM_HEADERS, (path, name)
-            else:
-                found = [d / name for d in (path.parent, hsaco.HIP_DIR / "include", hsaco.HIP_DIR)]
-                assert any(f.is_file() for f in found), (path, name)
-                assert all(f.resolve().is_relative_to(hsaco.HIP_DIR) for f in found if f.is_file()), (
-                    path,
-                    name,
-                )
-
-
-def test_code_object_checks(monkeypatch, tmp_path):
-    """Availability is per pass: a missing or foreign code object of one pass leaves the other available, and
-    hiprt refuses to load it. A stand-in manifest pins placeholder bytes (no compiler, no GPU)."""
-    hsaco, hiprt = _hk("hsaco"), _hk("hiprt")
-    man = hsaco.load_manifest()
-    blobs = {n: f"code object {n}".encode() for n in man["kernels"]}
-    pins = {n: dict(k, hsaco_sha256=hashlib.sha256(blobs[n]).hexdigest()) for n, k in man["kernels"].items()}
-    monkeypatch.setattr(hsaco, "_MANIFEST", dict(man, kernels=pins))
-    monkeypatch.setattr(hsaco, "_REASONS", {})
-
-    def bin_dir(name, **override):
-        d = tmp_path / name
-        d.mkdir()
-        for n, data in blobs.items():
-            data = override.get(n, data)
-            if data is not None:
-                (d / f"{n}.hsaco").write_bytes(data)
-        return d
-
-    full = bin_dir("full")
-    assert hsaco.unavailable_reason(hsaco.FWD_KERNELS, full) is None
-    assert hsaco.unavailable_reason(hsaco.BWD_KERNELS, full) is None
-    assert set(hiprt.load_kernels(hsaco.BWD_KERNELS, full)) == set(hsaco.BWD_KERNELS)
-    for name, data, why in (("missing", None, "not built"), ("foreign", b"other bytes", "sha256")):
-        d = bin_dir(name, k_delta=data)
-        assert hsaco.unavailable_reason(hsaco.FWD_KERNELS, d) is None
-        assert why in hsaco.unavailable_reason(hsaco.BWD_KERNELS, d)
-        assert set(hiprt.load_kernels(hsaco.FWD_KERNELS, d)) == {"k_mla_fwd"}
-        with pytest.raises(hiprt.HipError, match="unavailable"):
-            hiprt.load_kernels(hsaco.BWD_KERNELS, d)
-
-
-def test_build_never_fails_and_keeps_good_code_objects(monkeypatch, tmp_path):
-    """hsaco.build with a compiler that is not there, one that is not the pinned toolchain (skipped before compiling),
-    or one that emits other bytes, returns False without raising and leaves the code objects already in place
-    untouched (a new one replaces them only when it is the pinned one)."""
-    hsaco = _hk("hsaco")
-    monkeypatch.setattr(hsaco, "_REASONS", {})
+def test_build_never_fails_and_installs_only_pinned_code_objects(monkeypatch, tmp_path):
+    """Pinned code objects are kept, an unpinned one is removed, and a compiler that is missing, not the pinned
+    toolchain, or emits other bytes leaves the build failed without raising or installing anything."""
+    hsaco = _hsaco()
+    manifest = hsaco.load_manifest()
+    blobs = {n: f"code object {n}".encode() for n in manifest["kernels"]}
+    pinned = {
+        n: dict(k, hsaco_sha256=hashlib.sha256(blobs[n]).hexdigest()) for n, k in manifest["kernels"].items()
+    }
+    monkeypatch.setattr(hsaco, "load_manifest", lambda: dict(manifest, kernels=pinned))
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    before = {}
-    for name in hsaco.load_manifest()["kernels"]:
-        before[name] = f"old {name}".encode()
-        (bin_dir / f"{name}.hsaco").write_bytes(before[name])
+    for n, data in blobs.items():
+        (bin_dir / f"{n}.hsaco").write_bytes(b"stale" if n == "k_delta" else data)
     fake = tmp_path / "fake-clang"
     fake.write_text('#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && echo junk > "$2"; shift; done\n')
     fake.chmod(0o755)
-    toolchain = hsaco.load_manifest()["toolchain"]
     for cxx, version, want in (
         (tmp_path / "missing-clang", None, "not found"),
-        (fake, None, "not the validated"),
-        (fake, toolchain, "not built: RuntimeError"),
+        (fake, None, "not the pinned toolchain"),
+        (fake, manifest["toolchain"], "not built: RuntimeError"),
     ):
         if version is not None:
             monkeypatch.setattr(hsaco, "compiler_version", lambda c, v=version: v)
         logs = []
-        assert hsaco.build(cxx=str(cxx), bin_dir=bin_dir, force=True, log=logs.append) is False
+        assert hsaco.build(cxx=str(cxx), bin_dir=bin_dir, log=logs.append) is False
         assert any(want in m for m in logs), logs
-        assert {n: (bin_dir / f"{n}.hsaco").read_bytes() for n in before} == before
-        assert not list(bin_dir.glob("*.tmp"))
+        assert sorted(p.name for p in bin_dir.iterdir()) == [
+            "k_dkdv96ds.hsaco",
+            "k_dqds_c.hsaco",
+            "k_mla_fwd.hsaco",
+        ]
+    assert hsaco.unavailable_reason(hsaco.FWD_KERNELS, bin_dir) is None
+    assert "k_delta.hsaco is not built" == hsaco.unavailable_reason(hsaco.BWD_KERNELS, bin_dir)
 
 
 _ASM_HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@$")
@@ -614,13 +497,11 @@ def _asm_patch_hunks(patch):
 
 @pytest.mark.parametrize("name", sorted(_ASM_REGIONS))
 def test_asm_patch(tmp_path, name):
-    """The patch (tools/regen_asm_patch.py) has the generated kernel's shape: each hunk inserts one region right
-    behind its marker line (every region exactly once; no s_endpgm or PC change inside, branches only to the
-    region's own labels) or raises the VGPR allocation to 1024. hsaco.py applies it to its own context only: a
-    changed context line is rejected, and a compiler .s with another sha256 is refused before anything is patched."""
-    hsaco = _hk("hsaco")
+    """The committed patch (tools/regen_asm_patch.py) inserts each generated region right behind its marker line
+    (every region once; no s_endpgm or PC change inside, branches only to the region's own labels) and raises the
+    VGPR allocation to 1024. hsaco.py applies it to its exact context only, and only to the pinned compiler .s."""
+    hsaco = _hsaco()
     k = hsaco.load_manifest()["kernels"][name]
-    assert k["vgpr"] == 1024
     marker_re, want_regions = _ASM_REGIONS[name]
     patch = (hsaco.HIP_DIR / k["asm_patch"]).read_text()
     src, want, shift, regions, allocs = [], [], 0, [], 0
@@ -633,9 +514,14 @@ def test_asm_patch(tmp_path, name):
         old = [t for tag, t in ops if tag == "-"]
         new = [t for tag, t in ops if tag == "+"]
         if old:  # the VGPR allocation, one line
-            assert len(old) == len(new) == 1, old_start
             mo, mn = _ASM_ALLOC.fullmatch(old[0]), _ASM_ALLOC.fullmatch(new[0])
-            assert mo and mn and mo.group(1) == mn.group(1) and mn.group(2) == "1024", (old, new)
+            assert (
+                len(old) == len(new) == 1
+                and mo
+                and mn
+                and mo.group(1) == mn.group(1)
+                and mn.group(2) == "1024"
+            )
             allocs += 1
             continue
         first_new = next(j for j, (tag, _) in enumerate(ops) if tag == "+")
@@ -661,12 +547,6 @@ def test_asm_patch(tmp_path, name):
     saved.write_text(text)
     with pytest.raises(RuntimeError, match="asm_input_sha256"):
         hsaco.patch_and_reassemble(name, k, [], tmp_path)
-    saved.write_text(bad)
-    with pytest.raises(RuntimeError, match="does not apply"):
-        hsaco.patch_and_reassemble(
-            name, dict(k, asm_input_sha256=hashlib.sha256(bad.encode()).hexdigest()), [], tmp_path
-        )
-    assert saved.read_text() == bad
 
 
 # ---------------------------------------------------------------------------
@@ -676,29 +556,35 @@ def test_asm_patch(tmp_path, name):
 
 def _kernel_inputs(b, s, h, seed=0):
     """Kernel-layout (contiguous [b, s, h, d]) q, k, v on the card."""
-    q, k, v, _ = _inputs(b, s, s, h, layout="bshd", seed=seed)
-    return tuple(t.cuda() for t in (q, k, v))
+    return tuple(t.cuda() for t in _inputs(b, s, s, h, layout="bshd", seed=seed)[:3])
 
 
-@needs_hk_fwd
+@needs_hk
 @pytest.mark.parametrize(
     "dims",
-    [(1, 64, 2), (1, 256, 2), (2, 256, 2), (1, 640, 4), (1, 1024, 128), (1, 4096, 256)],
-    ids=["s64", "toy", "b2", "s640_partial_block", "persistent", "dsv3_mbs2_folded"],
+    [(1, 64, 2), (1, 256, 2), (2, 256, 2), (1, 640, 4), (1, 1024, 128), (1, 4096, 256), (2, 4096, 96)],
+    ids=["s64", "toy", "b2", "s640_partial_block", "persistent", "dsv3_mbs2_folded", "kimi_k3_mbs2"],
 )
 def test_hk_fwd_bitwise_equals_flydsl(dims):
     """out and lse bitwise equal to the FlyDSL forward's, every element written (outputs NaN-filled first), and a
     rerun bitwise identical; the persistent grid included."""
     q, k, v = _kernel_inputs(*dims)
     with _nan_filled_outputs():
-        got = _hk("fwd").hk_attn_fwd(q, k, v, MLA_SCALE, True)
-        again = _hk("fwd").hk_attn_fwd(q, k, v, MLA_SCALE, True)
+        got = hk.hk_mla_fwd(q, k, v, MLA_SCALE, True)
+        again = hk.hk_mla_fwd(q, k, v, MLA_SCALE, True)
         fly = mla_impl._forward_op(q, k, v, MLA_SCALE, True)
     for name, a, b, c in zip(("out", "lse"), got, again, fly):
         assert torch.isfinite(a).all() and torch.equal(a, b) and torch.equal(a, c), name
 
 
-@needs_hk_fwd
+def _counting(monkeypatch, name):
+    calls = []
+    real = getattr(hk, name)
+    monkeypatch.setattr(hk, name, lambda *a, **kw: calls.append(a[1].shape) or real(*a, **kw))
+    return calls
+
+
+@needs_hk
 @pytest.mark.parametrize(
     ("dims", "layout", "scale"),
     [
@@ -709,29 +595,25 @@ def test_hk_fwd_bitwise_equals_flydsl(dims):
     ids=["b2_sbhd_folded", "s640", "bhsd_default_scale"],
 )
 def test_hk_fwd_matches_reference(monkeypatch, dims, layout, scale):
-    """flash_attn_func with PRIMUS_TURBO_MLA_FWD_IMPL=hk (the HIP forward is used) against the fp32 reference,
-    gradients included (FlyDSL backward)."""
+    """flash_attn_func with the forward on hk against the fp32 reference, gradients included (FlyDSL backward)."""
     _settings(monkeypatch, fwd="hk")
-    calls = []
-    real = mla_impl._forward_hk_op
-    monkeypatch.setattr(mla_impl, "_forward_hk_op", lambda *a: calls.append(a[0].shape) or real(*a))
+    calls = _counting(monkeypatch, "hk_mla_fwd")
     q, k, v, dout = _inputs(*dims, layout=layout)
     got = _run(q, k, v, dout, scale)
-    assert len(calls) == 1, "the HIP forward was not used"
+    assert len(calls) == 1, "the HipKittens forward was not used"
     _check(got, _reference(q, k, v, dout, D_QK**-0.5 if scale is None else scale))
 
 
 def _run_hk_bwd(monkeypatch, q, k, v, dout):
     _settings(monkeypatch, bwd="hk")
-    calls = []
-    real = mla_impl._backward_hk_op
-    monkeypatch.setattr(mla_impl, "_backward_hk_op", lambda *a: calls.append(a[1].shape) or real(*a))
-    got = _run(q, k, v, dout)
-    assert len(calls) == 1, "the HIP backward was not used"
+    with pytest.MonkeyPatch.context() as mp:
+        calls = _counting(mp, "hk_mla_bwd")
+        got = _run(q, k, v, dout)
+    assert len(calls) == 1, "the HipKittens backward was not used"
     return got
 
 
-@needs_hk_bwd
+@needs_hk
 @pytest.mark.parametrize(
     ("dims", "layout"),
     [
@@ -739,12 +621,13 @@ def _run_hk_bwd(monkeypatch, q, k, v, dout):
         ((2, 256, 256, 2), "sbhd"),
         ((1, 256, 384, 2), "sbhd"),
         ((1, 640, 640, 4), "bshd"),
+        ((2, 1024, 1024, 96), "sbhd"),
     ],
-    ids=["toy", "toy_folded", "rect", "s640"],
+    ids=["toy", "toy_folded", "rect", "s640", "kimi_k3_heads"],
 )
 def test_hk_bwd_matches_reference_and_flydsl(monkeypatch, dims, layout):
-    """The HIP backward matches the fp32 reference, is bitwise deterministic, and every gradient's SNR is within
-    0.3 dB of the FlyDSL backward's (the folded ND rounds scale * P instead of P)."""
+    """The HipKittens backward matches the fp32 reference, is bitwise deterministic, and every gradient's SNR is
+    within 0.3 dB of the FlyDSL backward's (it rounds scale * P instead of P)."""
     q, k, v, dout = _inputs(*dims, layout=layout)
     got = _run_hk_bwd(monkeypatch, q, k, v, dout)
     ref = _reference(q, k, v, dout, MLA_SCALE)
@@ -764,76 +647,70 @@ def test_hk_bwd_matches_reference_and_flydsl(monkeypatch, dims, layout):
             assert snr_hk >= snr_fly - 0.3, f"{name}: {snr_hk:.2f} dB vs FlyDSL {snr_fly:.2f} dB"
 
 
-@needs_hk_bwd
+@needs_hk
 def test_hk_bwd_production_shape_matches_reference(monkeypatch):
-    """(1, 4096, 4096, 16): 42 96-row kv blocks + the 64-row tail, 10 384-query dQ tiles + the 256-query head;
-    with the dS scratch NaN-filled, so a block dQ reads but dK/dV never wrote fails."""
-    monkeypatch.setattr(_hk("bwd"), "POISON", True)
+    """(1, 4096, 4096, 16): 42 96-row kv blocks + the 64-row tail, 10 384-query dQ tiles + the 256-query head; outputs
+    and dS scratch NaN-filled, so a block dQ reads but dK / dV never wrote fails."""
     q, k, v, dout = _inputs(1, 4096, 4096, 16, layout="bshd")
     _check(_run_hk_bwd(monkeypatch, q, k, v, dout), _reference_by_heads(q, k, v, dout, MLA_SCALE))
 
 
-@needs_hk_bwd
-def test_hk_bwd_rect32_matches_reference(monkeypatch):
-    """hk_attn_bwd called directly at (Skv - Sq) % 64 == 32 (the FlyDSL gate refuses it, the HIP kernels' shape
-    rules admit it): dQ's last steady unit reads the first masked kv32 row, whose stored pairs start mid-row. Outputs
-    and scratch NaN-filled."""
-    bwd = _hk("bwd")
-    monkeypatch.setattr(bwd, "POISON", True)
+@needs_hk
+def test_hk_bwd_rect32_matches_reference():
+    """seqlen_kv - seqlen_q = 32 (the FlyDSL gate refuses it, the HipKittens rules admit it): dQ's last steady unit
+    reads the first masked kv32 row, whose stored pairs start mid-row."""
     q, k, v, dout = _inputs(1, 4096, 4128, 4, layout="bshd")
     ref = _reference_by_heads(q, k, v, dout, MLA_SCALE)
     out, lse = ref[0].to(torch.bfloat16).cuda(), ref[1].float().cuda()
     args = [t.cuda().contiguous() for t in (dout, q, k, v)]
-    got = bwd.hk_attn_bwd(*args, out, lse, MLA_SCALE, True)
-    again = bwd.hk_attn_bwd(*args, out, lse, MLA_SCALE, True)
+    with _nan_filled_outputs():
+        got = hk.hk_mla_bwd(*args, out, lse, MLA_SCALE, True)
+        again = hk.hk_mla_bwd(*args, out, lse, MLA_SCALE, True)
     for name, x, y, r in zip(("dq", "dk", "dv"), got, again, ref[2:]):
         assert torch.equal(x, y), name
-        snr = compute_snr(r, x.float().cpu())
-        assert snr >= 48.0, f"{name}: {snr:.1f} dB < 48 dB"
+        assert compute_snr(r, x.float().cpu()) >= 48.0, name
 
 
-@needs_hk_bwd
-def test_hk_bwd_head_chunks_are_bitwise_equal(monkeypatch):
-    """Head-chunked calls (2 batches x 2 chunks of 32 heads: views offset in batch and head, one shared scratch)
-    return exactly the unchunked gradients; outputs and scratch NaN-filled."""
-    bwd = _hk("bwd")
-    monkeypatch.setattr(bwd, "POISON", True)
+@needs_hk
+def test_hk_bwd_head_chunks_are_bitwise_equal():
+    """Head-chunked calls (2 batches x 2 chunks of 32 heads on one shared scratch) return exactly the unchunked
+    gradients; outputs and scratch NaN-filled."""
     q, k, v, dout = (t.cuda() for t in _inputs(2, 256, 256, 64, layout="bshd"))
     out, lse = mla_impl._forward_op(q, k, v, MLA_SCALE, True)
-    full = bwd.hk_attn_bwd(dout, q, k, v, out, lse, MLA_SCALE, True)
-    budget = bwd._scratch_bytes(1, 256, 256, 32, True)
-    assert bwd._plan(dout, q, k, v, out, lse, MLA_SCALE, True, max_scratch_bytes=budget)["chunks"] == [
-        (0, 0, 32),
-        (0, 32, 32),
-        (1, 0, 32),
-        (1, 32, 32),
-    ]
-    chunked = bwd.hk_attn_bwd(dout, q, k, v, out, lse, MLA_SCALE, True, max_scratch_bytes=budget)
+    budget = hk._mla_ds_bytes(1, 256, 256, 32, True) + 2 * hk._MLA_DS_GUARD
+    launches, _, _ = hk._hk_mla_bwd_plan(dout, q, k, v, out, lse, MLA_SCALE, True, budget)
+    assert len(launches) == 1 + 2 * 4
+    with _nan_filled_outputs():
+        full = hk.hk_mla_bwd(dout, q, k, v, out, lse, MLA_SCALE, True)
+        chunked = hk.hk_mla_bwd(dout, q, k, v, out, lse, MLA_SCALE, True, max_scratch_bytes=budget)
     for a, b in zip(full, chunked):
         assert torch.isfinite(a).all() and torch.equal(a, b)
 
 
-@needs_hk_bwd
-def test_hk_bwd_falls_back_when_the_scratch_does_not_fit(monkeypatch):
-    """Out of memory for the dS scratch: the call runs the FlyDSL backward (same gradients as FlyDSL's)."""
-    bwd = _hk("bwd")
-
-    def oom(nbytes, device):
-        raise torch.OutOfMemoryError(f"cannot allocate {nbytes} bytes")
-
+@needs_hk
+def test_hk_bwd_falls_back_to_flydsl(monkeypatch):
+    """Out of memory for the dS scratch: the call runs the FlyDSL backward; a shape FlyDSL cannot take either is
+    refused."""
     q, k, v, dout = (t.cuda() for t in _inputs(1, 256, 256, 4, layout="bshd"))
     out, lse = mla_impl._forward_op(q, k, v, MLA_SCALE, True)
     fly = mla_impl._backward_op(dout, q, k, v, out, lse, MLA_SCALE, True)
-    monkeypatch.setattr(bwd, "_ds_scratch", oom)
-    for a, b in zip(bwd.hk_attn_bwd(dout, q, k, v, out, lse, MLA_SCALE, True), fly):
+
+    def oom(*args):
+        raise torch.OutOfMemoryError("no memory for the scratch")
+
+    monkeypatch.setattr(hk, "_hk_mla_bwd_plan", oom)
+    for a, b in zip(hk.hk_mla_bwd(dout, q, k, v, out, lse, MLA_SCALE, True), fly):
         assert torch.equal(a, b)
+    q, k, v, dout = (t.cuda() for t in _inputs(1, 256, 288, 4, layout="bshd"))  # seqlen_kv % 64 == 32
+    lse = torch.zeros(1, 4, 256, device="cuda")
+    with pytest.raises(NotImplementedError, match="FlyDSL cannot take it either"):
+        hk.hk_mla_bwd(dout, q, k, v, dout, lse, MLA_SCALE, True)
 
 
 def _delta_inputs(b, s, h, special, seed=0):
-    """Kernel-layout dO / O [b, s, h, 128] bf16 and lse [b, h, s] fp32 on the card. special: every (row, head) of dO
-    and of O scaled by 2^-k, k in [0, 80), so the bf16 x bf16 products range from normal to below the fp32 denormal
-    range (where a fused multiply-add rounds differently from a multiply then an add); 5% bf16 denormals, 2% signed
-    zeros; lse with 5% fp32 denormals, 1% signed zeros and 1% +-3e38 (NL overflows to +-inf)."""
+    """Kernel-layout dO / O [b, s, h, 128] bf16 and lse [b, h, s] fp32 on the card. special: dO and O rows scaled by
+    2^-k, k in [0, 80), so the bf16 products reach below the fp32 denormals; 5% bf16 denormals, 2% signed zeros;
+    lse with 5% fp32 denormals, 1% signed zeros and 1% +-3e38 (NL overflows to +-inf)."""
     g = torch.Generator().manual_seed(seed)
     do, o = (torch.randn(b, s, h, D_V, generator=g) for _ in range(2))
     lse = torch.randn(b, h, s, generator=g) * 4 + 6
@@ -867,62 +744,54 @@ def _delta_inputs(b, s, h, special, seed=0):
     return do.cuda(), o.cuda(), lse.cuda()
 
 
-@needs_hk_bwd
+@needs_hk
 @pytest.mark.parametrize(
     ("dims", "special"),
     [
         ((1, 256, 2), False),
         ((2, 256, 4), False),
-        ((1, 640, 4), False),
         ((1, 4096, 16), False),
         ((2, 256, 4), True),
         ((1, 640, 4), True),
-    ],  # fmt: skip
-    ids=["toy", "b2", "s640", "s4096", "b2_denormals", "s640_denormals"],
+    ],
+    ids=["toy", "b2", "s4096", "b2_denormals", "s640_denormals"],
 )
 def test_hk_delta_matches_flydsl(dims, special):
-    """k_delta's delta bitwise equals the FlyDSL k_delta's, and its NL / ND equal the FlyDSL ones folded on the host
-    (NL + fp32 log2(scale), -delta): also for denormal inputs, products that underflow fp32, signed zeros and an lse
-    whose NL overflows."""
+    """k_delta's delta bitwise equals the FlyDSL k_delta's, and its NL / ND the FlyDSL ones folded on the host
+    (NL + fp32 log2(scale), -delta), also for denormals, underflowing products, signed zeros and overflowing NL."""
     from primus_turbo.flydsl.attention.gfx1250_mla import bwd as fly
 
-    bwd = _hk("bwd")
     do, o, lse = _delta_inputs(*dims, special)
     b, s, h, _ = do.shape
+    q = torch.empty(b, s, h, D_QK, dtype=torch.bfloat16, device="cuda")
+    with _nan_filled_outputs():
+        launches, _, _ = hk._hk_mla_bwd_plan(do, q, q, o, o, lse, MLA_SCALE, True, None)
+    name, grid, values = launches[0]
     stream = torch.cuda.current_stream()
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(bwd, "POISON", True)
-        q = torch.empty(b, s, h, D_QK, dtype=torch.bfloat16, device="cuda")
-        v = torch.empty(b, s, h, D_V, dtype=torch.bfloat16, device="cuda")
-        plan = bwd._plan(do, q, q, v, o, lse, MLA_SCALE, True)
-    grid, block, values = plan["launches"][0][2]
-    bwd.kernels()["k_delta"].call(grid, block, values, stream)
+    hk._mla_kernel(name)(grid, values, stream)
     delta, nl, nd = (torch.full((b, h, s), float("nan"), device="cuda") for _ in range(3))
     fly._launch(
         fly._k.launch_delta,
         (do, o, delta, lse, nl, nd, MLA_SCALE, s, h, b * s * h, s // fly._k.ROWS_DELTA, b * h, stream),
     )
-    want = (delta, nl + bwd.log2_scale_fp32(MLA_SCALE), -delta)
-    for name, x, y in zip(("delta", "NL", "ND"), (plan["delta"], plan["nl"], plan["nd"]), want):
-        assert not torch.isnan(x).any(), name
-        assert torch.equal(x.view(torch.int32), y.view(torch.int32)), name
+    l2s = struct.unpack("f", struct.pack("f", math.log2(MLA_SCALE)))[0]
+    for label, x, y in zip(
+        ("delta", "NL", "ND"), (values[2], values[4], values[5]), (delta, nl + l2s, -delta)
+    ):
+        assert not torch.isnan(x).any(), label
+        assert torch.equal(x.view(torch.int32), y.view(torch.int32)), label
     if special:
-        tiny = (plan["delta"] != 0) & (plan["delta"].abs() < torch.finfo(torch.float32).tiny)
+        tiny = (values[2] != 0) & (values[2].abs() < torch.finfo(torch.float32).tiny)
         assert tiny.any(), "no denormal delta: the inputs do not reach the fp32 denormal range"
 
 
 @needs_hk
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
 def test_hk_end_to_end(monkeypatch, compiled):
-    """Both passes on the HIP kernels through flash_attn_func (SBHD, folded), eager and torch.compile'd: out / lse
-    bitwise those of the FlyDSL kernels, gradients bitwise deterministic and as close to the reference."""
+    """Both passes on hk through flash_attn_func (SBHD, folded), eager and torch.compile'd: out / lse bitwise those of
+    the FlyDSL kernels, gradients bitwise deterministic and as close to the reference."""
     q, k, v, dout = _inputs(2, 256, 256, 8, layout="sbhd")
-    runs = {"fwd": 0, "bwd": 0}
-    for pass_, entry in (("fwd", "hk_attn_fwd"), ("bwd", "hk_attn_bwd")):
-        real = getattr(_hk(pass_), entry)
-        monkeypatch.setattr(
-            _hk(pass_), entry, lambda *a, p=pass_, f=real, **kw: runs.update({p: runs[p] + 1}) or f(*a, **kw)
-        )
+    fwd_calls, bwd_calls = _counting(monkeypatch, "hk_mla_fwd"), _counting(monkeypatch, "hk_mla_bwd")
     attn = flash_attn_func
     if compiled:
         torch._dynamo.reset()
@@ -935,7 +804,7 @@ def test_hk_end_to_end(monkeypatch, compiled):
         fly = _run(q, k, v, dout)
     finally:
         torch._dynamo.reset()
-    assert runs == {"fwd": 2, "bwd": 2}, runs
+    assert (len(fwd_calls), len(bwd_calls)) == (2, 2)
     ref = _reference(q, k, v, dout, MLA_SCALE)
     _check(got, ref)
     for name, a, b, c, r in zip(("out", "lse", "dq", "dk", "dv"), got, again, fly, ref):

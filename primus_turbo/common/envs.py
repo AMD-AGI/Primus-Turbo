@@ -43,6 +43,9 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_GROUPED_GEMM_BACKEND: str | None = None
     PRIMUS_TURBO_ATTN_BACKEND: str | None = None
     PRIMUS_TURBO_SPARSE_ATTN_BACKEND: str | None = None
+    PRIMUS_TURBO_MLA_FWD_IMPL: str = "flydsl"
+    PRIMUS_TURBO_MLA_BWD_IMPL: str = "flydsl"
+    PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES: int | None = None
     PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND: str | None = None
     PRIMUS_TURBO_AUTO_TUNE: bool = False
     PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32: bool = True
@@ -132,6 +135,19 @@ def env_clamped_int(name: str, default: int, lo: int, hi: int) -> Callable[[], i
     return _get
 
 
+def _mla_impl(name: str) -> Callable[[], str]:
+    """A getter for a gfx1250 MLA kernel choice: "flydsl" (also unset or blank) or "hk", any case."""
+
+    def _get() -> str:
+        raw = os.getenv(name, "")
+        value = raw.strip().lower() or "flydsl"
+        if value not in ("flydsl", "hk"):
+            raise ValueError(f"{name}={raw!r}: expected flydsl or hk")
+        return value
+
+    return _get
+
+
 def _deepep_cpu_timeout() -> int:
     raw = os.getenv("PRIMUS_TURBO_DEEPEP_CPU_TIMEOUT")
     if not raw:
@@ -165,6 +181,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PRIMUS_TURBO_ATTN_BACKEND": backend_spec("PRIMUS_TURBO_ATTN_BACKEND"),
     # Sparse-attention (DeepSeek-V4 sparse-MLA) backend, e.g. FLYDSL, TRITON, or "autotune".
     "PRIMUS_TURBO_SPARSE_ATTN_BACKEND": backend_spec("PRIMUS_TURBO_SPARSE_ATTN_BACKEND"),
+    # Kernels of the gfx1250 DeepSeek-V3 MLA attention (qk 192 / v 128) forward / backward under the
+    # FLYDSL backend: "flydsl" (unset or blank) or "hk", the HipKittens kernels, which hand a pass they
+    # cannot take to FlyDSL. Read once, when attention_flydsl_gfx1250_mla_impl is imported; another value
+    # raises ValueError there.
+    "PRIMUS_TURBO_MLA_FWD_IMPL": _mla_impl("PRIMUS_TURBO_MLA_FWD_IMPL"),
+    "PRIMUS_TURBO_MLA_BWD_IMPL": _mla_impl("PRIMUS_TURBO_MLA_BWD_IMPL"),
+    # Byte budget of the "hk" MLA backward's dS scratch (4.33 GB at DeepSeek-V3's b2 s4096 h128); over it
+    # the call is split by heads. Unset: no limit. Read at the first "hk" MLA backward.
+    "PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES": env_positive_int(
+        "PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES", None, "must be a positive byte count"
+    ),
     # MoE dispatch/combine EP backend: TURBO (the default when unset), DEEP_EP, or a custom EP name
     # such as UCCL_EP. "autotune" is rejected with an AssertionError.
     "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend_spec("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"),

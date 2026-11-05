@@ -6,7 +6,7 @@
 # 2. pre-commit install(the first time you download the repo, it will be cached for future use)
 
 # Assembly patches apply with exact context: their whitespace is data.
-exclude: ^primus_turbo/hipkittens/gfx1250_mla/hip/asm/
+exclude: ^csrc/kernels/attention/hipkittens/gfx1250_mla/asm/
 repos:
   - repo: local
     hooks:

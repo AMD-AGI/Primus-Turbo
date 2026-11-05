@@ -6,7 +6,7 @@
 
 """fwdgen -- the generated regions of the HK MLA forward kernel ``k_mla_fwd``.
 
-The shell (``hip/src/k_mla_fwd.hip``) carries inline-asm
+The shell (``src/k_mla_fwd.hip``) carries inline-asm
 markers; build.py compiles it, reads the registers LLVM gave each marker operand and asks this module for
 every region:
 
@@ -256,7 +256,8 @@ def mk(text, kind, tag=""):
     n = Node(text, kind, tag)
     if kind == "BAR":
         return n
-    if kind == "RESC" and text.startswith("HKRESC2"):  # "HKRESC2 a b oa ob corra corrb scc": O(a), O(b), one branch
+    # "HKRESC2 a b oa ob corra corrb scc": O(a), O(b), one branch
+    if kind == "RESC" and text.startswith("HKRESC2"):
         _, _, _, oa, ob, ca, cb, sany = text.split()
         n.vdefs = set(range(int(oa), int(oa) + 64)) | set(range(int(ob), int(ob) + 64))
         n.vuses = n.vdefs | {int(ca), int(cb)}
@@ -282,7 +283,8 @@ def mk(text, kind, tag=""):
         n.sdefs, n.suses = set(_sregs(ops[0])), set(_sregs(ops[1]))
     elif mn.startswith("tensor_load_to_lds"):
         n.suses = set(_sregs(ops[0])) | set(_sregs(ops[1]))
-    elif mn.startswith("s_"):  # other SALU: the first operand is the destination; scc unless it is known not to
+    # other SALU: the first operand is the destination; scc unless it is known not to
+    elif mn.startswith("s_"):
         n.sdefs = set(_sregs(ops[0]))
         if not mn.startswith(("s_mul_i32", "s_add_nc_u64", "s_bitset1_b32")):
             n.sdefs.add("scc")
@@ -691,8 +693,9 @@ def sum_nodes(L, i0, add, upd):
             if len(g) >= 2:
                 # the accumulator must be one of the first two (the first add is a + b); prefer the one whose banks
                 # differ from every other member, then the second (keeps the partial sums' banks alternating)
-                def clash(c):
+                def clash(c, g=g):
                     return sum(1 for y in g if y != c and _bank_pair(y) & _bank_pair(c))
+
                 acc = min((g[1], g[0]), key=clash)
             for y in (y for y in g if y != acc):
                 add(f"v_pk_add_f32 {vr(acc, 2)}, {vr(acc, 2)}, {vr(y, 2)}", "VALU", f"sum{i0}")

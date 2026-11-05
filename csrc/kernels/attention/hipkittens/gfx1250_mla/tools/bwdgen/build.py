@@ -8,7 +8,7 @@
 
     python3 build.py --out DIR [--cxx CXX]
 
- 1. compile the shell (hip/src/k_dkdv96ds.hip, exactly hsaco.py's command: the manifest's flags, -DHKGEN=1):
+ 1. compile the shell (src/k_dkdv96ds.hip, exactly hsaco.py's command: the manifest's flags, -DHKGEN=1):
     DIR/shell.s; and the LLVM-compiled kernel (-DHKGEN=0), whose operands in high VGPR blocks teach, with the
     shell's, the s_set_vgpr_msb operand-field map;
  2. read the markers (INIT, LOOP, FINAL per block height nkv) and the registers LLVM gave their operands; base = 1 +
@@ -33,7 +33,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TOOLS = HERE.parent
-HIP = TOOLS.parent / "hip"
+HIP = TOOLS.parent  # the kernel directory: src/, include/, hsaco.py
 sys.path[:0] = [str(HERE), str(TOOLS)]
 import bwdgen as G  # noqa: E402
 import shellbase  # noqa: E402

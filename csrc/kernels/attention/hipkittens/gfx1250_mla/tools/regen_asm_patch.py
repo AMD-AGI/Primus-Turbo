@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Regenerate the assembly patches hsaco.py applies (``hip/asm/<kernel>.s.patch``) and their manifest sha256s.
+"""Regenerate the assembly patches hsaco.py applies (``asm/<kernel>.s.patch``) and their manifest sha256s.
 
 Two kernels are generated: ``k_mla_fwd`` (``tools/fwdgen``) and ``k_dkdv96ds`` (``tools/bwdgen``). Compiled with the
 manifest's flags, their HIP source is a marker shell: the workgroup set-up, the TDM descriptors and the uniform
@@ -20,7 +20,7 @@ Per kernel:
      it and assemble the generator's code object byte for byte (``hsaco_sha256``);
   4. write the patch and both sha256 values.
 
-    python primus_turbo/hipkittens/gfx1250_mla/tools/regen_asm_patch.py [KERNEL ...] [--check] [--cxx PATH]
+    python csrc/kernels/attention/hipkittens/gfx1250_mla/tools/regen_asm_patch.py [KERNEL ...] [--check] [--cxx PATH]
 
 ``--check`` writes nothing and fails unless every regenerated patch and sha256 equals the committed one. CPU only;
 needs the pinned toolchain (manifest ``toolchain``).

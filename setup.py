@@ -106,11 +106,11 @@ def check_submodules():
     print("[Primus-Turbo] Submodules already initialized.")
 
 
-# -------- gfx1250 MLA attention HIP code objects --------
-# Built by the package's own hsaco.py with the flags manifest.json pins (never the csrc flags or the
-# 3rdparty/hipkittens headers); output that is not the pinned bytes is dropped and that pass stays on
-# FlyDSL. PRIMUS_TURBO_BUILD_HK_MLA=0 skips the step.
-HK_MLA_HSACO = PROJECT_ROOT / "primus_turbo" / "hipkittens" / "gfx1250_mla" / "hsaco.py"
+# -------- gfx1250 MLA attention HipKittens code objects --------
+# csrc/kernels/attention/hipkittens/gfx1250_mla/hsaco.py builds them into primus_turbo/lib/hk_gfx1250_mla with
+# the flags its manifest.json pins (not the extension's); output that is not the pinned bytes is dropped, and
+# those passes stay on FlyDSL. PRIMUS_TURBO_BUILD_HK_MLA=0 skips the step.
+HK_MLA_HSACO = PROJECT_ROOT / "csrc" / "kernels" / "attention" / "hipkittens" / "gfx1250_mla" / "hsaco.py"
 
 
 def build_hk_mla_hsaco(offload_arch_list):
@@ -580,14 +580,7 @@ if __name__ == "__main__":
         long_description=(PROJECT_ROOT / "README.md").read_text(encoding="utf-8"),
         long_description_content_type="text/markdown",
         packages=find_packages(exclude=["tests", "tests.*"]),
-        package_data={
-            "primus_turbo": [
-                "lib/*.so",
-                "hipkittens/gfx1250_mla/manifest.json",
-                "hipkittens/gfx1250_mla/bin/*.hsaco",
-                "hipkittens/gfx1250_mla/hip/**/*",
-            ]
-        },
+        package_data={"primus_turbo": ["lib/*.so", "lib/hk_gfx1250_mla/*.hsaco"]},
         ext_modules=ext_modules,
         cmdclass={"build_ext": TurboBuildExt.with_options(use_ninja=True)},
         entry_points=entry_points,
