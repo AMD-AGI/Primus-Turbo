@@ -50,7 +50,13 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 )
 from primus_turbo.flydsl.autotune import Compile, Op, Race, Refine, staged
 from primus_turbo.flydsl.autotune.engine import Entry
-from primus_turbo.flydsl.autotune.policies import Point, RealArgs, Synthetic
+from primus_turbo.flydsl.autotune.policies import (
+    Finite,
+    Point,
+    RealArgs,
+    Reproducible,
+    Synthetic,
+)
 from primus_turbo.flydsl.utils.prims import (
     ceildiv,
     floordiv_pow2,
@@ -1248,12 +1254,28 @@ def _tn4_gl_keys(pools):
     return keys
 
 
-def _dense_tn_slice_div(x, s):
-    """``x // s`` for a compile-time split-K slice factor: one shift, or one fixed-point
-    reciprocal multiply. Exact for every dividend the slice bounds reach (see _TN4_RCP_MAX)."""
+def _slice_div_magic(s, x_max, x_min=0):
+    """(m, k) such that ``(x * m) >> k == x // s`` for every 0 <= x <= ``x_max``, with
+    m = ceil(2^k / s) and ``x * m`` inside int32 for every ``x_min`` <= x <= ``x_max``. Exactness
+    holds when (m * s - 2^k) * x_max < 2^k, so k is picked per call: a fixed k = 16 is too short
+    for the split-K window divide, whose divisor is the window's tile count (up to the CU count)
+    and whose dividend reaches tiles x slices. Negative dividends only have to stay in range;
+    their quotients are discarded."""
+    span = max(x_max, -x_min, 1)
+    for k in range(30, 0, -1):
+        m = -(-(1 << k) // s)
+        if span * m < 1 << 31 and (m * s - (1 << k)) * x_max < 1 << k:
+            return m, k
+    raise AssertionError(f"no exact int32 reciprocal for x // {s} over [{x_min}, {x_max}]")
+
+
+def _dense_tn_slice_div(x, s, x_max, x_min=0):
+    """``x // s`` for a compile-time divisor ``s`` and a dividend in [``x_min``, ``x_max``]: one
+    shift, or one fixed-point reciprocal multiply that is exact over [0, ``x_max``]."""
     if s & (s - 1) == 0:
         return fx.Int32(floordiv_pow2(x, s))
-    return fx.Int32(fx.Int32(x * (-(-(1 << 16) // s))) >> 16)
+    m, k = _slice_div_magic(s, x_max, x_min)
+    return fx.Int32(fx.Int32(x * m) >> k)
 
 
 def _dense_tn_tile_mn(t, NBM, NBN, group_m, group_n):
@@ -1594,7 +1616,7 @@ def _dense_tn_wave4_tile(
         lo, nwin, s = split
         win_off = fx.Int32(d) - fx.Int32(lo)
         # sid < 0 = whole tile: the ids below the window take the whole K range.
-        sid = _dense_tn_slice_div(win_off, nwin)
+        sid = _dense_tn_slice_div(win_off, nwin, nwin * s - 1, -lo)
         tile_in_window = win_off - sid * fx.Int32(nwin)
         if lo:
             pre = win_off < fx.Int32(0)
@@ -1606,12 +1628,12 @@ def _dense_tn_wave4_tile(
             t = _readfirstlane_i32(fx.Int32(lo) + tile_in_window)
             sid = fx.Int32(_readfirstlane_i32(sid))
             slice_id = sid
-        k0 = _dense_tn_slice_div(fx.Int32(K_ITERS) * slice_id, s)
+        k0 = _dense_tn_slice_div(fx.Int32(K_ITERS) * slice_id, s, K_ITERS * (s - 1))
         ki = (
             fx.Int32(
                 arith.select(
                     slice_id + fx.Int32(1) < fx.Int32(s),
-                    _dense_tn_slice_div(fx.Int32(K_ITERS) * (slice_id + fx.Int32(1)), s),
+                    _dense_tn_slice_div(fx.Int32(K_ITERS) * (slice_id + fx.Int32(1)), s, K_ITERS * s),
                     fx.Int32(K_ITERS),
                 )
             )
@@ -1834,7 +1856,7 @@ def _dense_tn_wave4_tile(
 
 
 _TN4_SPLIT_S = (2, 3, 4)  # slice factors; an odd one is fine, the slices stay co-resident
-_TN4_RCP_MAX = 1 << 15  # exactness bound on _dense_tn_slice_div's dividend
+_TN4_RCP_MAX = 1 << 15  # bound on the split-K k-range dividends (K_ITERS * (s - 1)) the planner admits
 _TN4_OUT_ALIGN = 8  # out_ty elements the split-K bands keep aligned at C's row pitch
 
 
@@ -1853,7 +1875,7 @@ def _dense_tn_split(tiles, k_iters, ncu, phases):
     best, best_rounds, best_s = 1, 1, 1
     for s in _TN4_SPLIT_S:
         if k_iters < phases * s or k_iters * (s - 1) >= _TN4_RCP_MAX:
-            continue  # every slice must keep a whole main-loop pass, and stay exactly divisible
+            continue  # every slice must keep a whole main-loop pass
         rounds = _tn4_split_rounds(tiles, rem, s, ncu)
         if rounds * best_s < best_rounds * s:
             best, best_rounds, best_s = s, rounds, s
@@ -1989,7 +2011,7 @@ def _compile_dense_tn_wave4(
         """Fold the split-K window's slice bands into C, one row slab per workgroup. It runs
         the whole grid, so the fold spreads over every CU instead of only the window's."""
         tid = fx.thread_idx.x
-        wt = _dense_tn_slice_div(fx.Int32(fx.block_idx.x), _TN4_RED_WPT)
+        wt = _dense_tn_slice_div(fx.Int32(fx.block_idx.x), _TN4_RED_WPT, _RED_GRID - 1)
         part = fx.Int32(fx.block_idx.x) - wt * fx.Int32(_TN4_RED_WPT)
         block_m, block_n = _dense_tn_tile_mn(
             _readfirstlane_i32(fx.Int32(_LO) + wt), NBM, NBN, group_m, group_n
@@ -2966,9 +2988,13 @@ def _bench_dense_args(args):
 # race can reach do not, and nothing else sees it (#570). Untuned, a shape still takes the first
 # candidate that builds and holds: the base geometry does not hold for every shape. The TN
 # whole-loop races on finite output alone, on the caller's own arguments; it hands its
-# per-candidate compile scratches back.
-_DENSE_RACE = Race.interleaved(_PICK_PASSES, 40, ramp=_PICK_RAMP_ITERS, visit=(2, 3), check="reproducible")
-_TN4_RACE = _DENSE_RACE.checked_by("finite")
+# per-candidate compile scratches back. Both check the whole output for non-finite values, once
+# per shape: a split-K tile left unwritten can sit far from row 0, where a leading sample does not
+# reach, and can hold the same bytes on every repeat.
+_DENSE_RACE = Race.interleaved(
+    _PICK_PASSES, 40, ramp=_PICK_RAMP_ITERS, visit=(2, 3), check=Reproducible(n=None)
+)
+_TN4_RACE = _DENSE_RACE.checked_by(Finite(n=None))
 
 
 def _dense_probe(args):
