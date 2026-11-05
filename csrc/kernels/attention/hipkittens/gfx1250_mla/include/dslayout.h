@@ -105,7 +105,7 @@ DSL_FN bool dsl_stored(int kt, int qp, int Sq, int Skv, int causal) {
     return qp >= dsl_qp_first(kt, Skv - Sq, causal) && qp < dsl_nqp(Sq) && kt >= 0 &&
            kt < dsl_nkt(Skv);
 }
-// scratch bytes for B batches x Hq q heads (limits.ds_layout_bytes)
+// scratch bytes for B batches x Hq q heads (_mla_ds_bytes on the host)
 DSL_FN int64_t dsl_total_bytes(int B, int Hq, int Sq, int Skv, int causal) {
     return (int64_t) B * Hq * dsl_nblk_bh(Sq, Skv, causal) * DSL_BLK_B;
 }

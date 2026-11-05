@@ -251,7 +251,7 @@ K1_FN int k1_epi_g(int bat, int Skv, int Hkv, int hkv, int kv0, int isk, int rb,
 // ---- kv blocks: grid y = k3_nblk(Skv) blocks in ascending kv (longest first under bottom-right
 // causal). Blocks [0, n96) are 96-row blocks (2 waves x 48 rows, nkv 3) at kv0g = 96 bid; the n64
 // 64-row tail blocks (nkv 2) follow at 96 n96 + 64 j. Skv % 96 == 0: no tail; 64: one; 32: two
-// (96 (n - 1) + 128). The host rejects any other Skv (limits.k3_ok).
+// (96 (n - 1) + 128). The host admits no other Skv (hk_mla_unsupported_reason).
 #define K3_NKV 3              // 16-row kv sub-tiles per wave in a 96-row block
 #define K3_ROWS (32 * K3_NKV) // 96 kv rows per block
 K1_FN int k3_n96(int Skv) {
@@ -366,7 +366,7 @@ K1_FN int64_t k1ds_nblk_bh(int Sq, int Skv, int causal) { // == dsl_nblk_bh
 K1_FN int64_t k1ds_bh0(int bat, int Hq, int hkv, int G) {
     return (int64_t) bat * Hq + (int64_t) hkv * G;
 }
-// q-head stride in bytes (one region), i32: it scales gh, which is 0 under MHA (limits.py)
+// q-head stride in bytes (one region), i32: it scales gh, which is 0 under MHA (the host's rule)
 K1_FN int k1ds_hstride(int Sq, int Skv, int causal) {
     return (int) (k1ds_nblk_bh(Sq, Skv, causal) * DSL_BLK_B);
 }

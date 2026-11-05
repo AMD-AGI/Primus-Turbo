@@ -411,7 +411,7 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
     static_for<NST>([&](auto i) { acc[i] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; });
 #if HKGEN
     // ---- marker shell: the per-tile work as generated regions at inline-asm markers (tools/bwdgen; the asm patch
-    // splices them into this shell's .s). The generated loop assumes G == 1 (limits.py admits MHA only): tile k is
+    // splices them into this shell's .s). The generated loop assumes G == 1 (the host admits MHA only): tile k is
     // q pair qp_start + k, in stage k mod 3. Marker contract (checked by tools/bwdgen/build.py): the generated code
     // writes only VGPRs above every VGPR this shell references between INIT and FINAL, the clobbered SGPRs, vcc and
     // scc; one workgroup barrier per tile.

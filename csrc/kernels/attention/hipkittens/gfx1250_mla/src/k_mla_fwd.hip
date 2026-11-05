@@ -7,7 +7,7 @@
 // k_mla_fwd -- DeepSeek-V3 MLA attention forward on gfx1250: head dims qk 192 / v 128, bf16, MHA, bottom-right causal
 // (query i attends kv j <= i + Skv - Sq).
 //   Q [B, Sq, H, 192], K [B, Skv, H, 192], V [B, Skv, H, 128] -> O [B, Sq, H, 128] bf16, LSE [B, H, Sq] fp32 (natural
-//   log). The kernel relies on Sq == Skv and Sq % 64 == 0 (the host checks limits.fwd_shape_unsupported_reason).
+//   log). The kernel relies on Sq == Skv and Sq % 64 == 0 (the host checks hk_mla_unsupported_reason).
 //
 // Numerics: out and lse are bitwise equal to the FlyDSL MLA forward's: every q tile runs FlyDSL's fp32 operations in
 // FlyDSL's order. With c = scale * log2(e) and m the running row max in log2 units: s = Q K^T (WMMA chains over the
@@ -38,7 +38,7 @@
 //             tile t. Slots n..n + 2 past the last tile n - 1 load the next block's tiles 0..2 (its ring slots 0..2:
 //             the same stages) when there is one, else 1-row copies of tile n - 1, so wave 0 issues 3 ops in every
 //             tile. The next block is known three tiles before the block ends on the persistent static schedule only;
-//             that schedule needs Sq % 256 == 0 (fwd.persistent_workgroups), so every block has 4 diagonal tiles,
+//             that schedule needs Sq % 256 == 0 (hk_mla_persistent_workgroups), so every block has 4 diagonal tiles,
 //             which issue the slots n - 1..n + 2. One block per workgroup (npw == 0) has no next block.
 //   epilogue  after B_n: the next block's Q, then the output (staged at TAIL and in tile n - 1's stage)
 // No LDS read follows a tile's s_barrier_signal: right after B_n the next block's Q overwrites the Q area.
@@ -228,7 +228,7 @@ void k_mla_fwd(const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf1
   // no inter-workgroup dependence. With x = w % 8 (the XCD under the round-robin dispatch: L2 locality only),
   // w / 8 = r nqb + i and R = npw / 8 / nqb, its step s is head-batch hb = 8 (R s + r) + x, q block i on even steps
   // and nqb - 1 - i on odd ones; the list ends at the first hb >= H B, and w / 8 >= R nqb is idle. This covers every
-  // (q block, hb) exactly once when H B % 8 == 0 and R >= 1. The host (fwd.persistent_workgroups) also requires
+  // (q block, hb) exactly once when H B % 8 == 0 and R >= 1. The host (hk_mla_persistent_workgroups) also requires
   // Sq % 256 == 0, (npw / 8) % nqb == 0 and an even number of steps: then every two steps cost every workgroup
   // 4 (nqb + 1) tiles.
   //
@@ -598,7 +598,7 @@ void k_mla_fwd(const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf1
       //     rows 2 j, 2 j + 1), voffset vo_l (the lane's row 16 wv + l / 16 and 16-B column l % 16). The 64 rows
       //     q0 + 64 i .. + 63 are all < Sq or all >= Sq (Sq % 64 == 0): past Sq, num_records 0 drops the stores.
       //     Offsets and bounds in 32 bits (no 64-bit compares: VALU -> SGPR -> SALU chains): O is below 2 GiB, as q
-      //     is (limits.fwd_shape_unsupported_reason) and O has 128 of q's 192 columns.
+      //     is (hk_mla_unsupported_reason) and O has 128 of q's 192 columns.
       //   lse: one ds_load_b64 + one buffer_store_b64 for the wave's 64 rows (lane l: q tile l / 8, rows 2 (l % 8)
       //     and 2 (l % 8) + 1 = the slots of lanes 2 (l % 8), + 1); a row past Sq gets voffset OOB (soffset null).
       const long long o_bytes = (long long)B_ * Sq_ * H_ * D_V * 2;

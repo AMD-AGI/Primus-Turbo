@@ -97,17 +97,17 @@ compiles the per-tile work in HIP.
 ## Performance
 
 MI455X, DeepSeek-V3 MBS 2 (b2 s4096 h128), SBHD, causal, bf16, through the impl layer training uses; medians of 3
-processes x 10 interleaved rounds of 20 back-to-back calls, FlyDSL and HipKittens in the same process:
+processes x 10 interleaved rounds of 20 back-to-back calls each:
 
 | | FlyDSL (ms) | HipKittens (ms) | speedup |
 |---|---|---|---|
-| forward | 0.764 | 0.624 | 1.22x |
-| backward | 3.049 | 1.776 | 1.72x |
-| forward + backward (autograd) | 3.860 | 2.513 | 1.54x |
+| forward | 0.707 | 0.624 | 1.13x |
+| backward | 2.895 | 1.776 | 1.63x |
+| forward + backward (autograd) | 3.745 | 2.513 | 1.49x |
 
-With the L2 flushed before every call the forward takes 0.646 ms against FlyDSL's 0.770 and the backward 1.794
-against 2.998; with 20 ms of idle GPU before every call (the clocks of a training step) 0.634 against 0.726 and 1.798
-against 3.061.
+With the L2 flushed before every call the forward takes 0.646 ms against FlyDSL's 0.719 and the backward 1.794
+against 3.000; with 20 ms of idle GPU before every call (the clocks of a training step) 0.634 against 0.767 and 1.798
+against 3.065.
 
 DeepSeek-V3 proxy on one MI455X (4 layers, 32 experts, MBS 2, GBS 16; medians of 3 runs of 20 iterations):
-774.2 -> 735.9 ms per iteration (-4.9%), loss at iteration 20 1.90874 -> 1.90870, peak memory +4 GB (the dS scratch).
+774.6 -> 735.9 ms per iteration (-5.0%), loss at iteration 20 1.90874 -> 1.90870, peak memory +4 GB (the dS scratch).

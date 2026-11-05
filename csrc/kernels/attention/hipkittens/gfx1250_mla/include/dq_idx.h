@@ -54,7 +54,7 @@ constexpr int       DSI_BLK_B    = 4 * DSI_GRP_B; // one block image (1088 B)
 constexpr unsigned  TDIM0        = 0x7FFFFFFFu;   // inner extent: never clamps
 constexpr int       DQ_IMG_ROW_B = 400;           // dQ epilogue image row (384 B data + 16 B pad)
 constexpr int       DQ_LINE_EL   = 64;            // bf16 per 128-B dq line
-constexpr long long DQ_EXTENT_B  = 1LL << 30;     // dq buffer extent (> dq bytes: limits.MAX_BH_S)
+constexpr long long DQ_EXTENT_B  = 1LL << 30;     // dq buffer extent (> dq bytes: _MLA_MAX_BH_S)
 constexpr int       RSRC_FLAGS   = 0x27000;       // buffer descriptor word 3
 
 // ---- the rings: unit u = kv rows [64u, 64u + 64) = kv32 rows 2u, 2u + 1; one workgroup barrier

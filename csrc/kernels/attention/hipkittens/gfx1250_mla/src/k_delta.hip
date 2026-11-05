@@ -20,7 +20,7 @@
 // from 0), acc = e0 + e1, then acc += shfl_xor(acc, 1 / 2 / 4 / 8). FlyDSL issues separate multiplies and adds; a
 // fused multiply-add would round differently once a bf16 x bf16 product underflows into the fp32 denormal range, so
 // fp contraction is off here. fp32 denormals are preserved, as in FlyDSL (.amdhsa_float_denorm_mode_32 3).
-// Bounds: S % 64 == 0 (limits.py: seqlen_q % 384 is 0 or 256), so the grid covers [0, S) exactly.
+// Bounds: S % 64 == 0 (the host: seqlen_q % 384 is 0 or 256), so the grid covers [0, S) exactly.
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
