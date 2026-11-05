@@ -283,7 +283,7 @@ def _make_epoch_bump(add_combine, add_reduce):
     reset race): the flag banks are never zeroed; each call spins on the cumulative per-bank
     ``expected`` instead."""
 
-    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    @flyc.kernel(name="mega_fp8_combine_epoch_bump_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
     def epoch_bump_kernel(PARITY: fx.Tensor, COMBINE_EXP: fx.Tensor, REDUCE_EXP: fx.Tensor):
         if fx.thread_idx.x == fx.Int32(0):
             parity_res = create_buffer_resource(PARITY, max_size=True)
@@ -703,7 +703,7 @@ def _compile(
     payload_i32_total = combine_slots * H4
     reduce_fp8 = _make_topk_reduce_fp8(out_features, topk, combine_slots, apply_weights, with_gate, wide)
 
-    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    @flyc.kernel(name="mega_fp8_grouped_gemm_combine_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
     def kern(
         ACT: fx.Tensor,
         WEIGHTS: fx.Tensor,

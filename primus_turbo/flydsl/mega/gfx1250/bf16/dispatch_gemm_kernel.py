@@ -123,7 +123,7 @@ def _launch_dispatch_gemm_nt(
             f"the dispatch-only wait gives each of {num_experts_per_rank} experts a lane of {block}"
         )
 
-    @flyc.kernel(known_block_size=[64, 1, 1])
+    @flyc.kernel(name="mega_gfx1250_dispatch_epoch_bump", known_block_size=[64, 1, 1])
     def epoch_bump(arg_parity: fx.Pointer, arg_expected: fx.Pointer):
         """Flip the parity and raise the new bank's expected flag value by one per sender rank."""
         if fx.Int32(fx.thread_idx.x) == fx.Int32(0):
@@ -133,7 +133,7 @@ def _launch_dispatch_gemm_nt(
             bank = cast(new_parity, fx.T.i32)
             st(expected_addr, bank, ld(expected_addr, bank, dtype=fx.T.i64) + fx.Int64(NUM_RANKS))
 
-    @flyc.kernel(known_block_size=[block, 1, 1])
+    @flyc.kernel(name="dispatch_gemm_nt", known_block_size=[block, 1, 1])
     def dispatch_gemm_nt(
         arg_out: fx.Pointer,
         arg_x: fx.Pointer,

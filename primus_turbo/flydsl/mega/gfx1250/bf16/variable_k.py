@@ -387,7 +387,7 @@ def _launch_grouped_bf16_variable_k(
             f"{GATHER_ROWS_PER_OP}, at most one row per lane"
         )
 
-    @flyc.kernel(known_block_size=[block, 1, 1])
+    @flyc.kernel(name="mega_gfx1250_grouped_variable_k", known_block_size=[block, 1, 1])
     def kernel_grouped_variable_k(
         arg_c: fx.Pointer,
         arg_a: fx.Pointer,

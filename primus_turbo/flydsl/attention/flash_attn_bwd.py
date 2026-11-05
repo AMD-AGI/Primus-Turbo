@@ -331,7 +331,7 @@ def build_flash_attn_bwd_odo_module(
     BAT_LO = int(bat_lo)
     assert bat_all is None or (sbhd and not token_major), "odo batch sub-range is SBHD-only"
 
-    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    @flyc.kernel(name="flash_attn_bwd_odo_kernel", known_block_size=[BLOCK, 1, 1])
     def flash_attn_bwd_odo_kernel(
         O: fx.Tensor,
         DO: fx.Tensor,
@@ -509,7 +509,7 @@ def build_flash_attn_bwd_lset_module(B, Sq, Hq, scale, block=256):
     lds_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_off + TS * ROW * 4
 
-    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    @flyc.kernel(name="flash_attn_bwd_lset_kernel", known_block_size=[BLOCK, 1, 1])
     def flash_attn_bwd_lset_kernel(LSE: fx.Tensor, OUT: fx.Tensor):
         lds = SmemPtr(allocator.get_base(), lds_off, fx.Float32.ir_type, shape=(TS * ROW,)).get()
         bid = fx.Index(gpu.block_idx.x)
@@ -767,7 +767,7 @@ def build_flash_attn_bwd_dqred_module(
         and (N_CHUNK % _NUM_XCD == 0 or _NUM_XCD % N_CHUNK == 0)
     )
 
-    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    @flyc.kernel(name="flash_attn_bwd_dqred_kernel", known_block_size=[BLOCK, 1, 1])
     def flash_attn_bwd_dqred_kernel(
         WSQ: fx.Tensor, DQ: fx.Tensor, CARRY: fx.Tensor, CuSeqQ: fx.Tensor, CuSeqKv: fx.Tensor
     ):
@@ -1108,7 +1108,7 @@ def build_flash_attn_bwd_slotred_module(
     WPG = SPAN // TILE
     NS = n_slots
 
-    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    @flyc.kernel(name="flash_attn_bwd_slotred_kernel", known_block_size=[BLOCK, 1, 1])
     def flash_attn_bwd_slotred_kernel(WSK: fx.Tensor, DK: fx.Tensor, WSV: fx.Tensor, DV: fx.Tensor):
         bid = fx.Index(gpu.block_idx.x)
         tid = fx.Index(gpu.thread_idx.x)
@@ -1191,7 +1191,7 @@ def build_flash_attn_bwd_dqa16_module(B, Sq, Hq, D, sm_scale):
     NTILE = Sq // 16
     IMG_B = Sq * Hq * D  # elements one batch owns
 
-    @flyc.kernel(known_block_size=[_A16_BLOCK, 1, 1])
+    @flyc.kernel(name="flash_attn_bwd_dqa16_kernel", known_block_size=[_A16_BLOCK, 1, 1])
     def flash_attn_bwd_dqa16_kernel(IMG: fx.Tensor, DQ: fx.Tensor):
         tid = fx.Index(gpu.thread_idx.x)
         wid = fx.Index(gpu.block_idx.x) * fx.Index(WPG) + tid // fx.Index(64)
@@ -1815,7 +1815,7 @@ def build_flash_attn_bwd_dkdv_module(
     ld_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = ld_off + LD_ELEMS * 4
 
-    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+    @flyc.kernel(name="flash_attn_bwd_dkdv_kernel", known_block_size=[BLOCK_SIZE, 1, 1])
     def flash_attn_bwd_dkdv_kernel(
         Q: fx.Tensor,
         K: fx.Tensor,
@@ -5639,7 +5639,7 @@ def build_flash_dsink_module(B, Sq, Hq):
     lds_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_off + THREADS * 4
 
-    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name="flash_attn_bwd_dsink_kernel", known_block_size=[THREADS, 1, 1])
     def k_fn(SINK: fx.Tensor, LSE: fx.Tensor, DELTA: fx.Tensor, DSINK: fx.Tensor):
         lds = SmemPtr(allocator.get_base(), lds_off, fx.Float32.ir_type, shape=(THREADS,)).get()
         h = fx.Index(gpu.block_idx.x)

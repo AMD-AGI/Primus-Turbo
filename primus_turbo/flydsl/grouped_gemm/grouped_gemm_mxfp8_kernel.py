@@ -256,7 +256,7 @@ def _build_grouped_preshuffle_kernel(K128: int, G: int, N: int, KT: int = _PRESH
     class Smem:
         tile: fx.Array[fx.Int32, 64 * KT, 16]
 
-    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    @flyc.kernel(name="mxfp8_grouped_nt_scale_preshuffle", known_block_size=[BLK, 1, 1])
     def kern(
         a_raw: fx.Tensor,
         b_raw: fx.Tensor,
@@ -606,7 +606,12 @@ def _build_grouped_mxfp8_nt_kernel(
             rocdl.s_barrier()
             a1_frag = a_s2r.load(a_cur1)
             a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
-            rocdl.s_barrier()
+            # b_next0 and the last step's a_cur0 hold the final refill, which other waves also
+            # read: drain it here, the last barrier every wave crosses before both reads. Only
+            # b_cur1's refill and a_next1 may stay in flight (LDS-DMA retires in issue order);
+            # the sched_barrier keeps a_next1 issued before the wait.
+            rocdl.sched_barrier(0)
+            wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
             rocdl.s_setprio(1)
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0)
             rocdl.s_setprio(0)
@@ -661,7 +666,7 @@ def _build_grouped_mxfp8_nt_kernel(
         else:
             _do_tile(pid)
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name="kernel_grouped_mxfp8_nt", known_block_size=[512, 1, 1])
     def kernel_grouped_mxfp8_nt(
         A: fx.Tensor,
         B_T: fx.Tensor,
@@ -960,7 +965,7 @@ def _build_grouped_wgrad_preshuffle_kernel(OUT_M: int, OUT_N: int, KT: int = _PR
     class Smem:
         tile: fx.Array[fx.Int32, 64 * KT, 16]
 
-    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    @flyc.kernel(name="mxfp8_grouped_wgrad_scale_preshuffle", known_block_size=[BLK, 1, 1])
     def kern(
         a_raw: fx.Tensor,
         b_raw: fx.Tensor,
@@ -1070,7 +1075,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
         B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
         B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name="kernel_grouped_mxfp8_wgrad", known_block_size=[512, 1, 1])
     def kernel_grouped_mxfp8_wgrad(
         A: fx.Tensor,  # LHS [OUT_M, M_total] fp8
         B: fx.Tensor,  # RHS [OUT_N, M_total] fp8

@@ -50,7 +50,13 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 )
 from primus_turbo.flydsl.autotune import Compile, Op, Race, Refine, staged
 from primus_turbo.flydsl.autotune.engine import Entry
-from primus_turbo.flydsl.autotune.policies import Point, RealArgs, Synthetic
+from primus_turbo.flydsl.autotune.policies import (
+    Finite,
+    Point,
+    RealArgs,
+    Reproducible,
+    Synthetic,
+)
 from primus_turbo.flydsl.utils.prims import (
     ceildiv,
     floordiv_pow2,
@@ -147,7 +153,7 @@ def _compile_dense_nt(
         B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
         B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name="kernel_dense_nt", known_block_size=[512, 1, 1])
     def kernel_dense_nt(
         A: fx.Tensor,
         B_T: fx.Tensor,
@@ -495,7 +501,7 @@ def _compile_dense_nn(
         B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
         B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name="kernel_dense_nn", known_block_size=[512, 1, 1])
     def kernel_dense_nn(
         A: fx.Tensor,
         B: fx.Tensor,
@@ -855,7 +861,7 @@ def _compile_dense_tn(
         gsm = arith.select(rem_m < GM, rem_m, fx.Int32(GM))
         return fpm + (pig % gsm), pig // gsm
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name="kernel_dense_tn", known_block_size=[512, 1, 1])
     def kernel_dense_tn(
         A: fx.Tensor,
         B: fx.Tensor,
@@ -1248,12 +1254,28 @@ def _tn4_gl_keys(pools):
     return keys
 
 
-def _dense_tn_slice_div(x, s):
-    """``x // s`` for a compile-time split-K slice factor: one shift, or one fixed-point
-    reciprocal multiply. Exact for every dividend the slice bounds reach (see _TN4_RCP_MAX)."""
+def _slice_div_magic(s, x_max, x_min=0):
+    """(m, k) such that ``(x * m) >> k == x // s`` for every 0 <= x <= ``x_max``, with
+    m = ceil(2^k / s) and ``x * m`` inside int32 for every ``x_min`` <= x <= ``x_max``. Exactness
+    holds when (m * s - 2^k) * x_max < 2^k, so k is picked per call: a fixed k = 16 is too short
+    for the split-K window divide, whose divisor is the window's tile count (up to the CU count)
+    and whose dividend reaches tiles x slices. Negative dividends only have to stay in range;
+    their quotients are discarded."""
+    span = max(x_max, -x_min, 1)
+    for k in range(30, 0, -1):
+        m = -(-(1 << k) // s)
+        if span * m < 1 << 31 and (m * s - (1 << k)) * x_max < 1 << k:
+            return m, k
+    raise AssertionError(f"no exact int32 reciprocal for x // {s} over [{x_min}, {x_max}]")
+
+
+def _dense_tn_slice_div(x, s, x_max, x_min=0):
+    """``x // s`` for a compile-time divisor ``s`` and a dividend in [``x_min``, ``x_max``]: one
+    shift, or one fixed-point reciprocal multiply that is exact over [0, ``x_max``]."""
     if s & (s - 1) == 0:
         return fx.Int32(floordiv_pow2(x, s))
-    return fx.Int32(fx.Int32(x * (-(-(1 << 16) // s))) >> 16)
+    m, k = _slice_div_magic(s, x_max, x_min)
+    return fx.Int32(fx.Int32(x * m) >> k)
 
 
 def _dense_tn_tile_mn(t, NBM, NBN, group_m, group_n):
@@ -1334,46 +1356,53 @@ def _tn4_handoff_wait(flag, off, want, rows):
     return fx.Int32(_llvm.extractvalue(T.i32, r, [2]))
 
 
-# Accumulators a lane hands over per request; the slot is lane-contiguous so a pair rides one.
-_TN4_HAND_PACK = 2
+def _tn4_hand_ty(out_fp16):
+    """Element type of the handoff slot: the unscaled partial over half of K can outgrow fp16's
+    range, so fp16 output hands over in f32."""
+    return fx.Float32 if out_fp16 else fx.BFloat16
 
 
-def _tn4_frag_off(wave_id, lane_id, q, nacc):
-    """Element offset of accumulator ``q``'s pack in a tile's handoff scratch slot; C's own
-    layout would scatter a lane's four values over four rows instead."""
-    lane_elems = 4 * _TN4_HAND_PACK
-    return (wave_id * fx.Int32(nacc) + fx.Int32(q)) * fx.Int32(256) + lane_id * fx.Int32(lane_elems)
+def _tn4_hand_pack(hand_ty):
+    """Accumulators a lane hands over per b128 request; the slot is lane-contiguous so a
+    2-byte pair rides one."""
+    return 16 // (4 * (hand_ty.width // 8))
 
 
-def _tn4_publish_frag(frag, rsrc, wave_id, lane_id, q0, nacc, out_ty, aux):
+def _tn4_frag_off(wave_id, lane_id, q, nacc, n):
+    """Element offset of accumulator ``q``'s pack of ``n`` in a tile's handoff scratch slot;
+    C's own layout would scatter a lane's four values over four rows instead."""
+    return (wave_id * fx.Int32(nacc) + fx.Int32(q)) * fx.Int32(256) + lane_id * fx.Int32(4 * n)
+
+
+def _tn4_publish_frag(frag, rsrc, wave_id, lane_id, q0, nacc, hand_ty, aux):
     """Hand this slice's accumulators to the tile's scratch slot, unscaled: the folding slice
     adds them to its own and its store is what applies the per-tensor scale, once. A slice
     that owns no slot takes a zero-record descriptor and its stores drop."""
-    n = _TN4_HAND_PACK
+    n = _tn4_hand_pack(hand_ty)
     assert len(frag) % n == 0 and q0 % n == 0, "handoff pack must divide the accumulator run"
     for i in range_constexpr(len(frag) // n):
-        vals = [frag[n * i + h].to(out_ty) for h in range(n)]
+        vals = [frag[n * i + h].to(hand_ty) for h in range(n)]
         _buffer_ops.buffer_store(
-            Vec.from_elements([v[j] for v in vals for j in range(4)], out_ty),
+            Vec.from_elements([v[j] for v in vals for j in range(4)], hand_ty),
             rsrc,
-            _tn4_frag_off(wave_id, lane_id, q0 + n * i, nacc),
+            _tn4_frag_off(wave_id, lane_id, q0 + n * i, nacc, n),
             cache_modifier=aux,
         )
 
 
-def _tn4_fold_frag(frag, rsrc, wave_id, lane_id, q0, nacc, out_ty, aux):
+def _tn4_fold_frag(frag, rsrc, wave_id, lane_id, q0, nacc, hand_ty, aux):
     """Add the predecessor slice's published accumulators into this one's. A non-folding
     slice reads a zero-record descriptor, which returns zero and leaves its own values."""
-    n = _TN4_HAND_PACK
+    n = _tn4_hand_pack(hand_ty)
     assert len(frag) % n == 0 and q0 % n == 0, "handoff pack must divide the accumulator run"
     out = []
     for i in range_constexpr(len(frag) // n):
         got = Vec(
             _buffer_ops.buffer_load(
                 rsrc,
-                _tn4_frag_off(wave_id, lane_id, q0 + n * i, nacc),
+                _tn4_frag_off(wave_id, lane_id, q0 + n * i, nacc, n),
                 vec_width=4 * n,
-                dtype=out_ty.ir_type,
+                dtype=hand_ty.ir_type,
                 cache_modifier=aux,
             )
         ).to(fx.Float32)
@@ -1587,7 +1616,7 @@ def _dense_tn_wave4_tile(
         lo, nwin, s = split
         win_off = fx.Int32(d) - fx.Int32(lo)
         # sid < 0 = whole tile: the ids below the window take the whole K range.
-        sid = _dense_tn_slice_div(win_off, nwin)
+        sid = _dense_tn_slice_div(win_off, nwin, nwin * s - 1, -lo)
         tile_in_window = win_off - sid * fx.Int32(nwin)
         if lo:
             pre = win_off < fx.Int32(0)
@@ -1599,12 +1628,12 @@ def _dense_tn_wave4_tile(
             t = _readfirstlane_i32(fx.Int32(lo) + tile_in_window)
             sid = fx.Int32(_readfirstlane_i32(sid))
             slice_id = sid
-        k0 = _dense_tn_slice_div(fx.Int32(K_ITERS) * slice_id, s)
+        k0 = _dense_tn_slice_div(fx.Int32(K_ITERS) * slice_id, s, K_ITERS * (s - 1))
         ki = (
             fx.Int32(
                 arith.select(
                     slice_id + fx.Int32(1) < fx.Int32(s),
-                    _dense_tn_slice_div(fx.Int32(K_ITERS) * (slice_id + fx.Int32(1)), s),
+                    _dense_tn_slice_div(fx.Int32(K_ITERS) * (slice_id + fx.Int32(1)), s, K_ITERS * s),
                     fx.Int32(K_ITERS),
                 )
             )
@@ -1616,7 +1645,8 @@ def _dense_tn_wave4_tile(
         ki = fx.Int32(_readfirstlane_i32(ki))
         if handoff:
             # Which side of the protocol this id is on; a tile below the window issues neither.
-            slot = geom.bm * geom.bn * 2
+            hand_ty = _tn4_hand_ty(out_ty is fx.Float16)
+            slot = geom.bm * geom.bn * (hand_ty.width // 8)
             pub = sid == fx.Int32(0)
             fold = sid == fx.Int32(1)
             fold_rec = fx.Int32(_readfirstlane_i32(arith.select(fold, fx.Int32(slot), fx.Int32(0))))
@@ -1791,7 +1821,7 @@ def _dense_tn_wave4_tile(
         _lds_barrier()
 
     if handoff:
-        _tn4_publish_frag(res, hand_st, wave_id, lane_id, 0, nacc, out_ty, handoff)
+        _tn4_publish_frag(res, hand_st, wave_id, lane_id, 0, nacc, hand_ty, handoff)
         # The raise trails this tile's stores; the second barrier keeps a wave past the poll
         # from resetting the flag under one still spinning.
         wait_barrier(0)
@@ -1818,7 +1848,7 @@ def _dense_tn_wave4_tile(
             col_q = bn_off + wave_n * fx.Int32(pb.tiles * 16)
             frag = res[q : q + n]
             if handoff:
-                frag = _tn4_fold_frag(frag, hand_ld, wave_id, lane_id, q, nacc, out_ty, handoff)
+                frag = _tn4_fold_frag(frag, hand_ld, wave_id, lane_id, q, nacc, hand_ty, handoff)
             store_c[pb.tiles].store(frag, base_row + pa.gcol, col_q + pb.gcol)
             q += n
     for s in store_c.values():
@@ -1826,7 +1856,7 @@ def _dense_tn_wave4_tile(
 
 
 _TN4_SPLIT_S = (2, 3, 4)  # slice factors; an odd one is fine, the slices stay co-resident
-_TN4_RCP_MAX = 1 << 15  # exactness bound on _dense_tn_slice_div's dividend
+_TN4_RCP_MAX = 1 << 15  # bound on the split-K k-range dividends (K_ITERS * (s - 1)) the planner admits
 _TN4_OUT_ALIGN = 8  # out_ty elements the split-K bands keep aligned at C's row pitch
 
 
@@ -1845,7 +1875,7 @@ def _dense_tn_split(tiles, k_iters, ncu, phases):
     best, best_rounds, best_s = 1, 1, 1
     for s in _TN4_SPLIT_S:
         if k_iters < phases * s or k_iters * (s - 1) >= _TN4_RCP_MAX:
-            continue  # every slice must keep a whole main-loop pass, and stay exactly divisible
+            continue  # every slice must keep a whole main-loop pass
         rounds = _tn4_split_rounds(tiles, rem, s, ncu)
         if rounds * best_s < best_rounds * s:
             best, best_rounds, best_s = s, rounds, s
@@ -1914,7 +1944,7 @@ def _compile_dense_tn_wave4(
         )
     )
 
-    @flyc.kernel(known_block_size=[256, 1, 1])
+    @flyc.kernel(name="kernel_dense_tn_wave4", known_block_size=[256, 1, 1])
     def kernel_dense_tn_wave4(
         A: fx.Tensor,
         B: fx.Tensor,
@@ -1976,12 +2006,12 @@ def _compile_dense_tn_wave4(
     _RED_GRID = 0 if _hand else _NWIN * _TN4_RED_WPT
     _RED_ROWS = BM // _TN4_RED_WPT
 
-    @flyc.kernel(known_block_size=[256, 1, 1])
+    @flyc.kernel(name="kernel_dense_tn_wave4_reduce", known_block_size=[256, 1, 1])
     def kernel_dense_tn_wave4_reduce(C: fx.Tensor, WS: fx.Tensor):
         """Fold the split-K window's slice bands into C, one row slab per workgroup. It runs
         the whole grid, so the fold spreads over every CU instead of only the window's."""
         tid = fx.thread_idx.x
-        wt = _dense_tn_slice_div(fx.Int32(fx.block_idx.x), _TN4_RED_WPT)
+        wt = _dense_tn_slice_div(fx.Int32(fx.block_idx.x), _TN4_RED_WPT, _RED_GRID - 1)
         part = fx.Int32(fx.block_idx.x) - wt * fx.Int32(_TN4_RED_WPT)
         block_m, block_n = _dense_tn_tile_mn(
             _readfirstlane_i32(fx.Int32(_LO) + wt), NBM, NBN, group_m, group_n
@@ -2823,7 +2853,7 @@ def _compile_dense_wave4(
         )
     )
 
-    @flyc.kernel(known_block_size=[NTHR, 1, 1])
+    @flyc.kernel(name="kernel_dense_wave4", known_block_size=[NTHR, 1, 1])
     def kernel_dense_wave4(
         A: fx.Tensor,
         B: fx.Tensor,
@@ -2958,9 +2988,13 @@ def _bench_dense_args(args):
 # race can reach do not, and nothing else sees it (#570). Untuned, a shape still takes the first
 # candidate that builds and holds: the base geometry does not hold for every shape. The TN
 # whole-loop races on finite output alone, on the caller's own arguments; it hands its
-# per-candidate compile scratches back.
-_DENSE_RACE = Race.interleaved(_PICK_PASSES, 40, ramp=_PICK_RAMP_ITERS, visit=(2, 3), check="reproducible")
-_TN4_RACE = _DENSE_RACE.checked_by("finite")
+# per-candidate compile scratches back. Both check the whole output for non-finite values, once
+# per shape: a split-K tile left unwritten can sit far from row 0, where a leading sample does not
+# reach, and can hold the same bytes on every repeat.
+_DENSE_RACE = Race.interleaved(
+    _PICK_PASSES, 40, ramp=_PICK_RAMP_ITERS, visit=(2, 3), check=Reproducible(n=None)
+)
+_TN4_RACE = _DENSE_RACE.checked_by(Finite(n=None))
 
 
 def _dense_probe(args):
@@ -3247,30 +3281,31 @@ def _tn4_rounds(M, N, ncu, geom):
     return ceildiv(ceildiv(M, geom.bm) * ceildiv(N, geom.bn), ncu)
 
 
-def _tn4_grid(M, N, K, ncu, geom):
+def _tn4_grid(M, N, K, ncu, geom, out_fp16=False):
     """Workgroups one geometry launches, plus ``(bands, flags)`` in units of the M x N scratch
-    band: the reduce route needs s-1 bands, the handoff one fragment-ordered slot and one flag
-    per window tile."""
+    band of 2-byte out_ty: the reduce route needs s-1 bands, the handoff one fragment-ordered
+    slot of _tn4_hand_ty elements and one flag per window tile."""
     tiles = ceildiv(M, geom.bm) * ceildiv(N, geom.bn)
     split = _tn4_geom_split(M, N, K, ncu, geom)
     if split is None:
         return tiles, 0, 0
     grid = tiles + split[1] * (split[2] - 1)
     if _tn4_handoff(split):
-        return grid, ceildiv(split[1] * geom.bm * geom.bn, M * N), split[1]
+        slot_bytes = geom.bm * geom.bn * (_tn4_hand_ty(out_fp16).width // 8)
+        return grid, ceildiv(split[1] * slot_bytes, M * N * 2), split[1]
     return grid, split[2] - 1, 0
 
 
-def _tn4_plan(M, N, K, ncu):
+def _tn4_plan(M, N, K, ncu, out_fp16=False):
     """Whole-loop macro tiles for one TN shape, most promising first, with the scratch bands and
     flags the widest needs. The CU passes they occupy order them; that only orders the race,
     which is what picks one. Memoised because every launch reads it."""
-    key = (M, N, K, ncu)
+    key = (M, N, K, ncu, out_fp16)
     plan = _TN4_PLAN_CACHE.get(key)
     if plan is None:
         scored = []
         for rank, g in enumerate(_TN4_GEOMS):
-            _grid, bands, flags = _tn4_grid(M, N, K, ncu, g)
+            _grid, bands, flags = _tn4_grid(M, N, K, ncu, g, out_fp16)
             scored.append((_tn4_rounds(M, N, ncu, g), rank, bands, flags, g))
         scored.sort(key=lambda s: s[:2])
         plan = (
@@ -3432,7 +3467,7 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         # The split writes a workspace a later pass reduces, so an accumulate on the tile
         # store would be folded in twice; beta=1 takes the 8-wave epilogue instead.
         if _tn_wave4_supported(N, K, i64_tr) and not beta_is_one:
-            geoms, bands, flags = _tn4_plan(M, N, K, _dense_num_cus())
+            geoms, bands, flags = _tn4_plan(M, N, K, _dense_num_cus(), out_fp16)
             wargs = (
                 _dense_operand(a),
                 _dense_operand(b),

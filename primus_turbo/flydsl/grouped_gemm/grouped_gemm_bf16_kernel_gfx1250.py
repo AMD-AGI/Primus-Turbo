@@ -733,7 +733,7 @@ def _launch_grouped_bf16_variable_k(
     PRE_KT = 2 if vk_ovl else 1
     EPI_OPS = (epi_chunk * m_warp) if epi_chunk > 1 else 1
 
-    @flyc.kernel(known_block_size=[block, 1, 1])
+    @flyc.kernel(name="kernel_grouped_bf16_variable_k_gfx1250", known_block_size=[block, 1, 1])
     def kernel_grouped_variable_k(
         arg_c: fx.Pointer,
         arg_a: fx.Pointer,
@@ -2461,7 +2461,7 @@ def _launch_grouped_gemm_bf16_nt(
         )
     _check_smem(ARENA_B, str(_get_arch()))
 
-    @flyc.kernel(known_block_size=[block, 1, 1])
+    @flyc.kernel(name="kernel_grouped_bf16_nt_gfx1250", known_block_size=[block, 1, 1])
     def kernel_grouped_nt(
         arg_c: fx.Pointer,
         arg_a: fx.Pointer,

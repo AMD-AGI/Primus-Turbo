@@ -107,7 +107,7 @@ def build_flash_attn_dualwave_swp_module(
     class SharedStorage:
         kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
 
-    @flyc.kernel(known_block_size=[traits.BLOCK_SIZE, 1, 1])
+    @flyc.kernel(name="flash_attn_dualwave_swp_gfx950_kernel", known_block_size=[traits.BLOCK_SIZE, 1, 1])
     def flash_attn_dualwave_swp_gfx950_kernel(
         Q: fx.Tensor,
         K: fx.Tensor,

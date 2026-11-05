@@ -444,7 +444,7 @@ def _make_dispatch_v2(
     grid_threads = num_channels * NUM_THREADS
     idx_dtype = fx.T.i64 if topk_idx_bytes == 8 else fx.T.i32
 
-    @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
+    @flyc.kernel(name="deep_ep_dispatch_v2_kernel", known_block_size=[NUM_THREADS, 1, 1])
     def dispatch_v2_kernel(
         RECV_X: fx.Tensor,
         RECV_X_SCALES: fx.Tensor,
@@ -820,7 +820,7 @@ def launch_dispatch_v2(
 
 
 def _make_barrier(num_ranks):
-    @flyc.kernel(known_block_size=[NOTIFY_THREADS, 1, 1])
+    @flyc.kernel(name="deep_ep_barrier_kernel", known_block_size=[NOTIFY_THREADS, 1, 1])
     def barrier_kernel(BARRIER_PTRS: fx.Tensor, rank: fx.Int32):
         barrier_ptrs_res = create_buffer_resource(BARRIER_PTRS, max_size=True)
         barrier_block(barrier_ptrs_res, rank, num_ranks, False, "v2/barrier")
@@ -911,7 +911,7 @@ def _make_combine_v2(
     lds_grab = (push_warps * row_buffer_bytes if USE_TDM else 0) // 4
     smem_bytes = lds_grab * 4 + NUM_WARPS * 4
 
-    @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
+    @flyc.kernel(name="deep_ep_combine_v2_kernel", known_block_size=[NUM_THREADS, 1, 1])
     def combine_v2_kernel(
         RECV_X: fx.Tensor,
         RECV_TOPK_WEIGHTS: fx.Tensor,

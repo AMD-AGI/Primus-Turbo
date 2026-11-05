@@ -14,6 +14,12 @@ repos:
         language: system
         files: \.(py|cpp|cc|cxx|c|h|hpp|cu|cuh|hip)$
         exclude: ^3rdparty/
+      - id: check-env-reads
+        name: Read environment variables through primus_turbo.common.envs
+        entry: python tools/check_env_reads.py
+        language: system
+        files: ^primus_turbo/.*\.py$
+        exclude: ^primus_turbo/common/envs\.py$
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:

@@ -650,7 +650,7 @@ def _dkdv_fused_impl(
 def _dkdv_fused_kernels(group: int):
     """The fused kernels for one GQA group size (Hq / Hkv); it is baked into the code."""
 
-    @flyc.kernel(known_block_size=[W4_THREADS, 1, 1])
+    @flyc.kernel(name="k_flash_attn_bwd_dkdv_fused", known_block_size=[W4_THREADS, 1, 1])
     def k_dkdv_fused(
         Q: fx.Tensor,
         K: fx.Tensor,
@@ -695,7 +695,7 @@ def _dkdv_fused_kernels(group: int):
             fx.Int32(1),
         )
 
-    @flyc.kernel(known_block_size=[W4_THREADS, 1, 1])
+    @flyc.kernel(name="k_flash_attn_bwd_dkdv_fused_sp", known_block_size=[W4_THREADS, 1, 1])
     def k_dkdv_fused_sp(
         Q: fx.Tensor,
         K: fx.Tensor,
@@ -814,7 +814,7 @@ CVT_THREADS = 256
 CVT_ROW_B = D * 2 + 16  # LDS row pitch
 
 
-@flyc.kernel(known_block_size=[CVT_THREADS, 1, 1])
+@flyc.kernel(name="k_flash_attn_bwd_dq_cvt", known_block_size=[CVT_THREADS, 1, 1])
 def k_dq_cvt(DQA: fx.Tensor, DQ: fx.Tensor, Sq: fx.Int32, Hq: fx.Int32, n_tiles: fx.Int32, scale: fx.Float32):
     tid = fx.Int32(fx.thread_idx.x)
     tile = fx.Int32(fx.block_idx.x)  # (b * Hq + qh) * (Sq / 32) + qt

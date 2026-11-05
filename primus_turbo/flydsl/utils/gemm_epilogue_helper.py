@@ -970,11 +970,9 @@ def _splat_f32(c, lanes):
 def _sigmoid_rcp(x, lanes=None):
     """``sigmoid(x)`` via exp2 and the raw hardware reciprocal.
 
-    Spelled to match ``primus_turbo.triton.utils.silu._sigmoid_rcp`` operation
-    for operation, so a fused FlyDSL epilogue and the Triton one it replaces
-    agree to the last bit. Every IEEE-exact form of ``1/(1+exp(-x))`` costs
-    several times the VALU ops, and skipping the Newton fixup leaves
-    ``v_rcp_f32`` at ~1 ulp -- orders below bf16's 8-bit mantissa.
+    Every IEEE-exact form of ``1/(1+exp(-x))`` costs several times the VALU
+    ops, and skipping the Newton fixup leaves ``v_rcp_f32`` at ~1 ulp -- orders
+    below bf16's 8-bit mantissa.
 
     ``lanes`` is the width when ``x`` is a vector of independent columns. The
     same operations run in the same order on each of them, so the result is

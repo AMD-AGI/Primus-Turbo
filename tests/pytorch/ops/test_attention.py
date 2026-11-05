@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import primus_turbo.common.envs as envs
 from primus_turbo.pytorch.core.backend import (
     BackendType,
     GlobalBackendManager,
@@ -803,7 +804,7 @@ test_cases = [
 def test_attention_16bit(
     batch, dtype, config, causal, enable_sink, window_size_left, qkv_format, is_v3_atomic_fp32, backend
 ):
-    os.environ["PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"] = "1" if is_v3_atomic_fp32 else "0"
+    envs.set_env("PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32", "1" if is_v3_atomic_fp32 else "0")
 
     device = "cuda"
     seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (

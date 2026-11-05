@@ -274,7 +274,7 @@ def _build_grouped_mxfp4_ab_preshuffle(
         # are tail as well, and the row-band SRD drops whatever runs past ``total_M``. The
         # trip count is runtime, so the loop has to sit in the kernel function itself --
         # only that one's source is AST-rewritten into scf ops.
-        @flyc.kernel(known_block_size=[_PRESHUF_BLK, 1, 1])
+        @flyc.kernel(name="mxfp4_grouped_scale_preshuffle_padzero", known_block_size=[_PRESHUF_BLK, 1, 1])
         def kern(
             a_raw: fx.Tensor,
             a_out: fx.Tensor,
@@ -304,7 +304,7 @@ def _build_grouped_mxfp4_ab_preshuffle(
 
     else:
 
-        @flyc.kernel(known_block_size=[_PRESHUF_BLK, 1, 1])
+        @flyc.kernel(name="mxfp4_grouped_scale_preshuffle", known_block_size=[_PRESHUF_BLK, 1, 1])
         def kern(
             a_raw: fx.Tensor,
             a_out: fx.Tensor,
@@ -936,7 +936,7 @@ def _build_grouped_mxfp4_nt_kernel(
 
     if dglu_act_quant:
 
-        @flyc.kernel(known_block_size=[256, 1, 1])
+        @flyc.kernel(name="kernel_grouped_mxfp4_nt_dglu_quant", known_block_size=[256, 1, 1])
         def kern(
             A: fx.Tensor,
             B_T: fx.Tensor,
@@ -982,7 +982,7 @@ def _build_grouped_mxfp4_nt_kernel(
 
     elif glu_act_quant:
 
-        @flyc.kernel(known_block_size=[256, 1, 1])
+        @flyc.kernel(name="kernel_grouped_mxfp4_nt_glu_quant", known_block_size=[256, 1, 1])
         def kern(
             A: fx.Tensor,
             B_T: fx.Tensor,
@@ -1025,7 +1025,10 @@ def _build_grouped_mxfp4_nt_kernel(
 
     elif glu or dglu:
 
-        @flyc.kernel(known_block_size=[256, 1, 1])
+        @flyc.kernel(
+            name="kernel_grouped_mxfp4_nt_dglu" if dglu else "kernel_grouped_mxfp4_nt_glu",
+            known_block_size=[256, 1, 1],
+        )
         def kern(
             A: fx.Tensor,
             B_T: fx.Tensor,
@@ -1045,7 +1048,7 @@ def _build_grouped_mxfp4_nt_kernel(
 
     else:
 
-        @flyc.kernel(known_block_size=[256, 1, 1])
+        @flyc.kernel(name="kernel_grouped_mxfp4_nt", known_block_size=[256, 1, 1])
         def kern(
             A: fx.Tensor,
             B_T: fx.Tensor,
@@ -1674,7 +1677,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
         _anns[f"SC_lds{_b}"] = fx.Array[fx.Int32, _SCBUF, 16]
     SS = fx.struct(type("SSFp4Wgrad", (), {"__annotations__": _anns}))
 
-    @flyc.kernel(known_block_size=[256, 1, 1])
+    @flyc.kernel(name="kernel_grouped_mxfp4_wgrad", known_block_size=[256, 1, 1])
     def kern(
         A: fx.Tensor,  # lhs [OUT_M, M_total/2] fp4 (flat int8)
         B_T: fx.Tensor,  # rhs [OUT_N, M_total/2] fp4 (flat int8)
@@ -1973,7 +1976,9 @@ def _build_grouped_mxfp4_wgrad_kernel(
                 sc_buf_stride=(_SCBUF * 4),
                 half_n=_half_n,
                 quarter_n=_QUARTER_N,
-                half_g2s=True,
+                # The quarter-M re-tile reads wave_m 1's column band out of the BR pool, so
+                # that block needs the R half staged for real, not as a copy of the L half.
+                half_g2s=not _QUARTER_M,
                 cst=_cst,
                 cst_gap=LDS_BN_HALF * 2,
                 cst_ilv=_BILV,

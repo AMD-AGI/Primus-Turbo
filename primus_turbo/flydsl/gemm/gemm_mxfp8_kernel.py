@@ -157,7 +157,7 @@ def _build_mxfp8_fold_kernel(k_split, BLOCK_M, BLOCK_N, GROUP_M, group_n, cstore
     TILE_I32 = BLOCK_M * BLOCK_N // 2
     assert N_VECS % _FOLD_BLK == 0
 
-    @flyc.kernel(known_block_size=[_FOLD_BLK, 1, 1])
+    @flyc.kernel(name="kernel_mxfp8_fold", known_block_size=[_FOLD_BLK, 1, 1])
     def kernel_mxfp8_fold(
         WS: fx.Tensor,
         C: fx.Tensor,
@@ -277,7 +277,7 @@ def _build_mxfp8_nt_kernel(
         B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
         B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(name="kernel_mxfp8_nt", known_block_size=[512, 1, 1])
     def kernel_mxfp8_nt(
         A: fx.Tensor,
         B_T: fx.Tensor,
@@ -508,7 +508,12 @@ def _build_mxfp8_nt_kernel(
 
         a1_frag = a_s2r.load(a_cur1)
         a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
-        rocdl.s_barrier()
+        # b_next0 and the last step's a_cur0 hold the final refill, which other waves also read:
+        # drain it here, the last barrier every wave crosses before both reads. Only b_cur1's
+        # refill and a_next1 may stay in flight (LDS-DMA retires in issue order); the
+        # sched_barrier keeps a_next1 issued before the wait.
+        rocdl.sched_barrier(0)
+        wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
 
         rocdl.s_setprio(1)
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0)

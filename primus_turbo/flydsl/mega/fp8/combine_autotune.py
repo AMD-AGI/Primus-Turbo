@@ -57,11 +57,12 @@ may not reach; run more eager steps before capturing, or pin the split with
 ``PT_MEGA_FP8_L{1,2}_COMBINE_CU``.
 """
 
-import os
 import warnings
 from collections import defaultdict
 
 import torch
+
+import primus_turbo.common.envs as envs
 
 __all__ = [
     "env_combine_cu",
@@ -73,62 +74,25 @@ __all__ = [
 ]
 
 
-def _positive_cu(name, raw):
-    # 0 is not "off" for a CU split: the combine reads it as "no PUSH role", and with the reduce on,
-    # as in every production call, the reduce would then wait forever for arrivals nobody sends.
-    try:
-        cu = int(raw)
-    except ValueError:
-        cu = 0
-    if cu <= 0:
-        raise ValueError(f"{name}={raw!r}: the combine CU split must be a positive block count")
-    return cu
-
-
-def _env_int_list(name, default):
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    cands = tuple(_positive_cu(name, v) for v in raw.replace(",", " ").split())
-    if not cands:
-        raise ValueError(f"{name}={raw!r}: need at least one candidate CU split")
-    return cands
-
-
-def _env_positive_int(name, default):
-    # An empty schedule would lock in at the first call, on a candidate that was never measured.
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        value = 0
-    if value <= 0:
-        raise ValueError(f"{name}={raw!r}: must be a positive integer")
-    return value
-
-
 def env_combine_cu(name):
-    """A ``PT_MEGA_FP8_L{1,2}_COMBINE_CU``-style pin: its positive CU count, or None when unset."""
-    raw = os.environ.get(name)
-    return _positive_cu(name, raw) if raw else None
+    """A ``PT_MEGA_FP8_L{1,2}_COMBINE_CU`` pin: its positive CU count, or None when unset."""
+    return getattr(envs, name)
 
 
 # Spans both regimes seen so far: 16-32 is where DSv3-sized experts land, 80-128 where Qwen3-sized
 # ones do. Each candidate costs one extra kernel compile per direction on first use (``_compile``
 # is lru_cached at 64 entries, so 7 x 2 fits alongside everything else).
-_CANDIDATES = _env_int_list("PT_MEGA_FP8_COMBINE_CU_CANDIDATES", (16, 32, 48, 64, 80, 96, 128))
+_CANDIDATES = envs.PT_MEGA_FP8_COMBINE_CU_CANDIDATES
 
 # Samples per candidate. The first use of a candidate pays its kernel compile, so that sample is a
 # wild outlier -- taking the min over repeats discards it without a separate warmup phase.
-_REPS = _env_positive_int("PT_MEGA_FP8_COMBINE_TUNE_REPS", 3)
+_REPS = envs.PT_MEGA_FP8_COMBINE_TUNE_REPS
 
-_ENABLED = os.environ.get("PT_MEGA_FP8_COMBINE_AUTOTUNE", "1") not in ("0", "false", "False")
+_ENABLED = envs.PT_MEGA_FP8_COMBINE_AUTOTUNE
 
 # One line per shape when the split locks in. It is the only evidence that tuning ran and what
 # it chose, and a run makes at most a couple of these.
-_VERBOSE = os.environ.get("PT_MEGA_FP8_COMBINE_AUTOTUNE_VERBOSE", "1") not in ("0", "false", "False")
+_VERBOSE = envs.PT_MEGA_FP8_COMBINE_AUTOTUNE_VERBOSE
 
 
 def autotune_enabled() -> bool:

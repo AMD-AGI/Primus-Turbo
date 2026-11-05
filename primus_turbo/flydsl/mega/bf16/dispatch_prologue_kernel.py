@@ -139,7 +139,7 @@ def _make_dispatch_prologue(
         """Sign-extend an fx i32 value to i64 (group_lens/offs stored as int64)."""
         return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64, fx.as_ir_value(v)), signed=True)
 
-    @flyc.kernel(known_block_size=[block_threads, 1, 1])
+    @flyc.kernel(name="mega_bf16_dispatch_prologue_kernel", known_block_size=[block_threads, 1, 1])
     def dispatch_prologue_kernel(
         TOPK_INDICES: fx.Tensor,
         SCRATCH: fx.Tensor,

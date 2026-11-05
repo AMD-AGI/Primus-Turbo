@@ -571,7 +571,7 @@ def _attention(
         buffer_store(lse_val, lse_rsrc, off, mask=None, offset_is_bytes=True)
 
 
-@flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+@flyc.kernel(name="mla_fwd_kernel", known_block_size=[BLOCK_SIZE, 1, 1])
 def mla_fwd_kernel(
     o: fx.Tensor,
     q: fx.Tensor,
