@@ -289,6 +289,8 @@ def combine_v2_layout(num_nvl_bytes, hidden_bytes, num_topk):
     capacity = max(0, (half - 16 * len(regions)) // sum(b for _, b in regions))
     layout, end = _regions(DATA_OFFSET + half, capacity, regions)
     assert end <= DATA_OFFSET + 2 * half
+    # the combine's TDM push stores whole slots, so they have to start on 128-byte blocks (_make_combine_v2)
+    assert layout["x"] % 128 == 0
     return layout, capacity
 
 
@@ -1104,9 +1106,10 @@ def _make_combine_v2(
     layout, _ = combine_v2_layout(num_nvl_bytes, hidden_bytes, num_topk)
     slot_bytes = combine_v2_slot_bytes(hidden_bytes, num_topk)
     weights_offset = layout["x"] + hidden_bytes
-    # the whole slot, its padding included, so that no store ends inside a cache line: over XGMI a partial
-    # line costs about as much as a full one (hidden 7168 bf16 and top-8 end 96 bytes into the slot's last
-    # line). The padding comes from the warp's LDS buffer and is never read
+    # the whole slot, its padding included: a TDM store writes memory in 128-byte blocks, and one that ends
+    # inside a block merges into it with a read-modify-write, which over XGMI costs far more than storing
+    # the padding (hidden 7168 bf16 and top-8 end 32 bytes into the slot's last block). The padding comes
+    # from the warp's LDS buffer and is never read
     push_bytes = slot_bytes
     push_warps = combine_v2_push_warps(num_channels)
     if USE_TDM:
