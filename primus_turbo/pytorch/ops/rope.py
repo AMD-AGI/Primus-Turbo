@@ -117,6 +117,9 @@ def fused_qkv_rmsnorm_rope(
 
     The normalization result and inverse-RoPE gradient are rounded to BF16 in
     registers, preserving the numerical boundaries of the unfused training path.
+
+    For diffusion transformers (one q / k / v per head, interleaved RoPE, both
+    token orders, a text and an image stream) see ``dit_qk_norm_rope``.
     """
     why = qk_rmsnorm_rope_shape_error(qkv, q_gamma, k_gamma, freqs, qkv_split_arg_list)
     if why is not None:

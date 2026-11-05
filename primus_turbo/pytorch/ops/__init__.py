@@ -19,6 +19,7 @@ from .activation import *
 from .attention import *
 from .cross_entropy import cross_entropy
 from .deoscillation import *
+from .dit_qk_norm_rope import *
 from .gemm import *
 from .gemm_fp4 import *
 from .gemm_fp8 import *
