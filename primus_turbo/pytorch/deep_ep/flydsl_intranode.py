@@ -30,7 +30,7 @@ import torch
 import torch.distributed as dist
 
 import primus_turbo.common.envs as envs
-from primus_turbo.flydsl.deep_ep.arch import CPP_DEEPEP_ARCHS, default_intranode_backend
+from primus_turbo.flydsl.deep_ep.arch import CPP_DEEPEP_ARCHS, TRAITS, default_intranode_backend
 
 # FlyDSLIntranodeV1Runtime only
 from primus_turbo.flydsl.deep_ep.intranode_v1_kernel import (
@@ -933,7 +933,7 @@ class FlyDSLIntranodeV2Runtime(FlyDSLIntranodeRuntime):
         self.combine_epoch = self.combine_epoch % (2**31 - 1) + 1
         grab_base = self.reduce_grabs
         self.reduce_grabs += combine_v2_grabs(num_recv_tokens, num_channels)
-        if self.combine_needs_barrier:
+        if self.combine_needs_barrier or TRAITS.barrier_before_every_combine:
             run_launcher(launch_barrier, self.barrier_ptrs, self.rank, num_ranks, launch_stream)
         self.combine_needs_barrier = True
         dummy_f32 = args.rank_prefix_matrix.view(torch.float32)

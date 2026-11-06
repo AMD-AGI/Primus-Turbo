@@ -160,7 +160,11 @@ fence; only their waits take the gfx12 form.
   H=7168) that do not fit are moved in pieces.
 - **Between two combines** a rank may push into a peer's region only after the peer has finished
   the previous reduce: a dispatch in between gives that barrier through its notify, otherwise the
-  host launches a `launch_barrier`.
+  host launches a `launch_barrier`. On gfx1250 the host launches it before every combine
+  (`ArchTraits.barrier_before_every_combine`), so that a rank waits for a late peer in that one-block
+  kernel, not with the combine grid resident: on MI455X, after a combine grid waited seconds while the
+  queue was evicted again and again, the next combine started its workgroups on two of the eight XCDs
+  only and hung.
 
 For callers:
 

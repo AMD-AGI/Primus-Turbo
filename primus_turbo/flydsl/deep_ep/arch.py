@@ -80,6 +80,10 @@ class ArchTraits(NamedTuple):
     # prints and keeps spinning
     spin_timeout_cycles: int
     trap_on_timeout: bool
+    # a barrier kernel before every V2 combine, the first after a dispatch too (whose notify already lines
+    # the ranks up): a rank that gets to its combine first then waits for a late peer in that one-block
+    # kernel instead of with the whole combine grid resident
+    barrier_before_every_combine: bool
 
     def copy_piece_bytes(self, op: str, num_channels: int) -> int:
         for max_channels, piece in dict(self.copy_piece_table)[op]:
@@ -108,6 +112,7 @@ _GFX9 = dict(
     combine_loads_in_flight=32,
     spin_timeout_cycles=3_000_000_000,
     trap_on_timeout=False,
+    barrier_before_every_combine=False,
 )
 
 # gfx12 buffer cache policy: TH in bits 2:0 (TH_NT = 1), SCOPE in bits 4:3 (SCOPE_SYS = 3 << 3)
@@ -131,6 +136,11 @@ _TRAITS = {
         # a trapped one has no waves left
         spin_timeout_cycles=30_000_000_000,
         trap_on_timeout=True,
+        # On MI455X, after a combine grid waited seconds for a late peer while the queue was evicted every
+        # 20 ms, the next combine ran its workgroups on two of the eight XCDs only; the others never started
+        # and both ranks hung (EP2, the last rank 2 s late: about 1 run in 4 hung, 1 in 68 with the barrier).
+        # It costs about 6 us a dispatch + combine pair
+        barrier_before_every_combine=True,
     ),
 }
 
