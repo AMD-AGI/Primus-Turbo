@@ -105,6 +105,17 @@ def tile_geometry(tile_m: int, tile_n: int, tile_k: int, b_nn: bool = False):
     return lds_row, stage, pitch, arena
 
 
+def persist_geometry(tile_m: int, tile_n: int, tile_k: int, b_nn: bool = False):
+    """(C staging offset, flag word offset, arena bytes) of a tile run back to back in one workgroup.
+
+    The next tile's k-tile 0 lands in buffer 0 while this tile's epilogue runs, so the C staging
+    starts at buffer 1; the caller's flag word sits past both buffers."""
+    _, _, pitch, _ = tile_geometry(tile_m, tile_n, tile_k, b_nn)
+    c_bytes = tile_m * (tile_n * EB + LDS_PAD)
+    flag_off = max(NUM_BUFFERS * pitch, pitch + c_bytes)
+    return pitch, flag_off, flag_off + 16
+
+
 def resolve_lds_cosched(
     lds_cosched: int, issue_first: int, tile_m: int, tile_n: int, m_warp: int, n_warp: int
 ):
@@ -231,6 +242,92 @@ def _scatter_dgroups(row_indices, row_cols, num_rows: int, row_width: int, strid
 
 # ── the tile ─────────────────────────────────────────────────────────────────
 
+# `compute_ktile`'s prefetch slot taking the next tile's k-tile 0
+_NEXT_TILE_K0 = object()
+
+
+@ASTRewriter.transform
+def issue_tile_k0(
+    base_ptr,
+    *,
+    gA_base,
+    lda: int,
+    a_row0,
+    gB_base,
+    ldb: int,
+    b_slab,
+    blk_n,
+    m_rows,
+    n_valid,
+    live,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    num_waves: int,
+    b_nn: bool = False,
+    i32_n=None,
+):
+    """Issue k-tile 0 of a dense-A ``nt_gemm_tile`` into buffer 0: the loads of its prologue, same
+    arguments. A ``live`` False tile loads nothing (every extent 0)."""
+    KB = tile_k * EB
+    LDS_ROW, STAGE_A, _pitch, _arena = tile_geometry(tile_m, tile_n, tile_k, b_nn)
+    LDS_B_ROW = tile_n * EB + _nn_b_pad(tile_n, EB)
+    wave = rocdl.readfirstlane(T.i32, fx.Int32(fx.thread_idx.x) // WAVE)
+    zero32 = fx.Int32(0)
+    lda_b = fx.Int64(lda * EB)
+    ldb_b = fx.Int64(ldb * EB)
+
+    def _gv(base, off, shape, stride):
+        return fx.Tensor(fx.make_view(fx.add_offset(base, off), fx.make_layout(shape, stride)))
+
+    def _lv(ptr, shape, stride):
+        return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
+
+    def _tdm(gt, outer, stride):
+        return fx.rocdl.make_tdm_atom(
+            gt,
+            [outer, None],
+            strides=[stride, None],
+            num_warps=1,
+            pad_interval=KB,
+            pad_amount=LDS_PAD,
+            cache_modifier=0,
+            early_timeout=True,
+        )
+
+    gt_a = _gv(gA_base, fx.Int64(a_row0) * lda_b, (tile_m, KB), (KB, 1))
+    atom_a = _tdm(gt_a, live.select(m_rows, zero32), lda_b)
+    if const_expr(b_nn):
+        blk_n_eff = (blk_n > i32_n - fx.Int32(tile_n)).select(i32_n - fx.Int32(tile_n), blk_n)
+        gt_b = _gv(gB_base, b_slab + fx.Int64(blk_n_eff) * fx.Int64(EB), (tile_k, tile_n * EB), (ldb_b, 1))
+        atom_b = fx.rocdl.make_tdm_atom(
+            gt_b,
+            [live.select(fx.Int32(tile_k), zero32), fx.Int32(tile_n * EB)],
+            strides=[ldb_b, None],
+            num_warps=1,
+            pad_interval=tile_n * EB,
+            pad_amount=LDS_B_ROW - tile_n * EB,
+            cache_modifier=0,
+            early_timeout=True,
+        )
+    else:
+        gt_b = _gv(gB_base, b_slab + fx.Int64(blk_n) * ldb_b, (tile_n, KB), (KB, 1))
+        atom_b = _tdm(gt_b, live.select(n_valid, zero32), ldb_b)
+    if wave == fx.Int32(0):
+        fx.copy(atom_a, gt_a, _lv(base_ptr, (tile_m, KB), (LDS_ROW, 1)), imm_offset=fx.Int64(0))
+    if wave == fx.Int32(1 % num_waves):
+        if const_expr(b_nn):
+            fx.copy(
+                atom_b, gt_b, _lv(fx.add_offset(base_ptr, STAGE_A), (tile_k, tile_n * EB), (LDS_B_ROW, 1))
+            )
+        else:
+            fx.copy(
+                atom_b,
+                gt_b,
+                _lv(fx.add_offset(base_ptr, STAGE_A), (tile_n, KB), (LDS_ROW, 1)),
+                imm_offset=fx.Int64(0),
+            )
+
 
 @ASTRewriter.transform
 def nt_gemm_tile(
@@ -269,6 +366,9 @@ def nt_gemm_tile(
     issue_first: bool = False,
     lds_cosched: bool = False,
     wmma_b2b: bool = False,
+    k0_issued: bool = False,
+    next_tile=None,
+    c_off: int = 0,
 ):
     """One ``tile_m x tile_n`` block; must be called by all ``m_warp * n_warp`` waves.
 
@@ -300,6 +400,12 @@ def nt_gemm_tile(
     only and reads the next sub-step's one per matrix op, holding the running sub-step's
     fragments live to its end. ``wmma_b2b`` turns the WMMA arbitration stall off; not with a
     gathered A. Same results with any of them.
+
+    Tiles run back to back in one workgroup (dense A, an even number of k-tiles): ``k0_issued``
+    says this tile's k-tile 0 is already in flight to buffer 0 (``issue_tile_k0``), ``next_tile``
+    (``issue_tile_k0``'s per-tile arguments: ``a_row0``, ``b_slab``, ``blk_n``, ``n_valid``,
+    ``live``) issues the next tile's at the top of this tile's last k-tile, which runs from buffer
+    1, and ``c_off`` moves the C staging off buffer 0 (``persist_geometry``).
     """
     KB = tile_k * EB
     KSB = WMMA_K * EB
@@ -318,6 +424,8 @@ def nt_gemm_tile(
     resolve_lds_cosched(int(lds_cosched), issue_first, tile_m, tile_n, m_warp, n_warp)
     check_wmma_b2b(wmma_b2b, gather)
     assert ldc % 2 == 0, "the epilogue stores whole i32 words"
+    assert not (gather and (k0_issued or next_tile is not None)), "chained tiles have a dense A"
+    assert next_tile is None or num_waves > 1, "the epilogue fence counts one chained load per wave"
 
     tid = fx.Int32(fx.thread_idx.x)
     wave = rocdl.readfirstlane(T.i32, tid // WAVE)
@@ -539,12 +647,32 @@ def nt_gemm_tile(
         for t in act + wt:
             _llvm.call_intrinsic(None, "llvm.fake.use", [_raw(t.load())], [], [])
 
+    def _prefetch(kt):
+        if const_expr(kt is _NEXT_TILE_K0):
+            issue_tile_k0(
+                base_ptr,
+                gA_base=gA_base,
+                lda=lda,
+                gB_base=gB_base,
+                ldb=ldb,
+                m_rows=m_rows,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                num_waves=num_waves,
+                b_nn=b_nn,
+                i32_n=i32_n,
+                **next_tile,
+            )
+        else:
+            issue(kt % NUM_BUFFERS, kt)
+
     def compute_ktile(buf, prefetch_kt):
         """K_WS sub-steps; the last one is returned to run inside the barrier window."""
         ring = [None] * R
         if const_expr(issue_first and prefetch_kt is not None):
             rocdl.sched_barrier(0)
-            issue(prefetch_kt % NUM_BUFFERS, prefetch_kt)
+            _prefetch(prefetch_kt)
             rocdl.sched_barrier(0)
         ring[0] = _load_ks(buf, 0)
         if const_expr(lds_cosched):
@@ -571,7 +699,7 @@ def nt_gemm_tile(
             rocdl.s_wait_dscnt(min(K_WS - 1 - ks, R - 1) * KS_DS)
             if const_expr(ks == 0 and prefetch_kt is not None and not issue_first):
                 rocdl.sched_barrier(0)
-                issue(prefetch_kt % NUM_BUFFERS, prefetch_kt)
+                _prefetch(prefetch_kt)
                 rocdl.sched_barrier(0)
             if const_expr(ks < K_WS - 1):
                 _mma_ks(ring[ks % R])
@@ -599,7 +727,8 @@ def nt_gemm_tile(
         # two WMMAs cannot issue until the first has executed. After the index-table reads (placed
         # ahead of them it turns their scalar loads into vector loads), ahead of every matrix op.
         rocdl.disable_xdl_arb_stall()
-    issue(0, 0, prologue=True)
+    if const_expr(not k0_issued):
+        issue(0, 0, prologue=True)
     if const_expr(gather):
         _rocdl.s_wait_asynccnt(0)
     _pipeline_fence(outstanding=0)
@@ -607,7 +736,13 @@ def nt_gemm_tile(
         buf = _bidx(_buf_ptr(kt % NUM_BUFFERS))
         split_fence(compute_ktile(buf, kt + 1))
     buf = _bidx(_buf_ptr(n_steady % NUM_BUFFERS))
-    _mma_ks(compute_ktile(buf, None))
+    # the next tile's k-tile 0 goes to buffer 0, which the last k-tile (buffer 1) leaves alone
+    last_prefetch = None
+    epi_outstanding = 0
+    if const_expr(next_tile is not None):
+        last_prefetch = _NEXT_TILE_K0
+        epi_outstanding = 1
+    _mma_ks(compute_ktile(buf, last_prefetch))
 
     # ---- epilogue: accumulators -> LDS (row-major tile) -> 16 B buffer stores ----
     chunks_per_row = tile_n * EB // 16
@@ -638,7 +773,8 @@ def nt_gemm_tile(
             for wn in range_constexpr(wmma_n_rep)
         ]
         bias_scales = [bias_scale(wmb + wm * WMMA_M + lane16) for wm in range_constexpr(wmma_m_rep)]
-    _pipeline_fence(outstanding=0)
+    # waves 0 and 1 may have the next tile's k-tile 0 in flight
+    _pipeline_fence(outstanding=epi_outstanding)
     for wm in range_constexpr(wmma_m_rep):
         row_rel = wmb + wm * WMMA_M + lane16
         for wn in range_constexpr(wmma_n_rep):
@@ -649,9 +785,14 @@ def nt_gemm_tile(
                 term = std_arith.MulFOp(bias, vector.broadcast(f32x8, _raw(bias_scales[wm]))).result
                 acc = Vec(std_arith.AddFOp(as_ir_value(acc), term).result)
             h = acc.to(fx.BFloat16)
-            fx.ptr_store(h.bitcast(fx.Int8), base_ptr + row_rel * c_lds_row + col_rel * EB)
+            if const_expr(c_off):
+                fx.ptr_store(h.bitcast(fx.Int8), base_ptr + (row_rel * c_lds_row + col_rel * EB + c_off))
+            else:
+                fx.ptr_store(h.bitcast(fx.Int8), base_ptr + row_rel * c_lds_row + col_rel * EB)
     _workgroup_barrier()
     lds_c = fx.Int32(_bidx(base_ptr))
+    if const_expr(c_off):
+        lds_c = lds_c + fx.Int32(c_off)
     if const_expr(c_rows is not None):
         row_rank, row_idx, row_ok, _extra = rows_out
         # a store whose tile is wider than its column bound loses every row when the row bound's

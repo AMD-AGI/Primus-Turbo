@@ -30,6 +30,8 @@ GEMM drains), so nothing that spins can keep a GEMM tile from a CU. ``num_lead_c
 that many combine workgroups to after ``lead_gemm_percent`` of the tiles, to push while the GEMM
 runs; on MI455X they slow the GEMM by more than their early push saves, so the default has none. The GEMM tile is reached by every workgroup in straight-line code before the
 role branches and is masked with ``live`` elsewhere -- no dynamic branch covers the TDM pipeline.
+With ``persist`` (on wherever the shape allows it) the GEMM role is one workgroup per CU instead,
+each walking every ``num_cu``-th tile; the combine workgroups follow them.
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ import torch
 from flydsl._mlir.dialects import arith as std_arith
 from flydsl.expr import arith, const_expr, rocdl
 from flydsl.expr.arith import _to_raw as _raw
+from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.utils.arith import ArithValue
 
@@ -57,7 +60,9 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     NUM_XCD,
     WAVE,
     check_wmma_b2b,
+    issue_tile_k0,
     nt_gemm_tile,
+    persist_geometry,
     pool_tile_order,
     resolve_lds_cosched,
     tile_geometry,
@@ -148,9 +153,16 @@ def _launch_gemm_combine_nt(
     issue_first: Constexpr[int],
     wmma_b2b: Constexpr[int],
     lds_cosched: Constexpr[int],
+    PERSIST: Constexpr[int],
 ):
     block = m_warp * n_warp * WAVE
-    arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
+    # conditional expressions, not an if/else: the launcher body is AST-transformed
+    persist_geom = persist_geometry(tile_m, tile_n, tile_k, B_NN)
+    C_OFF = persist_geom[0] if PERSIST else 0
+    FLAG_WORD = persist_geom[1] // 4 if PERSIST else 0
+    arena_bytes = persist_geom[2] if PERSIST else tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
+    if PERSIST and (NUM_LEAD_COMBINE or (K // tile_k) % NUM_BUFFERS):
+        raise ValueError("persistent GEMM workgroups need no lead combine and an even number of k-tiles")
     if arena_bytes > GFX1250_LDS_BYTES:
         raise ValueError(f"LDS arena {arena_bytes} B exceeds {GFX1250_LDS_BYTES} B")
     NUM_COMBINE = NUM_LEAD_COMBINE + NUM_TAIL_COMBINE
@@ -244,148 +256,233 @@ def _launch_gemm_combine_nt(
         l2_base = _addr(fx.recast_iter(fx.Int8, arg_l2))
 
         num_tiles_m = rocdl.readfirstlane(T.i32, _i32_table(arg_num_tile_blocks)[fx.Int32(0)])
-        combine_start = num_tiles_m * fx.Int32(N_BLOCKS_N * LEAD_GEMM_PERCENT // 100)
-        tail_combine_start = num_tiles_m * fx.Int32(N_BLOCKS_N) + fx.Int32(NUM_LEAD_COMBINE)
-        is_lead_combine = (bid >= combine_start) & (bid < combine_start + fx.Int32(NUM_LEAD_COMBINE))
-        is_combine = is_lead_combine | (bid >= tail_combine_start)
-        # the combine workgroups also run the reduce, numbered lead first
-        combine_idx = arith.select(
-            is_lead_combine, bid - combine_start, bid - tail_combine_start + fx.Int32(NUM_LEAD_COMBINE)
-        )
-        gemm_block_idx = arith.select(bid < combine_start, bid, bid - fx.Int32(NUM_LEAD_COMBINE))
-
-        # ---- GEMM role: straight-line for every workgroup, masked by `live` ----
-        is_gemm = arith.select(is_combine, fx.Int32(0), fx.Int32(1)) == fx.Int32(1)
-        live = is_gemm & (gemm_block_idx < num_tiles_m * fx.Int32(N_BLOCKS_N))
-        gemm_block_idx = live.select(gemm_block_idx, fx.Int32(0))
-        # the flags count a pool block's N blocks in any order, so the order is free
-        tile_m_idx, tile_n_idx = pool_tile_order(gemm_block_idx, num_tiles_m, N_BLOCKS_N, group_m, num_xcd)
-        block_m = rocdl.readfirstlane(T.i32, tile_m_idx)
-        block_n = rocdl.readfirstlane(T.i32, tile_n_idx)
-        expert = rocdl.readfirstlane(T.i32, _i32_table(arg_tile_to_expert)[block_m])
-        expert = live.select(expert, fx.Int32(0))
-        blk_n = block_n * fx.Int32(tile_n)
-        m_row = block_m * fx.Int32(tile_m)
-        c_rows = None
+        gA = fx.recast_iter(fx.Int8, arg_act)
+        gW = fx.recast_iter(fx.Int8, arg_w)
+        LDB = N if B_NN else K
+        pool_bytes = num_tiles_m * fx.Int32(tile_m * 4)
         c_rank_bases = None
-        c_bias = None
         if const_expr(SCATTER):
             # dead tiles and the combine workgroups run the tile too, possibly over an empty pool
-            pool_bytes = num_tiles_m * fx.Int32(tile_m * 4)
             recv_token_res = create_buffer_resource_from_addr(
                 _addr(arg_pool_row_to_recv_token), num_records_bytes=pool_bytes
             )
             route_res = create_buffer_resource_from_addr(
                 _addr(arg_pool_row_to_route), num_records_bytes=pool_bytes
             )
-
-            def c_rows(lane_row):
-                # each row goes straight to its route's combine row on the token's source rank
-                pool_row = m_row + lane_row
-                recv_token = buffer_load(recv_token_res, pool_row, vec_width=1, dtype=T.i32)
-                route = buffer_load(route_res, pool_row, vec_width=1, dtype=T.i32)
-                # padding rows carry the num_max_recv_tokens sentinel
-                ok = (
-                    live
-                    & (recv_token >= fx.Int32(0))
-                    & (recv_token < fx.Int32(NUM_RANKS * NUM_MAX_TOKENS_PER_RANK))
-                    & (route >= fx.Int32(0))
-                    & (route < fx.Int32(num_max_routes))
-                )
-                src_rank = ok.select(recv_token // fx.Int32(NUM_MAX_TOKENS_PER_RANK), fx.Int32(RANK))
-                route = ok.select(route, fx.Int32(0))
-                return src_rank, route, ok, (pool_row, src_rank, route, ok)
-
             c_rank_bases = [sym_buffer.map(combine_token_base, fx.Int32(r)) for r in range(NUM_RANKS)]
             if const_expr(HAS_BIAS):
                 scale_res = create_buffer_resource_from_addr(
                     _addr(arg_bias_scale), num_records_bytes=pool_bytes
                 )
-                c_bias = (
-                    _addr(arg_bias) + fx.Int64(expert) * fx.Int64(N * EB),
-                    lambda tile_row: buffer_load(scale_res, m_row + tile_row, vec_width=1, dtype=T.f32),
-                )
-        rows_out = nt_gemm_tile(
-            base_ptr,
-            gA_base=fx.recast_iter(fx.Int8, arg_act),
-            lda=K,
-            a_row0=m_row,
-            a_rows=fx.Int32(0),
-            row_idx_table=_i32_table(arg_tile_to_expert),
-            row_idx_base=fx.Int32(0),
-            gB_base=fx.recast_iter(fx.Int8, arg_w),
-            ldb=N if B_NN else K,
-            b_slab=fx.Int64(expert) * fx.Int64(N * K * EB),
-            blk_n=blk_n,
-            c_addr=l2_base + (fx.Int64(m_row) * fx.Int64(N) + fx.Int64(blk_n)) * fx.Int64(EB),
-            ldc=N,
-            m_rows=fx.Int32(tile_m),
-            n_valid=fx.Int32(N) - blk_n,
-            i32_k=fx.Int32(K),
-            live=live,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            m_warp=m_warp,
-            n_warp=n_warp,
-            gather=False,
-            # scattered rows are read by the reduce on their source rank; the staged ones by
-            # combine workgroups on other CUs
-            c_cache_modifier=CPOL_SYSTEM_STREAM if SCATTER else CPOL_DEVICE_STREAM,
-            b_nn=B_NN,
-            issue_first=bool(issue_first),
-            lds_cosched=bool(lds_cosched),
-            wmma_b2b=bool(wmma_b2b),
-            i32_n=fx.Int32(N),
-            c_rows=c_rows,
-            c_rank_bases=c_rank_bases,
-            c_num_rows=num_max_routes,
-            c_bias=c_bias,
-        )
-        if const_expr(SCATTER):
-            pool_row, src_rank, route, row_ok = rows_out[3]
-        if const_expr(SCATTER and HAS_GRAD_GATE):
-            # one N block per pool block carries each row's gate value to its route
-            if block_n == fx.Int32(0):
-                if row_ok:
-                    gate = buffer_load(
-                        create_buffer_resource_from_addr(_addr(arg_grad_gate), num_records_bytes=pool_bytes),
-                        pool_row,
-                        vec_width=1,
-                        dtype=T.f32,
+
+        def _tile_expert(block_m, live):
+            expert = rocdl.readfirstlane(T.i32, _i32_table(arg_tile_to_expert)[block_m])
+            return live.select(expert, fx.Int32(0))
+
+        def _gemm_tile(sym_buffer, block_m, block_n, live, k0_issued=False, next_tile=None):
+            """One GEMM tile, its pool block's flag add and (scatter) the rows' publication.
+
+            ``sym_buffer`` is a parameter: the rewriter treats an object whose method a dynamic
+            branch calls as a branch result, which must be a local."""
+            expert = _tile_expert(block_m, live)
+            blk_n = block_n * fx.Int32(tile_n)
+            m_row = block_m * fx.Int32(tile_m)
+            c_rows = None
+            c_bias = None
+            if const_expr(SCATTER):
+
+                def c_rows(lane_row):
+                    # each row goes straight to its route's combine row on the token's source rank
+                    pool_row = m_row + lane_row
+                    recv_token = buffer_load(recv_token_res, pool_row, vec_width=1, dtype=T.i32)
+                    route = buffer_load(route_res, pool_row, vec_width=1, dtype=T.i32)
+                    # padding rows carry the num_max_recv_tokens sentinel
+                    ok = (
+                        live
+                        & (recv_token >= fx.Int32(0))
+                        & (recv_token < fx.Int32(NUM_RANKS * NUM_MAX_TOKENS_PER_RANK))
+                        & (route >= fx.Int32(0))
+                        & (route < fx.Int32(num_max_routes))
                     )
-                    st(
-                        sym_buffer.map(combine_gate_base, src_rank),
-                        route,
-                        ArithValue(std_arith.BitcastOp(T.i32, _raw(gate)).result),
-                        scope="sys",
+                    src_rank = ok.select(recv_token // fx.Int32(NUM_MAX_TOKENS_PER_RANK), fx.Int32(RANK))
+                    route = ok.select(route, fx.Int32(0))
+                    return src_rank, route, ok, (pool_row, src_rank, route, ok)
+
+                if const_expr(HAS_BIAS):
+                    c_bias = (
+                        _addr(arg_bias) + fx.Int64(expert) * fx.Int64(N * EB),
+                        lambda tile_row: buffer_load(scale_res, m_row + tile_row, vec_width=1, dtype=T.f32),
                     )
-        # every wave's C stores retire before the flag; two rendezvous, which LLVM would fold
-        wait_mem_all()
-        fx.gpu.barrier()
-        wait_mem_all()
-        fx.gpu.barrier()
-        if live:
-            if fx.Int32(tid) == fx.Int32(0):
-                flag_before = atomic_add(combine_flag_base, combine_bank + block_m, fx.Int64(1))
-                if const_expr(SCATTER):
-                    is_last_n = (flag_before + fx.Int64(1) == expected_combine).select(
-                        fx.Int32(1), fx.Int32(0)
-                    )
-                    st(_addr(base_ptr), fx.Int32(0), is_last_n, scope="workgroup", space=3)
-        if const_expr(SCATTER):
+            rows_out = nt_gemm_tile(
+                base_ptr,
+                gA_base=gA,
+                lda=K,
+                a_row0=m_row,
+                a_rows=fx.Int32(0),
+                row_idx_table=_i32_table(arg_tile_to_expert),
+                row_idx_base=fx.Int32(0),
+                gB_base=gW,
+                ldb=LDB,
+                b_slab=fx.Int64(expert) * fx.Int64(N * K * EB),
+                blk_n=blk_n,
+                c_addr=l2_base + (fx.Int64(m_row) * fx.Int64(N) + fx.Int64(blk_n)) * fx.Int64(EB),
+                ldc=N,
+                m_rows=fx.Int32(tile_m),
+                n_valid=fx.Int32(N) - blk_n,
+                i32_k=fx.Int32(K),
+                live=live,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                m_warp=m_warp,
+                n_warp=n_warp,
+                gather=False,
+                # scattered rows are read by the reduce on their source rank; the staged ones by
+                # combine workgroups on other CUs
+                c_cache_modifier=CPOL_SYSTEM_STREAM if SCATTER else CPOL_DEVICE_STREAM,
+                b_nn=B_NN,
+                issue_first=bool(issue_first),
+                lds_cosched=bool(lds_cosched),
+                wmma_b2b=bool(wmma_b2b),
+                i32_n=fx.Int32(N),
+                c_rows=c_rows,
+                c_rank_bases=c_rank_bases,
+                c_num_rows=num_max_routes,
+                c_bias=c_bias,
+                k0_issued=k0_issued,
+                next_tile=next_tile,
+                c_off=C_OFF,
+            )
+            if const_expr(SCATTER):
+                pool_row, src_rank, route, row_ok = rows_out[3]
+            if const_expr(SCATTER and HAS_GRAD_GATE):
+                # one N block per pool block carries each row's gate value to its route
+                if block_n == fx.Int32(0):
+                    if row_ok:
+                        gate = buffer_load(
+                            create_buffer_resource_from_addr(
+                                _addr(arg_grad_gate), num_records_bytes=pool_bytes
+                            ),
+                            pool_row,
+                            vec_width=1,
+                            dtype=T.f32,
+                        )
+                        st(
+                            sym_buffer.map(combine_gate_base, src_rank),
+                            route,
+                            ArithValue(std_arith.BitcastOp(T.i32, _raw(gate)).result),
+                            scope="sys",
+                        )
+            # every wave's C stores retire before the flag; two rendezvous, which LLVM would fold
+            wait_mem_all()
             fx.gpu.barrier()
-            is_last_n = live & (ld(_addr(base_ptr), fx.Int32(0), scope="workgroup", space=3) == fx.Int32(1))
-            # Every N block's stores of this pool block retired before its flag add, so the
-            # last one to add publishes the block's rows: their routes' reduce flags go up.
-            if is_last_n:
-                if row_ok:
-                    st(
-                        sym_buffer.map(reduce_flag_base, src_rank),
-                        reduce_bank + route,
-                        expected_reduce,
-                        scope="sys",
-                    )
+            wait_mem_all()
+            fx.gpu.barrier()
+            if live:
+                if fx.Int32(tid) == fx.Int32(0):
+                    flag_before = atomic_add(combine_flag_base, combine_bank + block_m, fx.Int64(1))
+                    if const_expr(SCATTER):
+                        is_last_n = (flag_before + fx.Int64(1) == expected_combine).select(
+                            fx.Int32(1), fx.Int32(0)
+                        )
+                        st(_addr(base_ptr), fx.Int32(FLAG_WORD), is_last_n, scope="workgroup", space=3)
+            if const_expr(SCATTER):
+                fx.gpu.barrier()
+                is_last_n = live & (
+                    ld(_addr(base_ptr), fx.Int32(FLAG_WORD), scope="workgroup", space=3) == fx.Int32(1)
+                )
+                # Every N block's stores of this pool block retired before its flag add, so the
+                # last one to add publishes the block's rows: their routes' reduce flags go up.
+                if is_last_n:
+                    if row_ok:
+                        st(
+                            sym_buffer.map(reduce_flag_base, src_rank),
+                            reduce_bank + route,
+                            expected_reduce,
+                            scope="sys",
+                        )
+
+        if const_expr(PERSIST):
+            # ---- GEMM role: PERSIST workgroups walk the live tiles, then the combine ones ----
+            is_combine = bid >= fx.Int32(PERSIST)
+            combine_idx = bid - fx.Int32(PERSIST)
+            n_live = num_tiles_m * fx.Int32(N_BLOCKS_N)
+            n_t = (n_live - bid + fx.Int32(PERSIST - 1)) // fx.Int32(PERSIST)
+            n_t = rocdl.readfirstlane(T.i32, (is_combine | (n_t < fx.Int32(0))).select(fx.Int32(0), n_t))
+
+            def _tile_coords(t):
+                # [0, n_live) in the tile order is every live tile once; a tile past it decodes as
+                # tile 0 and loads nothing
+                live = t < n_live
+                tile_m_idx, tile_n_idx = pool_tile_order(
+                    live.select(t, fx.Int32(0)), num_tiles_m, N_BLOCKS_N, group_m, num_xcd
+                )
+                return rocdl.readfirstlane(T.i32, tile_m_idx), rocdl.readfirstlane(T.i32, tile_n_idx), live
+
+            def _k0_args(block_m, block_n, live):
+                blk_n = block_n * fx.Int32(tile_n)
+                return dict(
+                    a_row0=block_m * fx.Int32(tile_m),
+                    b_slab=fx.Int64(_tile_expert(block_m, live)) * fx.Int64(N * K * EB),
+                    blk_n=blk_n,
+                    n_valid=fx.Int32(N) - blk_n,
+                    live=live,
+                )
+
+            # the first tile's k-tile 0; every later one is issued by the tile before it
+            bm0, bn0, live0 = _tile_coords(bid)
+            issue_tile_k0(
+                base_ptr,
+                gA_base=gA,
+                lda=K,
+                gB_base=gW,
+                ldb=LDB,
+                m_rows=fx.Int32(tile_m),
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                num_waves=m_warp * n_warp,
+                b_nn=B_NN,
+                i32_n=fx.Int32(N),
+                **_k0_args(bm0, bn0, live0 & (n_t > fx.Int32(0))),
+            )
+
+            def _persist_tile(t):
+                block_m, block_n, live = _tile_coords(t)
+                bm2, bn2, live2 = _tile_coords(t + fx.Int32(PERSIST))
+                _gemm_tile(
+                    sym_buffer, block_m, block_n, live, k0_issued=True, next_tile=_k0_args(bm2, bn2, live2)
+                )
+
+            for it in range(n_t):
+                _persist_tile(bid + it * fx.Int32(PERSIST))
+            # the last tile's prefetch loaded nothing, but it is still in flight
+            tdm_ops.tensor_wait(0)
+        else:
+            combine_start = num_tiles_m * fx.Int32(N_BLOCKS_N * LEAD_GEMM_PERCENT // 100)
+            tail_combine_start = num_tiles_m * fx.Int32(N_BLOCKS_N) + fx.Int32(NUM_LEAD_COMBINE)
+            is_lead_combine = (bid >= combine_start) & (bid < combine_start + fx.Int32(NUM_LEAD_COMBINE))
+            is_combine = is_lead_combine | (bid >= tail_combine_start)
+            # the combine workgroups also run the reduce, numbered lead first
+            combine_idx = arith.select(
+                is_lead_combine, bid - combine_start, bid - tail_combine_start + fx.Int32(NUM_LEAD_COMBINE)
+            )
+            gemm_block_idx = arith.select(bid < combine_start, bid, bid - fx.Int32(NUM_LEAD_COMBINE))
+
+            # ---- GEMM role: straight-line for every workgroup, masked by `live` ----
+            is_gemm = arith.select(is_combine, fx.Int32(0), fx.Int32(1)) == fx.Int32(1)
+            live = is_gemm & (gemm_block_idx < num_tiles_m * fx.Int32(N_BLOCKS_N))
+            gemm_block_idx = live.select(gemm_block_idx, fx.Int32(0))
+            # the flags count a pool block's N blocks in any order, so the order is free
+            tile_m_idx, tile_n_idx = pool_tile_order(
+                gemm_block_idx, num_tiles_m, N_BLOCKS_N, group_m, num_xcd
+            )
+            _gemm_tile(
+                sym_buffer,
+                rocdl.readfirstlane(T.i32, tile_m_idx),
+                rocdl.readfirstlane(T.i32, tile_n_idx),
+                live,
+            )
 
         if is_combine:
             lds = _addr(base_ptr)
@@ -617,6 +714,7 @@ def gemm_combine_nt_gfx1250(
     issue_first: int = 1,
     wmma_b2b: int | None = None,
     lds_cosched: int = -1,
+    persist: bool | None = None,
 ):
     """``act`` [pool rows, K] (pool order, as the L1 + activation left it) -> ``[tokens, N]`` combined,
     ``tokens = topk_idx.shape[0]``.
@@ -638,7 +736,11 @@ def gemm_combine_nt_gfx1250(
     ``issue_first`` issues each k-tile's prefetch at the top of the previous one, ``lds_cosched``
     interleaves the fragment reads with the matrix ops (``nt_gemm_tile``; -1: wherever the tile and
     ``issue_first`` allow it) and ``wmma_b2b`` turns the WMMA arbitration stall off (None: wherever
-    the tile is co-scheduled)."""
+    the tile is co-scheduled).
+
+    ``persist`` runs the GEMM on one workgroup per CU, each walking every ``num_cu``-th tile of
+    the tile order and loading its next tile's first k-tile under the current one's last; it needs
+    no lead combine and an even number of k-tiles (None: wherever it has them)."""
     lds_cosched = resolve_lds_cosched(lds_cosched, issue_first, tile_m, tile_n, m_warp, n_warp)
     if wmma_b2b is None:
         wmma_b2b = lds_cosched
@@ -670,6 +772,16 @@ def gemm_combine_nt_gfx1250(
     num_tail_combine = num_tail_combine or num_cu - num_lead_combine
     # the XCD bands need the GEMM tiles' bids past the lead combines to stay on XCD boundaries
     num_xcd = NUM_XCD if num_lead_combine % NUM_XCD == 0 else 1
+    n_blocks_n = (N + tile_n - 1) // tile_n
+    if persist is None:
+        persist = num_lead_combine == 0 and (K // tile_k) % NUM_BUFFERS == 0
+    if persist:
+        assert num_lead_combine == 0 and (K // tile_k) % NUM_BUFFERS == 0
+        # a workgroup keeps the XCD of its first tile, so the walk's stride must keep it too
+        assert num_cu % NUM_XCD == 0
+        num_gemm_wgs = num_cu
+    else:
+        num_gemm_wgs = rows // BLOCK_M * n_blocks_n
     out = torch.empty(int(symm.num_max_tokens_per_rank), N, dtype=torch.bfloat16, device=act.device)
     has_grad_gate = grad_gate is not None
     if has_grad_gate:
@@ -711,13 +823,14 @@ def gemm_combine_nt_gfx1250(
         _as_ptr(bias_scale if has_bias else out),
         symm.get_sym_buffer(),
         torch.cuda.current_stream(),
-        # GEMM tiles of this call's pool (the prologue's num_tile_blocks), then the combine
-        # workgroups: a worst-case grid would queue idle tiles ahead of the tail combine
-        rows // BLOCK_M * ((N + tile_n - 1) // tile_n) + num_lead_combine + num_tail_combine,
+        # GEMM tiles of this call's pool (the prologue's num_tile_blocks), or the persistent GEMM
+        # workgroups, then the combine workgroups: a worst-case grid would queue idle tiles ahead of
+        # the tail combine
+        num_gemm_wgs + num_lead_combine + num_tail_combine,
         N,
         K,
         int(symm.num_max_pool_tokens) // BLOCK_M,
-        (N + tile_n - 1) // tile_n,
+        n_blocks_n,
         num_lead_combine,
         num_tail_combine,
         lead_gemm_percent,
@@ -740,6 +853,7 @@ def gemm_combine_nt_gfx1250(
         issue_first,
         wmma_b2b,
         lds_cosched,
+        num_cu if persist else 0,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)

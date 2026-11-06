@@ -125,3 +125,42 @@ def test_gemm_combine_scheduling_is_bit_identical(ep1_group, b_nn):
     ]
     for opts, out in zip(_SCHEDULES[1:], outs[1:]):
         assert torch.equal(out, outs[0]), f"{opts} changed the result"
+
+
+@pytest.mark.parametrize("b_nn", [False, True], ids=["nt", "nn"])
+@pytest.mark.parametrize("num_tokens, num_empty", [(1024, 0), (333, 5), (1, 0)])
+def test_gemm_combine_persist_is_bit_identical(ep1_group, b_nn, num_tokens, num_empty):
+    """The persistent GEMM workgroups compute every tile as the one-tile-per-workgroup launch does, with
+    the gate gradient (``b_nn``) and over pools with empty experts or almost no rows."""
+    from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_combine_kernel import (
+        gemm_combine_nt_gfx1250,
+    )
+    from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
+        run_dispatch_prologue,
+    )
+
+    hidden, inter, num_experts, num_topk = 7168, 2048, 32, 8
+    torch.manual_seed(num_tokens + num_empty)
+    w1 = (torch.randn(num_experts, 2 * inter, hidden, device="cuda") / hidden**0.5).to(torch.bfloat16)
+    w2 = (torch.randn(num_experts, hidden, inter, device="cuda") / inter**0.5).to(torch.bfloat16)
+    k, w = (2 * inter, w1) if b_nn else (inter, w2)
+    for _ in range(_CALLS):
+        x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+        scores = torch.randn(num_tokens, num_experts, device="cuda")
+        scores[:, num_experts - num_empty :] = float("-inf")
+        topk_w, topk_idx = scores.softmax(-1).topk(num_topk, dim=-1)
+        handle, _ = run_dispatch_prologue(x, w1, ep1_group, topk_idx, topk_w)
+        rows = handle.pool_row_to_route.numel()
+        act = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+        kw = dict(b_nn=b_nn)
+        if b_nn:
+            kw["grad_gate"] = torch.randn(rows, device="cuda")
+        # the outputs may live in buffers the next call reuses
+        outs = [
+            [t.clone() for t in gemm_combine_nt_gfx1250(act, w, handle, topk_idx, persist=p, **kw)]
+            if b_nn
+            else [gemm_combine_nt_gfx1250(act, w, handle, topk_idx, persist=p, **kw).clone()]
+            for p in (False, True)
+        ]
+        for ref, got in zip(*outs):
+            assert torch.equal(got, ref), "the persistent GEMM changed the result"
