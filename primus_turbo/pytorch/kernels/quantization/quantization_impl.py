@@ -1019,7 +1019,7 @@ def quantize_mxfp4_impl(
             if x.ndim == 2 and dual_eligible(
                 x.shape[0], x.shape[1], scaling_recipe, scaling_recipe_for_trans
             ):
-                return flydsl_dual_quant(
+                row_data, row_scale, col_data, col_scale = flydsl_dual_quant(
                     x,
                     out_dtype,
                     scaling_recipe.use_rht,
@@ -1030,6 +1030,11 @@ def quantize_mxfp4_impl(
                     col_sr=scaling_recipe_for_trans.use_sr,
                     scale_rounding_mode=scale_rounding_mode,
                 )
+                # The internal cast may use a wider row pitch for GEMM loads.
+                # Public quantization outputs also feed dequantize/shuffle, which
+                # require the same contiguous layout as the HIP implementation.
+                row_data = row_data.view(torch.uint8).contiguous().view(out_dtype)
+                return row_data, row_scale, col_data, col_scale
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp4_dual(
             x,
             out_dtype,

@@ -936,6 +936,8 @@ _WHOLE_LOOP_LAUNCHES = {"launch_dense_wave4", "launch_dense_tn_wave4", "launch_g
 
 @requires_gfx950
 def test_no_launch_reads_a_mutable_global():
+    import importlib
+
     from flydsl.compiler.jit_function import JitFunction
 
     from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
@@ -943,6 +945,9 @@ def test_no_launch_reads_a_mutable_global():
     rt.force(True)
     for run, ref in (_fp8_gemm(4096, 4096, 4096, "NT"), _fp8_gemm(1024, 512, 1024, "TN"), _fp8_wgrad()):
         _check(run(), ref)
+    # Full-suite collection also loads these launches on gfx950. Cover them when
+    # this regression test is run alone, without relying on collection order.
+    importlib.import_module("primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250")
     want = set(_WHOLE_LOOP_LAUNCHES)
     if check_mxfp4_support()[0]:
         _mxfp4_gemm()()
