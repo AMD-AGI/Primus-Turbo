@@ -309,6 +309,8 @@ def run_config(model, seq, mbs, group, use_mlp, warmup, iters, fused=False):
             p.grad = None
         x = x0.clone().requires_grad_()
         _barrier()
+        # keep the GPU busy while the host queues the layer, as the previous layer does in training
+        torch.cuda._sleep(2_000_000)
         out = layer(x)
         REC.rec("bwd", "start")
         out.backward(dy)
@@ -329,6 +331,17 @@ def run_config(model, seq, mbs, group, use_mlp, warmup, iters, fused=False):
 
     mean = [v / n for v in _all_reduce(local, dist.ReduceOp.SUM)]
     stage_max = _all_reduce(local, dist.ReduceOp.MAX)
+    # The critical rank of a phase is the one with the most compute (attention + MLP): the others
+    # wait for it at the next exchange, so its own exchange stages carry no waiting.
+    per_rank = [None] * n
+    dist.all_gather_object(per_rank, local, group=group)
+    stage_crit = {}
+    for phase in ("fwd", "bwd"):
+        compute = [
+            sum(v for (p, st), v in zip(keys, r) if p == phase and st in ("attn", "mlp")) for r in per_rank
+        ]
+        crit = per_rank[max(range(n), key=compute.__getitem__)]
+        stage_crit[phase] = {st: v for (p, st), v in zip(keys, crit) if p == phase}
     totals = _all_reduce(local_totals, dist.ReduceOp.MAX)
     iso = [v / n for v in _all_reduce(iso_local, dist.ReduceOp.SUM)]
 
@@ -339,7 +352,13 @@ def run_config(model, seq, mbs, group, use_mlp, warmup, iters, fused=False):
     for (phase, st), v, vmax in zip(keys, mean, stage_max):
         stages[phase][st] = v
         stages_max[phase][st] = vmax
-    return stages, stages_max, {"fwd": totals[0], "bwd": totals[1]}, {"pre": iso[0], "post": iso[1]}
+    return (
+        stages,
+        stages_max,
+        {"fwd": totals[0], "bwd": totals[1]},
+        {"pre": iso[0], "post": iso[1]},
+        stage_crit,
+    )
 
 
 def analyze(stages, totals, iso):
@@ -434,27 +453,37 @@ def report(model, seq, mbs, n, use_mlp, stages, stages_max, totals, iso):
     return row
 
 
-def report_fused(model, seq, mbs, n, base_max, base_totals, fused_max, fused_totals):
-    """Each fused stage (max over ranks) against the unfused stages it replaces."""
+def report_fused(model, seq, mbs, n, base, fused):
+    """Each fused stage against the unfused stages it replaces; ``base`` / ``fused`` are
+    ``(mean over ranks, max over ranks, layer totals, critical rank)`` from :func:`run_config`.
+    The mean and max include ranks waiting for the critical (slowest-compute) rank; the critical
+    rank's own exchange stages do not, so that column is what the kernels add to the layer."""
     print(f"\n== fused vs unfused: {model}  seq={seq}  ulysses={n}  mbs={mbs} ==")
-    print("per layer, us; max over ranks of each rank's median")
-    print(f"  {'stage':<26}{'unfused':>10}{'fused':>10}{'speedup':>9}")
+    print("per layer, us; each rank's median: critical rank | mean over ranks [max rank]")
+    print(f"  {'stage':<26}{'unfused':>24}{'fused':>24}{'speedup':>9}")
     row = {"Model": model, "Seq": seq, "Ulysses": n, "MBS": mbs}
     for label, phase, parts in FUSED_STAGES:
-        fused_stage = [p for p in parts if p in fused_max[phase]]
+        fused_stage = [p for p in parts if p in fused[0][phase]]
         if not fused_stage:
             continue
-        base = sum(base_max[phase][p] for p in parts)
-        fused = fused_max[phase][fused_stage[0]]
-        print(f"  {label:<26}{base:>10.0f}{fused:>10.0f}{base / fused:>8.2f}x")
+        b_mean, b_max = (sum(st[phase][p] for p in parts) for st in base[:2])
+        b_crit = sum(base[3][phase][p] for p in parts)
+        f_mean, f_max = (st[phase][fused_stage[0]] for st in fused[:2])
+        f_crit = fused[3][phase][fused_stage[0]]
+        cells = [
+            f"{c:6.0f} | {m:6.0f} [{x:5.0f}]"
+            for c, m, x in ((b_crit, b_mean, b_max), (f_crit, f_mean, f_max))
+        ]
+        print(f"  {label:<26}{cells[0]:>24}{cells[1]:>24}{b_crit / f_crit:>8.2f}x")
         key = label.replace(" + ", "_").replace(" ", "_")
-        row[f"{key}_unfused_us"] = round(base, 1)
-        row[f"{key}_fused_us"] = round(fused, 1)
+        for name, vals in (("unfused", (b_crit, b_mean, b_max)), ("fused", (f_crit, f_mean, f_max))):
+            row.update({f"{key}_{name}_{k}_us": round(v, 1) for k, v in zip(("crit", "mean", "max"), vals)})
     for phase in ("fwd", "bwd"):
-        base, fused = base_totals[phase], fused_totals[phase]
-        print(f"  {phase + ' layer total':<26}{base:>10.0f}{fused:>10.0f}{base / fused:>8.2f}x")
-        row[f"{phase}_total_unfused_us"] = round(base, 1)
-        row[f"{phase}_total_fused_us"] = round(fused, 1)
+        b_tot, f_tot = base[2][phase], fused[2][phase]
+        print(
+            f"  {phase + ' layer total':<26}{b_tot:>24.0f}{f_tot:>24.0f}{b_tot / f_tot:>8.2f}x   (max rank)"
+        )
+        row.update({f"{phase}_total_unfused_us": round(b_tot, 1), f"{phase}_total_fused_us": round(f_tot, 1)})
     return row
 
 
@@ -484,18 +513,25 @@ def main():
     results = []
     for model in args.model:
         for seq in args.seq:
-            stages, stages_max, totals, iso = run_config(
+            stages, stages_max, totals, iso, crit = run_config(
                 model, seq, args.mbs, group, not args.no_mlp, args.warmup, args.iters
             )
             if args.fused:
-                _, fused_max, fused_totals, _ = run_config(
+                fused_stages, fused_max, fused_totals, _, fused_crit = run_config(
                     model, seq, args.mbs, group, not args.no_mlp, args.warmup, args.iters, fused=True
                 )
             if rank == 0:
                 row = report(model, seq, args.mbs, n, not args.no_mlp, stages, stages_max, totals, iso)
                 if args.fused:
                     row.update(
-                        report_fused(model, seq, args.mbs, n, stages_max, totals, fused_max, fused_totals)
+                        report_fused(
+                            model,
+                            seq,
+                            args.mbs,
+                            n,
+                            (stages, stages_max, totals, crit),
+                            (fused_stages, fused_max, fused_totals, fused_crit),
+                        )
                     )
                 results.append(row)
 
