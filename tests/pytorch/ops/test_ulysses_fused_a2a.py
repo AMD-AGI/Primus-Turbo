@@ -205,7 +205,7 @@ class _Layer:
 
 
 def check_scenarios(group, failures, hq=32, hkv=8, d=128, b=2, s_local=300, hidden=1024):
-    """Chained layers, a non-default stream and CUDA-graph replay of a forward + backward."""
+    """Chained layers and a non-default stream."""
     rank = group.rank()
     for qkv_format in ("sbhd", "bshd"):
         shape = (s_local, b, hidden) if qkv_format == "sbhd" else (b, s_local, hidden)
@@ -232,32 +232,29 @@ def check_scenarios(group, failures, hq=32, hkv=8, d=128, b=2, s_local=300, hidd
         torch.cuda.current_stream().wait_stream(side)
         layer.check(x, y, failures, f"[side stream {qkv_format}]")
 
-        # graph leaves must not have run backward on another stream (AccumulateGrad keeps the stream)
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
-            layer = _Layer(group, hq, hkv, d, hidden, qkv_format, seed=100)
-            static_x = _randn(*shape, seed=900 + rank).requires_grad_()
-            static_dy = _randn(*shape, seed=901 + rank)
-            for _ in range(2):
-                layer.w_qkv.grad = layer.w_o.grad = static_x.grad = None
-                layer(static_x).backward(static_dy)
-        torch.cuda.current_stream().wait_stream(side)
-        layer.w_qkv.grad = layer.w_o.grad = static_x.grad = None
-        graph = torch.cuda.CUDAGraph()
-        # capture on the warmed-up stream: hipBLASLt sets up per stream, which capture forbids
-        with torch.cuda.graph(graph, stream=side):
-            static_y = layer(static_x)
-            static_y.retain_grad()
-            static_y.backward(static_dy)
-        for it in range(3):
-            with torch.no_grad():
-                static_x.copy_(_randn(*shape, seed=1000 + 10 * it + rank))
-                static_dy.copy_(_randn(*shape, seed=1001 + 10 * it + rank))
-            graph.replay()
-            torch.cuda.synchronize()
-            # the reference reads static_y.grad, which the graph wrote as the incoming dy
-            layer.check(static_x, static_y, failures, f"[cuda graph {qkv_format}] replay {it}")
-        del graph
+
+def _poison_banks(group):
+    """Fill both recv banks of every workspace with bf16 NaN: a kernel that reads a recv row before
+    its producer wrote it this epoch (or a padding row into a live output) shows up as NaN."""
+    from primus_turbo.flydsl.ulysses.workspace import _WORKSPACES, FLAG_BYTES
+
+    torch.cuda.synchronize()
+    dist.barrier(group=group)
+    for ws in _WORKSPACES.values():
+        banks = ws.symm_mem.get_buffer(ws.rank, (ws.bank_bytes,), torch.int16, storage_offset=FLAG_BYTES // 2)
+        banks.fill_(0x7FC0)
+    torch.cuda.synchronize()
+    dist.barrier(group=group)
+
+
+def check_poisoned(group, failures, hq=32, hkv=8, d=128, b=2, s_local=300, hidden=1024):
+    """Forward + backward of both ops, the banks poisoned before every call."""
+    for qkv_format in ("sbhd", "bshd"):
+        for it in range(2):
+            _poison_banks(group)
+            check_qkv(group, hq, hkv, d, b, s_local, hidden, qkv_format, "interleaved", 1, failures)
+            _poison_banks(group)
+            check_o_gemm(group, hq, d, b, s_local, hidden, qkv_format, True, 1, failures)
 
 
 def run_suite(quick):
@@ -286,6 +283,7 @@ def run_suite(quick):
             continue
         check_o_gemm(group, hq, d, b, 300, 1024, qkv_format, with_residual, 3, failures)
     check_scenarios(group, failures)
+    check_poisoned(group, failures)
 
     gathered = [None] * n
     dist.all_gather_object(gathered, failures, group=group)

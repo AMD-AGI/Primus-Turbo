@@ -65,15 +65,18 @@ grid 的排列顺序是：`num_lead` 个 GEMM block（默认 = CU 数，即第�
 - 实测（8B 32K n=8，`trace` 时间线）：第一个 wave 约在 100 µs 结束，pull 合计约 350–390 GB/s，已到 XGMI 读带宽上限。pull 并发再加大会拖慢对端的 GEMM：tail=48 或 pull=64 都变慢。下限约为“第一个 wave + 44 MB / 350 GB/s ≈ 230–245 µs”，实测约 281 µs。
 - 试过但没有收益、已经移除的：XCD remap / GROUP_M，epilogue cache modifier 0/18/19，main 上的 dense tile（核心与 mega 快照相同），把本地列 tile 放到最后算，让最后一个 wave 的 GEMM block 跑完后去 pull（还会死锁）。
 - GemmA2A：GEMM 按 m-major 光栅化，数据按 m 逐步就绪。pull block 的块序是 `(m_tile, src=(me+i)%n)`，让各 rank 在同一时刻从不同的 src 读，7 条链路都用上。
-- A2AGemm：push block 按 `(m_tile, dst=(me+i)%n)` 推送，然后做 O_gathered 的拷出。
-- tile 形状（256×256、256×128、128×256）也交给 autotune，用 `tune_utils.autotune`，结果按形状缓存。
+- A2AGemm（`a2a_gemm_kernel.py`）：前 `num_push`（默认 32）个 block 先动态领取 push unit `(m_tile, dst=(me+i)%n)`，把 dst 那段序列的行写进 dst 的 recv bank 第 `me` 个列块，再置 dst 的 flag `m_tile*n + me`；领完后这些 block 去算最后几个 tile（它们的行反正最晚到齐）。每个 GEMM tile 等齐本 m_tile 所有来源的 flag，做一次 system 级 acquire，然后跑普通的 K 循环。
+  - 源数据可以是一个张量（o_proj：`G=1`）或 `(dq, dk, dv)` 三个张量，按权重行序（`G` 组，每组 `(nq, nk, nv)/G` 个头）写进 recv bank，所以 QKV dgrad 直接用原权重（concat 布局用 rank-major 重排后的权重），B 走 `nn` 布局。
+  - 需要 wgrad 时，每个 m_tile 的 n_tiles 个 block 各把 recv 行的一个列块拷到 `o_gathered`。
+  - residual 在 epilogue 里按 fp32 加到累加器上，只做一次 bf16 舍入（`_residual_store_c`，要求 N % 256 == 0）。
+  - `num_push` 扫过 16/32/48/64/96/128：o_proj 和 QKV dgrad 都是 32–48 最好。
+- tile 形状固定 256×256，没有做 autotune（见遗留问题）。
 
 ## 6. 确定性
 
 - GemmA2A 只有 GEMM 和纯拷贝，结果按位确定。
-- A2AGemm 的 dgrad 沿 K 跨 src 累加：
-  - `deterministic=True`：固定顺序，先 local，再依次 (me+1)%n, (me+2)%n, …。同一个 rank 每次运行结果按位一致。
-  - `deterministic=False`：每个 tile 按到达顺序挑下一个已经就绪的切片，skew 下尾部更短。
+- A2AGemm 的 K 沿 src 排列（recv bank 的列块 = 来源 rank），每个 tile 等齐所有来源后按固定 K 顺序累加，结果按位确定。
+  - 没有实现按到达顺序累加的 `deterministic=False`：实测（第 10 节）各阶段在关键 rank 上已不含等待，按到达顺序只能缩短非关键 rank 的等待，不缩短整层。
 - wgrad 不跨 rank 归约，结果总是确定的。
 
 ## 7. 缓冲区生命周期和大小
@@ -88,14 +91,35 @@ grid 的排列顺序是：`num_lead` 个 GEMM block（默认 = CU 数，即第�
 
 - `ulysses_qkv_gemm_a2a(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout="interleaved"|"concat")`：返回 `q, k, v`，形状为 `[s, b, h/n, d]`（sbhd）或 `[b, s, h/n, d]`（bshd）。
   - 反向：A2AGemm（dx）加上 wgrad。
-- `ulysses_a2a_o_gemm(o, w_o, residual, group, qkv_format, deterministic)`：返回 y。
+- `ulysses_a2a_o_gemm(o, w_o, residual, group, qkv_format)`：返回 y。
   - 反向：GemmA2A（dO）加上 wgrad（用保存的 O_gathered），`d_residual = dY`。
 - 现有的 `flash_attn_usp_func` 不改。
 
 ## 9. 已确认的决策
 
-- A2AGemm 默认 `deterministic=True`，按固定顺序累加；`deterministic=False` 时按到达顺序累加。
+- A2AGemm 按固定顺序累加（按位确定）。
 - 两种权重布局都支持。A/B benchmark 的 baseline 和融合路径都用 Megatron 交错布局。
 - wgrad 返回普通 bf16 `.grad`。`main_grad`（gradient_accumulation_fusion）放到遗留问题。
 - 对称堆按第 7 节的整份双 bank 分配。
 - A/B benchmark 从 Primus 复制到 `benchmark/ops/training/bench_ulysses_a2a.py`，在 Turbo 里改。
+
+## 10. 结果
+
+测量：`benchmark/ops/training/bench_ulysses_a2a.py --fused`，一层 attention + dense MLP 的 forward + backward，CUDA event 逐阶段计时，每个 rank 取 median。每轮开始前在 GPU 上排一个 `_sleep`，把 host 下发时间藏在后面（训练里前一层的 kernel 起同样作用）。
+
+各 rank 的阶段时间差别主要来自等待：本机 GPU 2 和 GPU 4 的 attention / MLP 固定慢 5–10%，其他 rank 在下一次交换处等它们，所以“各 rank 平均”和“最大 rank”里都含有等待，unfused 的 all-to-all 和 fused kernel 一样。表里的“关键 rank”是该 phase 计算（attention + MLP）最多的 rank：别人等它，它自己的交换阶段不含等待，这一列才是 kernel 在关键路径上的开销。
+
+<!-- RESULTS -->
+
+## 11. 遗留问题
+
+- `main_grad` / gradient_accumulation_fusion：wgrad 返回普通 bf16 `.grad`，没有融合 fp32 累加。
+- tile 形状固定 256×256，没有 autotune；GEMM 核心（mega bf16 tile）在同形状上比 hipBLASLt 慢约 15%（例如 8B 32K QKV dgrad 单独 GEMM：hipBLASLt 173 µs）。
+- Qwen3-30B-A3B（hidden 2048，n=4）交换量相对 GEMM 很大，受 XGMI 链路带宽限制（约 131 GB/s 每 rank），加速主要来自去掉 pack/unpack 和重叠。
+- GemmA2A 的调试开关“跳过 GEMM、只 pull”在 n=8、M=4096、leading pull=16 时会挂住，不是 flag 自旋（超时诊断没有触发）；原因没有查清，开关已删除，正常路径不受影响。
+- FlyDSL 磁盘缓存的 key 只哈希 launcher 可达函数的源码，不含类体：改了 epilogue 类而缓存没失效，曾经加载到旧 kernel。现在把类定义放在函数里；建议在 FlyDSL 上游修。
+- 传给 FlyDSL kernel 的 4 维张量（带 size 为 1 的维）出现过错误偏移，原因未查清；现在统一按 2/3 维传入。
+- residual epilogue 只支持 N % 256 == 0（所有目标模型都满足），否则报错。
+- 限制：`M_pad*K`、`M*N`、`K*N` < 2^31（i32 偏移），`m_tiles*n` ≤ 32768（一个 flag region）。
+- CUDA graph 不在支持范围内（不测试）。代码里保留了 capture 时不扩容 workspace、launcher 走原始路径的处理，但没有验证。
+- concat 权重布局：前向用缓存的 rank-major 重排权重（多占一份权重显存），dW 再 scatter 回 `[q; k; v]`。

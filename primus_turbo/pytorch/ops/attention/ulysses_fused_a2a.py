@@ -49,6 +49,16 @@ def _rank_major_concat_rows(hq, hkv, d, n, device):
 _PERMUTED_WEIGHTS = {}
 
 
+_SIDE_STREAMS = {}
+
+
+def _side_stream():
+    device = torch.cuda.current_device()
+    if device not in _SIDE_STREAMS:
+        _SIDE_STREAMS[device] = torch.cuda.Stream(device)
+    return _SIDE_STREAMS[device]
+
+
 def _rank_major_weight(w, hq, hkv, d, n):
     """``w[perm]`` for a concat-layout weight, rebuilt only when the weight changes."""
     key = (w.data_ptr(), hq, hkv, d, n)
@@ -256,6 +266,26 @@ def _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format):
     return do.view(*shape, heads, d)
 
 
+def _o_gemm_backward(dy2d, w_o, o_gathered, group, heads, d, s_local, b, qkv_format, need_do, need_dw):
+    """``(dO, dW_o)``: dO by GemmA2A, ``dW_o = dY^T @ O_gathered``."""
+    do = dw = None
+    if need_do and need_dw:
+        # wgrad does not depend on the exchange: it runs beside the GemmA2A, which is
+        # exchange-bound. Queued first, as the GemmA2A grid fills every CU once it starts.
+        main, side = torch.cuda.current_stream(), _side_stream()
+        dw = torch.empty_like(w_o)
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            torch.matmul(dy2d.t(), o_gathered, out=dw)
+        do = _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format)
+        main.wait_stream(side)
+    elif need_do:
+        do = _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format)
+    elif need_dw:
+        dw = dy2d.t() @ o_gathered
+    return do, dw
+
+
 class UlyssesA2AOGemmFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, o, w_o, residual, group, qkv_format):
@@ -275,10 +305,9 @@ class UlyssesA2AOGemmFunction(torch.autograd.Function):
             b, s_local, N = dy.shape
         heads, d = ctx.o_shape[2], ctx.o_shape[3]
         dy2d = dy.reshape(s_local * b, N).contiguous()
-        do = None
-        if ctx.needs_input_grad[0]:
-            do = _o_gemm_dgrad(dy2d, w_o, ctx.group, heads, d, s_local, b, qkv_format)
-        dw = dy2d.t() @ o_gathered if ctx.needs_input_grad[1] else None
+        do, dw = _o_gemm_backward(
+            dy2d, w_o, o_gathered, ctx.group, heads, d, s_local, b, qkv_format, *ctx.needs_input_grad[:2]
+        )
         d_residual = dy if ctx.has_residual and ctx.needs_input_grad[2] else None
         return do, dw, d_residual, None, None
 
