@@ -110,6 +110,24 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "deterministic: mark test as deterministic-only suite")
 
 
+class _Gfx1250Module(pytest.Module):
+    def collect(self):
+        pytest.skip("gfx1250-specific test module is not supported on gfx950", allow_module_level=True)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_pycollect_makemodule(module_path, parent):
+    # Skip before importing: even host-only tests load gfx1250 JIT launches that
+    # would otherwise enter the gfx950 launch-global regression's process-wide scan.
+    # A module collector also handles files explicitly passed on the command line.
+    if "gfx1250" in module_path.stem.split("_"):
+        from primus_turbo.pytorch.core.utils import is_gfx950
+
+        if is_gfx950():
+            return _Gfx1250Module.from_parent(parent, path=module_path)
+    return None
+
+
 def pytest_collection_modifyitems(config, items):
     """Skip distributed tests in parallel mode, skip single-GPU tests in --dist-only mode."""
     # TODO(ruibin): gfx1250 is not yet fully supported by the Primus-Turbo.
