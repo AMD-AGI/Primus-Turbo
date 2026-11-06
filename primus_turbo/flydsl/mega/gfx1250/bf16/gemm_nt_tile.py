@@ -138,6 +138,31 @@ def resolve_lds_cosched(
     return lds_cosched
 
 
+def head_pipe_ok(
+    head_pipe: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    m_warp: int,
+    n_warp: int,
+    lds_cosched: int,
+    gather: bool,
+) -> bool:
+    """Whether ``nt_gemm_tile`` takes ``head_pipe`` (> 0) on this tile.
+
+    The sub-step-0 reads ride on the co-scheduled loop, one per deferred matrix op after the first
+    ``head_pipe``, and must not land in the deferred sub-step's registers (two sub-steps per k-tile).
+    Dense A only."""
+    m_rep, n_rep = tile_m // m_warp // WMMA_M, tile_n // n_warp // WMMA_N
+    return (
+        head_pipe > 0
+        and bool(lds_cosched)
+        and not gather
+        and tile_k // WMMA_K >= 2
+        and head_pipe + 2 * (m_rep + n_rep) <= m_rep * n_rep
+    )
+
+
 def check_wmma_b2b(wmma_b2b: int, gather: bool):
     """``wmma_b2b`` (the WMMA arbitration stall off) is for a dense A only.
 
@@ -369,6 +394,7 @@ def nt_gemm_tile(
     k0_issued: bool = False,
     next_tile=None,
     c_off: int = 0,
+    head_pipe: int = 0,
 ):
     """One ``tile_m x tile_n`` block; must be called by all ``m_warp * n_warp`` waves.
 
@@ -406,6 +432,11 @@ def nt_gemm_tile(
     (``issue_tile_k0``'s per-tile arguments: ``a_row0``, ``b_slab``, ``blk_n``, ``n_valid``,
     ``live``) issues the next tile's at the top of this tile's last k-tile, which runs from buffer
     1, and ``c_off`` moves the C staging off buffer 0 (``persist_geometry``).
+
+    ``head_pipe`` > 0 (``head_pipe_ok``) reads each k-tile's sub-step-0 fragments in the barrier
+    window before it, behind the barrier wait and the first ``head_pipe`` matrix ops of the deferred
+    sub-step, and interleaved with the rest of them, instead of at the top of the k-tile where the
+    first matrix op waits for them. Same results.
     """
     KB = tile_k * EB
     KSB = WMMA_K * EB
@@ -426,6 +457,9 @@ def nt_gemm_tile(
     assert ldc % 2 == 0, "the epilogue stores whole i32 words"
     assert not (gather and (k0_issued or next_tile is not None)), "chained tiles have a dense A"
     assert next_tile is None or num_waves > 1, "the epilogue fence counts one chained load per wave"
+    assert head_pipe == 0 or head_pipe_ok(
+        head_pipe, tile_m, tile_n, tile_k, m_warp, n_warp, lds_cosched, gather
+    ), f"head_pipe={head_pipe} needs a co-scheduled dense-A tile and room among the matrix ops"
 
     tid = fx.Int32(fx.thread_idx.x)
     wave = rocdl.readfirstlane(T.i32, tid // WAVE)
@@ -639,6 +673,26 @@ def nt_gemm_tile(
                 idx = wm * wmma_n_rep + wn
                 fx.gemm(wmma_atom, c_frags[idx], wt[wn], act[wm], c_frags[idx])
 
+    # `_mma_ks`'s order, to split one sub-step's matrix ops
+    MMA_ORDER = [
+        (wm, (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw)
+        for wm in range_constexpr(wmma_m_rep)
+        for wn_raw in range_constexpr(wmma_n_rep)
+    ]
+
+    def _mma_range(state, lo, hi):
+        act, wt = state
+        for wm, wn in MMA_ORDER[lo:hi]:
+            idx = wm * wmma_n_rep + wn
+            fx.gemm(wmma_atom, c_frags[idx], wt[wn], act[wm], c_frags[idx])
+
+    def _load_into(buf, ks, dst):
+        act, wt = dst
+        for wm in range_constexpr(wmma_m_rep):
+            act[wm].store(load_a(buf, wm, ks))
+        for wn in range_constexpr(wmma_n_rep):
+            wt[wn].store(load_b(buf, wn, ks))
+
     def _hold_live(state):
         # Otherwise the allocator hands the next sub-step's reads registers an in-flight WMMA still
         # reads, and expert scheduling covers each such overwrite with a full VALU-dependency wait.
@@ -667,16 +721,21 @@ def nt_gemm_tile(
         else:
             issue(kt % NUM_BUFFERS, kt)
 
-    def compute_ktile(buf, prefetch_kt):
-        """K_WS sub-steps; the last one is returned to run inside the barrier window."""
+    def compute_ktile(buf, prefetch_kt, head=None):
+        """K_WS sub-steps; the last one is returned to run inside the barrier window. ``head``
+        (``head_pipe``) holds sub-step 0, read in the previous barrier window."""
         ring = [None] * R
         if const_expr(issue_first and prefetch_kt is not None):
             rocdl.sched_barrier(0)
             _prefetch(prefetch_kt)
             rocdl.sched_barrier(0)
-        ring[0] = _load_ks(buf, 0)
+        if const_expr(head is None):
+            ring[0] = _load_ks(buf, 0)
+        else:
+            ring[0] = head
         if const_expr(lds_cosched):
-            rocdl.sched_dsrd(KS_DS)
+            if const_expr(head is None):
+                rocdl.sched_dsrd(KS_DS)
             rocdl.sched_barrier(0)
             for ks in range_constexpr(K_WS):
                 # only this sub-step's reads are in flight here (R = 2)
@@ -722,6 +781,27 @@ def nt_gemm_tile(
         rocdl.sched_barrier(0)
         rocdl.s_barrier_wait(_WG_BARRIER)
 
+    def head_fence(tail, nxt_buf, head):
+        """``split_fence`` that also reads the next k-tile's sub-step 0 (in ``nxt_buf``) into ``head``:
+        the first ``head_pipe`` matrix ops of ``tail`` cover the barrier wait, the rest the reads."""
+        tdm_ops.tensor_wait(0)
+        rocdl.sched_barrier(0)
+        rocdl.s_barrier_signal(_WG_BARRIER)
+        rocdl.sched_barrier(0)
+        _mma_range(tail, 0, head_pipe)
+        rocdl.sched_mfma(head_pipe)
+        rocdl.sched_barrier(0)
+        rocdl.s_barrier_wait(_WG_BARRIER)
+        rocdl.sched_barrier(0)
+        _load_into(nxt_buf, 0, head)
+        _mma_range(tail, head_pipe, n_acc)
+        for _j in range_constexpr(KS_DS):
+            rocdl.sched_dsrd(1)
+            rocdl.sched_mfma(1)
+        rocdl.sched_mfma(n_acc - head_pipe - KS_DS)
+        _hold_live(tail)
+        rocdl.sched_barrier(0)
+
     if const_expr(wmma_b2b):
         # SCHED_MODE bit 2: no arbitration stall after a WMMA, without which a read placed between
         # two WMMAs cannot issue until the first has executed. After the index-table reads (placed
@@ -732,9 +812,20 @@ def nt_gemm_tile(
     if const_expr(gather):
         _rocdl.s_wait_asynccnt(0)
     _pipeline_fence(outstanding=0)
+    head = None
+    if const_expr(head_pipe):
+        head = (
+            [fx.make_rmem_tensor(8, fx.Int32) for _ in range_constexpr(wmma_m_rep)],
+            [fx.make_rmem_tensor(8, fx.Int32) for _ in range_constexpr(wmma_n_rep)],
+        )
+        _load_into(_bidx(_buf_ptr(0)), 0, head)
+        rocdl.sched_barrier(0)
     for kt in range(n_steady):
         buf = _bidx(_buf_ptr(kt % NUM_BUFFERS))
-        split_fence(compute_ktile(buf, kt + 1))
+        if const_expr(head_pipe):
+            head_fence(compute_ktile(buf, kt + 1, head), _bidx(_buf_ptr((kt + 1) % NUM_BUFFERS)), head)
+        else:
+            split_fence(compute_ktile(buf, kt + 1))
     buf = _bidx(_buf_ptr(n_steady % NUM_BUFFERS))
     # the next tile's k-tile 0 goes to buffer 0, which the last k-tile (buffer 1) leaves alone
     last_prefetch = None
@@ -742,7 +833,7 @@ def nt_gemm_tile(
     if const_expr(next_tile is not None):
         last_prefetch = _NEXT_TILE_K0
         epi_outstanding = 1
-    _mma_ks(compute_ktile(buf, last_prefetch))
+    _mma_ks(compute_ktile(buf, last_prefetch, head))
 
     # ---- epilogue: accumulators -> LDS (row-major tile) -> 16 B buffer stores ----
     chunks_per_row = tile_n * EB // 16

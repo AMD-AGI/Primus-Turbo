@@ -60,6 +60,7 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     NUM_XCD,
     WAVE,
     check_wmma_b2b,
+    head_pipe_ok,
     issue_tile_k0,
     nt_gemm_tile,
     persist_geometry,
@@ -154,6 +155,7 @@ def _launch_gemm_combine_nt(
     wmma_b2b: Constexpr[int],
     lds_cosched: Constexpr[int],
     PERSIST: Constexpr[int],
+    HEAD_PIPE: Constexpr[int],
 ):
     block = m_warp * n_warp * WAVE
     # conditional expressions, not an if/else: the launcher body is AST-transformed
@@ -344,6 +346,7 @@ def _launch_gemm_combine_nt(
                 issue_first=bool(issue_first),
                 lds_cosched=bool(lds_cosched),
                 wmma_b2b=bool(wmma_b2b),
+                head_pipe=HEAD_PIPE,
                 i32_n=fx.Int32(N),
                 c_rows=c_rows,
                 c_rank_bases=c_rank_bases,
@@ -715,6 +718,7 @@ def gemm_combine_nt_gfx1250(
     wmma_b2b: int | None = None,
     lds_cosched: int = -1,
     persist: bool | None = None,
+    head_pipe: int | None = None,
 ):
     """``act`` [pool rows, K] (pool order, as the L1 + activation left it) -> ``[tokens, N]`` combined,
     ``tokens = topk_idx.shape[0]``.
@@ -740,7 +744,10 @@ def gemm_combine_nt_gfx1250(
 
     ``persist`` runs the GEMM on one workgroup per CU, each walking every ``num_cu``-th tile of
     the tile order and loading its next tile's first k-tile under the current one's last; it needs
-    no lead combine and an even number of k-tiles (None: wherever it has them)."""
+    no lead combine and an even number of k-tiles (None: wherever it has them).
+
+    ``head_pipe`` reads each k-tile's first fragments in the barrier window before it, behind that
+    many matrix ops (``nt_gemm_tile``; None: 8 wherever ``head_pipe_ok`` allows it, else 0)."""
     lds_cosched = resolve_lds_cosched(lds_cosched, issue_first, tile_m, tile_n, m_warp, n_warp)
     if wmma_b2b is None:
         wmma_b2b = lds_cosched
@@ -782,6 +789,11 @@ def gemm_combine_nt_gfx1250(
         num_gemm_wgs = num_cu
     else:
         num_gemm_wgs = rows // BLOCK_M * n_blocks_n
+    if head_pipe is None:
+        head_pipe = 8 if head_pipe_ok(8, tile_m, tile_n, tile_k, m_warp, n_warp, lds_cosched, False) else 0
+    assert head_pipe == 0 or head_pipe_ok(
+        head_pipe, tile_m, tile_n, tile_k, m_warp, n_warp, lds_cosched, False
+    )
     out = torch.empty(int(symm.num_max_tokens_per_rank), N, dtype=torch.bfloat16, device=act.device)
     has_grad_gate = grad_gate is not None
     if has_grad_gate:
@@ -854,6 +866,7 @@ def gemm_combine_nt_gfx1250(
         wmma_b2b,
         lds_cosched,
         num_cu if persist else 0,
+        head_pipe,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)

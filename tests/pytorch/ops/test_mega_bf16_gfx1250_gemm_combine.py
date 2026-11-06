@@ -90,15 +90,17 @@ def test_gemm_combine_nt_ep1(ep1_group, num_tokens, hidden, inter, num_experts, 
 _SCHEDULES = [
     dict(issue_first=0, lds_cosched=0, wmma_b2b=0),
     dict(issue_first=1, lds_cosched=0, wmma_b2b=0),
+    dict(issue_first=1, lds_cosched=1, wmma_b2b=1, head_pipe=0),
+    dict(issue_first=1, lds_cosched=1, wmma_b2b=1, head_pipe=4),
     dict(issue_first=1, lds_cosched=1, wmma_b2b=1),
 ]
 
 
 @pytest.mark.parametrize("b_nn", [False, True], ids=["nt", "nn"])
 def test_gemm_combine_scheduling_is_bit_identical(ep1_group, b_nn):
-    """``issue_first``, ``lds_cosched`` and ``wmma_b2b`` reorder each k-tile's loads and matrix ops, not any
-    output's k-step sequence: every schedule gives the bits of the plain one, for the forward L2 (NT) and
-    the backward's L1 dgrad against w1 (``b_nn``)."""
+    """``issue_first``, ``lds_cosched``, ``wmma_b2b`` and ``head_pipe`` reorder each k-tile's loads and
+    matrix ops, not any output's k-step sequence: every schedule gives the bits of the plain one, for the
+    forward L2 (NT) and the backward's L1 dgrad against w1 (``b_nn``)."""
     from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_combine_kernel import (
         gemm_combine_nt_gfx1250,
     )
