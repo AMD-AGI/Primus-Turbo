@@ -608,7 +608,7 @@ def ulysses_a2a_gemm(
     layout="nt",
     head_dim=None,
     groups=1,
-    BM=256,
+    BM=None,
     BN=256,
     num_push=32,
     push_split=8,
@@ -636,6 +636,11 @@ def ulysses_a2a_gemm(
     assert residual is None or (residual.is_contiguous() and residual.shape == y.shape)
     assert o_gathered is None or (o_gathered.is_contiguous() and tuple(o_gathered.shape) == (M, K))
     oq, ok, ov = (parts[0] if p is None else p for p in parts)
+    num_cus = torch.cuda.get_device_properties(y.device).multi_processor_count
+    if BM is None:
+        # 256-row tiles while every tile has a CU (the staggered K walk); otherwise 128 rows halve the
+        # tail of the m-tile that lands last
+        BM = 256 if ceildiv(M, 256) * ceildiv(N, BN) + num_push <= num_cus else 128
     run_launcher(
         _launch,
         oq,
@@ -668,7 +673,7 @@ def ulysses_a2a_gemm(
         head_dim,
         groups,
         *heads,
-        torch.cuda.get_device_properties(y.device).multi_processor_count,
+        num_cus,
         trace is not None,
         torch.cuda.current_stream(),
     )

@@ -118,6 +118,8 @@ def _qkv_gemm_a2a_forward(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout
         seq_local=s_local,
         qkv_format=qkv_format,
         flag_region=REGION_QKV_GEMM_A2A,
+        num_pull_cu=24,
+        num_tail_pull=8,
     )
     return tuple(t.view(*shape, *t.shape[1:]) for t in (q, k, v))
 

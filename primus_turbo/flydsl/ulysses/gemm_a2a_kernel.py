@@ -454,7 +454,7 @@ def ulysses_gemm_a2a(
     seq_local,
     qkv_format,
     flag_region,
-    BM=256,
+    BM=128,
     BN=256,
     num_pull_cu=16,
     num_lead=None,
