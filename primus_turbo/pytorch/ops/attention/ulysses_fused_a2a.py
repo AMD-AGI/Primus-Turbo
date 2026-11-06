@@ -29,6 +29,7 @@ from primus_turbo.flydsl.ulysses.gemm_a2a_kernel import (
 from primus_turbo.flydsl.ulysses.workspace import (
     REGION_O_A2A_GEMM,
     REGION_O_GEMM_A2A,
+    REGION_QKV_A2A_GEMM,
     REGION_QKV_GEMM_A2A,
     get_ulysses_workspace,
 )
@@ -111,37 +112,46 @@ def _qkv_gemm_a2a_forward(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout
     return tuple(t.view(*shape, *t.shape[1:]) for t in (q, k, v))
 
 
-def _qkv_rows_to_weight_layout(dq, dk, dv, hq, hkv, d, weight_layout):
-    """[t, h, d] per-tensor grads -> [t, (hq + 2 * hkv) * d] in the weight's row order."""
-    t = dq.shape[0]
-    if weight_layout == "interleaved":
-        ng = hkv
-        return torch.cat(
-            (dq.view(t, ng, hq // ng, d), dk.view(t, ng, 1, d), dv.view(t, ng, 1, d)), dim=2
-        ).view(t, -1)
-    return torch.cat((dq.reshape(t, -1), dk.reshape(t, -1), dv.reshape(t, -1)), dim=1)
-
-
-def _qkv_backward_unfused(ctx, dq, dk, dv):
-    from primus_turbo.pytorch.ops.attention.usp.attention_a2a_helper import (
-        get_attention_cp_a2a_helper,
-    )
-
+def _qkv_backward(ctx, dq, dk, dv):
+    """A2AGemm: the local heads' grads over the full sequence are pushed into the sequence owner's
+    recv bank in the (rank-major) weight row order; ``dx = dqkv @ w_qkv`` consumes them as they land
+    and the gathered ``dqkv`` is kept for ``dw = dqkv^T @ x``."""
     x, w_qkv = ctx.saved_tensors
-    hq, hkv, d, group = ctx.hq, ctx.hkv, ctx.d, ctx.group
+    hq, hkv, d, group, weight_layout = ctx.hq, ctx.hkv, ctx.d, ctx.group, ctx.weight_layout
     n = group.size()
     s_local, b = ctx.s_local, ctx.b
-    seq_dim = 0 if ctx.qkv_format == "sbhd" else 1
-    helper = get_attention_cp_a2a_helper(b, s_local * n, hq, hkv, d, d, seq_dim, n)
-    packed = helper.combine_dqkv_before_a2a(dq.contiguous(), dk.contiguous(), dv.contiguous())
-    out = torch.empty_like(packed)
-    dist.all_to_all_single(out, packed, group=group)
-    dq, dk, dv = (t.reshape(s_local * b, -1, d) for t in helper.split_dqkv_after_a2a(out))
-    dqkv = _qkv_rows_to_weight_layout(dq, dk, dv, hq, hkv, d, ctx.weight_layout)
-    x2d = x.reshape(s_local * b, -1)
-    dx = (dqkv @ w_qkv).view_as(x)
-    dw = dqkv.t() @ x2d
-    return dx, dw
+    M, hidden = s_local * b, w_qkv.shape[1]
+    K = (hq + 2 * hkv) * d
+    concat = weight_layout != "interleaved"
+    w = _rank_major_weight(w_qkv, hq, hkv, d, n) if concat else w_qkv.contiguous()
+    parts = tuple(t.reshape(s_local * n * b, -1, d).contiguous() for t in (dq, dk, dv))
+    need_dx, need_dw = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
+    dx = torch.empty(M, hidden, dtype=x.dtype, device=x.device)
+    dqkv = torch.empty(M, K, dtype=x.dtype, device=x.device) if need_dw else None
+    workspace = get_ulysses_workspace(group, a2a_gemm_bank_bytes(M, K))
+    G = _qkv_rank_block(hq, hkv, d, n, weight_layout)[0]
+    ulysses_a2a_gemm(
+        parts,
+        w,
+        None,
+        dx,
+        dqkv,
+        workspace,
+        seq_local=s_local,
+        qkv_format=ctx.qkv_format,
+        flag_region=REGION_QKV_A2A_GEMM,
+        layout="nn",
+        groups=G,
+    )
+    dw = None
+    if need_dw:
+        dw_rank_major = dqkv.t() @ x.reshape(M, hidden)
+        if concat:
+            dw = torch.empty_like(dw_rank_major)
+            dw.index_copy_(0, _rank_major_concat_rows(hq, hkv, d, n, x.device), dw_rank_major)
+        else:
+            dw = dw_rank_major
+    return (dx.view_as(x) if need_dx else None), dw
 
 
 class UlyssesQKVGemmA2AFunction(torch.autograd.Function):
@@ -159,7 +169,7 @@ class UlyssesQKVGemmA2AFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dq, dk, dv):
-        dx, dw = _qkv_backward_unfused(ctx, dq, dk, dv)
+        dx, dw = _qkv_backward(ctx, dq, dk, dv)
         return dx, dw, None, None, None, None, None, None
 
 

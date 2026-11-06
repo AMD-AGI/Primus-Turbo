@@ -7,8 +7,9 @@
 """Ulysses A2AGemm: an all-to-all from head-sharded to sequence-sharded rows fused into the GEMM
 that consumes them (push mode), with an optional residual epilogue.
 
-Every rank holds ``O`` = ``[n * M, K_r]`` rows of the full sequence for its ``K_r`` columns (its
-heads). Push work moves the rows of destination ``dst``'s sequence slice into ``dst``'s symmetric
+Every rank holds rows of the full sequence for its ``K_r`` columns (its heads), as up to three
+tensors (``q``, ``k``, ``v`` grads ``[n * M, h_x, d]``) whose heads interleave in ``G`` groups of
+``(nq, nk, nv) / G`` heads, the weight's row order; the output projection is ``G = 1``, ``nk = nv = 0``. Push work moves the rows of destination ``dst``'s sequence slice into ``dst``'s symmetric
 recv bank at column block ``rank`` and raises ``dst``'s flag ``(m_tile, rank)``. The recv bank is
 row-major ``[M, n * K_r]``: the GEMM's ``A``. A GEMM tile waits for the flags of its m-tile from all
 sources, then runs the plain K loop, so the accumulation order is fixed (bitwise deterministic).
@@ -161,19 +162,36 @@ def _o_row(t, dst, M, seq_local, num_ranks, is_bshd):
 def _push_unit(thread_index, m_tile, dst, dst_heap, bank_offset, o_res, epoch, **c):
     """Rows of ``m_tile`` of ``dst``'s sequence slice into ``dst``'s recv bank, then ``dst``'s flag."""
     M, K, K_r, BM, rank, num_ranks = c["M"], c["K"], c["K_r"], c["BM"], c["rank"], c["num_ranks"]
-    vecs_per_row = K_r // VEC_BF16
+    G, d = c["G"], c["head_dim"]
     recv_res = create_buffer_resource_from_addr(dst_heap + bank_offset, num_records_bytes=c["M_pad"] * K * 2)
+    heads = (c["nq"], c["nk"], c["nv"])
+    vecs_per_head = d // VEC_BF16
+    group_vecs = sum(heads) // G * vecs_per_head
+    for x in range_constexpr(3):
+        h_x = heads[x]
+        if const_expr(h_x > 0):
+            vecs_per_row = h_x * vecs_per_head
+            per_group = h_x // G
+            head_off = sum(heads[:x]) // G
 
-    def coords(v):
-        r = v // fx.Int32(vecs_per_row)
-        col = (v % fx.Int32(vecs_per_row)) * fx.Int32(VEC_I32)
-        t = m_tile * fx.Int32(BM) + r
-        o_row = _o_row(t, dst, M, c["seq_local"], num_ranks, c["is_bshd"])
-        src_word = o_row * fx.Int32(K_r // 2) + col
-        dst_word = t * fx.Int32(K // 2) + fx.Int32(rank * K_r // 2) + col
-        return src_word, dst_word, (r < fx.Int32(BM)) & (t < fx.Int32(M))
+            def coords(v, vecs_per_row=vecs_per_row, per_group=per_group, head_off=head_off):
+                r = v // fx.Int32(vecs_per_row)
+                col = v % fx.Int32(vecs_per_row)
+                head = col // fx.Int32(vecs_per_head)
+                dst_col = (
+                    (head // fx.Int32(per_group)) * fx.Int32(group_vecs)
+                    + (head % fx.Int32(per_group) + fx.Int32(head_off)) * fx.Int32(vecs_per_head)
+                    + col % fx.Int32(vecs_per_head)
+                )
+                t = m_tile * fx.Int32(BM) + r
+                o_row = _o_row(t, dst, M, c["seq_local"], num_ranks, c["is_bshd"])
+                src_word = (o_row * fx.Int32(vecs_per_row) + col) * fx.Int32(VEC_I32)
+                dst_word = t * fx.Int32(K // 2) + (fx.Int32(rank * K_r // VEC_BF16) + dst_col) * fx.Int32(
+                    VEC_I32
+                )
+                return src_word, dst_word, (r < fx.Int32(BM)) & (t < fx.Int32(M))
 
-    _copy_rows(thread_index, BM * vecs_per_row, coords, o_res, recv_res, 0, SYS_NT)
+            _copy_rows(thread_index, BM * vecs_per_row, coords, o_res[x], recv_res, 0, SYS_NT)
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
     if thread_index == fx.Int32(0):
@@ -224,10 +242,17 @@ def _make_kernel(
     flag_region,
     bank_bytes,
     nt_vmcnt,
+    layout,
+    head_dim,
+    G,
+    nq,
+    nk,
+    nv,
 ):
-    assert K % num_ranks == 0 and N % VEC_BF16 == 0
+    assert K % num_ranks == 0 and N % VEC_BF16 == 0 and head_dim % VEC_BF16 == 0
     K_r = K // num_ranks
-    assert K_r % VEC_BF16 == 0
+    assert K_r == (nq + nk + nv) * head_dim and nq % G == 0 and nk % G == 0 and nv % G == 0
+    assert layout in ("nt", "nn") and not (has_residual and layout == "nn")
     m_tiles = ceildiv(M, BM)
     M_pad = m_tiles * BM
     n_tiles = ceildiv(N, BN)
@@ -238,7 +263,7 @@ def _make_kernel(
     assert not has_residual or (N % BN == 0 and BN == 256), "the residual epilogue needs N % 256 == 0"
     num_push = min(num_push, num_tiles)
     grid = num_tiles
-    gemm_tile = functools.partial(gemm_bf16_tile, "nt", pair_n=True)
+    gemm_tile = functools.partial(gemm_bf16_tile, layout, pair_n=True)
     # one extra i32: the block-wide broadcast of a claimed push unit
     SharedStorage = _make_shared_storage(BM, BN, num_lds_row_idx_entries=1)
     consts = dict(
@@ -252,6 +277,11 @@ def _make_kernel(
         seq_local=seq_local,
         is_bshd=is_bshd,
         flag_region=flag_region,
+        G=G,
+        head_dim=head_dim,
+        nq=nq,
+        nk=nk,
+        nv=nv,
     )
     # O_gathered copy-out: each of an m-tile's n_tiles blocks takes one column chunk of its rows
     og_vecs_per_row = K // VEC_BF16
@@ -259,7 +289,9 @@ def _make_kernel(
 
     @flyc.kernel(name="ulysses_a2a_gemm_kernel", known_block_size=[BLOCK_THREADS, 1, 1])
     def kernel(
-        O: fx.Tensor,
+        OQ: fx.Tensor,
+        OK: fx.Tensor,
+        OV: fx.Tensor,
         W: fx.Tensor,
         RES: fx.Tensor,
         Y: fx.Tensor,
@@ -278,7 +310,10 @@ def _make_kernel(
         my_base = ld(peers_base, fx.Int32(rank), dtype=fx.T.i64)
 
         if block_index < fx.Int32(num_push):
-            o_res = create_buffer_resource(O, num_records_bytes=num_ranks * M * K_r * 2)
+            o_res = [
+                create_buffer_resource(t, num_records_bytes=max(num_ranks * M * h * head_dim * 2, 4))
+                for t, h in ((OQ, nq), (OK, nk), (OV, nv))
+            ]
             _push_loop(thread_index, state_base, claim_slot, peers_base, bank_offset, o_res, epoch, **consts)
         # pushers take the last tiles: their rows are the last to arrive anyway
         tile_index = arith.select(
@@ -333,7 +368,9 @@ def _make_kernel(
 
 @flyc.jit
 def _launch(
-    O,
+    OQ,
+    OK,
+    OV,
     W,
     RES,
     Y,
@@ -355,6 +392,12 @@ def _launch(
     flag_region: fx.Constexpr[int],
     bank_bytes: fx.Constexpr[int],
     nt_vmcnt: fx.Constexpr[int],
+    layout: fx.Constexpr[str],
+    head_dim: fx.Constexpr[int],
+    G: fx.Constexpr[int],
+    nq: fx.Constexpr[int],
+    nk: fx.Constexpr[int],
+    nv: fx.Constexpr[int],
     stream: fx.Stream,
 ):
     kernel, grid = _make_kernel(
@@ -373,9 +416,17 @@ def _launch(
         flag_region,
         bank_bytes,
         nt_vmcnt,
+        layout,
+        head_dim,
+        G,
+        nq,
+        nk,
+        nv,
     )
     kernel(
-        O,
+        OQ,
+        OK,
+        OV,
         W,
         RES,
         Y,
@@ -401,24 +452,40 @@ def ulysses_a2a_gemm(
     seq_local,
     qkv_format,
     flag_region,
+    layout="nt",
+    head_dim=None,
+    groups=1,
     BM=256,
     BN=256,
     num_push=32,
 ):
-    """``o`` ``[n * M, K_r]`` this rank's heads over the full sequence (``qkv_format`` row order);
-    ``w`` ``[N, K]`` with ``K = n * K_r``; ``y = A @ w^T (+ residual)`` ``[M, N]`` where ``A`` is the
-    gathered ``[M, K]``, also copied to ``o_gathered`` unless it is ``None``."""
+    """``o`` this rank's heads over the full sequence (``qkv_format`` row order): one ``[n * M, K_r]``
+    tensor, or ``(dq, dk, dv)`` ``[n * M, h_x, d]`` whose heads interleave in ``groups`` groups per
+    rank (the weight's row order). ``y = A @ w^T`` (``layout="nt"``, ``w`` ``[N, K]``) or ``A @ w``
+    (``"nn"``, ``w`` ``[K, N]``), ``+ residual`` (nt only), where ``A`` is the gathered ``[M, K]``,
+    ``K = n * K_r``; ``A`` is also copied to ``o_gathered`` unless it is ``None``."""
     num_ranks = workspace.num_ranks
-    rows, K_r = o.shape
-    N, K = w.shape
+    if isinstance(o, torch.Tensor):
+        head_dim = head_dim or o.shape[-1]
+        parts = (o.view(o.shape[0], -1, head_dim), None, None)
+    else:
+        parts = tuple(o)
+        head_dim = parts[0].shape[-1]
+    heads = tuple(0 if p is None else p.shape[1] for p in parts)
+    rows = parts[0].shape[0]
+    K, N = (w.shape[1], w.shape[0]) if layout == "nt" else w.shape
     M = rows // num_ranks
-    assert K == num_ranks * K_r and tuple(y.shape) == (M, N)
-    assert o.is_contiguous() and w.is_contiguous() and y.is_contiguous()
+    assert K == num_ranks * sum(heads) * head_dim and tuple(y.shape) == (M, N)
+    assert all(p is None or (p.is_contiguous() and p.shape[0] == rows) for p in parts)
+    assert w.is_contiguous() and y.is_contiguous()
     assert residual is None or (residual.is_contiguous() and residual.shape == y.shape)
     assert o_gathered is None or (o_gathered.is_contiguous() and tuple(o_gathered.shape) == (M, K))
+    oq, ok, ov = (parts[0] if p is None else p for p in parts)
     run_launcher(
         _launch,
-        o,
+        oq,
+        ok,
+        ov,
         w,
         y if residual is None else residual,
         y,
@@ -440,5 +507,9 @@ def ulysses_a2a_gemm(
         flag_region,
         workspace.bank_bytes,
         3,
+        layout,
+        head_dim,
+        groups,
+        *heads,
         torch.cuda.current_stream(),
     )

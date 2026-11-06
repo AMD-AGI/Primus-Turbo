@@ -81,16 +81,19 @@ def reference_a2a_o_gemm(o, w_o, residual, group, qkv_format):
     return y if residual is None else y + residual
 
 
-def _close(name, out, ref, failures, tag):
+def _close(name, out, ref, failures, tag, scale=None):
+    """bf16 allclose; ``scale`` (default ``|ref|``) is what ``rtol`` is relative to, e.g. the summed
+    magnitudes when ``ref`` is a sum of terms that cancel."""
     from tests.pytorch.test_utils import get_tolerances
 
     tol = get_tolerances(torch.bfloat16)
     if out.shape != ref.shape:
         failures.append(f"{tag} {name}: shape {tuple(out.shape)} != {tuple(ref.shape)}")
         return
-    if not torch.allclose(out.float(), ref.float(), **tol):
-        diff = (out.float() - ref.float()).abs()
-        excess = diff - tol["atol"] - tol["rtol"] * ref.float().abs()
+    scale = ref.float().abs() if scale is None else scale
+    diff = (out.float() - ref.float()).abs()
+    excess = diff - tol["atol"] - tol["rtol"] * scale
+    if (excess > 0).any():
         i = excess.argmax().item()
         failures.append(
             f"{tag} {name}: max abs err {diff.max().item():.4g}, {(excess > 0).sum().item()} elements out of "
@@ -156,6 +159,107 @@ def check_o_gemm(group, hq, d, b, s_local, hidden, qkv_format, with_residual, re
             _close("d_residual", res.grad, res_ref.grad, failures, f"{tag} call {it}")
 
 
+class _Layer:
+    """QKV projection -> elementwise stand-in for attention (``q + k * v`` per GQA group, so dq, dk
+    and dv are all non-zero) -> output projection + residual."""
+
+    def __init__(self, group, hq, hkv, d, hidden, qkv_format, seed):
+        self.group, self.hq, self.hkv, self.d, self.qkv_format = group, hq, hkv, d, qkv_format
+        self.w_qkv = _randn((hq + 2 * hkv) * d, hidden, seed=seed, scale=0.02).requires_grad_()
+        self.w_o = _randn(hidden, hq * d, seed=seed + 1, scale=0.02).requires_grad_()
+
+    def _attn(self, q, k, v):
+        return q + (k * v).repeat_interleave(self.hq // self.hkv, dim=2)
+
+    def __call__(self, x):
+        from primus_turbo.pytorch.ops.attention.ulysses_fused_a2a import (
+            ulysses_a2a_o_gemm,
+            ulysses_qkv_gemm_a2a,
+        )
+
+        args = (self.hq, self.hkv, self.d, self.group, self.qkv_format, "interleaved")
+        self.qkv = ulysses_qkv_gemm_a2a(x, self.w_qkv, *args)
+        self.o = self._attn(*self.qkv)
+        for t in (*self.qkv, self.o):
+            t.retain_grad()
+        return ulysses_a2a_o_gemm(self.o, self.w_o, x, self.group, self.qkv_format)
+
+    def check(self, x, y, failures, tag):
+        """Each op of ``y = self(x)`` against the fp32 reference fed the same bf16 inputs and grads."""
+        group, fmt = self.group, self.qkv_format
+        x_ref, wq_ref, wo_ref = _fp32_leaf(x), _fp32_leaf(self.w_qkv), _fp32_leaf(self.w_o)
+        refs = reference_qkv_gemm_a2a(x_ref, wq_ref, self.hq, self.hkv, self.d, group, fmt, "interleaved")
+        for name, out, ref in zip("qkv", self.qkv, refs):
+            _close(name, out, ref, failures, tag)
+        torch.autograd.backward(refs, [t.grad.float() for t in self.qkv])
+        o_ref, res_ref = _fp32_leaf(self.o), _fp32_leaf(x)
+        y_ref = reference_a2a_o_gemm(o_ref, wo_ref, res_ref, group, fmt)
+        _close("y", y, y_ref, failures, tag)
+        y_ref.backward(y.grad.float())
+        _close("do", self.o.grad, o_ref.grad, failures, tag)
+        # autograd sums the two dx terms in bf16; they cancel in deep layers, where dy has grown
+        scale = x_ref.grad.abs() + res_ref.grad.abs()
+        _close("dx", x.grad, x_ref.grad + res_ref.grad, failures, tag, scale=scale)
+        _close("dw_qkv", self.w_qkv.grad, wq_ref.grad, failures, tag)
+        _close("dw_o", self.w_o.grad, wo_ref.grad, failures, tag)
+
+
+def check_scenarios(group, failures, hq=32, hkv=8, d=128, b=2, s_local=300, hidden=1024):
+    """Chained layers, a non-default stream and CUDA-graph replay of a forward + backward."""
+    rank = group.rank()
+    for qkv_format in ("sbhd", "bshd"):
+        shape = (s_local, b, hidden) if qkv_format == "sbhd" else (b, s_local, hidden)
+        layers = [_Layer(group, hq, hkv, d, hidden, qkv_format, seed=10 * i) for i in range(3)]
+
+        # back to back layers: every op of a layer overlaps the bank / flag reuse of the previous one
+        xs = [_randn(*shape, seed=500 + rank).requires_grad_()]
+        for layer in layers:
+            xs.append(layer(xs[-1]))
+            xs[-1].retain_grad()
+        xs[-1].backward(_randn(*shape, seed=600 + rank))
+        for i, layer in enumerate(layers):
+            layer.check(xs[i], xs[i + 1], failures, f"[layers {qkv_format}] layer {i}")
+
+        layer = layers[0]
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            layer.w_qkv.grad = layer.w_o.grad = None
+            x = _randn(*shape, seed=700 + rank).requires_grad_()
+            y = layer(x)
+            y.retain_grad()
+            y.backward(_randn(*shape, seed=800 + rank))
+        torch.cuda.current_stream().wait_stream(side)
+        layer.check(x, y, failures, f"[side stream {qkv_format}]")
+
+        # graph leaves must not have run backward on another stream (AccumulateGrad keeps the stream)
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            layer = _Layer(group, hq, hkv, d, hidden, qkv_format, seed=100)
+            static_x = _randn(*shape, seed=900 + rank).requires_grad_()
+            static_dy = _randn(*shape, seed=901 + rank)
+            for _ in range(2):
+                layer.w_qkv.grad = layer.w_o.grad = static_x.grad = None
+                layer(static_x).backward(static_dy)
+        torch.cuda.current_stream().wait_stream(side)
+        layer.w_qkv.grad = layer.w_o.grad = static_x.grad = None
+        graph = torch.cuda.CUDAGraph()
+        # capture on the warmed-up stream: hipBLASLt sets up per stream, which capture forbids
+        with torch.cuda.graph(graph, stream=side):
+            static_y = layer(static_x)
+            static_y.retain_grad()
+            static_y.backward(static_dy)
+        for it in range(3):
+            with torch.no_grad():
+                static_x.copy_(_randn(*shape, seed=1000 + 10 * it + rank))
+                static_dy.copy_(_randn(*shape, seed=1001 + 10 * it + rank))
+            graph.replay()
+            torch.cuda.synchronize()
+            # the reference reads static_y.grad, which the graph wrote as the incoming dy
+            layer.check(static_x, static_y, failures, f"[cuda graph {qkv_format}] replay {it}")
+        del graph
+
+
 def run_suite(quick):
     group = dist.group.WORLD
     n = group.size()
@@ -181,6 +285,7 @@ def run_suite(quick):
         if hq % n:
             continue
         check_o_gemm(group, hq, d, b, 300, 1024, qkv_format, with_residual, 3, failures)
+    check_scenarios(group, failures)
 
     gathered = [None] * n
     dist.all_gather_object(gathered, failures, group=group)
