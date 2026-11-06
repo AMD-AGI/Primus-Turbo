@@ -45,27 +45,40 @@ def _split_qkv_reference(qkv, hq, hkv, d, weight_layout):
     return q.reshape(*lead, hq, d), k.reshape(*lead, hkv, d), v.reshape(*lead, hkv, d)
 
 
-def _helper(x, hq, hkv, d, n, qkv_format):
+def _helper(b, seq, hq, hkv, d, n, qkv_format):
     from primus_turbo.pytorch.ops.attention.usp.attention_a2a_helper import (
         get_attention_cp_a2a_helper,
     )
 
-    if qkv_format == "sbhd":
-        s_local, b = x.shape[:2]
-    else:
-        b, s_local = x.shape[:2]
-    return get_attention_cp_a2a_helper(b, s_local * n, hq, hkv, d, d, 0 if qkv_format == "sbhd" else 1, n)
+    return get_attention_cp_a2a_helper(b, seq, hq, hkv, d, d, 0 if qkv_format == "sbhd" else 1, n)
+
+
+def _a2a(t, group):
+    """all_to_all_single with autograd: the reference backward is the mirrored all-to-all."""
+    from torch.distributed.nn.functional import all_to_all_single
+
+    return all_to_all_single(torch.empty_like(t), t.contiguous(), group=group)
 
 
 def reference_qkv_gemm_a2a(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout):
     n = group.size()
-    helper = _helper(x, hq, hkv, d, n, qkv_format)
-    qkv = F.linear(x.float(), w_qkv.float())
+    s_local, b = x.shape[:2] if qkv_format == "sbhd" else x.shape[1::-1]
+    helper = _helper(b, s_local * n, hq, hkv, d, n, qkv_format)
+    qkv = F.linear(x, w_qkv)
     q, k, v = _split_qkv_reference(qkv, hq, hkv, d, weight_layout)
-    packed = helper.combine_qkv_before_a2a(q, k, v)
-    out = torch.empty_like(packed)
-    dist.all_to_all_single(out, packed, group=group)
-    return helper.splits_qkv_after_a2a(out)
+    return helper.splits_qkv_after_a2a(_a2a(helper.combine_qkv_before_a2a(q, k, v), group))
+
+
+def reference_a2a_o_gemm(o, w_o, residual, group, qkv_format):
+    n = group.size()
+    if qkv_format == "sbhd":
+        seq, b, heads, d = o.shape
+    else:
+        b, seq, heads, d = o.shape
+    helper = _helper(b, seq, heads * n, heads * n, d, n, qkv_format)
+    o_gathered = helper.reshape_o_after_a2a(_a2a(helper.reshape_o_before_a2a(o), group))
+    y = F.linear(o_gathered.reshape(*o_gathered.shape[:2], -1), w_o)
+    return y if residual is None else y + residual
 
 
 def _close(name, out, ref, failures, tag):
@@ -76,25 +89,71 @@ def _close(name, out, ref, failures, tag):
         failures.append(f"{tag} {name}: shape {tuple(out.shape)} != {tuple(ref.shape)}")
         return
     if not torch.allclose(out.float(), ref.float(), **tol):
-        err = (out.float() - ref.float()).abs().max().item()
-        failures.append(f"{tag} {name}: max abs err {err:.4g}")
+        diff = (out.float() - ref.float()).abs()
+        excess = diff - tol["atol"] - tol["rtol"] * ref.float().abs()
+        i = excess.argmax().item()
+        failures.append(
+            f"{tag} {name}: max abs err {diff.max().item():.4g}, {(excess > 0).sum().item()} elements out of "
+            f"tolerance, worst got {out.flatten()[i].item():.5g} expected {ref.flatten()[i].item():.5g}"
+        )
 
 
-def check_qkv_forward(group, hq, hkv, d, b, s_local, hidden, qkv_format, weight_layout, repeats, failures):
+def _randn(*shape, seed, scale=1.0):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    return torch.randn(*shape, device="cuda", generator=gen).mul_(scale).bfloat16()
+
+
+def _fp32_leaf(t):
+    return t.detach().float().requires_grad_()
+
+
+def check_qkv(group, hq, hkv, d, b, s_local, hidden, qkv_format, weight_layout, repeats, failures):
     from primus_turbo.pytorch.ops.attention.ulysses_fused_a2a import ulysses_qkv_gemm_a2a
 
     rank = group.rank()
-    gen = torch.Generator(device="cuda").manual_seed(1234)
-    w_qkv = torch.randn((hq + 2 * hkv) * d, hidden, device="cuda", generator=gen).mul_(0.02).bfloat16()
-    tag = f"[qkv fwd hq={hq} hkv={hkv} d={d} b={b} s/n={s_local} {qkv_format} {weight_layout}]"
+    w_qkv = _randn((hq + 2 * hkv) * d, hidden, seed=1234, scale=0.02).requires_grad_()
+    tag = f"[qkv hq={hq} hkv={hkv} d={d} b={b} s/n={s_local} {qkv_format} {weight_layout}]"
     for it in range(repeats):
-        gen_x = torch.Generator(device="cuda").manual_seed(100 * it + rank)
         shape = (s_local, b, hidden) if qkv_format == "sbhd" else (b, s_local, hidden)
-        x = torch.randn(*shape, device="cuda", generator=gen_x).bfloat16()
+        x = _randn(*shape, seed=100 * it + rank).requires_grad_()
+        w_qkv.grad = None
         outs = ulysses_qkv_gemm_a2a(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout)
-        refs = reference_qkv_gemm_a2a(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout)
+        x_ref, w_ref = _fp32_leaf(x), _fp32_leaf(w_qkv)
+        refs = reference_qkv_gemm_a2a(x_ref, w_ref, hq, hkv, d, group, qkv_format, weight_layout)
+        grads = [_randn(*r.shape, seed=7 * it + 31 * j + rank) for j, r in enumerate(refs)]
         for name, out, ref in zip("qkv", outs, refs):
             _close(name, out, ref, failures, f"{tag} call {it}")
+        torch.autograd.backward(outs, grads)
+        torch.autograd.backward(refs, [g.float() for g in grads])
+        _close("dx", x.grad, x_ref.grad, failures, f"{tag} call {it}")
+        _close("dw_qkv", w_qkv.grad, w_ref.grad, failures, f"{tag} call {it}")
+
+
+def check_o_gemm(group, hq, d, b, s_local, hidden, qkv_format, with_residual, repeats, failures):
+    from primus_turbo.pytorch.ops.attention.ulysses_fused_a2a import ulysses_a2a_o_gemm
+
+    n, rank = group.size(), group.rank()
+    w_o = _randn(hidden, hq * d, seed=4321, scale=0.02).requires_grad_()
+    tag = f"[o_proj hq={hq} d={d} b={b} s/n={s_local} {qkv_format} residual={with_residual}]"
+    seq = s_local * n
+    for it in range(repeats):
+        o_shape = (seq, b, hq // n, d) if qkv_format == "sbhd" else (b, seq, hq // n, d)
+        y_shape = (s_local, b, hidden) if qkv_format == "sbhd" else (b, s_local, hidden)
+        o = _randn(*o_shape, seed=200 * it + rank).requires_grad_()
+        res = _randn(*y_shape, seed=300 * it + rank).requires_grad_() if with_residual else None
+        w_o.grad = None
+        y = ulysses_a2a_o_gemm(o, w_o, res, group, qkv_format)
+        o_ref, w_ref = _fp32_leaf(o), _fp32_leaf(w_o)
+        res_ref = _fp32_leaf(res) if with_residual else None
+        y_ref = reference_a2a_o_gemm(o_ref, w_ref, res_ref, group, qkv_format)
+        _close("y", y, y_ref, failures, f"{tag} call {it}")
+        dy = _randn(*y_shape, seed=400 * it + rank)
+        y.backward(dy)
+        y_ref.backward(dy.float())
+        _close("do", o.grad, o_ref.grad, failures, f"{tag} call {it}")
+        _close("dw_o", w_o.grad, w_ref.grad, failures, f"{tag} call {it}")
+        if with_residual:
+            _close("d_residual", res.grad, res_ref.grad, failures, f"{tag} call {it}")
 
 
 def run_suite(quick):
@@ -114,7 +173,14 @@ def run_suite(quick):
         hq, hkv = HEAD_CONFIGS[head_name](n)
         if hq % n or hkv % n:
             continue
-        check_qkv_forward(group, hq, hkv, d, b, 300, 1024, qkv_format, weight_layout, 3, failures)
+        check_qkv(group, hq, hkv, d, b, 300, 1024, qkv_format, weight_layout, 3, failures)
+    for head_name, d, b, qkv_format, with_residual in itertools.product(
+        head_names, dims, batches, formats, [True] if quick else [True, False]
+    ):
+        hq, _ = HEAD_CONFIGS[head_name](n)
+        if hq % n:
+            continue
+        check_o_gemm(group, hq, d, b, 300, 1024, qkv_format, with_residual, 3, failures)
 
     gathered = [None] * n
     dist.all_gather_object(gathered, failures, group=group)

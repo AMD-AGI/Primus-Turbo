@@ -25,11 +25,22 @@ import torch
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr
 
-from primus_turbo.flydsl.deep_ep.common import _asm, ld_lds, st_lds
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
 from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
     _make_shared_storage,
     gemm_bf16_tile,
+)
+from primus_turbo.flydsl.ulysses.common import (
+    BLOCK_THREADS,
+    NUM_WARPS,
+    SYS_NT,
+    VEC_BF16,
+    VEC_I32,
+    WARP,
+    claim_unit,
+    exit_and_bump_epoch,
+    i64_base,
+    spin_flag,
 )
 from primus_turbo.flydsl.ulysses.workspace import (
     FLAG_BYTES,
@@ -41,62 +52,20 @@ from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_store,
     create_buffer_resource,
     create_buffer_resource_from_addr,
-    extract_base_index,
 )
 from primus_turbo.flydsl.utils.gemm_helper import (
     make_bf16_fp16_tile_tensor,
     make_value_attrs,
 )
 from primus_turbo.flydsl.utils.prims import (
-    _readfirstlane_i32,
-    atomic_add,
-    cast,
     ceildiv,
     ld,
     read_clock,
-    spin_timed_out,
     st,
 )
 
-_WARP = 64
-_BLOCK_THREADS = 512
-_NUM_WARPS = _BLOCK_THREADS // _WARP
-# 16 B per lane per copy step
-_VEC_I32 = 4
-_VEC_BF16 = 8
 # head pieces whose loads are issued before their stores
 _PIECE_BATCH = 8
-# sc0|sc1|nt: system-coherent, streaming; staging is read by peers, recv reuses a bank every 2 epochs
-_SYS_NT = 19
-
-
-def _i64_base(tensor):
-    return fx.arith.ArithValue(arith.index_cast(fx.T.i64, extract_base_index(tensor)), signed=True)
-
-
-# s_memrealtime ticks at 100 MHz: 5 s
-_SPIN_TIMEOUT = 500_000_000
-
-
-@ASTRewriter.transform
-def _spin_flag(flag_base, flag_idx, expected, rank, src, tag):
-    """Spin until the i64 flag reaches ``expected``; on timeout report and trap (no silent hang)."""
-    spin_start = read_clock()
-    fx.rocdl.s_waitcnt(0)
-    flag = ld(flag_base, flag_idx, scope="sys", dtype=fx.T.i64)
-    while flag < expected:
-        fx.rocdl.s_sleep(fx.Int32(1))
-        if spin_timed_out(spin_start, _SPIN_TIMEOUT):
-            fx.printf(
-                f"[ulysses rank={rank} {tag}] flag wait timeout: src={{}} flag_idx={{}} flag={{}} expected={{}}\n",
-                src,
-                flag_idx,
-                flag,
-                expected,
-            )
-            _asm("s_trap 2")
-        fx.rocdl.s_waitcnt(0)
-        flag = ld(flag_base, flag_idx, scope="sys", dtype=fx.T.i64)
 
 
 def piece_dst(j, nq, nk, nv):
@@ -146,7 +115,7 @@ def _pull_unit(
     last_n = ((rank + 1) * N_r - 1) // BN
     if thread_index == fx.Int32(0):
         for tile_n in range_constexpr(first_n, last_n + 1):
-            _spin_flag(
+            spin_flag(
                 flag_base, m_tile * fx.Int32(n_tiles) + fx.Int32(tile_n), epoch, rank, src, "gemm_a2a pull"
             )
         if const_expr(trace_base is not None):
@@ -155,13 +124,13 @@ def _pull_unit(
     fx.gpu.barrier()
 
     stage_res = create_buffer_resource_from_addr(src_heap + bank_offset, num_records_bytes=M_pad * N * 2)
-    lanes_per_row = head_dim // _VEC_BF16
-    rows_per_warp = _WARP // lanes_per_row
-    rows_per_iter = _NUM_WARPS * rows_per_warp
-    lane = thread_index % fx.Int32(_WARP)
-    warp = thread_index // fx.Int32(_WARP)
+    lanes_per_row = head_dim // VEC_BF16
+    rows_per_warp = WARP // lanes_per_row
+    rows_per_iter = NUM_WARPS * rows_per_warp
+    lane = thread_index % fx.Int32(WARP)
+    warp = thread_index // fx.Int32(WARP)
     lane_row = lane // fx.Int32(lanes_per_row)
-    lane_word = (lane % fx.Int32(lanes_per_row)) * fx.Int32(_VEC_I32)
+    lane_word = (lane % fx.Int32(lanes_per_row)) * fx.Int32(VEC_I32)
     num_pieces = G * (nq + nk + nv)
     heads = (G * nq, G * nk, G * nv)
     for it in range(BM // rows_per_iter):
@@ -179,9 +148,9 @@ def _pull_unit(
                 buffer_load(
                     stage_res,
                     src_word + fx.Int32(j * head_dim // 2),
-                    vec_width=_VEC_I32,
+                    vec_width=VEC_I32,
                     dtype=fx.T.i32,
-                    cache_modifier=_SYS_NT,
+                    cache_modifier=SYS_NT,
                 )
                 for j in batch
             ]
@@ -191,22 +160,6 @@ def _pull_unit(
                     head_dim // 2
                 ) + lane_word
                 buffer_store(val, out_res[tensor_id], dst_word, mask=valid)
-
-
-@ASTRewriter.transform
-def _claim_unit(thread_index, state_base, claim_slot):
-    """Next pull unit for the whole block, from the call's shared counter ``state[2]``."""
-    lds = claim_slot
-    if thread_index == fx.Int32(0):
-        claimed = atomic_add(state_base, fx.Int32(2), fx.Int64(1), scope="agent")
-        st_lds(lds, 0, cast(claimed, fx.T.i32))
-    # s_barrier does not wait for LDS traffic: drain the store, then the reads
-    fx.rocdl.s_waitcnt(0)
-    fx.gpu.barrier()
-    unit = _readfirstlane_i32(ld_lds(lds, 0))
-    fx.rocdl.s_waitcnt(0)
-    fx.gpu.barrier()
-    return unit
 
 
 @ASTRewriter.transform
@@ -227,7 +180,7 @@ def _pull_loop(
     rank = consts["rank"]
     m_tiles = ceildiv(consts["M"], consts["BM"])
     num_units = num_ranks * m_tiles
-    unit = _claim_unit(thread_index, state_base, claim_slot)
+    unit = claim_unit(thread_index, state_base, claim_slot)
     while unit < fx.Int32(num_units):
         m_tile = unit // fx.Int32(num_ranks)
         src = (fx.Int32(rank) + unit % fx.Int32(num_ranks)) % fx.Int32(num_ranks)
@@ -257,7 +210,7 @@ def _pull_loop(
         # the next unit's flag wait must not overtake this unit's reads of the staging bank
         fx.rocdl.s_waitcnt(0)
         fx.gpu.barrier()
-        unit = _claim_unit(thread_index, state_base, claim_slot)
+        unit = claim_unit(thread_index, state_base, claim_slot)
 
 
 @functools.lru_cache(maxsize=64)
@@ -288,7 +241,7 @@ def _make_kernel(
     assert N % num_ranks == 0
     N_r = N // num_ranks
     assert N_r == G * (nq + nk + nv) * head_dim, "rank-column block must hold G * (nq + nk + nv) heads"
-    assert head_dim % _VEC_BF16 == 0 and _WARP % (head_dim // _VEC_BF16) == 0
+    assert head_dim % VEC_BF16 == 0 and WARP % (head_dim // VEC_BF16) == 0
     m_tiles = ceildiv(M, BM)
     M_pad = m_tiles * BM
     n_tiles = ceildiv(N, BN)
@@ -303,7 +256,7 @@ def _make_kernel(
     # one extra i32: the block-wide broadcast of a claimed pull unit
     SharedStorage = _make_shared_storage(BM, BN, num_lds_row_idx_entries=1)
 
-    @flyc.kernel(name="ulysses_gemm_a2a_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
+    @flyc.kernel(name="ulysses_gemm_a2a_kernel", known_block_size=[BLOCK_THREADS, 1, 1])
     def kernel(
         A: fx.Tensor,
         B: fx.Tensor,
@@ -318,10 +271,10 @@ def _make_kernel(
         block_index, _b, _c = fx.block_idx
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         claim_slot = fx.Int32(fx.ptrtoint(lds.lds_row_idx.ptr))
-        state_base = _i64_base(STATE)
-        peers_base = _i64_base(PEER_PTRS)
+        state_base = i64_base(STATE)
+        peers_base = i64_base(PEER_PTRS)
         # debug timeline (s_memrealtime): [start, end] per GEMM tile, then [claim, ready, end] per pull unit
-        trace_base = _i64_base(TRACE) if trace else None
+        trace_base = i64_base(TRACE) if trace else None
         epoch = ld(state_base, fx.Int32(0), dtype=fx.T.i64)
         bank_offset = fx.Int64(FLAG_BYTES) + (epoch & fx.Int64(1)) * fx.Int64(bank_bytes)
         my_base = ld(peers_base, fx.Int32(rank), dtype=fx.T.i64)
@@ -375,8 +328,8 @@ def _make_kernel(
             if const_expr(trace):
                 if thread_index == fx.Int32(0):
                     st(trace_base, (tile_m * fx.Int32(n_tiles) + tile_n) * fx.Int32(2), read_clock())
-            A_t = make_bf16_fp16_tile_tensor(_i64_base(A), fx.Int64(0), M * K)
-            B_t = make_bf16_fp16_tile_tensor(_i64_base(B), fx.Int64(0), K * N)
+            A_t = make_bf16_fp16_tile_tensor(i64_base(A), fx.Int64(0), M * K)
+            B_t = make_bf16_fp16_tile_tensor(i64_base(B), fx.Int64(0), K * N)
             C_t = make_bf16_fp16_tile_tensor(my_base, bank_offset, M_pad * N)
             gemm_tile(
                 A_t,
@@ -393,7 +346,7 @@ def _make_kernel(
                 out_fp16=False,
                 nt_vmcnt=nt_vmcnt,
                 n_tail=N % BN,
-                c_cache_modifier=_SYS_NT,
+                c_cache_modifier=SYS_NT,
             )
             fx.rocdl.s_waitcnt(0)
             fx.gpu.barrier()
@@ -406,14 +359,7 @@ def _make_kernel(
                 if const_expr(trace):
                     st(trace_base, (tile_m * fx.Int32(n_tiles) + tile_n) * fx.Int32(2) + 1, read_clock())
 
-        # the last block out bumps the epoch; every block read it before arriving here
-        fx.gpu.barrier()
-        if thread_index == fx.Int32(0):
-            arrived = atomic_add(state_base, fx.Int32(1), fx.Int64(1), scope="agent", order="acq_rel")
-            if arrived == fx.Int64(grid - 1):
-                st(state_base, fx.Int32(1), fx.Int64(0))
-                st(state_base, fx.Int32(2), fx.Int64(0))
-                st(state_base, fx.Int32(0), epoch + fx.Int64(1))
+        exit_and_bump_epoch(thread_index, state_base, epoch, grid)
 
     return kernel, grid
 
@@ -486,7 +432,7 @@ def _launch(
         STATE,
         TRACE,
         value_attrs=make_value_attrs(2, 0, "512,512"),
-    ).launch(grid=(grid, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
+    ).launch(grid=(grid, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
 
 
 def gemm_a2a_bank_bytes(M, N, BM):

@@ -411,6 +411,7 @@ def gemm_bf16_nt_tile(
     pair_n=False,
     n_tail=None,
     a_row_idx=None,
+    store_c_cls=StoreCBf16,
 ):
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
     assert K % BLOCK_K == 0, f"bf16 NT needs K % {BLOCK_K} == 0 (got K={K})"
@@ -463,7 +464,7 @@ def gemm_bf16_nt_tile(
     a_g2s = _make_a_g2s(a_div, gl_off_a, a_row_idx, lane_id, wave_id, K, N_LDS_STEPS_A, LDS_BLOCK_M)
     b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, fx.BFloat16.ir_type, wave_id)
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-    store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier)
+    store_c = store_c_cls(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier)
 
     def _run(pair_cols, grid, half_n, col_safe=False, b_steps=N_LDS_STEPS_B, pair_tiles=False):
         # The bodies differ only in B's column layout, so the loader is re-pointed, not duplicated.

@@ -13,21 +13,27 @@ with the local heads over the full sequence; ``ulysses_a2a_o_gemm`` replaces
 chunk of the sequence.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
+from primus_turbo.flydsl.ulysses.a2a_gemm_kernel import (
+    a2a_gemm_bank_bytes,
+    ulysses_a2a_gemm,
+)
 from primus_turbo.flydsl.ulysses.gemm_a2a_kernel import (
     gemm_a2a_bank_bytes,
     ulysses_gemm_a2a,
 )
 from primus_turbo.flydsl.ulysses.workspace import (
+    REGION_O_A2A_GEMM,
+    REGION_O_GEMM_A2A,
     REGION_QKV_GEMM_A2A,
     get_ulysses_workspace,
 )
 
-__all__ = ["ulysses_qkv_gemm_a2a"]
+__all__ = ["ulysses_qkv_gemm_a2a", "ulysses_a2a_o_gemm"]
 
 _QKV_FORMATS = ("sbhd", "bshd")
 _WEIGHT_LAYOUTS = ("interleaved", "concat")
@@ -181,3 +187,114 @@ def ulysses_qkv_gemm_a2a(
     return UlyssesQKVGemmA2AFunction.apply(
         x, w_qkv, num_q_heads, num_kv_heads, head_dim, group, qkv_format, weight_layout
     )
+
+
+def _o_gemm_forward(o, w_o, residual, group, qkv_format, save_o):
+    n = group.size()
+    if qkv_format == "sbhd":
+        seq, b, heads, d = o.shape
+    else:
+        b, seq, heads, d = o.shape
+    s_local = seq // n
+    M, K_r = s_local * b, heads * d
+    N, K = w_o.shape
+    assert K == n * K_r, f"w_o has {K} input features, expected {n} * {K_r}"
+    y_shape = (s_local, b, N) if qkv_format == "sbhd" else (b, s_local, N)
+    if residual is not None:
+        assert tuple(residual.shape) == y_shape, f"residual {tuple(residual.shape)} != {y_shape}"
+        residual = residual.reshape(M, N).contiguous()
+    y = torch.empty(M, N, dtype=o.dtype, device=o.device)
+    o_gathered = torch.empty(M, K, dtype=o.dtype, device=o.device) if save_o else None
+    workspace = get_ulysses_workspace(group, a2a_gemm_bank_bytes(M, K))
+    ulysses_a2a_gemm(
+        o.reshape(seq * b, K_r).contiguous(),
+        w_o.contiguous(),
+        residual,
+        y,
+        o_gathered,
+        workspace,
+        seq_local=s_local,
+        qkv_format=qkv_format,
+        flag_region=REGION_O_A2A_GEMM,
+    )
+    return y.view(y_shape), o_gathered
+
+
+def _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format):
+    """``dO = (dY @ w_o)`` scattered back to the local heads over the full sequence (GemmA2A)."""
+    n = group.size()
+    M, K = dy2d.shape[0], w_o.shape[1]
+    seq = s_local * n
+    do = torch.empty(seq * b, heads, d, dtype=dy2d.dtype, device=dy2d.device)
+    workspace = get_ulysses_workspace(group, gemm_a2a_bank_bytes(M, K, 256))
+    ulysses_gemm_a2a(
+        dy2d,
+        w_o.contiguous(),
+        (do, do, do),
+        workspace,
+        layout="nn",
+        head_dim=d,
+        groups=1,
+        nq=heads,
+        nk=0,
+        nv=0,
+        seq_local=s_local,
+        qkv_format=qkv_format,
+        flag_region=REGION_O_GEMM_A2A,
+    )
+    shape = (seq, b) if qkv_format == "sbhd" else (b, seq)
+    return do.view(*shape, heads, d)
+
+
+class UlyssesA2AOGemmFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, o, w_o, residual, group, qkv_format):
+        y, o_gathered = _o_gemm_forward(o, w_o, residual, group, qkv_format, save_o=w_o.requires_grad)
+        ctx.save_for_backward(w_o, o_gathered)
+        ctx.group, ctx.qkv_format, ctx.has_residual = group, qkv_format, residual is not None
+        ctx.o_shape = o.shape
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        w_o, o_gathered = ctx.saved_tensors
+        qkv_format = ctx.qkv_format
+        if qkv_format == "sbhd":
+            s_local, b, N = dy.shape
+        else:
+            b, s_local, N = dy.shape
+        heads, d = ctx.o_shape[2], ctx.o_shape[3]
+        dy2d = dy.reshape(s_local * b, N).contiguous()
+        do = None
+        if ctx.needs_input_grad[0]:
+            do = _o_gemm_dgrad(dy2d, w_o, ctx.group, heads, d, s_local, b, qkv_format)
+        dw = dy2d.t() @ o_gathered if ctx.needs_input_grad[1] else None
+        d_residual = dy if ctx.has_residual and ctx.needs_input_grad[2] else None
+        return do, dw, d_residual, None, None
+
+
+def ulysses_a2a_o_gemm(
+    o_local_heads: torch.Tensor,
+    w_o: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    group: dist.ProcessGroup,
+    qkv_format: str = "sbhd",
+) -> torch.Tensor:
+    """Output projection fused with the reverse Ulysses all-to-all, plus ``residual``.
+
+    Args:
+        o_local_heads: attention output for the local heads over the full sequence,
+            ``[s, b, h/n, d]`` (sbhd) or ``[b, s, h/n, d]`` (bshd).
+        w_o: ``[hidden, h * d]``.
+        residual: ``[s/n, b, hidden]`` (sbhd) / ``[b, s/n, hidden]`` (bshd), or ``None``.
+
+    Returns:
+        y = o_gathered @ w_o^T + residual, shaped like ``residual``. The K accumulation order is
+        fixed, so the result is bitwise reproducible.
+    """
+    assert qkv_format in _QKV_FORMATS, f"qkv_format must be one of {_QKV_FORMATS}"
+    n = group.size()
+    assert o_local_heads.shape[-1] in (64, 128), f"head_dim {o_local_heads.shape[-1]} is not supported"
+    seq_dim = 0 if qkv_format == "sbhd" else 1
+    assert o_local_heads.shape[seq_dim] % n == 0, "sequence length must divide by the group size"
+    return UlyssesA2AOGemmFunction.apply(o_local_heads, w_o, residual, group, qkv_format)
