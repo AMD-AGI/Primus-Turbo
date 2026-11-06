@@ -34,10 +34,11 @@ SYS_NT = 19
 # s_memrealtime ticks at 100 MHz: 5 s
 SPIN_TIMEOUT = 500_000_000
 
-# state: [epoch, exit counter, unit claim counter]
+# state: [epoch, exit counter, unit claim counter, tile claim counter]
 STATE_EPOCH = 0
 STATE_EXIT = 1
 STATE_CLAIM = 2
+STATE_TILE = 3
 
 
 def i64_base(tensor):
@@ -65,11 +66,39 @@ def spin_flag(flag_base, flag_idx, expected, rank, src, tag):
         flag = ld(flag_base, flag_idx, scope="sys", dtype=fx.T.i64)
 
 
+def _all_reached(flag_base, flag_idxs, expected):
+    ready = None
+    for idx in flag_idxs:
+        ok = ld(flag_base, idx, scope="sys", dtype=fx.T.i64) >= expected
+        ready = ok if ready is None else ready & ok
+    return ready
+
+
 @ASTRewriter.transform
-def claim_unit(thread_index, state_base, claim_slot):
-    """Next work unit for the whole block, from the call's shared counter ``state[STATE_CLAIM]``."""
+def spin_flags(flag_base, flag_idxs, expected, rank, src, tag):
+    """``spin_flag`` over several flags, polled together (one round trip per poll)."""
+    spin_start = read_clock()
+    fx.rocdl.s_waitcnt(0)
+    ready = _all_reached(flag_base, flag_idxs, expected)
+    while not ready:
+        fx.rocdl.s_sleep(fx.Int32(1))
+        if spin_timed_out(spin_start, SPIN_TIMEOUT):
+            fx.printf(
+                f"[ulysses rank={rank} {tag}] flag wait timeout: src={{}} first flag_idx={{}} expected={{}}\n",
+                src,
+                flag_idxs[0],
+                expected,
+            )
+            _asm("s_trap 2")
+        fx.rocdl.s_waitcnt(0)
+        ready = _all_reached(flag_base, flag_idxs, expected)
+
+
+@ASTRewriter.transform
+def claim_unit(thread_index, state_base, claim_slot, counter=STATE_CLAIM):
+    """Next work unit for the whole block, from the call's shared counter ``state[counter]``."""
     if thread_index == fx.Int32(0):
-        claimed = atomic_add(state_base, fx.Int32(STATE_CLAIM), fx.Int64(1), scope="agent")
+        claimed = atomic_add(state_base, fx.Int32(counter), fx.Int64(1), scope="agent")
         st_lds(claim_slot, 0, cast(claimed, fx.T.i32))
     # s_barrier does not wait for LDS traffic: drain the store, then the reads
     fx.rocdl.s_waitcnt(0)
@@ -89,4 +118,5 @@ def exit_and_bump_epoch(thread_index, state_base, epoch, grid):
         if arrived == fx.Int64(grid - 1):
             st(state_base, fx.Int32(STATE_EXIT), fx.Int64(0))
             st(state_base, fx.Int32(STATE_CLAIM), fx.Int64(0))
+            st(state_base, fx.Int32(STATE_TILE), fx.Int64(0))
             st(state_base, fx.Int32(STATE_EPOCH), epoch + fx.Int64(1))

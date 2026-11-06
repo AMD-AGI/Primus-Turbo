@@ -35,13 +35,15 @@ from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
 )
 from primus_turbo.flydsl.ulysses.common import (
     BLOCK_THREADS,
+    STATE_TILE,
     SYS_NT,
     VEC_BF16,
     VEC_I32,
     claim_unit,
     exit_and_bump_epoch,
     i64_base,
-    spin_flag,
+    read_clock,
+    spin_flags,
 )
 from primus_turbo.flydsl.ulysses.workspace import (
     FLAG_BYTES,
@@ -58,6 +60,7 @@ from primus_turbo.flydsl.utils.buffer_ops import (
 from primus_turbo.flydsl.utils.gemm_helper import (
     StoreCBf16,
     _pack_out_pair,
+    emit_if_then,
     make_bf16_fp16_tile_tensor,
     make_row_band_resource,
     make_value_attrs,
@@ -159,9 +162,10 @@ def _o_row(t, dst, M, seq_local, num_ranks, is_bshd):
 
 
 @ASTRewriter.transform
-def _push_unit(thread_index, m_tile, dst, dst_heap, bank_offset, o_res, epoch, **c):
-    """Rows of ``m_tile`` of ``dst``'s sequence slice into ``dst``'s recv bank, then ``dst``'s flag."""
-    M, K, K_r, BM, rank, num_ranks = c["M"], c["K"], c["K_r"], c["BM"], c["rank"], c["num_ranks"]
+def _push_unit(thread_index, m_sub, dst, dst_heap, bank_offset, o_res, epoch, **c):
+    """Rows of sub-tile ``m_sub`` of ``dst``'s sequence slice into ``dst``'s recv bank, then ``dst``'s flag."""
+    M, K, K_r, rank, num_ranks = c["M"], c["K"], c["K_r"], c["rank"], c["num_ranks"]
+    rows = c["BM"] // c["push_split"]
     G, d = c["G"], c["head_dim"]
     recv_res = create_buffer_resource_from_addr(dst_heap + bank_offset, num_records_bytes=c["M_pad"] * K * 2)
     heads = (c["nq"], c["nk"], c["nv"])
@@ -183,46 +187,186 @@ def _push_unit(thread_index, m_tile, dst, dst_heap, bank_offset, o_res, epoch, *
                     + (head % fx.Int32(per_group) + fx.Int32(head_off)) * fx.Int32(vecs_per_head)
                     + col % fx.Int32(vecs_per_head)
                 )
-                t = m_tile * fx.Int32(BM) + r
+                t = m_sub * fx.Int32(rows) + r
                 o_row = _o_row(t, dst, M, c["seq_local"], num_ranks, c["is_bshd"])
                 src_word = (o_row * fx.Int32(vecs_per_row) + col) * fx.Int32(VEC_I32)
                 dst_word = t * fx.Int32(K // 2) + (fx.Int32(rank * K_r // VEC_BF16) + dst_col) * fx.Int32(
                     VEC_I32
                 )
-                return src_word, dst_word, (r < fx.Int32(BM)) & (t < fx.Int32(M))
+                return src_word, dst_word, (r < fx.Int32(rows)) & (t < fx.Int32(M))
 
-            _copy_rows(thread_index, BM * vecs_per_row, coords, o_res[x], recv_res, 0, SYS_NT)
+            _copy_rows(thread_index, rows * vecs_per_row, coords, o_res[x], recv_res, 0, SYS_NT)
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
     if thread_index == fx.Int32(0):
         flag_base = dst_heap + fx.Int64(c["flag_region"] * FLAG_REGION_BYTES)
-        st(flag_base, m_tile * fx.Int32(num_ranks) + fx.Int32(rank), epoch, scope="sys", order="release")
+        st(flag_base, m_sub * fx.Int32(num_ranks) + fx.Int32(rank), epoch, scope="sys", order="release")
 
 
 @ASTRewriter.transform
-def _push_loop(thread_index, state_base, claim_slot, peers_base, bank_offset, o_res, epoch, **c):
-    """Claim ``(m_tile, dst = rank + i)`` units until none are left and push each one."""
-    num_ranks = c["num_ranks"]
-    num_units = num_ranks * ceildiv(c["M"], c["BM"])
+def _push_loop(thread_index, state_base, claim_slot, peers_base, bank_offset, o_res, epoch, trace_base, **c):
+    """Claim ``(m_sub, dst = rank + i)`` units (``m_sub``: a ``BM / push_split``-row sub-tile) until
+    none are left and push each one. Rank ``r`` walks the m-tiles from ``r * stagger`` on, so the
+    sources of one m-tile land at ``n`` different times (see ``_arrival_k_seg``)."""
+    num_ranks, S = c["num_ranks"], c["push_split"]
+    m_tiles = ceildiv(c["M"], c["BM"])
+    num_units = num_ranks * m_tiles * S
     unit = claim_unit(thread_index, state_base, claim_slot)
     while unit < fx.Int32(num_units):
-        m_tile = unit // fx.Int32(num_ranks)
+        pos = unit // fx.Int32(num_ranks)
+        m_tile = (pos // fx.Int32(S) + fx.Int32(c["rank"] * c["stagger"])) % fx.Int32(m_tiles)
+        m_sub = m_tile * fx.Int32(S) + pos % fx.Int32(S)
         dst = (fx.Int32(c["rank"]) + unit % fx.Int32(num_ranks)) % fx.Int32(num_ranks)
         dst_heap = ld(peers_base, dst, dtype=fx.T.i64)
-        _push_unit(thread_index, m_tile, dst, dst_heap, bank_offset, o_res, epoch, **c)
+        if const_expr(trace_base is not None):
+            if thread_index == fx.Int32(0):
+                st(trace_base, fx.Int32(c["trace_units_at"]) + unit * fx.Int32(2), read_clock())
+        _push_unit(thread_index, m_sub, dst, dst_heap, bank_offset, o_res, epoch, **c)
+        if const_expr(trace_base is not None):
+            if thread_index == fx.Int32(0):
+                st(trace_base, fx.Int32(c["trace_units_at"]) + unit * fx.Int32(2) + 1, read_clock())
         unit = claim_unit(thread_index, state_base, claim_slot)
 
 
+def _arrival_k_seg(flag_base, tile_m, epoch, trace_base=None, trace_idx=None, **c):
+    """The K walk of an m-tile: one segment per source, in the order the sources' rows land.
+
+    Source ``s`` pushes m-tile ``i`` at position ``(i - s * D) mod m_tiles`` of its walk, so the
+    earliest source of ``i`` is ``first = min(i // D, n - 1)`` and the rest follow ``first - 1, ...``
+    cyclically. The order depends on ``i`` only: the accumulation stays bitwise deterministic. Each
+    wave waits for a segment's flags itself before its first load of it."""
+    num_ranks, D, S, rank = c["num_ranks"], c["stagger"], c["push_split"], c["rank"]
+
+    class _ArrivalKSeg:
+        seg_len = c["K_r"] // 64
+
+        def __init__(self):
+            if D > 0:
+                lead = tile_m // fx.Int32(D)
+                self.first = arith.select(lead < fx.Int32(num_ranks - 1), lead, fx.Int32(num_ranks - 1))
+            else:
+                self.first = fx.Int32(0)
+
+        def src(self, seg):
+            return (self.first + fx.Int32(num_ranks) - seg) % fx.Int32(num_ranks)
+
+        def chunk_base(self, seg):
+            return self.src(seg) * fx.Int32(self.seg_len)
+
+        def wait(self, seg):
+            src = self.src(seg)
+            slots = [(tile_m * fx.Int32(S) + fx.Int32(sub)) * fx.Int32(num_ranks) + src for sub in range(S)]
+            spin_flags(flag_base, slots, epoch, rank, src, "a2a_gemm")
+            # recv rows are rewritten by peers every 2 epochs: the tile's first wait drops what this CU /
+            # XCD still caches of them. No block reads a row before its flag, so later segments only
+            # need their loads ordered after the flag.
+            memory_fence(order="acquire", scope="sys" if seg == 0 else "wavefront")
+            if const_expr(trace_base is not None and seg == num_ranks - 1):
+                emit_if_then(fx.thread_idx.x == fx.Int32(0), lambda: st(trace_base, trace_idx, read_clock()))
+
+    return _ArrivalKSeg()
+
+
+def _claimed_tile(q, **c):
+    """Tile of claim ``q``: m-tiles in the order their last source lands (equal ``i mod D`` together)."""
+    num_ranks, D, n_tiles = c["num_ranks"], c["stagger"], c["n_tiles"]
+    q_m = q // fx.Int32(n_tiles)
+    tile_m = q_m
+    if D > 0:
+        tile_m = arith.select(
+            q_m < fx.Int32(num_ranks * D),
+            (q_m % fx.Int32(num_ranks)) * fx.Int32(D) + q_m // fx.Int32(num_ranks),
+            q_m,
+        )
+    return tile_m, q % fx.Int32(n_tiles)
+
+
 @ASTRewriter.transform
-def _wait_m_tile(thread_index, flag_base, m_tile, epoch, rank, num_ranks):
-    """Every source's rows of ``m_tile`` have landed in this rank's recv bank."""
+def _wait_all(thread_index, flag_base, tile_m, epoch, **c):
+    """Every source's rows of ``tile_m`` have landed (all its sub-tiles)."""
+    num_ranks, S = c["num_ranks"], c["push_split"]
     if thread_index == fx.Int32(0):
-        for src in range_constexpr(num_ranks):
-            spin_flag(flag_base, m_tile * fx.Int32(num_ranks) + fx.Int32(src), epoch, rank, src, "a2a_gemm")
+        slots = [tile_m * fx.Int32(S * num_ranks) + fx.Int32(i) for i in range(S * num_ranks)]
+        spin_flags(flag_base, slots, epoch, c["rank"], -1, "a2a_gemm")
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
-    # recv rows are rewritten by peers every 2 epochs: drop anything this CU still caches
+    # recv rows are rewritten by peers every 2 epochs: drop what this CU / XCD still caches of them
     memory_fence(order="acquire", scope="sys")
+
+
+@ASTRewriter.transform
+def _tile_loop(
+    thread_index, state_base, claim_slot, flag_base, recv_addr, W, Y, RES, OG, lds, epoch, trace_base, **c
+):
+    """Claim GEMM tiles until none are left. Staggered (``D > 0``), a tile walks K by arrival
+    (``_arrival_k_seg``); in step, it waits for the whole m-tile, copies it out, then runs."""
+    M, M_pad, K, N, BM, BN = c["M"], c["M_pad"], c["K"], c["N"], c["BM"], c["BN"]
+    n_tiles, num_tiles, progressive = c["n_tiles"], c["num_tiles"], c["stagger"] > 0
+    gemm_tile = functools.partial(gemm_bf16_tile, c["layout"], pair_n=True)
+    epilogue = {}
+    if const_expr(c["has_residual"]):
+        epilogue["store_c_cls"] = _residual_store_c(RES)
+    og_vecs_per_row = K // VEC_BF16
+    og_chunk = ceildiv(og_vecs_per_row, n_tiles)
+
+    def copy_o(tile_m, tile_n):
+        recv_res = create_buffer_resource_from_addr(recv_addr, num_records_bytes=M_pad * K * 2)
+        og_res = create_buffer_resource(OG, num_records_bytes=M * K * 2)
+
+        def og_coords(v):
+            r = v // fx.Int32(og_chunk)
+            t = tile_m * fx.Int32(BM) + r
+            col = tile_n * fx.Int32(og_chunk) + v % fx.Int32(og_chunk)
+            word = t * fx.Int32(K // 2) + col * fx.Int32(VEC_I32)
+            valid = (r < fx.Int32(BM)) & (t < fx.Int32(M)) & (col < fx.Int32(og_vecs_per_row))
+            return word, word, valid
+
+        _copy_rows(thread_index, BM * og_chunk, og_coords, recv_res, og_res, SYS_NT, 0)
+
+    q = claim_unit(thread_index, state_base, claim_slot, STATE_TILE)
+    while q < fx.Int32(num_tiles):
+        tile_m, tile_n = _claimed_tile(q, **c)
+        tile_index = tile_m * fx.Int32(n_tiles) + tile_n
+        if const_expr(trace_base is not None):
+            if thread_index == fx.Int32(0):
+                st(trace_base, tile_index * fx.Int32(3), read_clock())
+        k_seg = None
+        if const_expr(progressive):
+            k_seg = _arrival_k_seg(flag_base, tile_m, epoch, trace_base, tile_index * fx.Int32(3) + 1, **c)
+        else:
+            _wait_all(thread_index, flag_base, tile_m, epoch, **c)
+            if const_expr(trace_base is not None):
+                if thread_index == fx.Int32(0):
+                    st(trace_base, tile_index * fx.Int32(3) + 1, read_clock())
+            if const_expr(c["save_o"]):
+                copy_o(tile_m, tile_n)
+        gemm_tile(
+            make_bf16_fp16_tile_tensor(recv_addr, fx.Int64(0), M_pad * K),
+            make_bf16_fp16_tile_tensor(i64_base(W), fx.Int64(0), K * N),
+            make_bf16_fp16_tile_tensor(i64_base(Y), fx.Int64(0), M * N),
+            fx.Int32(M),
+            fx.Int32(N),
+            lds,
+            tile_m,
+            tile_n,
+            K=K,
+            BLOCK_M=BM,
+            BLOCK_N=BN,
+            out_fp16=False,
+            nt_vmcnt=c["nt_vmcnt"],
+            n_tail=N % BN,
+            persistent="staggered",
+            k_seg=k_seg,
+            **epilogue,
+        )
+        if const_expr(progressive and c["save_o"]):
+            # every wave has waited for all of the m-tile's sources inside the K walk
+            copy_o(tile_m, tile_n)
+        if const_expr(trace_base is not None):
+            fx.rocdl.s_waitcnt(0)
+            if thread_index == fx.Int32(0):
+                st(trace_base, tile_index * fx.Int32(3) + 2, read_clock())
+        q = claim_unit(thread_index, state_base, claim_slot, STATE_TILE)
 
 
 @functools.lru_cache(maxsize=64)
@@ -239,6 +383,7 @@ def _make_kernel(
     has_residual,
     save_o,
     num_push,
+    push_split,
     flag_region,
     bank_bytes,
     nt_vmcnt,
@@ -248,6 +393,8 @@ def _make_kernel(
     nq,
     nk,
     nv,
+    num_cus,
+    trace=False,
 ):
     assert K % num_ranks == 0 and N % VEC_BF16 == 0 and head_dim % VEC_BF16 == 0
     K_r = K // num_ranks
@@ -257,13 +404,20 @@ def _make_kernel(
     M_pad = m_tiles * BM
     n_tiles = ceildiv(N, BN)
     num_tiles = m_tiles * n_tiles
-    assert m_tiles * num_ranks <= FLAGS_PER_REGION, "too many m-tiles for one flag region"
+    assert BM % push_split == 0 and m_tiles * push_split * num_ranks <= FLAGS_PER_REGION, (
+        "too many m-tiles for one flag region"
+    )
     assert M_pad * K < 2**31 and M * N < 2**31 and K * N < 2**31, "i32 element offsets overflow"
     assert M_pad * K * 2 <= bank_bytes
     assert not has_residual or (N % BN == 0 and BN == 256), "the residual epilogue needs N % 256 == 0"
-    num_push = min(num_push, num_tiles)
-    grid = num_tiles
-    gemm_tile = functools.partial(gemm_bf16_tile, layout, pair_n=True)
+    grid = min(num_tiles + num_push, num_cus)
+    num_push = min(num_push, grid)
+    # Staggered sources only pay off when every tile has a block from the start: a tile claimed late
+    # would walk most of its K after the last arrival. Otherwise all sources push m-major in step.
+    stagger = m_tiles // num_ranks if num_tiles <= grid - num_push else 0
+    # in step, one m-tile per pusher unit: sub-tiles only pace the staggered arrivals
+    push_split = push_split if stagger else 1
+    assert not stagger or K_r % 64 == 0, "a staggered K walk needs whole K chunks per source"
     # one extra i32: the block-wide broadcast of a claimed push unit
     SharedStorage = _make_shared_storage(BM, BN, num_lds_row_idx_entries=1)
     consts = dict(
@@ -272,6 +426,7 @@ def _make_kernel(
         K=K,
         K_r=K_r,
         BM=BM,
+        push_split=push_split,
         rank=rank,
         num_ranks=num_ranks,
         seq_local=seq_local,
@@ -282,10 +437,17 @@ def _make_kernel(
         nq=nq,
         nk=nk,
         nv=nv,
+        trace_units_at=3 * num_tiles,
+        stagger=stagger,
+        N=N,
+        BN=BN,
+        n_tiles=n_tiles,
+        num_tiles=num_tiles,
+        layout=layout,
+        nt_vmcnt=nt_vmcnt,
+        has_residual=has_residual,
+        save_o=save_o,
     )
-    # O_gathered copy-out: each of an m-tile's n_tiles blocks takes one column chunk of its rows
-    og_vecs_per_row = K // VEC_BF16
-    og_chunk = ceildiv(og_vecs_per_row, n_tiles)
 
     @flyc.kernel(name="ulysses_a2a_gemm_kernel", known_block_size=[BLOCK_THREADS, 1, 1])
     def kernel(
@@ -298,6 +460,7 @@ def _make_kernel(
         OG: fx.Tensor,
         PEER_PTRS: fx.Tensor,
         STATE: fx.Tensor,
+        TRACE: fx.Tensor,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
@@ -308,58 +471,40 @@ def _make_kernel(
         epoch = ld(state_base, fx.Int32(0), dtype=fx.T.i64)
         bank_offset = fx.Int64(FLAG_BYTES) + (epoch & fx.Int64(1)) * fx.Int64(bank_bytes)
         my_base = ld(peers_base, fx.Int32(rank), dtype=fx.T.i64)
+        # debug timeline (s_memrealtime): [start, ready, end] per GEMM tile, then [start, end] per push unit
+        trace_base = i64_base(TRACE) if trace else None
 
         if block_index < fx.Int32(num_push):
             o_res = [
                 create_buffer_resource(t, num_records_bytes=max(num_ranks * M * h * head_dim * 2, 4))
                 for t, h in ((OQ, nq), (OK, nk), (OV, nv))
             ]
-            _push_loop(thread_index, state_base, claim_slot, peers_base, bank_offset, o_res, epoch, **consts)
-        # pushers take the last tiles: their rows are the last to arrive anyway
-        tile_index = arith.select(
-            block_index < fx.Int32(num_push),
-            block_index + fx.Int32(num_tiles - num_push),
-            block_index - fx.Int32(num_push),
-        )
-        tile_m = tile_index // fx.Int32(n_tiles)
-        tile_n = tile_index % fx.Int32(n_tiles)
+            _push_loop(
+                thread_index,
+                state_base,
+                claim_slot,
+                peers_base,
+                bank_offset,
+                o_res,
+                epoch,
+                trace_base,
+                **consts,
+            )
         flag_base = my_base + fx.Int64(flag_region * FLAG_REGION_BYTES)
-        _wait_m_tile(thread_index, flag_base, tile_m, epoch, rank, num_ranks)
-
-        recv_addr = my_base + bank_offset
-        epilogue = {}
-        if const_expr(has_residual):
-            epilogue["store_c_cls"] = _residual_store_c(RES)
-        if const_expr(save_o):
-            recv_res = create_buffer_resource_from_addr(recv_addr, num_records_bytes=M_pad * K * 2)
-            og_res = create_buffer_resource(OG, num_records_bytes=M * K * 2)
-
-            def og_coords(v):
-                r = v // fx.Int32(og_chunk)
-                t = tile_m * fx.Int32(BM) + r
-                col = tile_n * fx.Int32(og_chunk) + v % fx.Int32(og_chunk)
-                word = t * fx.Int32(K // 2) + col * fx.Int32(VEC_I32)
-                valid = (r < fx.Int32(BM)) & (t < fx.Int32(M)) & (col < fx.Int32(og_vecs_per_row))
-                return word, word, valid
-
-            _copy_rows(thread_index, BM * og_chunk, og_coords, recv_res, og_res, SYS_NT, 0)
-
-        gemm_tile(
-            make_bf16_fp16_tile_tensor(recv_addr, fx.Int64(0), M_pad * K),
-            make_bf16_fp16_tile_tensor(i64_base(W), fx.Int64(0), K * N),
-            make_bf16_fp16_tile_tensor(i64_base(Y), fx.Int64(0), M * N),
-            fx.Int32(M),
-            fx.Int32(N),
+        _tile_loop(
+            thread_index,
+            state_base,
+            claim_slot,
+            flag_base,
+            my_base + bank_offset,
+            W,
+            Y,
+            RES,
+            OG,
             lds,
-            tile_m,
-            tile_n,
-            K=K,
-            BLOCK_M=BM,
-            BLOCK_N=BN,
-            out_fp16=False,
-            nt_vmcnt=nt_vmcnt,
-            n_tail=N % BN,
-            **epilogue,
+            epoch,
+            trace_base,
+            **consts,
         )
         exit_and_bump_epoch(thread_index, state_base, epoch, grid)
 
@@ -377,6 +522,7 @@ def _launch(
     OG,
     PEER_PTRS,
     STATE,
+    TRACE,
     M: fx.Constexpr[int],
     K: fx.Constexpr[int],
     N: fx.Constexpr[int],
@@ -389,6 +535,7 @@ def _launch(
     has_residual: fx.Constexpr[bool],
     save_o: fx.Constexpr[bool],
     num_push: fx.Constexpr[int],
+    push_split: fx.Constexpr[int],
     flag_region: fx.Constexpr[int],
     bank_bytes: fx.Constexpr[int],
     nt_vmcnt: fx.Constexpr[int],
@@ -398,6 +545,8 @@ def _launch(
     nq: fx.Constexpr[int],
     nk: fx.Constexpr[int],
     nv: fx.Constexpr[int],
+    num_cus: fx.Constexpr[int],
+    trace: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
     kernel, grid = _make_kernel(
@@ -413,6 +562,7 @@ def _launch(
         has_residual,
         save_o,
         num_push,
+        push_split,
         flag_region,
         bank_bytes,
         nt_vmcnt,
@@ -422,6 +572,8 @@ def _launch(
         nq,
         nk,
         nv,
+        num_cus,
+        trace,
     )
     kernel(
         OQ,
@@ -433,6 +585,7 @@ def _launch(
         OG,
         PEER_PTRS,
         STATE,
+        TRACE,
         value_attrs=make_value_attrs(2, 0, "512,512"),
     ).launch(grid=(grid, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
 
@@ -458,6 +611,8 @@ def ulysses_a2a_gemm(
     BM=256,
     BN=256,
     num_push=32,
+    push_split=8,
+    trace=None,
 ):
     """``o`` this rank's heads over the full sequence (``qkv_format`` row order): one ``[n * M, K_r]``
     tensor, or ``(dq, dk, dv)`` ``[n * M, h_x, d]`` whose heads interleave in ``groups`` groups per
@@ -492,6 +647,7 @@ def ulysses_a2a_gemm(
         y if o_gathered is None else o_gathered,
         workspace.peer_ptrs,
         workspace.state,
+        workspace.state if trace is None else trace,
         M,
         K,
         N,
@@ -504,6 +660,7 @@ def ulysses_a2a_gemm(
         residual is not None,
         o_gathered is not None,
         num_push,
+        push_split,
         flag_region,
         workspace.bank_bytes,
         3,
@@ -511,5 +668,7 @@ def ulysses_a2a_gemm(
         head_dim,
         groups,
         *heads,
+        torch.cuda.get_device_properties(y.device).multi_processor_count,
+        trace is not None,
         torch.cuda.current_stream(),
     )
