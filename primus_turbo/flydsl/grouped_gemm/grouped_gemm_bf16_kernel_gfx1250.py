@@ -459,14 +459,12 @@ def _decode_m_tile_span(mt, blk_m_idx, n_groups: int, block_m: int):
 
 
 # TDM cache policy (SCOPE / TH)
-# Launch tracing reads these tables; immutable tuples keep their cache keys
-# independent of mutable process-global state. Encodings are contiguous indices.
-_TDM_TH_LOAD = ("RT", "NT", "HT", "LU", "NT_RT", "RT_NT", "NT_HT")
-_TDM_TH_STORE = ("RT", "NT", "HT", "WB", "NT_RT", "RT_NT", "NT_HT", "NT_WB")
-_TDM_SCOPE = ("WGP", "SE", "DEV", "SYS")
+_TDM_TH_LOAD = {0: "RT", 1: "NT", 2: "HT", 3: "LU", 4: "NT_RT", 5: "RT_NT", 6: "NT_HT"}
+_TDM_TH_STORE = {0: "RT", 1: "NT", 2: "HT", 3: "WB", 4: "NT_RT", 5: "RT_NT", 6: "NT_HT", 7: "NT_WB"}
+_TDM_SCOPE = {0: "WGP", 1: "SE", 2: "DEV", 3: "SYS"}
 
 
-def _check_tdm_cache(value: int, table: tuple[str, ...], what: str) -> None:
+def _check_tdm_cache(value: int, table: dict, what: str) -> None:
     if value == 0:
         return
     th, scope = value & 0x7, (value >> 3) & 0x3
@@ -474,13 +472,13 @@ def _check_tdm_cache(value: int, table: tuple[str, ...], what: str) -> None:
         raise ValueError(
             f"{what}={value} is out of range: the field is TH (bits 2:0) | SCOPE << 3 (bits 4:3), so 0..31."
         )
-    if th >= len(table):
+    if th not in table:
         raise ValueError(
             f"{what}={value} selects TH={th}, which has no mnemonic on this side of the "
-            f"transfer (legal: {list(range(len(table)))}). The backend would emit `th:{th:#x}` and "
+            f"transfer (legal: {sorted(table)}). The backend would emit `th:{th:#x}` and "
             f"the assembler would fail with `expected an identifier`."
         )
-    if scope >= len(_TDM_SCOPE):  # pragma: no cover -- two bits, all four are named
+    if scope not in _TDM_SCOPE:  # pragma: no cover -- two bits, all four are named
         raise ValueError(f"{what}={value} selects SCOPE={scope}, which is not 0..3")
 
 

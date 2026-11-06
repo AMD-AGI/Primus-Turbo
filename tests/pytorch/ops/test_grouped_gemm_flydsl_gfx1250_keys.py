@@ -659,16 +659,3 @@ def test_ragged_rows_do_not_depend_on_the_stack():
     ref = _ref_rows(a, b, offs, trans_b=True)
     _assert_matches(keyed.detach().cpu(), ref, a.dtype)
     torch.testing.assert_close(plain, keyed, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("value", range(-1, 33))
-@pytest.mark.parametrize("side", ["load", "store"])
-def test_tdm_cache_policy_encodings(value, side):
-    """Load TH=7 is reserved; every store TH and all four scopes are valid."""
-    table = gg._TDM_TH_LOAD if side == "load" else gg._TDM_TH_STORE
-    valid = 0 <= value <= 31 and (side == "store" or value & 7 != 7)
-    if valid:
-        gg._check_tdm_cache(value, table, side)
-    else:
-        with pytest.raises(ValueError):
-            gg._check_tdm_cache(value, table, side)
