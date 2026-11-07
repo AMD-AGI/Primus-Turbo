@@ -79,6 +79,7 @@ class GemmFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         a, b = ctx.saved_tensors
+        grad_out = grad_out.contiguous()
 
         # AGrad
         # grad_a = grad_out * b^T
