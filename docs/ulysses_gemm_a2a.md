@@ -41,7 +41,10 @@ pull 模式下，慢的 peer 可能在本卡跑 attention 时还在读本卡显�
   - 两种布局下 GEMM 都是普通 dense GEMM，staging 的列按 rank 排列（rank r 占 `[r·N_r, (r+1)·N_r)`）。
 - **一个 N tile 跨两个 rank 也没关系**（比如 Wan 的 N_r=1920 不是 256 的整数倍）：pull 方只等覆盖自己列区间的那几个 tile 的 flag。pull 拷贝时按 constexpr 规则把列映射到 (q/k/v, local head, dd)，再把行映射到目的位置：sbhd 时每个 src 的数据是一整段连续行，bshd 时每个 (src, b) 是一段连续行。序列按 rank 连续切分，和 `AttentionCPA2AHelper` 一致。
 - **A2AGemm 的 recv 缓冲**是行主序的 `[T, n·K_r]`，src 对应列块 src，**它本身就是 GEMM 的 A 矩阵**，本地切片也拷进来（1/n 的数据量）。GEMM 沿 K 按 src 切片，K 循环在每个切片开头等 flag `(src, m_tile)`。这需要给 `dense_mma_pipeline_bf16` 加一个 constexpr 位置的 K-slice wait hook，并放在该切片的第一次 prefetch 之前。
-- **反向 QKV 的 wgrad** 按 src 天然可分：`dW[src 的行] = dQKV_src^T @ x`，不需要跨 rank 归约。第一阶段在融合 kernel 之后单独跑一个 GEMM，直接读 recv 缓冲（同一个 epoch 内这个缓冲一定有效）；以后再考虑把 wgrad tile 放进融合 kernel 里，盖住尾部等待。o_proj 的 wgrad 读前向保存的 O_gathered，处理方式相同。
+- **反向 QKV 的 wgrad** 按 src 天然可分：`dW[src 的行] = dQKV_src^T @ x`，不需要跨 rank 归约。现在在融合 kernel 之后串行跑一个 GEMM（hipBLASLt，读 A2AGemm 拷出的 gathered dqkv），Qwen3-30B-A3B n=4 时 16K / 32K 约 85 / 156 µs，是反向唯一没有被盖住的部分。试过、已回滚的做法（`agent/workspace/ulysses_fused_a2a/` 第 5、6 轮）：
+  - o_proj wgrad 的 tile 放进 GemmA2A 的 grid：更慢（bwd o 243/433 → 269–300/509–544 µs）。side stream 上的 hipBLASLt wgrad 本来就被 dgrad 盖住了（dgrad 单独 240/420 µs），所以 o_proj 的 wgrad 保持 side stream。
+  - QKV wgrad 按 M 分块放到 side stream，用 `hipStreamWaitValue64` 等 A2AGemm 拷完对应行：结果正确，但 16K 403 → 457 µs。另一个 stream 上的 GEMM 在剩余 CU 上和交换并发，拖慢交换的程度超过它藏住的时间；单是给 A2AGemm 的 grid 设上限就让 32K 多了 42 µs。MI355X 上多 stream 重叠不可控，这条路不再走。
+  - 剩下的方向是在 A2AGemm 同一个 kernel 里做 wgrad tile，由 kernel 自己分配 CU 和顺序。
 - **前向 O_gathered 的保存**：接收方的通信 CU 推完自己的数据后，把已经到达的切片从 recv 缓冲拷到普通张量，和 GEMM 重叠。
 
 ## 4. flag / parity 协议
