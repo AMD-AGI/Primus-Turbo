@@ -683,7 +683,10 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
 
     @classmethod
     def resolve(
-        cls, default_backend_enum: BackendType, user_backend_enum: Optional[BackendType] = None, **kwargs
+        cls,
+        default_backend_enum: BackendType,
+        user_backend_enum: Optional[BackendType | BackendChoice] = None,
+        **kwargs,
     ) -> BackendType:
         """Select (but do not execute) the backend enum for the given inputs.
 
@@ -692,6 +695,13 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         passes (e.g. an autograd forward/backward pair) can pin the *same*
         backend for every pass by resolving once and threading the enum through.
         """
+        # GEMM settings carry both the pinned backend and per-op autotune intent.
+        # Keep accepting bare enums for attention and existing direct callers.
+        user_auto_tune = False
+        if isinstance(user_backend_enum, BackendChoice):
+            user_auto_tune = user_backend_enum.auto_tune
+            user_backend_enum = user_backend_enum.backend
+
         # 1. User specified backend (env or code) - highest priority
         if user_backend_enum is not None:
             if user_backend_enum not in cls._backends:
@@ -708,7 +718,7 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
 
         # 2. Auto tune
         # NOTE: Skip autotune during cuda graph capture.
-        if GlobalBackendManager.auto_tune_enabled() and not cls._is_graph_capturing():
+        if (user_auto_tune or GlobalBackendManager.auto_tune_enabled()) and not cls._is_graph_capturing():
             backend_cls = cls.tune(**kwargs)
             tuned_enum = cls._enum_for_impl(backend_cls) if backend_cls is not None else None
             if tuned_enum is not None:
