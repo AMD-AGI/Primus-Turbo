@@ -41,10 +41,11 @@ pull 模式下，慢的 peer 可能在本卡跑 attention 时还在读本卡显�
   - 两种布局下 GEMM 都是普通 dense GEMM，staging 的列按 rank 排列（rank r 占 `[r·N_r, (r+1)·N_r)`）。
 - **一个 N tile 跨两个 rank 也没关系**（比如 Wan 的 N_r=1920 不是 256 的整数倍）：pull 方只等覆盖自己列区间的那几个 tile 的 flag。pull 拷贝时按 constexpr 规则把列映射到 (q/k/v, local head, dd)，再把行映射到目的位置：sbhd 时每个 src 的数据是一整段连续行，bshd 时每个 (src, b) 是一段连续行。序列按 rank 连续切分，和 `AttentionCPA2AHelper` 一致。
 - **A2AGemm 的 recv 缓冲**是行主序的 `[T, n·K_r]`，src 对应列块 src，**它本身就是 GEMM 的 A 矩阵**，本地切片也拷进来（1/n 的数据量）。GEMM 沿 K 按 src 切片，K 循环在每个切片开头等 flag `(src, m_tile)`。这需要给 `dense_mma_pipeline_bf16` 加一个 constexpr 位置的 K-slice wait hook，并放在该切片的第一次 prefetch 之前。
-- **反向 QKV 的 wgrad** 按 src 天然可分：`dW[src 的行] = dQKV_src^T @ x`，不需要跨 rank 归约。现在在融合 kernel 之后串行跑一个 GEMM（hipBLASLt，读 A2AGemm 拷出的 gathered dqkv），Qwen3-30B-A3B n=4 时 16K / 32K 约 85 / 156 µs，是反向唯一没有被盖住的部分。试过、已回滚的做法（`agent/workspace/ulysses_fused_a2a/` 第 5、6 轮）：
-  - o_proj wgrad 的 tile 放进 GemmA2A 的 grid：更慢（bwd o 243/433 → 269–300/509–544 µs）。side stream 上的 hipBLASLt wgrad 本来就被 dgrad 盖住了（dgrad 单独 240/420 µs），所以 o_proj 的 wgrad 保持 side stream。
-  - QKV wgrad 按 M 分块放到 side stream，用 `hipStreamWaitValue64` 等 A2AGemm 拷完对应行：结果正确，但 16K 403 → 457 µs。另一个 stream 上的 GEMM 在剩余 CU 上和交换并发，拖慢交换的程度超过它藏住的时间；单是给 A2AGemm 的 grid 设上限就让 32K 多了 42 µs。MI355X 上多 stream 重叠不可控，这条路不再走。
-  - 剩下的方向是在 A2AGemm 同一个 kernel 里做 wgrad tile，由 kernel 自己分配 CU 和顺序。
+- **wgrad 都在融合 kernel 里，不用 side stream**（MI355X 上多 stream 重叠不可控）。tile 用生产的 FlyDSL MoE wgrad tile `grouped_gemm_bf16_variable_k_tile`（K 循环按 256 行分块，运行时循环），加了三个可选参数：`a_base`（A 用地址给出）、`k_hook`（每个 K 块的 A 读之前调用）、`persistent="staggered"`。
+  - 反向 QKV：`dW[src 的行] = dQKV_src^T @ x` 按 src 天然可分，不需要跨 rank 归约。A2AGemm 的 tile 计数器上排 `K/256 × N/256` 个 wgrad tile（默认排在最前），直接读 recv bank，每个 K 块只等它读到的 m-tile 里本 tile 那个 src 的 flag，沿 M 固定顺序累加，结果确定。gathered dqkv 不再拷出。
+  - 反向 o_proj：`dW_o = dY^T @ O_gathered` 不依赖交换，GemmA2A 里每个 block 一个 wgrad tile，派发在第 `num_lead + GEMM tile 数 / 8` 个 GEMM tile 之后。排在全部 GEMM tile 之后会挡住尾部 pull（32K 503 µs，对比 419 µs）。
+  - 维度不是 256 的倍数时回退为 kernel 之后单独跑 wgrad。
+  - 之前回滚的做法（`agent/workspace/ulysses_fused_a2a/` 第 5、6 轮）：o_proj wgrad 用 mega `tn` tile 放进 grid（K 循环完全展开，kernel 内每 tile 比 variable-K tile 慢约 3 倍）；QKV wgrad 按 M 分块放 side stream、用 `hipStreamWaitValue64` 等待，并发 GEMM 拖慢交换（16K 403 → 457 µs）。
 - **前向 O_gathered 的保存**：接收方的通信 CU 推完自己的数据后，把已经到达的切片从 recv 缓冲拷到普通张量，和 GEMM 重叠。
 
 ## 4. flag / parity 协议
@@ -70,7 +71,7 @@ grid 的排列顺序是：`num_lead` 个 GEMM block（默认 = CU 数，即第�
 - GemmA2A：GEMM 按 m-major 光栅化，数据按 m 逐步就绪。pull block 的块序是 `(m_tile, src=(me+i)%n)`，让各 rank 在同一时刻从不同的 src 读，7 条链路都用上。
 - A2AGemm（`a2a_gemm_kernel.py`）：前 `num_push`（默认 32）个 block 先动态领取 push unit `(m_tile, dst=(me+i)%n)`，把 dst 那段序列的行写进 dst 的 recv bank 第 `me` 个列块，再置 dst 的 flag `m_tile*n + me`；领完后这些 block 去算最后几个 tile（它们的行反正最晚到齐）。每个 GEMM tile 等齐本 m_tile 所有来源的 flag，做一次 system 级 acquire，然后跑普通的 K 循环。
   - 源数据可以是一个张量（o_proj：`G=1`）或 `(dq, dk, dv)` 三个张量，按权重行序（`G` 组，每组 `(nq, nk, nv)/G` 个头）写进 recv bank，所以 QKV dgrad 直接用原权重（concat 布局用 rank-major 重排后的权重），B 走 `nn` 布局。
-  - 需要 wgrad 时，每个 m_tile 的 n_tiles 个 block 各把 recv 行的一个列块拷到 `o_gathered`。
+  - 前向 o_proj 需要给反向留 O 时，每个 m_tile 的 n_tiles 个 block 各把 recv 行的一个列块拷到 `o_gathered`。反向 QKV 的 wgrad tile 直接读 recv bank（第 3 节）。
   - residual 在 epilogue 里按 fp32 加到累加器上，只做一次 bf16 舍入（`_residual_store_c`，要求 N % 256 == 0）。
   - `num_push` 扫过 16/32/48/64/96/128：o_proj 和 QKV dgrad 都是 32–48 最好。
 - tile 形状固定 256×256，没有做 autotune（见遗留问题）。
@@ -93,9 +94,9 @@ grid 的排列顺序是：`num_lead` 个 GEMM block（默认 = CU 数，即第�
 ## 8. API 和 autograd
 
 - `ulysses_qkv_gemm_a2a(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout="interleaved"|"concat")`：返回 `q, k, v`，形状为 `[s, b, h/n, d]`（sbhd）或 `[b, s, h/n, d]`（bshd）。
-  - 反向：A2AGemm（dx）加上 wgrad。
+  - 反向：A2AGemm（dx 和 dW 在同一个 kernel 里）。
 - `ulysses_a2a_o_gemm(o, w_o, residual, group, qkv_format)`：返回 y。
-  - 反向：GemmA2A（dO）加上 wgrad（用保存的 O_gathered），`d_residual = dY`。
+  - 反向：GemmA2A（dO 和用保存的 O_gathered 算的 dW_o 在同一个 kernel 里），`d_residual = dY`。
 - 现有的 `flash_attn_usp_func` 不改。
 
 ## 9. 已确认的决策

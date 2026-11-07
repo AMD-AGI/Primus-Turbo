@@ -29,6 +29,9 @@ from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
+    grouped_gemm_bf16_variable_k_tile,
+)
 from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
     _make_shared_storage,
     gemm_bf16_tile,
@@ -69,6 +72,9 @@ from primus_turbo.flydsl.utils.prims import ceildiv, ld, memory_fence, st
 
 # 16 B vectors whose loads are issued before their stores
 _BATCH = 8
+# K chunk of the variable-K wgrad tile (CHUNK x BLOCK_K rows) and its LDS chunk stride
+_WGRAD_CHUNK_ROWS = 256
+_WGRAD_LDS_CHUNK_STRIDE = 1152
 
 
 def _residual_store_c(residual):
@@ -267,6 +273,34 @@ def _arrival_k_seg(flag_base, tile_m, epoch, trace_base=None, trace_idx=None, **
     return _ArrivalKSeg()
 
 
+def _wgrad_k_hook(flag_base, src, epoch, **c):
+    """Waits of a weight-gradient tile, whose ``A`` columns all come from source ``src``: before the
+    loads of K chunk ``k`` (``_WGRAD_CHUNK_ROWS`` rows, two 64-row steps prefetched past it), the
+    m-tiles those loads reach; only ``src``'s flags."""
+    num_ranks, S, rank, BM = c["num_ranks"], c["push_split"], c["rank"], c["BM"]
+    m_tiles = ceildiv(c["M"], BM)
+    per_chunk = _WGRAD_CHUNK_ROWS // BM
+    # last row a chunk loads: (k + 1) * CHUNK_ROWS + 2 * 64 - 1
+    lead = (_WGRAD_CHUNK_ROWS + 2 * 64 - 1) // BM
+
+    def wait(tiles):
+        slots = [(t * fx.Int32(S) + fx.Int32(sub)) * fx.Int32(num_ranks) + src for t in tiles for sub in range(S)]
+        spin_flags(flag_base, slots, epoch, rank, src, "a2a_gemm wgrad")
+
+    def hook(k):
+        if const_expr(isinstance(k, int)):
+            # prologue: the first two 64-row steps; see _arrival_k_seg.wait for the sys scope
+            wait([fx.Int32(0)])
+            memory_fence(order="acquire", scope="sys")
+        else:
+            hi = k * fx.Int32(per_chunk) + fx.Int32(lead)
+            tiles = [hi - fx.Int32(i) for i in range(per_chunk)]
+            wait([arith.select(t < fx.Int32(m_tiles), t, fx.Int32(m_tiles - 1)) for t in tiles])
+            memory_fence(order="acquire", scope="wavefront")
+
+    return hook
+
+
 def _claimed_tile(q, **c):
     """Tile of claim ``q``: m-tiles in the order their last source lands (equal ``i mod D`` together)."""
     num_ranks, D, n_tiles = c["num_ranks"], c["stagger"], c["n_tiles"]
@@ -295,13 +329,71 @@ def _wait_all(thread_index, flag_base, tile_m, epoch, **c):
 
 
 @ASTRewriter.transform
+def _wgrad_tile(thread_index, w, flag_base, recv_addr, XB, DW, lds, epoch, trace_base, **c):
+    """``DW[tile] = A[:, tile rows]^T @ XB[:, tile cols]`` over all of M (the variable-K wgrad tile),
+    in row order, each chunk after the m-tiles it reads have landed (``_wgrad_k_hook``)."""
+    M, K, N, BMw, BN = c["M"], c["K"], c["N"], c["BMw"], c["BN"]
+    wn_tiles = N // BN
+    tile_k, tile_n = w // fx.Int32(wn_tiles), w % fx.Int32(wn_tiles)
+    if const_expr(trace_base is not None):
+        if thread_index == fx.Int32(0):
+            st(trace_base, fx.Int32(c["trace_wgrad_at"]) + w * fx.Int32(2), read_clock())
+    src = tile_k * fx.Int32(BMw) // fx.Int32(c["K_r"])
+    grouped_gemm_bf16_variable_k_tile(
+        None,
+        XB,
+        DW,
+        fx.Int32(0),
+        tile_k,
+        tile_n,
+        fx.Int32(0),
+        fx.Int32(M),
+        lds,
+        fx.Int32(K),
+        fx.Int32(N),
+        G=1,
+        OUT_M=K,
+        OUT_N=N,
+        BLOCK_M=BMw,
+        BLOCK_N=BN,
+        persistent="staggered",
+        lds_chunk_stride=_WGRAD_LDS_CHUNK_STRIDE,
+        a_base=recv_addr,
+        k_hook=_wgrad_k_hook(flag_base, src, epoch, **c),
+    )
+    if const_expr(trace_base is not None):
+        fx.rocdl.s_waitcnt(0)
+        if thread_index == fx.Int32(0):
+            st(trace_base, fx.Int32(c["trace_wgrad_at"]) + w * fx.Int32(2) + 1, read_clock())
+
+
+@ASTRewriter.transform
 def _tile_loop(
-    thread_index, state_base, claim_slot, flag_base, recv_addr, W, Y, RES, OG, lds, epoch, trace_base, **c
+    thread_index, state_base, claim_slot, flag_base, recv_addr, W, Y, RES, OG, XB, DW, lds, epoch, trace_base, **c
 ):
-    """Claim GEMM tiles until none are left. Staggered (``D > 0``), a tile walks K by arrival
-    (``_arrival_k_seg``); in step, it waits for the whole m-tile, copies it out, then runs."""
+    """Claim tiles until none are left: the ``num_wtiles`` weight-gradient tiles sit at claim
+    positions ``[wgrad_at, wgrad_at + num_wtiles)``, the GEMM tiles around them."""
+    num_tiles, num_wtiles, w_at = c["num_tiles"], c["num_wtiles"], c["wgrad_at"]
+    q = claim_unit(thread_index, state_base, claim_slot, STATE_TILE)
+    while q < fx.Int32(num_tiles + num_wtiles):
+        if const_expr(num_wtiles > 0):
+            w = q - fx.Int32(w_at)
+            if (w >= fx.Int32(0)) & (w < fx.Int32(num_wtiles)):
+                _wgrad_tile(thread_index, w, flag_base, recv_addr, XB, DW, lds, epoch, trace_base, **c)
+            else:
+                qd = arith.select(q < fx.Int32(w_at), q, q - fx.Int32(num_wtiles))
+                _gemm_tile(thread_index, qd, flag_base, recv_addr, W, Y, RES, OG, lds, epoch, trace_base, **c)
+        else:
+            _gemm_tile(thread_index, q, flag_base, recv_addr, W, Y, RES, OG, lds, epoch, trace_base, **c)
+        q = claim_unit(thread_index, state_base, claim_slot, STATE_TILE)
+
+
+@ASTRewriter.transform
+def _gemm_tile(thread_index, q, flag_base, recv_addr, W, Y, RES, OG, lds, epoch, trace_base, **c):
+    """GEMM tile of claim ``q``. Staggered (``D > 0``), it walks K by arrival (``_arrival_k_seg``);
+    in step, it waits for the whole m-tile, copies it out, then runs."""
     M, M_pad, K, N, BM, BN = c["M"], c["M_pad"], c["K"], c["N"], c["BM"], c["BN"]
-    n_tiles, num_tiles, progressive = c["n_tiles"], c["num_tiles"], c["stagger"] > 0
+    n_tiles, progressive = c["n_tiles"], c["stagger"] > 0
     gemm_tile = functools.partial(gemm_bf16_tile, c["layout"], pair_n=True)
     epilogue = {}
     if const_expr(c["has_residual"]):
@@ -323,50 +415,47 @@ def _tile_loop(
 
         _copy_rows(thread_index, BM * og_chunk, og_coords, recv_res, og_res, SYS_NT, 0)
 
-    q = claim_unit(thread_index, state_base, claim_slot, STATE_TILE)
-    while q < fx.Int32(num_tiles):
-        tile_m, tile_n = _claimed_tile(q, **c)
-        tile_index = tile_m * fx.Int32(n_tiles) + tile_n
+    tile_m, tile_n = _claimed_tile(q, **c)
+    tile_index = tile_m * fx.Int32(n_tiles) + tile_n
+    if const_expr(trace_base is not None):
+        if thread_index == fx.Int32(0):
+            st(trace_base, tile_index * fx.Int32(3), read_clock())
+    k_seg = None
+    if const_expr(progressive):
+        k_seg = _arrival_k_seg(flag_base, tile_m, epoch, trace_base, tile_index * fx.Int32(3) + 1, **c)
+    else:
+        _wait_all(thread_index, flag_base, tile_m, epoch, **c)
         if const_expr(trace_base is not None):
             if thread_index == fx.Int32(0):
-                st(trace_base, tile_index * fx.Int32(3), read_clock())
-        k_seg = None
-        if const_expr(progressive):
-            k_seg = _arrival_k_seg(flag_base, tile_m, epoch, trace_base, tile_index * fx.Int32(3) + 1, **c)
-        else:
-            _wait_all(thread_index, flag_base, tile_m, epoch, **c)
-            if const_expr(trace_base is not None):
-                if thread_index == fx.Int32(0):
-                    st(trace_base, tile_index * fx.Int32(3) + 1, read_clock())
-            if const_expr(c["save_o"]):
-                copy_o(tile_m, tile_n)
-        gemm_tile(
-            make_bf16_fp16_tile_tensor(recv_addr, fx.Int64(0), M_pad * K),
-            make_bf16_fp16_tile_tensor(i64_base(W), fx.Int64(0), K * N),
-            make_bf16_fp16_tile_tensor(i64_base(Y), fx.Int64(0), M * N),
-            fx.Int32(M),
-            fx.Int32(N),
-            lds,
-            tile_m,
-            tile_n,
-            K=K,
-            BLOCK_M=BM,
-            BLOCK_N=BN,
-            out_fp16=False,
-            nt_vmcnt=c["nt_vmcnt"],
-            n_tail=N % BN,
-            persistent="staggered",
-            k_seg=k_seg,
-            **epilogue,
-        )
-        if const_expr(progressive and c["save_o"]):
-            # every wave has waited for all of the m-tile's sources inside the K walk
+                st(trace_base, tile_index * fx.Int32(3) + 1, read_clock())
+        if const_expr(c["save_o"]):
             copy_o(tile_m, tile_n)
-        if const_expr(trace_base is not None):
-            fx.rocdl.s_waitcnt(0)
-            if thread_index == fx.Int32(0):
-                st(trace_base, tile_index * fx.Int32(3) + 2, read_clock())
-        q = claim_unit(thread_index, state_base, claim_slot, STATE_TILE)
+    gemm_tile(
+        make_bf16_fp16_tile_tensor(recv_addr, fx.Int64(0), M_pad * K),
+        make_bf16_fp16_tile_tensor(i64_base(W), fx.Int64(0), K * N),
+        make_bf16_fp16_tile_tensor(i64_base(Y), fx.Int64(0), M * N),
+        fx.Int32(M),
+        fx.Int32(N),
+        lds,
+        tile_m,
+        tile_n,
+        K=K,
+        BLOCK_M=BM,
+        BLOCK_N=BN,
+        out_fp16=False,
+        nt_vmcnt=c["nt_vmcnt"],
+        n_tail=N % BN,
+        persistent="staggered",
+        k_seg=k_seg,
+        **epilogue,
+    )
+    if const_expr(progressive and c["save_o"]):
+        # every wave has waited for all of the m-tile's sources inside the K walk
+        copy_o(tile_m, tile_n)
+    if const_expr(trace_base is not None):
+        fx.rocdl.s_waitcnt(0)
+        if thread_index == fx.Int32(0):
+            st(trace_base, tile_index * fx.Int32(3) + 2, read_clock())
 
 
 @functools.lru_cache(maxsize=64)
@@ -394,6 +483,8 @@ def _make_kernel(
     nk,
     nv,
     num_cus,
+    BMw=0,
+    wgrad_at=0,
     trace=False,
 ):
     assert K % num_ranks == 0 and N % VEC_BF16 == 0 and head_dim % VEC_BF16 == 0
@@ -410,16 +501,25 @@ def _make_kernel(
     assert M_pad * K < 2**31 and M * N < 2**31 and K * N < 2**31, "i32 element offsets overflow"
     assert M_pad * K * 2 <= bank_bytes
     assert not has_residual or (N % BN == 0 and BN == 256), "the residual epilogue needs N % 256 == 0"
-    grid = min(num_tiles + num_push, num_cus)
+    num_wtiles = 0
+    if BMw:
+        # recv pad rows are never written: the M walk needs whole m-tiles, and a tile's A columns
+        # must come from one source
+        assert M == M_pad and K_r % BMw == 0 and N % BN == 0 and BN == 256 and _WGRAD_CHUNK_ROWS % BM == 0
+        num_wtiles = K // BMw * (N // BN)
+        assert 0 <= wgrad_at <= num_tiles
+    grid = min(num_tiles + num_wtiles + num_push, num_cus)
     num_push = min(num_push, grid)
     # Staggered sources only pay off when every tile has a block from the start: a tile claimed late
     # would walk most of its K after the last arrival. Otherwise all sources push m-major in step.
-    stagger = m_tiles // num_ranks if num_tiles <= grid - num_push else 0
+    stagger = m_tiles // num_ranks if num_tiles + num_wtiles <= grid - num_push else 0
     # in step, one m-tile per pusher unit: sub-tiles only pace the staggered arrivals
     push_split = push_split if stagger else 1
     assert not stagger or K_r % 64 == 0, "a staggered K walk needs whole K chunks per source"
     # one extra i32: the block-wide broadcast of a claimed push unit
-    SharedStorage = _make_shared_storage(BM, BN, num_lds_row_idx_entries=1)
+    SharedStorage = _make_shared_storage(
+        max(BM, BMw), BN, chunk_stride=_WGRAD_LDS_CHUNK_STRIDE if BMw else 1024, num_lds_row_idx_entries=1
+    )
     consts = dict(
         M=M,
         M_pad=M_pad,
@@ -438,6 +538,10 @@ def _make_kernel(
         nk=nk,
         nv=nv,
         trace_units_at=3 * num_tiles,
+        trace_wgrad_at=3 * num_tiles + 2 * num_ranks * m_tiles * push_split,
+        BMw=BMw,
+        num_wtiles=num_wtiles,
+        wgrad_at=wgrad_at,
         stagger=stagger,
         N=N,
         BN=BN,
@@ -458,6 +562,8 @@ def _make_kernel(
         RES: fx.Tensor,
         Y: fx.Tensor,
         OG: fx.Tensor,
+        XB: fx.Tensor,
+        DW: fx.Tensor,
         PEER_PTRS: fx.Tensor,
         STATE: fx.Tensor,
         TRACE: fx.Tensor,
@@ -501,6 +607,8 @@ def _make_kernel(
             Y,
             RES,
             OG,
+            XB,
+            DW,
             lds,
             epoch,
             trace_base,
@@ -520,6 +628,8 @@ def _launch(
     RES,
     Y,
     OG,
+    XB,
+    DW,
     PEER_PTRS,
     STATE,
     TRACE,
@@ -546,6 +656,8 @@ def _launch(
     nk: fx.Constexpr[int],
     nv: fx.Constexpr[int],
     num_cus: fx.Constexpr[int],
+    BMw: fx.Constexpr[int],
+    wgrad_at: fx.Constexpr[int],
     trace: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
@@ -573,6 +685,8 @@ def _launch(
         nk,
         nv,
         num_cus,
+        BMw,
+        wgrad_at,
         trace,
     )
     kernel(
@@ -583,6 +697,8 @@ def _launch(
         RES,
         Y,
         OG,
+        XB,
+        DW,
         PEER_PTRS,
         STATE,
         TRACE,
@@ -612,13 +728,19 @@ def ulysses_a2a_gemm(
     BN=256,
     num_push=32,
     push_split=8,
+    wgrad=None,
+    BMw=256,
+    wgrad_at=0,
     trace=None,
 ):
     """``o`` this rank's heads over the full sequence (``qkv_format`` row order): one ``[n * M, K_r]``
     tensor, or ``(dq, dk, dv)`` ``[n * M, h_x, d]`` whose heads interleave in ``groups`` groups per
     rank (the weight's row order). ``y = A @ w^T`` (``layout="nt"``, ``w`` ``[N, K]``) or ``A @ w``
     (``"nn"``, ``w`` ``[K, N]``), ``+ residual`` (nt only), where ``A`` is the gathered ``[M, K]``,
-    ``K = n * K_r``; ``A`` is also copied to ``o_gathered`` unless it is ``None``."""
+    ``K = n * K_r``; ``A`` is also copied to ``o_gathered`` unless it is ``None``.
+
+    ``wgrad=(x, dw)`` (``nn`` only) also computes ``dw = A^T @ x`` (``x`` ``[M, N]``, ``dw``
+    ``[K, N]``) in the same kernel, from ``BMw x 256`` tiles placed at claim position ``wgrad_at``."""
     num_ranks = workspace.num_ranks
     if isinstance(o, torch.Tensor):
         head_dim = head_dim or o.shape[-1]
@@ -637,10 +759,16 @@ def ulysses_a2a_gemm(
     assert o_gathered is None or (o_gathered.is_contiguous() and tuple(o_gathered.shape) == (M, K))
     oq, ok, ov = (parts[0] if p is None else p for p in parts)
     num_cus = torch.cuda.get_device_properties(y.device).multi_processor_count
+    num_wtiles = 0
+    if wgrad is not None:
+        xb, dw = wgrad
+        assert layout == "nn" and o_gathered is None
+        assert xb.is_contiguous() and tuple(xb.shape) == (M, N) and dw.is_contiguous() and tuple(dw.shape) == (K, N)
+        num_wtiles = K // BMw * (N // BN)
     if BM is None:
         # 256-row tiles while every tile has a CU (the staggered K walk); otherwise 128 rows halve the
         # tail of the m-tile that lands last
-        BM = 256 if ceildiv(M, 256) * ceildiv(N, BN) + num_push <= num_cus else 128
+        BM = 256 if ceildiv(M, 256) * ceildiv(N, BN) + num_wtiles + num_push <= num_cus else 128
     run_launcher(
         _launch,
         oq,
@@ -650,6 +778,8 @@ def ulysses_a2a_gemm(
         y if residual is None else residual,
         y,
         y if o_gathered is None else o_gathered,
+        y if wgrad is None else wgrad[0],
+        y if wgrad is None else wgrad[1],
         workspace.peer_ptrs,
         workspace.state,
         workspace.state if trace is None else trace,
@@ -674,6 +804,8 @@ def ulysses_a2a_gemm(
         groups,
         *heads,
         num_cus,
+        BMw if wgrad is not None else 0,
+        wgrad_at if wgrad is not None else 0,
         trace is not None,
         torch.cuda.current_stream(),
     )

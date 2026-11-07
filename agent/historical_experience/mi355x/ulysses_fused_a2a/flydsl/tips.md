@@ -23,3 +23,11 @@
   spent waiting; it works, but concurrent hipBLASLt slows a CU-driven exchange by more than it hides
   when compute ~ exchange time.
 - FlyDSL disk cache: `rm -rf /root/.flydsl` after kernel edits; env-var globals are not in the key.
+- Wgrad inside a fused kernel: use the production variable-K tile (`grouped_gemm_bf16_variable_k_tile`,
+  runtime chunked K loop, LDS chunk stride 1152) with `persistent="staggered"`, not the mega `tn`
+  tile (fully unrolled K loop): ~3x slower per tile in-kernel. A `k_hook` per 256-row chunk gates
+  the M walk on arrival flags (QKV: only the tile's source's flags).
+- An exchange-free wgrad in a pull GemmA2A: dispatch its blocks shortly after the first GEMM wave
+  (`num_lead + tiles / 8`); after all GEMM tiles they sit in front of the tail pulls.
+- No side streams on MI355X: an in-kernel wgrad beat both the side-stream hipBLASLt (bwd o 245 / 433
+  -> 228 / 419) and the stream-gated chunks of R6.

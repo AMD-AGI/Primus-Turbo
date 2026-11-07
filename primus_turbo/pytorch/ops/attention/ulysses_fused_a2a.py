@@ -49,16 +49,6 @@ def _rank_major_concat_rows(hq, hkv, d, n, device):
 _PERMUTED_WEIGHTS = {}
 
 
-_SIDE_STREAMS = {}
-
-
-def _side_stream():
-    device = torch.cuda.current_device()
-    if device not in _SIDE_STREAMS:
-        _SIDE_STREAMS[device] = torch.cuda.Stream(device)
-    return _SIDE_STREAMS[device]
-
-
 def _rank_major_weight(w, hq, hkv, d, n):
     """``w[perm]`` for a concat-layout weight, rebuilt only when the weight changes."""
     key = (w.data_ptr(), hq, hkv, d, n)
@@ -126,8 +116,9 @@ def _qkv_gemm_a2a_forward(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout
 
 def _qkv_backward(ctx, dq, dk, dv):
     """A2AGemm: the local heads' grads over the full sequence are pushed into the sequence owner's
-    recv bank in the (rank-major) weight row order; ``dx = dqkv @ w_qkv`` consumes them as they land
-    and the gathered ``dqkv`` is kept for ``dw = dqkv^T @ x``."""
+    recv bank in the (rank-major) weight row order; ``dx = dqkv @ w_qkv`` and ``dw = dqkv^T @ x``
+    consume them as they land, in the same kernel (shapes it cannot tile copy ``dqkv`` out for a
+    separate wgrad)."""
     x, w_qkv = ctx.saved_tensors
     hq, hkv, d, group, weight_layout = ctx.hq, ctx.hkv, ctx.d, ctx.group, ctx.weight_layout
     n = group.size()
@@ -139,7 +130,11 @@ def _qkv_backward(ctx, dq, dk, dv):
     parts = tuple(t.reshape(s_local * n * b, -1, d).contiguous() for t in (dq, dk, dv))
     need_dx, need_dw = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
     dx = torch.empty(M, hidden, dtype=x.dtype, device=x.device)
-    dqkv = torch.empty(M, K, dtype=x.dtype, device=x.device) if need_dw else None
+    # dw tiles inside the kernel: whole 256-row m-tiles, one source's columns per 256-row dw tile
+    fused_wgrad = need_dw and M % 256 == 0 and (K // n) % 256 == 0 and hidden % 256 == 0
+    x2d = x.reshape(M, hidden).contiguous() if need_dw else None
+    dqkv = torch.empty(M, K, dtype=x.dtype, device=x.device) if need_dw and not fused_wgrad else None
+    dw_rank_major = torch.empty(K, hidden, dtype=x.dtype, device=x.device) if fused_wgrad else None
     workspace = get_ulysses_workspace(group, a2a_gemm_bank_bytes(M, K))
     G = _qkv_rank_block(hq, hkv, d, n, weight_layout)[0]
     ulysses_a2a_gemm(
@@ -154,10 +149,12 @@ def _qkv_backward(ctx, dq, dk, dv):
         flag_region=REGION_QKV_A2A_GEMM,
         layout="nn",
         groups=G,
+        wgrad=(x2d, dw_rank_major) if fused_wgrad else None,
     )
     dw = None
     if need_dw:
-        dw_rank_major = dqkv.t() @ x.reshape(M, hidden)
+        if not fused_wgrad:
+            dw_rank_major = dqkv.t() @ x2d
         if concat:
             dw = torch.empty_like(dw_rank_major)
             dw.index_copy_(0, _rank_major_concat_rows(hq, hkv, d, n, x.device), dw_rank_major)
@@ -242,8 +239,9 @@ def _o_gemm_forward(o, w_o, residual, group, qkv_format, save_o):
     return y.view(y_shape), o_gathered
 
 
-def _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format):
-    """``dO = (dY @ w_o)`` scattered back to the local heads over the full sequence (GemmA2A)."""
+def _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format, wgrad=None):
+    """``dO = (dY @ w_o)`` scattered back to the local heads over the full sequence (GemmA2A);
+    ``wgrad=(o_gathered, dw)`` also computes ``dw = dY^T @ o_gathered`` in the same kernel."""
     n = group.size()
     M, K = dy2d.shape[0], w_o.shape[1]
     seq = s_local * n
@@ -263,6 +261,7 @@ def _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format):
         seq_local=s_local,
         qkv_format=qkv_format,
         flag_region=REGION_O_GEMM_A2A,
+        wgrad=None if wgrad is None else (dy2d, *wgrad),
     )
     shape = (seq, b) if qkv_format == "sbhd" else (b, seq)
     return do.view(*shape, heads, d)
@@ -271,16 +270,14 @@ def _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format):
 def _o_gemm_backward(dy2d, w_o, o_gathered, group, heads, d, s_local, b, qkv_format, need_do, need_dw):
     """``(dO, dW_o)``: dO by GemmA2A, ``dW_o = dY^T @ O_gathered``."""
     do = dw = None
-    if need_do and need_dw:
-        # wgrad does not depend on the exchange: it runs beside the GemmA2A, which is
-        # exchange-bound. Queued first, as the GemmA2A grid fills every CU once it starts.
-        main, side = torch.cuda.current_stream(), _side_stream()
+    hidden, K = w_o.shape
+    if need_do and need_dw and hidden % 256 == 0 and K % 256 == 0:
+        # wgrad does not depend on the exchange: its tiles fill the GemmA2A launch behind the GEMM tiles
         dw = torch.empty_like(w_o)
-        side.wait_stream(main)
-        with torch.cuda.stream(side):
-            torch.matmul(dy2d.t(), o_gathered, out=dw)
+        do = _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format, wgrad=(o_gathered, dw))
+    elif need_do and need_dw:
         do = _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format)
-        main.wait_stream(side)
+        dw = dy2d.t() @ o_gathered
     elif need_do:
         do = _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format)
     elif need_dw:

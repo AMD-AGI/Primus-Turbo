@@ -26,6 +26,9 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr
 
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
+    grouped_gemm_bf16_variable_k_tile,
+)
 from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
     _make_shared_storage,
     gemm_bf16_tile,
@@ -66,6 +69,10 @@ from primus_turbo.flydsl.utils.prims import (
 
 # head pieces whose loads are issued before their stores
 _PIECE_BATCH = 8
+# variable-K wgrad tile and its LDS chunk stride
+_WGRAD_BM = 256
+_WGRAD_BN = 256
+_WGRAD_LDS_CHUNK_STRIDE = 1152
 
 
 def piece_dst(j, nq, nk, nv):
@@ -236,6 +243,9 @@ def _make_kernel(
     bank_bytes,
     num_lead=0,
     num_tail_pull=0,
+    wgrad_n=0,
+    wgrad_at=0,
+    wgrad_bm=256,
     trace=False,
 ):
     assert N % num_ranks == 0
@@ -249,12 +259,22 @@ def _make_kernel(
     assert num_gemm_tiles <= FLAGS_PER_REGION, "too many tiles for one flag region"
     assert M_pad * N < 2**31 and M * K < 2**31 and K * N < 2**31, "i32 element offsets overflow"
     num_lead = min(num_lead, num_gemm_tiles)
+    # wgrad_n > 0: blocks dispatched after GEMM tile ``wgrad_at`` also compute DW = WA^T @ WB
+    # ([K, wgrad_n], over M), one variable-K tile each; they wait for nothing
+    wm_tiles = K // wgrad_bm if wgrad_n else 0
+    num_wtiles = wm_tiles * (wgrad_n // _WGRAD_BN)
+    assert not wgrad_n or (K % wgrad_bm == 0 and wgrad_n % _WGRAD_BN == 0)
+    wgrad_at = min(max(wgrad_at, num_lead), num_gemm_tiles)
     # tail pull blocks follow every GEMM block in dispatch order, so none of them can hold a CU a GEMM
     # tile they wait on still needs; they take the CUs the last GEMM wave leaves idle
-    grid = num_gemm_tiles + num_pull_cu + num_tail_pull
+    grid = num_gemm_tiles + num_pull_cu + num_wtiles + num_tail_pull
     gemm_tile = functools.partial(gemm_bf16_tile, layout, pair_n=True)
     # one extra i32: the block-wide broadcast of a claimed pull unit
-    SharedStorage = _make_shared_storage(BM, BN, num_lds_row_idx_entries=1)
+    SharedStorage = (
+        _make_shared_storage(max(BM, wgrad_bm), BN, chunk_stride=_WGRAD_LDS_CHUNK_STRIDE, num_lds_row_idx_entries=1)
+        if num_wtiles
+        else _make_shared_storage(BM, BN, num_lds_row_idx_entries=1)
+    )
 
     @flyc.kernel(name="ulysses_gemm_a2a_kernel", known_block_size=[BLOCK_THREADS, 1, 1])
     def kernel(
@@ -263,6 +283,9 @@ def _make_kernel(
         OUT_Q: fx.Tensor,
         OUT_K: fx.Tensor,
         OUT_V: fx.Tensor,
+        WA: fx.Tensor,
+        WB: fx.Tensor,
+        DW: fx.Tensor,
         PEER_PTRS: fx.Tensor,
         STATE: fx.Tensor,
         TRACE: fx.Tensor,
@@ -303,9 +326,34 @@ def _make_kernel(
             flag_region=flag_region,
         )
 
+        # dispatch order: lead GEMM | pull | GEMM up to wgrad_at | wgrad | rest of GEMM | tail pull
+        w_first = wgrad_at + num_pull_cu
         is_pull = ((block_index >= fx.Int32(num_lead)) & (block_index < fx.Int32(num_lead + num_pull_cu))) | (
-            block_index >= fx.Int32(num_gemm_tiles + num_pull_cu)
+            block_index >= fx.Int32(num_gemm_tiles + num_pull_cu + num_wtiles)
         )
+        is_wgrad = (block_index >= fx.Int32(w_first)) & (block_index < fx.Int32(w_first + num_wtiles))
+        if const_expr(num_wtiles > 0):
+            if is_wgrad:
+                w = block_index - fx.Int32(w_first)
+                grouped_gemm_bf16_variable_k_tile(
+                    WA,
+                    WB,
+                    DW,
+                    fx.Int32(0),
+                    w // fx.Int32(wgrad_n // _WGRAD_BN),
+                    w % fx.Int32(wgrad_n // _WGRAD_BN),
+                    fx.Int32(0),
+                    fx.Int32(M),
+                    lds,
+                    fx.Int32(K),
+                    fx.Int32(wgrad_n),
+                    G=1,
+                    OUT_M=K,
+                    OUT_N=wgrad_n,
+                    BLOCK_M=wgrad_bm,
+                    BLOCK_N=_WGRAD_BN,
+                    lds_chunk_stride=_WGRAD_LDS_CHUNK_STRIDE,
+                )
         if is_pull:
             _pull_loop(
                 thread_index,
@@ -319,9 +367,20 @@ def _make_kernel(
                 2 * num_gemm_tiles,
                 **consts,
             )
-        else:
+        is_gemm = (block_index < fx.Int32(num_lead)) | (
+            (block_index >= fx.Int32(num_lead + num_pull_cu))
+            & (block_index < fx.Int32(num_gemm_tiles + num_pull_cu + num_wtiles))
+            & ((block_index < fx.Int32(w_first)) | (block_index >= fx.Int32(w_first + num_wtiles)))
+        )
+        if is_gemm:
             gemm_index = arith.select(
-                block_index < fx.Int32(num_lead), block_index, block_index - fx.Int32(num_pull_cu)
+                block_index < fx.Int32(num_lead),
+                block_index,
+                arith.select(
+                    block_index < fx.Int32(w_first),
+                    block_index - fx.Int32(num_pull_cu),
+                    block_index - fx.Int32(num_pull_cu + num_wtiles),
+                ),
             )
             tile_m = gemm_index // fx.Int32(n_tiles)
             tile_n = gemm_index % fx.Int32(n_tiles)
@@ -371,6 +430,9 @@ def _launch(
     OUT_Q,
     OUT_K,
     OUT_V,
+    WA,
+    WB,
+    DW,
     PEER_PTRS,
     STATE,
     TRACE,
@@ -395,6 +457,9 @@ def _launch(
     nt_vmcnt: fx.Constexpr[int],
     num_lead: fx.Constexpr[int],
     num_tail_pull: fx.Constexpr[int],
+    wgrad_n: fx.Constexpr[int],
+    wgrad_at: fx.Constexpr[int],
+    wgrad_bm: fx.Constexpr[int],
     trace: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
@@ -420,6 +485,9 @@ def _launch(
         bank_bytes,
         num_lead,
         num_tail_pull,
+        wgrad_n,
+        wgrad_at,
+        wgrad_bm,
         trace,
     )
     kernel(
@@ -428,6 +496,9 @@ def _launch(
         OUT_Q,
         OUT_K,
         OUT_V,
+        WA,
+        WB,
+        DW,
         PEER_PTRS,
         STATE,
         TRACE,
@@ -459,19 +530,36 @@ def ulysses_gemm_a2a(
     num_pull_cu=16,
     num_lead=None,
     num_tail_pull=16,
+    wgrad=None,
+    wgrad_at=None,
+    wgrad_bm=256,
     trace=None,
 ):
     """``a`` [M, K] this rank's tokens; ``b`` [N, K] (``nt``) or [K, N] (``nn``), columns rank-major.
 
     ``outs`` = (q, k, v) ordinary tensors ``[rows, heads, head_dim]`` with ``rows = n * M`` laid out as
     ``qkv_format`` (``sbhd``: [s, b], ``bshd``: [b, s]); a q-only output repeats one tensor.
+
+    ``wgrad=(a, wb, dw)`` also computes ``dw = a^T @ wb`` (``wb`` [M, N_w], ``dw`` [K, N_w]) in the
+    same launch, on ``wgrad_bm x 256`` tiles dispatched after GEMM tile ``wgrad_at`` (needs
+    ``K % wgrad_bm == 0``, ``N_w % 256 == 0``).
     """
     M, K = a.shape
     N = b.shape[0] if layout == "nt" else b.shape[1]
     assert a.is_contiguous() and b.is_contiguous() and all(o.is_contiguous() for o in outs)
+    if wgrad is not None:
+        wa, wb, dw = wgrad
+        assert wa is a and wb.is_contiguous() and wb.shape[0] == M
+        assert dw.is_contiguous() and tuple(dw.shape) == (K, wb.shape[1])
     if num_lead is None:
         # pull blocks dispatch once the first GEMM wave retires: nothing is ready to copy before that
         num_lead = torch.cuda.get_device_properties(a.device).multi_processor_count
+    if wgrad is None:
+        wgrad_at = 0
+    elif wgrad_at is None:
+        # behind the first GEMM waves (the pulls need their tiles first); queued last, the wgrad tiles
+        # would hold the CUs the tail pulls need and run unhidden. Swept flat over 1/16..1/4 at n = 4
+        wgrad_at = num_lead + ceildiv(M, BM) * ceildiv(N, BN) // 8
     run_launcher(
         _launch,
         a,
@@ -479,6 +567,9 @@ def ulysses_gemm_a2a(
         outs[0],
         outs[1],
         outs[2],
+        a,
+        a if wgrad is None else wgrad[1],
+        a if wgrad is None else wgrad[2],
         workspace.peer_ptrs,
         workspace.state,
         workspace.state if trace is None else trace,
@@ -503,6 +594,9 @@ def ulysses_gemm_a2a(
         3,
         num_lead,
         num_tail_pull,
+        0 if wgrad is None else wgrad[1].shape[1],
+        wgrad_at,
+        wgrad_bm,
         trace is not None,
         torch.cuda.current_stream(),
     )

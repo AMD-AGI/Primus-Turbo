@@ -251,8 +251,10 @@ def check_poisoned(group, failures, hq=32, hkv=8, d=128, b=2, s_local=300, hidde
     """Forward + backward of both ops, the banks poisoned before every call."""
     for qkv_format in ("sbhd", "bshd"):
         for it in range(2):
-            _poison_banks(group)
-            check_qkv(group, hq, hkv, d, b, s_local, hidden, qkv_format, "interleaved", 1, failures)
+            # s/n = 512: dw tiles inside the A2AGemm
+            for s in (s_local, 512):
+                _poison_banks(group)
+                check_qkv(group, hq, hkv, d, b, s, hidden, qkv_format, "interleaved", 1, failures)
             _poison_banks(group)
             check_o_gemm(group, hq, d, b, s_local, hidden, qkv_format, True, 1, failures)
 
@@ -267,14 +269,15 @@ def run_suite(quick):
     batches = [1] if quick else [1, 2]
     formats = ["sbhd"] if quick else ["sbhd", "bshd"]
     layouts = ["interleaved"] if quick else ["interleaved", "concat"]
-    # s/n = 300 is not a multiple of any tile
-    for head_name, d, b, qkv_format, weight_layout in itertools.product(
-        head_names, dims, batches, formats, layouts
+    # s/n = 300 is not a multiple of any tile (separate wgrad); 512 runs the dw tiles in the A2AGemm
+    # where the rank's QKV columns divide by 256
+    for head_name, d, b, qkv_format, weight_layout, s_local in itertools.product(
+        head_names, dims, batches, formats, layouts, [300, 512]
     ):
         hq, hkv = HEAD_CONFIGS[head_name](n)
         if hq % n or hkv % n:
             continue
-        check_qkv(group, hq, hkv, d, b, 300, 1024, qkv_format, weight_layout, 3, failures)
+        check_qkv(group, hq, hkv, d, b, s_local, 1024, qkv_format, weight_layout, 3, failures)
     for head_name, d, b, qkv_format, with_residual in itertools.product(
         head_names, dims, batches, formats, [True] if quick else [True, False]
     ):

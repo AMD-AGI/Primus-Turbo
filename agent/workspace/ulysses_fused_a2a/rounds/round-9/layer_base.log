@@ -1,0 +1,116 @@
+W1107 07:41:08.351000 509907 torch/distributed/run.py:982] 
+W1107 07:41:08.351000 509907 torch/distributed/run.py:982] *****************************************
+W1107 07:41:08.351000 509907 torch/distributed/run.py:982] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1107 07:41:08.351000 509907 torch/distributed/run.py:982] *****************************************
+W1107 07:41:10.049000 510075 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1107 07:41:10.064000 510073 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1107 07:41:10.065000 510074 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1107 07:41:10.073000 510076 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1107 07:41:10.224000 510073 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 07:41:10.224000 510073 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 07:41:10.224000 510073 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 07:41:10.224000 510073 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 07:41:10.224000 510073 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 07:41:10.224000 510073 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 07:41:10.234000 510075 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 07:41:10.235000 510075 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 07:41:10.235000 510075 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 07:41:10.235000 510075 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 07:41:10.235000 510075 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 07:41:10.235000 510075 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 07:41:10.234000 510074 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 07:41:10.235000 510074 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 07:41:10.235000 510074 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 07:41:10.235000 510074 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 07:41:10.235000 510074 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 07:41:10.235000 510074 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 07:41:10.243000 510076 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 07:41:10.244000 510076 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 07:41:10.244000 510076 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 07:41:10.244000 510076 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 07:41:10.244000 510076 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 07:41:10.244000 510076 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+
+== qwen3-30b-a3b  seq=16384  ulysses=4  mbs=1  tokens/rank=4096  mlp=True ==
+per layer, us; mean over ranks of each rank's median (max rank in brackets)
+  stage                      fwd               bwd
+  qkv_gemm           99 [   103]      263 [   268]
+  pre_pack           75 [    76]       31 [    31]
+  pre_a2a           249 [   254]      268 [   280]
+  pre_unpack         27 [    28]       52 [    53]
+  attn              517 [   550]     1482 [  1500]
+  post_pack           6 [     6]       38 [    38]
+  post_a2a          220 [   237]      237 [   266]
+  post_unpack        36 [    37]        5 [     5]
+  o_gemm             77 [    80]      141 [   148]
+  mlp               343 [   356]      740 [   766]
+  layer total               1659              3262   (max rank)
+  a2a pre  isolated     250 us  (40 MiB/rank, 126 GB/s); in-layer fwd 249 / bwd 268 us
+  a2a post isolated     212 us  (32 MiB/rank, 119 GB/s); in-layer fwd 220 / bwd 237 us
+  pack + a2a + unpack, fwd+bwd: 1244 us = 25.3% of layer (copies 271, wire 924, waiting for slower ranks 49)
+  fusion                                     kind    base   bound  copies      expected
+  fwd pre : qkv GEMM -> a2a               GemmA2A     450     202     103    157-176   
+  fwd post: a2a -> o_proj GEMM            A2AGemm     339     119      42     76-80    
+  bwd post: o_proj dgrad/wgrad -> a2a     GemmA2A     421     184      43    144-160   
+  bwd pre : a2a -> qkv dgrad/wgrad        A2AGemm     614     333      83    213-223   
+  saving per layer: bound 838 us (17.0%), expected 591-639 us (12.0%-13.0%) of 4921 us fwd+bwd; pack/unpack alone 271 us (5.5%)
+
+== fused vs unfused: qwen3-30b-a3b  seq=16384  ulysses=4  mbs=1 ==
+per layer, us; each rank's median: critical rank | mean over ranks [max rank]
+  stage                                      unfused                   fused  speedup
+  fwd QKV GEMM + a2a            445 |    450 [  460]    249 |    255 [  260]    1.79x
+  fwd a2a + o_proj GEMM         309 |    339 [  360]    221 |    258 [  282]    1.39x
+  bwd o_proj GEMM + a2a         378 |    421 [  457]    258 |    296 [  316]    1.46x
+  bwd a2a + QKV GEMM            619 |    614 [  632]    381 |    395 [  406]    1.63x
+  fwd attn                      550 |    517 [  550]    558 |    525 [  558]    0.99x
+  bwd attn                     1488 |   1482 [ 1500]   1454 |   1435 [ 1454]    1.02x
+  fwd mlp                       356 |    343 [  356]    357 |    345 [  357]    0.99x
+  bwd mlp                       766 |    740 [  766]    771 |    745 [  771]    0.99x
+  fwd layer total                               1659                    1386    1.20x   (max rank)
+  bwd layer total                               3262                    2891    1.13x   (max rank)
+
+== qwen3-30b-a3b  seq=32768  ulysses=4  mbs=1  tokens/rank=8192  mlp=True ==
+per layer, us; mean over ranks of each rank's median (max rank in brackets)
+  stage                      fwd               bwd
+  qkv_gemm          186 [   193]      457 [   470]
+  pre_pack          139 [   142]       48 [    49]
+  pre_a2a           465 [   471]      489 [   532]
+  pre_unpack         41 [    42]       88 [    90]
+  attn             2025 [  2152]     5401 [  5462]
+  post_pack           6 [     6]       68 [    69]
+  post_a2a          472 [   540]      441 [   494]
+  post_unpack        69 [    70]        5 [     5]
+  o_gemm            128 [   134]      271 [   284]
+  mlp               655 [   680]     1353 [  1406]
+  layer total               4219              8633   (max rank)
+  a2a pre  isolated     468 us  (80 MiB/rank, 134 GB/s); in-layer fwd 465 / bwd 489 us
+  a2a post isolated     383 us  (64 MiB/rank, 131 GB/s); in-layer fwd 472 / bwd 441 us
+  pack + a2a + unpack, fwd+bwd: 2333 us = 18.2% of layer (copies 466, wire 1703, waiting for slower ranks 164)
+  fusion                                     kind    base   bound  copies      expected
+  fwd pre : qkv GEMM -> a2a               GemmA2A     832     367     180    286-319   
+  fwd post: a2a -> o_proj GEMM            A2AGemm     676     204      75    130-136   
+  bwd post: o_proj dgrad/wgrad -> a2a     GemmA2A     786     345      74    269-300   
+  bwd pre : a2a -> qkv dgrad/wgrad        A2AGemm    1082     593     136    380-398   
+  saving per layer: bound 1509 us (11.7%), expected 1065-1153 us (8.3%-9.0%) of 12852 us fwd+bwd; pack/unpack alone 466 us (3.6%)
+
+== fused vs unfused: qwen3-30b-a3b  seq=32768  ulysses=4  mbs=1 ==
+per layer, us; each rank's median: critical rank | mean over ranks [max rank]
+  stage                                      unfused                   fused  speedup
+  fwd QKV GEMM + a2a            831 |    832 [  849]    449 |    460 [  470]    1.85x
+  fwd a2a + o_proj GEMM         548 |    676 [  749]    367 |    503 [  584]    1.49x
+  bwd o_proj GEMM + a2a         699 |    786 [  852]    483 |    567 [  612]    1.45x
+  bwd a2a + QKV GEMM           1032 |   1082 [ 1141]    643 |    699 [  751]    1.61x
+  fwd attn                     2152 |   2025 [ 2152]   2163 |   2030 [ 2163]    0.99x
+  bwd attn                     5462 |   5401 [ 5462]   5382 |   5318 [ 5382]    1.01x
+  fwd mlp                       680 |    655 [  680]    685 |    658 [  685]    0.99x
+  bwd mlp                      1406 |   1353 [ 1406]   1415 |   1359 [ 1415]    0.99x
+  fwd layer total                               4219                    3666    1.15x   (max rank)
+  bwd layer total                               8633                    7954    1.09x   (max rank)

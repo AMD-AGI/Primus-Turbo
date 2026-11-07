@@ -63,6 +63,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     emit_for,
     emit_if_then,
     group_m_tile_decode,
+    make_bf16_buffer_tensor_from_addr,
     make_bf16_buffer_tensor_rebased,
     make_bf16_fp16_tile_tensor,
     make_value_attrs,
@@ -155,7 +156,13 @@ def grouped_gemm_bf16_variable_k_tile(
     trans_c=False,
     lds_chunk_stride=1152,
     mask_m=None,
+    a_base=None,
+    k_hook=None,
 ):
+    """``a_base`` (i64 address) replaces ``A``'s. ``k_hook(c)`` runs on every wave before the A
+    loads of K chunk ``c`` (``CHUNK * BLOCK_K`` rows, prefetching two ``BLOCK_K`` steps ahead) and
+    ``k_hook(-1)`` before the prologue's. ``persistent="staggered"`` keeps the one-barrier offset
+    of the two wave halves and realigns them at the tile's end (cf. ``dense_mma_pipeline_bf16``)."""
     CHUNK = 4
     WGRAD_WAVES = 8  # fixed 8 waves per block
     assert BLOCK_M >= 128 and BLOCK_N >= 64 and BLOCK_M % 128 == 0 and BLOCK_N % 64 == 0
@@ -183,7 +190,10 @@ def grouped_gemm_bf16_variable_k_tile(
     b_base_off = _i64(m_start) * fx.Int64(OUT_N * 2)
     a_span = _i64(group_tokens) * _i64(out_m_rt) * fx.Int64(2)
     b_span = _i64(group_tokens) * _i64(out_n_rt) * fx.Int64(2)
-    gA = make_bf16_buffer_tensor_rebased(A, bf16_ir, a_base_off, a_span)
+    if const_expr(a_base is None):
+        gA = make_bf16_buffer_tensor_rebased(A, bf16_ir, a_base_off, a_span)
+    else:
+        gA = make_bf16_buffer_tensor_from_addr(a_base, bf16_ir, a_base_off, a_span)
     gB = make_bf16_buffer_tensor_rebased(B, bf16_ir, b_base_off, b_span)
     a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
     b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
@@ -252,12 +262,14 @@ def grouped_gemm_bf16_variable_k_tile(
     def _prologue():
         wait_barrier(0)
         b_g2s.load(lds.B_lds_cur_0, b0_off + 0 * b_k_step)
+        if const_expr(k_hook is not None):
+            k_hook(-1)
         a_g2s.load(lds.A_lds_cur_0, a0_off + 0 * a_k_step)
         b_g2s.load(lds.B_lds_cur_1, b1_off + 0 * b_k_step)
         a_g2s.load(lds.A_lds_cur_1, a1_off + 0 * a_k_step)
         # Divergent only holds for one tile per WG; a persistent loop needs every wave to
         # stop before the next tile's g2s reuses this LDS. Cf. dense_mma_pipeline_bf16.
-        if const_expr(persistent):
+        if const_expr(persistent is True):
             rocdl.s_barrier()
         elif wave_m == 1:
             rocdl.s_barrier()
@@ -279,6 +291,8 @@ def grouped_gemm_bf16_variable_k_tile(
         a_next0, a_next1 = lds.A_lds_next_0, lds.A_lds_next_1
         b_cur0, b_cur1 = lds.B_lds_cur_0, lds.B_lds_cur_1
         b_next0, b_next1 = lds.B_lds_next_0, lds.B_lds_next_1
+        if const_expr(k_hook is not None):
+            k_hook(chunk_idx)
         for j in range_constexpr(CHUNK):
             k = chunk_idx * CHUNK + j
             # 4-buffer pipelined body: interleave s2r/g2s with the 4 mfma quadrants
@@ -369,6 +383,10 @@ def grouped_gemm_bf16_variable_k_tile(
         # Both column halves share the band SRD and every row address; only the store immediate differs.
         for cfrags, q_row in (((c00, c01), base_row), ((c10, c11), base_row + LDS_BLOCK_M)):
             store_c.store_band16(cfrags, q_row, base_col, LDS_BLOCK_N, NTA16, NTB16, row_bound, mask_n=MASK_N)
+    if const_expr(persistent == "staggered"):
+        # pairs with the high half's last barrier: past it no wave reads this tile's LDS
+        if (wave_m == 0) & (group_tokens > 0):
+            rocdl.s_barrier()
 
 
 @functools.lru_cache(maxsize=64)
