@@ -565,6 +565,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
                     axis=-2,
                     block_size=config.block_size,
                     group_lens=group_lens,
+                    scaling_recipe=ScalingRecipe(),
                 )
             else:
                 assert isinstance(x_t, QuantizedTensor)

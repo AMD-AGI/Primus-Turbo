@@ -512,7 +512,20 @@ class GEMMFP8KernelDispatcher(AutoKernelDispatcher):
     @classmethod
     def make_key(cls, a, b, trans_a, trans_b, trans_c, out_dtype, granularity, **kwargs):
         m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
-        return (m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity)
+        # A forward winner may lack the beta=1 epilogue required by accumulation.
+        return (
+            m,
+            n,
+            k,
+            a.dtype,
+            b.dtype,
+            out_dtype,
+            trans_a,
+            trans_b,
+            trans_c,
+            granularity,
+            kwargs.get("inplace_add_to_out", False),
+        )
 
 
 @_torch_custom_op_wrapper("primus_turbo::gemm_fp8_impl", mutates_args=(), device_types="cuda")
