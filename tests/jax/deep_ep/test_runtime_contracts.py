@@ -8,6 +8,7 @@
 Real IPC numerical round trips remain in lax/test_*dispatch_combine.py.
 """
 
+import os
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -24,12 +25,17 @@ def clean_runtime(monkeypatch):
     dep = Mock()
     dep.is_per_process_buffer_ready.return_value = False
     monkeypatch.setattr(rt, "_get_c_deep_ep", lambda: dep)
-    monkeypatch.delenv("PRIMUS_TURBO_JAX_DEEPEP_MODE", raising=False)
+    mode_name = "PRIMUS_TURBO_JAX_DEEPEP_MODE"
+    original_mode = os.environ.get(mode_name)
+    envs.set_env(mode_name, None)
     envs.reset_cache()
     rt.reset_runtime()
-    yield dep
-    rt.reset_runtime()
-    envs.reset_cache()
+    try:
+        yield dep
+    finally:
+        rt.reset_runtime()
+        envs.set_env(mode_name, original_mode)
+        envs.reset_cache()
 
 
 @pytest.mark.parametrize(
