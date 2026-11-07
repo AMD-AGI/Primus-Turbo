@@ -8,6 +8,7 @@ import torch
 
 from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
+    check_mxfp4_support,
     check_mxfp8_support,
     float4_e2m1fn_x2,
     float8_e4m3,
@@ -62,7 +63,20 @@ def make_tensor(*, fp4=False, mx=False):
     )
 
 
-@pytest.mark.parametrize("fp4, mx", [(False, False), (False, True), (True, True)])
+@pytest.mark.parametrize(
+    "fp4, mx",
+    [
+        (False, False),
+        (False, True),
+        pytest.param(
+            True,
+            True,
+            marks=pytest.mark.skipif(
+                not check_mxfp4_support()[0], reason="MXFP4 requires supported hardware"
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("operation", ["view", "reshape"])
 def test_reshape_preserves_payload_and_scale_mapping(fp4, mx, operation):
     tensor = make_tensor(fp4=fp4, mx=mx)

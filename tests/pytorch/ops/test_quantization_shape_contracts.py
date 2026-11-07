@@ -132,3 +132,46 @@ def test_gather_fallback_matches_materialized(dtype, zero_probs, lazy_seam):
             divisor = 2 if index == 2 else 32
             a, b = a[:, : used // divisor], b[:, : used // divisor]
         torch.testing.assert_close(a, b, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("width", [1408, 2880])
+def test_fp4_dual_pitched_rows_match_hip_dequantize_and_shuffle(width):
+    from primus_turbo.pytorch.core.low_precision import ScalingGranularity, float4_e2m1fn_x2
+    from primus_turbo.pytorch.ops.quantization import dequantize_fp4, quantize_fp4_with_trans
+
+    torch.manual_seed(807)
+    x = torch.randn(256, width, device="cuda", dtype=torch.bfloat16)
+    actual = quantize_fp4_with_trans(x, float4_e2m1fn_x2, ScalingGranularity.MX_BLOCKWISE, block_size=32)
+    expected = torch.ops.primus_turbo_cpp_extension.quantize_mxfp4_dual(
+        x,
+        float4_e2m1fn_x2,
+        128,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        0,
+    )
+    for got, ref in zip(actual, expected):
+        torch.testing.assert_close(got.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0)
+    for offset, axis in [(0, 1), (2, 0)]:
+        data, scale = actual[offset : offset + 2]
+        ref_data, ref_scale = expected[offset : offset + 2]
+        assert data.is_contiguous()
+        options = dict(block_size=32, axis=axis)
+        restored = dequantize_fp4(
+            data, torch.float32, ScalingGranularity.MX_BLOCKWISE, scale_inv=scale, **options
+        )
+        reference = dequantize_fp4(
+            ref_data, torch.float32, ScalingGranularity.MX_BLOCKWISE, scale_inv=ref_scale, **options
+        )
+        torch.testing.assert_close(restored, reference, rtol=0, atol=0)
+        shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_weight(data, [16, 16])
+        ref_shuffled = torch.ops.primus_turbo_cpp_extension.shuffle_weight(ref_data, [16, 16])
+        torch.testing.assert_close(shuffled.view(torch.uint8), ref_shuffled.view(torch.uint8))
