@@ -558,8 +558,13 @@ def ulysses_gemm_a2a(
         wgrad_at = 0
     elif wgrad_at is None:
         # behind the first GEMM waves (the pulls need their tiles first); queued last, the wgrad tiles
-        # would hold the CUs the tail pulls need and run unhidden. Swept flat over 1/16..1/4 at n = 4
-        wgrad_at = num_lead + ceildiv(M, BM) * ceildiv(N, BN) // 8
+        # would hold the CUs the tail pulls need and run unhidden. Swept flat over 1/16..1/4 at n = 4.
+        # More wgrad tiles than CUs (GLM-4.7: 960, MiniMax-M2.5: 288) would delay the GEMM tiles
+        # behind them by whole waves: those go last. Qwen3-30B (128) is 13 % slower that way.
+        gemm_tiles = ceildiv(M, BM) * ceildiv(N, BN)
+        num_wtiles = K // wgrad_bm * (wgrad[1].shape[1] // 256)
+        many_wtiles = num_wtiles > torch.cuda.get_device_properties(a.device).multi_processor_count
+        wgrad_at = gemm_tiles if many_wtiles else num_lead + gemm_tiles // 8
     run_launcher(
         _launch,
         a,

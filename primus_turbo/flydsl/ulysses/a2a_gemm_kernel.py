@@ -730,7 +730,7 @@ def ulysses_a2a_gemm(
     push_split=8,
     wgrad=None,
     BMw=256,
-    wgrad_at=0,
+    wgrad_at=None,
     trace=None,
 ):
     """``o`` this rank's heads over the full sequence (``qkv_format`` row order): one ``[n * M, K_r]``
@@ -740,7 +740,8 @@ def ulysses_a2a_gemm(
     ``K = n * K_r``; ``A`` is also copied to ``o_gathered`` unless it is ``None``.
 
     ``wgrad=(x, dw)`` (``nn`` only) also computes ``dw = A^T @ x`` (``x`` ``[M, N]``, ``dw``
-    ``[K, N]``) in the same kernel, from ``BMw x 256`` tiles placed at claim position ``wgrad_at``."""
+    ``[K, N]``) in the same kernel, from ``BMw x 256`` tiles placed at claim position ``wgrad_at``
+    (default: by shape, see below)."""
     num_ranks = workspace.num_ranks
     if isinstance(o, torch.Tensor):
         head_dim = head_dim or o.shape[-1]
@@ -765,13 +766,20 @@ def ulysses_a2a_gemm(
         assert layout == "nn" and o_gathered is None
         assert xb.is_contiguous() and tuple(xb.shape) == (M, N) and dw.is_contiguous() and tuple(dw.shape) == (K, N)
         num_wtiles = K // BMw * (N // BN)
+    # Over two waves of weight-gradient tiles (GLM-4.7: 1120): taken first they fill the CUs and the
+    # GEMM tiles run after the exchange, so the GEMM goes first, keeps its 256-row tiles and gets 32
+    # pushers. Not below that: Qwen3-30B (160) and MiniMax-M2.5 (384) are slower this way.
+    many_wtiles = num_wtiles > 2 * num_cus
     if num_push is None:
-        # with weight-gradient tiles the launch is compute-bound: 16 pushers still fill the links
-        num_push = 32 if wgrad is None else 16
+        # with few weight-gradient tiles the launch is compute-bound: 16 pushers still fill the links
+        num_push = 32 if wgrad is None or many_wtiles else 16
     if BM is None:
         # 256-row tiles while every tile has a CU (the staggered K walk); otherwise 128 rows halve the
         # tail of the m-tile that lands last
-        BM = 256 if ceildiv(M, 256) * ceildiv(N, BN) + num_wtiles + num_push <= num_cus else 128
+        fits = ceildiv(M, 256) * ceildiv(N, BN) + num_wtiles + num_push <= num_cus
+        BM = 256 if fits or many_wtiles else 128
+    if wgrad_at is None:
+        wgrad_at = ceildiv(M, BM) * ceildiv(N, BN) if many_wtiles else 0
     run_launcher(
         _launch,
         oq,

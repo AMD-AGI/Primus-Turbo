@@ -285,6 +285,9 @@ def run_suite(quick):
         if hq % n:
             continue
         check_o_gemm(group, hq, d, b, 300, 1024, qkv_format, with_residual, 3, failures)
+    # GLM-4.7 widths: over two waves of dw tiles (1120 QKV, 960 o_proj) change both launch orders
+    check_qkv(group, 96, 8, 128, 1, 512, 5120, "sbhd", "interleaved", 2, failures)
+    check_o_gemm(group, 96, 128, 1, 512, 5120, "sbhd", True, 2, failures)
     check_scenarios(group, failures)
     check_poisoned(group, failures)
 
