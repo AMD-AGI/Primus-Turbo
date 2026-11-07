@@ -43,7 +43,11 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from primus_turbo.pytorch.ops import flash_attn_func
-from primus_turbo.pytorch.ops.attention.mega_attn import mega_attn_func, ulysses_qkv_attn_func
+from primus_turbo.pytorch.ops.attention.mega_attn import (
+    mega_attn_func,
+    ulysses_attn_layer_func,
+    ulysses_qkv_attn_func,
+)
 from primus_turbo.pytorch.ops.attention.ulysses_fused_a2a import (
     ulysses_a2a_o_gemm,
     ulysses_qkv_gemm_a2a,
@@ -222,6 +226,7 @@ class UlyssesLayer:
         self.cfg, self.mbs, self.group, self.use_mlp, self.fused = cfg, mbs, group, use_mlp, fused
         self.seq_chunk, self.persistent_attn = seq_chunk, persistent_attn
         self.mega_fwd = False
+        self.mega_layer = False
         self.s_local = seq // n
         hidden, hq, hkv, d = cfg["hidden"], cfg["hq"], cfg["hkv"], cfg["d"]
 
@@ -244,7 +249,13 @@ class UlyssesLayer:
         hq, hkv, d = cfg["hq"], cfg["hkv"], cfg["d"]
 
         x = mark("start", "qkv_gemm", x)
-        if self.mega_fwd:
+        if self.mega_layer:
+            # one kernel through o_proj: the fwd "o_gemm" stage is the whole attention layer, the bwd
+            # "qkv_gemm" stage its whole backward
+            y = ulysses_attn_layer_func(
+                x, self.w_qkv, self.w_o, x, hq, hkv, d, self.group, "bshd", self.seq_chunk
+            )
+        elif self.mega_fwd:
             # one kernel: the fwd "attn" stage includes the QKV projection, the bwd "qkv_gemm" stage
             # the attention backward
             o = ulysses_qkv_attn_func(x, self.w_qkv, hq, hkv, d, self.group, "bshd", self.seq_chunk)
@@ -260,14 +271,16 @@ class UlyssesLayer:
             q, k, v = mark("qkv_gemm", None, q, k, v)
             q, k, v = _PreA2A.apply(q, k, v, self.helper, self.group)
             q, k, v = mark(None, "attn", q, k, v)
-        if self.mega_fwd:
+        if self.mega_fwd or self.mega_layer:
             pass
         elif self.persistent_attn:
             assert b == 1 and cfg["causal"], "the persistent attention takes [b, s] as an sbhd view: b = 1"
             o = mega_attn_func(*(t.permute(1, 0, 2, 3) for t in (q, k, v))).permute(1, 0, 2, 3)
         else:
             o = flash_attn_func(q, k, v, causal=cfg["causal"])
-        if self.fused:
+        if self.mega_layer:
+            pass
+        elif self.fused:
             o = mark("attn", "o_gemm", o)
             y = ulysses_a2a_o_gemm(o, self.w_o, x, self.group, "bshd", self.seq_chunk)
         else:
@@ -330,6 +343,7 @@ def run_config(
     seq_chunk=0,
     persistent_attn=False,
     mega_fwd=False,
+    mega_layer=False,
 ):
     cfg = MODEL_PARAMS_TABLE[model]
     n = group.size()
@@ -338,6 +352,7 @@ def run_config(
 
     layer = UlyssesLayer(cfg, seq, mbs, group, use_mlp, fused, seq_chunk, persistent_attn)
     layer.mega_fwd = mega_fwd
+    layer.mega_layer = mega_layer
     x0 = torch.randn(mbs, seq // n, cfg["hidden"], device="cuda", dtype=torch.bfloat16)
     dy = torch.randn_like(x0)
 
@@ -361,6 +376,11 @@ def run_config(
     keys = [(phase, st) for phase in ("fwd", "bwd") for st in STAGES if st in per_iter[phase][0]]
     local = [statistics.median(d[st] for d in per_iter[phase]) for phase, st in keys]
     local_totals = [statistics.median(sum(d.values()) for d in per_iter[phase]) for phase in ("fwd", "bwd")]
+    # fwd + bwd of the same iteration on one rank: a rank that finishes fwd early waits in bwd, so the
+    # max-rank fwd and bwd above can come from different ranks and double count that wait
+    local_totals.append(
+        statistics.median(sum(f.values()) + sum(b.values()) for f, b in zip(per_iter["fwd"], per_iter["bwd"]))
+    )
 
     tokens = mbs * seq // n
     iso_local = [
@@ -394,7 +414,7 @@ def run_config(
     return (
         stages,
         stages_max,
-        {"fwd": totals[0], "bwd": totals[1]},
+        {"fwd": totals[0], "bwd": totals[1], "step": totals[2]},
         {"pre": iso[0], "post": iso[1]},
         stage_crit,
     )
@@ -523,6 +543,9 @@ def report_fused(model, seq, mbs, n, base, fused):
             f"  {phase + ' layer total':<26}{b_tot:>24.0f}{f_tot:>24.0f}{b_tot / f_tot:>8.2f}x   (max rank)"
         )
         row.update({f"{phase}_total_unfused_us": round(b_tot, 1), f"{phase}_total_fused_us": round(f_tot, 1)})
+    b_step, f_step = base[2]["step"], fused[2]["step"]
+    print(f"  {'fwd+bwd per rank':<26}{b_step:>24.0f}{f_step:>24.0f}{b_step / f_step:>8.2f}x   (max rank)")
+    row.update({"step_unfused_us": round(b_step, 1), "step_fused_us": round(f_step, 1)})
     return row
 
 
@@ -548,6 +571,11 @@ def main():
     )
     parser.add_argument(
         "--mega-fwd", action="store_true", help="fused layer: QKV GemmA2A + attention forward in one kernel"
+    )
+    parser.add_argument(
+        "--mega-layer",
+        action="store_true",
+        help="fused layer: QKV GemmA2A + attention + A2AGemm o_proj forward in one kernel",
     )
     args = parser.parse_args()
 
@@ -577,6 +605,7 @@ def main():
                     seq_chunk=args.seq_chunk,
                     persistent_attn=args.persistent_attn,
                     mega_fwd=args.mega_fwd,
+                    mega_layer=args.mega_layer,
                 )
             if rank == 0:
                 row = report(model, seq, args.mbs, n, not args.no_mlp, stages, stages_max, totals, iso)

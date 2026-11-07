@@ -16,6 +16,14 @@ and pull block, so none of them holds a CU that a producer still needs.
 With a striped sequence split the pull units arrive m-major, i.e. in sequence order, so the prefix a
 q block needs is complete early for small q blocks: workers take a short ascending run of q blocks
 (they overlap the exchange tail), then the rest longest first.
+
+With ``o_proj``, the reverse exchange and the output projection follow in the same launch (A2AGemm,
+push mode): a worker pushes each finished O tile (128 rows of its head group) into the recv bank of
+the rank owning those tokens and raises that rank's flag ``(m-tile, src, head group)``. Once the
+attention items are all claimed, the claim counter continues over the o_proj GEMM tiles; a tile waits
+for the flags of its m-tile from every source and head group, then keeps the gathered O for the weight
+gradient and runs ``y = O @ w_o^T + residual``. Every attention item is claimed by a running worker
+before any worker waits on an o_proj flag, so the wait cannot deadlock.
 """
 
 import functools
@@ -25,7 +33,7 @@ import flydsl.expr as fx
 import torch
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith
+from flydsl.expr import arith, const_expr
 
 from primus_turbo.flydsl.attention.flash_attn_fwd import (
     DUALWAVE_SWP_COMPILE_HINTS,
@@ -38,20 +46,25 @@ from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
     gemm_bf16_tile,
 )
 from primus_turbo.flydsl.mega_attn.attn_fwd_persistent import make_traits
+from primus_turbo.flydsl.ulysses.a2a_gemm_kernel import _copy_rows, _residual_store_c
 from primus_turbo.flydsl.ulysses.common import (
     BLOCK_THREADS,
     SPIN_TIMEOUT,
     STATE_TILE,
     SYS_NT,
+    VEC_BF16,
+    VEC_I32,
     claim_unit,
     exit_and_bump_epoch,
     i64_base,
+    spin_flags,
 )
 from primus_turbo.flydsl.ulysses.gemm_a2a_kernel import _pull_unit
 from primus_turbo.flydsl.ulysses.workspace import (
     FLAG_BYTES,
     FLAG_REGION_BYTES,
     FLAGS_PER_REGION,
+    REGION_MEGA_O_PUSH,
     REGION_QKV_GEMM_A2A,
     REGION_QKV_READY,
 )
@@ -59,15 +72,28 @@ from primus_turbo.flydsl.utils.attn_helper import (
     DualwaveKernelContext,
     dtype_to_elem_type,
 )
-from primus_turbo.flydsl.utils.buffer_ops import create_buffer_resource
+from primus_turbo.flydsl.utils.buffer_ops import (
+    create_buffer_resource,
+    create_buffer_resource_from_addr,
+)
 from primus_turbo.flydsl.utils.gemm_helper import make_bf16_fp16_tile_tensor
 from primus_turbo.flydsl.utils.prims import (
     ceildiv,
     ld,
+    memory_fence,
     read_clock,
     spin_timed_out,
     st,
 )
+
+O_BM = 128
+O_BN = 256
+
+
+def qkv_attn_bank_bytes(M, N_qkv, K_o=0, BM=128):
+    """Bank bytes: the QKV staging tile rows, then (``K_o > 0``) the o_proj recv rows."""
+    stage = ceildiv(M, BM) * BM * N_qkv * 2
+    return stage + ceildiv(M, O_BM) * O_BM * K_o * 2
 
 
 @ASTRewriter.transform
@@ -121,35 +147,178 @@ def _wait_ready(thread_index, ready_base, num_flags, epoch, rank):
 
 
 @ASTRewriter.transform
-def _attn_loop(thread_index, state_base, claim_slot, ready_base, epoch, run_tile, trace_base, **c):
+def _push_o(thread_index, qb, h, peers_base, recv_offset, o_res, epoch, **c):
+    """O rows of q block ``qb`` for work-item head group ``h`` into the owner's recv bank (this rank's
+    column block, head order), then the owner's flag ``(m-tile, rank, h)``."""
+    bm, cs, n, rank, hg = c["block_m"], c["seq_chunk"], c["num_ranks"], c["rank"], c["head_groups"]
+    d, hq_r, K_o = c["head_dim"], c["hq_r"], c["K_o"]
+    # O is written by this CU's tile stores: drop stale L1 lines before reading it back
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    memory_fence(order="acquire", scope="agent")
+    pos0 = qb * fx.Int32(bm)
+    chunk = pos0 // fx.Int32(cs)
+    owner = chunk % fx.Int32(n)
+    t0 = chunk // fx.Int32(n) * fx.Int32(cs) + pos0 % fx.Int32(cs)
+    owner_heap = ld(peers_base, owner, dtype=fx.T.i64)
+    recv_res = create_buffer_resource_from_addr(
+        owner_heap + recv_offset, num_records_bytes=c["M_pad_o"] * K_o * 2
+    )
+    vecs_per_row = c["heads_per_wg"] * d // VEC_BF16
+    head0 = (h % fx.Int32(c["hkv_r"])) * fx.Int32(hq_r // c["hkv_r"]) + h // fx.Int32(c["hkv_r"]) * fx.Int32(
+        c["heads_per_wg"]
+    )
+    src_col0 = head0 * fx.Int32(d // VEC_BF16)
+    dst_col0 = fx.Int32(rank * hq_r * d // VEC_BF16) + src_col0
+
+    def coords(v):
+        r = v // fx.Int32(vecs_per_row)
+        col = v % fx.Int32(vecs_per_row)
+        src_word = ((pos0 + r) * fx.Int32(hq_r * d // VEC_BF16) + src_col0 + col) * fx.Int32(VEC_I32)
+        dst_word = ((t0 + r) * fx.Int32(K_o // VEC_BF16) + dst_col0 + col) * fx.Int32(VEC_I32)
+        return src_word, dst_word, r < fx.Int32(bm)
+
+    _copy_rows(thread_index, bm * vecs_per_row, coords, o_res, recv_res, 0, SYS_NT)
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    if thread_index == fx.Int32(0):
+        flag_base = owner_heap + fx.Int64(REGION_MEGA_O_PUSH * FLAG_REGION_BYTES)
+        slot = t0 // fx.Int32(bm) * fx.Int32(n * hg) + fx.Int32(rank * hg) + h
+        st(flag_base, slot, epoch, scope="sys", order="release")
+
+
+@ASTRewriter.transform
+def _o_tile(thread_index, j, flag_base, recv_addr, W_O, Y, RES, OG, gemm_lds, epoch, **c):
+    """o_proj tile ``j``: m-tiles in the order their attention rows finish (``o_ascending`` in sequence
+    order, then from the end), n fastest."""
+    M, K_o, N_o, n_tiles = c["seq_local"], c["K_o"], c["N_o"], c["n_tiles_o"]
+    m_tiles, asc, slots_per_tile = c["m_tiles_o"], c["o_ascending"], c["num_ranks"] * c["head_groups"]
+    k = j // fx.Int32(n_tiles)
+    tile_m = arith.select(k < fx.Int32(asc), k, fx.Int32(m_tiles - 1 + asc) - k)
+    tile_n = j % fx.Int32(n_tiles)
+    if thread_index == fx.Int32(0):
+        slots = [tile_m * fx.Int32(slots_per_tile) + fx.Int32(i) for i in range(slots_per_tile)]
+        spin_flags(flag_base, slots, epoch, c["rank"], -1, "mega_attn o_proj")
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    # recv rows are rewritten by peers every 2 epochs: drop what this CU / XCD still caches of them
+    memory_fence(order="acquire", scope="sys")
+    if const_expr(c["save_o"]):
+        recv_res = create_buffer_resource_from_addr(recv_addr, num_records_bytes=c["M_pad_o"] * K_o * 2)
+        og_res = create_buffer_resource(OG, num_records_bytes=M * K_o * 2)
+        og_vecs_per_row = K_o // VEC_BF16
+        og_chunk = ceildiv(og_vecs_per_row, n_tiles)
+
+        def og_coords(v):
+            r = v // fx.Int32(og_chunk)
+            t = tile_m * fx.Int32(O_BM) + r
+            col = tile_n * fx.Int32(og_chunk) + v % fx.Int32(og_chunk)
+            word = (t * fx.Int32(og_vecs_per_row) + col) * fx.Int32(VEC_I32)
+            return word, word, (r < fx.Int32(O_BM)) & (t < fx.Int32(M)) & (col < fx.Int32(og_vecs_per_row))
+
+        _copy_rows(thread_index, O_BM * og_chunk, og_coords, recv_res, og_res, SYS_NT, 0)
+    gemm_bf16_tile(
+        "nt",
+        make_bf16_fp16_tile_tensor(recv_addr, fx.Int64(0), c["M_pad_o"] * K_o),
+        make_bf16_fp16_tile_tensor(i64_base(W_O), fx.Int64(0), K_o * N_o),
+        make_bf16_fp16_tile_tensor(i64_base(Y), fx.Int64(0), M * N_o),
+        fx.Int32(M),
+        fx.Int32(N_o),
+        gemm_lds,
+        tile_m,
+        tile_n,
+        K=K_o,
+        BLOCK_M=O_BM,
+        BLOCK_N=O_BN,
+        out_fp16=False,
+        nt_vmcnt=3,
+        n_tail=0,
+        persistent="staggered",
+        pair_n=True,
+        store_c_cls=_residual_store_c(RES),
+    )
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+
+
+@ASTRewriter.transform
+def _attn_loop(
+    thread_index,
+    state_base,
+    claim_slot,
+    ready_base,
+    epoch,
+    run_tile,
+    trace_base,
+    o_args=None,
+    **c,
+):
     """Claim ``(head group, q block)`` items: ``num_ascending`` q blocks in sequence order, then the
-    rest longest first; wait for the KV prefix of each, then run its tile."""
+    rest longest first; wait for the KV prefix of each, then run its tile. With ``o_args`` push each
+    O tile, then continue over the o_proj tiles."""
     nqb, hg = c["num_q_blocks"], c["head_groups"]
     num_units = nqb * hg
+    num_claims = num_units + (c["n_tiles_o"] * c["m_tiles_o"] if o_args is not None else 0)
     span = c["seq_chunk"] * c["num_ranks"]
     unit = claim_unit(thread_index, state_base, claim_slot, counter=STATE_TILE)
-    while unit < fx.Int32(num_units):
-        k = unit // fx.Int32(hg)
-        asc = k < fx.Int32(c["num_ascending"])
-        qb = arith.select(asc, k, fx.Int32(nqb - 1 + c["num_ascending"]) - k)
-        q_end = (qb + fx.Int32(1)) * fx.Int32(c["block_m"])
-        # local tokens of every source rank that the prefix [0, q_end) can touch
-        local = (q_end + fx.Int32(span - 1)) // fx.Int32(span) * fx.Int32(c["seq_chunk"])
-        local = arith.select(local < fx.Int32(c["seq_local"]), local, fx.Int32(c["seq_local"]))
-        m_need = (local + fx.Int32(c["BM"] - 1)) // fx.Int32(c["BM"])
-        if const_expr(trace_base is not None):
-            if thread_index == fx.Int32(0):
-                st(trace_base, fx.Int32(c["trace_attn_at"]) + unit * fx.Int32(3), read_clock())
-        _wait_ready(thread_index, ready_base, m_need * fx.Int32(c["num_ranks"]), epoch, c["rank"])
-        if const_expr(trace_base is not None):
-            if thread_index == fx.Int32(0):
-                st(trace_base, fx.Int32(c["trace_attn_at"]) + unit * fx.Int32(3) + fx.Int32(1), read_clock())
-        run_tile((unit % fx.Int32(hg), fx.Int32(nqb - 1) - qb, fx.Int32(0)))
-        if const_expr(trace_base is not None):
-            fx.rocdl.s_waitcnt(0)
-            fx.gpu.barrier()
-            if thread_index == fx.Int32(0):
-                st(trace_base, fx.Int32(c["trace_attn_at"]) + unit * fx.Int32(3) + fx.Int32(2), read_clock())
+    while unit < fx.Int32(num_claims):
+        if unit < fx.Int32(num_units):
+            k = unit // fx.Int32(hg)
+            asc = k < fx.Int32(c["num_ascending"])
+            qb = arith.select(asc, k, fx.Int32(nqb - 1 + c["num_ascending"]) - k)
+            q_end = (qb + fx.Int32(1)) * fx.Int32(c["block_m"])
+            # local tokens of every source rank that the prefix [0, q_end) can touch
+            local = (q_end + fx.Int32(span - 1)) // fx.Int32(span) * fx.Int32(c["seq_chunk"])
+            local = arith.select(local < fx.Int32(c["seq_local"]), local, fx.Int32(c["seq_local"]))
+            m_need = (local + fx.Int32(c["BM"] - 1)) // fx.Int32(c["BM"])
+            if const_expr(trace_base is not None):
+                if thread_index == fx.Int32(0):
+                    st(trace_base, fx.Int32(c["trace_attn_at"]) + unit * fx.Int32(3), read_clock())
+            _wait_ready(thread_index, ready_base, m_need * fx.Int32(c["num_ranks"]), epoch, c["rank"])
+            if const_expr(trace_base is not None):
+                if thread_index == fx.Int32(0):
+                    st(
+                        trace_base,
+                        fx.Int32(c["trace_attn_at"]) + unit * fx.Int32(3) + fx.Int32(1),
+                        read_clock(),
+                    )
+            h = unit % fx.Int32(hg)
+            run_tile((h, fx.Int32(nqb - 1) - qb, fx.Int32(0)))
+            if const_expr(o_args is not None):
+                _push_o(
+                    thread_index,
+                    qb,
+                    h,
+                    o_args["peers_base"],
+                    o_args["recv_offset"],
+                    o_args["o_res"],
+                    epoch,
+                    **c,
+                )
+            if const_expr(trace_base is not None):
+                fx.rocdl.s_waitcnt(0)
+                fx.gpu.barrier()
+                if thread_index == fx.Int32(0):
+                    st(
+                        trace_base,
+                        fx.Int32(c["trace_attn_at"]) + unit * fx.Int32(3) + fx.Int32(2),
+                        read_clock(),
+                    )
+        else:
+            if const_expr(o_args is not None):
+                _o_tile(
+                    thread_index,
+                    unit - fx.Int32(num_units),
+                    o_args["flag_base"],
+                    o_args["recv_addr"],
+                    o_args["W_O"],
+                    o_args["Y"],
+                    o_args["RES"],
+                    o_args["OG"],
+                    o_args["gemm_lds"],
+                    epoch,
+                    **c,
+                )
         unit = claim_unit(thread_index, state_base, claim_slot, counter=STATE_TILE)
 
 
@@ -173,6 +342,8 @@ def _make_kernel(
     seq_chunk,
     bank_bytes,
     num_ascending,
+    N_o=0,
+    save_o=False,
     trace=False,
 ):
     hq, hkv = G * nq, G
@@ -233,17 +404,41 @@ def _make_kernel(
     # debug timeline (s_memrealtime): GEMM tile end, pull unit end, then [claim, ready, end] per attention item
     trace_pull_at = num_gemm_tiles
     trace_attn_at = trace_pull_at + m_tiles * num_ranks
+    chunk = seq_chunk if seq_chunk else seq_local
+    head_groups = hq // traits.Q_HEADS_PER_WG
+    o_proj = N_o > 0
+    K_o = num_ranks * hq * head_dim
+    m_tiles_o = ceildiv(seq_local, O_BM)
+    M_pad_o = m_tiles_o * O_BM
+    stage_bytes = M_pad * N * 2
+    if o_proj:
+        assert traits.BLOCK_M == O_BM and chunk % O_BM == 0, "o_proj push: whole q blocks per sequence chunk"
+        assert N_o % O_BN == 0, "the residual epilogue needs N_o % 256 == 0"
+        assert m_tiles_o * num_ranks * head_groups <= FLAGS_PER_REGION
+        assert M_pad_o * K_o < 2**31 and N_o * K_o < 2**31 and seq * hq * head_dim < 2**31
+        assert stage_bytes + M_pad_o * K_o * 2 <= bank_bytes
     attn_consts = dict(
         trace_attn_at=trace_attn_at,
         num_q_blocks=num_q_blocks,
-        head_groups=hq // traits.Q_HEADS_PER_WG,
+        head_groups=head_groups,
         num_ascending=num_ascending,
         block_m=traits.BLOCK_M,
         seq_local=seq_local,
-        seq_chunk=seq_chunk if seq_chunk else seq_local,
+        seq_chunk=chunk,
         num_ranks=num_ranks,
         BM=BM,
         rank=rank,
+        head_dim=head_dim,
+        hq_r=hq,
+        hkv_r=hkv,
+        heads_per_wg=traits.Q_HEADS_PER_WG,
+        K_o=K_o,
+        N_o=N_o,
+        M_pad_o=M_pad_o,
+        m_tiles_o=m_tiles_o,
+        n_tiles_o=N_o // O_BN,
+        o_ascending=num_ascending // num_ranks,
+        save_o=save_o,
     )
 
     @flyc.kernel(name="mega_attn_qkv_attn_kernel", known_block_size=[BLOCK_THREADS, 1, 1])
@@ -255,6 +450,10 @@ def _make_kernel(
         OUT_V: fx.Tensor,
         O: fx.Tensor,  # noqa: E741
         LSE: fx.Tensor,
+        W_O: fx.Tensor,
+        RES: fx.Tensor,
+        Y: fx.Tensor,
+        OG: fx.Tensor,
         PEER_PTRS: fx.Tensor,
         STATE: fx.Tensor,
         TRACE: fx.Tensor,
@@ -296,8 +495,31 @@ def _make_kernel(
             attn_tile(ctx)
 
         if block_index >= fx.Int32(first_attn):
+            o_args = None
+            if const_expr(o_proj):
+                recv_offset = bank_offset + fx.Int64(stage_bytes)
+                o_args = dict(
+                    peers_base=peers_base,
+                    recv_offset=recv_offset,
+                    o_res=create_buffer_resource(O, num_records_bytes=seq * hq * head_dim * 2),
+                    flag_base=my_base + fx.Int64(REGION_MEGA_O_PUSH * FLAG_REGION_BYTES),
+                    recv_addr=my_base + recv_offset,
+                    W_O=W_O,
+                    Y=Y,
+                    RES=RES,
+                    OG=OG,
+                    gemm_lds=gemm_lds,
+                )
             _attn_loop(
-                thread_index, state_base, claim_slot, ready_base, epoch, run_tile, trace_base, **attn_consts
+                thread_index,
+                state_base,
+                claim_slot,
+                ready_base,
+                epoch,
+                run_tile,
+                trace_base,
+                o_args,
+                **attn_consts,
             )
         else:
             is_pull = (
@@ -381,6 +603,10 @@ def _launch(
     OUT_V,
     O,  # noqa: E741
     LSE,
+    W_O,
+    RES,
+    Y,
+    OG,
     PEER_PTRS,
     STATE,
     TRACE,
@@ -402,6 +628,8 @@ def _launch(
     seq_chunk: fx.Constexpr[int],
     bank_bytes: fx.Constexpr[int],
     num_ascending: fx.Constexpr[int],
+    N_o: fx.Constexpr[int],
+    save_o: fx.Constexpr[bool],
     trace: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
@@ -424,11 +652,13 @@ def _launch(
         seq_chunk,
         bank_bytes,
         num_ascending,
+        N_o,
+        save_o,
         trace,
     )
-    kernel(A, B, OUT_Q, OUT_K, OUT_V, O, LSE, PEER_PTRS, STATE, TRACE, value_attrs=value_attrs).launch(
-        grid=(grid, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream
-    )
+    kernel(
+        A, B, OUT_Q, OUT_K, OUT_V, O, LSE, W_O, RES, Y, OG, PEER_PTRS, STATE, TRACE, value_attrs=value_attrs
+    ).launch(grid=(grid, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
 
 
 def ulysses_qkv_attn(
@@ -446,6 +676,10 @@ def ulysses_qkv_attn(
     nq,
     seq_local,
     seq_chunk,
+    w_o=None,
+    residual=None,
+    y=None,
+    o_gathered=None,
     BM=128,
     BN=256,
     num_pull_cu=24,
@@ -455,13 +689,27 @@ def ulysses_qkv_attn(
 ):
     """``a`` [M, K] this rank's tokens (batch 1), ``w`` [N, K] interleaved QKV rows (``groups`` kv heads
     of this rank, ``nq`` q heads each). Writes q / k / v ``[n * M, h, d]`` (sequence order) and the causal
-    attention output ``o`` (like ``q``) with its LSE ``[n * M, hq]`` fp32."""
+    attention output ``o`` (like ``q``) with its LSE ``[n * M, hq]`` fp32.
+
+    With ``w_o`` [N_o, n * hq * d]: also ``y = O_gathered @ w_o^T + residual`` ([M, N_o]) for this rank's
+    tokens, and the gathered O ``[M, n * hq * d]`` into ``o_gathered`` unless it is ``None``. The bank
+    must hold ``qkv_attn_bank_bytes(M, N, n * hq * d)``."""
     M, K = a.shape
     N = w.shape[0]
     assert all(t.is_contiguous() for t in (a, w, q, k, v, o, lse))
+    N_o = 0
+    if w_o is not None:
+        N_o = w_o.shape[0]
+        assert w_o.shape[1] == workspace.num_ranks * o.shape[-2] * head_dim
+        assert tuple(y.shape) == (M, N_o) and tuple(residual.shape) == (M, N_o)
+        assert all(t.is_contiguous() for t in (w_o, y, residual))
+        assert o_gathered is None or (
+            o_gathered.is_contiguous() and tuple(o_gathered.shape) == (M, w_o.shape[1])
+        )
     num_cus = torch.cuda.get_device_properties(a.device).multi_processor_count
     if num_ascending is None:
         num_ascending = ceildiv(seq_local * workspace.num_ranks, 128) // 2
+    dummy = workspace.state
     with CompilationContext.compile_hints(DUALWAVE_SWP_COMPILE_HINTS):
         run_launcher(
             _launch,
@@ -472,6 +720,10 @@ def ulysses_qkv_attn(
             v,
             o,
             lse,
+            dummy if w_o is None else w_o,
+            dummy if residual is None else residual,
+            dummy if y is None else y,
+            dummy if o_gathered is None else o_gathered,
             workspace.peer_ptrs,
             workspace.state,
             workspace.state if trace is None else trace,
@@ -493,6 +745,8 @@ def ulysses_qkv_attn(
             seq_chunk,
             workspace.bank_bytes,
             num_ascending,
+            N_o,
+            o_gathered is not None,
             trace is not None,
             torch.cuda.current_stream(),
         )

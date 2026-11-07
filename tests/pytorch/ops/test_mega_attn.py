@@ -5,9 +5,11 @@
 ###############################################################################
 
 """MegaAttn ops against the unfused fused-a2a path they replace: ``ulysses_qkv_attn_func`` =
-``ulysses_qkv_gemm_a2a`` + ``flash_attn_func``. The forward runs the same tiles in the same order and the
+``ulysses_qkv_gemm_a2a`` + ``flash_attn_func``, ``ulysses_attn_layer_func`` = that + ``ulysses_a2a_o_gemm``.
+The forward runs the same tiles in the same order and the
 backward the same kernels, so with the deterministic attention backward (no dQ atomics) everything is
-bitwise equal. The default (atomic dQ) backward differs run to run in either path; it only has to run.
+bitwise equal (the layer output ``y`` within bf16 rounding: its GEMM tiles differ from the A2AGemm's).
+The default (atomic dQ) backward differs run to run in either path; it only has to run.
 
     pytest tests/pytorch/ops/test_mega_attn.py --dist-only
     torchrun --nproc_per_node 4 tests/pytorch/ops/test_mega_attn.py
@@ -67,16 +69,52 @@ def check_qkv_attn(group, hq, hkv, d, s_local, hidden, qkv_format, seq_chunk, re
             failures.append(f"{tag} call {it} dx (atomic dQ): not finite")
 
 
-def run_suite():
+def check_layer(group, hq, hkv, d, s_local, hidden, qkv_format, seq_chunk, repeats, failures):
+    from primus_turbo.pytorch.ops.attention.mega_attn import ulysses_attn_layer_func
+    from primus_turbo.pytorch.ops.attention.ulysses_fused_a2a import ulysses_a2a_o_gemm
+
+    rank = group.rank()
+    tag = f"[layer hq={hq} hkv={hkv} s/n={s_local} {qkv_format} chunk={seq_chunk}]"
+    w = _randn((hq + 2 * hkv) * d, hidden, seed=11, scale=0.02).requires_grad_()
+    w_o = _randn(hidden, hq * d, seed=12, scale=0.02).requires_grad_()
+    shape = (s_local, 1, hidden) if qkv_format == "sbhd" else (1, s_local, hidden)
+    for it in range(repeats):
+        x = _randn(*shape, seed=100 * it + rank).requires_grad_()
+        res = _randn(*shape, seed=300 * it + rank).requires_grad_()
+        y = ulysses_attn_layer_func(
+            x, w, w_o, res, hq, hkv, d, group, qkv_format, seq_chunk, deterministic=True
+        )
+        dy = _randn(*y.shape, seed=200 * it + rank)
+        grads = torch.autograd.grad(y, (x, w, w_o, res), dy)
+        o_ref = _reference(x, w, hq, hkv, d, group, qkv_format, seq_chunk)
+        y_ref = ulysses_a2a_o_gemm(o_ref, w_o, res, group, qkv_format, seq_chunk)
+        grads_ref = torch.autograd.grad(y_ref, (x, w, w_o, res), dy)
+        if y.shape != y_ref.shape or not torch.allclose(y.float(), y_ref.float(), atol=2e-2, rtol=2e-2):
+            diff = (y.float() - y_ref.float()).abs().max().item() if y.shape == y_ref.shape else "shape"
+            failures.append(f"{tag} call {it} y: max abs diff {diff}")
+        for name, out, ref in zip(("dx", "dw", "dw_o", "dres"), grads, grads_ref):
+            if out.shape != ref.shape or not torch.equal(out, ref):
+                diff = (out.float() - ref.float()).abs().max().item() if out.shape == ref.shape else "shape"
+                failures.append(f"{tag} call {it} {name}: not bitwise, max abs diff {diff}")
+        y = ulysses_attn_layer_func(x, w, w_o, res, hq, hkv, d, group, qkv_format, seq_chunk)
+        (dx,) = torch.autograd.grad(y, (x,), dy)
+        if not torch.isfinite(dx).all():
+            failures.append(f"{tag} call {it} dx (atomic dQ): not finite")
+
+
+def run_suite(layer_only=False):
     group = dist.group.WORLD
     n, rank = group.size(), group.rank()
     failures = []
     for make in HEAD_CONFIGS:
         hq, hkv = make(n)
         for qkv_format in ("sbhd", "bshd"):
-            # s/n = 1024 in chunks of 256; s/n = 1000 in chunks of 200 (no tile multiple); contiguous
-            for s_local, seq_chunk in ((1024, 256), (1000, 200), (1024, 0)):
-                check_qkv_attn(group, hq, hkv, 128, s_local, 1024, qkv_format, seq_chunk, 2, failures)
+            if not layer_only:
+                # s/n = 1024 in chunks of 256; s/n = 1000 in chunks of 200 (no tile multiple); contiguous
+                for s_local, seq_chunk in ((1024, 256), (1000, 200), (1024, 0)):
+                    check_qkv_attn(group, hq, hkv, 128, s_local, 1024, qkv_format, seq_chunk, 2, failures)
+            for s_local, seq_chunk in ((1024, 256), (1024, 128), (1024, 0)):
+                check_layer(group, hq, hkv, 128, s_local, 1024, qkv_format, seq_chunk, 2, failures)
     gathered = [None] * n
     dist.all_gather_object(gathered, failures, group=group)
     if rank == 0:
@@ -88,7 +126,7 @@ def run_suite():
 def main():
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
     dist.init_process_group("nccl", timeout=timedelta(minutes=10))
-    ok = run_suite()
+    ok = run_suite(layer_only=os.environ.get("MEGA_ATTN_LAYER_ONLY") == "1")
     dist.barrier()
     dist.destroy_process_group()
     sys.exit(0 if ok else 1)

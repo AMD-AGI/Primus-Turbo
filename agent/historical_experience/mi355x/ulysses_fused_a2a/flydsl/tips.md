@@ -36,3 +36,6 @@
 
 - Mega fwd (QKV GemmA2A + attention in one grid): the gain is bounded by the exchange tail *after* the GEMM tiles end (16K: ~60 us, 32K: ~15 us) — the FlyDSL GemmA2A GEMM is the long pole. Claim order matters: too few ascending q blocks and workers grab LPT items that need the whole sequence and spin; nqb/2 was best at 16K and 32K.
 - `s_memrealtime` traces across ranks are only meaningful if launches are aligned; after `dist.barrier()` host skew can still be ms — trust rank 0 or sync + back-to-back launches.
+
+- Layer metric caveat: "max-rank fwd + max-rank bwd" double counts rank skew at the fwd/bwd boundary (an early rank waits in the first bwd exchange). A change that makes fwd end unevenly shows up as a bwd regression with unchanged bwd kernels; check the bench's "fwd+bwd per rank" line.
+- Mega fwd v2 push: an attention worker can push its own O tile (128 rows x head group, 64 KB) to the owner's recv bank right after the tile — ~no cost vs dedicated push CUs; read O back after `s_waitcnt(0)` + barrier + agent acquire fence (stale L1). The o_proj tiles can share the attention claim counter: they are only claimed after every attention item is held by a running worker, so the cross-rank waits cannot deadlock.
