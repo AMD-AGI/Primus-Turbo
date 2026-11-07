@@ -111,6 +111,15 @@ grid 的排列顺序是：`num_lead` 个 GEMM block（默认 = CU 数，即第�
 
 <!-- RESULTS -->
 
+### 端到端训练
+
+Primus / Megatron 预训练 Qwen3-30B-A3B，1×8 MI355X，TP=1，CP=4（Ulysses），EP=8，DP=2，micro batch 1，GBS 16，mock 数据，第 3–10 步平均 ms/iter。接入方式是 Primus 的 `ulysses_fused_a2a_patches.py`（`PRIMUS_ULYSSES_FUSED_A2A=1`）：CP 切分改为 contiguous，RoPE 放到 a2a 之后按全长序列做，attention 用本地 `flash_attn_func`。`serial` 是同一路径但 GEMM 和 RCCL all-to-all 串行（`PRIMUS_ULYSSES_FUSED_A2A_IMPL=serial`）。三者 loss 在 1e-3 内一致。
+
+| 长度 | base（Turbo `flash_attn_usp_func`） | serial | fused | fused 对 base | fused 对 serial |
+|---|---|---|---|---|---|
+| 16K | 3147 | 3094 | 2897 | -7.9% | -6.4% |
+| 32K | 6583 | 6534 | 6103 | -7.3% | -6.6% |
+
 ## 11. 遗留问题
 
 - `main_grad` / gradient_accumulation_fusion：wgrad 返回普通 bf16 `.grad`，没有融合 fp32 累加。
