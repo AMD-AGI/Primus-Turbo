@@ -22,7 +22,7 @@ written into one joint sequence, an optional fused QKV-bias gradient, Triton on 
 on gfx950.
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -62,11 +62,12 @@ def _v_view(qkv: torch.Tensor, D: int, layout: str) -> torch.Tensor:
 class _DitQkNormRope(torch.autograd.Function):
     @staticmethod
     def forward(ctx, qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, bias, txt_bias, eps, layout, rope,
-                round_normed, v_out):  # fmt: skip
+                round_normed, v_out, return_rstd):  # fmt: skip
         v_copy = v_out == "copy"
-        q, k, v = dit_qk_norm_rope_op(
-            qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, eps, layout, rope, round_normed, v_copy
-        )
+        q, k, v, rstd_q, rstd_k = dit_qk_norm_rope_op(
+            qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, eps, layout, rope, round_normed, v_copy,
+            return_rstd,
+        )  # fmt: skip
         if not v_copy:
             v = _v_view(qkv, w_q.shape[0], layout)
         ctx.has_txt = txt_qkv is not None
@@ -74,10 +75,13 @@ class _DitQkNormRope(torch.autograd.Function):
         ctx.bias_meta = [(b.shape, b.dtype) if b is not None else None for b in (bias, txt_bias)]
         ctx.args = (eps, layout, rope, round_normed)
         ctx.save_for_backward(qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k)
+        if return_rstd:
+            ctx.mark_non_differentiable(rstd_q, rstd_k)
+            return q, k, v, rstd_q, rstd_k
         return q, k, v
 
     @staticmethod
-    def backward(ctx, dq, dk, dv):
+    def backward(ctx, dq, dk, dv, *_rstd_grads):
         qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k = ctx.saved_tensors
         eps, layout, rope, round_normed = ctx.args
         dq, dk, dv = (
@@ -117,6 +121,7 @@ class _DitQkNormRope(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -137,7 +142,8 @@ def dit_qk_norm_rope(
     v_out: str = "copy",
     bias: Optional[torch.Tensor] = None,
     txt_bias: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_rstd: bool = False,
+) -> Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Tuple[torch.Tensor, ...]]:
     """q, k, v from the QKV GEMM output(s): q and k RMS-normalised over head_dim and rotated, v copied.
 
     Args:
@@ -161,9 +167,19 @@ def dit_qk_norm_rope(
         bias, txt_bias: the QKV GEMMs' biases, when the GEMM adds them without differentiating them (e.g. a
             detached bias). The backward then returns their gradients (the column sums of d(qkv)), summed in the
             same pass.
+        return_rstd: also return the per-row inverse RMS the norm used (see Returns). The forward computes it
+            anyway; this only stores it. q, k and v are bitwise what they are without it. The backward still
+            recomputes it, so the option does not change any gradient.
 
     Returns:
         q, k, v: ``[S_out, B, H, D]`` (``"sbhd"``) or ``[B, S_out, H, D]`` (``"bshd"``).
+        With ``return_rstd``: ``q, k, v, rstd_q, rstd_k``, the last two ``[tokens * H]`` float32 (whatever
+        qkv's dtype), non-differentiable. Flat index ``row * H + head`` with ``row`` the token's row in its
+        stream's ``qkv`` (``s * B + b`` for ``"sbhd"``, ``b * S + s`` for ``"bshd"``), i.e. the rows of the
+        QKV GEMM output as ``[tokens, H * 3 * D]``; with a text stream, its rows come first, then the image
+        stream's (for ``"sbhd"`` that is also the joint output's token order). A caller that fuses the q / k
+        norm backward into its own kernel, for example one that quantizes the gradient of the QKV GEMM output
+        as it forms it, can read them in that order instead of recomputing them.
 
     The backward returns d(qkv) in qkv's layout (dv in its v columns), dw_q / dw_k per stream and, with
     ``bias``, the bias gradients. The weight and bias gradients are fp32 partial sums reduced in a fixed order:
@@ -186,5 +202,5 @@ def dit_qk_norm_rope(
             raise ValueError(f"dit_qk_norm_rope: {name} must have {m['ROW_W']} elements, got {list(b.shape)}")
     return _DitQkNormRope.apply(
         qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, bias, txt_bias, float(eps), layout, rope,
-        bool(round_normed), v_out,
+        bool(round_normed), v_out, bool(return_rstd),
     )  # fmt: skip

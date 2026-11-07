@@ -19,12 +19,16 @@ in place. The outputs q / k / v are [B, S_out, H, D] or [S_out, B, H, D] (the so
 streams (text first) both are written into one joint output in one launch: programs [0, n_prog0) take the text
 segment, the rest the image segment at sequence offset ``s_src0``.
 
-Arithmetic. Per (token, head): rstd over D in fp32, ``y = x * rstd * w``, RoPE in fp32, one rounding of the
-result. ``ROUND`` also rounds ``y`` to the storage dtype before RoPE, and the inverse-RoPE gradient before the
-RMSNorm backward, which is what an unfused RMSNorm module followed by a RoPE function computes (diffusers'
+Arithmetic. Per (token, head): rstd over D in fp32 (``RSTD`` also stores it, see below), ``y = x * rstd * w``,
+RoPE in fp32, one rounding of the result. ``ROUND`` also rounds ``y`` to the storage dtype before RoPE, and the
+inverse-RoPE gradient before the RMSNorm backward, which is what an unfused RMSNorm module followed by a RoPE function computes (diffusers'
 Flux, #556). ``INTERLEAVED`` pairs (2i, 2i+1), as Megatron's ``rotary_interleaved`` and diffusers' Flux do;
 otherwise (i, i + D/2). The cos / sin rows hold each pair's angle twice, as both libraries build them; the
 kernels read the first copy.
+
+``RSTD``: the forward also stores each q / k row's rstd (fp32, the value the row was normalised with) at
+``(stream row offset + token) * H + head`` -- the source's token order, streams one after the other (text first),
+so a consumer that holds the QKV GEMM output as rows [tokens, H * 3D] indexes it by (row, head).
 
 The backward writes d(qkv) in the source layout (dv into the v columns), and fp32 partials of the norm-weight
 gradients and, with ``BIAS``, of the QKV bias gradient (the column sums of d(qkv)). ``reduce_partials_kernel``
@@ -97,9 +101,14 @@ def _norm_rope(
     INTERLEAVED: tl.constexpr,
     ROUND: tl.constexpr,
     CM: tl.constexpr,
+    RSTD: tl.constexpr,
+    rstd_ptrs,
+    h_ok,
 ):
     x = tl.load(x_ptrs, mask=hmask, other=0.0, cache_modifier=CM).to(tl.float32)
     rstd = tl.rsqrt(tl.sum(x * x, axis=1) / D + eps)
+    if RSTD:
+        tl.store(rstd_ptrs, rstd, mask=h_ok)
     y = x * rstd[:, None] * w[None, :]
     if ROUND:
         y = y.to(out_ptrs.dtype.element_ty).to(tl.float32)
@@ -117,6 +126,9 @@ def _fwd_segment(
     wk_ptr,
     cos_ptr,
     sin_ptr,
+    rq_ptr,
+    rk_ptr,
+    row_off,
     prog,
     n_tok,
     s_src,
@@ -140,6 +152,7 @@ def _fwd_segment(
     V_COPY: tl.constexpr,
     CS_PER_BATCH: tl.constexpr,
     CM: tl.constexpr,
+    RSTD: tl.constexpr,
 ):
     h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     d = tl.arange(0, D)
@@ -159,12 +172,15 @@ def _fwd_segment(
             src = src_ptr + tok.to(tl.int64) * TS
             c = tl.load(cos_ptr + cs_row * CSS + cs_cols).to(tl.float32)
             s = tl.load(sin_ptr + cs_row * CSS + cs_cols).to(tl.float32)
+            rrow = (row_off + tok).to(tl.int64) * H + h
             _norm_rope(
-                src + QO + hs, q_ptr + dst + hd, wq, c, s, eps, hmask, BLOCK_H, D, INTERLEAVED, ROUND, CM
-            )
+                src + QO + hs, q_ptr + dst + hd, wq, c, s, eps, hmask, BLOCK_H, D, INTERLEAVED, ROUND, CM,
+                RSTD, rq_ptr + rrow, h < H,
+            )  # fmt: skip
             _norm_rope(
-                src + KO + hs, k_ptr + dst + hd, wk, c, s, eps, hmask, BLOCK_H, D, INTERLEAVED, ROUND, CM
-            )
+                src + KO + hs, k_ptr + dst + hd, wk, c, s, eps, hmask, BLOCK_H, D, INTERLEAVED, ROUND, CM,
+                RSTD, rk_ptr + rrow, h < H,
+            )  # fmt: skip
             if V_COPY:
                 vv = tl.load(src + VO + hs, mask=hmask, cache_modifier=CM)
                 tl.store(v_ptr + dst + hd, vv, mask=hmask, cache_modifier=CM)
@@ -183,6 +199,8 @@ def dit_qk_norm_rope_fwd_kernel(
     wk1_ptr,
     cos_ptr,
     sin_ptr,
+    rq_ptr,
+    rk_ptr,
     n_tok0,
     s_src0,
     n_tok1,
@@ -208,6 +226,7 @@ def dit_qk_norm_rope_fwd_kernel(
     V_COPY: tl.constexpr,
     CS_PER_BATCH: tl.constexpr,
     CM: tl.constexpr,
+    RSTD: tl.constexpr,
 ):
     """Grid (n_prog0 [+ n_prog1], cdiv(H, BLOCK_H)); a program normalises and rotates TOKENS tokens' q and k
     for BLOCK_H heads and copies their v."""
@@ -223,6 +242,9 @@ def dit_qk_norm_rope_fwd_kernel(
                 wk0_ptr,
                 cos_ptr,
                 sin_ptr,
+                rq_ptr,
+                rk_ptr,
+                0,
                 pid,
                 n_tok0,
                 s_src0,
@@ -246,6 +268,7 @@ def dit_qk_norm_rope_fwd_kernel(
                 V_COPY,
                 CS_PER_BATCH,
                 CM,
+                RSTD,
             )
         else:
             _fwd_segment(
@@ -257,6 +280,9 @@ def dit_qk_norm_rope_fwd_kernel(
                 wk1_ptr,
                 cos_ptr,
                 sin_ptr,
+                rq_ptr,
+                rk_ptr,
+                n_tok0,
                 pid - n_prog0,
                 n_tok1,
                 s_src1,
@@ -280,6 +306,7 @@ def dit_qk_norm_rope_fwd_kernel(
                 V_COPY,
                 CS_PER_BATCH,
                 CM,
+                RSTD,
             )
     else:
         _fwd_segment(
@@ -291,6 +318,9 @@ def dit_qk_norm_rope_fwd_kernel(
             wk0_ptr,
             cos_ptr,
             sin_ptr,
+            rq_ptr,
+            rk_ptr,
+            0,
             pid,
             n_tok0,
             s_src0,
@@ -314,6 +344,7 @@ def dit_qk_norm_rope_fwd_kernel(
             V_COPY,
             CS_PER_BATCH,
             CM,
+            RSTD,
         )
 
 
