@@ -43,6 +43,7 @@ from primus_turbo.flydsl.ulysses.common import (
     exit_and_bump_epoch,
     i64_base,
     read_clock,
+    seq_row,
     spin_flags,
 )
 from primus_turbo.flydsl.ulysses.workspace import (
@@ -153,14 +154,6 @@ def _copy_rows(thread_index, num_vecs, vec_coords, src_res, dst_res, src_cm, dst
             buffer_store(val, dst_res, dst, mask=valid, cache_modifier=dst_cm)
 
 
-def _o_row(t, dst, M, seq_local, num_ranks, is_bshd):
-    """Row of ``O`` (full sequence) holding token ``t`` of ``dst``'s sequence slice."""
-    if is_bshd:
-        bi = t // fx.Int32(seq_local)
-        return t + bi * fx.Int32(seq_local * (num_ranks - 1)) + dst * fx.Int32(seq_local)
-    return dst * fx.Int32(M) + t
-
-
 @ASTRewriter.transform
 def _push_unit(thread_index, m_sub, dst, dst_heap, bank_offset, o_res, epoch, **c):
     """Rows of sub-tile ``m_sub`` of ``dst``'s sequence slice into ``dst``'s recv bank, then ``dst``'s flag."""
@@ -188,7 +181,7 @@ def _push_unit(thread_index, m_sub, dst, dst_heap, bank_offset, o_res, epoch, **
                     + col % fx.Int32(vecs_per_head)
                 )
                 t = m_sub * fx.Int32(rows) + r
-                o_row = _o_row(t, dst, M, c["seq_local"], num_ranks, c["is_bshd"])
+                o_row = seq_row(t, dst, M, c["seq_local"], num_ranks, c["is_bshd"], c["seq_chunk"])
                 src_word = (o_row * fx.Int32(vecs_per_row) + col) * fx.Int32(VEC_I32)
                 dst_word = t * fx.Int32(K // 2) + (fx.Int32(rank * K_r // VEC_BF16) + dst_col) * fx.Int32(
                     VEC_I32
@@ -380,6 +373,7 @@ def _make_kernel(
     num_ranks,
     seq_local,
     is_bshd,
+    seq_chunk,
     has_residual,
     save_o,
     num_push,
@@ -431,6 +425,7 @@ def _make_kernel(
         num_ranks=num_ranks,
         seq_local=seq_local,
         is_bshd=is_bshd,
+        seq_chunk=seq_chunk,
         flag_region=flag_region,
         G=G,
         head_dim=head_dim,
@@ -532,6 +527,7 @@ def _launch(
     num_ranks: fx.Constexpr[int],
     seq_local: fx.Constexpr[int],
     is_bshd: fx.Constexpr[bool],
+    seq_chunk: fx.Constexpr[int],
     has_residual: fx.Constexpr[bool],
     save_o: fx.Constexpr[bool],
     num_push: fx.Constexpr[int],
@@ -559,6 +555,7 @@ def _launch(
         num_ranks,
         seq_local,
         is_bshd,
+        seq_chunk,
         has_residual,
         save_o,
         num_push,
@@ -605,6 +602,7 @@ def ulysses_a2a_gemm(
     seq_local,
     qkv_format,
     flag_region,
+    seq_chunk=0,
     layout="nt",
     head_dim=None,
     groups=1,
@@ -618,7 +616,8 @@ def ulysses_a2a_gemm(
     tensor, or ``(dq, dk, dv)`` ``[n * M, h_x, d]`` whose heads interleave in ``groups`` groups per
     rank (the weight's row order). ``y = A @ w^T`` (``layout="nt"``, ``w`` ``[N, K]``) or ``A @ w``
     (``"nn"``, ``w`` ``[K, N]``), ``+ residual`` (nt only), where ``A`` is the gathered ``[M, K]``,
-    ``K = n * K_r``; ``A`` is also copied to ``o_gathered`` unless it is ``None``."""
+    ``K = n * K_r``; ``A`` is also copied to ``o_gathered`` unless it is ``None``. ``seq_chunk``: the
+    sequence split across ranks, see ``common.seq_row``."""
     num_ranks = workspace.num_ranks
     if isinstance(o, torch.Tensor):
         head_dim = head_dim or o.shape[-1]
@@ -662,6 +661,7 @@ def ulysses_a2a_gemm(
         num_ranks,
         seq_local,
         qkv_format == "bshd",
+        seq_chunk,
         residual is not None,
         o_gathered is not None,
         num_push,

@@ -7,7 +7,8 @@
 """Ulysses GemmA2A / A2AGemm fused projections against the unfused reference.
 
 Reference: fp32 ``F.linear`` -> Turbo's ``AttentionCPA2AHelper`` packing -> ``all_to_all_single``
--> unpacking, i.e. the ``flash_attn_usp_func`` sequence order.
+-> unpacking, i.e. the ``flash_attn_usp_func`` sequence order; a striped split (``seq_chunk``) is that
+reference with the full sequence permuted.
 
 The pytest entry launches this file under torchrun for every world size the node has GPUs for:
 
@@ -60,21 +61,34 @@ def _a2a(t, group):
     return all_to_all_single(torch.empty_like(t), t.contiguous(), group=group)
 
 
-def reference_qkv_gemm_a2a(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout):
+def _striped_positions(s_local, n, seq_chunk):
+    """Sequence position of the i-th token of the rank-major concatenation of the local slices."""
+    i = torch.arange(n * s_local, device="cuda")
+    src, s_l = i // s_local, i % s_local
+    return (s_l // seq_chunk * n + src) * seq_chunk + s_l % seq_chunk
+
+
+def reference_qkv_gemm_a2a(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, seq_chunk=0):
     n = group.size()
     s_local, b = x.shape[:2] if qkv_format == "sbhd" else x.shape[1::-1]
     helper = _helper(b, s_local * n, hq, hkv, d, n, qkv_format)
     qkv = F.linear(x, w_qkv)
     q, k, v = _split_qkv_reference(qkv, hq, hkv, d, weight_layout)
-    return helper.splits_qkv_after_a2a(_a2a(helper.combine_qkv_before_a2a(q, k, v), group))
+    outs = helper.splits_qkv_after_a2a(_a2a(helper.combine_qkv_before_a2a(q, k, v), group))
+    if seq_chunk:
+        order = _striped_positions(s_local, n, seq_chunk).argsort()
+        outs = tuple(t.index_select(0 if qkv_format == "sbhd" else 1, order) for t in outs)
+    return outs
 
 
-def reference_a2a_o_gemm(o, w_o, residual, group, qkv_format):
+def reference_a2a_o_gemm(o, w_o, residual, group, qkv_format, seq_chunk=0):
     n = group.size()
     if qkv_format == "sbhd":
         seq, b, heads, d = o.shape
     else:
         b, seq, heads, d = o.shape
+    if seq_chunk:
+        o = o.index_select(0 if qkv_format == "sbhd" else 1, _striped_positions(seq // n, n, seq_chunk))
     helper = _helper(b, seq, heads * n, heads * n, d, n, qkv_format)
     o_gathered = helper.reshape_o_after_a2a(_a2a(helper.reshape_o_before_a2a(o), group))
     y = F.linear(o_gathered.reshape(*o_gathered.shape[:2], -1), w_o)
@@ -110,19 +124,19 @@ def _fp32_leaf(t):
     return t.detach().float().requires_grad_()
 
 
-def check_qkv(group, hq, hkv, d, b, s_local, hidden, qkv_format, weight_layout, repeats, failures):
+def check_qkv(group, hq, hkv, d, b, s_local, hidden, qkv_format, weight_layout, repeats, failures, seq_chunk=0):
     from primus_turbo.pytorch.ops.attention.ulysses_fused_a2a import ulysses_qkv_gemm_a2a
 
     rank = group.rank()
     w_qkv = _randn((hq + 2 * hkv) * d, hidden, seed=1234, scale=0.02).requires_grad_()
-    tag = f"[qkv hq={hq} hkv={hkv} d={d} b={b} s/n={s_local} {qkv_format} {weight_layout}]"
+    tag = f"[qkv hq={hq} hkv={hkv} d={d} b={b} s/n={s_local} {qkv_format} {weight_layout} chunk={seq_chunk}]"
     for it in range(repeats):
         shape = (s_local, b, hidden) if qkv_format == "sbhd" else (b, s_local, hidden)
         x = _randn(*shape, seed=100 * it + rank).requires_grad_()
         w_qkv.grad = None
-        outs = ulysses_qkv_gemm_a2a(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout)
+        outs = ulysses_qkv_gemm_a2a(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, seq_chunk)
         x_ref, w_ref = _fp32_leaf(x), _fp32_leaf(w_qkv)
-        refs = reference_qkv_gemm_a2a(x_ref, w_ref, hq, hkv, d, group, qkv_format, weight_layout)
+        refs = reference_qkv_gemm_a2a(x_ref, w_ref, hq, hkv, d, group, qkv_format, weight_layout, seq_chunk)
         grads = [_randn(*r.shape, seed=7 * it + 31 * j + rank) for j, r in enumerate(refs)]
         for name, out, ref in zip("qkv", outs, refs):
             _close(name, out, ref, failures, f"{tag} call {it}")
@@ -132,12 +146,12 @@ def check_qkv(group, hq, hkv, d, b, s_local, hidden, qkv_format, weight_layout, 
         _close("dw_qkv", w_qkv.grad, w_ref.grad, failures, f"{tag} call {it}")
 
 
-def check_o_gemm(group, hq, d, b, s_local, hidden, qkv_format, with_residual, repeats, failures):
+def check_o_gemm(group, hq, d, b, s_local, hidden, qkv_format, with_residual, repeats, failures, seq_chunk=0):
     from primus_turbo.pytorch.ops.attention.ulysses_fused_a2a import ulysses_a2a_o_gemm
 
     n, rank = group.size(), group.rank()
     w_o = _randn(hidden, hq * d, seed=4321, scale=0.02).requires_grad_()
-    tag = f"[o_proj hq={hq} d={d} b={b} s/n={s_local} {qkv_format} residual={with_residual}]"
+    tag = f"[o_proj hq={hq} d={d} b={b} s/n={s_local} {qkv_format} residual={with_residual} chunk={seq_chunk}]"
     seq = s_local * n
     for it in range(repeats):
         o_shape = (seq, b, hq // n, d) if qkv_format == "sbhd" else (b, seq, hq // n, d)
@@ -145,10 +159,10 @@ def check_o_gemm(group, hq, d, b, s_local, hidden, qkv_format, with_residual, re
         o = _randn(*o_shape, seed=200 * it + rank).requires_grad_()
         res = _randn(*y_shape, seed=300 * it + rank).requires_grad_() if with_residual else None
         w_o.grad = None
-        y = ulysses_a2a_o_gemm(o, w_o, res, group, qkv_format)
+        y = ulysses_a2a_o_gemm(o, w_o, res, group, qkv_format, seq_chunk)
         o_ref, w_ref = _fp32_leaf(o), _fp32_leaf(w_o)
         res_ref = _fp32_leaf(res) if with_residual else None
-        y_ref = reference_a2a_o_gemm(o_ref, w_ref, res_ref, group, qkv_format)
+        y_ref = reference_a2a_o_gemm(o_ref, w_ref, res_ref, group, qkv_format, seq_chunk)
         _close("y", y, y_ref, failures, f"{tag} call {it}")
         dy = _randn(*y_shape, seed=400 * it + rank)
         y.backward(dy)
@@ -163,8 +177,9 @@ class _Layer:
     """QKV projection -> elementwise stand-in for attention (``q + k * v`` per GQA group, so dq, dk
     and dv are all non-zero) -> output projection + residual."""
 
-    def __init__(self, group, hq, hkv, d, hidden, qkv_format, seed):
+    def __init__(self, group, hq, hkv, d, hidden, qkv_format, seed, seq_chunk=0):
         self.group, self.hq, self.hkv, self.d, self.qkv_format = group, hq, hkv, d, qkv_format
+        self.seq_chunk = seq_chunk
         self.w_qkv = _randn((hq + 2 * hkv) * d, hidden, seed=seed, scale=0.02).requires_grad_()
         self.w_o = _randn(hidden, hq * d, seed=seed + 1, scale=0.02).requires_grad_()
 
@@ -177,23 +192,25 @@ class _Layer:
             ulysses_qkv_gemm_a2a,
         )
 
-        args = (self.hq, self.hkv, self.d, self.group, self.qkv_format, "interleaved")
+        args = (self.hq, self.hkv, self.d, self.group, self.qkv_format, "interleaved", self.seq_chunk)
         self.qkv = ulysses_qkv_gemm_a2a(x, self.w_qkv, *args)
         self.o = self._attn(*self.qkv)
         for t in (*self.qkv, self.o):
             t.retain_grad()
-        return ulysses_a2a_o_gemm(self.o, self.w_o, x, self.group, self.qkv_format)
+        return ulysses_a2a_o_gemm(self.o, self.w_o, x, self.group, self.qkv_format, self.seq_chunk)
 
     def check(self, x, y, failures, tag):
         """Each op of ``y = self(x)`` against the fp32 reference fed the same bf16 inputs and grads."""
         group, fmt = self.group, self.qkv_format
         x_ref, wq_ref, wo_ref = _fp32_leaf(x), _fp32_leaf(self.w_qkv), _fp32_leaf(self.w_o)
-        refs = reference_qkv_gemm_a2a(x_ref, wq_ref, self.hq, self.hkv, self.d, group, fmt, "interleaved")
+        refs = reference_qkv_gemm_a2a(
+            x_ref, wq_ref, self.hq, self.hkv, self.d, group, fmt, "interleaved", self.seq_chunk
+        )
         for name, out, ref in zip("qkv", self.qkv, refs):
             _close(name, out, ref, failures, tag)
         torch.autograd.backward(refs, [t.grad.float() for t in self.qkv])
         o_ref, res_ref = _fp32_leaf(self.o), _fp32_leaf(x)
-        y_ref = reference_a2a_o_gemm(o_ref, wo_ref, res_ref, group, fmt)
+        y_ref = reference_a2a_o_gemm(o_ref, wo_ref, res_ref, group, fmt, self.seq_chunk)
         _close("y", y, y_ref, failures, tag)
         y_ref.backward(y.grad.float())
         _close("do", self.o.grad, o_ref.grad, failures, tag)
@@ -204,12 +221,14 @@ class _Layer:
         _close("dw_o", self.w_o.grad, wo_ref.grad, failures, tag)
 
 
-def check_scenarios(group, failures, hq=32, hkv=8, d=128, b=2, s_local=300, hidden=1024):
-    """Chained layers and a non-default stream."""
+def check_scenarios(group, failures, hq=32, hkv=8, d=128, b=2, s_local=320, hidden=1024):
+    """Chained layers (alternating contiguous / striped splits) and a non-default stream."""
     rank = group.rank()
     for qkv_format in ("sbhd", "bshd"):
         shape = (s_local, b, hidden) if qkv_format == "sbhd" else (b, s_local, hidden)
-        layers = [_Layer(group, hq, hkv, d, hidden, qkv_format, seed=10 * i) for i in range(3)]
+        layers = [
+            _Layer(group, hq, hkv, d, hidden, qkv_format, seed=10 * i, seq_chunk=64 * (i % 2)) for i in range(3)
+        ]
 
         # back to back layers: every op of a layer overlaps the bank / flag reuse of the previous one
         xs = [_randn(*shape, seed=500 + rank).requires_grad_()]
@@ -247,14 +266,14 @@ def _poison_banks(group):
     dist.barrier(group=group)
 
 
-def check_poisoned(group, failures, hq=32, hkv=8, d=128, b=2, s_local=300, hidden=1024):
+def check_poisoned(group, failures, hq=32, hkv=8, d=128, b=2, s_local=320, hidden=1024):
     """Forward + backward of both ops, the banks poisoned before every call."""
     for qkv_format in ("sbhd", "bshd"):
-        for it in range(2):
+        for seq_chunk in (0, 64):
             _poison_banks(group)
-            check_qkv(group, hq, hkv, d, b, s_local, hidden, qkv_format, "interleaved", 1, failures)
+            check_qkv(group, hq, hkv, d, b, s_local, hidden, qkv_format, "interleaved", 1, failures, seq_chunk)
             _poison_banks(group)
-            check_o_gemm(group, hq, d, b, s_local, hidden, qkv_format, True, 1, failures)
+            check_o_gemm(group, hq, d, b, s_local, hidden, qkv_format, True, 1, failures, seq_chunk)
 
 
 def run_suite(quick):
@@ -282,6 +301,13 @@ def run_suite(quick):
         if hq % n:
             continue
         check_o_gemm(group, hq, d, b, 300, 1024, qkv_format, with_residual, 3, failures)
+    # striped split: s/n = 320 holds 5 chunks of 64, again not a multiple of any tile
+    for head_name, b, qkv_format in itertools.product(head_names, batches, formats):
+        hq, hkv = HEAD_CONFIGS[head_name](n)
+        if hq % n or hkv % n:
+            continue
+        check_qkv(group, hq, hkv, 128, b, 320, 1024, qkv_format, "interleaved", 2, failures, seq_chunk=64)
+        check_o_gemm(group, hq, 128, b, 320, 1024, qkv_format, True, 2, failures, seq_chunk=64)
     check_scenarios(group, failures)
     check_poisoned(group, failures)
 

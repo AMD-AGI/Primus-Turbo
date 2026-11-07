@@ -43,7 +43,7 @@ contiguous 切分（rank r 持有 `[r·s/n, (r+1)·s/n)`）下三者冲突：各
 
 工作表顺序：前面一小段按块号升序（覆盖交换窗口，保证到达即可算），之后按 causal 工作量降序（LPT，压住尾部）。交换窗口 ≈ 465 µs，32K attention ≈ 2.1 ms，所以绝大部分 item 领取时数据已到。
 
-资源：一个 kernel 只有一种 block 大小，取 256 线程。attention 关掉 GQA merge（每 CTA 一个 q head，4 wave）；单卡实测前向 16K +1.3%、32K +5.2%，输出逐位相同。VGPR / LDS 取各角色最大值（attention 约 68 KB LDS，每 CU 2 个 block）。
+资源：一个 kernel 只有一种 block 大小，取 512 线程——GemmA2A / A2AGemm 本来就是 512 线程（`common.BLOCK_THREADS`），attention 保持 GQA merge（512 线程）的生产配置。（作为对照：关掉 GQA merge 的 256 线程 attention 单卡前向 16K +1.3%、32K +5.2%，输出逐位相同。）VGPR / LDS 取各角色最大值（attention 约 68 KB LDS，每 CU 2 个 block）。
 
 死锁：GEMM block 不等任何东西，先派发；pull / push 是少量 persistent block，派发在 worker 之前；worker 只等 pull / push 和远端 worker 产出的数据，而远端的同角色 block 同样已驻留。
 

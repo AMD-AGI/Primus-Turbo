@@ -10,7 +10,9 @@
 with the local heads over the full sequence; ``ulysses_a2a_o_gemm`` replaces
 ``pack -> all-to-all -> unpack -> linear_proj + residual``. Attention between them is the plain
 ``flash_attn_func``. Sequence order matches ``flash_attn_usp_func``: rank r holds the r-th contiguous
-chunk of the sequence.
+chunk of the sequence; with ``seq_chunk = c`` the sequence is cut into ``c``-token chunks instead and
+chunk ``j`` lives on rank ``j % n`` (striped), which spreads the causal attention work evenly over the
+sequence order the exchange delivers it in.
 """
 
 from typing import Optional, Tuple
@@ -77,6 +79,12 @@ def _qkv_rank_block(hq, hkv, d, n, weight_layout):
     return 1, hq // n, hkv // n, hkv // n
 
 
+def _check_seq_chunk(seq_chunk, s_local):
+    assert seq_chunk >= 0 and (seq_chunk == 0 or s_local % seq_chunk == 0), (
+        f"seq_chunk={seq_chunk} must divide the local sequence length {s_local}"
+    )
+
+
 def _check(group, hq, hkv, d, qkv_format, weight_layout):
     n = group.size()
     assert qkv_format in _QKV_FORMATS, f"qkv_format must be one of {_QKV_FORMATS}"
@@ -85,7 +93,7 @@ def _check(group, hq, hkv, d, qkv_format, weight_layout):
     assert d in (64, 128), f"head_dim {d} is not supported"
 
 
-def _qkv_gemm_a2a_forward(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout):
+def _qkv_gemm_a2a_forward(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, seq_chunk):
     n = group.size()
     if qkv_format == "sbhd":
         s_local, b, hidden = x.shape
@@ -118,6 +126,7 @@ def _qkv_gemm_a2a_forward(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout
         seq_local=s_local,
         qkv_format=qkv_format,
         flag_region=REGION_QKV_GEMM_A2A,
+        seq_chunk=seq_chunk,
         num_pull_cu=24,
         num_tail_pull=8,
     )
@@ -152,6 +161,7 @@ def _qkv_backward(ctx, dq, dk, dv):
         seq_local=s_local,
         qkv_format=ctx.qkv_format,
         flag_region=REGION_QKV_A2A_GEMM,
+        seq_chunk=ctx.seq_chunk,
         layout="nn",
         groups=G,
     )
@@ -168,11 +178,11 @@ def _qkv_backward(ctx, dq, dk, dv):
 
 class UlyssesQKVGemmA2AFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout):
-        q, k, v = _qkv_gemm_a2a_forward(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout)
+    def forward(ctx, x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, seq_chunk):
+        q, k, v = _qkv_gemm_a2a_forward(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, seq_chunk)
         ctx.save_for_backward(x, w_qkv)
         ctx.hq, ctx.hkv, ctx.d, ctx.group = hq, hkv, d, group
-        ctx.qkv_format, ctx.weight_layout = qkv_format, weight_layout
+        ctx.qkv_format, ctx.weight_layout, ctx.seq_chunk = qkv_format, weight_layout, seq_chunk
         if qkv_format == "sbhd":
             ctx.s_local, ctx.b = x.shape[0], x.shape[1]
         else:
@@ -182,7 +192,7 @@ class UlyssesQKVGemmA2AFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dq, dk, dv):
         dx, dw = _qkv_backward(ctx, dq, dk, dv)
-        return dx, dw, None, None, None, None, None, None
+        return dx, dw, None, None, None, None, None, None, None
 
 
 def ulysses_qkv_gemm_a2a(
@@ -194,6 +204,7 @@ def ulysses_qkv_gemm_a2a(
     group: dist.ProcessGroup,
     qkv_format: str = "sbhd",
     weight_layout: str = "interleaved",
+    seq_chunk: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """QKV projection fused with the Ulysses all-to-all.
 
@@ -201,17 +212,20 @@ def ulysses_qkv_gemm_a2a(
         x: this rank's tokens, ``[s/n, b, hidden]`` (sbhd) or ``[b, s/n, hidden]`` (bshd).
         w_qkv: ``[(hq + 2 * hkv) * d, hidden]``; ``interleaved`` is Megatron's ``[ng, hq/ng + 2, d]``
             row order, ``concat`` is ``[q; k; v]``.
+        seq_chunk: 0 if ``x`` is the rank's contiguous slice of the sequence, ``c`` if it is the rank's
+            ``c``-token chunks of a striped split (chunk ``j`` on rank ``j % n``).
 
     Returns:
-        q, k, v: local heads over the full sequence, ``[s, b, h/n, d]`` (sbhd) or ``[b, s, h/n, d]``.
+        q, k, v: local heads over the full sequence in order, ``[s, b, h/n, d]`` (sbhd) or ``[b, s, h/n, d]``.
     """
     _check(group, num_q_heads, num_kv_heads, head_dim, qkv_format, weight_layout)
+    _check_seq_chunk(seq_chunk, x.shape[0 if qkv_format == "sbhd" else 1])
     return UlyssesQKVGemmA2AFunction.apply(
-        x, w_qkv, num_q_heads, num_kv_heads, head_dim, group, qkv_format, weight_layout
+        x, w_qkv, num_q_heads, num_kv_heads, head_dim, group, qkv_format, weight_layout, seq_chunk
     )
 
 
-def _o_gemm_forward(o, w_o, residual, group, qkv_format, save_o):
+def _o_gemm_forward(o, w_o, residual, group, qkv_format, seq_chunk, save_o):
     n = group.size()
     if qkv_format == "sbhd":
         seq, b, heads, d = o.shape
@@ -238,11 +252,12 @@ def _o_gemm_forward(o, w_o, residual, group, qkv_format, save_o):
         seq_local=s_local,
         qkv_format=qkv_format,
         flag_region=REGION_O_A2A_GEMM,
+        seq_chunk=seq_chunk,
     )
     return y.view(y_shape), o_gathered
 
 
-def _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format):
+def _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format, seq_chunk):
     """``dO = (dY @ w_o)`` scattered back to the local heads over the full sequence (GemmA2A)."""
     n = group.size()
     M, K = dy2d.shape[0], w_o.shape[1]
@@ -263,12 +278,15 @@ def _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format):
         seq_local=s_local,
         qkv_format=qkv_format,
         flag_region=REGION_O_GEMM_A2A,
+        seq_chunk=seq_chunk,
     )
     shape = (seq, b) if qkv_format == "sbhd" else (b, seq)
     return do.view(*shape, heads, d)
 
 
-def _o_gemm_backward(dy2d, w_o, o_gathered, group, heads, d, s_local, b, qkv_format, need_do, need_dw):
+def _o_gemm_backward(
+    dy2d, w_o, o_gathered, group, heads, d, s_local, b, qkv_format, seq_chunk, need_do, need_dw
+):
     """``(dO, dW_o)``: dO by GemmA2A, ``dW_o = dY^T @ O_gathered``."""
     do = dw = None
     if need_do and need_dw:
@@ -279,10 +297,10 @@ def _o_gemm_backward(dy2d, w_o, o_gathered, group, heads, d, s_local, b, qkv_for
         side.wait_stream(main)
         with torch.cuda.stream(side):
             torch.matmul(dy2d.t(), o_gathered, out=dw)
-        do = _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format)
+        do = _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format, seq_chunk)
         main.wait_stream(side)
     elif need_do:
-        do = _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format)
+        do = _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format, seq_chunk)
     elif need_dw:
         dw = dy2d.t() @ o_gathered
     return do, dw
@@ -290,10 +308,11 @@ def _o_gemm_backward(dy2d, w_o, o_gathered, group, heads, d, s_local, b, qkv_for
 
 class UlyssesA2AOGemmFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, o, w_o, residual, group, qkv_format):
-        y, o_gathered = _o_gemm_forward(o, w_o, residual, group, qkv_format, save_o=w_o.requires_grad)
+    def forward(ctx, o, w_o, residual, group, qkv_format, seq_chunk):
+        y, o_gathered = _o_gemm_forward(o, w_o, residual, group, qkv_format, seq_chunk, save_o=w_o.requires_grad)
         ctx.save_for_backward(w_o, o_gathered)
         ctx.group, ctx.qkv_format, ctx.has_residual = group, qkv_format, residual is not None
+        ctx.seq_chunk = seq_chunk
         ctx.o_shape = o.shape
         return y
 
@@ -308,10 +327,20 @@ class UlyssesA2AOGemmFunction(torch.autograd.Function):
         heads, d = ctx.o_shape[2], ctx.o_shape[3]
         dy2d = dy.reshape(s_local * b, N).contiguous()
         do, dw = _o_gemm_backward(
-            dy2d, w_o, o_gathered, ctx.group, heads, d, s_local, b, qkv_format, *ctx.needs_input_grad[:2]
+            dy2d,
+            w_o,
+            o_gathered,
+            ctx.group,
+            heads,
+            d,
+            s_local,
+            b,
+            qkv_format,
+            ctx.seq_chunk,
+            *ctx.needs_input_grad[:2],
         )
         d_residual = dy if ctx.has_residual and ctx.needs_input_grad[2] else None
-        return do, dw, d_residual, None, None
+        return do, dw, d_residual, None, None, None
 
 
 def ulysses_a2a_o_gemm(
@@ -320,6 +349,7 @@ def ulysses_a2a_o_gemm(
     residual: Optional[torch.Tensor],
     group: dist.ProcessGroup,
     qkv_format: str = "sbhd",
+    seq_chunk: int = 0,
 ) -> torch.Tensor:
     """Output projection fused with the reverse Ulysses all-to-all, plus ``residual``.
 
@@ -328,6 +358,7 @@ def ulysses_a2a_o_gemm(
             ``[s, b, h/n, d]`` (sbhd) or ``[b, s, h/n, d]`` (bshd).
         w_o: ``[hidden, h * d]``.
         residual: ``[s/n, b, hidden]`` (sbhd) / ``[b, s/n, hidden]`` (bshd), or ``None``.
+        seq_chunk: the rank's share of the sequence, as in ``ulysses_qkv_gemm_a2a``.
 
     Returns:
         y = o_gathered @ w_o^T + residual, shaped like ``residual``. The K accumulation order is
@@ -338,4 +369,5 @@ def ulysses_a2a_o_gemm(
     assert o_local_heads.shape[-1] in (64, 128), f"head_dim {o_local_heads.shape[-1]} is not supported"
     seq_dim = 0 if qkv_format == "sbhd" else 1
     assert o_local_heads.shape[seq_dim] % n == 0, "sequence length must divide by the group size"
-    return UlyssesA2AOGemmFunction.apply(o_local_heads, w_o, residual, group, qkv_format)
+    _check_seq_chunk(seq_chunk, o_local_heads.shape[seq_dim] // n)
+    return UlyssesA2AOGemmFunction.apply(o_local_heads, w_o, residual, group, qkv_format, seq_chunk)

@@ -45,6 +45,29 @@ def i64_base(tensor):
     return fx.arith.ArithValue(arith.index_cast(fx.T.i64, extract_base_index(tensor)), signed=True)
 
 
+def seq_row(t, src, M, seq_local, num_ranks, is_bshd, seq_chunk):
+    """Row of a full-sequence tensor holding row ``t`` of ``src``'s ``[M, ...]`` slice (``M = s/n * b``).
+
+    ``seq_chunk = 0``: rank r holds the r-th contiguous ``s/n`` tokens. ``seq_chunk = c``: the sequence is
+    cut into ``c``-token chunks and chunk ``j`` lives on rank ``j % n`` (striped)."""
+    if seq_chunk == 0:
+        if is_bshd:
+            bi = t // fx.Int32(seq_local)
+            return t + bi * fx.Int32(seq_local * (num_ranks - 1)) + src * fx.Int32(seq_local)
+        return src * fx.Int32(M) + t
+    batch = M // seq_local
+    if is_bshd:
+        bi, s_l = t // fx.Int32(seq_local), t % fx.Int32(seq_local)
+    else:
+        bi, s_l = t % fx.Int32(batch), t // fx.Int32(batch)
+    pos = (s_l // fx.Int32(seq_chunk) * fx.Int32(num_ranks) + src) * fx.Int32(seq_chunk) + s_l % fx.Int32(
+        seq_chunk
+    )
+    if is_bshd:
+        return bi * fx.Int32(seq_local * num_ranks) + pos
+    return pos * fx.Int32(batch) + bi
+
+
 @ASTRewriter.transform
 def spin_flag(flag_base, flag_idx, expected, rank, src, tag):
     """Spin until the i64 flag reaches ``expected``; on timeout report and trap (no silent hang)."""

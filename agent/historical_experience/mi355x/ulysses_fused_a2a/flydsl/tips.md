@@ -23,3 +23,7 @@
   spent waiting; it works, but concurrent hipBLASLt slows a CU-driven exchange by more than it hides
   when compute ~ exchange time.
 - FlyDSL disk cache: `rm -rf /root/.flydsl` after kernel edits; env-var globals are not in the key.
+- Sequence split as a row mapping: keep one helper (`common.seq_row`) shared by the producer (pull)
+  and consumer (push) sides; a striped split then costs nothing (layer time within 0.2 %). Test it as
+  the contiguous reference with the full sequence permuted (`index_select`), autograd included.
+- Cold JIT of the full fused-a2a suite at n = 8 can exceed 30 min; give torchrun 1 h or warm the cache.

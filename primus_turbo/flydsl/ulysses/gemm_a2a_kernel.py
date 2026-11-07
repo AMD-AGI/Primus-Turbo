@@ -40,6 +40,7 @@ from primus_turbo.flydsl.ulysses.common import (
     claim_unit,
     exit_and_bump_epoch,
     i64_base,
+    seq_row,
     spin_flag,
 )
 from primus_turbo.flydsl.ulysses.workspace import (
@@ -102,6 +103,7 @@ def _pull_unit(
     nv,
     seq_local,
     is_bshd,
+    seq_chunk,
     rank,
     num_ranks,
     flag_region,
@@ -136,11 +138,7 @@ def _pull_unit(
     for it in range(BM // rows_per_iter):
         t = m_tile * fx.Int32(BM) + fx.Int32(it * rows_per_iter) + warp * fx.Int32(rows_per_warp) + lane_row
         valid = t < fx.Int32(M)
-        if const_expr(is_bshd):
-            bi = t // fx.Int32(seq_local)
-            dst_row = t + bi * fx.Int32(seq_local * (num_ranks - 1)) + src * fx.Int32(seq_local)
-        else:
-            dst_row = src * fx.Int32(M) + t
+        dst_row = seq_row(t, src, M, seq_local, num_ranks, is_bshd, seq_chunk)
         src_word = t * fx.Int32(N // 2) + fx.Int32(rank * N_r // 2) + lane_word
         for first in range_constexpr(0, num_pieces, _PIECE_BATCH):
             batch = list(range(first, min(first + _PIECE_BATCH, num_pieces)))
@@ -231,6 +229,7 @@ def _make_kernel(
     nv,
     seq_local,
     is_bshd,
+    seq_chunk,
     flag_region,
     nt_vmcnt,
     bank_bytes,
@@ -298,6 +297,7 @@ def _make_kernel(
             nv=nv,
             seq_local=seq_local,
             is_bshd=is_bshd,
+            seq_chunk=seq_chunk,
             rank=rank,
             num_ranks=num_ranks,
             flag_region=flag_region,
@@ -391,6 +391,7 @@ def _launch(
     nv: fx.Constexpr[int],
     seq_local: fx.Constexpr[int],
     is_bshd: fx.Constexpr[bool],
+    seq_chunk: fx.Constexpr[int],
     flag_region: fx.Constexpr[int],
     nt_vmcnt: fx.Constexpr[int],
     num_lead: fx.Constexpr[int],
@@ -415,6 +416,7 @@ def _launch(
         nv,
         seq_local,
         is_bshd,
+        seq_chunk,
         flag_region,
         nt_vmcnt,
         bank_bytes,
@@ -454,6 +456,7 @@ def ulysses_gemm_a2a(
     seq_local,
     qkv_format,
     flag_region,
+    seq_chunk=0,
     BM=128,
     BN=256,
     num_pull_cu=16,
@@ -465,6 +468,7 @@ def ulysses_gemm_a2a(
 
     ``outs`` = (q, k, v) ordinary tensors ``[rows, heads, head_dim]`` with ``rows = n * M`` laid out as
     ``qkv_format`` (``sbhd``: [s, b], ``bshd``: [b, s]); a q-only output repeats one tensor.
+    ``seq_chunk``: the sequence split across ranks, see ``common.seq_row``.
     """
     M, K = a.shape
     N = b.shape[0] if layout == "nt" else b.shape[1]
@@ -499,6 +503,7 @@ def ulysses_gemm_a2a(
         nv,
         seq_local,
         qkv_format == "bshd",
+        seq_chunk,
         flag_region,
         3,
         num_lead,
