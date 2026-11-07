@@ -30,10 +30,8 @@ def test_sparse_mla_reference_and_fake(backend, sink_enabled, monkeypatch):
     GlobalBackendManager.set_sparse_attn_backend(backend)
     GlobalBackendManager.set_auto_tune(backend is None)
     q = torch.randn(64, 64, 576, device="cuda", dtype=torch.bfloat16)
-    q[..., 512:] = 0
     q.requires_grad_()
     kv = torch.randn(64, 576, device="cuda", dtype=torch.bfloat16)
-    kv[..., 512:] = 0
     kv.requires_grad_()
     indices = torch.stack([torch.randperm(64, device="cuda")[:64] for _ in range(64)]).int()
     indices[:, -4:] = -1
@@ -54,6 +52,12 @@ def test_sparse_mla_reference_and_fake(backend, sink_enabled, monkeypatch):
     actual.backward(grad)
     ref.backward(grad.float())
     pairs = [(actual, ref), (q.grad, qr.grad), (kv.grad, kr.grad)]
+    for result, expected in [
+        (q.grad[..., 512:], qr.grad[..., 512:]),
+        (kv.grad[..., 512:], kr.grad[..., 512:]),
+    ]:
+        assert expected.abs().max() > 0
+        assert compute_snr(expected, result.float()) > 35
     if sink_enabled:
         pairs.append((sink.grad, sr.grad))
     for result, expected in pairs:
