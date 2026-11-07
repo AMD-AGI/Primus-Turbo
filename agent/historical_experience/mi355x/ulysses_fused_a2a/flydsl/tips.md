@@ -46,3 +46,8 @@
   tiles it runs unpaced and long (115-134 us for 256 x 256 x 4096) after the last push.
 - FlyDSL disk cache can return the previous build after a kernel edit (same timings, new trace
   slots empty): `rm -rf /root/.flydsl/cache` before every A/B of kernel code.
+- Fine push units cost: 16-row push sub-units (BM 128, push_split 8) with a sys-release flag each
+  stretch a link-bound 205 us push to ~286 us. Keep units >= 64 rows.
+- Before shortening a tail with a smarter K order, count CU-us: if some tiles only get a CU at the
+  last arrival (claim-start trace percentiles near the push end), the tail is one whole tile
+  whatever the order inside it.

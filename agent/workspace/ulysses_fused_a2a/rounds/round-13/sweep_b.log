@@ -1,0 +1,21 @@
+  warnings.warn(
+  warnings.warn(
+  warnings.warn(
+  warnings.warn(
+seq=16384 w,0,256=301(e5e-05)  w,0,256,128,16,2=372(e4e-05)  w,0,256,128,16,4=379(e4e-05)  w,0,256,128,16,1=371(e4e-05)
+rank0: end=368 push_end=286
+  dgrad start 3 4 142 211 266 287 | ready 84 123 211 282 331 350 | end 106 145 234 307 350 368 | dur(after ready) 17 21 22 24 24 27
+  wgrad start 1 1 2 2 3 3 | end 295 297 308 315 317 322 | dur 294 296 306 313 315 321
+  push unit end 3 78 147 216 259 286
+rank1: end=367 push_end=286
+  dgrad start 3 4 144 215 269 286 | ready 83 128 213 283 333 348 | end 104 149 239 306 351 367 | dur(after ready) 17 22 22 24 25 27
+  wgrad start 1 1 2 2 3 4 | end 299 301 310 314 316 320 | dur 298 300 308 312 314 319
+  push unit end 3 78 146 217 259 286
+rank2: end=362 push_end=287
+  dgrad start 3 4 142 211 270 281 | ready 80 125 209 276 335 344 | end 100 148 233 297 356 362 | dur(after ready) 17 21 22 23 23 26
+  wgrad start 1 1 2 2 3 4 | end 297 300 307 309 315 317 | dur 296 299 305 307 314 315
+  push unit end 4 78 148 218 259 287
+rank3: end=365 push_end=282
+  dgrad start 3 3 141 212 268 282 | ready 82 122 212 283 334 346 | end 104 144 235 305 354 365 | dur(after ready) 18 22 22 23 24 28
+  wgrad start 0 1 2 2 2 3 | end 295 298 306 312 316 317 | dur 294 297 304 310 314 316
+  push unit end 4 77 145 214 255 282

@@ -79,3 +79,12 @@
 - Floor in step: push end + one 128 x 256 x 5120 dgrad tile = ~280 / ~480 us (82 % / ~97 % hidden).
   Below it: staggered sources (K walk by arrival) for the last m-tiles + rotated wgrad M walk, with
   ~95 CUs left to dgrad through the last ~80 us.
+
+## 2026-11-07 Round 13 ROLLED BACK — staggered sources for bwd QKV
+- Block-local stagger (blocks of n * D m-tiles) + K walk by arrival: correct; best 304 / 518 us
+  (D=1, push_split 1) vs 302 / 515. After its last segment a dgrad tile needs 17-28 us, but ~10 %
+  of the dgrad tiles are claimed at the last push and run whole. BM 256 tiles take ~155 us (no
+  CU-us gain); push_split 8 at BM 128 stretches the push to ~286 us.
+- Third rollback in a row: the bwd QKV tail is CU-us-bound (160 wgrad tiles pinned at ~45 % busy,
+  dgrad needs ~96 CUs, gets ~80). Further gains need a cheaper dgrad tile under load or wgrad
+  tiles that do not hold an idle CU.
