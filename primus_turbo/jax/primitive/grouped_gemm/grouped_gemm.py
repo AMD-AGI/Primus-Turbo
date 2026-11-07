@@ -105,6 +105,7 @@ from jax.interpreters import batching
 
 from primus_turbo.jax.primitive._batching import (
     broadcast_to_batch,
+    enable_x64,
     make_grouped_gemm_spmd_rule,
 )
 
@@ -124,7 +125,7 @@ def _compute_group_offs_batch_rule(args, axes):
         return compute_group_offs_p.bind(group_lens), None
     if axis != 0:
         group_lens = jnp.moveaxis(group_lens, axis, 0)
-    with jax.experimental.enable_x64():
+    with enable_x64():
         group_lens = group_lens.astype(jnp.int64)
         last_axis = group_lens.ndim - 1
         zeros = jnp.zeros(group_lens.shape[:-1] + (1,), dtype=jnp.int64)
@@ -160,7 +161,7 @@ def _ck_grouped_gemm_merge_rule(args, axes, **kwargs):
 
     a_merged = a_b.reshape((-1,) + a_b.shape[2:])  # (B*m_total, k)
     b_merged = b_b.reshape((-1,) + b_b.shape[2:])  # (B*G, k, n)
-    with jax.experimental.enable_x64():
+    with enable_x64():
         gl_merged = gl_b.reshape(-1).astype(jnp.int64)
         zeros = jnp.zeros((1,), dtype=jnp.int64)
         go_merged = jnp.concatenate([zeros, jax.lax.cumsum(gl_merged, axis=0)], axis=0).astype(jnp.int64)
@@ -195,7 +196,7 @@ def _ck_grouped_gemm_variable_k_merge_rule(args, axes, **kwargs):
 
     a_merged = a_b.reshape((-1,) + a_b.shape[2:])  # (B*k_total, m)
     b_merged = b_b.reshape((-1,) + b_b.shape[2:])  # (B*k_total, n)
-    with jax.experimental.enable_x64():
+    with enable_x64():
         gl_merged = gl_b.reshape(-1).astype(jnp.int64)
         zeros = jnp.zeros((1,), dtype=jnp.int64)
         go_merged = jnp.concatenate([zeros, jax.lax.cumsum(gl_merged, axis=0)], axis=0).astype(jnp.int64)

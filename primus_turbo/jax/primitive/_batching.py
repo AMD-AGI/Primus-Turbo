@@ -31,6 +31,11 @@ When there is no ``spmd_axis_name`` the fancy rule degrades to the plain rule.
 import jax
 import jax.numpy as jnp
 
+try:
+    from jax import enable_x64
+except ImportError:  # JAX versions before the context manager became public.
+    from jax.experimental import enable_x64
+
 __all__ = [
     "broadcast_to_batch",
     "spmd_name_or_none",
@@ -120,7 +125,7 @@ def make_grouped_gemm_spmd_rule(prim, plain_rule, int64_arg_indices=(2, 3)):
         args_b = [broadcast_to_batch(a, ax, bs) for a, ax in zip(args, axes)]
         local_idx = jax.lax.axis_index(spmd_name)
         args_local = [jax.lax.dynamic_index_in_dim(a, local_idx, axis=0, keepdims=False) for a in args_b]
-        with jax.experimental.enable_x64():
+        with enable_x64():
             for i in int64_arg_indices:
                 args_local[i] = args_local[i].astype(jnp.int64)
         out_local, ws_local = prim.bind(*args_local, **kwargs)
