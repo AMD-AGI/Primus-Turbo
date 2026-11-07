@@ -59,6 +59,36 @@ def _v_view(qkv: torch.Tensor, D: int, layout: str) -> torch.Tensor:
     return qkv[..., m["VO"] : m["VO"] + m["H"] * D].unflatten(-1, (m["H"], D))
 
 
+def _joint_v_view(txt_qkv: torch.Tensor, qkv: torch.Tensor, D: int, layout: str) -> torch.Tensor:
+    """v of two streams as one strided view, when the streams are adjacent slices of one buffer.
+
+    ``txt_qkv`` and ``qkv`` (``"sbhd"``) must lie back to back in one storage with the same strides, as
+    ``buf[:S_txt]`` and ``buf[S_txt:]`` of one ``[S_txt + S, B, ...]`` GEMM output do; then v of the joint
+    sequence (text first) is the view of that buffer's v columns. Raises ``ValueError`` otherwise (the caller
+    then asks for ``v_out="copy"``)."""
+    if layout != "sbhd":
+        raise ValueError(
+            "dit_qk_norm_rope: v_out='none' with a text stream needs layout='sbhd' (in 'bshd' the two streams "
+            "are not adjacent in memory)"
+        )
+    vt, vi = _v_view(txt_qkv, D, layout), _v_view(qkv, D, layout)
+    # torch.compile cannot read storage offsets or pointers, so a traced call checks the strides and shapes only
+    # and leaves "adjacent slices of one buffer" to the caller; eagerly the storage and the offsets are checked too.
+    adjacent = vt.stride() == vi.stride() and vt.shape[1:] == vi.shape[1:]
+    if adjacent and not torch.compiler.is_compiling():
+        adjacent = (
+            vt.untyped_storage().data_ptr() == vi.untyped_storage().data_ptr()
+            and vi.storage_offset() == vt.storage_offset() + vt.shape[0] * vt.stride(0)
+        )
+    if not adjacent:
+        raise ValueError(
+            "dit_qk_norm_rope: v_out='none' with a text stream needs txt_qkv and qkv to be adjacent slices of one "
+            "buffer (qkv[:S_txt] and qkv[S_txt:] of one GEMM output) with the same strides; use v_out='copy'"
+        )
+    shape = (vt.shape[0] + vi.shape[0],) + tuple(vt.shape[1:])
+    return vt.as_strided(shape, vt.stride())  # offset defaults to the text stream's: the view starts there
+
+
 class _DitQkNormRope(torch.autograd.Function):
     @staticmethod
     def forward(ctx, qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, bias, txt_bias, eps, layout, rope,
@@ -69,7 +99,8 @@ class _DitQkNormRope(torch.autograd.Function):
             return_rstd,
         )  # fmt: skip
         if not v_copy:
-            v = _v_view(qkv, w_q.shape[0], layout)
+            D = w_q.shape[0]
+            v = _v_view(qkv, D, layout) if txt_qkv is None else _joint_v_view(txt_qkv, qkv, D, layout)
         ctx.has_txt = txt_qkv is not None
         ctx.bias_grad = bias is not None
         ctx.bias_meta = [(b.shape, b.dtype) if b is not None else None for b in (bias, txt_bias)]
@@ -162,8 +193,11 @@ def dit_qk_norm_rope(
         round_normed: round the normalised, weighted q / k to qkv's dtype before RoPE, and the inverse-RoPE
             gradient before the RMSNorm backward. True is what an RMSNorm module followed by RoPE computes
             (diffusers, #556); False keeps both in fp32 (one rounding per output; closer to fp64).
-        v_out: ``"copy"`` writes v into a fresh ``[.., .., H, D]`` tensor; ``"none"`` (one stream only) returns v as
-            a strided view of qkv, and its gradient is written into d(qkv) by this op's backward.
+        v_out: ``"copy"`` writes v into a fresh ``[.., .., H, D]`` tensor; ``"none"`` returns v as a strided view of
+            the source instead (no copy), and its gradient is written into d(qkv) by this op's backward. With a
+            text stream, the view spans both streams as one joint sequence, which needs ``layout="sbhd"`` and
+            ``txt_qkv`` / ``qkv`` to be adjacent slices of one buffer with the same strides (``buf[:S_txt]`` and
+            ``buf[S_txt:]`` of one ``[S_txt + S, B, ..]`` GEMM output); otherwise ``ValueError``.
         bias, txt_bias: the QKV GEMMs' biases, when the GEMM adds them without differentiating them (e.g. a
             detached bias). The backward then returns their gradients (the column sums of d(qkv)), summed in the
             same pass.
@@ -188,8 +222,6 @@ def dit_qk_norm_rope(
     """
     if v_out not in _V_OUT:
         raise ValueError(f"dit_qk_norm_rope: v_out must be one of {_V_OUT}, got {v_out!r}")
-    if v_out == "none" and txt_qkv is not None:
-        raise ValueError("dit_qk_norm_rope: v_out='none' needs one stream (the joint v is a concatenation)")
     if txt_bias is not None and (bias is None or txt_qkv is None):
         raise ValueError("dit_qk_norm_rope: txt_bias needs txt_qkv and bias")
     if bias is not None and txt_qkv is not None and txt_bias is None:
@@ -197,6 +229,8 @@ def dit_qk_norm_rope(
     metas, D, _, _ = check_operands(
         qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, layout, rope, bias_grad=bias is not None
     )
+    if v_out == "none" and txt_qkv is not None:
+        _joint_v_view(txt_qkv, qkv, D, layout)  # raises before any launch when the streams are not adjacent
     for name, b, m in (("bias", bias, metas[-1]), ("txt_bias", txt_bias, metas[0])):
         if b is not None and b.numel() != m["ROW_W"]:
             raise ValueError(f"dit_qk_norm_rope: {name} must have {m['ROW_W']} elements, got {list(b.shape)}")

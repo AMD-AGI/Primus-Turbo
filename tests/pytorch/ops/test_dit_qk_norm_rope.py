@@ -225,10 +225,94 @@ def test_v_out_none():
         assert torch.equal(a[key], b[key])
     assert torch.equal(a["d_src"][0], b["d_src"][0])
     assert all(torch.equal(x, y) for x, y in zip(a["dw"][0], b["dw"][0]))
-    with pytest.raises(ValueError):
-        srcs2, ws2, _, _ = _make("sbhd", 4, True, H=H, D=D)
-        dit_qk_norm_rope(srcs2[1], *ws2[1], cos, sin, txt_qkv=srcs2[0], w_txt_q=ws2[0][0], w_txt_k=ws2[0][1],
+    with pytest.raises(ValueError, match="adjacent"):  # two separate buffers: no view spans them
+        srcs2, ws2, angs2, _ = _make("sbhd", 4, True, H=H, D=D)
+        cos2, sin2 = _tables(angs2, "interleaved", srcs2[0].dtype)
+        dit_qk_norm_rope(srcs2[1], *ws2[1], cos2, sin2, txt_qkv=srcs2[0], w_txt_q=ws2[0][0], w_txt_k=ws2[0][1],
                          v_out="none")  # fmt: skip
+
+
+def _joint_buffer(form, H, D, S=(128, 128), B=2, seed=0):
+    """One [S_txt + S_img, B, ..] buffer; its two slices are the adjacent streams."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    shape = (sum(S), B) + ((H, 3 * D) if form == 4 else (3 * H * D,))
+    buf = torch.randn(shape, generator=g).to(torch.bfloat16).cuda()
+    return buf[: S[0]], buf[S[0] :], buf
+
+
+@requires_gpu
+@pytest.mark.parametrize("form", [4, 3])
+@pytest.mark.parametrize("return_rstd", [False, True])
+def test_joint_v_view(form, return_rstd):
+    """v_out='none' with two adjacent streams: one strided view over both, bitwise the copy path, gradients too."""
+    H, D, eps = 16, 128, 1e-6
+    txt, img, buf = _joint_buffer(form, H, D)
+    ws = [tuple((1 + 0.3 * torch.randn(D)).bfloat16().cuda() for _ in range(2)) for _ in range(2)]
+    ang = (torch.randn(256 * 2, D // 2, dtype=torch.float64) * 3).repeat_interleave(2, dim=-1)
+    cos, sin = torch.cos(ang).bfloat16().cuda(), torch.sin(ang).bfloat16().cuda()
+
+    storages = []
+
+    def run(v_out):
+        lb = buf.detach().clone().requires_grad_()
+        storages.append(lb.untyped_storage().data_ptr())
+        wl = [tuple(w.detach().clone().requires_grad_() for w in p) for p in ws]
+        t, i = lb[:128], lb[128:]
+        out = dit_qk_norm_rope(i, *wl[1], cos, sin, eps, txt_qkv=t, w_txt_q=wl[0][0], w_txt_k=wl[0][1],
+                               v_out=v_out, return_rstd=return_rstd)  # fmt: skip
+        q, k, v = out[:3]
+        gen = torch.Generator().manual_seed(9)
+        grads = [torch.randn(x.shape, generator=gen).bfloat16().cuda() for x in (q, k, v)]
+        torch.autograd.backward((q, k, v), grads)
+        return out, lb.grad, [x.grad for p in wl for x in p]
+
+    (a, ga, wa), (b, gb, wb) = run("copy"), run("none")
+    assert b[2]._base is not None and not b[2].is_contiguous() and a[2].is_contiguous()
+    assert b[2].shape == a[2].shape and b[2].untyped_storage().data_ptr() == storages[1]
+    for x, y in zip(a, b):
+        assert torch.equal(x, y)
+    assert torch.equal(ga, gb) and all(torch.equal(x, y) for x, y in zip(wa, wb))
+
+
+@requires_gpu
+def test_joint_v_view_validation():
+    H, D = 16, 128
+    txt, img, buf = _joint_buffer(4, H, D)
+    w = torch.ones(D, dtype=torch.bfloat16, device="cuda")
+    cos = sin = torch.zeros(512, D, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="adjacent"):  # swapped: the image stream first
+        dit_qk_norm_rope(buf[:128], w, w, cos, sin, txt_qkv=buf[128:], w_txt_q=w, w_txt_k=w, v_out="none")
+    with pytest.raises(ValueError, match="adjacent"):  # a gap between the streams
+        big = torch.randn(256 + 16, 2, H, 3 * D, dtype=torch.bfloat16, device="cuda")
+        dit_qk_norm_rope(big[144:], w, w, cos, sin, txt_qkv=big[:128], w_txt_q=w, w_txt_k=w, v_out="none")
+    bs = torch.randn(2, 128, 3 * H * D, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="sbhd"):
+        dit_qk_norm_rope(bs, w, w, cos, sin, layout="bshd", txt_qkv=bs.clone(), w_txt_q=w, w_txt_k=w,
+                         v_out="none")  # fmt: skip
+
+
+@requires_gpu
+def test_joint_v_view_torch_compile():
+    H, D, eps = 16, 128, 1e-6
+    txt, img, buf = _joint_buffer(4, H, D)
+    ws = [(1 + 0.3 * torch.randn(D)).bfloat16().cuda() for _ in range(4)]
+    ang = (torch.randn(512, D // 2, dtype=torch.float64) * 3).repeat_interleave(2, dim=-1)
+    cos, sin = torch.cos(ang).bfloat16().cuda(), torch.sin(ang).bfloat16().cuda()
+
+    def f(b, w0, w1, w2, w3):
+        q, k, v = dit_qk_norm_rope(b[128:], w2, w3, cos, sin, eps, txt_qkv=b[:128], w_txt_q=w0, w_txt_k=w1,
+                                   v_out="none")  # fmt: skip
+        return q, k, v
+
+    def run(fn):
+        leaves = [t.detach().clone().requires_grad_() for t in (buf, *ws)]
+        out = fn(*leaves)
+        loss = sum(o.float().square().sum() * 1e-3 for o in out)
+        loss.backward()
+        return [o.detach().contiguous() for o in out] + [t.grad for t in leaves]
+
+    for a, b in zip(run(f), run(torch.compile(f, fullgraph=True))):
+        assert torch.equal(a, b)
 
 
 def _bwd(srcs, ws, cos, sin, grads, layout, rope, round_normed, bias, backend):
