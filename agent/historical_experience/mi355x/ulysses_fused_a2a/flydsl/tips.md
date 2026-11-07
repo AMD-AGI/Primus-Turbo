@@ -27,3 +27,9 @@
   and consumer (push) sides; a striped split then costs nothing (layer time within 0.2 %). Test it as
   the contiguous reference with the full sequence permuted (`index_select`), autograd included.
 - Cold JIT of the full fused-a2a suite at n = 8 can exceed 30 min; give torchrun 1 h or warm the cache.
+- Moving a FlyDSL kernel body into a helper function: decorate the helper with `@ASTRewriter.transform`,
+  or its dynamic `if` / `while` are evaluated in Python at trace time (it compiles, runs fast, and is
+  wrong). One `SharedAllocator` per kernel: callers that own it pass the view in (`_setup(lds=...)`);
+  roles that need different LDS layouts go in an `fx.union`.
+- A persistent attention (grid = #CUs, counter-claimed tiles in the tiled launch's order) is bitwise
+  equal to the tiled launch and no slower; under 4-rank exchange load it was faster on the max rank.

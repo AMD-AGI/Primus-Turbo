@@ -43,6 +43,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from primus_turbo.pytorch.ops import flash_attn_func
+from primus_turbo.pytorch.ops.attention.mega_attn import mega_attn_func
 from primus_turbo.pytorch.ops.attention.ulysses_fused_a2a import (
     ulysses_a2a_o_gemm,
     ulysses_qkv_gemm_a2a,
@@ -205,10 +206,21 @@ class _PostA2A(torch.autograd.Function):
 
 
 class UlyssesLayer:
-    def __init__(self, cfg, seq, mbs, group, use_mlp, fused=False, seq_chunk=0, dtype=torch.bfloat16):
+    def __init__(
+        self,
+        cfg,
+        seq,
+        mbs,
+        group,
+        use_mlp,
+        fused=False,
+        seq_chunk=0,
+        persistent_attn=False,
+        dtype=torch.bfloat16,
+    ):
         n = group.size()
         self.cfg, self.mbs, self.group, self.use_mlp, self.fused = cfg, mbs, group, use_mlp, fused
-        self.seq_chunk = seq_chunk
+        self.seq_chunk, self.persistent_attn = seq_chunk, persistent_attn
         self.s_local = seq // n
         hidden, hq, hkv, d = cfg["hidden"], cfg["hq"], cfg["hkv"], cfg["d"]
 
@@ -243,7 +255,11 @@ class UlyssesLayer:
             q, k, v = mark("qkv_gemm", None, q, k, v)
             q, k, v = _PreA2A.apply(q, k, v, self.helper, self.group)
             q, k, v = mark(None, "attn", q, k, v)
-        o = flash_attn_func(q, k, v, causal=cfg["causal"])
+        if self.persistent_attn:
+            assert b == 1 and cfg["causal"], "the persistent attention takes [b, s] as an sbhd view: b = 1"
+            o = mega_attn_func(*(t.permute(1, 0, 2, 3) for t in (q, k, v))).permute(1, 0, 2, 3)
+        else:
+            o = flash_attn_func(q, k, v, causal=cfg["causal"])
         if self.fused:
             o = mark("attn", "o_gemm", o)
             y = ulysses_a2a_o_gemm(o, self.w_o, x, self.group, "bshd", self.seq_chunk)
@@ -295,13 +311,15 @@ def _all_reduce(values, op):
     return t.tolist()
 
 
-def run_config(model, seq, mbs, group, use_mlp, warmup, iters, fused=False, seq_chunk=0):
+def run_config(
+    model, seq, mbs, group, use_mlp, warmup, iters, fused=False, seq_chunk=0, persistent_attn=False
+):
     cfg = MODEL_PARAMS_TABLE[model]
     n = group.size()
     for what, size in (("seq", seq), ("q heads", cfg["hq"]), ("kv heads", cfg["hkv"])):
         assert size % n == 0, f"{what}={size} must be divisible by the Ulysses degree {n}"
 
-    layer = UlyssesLayer(cfg, seq, mbs, group, use_mlp, fused, seq_chunk)
+    layer = UlyssesLayer(cfg, seq, mbs, group, use_mlp, fused, seq_chunk, persistent_attn)
     x0 = torch.randn(mbs, seq // n, cfg["hidden"], device="cuda", dtype=torch.bfloat16)
     dy = torch.randn_like(x0)
 
@@ -507,6 +525,9 @@ def main():
     parser.add_argument(
         "--seq-chunk", type=int, default=0, help="fused layer: striped split in chunks of this many tokens"
     )
+    parser.add_argument(
+        "--persistent-attn", action="store_true", help="fused layer: persistent forward attention kernel"
+    )
     args = parser.parse_args()
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -533,6 +554,7 @@ def main():
                     args.iters,
                     fused=True,
                     seq_chunk=args.seq_chunk,
+                    persistent_attn=args.persistent_attn,
                 )
             if rank == 0:
                 row = report(model, seq, args.mbs, n, not args.no_mlp, stages, stages_max, totals, iso)

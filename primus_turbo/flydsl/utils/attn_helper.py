@@ -605,7 +605,10 @@ class DualwaveKernelContext:
         self.head_dim_runtime = head_dim_runtime
         self.block_table_stride = block_table_stride
 
-    def _setup(self, shared_storage):
+    def _setup(self, shared_storage, block_ids=None, lds=None):
+        """``block_ids``: ``(head group, q block, batch)`` of the work item instead of the CTA's block
+        index (q block in the dispatch order, see below); ``lds``: the ``shared_storage`` view when the
+        caller owns the kernel's one LDS allocator."""
         head_dim_runtime = self.head_dim_runtime
         traits = self.traits
         self.NUM_DMA_K = traits.SMEM_D_RPT
@@ -651,21 +654,24 @@ class DualwaveKernelContext:
         self.stride_q_n_v = fx.Index(stride_q_n)
         self.stride_kv_n_v = fx.Index(stride_kv_n)
 
-        lds = fx.SharedAllocator().allocate(shared_storage).peek()
+        if lds is None:
+            lds = fx.SharedAllocator().allocate(shared_storage).peek()
         self.lds = lds
         self.lds_kv_base_idx = fx.Index(fx.ptrtoint(lds.kv.ptr))
         self.lds_kv_base_ptr = buffer_ops.create_llvm_ptr(self.lds_kv_base_idx, address_space=3)
 
-        self.h_idx = fx.Index(gpu.block_idx.x)
+        if block_ids is None:
+            block_ids = (gpu.block_idx.x, gpu.block_idx.y, gpu.block_idx.z)
+        self.h_idx = fx.Index(block_ids[0])
         if const_expr(traits.CAUSAL):
             # Dispatch order is the list-schedule order and causal work grows with q_block
             # (a window flattens but never inverts that), so walk q_block descending
             # (longest-processing-time-first). From seq_len, not grid_dim.y, to stay uniform.
             _nq = (self.seq_len_v + fx.Index(traits.BLOCK_M - 1)) // fx.Index(traits.BLOCK_M)
-            self.q_block_idx = _nq - fx.Index(1) - fx.Index(gpu.block_idx.y)
+            self.q_block_idx = _nq - fx.Index(1) - fx.Index(block_ids[1])
         else:
-            self.q_block_idx = fx.Index(gpu.block_idx.y)
-        self.batch_idx = fx.Index(gpu.block_idx.z)
+            self.q_block_idx = fx.Index(block_ids[1])
+        self.batch_idx = fx.Index(block_ids[2])
         self.tid = fx.Index(gpu.thread_idx.x)
 
         self.wave_id = self.tid // traits.WARP_SIZE

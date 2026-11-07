@@ -124,7 +124,9 @@ def _fp32_leaf(t):
     return t.detach().float().requires_grad_()
 
 
-def check_qkv(group, hq, hkv, d, b, s_local, hidden, qkv_format, weight_layout, repeats, failures, seq_chunk=0):
+def check_qkv(
+    group, hq, hkv, d, b, s_local, hidden, qkv_format, weight_layout, repeats, failures, seq_chunk=0
+):
     from primus_turbo.pytorch.ops.attention.ulysses_fused_a2a import ulysses_qkv_gemm_a2a
 
     rank = group.rank()
@@ -151,7 +153,9 @@ def check_o_gemm(group, hq, d, b, s_local, hidden, qkv_format, with_residual, re
 
     n, rank = group.size(), group.rank()
     w_o = _randn(hidden, hq * d, seed=4321, scale=0.02).requires_grad_()
-    tag = f"[o_proj hq={hq} d={d} b={b} s/n={s_local} {qkv_format} residual={with_residual} chunk={seq_chunk}]"
+    tag = (
+        f"[o_proj hq={hq} d={d} b={b} s/n={s_local} {qkv_format} residual={with_residual} chunk={seq_chunk}]"
+    )
     seq = s_local * n
     for it in range(repeats):
         o_shape = (seq, b, hq // n, d) if qkv_format == "sbhd" else (b, seq, hq // n, d)
@@ -227,7 +231,8 @@ def check_scenarios(group, failures, hq=32, hkv=8, d=128, b=2, s_local=320, hidd
     for qkv_format in ("sbhd", "bshd"):
         shape = (s_local, b, hidden) if qkv_format == "sbhd" else (b, s_local, hidden)
         layers = [
-            _Layer(group, hq, hkv, d, hidden, qkv_format, seed=10 * i, seq_chunk=64 * (i % 2)) for i in range(3)
+            _Layer(group, hq, hkv, d, hidden, qkv_format, seed=10 * i, seq_chunk=64 * (i % 2))
+            for i in range(3)
         ]
 
         # back to back layers: every op of a layer overlaps the bank / flag reuse of the previous one
@@ -271,7 +276,9 @@ def check_poisoned(group, failures, hq=32, hkv=8, d=128, b=2, s_local=320, hidde
     for qkv_format in ("sbhd", "bshd"):
         for seq_chunk in (0, 64):
             _poison_banks(group)
-            check_qkv(group, hq, hkv, d, b, s_local, hidden, qkv_format, "interleaved", 1, failures, seq_chunk)
+            check_qkv(
+                group, hq, hkv, d, b, s_local, hidden, qkv_format, "interleaved", 1, failures, seq_chunk
+            )
             _poison_banks(group)
             check_o_gemm(group, hq, d, b, s_local, hidden, qkv_format, True, 1, failures, seq_chunk)
 

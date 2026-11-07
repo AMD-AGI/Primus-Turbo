@@ -309,7 +309,9 @@ def _o_gemm_backward(
 class UlyssesA2AOGemmFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, o, w_o, residual, group, qkv_format, seq_chunk):
-        y, o_gathered = _o_gemm_forward(o, w_o, residual, group, qkv_format, seq_chunk, save_o=w_o.requires_grad)
+        y, o_gathered = _o_gemm_forward(
+            o, w_o, residual, group, qkv_format, seq_chunk, save_o=w_o.requires_grad
+        )
         ctx.save_for_backward(w_o, o_gathered)
         ctx.group, ctx.qkv_format, ctx.has_residual = group, qkv_format, residual is not None
         ctx.seq_chunk = seq_chunk

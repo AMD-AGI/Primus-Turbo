@@ -21,6 +21,7 @@ the left-windowed path keeps an odd span and pairs it with a two-tile epilogue d
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
@@ -40,113 +41,25 @@ from primus_turbo.flydsl.utils.attn_helper import (
     dtype_to_elem_type,
 )
 
+# K/V LDS reads are spread across compute clusters, so the module compiles with a memory-clause
+# pre-RA schedule plus the post-RA waitcnt cleanup.
+DUALWAVE_SWP_COMPILE_HINTS = {
+    "fast_fp_math": True,
+    "unsafe_fp_math": True,
+    "llvm_options": {
+        "amdgpu-sched-strategy": "max-memory-clause",
+        "enable-post-misched": True,
+        "lsr-drop-solution": True,
+    },
+}
 
-def build_flash_attn_dualwave_swp_module(
-    num_heads,
-    head_dim,
-    causal=True,
-    dtype_str="bf16",
-    num_kv_heads=None,
-    waves_per_eu=2,
-    daz=True,
-    dualwave_swp_setprio=True,
-    dualwave_swp_enable_stagger=True,
-    varlen=False,
-    cross_seqlen=False,
-    emit_lse=False,
-    window_left=-1,
-    block_m=None,
-    gqa_merge=None,
-    sbhd=False,
-    has_sink=False,
-):
-    """Build a DUALWAVE_SWP flash_attn launcher for D=64/128 bf16/f16 on gfx950.
 
-    Supports dense (SBHD) and varlen packed QKV (THD) layouts. has_sink folds a learned
-    per-q-head attention sink (SINK[Hq] fp32) into the online-softmax denominator.
-    """
-    gpu_arch = get_hip_arch()
+def make_dualwave_swp_tile(traits):
+    """The kernel body for one (head group, q block, batch) work item: ``attn_tile(ctx)`` after
+    ``ctx._setup``. Shared by the one-CTA-per-tile launch and persistent callers."""
 
-    if not gpu_arch.startswith("gfx950"):
-        raise RuntimeError(
-            f"flash_attn_dualwave_swp requires gfx950+ (uses ds_read_tr16_b64), got {gpu_arch}"
-        )
-    if head_dim not in (64, 128):
-        raise RuntimeError(f"flash_attn_dualwave_swp supports D=64 or D=128 only, got head_dim={head_dim}")
-    if dtype_str not in ("bf16", "f16"):
-        raise RuntimeError(f"flash_attn_dualwave_swp supports bf16/f16 only, got dtype={dtype_str}")
-
-    if num_kv_heads is None:
-        num_kv_heads = num_heads
-    assert num_heads % num_kv_heads == 0
-
-    traits = _make_dualwave_swp_traits(
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        causal=causal,
-        dtype_str=dtype_str,
-        waves_per_eu=waves_per_eu,
-        daz=daz,
-        dualwave_swp_setprio=dualwave_swp_setprio,
-        dualwave_swp_enable_stagger=dualwave_swp_enable_stagger,
-        varlen=varlen,
-        cross_seqlen=cross_seqlen,
-        emit_lse=emit_lse,
-        window_left=window_left,
-        block_m=block_m,
-        gqa_merge=gqa_merge,
-        sbhd=sbhd,
-        has_sink=has_sink,
-    )
-    _dualwave_swp_cache_tag = traits.cache_tag
-
-    _lds_elem_dtype = dtype_to_elem_type(traits.DTYPE_STR)
-
-    @fx.struct
-    class SharedStorage:
-        kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
-
-    @flyc.kernel(name="flash_attn_dualwave_swp_gfx950_kernel", known_block_size=[traits.BLOCK_SIZE, 1, 1])
-    def flash_attn_dualwave_swp_gfx950_kernel(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        O: fx.Tensor,  # noqa: E741
-        DebugCounts: fx.Tensor,
-        CuSeqQ: fx.Tensor,
-        CuSeqKv: fx.Tensor,
-        BlockTable: fx.Tensor,
-        SINK: fx.Tensor,
-        ScoreBound: fx.Tensor,
-        seq_len: fx.Int32,
-        seq_len_kv: fx.Int32,
-        stride_q_n: fx.Int32,
-        stride_kv_n: fx.Int32,
-        head_dim_runtime: fx.Int32,
-        block_table_stride: fx.Int32,
-    ):
-        ctx = DualwaveKernelContext(
-            traits,
-            Q,
-            K,
-            V,
-            O,
-            DebugCounts,
-            CuSeqQ,
-            CuSeqKv,
-            BlockTable,
-            seq_len,
-            seq_len_kv,
-            stride_q_n,
-            stride_kv_n,
-            head_dim_runtime,
-            block_table_stride,
-            SINK=SINK,
-            ScoreBound=ScoreBound,
-        )
-        ctx._setup(SharedStorage)
-
+    @ASTRewriter.transform
+    def attn_tile(ctx):
         active = ctx.active
         # A tile's LDS buffer is not overwritten until two barriers later, so its drain can sink
         # into the consuming compute cluster; stagger spends that same slack, hence the exclusion.
@@ -858,6 +771,117 @@ def build_flash_attn_dualwave_swp_module(
 
             _run_body_if_active()
 
+    return attn_tile
+
+
+def build_flash_attn_dualwave_swp_module(
+    num_heads,
+    head_dim,
+    causal=True,
+    dtype_str="bf16",
+    num_kv_heads=None,
+    waves_per_eu=2,
+    daz=True,
+    dualwave_swp_setprio=True,
+    dualwave_swp_enable_stagger=True,
+    varlen=False,
+    cross_seqlen=False,
+    emit_lse=False,
+    window_left=-1,
+    block_m=None,
+    gqa_merge=None,
+    sbhd=False,
+    has_sink=False,
+):
+    """Build a DUALWAVE_SWP flash_attn launcher for D=64/128 bf16/f16 on gfx950.
+
+    Supports dense (SBHD) and varlen packed QKV (THD) layouts. has_sink folds a learned
+    per-q-head attention sink (SINK[Hq] fp32) into the online-softmax denominator.
+    """
+    gpu_arch = get_hip_arch()
+
+    if not gpu_arch.startswith("gfx950"):
+        raise RuntimeError(
+            f"flash_attn_dualwave_swp requires gfx950+ (uses ds_read_tr16_b64), got {gpu_arch}"
+        )
+    if head_dim not in (64, 128):
+        raise RuntimeError(f"flash_attn_dualwave_swp supports D=64 or D=128 only, got head_dim={head_dim}")
+    if dtype_str not in ("bf16", "f16"):
+        raise RuntimeError(f"flash_attn_dualwave_swp supports bf16/f16 only, got dtype={dtype_str}")
+
+    if num_kv_heads is None:
+        num_kv_heads = num_heads
+    assert num_heads % num_kv_heads == 0
+
+    traits = _make_dualwave_swp_traits(
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        causal=causal,
+        dtype_str=dtype_str,
+        waves_per_eu=waves_per_eu,
+        daz=daz,
+        dualwave_swp_setprio=dualwave_swp_setprio,
+        dualwave_swp_enable_stagger=dualwave_swp_enable_stagger,
+        varlen=varlen,
+        cross_seqlen=cross_seqlen,
+        emit_lse=emit_lse,
+        window_left=window_left,
+        block_m=block_m,
+        gqa_merge=gqa_merge,
+        sbhd=sbhd,
+        has_sink=has_sink,
+    )
+    _dualwave_swp_cache_tag = traits.cache_tag
+    attn_tile = make_dualwave_swp_tile(traits)
+
+    _lds_elem_dtype = dtype_to_elem_type(traits.DTYPE_STR)
+
+    @fx.struct
+    class SharedStorage:
+        kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
+
+    @flyc.kernel(name="flash_attn_dualwave_swp_gfx950_kernel", known_block_size=[traits.BLOCK_SIZE, 1, 1])
+    def flash_attn_dualwave_swp_gfx950_kernel(
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        O: fx.Tensor,  # noqa: E741
+        DebugCounts: fx.Tensor,
+        CuSeqQ: fx.Tensor,
+        CuSeqKv: fx.Tensor,
+        BlockTable: fx.Tensor,
+        SINK: fx.Tensor,
+        ScoreBound: fx.Tensor,
+        seq_len: fx.Int32,
+        seq_len_kv: fx.Int32,
+        stride_q_n: fx.Int32,
+        stride_kv_n: fx.Int32,
+        head_dim_runtime: fx.Int32,
+        block_table_stride: fx.Int32,
+    ):
+        ctx = DualwaveKernelContext(
+            traits,
+            Q,
+            K,
+            V,
+            O,
+            DebugCounts,
+            CuSeqQ,
+            CuSeqKv,
+            BlockTable,
+            seq_len,
+            seq_len_kv,
+            stride_q_n,
+            stride_kv_n,
+            head_dim_runtime,
+            block_table_stride,
+            SINK=SINK,
+            ScoreBound=ScoreBound,
+        )
+        ctx._setup(SharedStorage)
+        attn_tile(ctx)
+
     @flyc.jit
     def launch_flash_attn_dualwave_swp(
         Q: fx.Tensor,
@@ -923,17 +947,7 @@ def build_flash_attn_dualwave_swp_module(
             stream=stream,
         )
 
-    # K/V LDS reads are spread across compute clusters, so this module compiles with a
-    # memory-clause pre-RA schedule plus the post-RA waitcnt cleanup.
-    _dualwave_swp_compile_hints = {
-        "fast_fp_math": True,
-        "unsafe_fp_math": True,
-        "llvm_options": {
-            "amdgpu-sched-strategy": "max-memory-clause",
-            "enable-post-misched": True,
-            "lsr-drop-solution": True,
-        },
-    }
+    _dualwave_swp_compile_hints = DUALWAVE_SWP_COMPILE_HINTS
 
     _compiled: dict = {}
     _COMPILED_MAX = 64
