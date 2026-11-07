@@ -11,7 +11,17 @@
 | 16K | 1387 | 2897 | 4284 µs | 249 + 220 + 255 + 420 = 1144 µs | 558 + 1443 = 2001 µs |
 | 32K | 3658 | 8000 | 11658 µs | 453 + 368 + 489 + 645 = 1955 µs | 2156 + 5417 = 7573 µs |
 
-交换阶段全部藏到 attention 后面的上限：16K 每层 -27%，32K 每层 -17%。attention 本身是交换的 2–4 倍长，时间上放得下。
+四个阶段都是“GEMM + 交换”。GEMM 和 attention 都受计算限制，抢同一批 CU，藏不到 attention 后面，能藏的只有交换本身。扣掉同一份日志里未融合 hipBLASLt 的纯 GEMM 时间：
+
+| | 16K | 32K |
+|---|---|---|
+| 纯 GEMM（QKV fwd + o_proj fwd + o_proj bwd + QKV bwd） | 99 + 77 + 141 + 261 = 578 | 186 + 127 + 270 + 456 = 1039 |
+| 交换部分 = 阶段合计 − 纯 GEMM | 566 | 916 |
+| 上限 = 交换部分 / 层合计 | **13.2%** | **7.9%** |
+
+（最初写的 -27% / -17% 直接拿阶段合计除以层合计，把 GEMM 也算成可藏的，高估约一倍。）
+
+实际可藏的还要小。融合阶段的时间 ≈ max(GEMM, 链路时间)：单独的 a2a（RCCL）在 32K 是 pre 468 / post 384 µs，16K 是 251 / 212 µs，GemmA2A / A2AGemm 的前向两段已经贴着链路时间。而且 GEMM 和 pull 同时跑时 GEMM tile 慢约一倍（BM128 约 30 → 60 µs，BM256 约 55 → 100 µs，与 tile 实现和光栅顺序无关，pull 用 nt store 也没用），所以“链路时间 − GEMM”这段真正空出来的窗口很短：第 4 轮 trace 里前向 QKV 只剩约 60 µs（16K）/ 15 µs（32K）的交换尾巴。
 
 ## 2. 序列切分：条带（striped）
 
@@ -61,3 +71,32 @@ contiguous 切分（rank r 持有 `[r·s/n, (r+1)·s/n)`）下三者冲突：各
 6. 里程碑：e2e 训练（Primus，Qwen3-30B-A3B CP4，16K / 32K）。
 
 约束：不用 CUDA graph；op 返回后无常驻 kernel；无全局 barrier、无 D2H 同步；每个自旋有超时诊断；容忍 rank skew；结果按位确定。
+
+## 6. 结果和结论（第 1–5 轮，已暂停）
+
+记录在 `agent/workspace/mega_attn_flydsl_gfx950_20261107/`，分支 `feat/mega-attn`。得分 = 16K、32K 层 fwd+bwd 的几何平均（µs）。
+
+| 轮 | 内容 | 得分（最慢 rank fwd + 最慢 rank bwd） |
+|---|---|---|
+| 1 | baseline：GemmA2A / A2AGemm + 独立 FlyDSL attention | 7067 |
+| 2 | 条带切分 `seq_chunk` | 7054 |
+| 3 | 持久化前向 attention（按位等于生产 kernel） | 7001 |
+| 4 | 前向 QKV GemmA2A + attention 一个 kernel，按 pull 单元的就绪 flag 开算 | 6937 |
+| 5 | attention worker 直接把 O tile 推给 owner，o_proj tile 在同一 kernel 里接着领 | 6931（每 rank fwd+bwd：6949 → 6889） |
+
+- 第 5 轮起 bench 多一行 “fwd+bwd per rank”（同一 rank 同一迭代的 fwd + bwd，再取各 rank 最大）。“最慢 rank fwd + 最慢 rank bwd” 会把前向结束处的 rank 偏斜算两次。
+- 前向整层在 16K / 32K 一共少了约 85 / 270 µs，整层约 -2%；GemmA2A / A2AGemm 本身（相对 unfused）是 -12% / -9%。
+- 收益小的原因就是第 1 节：前向两段交换已经和 GEMM 重叠到链路时间，剩下的窗口只有几十 µs；attention 和 GEMM 不能互相重叠。
+- 层 kernel 的 pull CU 数（`num_pull + num_tail`）：32K 24+8 / 16+8 / 8+8 = 2711 / 2680 / 2684 µs，16K = 952 / 969 / 1052 µs，现默认 24+8。
+- 反向没有做。反向各段（4 rank，最慢 rank 的 median，µs）：
+
+| | 32K | 16K |
+|---|---|---|
+| QKV A2AGemm（dx + 收集 dqkv） | 513 | 289 |
+| QKV wgrad（在 A2AGemm 之后串行） | 156 | 85 |
+| o_proj GemmA2A dgrad | 392 | 226 |
+| o_proj wgrad（side stream，已被 dgrad 盖住） | 143 | 78 |
+
+  能拿的只剩串行的 QKV wgrad（32K 约 145 µs、16K 约 85 µs，每层 1.3–2%），这属于 A2AGemm 本身的优化，不需要 MegaAttn。
+
+结论：MegaAttn 暂停，代码保留在 `feat/mega-attn`（`ulysses_attn_layer_func`，测试 `tests/pytorch/ops/test_mega_attn.py`）。后续优化回到 GemmA2A / A2AGemm。
