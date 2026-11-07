@@ -303,6 +303,9 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
             )
 
 
+# Routing state and FlyDSL JIT launches must stay outside Dynamo tracing.
+# The eager custom autograd edge still connects both sides of a compiled model.
+@torch.compiler.disable
 def fused_mega_moe_stage1(
     x: torch.Tensor,
     topk_idx: torch.Tensor,
@@ -319,6 +322,9 @@ def fused_mega_moe_stage1(
     return l1_out, dispatch_weights, DispatchHandle(*handle)
 
 
+# Routing state and FlyDSL JIT launches must stay outside Dynamo tracing.
+# The eager custom autograd edge still connects both sides of a compiled model.
+@torch.compiler.disable
 def fused_mega_moe_stage2(
     l1_out: torch.Tensor,
     dispatch_weights: torch.Tensor,
