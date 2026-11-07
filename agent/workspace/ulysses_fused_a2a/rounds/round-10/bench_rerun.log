@@ -1,0 +1,57 @@
+W1107 12:29:48.835000 559019 torch/distributed/run.py:982] 
+W1107 12:29:48.835000 559019 torch/distributed/run.py:982] *****************************************
+W1107 12:29:48.835000 559019 torch/distributed/run.py:982] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1107 12:29:48.835000 559019 torch/distributed/run.py:982] *****************************************
+W1107 12:29:50.539000 559186 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1107 12:29:50.544000 559187 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1107 12:29:50.563000 559185 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1107 12:29:50.566000 559188 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1107 12:29:50.672000 559187 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 12:29:50.672000 559187 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 12:29:50.673000 559187 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 12:29:50.673000 559187 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 12:29:50.673000 559187 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 12:29:50.673000 559187 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 12:29:50.707000 559186 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 12:29:50.707000 559186 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 12:29:50.707000 559186 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 12:29:50.707000 559186 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 12:29:50.707000 559186 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 12:29:50.707000 559186 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 12:29:50.718000 559188 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 12:29:50.718000 559188 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 12:29:50.718000 559188 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 12:29:50.718000 559188 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 12:29:50.718000 559188 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 12:29:50.718000 559188 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 12:29:50.724000 559185 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 12:29:50.724000 559185 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 12:29:50.724000 559185 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 12:29:50.724000 559185 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1107 12:29:50.724000 559185 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1107 12:29:50.724000 559185 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+peaks: GEMM 1241 TFLOP/s (hipBLASLt 8192^3), link 145 GB/s per rank off-rank (RCCL 1 GiB a2a)
+
+== qwen3-30b-a3b seq=16384 ulysses=4 mbs=1  (us, max over ranks)
+  op                               gemm    wgrad      a2a     pack   serial  unfused  overlap    fused roofline  hidden fused/roof
+  fwd QKV (GemmA2A)                  86        0      251      110      337      440      251      256      217    95%      1.18x
+  fwd o_proj (A2AGemm)               77        0      215       37      292      319      215      237      174    72%      1.36x
+  bwd o_proj (GemmA2A+wgrad)         67       77      216       37      361      386      216      238      174    85%      1.37x
+  bwd QKV (A2AGemm+wgrad)            88       85      251       74      423      527      251      301      217    71%      1.39x
+
+== qwen3-30b-a3b seq=32768 ulysses=4 mbs=1  (us, max over ranks)
+  op                               gemm    wgrad      a2a     pack   serial  unfused  overlap    fused roofline  hidden fused/roof
+  fwd QKV (GemmA2A)                 163        0      472      185      635      828      472      469      435   102%      1.08x
+  fwd o_proj (A2AGemm)              131        0      387       65      518      576      387      409      348    83%      1.18x
+  bwd o_proj (GemmA2A+wgrad)        127      143      389       65      659      715      389      425      348    86%      1.22x
+  bwd QKV (A2AGemm+wgrad)           146      156      474      123      775      978      474      516      435    86%      1.19x
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)

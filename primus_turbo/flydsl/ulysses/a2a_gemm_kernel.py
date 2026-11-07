@@ -726,7 +726,7 @@ def ulysses_a2a_gemm(
     groups=1,
     BM=None,
     BN=256,
-    num_push=32,
+    num_push=None,
     push_split=8,
     wgrad=None,
     BMw=256,
@@ -765,6 +765,9 @@ def ulysses_a2a_gemm(
         assert layout == "nn" and o_gathered is None
         assert xb.is_contiguous() and tuple(xb.shape) == (M, N) and dw.is_contiguous() and tuple(dw.shape) == (K, N)
         num_wtiles = K // BMw * (N // BN)
+    if num_push is None:
+        # with weight-gradient tiles the launch is compute-bound: 16 pushers still fill the links
+        num_push = 32 if wgrad is None else 16
     if BM is None:
         # 256-row tiles while every tile has a CU (the staggered K walk); otherwise 128 rows halve the
         # tail of the m-tile that lands last

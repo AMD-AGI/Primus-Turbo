@@ -58,3 +58,13 @@
   hold the tail pulls' CUs (257 / 503).
 - Step sum 3072 -> 2887 (-6.0 %); layer fwd+bwd 16K 4277 -> 4185, 32K 11620 -> 11435.
 - The R5 / R6 rollbacks were partly the tile, not the idea: R5 measured the mega `tn` tile.
+
+## 2026-11-07 Round 10 ACCEPTED — bwd QKV: 16 push blocks with the wgrad tiles
+- Trace of R9 bwd QKV: push ends 193 / 385 us, kernel 318 / 544. The 160 wgrad tiles hold their CUs
+  through the whole exchange (paced by arrival, ~45 % busy); dgrad gets ~64 CUs, backs up, and the
+  last m-tile's tile (in step: starts after its last source) takes ~80 us after the last push.
+- Push-count sweep: 16-20 best (303 / 513, 300 / 512); push still link-bound (ends 201-211 / 396-420).
+- Same-session A/B R9 -> R10: bwd QKV 324 -> 302, 559 -> 514; step sum 2906 -> 2841.
+- Primus e2e (R9 + R10): 16K 3152.7 -> 2804.4 ms/iter (-11.0 %), 32K 6584.8 -> 5974.0 (-9.3 %).
+- Remaining bwd QKV gap (~85 us at 16K): the in-step dgrad tail. Next: split late dgrad tiles' K
+  by source with a deterministic fixed-order reduction.

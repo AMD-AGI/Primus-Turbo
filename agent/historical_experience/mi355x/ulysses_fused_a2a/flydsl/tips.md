@@ -31,3 +31,11 @@
   (`num_lead + tiles / 8`); after all GEMM tiles they sit in front of the tail pulls.
 - No side streams on MI355X: an in-kernel wgrad beat both the side-stream hipBLASLt (bwd o 245 / 433
   -> 228 / 419) and the stream-gated chunks of R6.
+- Once compute tiles (e.g. an in-kernel wgrad) share a push-mode launch, re-sweep the pusher count:
+  bwd QKV went 32 -> 16 pushers for -7 / -8 % with the push still at link rate. Check with the trace
+  that the push end barely moves; the freed CUs only help while tiles are queued behind it.
+- A tile that walks all of M (wgrad) and is claimed at the start holds its CU for the whole
+  exchange at the arrival rate (~45 % busy at 16K); an in-step dgrad tile of the last m-tile adds its
+  full latency (~80 us for 128 x 256 x 5120) after the last push. Those two set the tail.
+- After `rm -rf /root/.flydsl/cache` the full Ulysses test suite cold-compiles ~20-30 min (CPU-bound,
+  GPU idle, cache dir growing): not a hang; run `--quick` first.
