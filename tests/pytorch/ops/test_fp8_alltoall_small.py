@@ -52,7 +52,9 @@ class FP8AllToAllSmallTest(MultiProcessTestCase):
             torch.testing.assert_close(
                 actual, expected, rtol=0.07 if quantize[0] else 0, atol=0.02 if quantize[0] else 0
             )
-            grad = torch.ones_like(actual)
+            # Distinct token/channel values expose permutations in the inverse exchange.
+            grad = torch.arange(actual.numel(), device=actual.device, dtype=actual.dtype).reshape_as(actual)
+            grad = ((grad + 17 * self.rank) % 31 - 15) / 16
             expected_dx = torch.empty_like(x)
             dist.all_to_all_single(expected_dx, grad, input_splits, output_splits)
             # coverage.py's thread tracer misses Python callbacks on autograd's
@@ -93,7 +95,9 @@ class FP8AllToAllSmallTest(MultiProcessTestCase):
                 dist.group.WORLD, x, output_splits, input_splits, False, False, Float8QuantConfig()
             )
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            grad = torch.ones_like(actual)
+            # Distinct token/channel values expose permutations in the inverse exchange.
+            grad = torch.arange(actual.numel(), device=actual.device, dtype=actual.dtype).reshape_as(actual)
+            grad = ((grad + 17 * self.rank) % 31 - 15) / 16
             expected_dx = torch.empty_like(x)
             dist.all_to_all_single(expected_dx, grad, input_splits, output_splits)
             with torch.autograd.set_multithreading_enabled(False):
