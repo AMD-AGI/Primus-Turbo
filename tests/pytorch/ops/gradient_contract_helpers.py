@@ -19,7 +19,14 @@ from tests.pytorch.test_utils import compute_snr, get_tolerances
 def caller_thread_backward(monkeypatch):
     # Run backward on the caller thread so coverage.py can trace Python callbacks.
     # Restore backend settings and autograd scheduling after each test.
-    for name in ("_attn_backend", "_gemm_backend", "_grouped_gemm_backend", "_auto_tune"):
+    for name in (
+        "_attn_backend",
+        "_sparse_attn_backend",
+        "_gemm_backend",
+        "_grouped_gemm_backend",
+        "_moe_dispatch_combine_backend",
+        "_auto_tune",
+    ):
         monkeypatch.setattr(GlobalBackendManager, name, copy.deepcopy(getattr(GlobalBackendManager, name)))
     GlobalBackendManager.set_auto_tune(False)
     with torch.autograd.set_multithreading_enabled(False):
