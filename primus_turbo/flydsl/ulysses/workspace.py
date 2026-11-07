@@ -26,7 +26,7 @@ import torch.distributed as dist
 from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
 
 FLAGS_PER_REGION = 1 << 15
-NUM_FLAG_REGIONS = 4
+NUM_FLAG_REGIONS = 5
 FLAG_REGION_BYTES = FLAGS_PER_REGION * 8
 FLAG_BYTES = NUM_FLAG_REGIONS * FLAG_REGION_BYTES
 BANK_ALIGN = 1 << 16
@@ -36,6 +36,8 @@ REGION_QKV_GEMM_A2A = 0
 REGION_O_GEMM_A2A = 1
 REGION_O_A2A_GEMM = 2
 REGION_QKV_A2A_GEMM = 3
+# local only: q / k / v rows a QKV GemmA2A pull unit has written, for attention in the same kernel
+REGION_QKV_READY = 4
 
 
 def _align(value: int, alignment: int) -> int:

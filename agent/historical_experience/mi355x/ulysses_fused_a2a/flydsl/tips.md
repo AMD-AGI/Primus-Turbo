@@ -33,3 +33,6 @@
   roles that need different LDS layouts go in an `fx.union`.
 - A persistent attention (grid = #CUs, counter-claimed tiles in the tiled launch's order) is bitwise
   equal to the tiled launch and no slower; under 4-rank exchange load it was faster on the max rank.
+
+- Mega fwd (QKV GemmA2A + attention in one grid): the gain is bounded by the exchange tail *after* the GEMM tiles end (16K: ~60 us, 32K: ~15 us) — the FlyDSL GemmA2A GEMM is the long pole. Claim order matters: too few ascending q blocks and workers grab LPT items that need the whole sequence and spin; nqb/2 was best at 16K and 32K.
+- `s_memrealtime` traces across ranks are only meaningful if launches are aligned; after `dist.barrier()` host skew can still be ms — trust rank 0 or sync + back-to-back launches.
