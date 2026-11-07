@@ -294,7 +294,7 @@ def test_grouped_fp4_transposed_variable_k_and_autotune(backend):
         assert torch.isfinite(out).all()
 
 
-def test_dense_fp4_autotune_does_not_accumulate_timing_iterations():
+def test_dense_fp4_pinned_accumulation_with_global_autotune_enabled():
     from tests.pytorch.ops.test_gemm_accumulation_gradients import test_existing_main_grad_accumulates
 
     GlobalBackendManager.set_auto_tune(True)

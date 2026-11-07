@@ -16,7 +16,12 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from primus_turbo.pytorch.core.low_precision import ScalingGranularity, float4_e2m1fn_x2, float8_e4m3
+from primus_turbo.pytorch.core.low_precision import (
+    ScalingGranularity,
+    check_mxfp4_support,
+    float4_e2m1fn_x2,
+    float8_e4m3,
+)
 from primus_turbo.pytorch.kernels.gemm import gemm_fp4_impl as fp4
 from primus_turbo.pytorch.kernels.gemm import gemm_fp8_impl as fp8
 from primus_turbo.pytorch.kernels.grouped_gemm import grouped_gemm_fp8_impl as group8
@@ -37,6 +42,7 @@ def fp4_args():
     )
 
 
+@pytest.mark.skipif(not check_mxfp4_support()[0], reason="MXFP4 requires supported hardware")
 def test_fp4_preshuffle_layout_and_accumulation_gates(monkeypatch):
     monkeypatch.setattr(fp4, "is_gfx950", lambda: True)
     monkeypatch.setattr(fp4, "is_gfx942", lambda: False)

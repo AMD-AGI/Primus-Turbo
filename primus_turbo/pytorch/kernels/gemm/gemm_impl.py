@@ -114,7 +114,18 @@ class GEMMKernelDispatcher(AutoKernelDispatcher):
         M = a.shape[1] if trans_a else a.shape[0]
         Ka = a.shape[0] if trans_a else a.shape[1]
         N = b.shape[0] if trans_b else b.shape[1]
-        return (M, N, Ka, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c)
+        return (
+            M,
+            N,
+            Ka,
+            a.dtype,
+            b.dtype,
+            out_dtype,
+            trans_a,
+            trans_b,
+            trans_c,
+            kwargs.get("inplace_add_to_out", False),
+        )
 
 
 @_torch_custom_op_wrapper("primus_turbo::gemm_impl", mutates_args=(), device_types="cuda")
@@ -192,15 +203,22 @@ def gemm_accum_impl(
         out=out,
     )
 
-    # The tuner benchmarks a backend by launching it repeatedly, so letting it tune on
-    # the caller's buffer would accumulate the wgrad once per warmup and timing
-    # iteration. Prime the cache on a scratch buffer first: the tune key ignores `out`,
-    # so the dispatch below hits that cache and runs exactly once on the real buffer.
-    # Zeroed, not empty -- beta=1 reads the buffer back and NaNs would skew the timings.
-    if GlobalBackendManager.auto_tune_enabled() and not GEMMKernelDispatcher._is_graph_capturing():
-        GEMMKernelDispatcher.tune(**{**kwargs, "out": torch.zeros_like(out)})
+    # Profiling may execute beta=1 repeatedly; only the final call may mutate out.
+    user_selected_backend = user_backend_choice is not None and user_backend_choice.backend is not None
+    should_autotune = not user_selected_backend and (
+        (user_backend_choice is not None and user_backend_choice.auto_tune)
+        or default_backend_choice.auto_tune
+        or GlobalBackendManager.auto_tune_enabled()
+    )
+    tuning_kwargs = None
+    if should_autotune and not GEMMKernelDispatcher._is_graph_capturing():
+        key = GEMMKernelDispatcher.make_key(**kwargs)
+        if key not in GEMMKernelDispatcher._cache:
+            tuning_kwargs = {**kwargs, "out": torch.zeros_like(out)}
 
-    GEMMKernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
+    GEMMKernelDispatcher.dispatch(
+        default_backend_choice, user_backend_choice, tuning_kwargs=tuning_kwargs, **kwargs
+    )
 
 
 @gemm_accum_impl.register_fake

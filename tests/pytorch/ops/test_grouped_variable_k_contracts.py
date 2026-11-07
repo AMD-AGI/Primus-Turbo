@@ -11,6 +11,7 @@ import torch
 
 from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity, float8_e4m3
+from primus_turbo.pytorch.core.utils import build_ck, is_gfx950
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_variable_k_accum_impl,
     grouped_gemm_fp8_variable_k_impl,
@@ -25,9 +26,26 @@ pytestmark = pytest.mark.usefixtures("caller_thread_backward")
 
 
 @pytest.mark.parametrize("trans_c", [False, True])
-@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.HIPBLASLT])
+@pytest.mark.parametrize(
+    "backend,schedule",
+    [
+        pytest.param(
+            BackendType.CK,
+            "static",
+            marks=pytest.mark.skipif(not build_ck(), reason="CK backend is not built"),
+        ),
+        pytest.param(
+            BackendType.CK,
+            "work_steal",
+            marks=pytest.mark.skipif(
+                not build_ck() or not is_gfx950(), reason="CK work-steal requires gfx950 and a CK build"
+            ),
+        ),
+        (BackendType.HIPBLASLT, "static"),
+    ],
+)
 @pytest.mark.parametrize("fp8", [False, True])
-def test_variable_k_output_and_accumulation(fp8, backend, trans_c):
+def test_variable_k_output_and_accumulation(fp8, backend, schedule, trans_c):
     GlobalBackendManager.set_grouped_gemm_backend(backend)
     torch.manual_seed(823)
     lens = torch.tensor([128, 256], device="cuda", dtype=torch.int64)
@@ -63,7 +81,7 @@ def test_variable_k_output_and_accumulation(fp8, backend, trans_c):
     else:
         args = (a, b, lens, offs, True, False, trans_c, None, backend.value)
         op, accum_op = grouped_gemm_variable_k_impl, grouped_gemm_variable_k_accum_impl
-        kw = {"schedule": "work_steal"} if backend is BackendType.CK else {}
+        kw = {"schedule": schedule}
     out = op(*args, **kw)
     torch.testing.assert_close(out.float(), ref, rtol=0.008, atol=0.04)
     if backend is BackendType.HIPBLASLT:

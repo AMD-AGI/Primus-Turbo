@@ -470,10 +470,21 @@ def resolve_fp4_backend(
     times each candidate on the layout it would be fed (see ``KernelBackend.tuning_kwargs``),
     and none of it reads the operands for anything but their timing, so empty ones will do.
 
-    Cached per shape -- the answer cannot change between two calls with the same arguments, and
-    running the race is not cheap.
+    Cache entries include backend preferences so changes to user settings take effect.
     """
-    key = (m, n, k, out_dtype, str(device), granularity, default_backend)
+    user_choice = GlobalBackendManager.get_gemm_backend(PrecisionType.FP4)
+    key = (
+        m,
+        n,
+        k,
+        out_dtype,
+        str(device),
+        granularity,
+        default_backend,
+        user_choice.backend if user_choice is not None else None,
+        user_choice.auto_tune if user_choice is not None else False,
+        GlobalBackendManager.auto_tune_enabled(),
+    )
     hit = _FP4_BACKEND_FOR_SHAPE.get(key)
     if hit is not None:
         return hit
@@ -486,7 +497,7 @@ def resolve_fp4_backend(
 
     chosen = GEMMFP4KernelDispatcher.resolve(
         default_backend,
-        GlobalBackendManager.get_gemm_backend(PrecisionType.FP4),
+        user_choice,
         a=_fp4(m),
         b=_fp4(n),
         a_scale_inv=_scale(m),
@@ -595,15 +606,22 @@ def gemm_fp4_accum_impl(
         out=out,
     )
 
-    # The tuner benchmarks a backend by launching it repeatedly, so letting it tune on
-    # the caller's buffer would accumulate the wgrad once per warmup and timing
-    # iteration. Prime the cache on a scratch buffer first: the tune key ignores `out`,
-    # so the dispatch below hits that cache and runs exactly once on the real buffer.
-    # Zeroed, not empty -- beta=1 reads the buffer back and NaNs would skew the timings.
-    if GlobalBackendManager.auto_tune_enabled() and not GEMMFP4KernelDispatcher._is_graph_capturing():
-        GEMMFP4KernelDispatcher.tune(**{**kwargs, "out": torch.zeros_like(out)})
+    # Profiling may execute beta=1 repeatedly; only the final call may mutate out.
+    user_selected_backend = user_backend_choice is not None and user_backend_choice.backend is not None
+    should_autotune = not user_selected_backend and (
+        (user_backend_choice is not None and user_backend_choice.auto_tune)
+        or default_backend_choice.auto_tune
+        or GlobalBackendManager.auto_tune_enabled()
+    )
+    tuning_kwargs = None
+    if should_autotune and not GEMMFP4KernelDispatcher._is_graph_capturing():
+        key = GEMMFP4KernelDispatcher.make_key(**kwargs)
+        if key not in GEMMFP4KernelDispatcher._cache:
+            tuning_kwargs = {**kwargs, "out": torch.zeros_like(out)}
 
-    GEMMFP4KernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
+    GEMMFP4KernelDispatcher.dispatch(
+        default_backend_choice, user_backend_choice, tuning_kwargs=tuning_kwargs, **kwargs
+    )
 
 
 @gemm_fp4_accum_impl.register_fake

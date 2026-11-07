@@ -10,7 +10,14 @@ import pytest
 import torch
 
 from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
-from primus_turbo.pytorch.core.low_precision import Float8QuantConfig, Format, ScaleDtype, ScalingGranularity
+from primus_turbo.pytorch.core.low_precision import (
+    Float8QuantConfig,
+    Format,
+    ScaleDtype,
+    ScalingGranularity,
+    check_mxfp8_support,
+)
+from primus_turbo.pytorch.core.utils import build_ck
 from primus_turbo.pytorch.ops import gemm_fp8, grouped_gemm_fp8
 from tests.pytorch.ops.gradient_contract_helpers import caller_thread_backward  # noqa: F401
 from tests.pytorch.test_utils import compute_snr
@@ -21,7 +28,11 @@ CONFIGS = [
     (ScalingGranularity.TENSORWISE, BackendType.CK),
     (ScalingGranularity.ROWWISE, BackendType.CK),
     (ScalingGranularity.BLOCKWISE, BackendType.TRITON),
-    (ScalingGranularity.MX_BLOCKWISE, BackendType.HIPBLASLT),
+    pytest.param(
+        ScalingGranularity.MX_BLOCKWISE,
+        BackendType.HIPBLASLT,
+        marks=pytest.mark.skipif(not check_mxfp8_support()[0], reason="MXFP8 requires supported hardware"),
+    ),
 ]
 
 
@@ -29,6 +40,8 @@ CONFIGS = [
 @pytest.mark.parametrize("grad_inputs", ["a", "b", "ab"])
 @pytest.mark.parametrize("grouped", [False, True])
 def test_fp8_partial_gradients(granularity, backend, grad_inputs, grouped):
+    if backend is BackendType.CK and not build_ck():
+        pytest.skip("CK backend is not built")
     torch.manual_seed(719)
     # Grouped MXFP8 is implemented by Triton; hipBLASLt covers dense MXFP8.
     if grouped and granularity is ScalingGranularity.MX_BLOCKWISE:

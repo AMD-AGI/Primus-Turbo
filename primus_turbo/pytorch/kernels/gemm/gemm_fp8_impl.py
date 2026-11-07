@@ -597,13 +597,22 @@ def gemm_fp8_accum_impl(
         out=out,
     )
 
-    # The tuner benchmarks a backend by launching it repeatedly, so letting it tune on
-    # the caller's buffer would accumulate the wgrad once per warmup and timing
-    # iteration.
-    if GlobalBackendManager.auto_tune_enabled() and not GEMMFP8KernelDispatcher._is_graph_capturing():
-        GEMMFP8KernelDispatcher.tune(**{**kwargs, "out": torch.zeros_like(out)})
+    # Profiling may execute beta=1 repeatedly; only the final call may mutate out.
+    user_selected_backend = user_backend_choice is not None and user_backend_choice.backend is not None
+    should_autotune = not user_selected_backend and (
+        (user_backend_choice is not None and user_backend_choice.auto_tune)
+        or default_backend_choice.auto_tune
+        or GlobalBackendManager.auto_tune_enabled()
+    )
+    tuning_kwargs = None
+    if should_autotune and not GEMMFP8KernelDispatcher._is_graph_capturing():
+        key = GEMMFP8KernelDispatcher.make_key(**kwargs)
+        if key not in GEMMFP8KernelDispatcher._cache:
+            tuning_kwargs = {**kwargs, "out": torch.zeros_like(out)}
 
-    GEMMFP8KernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
+    GEMMFP8KernelDispatcher.dispatch(
+        default_backend_choice, user_backend_choice, tuning_kwargs=tuning_kwargs, **kwargs
+    )
 
 
 @gemm_fp8_impl.register_fake

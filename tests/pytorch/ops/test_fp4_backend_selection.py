@@ -62,7 +62,7 @@ def test_triton_grouped_fp4_backward(dtype):
 
 
 @pytest.mark.parametrize("precision", ["bf16", "fp8", "fp4"])
-def test_autotune_does_not_accumulate_profile_iterations(precision):
+def test_pinned_accumulation_with_global_autotune_enabled(precision):
     from tests.pytorch.ops.test_gemm_accumulation_gradients import (
         test_existing_main_grad_accumulates as run_accum,
     )

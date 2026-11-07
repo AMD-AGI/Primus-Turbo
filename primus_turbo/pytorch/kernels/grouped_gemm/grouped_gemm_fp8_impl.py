@@ -931,7 +931,20 @@ class GroupedGEMMFP8VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
         k = a.shape[0] if trans_a else a.shape[1]
         if trans_c:
             m, n = n, m
-        return (bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity)
+        return (
+            bs,
+            m,
+            n,
+            k,
+            a.dtype,
+            b.dtype,
+            out_dtype,
+            trans_a,
+            trans_b,
+            trans_c,
+            granularity,
+            kwargs.get("inplace_add_to_out", False),
+        )
 
 
 _torch_custom_op_wrapper = torch.library.custom_op
@@ -1083,13 +1096,22 @@ def grouped_gemm_fp8_variable_k_accum_impl(
         n_real=n_real,
     )
 
-    if (
-        GlobalBackendManager.auto_tune_enabled()
-        and not GroupedGEMMFP8VariableKKernelDispatcher._is_graph_capturing()
-    ):
-        GroupedGEMMFP8VariableKKernelDispatcher.tune(**{**kwargs, "out": torch.zeros_like(out)})
+    # Profiling may execute beta=1 repeatedly; only the final call may mutate out.
+    user_selected_backend = user_backend_choice is not None and user_backend_choice.backend is not None
+    should_autotune = not user_selected_backend and (
+        (user_backend_choice is not None and user_backend_choice.auto_tune)
+        or default_backend_choice.auto_tune
+        or GlobalBackendManager.auto_tune_enabled()
+    )
+    tuning_kwargs = None
+    if should_autotune and not GroupedGEMMFP8VariableKKernelDispatcher._is_graph_capturing():
+        key = GroupedGEMMFP8VariableKKernelDispatcher.make_key(**kwargs)
+        if key not in GroupedGEMMFP8VariableKKernelDispatcher._cache:
+            tuning_kwargs = {**kwargs, "out": torch.zeros_like(out)}
 
-    GroupedGEMMFP8VariableKKernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
+    GroupedGEMMFP8VariableKKernelDispatcher.dispatch(
+        default_backend_choice, user_backend_choice, tuning_kwargs=tuning_kwargs, **kwargs
+    )
 
 
 @grouped_gemm_fp8_variable_k_accum_impl.register_fake

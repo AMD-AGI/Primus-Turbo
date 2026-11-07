@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Cached quantized weights/activation pairs preserve the public MLP contract."""
+"""Check cache consistency and compare prequantized MLPs with FP32 arithmetic."""
 
 import pytest
 import torch
@@ -103,6 +103,26 @@ def test_mlp_prequantized_inputs(kind, cache_transpose, quantize_activation):
             )
         return mlp_fp4(*args, config=config)
 
+    oracle_inputs = [v.detach().float().requires_grad_() for v in inputs]
+
+    def dense_reference(inp, weight1, weight2):
+        gate, up = (inp @ weight1.T).chunk(2, dim=-1)
+        return (torch.nn.functional.silu(gate) * up) @ weight2.T
+
+    if grouped:
+        oracle = (
+            torch.cat(
+                [
+                    dense_reference(inp, weight1, weight2)
+                    for inp, weight1, weight2 in zip(
+                        oracle_inputs[0].split([239, 273]), oracle_inputs[1], oracle_inputs[2]
+                    )
+                ]
+            )
+            * probs[:, None]
+        )
+    else:
+        oracle = dense_reference(*oracle_inputs)
     ref_inputs = [v.detach().requires_grad_() for v in inputs]
     reference = call(ref_inputs)
     out = call(quantized)
@@ -110,7 +130,10 @@ def test_mlp_prequantized_inputs(kind, cache_transpose, quantize_activation):
     ref_grads = torch.autograd.grad(reference, ref_inputs, grad)
     leaves = [v.data if isinstance(v, QuantizedTensorPair) else v for v in quantized]
     grads = torch.autograd.grad(out, leaves, grad)
+    oracle_grads = torch.autograd.grad(oracle, oracle_inputs, grad.float())
     floor = 6 if fp4 else 20
+    for actual, expected in zip([out, *grads], [oracle, *oracle_grads]):
+        assert compute_snr(expected.float(), actual.float()) > floor
     for actual, expected in zip([out, *grads], [reference, *ref_grads]):
         assert actual.shape == expected.shape
         assert torch.isfinite(actual).all()
