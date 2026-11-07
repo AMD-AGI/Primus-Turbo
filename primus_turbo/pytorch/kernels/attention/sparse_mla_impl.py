@@ -62,7 +62,7 @@ class SparseMlaFwdFlydslBackend(KernelBackend):
             (is_gfx950() or is_gfx1250())
             and q.dtype == torch.bfloat16
             and d_qk == _DSV4_QK_DIM
-            and num_heads % 32 == 0
+            and num_heads % (64 if is_gfx950() else 32) == 0
             and topk_indices.shape[1] % 32 == 0
         )
 
@@ -108,7 +108,7 @@ class SparseMlaBwdFlydslBackend(KernelBackend):
             (is_gfx950() or (is_gfx1250() and 128 % num_heads == 0))
             and q.dtype == torch.bfloat16
             and d_qk == _DSV4_QK_DIM
-            and num_heads % 32 == 0
+            and num_heads % (64 if is_gfx950() else 32) == 0
             and topk_indices.shape[1] % 32 == 0
         )
 
