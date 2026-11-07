@@ -39,3 +39,10 @@
   full latency (~80 us for 128 x 256 x 5120) after the last push. Those two set the tail.
 - After `rm -rf /root/.flydsl/cache` the full Ulysses test suite cold-compiles ~20-30 min (CPU-bound,
   GPU idle, cache dir growing): not a hang; run `--quick` first.
+- No split-K through memory inside a busy fused kernel: uncached fp32 partials move at ~10-15 GB/s
+  per CU while every CU streams operands (write 128 KB ~15 us, read 512 KB ~40 us), whether SYS_NT
+  or cached + agent fences. Keep partial sums in registers (a K walk by arrival) instead.
+- A tile that needs the whole exchanged M (wgrad) must be claimed early: claimed after the dgrad
+  tiles it runs unpaced and long (115-134 us for 256 x 256 x 4096) after the last push.
+- FlyDSL disk cache can return the previous build after a kernel edit (same timings, new trace
+  slots empty): `rm -rf /root/.flydsl/cache` before every A/B of kernel code.

@@ -68,3 +68,14 @@
 - Primus e2e (R9 + R10): 16K 3152.7 -> 2804.4 ms/iter (-11.0 %), 32K 6584.8 -> 5974.0 (-9.3 %).
 - Remaining bwd QKV gap (~85 us at 16K): the in-step dgrad tail. Next: split late dgrad tiles' K
   by source with a deterministic fixed-order reduction.
+
+## 2026-11-07 Rounds 11-12 ROLLED BACK — the in-step bwd QKV tail
+- R11 split-K (one part per source, fp32 partials in scratch, never-reset counters in `state`,
+  last part reduces in source order): correct but 330-411 / 570-637 us. Partials through memory
+  move at ~10-15 GB/s per CU under load whatever the cache bits / fences (reduce 512 KB ~40 us,
+  stores-only reduce 1-3 us).
+- R12 late wgrad tiles: dgrad ends at push end + ~80 us (no backlog) but late wgrad tiles take
+  115-134 us -> 352-357 / 661-688 us.
+- Floor in step: push end + one 128 x 256 x 5120 dgrad tile = ~280 / ~480 us (82 % / ~97 % hidden).
+  Below it: staggered sources (K walk by arrival) for the last m-tiles + rotated wgrad M walk, with
+  ~95 CUs left to dgrad through the last ~80 us.
