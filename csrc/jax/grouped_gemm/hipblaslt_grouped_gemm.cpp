@@ -51,17 +51,20 @@ constexpr int64_t kArgsPad = 16;
 //   transA=true : c[g] [K_a, N] = a[rows of g, K_a]^T x b[rows of g, N] -> hip m=N, n=K_a, k=len
 struct Dims {
     bool    transA = false, transB = false;
-    int     dtype  = 0; // 0: bf16, 1: fp16
+    int     dtype  = 0; // 0: bf16, 1: fp16, 2: fp8 e4m3 inputs (per-tensor scales) with bf16 output
     int64_t G = 0, M = 0;
     int64_t a_cols = 0;           // K (fwd) or K_a (transA)
     int64_t b_d1 = 0, b_d2 = 0;   // b dims after the group dim (fwd), or b [M, N] (transA)
     int64_t c_rows = 0;           // hip m = last dim of c
 
-    hipDataType        type() const { return dtype == 0 ? HIP_R_16BF : HIP_R_16F; }
+    bool               fp8() const { return dtype == 2; }
+    hipDataType        type() const { return dtype == 1 ? HIP_R_16F : HIP_R_16BF; }      // output type
+    hipDataType        in_type() const { return fp8() ? HIP_R_8F_E4M3 : type(); }         // a / b type
+    int64_t            in_es() const { return fp8() ? 1 : 2; }
     hipblasOperation_t opA() const { return transB ? HIPBLAS_OP_T : HIPBLAS_OP_N; }
     hipblasOperation_t opB() const { return transA ? HIPBLAS_OP_T : HIPBLAS_OP_N; }
-    int64_t a_bytes() const { return M * a_cols * 2; }
-    int64_t b_bytes() const { return (transA ? b_d1 * b_d2 : G * b_d1 * b_d2) * 2; }
+    int64_t a_bytes() const { return M * a_cols * in_es(); }
+    int64_t b_bytes() const { return (transA ? b_d1 * b_d2 : G * b_d1 * b_d2) * in_es(); }
     int64_t c_bytes() const { return (transA ? G * a_cols * c_rows : M * c_rows) * 2; }
 };
 
@@ -86,7 +89,7 @@ hipblasLtHandle_t get_handle(int device) {
 }
 
 std::unique_ptr<hipblaslt_ext::GroupedGemm> make_gemm(hipblasLtHandle_t handle, const Dims &d) {
-    return std::make_unique<hipblaslt_ext::GroupedGemm>(handle, d.opA(), d.opB(), d.type(), d.type(),
+    return std::make_unique<hipblaslt_ext::GroupedGemm>(handle, d.opA(), d.opB(), d.in_type(), d.in_type(),
                                                         d.type(), d.type(), HIPBLAS_COMPUTE_32F);
 }
 
@@ -99,11 +102,16 @@ hipblasStatus_t set_problem(hipblaslt_ext::GroupedGemm &gemm, const Dims &d, int
     std::vector<int64_t> batch(G, 1), lda(G, d.b_d2), ldb(G, d.a_cols), ldc(G, d.c_rows), ldd(G, d.c_rows);
     std::vector<int64_t> zero(G, 0);
     std::vector<hipblaslt_ext::GemmEpilogue> epilogue(G);
+    if (d.fp8())
+        for (auto &e : epilogue) {
+            e.setScalingAType(HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F);
+            e.setScalingBType(HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F);
+        }
     std::vector<hipblaslt_ext::GemmInputs>   inputs(G);
     static const float                       one = 1.0f, beta0 = 0.0f;
     for (int64_t g = 0; g < G; ++g) {
-        const int64_t a_off = real_layout ? g * rows * d.a_cols * 2 : 0;
-        const int64_t b_off = real_layout ? (d.transA ? g * rows * d.b_d2 : g * d.b_d1 * d.b_d2) * 2 : 0;
+        const int64_t a_off = real_layout ? g * rows * d.a_cols * d.in_es() : 0;
+        const int64_t b_off = real_layout ? (d.transA ? g * rows * d.b_d2 : g * d.b_d1 * d.b_d2) * d.in_es() : 0;
         const int64_t c_off = real_layout ? (d.transA ? g * d.a_cols * d.c_rows : g * rows * d.c_rows) * 2 : 0;
         inputs[g].setA(static_cast<const char *>(b) + b_off);
         inputs[g].setB(static_cast<const char *>(a) + a_off);
@@ -111,8 +119,12 @@ hipblasStatus_t set_problem(hipblaslt_ext::GroupedGemm &gemm, const Dims &d, int
         inputs[g].setD(static_cast<char *>(c) + c_off);
         inputs[g].setAlpha(&one);
         inputs[g].setBeta(&beta0);
+        if (d.fp8()) { // placeholders (any valid device pointer); the real scale pointers go into the UserArgs
+            inputs[g].setScaleA(a);
+            inputs[g].setScaleB(a);
+        }
     }
-    hipblaslt_ext::GemmProblemType problem(d.opA(), d.opB(), d.type(), d.type(), d.type(), d.type(),
+    hipblaslt_ext::GemmProblemType problem(d.opA(), d.opB(), d.in_type(), d.in_type(), d.type(), d.type(),
                                            HIPBLAS_COMPUTE_32F);
     return gemm.setProblem(m, n, k, batch, lda, ldb, ldc, ldd, zero, zero, zero, zero, epilogue, inputs,
                            problem);
@@ -166,10 +178,14 @@ struct Plan {
 };
 
 Plan *get_plan(int device, hipblasLtHandle_t handle, const Dims &d, const void *a, const void *b, void *c) {
-    using PlanKey = std::tuple<int, TuneKey, int64_t>;
+    using PlanKey = std::tuple<int, TuneKey, int64_t, int>;
     static std::mutex                               mu;
     static std::map<PlanKey, std::unique_ptr<Plan>> plans;
-    PlanKey                     key{device, tune_key(d), d.M};
+    // PRIMUS_TURBO_HB_GG_PICK_{NN,NT,TN}=k: use the k-th supported heuristic candidate instead of the first
+    // (kernel sweeps; read at every call so one process can try many).
+    const char *pick_env = std::getenv(d.transA ? "PRIMUS_TURBO_HB_GG_PICK_TN" : d.transB ? "PRIMUS_TURBO_HB_GG_PICK_NT" : "PRIMUS_TURBO_HB_GG_PICK_NN");
+    const int   pick     = pick_env ? std::atoi(pick_env) : 0;
+    PlanKey                     key{device, tune_key(d), d.M, pick};
     std::lock_guard<std::mutex> lock(mu);
     auto                        it = plans.find(key);
     if (it != plans.end())
@@ -203,9 +219,12 @@ Plan *get_plan(int device, hipblasLtHandle_t handle, const Dims &d, const void *
         pref.setMaxWorkspaceBytes(kAlgoWorkspaceBytes);
         std::vector<hipblasLtMatmulHeuristicResult_t> cand;
         PRIMUS_TURBO_CHECK_HIPBLAS(set_problem(*plan->gemm, d, std::max<int64_t>(1, d.M / d.G) | 1, a, b, c, false));
-        PRIMUS_TURBO_CHECK_HIPBLAS(plan->gemm->algoGetHeuristic(16, pref, cand));
+        PRIMUS_TURBO_CHECK_HIPBLAS(plan->gemm->algoGetHeuristic(pick_env ? 256 : 16, pref, cand));
+        int seen = 0;
         for (auto &h : cand) {
             if (supports_any_size(*plan->gemm, d, max_rows, h.algo, a, b, c)) {
+                if (seen++ < pick)
+                    continue;
                 algo = h.algo;
                 have = true;
                 break;
@@ -236,7 +255,8 @@ template <typename LenT>
 __global__ void fill_user_args_kernel(UserArgs *args, const LenT *group_lens, int64_t G, bool transA,
                                       const char *a, const char *b, char *c, int64_t a_cols,
                                       int64_t b_group_elems, int64_t b_cols, int64_t c_rows,
-                                      int64_t c_group_elems, int64_t elem_bytes) {
+                                      int64_t c_group_elems, int64_t in_bytes, int64_t out_bytes,
+                                      const void *a_scale, const void *b_scale) {
     __shared__ int64_t offs[kMaxGroups + 1];
     if (threadIdx.x == 0) {
         int64_t acc = 0;
@@ -255,18 +275,22 @@ __global__ void fill_user_args_kernel(UserArgs *args, const LenT *group_lens, in
             u.m = static_cast<uint32_t>(len == 0 ? 0 : c_rows);
             u.n = static_cast<uint32_t>(len);
             u.k = static_cast<uint32_t>(a_cols);
-            u.a = const_cast<char *>(b) + g * b_group_elems * elem_bytes;
-            u.b = const_cast<char *>(a) + off * a_cols * elem_bytes;
-            u.c = c + off * c_rows * elem_bytes;
+            u.a = const_cast<char *>(b) + g * b_group_elems * in_bytes;
+            u.b = const_cast<char *>(a) + off * a_cols * in_bytes;
+            u.c = c + off * c_rows * out_bytes;
         } else {
             u.m = static_cast<uint32_t>(len == 0 ? 0 : c_rows);
             u.n = static_cast<uint32_t>(len == 0 ? 0 : a_cols);
             u.k = static_cast<uint32_t>(len);
-            u.a = const_cast<char *>(b) + off * b_cols * elem_bytes;
-            u.b = const_cast<char *>(a) + off * a_cols * elem_bytes;
-            u.c = c + g * c_group_elems * elem_bytes;
+            u.a = const_cast<char *>(b) + off * b_cols * in_bytes;
+            u.b = const_cast<char *>(a) + off * a_cols * in_bytes;
+            u.c = c + g * c_group_elems * out_bytes;
         }
         u.d = u.c;
+        if (a_scale != nullptr) { // fp8: hipBLASLt's A is our b, hipBLASLt's B is our a
+            u.scaleA = const_cast<void *>(b_scale);
+            u.scaleB = const_cast<void *>(a_scale);
+        }
     }
 }
 
@@ -307,10 +331,23 @@ __global__ void fill_random_kernel(uint16_t *p, size_t n, uint32_t seed, bool bf
     }
 }
 
+// Random e4m3 bytes with magnitudes in about [0.06, 16] (tuning only).
+__global__ void fill_random_fp8_kernel(uint8_t *p, size_t n, uint32_t seed) {
+    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n;
+         i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        uint32_t x = static_cast<uint32_t>(i) * 2654435761u ^ seed;
+        x ^= x >> 13;
+        x *= 0x5bd1e995u;
+        x ^= x >> 15;
+        p[i] = static_cast<uint8_t>((x & 0x80) | (0x28 + ((x >> 8) % 0x30)));
+    }
+}
+
 // Enqueue fill + zero kernels and the grouped GEMM on `stream`.
 template <typename LenT>
 void launch(Plan *plan, const Dims &d, hipStream_t stream, UserArgs *dev_args, const LenT *gl,
-            const void *a, const void *b, void *c) {
+            const void *a, const void *b, void *c, const void *a_scale = nullptr, const void *b_scale = nullptr) {
+    (void) hipGetLastError(); // clear sticky errors left by candidate probing (hipBLASLt isAlgoSupported/allocations)
     PRIMUS_TURBO_CHECK_HIP(hipMemcpyAsync(dev_args, plan->host_template, d.G * sizeof(UserArgs),
                                           hipMemcpyHostToDevice, stream));
     PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(dev_args + d.G, 0, kArgsPad * sizeof(UserArgs), stream));
@@ -319,7 +356,8 @@ void launch(Plan *plan, const Dims &d, hipStream_t stream, UserArgs *dev_args, c
     const int     fill_threads  = static_cast<int>(std::min<int64_t>(256, d.G));
     fill_user_args_kernel<LenT><<<1, fill_threads, 0, stream>>>(
         dev_args, gl, d.G, d.transA, static_cast<const char *>(a), static_cast<const char *>(b),
-        static_cast<char *>(c), d.a_cols, b_group_elems, d.b_d2, d.c_rows, c_group_elems, 2);
+        static_cast<char *>(c), d.a_cols, b_group_elems, d.b_d2, d.c_rows, c_group_elems, d.in_es(), 2,
+        a_scale, b_scale);
     const dim3 zero_grid = d.transA ? dim3(64, static_cast<unsigned>(d.G)) : dim3(1024);
     zero_unwritten_kernel<LenT><<<zero_grid, 256, 0, stream>>>(static_cast<uint16_t *>(c), gl, d.G,
                                                               d.transA, d.M, d.c_rows, c_group_elems);
@@ -386,8 +424,13 @@ std::tuple<int, double, std::string> TuneHipblasltGroupedGemm(int64_t G, int64_t
     PRIMUS_TURBO_CHECK_HIP(hipMalloc(&ws, kAlgoWorkspaceBytes + kSlack));
     PRIMUS_TURBO_CHECK_HIP(hipMalloc(&dev_args, (G + kArgsPad) * sizeof(UserArgs) + kSlack));
     PRIMUS_TURBO_CHECK_HIP(hipMemset(dev_args, 0, (G + kArgsPad) * sizeof(UserArgs)));
-    fill_random_kernel<<<1024, 256>>>(static_cast<uint16_t *>(a), d.a_bytes() / 2, 1, d.dtype == 0);
-    fill_random_kernel<<<1024, 256>>>(static_cast<uint16_t *>(b), d.b_bytes() / 2, 2, d.dtype == 0);
+    if (d.fp8()) {
+        fill_random_fp8_kernel<<<1024, 256>>>(static_cast<uint8_t *>(a), d.a_bytes(), 1);
+        fill_random_fp8_kernel<<<1024, 256>>>(static_cast<uint8_t *>(b), d.b_bytes(), 2);
+    } else {
+        fill_random_kernel<<<1024, 256>>>(static_cast<uint16_t *>(a), d.a_bytes() / 2, 1, d.dtype == 0);
+        fill_random_kernel<<<1024, 256>>>(static_cast<uint16_t *>(b), d.b_bytes() / 2, 2, d.dtype == 0);
+    }
     PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
     hipStream_t stream;
     hipEvent_t  e0, e1;
@@ -396,10 +439,15 @@ std::tuple<int, double, std::string> TuneHipblasltGroupedGemm(int64_t G, int64_t
     PRIMUS_TURBO_CHECK_HIP(hipEventCreate(&e1));
 
     auto                                          gemm = make_gemm(handle, d);
+    // Candidates: the heuristic's list for this problem. (getAllAlgos does not return the grouped "GG" solutions of
+    // the Tensile library, which is why the tuner used to find at most the generic ones.)
     std::vector<hipblasLtMatmulHeuristicResult_t> all;
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblaslt_ext::getAllAlgos(
-        handle, hipblaslt_ext::GemmType::HIPBLASLT_GROUPED_GEMM, d.opA(), d.opB(), d.type(), d.type(),
-        d.type(), d.type(), HIPBLAS_COMPUTE_32F, all));
+    {
+        hipblaslt_ext::GemmPreference pref;
+        pref.setMaxWorkspaceBytes(kAlgoWorkspaceBytes);
+        PRIMUS_TURBO_CHECK_HIPBLAS(set_problem(*gemm, d, std::max<int64_t>(1, rows) | 1, a, b, c, false));
+        PRIMUS_TURBO_CHECK_HIPBLAS(gemm->algoGetHeuristic(1024, pref, all));
+    }
 
     // Rank by macro-tile area (kernel name MT<m>x<n>, largest first) and keep the first max_candidates that
     // handle any group size. Checking support is the slow part, so stop once enough are found.
@@ -421,11 +469,19 @@ std::tuple<int, double, std::string> TuneHipblasltGroupedGemm(int64_t G, int64_t
             pool.push_back(r);
     }
 
+    const bool verbose = std::getenv("PRIMUS_TURBO_HB_GG_VERBOSE") != nullptr;
+    if (verbose)
+        fprintf(stderr, "[primus_turbo] tune: %zu heuristic candidates, %zu support any group size (m_tune=%ld rows=%ld)\n",
+                all.size(), pool.size(), (long) m_tune, (long) rows);
     auto time_algo = [&](hipblasLtMatmulAlgo_t &algo, int iters) -> double {
-        if (set_problem(*gemm, d, rows, a, b, c, true) != HIPBLAS_STATUS_SUCCESS ||
-            gemm->initialize(algo, ws, true) != HIPBLAS_STATUS_SUCCESS ||
-            gemm->getDefaultValueForDeviceUserArguments(host_args.data()) != HIPBLAS_STATUS_SUCCESS)
+        auto s1 = set_problem(*gemm, d, rows, a, b, c, true);
+        auto s2 = s1 == HIPBLAS_STATUS_SUCCESS ? gemm->initialize(algo, ws, true) : s1;
+        auto s3 = s2 == HIPBLAS_STATUS_SUCCESS ? gemm->getDefaultValueForDeviceUserArguments(host_args.data()) : s2;
+        if (s3 != HIPBLAS_STATUS_SUCCESS) {
+            if (verbose)
+                fprintf(stderr, "[primus_turbo] tune: candidate rejected set_problem=%d initialize=%d args=%d\n", (int) s1, (int) s2, (int) s3);
             return -1;
+        }
         PRIMUS_TURBO_CHECK_HIP(hipMemcpyAsync(dev_args, host_args.data(), G * sizeof(UserArgs),
                                               hipMemcpyHostToDevice, stream));
         if (gemm->run(dev_args, stream) != HIPBLAS_STATUS_SUCCESS)
@@ -542,6 +598,75 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(HipblasltGroupedGemmHandler, HipblasltGroupedGemmF
                                   .Arg<ffi::AnyBuffer>()                   // b
                                   .Arg<ffi::AnyBuffer>()                   // group_lens
                                   .Ret<ffi::AnyBuffer>()                   // c
+                                  .Ret<ffi::AnyBuffer>()                   // workspace
+                                  .Attr<bool>("transA")
+                                  .Attr<bool>("transB"));
+
+// FP8 (e4m3, per-tensor scales): a [M, K] e4m3, b like the bf16 handler but e4m3, a_scale / b_scale f32[1]
+// (dequantisation factors, applied by the kernel epilogue), c bf16.
+ffi::Error HipblasltGroupedGemmFp8FFI(hipStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
+                                      ffi::AnyBuffer a_scale, ffi::AnyBuffer b_scale,
+                                      ffi::AnyBuffer group_lens, ffi::Result<ffi::AnyBuffer> c,
+                                      ffi::Result<ffi::AnyBuffer> workspace, bool transA, bool transB) {
+    if (a.element_type() != ffi::F8E4M3FN || b.element_type() != ffi::F8E4M3FN ||
+        c->element_type() != ffi::BF16 || a_scale.element_type() != ffi::F32 ||
+        b_scale.element_type() != ffi::F32 || a_scale.element_count() != 1 || b_scale.element_count() != 1) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "hipblaslt_grouped_gemm_fp8 needs e4m3 a, b, f32[1] scales and a bf16 c");
+    }
+    if (transA && transB) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "hipblaslt_grouped_gemm_fp8: transA and transB together are not supported");
+    }
+    const auto gl_type = group_lens.element_type();
+    if (gl_type != ffi::S32 && gl_type != ffi::S64) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, "group_lens must be int32 or int64");
+    }
+    const std::vector<int64_t> a_shape = dims_of(a), b_shape = dims_of(b), c_shape = dims_of(*c);
+    const int64_t              G       = static_cast<int64_t>(group_lens.element_count());
+    if (G < 1 || G > kMaxGroups || a_shape.size() != 2 ||
+        (transA ? (b_shape.size() != 2 || c_shape.size() != 3 || b_shape[0] != a_shape[0])
+                : (b_shape.size() != 3 || c_shape.size() != 2 || b_shape[0] != G))) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, "hipblaslt_grouped_gemm_fp8: bad shapes");
+    }
+    if (workspace->size_bytes() < static_cast<size_t>(GetHipblasltGroupedGemmWorkspaceSize(G))) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, "hipblaslt_grouped_gemm_fp8: workspace too small");
+    }
+    Dims d;
+    d.transA = transA;
+    d.transB = transB;
+    d.dtype  = 2;
+    d.G      = G;
+    d.M      = a_shape[0];
+    d.a_cols = a_shape[1];
+    d.b_d1   = transA ? b_shape[0] : b_shape[1];
+    d.b_d2   = transA ? b_shape[1] : b_shape[2];
+    d.c_rows = c_shape.back();
+
+    int device = 0;
+    PRIMUS_TURBO_CHECK_HIP(hipStreamGetDevice(stream, &device));
+    Plan *plan = get_plan(device, get_handle(device), d, a.untyped_data(), b.untyped_data(), c->untyped_data());
+
+    std::lock_guard<std::mutex> lock(plan->mu);
+    auto *dev_args = static_cast<UserArgs *>(workspace->untyped_data());
+    if (gl_type == ffi::S64)
+        launch(plan, d, stream, dev_args, static_cast<const int64_t *>(group_lens.untyped_data()),
+               a.untyped_data(), b.untyped_data(), c->untyped_data(), a_scale.untyped_data(), b_scale.untyped_data());
+    else
+        launch(plan, d, stream, dev_args, static_cast<const int32_t *>(group_lens.untyped_data()),
+               a.untyped_data(), b.untyped_data(), c->untyped_data(), a_scale.untyped_data(), b_scale.untyped_data());
+    return ffi::Error::Success();
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(HipblasltGroupedGemmFp8Handler, HipblasltGroupedGemmFp8FFI,
+                              ffi::Ffi::Bind()
+                                  .Ctx<ffi::PlatformStream<hipStream_t>>() // stream
+                                  .Arg<ffi::AnyBuffer>()                   // a (e4m3)
+                                  .Arg<ffi::AnyBuffer>()                   // b (e4m3)
+                                  .Arg<ffi::AnyBuffer>()                   // a_scale f32[1]
+                                  .Arg<ffi::AnyBuffer>()                   // b_scale f32[1]
+                                  .Arg<ffi::AnyBuffer>()                   // group_lens
+                                  .Ret<ffi::AnyBuffer>()                   // c (bf16)
                                   .Ret<ffi::AnyBuffer>()                   // workspace
                                   .Attr<bool>("transA")
                                   .Attr<bool>("transB"));

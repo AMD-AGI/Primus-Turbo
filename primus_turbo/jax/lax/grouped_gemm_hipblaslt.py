@@ -102,6 +102,8 @@ def _tune_in_subprocess(key, max_candidates):
         proc = subprocess.run(
             [sys.executable, "-c", _TUNE_SCRIPT, *args], capture_output=True, text=True, timeout=900
         )
+        if os.environ.get('PRIMUS_TURBO_HB_GG_DEBUG'):
+            print('[primus_turbo] tune subprocess stderr:', proc.stderr[-1500:], flush=True)
         for line in proc.stdout.splitlines():
             if line.startswith("PRIMUS_TURBO_TUNE_RESULT"):
                 _, idx, ms, name = line.split(" ", 3)
@@ -126,7 +128,7 @@ def _tune(lhs, rhs, group_lens, transA, transB):
     else:
         g, b_d1, b_d2 = rhs.shape
         c_rows = b_d1 if transB else b_d2
-    dtype = 0 if lhs.dtype == jnp.bfloat16 else 1
+    dtype = 2 if lhs.dtype == jnp.float8_e4m3fn else (0 if lhs.dtype == jnp.bfloat16 else 1)
     key = (g, m, a_cols, b_d1, b_d2, c_rows, transA, transB, dtype)
     if key in _tuned:
         return

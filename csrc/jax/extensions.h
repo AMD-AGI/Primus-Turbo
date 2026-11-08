@@ -30,6 +30,7 @@ XLA_FFI_DECLARE_HANDLER_SYMBOL(CKGroupedGemmHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(CKGroupedGemmVariableKHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(ComputeGroupOffsHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(HipblasltGroupedGemmHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(HipblasltGroupedGemmFp8Handler);
 int64_t GetHipblasltGroupedGemmWorkspaceSize(int64_t group_num);
 std::tuple<int, double, std::string> TuneHipblasltGroupedGemm(int64_t G, int64_t M, int64_t a_cols,
                                                               int64_t b_d1, int64_t b_d2, int64_t c_rows,
