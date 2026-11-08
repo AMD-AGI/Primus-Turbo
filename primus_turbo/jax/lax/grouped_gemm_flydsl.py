@@ -81,7 +81,7 @@ def _snapshot(compiled, args, buf_arg_idx):
 class _Kernel:
     """Compiled launcher: one FlyDSL compile (dummy run on device 0), one loaded engine per device, ABI template."""
 
-    def __init__(self, make_launch, make_args, buf_arg_idx):
+    def __init__(self, make_launch, make_args, buf_arg_idx, compile_fn=None):
         flyc, torch, _ = _flydsl()
         import sys
         ndev = len(jax.devices())
@@ -91,7 +91,7 @@ class _Kernel:
         torch.cuda.set_device(0)
         launch = make_launch()
         args = make_args(0)
-        compiled = flyc.compile(launch, *args)
+        compiled = compile_fn(launch, args) if compile_fn else flyc.compile(launch, *args)
         torch.cuda.synchronize()
         _fn0, self.blob, self.offs, self.buf_slot, self.stream_slot = _snapshot(compiled, args, buf_arg_idx)
         del args
@@ -320,8 +320,9 @@ _warned = set()
 def grouped_gemm_flydsl(a, b, group_lens, zero_pad=True):
     """Grouped GEMM out[rows_g] = a[rows_g] @ b[g] (bf16, rows sorted by group, device-side group sizes) with autodiff.
     Shapes the FlyDSL kernels cannot handle fall back to jax.lax.ragged_dot (with a warning)."""
-    # Skipping the output memset is NOT safe even without expert parallelism (MaxText still hands over padding rows whose
-    # garbage reaches the loss); only honour zero_pad=False when explicitly allowed.
+    # Skipping the output memset (~2% of a Mixtral step) is only valid when sum(group_lens) == M, i.e. no padding rows are left
+    # unwritten (checked with a NaN-poisoned allocator: test_nozero_poison.py). It is off by default; PRIMUS_FLYDSL_ALLOW_NOZERO=1
+    # honours zero_pad=False (MaxText passes it for dropless runs without expert parallelism).
     if os.environ.get('PRIMUS_FLYDSL_ALLOW_NOZERO') != '1':
         zero_pad = True
     if supported(a, b):
