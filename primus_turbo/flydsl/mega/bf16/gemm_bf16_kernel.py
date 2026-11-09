@@ -127,10 +127,15 @@ def dense_mma_pipeline_bf16(
     col_safe=False,
     persistent=False,
     merge_tile_pairs=False,
+    k_seg=None,
 ):
     """Shared 4-quadrant pipelined MMA loop and store epilogue for the fixed-K bf16 tile.
     Keyword flags select the feed and epilogue variants a ragged N needs; each is explained at
-    the site that consumes it.  Every caller feeds ``Mfma16x16x32``."""
+    the site that consumes it.  Every caller feeds ``Mfma16x16x32``.
+
+    ``k_seg`` (optional) walks K in segments of ``k_seg.seg_len`` chunks: chunk ``c`` reads K chunk
+    ``k_seg.chunk_base(seg) + c % seg_len`` of ``seg = c // seg_len``, and every wave runs
+    ``k_seg.wait(seg)`` before its first A load of a segment (each wave orders its own loads)."""
     MFMA_MN = 16
     K_ITERS = K // BLOCK_K
     assert K_ITERS >= 2, f"K_ITERS={K_ITERS} too small; need K >= {2 * BLOCK_K}"
@@ -155,6 +160,23 @@ def dense_mma_pipeline_bf16(
     b_next1 = lds.B_lds_next_1
 
     PRED = quad_conds is not None
+    if const_expr(k_seg is None):
+        seg_len, seg_base = K_ITERS, [0]
+    else:
+        seg_len = k_seg.seg_len
+        assert K_ITERS % seg_len == 0
+        seg_base = [k_seg.chunk_base(seg) for seg in range_constexpr(K_ITERS // seg_len)]
+
+    def a_off(base, c):
+        return base + (seg_base[c // seg_len] + c % seg_len) * a_k_step
+
+    def b_off(base, c):
+        return base + (seg_base[c // seg_len] + c % seg_len) * b_k_step
+
+    def k_wait(c):
+        if const_expr(k_seg is not None and c % seg_len == 0):
+            k_seg.wait(c // seg_len)
+
     c00_frag = [mfma.zero_value] * N_ACCUMS
     c01_frag = [mfma.zero_value] * N_ACCUMS
     c10_frag = [mfma.zero_value] * N_ACCUMS
@@ -193,25 +215,28 @@ def dense_mma_pipeline_bf16(
         # ``nt_vmcnt`` counts the full body's issue stream, so a narrowed feed retires a different load.
         ITER_DRAIN = N_LDS_STEPS_A
 
-    b_g2s.load(b_cur0, B0_gl_offset + 0 * b_k_step)
-    a_g2s0.load(a_cur0, A0_gl_offset + 0 * a_k_step)
+    b_g2s.load(b_cur0, b_off(B0_gl_offset, 0))
+    k_wait(0)
+    a_g2s0.load(a_cur0, a_off(A0_gl_offset, 0))
     if const_expr(not half_n):
-        b_g2s.load(b_cur1, B1_gl_offset + 0 * b_k_step)
-    a_g2s1.load(a_cur1, A1_gl_offset + 0 * a_k_step)
+        b_g2s.load(b_cur1, b_off(B1_gl_offset, 0))
+    a_g2s1.load(a_cur1, a_off(A1_gl_offset, 0))
 
     # One tile per WG: only the high half has to wait here, and the divergence is harmless
     # because the WG ends right after. Inside a persistent tile loop it is not -- the next
     # tile's g2s would overrun LDS the other waves are still reading -- so every wave stops.
-    if const_expr(persistent):
+    # ``persistent="staggered"`` keeps the one-WG offset and realigns at the tile's end instead.
+    if const_expr(persistent is True):
         rocdl.s_barrier()
     elif WAVE_HI == 1:
         rocdl.s_barrier()
     wait_barrier(N_LDS_STEPS_A + B1_STEPS)
 
-    b_g2s.load(b_next0, B0_gl_offset + 1 * b_k_step)
-    a_g2s0.load(a_next0, A0_gl_offset + 1 * a_k_step)
+    b_g2s.load(b_next0, b_off(B0_gl_offset, 1))
+    k_wait(1)
+    a_g2s0.load(a_next0, a_off(A0_gl_offset, 1))
     if const_expr(not half_n):
-        b_g2s.load(b_next1, B1_gl_offset + 1 * b_k_step)
+        b_g2s.load(b_next1, b_off(B1_gl_offset, 1))
 
     # K_ITERS == 2 skips the main loop, leaving the tail's b_next0 read with no vmcnt wait.
     # B1_STEPS lands it either way: full-N leaves b_next1 behind it, half-N issues nothing after.
@@ -220,7 +245,7 @@ def dense_mma_pipeline_bf16(
     for k in range_constexpr(K_ITERS - 2):
         b0_frag = b_s2r.load(b_cur0)
         a0_frag = a_s2r.load(a_cur0)
-        a_g2s1.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
+        a_g2s1.load(a_next1, a_off(A1_gl_offset, (k + 1)))
         rocdl.s_barrier()
 
         rocdl.sched_barrier(0)
@@ -230,7 +255,7 @@ def dense_mma_pipeline_bf16(
 
         if const_expr(not half_n):
             b1_frag = b_s2r.load(b_cur1)
-        b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * b_k_step)
+        b_g2s.load(b_cur0, b_off(B0_gl_offset, (k + 2)))
         if const_expr(not half_n):
             rocdl.s_barrier()
 
@@ -241,7 +266,8 @@ def dense_mma_pipeline_bf16(
             rocdl.s_barrier()
 
         a1_frag = a_s2r.load(a_cur1)
-        a_g2s0.load(a_cur0, A0_gl_offset + (k + 2) * a_k_step)
+        k_wait(k + 2)
+        a_g2s0.load(a_cur0, a_off(A0_gl_offset, (k + 2)))
         rocdl.s_barrier()
 
         rocdl.sched_barrier(0)
@@ -249,7 +275,7 @@ def dense_mma_pipeline_bf16(
         rocdl.sched_barrier(0)
         if const_expr(not half_n):
             rocdl.s_barrier()
-            b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * b_k_step)
+            b_g2s.load(b_cur1, b_off(B1_gl_offset, (k + 2)))
         wait_barrier(LOOP_DRAIN)
 
         if const_expr(not half_n):
@@ -296,7 +322,7 @@ def dense_mma_pipeline_bf16(
     rocdl.s_barrier()
 
     b0_frag = b_s2r.load(b_next0)
-    a_g2s1.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
+    a_g2s1.load(a_next1, a_off(A1_gl_offset, (k + 1)))
     if const_expr(not half_n):
         rocdl.s_barrier()
         rocdl.sched_barrier(0)
@@ -384,6 +410,10 @@ def dense_mma_pipeline_bf16(
             c11_frag = [Vec(fx.memref_load_vec(reg)) for reg in acc[3]]
 
     _store_row(c10_frag, c11_frag, base_row + LDS_BLOCK_M)
+    if const_expr(persistent == "staggered"):
+        # pairs with the high half's last barrier: past it no wave reads this tile's LDS
+        if WAVE_HI == 0:
+            rocdl.s_barrier()
 
 
 def gemm_bf16_nt_tile(
@@ -411,6 +441,8 @@ def gemm_bf16_nt_tile(
     pair_n=False,
     n_tail=None,
     a_row_idx=None,
+    store_c_cls=StoreCBf16,
+    k_seg=None,
 ):
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
     assert K % BLOCK_K == 0, f"bf16 NT needs K % {BLOCK_K} == 0 (got K={K})"
@@ -463,7 +495,7 @@ def gemm_bf16_nt_tile(
     a_g2s = _make_a_g2s(a_div, gl_off_a, a_row_idx, lane_id, wave_id, K, N_LDS_STEPS_A, LDS_BLOCK_M)
     b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, fx.BFloat16.ir_type, wave_id)
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-    store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier)
+    store_c = store_c_cls(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier)
 
     def _run(pair_cols, grid, half_n, col_safe=False, b_steps=N_LDS_STEPS_B, pair_tiles=False):
         # The bodies differ only in B's column layout, so the loader is re-pointed, not duplicated.
@@ -507,6 +539,7 @@ def gemm_bf16_nt_tile(
             wave_hi=wave_m,
             col_safe=col_safe,
             persistent=persistent,
+            k_seg=k_seg,
         )
 
     TAIL_QUADS = 0 if n_tail is None else ceildiv(n_tail, 32)
@@ -547,6 +580,7 @@ def _gemm_bf16_nn_tn_tile_impl(
     n_tail=0,
     a_row_idx=None,
     pair_n=False,
+    k_seg=None,
 ):
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
     assert K % BLOCK_K == 0, f"bf16 NN/TN needs K % {BLOCK_K} == 0 (got K={K})"
@@ -645,6 +679,7 @@ def _gemm_bf16_nn_tn_tile_impl(
             col_safe=col_safe,
             persistent=persistent,
             merge_tile_pairs=merge_tile_pairs,
+            k_seg=k_seg,
         )
 
     # Fork a ragged N on the workgroup-uniform column index: barriers stay matched and a feed half drops.
@@ -691,6 +726,7 @@ def gemm_bf16_nn_tile(
     n_tail=0,
     a_row_idx=None,
     pair_n=False,
+    k_seg=None,
 ):
     _gemm_bf16_nn_tn_tile_impl(
         A,
@@ -717,6 +753,7 @@ def gemm_bf16_nn_tile(
         n_tail=n_tail,
         a_row_idx=a_row_idx,
         pair_n=pair_n,
+        k_seg=k_seg,
     )
 
 
