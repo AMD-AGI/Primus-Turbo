@@ -13,6 +13,7 @@ with the local heads over the full sequence; ``ulysses_a2a_o_gemm`` replaces
 chunk of the sequence.
 """
 
+from dataclasses import asdict, dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -34,10 +35,54 @@ from primus_turbo.flydsl.ulysses.workspace import (
     get_ulysses_workspace,
 )
 
-__all__ = ["ulysses_qkv_gemm_a2a", "ulysses_a2a_o_gemm"]
+__all__ = ["ulysses_qkv_gemm_a2a", "ulysses_a2a_o_gemm", "GemmA2ATuning", "A2AGemmTuning"]
 
 _QKV_FORMATS = ("sbhd", "bshd")
 _WEIGHT_LAYOUTS = ("interleaved", "concat")
+
+
+@dataclass(frozen=True)
+class GemmA2ATuning:
+    """Launch knobs of a GemmA2A (forward QKV, backward o_proj); ``None`` keeps the default.
+
+    Attributes:
+        BM: GEMM tile rows (128); smaller tiles finish, and get pulled, earlier.
+        num_lead: GEMM blocks dispatched ahead of the pull blocks (CU count, one wave).
+        num_pull_cu: pull blocks queued after the lead wave (16; forward QKV 24).
+        num_tail_pull: pull blocks queued after all GEMM blocks, for the last wave (16; forward QKV 8).
+        wgrad_at: GEMM tile after which the in-kernel wgrad tiles are dispatched (backward o_proj
+            only; ``num_lead + gemm_tiles // 8``, or last when there are more wgrad tiles than CUs).
+    """
+
+    BM: Optional[int] = None
+    num_lead: Optional[int] = None
+    num_pull_cu: Optional[int] = None
+    num_tail_pull: Optional[int] = None
+    wgrad_at: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class A2AGemmTuning:
+    """Launch knobs of an A2AGemm (forward o_proj, backward QKV); ``None`` keeps the shape heuristic.
+
+    Attributes:
+        BM: GEMM tile rows, 128 or 256 (256 when every tile fits on the CUs or wgrad tiles are many).
+        num_push: push blocks, which run the last GEMM tiles once done (32; 16 with few wgrad tiles).
+        push_split: sub-tiles a ``BM``-row m-tile is pushed in, so its rows land in pieces (8).
+        wgrad_at: claim slot of the in-kernel wgrad tiles (backward QKV only; 0, or after every
+            dgrad tile when there are more than 2x CU wgrad tiles).
+    """
+
+    BM: Optional[int] = None
+    num_push: Optional[int] = None
+    push_split: Optional[int] = None
+    wgrad_at: Optional[int] = None
+
+
+def _launch_kwargs(tuning, **defaults):
+    if tuning is None:
+        return defaults
+    return {**defaults, **{k: v for k, v in asdict(tuning).items() if v is not None}}
 
 
 def _rank_major_concat_rows(hq, hkv, d, n, device):
@@ -75,7 +120,7 @@ def _check(group, hq, hkv, d, qkv_format, weight_layout):
     assert d in (64, 128), f"head_dim {d} is not supported"
 
 
-def _qkv_gemm_a2a_forward(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout):
+def _qkv_gemm_a2a_forward(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, tuning=None):
     n = group.size()
     if qkv_format == "sbhd":
         s_local, b, hidden = x.shape
@@ -108,8 +153,7 @@ def _qkv_gemm_a2a_forward(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout
         seq_local=s_local,
         qkv_format=qkv_format,
         flag_region=REGION_QKV_GEMM_A2A,
-        num_pull_cu=24,
-        num_tail_pull=8,
+        **_launch_kwargs(tuning, num_pull_cu=24, num_tail_pull=8),
     )
     return tuple(t.view(*shape, *t.shape[1:]) for t in (q, k, v))
 
@@ -150,6 +194,7 @@ def _qkv_backward(ctx, dq, dk, dv):
         layout="nn",
         groups=G,
         wgrad=(x2d, dw_rank_major) if fused_wgrad else None,
+        **_launch_kwargs(ctx.bwd_tuning),
     )
     dw = None
     if need_dw:
@@ -165,11 +210,11 @@ def _qkv_backward(ctx, dq, dk, dv):
 
 class UlyssesQKVGemmA2AFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout):
-        q, k, v = _qkv_gemm_a2a_forward(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout)
+    def forward(ctx, x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, fwd_tuning, bwd_tuning):
+        q, k, v = _qkv_gemm_a2a_forward(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, fwd_tuning)
         ctx.save_for_backward(x, w_qkv)
         ctx.hq, ctx.hkv, ctx.d, ctx.group = hq, hkv, d, group
-        ctx.qkv_format, ctx.weight_layout = qkv_format, weight_layout
+        ctx.qkv_format, ctx.weight_layout, ctx.bwd_tuning = qkv_format, weight_layout, bwd_tuning
         if qkv_format == "sbhd":
             ctx.s_local, ctx.b = x.shape[0], x.shape[1]
         else:
@@ -179,7 +224,7 @@ class UlyssesQKVGemmA2AFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dq, dk, dv):
         dx, dw = _qkv_backward(ctx, dq, dk, dv)
-        return dx, dw, None, None, None, None, None, None
+        return dx, dw, None, None, None, None, None, None, None, None
 
 
 def ulysses_qkv_gemm_a2a(
@@ -191,6 +236,8 @@ def ulysses_qkv_gemm_a2a(
     group: dist.ProcessGroup,
     qkv_format: str = "sbhd",
     weight_layout: str = "interleaved",
+    fwd_tuning: Optional[GemmA2ATuning] = None,
+    bwd_tuning: Optional[A2AGemmTuning] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """QKV projection fused with the Ulysses all-to-all.
 
@@ -198,17 +245,28 @@ def ulysses_qkv_gemm_a2a(
         x: this rank's tokens, ``[s/n, b, hidden]`` (sbhd) or ``[b, s/n, hidden]`` (bshd).
         w_qkv: ``[(hq + 2 * hkv) * d, hidden]``; ``interleaved`` is Megatron's ``[ng, hq/ng + 2, d]``
             row order, ``concat`` is ``[q; k; v]``.
+        fwd_tuning: launch knobs of the forward GemmA2A.
+        bwd_tuning: launch knobs of the backward A2AGemm (dgrad + in-kernel wgrad).
 
     Returns:
         q, k, v: local heads over the full sequence, ``[s, b, h/n, d]`` (sbhd) or ``[b, s, h/n, d]``.
     """
     _check(group, num_q_heads, num_kv_heads, head_dim, qkv_format, weight_layout)
     return UlyssesQKVGemmA2AFunction.apply(
-        x, w_qkv, num_q_heads, num_kv_heads, head_dim, group, qkv_format, weight_layout
+        x,
+        w_qkv,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        group,
+        qkv_format,
+        weight_layout,
+        fwd_tuning,
+        bwd_tuning,
     )
 
 
-def _o_gemm_forward(o, w_o, residual, group, qkv_format, save_o):
+def _o_gemm_forward(o, w_o, residual, group, qkv_format, save_o, tuning=None):
     n = group.size()
     if qkv_format == "sbhd":
         seq, b, heads, d = o.shape
@@ -235,11 +293,12 @@ def _o_gemm_forward(o, w_o, residual, group, qkv_format, save_o):
         seq_local=s_local,
         qkv_format=qkv_format,
         flag_region=REGION_O_A2A_GEMM,
+        **_launch_kwargs(tuning),
     )
     return y.view(y_shape), o_gathered
 
 
-def _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format, wgrad=None):
+def _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format, wgrad=None, tuning=None):
     """``dO = (dY @ w_o)`` scattered back to the local heads over the full sequence (GemmA2A);
     ``wgrad=(o_gathered, dw)`` also computes ``dw = dY^T @ o_gathered`` in the same kernel."""
     n = group.size()
@@ -262,24 +321,28 @@ def _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format, wgrad=None
         qkv_format=qkv_format,
         flag_region=REGION_O_GEMM_A2A,
         wgrad=None if wgrad is None else (dy2d, *wgrad),
+        **_launch_kwargs(tuning),
     )
     shape = (seq, b) if qkv_format == "sbhd" else (b, seq)
     return do.view(*shape, heads, d)
 
 
-def _o_gemm_backward(dy2d, w_o, o_gathered, group, heads, d, s_local, b, qkv_format, need_do, need_dw):
+def _o_gemm_backward(
+    dy2d, w_o, o_gathered, group, heads, d, s_local, b, qkv_format, need_do, need_dw, tuning=None
+):
     """``(dO, dW_o)``: dO by GemmA2A, ``dW_o = dY^T @ O_gathered``."""
     do = dw = None
     hidden, K = w_o.shape
+    dgrad_args = (dy2d, w_o, group, heads, d, s_local, b, qkv_format)
     if need_do and need_dw and hidden % 256 == 0 and K % 256 == 0:
         # wgrad does not depend on the exchange: its tiles fill the GemmA2A launch behind the GEMM tiles
         dw = torch.empty_like(w_o)
-        do = _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format, wgrad=(o_gathered, dw))
+        do = _o_gemm_dgrad(*dgrad_args, wgrad=(o_gathered, dw), tuning=tuning)
     elif need_do and need_dw:
-        do = _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format)
+        do = _o_gemm_dgrad(*dgrad_args, tuning=tuning)
         dw = dy2d.t() @ o_gathered
     elif need_do:
-        do = _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format)
+        do = _o_gemm_dgrad(*dgrad_args, tuning=tuning)
     elif need_dw:
         dw = dy2d.t() @ o_gathered
     return do, dw
@@ -287,10 +350,13 @@ def _o_gemm_backward(dy2d, w_o, o_gathered, group, heads, d, s_local, b, qkv_for
 
 class UlyssesA2AOGemmFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, o, w_o, residual, group, qkv_format):
-        y, o_gathered = _o_gemm_forward(o, w_o, residual, group, qkv_format, save_o=w_o.requires_grad)
+    def forward(ctx, o, w_o, residual, group, qkv_format, fwd_tuning, bwd_tuning):
+        y, o_gathered = _o_gemm_forward(
+            o, w_o, residual, group, qkv_format, save_o=w_o.requires_grad, tuning=fwd_tuning
+        )
         ctx.save_for_backward(w_o, o_gathered)
         ctx.group, ctx.qkv_format, ctx.has_residual = group, qkv_format, residual is not None
+        ctx.bwd_tuning = bwd_tuning
         ctx.o_shape = o.shape
         return y
 
@@ -305,10 +371,20 @@ class UlyssesA2AOGemmFunction(torch.autograd.Function):
         heads, d = ctx.o_shape[2], ctx.o_shape[3]
         dy2d = dy.reshape(s_local * b, N).contiguous()
         do, dw = _o_gemm_backward(
-            dy2d, w_o, o_gathered, ctx.group, heads, d, s_local, b, qkv_format, *ctx.needs_input_grad[:2]
+            dy2d,
+            w_o,
+            o_gathered,
+            ctx.group,
+            heads,
+            d,
+            s_local,
+            b,
+            qkv_format,
+            *ctx.needs_input_grad[:2],
+            tuning=ctx.bwd_tuning,
         )
         d_residual = dy if ctx.has_residual and ctx.needs_input_grad[2] else None
-        return do, dw, d_residual, None, None
+        return do, dw, d_residual, None, None, None, None
 
 
 def ulysses_a2a_o_gemm(
@@ -317,6 +393,8 @@ def ulysses_a2a_o_gemm(
     residual: Optional[torch.Tensor],
     group: dist.ProcessGroup,
     qkv_format: str = "sbhd",
+    fwd_tuning: Optional[A2AGemmTuning] = None,
+    bwd_tuning: Optional[GemmA2ATuning] = None,
 ) -> torch.Tensor:
     """Output projection fused with the reverse Ulysses all-to-all, plus ``residual``.
 
@@ -325,6 +403,8 @@ def ulysses_a2a_o_gemm(
             ``[s, b, h/n, d]`` (sbhd) or ``[b, s, h/n, d]`` (bshd).
         w_o: ``[hidden, h * d]``.
         residual: ``[s/n, b, hidden]`` (sbhd) / ``[b, s/n, hidden]`` (bshd), or ``None``.
+        fwd_tuning: launch knobs of the forward A2AGemm.
+        bwd_tuning: launch knobs of the backward GemmA2A (dgrad + in-kernel wgrad).
 
     Returns:
         y = o_gathered @ w_o^T + residual, shaped like ``residual``. The K accumulation order is
@@ -335,4 +415,6 @@ def ulysses_a2a_o_gemm(
     assert o_local_heads.shape[-1] in (64, 128), f"head_dim {o_local_heads.shape[-1]} is not supported"
     seq_dim = 0 if qkv_format == "sbhd" else 1
     assert o_local_heads.shape[seq_dim] % n == 0, "sequence length must divide by the group size"
-    return UlyssesA2AOGemmFunction.apply(o_local_heads, w_o, residual, group, qkv_format)
+    return UlyssesA2AOGemmFunction.apply(
+        o_local_heads, w_o, residual, group, qkv_format, fwd_tuning, bwd_tuning
+    )
