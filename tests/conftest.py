@@ -50,6 +50,9 @@ _GFX1250_ENABLED_TESTS = (
     # stack off is left with. Mostly host-only as well; its numeric cases are the DeepSeek-V3
     # delivery shapes, which are the only shapes in this suite that take the keyed path.
     "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_keys.py",
+    # The kwargs-mode shape keys of the same kernel (the MiniMax-M3 shapes): which calls get a key's
+    # whole argument set, and that the keyed result is bit-identical to the untuned one.
+    "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_kwargs_keys.py",
     # FlyDSL attention at the DeepSeek-V3 MLA head dims (primus_turbo/flydsl/attention/gfx1250_mla).
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla.py",
     # Dense FlyDSL attention (primus_turbo/flydsl/attention/gfx1250), bf16 head_dim 128.
