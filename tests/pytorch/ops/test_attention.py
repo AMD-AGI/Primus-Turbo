@@ -1633,9 +1633,9 @@ def _hk_ref(q, k, v, window_left, scale):
 
 
 def _run_hk_case(Sq, Skv, B, Hq, Hkv, D, window_left, bar=40.0):
-    from primus_turbo.hipkittens.attention import (
-        hipkittens_attn_backward,
-        hipkittens_attn_forward,
+    from primus_turbo.pytorch.kernels.attention.attention_hipkittens_impl import (
+        flash_attn_sbhd_hipkittens_backward_impl,
+        flash_attn_sbhd_hipkittens_forward_impl,
     )
 
     torch.manual_seed(0)
@@ -1645,13 +1645,15 @@ def _run_hk_case(Sq, Skv, B, Hq, Hkv, D, window_left, bar=40.0):
         return torch.randn(s, B, h, D, device="cuda", dtype=torch.bfloat16) * 0.5
 
     q, k, v = mk(Sq, Hq), mk(Skv, Hkv), mk(Skv, Hkv)
-    out, lse = hipkittens_attn_forward(q, k, v, scale, True, (window_left, 0))
+    out, lse = flash_attn_sbhd_hipkittens_forward_impl(q, k, v, scale, True, (window_left, 0))
     assert out.shape == q.shape
     assert lse.shape == (B, Hq, 1, Sq)
     assert compute_snr(_hk_ref(q, k, v, window_left, scale), out) > bar, "forward SNR too low"
 
     dout = torch.randn_like(out)
-    dq, dk, dv = hipkittens_attn_backward(dout, q, k, v, out, lse, scale, True, (window_left, 0))
+    dq, dk, dv = flash_attn_sbhd_hipkittens_backward_impl(
+        dout, q, k, v, out, lse, scale, True, (window_left, 0)
+    )
     assert (dq.shape, dk.shape, dv.shape) == (q.shape, k.shape, v.shape)
 
     qd, kd, vd = (t.detach().clone().float().requires_grad_(True) for t in (q, k, v))
@@ -1685,9 +1687,9 @@ def test_attention_hipkittens_deterministic():
     Constructive rather than hopeful: one workgroup owns each output tile, there are no float
     atomics, and the split-K partials are folded in a fixed band order.
     """
-    from primus_turbo.hipkittens.attention import (
-        hipkittens_attn_backward,
-        hipkittens_attn_forward,
+    from primus_turbo.pytorch.kernels.attention.attention_hipkittens_impl import (
+        flash_attn_sbhd_hipkittens_backward_impl,
+        flash_attn_sbhd_hipkittens_forward_impl,
     )
 
     D, S, B, Hq, Hkv = 128, 1024, 2, 32, 4
@@ -1697,13 +1699,13 @@ def test_attention_hipkittens_deterministic():
     k = torch.randn(S, B, Hkv, D, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(S, B, Hkv, D, device="cuda", dtype=torch.bfloat16)
 
-    o1, l1 = hipkittens_attn_forward(q, k, v, scale, True, (-1, 0))
-    o2, l2 = hipkittens_attn_forward(q, k, v, scale, True, (-1, 0))
+    o1, l1 = flash_attn_sbhd_hipkittens_forward_impl(q, k, v, scale, True, (-1, 0))
+    o2, l2 = flash_attn_sbhd_hipkittens_forward_impl(q, k, v, scale, True, (-1, 0))
     assert torch.equal(o1, o2) and torch.equal(l1, l2), "forward is not run-to-run deterministic"
 
     do = torch.randn_like(o1)
-    g1 = hipkittens_attn_backward(do, q, k, v, o1, l1, scale, True, (-1, 0))
-    g2 = hipkittens_attn_backward(do, q, k, v, o1, l1, scale, True, (-1, 0))
+    g1 = flash_attn_sbhd_hipkittens_backward_impl(do, q, k, v, o1, l1, scale, True, (-1, 0))
+    g2 = flash_attn_sbhd_hipkittens_backward_impl(do, q, k, v, o1, l1, scale, True, (-1, 0))
     for name, a, b in zip(("dq", "dk", "dv"), g1, g2):
         assert torch.equal(a, b), f"{name} is not run-to-run deterministic"
 
@@ -1730,7 +1732,9 @@ def test_attention_hipkittens_envelope(case, needle):
     because the kernels declare gl<bf16, ...>, and Sq > Skv leaves the leading Sq - Skv query
     rows -- which attend to no key at all -- unwritten by the forward.
     """
-    from primus_turbo.hipkittens.attention import hipkittens_attn_supported
+    from primus_turbo.pytorch.kernels.attention.attention_hipkittens_impl import (
+        hipkittens_attn_supported_impl,
+    )
 
     dtype = torch.float16 if case == "fp16" else torch.bfloat16
     D = 32 if case == "head_dim" else 64
@@ -1754,7 +1758,7 @@ def test_attention_hipkittens_envelope(case, needle):
         q = torch.randn(Sq, 2, 8, D, device="cuda", dtype=dtype).transpose(0, 1)
         k = v = torch.randn(Skv, 2, 8, D, device="cuda", dtype=dtype)
 
-    ok, why = hipkittens_attn_supported(q, k, v, **kw)
+    ok, why = hipkittens_attn_supported_impl(q, k, v, **kw)
     assert not ok and needle in why, f"expected a refusal mentioning {needle!r}, got {ok} / {why!r}"
 
 

@@ -152,8 +152,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
 
     // ********* HipKittens attention (gfx950) *********
     // Registered only where the *_gfx950.cu kernels were built, i.e. where gfx950 is among the
-    // offload archs; hipkittens_attn_supported reports their absence rather than letting the op
-    // lookup fail. Even then they are only functional ON gfx950 -- the kernel bodies are guarded
+    // offload archs; hipkittens_attn_supported_impl reports their absence rather than letting the
+    // op lookup fail. Even then they are only functional ON gfx950 -- the kernel bodies are guarded
     // on __gfx950__ and the Python layer refuses any other device before launch. The kernels
     // write through their outputs, so these are mutating and return nothing.
 #ifdef BUILD_HIPKITTENS_BACKEND

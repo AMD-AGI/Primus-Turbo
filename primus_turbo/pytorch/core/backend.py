@@ -66,7 +66,7 @@ class BackendType(Enum):
     FLYDSL = auto()
     # HipKittens attention. gfx950-only at runtime: the kernels are built into the shared extension
     # in all arch configurations but are guarded on __gfx950__ and must be capability-gated before
-    # launch (see is_gfx950()/hipkittens_attn_supported).
+    # launch (see is_gfx950()/hipkittens_attn_supported_impl).
     HIPKITTENS = auto()
     GLUON = auto()
 
