@@ -1,7 +1,14 @@
 ###############################################################################
-# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-# See LICENSE for license information.
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 FlyDSL Project Contributors
+#
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
+# Modified by the Primus-Turbo team.
+#
+# This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
+# not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
 """Ulysses A2AGemm: an all-to-all from head-sharded to sequence-sharded rows fused into the GEMM
@@ -284,7 +291,9 @@ def _wgrad_k_hook(flag_base, src, epoch, **c):
     lead = (_WGRAD_CHUNK_ROWS + 2 * 64 - 1) // BM
 
     def wait(tiles):
-        slots = [(t * fx.Int32(S) + fx.Int32(sub)) * fx.Int32(num_ranks) + src for t in tiles for sub in range(S)]
+        slots = [
+            (t * fx.Int32(S) + fx.Int32(sub)) * fx.Int32(num_ranks) + src for t in tiles for sub in range(S)
+        ]
         spin_flags(flag_base, slots, epoch, rank, src, "a2a_gemm wgrad")
 
     def hook(k):
@@ -369,7 +378,21 @@ def _wgrad_tile(thread_index, w, flag_base, recv_addr, XB, DW, lds, epoch, trace
 
 @ASTRewriter.transform
 def _tile_loop(
-    thread_index, state_base, claim_slot, flag_base, recv_addr, W, Y, RES, OG, XB, DW, lds, epoch, trace_base, **c
+    thread_index,
+    state_base,
+    claim_slot,
+    flag_base,
+    recv_addr,
+    W,
+    Y,
+    RES,
+    OG,
+    XB,
+    DW,
+    lds,
+    epoch,
+    trace_base,
+    **c,
 ):
     """Claim tiles until none are left: the ``num_wtiles`` weight-gradient tiles sit at claim
     positions ``[wgrad_at, wgrad_at + num_wtiles)``, the GEMM tiles around them."""
@@ -764,7 +787,12 @@ def ulysses_a2a_gemm(
     if wgrad is not None:
         xb, dw = wgrad
         assert layout == "nn" and o_gathered is None
-        assert xb.is_contiguous() and tuple(xb.shape) == (M, N) and dw.is_contiguous() and tuple(dw.shape) == (K, N)
+        assert (
+            xb.is_contiguous()
+            and tuple(xb.shape) == (M, N)
+            and dw.is_contiguous()
+            and tuple(dw.shape) == (K, N)
+        )
         num_wtiles = K // BMw * (N // BN)
     # Over two waves of weight-gradient tiles (GLM-4.7: 1120): taken first they fill the CUs and the
     # GEMM tiles run after the exchange, so the GEMM goes first, keeps its 256-row tiles and gets 32

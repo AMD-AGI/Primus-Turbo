@@ -99,7 +99,9 @@ def main():
             rows.append((mib, grid[0], result["push"], result["pull"], peer_numel * 2 * (n - 1)))
 
     if rank == 0:
-        print(f"ranks={n}  (max over ranks of per-rank median, us; GB/s = bytes leaving or entering one rank)")
+        print(
+            f"ranks={n}  (max over ranks of per-rank median, us; GB/s = bytes leaving or entering one rank)"
+        )
         print(f"{'MiB/peer':>9}{'CUs':>6}{'push us':>10}{'push GB/s':>11}{'pull us':>10}{'pull GB/s':>11}")
         for mib, cus, push, pull, nbytes in rows:
             print(

@@ -1,7 +1,14 @@
 ###############################################################################
-# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-# See LICENSE for license information.
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 FlyDSL Project Contributors
+#
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
+# Modified by the Primus-Turbo team.
+#
+# This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
+# not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
 """Ulysses GemmA2A: a dense GEMM whose output columns are head-sharded over the group, scattered
@@ -271,7 +278,9 @@ def _make_kernel(
     gemm_tile = functools.partial(gemm_bf16_tile, layout, pair_n=True)
     # one extra i32: the block-wide broadcast of a claimed pull unit
     SharedStorage = (
-        _make_shared_storage(max(BM, wgrad_bm), BN, chunk_stride=_WGRAD_LDS_CHUNK_STRIDE, num_lds_row_idx_entries=1)
+        _make_shared_storage(
+            max(BM, wgrad_bm), BN, chunk_stride=_WGRAD_LDS_CHUNK_STRIDE, num_lds_row_idx_entries=1
+        )
         if num_wtiles
         else _make_shared_storage(BM, BN, num_lds_row_idx_entries=1)
     )
