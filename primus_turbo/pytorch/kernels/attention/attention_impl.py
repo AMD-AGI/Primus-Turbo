@@ -749,7 +749,16 @@ class FlashAttnVarlenDispatcher(AutoKernelDispatcher):
 # =============================================================================
 
 
+def _default_flash_attn_backend(varlen: bool, q, k, v) -> BackendType:
+    # gfx950 MLA (qk 192 / v 128) defaults to aiter: its opus forward is faster than the FlyDSL
+    # MLA forward (0.81-0.88x of aiter 0.1.24.post1), which stays reachable as an explicit choice.
+    if not varlen and k is not None and v is not None and not is_gfx1250() and is_flydsl_mla_head_dims(q, k, v):
+        return BackendType.AITER
+    return BackendType.FLYDSL
+
+
 def resolve_flash_attn_backend(varlen: bool, user_backend: Optional[BackendType], **kwargs) -> BackendType:
-    """Resolve the dense/varlen flash-attn backend enum (default FLYDSL, else AITER)."""
+    """Resolve the dense/varlen flash-attn backend enum (default FLYDSL, AITER for gfx950 MLA)."""
     dispatcher = FlashAttnVarlenDispatcher if varlen else FlashAttnDenseDispatcher
-    return dispatcher.resolve(BackendType.FLYDSL, user_backend, **kwargs)
+    default = _default_flash_attn_backend(varlen, kwargs.get("q"), kwargs.get("k"), kwargs.get("v"))
+    return dispatcher.resolve(default, user_backend, **kwargs)

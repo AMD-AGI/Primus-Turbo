@@ -10,3 +10,10 @@
   (tell-tale: compile+run ~0.2 s). Clear the cache before trusting such an experiment.
 - K LDS for qk 192 = 3 strips × 8 lines × 520 elems; per buffer (K+V) 42.4 KB, double-buffered
   84.7 KB, so BLOCK_M=128 (2 CTAs/CU) does not fit 160 KB; BLOCK_M=256 / 8 waves / 1 CTA per CU does.
+- Before trusting any aiter baseline, profile it and check the kernel name. On gfx950 with aiter
+  0.1.24.post1 the MLA 192/128 forward is opus `gqa_d192_v128_kernel` (~970 TFLOPS on DeepSeek-V3
+  training shapes) and the backward is asm `fmha_bwd_hd192_128_bf16_causal_br_a16_pssk` (~695
+  TFLOPS). Seeing `fmha_fwd_hd192_hd128_bf16_causal` (~450 TFLOPS) means a fallback: an old aiter
+  (0.1.14) or aiter's CK/HIP JIT disabled ("ROCm/HIP JIT runtime not available"), e.g. by a flydsl
+  on PYTHONPATH that does not match aiter's pinned flydsl. Always measure aiter and FlyDSL in the
+  same process.
