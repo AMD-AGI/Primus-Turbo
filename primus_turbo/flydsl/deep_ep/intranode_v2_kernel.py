@@ -229,10 +229,12 @@ def _tdm_load_checked(lds_addr, global_addr, num_bytes: int, sys_load: bool):
     beside the load; ``sys_load``: system scope, for a heap the peers write). An eviction can drop a queued
     TDM load, all of it or a part, after s_wait_tensorcnt, and the warp would store its buffer's previous
     contents; the redo (TDM_REDO_TICKS) moves the row again after an eviction, this check does not depend
-    on how long the wave was away. A TDM load that follows outstanding stores is lost far more often."""
+    on how long the wave was away. A TDM load that follows outstanding stores is lost far more often. A
+    check that keeps failing goes to the watchdog: taking the load anyway would let the stale row through."""
     lane_id = fx.thread_idx.x % fx.Int32(WARP_SIZE)
     check_word = (lane_id * fx.Int32(num_bytes // 4 - 1)) // fx.Int32(WARP_SIZE - 1)
     landed = fx.Int32(0)
+    spin_start = read_clock()
     while landed == fx.Int32(0):
         if fx.const_expr(sys_load):
             _tdm_load(lds_addr, global_addr, num_bytes, cache_policy=SYS_LOAD)
@@ -245,6 +247,15 @@ def _tdm_load_checked(lds_addr, global_addr, num_bytes: int, sys_load: bool):
         tdm_ops.tensor_wait(0)
         stale = _popc(_ballot(ld_lds(lds_addr, check_word) != expected)) > fx.Int32(0)
         landed = arith.select(stale, fx.Int32(0), fx.Int32(1))
+        if landed == fx.Int32(0):
+            if timed_out(spin_start):
+                watchdog_report(
+                    "[DeepEP FlyDSL V2] TDM load check timeout: bytes={} word={} expected={}\n",
+                    fx.Int32(num_bytes),
+                    check_word,
+                    expected,
+                )
+                spin_start = read_clock()
 
 
 def _align(value, alignment):
