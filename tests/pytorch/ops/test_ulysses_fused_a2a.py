@@ -27,6 +27,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from primus_turbo.pytorch.core.utils import is_gfx950
+
 # (hq, hkv) as multiples of n: GQA 32/8, MHA 40/40, hkv == n (Qwen3 64/4 at n = 4)
 HEAD_CONFIGS = {
     "gqa": lambda n: (32, 8),
@@ -312,6 +314,9 @@ def main():
 
 
 @pytest.mark.multigpu
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()), reason="the Ulysses FlyDSL kernels need gfx950"
+)
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 def test_ulysses_fused_a2a(world_size):
     if torch.cuda.device_count() < world_size:
