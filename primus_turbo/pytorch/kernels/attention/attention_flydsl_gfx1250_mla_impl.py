@@ -10,12 +10,21 @@ q/k head dim 192, v head dim 128, bf16, MHA, bottom-right causal, any softmax sc
 bias, alibi, sink or sliding window. The kernels take contiguous [b, s, h, d] tensors. b > 1 SBHD
 storage (Megatron's layout) is handed over as [1, s, b*h, d], the same bytes with the batch folded
 into the heads, so it is not copied. Dispatch and autograd wiring belong to the caller.
+
+The backward runs on the HipKittens kernels (``attention_hipkittens_gfx1250_mla_impl.hk_mla_bwd``)
+when PRIMUS_TURBO_MLA_BWD_IMPL is ``hk`` (``mla_bwd_impl``) and they take the call; a call they
+cannot take runs on FlyDSL, with one warning per reason.
 """
 
 from typing import Optional, Tuple
 
 import torch
 
+import primus_turbo.common.envs as envs
+from primus_turbo.common.logger import logger
+from primus_turbo.pytorch.kernels.attention import (
+    attention_hipkittens_gfx1250_mla_impl as hk,
+)
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
     _eager_custom_op,
 )
@@ -100,6 +109,48 @@ def _backward_op_fake(dout, q, k, v, out, lse, softmax_scale, causal):
     return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
 
+@_eager_custom_op("primus_turbo::flash_attn_hk_gfx1250_mla_backward")
+def _backward_hk_op(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return hk.hk_mla_bwd(dout, q, k, v, out, lse, softmax_scale, causal)
+
+
+_backward_hk_op.register_fake(_backward_op_fake)
+
+
+@torch.compiler.assume_constant_result
+def mla_bwd_impl() -> str:
+    """The backward kernels, "flydsl" or "hk": PRIMUS_TURBO_MLA_BWD_IMPL through envs, so at the first MLA backward,
+    not at import (an invalid value raises ValueError there). torch.compile runs this while tracing the backward,
+    with the forward: a compiled graph keeps the setting it was traced with."""
+    return envs.PRIMUS_TURBO_MLA_BWD_IMPL
+
+
+@torch.compiler.assume_constant_result  # runs while torch.compile traces, which cannot trace a logger call
+def _log_fallback(reason: str) -> bool:
+    logger.warning(f"PRIMUS_TURBO_MLA_BWD_IMPL=hk, but this backward runs on FlyDSL: {reason}", once=True)
+    return True
+
+
+def _backward_kernels(q, k, v, causal: bool):
+    """``_backward_hk_op`` when the setting is "hk" and the HipKittens kernels take the call, else ``_backward_op``."""
+    if mla_bwd_impl() != "hk":
+        return _backward_op
+    reason = hk.hk_mla_unsupported_reason(q, k, v, causal)
+    if reason is None:
+        return _backward_hk_op
+    _log_fallback(reason)
+    return _backward_op
+
+
 def _scale(softmax_scale: Optional[float]) -> float:
     return float(D_QK**-0.5 if softmax_scale is None else softmax_scale)
 
@@ -140,7 +191,8 @@ def flash_attn_flydsl_gfx1250_mla_backward_impl(dout, q, k, v, out, lse, softmax
     """
     batch = dout.shape[0]
     fold = q.shape[0] != batch  # the forward folded the batch into the heads
-    grads = _backward_op(
-        _to_kernel_layout(dout, fold), q, k, v, out, lse, _scale(softmax_scale), bool(causal)
+    causal = bool(causal)
+    grads = _backward_kernels(q, k, v, causal)(
+        _to_kernel_layout(dout, fold), q, k, v, out, lse, _scale(softmax_scale), causal
     )
     return tuple(_from_kernel_layout(g, batch) for g in grads)

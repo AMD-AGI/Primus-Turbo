@@ -16,3 +16,5 @@ logs/
 primus_turbo/_build_info.py
 primus_turbo/_version.py
 .coverage*
+!csrc/kernels/attention/hipkittens/gfx1250_mla/src/*.hip
+primus_turbo/lib/hk_gfx1250_mla/

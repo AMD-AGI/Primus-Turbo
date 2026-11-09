@@ -17,6 +17,7 @@ import sys
 import pytest
 import torch
 
+import primus_turbo.common.envs as envs
 from primus_turbo.pytorch.core.backend import (
     BackendType,
     GlobalBackendManager,
@@ -59,6 +60,14 @@ def _meta(b=1, sq=256, skv=256, h=2, hkv=None, d_qk=D_QK, d_v=D_V, dtype=torch.b
 
     hkv = h if hkv is None else hkv
     return make(sq, h, d_qk), make(skv, hkv, d_qk), make(skv, hkv, d_v)
+
+
+@pytest.fixture(autouse=True)
+def _flydsl_backward(monkeypatch):
+    """These tests cover the FlyDSL kernels: an exported PRIMUS_TURBO_MLA_BWD_IMPL=hk must not route the backward to
+    the HipKittens kernels (test_attention_hipkittens_gfx1250_mla covers those)."""
+    monkeypatch.delenv("PRIMUS_TURBO_MLA_BWD_IMPL", raising=False)
+    envs.reset_cache("PRIMUS_TURBO_MLA_BWD_IMPL")
 
 
 def _on_gfx1250(monkeypatch):
