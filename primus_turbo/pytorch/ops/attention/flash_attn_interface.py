@@ -37,10 +37,12 @@ from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_mla_impl im
     is_mla_head_dims,
 )
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
+    flash_attn_mla_sbhd_flydsl_forward_impl,
     flash_attn_sbhd_flydsl_backward_impl,
     flash_attn_sbhd_flydsl_forward_impl,
     flash_attn_varlen_flydsl_backward_impl,
     flash_attn_varlen_flydsl_forward_impl,
+    is_flydsl_mla_head_dims,
 )
 from primus_turbo.pytorch.kernels.attention.attention_gluon_impl import (
     flash_attn_gluon_forward_impl,
@@ -125,6 +127,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.backend = backend
         # FLYDSL names two kernel families; the arch decides which, once, for both passes.
         ctx.flydsl_gfx1250 = backend == BackendType.FLYDSL and is_gfx1250()
+        ctx.flydsl_mla = False
         if backend == BackendType.TRITON:
             # The dispatcher only picks this backend when DenseAttnFwdTritonBackend.can_handle
             # said yes, but FlashAttnFunc.apply is reachable directly, and these arguments have
@@ -236,6 +239,26 @@ class FlashAttnFunc(torch.autograd.Function):
             # straight, and then reading bshd bytes as sbhd would just return the wrong answer.
             assert _sbhd_layout(q, qkv_format), f"flydsl gfx950 attention is sbhd only, got {qkv_format}"
             q_s, k_s, v_s = (t.permute(1, 0, 2, 3) for t in (q, k, v))
+            B, Sq, Hq = q.shape[0], q.shape[1], q.shape[2]
+            if is_flydsl_mla_head_dims(q, k, v):
+                if dropout_p != 0.0 or bias is not None or alibi_slopes is not None or sink is not None:
+                    raise ValueError("flydsl MLA attention does not implement dropout, bias, alibi or sink")
+                if int(window_size[0]) >= 0:
+                    raise ValueError(f"flydsl MLA attention has no sliding window, got {window_size}")
+                out_s, lse = flash_attn_mla_sbhd_flydsl_forward_impl(
+                    q_s, k_s, v_s, softmax_scale=softmax_scale, causal=causal, return_lse=True
+                )
+                out = out_s.permute(1, 0, 2, 3)
+                # [B*Sq, Hq] -> the [B, Hq, Sq] the aiter backward reads.
+                lse = lse.view(B, Sq, Hq).permute(0, 2, 1)
+                if is_grad_enabled and _any_requires_grad(q, k, v):
+                    ctx.flydsl_mla = True
+                    ctx.save_for_backward(q, k, v, out, lse.contiguous())
+                    ctx.softmax_scale = q.shape[-1] ** (-0.5) if softmax_scale is None else softmax_scale
+                    ctx.causal = causal
+                    ctx.window_size = window_size
+                    ctx.deterministic = deterministic
+                return (out, lse) if return_lse else out
             out_s, lse = flash_attn_sbhd_flydsl_forward_impl(
                 q_s,
                 k_s,
@@ -246,7 +269,6 @@ class FlashAttnFunc(torch.autograd.Function):
                 return_lse=True,
                 sink=sink,
             )
-            B, Sq, Hq = q.shape[0], q.shape[1], q.shape[2]
             if is_grad_enabled and _any_requires_grad(q, k, v, sink):
                 ctx.save_for_backward(q_s, k_s, v_s, out_s, lse)
                 ctx.softmax_scale = softmax_scale
@@ -386,6 +408,38 @@ class FlashAttnFunc(torch.autograd.Function):
                     causal=ctx.causal,
                     deterministic=ctx.deterministic,
                 )
+            return _flash_attn_grads(dq, dk, dv, None, None)
+
+        if ctx.flydsl_mla:
+            # No FlyDSL MLA backward yet: aiter's, on the FlyDSL forward's O and LSE.
+            q, k, v, out, lse = ctx.saved_tensors
+            dq, dk, dv = (
+                torch.empty(t.shape[1], t.shape[0], *t.shape[2:], dtype=t.dtype, device=t.device).permute(1, 0, 2, 3)
+                for t in (q, k, v)
+            )
+            attention_aiter_backward_impl(
+                dout=dout,
+                q=q,
+                k=k,
+                v=v,
+                out=out,
+                softmax_lse=lse,
+                dq=dq,
+                dk=dk,
+                dv=dv,
+                dropout_p=0.0,
+                softmax_scale=ctx.softmax_scale,
+                causal=ctx.causal,
+                window_size_left=int(ctx.window_size[0]),
+                window_size_right=int(ctx.window_size[1]),
+                bias=None,
+                alibi_slopes=None,
+                deterministic=ctx.deterministic,
+                rng_state=torch.empty((2,), dtype=torch.int64, device=q.device),
+                is_v3_atomic_fp32=_resolve_is_v3_atomic_fp32_from_env(),
+                how_v3_bf16_cvt=0,
+                qkv_format="sbhd",
+            )
             return _flash_attn_grads(dq, dk, dv, None, None)
 
         if ctx.backend == BackendType.FLYDSL:

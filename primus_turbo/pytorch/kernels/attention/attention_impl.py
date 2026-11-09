@@ -44,8 +44,10 @@ from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_mla_impl im
     is_mla_head_dims,
 )
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
+    flash_attn_mla_sbhd_flydsl_forward_impl,
     flash_attn_sbhd_flydsl_forward_impl,
     flash_attn_varlen_flydsl_forward_impl,
+    is_flydsl_mla_head_dims,
 )
 from primus_turbo.pytorch.kernels.attention.attention_hipkittens_impl import (
     flash_attn_sbhd_hipkittens_forward_impl,
@@ -125,6 +127,25 @@ def _flydsl_common_ok(
         and bias is None
         and alibi_slopes is None
     )
+
+
+def _flydsl_mla_ok(q, k, v, causal, window_size, softmax_scale, dropout_p, bias, alibi_slopes, sink) -> bool:
+    """Eligibility for the gfx950 MLA forward (qk 192 / v 128). Its backward is aiter's, run on
+    this forward's O and LSE, so only the forward's own rules are checked here: bf16, causal with
+    no window, Hq == Hkv, Sq == Skv, scale 1/sqrt(192), and contiguous sbhd storage."""
+    if get_device_compute_capability() != _GFX950 or not bool(causal):
+        return False
+    if any(t.dtype != torch.bfloat16 for t in (q, k, v)):
+        return False
+    if int(window_size[0]) >= 0 or int(window_size[1]) not in (0, -1):
+        return False
+    if sink is not None or dropout_p != 0.0 or bias is not None or alibi_slopes is not None:
+        return False
+    if not _scale_ok(softmax_scale, q.shape[-1]):
+        return False
+    if k.shape[:3] != q.shape[:3] or v.shape[:3] != q.shape[:3]:
+        return False
+    return all(t.permute(1, 0, 2, 3).is_contiguous() for t in (q, k, v))
 
 
 # =============================================================================
@@ -255,7 +276,8 @@ def _flydsl_gfx1250_ok(
 
 
 class DenseAttnFwdFlydslBackend(KernelBackend):
-    """FlyDSL dense attention: the gfx950 kernels (sbhd storage, head dim 64/128) on MI355X; on
+    """FlyDSL dense attention: the gfx950 kernels (sbhd storage, head dim 64/128, plus the MLA
+    forward for qk 192 / v 128 whose backward is aiter's) on MI355X; on
     MI455X (gfx1250) the DeepSeek-V3 MLA kernels (qk 192 / v 128) and the head-dim-128 GQA kernels,
     both in any byte order."""
 
@@ -298,6 +320,10 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         # for it has to go to aiter, which does.
         if return_softmax:
             return False
+        if is_flydsl_mla_head_dims(q, k, v):
+            return _flydsl_mla_ok(
+                q, k, v, causal, window_size, softmax_scale, dropout_p, bias, alibi_slopes, sink
+            )
         if not _gqa_group_ok(q.shape[2], k.shape[2], q.shape[3]) or not _sink_ok(sink, q.shape[2]):
             return False
         return _flydsl_common_ok(q, causal, window_size, softmax_scale, dropout_p, bias, alibi_slopes)
@@ -312,6 +338,10 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
             return (out, lse) if return_lse else out
         # Under autotune, off the op layer's path, so the sbhd view is taken here too.
         q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))
+        if is_flydsl_mla_head_dims(q, k, v):
+            return flash_attn_mla_sbhd_flydsl_forward_impl(
+                q, k, v, softmax_scale=softmax_scale, causal=causal, return_lse=return_lse
+            )
         return flash_attn_sbhd_flydsl_forward_impl(
             q,
             k,

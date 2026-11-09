@@ -23,6 +23,11 @@ from primus_turbo.flydsl.attention.flash_attn_bwd import (
 from primus_turbo.flydsl.attention.flash_attn_fwd import (
     build_flash_attn_dualwave_swp_module,
 )
+from primus_turbo.flydsl.attention.flash_attn_mla_fwd import (
+    MLA_HEAD_DIM_QK,
+    MLA_HEAD_DIM_V,
+    build_flash_attn_mla_fwd_module,
+)
 from primus_turbo.flydsl.utils.attn_helper import (
     SCORE_BOUND_HEAD_DIM_MAX,
     SCORE_BOUND_KV_CHUNKS,
@@ -484,6 +489,54 @@ def flash_attn_sbhd_flydsl_forward_impl(
     Hq, D = q.shape[2], q.shape[3]
     window_left = _check_fwd(q, k, v, softmax_scale, causal, window_size, sink, Hq, D, sbhd=True)
     out, lse = _sbhd_forward_op(q, k, v, window_left, bool(return_lse), sink)
+    return (out, lse) if return_lse else out
+
+
+def is_flydsl_mla_head_dims(q, k, v) -> bool:
+    """The MLA training head dims the gfx950 MLA forward is built for: q/k 192, v 128."""
+    return q.shape[-1] == MLA_HEAD_DIM_QK and k.shape[-1] == MLA_HEAD_DIM_QK and v.shape[-1] == MLA_HEAD_DIM_V
+
+
+@functools.lru_cache(maxsize=64)
+def _mla_fwd_module(Hq, emit_lse):
+    return build_flash_attn_mla_fwd_module(Hq, Hq, emit_lse=emit_lse)
+
+
+@_eager_custom_op("primus_turbo::flash_attn_mla_sbhd_flydsl_forward")
+def _mla_sbhd_forward_op(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    return_lse: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    Sq, B, Hq, _ = q.shape
+    mod = _mla_fwd_module(Hq, bool(return_lse))
+    out = q.new_empty((Sq, B, Hq, MLA_HEAD_DIM_V))
+    lse = torch.empty((B * Sq, Hq) if return_lse else (0,), device=q.device, dtype=torch.float32)
+    mod(q, k, v, out, lse if return_lse else None, B, Sq, stream=_current_stream())
+    return out, lse
+
+
+@_mla_sbhd_forward_op.register_fake
+def _mla_sbhd_forward_op_fake(q, k, v, return_lse):
+    Sq, B, Hq, _ = q.shape
+    lse_shape = (B * Sq, Hq) if return_lse else (0,)
+    return q.new_empty((Sq, B, Hq, MLA_HEAD_DIM_V)), q.new_empty(lse_shape, dtype=torch.float32)
+
+
+def flash_attn_mla_sbhd_flydsl_forward_impl(q, k, v, softmax_scale=None, causal=True, return_lse=False):
+    """MLA SBHD forward: q/k [S,B,H,192], v [S,B,H,128] bf16, Hq == Hkv, Sq == Skv, bottom-right
+    causal, scale 1/sqrt(192). Returns O [S,B,H,128] (and LSE [B*S,H] fp32 when ``return_lse``)."""
+    assert causal, "flydsl MLA forward is causal only"
+    assert q.dtype == torch.bfloat16 and k.dtype == q.dtype and v.dtype == q.dtype, "flydsl MLA forward is bf16 only"
+    assert is_flydsl_mla_head_dims(q, k, v), f"flydsl MLA forward wants qk 192 / v 128, got {q.shape}, {v.shape}"
+    assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous(), "SBHD tensors must be contiguous"
+    assert k.shape[:3] == q.shape[:3] and v.shape[:3] == q.shape[:3], "flydsl MLA forward needs Hq == Hkv, Sq == Skv"
+    if softmax_scale is not None:
+        assert abs(softmax_scale - 1.0 / math.sqrt(MLA_HEAD_DIM_QK)) < 1e-6, (
+            "flydsl MLA forward bakes softmax_scale=1/sqrt(192)"
+        )
+    out, lse = _mla_sbhd_forward_op(q, k, v, bool(return_lse))
     return (out, lse) if return_lse else out
 
 
