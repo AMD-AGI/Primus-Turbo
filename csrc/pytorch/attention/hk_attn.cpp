@@ -13,7 +13,7 @@
 // has none of them and this file would reference symbols nothing defined -- hence the same guard
 // setup.py puts on their compilation. Where they are built, one object covers every arch and the
 // non-gfx950 passes are an assert-and-return, so reaching them on another card is a caller bug:
-// primus_turbo/hipkittens/attention/ refuses a non-gfx950 device, along with the rest of the
+// attention_hipkittens_impl.py refuses a non-gfx950 device, along with the rest of the
 // envelope these kernels admit.
 
 #ifdef BUILD_HIPKITTENS_BACKEND
