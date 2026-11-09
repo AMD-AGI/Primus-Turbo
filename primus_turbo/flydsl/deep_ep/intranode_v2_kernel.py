@@ -137,6 +137,9 @@ USE_TDM = IS_GFX1250
 # threshold. Sources do not change during a call and nobody reads a row before its flag or the channel's
 # count is published, so moving it twice is harmless; the combine checks each row before its flag goes up.
 TDM_REDO_TICKS = 50_000
+# a row moves at most this many times more, the last pass kept however long it took: with no cap, a row
+# whose move alone took longer than TDM_REDO_TICKS would be moved for ever, and nothing in the loop traps
+TDM_REDO_MAX = 8
 # LDS a block can allocate on gfx1250
 MAX_LDS_BYTES = 320 * 1024
 # combine: tokens a warp claims from the reduce queue at a time. A claim waits for the rows of all its
@@ -210,6 +213,13 @@ def _tdm_moved(start, redo_ticks: int):
     delta = read_clock() - start
     in_time = (delta >= fx.Int64(0)) & (delta <= fx.Int64(redo_ticks))
     return arith.select(in_time, fx.Int32(1), fx.Int32(0))
+
+
+def _tdm_pass_done(start, passes, redo_ticks: int, redo_max: int):
+    """After the tensor_wait(0) that ends pass ``passes`` (1 for the first) of a row's TDM ops, issued after
+    ``read_clock()`` read ``start``: 1 if that pass was in time (``_tdm_moved``) or the row has already been
+    moved ``redo_max`` times more (TDM_REDO_MAX), else 0."""
+    return arith.select(passes > fx.Int32(redo_max), fx.Int32(1), _tdm_moved(start, redo_ticks))
 
 
 @ASTRewriter.transform
@@ -369,15 +379,26 @@ MAX_EPOCH = (1 << 11) - 1
 
 @ASTRewriter.transform
 def _copy_received_x(
-    local, layout, outputs, row, hidden_bytes: int, row_lds, row_buffer_bytes: int, redo_ticks: int
+    local,
+    layout,
+    outputs,
+    row,
+    hidden_bytes: int,
+    row_lds,
+    row_buffer_bytes: int,
+    redo_ticks: int,
+    redo_max: int,
 ):
-    """``_tdm_copy_received_x``, repeated until a pass of it was in time (see TDM_REDO_TICKS)."""
+    """``_tdm_copy_received_x``, repeated until a pass of it was in time or it reached the cap (see
+    TDM_REDO_TICKS, TDM_REDO_MAX)."""
     moved = fx.Int32(0)
+    passes = fx.Int32(0)
     while moved == fx.Int32(0):
         start = read_clock()
         _tdm_copy_received_x(local, layout, outputs, row, hidden_bytes, row_lds, row_buffer_bytes)
         tdm_ops.tensor_wait(0)
-        moved = _tdm_moved(start, redo_ticks)
+        passes = passes + fx.Int32(1)
+        moved = _tdm_pass_done(start, passes, redo_ticks, redo_max)
 
 
 @ASTRewriter.transform
@@ -394,15 +415,27 @@ def _tdm_copy_received_x(local, layout, outputs, row, hidden_bytes: int, row_lds
 
 @ASTRewriter.transform
 def _send_x_row(
-    row_lds, x_base, t, hidden_bytes: int, row_buffer_bytes: int, dst_x, rows, routed, redo_ticks: int
+    row_lds,
+    x_base,
+    t,
+    hidden_bytes: int,
+    row_buffer_bytes: int,
+    dst_x,
+    rows,
+    routed,
+    redo_ticks: int,
+    redo_max: int,
 ):
-    """``_tdm_send_row``, repeated until a pass of it was in time (see TDM_REDO_TICKS)."""
+    """``_tdm_send_row``, repeated until a pass of it was in time or it reached the cap (see TDM_REDO_TICKS,
+    TDM_REDO_MAX)."""
     moved = fx.Int32(0)
+    passes = fx.Int32(0)
     while moved == fx.Int32(0):
         start = read_clock()
         _tdm_send_row(row_lds, x_base, t, hidden_bytes, row_buffer_bytes, dst_x, rows, routed)
         tdm_ops.tensor_wait(0)
-        moved = _tdm_moved(start, redo_ticks)
+        passes = passes + fx.Int32(1)
+        moved = _tdm_pass_done(start, passes, redo_ticks, redo_max)
 
 
 @ASTRewriter.transform
@@ -478,6 +511,7 @@ def _copy_received(
     row_lds,
     row_buffer_bytes: int,
     redo_ticks: int,
+    redo_max: int,
 ):
     """The block copies the rows that have arrived and it has not copied yet, with their metadata,
     from the heap into the outputs."""
@@ -503,7 +537,9 @@ def _copy_received(
         for s in range_constexpr(1, num_ranks):
             row = arith.select(j >= cums[s], starts[s] + j - cums[s], row)
         if fx.const_expr(row_lds is not None):
-            _copy_received_x(local, layout, outputs, row, hidden_bytes, row_lds, row_buffer_bytes, redo_ticks)
+            _copy_received_x(
+                local, layout, outputs, row, hidden_bytes, row_lds, row_buffer_bytes, redo_ticks, redo_max
+            )
         else:
             _copy_row(
                 _addr(outputs["x"], 0, row, hidden_bytes),
@@ -572,8 +608,9 @@ def _make_dispatch_v2(
     row_buffer_bytes = min(_align(hidden_bytes, 128), (MAX_LDS_BYTES - lds_rows) // NUM_WARPS // 128 * 128)
     if USE_TDM:
         lds_words = (lds_rows + NUM_WARPS * row_buffer_bytes) // 4
-    # read here and passed down, not read in the helpers, so that it is part of FlyDSL's kernel cache key
+    # read here and passed down, not read in the helpers, so that they are part of FlyDSL's kernel cache key
     redo_ticks = TDM_REDO_TICKS
+    redo_max = TDM_REDO_MAX
     grid_threads = num_channels * NUM_THREADS
     idx_dtype = fx.T.i64 if topk_idx_bytes == 8 else fx.T.i32
 
@@ -733,6 +770,7 @@ def _make_dispatch_v2(
                         rows,
                         routed,
                         redo_ticks,
+                        redo_max,
                     )
                 else:
                     dst_resources = [
@@ -833,6 +871,7 @@ def _make_dispatch_v2(
                 row_lds,
                 row_buffer_bytes,
                 redo_ticks,
+                redo_max,
             )
             remaining = fx.Int32(0)
             for s in range_constexpr(num_ranks):
@@ -1010,15 +1049,20 @@ def _tdm_push_row(
 
 
 @ASTRewriter.transform
-def _tdm_push_again(pushed, row, start, redo_ticks: int, *push_args):
+def _tdm_push_again(pushed, row, start, redo_ticks: int, redo_max: int, *push_args):
     """Combine, after a tensor_wait(0): row ``row``'s push into slot ``pushed`` (none if < 0), issued after
-    ``read_clock()`` read ``start``, done again until a pass is in time (see TDM_REDO_TICKS)."""
-    moved = arith.select(pushed >= fx.Int32(0), _tdm_moved(start, redo_ticks), fx.Int32(1))
+    ``read_clock()`` read ``start``, done again until a pass is in time or the row reached the cap (see
+    TDM_REDO_TICKS, TDM_REDO_MAX)."""
+    passes = fx.Int32(1)
+    moved = arith.select(
+        pushed >= fx.Int32(0), _tdm_pass_done(start, passes, redo_ticks, redo_max), fx.Int32(1)
+    )
     while moved == fx.Int32(0):
         again = read_clock()
         _tdm_push_row(row, pushed, *push_args)
         tdm_ops.tensor_wait(0)
-        moved = _tdm_moved(again, redo_ticks)
+        passes = passes + fx.Int32(1)
+        moved = _tdm_pass_done(again, passes, redo_ticks, redo_max)
 
 
 @ASTRewriter.transform
@@ -1133,8 +1177,9 @@ def _make_combine_v2(
     steps_per_pass = max(1, TRAITS.combine_loads_in_flight // (num_ranks + int(has_bias_0) + int(has_bias_1)))
     row_buffer_bytes = slot_bytes
     lds_grab = (push_warps * row_buffer_bytes if USE_TDM else 0) // 4
-    # read here and passed down, not read in the helpers, so that it is part of FlyDSL's kernel cache key
+    # read here and passed down, not read in the helpers, so that they are part of FlyDSL's kernel cache key
     redo_ticks = TDM_REDO_TICKS
+    redo_max = TDM_REDO_MAX
     smem_bytes = lds_grab * 4 + NUM_WARPS * 4
 
     @flyc.kernel(name="deep_ep_combine_v2_kernel", known_block_size=[NUM_THREADS, 1, 1])
@@ -1235,7 +1280,7 @@ def _make_combine_v2(
                 wait_mem_all()
             if fx.const_expr(USE_TDM):
                 # before its flag goes up
-                _tdm_push_again(pushed, pushed_row, pushed_start, redo_ticks, *push_args)
+                _tdm_push_again(pushed, pushed_row, pushed_start, redo_ticks, redo_max, *push_args)
                 pushed_start = read_clock()
             weight = fx.Float32(0.0)
             if fx.const_expr(num_topk > 0):
@@ -1283,7 +1328,7 @@ def _make_combine_v2(
         else:
             wait_mem_all()
         if fx.const_expr(USE_TDM):
-            _tdm_push_again(pushed, pushed_row, pushed_start, redo_ticks, *push_args)
+            _tdm_push_again(pushed, pushed_row, pushed_start, redo_ticks, redo_max, *push_args)
         if (pushed >= fx.Int32(0)) & (lane_id == fx.Int32(0)):
             _st_sys(peer_flags, pushed, epoch)
         if fx.const_expr(push_done):
