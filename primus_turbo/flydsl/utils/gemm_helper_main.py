@@ -167,6 +167,11 @@ def make_bf16_buffer_tensor_rebased(arg, bf16_ir_t, base_bytes, num_records_byte
     -> per-group K-tail reads 0). Folds the per-group token base into the descriptor
     so the buffer voffset/soffset stay int32 even past 2^31 elems."""
     base = arith.index_cast(T.i64, _buffer_ops.extract_base_index(arg))
+    return make_bf16_buffer_tensor_from_addr(base, bf16_ir_t, base_bytes, num_records_bytes)
+
+
+def make_bf16_buffer_tensor_from_addr(base, bf16_ir_t, base_bytes, num_records_bytes):
+    """``make_bf16_buffer_tensor_rebased`` for an operand given by its i64 address."""
     base_off = arith.index_cast(T.i64, arith.index_cast(T.index, base_bytes))
     base = _readfirstlane_i32(base + base_off)
     nr = arith.minui(arith.index_cast(T.index, num_records_bytes), arith.index(0xFFFFFFFF))
