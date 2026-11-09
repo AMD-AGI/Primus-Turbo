@@ -84,7 +84,7 @@ class _Kernel:
     def __init__(self, make_launch, make_args, buf_arg_idx, compile_fn=None):
         flyc, torch, _ = _flydsl()
         import sys
-        ndev = len(jax.devices())
+        ndev = jax.local_device_count()   # local ordinals only: with several hosts jax.devices() lists all processes' GPUs
         sys.stderr.write(f'[flydsl_gmm] jax devices={ndev} torch device_count={torch.cuda.device_count()} '
                          f'env={ {k: v for k, v in os.environ.items() if "VISIBLE" in k} }\n')
         cur = torch.cuda.current_device()
@@ -214,6 +214,23 @@ def _upper(M, block_m, G):
     return (M + block_m - 1) // block_m + G
 
 
+# Ring-of-experts EP hands the kernels a buffer of M = ep x (local rows) rows of which only ~M/ep are valid: the grid is sized by M, and the
+# ~(M/BM) dead tiles cost ~3x the useful work (profile: 4 ms vs 0.95 ms per call at M=2.1M). PRIMUS_FLYDSL_ROWS_CAP_DIV=d launches a grid sized for
+# M/d rows whenever sum(group_lens) <= M/d (exact), and the full grid otherwise (lax.cond on the device value), so dropless semantics are unchanged.
+ROWS_CAP_DIV = int(os.environ.get("PRIMUS_FLYDSL_ROWS_CAP_DIV", "0"))
+
+
+def _capped(M, BM, G, group_lens, run):
+    """run(up) -> out for a tile-grid upper bound `up`; picks the small grid when the live rows fit."""
+    up = _upper(M, BM, G)
+    cap_rows = (M // ROWS_CAP_DIV // BM) * BM if ROWS_CAP_DIV > 1 else 0
+    if cap_rows < 4 * BM or _upper(cap_rows, BM, G) >= up:
+        return run(up)
+    up_small = _upper(cap_rows, BM, G)
+    fits = jnp.sum(group_lens.astype(jnp.int32)) <= cap_rows
+    return jax.lax.cond(fits, lambda: run(up_small), lambda: run(up))
+
+
 def _i64_of(x32):
     """int32 vector -> the same values as little-endian int64, passed as int32 pairs (no global x64 needed)."""
     return jnp.stack([x32.astype(jnp.int32), jnp.zeros_like(x32, jnp.int32)], axis=-1).reshape(-1)
@@ -242,10 +259,13 @@ def gg_nn(a, b, group_lens, **kw):
     zero = _zero_pad(kw)
     kw = _cfg("NN", **kw)
     BM = kw.get("BM", 256)
-    up = _upper(M, BM, G)
-    k = _nn_kernel(up, N, K, G, **kw)
-    (out,) = k.call((a, b, _m_tiles(group_lens, BM, up)), [jax.ShapeDtypeStruct((M, N), a.dtype)], zero_ret=zero)
-    return out
+
+    def run(up):
+        k = _nn_kernel(up, N, K, G, **kw)
+        (out,) = k.call((a, b, _m_tiles(group_lens, BM, up)), [jax.ShapeDtypeStruct((M, N), a.dtype)], zero_ret=zero)
+        return out
+
+    return _capped(M, BM, G, group_lens, run)
 
 
 def gg_nt(a, b, group_lens, **kw):
@@ -255,10 +275,13 @@ def gg_nt(a, b, group_lens, **kw):
     zero = _zero_pad(kw)
     kw = _cfg("NT", **kw)
     BM = kw.get("BM", 256)
-    up = _upper(M, BM, G)
-    k = _nt_kernel(up, N, K, G, **kw)
-    (out,) = k.call((a, b, _m_tiles(group_lens, BM, up)), [jax.ShapeDtypeStruct((M, N), a.dtype)], zero_ret=zero)
-    return out
+
+    def run(up):
+        k = _nt_kernel(up, N, K, G, **kw)
+        (out,) = k.call((a, b, _m_tiles(group_lens, BM, up)), [jax.ShapeDtypeStruct((M, N), a.dtype)], zero_ret=zero)
+        return out
+
+    return _capped(M, BM, G, group_lens, run)
 
 
 WG_MAX_G = int(os.environ.get('PRIMUS_FLYDSL_WG_MAX_G', '64'))  # (64 = correct; larger reproduces the old wrong-gradient bug, for sensitivity tests)  # the variable-K kernel ranks groups with one 64-lane wave: groups >= 64 are mis-assigned (verified wrong from G=65)
