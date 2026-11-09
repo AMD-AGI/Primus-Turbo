@@ -17,3 +17,13 @@
   (0.1.14) or aiter's CK/HIP JIT disabled ("ROCm/HIP JIT runtime not available"), e.g. by a flydsl
   on PYTHONPATH that does not match aiter's pinned flydsl. Always measure aiter and FlyDSL in the
   same process.
+- `scale_all` (fpext -> fmul -> fptrunc on the whole Q) lets the backend sink the fptrunc into every
+  QK use, so the live value is the f32 product (2x the packed bf16 VGPRs). At D_QK=192 that alone
+  spilled 104 slots, all in the prologue/drain: a per-CTA cost (28 vs 11 us/CTA) that hid at 64K
+  (0.99x aiter) and cost 19% at 4K. Pinning each packed k-step through an empty
+  `llvm.inline_asm("", "=v,0")` fixed it (spill 8, +18% at 4K). `amdgpu-agpr-alloc` does NOT help:
+  the allocator moves MFMA accumulators into the AGPRs and spills more.
+- To split a forward's gap into per-CTA and per-tile cost, time S=256..4096 at fixed CTAs/CU and fit
+  `t = ctas*fixed + tiles*per_tile` (fixed_cost_probe.py); a long-S-only parity means the fixed part.
+- FlyDSL's disk cache does not hash a kernel-context class's methods: a change there needs a cache_tag
+  bump, or the old binary is silently reused (tell-tale: identical numbers, compile+run ~0.2 s).

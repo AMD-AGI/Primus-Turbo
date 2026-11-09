@@ -22,7 +22,7 @@ tile never sits in registers whole.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import fly
+from flydsl._mlir.dialects import fly, llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
@@ -55,7 +55,8 @@ _KS_PER_STRIP = 4
 class MlaDualwaveSwpTraits(DualwaveSwpTraits):
     @property
     def cache_tag(self):
-        return super().cache_tag + ("mla", self.HEAD_DIM_QK, self.K_HEAD_STEPS)
+        # The on-disk cache does not hash MlaDualwaveKernelContext; name its codegen-relevant revision.
+        return super().cache_tag + ("mla", self.HEAD_DIM_QK, self.K_HEAD_STEPS, "qpin")
 
 
 def _make_mla_fwd_traits(num_heads, num_kv_heads, block_m=256, waves_per_eu=2, emit_lse=True, k_head_steps=4):
@@ -180,6 +181,25 @@ class MlaDualwaveKernelContext(DualwaveKernelContext):
                 nxt[-1] = _concat_vectors(nxt[-1], packs[-1])
             packs = nxt
         return Vec(packs[0], (traits.K_STEPS_QK * traits.MFMA_LANE_K,), self.elem_dtype)
+
+    def scale_all(self, q_all_bf16):
+        """Scaled Q, pinned packed: each k-step's 4 dwords pass an empty asm identity. Otherwise the
+        backend sinks the bf16 repack into every QK and keeps the 96-dword f32 product live across
+        the loop and the drain instead of the 48-dword packed one, which spills to scratch."""
+        traits = self.traits
+        q = Vec(super().scale_all(q_all_bf16))
+        lane_k = traits.MFMA_LANE_K
+        packs = []
+        for ks in range_constexpr(traits.K_STEPS_QK):
+            pack = q.shuffle(q, [ks * lane_k + i for i in range(lane_k)]).bitcast(fx.Int32)
+            pinned = llvm.inline_asm(self.q_load_i32x4_type, [pack.ir_value()], "", "=v,0", has_side_effects=False)
+            packs.append(Vec(pinned, (4,), fx.Int32).bitcast(self.elem_dtype).ir_value())
+        while len(packs) > 1:
+            nxt = [_concat_vectors(packs[i], packs[i + 1]) for i in range(0, len(packs) - 1, 2)]
+            if len(packs) % 2:
+                nxt[-1] = _concat_vectors(nxt[-1], packs[-1])
+            packs = nxt
+        return Vec(packs[0], (traits.K_STEPS_QK * lane_k,), self.elem_dtype)
 
     def _load_kv_x(self, tile_start, buf_id, dma_m0, div, num_dma, src_base, stride_n):
         soffset = tile_start * stride_n
