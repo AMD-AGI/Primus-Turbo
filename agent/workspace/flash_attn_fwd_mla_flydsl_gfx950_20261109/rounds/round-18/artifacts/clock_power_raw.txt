@@ -1,0 +1,93 @@
+## S65536 r17
+r18r17 gfx0 2109 MHz power 1334 W hotspot 56 C
+r18r17 gfx0 2104 MHz power 1334 W hotspot 60 C
+r18r17 gfx0 2097 MHz power 1349 W hotspot 61 C
+r18r17 gfx0 2100 MHz power 1350 W hotspot 61 C
+r18r17 gfx0 2112 MHz power 1330 W hotspot 61 C
+r18r17 gfx0 2102 MHz power 1360 W hotspot 60 C
+r18r17 throttle frac: PPT 0.62 SOCK_TH 0.00 VR_TH 0.00 HBM_TH 0.00 XCD0_PWR 0.00 XCD0_TH 0.00
+r18r17 r7 /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_fwd_mla_flydsl_gfx950_20261109/profiles/pkg_r17 calls 120 ms/call 126.7663 TFLOPS 1387.8
+## S65536 g32
+r18g32 gfx0 2115 MHz power 1352 W hotspot 58 C
+r18g32 gfx0 2105 MHz power 1368 W hotspot 61 C
+r18g32 gfx0 2107 MHz power 1375 W hotspot 62 C
+r18g32 gfx0 2109 MHz power 1377 W hotspot 62 C
+r18g32 gfx0 2109 MHz power 1343 W hotspot 62 C
+r18g32 gfx0 2262 MHz power 290 W hotspot 56 C
+r18g32 throttle frac: PPT 0.72 SOCK_TH 0.00 VR_TH 0.00 HBM_TH 0.00 XCD0_PWR 0.00 XCD0_TH 0.00
+r18g32 r7 /perf_apps/xiaoming/megaattention_overlap_bench calls 120 ms/call 124.5531 TFLOPS 1412.4
+## S65536 g16
+r18g16 gfx0 2088 MHz power 1338 W hotspot 56 C
+r18g16 gfx0 2095 MHz power 1337 W hotspot 60 C
+r18g16 gfx0 2095 MHz power 1362 W hotspot 61 C
+r18g16 gfx0 2085 MHz power 1355 W hotspot 61 C
+r18g16 gfx0 2087 MHz power 1363 W hotspot 61 C
+r18g16 gfx0 2265 MHz power 755 W hotspot 59 C
+r18g16 throttle frac: PPT 0.65 SOCK_TH 0.00 VR_TH 0.00 HBM_TH 0.00 XCD0_PWR 0.00 XCD0_TH 0.00
+r18g16 r7 /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_fwd_mla_flydsl_gfx950_20261109/profiles/variants/r18_g16_8 calls 120 ms/call 126.6616 TFLOPS 1388.9
+## S65536 g16
+r18g16 gfx0 2086 MHz power 1338 W hotspot 61 C
+r18g16 gfx0 2085 MHz power 1348 W hotspot 61 C
+r18g16 gfx0 2080 MHz power 1329 W hotspot 61 C
+r18g16 gfx0 2105 MHz power 1340 W hotspot 61 C
+r18g16 gfx0 2278 MHz power 712 W hotspot 59 C
+r18g16 throttle frac: PPT 0.62 SOCK_TH 0.00 VR_TH 0.00 HBM_TH 0.00 XCD0_PWR 0.00 XCD0_TH 0.00
+r18g16 r7 /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_fwd_mla_flydsl_gfx950_20261109/profiles/variants/r18_g16_8 calls 120 ms/call 126.8501 TFLOPS 1386.8
+## S65536 g32
+r18g32 gfx0 2125 MHz power 1343 W hotspot 62 C
+r18g32 gfx0 2114 MHz power 1352 W hotspot 62 C
+r18g32 gfx0 2110 MHz power 1349 W hotspot 62 C
+r18g32 gfx0 2105 MHz power 1344 W hotspot 62 C
+r18g32 gfx0 2376 MHz power 358 W hotspot 58 C
+r18g32 throttle frac: PPT 0.72 SOCK_TH 0.00 VR_TH 0.00 HBM_TH 0.00 XCD0_PWR 0.00 XCD0_TH 0.00
+r18g32 r7 /perf_apps/xiaoming/megaattention_overlap_bench calls 120 ms/call 125.0557 TFLOPS 1406.7
+## S65536 r17
+r18r17 gfx0 2091 MHz power 1324 W hotspot 61 C
+r18r17 gfx0 2096 MHz power 1364 W hotspot 61 C
+r18r17 gfx0 2091 MHz power 1349 W hotspot 61 C
+r18r17 gfx0 2099 MHz power 1330 W hotspot 61 C
+r18r17 gfx0 2385 MHz power 321 W hotspot 57 C
+r18r17 throttle frac: PPT 0.62 SOCK_TH 0.00 VR_TH 0.00 HBM_TH 0.00 XCD0_PWR 0.00 XCD0_TH 0.00
+r18r17 r7 /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_fwd_mla_flydsl_gfx950_20261109/profiles/pkg_r17 calls 120 ms/call 127.6360 TFLOPS 1378.3
+## S16384 r17
+r18r17 gfx0 2142 MHz power 1360 W hotspot 61 C
+r18r17 gfx0 2135 MHz power 1353 W hotspot 61 C
+r18r17 gfx0 2134 MHz power 1355 W hotspot 61 C
+r18r17 gfx0 2137 MHz power 1361 W hotspot 61 C
+r18r17 throttle frac: PPT 0.66 SOCK_TH 0.00 VR_TH 0.00 HBM_TH 0.00 XCD0_PWR 0.00 XCD0_TH 0.00
+r18r17 r7 /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_fwd_mla_flydsl_gfx950_20261109/profiles/pkg_r17 calls 1680 ms/call 8.3722 TFLOPS 1313.3
+## S16384 g32
+r18g32 gfx0 2105 MHz power 1325 W hotspot 61 C
+r18g32 gfx0 2159 MHz power 1359 W hotspot 61 C
+r18g32 gfx0 2155 MHz power 1358 W hotspot 61 C
+r18g32 gfx0 2153 MHz power 1352 W hotspot 62 C
+r18g32 throttle frac: PPT 0.69 SOCK_TH 0.00 VR_TH 0.00 HBM_TH 0.00 XCD0_PWR 0.00 XCD0_TH 0.00
+r18g32 r7 /perf_apps/xiaoming/megaattention_overlap_bench calls 1700 ms/call 8.3205 TFLOPS 1321.4
+## S16384 g16
+r18g16 gfx0 2124 MHz power 1342 W hotspot 60 C
+r18g16 gfx0 2123 MHz power 1340 W hotspot 60 C
+r18g16 gfx0 2108 MHz power 1332 W hotspot 60 C
+r18g16 gfx0 2112 MHz power 1340 W hotspot 61 C
+r18g16 throttle frac: PPT 0.66 SOCK_TH 0.00 VR_TH 0.00 HBM_TH 0.00 XCD0_PWR 0.00 XCD0_TH 0.00
+r18g16 r7 /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_fwd_mla_flydsl_gfx950_20261109/profiles/variants/r18_g16_8 calls 1680 ms/call 8.4197 TFLOPS 1305.9
+## S16384 g16
+r18g16 gfx0 2118 MHz power 1337 W hotspot 60 C
+r18g16 gfx0 2120 MHz power 1344 W hotspot 60 C
+r18g16 gfx0 2129 MHz power 1352 W hotspot 61 C
+r18g16 gfx0 2123 MHz power 1351 W hotspot 61 C
+r18g16 throttle frac: PPT 0.70 SOCK_TH 0.00 VR_TH 0.00 HBM_TH 0.00 XCD0_PWR 0.00 XCD0_TH 0.00
+r18g16 r7 /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_fwd_mla_flydsl_gfx950_20261109/profiles/variants/r18_g16_8 calls 1680 ms/call 8.4078 TFLOPS 1307.7
+## S16384 g32
+r18g32 gfx0 2152 MHz power 1351 W hotspot 61 C
+r18g32 gfx0 2155 MHz power 1355 W hotspot 61 C
+r18g32 gfx0 2151 MHz power 1354 W hotspot 61 C
+r18g32 gfx0 2147 MHz power 1349 W hotspot 61 C
+r18g32 throttle frac: PPT 0.69 SOCK_TH 0.00 VR_TH 0.00 HBM_TH 0.00 XCD0_PWR 0.00 XCD0_TH 0.00
+r18g32 r7 /perf_apps/xiaoming/megaattention_overlap_bench calls 1700 ms/call 8.3196 TFLOPS 1321.6
+## S16384 r17
+r18r17 gfx0 2140 MHz power 1358 W hotspot 61 C
+r18r17 gfx0 2137 MHz power 1362 W hotspot 61 C
+r18r17 gfx0 2143 MHz power 1370 W hotspot 61 C
+r18r17 gfx0 2139 MHz power 1365 W hotspot 61 C
+r18r17 throttle frac: PPT 0.68 SOCK_TH 0.00 VR_TH 0.00 HBM_TH 0.00 XCD0_PWR 0.00 XCD0_TH 0.00
+r18r17 r7 /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_fwd_mla_flydsl_gfx950_20261109/profiles/pkg_r17 calls 1680 ms/call 8.3772 TFLOPS 1312.5

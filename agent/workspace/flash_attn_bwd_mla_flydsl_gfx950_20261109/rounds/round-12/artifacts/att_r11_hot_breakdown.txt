@@ -1,0 +1,33 @@
+per wave per 192x32 tile (ours: hot loop only; aiter: whole kernel)
+class        ours n  ours lat ours stall  aiter n aiter lat aiter stall  d stall
+mfma          156.0      1517        887    154.8       774         148      739
+waitcnt        52.0       662        662     22.0       136         136      526
+ds_read       148.0       955        359    195.2       979         198      162
+salu           77.0       396        147     47.7       193           1      146
+ds_write       10.0       246         51      6.4        97          20       31
+scratch_ld      3.0        27         14      0.0         0           0       14
+other          12.0        93          8     12.0        65           8       -1
+vmem_st         0.0         0          0      0.2        12          11      -11
+vmem_ld         8.0        38          5     10.4        79          31      -26
+valu          195.0       961        163    219.8      1278         208      -45
+v_exp          24.0       206         19     23.8       288          97      -78
+barrier         0.0         0          0      8.2       112          96      -96
+total                    5101       2315               4012         953     1362
+
+ours hot-loop top stalls per iteration:
+    250.4  s_waitcnt vmcnt(0)
+     99.3  s_waitcnt vmcnt(0) lgkmcnt(11)
+     48.9  s_waitcnt lgkmcnt(0)
+     45.1  s_waitcnt lgkmcnt(0)
+     29.9  s_waitcnt lgkmcnt(5)
+     24.0  s_nop 5
+     24.0  s_nop 5
+     23.8  s_nop 5
+     13.6  ds_write_b128 v51, v[12:15] offset:2048
+     13.6  ds_write_b128 v50, a[64:67] offset:16384
+     12.0  v_mfma_f32_16x16x32_bf16 a[164:167], v[28:31], v[12:15], a[164:167]
+     12.0  v_mfma_f32_16x16x32_bf16 v[236:239], v[28:31], v[24:27], v[236:239]
+     12.0  v_mfma_f32_16x16x32_bf16 a[152:155], v[8:11], v[12:15], a[152:155]
+     12.0  v_mfma_f32_16x16x32_bf16 a[124:127], v[8:11], v[232:235], a[124:127]
+     12.0  v_mfma_f32_16x16x32_bf16 v[8:11], v[36:39], v[12:15], 0
+     12.0  v_mfma_f32_16x16x32_bf16 v[4:7], v[40:43], v[16:19], v[4:7]

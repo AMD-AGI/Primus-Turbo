@@ -1,0 +1,22 @@
+W1109 16:15:34.217000 21743 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1109 16:15:34.287000 21743 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:15:34.287000 21743 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 16:15:34.287000 21743 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:15:34.287000 21743 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 16:15:34.287000 21743 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:15:34.287000 21743 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+bk192 default: ok=True snr=['47.01', '49.74', '51.28']
+g2d=1: ok=True snr=['47.00', '49.74', '51.28']
+g2d=1 sb0: ok=True snr=['47.00', '49.74', '51.28']
+g2d=1 g3d3: ok=True snr=['47.00', '49.74', '51.28']
+g2d=1 sb0 g3d3: ok=True snr=['47.01', '49.74', '51.28']
+
+config                    B2S4096 ms      d%   B1S16384 ms      d%   gm d%  snr dq/dk/dv
+bk192 default                  5.666   +0.00        37.054   +0.00   +0.00  47.01/49.74/51.28
+g2d=1                          5.467   +3.64        36.207   +2.34   +2.99  47.00/49.74/51.28
+g2d=1 sb0                      5.393   +5.07        36.383   +1.84   +3.44  47.00/49.74/51.28
+g2d=1 g3d3                     5.582   +1.52        36.549   +1.38   +1.45  47.00/49.74/51.28
+g2d=1 sb0 g3d3                 5.414   +4.66        36.333   +1.98   +3.31  47.01/49.74/51.28
+EXIT 0

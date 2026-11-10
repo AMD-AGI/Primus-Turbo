@@ -1,0 +1,50 @@
+r15 r1 b1_s4k PASS 1088.3
+r15 r1 b1_s16k PASS 1284.5
+r15 r1 b1_s64k PASS 1325.6
+r15 r1 b2_s4k PASS 1070.0
+r15 r1 geomean 1186.67
+paired r1 b1_s4k PASS 1071.0
+paired r1 b1_s16k PASS 1284.3
+paired r1 b1_s64k PASS 1354.3
+paired r1 b2_s4k PASS 1059.1
+paired r1 geomean 1185.16
+midpair r1 b1_s4k FAIL 1104.3
+midpair r1 b1_s16k FAIL 1321.2
+midpair r1 b1_s64k FAIL 1387.5
+midpair r1 b2_s4k FAIL 1092.0
+midpair r1 geomean 0.00
+noswap r1 b1_s4k FAIL 1101.0
+noswap r1 b1_s16k FAIL 1320.7
+noswap r1 b1_s64k FAIL 1393.3
+noswap r1 b2_s4k FAIL 1085.9
+noswap r1 geomean 0.00
+both r1 b1_s4k FAIL 1131.9
+both r1 b1_s16k FAIL 1352.1
+both r1 b1_s64k FAIL 1422.3
+both r1 b2_s4k FAIL 1117.4
+both r1 geomean 0.00
+r15 r2 b1_s4k PASS 1082.3
+r15 r2 b1_s16k PASS 1282.1
+r15 r2 b1_s64k PASS 1325.2
+r15 r2 b2_s4k PASS 1064.5
+r15 r2 geomean 1182.85
+paired r2 b1_s4k PASS 1069.8
+paired r2 b1_s16k PASS 1283.8
+paired r2 b1_s64k PASS 1350.9
+paired r2 b2_s4k PASS 1058.4
+paired r2 geomean 1183.77
+midpair r2 b1_s4k FAIL 1100.6
+midpair r2 b1_s16k FAIL 1314.4
+midpair r2 b1_s64k FAIL 1382.3
+midpair r2 b2_s4k FAIL 1086.4
+midpair r2 geomean 0.00
+noswap r2 b1_s4k FAIL 1100.8
+noswap r2 b1_s16k FAIL 1320.2
+noswap r2 b1_s64k FAIL 1387.2
+noswap r2 b2_s4k FAIL 1089.8
+noswap r2 geomean 0.00
+both r2 b1_s4k FAIL 1127.2
+both r2 b1_s16k FAIL 1347.1
+both r2 b1_s64k FAIL 1418.5
+both r2 b2_s4k FAIL 1113.2
+both r2 geomean 0.00

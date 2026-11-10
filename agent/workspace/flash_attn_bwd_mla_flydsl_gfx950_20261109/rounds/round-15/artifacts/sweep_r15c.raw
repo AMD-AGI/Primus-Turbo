@@ -1,0 +1,10 @@
+round 0 r13 (modulo): 2x4096 5.078 1x8192 8.841 1x16384 32.544
+round 0 csub32, wrap as a branch: 2x4096 5.001 1x8192 8.506 1x16384 31.341
+round 1 csub32, wrap as a branch: 2x4096 4.981 1x8192 8.482 1x16384 31.221
+round 1 r13 (modulo): 2x4096 5.089 1x8192 8.851 1x16384 32.624
+round 2 r13 (modulo): 2x4096 5.084 1x8192 8.867 1x16384 32.664
+round 2 csub32, wrap as a branch: 2x4096 5.001 1x8192 8.542 1x16384 31.396
+
+config                        B2S4096 ms      d%    B1S8192 ms      d%   B1S16384 ms      d%   gm d%  snr dq/dk/dv
+r13 (modulo)                       5.084   +0.00         8.851   +0.00        32.624   +0.00   +0.00  47.00/49.74/51.28
+csub32, wrap as a branch           5.001   +1.66         8.506   +4.06        31.341   +4.09   +3.26  47.00/49.74/51.28

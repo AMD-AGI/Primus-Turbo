@@ -1,0 +1,67 @@
+=== r18 run 1 10:28:17
+b1_s4k     PASS  fwd   1089.8 +-   9.8 aiter   1078.6 ratio 1.010 o_rel 0.0019 lse 0.0046
+b1_s8k     PASS  fwd   1237.7 +-   1.5 aiter   1208.7 ratio 1.024 o_rel 0.0018 lse 0.0048
+b1_s16k    PASS  fwd   1323.5 +-   8.1 aiter   1266.0 ratio 1.045 o_rel 0.0018 lse 0.0049
+b1_s32k    PASS  fwd   1372.0 +-   2.6 aiter   1295.5 ratio 1.059 o_rel 0.0016 lse 0.0048
+b1_s64k    PASS  fwd   1408.3 +-   2.7 aiter   1302.5 ratio 1.081 o_rel 0.0016 lse 0.0051
+b2_s4k     PASS  fwd   1077.6 +-   3.9 aiter   1075.2 ratio 1.002 o_rel 0.0020 lse 0.0048
+b2_s16k    PASS  fwd   1306.3 +-   1.8 aiter   1268.0 ratio 1.030 o_rel 0.0018 lse 0.0048
+Geomean Fwd TFLOPS: 1253.22
+Geomean aiter Fwd TFLOPS: 1209.98
+Geomean ratio vs aiter: 1.0357
+=== r19 run 1 10:29:01
+b1_s4k     PASS  fwd   1083.2 +-   8.3 aiter   1070.4 ratio 1.012 o_rel 0.0019 lse 0.0046
+b1_s8k     PASS  fwd   1235.1 +-   2.6 aiter   1207.1 ratio 1.023 o_rel 0.0018 lse 0.0048
+b1_s16k    PASS  fwd   1326.1 +-   2.4 aiter   1270.0 ratio 1.044 o_rel 0.0018 lse 0.0049
+b1_s32k    PASS  fwd   1367.0 +-   2.1 aiter   1298.3 ratio 1.053 o_rel 0.0016 lse 0.0048
+b1_s64k    PASS  fwd   1402.8 +-   2.0 aiter   1310.4 ratio 1.070 o_rel 0.0016 lse 0.0051
+b2_s4k     PASS  fwd   1073.1 +-   4.4 aiter   1048.4 ratio 1.024 o_rel 0.0020 lse 0.0048
+b2_s16k    PASS  fwd   1300.3 +-   4.1 aiter   1270.3 ratio 1.024 o_rel 0.0018 lse 0.0048
+Geomean Fwd TFLOPS: 1249.21
+Geomean aiter Fwd TFLOPS: 1206.34
+Geomean ratio vs aiter: 1.0355
+=== g16 run 1 10:29:45
+b1_s4k     PASS  fwd   1099.9 +-   7.7 aiter   1068.6 ratio 1.029 o_rel 0.0019 lse 0.0046
+b1_s8k     PASS  fwd   1239.2 +-   0.6 aiter   1205.7 ratio 1.028 o_rel 0.0018 lse 0.0048
+b1_s16k    PASS  fwd   1305.5 +-   2.9 aiter   1266.9 ratio 1.030 o_rel 0.0018 lse 0.0049
+b1_s32k    PASS  fwd   1344.0 +-   2.7 aiter   1297.2 ratio 1.036 o_rel 0.0016 lse 0.0048
+b1_s64k    PASS  fwd   1382.8 +-   0.8 aiter   1306.2 ratio 1.059 o_rel 0.0016 lse 0.0051
+b2_s4k     PASS  fwd   1085.7 +-   4.2 aiter   1043.8 ratio 1.040 o_rel 0.0020 lse 0.0048
+b2_s16k    PASS  fwd   1299.6 +-   1.1 aiter   1267.0 ratio 1.026 o_rel 0.0018 lse 0.0048
+Geomean Fwd TFLOPS: 1246.12
+Geomean aiter Fwd TFLOPS: 1203.54
+Geomean ratio vs aiter: 1.0354
+=== g16 run 2 10:30:29
+b1_s4k     PASS  fwd   1097.5 +-   8.9 aiter   1075.2 ratio 1.021 o_rel 0.0019 lse 0.0046
+b1_s8k     PASS  fwd   1237.2 +-   1.4 aiter   1205.5 ratio 1.026 o_rel 0.0018 lse 0.0048
+b1_s16k    PASS  fwd   1305.1 +-   2.4 aiter   1268.7 ratio 1.029 o_rel 0.0018 lse 0.0049
+b1_s32k    PASS  fwd   1346.6 +-   1.9 aiter   1294.2 ratio 1.040 o_rel 0.0016 lse 0.0048
+b1_s64k    PASS  fwd   1383.0 +-   1.4 aiter   1304.0 ratio 1.061 o_rel 0.0016 lse 0.0051
+b2_s4k     PASS  fwd   1084.1 +-   4.5 aiter   1046.1 ratio 1.036 o_rel 0.0020 lse 0.0048
+b2_s16k    PASS  fwd   1297.5 +-   1.2 aiter   1264.4 ratio 1.026 o_rel 0.0018 lse 0.0048
+Geomean Fwd TFLOPS: 1245.22
+Geomean aiter Fwd TFLOPS: 1204.14
+Geomean ratio vs aiter: 1.0341
+=== r19 run 2 10:31:10
+b1_s4k     PASS  fwd   1081.1 +-   7.0 aiter   1074.0 ratio 1.007 o_rel 0.0019 lse 0.0046
+b1_s8k     PASS  fwd   1227.9 +-   1.8 aiter   1203.3 ratio 1.020 o_rel 0.0018 lse 0.0048
+b1_s16k    PASS  fwd   1320.1 +-   3.0 aiter   1269.5 ratio 1.040 o_rel 0.0018 lse 0.0049
+b1_s32k    PASS  fwd   1365.6 +-   1.4 aiter   1292.9 ratio 1.056 o_rel 0.0016 lse 0.0048
+b1_s64k    PASS  fwd   1400.1 +-   1.9 aiter   1304.7 ratio 1.073 o_rel 0.0016 lse 0.0051
+b2_s4k     PASS  fwd   1071.9 +-   4.4 aiter   1045.6 ratio 1.025 o_rel 0.0020 lse 0.0048
+b2_s16k    PASS  fwd   1299.2 +-   3.2 aiter   1267.2 ratio 1.025 o_rel 0.0018 lse 0.0048
+Geomean Fwd TFLOPS: 1246.12
+Geomean aiter Fwd TFLOPS: 1203.97
+Geomean ratio vs aiter: 1.0350
+=== r18 run 2 10:31:51
+b1_s4k     PASS  fwd   1083.8 +-   9.0 aiter   1064.8 ratio 1.018 o_rel 0.0019 lse 0.0046
+b1_s8k     PASS  fwd   1232.7 +-   2.3 aiter   1204.3 ratio 1.024 o_rel 0.0018 lse 0.0048
+b1_s16k    PASS  fwd   1321.9 +-   1.5 aiter   1267.1 ratio 1.043 o_rel 0.0018 lse 0.0049
+b1_s32k    PASS  fwd   1364.1 +-   2.2 aiter   1293.7 ratio 1.054 o_rel 0.0016 lse 0.0048
+b1_s64k    PASS  fwd   1400.4 +-   1.0 aiter   1308.3 ratio 1.070 o_rel 0.0016 lse 0.0051
+b2_s4k     PASS  fwd   1071.9 +-   5.0 aiter   1044.0 ratio 1.027 o_rel 0.0020 lse 0.0048
+b2_s16k    PASS  fwd   1298.8 +-   3.6 aiter   1268.4 ratio 1.024 o_rel 0.0018 lse 0.0048
+Geomean Fwd TFLOPS: 1247.30
+Geomean aiter Fwd TFLOPS: 1202.77
+Geomean ratio vs aiter: 1.0370
+=== done 10:32:32

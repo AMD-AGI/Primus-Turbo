@@ -1,0 +1,6 @@
+b1_s1k: 3/3 deterministic and within tolerance of round 7 (max|dO| 3.906e-03 max|dLSE| 5.550e-04)
+b1_s4k: 3/3 deterministic and within tolerance of round 7 (max|dO| 3.906e-03 max|dLSE| 4.654e-04)
+b1_s16k: 3/3 deterministic and within tolerance of round 7 (max|dO| 3.906e-03 max|dLSE| 1.666e-03)
+b2_s4k: 3/3 deterministic and within tolerance of round 7 (max|dO| 3.906e-03 max|dLSE| 7.510e-04)
+b1_s64k: 3/3 deterministic and within tolerance of round 7 (max|dO| 3.906e-03 max|dLSE| 4.973e-04)
+ALL WITHIN TOLERANCE

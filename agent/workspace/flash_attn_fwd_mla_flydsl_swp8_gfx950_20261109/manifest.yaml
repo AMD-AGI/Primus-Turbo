@@ -1,0 +1,38 @@
+target_op: flash_attn_fwd_mla_192_128
+target_backend: FLYDSL
+target_lang: FLYDSL
+target_gpu: gfx950
+execution_mode: workspace
+project_skill: primus-turbo-develop
+performance_target: "same-GPU Forward TFLOPS ratio vs Turbo AITER >= 1.0 (geomean over target_shapes); first milestone: beat round-7 dualwave (1057.20 this session)"
+primary_metric: "Forward TFLOPS (geomean over PASS shapes); fwd-only, Bwd columns '-'"
+target_shapes: >-
+  DSV3 MLA, Hq = Hkv = 128, d_qk 192, d_v 128, causal, sbhd bf16:
+  B1 S 4K/8K/16K/32K/64K, B2 S 4K/16K
+kernel_source:
+  - /perf_apps/xiaoming/megaattention_overlap_bench/flydsl_mla/flash_attn_fwd_mla_swp8.py
+  - /perf_apps/xiaoming/megaattention_overlap_bench/flydsl_mla/attn_helper_mla_swp8.py
+  - /perf_apps/xiaoming/megaattention_overlap_bench/flydsl_mla/ops_swp8.py
+reference_kernels:
+  round7_dualwave: /perf_apps/xiaoming/megaattention_overlap_bench/flydsl_mla/flash_attn_fwd_mla.py
+  aiter: "Turbo AITER backend (fmha_fwd_bf16_opus, d192 8-stage)"
+test_command: >-
+  HIP_VISIBLE_DEVICES=0 python <campaign_dir>/swp8_check.py [--approx]
+  (bitwise vs round 7, or determinism + coarse tolerance when rounding order differs);
+  then quick_test_bench.py Check column: O rel vs fp32 <= 3e-3, LSE max abs <= 1e-2
+benchmark_command: "HIP_VISIBLE_DEVICES=0 python <campaign_dir>/quick_test_bench.py --set full --summary-csv <round_dir>/artifacts/benchmark_full.csv"
+quick_command: "HIP_VISIBLE_DEVICES=0 python <campaign_dir>/quick_test_bench.py --set quick"
+representative_shapes: [b1_s4k, b1_s16k, b1_s64k, b2_s4k]
+validation_level: full
+rebuild: "none (FlyDSL JIT); bump SWP8_REV and use a fresh FLYDSL_RUNTIME_CACHE_DIR per variant"
+profiling:
+  isa: "profiles/build_stats.sh <tag> [check args]"
+  att: "rocprofv3 --att ... --kernel-include-regex flash_attn_swp8 --att-target-cu 1 -- python profiles/prof_driver.py swp8 1 16384; profiles/att_stages.py / att_seg.py"
+run_env: "docker exec xiaoming-dev bash -lc '...' on smci355-ccs-aus-n04-25; GPU 0 pinned for every round"
+constraints:
+  - "Do not modify existing Primus-Turbo / Megatron / Primus kernels; work only in megaattention_overlap_bench/flydsl_mla/ (new swp8 files)"
+  - "No git commit without explicit instruction"
+git_commit: false
+git_branch: none
+max_iterations: null
+created: 2026-11-09 10:05

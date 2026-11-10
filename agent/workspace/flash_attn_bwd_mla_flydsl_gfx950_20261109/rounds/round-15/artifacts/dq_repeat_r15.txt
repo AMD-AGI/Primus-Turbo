@@ -1,0 +1,3 @@
+B1 S1024 dQ snr modulo-vs-modulo 62.40 csub-vs-csub 62.10 csub-vs-modulo 61.81
+B1 S4096 dQ snr modulo-vs-modulo 53.10 csub-vs-csub 52.77 csub-vs-modulo 53.04
+B1 S8192 dQ snr modulo-vs-modulo 50.03 csub-vs-csub 49.72 csub-vs-modulo 49.67

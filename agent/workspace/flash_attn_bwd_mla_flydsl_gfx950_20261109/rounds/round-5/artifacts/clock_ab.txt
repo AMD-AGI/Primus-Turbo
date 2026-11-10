@@ -1,0 +1,11 @@
+# profiles/clock_ab.sh, n02-29 GPU 0, rocprofv3 --kernel-trace --pmc GRBM_GUI_ACTIVE, mean of dispatches 2-5
+# B1 S4096
+base         dispatches 5  dkdv    2.735 ms  GRBM 4.403e+07  clock 2.012 GHz (8 XCD)
+drain        dispatches 5  dkdv    2.734 ms  GRBM 4.395e+07  clock 2.010 GHz (8 XCD)
+base2        dispatches 5  dkdv    2.785 ms  GRBM 4.456e+07  clock 2.000 GHz (8 XCD)
+drain2       dispatches 5  dkdv    2.743 ms  GRBM 4.4e+07  clock 2.005 GHz (8 XCD)
+# B1 S16384
+base         dispatches 5  dkdv   38.904 ms  GRBM 7.312e+08  clock 2.349 GHz (8 XCD)
+drain        dispatches 5  dkdv   40.687 ms  GRBM 7.62e+08  clock 2.341 GHz (8 XCD)
+base2        dispatches 5  dkdv   38.988 ms  GRBM 7.311e+08  clock 2.344 GHz (8 XCD)
+drain2       dispatches 5  dkdv   40.562 ms  GRBM 7.6e+08  clock 2.342 GHz (8 XCD)

@@ -1,0 +1,7 @@
+r9 code, ATT B1 S8K CU 1 (profiles/att_r11_r9_s8k), cycles per hot-loop iteration (latency / hits)
+whole hot loop idx 2172-3070: 5249
+before first MFMA (idx 2172-2258): 798
+after last MFMA (idx 2765-3070): 431
+modulo 1 fast path (idx 2905-2934): 131
+modulo 2 fast path (idx 3049-3070): 100
+64-bit path checks + q arithmetic (idx 2778-2795): 73

@@ -1,0 +1,44 @@
+iteration length (sum of per-exec latency) ~ 5301
+    46 idx  2181 barrier     lat    57  s_barrier
+   133 idx  2183 VMEM load   lat     6  buffer_load_dwordx4 a[48:51], v4, s[16:19], 0 offen
+   205 idx  2190 VMEM load   lat     4  buffer_load_dwordx4 a[52:55], v4, s[16:19], 0 offen
+   268 idx  2197 VMEM load   lat     5  buffer_load_dwordx4 a[56:59], v4, s[16:19], 0 offen
+   319 idx  2205 VMEM load   lat     4  buffer_load_dwordx4 a[60:63], v4, s[16:19], 0 offen
+   365 idx  2209 VMEM load   lat     4  buffer_load_dwordx4 a[64:67], v4, s[20:23], 0 offen
+   410 idx  2214 VMEM load   lat     6  buffer_load_dwordx4 a[68:71], v4, s[20:23], 0 offen
+   432 idx  2219 VMEM load   lat     5  buffer_load_dword a72, v4, s[28:31], 0 offen
+   437 idx  2220 VMEM load   lat     4  buffer_load_dword a73, v4, s[24:27], 0 offen
+   508 idx  2224 barrier     lat    16  s_barrier
+   729 idx  2258 mfma#1      lat     4  v_mfma_f32_16x16x32_bf16 v[4:7], v[6:9], v[12:15], 0
+  1005 idx  2297 scratch     lat     7  scratch_load_dwordx4 a[90:93], off, off offset:16
+  1048 idx  2307 mfma#12     lat     4  v_mfma_f32_16x16x32_bf16 v[232:235], a[74:77], v[32:35], v[8
+  1136 idx  2327 mfma#13     lat     4  v_mfma_f32_16x16x32_bf16 v[4:7], v[6:9], v[12:15], 0
+  1582 idx  2389 scratch     lat    10  scratch_load_dwordx4 a[86:89], off, off
+  1619 idx  2394 mfma#36     lat     4  v_mfma_f32_16x16x32_bf16 v[228:231], a[82:85], v[32:35], v[1
+  1731 idx  2420 vmcnt wait  lat    99  s_waitcnt vmcnt(0) lgkmcnt(11)
+  1830 idx  2421 mfma#37     lat     4  v_mfma_f32_16x16x32_bf16 v[16:19], v[24:27], a[86:89], v[12:
+  1970 idx  2435 exp         lat     8  v_exp_f32_e32 v22, v22
+  2078 idx  2445 scratch     lat    10  scratch_load_dwordx4 v[40:43], off, off offset:256
+  2088 idx  2446 vmcnt wait  lat   250  s_waitcnt vmcnt(0)
+  2483 idx  2467 mfma#60     lat    12  v_mfma_f32_16x16x32_bf16 v[32:35], a[82:85], a[228:231], v[1
+  2495 idx  2468 mfma#61     lat    16  v_mfma_f32_16x16x32_bf16 v[12:15], v[64:67], a[236:239], v[2
+  2934 idx  2512 mfma#84     lat    12  v_mfma_f32_16x16x32_bf16 v[68:71], a[90:93], a[12:15], v[44:
+  2946 idx  2513 mfma#85     lat    16  v_mfma_f32_16x16x32_bf16 v[44:47], a[78:81], a[16:19], v[28:
+  3062 idx  2527 atomic      lat     8  buffer_atomic_pk_add_bf16 v73, v72, s[12:15], 0 offen
+  3085 idx  2530 atomic      lat     8  buffer_atomic_pk_add_bf16 v73, v72, s[12:15], s47 offen
+  3103 idx  2533 atomic      lat     8  buffer_atomic_pk_add_bf16 v73, v72, s[12:15], s51 offen
+  3115 idx  2535 atomic      lat     8  buffer_atomic_pk_add_bf16 v73, v72, s[12:15], s52 offen
+  3128 idx  2537 exp         lat    11  v_exp_f32_e32 v72, v24
+  3551 idx  2602 atomic      lat     4  buffer_atomic_pk_add_bf16 v8, v28, s[12:15], 0 offen
+  3560 idx  2604 atomic      lat     8  buffer_atomic_pk_add_bf16 v8, v28, s[12:15], s47 offen
+  3568 idx  2605 atomic      lat     8  buffer_atomic_pk_add_bf16 v4, v28, s[12:15], s51 offen
+  3580 idx  2607 atomic      lat     8  buffer_atomic_pk_add_bf16 v4, v28, s[12:15], s52 offen
+  3807 idx  2644 mfma#108    lat    16  v_mfma_f32_16x16x32_bf16 v[120:123], v[8:11], v[12:15], v[12
+  3839 idx  2648 mfma#109    lat     4  v_mfma_f32_16x16x32_bf16 v[196:199], v[28:31], v[16:19], v[1
+  4223 idx  2700 mfma#132    lat    16  v_mfma_f32_16x16x32_bf16 a[176:179], v[4:7], v[12:15], a[176
+  4744 idx  2763 mfma#156    lat     4  v_mfma_f32_16x16x32_bf16 v[0:3], v[16:19], v[12:15], v[0:3]
+  4777 idx  2770 atomic      lat     7  buffer_atomic_pk_add_bf16 v5, v4, s[12:15], 0 offen
+  4788 idx  2772 atomic      lat     8  buffer_atomic_pk_add_bf16 v5, v4, s[12:15], s47 offen
+  4802 idx  2774 atomic      lat     8  buffer_atomic_pk_add_bf16 v5, v4, s[12:15], s51 offen
+  4814 idx  2776 atomic      lat     8  buffer_atomic_pk_add_bf16 v5, v4, s[12:15], s52 offen
+  5243 idx  3080 barrier     lat    58  s_barrier

@@ -1,0 +1,26 @@
+cp20_r18_s4k gfx0 2255 MHz power 1368 W hotspot 55 C
+cp20_r18_s4k gfx0 2264 MHz power 1367 W hotspot 58 C
+cp20_r18_s4k gfx0 2251 MHz power 1365 W hotspot 59 C
+cp20_r18_s4k gfx0 2251 MHz power 1365 W hotspot 59 C
+cp20_r18_s4k gfx0 2248 MHz power 1364 W hotspot 59 C
+cp20_r18_s4k throttle frac: PPT 0.64 SOCK_TH 0.00 VR_TH 0.00 HBM_TH 0.00 XCD0_PWR 0.00 XCD0_TH 0.00
+cp20_r18_s4k r7 /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_fwd_mla_flydsl_gfx950_20261109/profiles/pkg_r18 calls 22100 ms/call 0.6336 TFLOPS 1084.5
+cp20_r20_s4k gfx0 2239 MHz power 1365 W hotspot 55 C
+cp20_r20_s4k gfx0 2234 MHz power 1365 W hotspot 59 C
+cp20_r20_s4k gfx0 2244 MHz power 1374 W hotspot 59 C
+cp20_r20_s4k gfx0 2239 MHz power 1371 W hotspot 59 C
+cp20_r20_s4k gfx0 2238 MHz power 1375 W hotspot 60 C
+cp20_r20_s4k throttle frac: PPT 0.65 SOCK_TH 0.00 VR_TH 0.00 HBM_TH 0.00 XCD0_PWR 0.00 XCD0_TH 0.00
+cp20_r20_s4k r7 /perf_apps/xiaoming/megaattention_overlap_bench calls 22600 ms/call 0.6195 TFLOPS 1109.3
+cp20_r18_s4k gfx0 2255 MHz power 1368 W hotspot 59 C
+cp20_r18_s4k gfx0 2245 MHz power 1364 W hotspot 59 C
+cp20_r18_s4k gfx0 2250 MHz power 1362 W hotspot 59 C
+cp20_r18_s4k gfx0 2269 MHz power 1371 W hotspot 59 C
+cp20_r18_s4k throttle frac: PPT 0.62 SOCK_TH 0.00 VR_TH 0.00 HBM_TH 0.00 XCD0_PWR 0.00 XCD0_TH 0.00
+cp20_r18_s4k r7 /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_fwd_mla_flydsl_gfx950_20261109/profiles/pkg_r18 calls 22040 ms/call 0.6355 TFLOPS 1081.3
+cp20_r20_s4k gfx0 2235 MHz power 1373 W hotspot 59 C
+cp20_r20_s4k gfx0 2224 MHz power 1368 W hotspot 59 C
+cp20_r20_s4k gfx0 2238 MHz power 1378 W hotspot 60 C
+cp20_r20_s4k gfx0 2223 MHz power 1360 W hotspot 60 C
+cp20_r20_s4k throttle frac: PPT 0.65 SOCK_TH 0.00 VR_TH 0.00 HBM_TH 0.00 XCD0_PWR 0.00 XCD0_TH 0.00
+cp20_r20_s4k r7 /perf_apps/xiaoming/megaattention_overlap_bench calls 22600 ms/call 0.6196 TFLOPS 1109.1

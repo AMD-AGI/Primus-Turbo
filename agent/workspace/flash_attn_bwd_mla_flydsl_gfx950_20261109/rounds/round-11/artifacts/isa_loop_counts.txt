@@ -1,0 +1,3 @@
+isa_r9/g1ko0                                                 spill 98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 4 | hot loop: scratch_load 3 vmcnt(0) 2
+isa_r11/qpf1                                                 spill 125 scratch 504 B | masked loop: scratch_load 32 vmcnt(0) 16 | hot loop: scratch_load 16 vmcnt(0) 11
+isa_r11/qpf2                                                 spill 75 scratch 304 B | masked loop: scratch_load 15 vmcnt(0) 5 | hot loop: scratch_load 6 vmcnt(0) 1

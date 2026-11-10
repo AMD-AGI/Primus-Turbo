@@ -1,0 +1,5 @@
+ISA screen (dev/isa_sweep.py sweep_r17.py isa_r17), dkdv spill / scratch / loop counts, md5 of the ISA without comments/directives
+c00 94 scratch 380 B | masked loop: scratch_load 16 vmcnt(0) 1 | hot loop: scratch_load 3 vmcnt(0) 2 md5 c587bf720b
+c01 94 scratch 380 B | masked loop: scratch_load 16 vmcnt(0) 1 | hot loop: scratch_load 3 vmcnt(0) 2 md5 b52b1ac679
+c02 94 scratch 380 B | masked loop: scratch_load 16 vmcnt(0) 1 | hot loop: scratch_load 3 vmcnt(0) 2 md5 b76d49affc
+c00 = r16 (g3_rdv=0), c01 = g3_rdv=1, c02 = g3_rdv=2

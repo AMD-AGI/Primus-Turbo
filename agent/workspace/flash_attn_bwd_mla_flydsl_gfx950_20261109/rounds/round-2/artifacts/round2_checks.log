@@ -1,0 +1,16 @@
+det=True dq: bitwise=True maxdiff=0.000e+00
+det=True dk: bitwise=True maxdiff=0.000e+00
+det=True dv: bitwise=True maxdiff=0.000e+00
+det=False dq: bitwise=False maxdiff=6.250e-02
+det=False dk: bitwise=True maxdiff=0.000e+00
+det=False dv: bitwise=True maxdiff=0.000e+00
+mla-shaped D128 ws_dk: bitwise=True maxdiff=0.000e+00
+mla-shaped D128 ws_dv: bitwise=True maxdiff=0.000e+00
+mla-shaped D128 img: bitwise=False maxdiff=1.250e-01
+REGRESS PASS
+K=1 (adds/img 16): dq 47.19 dk 48.47 dv 49.78  dkdv_equal_K1=True  finite=True
+K=2 (adds/img 8): dq 47.87 dk 48.47 dv 49.78  dkdv_equal_K1=True  finite=True
+K=4 (adds/img 4): dq 48.28 dk 48.47 dv 49.78  dkdv_equal_K1=True  finite=True
+K=1 (adds/img 32): dq 46.42 dk 48.47 dv 49.76  dkdv_equal_K1=True  finite=True
+K=2 (adds/img 16): dq 47.37 dk 48.47 dv 49.76  dkdv_equal_K1=True  finite=True
+K=4 (adds/img 8): dq 47.98 dk 48.47 dv 49.76  dkdv_equal_K1=True  finite=True

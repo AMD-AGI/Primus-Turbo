@@ -1,0 +1,31 @@
+W1109 14:50:44.469000 6171 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1109 14:50:44.538000 6171 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 14:50:44.538000 6171 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 14:50:44.538000 6171 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 14:50:44.538000 6171 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 14:50:44.538000 6171 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 14:50:44.538000 6171 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+[aiter] import [module_aiter_core] under /opt/venv/lib/python3.12/site-packages/aiter/jit/module_aiter_core.so
+[aiter] import [module_fmha_fwd_bf16_opus] under /opt/venv/lib/python3.12/site-packages/aiter/jit/module_fmha_fwd_bf16_opus.so
+[aiter] import [module_fmha_v3_bwd] under /opt/venv/lib/python3.12/site-packages/aiter/jit/module_fmha_v3_bwd.so
+[aiter] type hints mismatch, override to --> fmha_v3_bwd(dout: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor, softmax_lse: torch.Tensor, dropout_p: float, softmax_scale: float, is_causal: bool, window_size_left: int, window_size_right: int, deterministic: bool, is_v3_atomic_fp32: bool, how_v3_bf16_cvt: int, dq: Optional[torch.Tensor] = None, dk: Optional[torch.Tensor] = None, dv: Optional[torch.Tensor] = None, alibi_slopes: Optional[torch.Tensor] = None, rng_state: Optional[torch.Tensor] = None, gen: Optional[torch.Generator] = None) -> List[torch.Tensor]
+[aiter] LoadKernel: _ZN5aiter23fmha_bwd_hd128_odo_bf16E hsaco: /opt/venv/lib/python3.12/site-packages/aiter_meta/hsa//gfx950/fmha_v3_bwd/bwd_hd128_odo_bf16.co
+[aiter] LoadKernel: _ZN5aiter42fmha_bwd_hd192_128_bf16_causal_br_a16_psskE hsaco: /opt/venv/lib/python3.12/site-packages/aiter_meta/hsa//gfx950/fmha_v3_bwd/bwd_hd192_128_bf16_causal_br_a16_pssk.co
+[aiter] LoadKernel: _ZN5aiter25fmha_bwd_hd192_dq_shuffleE hsaco: /opt/venv/lib/python3.12/site-packages/aiter_meta/hsa//gfx950/fmha_v3_bwd/bwd_hd192_dq_shuffle.co
+b1_s4k   PASS bwd   637.4 +-  2.6 (   2.804 ms) aiter   808.1 r 0.789 | step   715.1 aiter   863.9 r 0.828 | snr 46.43/49.57/51.21 aiter 49.08/52.17/52.60 rep True
+b1_s8k   PASS bwd   684.3 +-  0.3 (  10.445 ms) aiter   915.0 r 0.748 | step   774.5 aiter   976.5 r 0.793 | snr 45.18/49.54/51.27 aiter 47.59/52.20/52.81 rep True
+b1_s16k  PASS bwd   710.4 +-  0.2 (  40.242 ms) aiter   964.4 r 0.737 | step   808.2 aiter  1035.3 r 0.781 | snr 43.99/49.66/51.08 aiter 46.24/52.51/52.60 rep True
+b1_s32k  PASS bwd   728.7 +-  0.5 ( 156.937 ms) aiter  1011.3 r 0.721 | step   831.4 aiter  1081.7 r 0.769 | snr 44.07/49.62/51.16 aiter 44.04/52.38/52.65 rep True
+b1_s64k  PASS bwd   733.8 +-  0.2 ( 623.318 ms) aiter  1031.5 r 0.711 | step   839.5 aiter  1102.1 r 0.762 | snr 44.39/49.60/51.16 aiter 41.95/52.48/52.65 rep True
+b2_s4k   PASS bwd   643.0 +-  0.2 (   5.559 ms) aiter   834.2 r 0.771 | step   721.1 aiter   889.4 r 0.811 | snr 46.39/49.66/51.38 aiter 49.00/52.24/52.86 rep True
+b2_s16k  PASS bwd   708.7 +-  0.2 (  80.682 ms) aiter   984.9 r 0.720 | step   806.8 aiter  1050.2 r 0.768 | snr 43.83/49.54/51.31 aiter 46.05/52.27/52.75 rep True
+Geomean Step TFLOPS: 783.82
+Geomean Bwd TFLOPS: 691.36
+Geomean aiter Step TFLOPS: 996.03
+Geomean aiter Bwd TFLOPS: 932.07
+Geomean step ratio vs aiter: 0.7869
+Geomean bwd ratio vs aiter: 0.7417
+Summary CSV: /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/rounds/round-3/artifacts/benchmark_full.csv
+EXIT 0

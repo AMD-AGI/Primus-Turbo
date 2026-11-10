@@ -1,0 +1,5 @@
+r13 (modulo)                                               98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2
+csub32                                                     132 scratch 484 B | masked loop: scratch_load 22 vmcnt(0) 6 | hot loop: scratch_load 35 vmcnt(0) 27
+csub32, opaque result                                      140 scratch 476 B | masked loop: scratch_load 33 vmcnt(0) 16 | hot loop: scratch_load 34 vmcnt(0) 26
+csub32, opaque invariants                                  139 scratch 476 B | masked loop: scratch_load 32 vmcnt(0) 16 | hot loop: scratch_load 34 vmcnt(0) 26
+two stride loops                                           268 scratch 752 B | masked loop: scratch_load 27 vmcnt(0) 11 | hot loop: scratch_load 29 vmcnt(0) 19

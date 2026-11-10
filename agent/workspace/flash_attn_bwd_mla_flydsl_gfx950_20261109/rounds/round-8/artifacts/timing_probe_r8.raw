@@ -1,0 +1,27 @@
+W1109 16:47:27.137000 24210 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1109 16:47:27.203000 24210 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:47:27.203000 24210 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 16:47:27.203000 24210 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:47:27.203000 24210 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 16:47:27.203000 24210 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:47:27.203000 24210 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+B1 S16384 repeats 5
+ev_short       r7   37.571 ms  r8   37.086 ms  r8 gain  +1.31%  r7 all ['37.49', '37.53', '37.69', '37.57', '37.67']  r8 all ['36.98', '37.21', '37.12', '37.05', '37.09']
+ev_long16      r7   37.639 ms  r8   37.078 ms  r8 gain  +1.51%  r7 all ['37.55', '37.66', '37.64', '37.57', '37.67']  r8 all ['37.03', '37.08', '37.15', '37.14', '37.04']
+bench_pc       r7   37.635 ms  r8   37.068 ms  r8 gain  +1.53%  r7 all ['37.64', '37.63', '37.58', '37.63', '37.64']  r8 all ['37.12', '37.04', '37.02', '37.13', '37.07']
+W1109 16:47:44.956000 24378 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1109 16:47:45.023000 24378 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:47:45.023000 24378 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 16:47:45.023000 24378 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:47:45.023000 24378 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 16:47:45.023000 24378 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:47:45.023000 24378 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+B2 S4096 repeats 5
+ev_short       r7    5.650 ms  r8    5.368 ms  r8 gain  +5.26%  r7 all ['5.65', '5.65', '5.65', '5.66', '5.66']  r8 all ['5.35', '5.37', '5.36', '5.37', '5.41']
+ev_long106     r7    5.655 ms  r8    5.369 ms  r8 gain  +5.31%  r7 all ['5.65', '5.65', '5.65', '5.66', '5.66']  r8 all ['5.37', '5.37', '5.37', '5.37', '5.38']
+bench_pc       r7    5.653 ms  r8    5.376 ms  r8 gain  +5.14%  r7 all ['5.65', '5.65', '5.65', '5.66', '5.66']  r8 all ['5.36', '5.37', '5.38', '5.38', '5.39']
+EXIT 0

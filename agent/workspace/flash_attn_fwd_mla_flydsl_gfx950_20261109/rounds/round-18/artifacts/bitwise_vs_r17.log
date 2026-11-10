@@ -1,0 +1,5 @@
+B1 S4096: 5/5 bitwise equal to ../profiles/pkg_r17
+B1 S16384: 5/5 bitwise equal to ../profiles/pkg_r17
+B2 S4096: 5/5 bitwise equal to ../profiles/pkg_r17
+B1 S65536: 5/5 bitwise equal to ../profiles/pkg_r17
+ALL BITWISE EQUAL

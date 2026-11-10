@@ -1,0 +1,20 @@
+W1109 05:48:57.128000 4424 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1109 05:48:57.204000 4424 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 05:48:57.204000 4424 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 05:48:57.204000 4424 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 05:48:57.205000 4424 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 05:48:57.205000 4424 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 05:48:57.205000 4424 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+[aiter] import [module_aiter_core] under /opt/venv/lib/python3.12/site-packages/aiter/jit/module_aiter_core.so
+[aiter] import [module_fmha_fwd_bf16_opus] under /opt/venv/lib/python3.12/site-packages/aiter/jit/module_fmha_fwd_bf16_opus.so
+b1_s4k     PASS  fwd   1058.4 +-   8.9 aiter      nan ratio nan o_rel 0.0019 lse 0.0046
+b1_s8k     PASS  fwd   1182.5 +-   1.7 aiter      nan ratio nan o_rel 0.0018 lse 0.0048
+b1_s16k    PASS  fwd   1273.3 +-   2.3 aiter      nan ratio nan o_rel 0.0018 lse 0.0049
+b1_s32k    PASS  fwd   1308.5 +-   1.1 aiter      nan ratio nan o_rel 0.0016 lse 0.0048
+b1_s64k    PASS  fwd   1327.0 +-   0.5 aiter      nan ratio nan o_rel 0.0016 lse 0.0051
+b2_s4k     PASS  fwd   1034.5 +-   1.2 aiter      nan ratio nan o_rel 0.0020 lse 0.0048
+b2_s16k    PASS  fwd   1250.7 +-   0.8 aiter      nan ratio nan o_rel 0.0018 lse 0.0048
+Geomean Fwd TFLOPS: 1199.85
+Summary CSV: /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_fwd_mla_flydsl_gfx950_20261109/rounds/round-14/sweep/G16_T16/bench_n02.csv

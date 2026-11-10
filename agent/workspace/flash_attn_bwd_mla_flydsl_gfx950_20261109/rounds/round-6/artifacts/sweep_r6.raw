@@ -1,0 +1,24 @@
+W1109 15:49:39.649000 15984 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1109 15:49:39.724000 15984 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 15:49:39.725000 15984 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 15:49:39.725000 15984 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 15:49:39.725000 15984 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 15:49:39.725000 15984 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 15:49:39.725000 15984 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+qdesc_r=2 (default): ok=True snr=['46.43', '49.74', '51.28']
+qdesc_r=1: ok=True snr=['46.42', '49.74', '51.28']
+qdesc_r=4: ok=True snr=['46.42', '49.74', '51.28']
+qdesc_r=8: ok=True snr=['46.42', '49.74', '51.28']
+qdesc_r=16: ok=True snr=['46.42', '49.74', '51.28']
+qdesc_r=32: ok=True snr=['46.43', '49.74', '51.28']
+
+config                    B2S4096 ms      d%   B1S16384 ms      d%   gm d%  snr dq/dk/dv
+qdesc_r=2 (default)            5.569   +0.00        39.699   +0.00   +0.00  46.43/49.74/51.28
+qdesc_r=1                      5.572   -0.04        39.728   -0.07   -0.06  46.42/49.74/51.28
+qdesc_r=4                      5.576   -0.12        39.646   +0.13   +0.01  46.42/49.74/51.28
+qdesc_r=8                      5.567   +0.05        39.650   +0.12   +0.09  46.42/49.74/51.28
+qdesc_r=16                     5.564   +0.09        39.680   +0.05   +0.07  46.42/49.74/51.28
+qdesc_r=32                     5.563   +0.11        39.707   -0.02   +0.05  46.43/49.74/51.28
+EXIT 0

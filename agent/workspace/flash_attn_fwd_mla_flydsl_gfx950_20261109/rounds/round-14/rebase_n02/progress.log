@@ -1,0 +1,12 @@
+r7 Geomean Fwd TFLOPS: 1088.92 Geomean aiter Fwd TFLOPS: 1204.47 Geomean ratio vs aiter: 0.9041
+r13 Geomean Fwd TFLOPS: 1179.59 Geomean aiter Fwd TFLOPS: 1207.66 Geomean ratio vs aiter: 0.9768
+G4 T4 7 pass Geomean Fwd TFLOPS: 1149.33
+G4 T8 7 pass Geomean Fwd TFLOPS: 1153.85
+G4 T16 7 pass Geomean Fwd TFLOPS: 1150.05
+G8 T4 7 pass Geomean Fwd TFLOPS: 1179.54
+G8 T8 7 pass Geomean Fwd TFLOPS: 1180.42
+G8 T16 7 pass Geomean Fwd TFLOPS: 1173.02
+G16 T4 7 pass Geomean Fwd TFLOPS: 1198.22
+G16 T8 7 pass Geomean Fwd TFLOPS: 1199.79
+G16 T16 7 pass Geomean Fwd TFLOPS: 1199.85
+ALL_DONE

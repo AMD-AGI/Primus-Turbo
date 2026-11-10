@@ -1,0 +1,6 @@
+B1 S4096: 5/5 bitwise equal to round-5
+B1 S16384: 5/5 bitwise equal to round-5
+B2 S4096: 5/5 bitwise equal to round-5
+B1 S65536: 5/5 bitwise equal to round-5
+ALL BITWISE EQUAL
+EXIT=0

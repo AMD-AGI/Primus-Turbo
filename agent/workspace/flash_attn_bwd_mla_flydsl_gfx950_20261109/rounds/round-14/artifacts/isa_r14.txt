@@ -1,0 +1,18 @@
+r13 (U+G)                                                  98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2
+U+G+misched-regpressure=False                              131 scratch 524 B | masked loop: scratch_load 38 vmcnt(0) 20 | hot loop: scratch_load 17 vmcnt(0) 12
+U+G+amdgpu-mfma-vgpr-form=False                            98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2
+U+G+amdgpu-spill-vgpr-to-agpr=False                        98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2
+U+G+misched-cluster=False                                  98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2
+U+G+misched-cyclicpath=False                               98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2
+U+G+misched-fusion=False                                   98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2
+U+G+enable-misched=False                                   100 scratch 404 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 4 vmcnt(0) 3
+U+G+misched-postra=True                                    98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2
+U+G+amdgpu-igrouplp-exact-solver=True                      FAIL ['[flydsl.compile] dump 04_fly_layout_lowering -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r14/c09/flash_attn_bwd_mla_dkdv_kernel/04_fly_layout_lowering.mlir']
+U+G+amdgpu-enable-rewrite-partial-reg-uses=False           98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2
+U+G+misched-limit=1024                                     98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2
+U+G+dag-maps-huge-region=4000                              98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2
+U+G+regalloc-eviction-max-interference-cutoff=100          98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2
+U+G+split-threshold-for-reg-with-hint=0                    98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2
+U+G+amdgpu-sched-strategy=iterative-ilp                    138 scratch 520 B | masked loop: scratch_load 25 vmcnt(0) 17 | hot loop: scratch_load 46 vmcnt(0) 24
+U+G+amdgpu-sched-strategy=iterative-minreg                 162 scratch 596 B | masked loop: scratch_load 53 vmcnt(0) 18 | hot loop: scratch_load 39 vmcnt(0) 21
+U+G+amdgpu-sched-strategy=iterative-maxocc                 219 scratch 732 B | masked loop: scratch_load 71 vmcnt(0) 37 | hot loop: scratch_load 51 vmcnt(0) 23

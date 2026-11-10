@@ -1,0 +1,4 @@
+r9 default                                                 98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 4 | hot loop: scratch_load 3 vmcnt(0) 2
+no-unclustered-resched                                     98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 4 | hot loop: scratch_load 4 vmcnt(0) 1
+regclass-priority                                          98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2
+no-unclustered+regclass                                    98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2

@@ -1,0 +1,3 @@
+r13 (modulo)                                               98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2
+32-bit modulo                                              157 scratch 520 B | masked loop: scratch_load 27 vmcnt(0) 6 | hot loop: scratch_load 28 vmcnt(0) 16
+csub32, wrap as a branch                                   94 scratch 380 B | masked loop: scratch_load 16 vmcnt(0) 1 | hot loop: scratch_load 3 vmcnt(0) 2

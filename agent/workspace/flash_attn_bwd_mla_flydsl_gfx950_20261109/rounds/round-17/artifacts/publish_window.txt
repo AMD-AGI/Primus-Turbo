@@ -1,0 +1,99 @@
+== g3_rdv=1: from 4 lines before the publish barrier (line 2408)
+	buffer_load_dword a93, v12, s[24:27], 0 offen
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	scratch_load_dwordx4 a[84:87], off, off
+	scratch_load_dwordx4 a[88:91], off, off offset:16
+	s_waitcnt vmcnt(1) lgkmcnt(6)
+	v_mfma_f32_16x16x32_bf16 v[20:23], v[28:31], a[84:87], v[12:15]
+	v_mfma_f32_16x16x32_bf16 v[24:27], v[28:31], a[226:229], v[12:15]
+	v_mfma_f32_16x16x32_bf16 v[12:15], v[28:31], a[184:187], v[12:15]
+	s_waitcnt vmcnt(0)
+	v_mfma_f32_16x16x32_bf16 v[20:23], v[32:35], a[88:91], v[20:23]
+	v_mfma_f32_16x16x32_bf16 v[24:27], v[32:35], a[234:237], v[24:27]
+	v_mfma_f32_16x16x32_bf16 v[12:15], v[32:35], a[196:199], v[12:15]
+	v_mfma_f32_16x16x32_bf16 v[20:23], v[36:39], a[192:195], v[20:23]
+	v_mfma_f32_16x16x32_bf16 v[24:27], v[36:39], a[242:245], v[24:27]
+	v_mfma_f32_16x16x32_bf16 v[12:15], v[36:39], a[214:217], v[12:15]
+	scratch_load_dwordx4 v[36:39], off, off offset:240
+	s_waitcnt lgkmcnt(0)
+	v_mfma_f32_16x16x32_bf16 v[28:31], v[52:55], a[84:87], v[16:19]
+	v_mfma_f32_16x16x32_bf16 v[32:35], v[52:55], a[226:229], v[16:19]
+	v_mfma_f32_16x16x32_bf16 v[16:19], v[52:55], a[184:187], v[16:19]
+	v_mfma_f32_16x16x32_bf16 v[16:19], v[56:59], a[196:199], v[16:19]
+	v_mfma_f32_16x16x32_bf16 v[16:19], v[60:63], a[214:217], v[16:19]
+	s_waitcnt vmcnt(0)
+	v_mfma_f32_16x16x32_bf16 v[12:15], v[40:43], v[36:39], v[12:15]
+	v_mfma_f32_16x16x32_bf16 v[28:31], v[56:59], a[88:91], v[28:31]
+	v_mfma_f32_16x16x32_bf16 v[32:35], v[56:59], a[234:237], v[32:35]
+	v_mfma_f32_16x16x32_bf16 v[16:19], a[72:75], v[36:39], v[16:19]
+	v_mfma_f32_16x16x32_bf16 v[20:23], v[40:43], a[200:203], v[20:23]
+	v_mfma_f32_16x16x32_bf16 v[24:27], v[40:43], a[250:253], v[24:27]
+	v_mfma_f32_16x16x32_bf16 v[28:31], v[60:63], a[192:195], v[28:31]
+	v_mfma_f32_16x16x32_bf16 v[12:15], v[44:47], v[40:43], v[12:15]
+	v_mfma_f32_16x16x32_bf16 v[32:35], v[60:63], a[242:245], v[32:35]
+	v_mfma_f32_16x16x32_bf16 v[16:19], a[76:79], v[40:43], v[16:19]
+	v_mfma_f32_16x16x32_bf16 v[20:23], v[44:47], a[208:211], v[20:23]
+	v_mfma_f32_16x16x32_bf16 v[24:27], v[44:47], a[94:97], v[24:27]
+	v_mfma_f32_16x16x32_bf16 v[28:31], a[72:75], a[200:203], v[28:31]
+== g3_rdv=2: from 4 lines before the publish barrier (line 2381)
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	scratch_load_dwordx4 a[88:91], off, off
+	scratch_load_dwordx4 a[92:95], off, off offset:16
+	v_mfma_f32_16x16x32_bf16 v[12:15], v[30:33], v[22:25], v[12:15]
+	v_mfma_f32_16x16x32_bf16 v[16:19], v[34:37], v[22:25], v[16:19]
+	v_mfma_f32_16x16x32_bf16 v[12:15], v[42:45], v[38:41], v[12:15]
+	v_mfma_f32_16x16x32_bf16 v[16:19], v[46:49], v[38:41], v[16:19]
+	v_mfma_f32_16x16x32_bf16 v[12:15], v[54:57], v[50:53], v[12:15]
+	v_mfma_f32_16x16x32_bf16 v[16:19], v[200:203], v[50:53], v[16:19]
+	v_mfma_f32_16x16x32_bf16 v[12:15], a[72:75], v[204:207], v[12:15]
+	v_mfma_f32_16x16x32_bf16 v[16:19], a[80:83], v[204:207], v[16:19]
+	v_mfma_f32_16x16x32_bf16 v[204:207], v[26:29], a[76:79], v[12:15]
+	v_mfma_f32_16x16x32_bf16 v[200:203], a[84:87], a[76:79], v[16:19]
+	s_waitcnt vmcnt(1) lgkmcnt(6)
+	v_mfma_f32_16x16x32_bf16 v[20:23], v[28:31], a[88:91], v[12:15]
+	v_mfma_f32_16x16x32_bf16 v[24:27], v[28:31], a[228:231], v[12:15]
+	v_mfma_f32_16x16x32_bf16 v[12:15], v[28:31], a[184:187], v[12:15]
+	s_waitcnt vmcnt(0)
+	v_mfma_f32_16x16x32_bf16 v[20:23], v[32:35], a[92:95], v[20:23]
+	v_mfma_f32_16x16x32_bf16 v[24:27], v[32:35], a[236:239], v[24:27]
+	v_mfma_f32_16x16x32_bf16 v[12:15], v[32:35], a[196:199], v[12:15]
+	v_mfma_f32_16x16x32_bf16 v[20:23], v[36:39], a[192:195], v[20:23]
+	v_mfma_f32_16x16x32_bf16 v[24:27], v[36:39], a[244:247], v[24:27]
+	v_mfma_f32_16x16x32_bf16 v[12:15], v[36:39], a[216:219], v[12:15]
+	scratch_load_dwordx4 v[36:39], off, off offset:240
+	s_waitcnt lgkmcnt(0)
+	v_mfma_f32_16x16x32_bf16 v[28:31], v[52:55], a[88:91], v[16:19]
+	v_mfma_f32_16x16x32_bf16 v[32:35], v[52:55], a[228:231], v[16:19]
+	v_mfma_f32_16x16x32_bf16 v[16:19], v[52:55], a[184:187], v[16:19]
+	v_mfma_f32_16x16x32_bf16 v[16:19], v[56:59], a[196:199], v[16:19]
+	v_mfma_f32_16x16x32_bf16 v[16:19], a[72:75], a[216:219], v[16:19]
+	s_waitcnt vmcnt(0)
+	v_mfma_f32_16x16x32_bf16 v[12:15], v[40:43], v[36:39], v[12:15]
+	v_mfma_f32_16x16x32_bf16 v[28:31], v[56:59], a[92:95], v[28:31]
+	v_mfma_f32_16x16x32_bf16 v[32:35], v[56:59], a[236:239], v[32:35]
+	v_mfma_f32_16x16x32_bf16 v[16:19], a[76:79], v[36:39], v[16:19]
+	v_mfma_f32_16x16x32_bf16 v[20:23], v[40:43], a[200:203], v[20:23]
+	v_mfma_f32_16x16x32_bf16 v[24:27], v[40:43], a[252:255], v[24:27]
+== r16: from the publish barrier (line 2227)
+	buffer_load_dword a97, v4, s[24:27], 0 offen
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	scratch_load_dwordx4 a[88:91], off, off
+	s_waitcnt lgkmcnt(12)
+	v_mfma_f32_16x16x32_bf16 v[4:7], v[6:9], v[18:21], 0
+	scratch_load_dwordx4 a[92:95], off, off offset:16
+	v_mfma_f32_16x16x32_bf16 v[8:11], v[10:13], v[18:21], 0
+	s_waitcnt lgkmcnt(13)
+	v_mfma_f32_16x16x32_bf16 v[4:7], v[14:17], v[26:29], v[4:7]
+	v_mfma_f32_16x16x32_bf16 v[8:11], v[22:25], v[26:29], v[8:11]
+	s_waitcnt lgkmcnt(9)
+	v_mfma_f32_16x16x32_bf16 v[4:7], v[30:33], v[38:41], v[4:7]
+	v_mfma_f32_16x16x32_bf16 v[8:11], v[34:37], v[38:41], v[8:11]
+	s_waitcnt lgkmcnt(7)
+	v_mfma_f32_16x16x32_bf16 v[4:7], v[42:45], v[50:53], v[4:7]
+	v_mfma_f32_16x16x32_bf16 v[8:11], v[46:49], v[50:53], v[8:11]
+	s_waitcnt lgkmcnt(10)
+	v_mfma_f32_16x16x32_bf16 v[4:7], v[54:57], v[204:207], v[4:7]
+	v_mfma_f32_16x16x32_bf16 v[8:11], v[200:203], v[204:207], v[8:11]

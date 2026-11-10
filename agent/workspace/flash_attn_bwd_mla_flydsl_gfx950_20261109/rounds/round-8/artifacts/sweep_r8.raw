@@ -1,0 +1,42 @@
+W1109 16:13:20.897000 20918 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1109 16:13:20.965000 20918 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:13:20.965000 20918 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 16:13:20.966000 20918 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:13:20.966000 20918 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 16:13:20.966000 20918 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:13:20.966000 20918 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+bk192 default: ok=True snr=['47.00', '49.74', '51.28']
+k_reg=False: BUILD/RUN FAIL AssertionError: MLA: GEMM1a reads K from the register packs
+Traceback (most recent call last):
+  File "/perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/sweep.py", line 51, in <module>
+    g = qb.mla_bwd_sbhd(do, q, k, v, o, lse, **over)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/perf_apps/xiaoming/megaattention_overlap_bench/flydsl_mla/ops_bwd.py", line 94, in mla_bwd_sbhd
+    dkdv, odo, dqa16 = _launchers(B, Sq, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, n_img, over)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: MLA: GEMM1a reads K from the register packs
+k_reg=False: ok=False snr=[]
+g2d=1: ok=True snr=['47.00', '49.74', '51.28']
+g3d=2: ok=True snr=['47.00', '49.74', '51.28']
+g3d=3: ok=True snr=['47.00', '49.74', '51.28']
+g3_st_at=0: ok=True snr=['47.01', '49.74', '51.28']
+g3_st_at=2: ok=True snr=['47.00', '49.74', '51.28']
+mfma_tie=2: ok=True snr=['47.01', '49.74', '51.28']
+g3_dbat=6: ok=True snr=['47.01', '49.74', '51.28']
+iglp=0: ok=True snr=['47.00', '49.74', '51.28']
+g3_sb=0: ok=True snr=['47.01', '49.74', '51.28']
+
+config                    B2S4096 ms      d%   B1S16384 ms      d%   gm d%  snr dq/dk/dv
+bk192 default                  5.435   +0.00        34.872   +0.00   +0.00  47.00/49.74/51.28
+g2d=1                          5.267   +3.20        34.196   +1.98   +2.59  47.00/49.74/51.28
+g3d=2                          5.452   -0.31        34.881   -0.03   -0.17  47.00/49.74/51.28
+g3d=3                          5.397   +0.71        34.681   +0.55   +0.63  47.00/49.74/51.28
+g3_st_at=0                     6.043  -10.06        40.463  -13.82  -11.96  47.01/49.74/51.28
+g3_st_at=2                     6.137  -11.43        39.171  -10.98  -11.20  47.00/49.74/51.28
+mfma_tie=2                     9.613  -43.46        61.645  -43.43  -43.44  47.01/49.74/51.28
+g3_dbat=6                      7.983  -31.91        56.605  -38.39  -35.23  47.01/49.74/51.28
+iglp=0                         5.474   -0.71        35.927   -2.94   -1.83  47.00/49.74/51.28
+g3_sb=0                        5.331   +1.97        34.593   +0.81   +1.39  47.01/49.74/51.28
+EXIT 0

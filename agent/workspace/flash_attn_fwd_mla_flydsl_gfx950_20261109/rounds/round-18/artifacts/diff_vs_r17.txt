@@ -1,0 +1,63 @@
+39c39
+< CODEGEN_REV = 8
+---
+> CODEGEN_REV = 9
+47,49c47,49
+< XCD_Q_GROUP = 16
+< # Group used when fewer than XCD_Q_GROUP ranks precede the tail, so short sequences still share.
+< XCD_Q_GROUP_SHORT = 8
+---
+> # Sizes largest first: as many full groups of each size as the ranks ahead of the tail allow, the
+> # remainder going to the next size. 32 = the CTAs one XCD holds at once (32 CUs, 1 CTA per CU).
+> XCD_Q_GROUPS = (32, 16, 8)
+51c51
+< # jobs of XCD_Q_GROUP different lengths in each XCD's final wave and idle CUs behind the longest.
+---
+> # jobs of a group's different lengths in each XCD's final wave and idle CUs behind the longest.
+773,774c773,774
+<             # Each XCD owns every NUM_XCD-th head and walks them XCD_Q_GROUP q-blocks at a time,
+<             # so its resident CTAs read a few heads' K/V through its L2 rather than one CTA each.
+---
+>             # Each XCD owns every NUM_XCD-th head and walks them a group of q-blocks at a time, so
+>             # its resident CTAs read a few heads' K/V through its L2 rather than one CTA each.
+781,796c781,803
+<             def _xcd_map(group):
+<                 q_split = _nq_head // group * group
+<                 grp = _slot // (group * _heads_per_xcd)
+<                 r = _slot - grp * (group * _heads_per_xcd)
+<                 split_slot = q_split * _heads_per_xcd
+<                 t = _slot - split_slot
+<                 in_tail = ArithValue(_slot >= split_slot)
+<                 h_local = in_tail.select(t % _heads_per_xcd, r // group)
+<                 q_rank = in_tail.select(q_split + t // _heads_per_xcd, grp * group + r % group)
+<                 return h_local, q_rank
+< 
+<             _h_big, _q_big = _xcd_map(XCD_Q_GROUP)
+<             _h_short, _q_short = _xcd_map(XCD_Q_GROUP_SHORT)
+<             _use_big = ArithValue(_nq_head >= fx.Index(XCD_Q_GROUP))
+<             self.h_idx = _use_big.select(_h_big, _h_short) * NUM_XCD + _lin % NUM_XCD
+<             _q_rank = _use_big.select(_q_big, _q_short)
+---
+>             # Rank sections [lo, hi) per group size, then the rank-major tail; a slot takes the
+>             # last section starting at or below it (an empty section yields to the next one).
+>             _lo = fx.Index(0)
+>             _h_local = _q_rank = None
+>             for _i in range_constexpr(len(XCD_Q_GROUPS)):
+>                 _g = XCD_Q_GROUPS[_i]
+>                 _u = _slot - _lo * _heads_per_xcd
+>                 _grp = _u // (_g * _heads_per_xcd)
+>                 _r = _u - _grp * (_g * _heads_per_xcd)
+>                 _h_sec = _r // _g
+>                 _q_sec = _lo + _grp * _g + _r % _g
+>                 if const_expr(_i == 0):
+>                     _h_local, _q_rank = _h_sec, _q_sec
+>                 else:
+>                     _in = ArithValue(_slot >= _lo * _heads_per_xcd)
+>                     _h_local = _in.select(_h_sec, _h_local)
+>                     _q_rank = _in.select(_q_sec, _q_rank)
+>                 _lo = _lo + (_nq_head - _lo) // _g * _g
+>             _t = _slot - _lo * _heads_per_xcd
+>             _in_tail = ArithValue(_slot >= _lo * _heads_per_xcd)
+>             _h_local = _in_tail.select(_t % _heads_per_xcd, _h_local)
+>             _q_rank = _in_tail.select(_lo + _t // _heads_per_xcd, _q_rank)
+>             self.h_idx = _h_local * NUM_XCD + _lin % NUM_XCD

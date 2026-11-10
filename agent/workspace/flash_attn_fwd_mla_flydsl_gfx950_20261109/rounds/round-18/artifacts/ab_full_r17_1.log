@@ -1,0 +1,22 @@
+W1109 08:44:28.109000 50145 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1109 08:44:28.185000 50145 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 08:44:28.186000 50145 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 08:44:28.186000 50145 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 08:44:28.186000 50145 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 08:44:28.186000 50145 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 08:44:28.187000 50145 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+[aiter] import [module_aiter_core] under /opt/venv/lib/python3.12/site-packages/aiter/jit/module_aiter_core.so
+[aiter] import [module_fmha_fwd_bf16_opus] under /opt/venv/lib/python3.12/site-packages/aiter/jit/module_fmha_fwd_bf16_opus.so
+b1_s4k     PASS  fwd   1100.0 +-   8.5 aiter   1083.1 ratio 1.016 o_rel 0.0019 lse 0.0046
+b1_s8k     PASS  fwd   1210.0 +-   4.1 aiter   1210.2 ratio 1.000 o_rel 0.0018 lse 0.0048
+b1_s16k    PASS  fwd   1320.8 +-   1.2 aiter   1268.3 ratio 1.041 o_rel 0.0018 lse 0.0049
+b1_s32k    PASS  fwd   1356.1 +-   1.7 aiter   1299.6 ratio 1.044 o_rel 0.0016 lse 0.0048
+b1_s64k    PASS  fwd   1381.9 +-   1.9 aiter   1310.4 ratio 1.055 o_rel 0.0016 lse 0.0051
+b2_s4k     PASS  fwd   1083.9 +-   4.1 aiter   1072.3 ratio 1.011 o_rel 0.0020 lse 0.0048
+b2_s16k    PASS  fwd   1292.0 +-   1.9 aiter   1268.0 ratio 1.019 o_rel 0.0018 lse 0.0048
+Geomean Fwd TFLOPS: 1244.12
+Geomean aiter Fwd TFLOPS: 1212.33
+Geomean ratio vs aiter: 1.0262
+Summary CSV: /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_fwd_mla_flydsl_gfx950_20261109/rounds/round-18/artifacts/ab_full_r17_1.csv

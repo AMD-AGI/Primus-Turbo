@@ -1,0 +1,27 @@
+round 0 r9 default: 2x4096 5.195 1x8192 9.043 1x16384 33.277
+round 0 trackers: 2x4096 6.557 1x8192 11.529 1x16384 43.202
+round 0 no-unclustered-resched: 2x4096 5.092 1x8192 8.919 1x16384 33.056
+round 0 regclass-priority: 2x4096 5.138 1x8192 8.949 1x16384 32.946
+round 0 trackers+no-unclustered: 2x4096 6.501 1x8192 11.390 1x16384 42.707
+round 0 trackers+regclass: 2x4096 6.602 1x8192 11.666 1x16384 43.781
+round 1 trackers: 2x4096 6.542 1x8192 11.542 1x16384 43.291
+round 1 no-unclustered-resched: 2x4096 5.085 1x8192 8.909 1x16384 33.063
+round 1 regclass-priority: 2x4096 5.130 1x8192 8.943 1x16384 32.990
+round 1 trackers+no-unclustered: 2x4096 6.487 1x8192 11.410 1x16384 42.844
+round 1 trackers+regclass: 2x4096 6.613 1x8192 11.667 1x16384 43.753
+round 1 r9 default: 2x4096 5.205 1x8192 9.041 1x16384 33.297
+round 2 no-unclustered-resched: 2x4096 5.086 1x8192 8.933 1x16384 33.121
+round 2 regclass-priority: 2x4096 5.128 1x8192 8.968 1x16384 32.988
+round 2 trackers+no-unclustered: 2x4096 6.472 1x8192 11.394 1x16384 42.786
+round 2 trackers+regclass: 2x4096 6.588 1x8192 11.641 1x16384 43.734
+round 2 r9 default: 2x4096 5.206 1x8192 9.048 1x16384 33.322
+round 2 trackers: 2x4096 6.550 1x8192 11.548 1x16384 43.354
+
+config                        B2S4096 ms      d%    B1S8192 ms      d%   B1S16384 ms      d%   gm d%  snr dq/dk/dv
+r9 default                         5.205   +0.00         9.043   +0.00        33.297   +0.00   +0.00  47.01/49.74/51.28
+trackers                           6.550  -20.53        11.542  -21.65        43.291  -23.09  -21.76  47.01/49.74/51.28
+no-unclustered-resched             5.086   +2.34         8.919   +1.38        33.063   +0.71   +1.47  47.01/49.74/51.28
+regclass-priority                  5.130   +1.46         8.949   +1.04        32.988   +0.94   +1.15  47.00/49.74/51.28
+trackers+no-unclustered            6.487  -19.76        11.394  -20.64        42.786  -22.18  -20.87  47.01/49.74/51.28
+trackers+regclass                  6.602  -21.16        11.666  -22.49        43.753  -23.90  -22.52  47.01/49.74/51.28
+EXIT 0

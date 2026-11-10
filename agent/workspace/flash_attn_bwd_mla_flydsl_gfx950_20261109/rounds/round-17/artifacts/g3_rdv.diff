@@ -1,0 +1,68 @@
+1412a1413,1414
+>     # g3_rdv: emit the deferred GEMM3 inside the Q/dO rendezvous (0 = off). See G3_RDV.
+>     g3_rdv=0,
+1868a1871,1881
+>     # G3_RDV: the same move on the VGPR-staged Q_PREF route, which has no LDS DMA pending to
+>     # force that wait: the deferred GEMM3 runs between the WAR barrier and the publish barrier
+>     # (1 = ahead of the Q/dO commit, 2 = after it), so its reads are retired by the publish
+>     # drain. dS is already published by the WAR barrier: gpu.barrier lowers to a workgroup
+>     # release fence + s_barrier + acquire fence, so the ds_writes retire ahead of it. With one
+>     # head per kv group the producer and the deferred reader share dS slot 0, and the publish
+>     # barrier is then also the WAR fence between this GEMM3's reads and this head-step's own
+>     # dS writes, which otherwise only GEMM1 and the softmax separate.
+>     G3_RDV = int(g3_rdv)
+>     assert G3_RDV in (0, 1, 2)
+>     assert not G3_RDV or (Q_PREF and G3_DEFER and not G3_SHADOW and DMA_GRP == 1)
+1875a1889
+>     assert not G3_RDV or HS_WAR_BAR, "G3_RDV reads dS published by the leading WAR barrier"
+3471a3486,3504
+>             # The previous head-step's dQ stores, if it handed them over (see G3_ST_HS).
+>             _g3_pend = list(st_io) if const_expr(G3_ST_HS and st_io is not None) else []
+>             if const_expr(G3_ST_HS and st_io is not None):
+>                 del st_io[:]
+>             # At head 0 the predecessor is the LAST head of the PREVIOUS trip (see G3_QCARRY);
+>             # its slot is the other one, so the same two-slot argument holds across the trip.
+>             _g3_h = const_expr((head_local - 1) % GQA_GROUP_SIZE)
+>             _g3_q = g3_prev if const_expr(head_local == 0) else q_start
+>             _g3_on = G3_DEFER and not G3_SHADOW and (head_local > 0 or g3_prev is not None)
+>             _g3_rdv = bool(G3_RDV) and _g3_on and (not QDO_TAIL or head_local == 0)
+> 
+>             def _g3_emit(_q=_g3_q, _h=_g3_h):
+>                 _gemm3(
+>                     _q,
+>                     _h,
+>                     const_expr(_h % G3S_SLOTS),
+>                     st_sink=_g3_pend if const_expr(G3_ST_AT >= 0) else None,
+>                 )
+> 
+3484a3518,3519
+>                     if const_expr(_g3_rdv and G3_RDV == 1):
+>                         _g3_emit()
+3489a3525,3526
+>                     if const_expr(_g3_rdv and G3_RDV == 2):
+>                         _g3_emit()
+3540,3543d3576
+<             # The previous head-step's dQ stores, if it handed them over (see G3_ST_HS).
+<             _g3_pend = list(st_io) if const_expr(G3_ST_HS and st_io is not None) else []
+<             if const_expr(G3_ST_HS and st_io is not None):
+<                 del st_io[:]
+3566,3570c3599
+<             # At head 0 the predecessor is the LAST head of the PREVIOUS trip (see G3_QCARRY);
+<             # its slot is the other one, so the same two-slot argument holds across the trip.
+<             _g3_h = const_expr((head_local - 1) % GQA_GROUP_SIZE)
+<             _g3_q = g3_prev if const_expr(head_local == 0) else q_start
+<             if const_expr(G3_DEFER and not G3_SHADOW and (head_local > 0 or g3_prev is not None)):
+---
+>             if const_expr(_g3_on):
+3579,3586c3608,3609
+<                 _g3_call.append(
+<                     lambda _q=_g3_q, _h=_g3_h: _gemm3(
+<                         _q,
+<                         _h,
+<                         const_expr(_h % G3S_SLOTS),
+<                         st_sink=_g3_pend if const_expr(G3_ST_AT >= 0) else None,
+<                     )
+<                 )
+---
+>                 if const_expr(not _g3_rdv):
+>                     _g3_call.append(_g3_emit)

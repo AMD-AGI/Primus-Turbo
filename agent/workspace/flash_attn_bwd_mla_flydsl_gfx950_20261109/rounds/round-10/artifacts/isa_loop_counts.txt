@@ -1,0 +1,11 @@
+isa_r9/g1ko0                                                 spill 98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 4 | hot loop: scratch_load 3 vmcnt(0) 2
+isa_r10/kreg0                                                spill 85 scratch 276 B | masked loop: scratch_load 30 vmcnt(0) 20 | hot loop: scratch_load 31 vmcnt(0) 17
+isa_r10/kreg0ko                                              spill 88 scratch 272 B | masked loop: scratch_load 29 vmcnt(0) 20 | hot loop: scratch_load 35 vmcnt(0) 25
+isa_r10/kl1                                                  spill 76 scratch 276 B | masked loop: scratch_load 31 vmcnt(0) 24 | hot loop: scratch_load 19 vmcnt(0) 15
+isa_r10/kl2                                                  spill 68 scratch 244 B | masked loop: scratch_load 23 vmcnt(0) 20 | hot loop: scratch_load 19 vmcnt(0) 15
+isa_r10/kl3                                                  spill 68 scratch 244 B | masked loop: scratch_load 23 vmcnt(0) 20 | hot loop: scratch_load 19 vmcnt(0) 15
+isa_r10/kl4                                                  spill 68 scratch 244 B | masked loop: scratch_load 23 vmcnt(0) 20 | hot loop: scratch_load 19 vmcnt(0) 15
+isa_r10/kl6                                                  spill 55 scratch 208 B | masked loop: scratch_load 14 vmcnt(0) 10 | hot loop: scratch_load 14 vmcnt(0) 10
+isa_r10/kl1ko                                                spill 70 scratch 248 B | masked loop: scratch_load 24 vmcnt(0) 19 | hot loop: scratch_load 19 vmcnt(0) 14
+isa_r10/kl2ko                                                spill 71 scratch 252 B | masked loop: scratch_load 25 vmcnt(0) 19 | hot loop: scratch_load 19 vmcnt(0) 15
+isa_r10/kl6ko                                                spill 63 scratch 220 B | masked loop: scratch_load 13 vmcnt(0) 9 | hot loop: scratch_load 23 vmcnt(0) 18

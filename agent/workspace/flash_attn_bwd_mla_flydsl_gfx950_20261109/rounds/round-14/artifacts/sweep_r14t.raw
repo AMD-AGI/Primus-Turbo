@@ -1,0 +1,22 @@
+round 0 r13 (U+G): 2x4096 5.073 1x8192 8.852 1x16384 32.561
+round 0 +misched-cluster=False: 2x4096 5.135 1x8192 8.950 1x16384 32.938
+round 0 +misched-fusion=False: 2x4096 5.079 1x8192 8.871 1x16384 32.527
+round 0 +enable-misched=False: 2x4096 5.135 1x8192 8.782 1x16384 32.478
+round 0 +amdgpu-enable-rewrite-partial-reg-uses=False: 2x4096 5.089 1x8192 8.845 1x16384 32.540
+round 1 +misched-cluster=False: 2x4096 5.143 1x8192 8.964 1x16384 33.010
+round 1 +misched-fusion=False: 2x4096 5.088 1x8192 8.867 1x16384 32.648
+round 1 +enable-misched=False: 2x4096 5.155 1x8192 8.874 1x16384 32.560
+round 1 +amdgpu-enable-rewrite-partial-reg-uses=False: 2x4096 5.094 1x8192 8.844 1x16384 32.639
+round 1 r13 (U+G): 2x4096 5.087 1x8192 8.870 1x16384 32.668
+round 2 +misched-fusion=False: 2x4096 5.085 1x8192 8.864 1x16384 32.669
+round 2 +enable-misched=False: 2x4096 5.150 1x8192 8.889 1x16384 32.543
+round 2 +amdgpu-enable-rewrite-partial-reg-uses=False: 2x4096 5.097 1x8192 8.866 1x16384 32.643
+round 2 r13 (U+G): 2x4096 5.083 1x8192 8.872 1x16384 32.682
+round 2 +misched-cluster=False: 2x4096 5.149 1x8192 8.983 1x16384 33.082
+
+config                        B2S4096 ms      d%    B1S8192 ms      d%   B1S16384 ms      d%   gm d%  snr dq/dk/dv
+r13 (U+G)                          5.083   +0.00         8.870   +0.00        32.668   +0.00   +0.00  47.01/49.74/51.28
++misched-cluster=False             5.143   -1.16         8.964   -1.06        33.010   -1.04   -1.08  47.01/49.74/51.28
++misched-fusion=False              5.085   -0.05         8.867   +0.04        32.648   +0.06   +0.02  47.00/49.74/51.28
++enable-misched=False              5.150   -1.31         8.874   -0.05        32.543   +0.38   -0.33  47.01/49.74/51.28
++amdgpu-enable-rewrite-partial-reg-uses=False         5.094   -0.22         8.845   +0.28        32.639   +0.09   +0.05  47.00/49.74/51.28

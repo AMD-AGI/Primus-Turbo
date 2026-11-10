@@ -1,0 +1,19 @@
+== r8 (timing_probe.py 1 16384 2 r8 )
+flash_attn_bwd_mla_dkdv_kernel                   kernel_id  425 n   39 median    33.414 ms scratch 188
+flash_attn_dualwave_swp_gfx950_kernel_0          kernel_id   30 n    2 median     9.681 ms scratch 48
+flash_attn_bwd_dqa16_kernel                      kernel_id  426 n   38 median     0.305 ms scratch 0
+void at::native::vectorized_elementwise_kernel<8 kernel_id  224 n   37 median     0.257 ms scratch 0
+flash_attn_bwd_odo_kernel                        kernel_id  247 n   38 median     0.154 ms scratch 0
+void at::native::vectorized_elementwise_kernel<8 kernel_id  290 n   38 median     0.121 ms scratch 0
+void at::native::(anonymous namespace)::distribu kernel_id    2 n    4 median     0.427 ms scratch 0
+== r8_r7 (timing_probe.py 1 16384 2 r8,r7 )
+flash_attn_bwd_mla_dkdv_kernel                   kernel_id  425 n   39 median    36.067 ms scratch 188
+flash_attn_bwd_mla_dkdv_kernel                   kernel_id  428 n   37 median    36.701 ms scratch 244
+flash_attn_dualwave_swp_gfx950_kernel_0          kernel_id   30 n    2 median     9.646 ms scratch 48
+void at::native::vectorized_elementwise_kernel<8 kernel_id  224 n   72 median     0.258 ms scratch 0
+flash_attn_bwd_dqa16_kernel                      kernel_id  426 n   38 median     0.304 ms scratch 0
+flash_attn_bwd_dqa16_kernel                      kernel_id  429 n   36 median     0.303 ms scratch 0
+void at::native::vectorized_elementwise_kernel<8 kernel_id  290 n   74 median     0.122 ms scratch 0
+flash_attn_bwd_odo_kernel                        kernel_id  247 n   38 median     0.155 ms scratch 0
+flash_attn_bwd_odo_kernel                        kernel_id  427 n   36 median     0.155 ms scratch 0
+void at::native::(anonymous namespace)::distribu kernel_id    2 n    4 median     0.433 ms scratch 0

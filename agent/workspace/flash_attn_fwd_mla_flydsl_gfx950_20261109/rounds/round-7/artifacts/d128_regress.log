@@ -1,0 +1,21 @@
+W1109 01:41:18.351000 19855 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1109 01:41:18.425000 19855 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 01:41:18.426000 19855 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 01:41:18.426000 19855 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 01:41:18.426000 19855 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 01:41:18.426000 19855 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 01:41:18.426000 19855 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+{"mode": "regress", "hq": 32, "hkv": 32, "b": 1, "s": 1024, "o_bitwise": true, "lse_bitwise": true, "o_maxdiff": 0.0}
+{"mode": "regress", "hq": 32, "hkv": 32, "b": 1, "s": 4096, "o_bitwise": true, "lse_bitwise": true, "o_maxdiff": 0.0}
+{"mode": "regress", "hq": 32, "hkv": 32, "b": 2, "s": 1024, "o_bitwise": true, "lse_bitwise": true, "o_maxdiff": 0.0}
+{"mode": "regress", "hq": 32, "hkv": 32, "b": 2, "s": 4096, "o_bitwise": true, "lse_bitwise": true, "o_maxdiff": 0.0}
+{"mode": "regress", "hq": 32, "hkv": 8, "b": 1, "s": 1024, "o_bitwise": true, "lse_bitwise": true, "o_maxdiff": 0.0}
+{"mode": "regress", "hq": 32, "hkv": 8, "b": 1, "s": 4096, "o_bitwise": true, "lse_bitwise": true, "o_maxdiff": 0.0}
+{"mode": "regress", "hq": 32, "hkv": 8, "b": 2, "s": 1024, "o_bitwise": true, "lse_bitwise": true, "o_maxdiff": 0.0}
+{"mode": "regress", "hq": 32, "hkv": 8, "b": 2, "s": 4096, "o_bitwise": true, "lse_bitwise": true, "o_maxdiff": 0.0}
+{"mode": "regress", "hq": 64, "hkv": 8, "b": 1, "s": 1024, "o_bitwise": true, "lse_bitwise": true, "o_maxdiff": 0.0}
+{"mode": "regress", "hq": 64, "hkv": 8, "b": 1, "s": 4096, "o_bitwise": true, "lse_bitwise": true, "o_maxdiff": 0.0}
+{"mode": "regress", "hq": 64, "hkv": 8, "b": 2, "s": 1024, "o_bitwise": true, "lse_bitwise": true, "o_maxdiff": 0.0}
+{"mode": "regress", "hq": 64, "hkv": 8, "b": 2, "s": 4096, "o_bitwise": true, "lse_bitwise": true, "o_maxdiff": 0.0}

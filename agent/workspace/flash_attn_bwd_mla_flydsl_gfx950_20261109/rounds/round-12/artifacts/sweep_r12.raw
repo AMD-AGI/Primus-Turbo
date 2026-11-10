@@ -1,0 +1,15 @@
+round 0 r9 default (kv_order 0): 2x4096 5.196 1x8192 9.031 1x16384 33.260
+round 0 kv_order=1 zigzag: 2x4096 6.436 1x8192 11.135 1x16384 44.211
+round 0 kv_order=2 tile-major: 2x4096 5.477 1x8192 9.161 1x16384 34.111
+round 1 kv_order=1 zigzag: 2x4096 6.443 1x8192 11.148 1x16384 44.286
+round 1 kv_order=2 tile-major: 2x4096 5.483 1x8192 9.156 1x16384 34.108
+round 1 r9 default (kv_order 0): 2x4096 5.206 1x8192 9.050 1x16384 33.330
+round 2 kv_order=2 tile-major: 2x4096 5.465 1x8192 9.215 1x16384 34.211
+round 2 r9 default (kv_order 0): 2x4096 5.213 1x8192 9.042 1x16384 33.360
+round 2 kv_order=1 zigzag: 2x4096 6.441 1x8192 11.134 1x16384 44.380
+
+config                        B2S4096 ms      d%    B1S8192 ms      d%   B1S16384 ms      d%   gm d%  snr dq/dk/dv
+r9 default (kv_order 0)            5.206   +0.00         9.042   +0.00        33.330   +0.00   +0.00  47.00/49.74/51.28
+kv_order=1 zigzag                  6.441  -19.18        11.135  -18.80        44.286  -24.74  -20.95  47.01/49.74/51.28
+kv_order=2 tile-major              5.477   -4.95         9.161   -1.30        34.111   -2.29   -2.86  46.92/49.74/51.28
+EXIT 0

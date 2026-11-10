@@ -1,0 +1,6 @@
+B1 S4096: 10/10 bitwise equal to round-7
+B1 S16384: 10/10 bitwise equal to round-7
+B2 S4096: 10/10 bitwise equal to round-7
+B1 S65536: 10/10 bitwise equal to round-7
+ALL BITWISE EQUAL
+BITWISE_EXIT=0

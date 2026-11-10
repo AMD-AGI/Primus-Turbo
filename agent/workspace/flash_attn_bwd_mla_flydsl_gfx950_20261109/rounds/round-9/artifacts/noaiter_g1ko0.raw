@@ -1,0 +1,20 @@
+W1109 17:29:23.337000 37760 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1109 17:29:23.408000 37760 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 17:29:23.409000 37760 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 17:29:23.409000 37760 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 17:29:23.409000 37760 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 17:29:23.409000 37760 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 17:29:23.409000 37760 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+overrides: {}
+b1_s4k   PASS bwd   633.9 +-  1.6 (   2.819 ms) aiter     nan r nan | step   712.0 aiter     nan r nan | snr 47.02/49.57/51.21 aiter nan/nan/nan rep True
+b1_s8k   PASS bwd   788.2 +-  1.3 (   9.069 ms) aiter     nan r nan | step   867.6 aiter     nan r nan | snr 46.01/49.54/51.27 aiter nan/nan/nan rep True
+b1_s16k  PASS bwd   857.2 +-  0.8 (  33.352 ms) aiter     nan r nan | step   940.1 aiter     nan r nan | snr 45.01/49.66/51.08 aiter nan/nan/nan rep True
+b1_s32k  PASS bwd   891.7 +-  0.2 ( 128.239 ms) aiter     nan r nan | step   979.2 aiter     nan r nan | snr 45.08/49.62/51.16 aiter nan/nan/nan rep True
+b1_s64k  PASS bwd   892.7 +-  0.5 ( 512.368 ms) aiter     nan r nan | step   984.8 aiter     nan r nan | snr 44.68/49.59/51.16 aiter nan/nan/nan rep True
+b2_s4k   PASS bwd   682.1 +-  1.1 (   5.240 ms) aiter     nan r nan | step   756.0 aiter     nan r nan | snr 46.98/49.66/51.38 aiter nan/nan/nan rep True
+b2_s16k  PASS bwd   867.7 +-  0.4 (  65.894 ms) aiter     nan r nan | step   950.0 aiter     nan r nan | snr 44.87/49.54/51.31 aiter nan/nan/nan rep True
+Geomean Step TFLOPS: 878.00
+Geomean Bwd TFLOPS: 795.61
+Summary CSV: /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/rounds/round-9/artifacts/noaiter_g1ko0.csv

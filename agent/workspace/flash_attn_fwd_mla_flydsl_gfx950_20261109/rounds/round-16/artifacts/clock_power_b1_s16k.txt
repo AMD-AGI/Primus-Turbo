@@ -1,0 +1,24 @@
+r15 gfx0 1930 MHz power 1380 W
+r15 gfx0 1929 MHz power 1383 W
+r15 gfx0 1927 MHz power 1384 W
+r15 gfx0 1927 MHz power 1385 W
+r15 gfx0 1927 MHz power 1386 W
+r15 r7 /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_fwd_mla_flydsl_gfx950_20261109/profiles/pkg_r15 calls 1640 ms/call 8.5845 TFLOPS 1280.8
+r16 gfx0 2040 MHz power 1367 W
+r16 gfx0 2036 MHz power 1360 W
+r16 gfx0 2029 MHz power 1353 W
+r16 gfx0 2026 MHz power 1356 W
+r16 gfx0 2032 MHz power 1356 W
+r16 r7 /perf_apps/xiaoming/megaattention_overlap_bench calls 1640 ms/call 8.5392 TFLOPS 1287.6
+r15 gfx0 1931 MHz power 1374 W
+r15 gfx0 1933 MHz power 1371 W
+r15 gfx0 1930 MHz power 1382 W
+r15 gfx0 1930 MHz power 1381 W
+r15 gfx0 1929 MHz power 1382 W
+r15 r7 /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_fwd_mla_flydsl_gfx950_20261109/profiles/pkg_r15 calls 1640 ms/call 8.6278 TFLOPS 1274.4
+r16 gfx0 2029 MHz power 1354 W
+r16 gfx0 2029 MHz power 1360 W
+r16 gfx0 2027 MHz power 1353 W
+r16 gfx0 2034 MHz power 1360 W
+r16 gfx0 2025 MHz power 1349 W
+r16 r7 /perf_apps/xiaoming/megaattention_overlap_bench calls 1640 ms/call 8.5593 TFLOPS 1284.6

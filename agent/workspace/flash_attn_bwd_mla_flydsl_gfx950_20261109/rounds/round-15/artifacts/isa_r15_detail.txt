@@ -1,0 +1,21 @@
+== isa_r15/c00 md5 67d9a2343c s_cbranch 13 v_rcp 6
+hot loop lines 2163-3046, 877 instructions: {'s': 256, 'a': 33, 'V': 164, 'w': 49, 'b': 2, 'W': 10, 'G': 8, 'R': 148, 'M': 156, 'L': 3, 'n': 12, 'E': 24, 'A': 12}
+MFMAs 156; gaps of 0 instructions between consecutive MFMAs: 54; <=1: 88; <=2: 99
+== isa_r15/c01 md5 12c38633da s_cbranch 9 v_rcp 2
+hot loop lines 2581-3310, 729 instructions: {'s': 23, 'V': 110, 'a': 108, 'w': 85, 'b': 2, 'W': 10, 'G': 8, 'L': 35, 'R': 148, 'M': 156, 'n': 8, 'E': 24, 'A': 12}
+MFMAs 156; gaps of 0 instructions between consecutive MFMAs: 56; <=1: 88; <=2: 104
+== isa_r15/c02 md5 e19102efc4 s_cbranch 9 v_rcp 2
+hot loop lines 2668-3386, 714 instructions: {'s': 23, 'V': 110, 'w': 83, 'b': 2, 'W': 10, 'G': 8, 'a': 96, 'L': 34, 'R': 148, 'M': 156, 'n': 8, 'E': 24, 'A': 12}
+MFMAs 156; gaps of 0 instructions between consecutive MFMAs: 55; <=1: 86; <=2: 105
+== isa_r15/c03 md5 a692185f34 s_cbranch 9 v_rcp 2
+hot loop lines 2628-3356, 720 instructions: {'s': 29, 'V': 110, 'w': 83, 'b': 2, 'W': 10, 'G': 8, 'a': 96, 'L': 34, 'R': 148, 'M': 156, 'n': 8, 'E': 24, 'A': 12}
+MFMAs 156; gaps of 0 instructions between consecutive MFMAs: 56; <=1: 87; <=2: 105
+== isa_r15/c04 md5 76a9a3033d s_cbranch 10 v_rcp 2
+hot loop lines 2349-3057, 708 instructions: {'s': 11, 'V': 105, 'S': 2, 'w': 84, 'a': 112, 'b': 2, 'W': 10, 'G': 8, 'L': 29, 'R': 148, 'M': 156, 'n': 5, 'E': 24, 'A': 12}
+MFMAs 156; gaps of 0 instructions between consecutive MFMAs: 45; <=1: 77; <=2: 89
+== isa_r15b/c01 md5 31241cd471 s_cbranch 9 v_rcp 3
+hot loop lines 2499-3152, 653 instructions: {'s': 43, 'w': 66, 'V': 109, 'S': 2, 'b': 2, 'W': 10, 'G': 8, 'a': 40, 'L': 28, 'R': 148, 'M': 156, 'n': 5, 'E': 24, 'A': 12}
+MFMAs 156; gaps of 0 instructions between consecutive MFMAs: 53; <=1: 79; <=2: 98
+== isa_r15b/c02 md5 9aff03ccb5 s_cbranch 13 v_rcp 2
+hot loop lines 2173-2779, 600 instructions: {'s': 25, 'a': 36, 'V': 130, 'w': 42, 'b': 2, 'W': 10, 'G': 8, 'R': 148, 'M': 156, 'L': 3, 'n': 4, 'E': 24, 'A': 12}
+MFMAs 156; gaps of 0 instructions between consecutive MFMAs: 52; <=1: 85; <=2: 92

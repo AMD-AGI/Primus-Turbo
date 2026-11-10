@@ -1,0 +1,32 @@
+W1109 16:38:25.472000 23840 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1109 16:38:25.541000 23840 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:38:25.541000 23840 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 16:38:25.541000 23840 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:38:25.541000 23840 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 16:38:25.541000 23840 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:38:25.541000 23840 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+overrides: {'g2d': 2, 'g3_sb': 1}
+[aiter] import [module_aiter_core] under /opt/venv/lib/python3.12/site-packages/aiter/jit/module_aiter_core.so
+[aiter] import [module_fmha_fwd_bf16_opus] under /opt/venv/lib/python3.12/site-packages/aiter/jit/module_fmha_fwd_bf16_opus.so
+[aiter] import [module_fmha_v3_bwd] under /opt/venv/lib/python3.12/site-packages/aiter/jit/module_fmha_v3_bwd.so
+[aiter] type hints mismatch, override to --> fmha_v3_bwd(dout: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor, softmax_lse: torch.Tensor, dropout_p: float, softmax_scale: float, is_causal: bool, window_size_left: int, window_size_right: int, deterministic: bool, is_v3_atomic_fp32: bool, how_v3_bf16_cvt: int, dq: Optional[torch.Tensor] = None, dk: Optional[torch.Tensor] = None, dv: Optional[torch.Tensor] = None, alibi_slopes: Optional[torch.Tensor] = None, rng_state: Optional[torch.Tensor] = None, gen: Optional[torch.Generator] = None) -> List[torch.Tensor]
+[aiter] LoadKernel: _ZN5aiter23fmha_bwd_hd128_odo_bf16E hsaco: /opt/venv/lib/python3.12/site-packages/aiter_meta/hsa//gfx950/fmha_v3_bwd/bwd_hd128_odo_bf16.co
+[aiter] LoadKernel: _ZN5aiter42fmha_bwd_hd192_128_bf16_causal_br_a16_psskE hsaco: /opt/venv/lib/python3.12/site-packages/aiter_meta/hsa//gfx950/fmha_v3_bwd/bwd_hd192_128_bf16_causal_br_a16_pssk.co
+[aiter] LoadKernel: _ZN5aiter25fmha_bwd_hd192_dq_shuffleE hsaco: /opt/venv/lib/python3.12/site-packages/aiter_meta/hsa//gfx950/fmha_v3_bwd/bwd_hd192_dq_shuffle.co
+b1_s4k   PASS bwd   627.9 +-  0.6 (   2.846 ms) aiter   807.7 r 0.777 | step   706.6 aiter   864.4 r 0.817 | snr 47.02/49.57/51.21 aiter 49.09/52.17/52.60 rep True
+b1_s8k   PASS bwd   707.8 +-  0.7 (  10.099 ms) aiter   910.8 r 0.777 | step   795.9 aiter   974.8 r 0.817 | snr 46.01/49.54/51.27 aiter 47.58/52.20/52.81 rep True
+b1_s16k  PASS bwd   764.4 +-  0.7 (  37.402 ms) aiter   960.6 r 0.796 | step   858.0 aiter  1030.7 r 0.832 | snr 45.01/49.66/51.08 aiter 46.23/52.51/52.60 rep True
+b1_s32k  PASS bwd   795.6 +-  1.3 ( 143.736 ms) aiter  1012.9 r 0.785 | step   893.5 aiter  1083.7 r 0.825 | snr 45.08/49.62/51.16 aiter 44.03/52.38/52.65 rep True
+b1_s64k  PASS bwd   795.8 +-  0.7 ( 574.774 ms) aiter  1032.2 r 0.771 | step   897.2 aiter  1102.9 r 0.813 | snr 44.68/49.59/51.16 aiter 41.96/52.48/52.65 rep True
+b2_s4k   PASS bwd   631.6 +-  0.5 (   5.659 ms) aiter   834.2 r 0.757 | step   710.6 aiter   890.3 r 0.798 | snr 46.98/49.66/51.38 aiter 49.02/52.24/52.86 rep True
+b2_s16k  PASS bwd   751.6 +-  0.6 (  76.078 ms) aiter   984.4 r 0.763 | step   846.6 aiter  1049.8 r 0.806 | snr 44.87/49.54/51.31 aiter 46.05/52.27/52.75 rep True
+Geomean Step TFLOPS: 811.97
+Geomean Bwd TFLOPS: 721.82
+Geomean aiter Step TFLOPS: 995.69
+Geomean aiter Bwd TFLOPS: 931.11
+Geomean step ratio vs aiter: 0.8155
+Geomean bwd ratio vs aiter: 0.7752
+Summary CSV: /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/rounds/round-8/artifacts/aba_r7b.csv
+EXIT 0

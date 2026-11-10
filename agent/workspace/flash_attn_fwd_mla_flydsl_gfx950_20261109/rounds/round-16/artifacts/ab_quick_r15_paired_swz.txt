@@ -1,0 +1,45 @@
+r15 r1 b1_s4k PASS 1086.3
+r15 r1 b1_s16k PASS 1284.4
+r15 r1 b1_s64k PASS 1325.5
+r15 r1 b2_s4k PASS 1070.6
+r15 r1 geomean 1186.20
+paired r1 b1_s4k PASS 1073.2
+paired r1 b1_s16k PASS 1286.4
+paired r1 b1_s64k PASS 1354.2
+paired r1 b2_s4k PASS 1059.5
+paired r1 geomean 1186.37
+swz r1 b1_s4k PASS 1080.5
+swz r1 b1_s16k PASS 1295.4
+swz r1 b1_s64k PASS 1363.6
+swz r1 b2_s4k PASS 1067.3
+swz r1 geomean 1194.67
+r15 r2 b1_s4k PASS 1083.2
+r15 r2 b1_s16k PASS 1283.4
+r15 r2 b1_s64k PASS 1325.2
+r15 r2 b2_s4k PASS 1067.2
+r15 r2 geomean 1184.14
+paired r2 b1_s4k PASS 1069.2
+paired r2 b1_s16k PASS 1281.4
+paired r2 b1_s64k PASS 1350.9
+paired r2 b2_s4k PASS 1059.7
+paired r2 geomean 1183.40
+swz r2 b1_s4k PASS 1079.1
+swz r2 b1_s16k PASS 1292.3
+swz r2 b1_s64k PASS 1359.0
+swz r2 b2_s4k PASS 1066.1
+swz r2 geomean 1192.25
+r15 r3 b1_s4k PASS 1076.1
+r15 r3 b1_s16k PASS 1280.7
+r15 r3 b1_s64k PASS 1324.8
+r15 r3 b2_s4k PASS 1065.1
+r15 r3 geomean 1180.90
+paired r3 b1_s4k PASS 1067.2
+paired r3 b1_s16k PASS 1283.1
+paired r3 b1_s64k PASS 1348.9
+paired r3 b2_s4k PASS 1056.8
+paired r3 geomean 1182.01
+swz r3 b1_s4k PASS 1075.1
+swz r3 b1_s16k PASS 1285.4
+swz r3 b1_s64k PASS 1358.5
+swz r3 b2_s4k PASS 1065.1
+swz r3 geomean 1189.12

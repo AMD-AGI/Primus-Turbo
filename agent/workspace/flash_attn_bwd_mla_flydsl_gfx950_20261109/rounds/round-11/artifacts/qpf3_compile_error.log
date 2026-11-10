@@ -1,0 +1,85 @@
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0
+[flydsl.compile] dump 00_origin -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_rocdl_expand_ops -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/03_fly_rocdl_expand_ops.mlir
+[flydsl.compile] dump 04_fly_layout_lowering -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/04_fly_layout_lowering.mlir
+[flydsl.compile] dump 05_fly_int_swizzle_simplify -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/05_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 06_canonicalize -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/06_canonicalize.mlir
+[flydsl.compile] dump 07_fly_convert_atom_call_to_ssa_form -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/07_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 08_fly_promote_regmem_to_vectorssa -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/08_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 09_convert_fly_to_rocdl -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/09_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 10_canonicalize -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/10_canonicalize.mlir
+[flydsl.compile] dump 11_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/11_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 12_rocdl_attach_target -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/12_rocdl_attach_target.mlir
+[flydsl.compile] dump 13_convert_scf_to_cf -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/13_convert_scf_to_cf.mlir
+[flydsl.compile] dump 14_convert_cf_to_llvm -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/14_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 15_gpu_to_llvm -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/15_gpu_to_llvm.mlir
+[flydsl.compile] dump 16_convert_vector_to_llvm -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/16_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 17_convert_arith_to_llvm -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/17_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 18_convert_func_to_llvm -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/18_convert_func_to_llvm.mlir
+[flydsl.compile] dump 19_reconcile_unrealized_casts -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/19_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 20_gpu_module_to_binary -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/20_gpu_module_to_binary.mlir
+[flydsl.compile] dump 21_llvm_ir -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/21_llvm_ir.ll
+[flydsl.compile] dump 22_final_isa -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_dualwave_swp_gfx950_kernel_0/22_final_isa.s
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel
+[flydsl.compile] dump 00_origin -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_rocdl_expand_ops -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/03_fly_rocdl_expand_ops.mlir
+[flydsl.compile] dump 04_fly_layout_lowering -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/04_fly_layout_lowering.mlir
+[flydsl.compile] dump 05_fly_int_swizzle_simplify -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/05_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 06_canonicalize -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/06_canonicalize.mlir
+[flydsl.compile] dump 07_fly_convert_atom_call_to_ssa_form -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/07_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 08_fly_promote_regmem_to_vectorssa -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/08_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 09_convert_fly_to_rocdl -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/09_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 10_canonicalize -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/10_canonicalize.mlir
+[flydsl.compile] dump 11_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/11_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 12_rocdl_attach_target -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/12_rocdl_attach_target.mlir
+[flydsl.compile] dump 13_convert_scf_to_cf -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/13_convert_scf_to_cf.mlir
+[flydsl.compile] dump 14_convert_cf_to_llvm -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/14_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 15_gpu_to_llvm -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/15_gpu_to_llvm.mlir
+[flydsl.compile] dump 16_convert_vector_to_llvm -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/16_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 17_convert_arith_to_llvm -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/17_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 18_convert_func_to_llvm -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/18_convert_func_to_llvm.mlir
+[flydsl.compile] dump 19_reconcile_unrealized_casts -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/19_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 20_gpu_module_to_binary -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/20_gpu_module_to_binary.mlir
+[flydsl.compile] dump 21_llvm_ir -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/21_llvm_ir.ll
+[flydsl.compile] dump 22_final_isa -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_odo_kernel/22_final_isa.s
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel
+[flydsl.compile] dump 00_origin -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_rocdl_expand_ops -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/03_fly_rocdl_expand_ops.mlir
+[flydsl.compile] dump 04_fly_layout_lowering -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/04_fly_layout_lowering.mlir
+[flydsl.compile] dump 05_fly_int_swizzle_simplify -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/05_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 06_canonicalize -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/06_canonicalize.mlir
+[flydsl.compile] dump 07_fly_convert_atom_call_to_ssa_form -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/07_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 08_fly_promote_regmem_to_vectorssa -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/08_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 09_convert_fly_to_rocdl -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/09_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 10_canonicalize -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/10_canonicalize.mlir
+[flydsl.compile] dump 11_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/11_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 12_rocdl_attach_target -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/12_rocdl_attach_target.mlir
+[flydsl.compile] dump 13_convert_scf_to_cf -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/13_convert_scf_to_cf.mlir
+[flydsl.compile] dump 14_convert_cf_to_llvm -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/14_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 15_gpu_to_llvm -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/15_gpu_to_llvm.mlir
+[flydsl.compile] dump 16_convert_vector_to_llvm -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/16_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 17_convert_arith_to_llvm -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/17_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 18_convert_func_to_llvm -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/18_convert_func_to_llvm.mlir
+[flydsl.compile] dump 19_reconcile_unrealized_casts -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/19_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 20_gpu_module_to_binary -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/20_gpu_module_to_binary.mlir
+[flydsl.compile] dump 21_llvm_ir -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/21_llvm_ir.ll
+[flydsl.compile] dump 22_final_isa -> /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_r11/qpf3/flash_attn_bwd_lset_kernel/22_final_isa.s
+Traceback (most recent call last):
+  File "/perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/isa_dump_bwd.py", line 22, in <module>
+    mla_bwd_sbhd(do, q, k, v, o, lse, **over)
+  File "/perf_apps/xiaoming/megaattention_overlap_bench/flydsl_mla/ops_bwd.py", line 119, in mla_bwd_sbhd
+    dkdv(*args, B, Sq, Skv, 0, st)
+  File "/perf_apps/xiaoming/megaattention_overlap_bench/flydsl_mla/flash_attn_bwd_mla.py", line 4523, in _launch
+    return _cached_launch(_compiled, launch_flash_attn_bwd_dkdv, _hints, args, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/perf_apps/xiaoming/megaattention_overlap_bench/flydsl_mla/flash_attn_bwd_mla.py", line 222, in _cached_launch
+    fn = flyc.compile(jit_fn, *args)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+----------------------------------------
+DSLCompileError: operand #61 does not dominate this use

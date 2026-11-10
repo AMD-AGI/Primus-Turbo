@@ -1,0 +1,14 @@
+r9 default                                                 98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 4 | hot loop: scratch_load 3 vmcnt(0) 2
+exhaustive-register-search=True                            98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 4 | hot loop: scratch_load 3 vmcnt(0) 2
+amdgpu-use-amdgpu-trackers=True                            66 scratch 268 B | masked loop: scratch_load 9 vmcnt(0) 1 | hot loop: scratch_load 8 vmcnt(0) 1
+amdgpu-disable-unclustered-high-rp-reschedule=True         98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 4 | hot loop: scratch_load 4 vmcnt(0) 1
+amdgpu-disable-clustered-low-occupancy-reschedule=True     98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 4 | hot loop: scratch_load 3 vmcnt(0) 2
+amdgpu-schedule-relaxed-occupancy=True                     98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 4 | hot loop: scratch_load 3 vmcnt(0) 2
+greedy-reverse-local-assignment=True                       137 scratch 540 B | masked loop: scratch_load 41 vmcnt(0) 22 | hot loop: scratch_load 20 vmcnt(0) 16
+enable-local-reassign=True                                 98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 4 | hot loop: scratch_load 3 vmcnt(0) 2
+greedy-regclass-priority-trumps-globalness=True            98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2
+amdgpu-disable-rewrite-mfma-form-sched-stage=False         98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 4 | hot loop: scratch_load 3 vmcnt(0) 2
+amdgpu-schedule-metric-bias=0                              98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 4 | hot loop: scratch_load 3 vmcnt(0) 2
+amdgpu-schedule-metric-bias=100                            98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 4 | hot loop: scratch_load 3 vmcnt(0) 2
+amdgpu-sched-strategy=max-memory-clause                    104 scratch 420 B | masked loop: scratch_load 18 vmcnt(0) 5 | hot loop: scratch_load 5 vmcnt(0) 4
+amdgpu-sched-strategy=max-ilp                              140 scratch 536 B | masked loop: scratch_load 34 vmcnt(0) 13 | hot loop: scratch_load 20 vmcnt(0) 18

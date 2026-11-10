@@ -1,0 +1,9 @@
+(32, 16, 8): bijective for nq 1..400, heads/XCD 1, 2, 8, 16
+(16, 8): bijective for nq 1..400, heads/XCD 1, 2, 8, 16
+(16,): bijective for nq 1..400, heads/XCD 1, 2, 8, 16
+sections per launch (BLOCK_M 256):
+  S4K nq 16: (32,16,8) G8x1 tail8 | (16,8) G8x1 tail8
+  S8K nq 32: (32,16,8) G16x1 G8x1 tail8 | (16,8) G16x1 G8x1 tail8
+  S16K nq 64: (32,16,8) G32x1 G16x1 G8x1 tail8 | (16,8) G16x3 G8x1 tail8
+  S32K nq 128: (32,16,8) G32x3 G16x1 G8x1 tail8 | (16,8) G16x7 G8x1 tail8
+  S64K nq 256: (32,16,8) G32x7 G16x1 G8x1 tail8 | (16,8) G16x15 G8x1 tail8

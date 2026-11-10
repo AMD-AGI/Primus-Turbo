@@ -1,0 +1,19 @@
+round 0 r9 default: 2x4096 5.201 1x8192 9.034 1x16384 33.199
+round 0 no-unclustered-resched: 2x4096 5.093 1x8192 8.923 1x16384 33.064
+round 0 regclass-priority: 2x4096 5.138 1x8192 8.975 1x16384 32.891
+round 0 no-unclustered+regclass: 2x4096 5.089 1x8192 8.864 1x16384 32.611
+round 1 no-unclustered-resched: 2x4096 5.088 1x8192 8.942 1x16384 33.142
+round 1 regclass-priority: 2x4096 5.125 1x8192 8.931 1x16384 32.912
+round 1 no-unclustered+regclass: 2x4096 5.096 1x8192 8.867 1x16384 32.654
+round 1 r9 default: 2x4096 5.204 1x8192 9.037 1x16384 33.279
+round 2 regclass-priority: 2x4096 5.130 1x8192 8.965 1x16384 32.968
+round 2 no-unclustered+regclass: 2x4096 5.096 1x8192 8.857 1x16384 32.631
+round 2 r9 default: 2x4096 5.204 1x8192 9.043 1x16384 33.298
+round 2 no-unclustered-resched: 2x4096 5.092 1x8192 8.934 1x16384 33.110
+
+config                        B2S4096 ms      d%    B1S8192 ms      d%   B1S16384 ms      d%   gm d%  snr dq/dk/dv
+r9 default                         5.204   +0.00         9.037   +0.00        33.279   +0.00   +0.00  47.01/49.74/51.28
+no-unclustered-resched             5.092   +2.20         8.934   +1.16        33.110   +0.51   +1.29  47.01/49.74/51.28
+regclass-priority                  5.130   +1.43         8.965   +0.80        32.912   +1.12   +1.12  47.01/49.74/51.28
+no-unclustered+regclass            5.096   +2.11         8.864   +1.96        32.631   +1.99   +2.02  47.00/49.74/51.28
+EXIT 0

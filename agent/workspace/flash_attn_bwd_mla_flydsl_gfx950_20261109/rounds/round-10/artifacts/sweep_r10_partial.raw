@@ -1,0 +1,5 @@
+round 0 r9 default: 2x4096 5.189 1x16384 33.264
+round 0 k_reg=False: 2x4096 8.250 1x16384 55.611
+round 0 k_reg=False ks_outer: 2x4096 8.665 1x16384 63.477
+round 0 k_reg=False g2d=2: 2x4096 9.281 1x16384 62.306
+KILLED in round 1 (k_reg=False recompile after source edit, >6 min CPU)

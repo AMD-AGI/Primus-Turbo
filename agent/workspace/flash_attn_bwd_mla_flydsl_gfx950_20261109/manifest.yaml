@@ -1,0 +1,36 @@
+target_op: flash_attn_bwd_mla_192_128
+target_backend: FLYDSL
+target_lang: FLYDSL
+target_gpu: gfx950
+execution_mode: workspace
+project_skill: primus-turbo-develop
+performance_target: "same-GPU Step TFLOPS ratio vs Turbo AITER (a16 dQ, as Primus training runs it) >= 1.0 (geomean over target_shapes)"
+primary_metric: >-
+  Step TFLOPS = (fwd FLOPs + bwd FLOPs) / (fwd ms + bwd ms) per PASS shape, geomean over PASS shapes.
+  fwd = 2*(dqk+dv) and bwd = 2*(3*dqk+2*dv) FLOPs per causal (q, k) pair. This is inverse step time;
+  the GEMM form 6/(2/Fwd + 4/Bwd) assumes bwd = 2x fwd FLOPs, which attention does not have (2.6x here).
+  Fwd is the round-20 forward of the forward campaign and is not changed by this campaign.
+target_shapes: >-
+  DSV3 MLA, Hq = Hkv = 128, d_qk 192, d_v 128, causal, sbhd bf16:
+  B1 S 4K/8K/16K/32K/64K, B2 S 4K/16K
+kernel_source:
+  - /perf_apps/xiaoming/megaattention_overlap_bench/flydsl_mla/flash_attn_bwd_mla.py
+  - /perf_apps/xiaoming/megaattention_overlap_bench/flydsl_mla/ops_bwd.py
+reference: "Turbo AITER backward with PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32=0 (fmha_bwd_hd192_128_bf16_causal_br_a16_pssk)"
+test_command: >-
+  HIP_VISIBLE_DEVICES=0 python <campaign_dir>/quick_test_bench.py --set full
+  (Check: dq/dk/dv SNR > 40 dB vs chunked fp32 reference on (batch, head) in {0, B-1} x {0, 77, 127},
+  finite on full tensors, dK/dV bitwise repeat)
+benchmark_command: "HIP_VISIBLE_DEVICES=0 python <campaign_dir>/quick_test_bench.py --set full --summary-csv <round_dir>/artifacts/benchmark_full.csv"
+quick_command: "HIP_VISIBLE_DEVICES=0 python <campaign_dir>/quick_test_bench.py --set quick --summary-csv <round_dir>/artifacts/benchmark.csv"
+representative_shapes: [b1_s4k, b1_s16k, b1_s64k, b2_s4k]
+rebuild: "none (FlyDSL JIT; cache_tag / source hash pick up edits)"
+run_env: "ssh smci355-ccs-aus-n02-29, docker exec xiaoming-dev bash -lc '...'; GPU 0 pinned for every round"
+constraints:
+  - "Do not modify existing Primus-Turbo / Megatron / Primus kernels; work only in megaattention_overlap_bench/flydsl_mla/"
+  - "No git commit without explicit instruction"
+  - "D128 regression (dev/d128_regress.py) must stay bitwise vs Turbo for any change in the shared builder code"
+git_commit: false
+git_branch: none
+max_iterations: null
+created: 2026-11-09 22:20

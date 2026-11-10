@@ -1,0 +1,9 @@
+pre floats    0 localSizeBytes    0: r8 B1 S16K   34.482 ms ['34.48', '34.43', '34.50', '34.48']
+pre floats   40 localSizeBytes  176: r8 B1 S16K   34.218 ms ['34.22', '34.19', '34.22', '34.27']
+pre floats   61 localSizeBytes  256: r8 B1 S16K   36.845 ms ['36.71', '36.83', '36.95', '36.86']
+pre floats   64 localSizeBytes  272: r8 B1 S16K   34.473 ms ['34.42', '34.57', '34.47', '34.48']
+pre floats   75 localSizeBytes  304: r8 B1 S16K   34.346 ms ['34.32', '34.32', '34.40', '34.37']
+pre floats   96 localSizeBytes  400: r8 B1 S16K   34.358 ms ['34.37', '34.35', '34.37', '34.35']
+pre floats  128 localSizeBytes  528: r8 B1 S16K   34.413 ms ['34.37', '34.42', '34.41', '34.43']
+pre floats    0 localSizeBytes    0: r8 B1 S16K   34.295 ms ['34.30', '34.29', '34.27', '34.31']
+EXIT 0

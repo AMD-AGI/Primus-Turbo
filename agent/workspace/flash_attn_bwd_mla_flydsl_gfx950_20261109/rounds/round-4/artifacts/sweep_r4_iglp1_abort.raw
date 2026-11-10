@@ -1,0 +1,29 @@
+W1109 14:59:05.588000 10695 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1109 14:59:05.657000 10695 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 14:59:05.658000 10695 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 14:59:05.658000 10695 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 14:59:05.658000 10695 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 14:59:05.658000 10695 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 14:59:05.658000 10695 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+default: ok=True snr=['46.42', '49.74', '51.28']
+g2d=1: ok=True snr=['46.42', '49.74', '51.28']
+g2d=3: ok=True snr=['46.41', '49.74', '51.28']
+g2d=4: ok=True snr=['46.42', '49.74', '51.28']
+g3d=1: ok=True snr=['46.42', '49.74', '51.28']
+g3d=2: ok=True snr=['46.42', '49.74', '51.28']
+g3d=3: ok=True snr=['46.42', '49.74', '51.28']
+mfma_tie=1: ok=True snr=['46.42', '49.74', '51.28']
+mfma_tie=2: ok=True snr=['46.41', '49.74', '51.28']
+g3_dbat=6: ok=True snr=['46.42', '49.74', '51.28']
+g3_st_at=-1: ok=True snr=['46.41', '49.74', '51.28']
+g3_st_at=1: ok=True snr=['46.43', '49.74', '51.28']
+g3_st_at=2: ok=True snr=['46.42', '49.74', '51.28']
+g3_st_n=2: ok=True snr=['46.42', '49.74', '51.28']
+g3_st_n=3: ok=True snr=['46.42', '49.74', '51.28']
+g3_sb=0: ok=True snr=['46.42', '49.74', '51.28']
+iglp=0: ok=True snr=['46.41', '49.74', '51.28']
+python: /llvm-project/llvm/lib/Target/AMDGPU/AMDGPUIGroupLP.cpp:2220: virtual bool {anonymous}::MFMASmallGemmSingleWaveOpt::applyIGLPStrategy(llvm::DenseMap<int, llvm::DenseMap<llvm::SUnit*, llvm::SmallVector<int, 4> > >&, llvm::DenseMap<int, llvm::SmallVector<{anonymous}::SchedGroup, 4> >&, llvm::AMDGPU::SchedulingPhase): Assertion `(!IsInitial || (DSWCount == 0 && DSWWithPermCount == 0 && DSWWithSharedVMEMCount == 0)) && "DSWCounters should be zero in pre-RA scheduling!"' failed.
+timeout: the monitored command dumped core
+EXIT 134

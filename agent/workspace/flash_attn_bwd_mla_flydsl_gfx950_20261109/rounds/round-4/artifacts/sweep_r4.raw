@@ -1,0 +1,62 @@
+W1109 15:04:59.647000 12024 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1109 15:04:59.715000 12024 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 15:04:59.715000 12024 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 15:04:59.715000 12024 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 15:04:59.715000 12024 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 15:04:59.715000 12024 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 15:04:59.715000 12024 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+default: ok=True snr=['46.42', '49.74', '51.28']
+g2d=1: ok=True snr=['46.42', '49.74', '51.28']
+g2d=3: ok=True snr=['46.42', '49.74', '51.28']
+g2d=4: ok=True snr=['46.42', '49.74', '51.28']
+g3d=1: ok=True snr=['46.42', '49.74', '51.28']
+g3d=2: ok=True snr=['46.42', '49.74', '51.28']
+g3d=3: ok=True snr=['46.42', '49.74', '51.28']
+mfma_tie=1: ok=True snr=['46.42', '49.74', '51.28']
+mfma_tie=2: ok=True snr=['46.42', '49.74', '51.28']
+g3_dbat=6: ok=True snr=['46.41', '49.74', '51.28']
+g3_st_at=-1: ok=True snr=['46.43', '49.74', '51.28']
+g3_st_at=1: ok=True snr=['46.43', '49.74', '51.28']
+g3_st_at=2: ok=True snr=['46.42', '49.74', '51.28']
+g3_st_n=2: ok=True snr=['46.42', '49.74', '51.28']
+g3_st_n=3: ok=True snr=['46.43', '49.74', '51.28']
+g3_sb=0: ok=True snr=['46.42', '49.74', '51.28']
+iglp=0: ok=True snr=['46.42', '49.74', '51.28']
+iglp=3: ok=True snr=['46.42', '49.74', '51.28']
+block_q=16: BUILD/RUN FAIL AssertionError: BLOCK_Q must cover one GEMM2 K-step (>= 2 * N_TILE q rows)
+Traceback (most recent call last):
+  File "/perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/dev/sweep.py", line 50, in <module>
+    g = qb.mla_bwd_sbhd(do, q, k, v, o, lse, **over)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/perf_apps/xiaoming/megaattention_overlap_bench/flydsl_mla/ops_bwd.py", line 91, in mla_bwd_sbhd
+    dkdv, odo, dqa16 = _launchers(B, Sq, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, n_img, over)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: BLOCK_Q must cover one GEMM2 K-step (>= 2 * N_TILE q rows)
+block_q=16: ok=False snr=[]
+block_q=64: ok=True snr=['46.43', '49.74', '51.28']
+block_kv=64: ok=True snr=['45.07', '49.74', '51.28']
+
+config                    B2S4096 ms      d%   B1S16384 ms      d%   gm d%  snr dq/dk/dv
+default                        5.565   +0.00        40.163   +0.00   +0.00  46.42/49.74/51.28
+g2d=1                          5.550   +0.28        40.179   -0.04   +0.12  46.42/49.74/51.28
+g2d=3                          5.546   +0.35        40.209   -0.12   +0.12  46.42/49.74/51.28
+g2d=4                          5.544   +0.39        40.163   -0.00   +0.19  46.42/49.74/51.28
+g3d=1                          5.548   +0.32        40.209   -0.11   +0.10  46.42/49.74/51.28
+g3d=2                          5.561   +0.08        40.104   +0.15   +0.11  46.42/49.74/51.28
+g3d=3                          5.554   +0.20        40.150   +0.03   +0.11  46.42/49.74/51.28
+mfma_tie=1                     5.533   +0.59        40.126   +0.09   +0.34  46.42/49.74/51.28
+mfma_tie=2                     5.528   +0.67        40.143   +0.05   +0.36  46.42/49.74/51.28
+g3_dbat=6                      5.553   +0.22        40.199   -0.09   +0.06  46.41/49.74/51.28
+g3_st_at=-1                    5.678   -1.98        42.309   -5.07   -3.54  46.43/49.74/51.28
+g3_st_at=1                     5.572   -0.12        39.666   +1.25   +0.56  46.43/49.74/51.28
+g3_st_at=2                     5.653   -1.54        39.973   +0.48   -0.54  46.42/49.74/51.28
+g3_st_n=2                      5.558   +0.14        40.676   -1.26   -0.56  46.42/49.74/51.28
+g3_st_n=3                      5.642   -1.37        41.612   -3.48   -2.43  46.43/49.74/51.28
+g3_sb=0                        5.595   -0.54        39.946   +0.54   +0.00  46.42/49.74/51.28
+iglp=0                         5.586   -0.36        39.894   +0.67   +0.15  46.42/49.74/51.28
+iglp=3                         5.560   +0.10        40.152   +0.03   +0.06  46.42/49.74/51.28
+block_q=64                     7.746  -28.15        54.935  -26.89  -27.52  46.43/49.74/51.28
+block_kv=64                   10.535  -47.17        79.406  -49.42  -48.31  45.07/49.74/51.28
+EXIT 0

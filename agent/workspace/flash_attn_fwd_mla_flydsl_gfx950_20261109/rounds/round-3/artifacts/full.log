@@ -1,0 +1,23 @@
+W1109 01:03:22.537000 12388 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1109 01:03:22.620000 12388 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 01:03:22.620000 12388 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 01:03:22.620000 12388 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 01:03:22.620000 12388 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 01:03:22.620000 12388 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 01:03:22.620000 12388 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+[aiter] import [module_aiter_core] under /opt/venv/lib/python3.12/site-packages/aiter/jit/module_aiter_core.so
+[aiter] import [module_fmha_fwd_bf16_opus] under /opt/venv/lib/python3.12/site-packages/aiter/jit/module_fmha_fwd_bf16_opus.so
+b1_s4k     PASS  fwd    839.4 +-   2.1 aiter   1022.9 ratio 0.821 o_rel 0.0019 lse 0.0046
+b1_s8k     PASS  fwd    949.0 +-   0.5 aiter   1146.0 ratio 0.828 o_rel 0.0018 lse 0.0048
+b1_s16k    PASS  fwd   1002.0 +-   1.9 aiter   1188.7 ratio 0.843 o_rel 0.0018 lse 0.0049
+b1_s32k    PASS  fwd   1020.8 +-   1.2 aiter   1215.1 ratio 0.840 o_rel 0.0016 lse 0.0048
+b1_s64k    PASS  fwd   1044.4 +-   1.2 aiter   1222.5 ratio 0.854 o_rel 0.0016 lse 0.0051
+b2_s4k     PASS  fwd    822.8 +-   1.5 aiter   1012.1 ratio 0.813 o_rel 0.0020 lse 0.0048
+b2_s16k    PASS  fwd    979.4 +-   1.5 aiter   1195.0 ratio 0.820 o_rel 0.0018 lse 0.0048
+Geomean Fwd TFLOPS: 947.53
+Geomean aiter Fwd TFLOPS: 1140.09
+Geomean ratio vs aiter: 0.8311
+Summary CSV: rounds/round-3/artifacts/benchmark_full.csv
+EXIT=0

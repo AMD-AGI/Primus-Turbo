@@ -1,0 +1,40 @@
+39c39
+< CODEGEN_REV = 10
+---
+> CODEGEN_REV = 9
+781,806c781,802
+<             # Same section order as round 18 (G32, G16, G8, then rank-major tail), but each
+<             # section's (h, q) is computed independently and the active one is selected, like
+<             # round 17's two-map form. The round-18 loop that threaded _lo through selects
+<             # re-scheduled the main loop (~1.3 % at S4K / S8K with identical CTA order).
+<             def _xcd_sec(lo, group):
+<                 u = _slot - lo * _heads_per_xcd
+<                 grp = u // (group * _heads_per_xcd)
+<                 r = u - grp * (group * _heads_per_xcd)
+<                 return r // group, lo + grp * group + r % group
+< 
+<             _g0, _g1, _g2 = XCD_Q_GROUPS
+<             _lo0 = fx.Index(0)
+<             _lo1 = (_nq_head // _g0) * _g0
+<             _lo2 = _lo1 + (_nq_head - _lo1) // _g1 * _g1
+<             _lo3 = _lo2 + (_nq_head - _lo2) // _g2 * _g2
+<             _h0, _q0 = _xcd_sec(_lo0, _g0)
+<             _h1, _q1 = _xcd_sec(_lo1, _g1)
+<             _h2, _q2 = _xcd_sec(_lo2, _g2)
+<             _t = _slot - _lo3 * _heads_per_xcd
+<             _h_t, _q_t = _t % _heads_per_xcd, _lo3 + _t // _heads_per_xcd
+<             # Empty sections share a start with the next; the later select wins, so they yield.
+<             _in1 = ArithValue(_slot >= _lo1 * _heads_per_xcd)
+<             _in2 = ArithValue(_slot >= _lo2 * _heads_per_xcd)
+<             _in_t = ArithValue(_slot >= _lo3 * _heads_per_xcd)
+<             _h_local = _in_t.select(_h_t, _in2.select(_h2, _in1.select(_h1, _h0)))
+<             _q_rank = _in_t.select(_q_t, _in2.select(_q2, _in1.select(_q1, _q0)))
+---
+>             # Rank sections [lo, hi) per group size, then the rank-major tail; a slot takes the
+>             # last section starting at or below it (an empty section yields to the next one).
+>             _lo = fx.Index(0)
+>             _h_local = _q_rank = None
+>             for _i in range_constexpr(len(XCD_Q_GROUPS)):
+>                 _g = XCD_Q_GROUPS[_i]
+>                 _u = _slot - _lo * _heads_per_xcd
+>                 _grp = _u // (_g * _heads_per_xcd)

@@ -708,10 +708,32 @@ def build_flash_attn_dualwave_swp_module(
                 _, _live_hi_m1 = ctx.chunk_live(max_m1)
                 v_o = _pv_hi_live(v_p_0, v_packs_s8, v_o, 0, _live_hi_m1)
             else:
-                # Dense causal drain: skip wave-uniform dead halves on the last two KV tiles.
-                # max_m2 LO is always live; pass live=(None, hi) to avoid an always-true branch.
-                _live_hi_m2 = ctx.chunk_live(max_m2)[1]
-                _live_lo_m1, _live_hi_m1 = ctx.chunk_live(max_m1)
+                # Dense causal drain: skip wave-uniform dead halves on the diagonal KV tiles.
+                def _diag_live(k):
+                    """chunk_live of the k-th last KV tile; None for a half no wave can find dead
+                    (its start never passes wave 0's last row), which saves an always-true branch."""
+                    lo_start = traits.BLOCK_M - k * traits.BLOCK_N
+                    if const_expr(lo_start + traits.BLOCK_N // 2 < traits.ROWS_PER_WAVE):
+                        return (None, None)
+                    live_lo, live_hi = ctx.chunk_live(split_t_end - k)
+                    return (live_lo if lo_start >= traits.ROWS_PER_WAVE else None, live_hi)
+
+                def _qk_diag(v_k, buf_id, live):
+                    if const_expr(live[1] is None):
+                        return _qk(v_k, buf_id)
+                    return _qk(v_k, buf_id, live=live)
+
+                def _pv_diag(v_p, v_v, v_o, buf_id, live):
+                    if const_expr(live[1] is None):
+                        return _pv(v_p, v_v, v_o, buf_id)
+                    if const_expr(live[0] is None):
+                        return _pv_hi_live(v_p, v_v, v_o, buf_id, live[1])
+                    return _pv_both_live(v_p, v_v, v_o, buf_id, live[0], live[1])
+
+                _live_m4 = _diag_live(4)
+                _live_m3 = _diag_live(3)
+                _live_m2 = _diag_live(2)
+                _live_m1 = _diag_live(1)
 
                 # Epilogue C0 prefetches V and reads K.
                 _s_nop(3)
@@ -725,7 +747,7 @@ def build_flash_attn_dualwave_swp_module(
                 # Epilogue C1 (compute): finish v_p_0 softmax, then MMA0 -> v_s_1 (like C1).
                 v_p_0 = ctx.exp2(v_p_0, 16, 16)
                 v_p_0, l_row = ctx.cast_p_and_sum(l_row, v_p_0)
-                v_s_1 = _qk(v_k, 1)
+                v_s_1 = _qk_diag(v_k, 1, _live_m3)
                 _sched_barrier_pairs(traits, 6, 3, 5, traits.SCHED_EXP_MASK)
                 _sched_barrier_pairs(traits, 10, 5, 5)
                 _dualwave_sync_barrier()
@@ -748,10 +770,10 @@ def build_flash_attn_dualwave_swp_module(
                 _waitcnt_vm_n(ctx.VM_DRAIN_KV)
                 _dualwave_sync_barrier()
 
-                # Epilogue C3 (compute): full P*V + unconditional rescale
+                # Epilogue C3 (compute): P*V of max_m4 + unconditional rescale
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
-                v_o = _pv(v_p_0, v_packs_e3, v_o, 0)
+                v_o = _pv_diag(v_p_0, v_packs_e3, v_o, 0, _live_m4)
                 m_row, l_row, v_s_1, v_o = ctx.rebase_if_needed(m_row, l_row, v_s_1, v_o)
                 v_p_1 = ctx.exp2(v_s_1, 0, 16)
                 _sched_barrier_pairs(traits, 10, 5, 6)
@@ -775,7 +797,7 @@ def build_flash_attn_dualwave_swp_module(
                 # Epilogue C5 finishes the v_p_1 softmax, then computes MMA0.
                 v_p_1 = ctx.exp2(v_p_1, 16, 16)
                 v_p_1, l_row = ctx.cast_p_and_sum(l_row, v_p_1)
-                v_s_0 = _qk(v_k, 0, live=(None, _live_hi_m2))
+                v_s_0 = _qk_diag(v_k, 0, _live_m2)
                 _sched_barrier_pairs(traits, 6, 3, 7, traits.SCHED_EXP_MASK)
                 _sched_barrier_pairs(traits, 10, 5, 7)
                 _dualwave_sync_barrier()
@@ -795,10 +817,10 @@ def build_flash_attn_dualwave_swp_module(
                 _waitcnt_vm_n(ctx.VM_DRAIN_V)
                 _dualwave_sync_barrier()
 
-                # Epilogue C7 (compute, mirror of C3): full P*V + unconditional rescale.
+                # Epilogue C7 (compute, mirror of C3): P*V of max_m3 + unconditional rescale.
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
-                v_o = _pv(v_p_1, v_packs_e7, v_o, 1)
+                v_o = _pv_diag(v_p_1, v_packs_e7, v_o, 1, _live_m3)
                 m_row, l_row, v_s_0, v_o = ctx.rebase_if_needed(m_row, l_row, v_s_0, v_o)
                 v_p_0 = ctx.exp2(v_s_0, 0, 16)
                 _sched_barrier_pairs(traits, 10, 5, 8)
@@ -821,7 +843,7 @@ def build_flash_attn_dualwave_swp_module(
                 # Epilogue C9 finishes v_p_0, then computes the last-tile MMA0.
                 v_p_0 = ctx.exp2(v_p_0, 16, 16)
                 v_p_0, l_row = ctx.cast_p_and_sum(l_row, v_p_0)
-                v_s_1 = _qk(v_k, 1, live=(_live_lo_m1, _live_hi_m1))
+                v_s_1 = _qk_diag(v_k, 1, _live_m1)
                 _sched_barrier_pairs(traits, 6, 3, 9, traits.SCHED_EXP_MASK)
                 _sched_barrier_pairs(traits, 10, 5, 9)
                 _dualwave_sync_barrier()
@@ -843,7 +865,7 @@ def build_flash_attn_dualwave_swp_module(
 
                 # Epilogue C11: final rescale and complete the last tile's softmax in-place.
                 # v_p_0 belongs to max_m2, whose HI half is dead for row group 0.
-                v_o = _pv_hi_live(v_p_0, v_packs_e11, v_o, 0, _live_hi_m2)
+                v_o = _pv_diag(v_p_0, v_packs_e11, v_o, 0, _live_m2)
                 m_row, l_row, v_s_1, v_o = ctx.rebase_if_needed(m_row, l_row, v_s_1, v_o)
                 v_p_1 = ctx.exp2(v_s_1, 0, 16)
                 _sched_barrier_pairs(traits, 9, 6, 10)
@@ -863,7 +885,7 @@ def build_flash_attn_dualwave_swp_module(
 
                 # Epilogue C13 (compute): final P*V -> v_o holds the unnormalized output.
                 # v_p_1 belongs to max_m1; both halves are dead for row groups 0 and 32.
-                v_o = _pv_both_live(v_p_1, v_packs_e13, v_o, 1, _live_lo_m1, _live_hi_m1)
+                v_o = _pv_diag(v_p_1, v_packs_e13, v_o, 1, _live_m1)
 
             # Normalize O; split-K stores normalized partials for later w_s * l_s reweighting.
             # finalize_o_scale folds the learned sink into the denominator when HAS_SINK

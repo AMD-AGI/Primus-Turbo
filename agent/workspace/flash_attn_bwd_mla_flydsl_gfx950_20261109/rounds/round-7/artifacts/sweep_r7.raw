@@ -1,0 +1,16 @@
+W1109 16:00:17.243000 19791 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1109 16:00:17.324000 19791 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:00:17.324000 19791 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 16:00:17.324000 19791 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:00:17.325000 19791 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+W1109 16:00:17.325000 19791 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1109 16:00:17.325000 19791 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+/opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+bk128 (default): ok=True snr=['45.91', '49.66', '51.20']
+bk192 dv_pin0: ok=True snr=['46.61', '49.66', '51.20']
+
+config                    B2S6144 ms      d%   B1S12288 ms      d%   gm d%  snr dq/dk/dv
+bk128 (default)               11.832   +0.00        22.513   +0.00   +0.00  45.91/49.66/51.20
+bk192 dv_pin0                 11.555   +2.40        20.550   +9.55   +5.92  46.61/49.66/51.20
+EXIT 0

@@ -1,0 +1,17 @@
+CONFIGS = [
+    ("r8 default", {}),
+    ("g3d=2", {"g3d": 2}),
+    ("g3d=3", {"g3d": 3}),
+    ("g3d=4", {"g3d": 4}),
+    ("iglp=0", {"iglp": 0}),
+    ("iglp=3", {"iglp": 3}),
+    ("g3_dbat=1", {"g3_dbat": 1}),
+    ("g3_dbat=3", {"g3_dbat": 3}),
+    ("g3_st_n=2", {"g3_st_n": 2}),
+    ("g2_fill", {"g2_fill": True}),
+    ("g2_half=False", {"g2_half": False}),
+    ("g1_ks_outer=False", {"g1_ks_outer": False}),
+    ("mfma_tie=1", {"mfma_tie": 1}),
+    ("g3_sb=2", {"g3_sb": 2}),
+    ("g3_sb=3", {"g3_sb": 3}),
+]
