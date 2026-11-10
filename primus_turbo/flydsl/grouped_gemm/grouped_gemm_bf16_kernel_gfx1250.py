@@ -49,6 +49,7 @@ import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import rocdl as _rocdl
+from flydsl._mlir.dialects import vector as _vector
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import cluster as _cluster
@@ -367,6 +368,56 @@ def _decode_m_tile_tt(mt, blk_m_idx, n_groups: int, m_tiles: int):
     return tuple(rocdl.readfirstlane(T.i32, mt[b + fx.Int32(j)]) for j in range(5))
 
 
+def _decode_m_tile_tt_issue(mt, blk_m_idx, n_groups: int, m_tiles: int):
+    """The loads of `_decode_m_tile_tt`, left in vector registers (see `_decode_m_tile_tt_finish`)."""
+    t = rocdl.readfirstlane(T.i32, blk_m_idx)
+    t = (t < fx.Int32(0)).select(fx.Int32(0), t)
+    t = (t > fx.Int32(m_tiles - 1)).select(fx.Int32(m_tiles - 1), t)
+    b = fx.Int32(_tt_off(n_groups)) + t * fx.Int32(8)
+    return tuple(mt[b + fx.Int32(j)] for j in range(5))
+
+
+def _decode_m_tile_tt_finish(raw):
+    return tuple(rocdl.readfirstlane(T.i32, v) for v in raw)
+
+
+def _decode_m_tile_span_vec_issue(mt, blk_m_idx, n_groups: int, lane):
+    """The per-lane loads of `_decode_m_tile_span_vec` (see `_decode_m_tile_span_vec_finish`)."""
+    G = n_groups
+    t = rocdl.readfirstlane(T.i32, blk_m_idx)
+    li = (lane < fx.Int32(G - 1)).select(lane, fx.Int32(G - 1))
+    return t, mt[li], mt[fx.Int32(G) + li], mt[fx.Int32(G + 1) + li]
+
+
+def _decode_m_tile_span_vec_finish(issued, n_groups: int, block_m: int, lane):
+    G = n_groups
+    t, end_l, off0_l, off1_l = issued
+    zero = t * fx.Int32(0)
+    le = end_l <= t
+    if G < 32:
+        le = (lane < fx.Int32(G)).select(le, lane < zero)
+    mask = fx.Int32(rocdl.ballot(T.i32, le))
+    cnt = fx.Int32(_llvm.intr_ctpop(_raw(mask)))
+    g_idx = rocdl.readfirstlane(T.i32, (cnt < fx.Int32(G)).select(cnt, fx.Int32(G - 1)))
+    row_beg = fx.Int32(rocdl.readlane(T.i32, off0_l, g_idx))
+    len_g = fx.Int32(rocdl.readlane(T.i32, off1_l, g_idx)) - row_beg
+    end_g = fx.Int32(rocdl.readlane(T.i32, end_l, g_idx))
+    blocks_g = (len_g + fx.Int32(block_m - 1)) // fx.Int32(block_m)
+    first_g = end_g - blocks_g
+    local = t - first_g
+    raw = len_g - local * fx.Int32(block_m)
+    rows = (raw < fx.Int32(block_m)).select(raw, fx.Int32(block_m))
+    rows = (rows > zero).select(rows, zero)
+    m_row = (rows > zero).select(row_beg + local * fx.Int32(block_m), zero)
+    return (
+        g_idx,
+        rocdl.readfirstlane(T.i32, m_row),
+        rocdl.readfirstlane(T.i32, rows),
+        rocdl.readfirstlane(T.i32, first_g),
+        rocdl.readfirstlane(T.i32, end_g),
+    )
+
+
 def _decode_m_tile_scan(mt, blk_m_idx, n_groups: int, block_m: int):
     G = n_groups
     t = rocdl.readfirstlane(T.i32, blk_m_idx)
@@ -605,6 +656,71 @@ def _launch_grouped_bf16_variable_k(
     #        first ones that land on the staging. K_TILES is clamped to >= 4 so that k-tile is a steady one.
     # bit 2: the next tile's decode (expert table reads included) is done at the top of the tile.
     vk_ovl: Constexpr[int] = 0,
+    # Persistent tile seam, the epilogue and the tile decode (needs persist). Bit-identical to 0: it moves
+    # matrix ops, staging writes and table reads, never an address, an extent or an accumulation order.
+    # bit 0 (needs a deferred last sub-step -- head_pipe or split_bar -- and epi_chunk > 1): the last
+    #        k-tile's deferred sub-step runs one epilogue chunk at a time, and each chunk's matrix ops are
+    #        dealt between the conversion and staging writes of the chunk before it, whose results are
+    #        already final; the last chunk's conversion is the only one left without matrix work.
+    # bit 1: the tile decode is carried over from the previous tile's next-tile decode instead of being
+    #        recomputed, with its expert-table read, at the top of every tile.
+    # bit 2: with vk_ovl bit 2, the next tile's decode moves from the top of the tile to behind its first
+    #        head read, past the prologue barriers (which would wait for its table read), and the table
+    #        words are made uniform only in the epilogue that consumes them.
+    # bit 3 (needs head_pipe and vk_ovl bit 1): the tile's first k-tile does not wait for its whole
+    #        sub-step 0 read: the head is read in first-use order and each matrix op waits for its own
+    #        fragments only.
+    # bit 4 (needs head_pipe, num_buffers=4 and vk_ovl bits 0 and 2): the next tile's k-tiles 0 and 1 are
+    #        issued as soon as their ring slots are free -- ahead of the tile's second-to-last k-tile when
+    #        K_TILES % 4 == 0, ahead of its last one when K_TILES % 4 == 3 -- instead of in the epilogue,
+    #        so their load latency is no longer waited for at the top of the next tile.
+    # bit 7 (needs bits 0 and 4, vk_ovl = 7 and whole output tiles): C leaves through the vector memory path.
+    #        Each wave stages its own sub-tile, one 16-row block at a time, in a private LDS region past the
+    #        ring, reads every block back row-major (16 lanes per 256 B row segment) and stores it with
+    #        full-line global stores, so there is no staging barrier, no TDM store and no store descriptor,
+    #        and the ring never holds C. The next tile's k-tiles 2 and 3 are issued at the epilogue fence,
+    #        right behind its k-tiles 0 and 1, and its peeled k-tile 0 issues nothing.
+    # bit 8 (needs bit 7): the read-back and store of each block is one asynchronous LDS-to-global store per
+    #        row pair instead of an LDS load and a global store.
+    # bit 9 (needs bit 0, vk_ovl bit 1, whole output tiles; excludes bit 7): C is staged as without it, but each
+    #        wave stores the rows it staged itself, two rows per asynchronous LDS-to-global store (full 128 B
+    #        lines), a chunk at a time two chunks behind its staging writes: no staging barrier, no TDM store
+    #        and no store descriptor, and the stores count on ASYNCcnt instead of TENSORcnt. The next tile's
+    #        k-tiles 2 and 3 are issued once every wave's stores have read the staging (ASYNCcnt 0 and a
+    #        barrier): at its peeled k-tile 0's fence, or with bit 10 at its prologue fence.
+    # bit 11 (needs bit 7 without bit 8): the epilogue runs in steps of one 16-row block: a step deals the next
+    #        block's matrix ops, this block's conversions and the staging writes between them, and ends with the
+    #        read-back of the block staged one step earlier as one burst, so the DS port turns from writes to
+    #        reads once per block instead of once per fragment; the stores of a block follow one step later,
+    #        one per matrix op.
+    # bit 13 (needs bit 11): the last two blocks of every wave leave by asynchronous LDS-to-global stores straight
+    #        from the private staging (no read-back, no store data in registers); they complete in the background
+    #        and the staging blocks they read are reused only by the next tile's epilogue, which waits for them.
+    # bit 14 (needs bit 0, vk_ovl bit 1, an even epi_chunk > 1 and half the C staging within one ring slot;
+    #        excludes bits 7 and 9): C is staged chunk-major, so the first half of the chunks fills the ring slot
+    #        of the next tile's k-tile 2 and the second half that of its k-tile 3, and the next tile releases the
+    #        two slots one k-step apart: its peeled k-tile 0 waits for the first half of the store ops only and
+    #        issues k-tile 2, its k-tile 1 (which still issues k-tile 4 at its head) waits for the second half
+    #        and issues k-tile 3. K_TILES is clamped to >= 6 so that k-tiles 1 and 2 are steady ones.
+    # bit 16 (needs bits 11 and 13): the private staging has three 16-row blocks per wave at a dense 256 B row
+    #        pitch, the 16 B chunks of row r XOR-swizzled by r (conflict-free for both the fragment-layout writes
+    #        and the row-major reads), and the last three blocks leave by asynchronous stores.
+    # bit 17 (needs bit 11): a block's read-back is held two steps instead of one before its stores.
+    # bit 19 (needs bit 7): the C global stores carry the non-temporal hint.
+    # bit 18 (needs bit 11): every block is staged within its own step -- its last two staging writes follow the
+    #        step's matrix ops instead of opening the next step -- so no conversion result lives across a step.
+    # bit 15 (DIAGNOSTIC ONLY, WRONG OUTPUT; needs bit 0, epi_chunk even, excludes bits 7 / 9 / 14): the TDM
+    #        stores of the second half of the chunks are skipped, to measure the kernel with half the C traffic.
+    # bit 12 (needs mc_tile_sync and a cluster): the per-tile cluster barrier is split: each workgroup signals
+    #        it at its epilogue fence (all its waves are past the k-loop) when a next tile follows, and the next
+    #        tile only waits for it, so a peer that is up to an epilogue behind no longer stalls the others.
+    vk_seam: Constexpr[int] = 0,
+    # > 0 (needs persist): phase groups of tile walks (clusters, or workgroups without one) start their first
+    # tile later, so that the groups reach their tile seams -- and their C write-back bursts -- out of phase.
+    # bits 0-9: sleep per group step, in 64-clock `s_sleep` units; bits 10-11: groups, 0 = 2 by walk parity,
+    # 1 = 2 by walk half (walk < C_STEP / 2 or not), 2 = 4 by walk % 4, 3 = 4 by walk quarter. Group g sleeps
+    # g steps.
+    vk_stagger: Constexpr[int] = 0,
 ):
     WMMA_M = WMMA_N = 16
     WMMA_K = 32
@@ -677,15 +793,17 @@ def _launch_grouped_bf16_variable_k(
         raise ValueError("split_bar is not supported with frag_pipeline=2")
     if lds_cosched not in (0, 1, 2):
         raise ValueError(f"lds_cosched must be 0, 1 or 2 on the variable-K path, got {lds_cosched}")
-    if lds_cosched and frag_pipeline != 1:
-        raise ValueError(f"lds_cosched={lds_cosched} needs frag_pipeline=1, got {frag_pipeline}")
-    if lds_cosched >= 2 and 2 * (warp_tile_m // WMMA_M + warp_tile_n // WMMA_N) >= n_acc:
-        raise ValueError(f"lds_cosched={lds_cosched} needs fewer fragment reads per sub-step than matrix ops")
+    if not _vk_lds_cosched_ok(lds_cosched, wmma_m_rep, wmma_n_rep, frag_pipeline):
+        raise ValueError(
+            f"lds_cosched={lds_cosched} needs frag_pipeline=1 and, from level 2, fewer fragment reads per "
+            f"sub-step ({2 * (wmma_m_rep + wmma_n_rep)}) than matrix ops ({n_acc}); "
+            f"got frag_pipeline={frag_pipeline}"
+        )
     if head_pipe and (lds_cosched != 2 or not split_bar or issue_first or k_tiles_const):
         raise ValueError(
             f"head_pipe={head_pipe} needs lds_cosched=2, split_bar=1, issue_first=0 and k_tiles_const=0"
         )
-    if head_pipe < 0 or head_pipe + 2 * (warp_tile_m // WMMA_M + warp_tile_n // WMMA_N) > n_acc:
+    if head_pipe < 0 or not _head_pipe_fits(head_pipe, wmma_m_rep, wmma_n_rep):
         raise ValueError(f"head_pipe={head_pipe} leaves too few deferred matrix ops for the head reads")
     if (hp_burst or hp_opaque) and not head_pipe:
         raise ValueError("hp_burst / hp_opaque need head_pipe")
@@ -717,9 +835,16 @@ def _launch_grouped_bf16_variable_k(
     # C_PITCHES buffers from the arena base.
     C_PITCHES = -(-C_STORE_B // PITCH)
     PREFETCH_OK = bool(persist) and C_PITCHES < num_buffers
-    if ARENA_B > _GFX1250_LDS_BYTES:
-        raise ValueError(f"LDS arena {ARENA_B} B exceeds the gfx1250 budget {_GFX1250_LDS_BYTES} B")
-    _check_smem(ARENA_B, str(_get_arch()))
+    # vk_seam bit 7: per-wave staging past the ring, WS_NSUB blocks of 16 rows; the pad keeps both the
+    # fragment-layout writes and the row-major reads at two LDS cycles per 128-bit access.
+    WS_NSUB = 3 if (vk_seam & (256 | 65536)) else 2
+    WS_RB = warp_tile_n * EB if (vk_seam & 65536) else (warp_tile_n + C_PAD_E) * EB
+    WS_SUB = WMMA_M * WS_RB
+    WS_WAVE = WS_NSUB * WS_SUB
+    ARENA_TOT = (ARENA_B + num_waves * WS_WAVE) if (vk_seam & 128) else ARENA_B
+    if ARENA_TOT > _GFX1250_LDS_BYTES:
+        raise ValueError(f"LDS arena {ARENA_TOT} B exceeds the gfx1250 budget {_GFX1250_LDS_BYTES} B")
+    _check_smem(ARENA_TOT, str(_get_arch()))
     if vk_ovl < 0 or vk_ovl > 7 or vk_ovl == 2 or vk_ovl == 6:
         raise ValueError(f"vk_ovl must be a bitfield of 1, 2 (needs 1) and 4, got {vk_ovl}")
     if vk_ovl and not (PREFETCH_OK and C_PITCHES + 2 <= num_buffers):
@@ -729,9 +854,69 @@ def _launch_grouped_bf16_variable_k(
         )
     if (vk_ovl & 2) and (not head_pipe or num_buffers != 4 or C_PITCHES != 2 or MC > 1 and mc_sync):
         raise ValueError("vk_ovl bit 1 needs head_pipe, num_buffers=4, C_PITCHES=2 and mc_sync=0")
+    if vk_seam < 0 or vk_seam & ~(
+        31 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536 | 131072 | 262144 | 524288
+    ):
+        raise ValueError(f"vk_seam must be a bitfield of 1, 2, 4, 8, 16 and 128 .. 524288, got {vk_seam}")
+    if (vk_seam & 131072) and not (vk_seam & 2048):
+        raise ValueError("vk_seam bit 17 needs bit 11")
+    if (vk_seam & 262144) and not (vk_seam & 2048):
+        raise ValueError("vk_seam bit 18 needs bit 11")
+    if (vk_seam & 65536) and (vk_seam & (2048 | 8192)) != (2048 | 8192):
+        raise ValueError("vk_seam bit 16 needs bits 11 and 13")
+    if (vk_seam & 32768) and (not (vk_seam & 1) or epi_chunk % 2 or (vk_seam & (128 | 512 | 16384))):
+        raise ValueError(
+            "vk_seam bit 15 (diagnostic) needs bit 0 and an even epi_chunk, excludes bits 7, 9 and 14"
+        )
+    if (vk_seam & 16384) and (
+        not (vk_seam & 1)
+        or not (vk_ovl & 2)
+        or not head_pipe
+        or epi_chunk < 2
+        or epi_chunk % 2
+        or (tile_m // 2) * C_ROW_E * EB > PITCH
+        or PITCH + (tile_m // 2) * C_ROW_E * EB > C_PITCHES * PITCH
+        or (vk_seam & (128 | 512))
+    ):
+        raise ValueError(
+            "vk_seam bit 14 needs bit 0, vk_ovl bit 1, head_pipe, an even epi_chunk > 1 and half the C staging "
+            "within one ring slot, and excludes bits 7 and 9"
+        )
+    if (vk_seam & 8192) and not (vk_seam & 2048):
+        raise ValueError("vk_seam bit 13 needs bit 11")
+    if (vk_seam & 4096) and not (MC > 1 and mc_tile_sync and persist):
+        raise ValueError("vk_seam bit 12 needs a cluster with mc_tile_sync and persist")
+    if (vk_seam & 2048) and (vk_seam & (128 | 256)) != 128:
+        raise ValueError("vk_seam bit 11 needs bit 7 without bit 8")
+    if (vk_seam & 128) and ((vk_seam & 17) != 17 or vk_ovl != 7 or warp_tile_n * EB != 256):
+        raise ValueError("vk_seam bit 7 needs bits 0 and 4, vk_ovl=7 and 256 B wave row segments")
+    if (vk_seam & 256) and not (vk_seam & 128):
+        raise ValueError("vk_seam bit 8 needs bit 7")
+    if (vk_seam & 512) and (
+        not (vk_seam & 1) or not (vk_ovl & 2) or (vk_seam & 128) or warp_tile_n * EB != 256
+    ):
+        raise ValueError(
+            "vk_seam bit 9 needs bit 0 and vk_ovl bit 1, excludes bit 7, and 256 B wave row segments"
+        )
+    if (vk_seam & 1024) and not (vk_seam & 512):
+        raise ValueError("vk_seam bit 10 needs bit 9")
+    if vk_stagger and (not persist or vk_stagger < 0 or vk_stagger >= 4096):
+        raise ValueError(f"vk_stagger={vk_stagger} needs persist and must be < 4096")
+    if (vk_seam & 16) and not (head_pipe and num_buffers == 4 and (vk_ovl & 5) == 5):
+        raise ValueError("vk_seam bit 4 needs head_pipe, num_buffers=4 and vk_ovl bits 0 and 2")
+    if vk_seam and not persist:
+        raise ValueError(f"vk_seam={vk_seam} needs persist")
+    if (vk_seam & 1) and (not (head_pipe or split_bar) or epi_chunk < 2):
+        raise ValueError(
+            "vk_seam bit 0 needs a deferred last sub-step (head_pipe or split_bar) and epi_chunk > 1"
+        )
+    if (vk_seam & 8) and not (head_pipe and (vk_ovl & 2)):
+        raise ValueError("vk_seam bit 3 needs head_pipe and vk_ovl bit 1")
     # k-tiles the epilogue prefetches for the next tile, and TDM ops one wave issues for the C store.
     PRE_KT = 2 if vk_ovl else 1
     EPI_OPS = (epi_chunk * m_warp) if epi_chunk > 1 else 1
+    if vk_seam & 32768:
+        EPI_OPS //= 2
 
     @flyc.kernel(name="kernel_grouped_bf16_variable_k_gfx1250", known_block_size=[block, 1, 1])
     def kernel_grouped_variable_k(
@@ -812,8 +997,23 @@ def _launch_grouped_bf16_variable_k(
             bk = (kp * fx.Int32(mc_n) + mc_ly) if const_expr(mc_n > 1) else kp
             return g, bn, bk
 
-        def _one_output_tile(tile_raw):
+        def _tile_dec(tile_raw):
             if const_expr(MC > 1):
+                return _cluster_tile(tile_raw)
+            tile = _xcd_band_remap(tile_raw, TOTAL_TILES, num_xcd, xcd_band)
+            g = rocdl.readfirstlane(T.i32, tile // fx.Int32(TILES_PER_EXPERT))
+            bn, bk = _group_m_tile_decode(tile % fx.Int32(TILES_PER_EXPERT), N_BLOCKS_N, N_BLOCKS_K, group_m)
+            return g, bn, bk
+
+        def _one_output_tile(tile_raw, carry=None):
+            if const_expr(carry is not None):
+                # This tile's decode, done by the previous tile's `_next_dec()` (vk_seam bit 1):
+                # (g, blk_n_idx, blk_k_idx, m_start, m_len).
+                cv = carry.load()
+                g_idx = rocdl.readfirstlane(T.i32, cv[0])
+                blk_n_idx = rocdl.readfirstlane(T.i32, cv[1])
+                blk_k_idx = rocdl.readfirstlane(T.i32, cv[2])
+            elif const_expr(MC > 1):
                 # `tile_raw` counts whole clusters.
                 g_idx, blk_n_idx, blk_k_idx = _cluster_tile(tile_raw)
             else:
@@ -826,9 +1026,13 @@ def _launch_grouped_bf16_variable_k(
             # `masked_k[g]` when the caller passed one -- the padded tail between m_start+m_len
             # and the next expert's m_start is then never addressed.
             et = _i32_table(arg_etab)
-            e = g_idx * fx.Int32(2)
-            m_start = rocdl.readfirstlane(T.i32, et[e])
-            m_len = rocdl.readfirstlane(T.i32, et[e + fx.Int32(1)])
+            if const_expr(carry is not None):
+                m_start = rocdl.readfirstlane(T.i32, cv[3])
+                m_len = rocdl.readfirstlane(T.i32, cv[4])
+            else:
+                e = g_idx * fx.Int32(2)
+                m_start = rocdl.readfirstlane(T.i32, et[e])
+                m_len = rocdl.readfirstlane(T.i32, et[e + fx.Int32(1)])
 
             blk_n = blk_n_idx * tile_m
             blk_k = blk_k_idx * tile_n
@@ -862,18 +1066,25 @@ def _launch_grouped_bf16_variable_k(
                     l2 = nxt % fx.Int32(TILES_PER_EXPERT)
                     bn2_idx, bk2_idx = _group_m_tile_decode(l2, N_BLOCKS_N, N_BLOCKS_K, group_m)
                 e2 = g2 * fx.Int32(2)
-                ms2 = rocdl.readfirstlane(T.i32, et[e2])
-                ml2 = rocdl.readfirstlane(T.i32, et[e2 + fx.Int32(1)])
+                if const_expr(vk_seam & 4):
+                    # Made uniform by the epilogue that consumes them.
+                    ms2 = et[e2]
+                    ml2 = et[e2 + fx.Int32(1)]
+                else:
+                    ms2 = rocdl.readfirstlane(T.i32, et[e2])
+                    ml2 = rocdl.readfirstlane(T.i32, et[e2 + fx.Int32(1)])
                 bn2 = bn2_idx * tile_m
                 bk2 = bk2_idx * tile_n
                 bne2 = (bn2 > (i32_n - fx.Int32(tile_m))).select(i32_n - fx.Int32(tile_m), bn2)
                 bke2 = (bk2 > (i32_k - fx.Int32(tile_n))).select(i32_k - fx.Int32(tile_n), bk2)
-                return ms2, ml2, bne2, bke2
+                return ms2, ml2, bne2, bke2, g2, bn2_idx, bk2_idx
 
-            nxt_dec = _next_dec() if const_expr(PREFETCH_OK and (vk_ovl & 4)) else None
+            # vk_seam bit 2 computes it after the tile's prologue barriers instead, which would
+            # otherwise wait for its table read.
+            nxt_dec = _next_dec() if const_expr(PREFETCH_OK and (vk_ovl & 4) and not (vk_seam & 4)) else None
 
             arena = fx.SharedAllocator(static=False)
-            arena.allocate(ARENA_B)
+            arena.allocate(ARENA_TOT)
             base_ptr = arena.base_ptr
 
             def _bidx(p):
@@ -1154,7 +1365,7 @@ def _launch_grouped_bf16_variable_k(
             # Clamp it up to the pipeline depth: a short expert then runs a few extra k-tiles
             # whose reads are all past m_len, hence zeroed, and the barriers stay matched.
             # vk_ovl bit 1 peels steady k-tile 0, so it keeps one more.
-            KT_MIN = NB1 + 1 if const_expr(vk_ovl & 2) else NB1
+            KT_MIN = NB1 + 3 if const_expr(vk_seam & 16384) else (NB1 + 1 if const_expr(vk_ovl & 2) else NB1)
             if const_expr(k_tiles_const):
                 K_TILES = max(k_tiles_const, KT_MIN)
             else:
@@ -1163,7 +1374,13 @@ def _launch_grouped_bf16_variable_k(
 
             # Every peer walks the same number of tiles, each with the same K_TILES (same expert), so
             # every cluster barrier below is taken the same number of times by all of them.
-            if const_expr(MC > 1 and mc_tile_sync):
+            if const_expr(MC > 1 and mc_tile_sync and (vk_seam & 4096)):
+                # Past the first tile the signal was given at the previous tile's epilogue fence.
+                if tile_raw < fx.Int32(C_STEP):
+                    _cluster.cluster_barrier()
+                else:
+                    _cluster.cluster_wait()
+            elif const_expr(MC > 1 and mc_tile_sync):
                 _cluster.cluster_barrier()
             for i in range_constexpr(NB1):
                 if PREFETCH_OK and i < PRE_KT:
@@ -1172,9 +1389,27 @@ def _launch_grouped_bf16_variable_k(
                         issue(_slot(i), i)
                 elif const_expr(not (vk_ovl & 2)):
                     issue(_slot(i), i)
+            if const_expr(vk_seam & 128):
+                # Every later tile finds its k-tiles 0..3 issued by the previous tile's epilogue.
+                if tile_raw < fx.Int32(C_STEP):
+                    for i in range_constexpr(PRE_KT, num_buffers):
+                        issue(_slot(i), i)
             n_steady = (K_TILES - NB1) if const_expr(k_tiles_const) else (K_TILES - fx.Int32(NB1))
 
-            if const_expr(vk_ovl & 2):
+            if const_expr(vk_seam & 128):
+                # In flight: k-tiles 0..3 and nothing behind them; in-order retirement.
+                _fence(outstanding=TDM_PW * NB1)
+            elif const_expr(vk_seam & 512):
+                # In flight on TENSORcnt: k-tiles 0 and 1 only (the stores count on ASYNCcnt).
+                if const_expr(vk_seam & 1024):
+                    # Past the barrier every wave's stores have read the staging, so k-tiles 2 and 3 may
+                    # land on it.
+                    rocdl.s_wait_asynccnt(0)
+                _fence(outstanding=TDM_PW)
+                if const_expr(vk_seam & 1024):
+                    for i in range_constexpr(PRE_KT, num_buffers):
+                        issue(_slot(i), i)
+            elif const_expr(vk_ovl & 2):
                 # In flight: k-tiles 0 and 1, then (past the first tile) this wave's EPI_OPS store ops of
                 # the previous tile. In-order retirement: at most TDM_PW + EPI_OPS left = k-tile 0 landed.
                 # The first tile has no store behind k-tile 1, so it waits for TDM_PW on its own.
@@ -1207,6 +1442,19 @@ def _launch_grouped_bf16_variable_k(
                 for wn in range_constexpr(wmma_n_rep):
                     wt[wn].store(_frag(addrs[1], LDS_B_ROW, ks * WMMA_K, wn * WMMA_N * EB))
 
+            def _load_into_first_use(addrs, ks, dst):
+                # MMA_ORDER's first row needs A fragment 0 and every B fragment, each later row one
+                # more A fragment.
+                act, wt = dst
+                act[0].store(_frag(addrs[0], LDS_A_ROW, ks * WMMA_K, 0))
+                rocdl.sched_barrier(0)
+                for wn in range_constexpr(wmma_n_rep):
+                    wt[wn].store(_frag(addrs[1], LDS_B_ROW, ks * WMMA_K, wn * WMMA_N * EB))
+                    rocdl.sched_barrier(0)
+                for wm in range_constexpr(1, wmma_m_rep):
+                    act[wm].store(_frag(addrs[0], LDS_A_ROW, ks * WMMA_K, wm * WMMA_M * EB))
+                    rocdl.sched_barrier(0)
+
             def _opaque(v):
                 # An asm result cannot be rematerialized, so the allocator keeps the address live
                 # instead of recomputing it with a VALU add inside the loop.
@@ -1236,14 +1484,17 @@ def _launch_grouped_bf16_variable_k(
                 _hold_live(ring[0])
                 rocdl.sched_barrier(0)
 
-            def _hp_ktile(addrs, prefetch_kt, head, prev_tail=None):
+            def _hp_ktile(addrs, prefetch_kt, head, prev_tail=None, first=False):
                 # `head` holds this k-tile's sub-step 0, read in the previous barrier window.
                 # `prev_tail` (the previous k-tile's deferred sub-step, whose matrix ops may still be
                 # in flight) is held live across this run so the reads here cannot reuse its registers.
+                # `first`: the head was read just ahead of this run, so its matrix ops wait for their
+                # own fragments instead of the whole head.
                 ring = [head, None]
                 for ks in range_constexpr(K_WS):
                     load_ks = ks + 1
-                    rocdl.s_wait_dscnt(0)
+                    if const_expr(not (first and ks == 0)):
+                        rocdl.s_wait_dscnt(0)
                     if const_expr(ks == 0 and prefetch_kt is not None and (tdm_deal & 2)):
                         _hp_run_issue(addrs, ring, prefetch_kt)
                     else:
@@ -1275,7 +1526,14 @@ def _launch_grouped_bf16_variable_k(
                 return ring[(K_WS - 1) % 2]
 
             def _hp_fence(tail, outstanding, nxt_addrs, head, late=()):
-                tdm_ops.tensor_wait(outstanding)
+                if const_expr(isinstance(outstanding, tuple)):
+                    # (cond_a, count_a, cond_b, count_b), the conditions uniform, exclusive and exhaustive.
+                    if outstanding[0]:
+                        tdm_ops.tensor_wait(outstanding[1])
+                    if outstanding[2]:
+                        tdm_ops.tensor_wait(outstanding[3])
+                else:
+                    tdm_ops.tensor_wait(outstanding)
                 rocdl.sched_barrier(0)
                 rocdl.s_barrier_signal(_WG_BARRIER)
                 rocdl.sched_barrier(0)
@@ -1315,7 +1573,14 @@ def _launch_grouped_bf16_variable_k(
                 SLOT_ADDRS = [
                     tuple(_opaque(x) for x in _addrs(s - BUF_SHIFT)) for s in range_constexpr(num_buffers)
                 ]
-                _load_into(SLOT_ADDRS[_slot(0)], 0, HEAD)
+                if const_expr(vk_seam & 8):
+                    _load_into_first_use(SLOT_ADDRS[_slot(0)], 0, HEAD)
+                else:
+                    _load_into(SLOT_ADDRS[_slot(0)], 0, HEAD)
+                rocdl.sched_barrier(0)
+            if const_expr(PREFETCH_OK and (vk_ovl & 4) and (vk_seam & 4)):
+                # Behind the head reads, whose latency it covers.
+                nxt_dec = _next_dec()
                 rocdl.sched_barrier(0)
 
             def _steady_hp(kt, addrs, nxt_addrs, prev_tail=None):
@@ -1345,20 +1610,46 @@ def _launch_grouped_bf16_variable_k(
                 # remaining prologue slot are the C staging. Its fence retires everything (k-tile 1 and
                 # this wave's store ops), and the barrier makes every wave's store complete, before
                 # k-tiles NB1 - 1 and NB1 are issued; from k-tile 1 on the ring runs as usual.
-                tail0 = _hp_ktile(SLOT_ADDRS[_slot(0)], None, HEAD)
-                _hp_fence(tail0, 0, SLOT_ADDRS[_slot(1)], HEAD, late=(NB1 - 1, NB1))
-                n_st = n_steady - fx.Int32(1)
+                tail0 = _hp_ktile(SLOT_ADDRS[_slot(0)], None, HEAD, first=bool(vk_seam & 8))
+                KT_PEEL = 1
+                if const_expr((vk_seam & 128) or (vk_seam & 1024)):
+                    # k-tiles 2 and 3 are already in flight (issued by the previous epilogue / the prologue).
+                    _hp_fence(tail0, TDM_PW * (num_buffers - 2), SLOT_ADDRS[_slot(1)], HEAD)
+                elif const_expr(vk_seam & 16384):
+                    # In flight: k-tile 1, then the store ops, chunk by chunk. At most EPI_OPS / 2 left = k-tile
+                    # 1 and the first half of the stores (k-tile 2's slot) retired. The first tile has no store
+                    # behind k-tile 1.
+                    if tile_raw < fx.Int32(C_STEP):
+                        tdm_ops.tensor_wait(0)
+                    _hp_fence(tail0, EPI_OPS // 2, SLOT_ADDRS[_slot(1)], HEAD, late=(NB1 - 1,))
+                    # k-tile 1 issues k-tile 4 at its head as usual; in flight then: the second half of the stores,
+                    # k-tile 2, k-tile 4. At most 1 left = k-tile 2 landed and every store retired, so k-tile 3
+                    # (the second half's slot) goes out at the fence. k-tile 2's fence waits for k-tile 3 with
+                    # k-tile 4 ahead of it and k-tile 5 behind.
+                    tail1 = _hp_ktile(SLOT_ADDRS[_slot(1)], NB1 + 1, HEAD, tail0)
+                    _hp_fence(tail1, TDM_PW, SLOT_ADDRS[_slot(2)], HEAD, late=(NB1,))
+                    tail2 = _hp_ktile(SLOT_ADDRS[_slot(2)], NB1 + 2, HEAD, tail1)
+                    _hp_fence(tail2, TDM_PW, SLOT_ADDRS[_slot(3)], HEAD)
+                    KT_PEEL = 3
+                else:
+                    if const_expr(vk_seam & 512):
+                        rocdl.sched_barrier(0)
+                        rocdl.s_wait_asynccnt(0)
+                    _hp_fence(tail0, 0, SLOT_ADDRS[_slot(1)], HEAD, late=(NB1 - 1, NB1))
+                n_st = n_steady - fx.Int32(KT_PEEL)
                 n_rot = n_st // fx.Int32(num_buffers)
                 for it in range(n_rot):
                     prev = None
                     for r in range_constexpr(num_buffers):
-                        kt_r = it * num_buffers + (r + 1)
+                        kt_r = it * num_buffers + (r + KT_PEEL)
                         if const_expr(hp_opaque):
                             kt_r = rocdl.readfirstlane(T.i32, fx.Int32(kt_r))
-                        prev = _steady_hp(kt_r, SLOT_ADDRS[_slot(r + 1)], SLOT_ADDRS[_slot(r + 2)], prev)
+                        prev = _steady_hp(
+                            kt_r, SLOT_ADDRS[_slot(r + KT_PEEL)], SLOT_ADDRS[_slot(r + KT_PEEL + 1)], prev
+                        )
                 n_done = n_rot * fx.Int32(num_buffers)
                 for kr in range(n_st - n_done):
-                    kt = n_done + kr + fx.Int32(1)
+                    kt = n_done + kr + fx.Int32(KT_PEEL)
                     _steady_ktile(kt)
             elif const_expr(head_pipe):
                 # Whole ring rotations first, so every slot (and its addresses) is a constant.
@@ -1381,19 +1672,53 @@ def _launch_grouped_bf16_variable_k(
                 for kt in range(n_steady):
                     _steady_ktile(kt)
 
+            last_tail = None
+            dec2 = None
+            if const_expr(vk_seam & 16):
+                # The next tile's k-tiles 0 and 1 land in slots 2 and 3 (BUF_SHIFT), which hold this tile's
+                # k-tiles K_TILES - 4 and K_TILES - 3 when K_TILES % 4 == 0 (both read before the
+                # second-to-last k-tile's fence) and K_TILES - 3 and K_TILES - 2 when K_TILES % 4 == 3
+                # (both read before the last one's); otherwise one of them is the last k-tile's.
+                dec2 = nxt_dec
+                if const_expr(vk_seam & 4):
+                    dec2 = (rocdl.readfirstlane(T.i32, dec2[0]), rocdl.readfirstlane(T.i32, dec2[1])) + tuple(
+                        dec2[2:]
+                    )
+                k4 = K_TILES % fx.Int32(4)
+                pre_a = k4 == fx.Int32(0)
+                pre_not_a = k4 != fx.Int32(0)
+                pre_b = k4 == fx.Int32(3)
+                pre_epi = ((k4 + fx.Int32(3)) % fx.Int32(4)) < fx.Int32(2)
+
+                def _pre_issue():
+                    for pk in range_constexpr(PRE_KT):
+                        issue(_slot(pk), pk, dec=dec2[:4])
+
             for j in range_constexpr(NB1):
                 kt = n_steady + j
                 buf = _bidx(_buf_ptr(_slot(kt)))
                 if const_expr(head_pipe):
+                    if const_expr((vk_seam & 16) and j == NB1 - 2):
+                        if pre_a:
+                            _pre_issue()
+                    if const_expr((vk_seam & 16) and j == NB1 - 1):
+                        if pre_b:
+                            _pre_issue()
                     tail = _hp_ktile(_addrs(kt), None, HEAD)
-                    if const_expr(j < num_buffers - 2):
+                    if const_expr((vk_seam & 16) and j == NB1 - 2):
+                        _hp_fence(tail, (pre_a, TDM_PW * PRE_KT, pre_not_a, 0), _addrs(kt + 1), HEAD)
+                    elif const_expr(j < num_buffers - 2):
                         _hp_fence(tail, TDM_PW * (num_buffers - 3 - j), _addrs(kt + 1), HEAD)
+                    elif const_expr(vk_seam & 1):
+                        last_tail = tail
                     else:
                         _mma_ks(tail)
                 elif const_expr(split_bar):
                     tail = compute_ktile(buf, None, defer_last=True)
                     if const_expr(j < num_buffers - 2):
                         _vk_split_fence(tail, TDM_PW * (num_buffers - 3 - j))
+                    elif const_expr(vk_seam & 1):
+                        last_tail = tail
                     else:
                         _mma_ks(tail)
                 else:
@@ -1401,16 +1726,268 @@ def _launch_grouped_bf16_variable_k(
                     compute_ktile(buf, None)
 
             # epilogue: out[g] tile, both output axes clamped
-            accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
-            _fence(outstanding=0)
+            if const_expr(vk_seam & 1):
+                # Read where each chunk is staged, after its last matrix ops.
+                accs = None
+            else:
+                accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
+            # vk_seam bit 4: the next tile's k-tiles 0 and 1 may be in flight; they are not in the staging.
+            _fence(outstanding=(TDM_PW * PRE_KT) if const_expr(vk_seam & 16) else 0)
             if const_expr(MC > 1 and mc_epi_sync):
                 _cluster.cluster_barrier()
-            if PREFETCH_OK:
+            if const_expr(vk_seam & 4096):
+                # The fence's barrier put every wave past the k-loop; the next tile waits for this signal.
+                if tile_raw + fx.Int32(C_STEP) < fx.Int32(C_TOTAL):
+                    _cluster.cluster_signal_once_per_wg()
+            if const_expr(vk_seam & 128):
+                # Every wave is past its last ring read, so all four slots may be refilled: the next tile's
+                # k-tiles 2 and 3 go out behind its k-tiles 0 and 1, riding the first two blocks' matrix ops.
+                rocdl.sched_barrier(0)
+                if pre_epi:
+                    _pre_issue()
+                rocdl.sched_barrier(0)
+                VB_BLK = 1 if const_expr(vk_seam & 2048) else 2
+                VB_MMA = VB_BLK * wmma_n_rep
+                _mma_ks_range(last_tail, 0, VB_MMA)
+                for pk in range_constexpr(PRE_KT, num_buffers):
+                    issue(_slot(pk), pk, dec=dec2[:4])
+                if const_expr(carry is not None):
+                    carry.store(
+                        Vec.from_elements([dec2[4], dec2[5], dec2[6], dec2[0], dec2[1], 0, 0, 0], fx.Int32)
+                    )
+                for _j in range_constexpr(VB_MMA):
+                    rocdl.sched_mfma(1)
+                    rocdl.sched_group_barrier(0x4, 2, 0)
+                rocdl.sched_barrier(0)
+                # Slot u: matrix op VB_MMA + u, conversion of fragment u, staging write of fragment u - 2, and
+                # (row pair j = u - VR) the read-back / store of the blocks, VL slots apart. Fragments run in
+                # MMA_ORDER, block by block; block b lives in staging block b % WS_NSUB of this wave.
+                VR = wmma_n_rep + 2
+                VL = 0 if const_expr(vk_seam & 256) else wmma_n_rep
+                NF = n_acc
+                ws_wave = fx.Int32(ARENA_B) + wave * fx.Int32(WS_WAVE)
+                st_lane = ws_wave + lane16 * fx.Int32(WS_RB) + kgrp * fx.Int32(16)
+                ld_lane = fx.Int32(_bidx(base_ptr)) + ws_wave + kgrp * fx.Int32(WS_RB) + lane16 * fx.Int32(16)
+                # Whole tiles and out_ldc = 0 (checked by the entry point): the row stride is OUT_N, known here,
+                # so every store of the tile is one base plus an immediate offset.
+                ROW_B = C_GRP_ELEMS // (N_BLOCKS_N * tile_m) * EB
+                g_vb = (
+                    fx.Int64(fx.ptrtoint(fx.recast_iter(fx.Int8, arg_c)))
+                    + (
+                        fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS)
+                        + fx.Int64(blk_n + wmb) * fx.Int64(ROW_B // EB)
+                        + fx.Int64(blk_k + wnb)
+                    )
+                    * fx.Int64(EB)
+                    + fx.Int64(kgrp * fx.Int32(ROW_B) + lane16 * fx.Int32(16))
+                )
+                vec4i = ir.VectorType.get([4], ir.IntegerType.get_signless(32))
+                _PTR1 = ir.Type.parse("!llvm.ptr<1>")
+
+                def _lds_p(addr):
+                    return _llvm.inttoptr(_PTR3, _raw(addr))
+
+                def _g_addr(j):
+                    return g_vb + fx.Int64(((j // wmma_n_rep) * WMMA_M + 2 * (j % wmma_n_rep)) * ROW_B)
+
+                def _ld_off(j):
+                    return ((j // wmma_n_rep) % WS_NSUB) * WS_SUB + 2 * (j % wmma_n_rep) * WS_RB
+
+                def _stage_slot(f):
+                    return f + 2
+
+                def _rd_slot(j):
+                    return j + VR
+
+                def _n_after(kind, u0, u1):
+                    # Ops of `kind` emitted in slots u0 < u <= u1 (staging writes and reads are DS ops,
+                    # asynchronous stores ASYNC ops), counted the way they are emitted below.
+                    n = 0
+                    for u in range(u0 + 1, u1 + 1):
+                        if kind == "ds" and 0 <= u - 2 < NF:
+                            n += 1
+                        if kind == "ds" and VL and 0 <= u - VR < NF:
+                            n += 1
+                        if kind == "async" and 0 <= u - VR < NF:
+                            n += 1
+                    return n
+
+                if const_expr(vk_seam & 2048):
+                    # Step s, slot k: matrix op of block s + VB_BLK, conversion of block s, staging write of
+                    # fragment 8 s + k - 2, store of row pair k of block s - 2 - VDL; the step closes with the
+                    # read-back of block s - 1, whose last staging write was this step's slot 1.
+                    VDL = 2 if const_expr(vk_seam & 131072) else 1
+                    NB_ = wmma_m_rep
+                    FPB = wmma_n_rep
+                    NAS = WS_NSUB if const_expr(vk_seam & 8192) else 0
+                    cvt = {}
+                    rdv = {}
+                    if const_expr(vk_seam & 65536):
+                        # Chunk c (16 B) of row r of a block sits at chunk c ^ r. Fragment column chunk 2 wn + kgrp
+                        # of row lane16, and row-pair chunk lane16 of row 2 i + kgrp, both land on (2 w) ^ sx.
+                        sx = kgrp ^ lane16
+                        SW_ST = [
+                            fx.Int32(_bidx(base_ptr))
+                            + ws_wave
+                            + lane16 * fx.Int32(WS_RB)
+                            + ((sx ^ fx.Int32(2 * w)) * fx.Int32(16))
+                            for w in range_constexpr(FPB)
+                        ]
+                        SW_LD = [
+                            fx.Int32(_bidx(base_ptr))
+                            + ws_wave
+                            + kgrp * fx.Int32(WS_RB)
+                            + ((sx ^ fx.Int32(2 * w)) * fx.Int32(16))
+                            for w in range_constexpr(FPB)
+                        ]
+
+                    def _stage(h, wm, wn):
+                        if const_expr(vk_seam & 65536):
+                            _llvm.store(
+                                _raw(h.bitcast(fx.Int32)),
+                                _lds_p(SW_ST[wn] + fx.Int32((wm % WS_NSUB) * WS_SUB)),
+                                alignment=16,
+                            )
+                        else:
+                            fx.ptr_store(
+                                h.bitcast(fx.Int8),
+                                base_ptr + (st_lane + fx.Int32((wm % WS_NSUB) * WS_SUB + wn * WMMA_N * EB)),
+                            )
+
+                    def _ld_addr(j):
+                        if const_expr(vk_seam & 65536):
+                            i = j % wmma_n_rep
+                            return SW_LD[i] + fx.Int32(((j // wmma_n_rep) % WS_NSUB) * WS_SUB + 2 * i * WS_RB)
+                        return ld_lane + fx.Int32(_ld_off(j))
+
+                    if const_expr(NAS):
+                        # The previous tile's asynchronous stores read staging blocks 0 and 1.
+                        rocdl.s_wait_asynccnt(0)
+                    for s in range_constexpr(NB_ + 2 + VDL):
+                        for k in range_constexpr(FPB):
+                            if const_expr(s + VB_BLK < NB_):
+                                f_m = (s + VB_BLK) * FPB + k
+                                _mma_ks_range(last_tail, f_m, f_m + 1)
+                            if const_expr(s < NB_):
+                                wm, wn = MMA_ORDER[s * FPB + k]
+                                cvt[s * FPB + k] = c_frags[wm * wmma_n_rep + wn].load().to(elem_cls)
+                            fs = s * FPB + k - 2
+                            if const_expr(0 <= fs < NF and not ((vk_seam & 262144) and k < 2)):
+                                wm, wn = MMA_ORDER[fs]
+                                _stage(cvt.pop(fs), wm, wn)
+                            bs = s - 2 - VDL
+                            if const_expr(0 <= bs < NB_ - NAS):
+                                j = bs * FPB + k
+                                _llvm.store(
+                                    rdv.pop(j),
+                                    _llvm.inttoptr(_PTR1, _raw(_g_addr(j))),
+                                    alignment=16,
+                                    nontemporal=True if const_expr(vk_seam & 524288) else None,
+                                )
+                            rocdl.sched_barrier(0)
+                        if const_expr((vk_seam & 262144) and s < NB_):
+                            for k in range_constexpr(FPB - 2, FPB):
+                                wm, wn = MMA_ORDER[s * FPB + k]
+                                _stage(cvt.pop(s * FPB + k), wm, wn)
+                                rocdl.sched_barrier(0)
+                        bl = s - 1
+                        if const_expr(0 <= bl < NB_ - NAS):
+                            # In program order behind the block's last staging write; the LDS runs a wave's
+                            # accesses in order.
+                            _llvm.fence(_llvm.AtomicOrdering.acq_rel, syncscope="wavefront")
+                            for k in range_constexpr(FPB):
+                                j = bl * FPB + k
+                                rdv[j] = _llvm.load(vec4i, _lds_p(_ld_addr(j)), alignment=16)
+                            rocdl.sched_barrier(0)
+                        elif const_expr(NB_ - NAS <= bl < NB_):
+                            # The block's staging writes have landed: only the next block's (this step's
+                            # slots 2.. ) were issued behind its last one.
+                            if const_expr(vk_seam & 262144):
+                                # Behind the block's last staging write (its own step's tail): the previous block's
+                                # read-back, if it has one, and the next block's staging writes.
+                                rocdl.s_wait_dscnt(
+                                    (FPB if 0 <= bl - 1 < NB_ - NAS else 0) + (FPB if bl + 1 < NB_ else 0)
+                                )
+                            else:
+                                rocdl.s_wait_dscnt(max(0, min(FPB - 2, NF - (bl + 1) * FPB)))
+                            _llvm.fence(_llvm.AtomicOrdering.acq_rel, syncscope="wavefront")
+                            for k in range_constexpr(FPB):
+                                j = bl * FPB + k
+                                _rocdl.global_store_async_from_lds_b128(
+                                    _llvm.inttoptr(_PTR1, _raw(_g_addr(j))), _lds_p(_ld_addr(j)), 0
+                                )
+                            rocdl.sched_barrier(0)
+                    return
+
+                cvt = {}
+                rdv = {}
+                for u in range_constexpr(NF + VR + VL):
+                    if const_expr(VB_MMA + u < NF):
+                        _mma_ks_range(last_tail, VB_MMA + u, VB_MMA + u + 1)
+                    if const_expr(u < NF):
+                        wm, wn = MMA_ORDER[u]
+                        cvt[u] = c_frags[wm * wmma_n_rep + wn].load().to(elem_cls)
+                    fs = u - 2
+                    if const_expr(0 <= fs < NF):
+                        wm, wn = MMA_ORDER[fs]
+                        if const_expr((vk_seam & 256) and fs % wmma_n_rep == 0 and wm >= WS_NSUB):
+                            # The block this one overwrites has been read by its asynchronous stores.
+                            j_last = (wm - WS_NSUB + 1) * wmma_n_rep - 1
+                            rocdl.s_wait_asynccnt(_n_after("async", _rd_slot(j_last), u - 1))
+                        fx.ptr_store(
+                            cvt.pop(fs).bitcast(fx.Int8),
+                            base_ptr + (st_lane + fx.Int32((wm % WS_NSUB) * WS_SUB + wn * WMMA_N * EB)),
+                        )
+                    j = u - VR
+                    if const_expr(0 <= j < NF):
+                        if const_expr(j % wmma_n_rep == 0):
+                            # The block's last staging write is in program order before its read-back.
+                            _llvm.fence(_llvm.AtomicOrdering.acq_rel, syncscope="wavefront")
+                        if const_expr(vk_seam & 256):
+                            if const_expr(j % wmma_n_rep == 0):
+                                rocdl.s_wait_dscnt(_n_after("ds", _stage_slot(j + wmma_n_rep - 1), u))
+                            _rocdl.global_store_async_from_lds_b128(
+                                _llvm.inttoptr(_PTR1, _raw(_g_addr(j))),
+                                _lds_p(ld_lane + fx.Int32(_ld_off(j))),
+                                0,
+                            )
+                        else:
+                            rdv[j] = _llvm.load(vec4i, _lds_p(ld_lane + fx.Int32(_ld_off(j))), alignment=16)
+                    js = u - VR - VL
+                    if const_expr(VL and 0 <= js < NF):
+                        # Behind the read-back, so that it cannot take this store's data registers.
+                        rocdl.sched_barrier(0)
+                        _llvm.store(rdv.pop(js), _llvm.inttoptr(_PTR1, _raw(_g_addr(js))), alignment=16)
+                    rocdl.sched_barrier(0)
+                return
+            if const_expr(vk_seam & 1):
+                # The prefetch issue below rides the first chunk's matrix ops.
+                rocdl.sched_barrier(0)
+                if const_expr(epi_chunk > 1):
+                    EPI_CH_MMA = (wmma_m_rep // epi_chunk) * wmma_n_rep
+                    _mma_ks_range(last_tail, 0, EPI_CH_MMA)
+            if const_expr((PREFETCH_OK or carry is not None) and dec2 is None):
                 dec2 = nxt_dec if const_expr(nxt_dec is not None) else _next_dec()
+                if const_expr(vk_seam & 4):
+                    dec2 = (rocdl.readfirstlane(T.i32, dec2[0]), rocdl.readfirstlane(T.i32, dec2[1])) + tuple(
+                        dec2[2:]
+                    )
+            if const_expr(vk_seam & 16):
+                if pre_epi:
+                    _pre_issue()
+            elif PREFETCH_OK:
                 # Ahead of the store ops, so the next tile can wait for these alone (in-order TENSORcnt).
                 for pk in range_constexpr(PRE_KT):
-                    issue(_slot(pk), pk, dec=dec2)
+                    issue(_slot(pk), pk, dec=dec2[:4])
+            if const_expr(carry is not None):
+                carry.store(
+                    Vec.from_elements([dec2[4], dec2[5], dec2[6], dec2[0], dec2[1], 0, 0, 0], fx.Int32)
+                )
             c_off = fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS) + fx.Int64(blk_n) * ldc64 + fx.Int64(blk_k)
+            if const_expr(vk_seam & 1):
+                for _j in range_constexpr(EPI_CH_MMA):
+                    rocdl.sched_mfma(1)
+                    rocdl.sched_group_barrier(0x4, 2, 0)
 
             def _epi_stage(wm_lo, wm_hi):
                 for wm in range_constexpr(wm_hi - wm_lo):
@@ -1418,10 +1995,23 @@ def _launch_grouped_bf16_variable_k(
                     row_rel = wmb + wmg * WMMA_M + lane16
                     for wn in range_constexpr(wmma_n_rep):
                         col_rel = wnb + wn * WMMA_N + kgrp * 8
-                        h = accs[wmg * wmma_n_rep + wn].to(elem_cls)
+                        acc = (
+                            c_frags[wmg * wmma_n_rep + wn].load()
+                            if const_expr(accs is None)
+                            else accs[wmg * wmma_n_rep + wn]
+                        )
+                        h = acc.to(elem_cls)
                         fx.ptr_store(h.bitcast(fx.Int8), base_ptr + (row_rel * C_ROW_E + col_rel) * EB)
 
-            def _epi_store(r0, rows):
+            def _stg_shift(lr):
+                # vk_seam bit 14: the second half of the staging starts at the second slot, so that the first
+                # slot holds the first half only.
+                return (PITCH - (tile_m // 2) * C_ROW_E * EB) if const_expr(lr >= tile_m // 2) else 0
+
+            def _epi_store(r0, rows, lr0=None):
+                # Output rows [r0, r0 + rows) of the tile, staged at LDS rows [lr0, lr0 + rows) (default r0).
+                if const_expr(lr0 is None):
+                    lr0 = r0
                 if const_expr(r0):
                     ext0 = n_valid - fx.Int32(r0)
                     ext0 = (ext0 > fx.Int32(0)).select(ext0, fx.Int32(0))
@@ -1439,12 +2029,113 @@ def _launch_grouped_bf16_variable_k(
                 )
                 src = (
                     fx.recast_iter(elem_cls, base_ptr)
-                    if const_expr(r0 == 0)
-                    else fx.recast_iter(elem_cls, fx.add_offset(base_ptr, r0 * C_ROW_E * EB))
+                    if const_expr(lr0 == 0)
+                    else fx.recast_iter(
+                        elem_cls,
+                        fx.add_offset(
+                            base_ptr,
+                            lr0 * C_ROW_E * EB + (_stg_shift(lr0) if const_expr(vk_seam & 16384) else 0),
+                        ),
+                    )
                 )
                 fx.copy(atom, _lv(src, (rows, C_ROW_E), (C_ROW_E, 1)), gts)
 
-            if const_expr(epi_chunk > 1):
+            if const_expr(vk_seam & 1):
+                # Chunk 0's matrix ops are above. Chunk ch's run one per step with chunk ch - 1's
+                # conversions, in MMA order, each fragment's staging write EPI_LAG steps behind its
+                # conversion so that it never waits for it; every step is fenced so the order holds.
+                EPI_REP = wmma_m_rep // epi_chunk
+                EPI_ROWS = EPI_REP * WMMA_M
+                EPI_LAG = 2
+
+                def _epi_cvt(k):
+                    wm, wn = MMA_ORDER[k]
+                    if const_expr(vk_seam & 16384):
+                        # Chunk-major: chunk ch of wave row i at LDS rows (ch * m_warp + i) * EPI_ROWS, the second
+                        # half of the chunks shifted to the second slot.
+                        ch_ = wm // EPI_REP
+                        row_rel = (
+                            wave_m * fx.Int32(EPI_ROWS)
+                            + fx.Int32(ch_ * m_warp * EPI_ROWS + (wm % EPI_REP) * WMMA_M)
+                            + lane16
+                        )
+                        col_rel = wnb + wn * WMMA_N + kgrp * 8
+                        h = c_frags[wm * wmma_n_rep + wn].load().to(elem_cls)
+                        return h, base_ptr + (
+                            (row_rel * C_ROW_E + col_rel) * EB + fx.Int32(_stg_shift(ch_ * m_warp * EPI_ROWS))
+                        )
+                    row_rel = wmb + wm * WMMA_M + lane16
+                    col_rel = wnb + wn * WMMA_N + kgrp * 8
+                    h = c_frags[wm * wmma_n_rep + wn].load().to(elem_cls)
+                    return h, base_ptr + (row_rel * C_ROW_E + col_rel) * EB
+
+                if const_expr(vk_seam & 512):
+                    # Whole tiles and out_ldc = 0 (checked by the entry point): the row stride is OUT_N.
+                    ROW_B = C_GRP_ELEMS // (N_BLOCKS_N * tile_m) * EB
+                    _PTR1 = ir.Type.parse("!llvm.ptr<1>")
+                    a_lds = (
+                        fx.Int32(_bidx(base_ptr))
+                        + (wmb + kgrp) * fx.Int32(C_ROW_E * EB)
+                        + (wnb + lane16 * fx.Int32(8)) * fx.Int32(EB)
+                    )
+                    a_glb = (
+                        fx.Int64(fx.ptrtoint(fx.recast_iter(fx.Int8, arg_c)))
+                        + (
+                            fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS)
+                            + fx.Int64(blk_n + wmb) * fx.Int64(ROW_B // EB)
+                            + fx.Int64(blk_k + wnb)
+                        )
+                        * fx.Int64(EB)
+                        + fx.Int64(kgrp * fx.Int32(ROW_B) + lane16 * fx.Int32(16))
+                    )
+
+                    def _async_chunk(c, n_after):
+                        # This wave's EPI_ROWS rows of chunk c, two per store; `n_after` staging writes were
+                        # issued behind the chunk's own.
+                        rocdl.s_wait_dscnt(n_after)
+                        _llvm.fence(_llvm.AtomicOrdering.acq_rel, syncscope="wavefront")
+                        for i in range_constexpr(EPI_ROWS // 2):
+                            r = c * EPI_ROWS + 2 * i
+                            _rocdl.global_store_async_from_lds_b128(
+                                _llvm.inttoptr(_PTR1, _raw(a_glb + fx.Int64(r * ROW_B))),
+                                _llvm.inttoptr(_PTR3, _raw(a_lds + fx.Int32(r * C_ROW_E * EB))),
+                                0,
+                            )
+                        rocdl.sched_barrier(0)
+
+                for ch in range_constexpr(1, epi_chunk + 1):
+                    rocdl.sched_barrier(0)
+                    pend = []
+                    for j in range_constexpr(EPI_CH_MMA):
+                        if const_expr(ch < epi_chunk):
+                            _mma_ks_range(last_tail, ch * EPI_CH_MMA + j, ch * EPI_CH_MMA + j + 1)
+                        pend.append(_epi_cvt((ch - 1) * EPI_CH_MMA + j))
+                        if const_expr(j >= EPI_LAG):
+                            h, addr = pend.pop(0)
+                            fx.ptr_store(h.bitcast(fx.Int8), addr)
+                        rocdl.sched_barrier(0)
+                    for p in range_constexpr(len(pend)):
+                        fx.ptr_store(pend[p][0].bitcast(fx.Int8), pend[p][1])
+                    rocdl.sched_barrier(0)
+                    if const_expr(vk_seam & 512):
+                        if const_expr(ch >= 2):
+                            _async_chunk(ch - 2, EPI_CH_MMA)
+                    elif const_expr(vk_seam & 16384):
+                        gpu.barrier()
+                        for i in range_constexpr(m_warp):
+                            _epi_store(
+                                i * warp_tile_m + (ch - 1) * EPI_ROWS,
+                                EPI_ROWS,
+                                ((ch - 1) * m_warp + i) * EPI_ROWS,
+                            )
+                    else:
+                        gpu.barrier()
+                        if const_expr(not ((vk_seam & 32768) and ch - 1 >= epi_chunk // 2)):
+                            for i in range_constexpr(m_warp):
+                                _epi_store(i * warp_tile_m + (ch - 1) * EPI_ROWS, EPI_ROWS)
+                if const_expr(vk_seam & 512):
+                    _async_chunk(epi_chunk - 1, 0)
+            elif const_expr(epi_chunk > 1):
                 EPI_REP = wmma_m_rep // epi_chunk
                 EPI_ROWS = EPI_REP * WMMA_M
                 for ch in range_constexpr(epi_chunk):
@@ -1466,11 +2157,36 @@ def _launch_grouped_bf16_variable_k(
         # c, c + C_STEP, ..., and its peers the adjacent tiles inside each.
         walk = mc_cid if const_expr(MC > 1) else pid
         if persist:
+            if const_expr(vk_stagger > 0):
+                ST_UNITS = vk_stagger & 1023
+                ST_MODE = vk_stagger >> 10
+                ST_NG = 2 if ST_MODE < 2 else 4
+                if const_expr(ST_MODE % 2 == 0):
+                    st_grp = walk % fx.Int32(ST_NG)
+                else:
+                    st_grp = walk // fx.Int32(max(C_STEP // ST_NG, 1))
+                ST_SLEEPS = [127] * (ST_UNITS // 127) + ([ST_UNITS % 127] if ST_UNITS % 127 else [])
+                for g_s in range_constexpr(1, ST_NG):
+                    if st_grp >= fx.Int32(g_s):
+                        for n_s in range_constexpr(len(ST_SLEEPS)):
+                            _rocdl.s_sleep(ST_SLEEPS[n_s])
+            carry = None
+            if const_expr(vk_seam & 2):
+                carry = fx.make_rmem_tensor(8, fx.Int32)
+                g0, bn0, bk0 = _tile_dec(walk)
+                et0 = _i32_table(arg_etab)
+                e0 = g0 * fx.Int32(2)
+                carry.store(
+                    Vec.from_elements([g0, bn0, bk0, et0[e0], et0[e0 + fx.Int32(1)], 0, 0, 0], fx.Int32)
+                )
             for _t in range(TILES_PER_WG):
-                _one_output_tile(walk + _t * fx.Int32(C_STEP))
+                _one_output_tile(walk + _t * fx.Int32(C_STEP), carry)
             if const_expr(vk_ovl & 2):
                 # The last tile's store ops (and its never-consumed prefetch) are still in flight.
                 tdm_ops.tensor_wait(0)
+            if const_expr(vk_seam & (256 | 512 | 8192)):
+                # The asynchronous stores read this workgroup's LDS.
+                rocdl.s_wait_asynccnt(0)
         else:
             _one_output_tile(walk)
 
@@ -1600,6 +2316,46 @@ def _pick_lds_cosched(kind: str, N: int, K: int, avg_m: int, stack: bool = False
     if stack and key in _STACK_LDS_COSCHED[kind]:
         return _STACK_LDS_COSCHED[kind][key]
     return _LDS_COSCHED_KEYS[kind].get(key, 0)
+
+
+# The launchers raise on these and the entry points lower a keyed level with them, so both read one
+# rule. The tables above name a shape, but the tile also follows the expert count: one expert at a
+# keyed avg_m=2048 gets 128x128 (`_pick_config_shape`), whose 4x4 warp tile has as many fragment
+# reads per sub-step (16) as matrix ops.
+def _nt_lds_cosched_ok(
+    lds_cosched: int, wmma_m_rep: int, wmma_n_rep: int, frag_ring: int, sched_style: int, issue_first: int
+) -> bool:
+    # From level 2 a sub-step's fragment reads are issued one per matrix op of the previous sub-step.
+    return lds_cosched < 2 or bool(
+        frag_ring == 2
+        and not sched_style
+        and issue_first
+        and 2 * (wmma_m_rep + wmma_n_rep) < wmma_m_rep * wmma_n_rep
+    )
+
+
+def _vk_lds_cosched_ok(lds_cosched: int, wmma_m_rep: int, wmma_n_rep: int, frag_pipeline: int) -> bool:
+    return not lds_cosched or bool(
+        frag_pipeline == 1 and (lds_cosched < 2 or 2 * (wmma_m_rep + wmma_n_rep) < wmma_m_rep * wmma_n_rep)
+    )
+
+
+def _pick_nt_lds_cosched(kind, N, K, avg_m, cfg, frag_ring, sched_style, issue_first) -> int:
+    """The keyed level of an NT or native-NN launch on ``cfg``, lowered to the highest one it can build."""
+    wm, wn = cfg[0] // cfg[3] // 16, cfg[1] // cfg[4] // 16
+    level = _pick_lds_cosched(kind, N, K, avg_m)
+    while level and not _nt_lds_cosched_ok(level, wm, wn, frag_ring, sched_style, issue_first):
+        level -= 1
+    return level
+
+
+def _pick_vk_lds_cosched(OUT_M, OUT_N, avg_m, stack, cfg, frag_pipeline) -> int:
+    """`_pick_nt_lds_cosched` for the variable-K launcher."""
+    wm, wn = cfg[0] // cfg[3] // 16, cfg[1] // cfg[4] // 16
+    level = _pick_lds_cosched("vk", OUT_M, OUT_N, avg_m, stack)
+    while level and not _vk_lds_cosched_ok(level, wm, wn, frag_pipeline):
+        level -= 1
+    return level
 
 
 # The persistent-cluster stack: `persist` and the knobs that exist only under it. Its members are
@@ -1837,7 +2593,7 @@ def grouped_gemm_bf16_variable_k_supported(OUT_M: int, OUT_N: int, avg_m: int = 
 wgrad_tn_ok = grouped_gemm_bf16_variable_k_supported
 
 
-def grouped_gemm_bf16_variable_k_flydsl_kernel(
+def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
     a: torch.Tensor,
     b: torch.Tensor,
     group_k_offsets: torch.Tensor,
@@ -1893,6 +2649,9 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     tdm_deal: int = -1,
     # Persistent tile seam; see the launcher's `vk_ovl`.
     vk_ovl: int = -1,
+    # Epilogue / tile-decode seam; see the launcher's `vk_seam`. Not a `_STACK_KEYS` member: 0 = off.
+    vk_seam: int = 0,
+    vk_stagger: int = 0,
 ) -> torch.Tensor:
     """Variable-K grouped wgrad: ``out[g] = a[rows_g].T @ b[rows_g]``."""
     assert a.dim() == 2 and b.dim() == 2, f"a must be [M,OUT_M] and b [M,OUT_N], got {a.dim()}/{b.dim()}"
@@ -1968,14 +2727,15 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     _auto_cosched = lds_cosched < 0
     _auto_buffers = not num_buffers
     _auto_sbar = split_bar == -1
-    if _auto_cosched:
-        lds_cosched = _pick_lds_cosched("vk", OUT_M, OUT_N, _avg_m, _want) if _keyed else 0
     tile_m = BLOCK_M or cfg[0]
     tile_n = BLOCK_N or cfg[1]
     tile_k = BLOCK_K or cfg[2]
     m_warp = m_warp or cfg[3]
     n_warp = n_warp or cfg[4]
     num_buffers = num_buffers or cfg[5]
+    _tile = (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
+    if _auto_cosched:
+        lds_cosched = _pick_vk_lds_cosched(OUT_M, OUT_N, _avg_m, _want, _tile, frag_pipeline) if _keyed else 0
     assert OUT_M >= tile_m, f"OUT_M={OUT_M} must be >= tile_m={tile_m} for the descriptor back-off"
     assert OUT_N >= tile_n, f"OUT_N={OUT_N} must be >= tile_n={tile_n} for the descriptor back-off"
     lds_pad = lds_pad or _vk_lds_pad(tile_m, tile_n, 2)
@@ -2013,7 +2773,7 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
         # then refused. Put its two advanced knobs back on the ungrouped values: with no
         # `head_pipe` / `tdm_deal` / `vk_ovl` riding them they are cost and nothing else.
         if _auto_cosched:
-            lds_cosched = _pick_lds_cosched("vk", OUT_M, OUT_N, _avg_m)
+            lds_cosched = _pick_vk_lds_cosched(OUT_M, OUT_N, _avg_m, False, _tile, frag_pipeline)
         if _auto_buffers:
             num_buffers = _pick_variable_k_config(OUT_M, OUT_N, _avg_m)[5]
             if _auto_sbar:
@@ -2041,6 +2801,11 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
         tdm_deal = 0
     if (tdm_deal & 2) and (not head_pipe or hp_burst):
         tdm_deal &= 1
+    if (vk_seam & (128 | 512)) and (OUT_M % tile_m or OUT_N % tile_n or out_ldc):
+        raise ValueError(
+            f"vk_seam bits 7 / 9 store whole tiles unclamped through the row stride OUT_N: OUT_M={OUT_M} / "
+            f"OUT_N={OUT_N} must be multiples of the tile ({tile_m}, {tile_n}) and out_ldc must be 0"
+        )
 
     # Checked rather than assumed: a mismatch writes out of bounds.
     c_ldc = out_ldc or OUT_N
@@ -2106,12 +2871,18 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
         )
         + (
             (mc_m, mc_n, mc_early, mc_sync, mc_tile_sync, mc_epi_sync)
-            if (mc_m * mc_n > 1 or head_pipe or tdm_deal or vk_ovl)
+            if (mc_m * mc_n > 1 or head_pipe or tdm_deal or vk_ovl or vk_seam or vk_stagger)
             else ()
         )
-        + ((head_pipe, hp_burst, hp_opaque) if (head_pipe or tdm_deal or vk_ovl) else ())
-        + ((tdm_deal,) if (tdm_deal or vk_ovl) else ())
-        + ((vk_ovl,) if vk_ovl else ())
+        + (
+            (head_pipe, hp_burst, hp_opaque)
+            if (head_pipe or tdm_deal or vk_ovl or vk_seam or vk_stagger)
+            else ()
+        )
+        + ((tdm_deal,) if (tdm_deal or vk_ovl or vk_seam or vk_stagger) else ())
+        + ((vk_ovl,) if (vk_ovl or vk_seam or vk_stagger) else ())
+        + ((vk_seam,) if (vk_seam or vk_stagger) else ())
+        + ((vk_stagger,) if vk_stagger else ())
     )
     return out[:, :, :OUT_N] if out_ldc else out
 
@@ -2239,6 +3010,27 @@ def _launch_grouped_gemm_bf16_nt(
     # 1: the m-tile decode reads the tile's record from the per-tile table behind the map (`build_m_tile_tt`);
     # needs inkernel_scan=0. Takes precedence over vec_dec.
     tt_dec: Constexpr[int] = 0,
+    # Persistent tile seam. bit 0 (needs nt_ovl, ntp_flags bit 0 and num_buffers=2): when the tile's k-tile count is
+    # even, the next tile's k-tile 0 is issued at the head of this tile's last k-tile -- buffer 0 is free once the
+    # second-to-last k-tile's fence has passed -- instead of in the epilogue, so its load latency overlaps the last
+    # k-tile and the epilogue rather than the next tile's first fence. bit 2 (needs bit 0, and tt_dec or vec_dec
+    # with the span decode or no cluster): each tile's m-tile decode is carried over from the previous tile's
+    # next-tile decode, whose table reads are issued at the top of the tile and consumed only ahead of its last
+    # k-tile. bit 3 (needs bit 2): the next tile's coordinates and table reads move past the tile's first fence (past
+    # k-tile 0's barrier without nt_c1) -- a barrier with a memory fence waits for every load in flight, so issued at
+    # the top of the tile they were waited for in the seam -- and this tile's coordinates come with the carry.
+    # Bit-identical to 0: it only moves load issues.
+    nt_seam: Constexpr[int] = 0,
+    # 1 (needs 4 waves, tdm_balance on NT or tdm_nn on NN, k_tail=0, b_imm_walk=0): branch-free k-tile issue --
+    # each wave issues its own one of the four TDM jobs with a descriptor built once per tile in scalar registers
+    # (the copy atom's descriptor, field by field). Bit-identical to 0.
+    nt_deal: Constexpr[int] = 0,
+    # > 0 (needs persist, nt_ovl, head_pipe, epi_chunk=1, 4 waves and k-tile job regions that each hold one block of C
+    # rows): the C staging is laid out in the LDS regions of the next tile's k-tile 1 jobs, one block of rows per job,
+    # and each wave stores the block in the region of the job it issues itself. A wave's k-tile 1 job then only
+    # overwrites what its own store read, so it is issued as soon as that store has drained, with no barrier:
+    # 1 = at the next tile's first fence, 2 + s = ahead of sub-step s of the next tile's k-tile 0. Bit-identical to 0.
+    nt_c1: Constexpr[int] = 0,
 ):
     WMMA_M = WMMA_N = 16
     WMMA_K = 32
@@ -2305,9 +3097,7 @@ def _launch_grouped_gemm_bf16_nt(
         raise ValueError(f"epi_chunk must divide wmma_m_rep={wmma_m_rep}, got {epi_chunk}")
     if lds_cosched not in (0, 1, 2, 3):
         raise ValueError(f"lds_cosched must be 0, 1, 2 or 3, got {lds_cosched}")
-    if lds_cosched >= 2 and (
-        frag_ring != 2 or sched_style or not issue_first or 2 * (wmma_m_rep + wmma_n_rep) >= n_acc
-    ):
+    if not _nt_lds_cosched_ok(lds_cosched, wmma_m_rep, wmma_n_rep, frag_ring, sched_style, issue_first):
         raise ValueError(
             f"lds_cosched={lds_cosched} needs frag_ring=2, sched_style=0, issue_first=1 and fewer "
             f"fragment reads per sub-step ({2 * (wmma_m_rep + wmma_n_rep)}) than matrix ops ({n_acc}); "
@@ -2320,7 +3110,7 @@ def _launch_grouped_gemm_bf16_nt(
             f"head_pipe={head_pipe} needs lds_cosched>=2, split_bar=1, split_bar_depth=1, num_buffers=2, "
             f"k_tail=0 and half_n_skip=0"
         )
-    if head_pipe < 0 or head_pipe + 2 * (wmma_m_rep + wmma_n_rep) > n_acc:
+    if head_pipe < 0 or not _head_pipe_fits(head_pipe, wmma_m_rep, wmma_n_rep):
         raise ValueError(f"head_pipe={head_pipe} leaves too few deferred matrix ops for the head reads")
     if (hp_opaque or hp_epi) and not head_pipe:
         raise ValueError("hp_opaque / hp_epi need head_pipe")
@@ -2335,6 +3125,34 @@ def _launch_grouped_gemm_bf16_nt(
     EPI_OPS = (epi_chunk * m_warp) if epi_chunk > 1 else 1
     if tt_dec not in (0, 1) or (tt_dec and inkernel_scan):
         raise ValueError(f"tt_dec={tt_dec} must be 0 or 1 and needs inkernel_scan=0")
+    MC_SPAN_OK = mc_m * mc_n > 1 and mc_m >= 2 and not inkernel_scan
+    MC = mc_m * mc_n
+    if nt_seam < 0 or nt_seam > 15 or (nt_seam & 2):
+        raise ValueError(f"nt_seam must be a bitfield of 1, 4 and 8, got {nt_seam}")
+    if (nt_seam & 8) and not (nt_seam & 4):
+        raise ValueError("nt_seam bit 3 needs bit 2")
+    if (nt_seam & 4) and not (
+        (nt_seam & 1) and head_pipe and (tt_dec or vec_dec) and not inkernel_scan and (MC == 1 or MC_SPAN_OK)
+    ):
+        raise ValueError(
+            "nt_seam bit 2 needs bit 0, head_pipe, tt_dec or vec_dec, and the span decode under a cluster"
+        )
+    if nt_deal not in (0, 1):
+        raise ValueError(f"nt_deal must be 0 or 1, got {nt_deal}")
+    if nt_deal and not (
+        m_warp * n_warp == 4
+        and (tdm_nn if b_lds_transpose else tdm_balance)
+        and not k_tail
+        and not b_imm_walk
+        and not half_n_skip
+        and tile_m == tile_n
+    ):
+        raise ValueError(
+            "nt_deal needs 4 waves, the four-job split (tdm_balance on NT, tdm_nn on NN), tile_m == tile_n, "
+            "k_tail=0, b_imm_walk=0 and half_n_skip=0"
+        )
+    if (nt_seam & 1) and not (nt_ovl and (ntp_flags & 1) and num_buffers == 2):
+        raise ValueError("nt_seam bit 0 needs nt_ovl, ntp_flags bit 0 and num_buffers=2")
     if b_lds_transpose:
         # Each combination rejected below would give a silently wrong answer rather than a crash.
         if tdm_balance:
@@ -2391,6 +3209,44 @@ def _launch_grouped_gemm_bf16_nt(
     # C staging offset: the top of the arena under `persist`, so buffer 0 (the cross-tile
     # prefetch target) stays clear of it.
     C_OFF = (ARENA_B - C_STORE_B) if persist else 0
+    # nt_c1: block r of C (rows [r * C1_RB, (r + 1) * C1_RB)) is staged at buffer 1 + r * C1_REG, the region of k-tile
+    # job r in LDS order (A halves, then B halves), and stored by the wave that issues that job.
+    C1_NREG = 2 * tdm_parts
+    C1_RB = tile_m // C1_NREG
+    C1_REG = A_ROWS * LDS_ROW
+    C1_SLACK = C1_REG - C1_RB * C_ROW_E * EB
+    C1_B_REG = (BK_ROWS * LDS_B_ROW) if b_lds_transpose else (B_ROWS * LDS_ROW)
+    # The issuing waves of `issue`'s jobs (and of `_deal_desc`'s): A half p on 3p | 2p, B half p on 1 + p | 2p + 1.
+    C1_WAVES = (
+        [0, (3 if tdm_assign else 2) % num_waves, 1 % num_waves, (2 if tdm_assign else 3) % num_waves]
+        if tdm_parts == 2
+        else [0, 1 % num_waves]
+    )
+    if nt_c1 < 0 or nt_c1 > K_WS + 1:
+        raise ValueError(f"nt_c1 must be in [0, K_WS + 1 = {K_WS + 1}], got {nt_c1}")
+    # A list, not a chain of `and`: the launcher's AST rewrite of a long boolean chain does not finish.
+    C1_OK = all(
+        [
+            persist > 0,
+            nt_ovl == 1,
+            head_pipe > 0,
+            epi_chunk == 1,
+            num_waves == 4,
+            num_buffers == 2,
+            seg_split == 0,
+            B_DELTA == STAGE_A,
+            STAGE_A == tdm_parts * C1_REG,
+            C1_B_REG == C1_REG,
+            C1_SLACK >= 0,
+            C1_NREG * C1_REG <= PITCH,
+            len(set(C1_WAVES)) == C1_NREG,
+        ]
+    )
+    if nt_c1 and not C1_OK:
+        raise ValueError(
+            "nt_c1 needs persist, nt_ovl, head_pipe, epi_chunk=1, 4 waves, num_buffers=2, seg_split=0, equal A / B "
+            "k-tile job regions that each hold one block of C rows, and one job per issuing wave"
+        )
     XCD_SPAN = (
         xcd_band * num_xcd if (num_xcd > 1 and xcd_band > 0 and TOTAL_TILES >= xcd_band * num_xcd) else 0
     )
@@ -2522,8 +3378,13 @@ def _launch_grouped_gemm_bf16_nt(
                 bm, bn = _group_m_tile_decode(tc, M_TILES, N_BLOCKS_N, group_m)
             return bm, bn
 
-        def _one_tile(tile_raw):
-            blk_m_idx, blk_n_idx = _tile_coords(tile_raw)
+        def _one_tile(tile_raw, carry=None):
+            if const_expr((nt_seam & 8) and carry is not None):
+                # nt_seam bit 3: this tile's coordinates come with the carried decode.
+                cv0 = carry.load()
+                blk_m_idx, blk_n_idx = rocdl.readfirstlane(T.i32, cv0[5]), rocdl.readfirstlane(T.i32, cv0[6])
+            else:
+                blk_m_idx, blk_n_idx = _tile_coords(tile_raw)
 
             _dec = _decode_m_tile_scan if const_expr(inkernel_scan) else _decode_m_tile
             if const_expr(tt_dec):
@@ -2547,7 +3408,17 @@ def _launch_grouped_gemm_bf16_nt(
                     out = _dec(_i32_table(arg_mtiles), bm, N_GROUPS, tile_m) + (None, None)
                 return out
 
-            g_idx, m_row, m_rows, g_first, g_end = _dec_span(blk_m_idx)
+            if const_expr(carry is not None):
+                # This tile's decode, done by the previous tile's next-tile decode (nt_seam bit 2).
+                cv = carry.load()
+                g_idx, m_row, m_rows = (rocdl.readfirstlane(T.i32, cv[j]) for j in range(3))
+                g_first, g_end = (
+                    (rocdl.readfirstlane(T.i32, cv[3]), rocdl.readfirstlane(T.i32, cv[4]))
+                    if const_expr(MC_SPAN)
+                    else (None, None)
+                )
+            else:
+                g_idx, m_row, m_rows, g_first, g_end = _dec_span(blk_m_idx)
 
             def _mc_masks(bm, g, rows, span_first, span_end):
                 # Workgroup-uniform and symmetric: every peer a mask names computes the same mask,
@@ -2610,7 +3481,58 @@ def _launch_grouped_gemm_bf16_nt(
                 a_mask2, b_mask2 = _mc_masks(bm2_idx, g2, m_rows2, g2_first, g2_end)
                 return g2, m_row2, m_rows2, bn2_idx, a_mask2, b_mask2
 
-            nxt_dec = _decode_next() if const_expr(persist and (ntp_flags & 1)) else None
+            def _dec_span_issue(bm):
+                if const_expr(tt_dec):
+                    return _decode_m_tile_tt_issue(_i32_table(arg_mtiles), bm, N_GROUPS, M_TILES)
+                return _decode_m_tile_span_vec_issue(_i32_table(arg_mtiles), bm, N_GROUPS, lane)
+
+            def _dec_span_finish(issued):
+                if const_expr(tt_dec):
+                    out = _decode_m_tile_tt_finish(issued)
+                else:
+                    out = _decode_m_tile_span_vec_finish(issued, N_GROUPS, tile_m, lane)
+                return out if const_expr(MC_SPAN) else out[:3] + (None, None)
+
+            # nt_seam bit 2: the next tile's decode in two halves; `nxt_hold[0]` is filled ahead of the last k-tile.
+            # `nxt_st` = (m-tile, n-block, issued table loads) of the next tile.
+            nxt_hold = [None]
+            nxt_st = [None, None, None]
+
+            def _decode_next_issue():
+                nxt_raw0 = tile_raw + fx.Int32(C_STEP)
+                nxt_raw0 = (nxt_raw0 > fx.Int32(TOTAL_C - 1)).select(fx.Int32(TOTAL_C - 1), nxt_raw0)
+                nxt_st[0], nxt_st[1] = _tile_coords(nxt_raw0)
+                nxt_st[2] = _dec_span_issue(nxt_st[0])
+
+            if const_expr((nt_seam & 4) and not (nt_seam & 8)):
+                _decode_next_issue()
+
+            def _decode_next_finish():
+                nxt_bm, nxt_bn, nxt_iss = nxt_st
+                g2, m_row2, m_rows2, g2_first, g2_end = _dec_span_finish(nxt_iss)
+                a_mask2, b_mask2 = _mc_masks(nxt_bm, g2, m_rows2, g2_first, g2_end)
+                if const_expr(carry is not None):
+                    zero = fx.Int32(0)
+                    carry.store(
+                        Vec.from_elements(
+                            [
+                                g2,
+                                m_row2,
+                                m_rows2,
+                                g2_first if const_expr(MC_SPAN) else zero,
+                                g2_end if const_expr(MC_SPAN) else zero,
+                                nxt_bm if const_expr(nt_seam & 8) else zero,
+                                nxt_bn if const_expr(nt_seam & 8) else zero,
+                                zero,
+                            ],
+                            fx.Int32,
+                        )
+                    )
+                return g2, m_row2, m_rows2, nxt_bn, a_mask2, b_mask2
+
+            nxt_dec = (
+                _decode_next() if const_expr(persist and (ntp_flags & 1) and not (nt_seam & 4)) else None
+            )
             if const_expr(lds_cosched == 3 and not wmma_b2b):
                 # After the table reads: emitted ahead of them, it turns their scalar loads into
                 # vector loads. Still ahead of every matrix op.
@@ -2754,7 +3676,111 @@ def _launch_grouped_gemm_bf16_nt(
                 )
                 atom_b_fixed = _b_tdm(gt_b_fixed, mask=mc_b_mask)
 
+            def _deal_desc(g_, m_row_, m_rows_, bn_idx_, a_mask_, b_mask_):
+                # This wave's job of the four (A halves on waves 3p | 2p, B halves on waves 1 + p | 2p + 1), with
+                # the descriptor the copy atom builds for it: (global base, per-k-tile step, LDS offset, group 1).
+                zero = fx.Int32(0)
+                one = fx.Int32(1)
+                w = wave
+                is_b = ((w ^ (w >> one)) & one) if const_expr(tdm_assign) else (w & one)
+                pp = w >> one
+                live_ = (m_rows_ > zero) if const_expr(dead_tile_skip) else None
+                blk_n_ = bn_idx_ * tile_n
+                n_valid_ = i32_n - blk_n_
+                n_valid_b_ = live_.select(n_valid_, zero) if const_expr(dead_tile_skip) else n_valid_
+                a_ptr = fx.Int64(fx.ptrtoint(gA_base))
+                b_ptr = fx.Int64(fx.ptrtoint(gB_base))
+                a_gb = a_ptr + fx.Int64(m_row_) * lda_b + fx.Int64(pp * fx.Int32(A_ROWS)) * lda_b
+                a_ext = m_rows_ - pp * fx.Int32(A_ROWS)
+                a_lds = pp * fx.Int32(A_ROWS * LDS_ROW)
+                b_slab_ = fx.Int64(g_) * fx.Int64(B_GRP_ELEMS * EB)
+                if const_expr(b_lds_transpose):
+                    blk_n_eff_ = (blk_n_ > (i32_n - fx.Int32(tile_n))).select(
+                        i32_n - fx.Int32(tile_n), blk_n_
+                    )
+                    b_gb = (
+                        b_ptr
+                        + b_slab_
+                        + fx.Int64(pp * fx.Int32(BK_ROWS)) * ldb_b
+                        + fx.Int64(blk_n_eff_) * fx.Int64(EB)
+                    )
+                    b_ext = (
+                        live_.select(fx.Int32(BK_ROWS), zero)
+                        if const_expr(dead_tile_skip)
+                        else fx.Int32(BK_ROWS)
+                    )
+                    b_lds = fx.Int32(STAGE_A) + pp * fx.Int32(BK_ROWS * LDS_B_ROW)
+                    b_step = fx.Int64(tile_k) * ldb_b
+                    B_IN, B_TD0, B_TD1 = tile_n * EB, tile_n * EB, BK_ROWS
+                    B_PAD_INT, B_PAD_AMT = tile_n * EB, b_pad
+                else:
+                    b_gb = b_ptr + b_slab_ + fx.Int64(blk_n_ + pp * fx.Int32(B_ROWS)) * ldb_b
+                    b_ext = n_valid_b_ - pp * fx.Int32(B_ROWS)
+                    b_lds = fx.Int32(B_DELTA) + pp * fx.Int32(B_ROWS * LDS_ROW)
+                    b_step = fx.Int64(KB)
+                    B_IN, B_TD0, B_TD1 = 0x7FFFFFFF, KB, B_ROWS
+                    B_PAD_INT, B_PAD_AMT = KB, LDS_PAD
+                a_ext = (a_ext > zero).select(a_ext, zero)
+                b_ext = (b_ext > zero).select(b_ext, zero)
+
+                def _cfg(pad_int, pad_amt, has_mask):
+                    i_dw, a_dw = pad_int // 4, pad_amt // 4
+                    early = bool(mc_early) if has_mask else True
+                    return (
+                        (1 << 20) | (int(early) << 21) | ((i_dw.bit_length() - 2) << 22) | ((a_dw - 1) << 25)
+                    )
+
+                sel = is_b != zero
+                a_has, b_has = a_mask_ is not None, b_mask_ is not None
+                a_w0 = fx.Int32(_cfg(KB, LDS_PAD, a_has)) | ((a_mask_ & fx.Int32(0xFFFF)) if a_has else zero)
+                b_w0 = fx.Int32(_cfg(B_PAD_INT, B_PAD_AMT, b_has)) | (
+                    (b_mask_ & fx.Int32(0xFFFF)) if b_has else zero
+                )
+                ext = sel.select(b_ext, a_ext)
+                in_lo = sel.select(fx.Int32((B_IN & 0xFFFF) << 16), fx.Int32(-65536))
+                in_hi = sel.select(fx.Int32((B_IN >> 16) & 0xFFFF), fx.Int32(0x7FFF))
+                td0 = sel.select(fx.Int32(B_TD0 << 16), fx.Int32(KB << 16))
+                td1 = sel.select(fx.Int32(B_TD1), fx.Int32(A_ROWS))
+                stride = sel.select(ldb_b, lda_b)
+                words1 = [
+                    sel.select(b_w0, a_w0),
+                    in_lo,
+                    in_hi | ((ext & fx.Int32(0xFFFF)) << fx.Int32(16)),
+                    ((ext >> fx.Int32(16)) & fx.Int32(0xFFFF)) | td0,
+                    td1,
+                    fx.Int32(stride & fx.Int64(0xFFFFFFFF)),
+                    fx.Int32((stride >> fx.Int64(32)) & fx.Int64(0xFFFF)),
+                    zero,
+                ]
+                vec8 = ir.VectorType.get([8], ir.IntegerType.get_signless(32))
+                g1 = _vector.from_elements(vec8, [_raw(rocdl.readfirstlane(T.i32, x)) for x in words1])
+                gb = sel.select(b_gb, a_gb)
+                return gb, sel.select(b_step, fx.Int64(KB)), sel.select(b_lds, a_lds), g1
+
+            def _deal_issue(desc, s, kt):
+                gb, step, lds_off, g1 = desc
+                ga = gb + fx.Int64(kt) * step
+                lds = fx.Int32(_bidx(_buf_ptr(s))) + lds_off
+                g_lo = fx.Int32(ga & fx.Int64(0xFFFFFFFF))
+                g_hi = fx.Int32((ga >> fx.Int64(32)) & fx.Int64(0xFFFFFFFF)) | fx.Int32(-0x80000000)
+                vec4 = ir.VectorType.get([4], ir.IntegerType.get_signless(32))
+                g0 = _vector.from_elements(
+                    vec4, [_raw(rocdl.readfirstlane(T.i32, x)) for x in (fx.Int32(1), lds, g_lo, g_hi)]
+                )
+                tdm_ops.tensor_load_2d(
+                    tdm_ops.TDMDescriptor2D(dgroup0=g0, dgroup1=g1), cache_policy=tdm_load_cache
+                )
+
+            deal_cur = (
+                _deal_desc(g_idx, m_row, m_rows, blk_n_idx, mc_a_mask, mc_b_mask)
+                if const_expr(nt_deal)
+                else None
+            )
+
             def issue(s, kt, is_tail=False):
+                if const_expr(nt_deal):
+                    _deal_issue(deal_cur, s, kt)
+                    return
                 pa = _buf_ptr(s)
                 if const_expr(k_tail and is_tail):
                     koff = fx.Int64(i32_k - fx.Int32(tile_k)) * fx.Int64(EB)
@@ -2803,6 +3829,9 @@ def _launch_grouped_gemm_bf16_nt(
             def _issue_next(g2, m_row2, m_rows2, blk_n_idx2, a_mask2, b_mask2):
                 # `issue(0, 0)` for another tile: the same jobs, waves, extents and clamps, built
                 # from that tile's decode, into buffer 0.
+                if const_expr(nt_deal):
+                    _deal_issue(_deal_desc(g2, m_row2, m_rows2, blk_n_idx2, a_mask2, b_mask2), 0, 0)
+                    return
                 live2 = (m_rows2 > fx.Int32(0)) if const_expr(dead_tile_skip) else None
                 blk_n2 = blk_n_idx2 * tile_n
                 n_valid2 = i32_n - blk_n2
@@ -3092,6 +4121,7 @@ def _launch_grouped_gemm_bf16_nt(
                 # `head` holds this k-tile's sub-step 0, read in the previous barrier window.
                 # `ovl` replaces the prefetch at the head with one before sub-step K_WS // 2, behind a
                 # wait-all (this wave's share of the previous tile's store) and a barrier (every wave's).
+                # With nt_c1 it comes before sub-step nt_c1 - 2, behind this wave's wait-all only.
                 if const_expr(prefetch_kt is not None):
                     rocdl.sched_barrier(0)
                     issue(prefetch_slot, prefetch_kt)
@@ -3099,7 +4129,13 @@ def _launch_grouped_gemm_bf16_nt(
                 ring = [head, None]
                 for i in range_constexpr(K_WS):
                     load_ks = i + 1
-                    if const_expr(ovl and i == K_WS // 2):
+                    if const_expr(ovl and nt_c1 >= 2 and i == nt_c1 - 2):
+                        # nt_c1: this wave's job only overwrites the C block its own store read.
+                        rocdl.sched_barrier(0)
+                        tdm_ops.tensor_wait(0)
+                        issue(1, 1)
+                        rocdl.sched_barrier(0)
+                    if const_expr(ovl and not nt_c1 and i == K_WS // 2):
                         rocdl.sched_barrier(0)
                         tdm_ops.tensor_wait(0)
                         _workgroup_barrier()
@@ -3142,7 +4178,7 @@ def _launch_grouped_gemm_bf16_nt(
                 _hold_live(tail)
                 rocdl.sched_barrier(0)
 
-            def _hp_kloop(n_loop, n_steady):
+            def _hp_kloop(n_loop, n_steady, kt_even=None):
                 # Runs after the tile's first fence: k-tile 0 is in buffer 0.
                 head = (
                     [fx.make_rmem_tensor(8, fx.Int32) for _ in range_constexpr(wmma_m_rep)],
@@ -3150,10 +4186,18 @@ def _launch_grouped_gemm_bf16_nt(
                 )
                 slots = [_hp_addrs(s) for s in range_constexpr(num_buffers)]
                 _hp_load_into(slots[0], 0, head)
+                if const_expr((nt_seam & 8) and nt_c1):
+                    # nt_seam bit 3: past the tile's last barrier with a memory fence (whose wait would take these
+                    # loads in), while the head reads are in flight.
+                    _decode_next_issue()
                 rocdl.sched_barrier(0)
                 if const_expr(nt_ovl):
                     # n_loop >= 1 (a dead tile runs one steady k-tile under nt_ovl). k-tile kt sits in slot kt % 2.
                     tail0 = _hp_ktile(slots[0], head, ovl=True)
+                    if const_expr((nt_seam & 8) and not nt_c1):
+                        rocdl.sched_barrier(0)
+                        _decode_next_issue()
+                        rocdl.sched_barrier(0)
                     _hp_fence(tail0, slots[1], head)
                     n_loop1 = n_loop - fx.Int32(1)
                     n_rot1 = n_loop1 // fx.Int32(2)
@@ -3187,6 +4231,14 @@ def _launch_grouped_gemm_bf16_nt(
                 for kr in range(n_rem):
                     tail_k = _hp_ktile(slots[0], head, n_done + kr + fx.Int32(1), 1)
                     _hp_fence(tail_k, slots[1], head)
+                if const_expr(nt_seam & 4):
+                    nxt_hold[0] = _decode_next_finish()
+                if const_expr(nt_seam & 1):
+                    # The second-to-last k-tile's fence has passed, so with an even k-tile count buffer 0 is free.
+                    rocdl.sched_barrier(0)
+                    if kt_even:
+                        _issue_next(*(nxt_hold[0] if const_expr(nt_seam & 4) else nxt_dec))
+                    rocdl.sched_barrier(0)
                 tail_d = _hp_ktile(_hp_addrs(n_steady % fx.Int32(num_buffers), pin=False), head)
                 _mma_ks(tail_d)
 
@@ -3213,13 +4265,25 @@ def _launch_grouped_gemm_bf16_nt(
                 )
                 n_peel = 1 if const_expr(k_tail and k_tail_peel) else 0
                 n_loop = (n_steady - 1) if const_expr(n_peel) else n_steady
+                kt_even = kt_odd = None
+                if const_expr(nt_seam & 1):
+                    kt_par = (n_steady + fx.Int32(num_buffers - 1)) % fx.Int32(2)
+                    kt_even = kt_par == fx.Int32(0)
+                    kt_odd = kt_par != fx.Int32(0)
                 if const_expr(head_pipe and nt_ovl):
                     # In flight: k-tile 0, then (past the first tile) this wave's EPI_OPS store ops of the previous
                     # tile. The first tile issued its k-tile 0 just above, with nothing behind it.
                     if tile_raw < fx.Int32(C_STEP):
                         tdm_ops.tensor_wait(0)
-                    _pipeline_fence(outstanding=EPI_OPS)
-                    _hp_kloop(n_loop, n_steady)
+                    if const_expr(nt_c1 == 1):
+                        tdm_ops.tensor_wait(0)
+                        rocdl.sched_barrier(0)
+                        issue(1, 1)
+                        rocdl.sched_barrier(0)
+                        _workgroup_barrier()
+                    else:
+                        _pipeline_fence(outstanding=EPI_OPS)
+                    _hp_kloop(n_loop, n_steady, kt_even)
                 elif const_expr(head_pipe):
                     _pipeline_fence(outstanding=TDM_PW * (num_buffers - 2))
                     _hp_kloop(n_loop, n_steady)
@@ -3266,11 +4330,20 @@ def _launch_grouped_gemm_bf16_nt(
 
                 # epilogue: accumulators -> LDS -> TDM store, clamped twice
                 accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
-                if const_expr(epi_fence >= 2):
+                if const_expr(nt_seam & 1):
+                    # The next tile's k-tile 0 (one TDM op per issuing wave) is the only load that may be in flight.
+                    if kt_even:
+                        tdm_ops.tensor_wait(TDM_PW)
+                    if kt_odd:
+                        tdm_ops.tensor_wait(0)
+                    gpu.barrier()
+                    if kt_odd:
+                        _issue_next(*(nxt_hold[0] if const_expr(nt_seam & 4) else nxt_dec))
+                elif const_expr(epi_fence >= 2):
                     _pipeline_fence(outstanding=0)
                 elif const_expr(epi_fence == 1):
                     _workgroup_barrier()
-                if const_expr(persist):
+                if const_expr(persist and not (nt_seam & 1)):
                     # Every wave is past its last LDS read and every load has landed, so buffer 0
                     # is free.
                     _issue_next(*(nxt_dec if const_expr(ntp_flags & 1) else _decode_next()))
@@ -3284,10 +4357,18 @@ def _launch_grouped_gemm_bf16_nt(
                     for wm in range_constexpr(wm_hi - wm_lo):
                         wmg = wm_lo + wm
                         row_rel = wmb + wmg * WMMA_M + e_lane16
+                        if const_expr(nt_c1):
+                            # Workgroup-uniform: a 16-row run never straddles a block.
+                            c1_off = (wmb + fx.Int32(wmg * WMMA_M)) // fx.Int32(C1_RB) * fx.Int32(C1_SLACK)
                         for wn in range_constexpr(wmma_n_rep):
                             col_rel = wnb + wn * WMMA_N + e_kgrp * 8
                             h = accs[wmg * wmma_n_rep + wn].to(elem_cls)
-                            if const_expr(C_OFF):
+                            if const_expr(nt_c1):
+                                fx.ptr_store(
+                                    h.bitcast(fx.Int8),
+                                    base_ptr + ((row_rel * C_ROW_E + col_rel) * EB + c1_off + PITCH),
+                                )
+                            elif const_expr(C_OFF):
                                 fx.ptr_store(
                                     h.bitcast(fx.Int8),
                                     base_ptr + ((row_rel * C_ROW_E + col_rel) * EB + C_OFF),
@@ -3320,6 +4401,34 @@ def _launch_grouped_gemm_bf16_nt(
                     )
                     fx.copy(atom, _lv(src, (rows, C_ROW_E), (C_ROW_E, 1)), gts)
 
+                def _epi_c1():
+                    # Block r, from its job region, by the wave that issues job r.
+                    n_cols = (n_valid < fx.Int32(tile_n)).select(n_valid, fx.Int32(tile_n))
+                    for r in range_constexpr(C1_NREG):
+                        if wave == C1_WAVES[r]:
+                            r0 = r * C1_RB
+                            if const_expr(r0):
+                                ext_r = m_rows - fx.Int32(r0)
+                                ext_r = (ext_r > fx.Int32(0)).select(ext_r, fx.Int32(0))
+                            else:
+                                ext_r = m_rows
+                            gts = _gv(
+                                gC_base,
+                                (fx.Int64(m_row) + fx.Int64(r0)) * ldc64 + fx.Int64(blk_n),
+                                (C1_RB, C_ROW_E),
+                                (C_ROW_E, 1),
+                            )
+                            atom = fx.rocdl.make_tdm_atom(
+                                gts,
+                                [ext_r, n_cols],
+                                strides=[ldc64, None],
+                                num_warps=1,
+                                cache_modifier=tdm_store_cache,
+                                early_timeout=False,
+                            )
+                            src = fx.recast_iter(elem_cls, fx.add_offset(base_ptr, PITCH + r * C1_REG))
+                            fx.copy(atom, _lv(src, (C1_RB, C_ROW_E), (C_ROW_E, 1)), gts)
+
                 if const_expr(epi_chunk > 1):
                     EPI_REP = wmma_m_rep // epi_chunk
                     EPI_ROWS = EPI_REP * WMMA_M
@@ -3328,6 +4437,10 @@ def _launch_grouped_gemm_bf16_nt(
                         _workgroup_barrier()
                         for i in range_constexpr(m_warp):
                             _epi_store(i * warp_tile_m + ch * EPI_ROWS, EPI_ROWS)
+                elif const_expr(nt_c1):
+                    _epi_stage(0, wmma_m_rep)
+                    _workgroup_barrier()
+                    _epi_c1()
                 else:
                     _epi_stage(0, wmma_m_rep)
                     _workgroup_barrier()
@@ -3346,6 +4459,26 @@ def _launch_grouped_gemm_bf16_nt(
                     _tile_tail()
             else:
                 _tile_tail()
+
+        def _first_carry(raw0):
+            # The decode of a workgroup's first tile, as the carry of nt_seam bit 2.
+            bm0, _bn0 = _tile_coords(raw0)
+            if const_expr(tt_dec):
+                d0 = _decode_m_tile_tt_finish(
+                    _decode_m_tile_tt_issue(_i32_table(arg_mtiles), bm0, N_GROUPS, M_TILES)
+                )
+            else:
+                d0 = _decode_m_tile_span_vec_finish(
+                    _decode_m_tile_span_vec_issue(_i32_table(arg_mtiles), bm0, N_GROUPS, lane),
+                    N_GROUPS,
+                    tile_m,
+                    lane,
+                )
+            c = fx.make_rmem_tensor(8, fx.Int32)
+            zero = fx.Int32(0)
+            c5, c6 = (bm0, _bn0) if const_expr(nt_seam & 8) else (zero, zero)
+            c.store(Vec.from_elements([d0[0], d0[1], d0[2], d0[3], d0[4], c5, c6, zero], fx.Int32))
+            return c
 
         if const_expr(persist):
             # Workgroup-uniform trip count over the prefix [0, L) of the tile space that holds
@@ -3387,8 +4520,9 @@ def _launch_grouped_gemm_bf16_nt(
                     )
                     n_live_c = (n_live_c > fx.Int32(TOTAL_C)).select(fx.Int32(TOTAL_C), n_live_c)
                 n_t = (n_live_c - mc_cid + fx.Int32(C_STEP - 1)) // fx.Int32(C_STEP)
+                carry = _first_carry(mc_cid) if const_expr(nt_seam & 4) else None
                 for _t in range(n_t):
-                    _one_tile(mc_cid + _t * fx.Int32(C_STEP))
+                    _one_tile(mc_cid + _t * fx.Int32(C_STEP), carry)
             else:
                 if const_expr(group_m > 1):
                     nlm = (nlm + fx.Int32(group_m - 1)) // fx.Int32(group_m) * fx.Int32(group_m)
@@ -3398,8 +4532,9 @@ def _launch_grouped_gemm_bf16_nt(
                     n_live_t = (n_live_t + fx.Int32(XCD_SPAN - 1)) // fx.Int32(XCD_SPAN) * fx.Int32(XCD_SPAN)
                     n_live_t = (n_live_t > fx.Int32(TOTAL_TILES)).select(fx.Int32(TOTAL_TILES), n_live_t)
                 n_t = (n_live_t - pid + fx.Int32(persist - 1)) // fx.Int32(persist)
+                carry = _first_carry(pid) if const_expr(nt_seam & 4) else None
                 for _t in range(n_t):
-                    _one_tile(pid + _t * fx.Int32(persist))
+                    _one_tile(pid + _t * fx.Int32(persist), carry)
             if const_expr(ntp_flags & 2):
                 tdm_ops.tensor_wait(0)
         else:
@@ -3710,6 +4845,12 @@ def _pick_config_shape(N: int, K: int, avg_m: int, n_groups: int = 0, b_lds_tran
     return (256, 256, 64, 2, 2, 3)
 
 
+def _head_pipe_fits(head_pipe: int, wmma_m_rep: int, wmma_n_rep: int) -> bool:
+    # The next sub-step 0's 2 * (wm + wn) fragment reads go one per matrix op between the wm * wn -
+    # head_pipe deferred ones left after the barrier wait; with the chain off there are none.
+    return not head_pipe or head_pipe + 2 * (wmma_m_rep + wmma_n_rep) <= wmma_m_rep * wmma_n_rep
+
+
 def _head_pipe_ok(head_pipe, cfg, lds_cosched, split_bar, split_bar_depth, k_tail, half_n_skip) -> bool:
     # Performance-only knob: where the resolved schedule cannot carry it (e.g. off the exact keys,
     # where lds_cosched stays 0), it is dropped rather than raised, like the keyed knobs.
@@ -3723,7 +4864,7 @@ def _head_pipe_ok(head_pipe, cfg, lds_cosched, split_bar, split_bar_depth, k_tai
         and num_buffers == 2
         and not k_tail
         and not half_n_skip
-        and head_pipe + 2 * (wm + wn) <= wm * wn
+        and _head_pipe_fits(head_pipe, wm, wn)
     )
 
 
@@ -3733,7 +4874,7 @@ def grouped_gemm_bf16_nt_supported(N: int, K: int, avg_m: int = 0, n_groups: int
     return _nt_unsupported_reason(K, cfg) is None
 
 
-def grouped_gemm_bf16_nt_flydsl_kernel(
+def _grouped_gemm_bf16_nt_flydsl_kernel_entry(
     a: torch.Tensor,
     b: torch.Tensor,
     group_offs: torch.Tensor,
@@ -3807,6 +4948,12 @@ def grouped_gemm_bf16_nt_flydsl_kernel(
     nt_ovl: int = -1,
     # Per-tile decode table; see the launcher's `tt_dec`.
     tt_dec: int = -1,
+    # Persistent tile seam; see the launcher's `nt_seam`. Not a `_STACK_KEYS` member: 0 = off.
+    nt_seam: int = 0,
+    # Branch-free k-tile issue; see the launcher's `nt_deal`. 0 = off.
+    nt_deal: int = 0,
+    # C staging in the k-tile 1 job regions; see the launcher's `nt_c1`. 0 = off.
+    nt_c1: int = 0,
 ) -> torch.Tensor:
     """Grouped NT forward: ``out[rows] = a[rows] @ b[g].T`` for the expert owning each run."""
     assert a.dim() == 2 and b.dim() == 3, f"a must be 2-D and b 3-D, got {a.dim()}/{b.dim()}"
@@ -3830,14 +4977,19 @@ def grouped_gemm_bf16_nt_flydsl_kernel(
         tdm_balance, tdm_assign = 1, 1
     if issue_first < 0:
         issue_first = _pick_issue_first("nt", N, K, avg_m) if _keyed else 0
-    if lds_cosched < 0:
-        lds_cosched = _pick_lds_cosched("nt", N, K, avg_m) if _keyed else 0
     tile_m = BLOCK_M or cfg[0]
     tile_n = BLOCK_N or cfg[1]
     tile_k = BLOCK_K or cfg[2]
     m_warp = m_warp or cfg[3]
     n_warp = n_warp or cfg[4]
     num_buffers = num_buffers or cfg[5]
+    _tile = (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
+    if lds_cosched < 0:
+        lds_cosched = (
+            _pick_nt_lds_cosched("nt", N, K, avg_m, _tile, frag_ring, sched_style, issue_first)
+            if _keyed
+            else 0
+        )
     k_tail = K % tile_k
     ragged_ok = allow_ragged_k == 1 or (allow_ragged_k < 0 and not BLOCK_K)
     why = _nt_unsupported_reason(
@@ -3882,7 +5034,6 @@ def grouped_gemm_bf16_nt_flydsl_kernel(
         nt_ovl,
         tt_dec,
     )
-    _tile = (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
     (
         _stack,
         (
@@ -4015,13 +5166,20 @@ def grouped_gemm_bf16_nt_flydsl_kernel(
         )
         + (
             (mc_m, mc_n, mc_early, mc_tile_sync)
-            if (mc_m * mc_n > 1 or head_pipe or vec_dec or nt_ovl or tt_dec)
+            if (mc_m * mc_n > 1 or head_pipe or vec_dec or nt_ovl or tt_dec or nt_seam or nt_deal or nt_c1)
             else ()
         )
-        + ((head_pipe, hp_opaque, hp_epi) if (head_pipe or vec_dec or nt_ovl or tt_dec) else ())
-        + ((vec_dec,) if (vec_dec or nt_ovl or tt_dec) else ())
-        + ((nt_ovl,) if (nt_ovl or tt_dec) else ())
-        + ((tt_dec,) if tt_dec else ())
+        + (
+            (head_pipe, hp_opaque, hp_epi)
+            if (head_pipe or vec_dec or nt_ovl or tt_dec or nt_seam or nt_deal or nt_c1)
+            else ()
+        )
+        + ((vec_dec,) if (vec_dec or nt_ovl or tt_dec or nt_seam or nt_deal or nt_c1) else ())
+        + ((nt_ovl,) if (nt_ovl or tt_dec or nt_seam or nt_deal or nt_c1) else ())
+        + ((tt_dec,) if (tt_dec or nt_seam or nt_deal or nt_c1) else ())
+        + ((nt_seam,) if (nt_seam or nt_deal or nt_c1) else ())
+        + ((nt_deal,) if (nt_deal or nt_c1) else ())
+        + ((nt_c1,) if nt_c1 else ())
     )
     return out[:, :N] if out_ldc else out
 
@@ -4152,6 +5310,9 @@ def _nn_native_launch(
     vec_dec=0,
     nt_ovl=0,
     tt_dec=0,
+    nt_seam=0,
+    nt_deal=0,
+    nt_c1=0,
 ):
     tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers = cfg
     if wave_grid < 0:
@@ -4242,18 +5403,25 @@ def _nn_native_launch(
         )
         + (
             (mc_m, mc_n, mc_early, mc_tile_sync)
-            if (mc_m * mc_n > 1 or head_pipe or vec_dec or nt_ovl or tt_dec)
+            if (mc_m * mc_n > 1 or head_pipe or vec_dec or nt_ovl or tt_dec or nt_seam or nt_deal or nt_c1)
             else ()
         )
-        + ((head_pipe, hp_opaque, hp_epi) if (head_pipe or vec_dec or nt_ovl or tt_dec) else ())
-        + ((vec_dec,) if (vec_dec or nt_ovl or tt_dec) else ())
-        + ((nt_ovl,) if (nt_ovl or tt_dec) else ())
-        + ((tt_dec,) if tt_dec else ())
+        + (
+            (head_pipe, hp_opaque, hp_epi)
+            if (head_pipe or vec_dec or nt_ovl or tt_dec or nt_seam or nt_deal or nt_c1)
+            else ()
+        )
+        + ((vec_dec,) if (vec_dec or nt_ovl or tt_dec or nt_seam or nt_deal or nt_c1) else ())
+        + ((nt_ovl,) if (nt_ovl or tt_dec or nt_seam or nt_deal or nt_c1) else ())
+        + ((tt_dec,) if (tt_dec or nt_seam or nt_deal or nt_c1) else ())
+        + ((nt_seam,) if (nt_seam or nt_deal or nt_c1) else ())
+        + ((nt_deal,) if (nt_deal or nt_c1) else ())
+        + ((nt_c1,) if nt_c1 else ())
     )
     return out
 
 
-def grouped_gemm_bf16_nn_flydsl_kernel(
+def _grouped_gemm_bf16_nn_flydsl_kernel_entry(
     a: torch.Tensor,
     b: torch.Tensor,
     group_offs: torch.Tensor,
@@ -4317,6 +5485,12 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
     # Store / k-tile 0 overlap and per-tile decode table; see the launcher's `nt_ovl` and `tt_dec`.
     nt_ovl: int = -1,
     tt_dec: int = -1,
+    # Native NN path only: persistent tile seam; see the launcher's `nt_seam`. 0 = off.
+    nt_seam: int = 0,
+    # Native NN path only: branch-free k-tile issue; see the launcher's `nt_deal`. 0 = off.
+    nt_deal: int = 0,
+    # Native NN path only: C staging in the k-tile 1 job regions; see the launcher's `nt_c1`. 0 = off.
+    nt_c1: int = 0,
     **kw,
 ) -> torch.Tensor:
     """Grouped NN: ``out[rows] = a[rows] @ b[g]`` for the expert g owning each row run."""
@@ -4359,7 +5533,11 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
             if wmma_b2b < 0:
                 wmma_b2b = _pick_wmma_b2b("nn", N, Kb, avg_m) if keyed else 0
             if lds_cosched < 0:
-                lds_cosched = _pick_lds_cosched("nn", N, Kb, avg_m) if keyed else 0
+                lds_cosched = (
+                    _pick_nt_lds_cosched("nn", N, Kb, avg_m, cfg, frag_ring, sched_style, issue_first)
+                    if keyed
+                    else 0
+                )
             # The native path pins seg_split, half_n_skip, dead_tile_exit and split_bar_depth, so
             # `persist` only has `epi_fence` left to clash with; the span decode needs the map.
             _passed = (
@@ -4457,6 +5635,9 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
                 vec_dec=vec_dec,
                 nt_ovl=nt_ovl,
                 tt_dec=tt_dec,
+                nt_seam=nt_seam,
+                nt_deal=nt_deal,
+                nt_c1=nt_c1,
             )
             return out[:, :N] if out_ldc else out
         if out_ldc:
@@ -4539,6 +5720,217 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
         dead_tile_skip=dead_tile_skip,
         **kw,
     )
+
+
+# Shapes tuned as a whole set of entry-point arguments rather than through `_STACK_KEYS`: per (N, K, avg_m),
+# keyed like `_STACK_KEYS` (avg_m = TOTAL_M // G; NN by its output N and reduction K, variable-K by
+# (OUT_M, OUT_N)), the one combination measured at that shape. A call that passes no tuning argument -- only
+# what `_KWARGS_PASSTHROUGH` names -- gets the key's set exactly as if it had passed it itself, so every gate
+# and refusal of the explicit path still applies; a call that passes any tuning argument gets none of it, and
+# every other shape reaches the entry points unchanged. A key also declines a call whose expert count the
+# launchers would refuse it for (see `_keyed_kwargs`). These shapes cannot go through `_STACK_KEYS`: its
+# group also needs `lds_cosched`, `issue_first`, the tile order and the TDM dealing from tables keyed for
+# DeepSeek-V3 at avg_m = 2048 only (the forward `tdm_balance` / `tdm_assign` pair is tied to avg_m == 2048
+# in code), and off those keys `head_pipe` is dropped and `nt_ovl` then refuses. Every value moves a
+# schedule, a dealing or a store granularity -- none moves an address, an extent or an accumulation order --
+# so a key changes the speed and never the result.
+#
+# MiniMax-M3 MoE: hidden 6144, gated expert FFN 3072 (fc1 N = 6144), 128 experts, top-4. At EP4 and
+# sequence 4096 each GPU holds G = 32 experts and receives M = 16384 rows, avg_m = 512.
+_KWARGS_KEYS = {
+    "nt": {
+        # MiniMax-M3 fwd fc2, avg_m = 512
+        (6144, 3072, 512): {
+            "GROUP_M": 4,
+            "epi_chunk": 1,
+            "head_pipe": 32,
+            "issue_first": 1,
+            "lds_cosched": 3,
+            "mc_m": 2,
+            "mc_n": 4,
+            "nt_c1": 4,
+            "nt_deal": 1,
+            "nt_ovl": 1,
+            "nt_seam": 13,
+            "ntp_flags": 3,
+            "num_xcd": 8,
+            "persist": 256,
+            "tdm_balance": 1,
+            "vec_dec": 1,
+            "xcd_band": 32,
+        },
+        # MiniMax-M3 fwd fc1, avg_m = 512
+        (6144, 6144, 512): {
+            "GROUP_M": 4,
+            "head_pipe": 32,
+            "hp_epi": 0,
+            "issue_first": 1,
+            "lds_cosched": 3,
+            "mc_m": 2,
+            "mc_n": 4,
+            "mc_tile_sync": 1,
+            "nt_c1": 4,
+            "nt_deal": 1,
+            "nt_ovl": 1,
+            "nt_seam": 13,
+            "ntp_flags": 3,
+            "num_xcd": 8,
+            "persist": 256,
+            "tdm_assign": 1,
+            "tdm_balance": 1,
+            "vec_dec": 1,
+            "xcd_band": 32,
+        },
+    },
+    "nn": {
+        # MiniMax-M3 dgrad fc2, avg_m = 512
+        (3072, 6144, 512): {
+            "GROUP_M": 8,
+            "head_pipe": 32,
+            "issue_first": 1,
+            "lds_cosched": 3,
+            "mc_m": 2,
+            "mc_n": 4,
+            "mc_tile_sync": 1,
+            "nt_c1": 2,
+            "nt_deal": 1,
+            "nt_ovl": 1,
+            "nt_seam": 13,
+            "ntp_flags": 3,
+            "num_xcd": 8,
+            "persist": 256,
+            "tdm_nn": 1,
+            "tt_dec": 1,
+            "wmma_b2b": 1,
+            "xcd_band": 32,
+        },
+        # MiniMax-M3 dgrad fc1, avg_m = 512
+        (6144, 6144, 512): {
+            "GROUP_M": 8,
+            "head_pipe": 32,
+            "issue_first": 1,
+            "lds_cosched": 3,
+            "mc_m": 2,
+            "mc_n": 4,
+            "mc_tile_sync": 1,
+            "nt_c1": 3,
+            "nt_deal": 1,
+            "nt_ovl": 1,
+            "nt_seam": 13,
+            "ntp_flags": 3,
+            "num_xcd": 8,
+            "persist": 256,
+            "tdm_assign": 1,
+            "tdm_nn": 1,
+            "tt_dec": 1,
+            "xcd_band": 32,
+        },
+    },
+    "vk": {
+        # MiniMax-M3 wgrad fc2, avg_m = 512
+        (6144, 3072, 512): {
+            "BLOCK_K": 64,
+            "epi_chunk": 4,
+            "head_pipe": 8,
+            "lds_cosched": 2,
+            "mc_early": 0,
+            "mc_m": 4,
+            "mc_n": 4,
+            "mc_tile_sync": 1,
+            "num_buffers": 4,
+            "num_xcd": 8,
+            "persist": 256,
+            "split_bar": 1,
+            "tdm_deal": 3,
+            "vk_ovl": 7,
+            "vk_seam": 538783,
+            "vk_stagger": 127,
+            "wmma_b2b": 1,
+            "xcd_band": 128,
+        },
+        # MiniMax-M3 wgrad fc1, avg_m = 512
+        (6144, 6144, 512): {
+            "BLOCK_K": 64,
+            "epi_chunk": 4,
+            "head_pipe": 8,
+            "lds_cosched": 2,
+            "mc_early": 0,
+            "mc_m": 4,
+            "mc_n": 4,
+            "mc_tile_sync": 1,
+            "num_buffers": 4,
+            "num_xcd": 8,
+            "persist": 256,
+            "split_bar": 1,
+            "tdm_deal": 3,
+            "vk_ovl": 7,
+            "vk_seam": 538783,
+            "vk_stagger": 127,
+            "wmma_b2b": 1,
+            "xcd_band": 256,
+        },
+    },
+}
+_KWARGS_PASSTHROUGH = {
+    "nt": frozenset({"out", "out_dtype", "m_tiles"}),
+    "nn": frozenset({"out", "out_dtype", "m_tiles"}),
+    "vk": frozenset({"out", "out_dtype", "masked_k", "expert_table"}),
+}
+
+
+def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:
+    """The key's kwargs for this call, or {} when the call tunes anything or the shape is not a key."""
+    # The positional extras the entry points take: out_dtype (NT / NN), masked_k and out_dtype (variable-K).
+    if n_pos > (2 if kind == "vk" else 1) or not set(kw) <= _KWARGS_PASSTHROUGH[kind]:
+        return {}
+    keyed = _KWARGS_KEYS[kind].get(key)
+    if keyed is None:
+        return {}
+    if kind == "vk" and keyed.get("persist", 0) > 0:
+        # The variable-K launcher refuses a persistent grid that does not divide the call's tile count into
+        # two or more tiles per workgroup, which another G at the same avg_m can give.
+        tm, tn = keyed.get("BLOCK_M") or 256, keyed.get("BLOCK_N") or 256
+        tiles = G * (-(-key[0] // tm)) * (-(-key[1] // tn))
+        if tiles % keyed["persist"] or tiles // keyed["persist"] < 2:
+            return {}
+    if kind != "vk" and keyed.get("vec_dec") and G > 32:
+        # The NT and NN launchers drop vec_dec above 32 experts, and nt_seam bit 2 then refuses the set.
+        return {}
+    return dict(keyed)
+
+
+@functools.wraps(_grouped_gemm_bf16_nt_flydsl_kernel_entry, assigned=("__doc__",), updated=())
+def grouped_gemm_bf16_nt_flydsl_kernel(
+    a: torch.Tensor, b: torch.Tensor, group_offs: torch.Tensor, *args, **kw
+):
+    if a.dim() == 2 and b.dim() == 3:
+        G = b.shape[0]
+        kw.update(
+            _keyed_kwargs("nt", (b.shape[1], b.shape[2], max(1, a.shape[0] // max(G, 1))), G, len(args), kw)
+        )
+    return _grouped_gemm_bf16_nt_flydsl_kernel_entry(a, b, group_offs, *args, **kw)
+
+
+@functools.wraps(_grouped_gemm_bf16_nn_flydsl_kernel_entry, assigned=("__doc__",), updated=())
+def grouped_gemm_bf16_nn_flydsl_kernel(
+    a: torch.Tensor, b: torch.Tensor, group_offs: torch.Tensor, *args, **kw
+):
+    if a.dim() == 2 and b.dim() == 3:
+        G = b.shape[0]
+        kw.update(
+            _keyed_kwargs("nn", (b.shape[2], b.shape[1], max(1, a.shape[0] // max(G, 1))), G, len(args), kw)
+        )
+    return _grouped_gemm_bf16_nn_flydsl_kernel_entry(a, b, group_offs, *args, **kw)
+
+
+@functools.wraps(_grouped_gemm_bf16_variable_k_flydsl_kernel_entry, assigned=("__doc__",), updated=())
+def grouped_gemm_bf16_variable_k_flydsl_kernel(
+    a: torch.Tensor, b: torch.Tensor, group_k_offsets: torch.Tensor, *args, **kw
+):
+    if a.dim() == 2 and b.dim() == 2:
+        G = max(group_k_offsets.numel() - 1, 1)
+        kw.update(_keyed_kwargs("vk", (a.shape[1], b.shape[1], max(1, a.shape[0] // G)), G, len(args), kw))
+    return _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(a, b, group_k_offsets, *args, **kw)
 
 
 __all__ = [

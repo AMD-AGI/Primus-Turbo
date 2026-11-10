@@ -65,21 +65,6 @@ from primus_turbo.flydsl.deep_ep.common import (
     SYS_LOAD,
     SYS_STORE,
     WARP_SIZE,
-    ld_lds,
-    lds_base,
-    load_i32,
-    load_index,
-    read_clock,
-    st_lds,
-    tensor_addr,
-    timed_out,
-    timeout_hit,
-    wait_mem_all,
-)
-from primus_turbo.flydsl.deep_ep.intranode_kernel import (
-    NOTIFY_THREADS,
-    NUM_THREADS,
-    NUM_WARPS,
     _addr,
     _channel_task_range,
     _copy_row,
@@ -90,7 +75,19 @@ from primus_turbo.flydsl.deep_ep.intranode_kernel import (
     _st_sys,
     _uniform_i64,
     barrier_block,
+    ld_lds,
+    lds_base,
+    load_i32,
+    load_index,
+    read_clock,
+    st_lds,
+    tensor_addr,
+    timed_out,
+    timed_out_at,
+    wait_mem_all,
+    watchdog_report,
 )
+from primus_turbo.flydsl.deep_ep.notify_kernel import NOTIFY_THREADS
 from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_load,
     buffer_store,
@@ -104,6 +101,9 @@ from primus_turbo.flydsl.utils.prims import (
     atomic_add,
 )
 
+NUM_THREADS = 1024
+NUM_WARPS = NUM_THREADS // WARP_SIZE
+
 META_BYTES = 64 * 1024
 # int32 [num_ranks][num_channels]: where each source's channel starts in its receive block
 RECV_CHANNEL_OFFSET_OFFSET = META_BYTES + 4096
@@ -113,6 +113,10 @@ TAILS_OFFSET = 128 * 1024
 # int32 per combine slot: the epoch of the combine whose row has landed there
 COMBINE_FLAGS_OFFSET = 256 * 1024
 COMBINE_FLAGS_BYTES = 4 << 20
+# combine push-done marks: int32 [source rank][push warp of the source for this rank], in the end of the
+# combine flags: the epoch of the combine in which that warp's rows have all landed
+COMBINE_DONE_BYTES = 8 * 32768 * 4
+COMBINE_DONE_OFFSET = COMBINE_FLAGS_OFFSET + COMBINE_FLAGS_BYTES - COMBINE_DONE_BYTES
 DATA_OFFSET = COMBINE_FLAGS_OFFSET + COMBINE_FLAGS_BYTES
 assert RECV_CHANNEL_OFFSET_OFFSET + 8 * MAX_CHANNELS * 4 <= TAILS_OFFSET
 assert TAILS_OFFSET + 8 * MAX_CHANNELS * 4 <= 192 * 1024
@@ -122,10 +126,23 @@ FANOUT_PIECE_BYTES = 8 * 1024
 # rows move global -> LDS -> global through the Tensor Data Mover: a warp copy of the row
 # through VGPRs caps how much each CU keeps in flight, and with it the bandwidth per CU
 USE_TDM = IS_GFX1250
+# A TDM op in flight when the queue is evicted (a context save and restore; the KFD evicts every queue of
+# a process e.g. when NUMA balancing unmaps host pages registered with the GPU, every few seconds) can be
+# lost: the wave resumes past it with nothing outstanding, s_wait_tensorcnt does not wait for it, a load
+# leaves the LDS buffer as it was and a store never lands. The dispatch and the combine's push move a row
+# again when its TDM ops took more than TDM_REDO_TICKS of the realtime counter (read_clock, 100 MHz): an
+# eviction takes milliseconds, a row tens of microseconds. Not the shader cycle counter: it belongs to the
+# unit a wave runs on, mostly stands still while the queues are evicted and the wave comes back to the
+# same unit, and jumps when it comes back to another, so about 4 in 10 evictions looked shorter than the
+# threshold. Sources do not change during a call and nobody reads a row before its flag or the channel's
+# count is published, so moving it twice is harmless; the combine checks each row before its flag goes up.
+TDM_REDO_TICKS = 50_000
 # LDS a block can allocate on gfx1250
 MAX_LDS_BYTES = 320 * 1024
-# combine: tokens a warp claims from the reduce queue at a time
-REDUCE_GRAB_TOKENS = 4
+# combine: tokens a warp claims from the reduce queue at a time. A claim waits for the rows of all its
+# tokens, which come from different source ranks whose pushes do not end together, so one late row holds
+# up the whole claim: one token a claim. REDUCE_GRAB_TOKENS x num_ranks lanes must fit a wave
+REDUCE_GRAB_TOKENS = 1
 
 
 def _tdm_row(lds_addr, global_addr, num_bytes):
@@ -154,6 +171,70 @@ def _tdm_row(lds_addr, global_addr, num_bytes):
     )
     group1 = vector.from_elements(fx.T.vec(8, i32), [fx.as_ir_value(fx.Int32(w)) for w in words])
     return tdm_ops.TDMDescriptor2D(dgroup0=group0, dgroup1=group1)
+
+
+def _tdm_desc_wait(desc, asm_string):
+    """``asm_string`` with ``desc`` as its operands: the descriptor's SGPRs hold it at that point."""
+    llvm.inline_asm(
+        res=None,
+        operands_=[fx.as_ir_value(desc.dgroup0), fx.as_ir_value(desc.dgroup1)],
+        asm_string=asm_string,
+        constraints="s,s,~{memory}",
+        has_side_effects=True,
+    )
+
+
+def _tdm_op(op, lds_addr, global_addr, num_bytes, **kwargs):
+    """TDM ``op`` (load or store) of one ``num_bytes`` row between LDS ``lds_addr`` and ``global_addr``
+    (``_tdm_row``), then an ``s_wait_xcnt 0`` until the op has read its descriptor. The compiler emits none
+    after a TDM op, and the dispatch rewrote a descriptor's SGPRs within a few instructions of the op that
+    reads them, which faulted about once in 6000 cached dispatches at EP4 on an address twice a row's (none
+    in about 96000 with the wait, at no measured cost)."""
+    desc = _tdm_row(lds_addr, global_addr, num_bytes)
+    op(desc, **kwargs)
+    _tdm_desc_wait(desc, "s_wait_xcnt 0x0")
+
+
+def _tdm_load(lds_addr, global_addr, num_bytes, **kwargs):
+    _tdm_op(tdm_ops.tensor_load_2d, lds_addr, global_addr, num_bytes, **kwargs)
+
+
+def _tdm_store(lds_addr, global_addr, num_bytes, **kwargs):
+    _tdm_op(tdm_ops.tensor_store_2d, lds_addr, global_addr, num_bytes, **kwargs)
+
+
+def _tdm_moved(start, redo_ticks: int):
+    """After a tensor_wait(0): 1 if the TDM ops issued since ``read_clock()`` read ``start`` took at most
+    ``redo_ticks`` (TDM_REDO_TICKS), so cannot have been lost to an eviction, else 0. The range test holds
+    whether the compares come out signed or not."""
+    delta = read_clock() - start
+    in_time = (delta >= fx.Int64(0)) & (delta <= fx.Int64(redo_ticks))
+    return arith.select(in_time, fx.Int32(1), fx.Int32(0))
+
+
+@ASTRewriter.transform
+def _tdm_load_checked(lds_addr, global_addr, num_bytes: int, sys_load: bool):
+    """``_tdm_load`` of ``num_bytes`` from ``global_addr`` into LDS ``lds_addr`` and a tensor_wait(0), issued
+    again until LDS holds what ``global_addr`` does at 32 words from the first to the last (a lane each, read
+    beside the load; ``sys_load``: system scope, for a heap the peers write). An eviction can drop a queued
+    TDM load, all of it or a part, after s_wait_tensorcnt, and the warp would store its buffer's previous
+    contents; the redo (TDM_REDO_TICKS) moves the row again after an eviction, this check does not depend
+    on how long the wave was away. A TDM load that follows outstanding stores is lost far more often."""
+    lane_id = fx.thread_idx.x % fx.Int32(WARP_SIZE)
+    check_word = (lane_id * fx.Int32(num_bytes // 4 - 1)) // fx.Int32(WARP_SIZE - 1)
+    landed = fx.Int32(0)
+    while landed == fx.Int32(0):
+        if fx.const_expr(sys_load):
+            _tdm_load(lds_addr, global_addr, num_bytes, cache_policy=SYS_LOAD)
+            expected = _ld_sys(global_addr, check_word)
+        else:
+            _tdm_load(lds_addr, global_addr, num_bytes)
+            expected = load_i32(
+                create_buffer_resource_from_addr(global_addr, num_records_bytes=num_bytes), check_word
+            )
+        tdm_ops.tensor_wait(0)
+        stale = _popc(_ballot(ld_lds(lds_addr, check_word) != expected)) > fx.Int32(0)
+        landed = arith.select(stale, fx.Int32(0), fx.Int32(1))
 
 
 def _align(value, alignment):
@@ -204,6 +285,8 @@ def combine_v2_layout(num_nvl_bytes, hidden_bytes, num_topk):
     capacity = max(0, (half - 16 * len(regions)) // sum(b for _, b in regions))
     layout, end = _regions(DATA_OFFSET + half, capacity, regions)
     assert end <= DATA_OFFSET + 2 * half
+    # the combine's TDM push stores whole slots, so they have to start on 128-byte blocks (_make_combine_v2)
+    assert layout["x"] % 128 == 0
     return layout, capacity
 
 
@@ -285,6 +368,63 @@ MAX_EPOCH = (1 << 11) - 1
 
 
 @ASTRewriter.transform
+def _copy_received_x(
+    local, layout, outputs, row, hidden_bytes: int, row_lds, row_buffer_bytes: int, redo_ticks: int
+):
+    """``_tdm_copy_received_x``, repeated until a pass of it was in time (see TDM_REDO_TICKS)."""
+    moved = fx.Int32(0)
+    while moved == fx.Int32(0):
+        start = read_clock()
+        _tdm_copy_received_x(local, layout, outputs, row, hidden_bytes, row_lds, row_buffer_bytes)
+        tdm_ops.tensor_wait(0)
+        moved = _tdm_moved(start, redo_ticks)
+
+
+@ASTRewriter.transform
+def _tdm_copy_received_x(local, layout, outputs, row, hidden_bytes: int, row_lds, row_buffer_bytes: int):
+    """Received row ``row``'s data from the heap into the output through the warp's LDS row buffer."""
+    for p in range_constexpr(0, hidden_bytes, row_buffer_bytes):
+        piece = min(row_buffer_bytes, hidden_bytes - p)
+        tdm_ops.tensor_wait(0)
+        _tdm_load_checked(
+            row_lds, _uniform_i64(_addr(local, layout["x"] + p, row, hidden_bytes)), piece, True
+        )
+        _tdm_store(row_lds, _uniform_i64(_addr(outputs["x"], p, row, hidden_bytes)), piece)
+
+
+@ASTRewriter.transform
+def _send_x_row(
+    row_lds, x_base, t, hidden_bytes: int, row_buffer_bytes: int, dst_x, rows, routed, redo_ticks: int
+):
+    """``_tdm_send_row``, repeated until a pass of it was in time (see TDM_REDO_TICKS)."""
+    moved = fx.Int32(0)
+    while moved == fx.Int32(0):
+        start = read_clock()
+        _tdm_send_row(row_lds, x_base, t, hidden_bytes, row_buffer_bytes, dst_x, rows, routed)
+        tdm_ops.tensor_wait(0)
+        moved = _tdm_moved(start, redo_ticks)
+
+
+@ASTRewriter.transform
+def _tdm_send_row(row_lds, x_base, t, hidden_bytes: int, row_buffer_bytes: int, dst_x, rows, routed):
+    """Token ``t``'s row of x, loaded once a piece at a time into the warp's LDS row buffer and stored from
+    there to row ``rows[d]`` of every destination ``d`` it is ``routed`` to."""
+    for p in range_constexpr(0, hidden_bytes, row_buffer_bytes):
+        piece = min(row_buffer_bytes, hidden_bytes - p)
+        # the previous stores are done with the buffer
+        tdm_ops.tensor_wait(0)
+        _tdm_load_checked(row_lds, _uniform_i64(_addr(x_base, p, t, hidden_bytes)), piece, False)
+        for d in range_constexpr(len(rows)):
+            if routed[d]:
+                _tdm_store(
+                    row_lds,
+                    _uniform_i64(_addr(dst_x[d], p, rows[d], hidden_bytes)),
+                    piece,
+                    cache_policy=SYS_STORE,
+                )
+
+
+@ASTRewriter.transform
 def _poll_tails(
     lds,
     lds_recv: int,
@@ -337,6 +477,7 @@ def _copy_received(
     idx_dtype,
     row_lds,
     row_buffer_bytes: int,
+    redo_ticks: int,
 ):
     """The block copies the rows that have arrived and it has not copied yet, with their metadata,
     from the heap into the outputs."""
@@ -362,17 +503,7 @@ def _copy_received(
         for s in range_constexpr(1, num_ranks):
             row = arith.select(j >= cums[s], starts[s] + j - cums[s], row)
         if fx.const_expr(row_lds is not None):
-            for p in range_constexpr(0, hidden_bytes, row_buffer_bytes):
-                piece = min(row_buffer_bytes, hidden_bytes - p)
-                tdm_ops.tensor_wait(0)
-                tdm_ops.tensor_load_2d(
-                    _tdm_row(row_lds, _uniform_i64(_addr(local, layout["x"] + p, row, hidden_bytes)), piece),
-                    cache_policy=SYS_LOAD,
-                )
-                tdm_ops.tensor_wait(0)
-                tdm_ops.tensor_store_2d(
-                    _tdm_row(row_lds, _uniform_i64(_addr(outputs["x"], p, row, hidden_bytes)), piece)
-                )
+            _copy_received_x(local, layout, outputs, row, hidden_bytes, row_lds, row_buffer_bytes, redo_ticks)
         else:
             _copy_row(
                 _addr(outputs["x"], 0, row, hidden_bytes),
@@ -441,6 +572,8 @@ def _make_dispatch_v2(
     row_buffer_bytes = min(_align(hidden_bytes, 128), (MAX_LDS_BYTES - lds_rows) // NUM_WARPS // 128 * 128)
     if USE_TDM:
         lds_words = (lds_rows + NUM_WARPS * row_buffer_bytes) // 4
+    # read here and passed down, not read in the helpers, so that it is part of FlyDSL's kernel cache key
+    redo_ticks = TDM_REDO_TICKS
     grid_threads = num_channels * NUM_THREADS
     idx_dtype = fx.T.i64 if topk_idx_bytes == 8 else fx.T.i32
 
@@ -590,24 +723,17 @@ def _make_dispatch_v2(
                     rows.append(rank_offsets[d] + arith.select(is_routed, slot, fx.Int32(0)))
                     routed.append(is_routed)
                 if fx.const_expr(USE_TDM):
-                    for p in range_constexpr(0, hidden_bytes, row_buffer_bytes):
-                        piece = min(row_buffer_bytes, hidden_bytes - p)
-                        # the previous stores are done with the buffer
-                        tdm_ops.tensor_wait(0)
-                        tdm_ops.tensor_load_2d(
-                            _tdm_row(row_lds, _uniform_i64(_addr(x_base, p, t, hidden_bytes)), piece)
-                        )
-                        tdm_ops.tensor_wait(0)
-                        for d in range_constexpr(num_ranks):
-                            if routed[d]:
-                                tdm_ops.tensor_store_2d(
-                                    _tdm_row(
-                                        row_lds,
-                                        _uniform_i64(_addr(dst_bases["x"][d], p, rows[d], hidden_bytes)),
-                                        piece,
-                                    ),
-                                    cache_policy=SYS_STORE,
-                                )
+                    _send_x_row(
+                        row_lds,
+                        x_base,
+                        t,
+                        hidden_bytes,
+                        row_buffer_bytes,
+                        dst_bases["x"],
+                        rows,
+                        routed,
+                        redo_ticks,
+                    )
                 else:
                     dst_resources = [
                         create_buffer_resource_from_addr(
@@ -706,6 +832,7 @@ def _make_dispatch_v2(
                 idx_dtype,
                 row_lds,
                 row_buffer_bytes,
+                redo_ticks,
             )
             remaining = fx.Int32(0)
             for s in range_constexpr(num_ranks):
@@ -717,13 +844,12 @@ def _make_dispatch_v2(
                     - ld_lds(lds, fx.Int32(lds_recv + s))
                 )
             if (thread_id == fx.Int32(0)) & timed_out(spin_start):
-                fx.printf(
+                watchdog_report(
                     "[DeepEP FlyDSL V2 dispatch] receive timeout: rank={} channel={} remaining={}\n",
                     rank,
                     channel,
                     remaining,
                 )
-                timeout_hit()
                 spin_start = read_clock()
             # everyone has read the counts before the next poll rewrites them
             fx.gpu.barrier()
@@ -846,6 +972,56 @@ def _wait_lds():
 
 
 @ASTRewriter.transform
+def _tdm_push_row(
+    row,
+    slot,
+    row_lds,
+    x_base,
+    hidden_bytes: int,
+    num_topk: int,
+    topk_weights_res,
+    peer,
+    x_offset: int,
+    slot_bytes: int,
+    push_bytes: int,
+):
+    """Combine: row ``row`` of x with its top-k weights, through the warp's LDS row buffer, into slot
+    ``slot`` of the peer's heap."""
+    lane_id = fx.thread_idx.x % fx.Int32(WARP_SIZE)
+    weight = fx.Float32(0.0)
+    if fx.const_expr(num_topk > 0):
+        weight = buffer_load(
+            topk_weights_res,
+            row * fx.Int32(num_topk) + arith.select(lane_id < fx.Int32(num_topk), lane_id, fx.Int32(0)),
+            vec_width=1,
+            dtype=fx.T.f32,
+        )
+    _tdm_load_checked(row_lds, _uniform_i64(_addr(x_base, 0, row, hidden_bytes)), hidden_bytes, False)
+    if fx.const_expr(num_topk > 0):
+        if lane_id < fx.Int32(num_topk):
+            st_lds(row_lds, fx.Int32(hidden_bytes // 4) + lane_id, weight)
+        _wait_lds()
+    _tdm_store(
+        row_lds,
+        _uniform_i64(_addr(peer, x_offset, slot, slot_bytes)),
+        push_bytes,
+        cache_policy=SYS_STORE,
+    )
+
+
+@ASTRewriter.transform
+def _tdm_push_again(pushed, row, start, redo_ticks: int, *push_args):
+    """Combine, after a tensor_wait(0): row ``row``'s push into slot ``pushed`` (none if < 0), issued after
+    ``read_clock()`` read ``start``, done again until a pass is in time (see TDM_REDO_TICKS)."""
+    moved = arith.select(pushed >= fx.Int32(0), _tdm_moved(start, redo_ticks), fx.Int32(1))
+    while moved == fx.Int32(0):
+        again = read_clock()
+        _tdm_push_row(row, pushed, *push_args)
+        tdm_ops.tensor_wait(0)
+        moved = _tdm_moved(again, redo_ticks)
+
+
+@ASTRewriter.transform
 def _grab_tokens(counter, lds, lds_slot, base):
     """First of the warp's next ``REDUCE_GRAB_TOKENS`` tokens from the reduce queue."""
     lane_id = fx.thread_idx.x % fx.Int32(WARP_SIZE)
@@ -861,16 +1037,56 @@ def _wait_rows(flags, flag_idx, waits, epoch, rank, token):
     value = _ld_sys(flags, flag_idx)
     while _popc(_ballot(waits & (value != epoch))) > fx.Int32(0):
         if timed_out(spin_start):
-            fx.printf(
+            watchdog_report(
                 "[DeepEP FlyDSL V2 combine] row timeout: rank={} token={} flag={} epoch={}\n",
                 rank,
                 token,
                 value,
                 epoch,
             )
-            timeout_hit()
             spin_start = read_clock()
         value = _ld_sys(flags, flag_idx)
+
+
+# a push warp, its last row landed and nothing of it in flight, also marks itself done on its destination
+# (COMBINE_DONE_OFFSET), and a reducer that has waited long for a row takes that warp's mark for the row's
+# flag. When a rank's call starts seconds after its peers' (a first call, compiled at different speeds)
+# while their queues are evicted, a few flags they write into it in its next call never show, in memory
+# either (a system-scope atomic reads the old epoch): the combine hung there. Where the marks do not fit
+# (more than 32768 push warps a source, or a flag region full of slots), only the flags count
+# a reducer reads the done marks only after this many realtime ticks (100 MHz) of waiting for a row: 1 ms
+COMBINE_DONE_AFTER_TICKS = 100_000
+
+
+def _done_index(waits, lane_r, index, warps_per_peer: int):
+    """The push-done mark of a waiting lane: that of source lane_r's warp index % warps_per_peer."""
+    return arith.select(
+        waits, lane_r * fx.Int32(warps_per_peer) + index % fx.Int32(warps_per_peer), fx.Int32(0)
+    )
+
+
+@ASTRewriter.transform
+def _wait_rows_or_done(flags, flag_idx, waits, epoch, rank, token, done, lane_r, index, warps_per_peer: int):
+    """``_wait_rows``, where the done mark of the warp that pushed a lane's row counts as the row's flag;
+    read only once the wait is past COMBINE_DONE_AFTER_TICKS, far beyond a flag's usual wait."""
+    spin_start = read_clock()
+    wait_start = spin_start
+    value = _ld_sys(flags, flag_idx)
+    while _popc(_ballot(waits & (value != epoch))) > fx.Int32(0):
+        now = read_clock()
+        if timed_out_at(now, spin_start):
+            watchdog_report(
+                "[DeepEP FlyDSL V2 combine] row timeout: rank={} token={} flag={} epoch={}\n",
+                rank,
+                token,
+                value,
+                epoch,
+            )
+            spin_start = read_clock()
+        value = _ld_sys(flags, flag_idx)
+        if (now - wait_start) > fx.Int64(COMBINE_DONE_AFTER_TICKS):
+            mark = _ld_sys(done, _done_index(waits, lane_r, index, warps_per_peer))
+            value = arith.select(mark == epoch, epoch, value)
 
 
 def combine_v2_push_warps(num_channels):
@@ -895,20 +1111,30 @@ def _make_combine_v2(
     layout, _ = combine_v2_layout(num_nvl_bytes, hidden_bytes, num_topk)
     slot_bytes = combine_v2_slot_bytes(hidden_bytes, num_topk)
     weights_offset = layout["x"] + hidden_bytes
-    # the row and its weights, in whole 8-byte TDM elements
-    push_bytes = _align(hidden_bytes + num_topk * 4, 8)
+    # the whole slot, its padding included: a TDM store writes memory in 128-byte blocks, and one that ends
+    # inside a block merges into it with a read-modify-write, which over XGMI costs far more than storing
+    # the padding (hidden 7168 bf16 and top-8 end 32 bytes into the slot's last block). The padding comes
+    # from the warp's LDS buffer and is never read
+    push_bytes = slot_bytes
     push_warps = combine_v2_push_warps(num_channels)
     if USE_TDM:
         # each pusher holds a whole slot in LDS: the weights go with the row's store
         push_warps = min(push_warps, (MAX_LDS_BYTES - NUM_WARPS * 4) // slot_bytes)
     grid_push_warps = num_channels * push_warps
     assert grid_push_warps >= num_ranks and REDUCE_GRAB_TOKENS * num_ranks <= WARP_SIZE
+    push_done = (
+        grid_push_warps * 4 * 8 <= COMBINE_DONE_BYTES
+        and combine_v2_layout(num_nvl_bytes, hidden_bytes, num_topk)[1] * 4
+        <= COMBINE_FLAGS_BYTES - COMBINE_DONE_BYTES
+    )
     vec_elems = 16 // elem_bytes
     num_vecs = hidden_bytes // 16
     num_steps = (num_vecs + WARP_SIZE - 1) // WARP_SIZE
     steps_per_pass = max(1, TRAITS.combine_loads_in_flight // (num_ranks + int(has_bias_0) + int(has_bias_1)))
     row_buffer_bytes = slot_bytes
     lds_grab = (push_warps * row_buffer_bytes if USE_TDM else 0) // 4
+    # read here and passed down, not read in the helpers, so that it is part of FlyDSL's kernel cache key
+    redo_ticks = TDM_REDO_TICKS
     smem_bytes = lds_grab * 4 + NUM_WARPS * 4
 
     @flyc.kernel(name="deep_ep_combine_v2_kernel", known_block_size=[NUM_THREADS, 1, 1])
@@ -987,6 +1213,19 @@ def _make_combine_v2(
             row_lds = lds + _readfirstlane_i32(warp_id) * fx.Int32(row_buffer_bytes)
         pushed = fx.Int32(-1)
         topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
+        push_args = (
+            row_lds,
+            x_base,
+            hidden_bytes,
+            num_topk,
+            topk_weights_res,
+            peer,
+            layout["x"],
+            slot_bytes,
+            push_bytes,
+        )
+        pushed_row = row
+        pushed_start = read_clock() if USE_TDM else fx.Int64(0)
         while row < row_end:
             slot = row - row_begin + base
             # the previous row has landed, and is done with the LDS buffer
@@ -994,6 +1233,10 @@ def _make_combine_v2(
                 tdm_ops.tensor_wait(0)
             else:
                 wait_mem_all()
+            if fx.const_expr(USE_TDM):
+                # before its flag goes up
+                _tdm_push_again(pushed, pushed_row, pushed_start, redo_ticks, *push_args)
+                pushed_start = read_clock()
             weight = fx.Float32(0.0)
             if fx.const_expr(num_topk > 0):
                 weight = buffer_load(
@@ -1004,16 +1247,17 @@ def _make_combine_v2(
                     dtype=fx.T.f32,
                 )
             if fx.const_expr(USE_TDM):
-                tdm_ops.tensor_load_2d(
-                    _tdm_row(row_lds, _uniform_i64(_addr(x_base, 0, row, hidden_bytes)), hidden_bytes)
+                _tdm_load_checked(
+                    row_lds, _uniform_i64(_addr(x_base, 0, row, hidden_bytes)), hidden_bytes, False
                 )
                 if fx.const_expr(num_topk > 0):
                     if lane_id < fx.Int32(num_topk):
                         st_lds(row_lds, fx.Int32(hidden_bytes // 4) + lane_id, weight)
                     _wait_lds()
-                tdm_ops.tensor_wait(0)
-                tdm_ops.tensor_store_2d(
-                    _tdm_row(row_lds, _uniform_i64(_addr(peer, layout["x"], slot, slot_bytes)), push_bytes),
+                _tdm_store(
+                    row_lds,
+                    _uniform_i64(_addr(peer, layout["x"], slot, slot_bytes)),
+                    push_bytes,
                     cache_policy=SYS_STORE,
                 )
             else:
@@ -1032,13 +1276,25 @@ def _make_combine_v2(
             if (pushed >= fx.Int32(0)) & (lane_id == fx.Int32(0)):
                 _st_sys(peer_flags, pushed, epoch)
             pushed = slot
+            pushed_row = row
             row = row + fx.Int32(warps_per_peer)
         if fx.const_expr(USE_TDM):
             tdm_ops.tensor_wait(0)
         else:
             wait_mem_all()
+        if fx.const_expr(USE_TDM):
+            _tdm_push_again(pushed, pushed_row, pushed_start, redo_ticks, *push_args)
         if (pushed >= fx.Int32(0)) & (lane_id == fx.Int32(0)):
             _st_sys(peer_flags, pushed, epoch)
+        if fx.const_expr(push_done):
+            # nothing of this warp is in flight any more: a reducer that waits too long for one of its
+            # rows takes this mark for the row's flag
+            if is_pusher & (lane_id == fx.Int32(0)):
+                _st_sys(
+                    peer + fx.Int64(COMBINE_DONE_OFFSET),
+                    rank * fx.Int32(warps_per_peer) + global_warp // fx.Int32(num_peers),
+                    epoch,
+                )
 
         # ---- reduce: each of our tokens over the ranks it went to, as soon as its rows are in;
         # warps claim tokens in order from a queue, the pushers once they are done ----
@@ -1086,14 +1342,29 @@ def _make_combine_v2(
             )
             index = arith.select(in_claim, index, fx.Int32(-1))
             waits = (lane_r != rank) & (index >= fx.Int32(0))
-            _wait_rows(
-                local_flags,
-                arith.select(waits, lane_base + index, fx.Int32(0)),
-                waits,
-                epoch,
-                rank,
-                first,
-            )
+            if fx.const_expr(push_done):
+                # source lane_r's warp index % warps_per_peer pushed the row
+                _wait_rows_or_done(
+                    local_flags,
+                    arith.select(waits, lane_base + index, fx.Int32(0)),
+                    waits,
+                    epoch,
+                    rank,
+                    first,
+                    local + fx.Int64(COMBINE_DONE_OFFSET),
+                    lane_r,
+                    index,
+                    warps_per_peer,
+                )
+            else:
+                _wait_rows(
+                    local_flags,
+                    arith.select(waits, lane_base + index, fx.Int32(0)),
+                    waits,
+                    epoch,
+                    rank,
+                    first,
+                )
             token = first
             while token < token_end:
                 claim_lane = (token - first) * fx.Int32(num_ranks)

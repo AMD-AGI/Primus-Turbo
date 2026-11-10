@@ -39,7 +39,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, rocdl
+from flydsl.expr import arith, const_expr, rocdl
 from flydsl.expr.typing import Constexpr, T
 
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
@@ -53,6 +53,7 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     NUM_BUFFERS,
     WAVE,
     nt_gemm_tile,
+    resolve_lds_cosched,
     tile_geometry,
 )
 from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
@@ -134,6 +135,9 @@ def _launch_gemm_combine_nt(
     HAS_GRAD_GATE: Constexpr[bool],
     B_NN: Constexpr[bool],
     HAS_BIAS: Constexpr[bool],
+    issue_first: Constexpr[int],
+    wmma_b2b: Constexpr[int],
+    lds_cosched: Constexpr[int],
 ):
     block = m_warp * n_warp * WAVE
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
@@ -189,6 +193,8 @@ def _launch_gemm_combine_nt(
         arg_bias_scale: fx.Pointer,
         sym_buffer,
     ):
+        if const_expr(wmma_b2b):
+            rocdl.disable_xdl_arb_stall()
         arena = fx.SharedAllocator(static=False)
         arena.allocate(arena_bytes)
         base_ptr = arena.base_ptr
@@ -274,6 +280,8 @@ def _launch_gemm_combine_nt(
             gather=False,
             c_cache_modifier=CPOL_DEVICE_STREAM,  # read by combine workgroups on other CUs
             b_nn=B_NN,
+            issue_first=bool(issue_first),
+            lds_cosched=bool(lds_cosched),
             i32_n=fx.Int32(N),
         )
         # every wave's C stores retire before the flag; two rendezvous, which LLVM would fold
@@ -506,6 +514,9 @@ def gemm_combine_nt_gfx1250(
     b_nn: bool = False,
     bias: torch.Tensor | None = None,
     bias_scale: torch.Tensor | None = None,
+    issue_first: int = 1,
+    wmma_b2b: int | None = None,
+    lds_cosched: int = -1,
 ):
     """``act`` [pool rows, K] (pool order, as the L1 + activation left it) -> ``[tokens, N]`` combined,
     ``tokens = topk_idx.shape[0]``.
@@ -517,7 +528,14 @@ def gemm_combine_nt_gfx1250(
     this rank's token ``t``, on whichever rank holds them. No routing weight is applied here.
     ``w2`` is ``[experts, N, K]``, or ``[experts, K, N]`` with ``b_nn`` (``act[p] @ w2[e(p)]``).
     ``bias`` [experts, N] adds ``bias[e(p)] * bias_scale[p]`` to every pool row before the sum,
-    ``bias_scale`` being the rows' f32 routing weight. ``tile_k`` 0 is 128 when it divides K, else 64."""
+    ``bias_scale`` being the rows' f32 routing weight. ``tile_k`` 0 is 128 when it divides K, else 64.
+    ``issue_first`` issues each k-tile's prefetch at the top of the previous one, ``lds_cosched``
+    interleaves the fragment reads with the matrix ops (``nt_gemm_tile``; -1: wherever the tile and
+    ``issue_first`` allow it) and ``wmma_b2b`` turns the WMMA arbitration stall off (None: on for NT,
+    off with ``b_nn``)."""
+    if wmma_b2b is None:
+        wmma_b2b = 0 if b_nn else 1
+    lds_cosched = resolve_lds_cosched(lds_cosched, issue_first, tile_m, tile_n, m_warp, n_warp)
     _require_gfx1250(act.device)
     symm = get_symm_buffer_for_mega_moe()
     G, N, K = w2.shape
@@ -607,6 +625,9 @@ def gemm_combine_nt_gfx1250(
         has_grad_gate,
         b_nn,
         has_bias,
+        issue_first,
+        wmma_b2b,
+        lds_cosched,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)

@@ -11,34 +11,38 @@
 
 """FlyDSL backend of DeepEP's intranode path (``num_rdma_ranks == 1``).
 
-``FlyDSLIntranodeRuntime`` exposes the three intranode methods of the C++ ``Buffer``
-runtime with the same arguments and return tuples, so ``Buffer`` can route to either.
-It owns its own uncached HIP-IPC heap; the handles it returns are plain tensors and
-are interchangeable with the C++ backend's.
+A runtime exposes the three intranode methods of the C++ ``Buffer`` runtime with the same arguments
+and return tuples, so ``Buffer`` can route to either, and owns its own uncached HIP-IPC heap.
+``FlyDSLIntranodeRuntime`` holds what both versions share; each version is a subclass:
 
-``version=2`` (backend ``flydsl_v2``) runs the V2 kernels of ``intranode_v2_kernel``: direct
-writes into fixed slots instead of channel rings. Its outputs match V1's; its handles are its own
-(``send_head`` holds stream indices, and a channel is one block, ``num_sms`` of them).
+- ``FlyDSLIntranodeV1Runtime`` (backend ``flydsl``) runs the V1 kernels of ``intranode_v1_kernel``,
+  the channel rings of the HIP kernels; its handles are plain tensors, interchangeable with the C++
+  backend's.
+- ``FlyDSLIntranodeV2Runtime`` (backend ``flydsl_v2``) runs the V2 kernels of ``intranode_v2_kernel``:
+  direct writes into fixed slots instead of channel rings. Its outputs match V1's; its handles are its
+  own (``send_head`` holds stream indices, and a channel is one block, ``num_sms`` of them).
 """
 
 import contextlib
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 import torch.distributed as dist
 
 import primus_turbo.common.envs as envs
 from primus_turbo.flydsl.deep_ep.arch import CPP_DEEPEP_ARCHS, default_intranode_backend
-from primus_turbo.flydsl.deep_ep.intranode_kernel import (
+
+# FlyDSLIntranodeV1Runtime only
+from primus_turbo.flydsl.deep_ep.intranode_v1_kernel import (
     combine_buffer_layout,
     combine_min_recv_buffer_tokens,
     dispatch_buffer_layout,
     launch_cached_notify_combine,
-    launch_cached_notify_dispatch,
     launch_combine,
     launch_dispatch,
-    launch_notify_dispatch,
 )
+
+# FlyDSLIntranodeV2Runtime and v2_heap_bytes only
 from primus_turbo.flydsl.deep_ep.intranode_v2_kernel import (
     COMBINE_FLAGS_BYTES,
     DATA_OFFSET,
@@ -55,6 +59,7 @@ from primus_turbo.flydsl.deep_ep.intranode_v2_kernel import (
 )
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
 from primus_turbo.flydsl.deep_ep.layout_kernel import get_dispatch_layout_flydsl
+from primus_turbo.flydsl.deep_ep.notify_kernel import launch_cached_notify_dispatch, launch_notify_dispatch
 from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
 
 from ._compat import NUM_MAX_NVL_PEERS, EventHandle
@@ -87,45 +92,69 @@ def _check(cond: bool, msg: str = "") -> None:
         raise RuntimeError(f"DeepEP FlyDSL intranode check failed: {msg}")
 
 
-# the widest top-k index the dispatch takes (int64)
-_V2_TOPK_IDX_BYTES = 8
+class _DispatchArgs(NamedTuple):
+    """What a dispatch launch takes, once the shared part of ``intranode_dispatch`` has run."""
+
+    x: torch.Tensor
+    x_scales: Optional[torch.Tensor]
+    topk_idx: Optional[torch.Tensor]
+    topk_weights: Optional[torch.Tensor]
+    is_token_in_rank_u8: torch.Tensor
+    rank_prefix_matrix: torch.Tensor
+    channel_prefix_matrix: torch.Tensor
+    recv_x: torch.Tensor
+    recv_x_scales: Optional[torch.Tensor]
+    recv_src_idx: torch.Tensor
+    recv_topk_idx: Optional[torch.Tensor]
+    recv_topk_weights: Optional[torch.Tensor]
+    recv_channel_prefix_matrix: torch.Tensor
+    send_head: torch.Tensor
+    num_tokens: int
+    num_recv_tokens: int
+    num_worst_tokens: int
+    num_channels: int
+    hidden_bytes: int
+    num_topk: int
+    num_experts: int
+    num_scales: int
+    scale_token_stride: int
+    scale_hidden_stride: int
+    topk_idx_bytes: int
+    config: object
 
 
-def v2_heap_bytes(num_max_tokens_per_rank: int, num_ranks: int, hidden_bytes: int, num_topk: int) -> int:
-    """Heap bytes the V2 backend needs when no rank sends more than ``num_max_tokens_per_rank`` tokens:
-    the dispatch region of a rank may receive every rank's tokens, and the combine region holds each of
-    its own tokens coming back from every rank. ``hidden_bytes`` is the bf16 row; an fp8 row with its
-    scales is smaller."""
-    _check(num_max_tokens_per_rank > 0, "the V2 heap is sized from the maximum number of tokens per rank")
-    rows = num_max_tokens_per_rank * num_ranks
-    _check(
-        rows * 4 <= COMBINE_FLAGS_BYTES,
-        f"V2 takes at most {COMBINE_FLAGS_BYTES // 4} tokens x ranks, got {rows}",
-    )
-    dispatch_row = hidden_bytes + 4 + num_topk * (_V2_TOPK_IDX_BYTES + 4)
-    row = max(dispatch_row, combine_v2_slot_bytes(hidden_bytes, num_topk))
-    # every region starts 16-byte aligned (dispatch_v2_layout has 5); halves are whole 4 KiB pages
-    half = -(-(rows * row + 16 * 5) // 4096) * 4096
-    num_bytes = DATA_OFFSET + 2 * half
-    assert dispatch_v2_layout(num_bytes, hidden_bytes, num_topk, _V2_TOPK_IDX_BYTES, 0)[1] >= rows
-    assert combine_v2_layout(num_bytes, hidden_bytes, num_topk)[1] >= rows
-    return num_bytes
+class _CombineArgs(NamedTuple):
+    """What a combine launch takes, once the shared part of ``intranode_combine`` has run."""
+
+    x: torch.Tensor
+    topk_weights: Optional[torch.Tensor]
+    bias_0: Optional[torch.Tensor]
+    bias_1: Optional[torch.Tensor]
+    src_idx: torch.Tensor
+    rank_prefix_matrix: torch.Tensor
+    channel_prefix_matrix: torch.Tensor
+    send_head: torch.Tensor
+    recv_x: torch.Tensor
+    recv_topk_weights: Optional[torch.Tensor]
+    num_tokens: int
+    num_recv_tokens: int
+    num_channels: int
+    hidden: int
+    hidden_bytes: int
+    num_topk: int
+    config: object
 
 
 class FlyDSLIntranodeRuntime:
-    """Intranode dispatch / combine on FlyDSL kernels over a symmetric uncached heap."""
+    """Intranode dispatch / combine on FlyDSL kernels over a symmetric uncached heap: what V1
+    (``FlyDSLIntranodeV1Runtime``) and V2 (``FlyDSLIntranodeV2Runtime``) share -- the heap, the
+    streams, the layout, the checks of the arguments, the notify and the outputs. A subclass sets the
+    channel count and what the notify clears, and launches its own dispatch and combine."""
 
-    def __init__(
-        self, group: dist.ProcessGroup, num_nvl_bytes: int, comm_stream: torch.cuda.Stream, version: int = 1
-    ) -> None:
-        _check(version in (1, 2), f"version must be 1 or 2, got {version}")
-        # V2 moves rows with TDM, which gfx942 / gfx950 lack; its non-TDM path has never run there
-        _check(
-            version == 1 or default_intranode_backend() != "cpp",
-            f"the V2 backend (flydsl_v2) does not run on {' / '.join(CPP_DEEPEP_ARCHS)}; "
-            f"leave intranode_backend unset, which takes this GPU's '{default_intranode_backend()}'",
-        )
-        self.version = version
+    # notify_dispatch fills every column of the rank prefix matrix, not only this rank's
+    FULL_RANK_MATRIX = False
+
+    def __init__(self, group: dist.ProcessGroup, num_nvl_bytes: int, comm_stream: torch.cuda.Stream) -> None:
         self.group = group
         self.rank = group.rank()
         self.num_ranks = group.size()
@@ -152,23 +181,33 @@ class FlyDSLIntranodeRuntime:
         # notify's receive counts land here: [num_recv_tokens, per local expert...]
         self.host_counters = torch.empty(1 + NUM_MAX_LOCAL_EXPERTS, dtype=torch.int32, pin_memory=True)
         self.counters_ready = torch.cuda.Event()
-        if version == 2:
-            _check(num_nvl_bytes > DATA_OFFSET, f"the V2 heap needs more than {DATA_OFFSET} bytes")
-            # the combine's row flags hold epochs, which start at 1
-            self.symm.get_buffer(
-                self.rank, ((DATA_OFFSET - META_BYTES) // 4,), torch.int32, META_BYTES // 4
-            ).zero_()
-            self.dispatch_epoch = 0
-            self.combine_epoch = 0
-            # the combine's reduce queue; it only ever grows, each combine claims from where the
-            # previous one left it
-            self.reduce_counter = torch.zeros(1, dtype=torch.int32, device="cuda")
-            self.reduce_grabs = 0
-            # a combine may push into a peer's combine region only once that peer is done reducing
-            # the previous combine: the notify of a dispatch in between is a barrier that ensures it
-            self.combine_needs_barrier = False
+        self._init_state()
         torch.cuda.synchronize()
         group.barrier()
+
+    # ── what a version sets ──────────────────────────────────────────────────
+
+    def _init_state(self) -> None:
+        """The version's own state and heap contents, set before every rank meets in ``__init__``."""
+
+    def _num_channels(self, config) -> int:
+        """The channels of a dispatch / combine with ``config``; raises where the version cannot run it."""
+        raise NotImplementedError
+
+    def _notify_memset_ints(self, num_channels: int) -> int:
+        """The int32 words after the rank prefix matrix the notify clears for the dispatch."""
+        raise NotImplementedError
+
+    def _launch_dispatch(self, args: _DispatchArgs, launch_stream: torch.cuda.Stream) -> None:
+        raise NotImplementedError
+
+    def _check_combine_config(self, config) -> None:
+        """Raises for a ``config`` the version's combine cannot run."""
+
+    def _launch_combine(self, args: _CombineArgs, launch_stream: torch.cuda.Stream) -> None:
+        raise NotImplementedError
+
+    # ── heap ─────────────────────────────────────────────────────────────────
 
     def destroy(self) -> None:
         """Collective: every rank of the group calls it."""
@@ -180,16 +219,6 @@ class FlyDSLIntranodeRuntime:
                 dist.barrier(group=self.group)
             self.symm.destroy()
             self.symm = None
-
-    @staticmethod
-    def _check_not_capturing() -> None:
-        # a V2 launch takes host state that every call advances (the epoch its flags carry, the base of
-        # the reduce queue): a graph replay would rerun the old values and take stale flags as fresh
-        _check(
-            not torch.cuda.is_current_stream_capturing(),
-            "flydsl_v2 cannot be captured in a CUDA graph: each call advances host-side epochs; "
-            "to capture the MoE token exchange on MI455X, use the all-to-all (RCCL) token dispatcher",
-        )
 
     def get_local_buffer_tensor(self, dtype: torch.dtype, offset: int) -> torch.Tensor:
         return self.symm.get_buffer(
@@ -283,12 +312,7 @@ class FlyDSLIntranodeRuntime:
     ):
         num_ranks, rank = self.num_ranks, self.rank
         cached_mode = cached_rank_prefix_matrix is not None
-        if self.version == 2:
-            self._check_not_capturing()
-            num_channels = config.num_sms
-        else:
-            _check(config.num_sms % 2 == 0, "num_sms must be even")
-            num_channels = config.num_sms // 2
+        num_channels = self._num_channels(config)
         if cached_mode:
             _check(cached_channel_prefix_matrix is not None, "cached mode needs the channel prefix matrix")
             _check(
@@ -343,8 +367,7 @@ class FlyDSLIntranodeRuntime:
             previous_event, async_finish, allocate_on_comm_stream
         )
         device = x.device
-        # V2 has no channel queues to reset
-        num_memset_int = 0 if self.version == 2 else num_channels * num_ranks * 4
+        num_memset_int = self._notify_memset_ints(num_channels)
         num_recv_tokens_per_expert_list = []
         is_token_in_rank_u8 = is_token_in_rank.view(torch.uint8)
         with self._alloc_stream(launch_stream, cross):
@@ -388,7 +411,7 @@ class FlyDSLIntranodeRuntime:
                     num_channels,
                     num_memset_int,
                     expert_alignment,
-                    self.version == 2,
+                    self.FULL_RANK_MATRIX,
                     launch_stream,
                 )
                 if num_worst_tokens > 0:
@@ -422,125 +445,35 @@ class FlyDSLIntranodeRuntime:
                     (num_recv_tokens, num_scales), dtype=x_scales.dtype, device=device
                 )
 
-        if self.version == 2:
-            _, capacity = dispatch_v2_layout(
-                self.num_nvl_bytes, hidden_bytes, num_topk, topk_idx_bytes, num_scales
-            )
-            _check(
-                num_recv_tokens <= capacity,
-                f"V2 dispatch receives {num_recv_tokens} tokens > the heap's {capacity}; raise num_nvl_bytes",
-            )
-            _check(
-                (num_tokens + num_channels - 1) // num_channels < TAIL_DONE_BIT,
-                f"V2 dispatch takes fewer than {TAIL_DONE_BIT} tokens per channel",
-            )
-            self.dispatch_epoch = self.dispatch_epoch % MAX_EPOCH + 1
-            self.combine_needs_barrier = False
-            dummy_i32 = rank_prefix_matrix
-            dummy_f32 = dummy_i32.view(torch.float32)
-            run_launcher(
-                launch_dispatch_v2,
-                recv_x.view(torch.uint8),
-                recv_x_scales if recv_x_scales is not None else dummy_i32,
-                recv_src_idx,
-                recv_topk_idx if recv_topk_idx is not None else dummy_i32,
-                recv_topk_weights if recv_topk_weights is not None else dummy_f32,
-                recv_channel_prefix_matrix,
-                send_head,
-                x.view(torch.uint8),
-                x_scales if x_scales is not None else dummy_i32,
-                topk_idx if topk_idx is not None else dummy_i32,
-                topk_weights if topk_weights is not None else dummy_f32,
-                is_token_in_rank_u8,
-                channel_prefix_matrix,
-                rank_prefix_matrix,
-                self.buffer_ptrs,
-                num_tokens,
-                num_worst_tokens,
-                scale_token_stride,
-                scale_hidden_stride,
-                rank,
-                self.dispatch_epoch,
-                num_ranks,
-                num_channels,
-                hidden_bytes,
-                num_topk,
-                num_experts,
-                num_scales,
-                topk_idx_bytes,
-                self.num_nvl_bytes,
-                launch_stream,
-            )
-            return self._dispatch_outputs(
-                compute_stream,
-                launch_stream,
-                cross,
-                async_finish,
-                x,
-                x_scales,
-                topk_idx,
-                topk_weights,
-                is_token_in_rank,
-                num_tokens_per_rank,
-                num_tokens_per_expert,
-                num_recv_tokens_per_expert_list,
-                rank_prefix_matrix,
-                channel_prefix_matrix,
-                recv_x,
-                recv_x_scales,
-                recv_topk_idx,
-                recv_topk_weights,
-                recv_channel_prefix_matrix,
-                recv_src_idx,
-                send_head,
-            )
-
-        _, num_bytes = dispatch_buffer_layout(
-            num_ranks,
-            num_channels,
-            config.num_max_nvl_chunked_recv_tokens,
-            hidden_bytes,
-            num_topk,
-            topk_idx_bytes,
-            num_scales,
-        )
-        _check(
-            num_bytes <= self.num_nvl_bytes, f"dispatch needs {num_bytes} buffer bytes > {self.num_nvl_bytes}"
-        )
-
-        # the kernel reads optional operands only when their count is non-zero
-        dummy_i32 = rank_prefix_matrix
-        dummy_f32 = dummy_i32.view(torch.float32)
-        run_launcher(
-            launch_dispatch,
-            recv_x.view(torch.uint8),
-            recv_x_scales if recv_x_scales is not None else dummy_i32,
-            recv_src_idx,
-            recv_topk_idx if recv_topk_idx is not None else dummy_i32,
-            recv_topk_weights if recv_topk_weights is not None else dummy_f32,
-            recv_channel_prefix_matrix,
-            send_head,
-            x.view(torch.uint8),
-            x_scales if x_scales is not None else dummy_i32,
-            topk_idx if topk_idx is not None else dummy_i32,
-            topk_weights if topk_weights is not None else dummy_f32,
-            is_token_in_rank_u8,
-            channel_prefix_matrix,
-            self.buffer_ptrs,
-            num_tokens,
-            num_worst_tokens,
-            scale_token_stride,
-            scale_hidden_stride,
-            rank,
-            num_ranks,
-            num_channels,
-            hidden_bytes,
-            num_topk,
-            num_experts,
-            num_scales,
-            config.num_max_nvl_chunked_send_tokens,
-            config.num_max_nvl_chunked_recv_tokens,
-            topk_idx_bytes,
+        self._launch_dispatch(
+            _DispatchArgs(
+                x=x,
+                x_scales=x_scales,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                is_token_in_rank_u8=is_token_in_rank_u8,
+                rank_prefix_matrix=rank_prefix_matrix,
+                channel_prefix_matrix=channel_prefix_matrix,
+                recv_x=recv_x,
+                recv_x_scales=recv_x_scales,
+                recv_src_idx=recv_src_idx,
+                recv_topk_idx=recv_topk_idx,
+                recv_topk_weights=recv_topk_weights,
+                recv_channel_prefix_matrix=recv_channel_prefix_matrix,
+                send_head=send_head,
+                num_tokens=num_tokens,
+                num_recv_tokens=num_recv_tokens,
+                num_worst_tokens=num_worst_tokens,
+                num_channels=num_channels,
+                hidden_bytes=hidden_bytes,
+                num_topk=num_topk,
+                num_experts=num_experts,
+                num_scales=num_scales,
+                scale_token_stride=scale_token_stride,
+                scale_hidden_stride=scale_hidden_stride,
+                topk_idx_bytes=topk_idx_bytes,
+                config=config,
+            ),
             launch_stream,
         )
         return self._dispatch_outputs(
@@ -646,19 +579,14 @@ class FlyDSLIntranodeRuntime:
         async_finish,
         allocate_on_comm_stream,
     ):
-        num_ranks, rank = self.num_ranks, self.rank
+        num_ranks = self.num_ranks
         _check(x.dim() == 2 and x.is_contiguous(), "x must be a contiguous 2D tensor")
         _check(x.dtype in (torch.bfloat16, torch.float32), f"combine supports bf16 / fp32, got {x.dtype}")
         _check(src_idx.dim() == 1 and src_idx.is_contiguous() and src_idx.dtype == torch.int32)
         _check(send_head.dim() == 2 and send_head.is_contiguous() and send_head.dtype == torch.int32)
         _check(rank_prefix_matrix.is_contiguous() and rank_prefix_matrix.dtype == torch.int32)
         _check(channel_prefix_matrix.is_contiguous() and channel_prefix_matrix.dtype == torch.int32)
-        if self.version == 2:
-            self._check_not_capturing()
-            num_channels = config.num_sms
-        else:
-            _check(config.num_sms % 2 == 0, "num_sms must be even")
-            num_channels = config.num_sms // 2
+        num_channels = self._num_channels(config)
 
         num_tokens, hidden = x.shape
         num_recv_tokens = send_head.size(0)
@@ -667,13 +595,7 @@ class FlyDSLIntranodeRuntime:
         _check(tuple(channel_prefix_matrix.shape) == (num_ranks, num_channels))
         hidden_bytes = hidden * x.element_size()
         _check(hidden_bytes % 16 == 0, "hidden bytes must be a multiple of 16")
-        if self.version == 1:
-            min_recv_tokens = combine_min_recv_buffer_tokens(config.num_max_nvl_chunked_send_tokens)
-            _check(
-                config.num_max_nvl_chunked_recv_tokens >= min_recv_tokens,
-                f"combine needs num_max_nvl_chunked_recv_tokens >= {min_recv_tokens} "
-                f"for {config.num_max_nvl_chunked_send_tokens} send tokens, or it can deadlock",
-            )
+        self._check_combine_config(config)
 
         compute_stream, launch_stream, cross = self._fork(
             previous_event, async_finish, allocate_on_comm_stream
@@ -694,125 +616,28 @@ class FlyDSLIntranodeRuntime:
                     _check(tuple(bias.shape) == (num_recv_tokens, hidden))
             recv_x = torch.empty((num_recv_tokens, hidden), dtype=x.dtype, device=x.device)
 
-        if self.version == 2:
-            _, capacity = combine_v2_layout(self.num_nvl_bytes, hidden_bytes, num_topk)
-            # a token comes back from at most every rank
-            _check(
-                num_recv_tokens * num_ranks <= capacity,
-                f"V2 combine may receive {num_recv_tokens * num_ranks} rows > the heap's {capacity}; "
-                "raise num_nvl_bytes",
-            )
-            _check(
-                num_recv_tokens * num_ranks * 4 <= COMBINE_FLAGS_BYTES,
-                f"V2 combine of {num_recv_tokens} tokens needs more than {COMBINE_FLAGS_BYTES} flag bytes",
-            )
-            self.combine_epoch = self.combine_epoch % (2**31 - 1) + 1
-            grab_base = self.reduce_grabs
-            self.reduce_grabs += combine_v2_grabs(num_recv_tokens, num_channels)
-            if self.combine_needs_barrier:
-                run_launcher(launch_barrier, self.barrier_ptrs, rank, num_ranks, launch_stream)
-            self.combine_needs_barrier = True
-            dummy_f32 = rank_prefix_matrix.view(torch.float32)
-            run_launcher(
-                launch_combine_v2,
-                recv_x,
-                recv_topk_weights if recv_topk_weights is not None else dummy_f32,
-                x,
-                topk_weights if topk_weights is not None else dummy_f32,
-                bias_0 if bias_0 is not None else x,
-                bias_1 if bias_1 is not None else x,
-                rank_prefix_matrix,
-                send_head,
-                self.buffer_ptrs,
-                self.reduce_counter,
-                num_tokens,
-                num_recv_tokens,
-                rank,
-                self.combine_epoch,
-                _as_i32(grab_base),
-                num_ranks,
-                num_channels,
-                hidden,
-                x.element_size(),
-                num_topk,
-                bias_0 is not None,
-                bias_1 is not None,
-                self.num_nvl_bytes,
-                launch_stream,
-            )
-            event = self._finish(
-                compute_stream,
-                launch_stream,
-                cross,
-                async_finish,
-                (
-                    x,
-                    src_idx,
-                    send_head,
-                    rank_prefix_matrix,
-                    channel_prefix_matrix,
-                    recv_x,
-                    topk_weights,
-                    recv_topk_weights,
-                    bias_0,
-                    bias_1,
-                ),
-            )
-            return recv_x, recv_topk_weights, event
-
-        _, num_bytes = combine_buffer_layout(
-            num_ranks,
-            num_channels,
-            config.num_max_nvl_chunked_recv_tokens,
-            hidden_bytes,
-            num_topk,
-        )
-        _check(
-            num_bytes <= self.num_nvl_bytes, f"combine needs {num_bytes} buffer bytes > {self.num_nvl_bytes}"
-        )
-
-        # barrier, reset the queue heads / tails, and patch send_head for skipped tokens
-        run_launcher(
-            launch_cached_notify_combine,
-            send_head,
-            self.buffer_ptrs,
-            self.barrier_ptrs,
-            num_recv_tokens,
-            rank,
-            num_ranks,
-            num_channels,
-            num_channels * num_ranks * 2,
+        self._launch_combine(
+            _CombineArgs(
+                x=x,
+                topk_weights=topk_weights,
+                bias_0=bias_0,
+                bias_1=bias_1,
+                src_idx=src_idx,
+                rank_prefix_matrix=rank_prefix_matrix,
+                channel_prefix_matrix=channel_prefix_matrix,
+                send_head=send_head,
+                recv_x=recv_x,
+                recv_topk_weights=recv_topk_weights,
+                num_tokens=num_tokens,
+                num_recv_tokens=num_recv_tokens,
+                num_channels=num_channels,
+                hidden=hidden,
+                hidden_bytes=hidden_bytes,
+                num_topk=num_topk,
+                config=config,
+            ),
             launch_stream,
         )
-        if num_recv_tokens > 0 or num_tokens > 0:
-            dummy_f32 = rank_prefix_matrix.view(torch.float32)
-            run_launcher(
-                launch_combine,
-                recv_x,
-                recv_topk_weights if recv_topk_weights is not None else dummy_f32,
-                x,
-                topk_weights if topk_weights is not None else dummy_f32,
-                bias_0 if bias_0 is not None else x,
-                bias_1 if bias_1 is not None else x,
-                src_idx,
-                rank_prefix_matrix,
-                channel_prefix_matrix,
-                send_head,
-                self.buffer_ptrs,
-                num_recv_tokens,
-                rank,
-                num_ranks,
-                num_channels,
-                hidden,
-                x.element_size(),
-                num_topk,
-                config.num_max_nvl_chunked_send_tokens,
-                config.num_max_nvl_chunked_recv_tokens,
-                bias_0 is not None,
-                bias_1 is not None,
-                launch_stream,
-            )
-
         event = self._finish(
             compute_stream,
             launch_stream,
@@ -832,3 +657,310 @@ class FlyDSLIntranodeRuntime:
             ),
         )
         return recv_x, recv_topk_weights, event
+
+
+# ── V1: the channel rings of the HIP kernels ─────────────────────────────────
+
+
+class FlyDSLIntranodeV1Runtime(FlyDSLIntranodeRuntime):
+    """Backend ``flydsl``: the V1 kernels of ``intranode_v1_kernel``, whose channel rings, buffer
+    layout and handles are the C++ backend's. A channel is a pair of blocks, ``num_sms // 2`` of them."""
+
+    def _num_channels(self, config) -> int:
+        _check(config.num_sms % 2 == 0, "num_sms must be even")
+        return config.num_sms // 2
+
+    def _notify_memset_ints(self, num_channels: int) -> int:
+        # the channel queues' start / end offsets and heads / tails
+        return num_channels * self.num_ranks * 4
+
+    def _launch_dispatch(self, args: _DispatchArgs, launch_stream: torch.cuda.Stream) -> None:
+        config = args.config
+        _, num_bytes = dispatch_buffer_layout(
+            self.num_ranks,
+            args.num_channels,
+            config.num_max_nvl_chunked_recv_tokens,
+            args.hidden_bytes,
+            args.num_topk,
+            args.topk_idx_bytes,
+            args.num_scales,
+        )
+        _check(
+            num_bytes <= self.num_nvl_bytes, f"dispatch needs {num_bytes} buffer bytes > {self.num_nvl_bytes}"
+        )
+
+        # the kernel reads optional operands only when their count is non-zero
+        dummy_i32 = args.rank_prefix_matrix
+        dummy_f32 = dummy_i32.view(torch.float32)
+        run_launcher(
+            launch_dispatch,
+            args.recv_x.view(torch.uint8),
+            args.recv_x_scales if args.recv_x_scales is not None else dummy_i32,
+            args.recv_src_idx,
+            args.recv_topk_idx if args.recv_topk_idx is not None else dummy_i32,
+            args.recv_topk_weights if args.recv_topk_weights is not None else dummy_f32,
+            args.recv_channel_prefix_matrix,
+            args.send_head,
+            args.x.view(torch.uint8),
+            args.x_scales if args.x_scales is not None else dummy_i32,
+            args.topk_idx if args.topk_idx is not None else dummy_i32,
+            args.topk_weights if args.topk_weights is not None else dummy_f32,
+            args.is_token_in_rank_u8,
+            args.channel_prefix_matrix,
+            self.buffer_ptrs,
+            args.num_tokens,
+            args.num_worst_tokens,
+            args.scale_token_stride,
+            args.scale_hidden_stride,
+            self.rank,
+            self.num_ranks,
+            args.num_channels,
+            args.hidden_bytes,
+            args.num_topk,
+            args.num_experts,
+            args.num_scales,
+            config.num_max_nvl_chunked_send_tokens,
+            config.num_max_nvl_chunked_recv_tokens,
+            args.topk_idx_bytes,
+            launch_stream,
+        )
+
+    def _check_combine_config(self, config) -> None:
+        min_recv_tokens = combine_min_recv_buffer_tokens(config.num_max_nvl_chunked_send_tokens)
+        _check(
+            config.num_max_nvl_chunked_recv_tokens >= min_recv_tokens,
+            f"combine needs num_max_nvl_chunked_recv_tokens >= {min_recv_tokens} "
+            f"for {config.num_max_nvl_chunked_send_tokens} send tokens, or it can deadlock",
+        )
+
+    def _launch_combine(self, args: _CombineArgs, launch_stream: torch.cuda.Stream) -> None:
+        config = args.config
+        num_ranks, num_channels = self.num_ranks, args.num_channels
+        _, num_bytes = combine_buffer_layout(
+            num_ranks,
+            num_channels,
+            config.num_max_nvl_chunked_recv_tokens,
+            args.hidden_bytes,
+            args.num_topk,
+        )
+        _check(
+            num_bytes <= self.num_nvl_bytes, f"combine needs {num_bytes} buffer bytes > {self.num_nvl_bytes}"
+        )
+
+        # barrier, reset the queue heads / tails, and patch send_head for skipped tokens
+        run_launcher(
+            launch_cached_notify_combine,
+            args.send_head,
+            self.buffer_ptrs,
+            self.barrier_ptrs,
+            args.num_recv_tokens,
+            self.rank,
+            num_ranks,
+            num_channels,
+            num_channels * num_ranks * 2,
+            launch_stream,
+        )
+        if args.num_recv_tokens > 0 or args.num_tokens > 0:
+            dummy_f32 = args.rank_prefix_matrix.view(torch.float32)
+            run_launcher(
+                launch_combine,
+                args.recv_x,
+                args.recv_topk_weights if args.recv_topk_weights is not None else dummy_f32,
+                args.x,
+                args.topk_weights if args.topk_weights is not None else dummy_f32,
+                args.bias_0 if args.bias_0 is not None else args.x,
+                args.bias_1 if args.bias_1 is not None else args.x,
+                args.src_idx,
+                args.rank_prefix_matrix,
+                args.channel_prefix_matrix,
+                args.send_head,
+                self.buffer_ptrs,
+                args.num_recv_tokens,
+                self.rank,
+                num_ranks,
+                num_channels,
+                args.hidden,
+                args.x.element_size(),
+                args.num_topk,
+                config.num_max_nvl_chunked_send_tokens,
+                config.num_max_nvl_chunked_recv_tokens,
+                args.bias_0 is not None,
+                args.bias_1 is not None,
+                launch_stream,
+            )
+
+
+# ── V2: direct writes into fixed slots ───────────────────────────────────────
+
+# the widest top-k index the dispatch takes (int64)
+_V2_TOPK_IDX_BYTES = 8
+
+
+def v2_heap_bytes(num_max_tokens_per_rank: int, num_ranks: int, hidden_bytes: int, num_topk: int) -> int:
+    """Heap bytes the V2 backend needs when no rank sends more than ``num_max_tokens_per_rank`` tokens:
+    the dispatch region of a rank may receive every rank's tokens, and the combine region holds each of
+    its own tokens coming back from every rank. ``hidden_bytes`` is the bf16 row; an fp8 row with its
+    scales is smaller."""
+    _check(num_max_tokens_per_rank > 0, "the V2 heap is sized from the maximum number of tokens per rank")
+    rows = num_max_tokens_per_rank * num_ranks
+    _check(
+        rows * 4 <= COMBINE_FLAGS_BYTES,
+        f"V2 takes at most {COMBINE_FLAGS_BYTES // 4} tokens x ranks, got {rows}",
+    )
+    dispatch_row = hidden_bytes + 4 + num_topk * (_V2_TOPK_IDX_BYTES + 4)
+    row = max(dispatch_row, combine_v2_slot_bytes(hidden_bytes, num_topk))
+    # every region starts 16-byte aligned (dispatch_v2_layout has 5); halves are whole 4 KiB pages
+    half = -(-(rows * row + 16 * 5) // 4096) * 4096
+    num_bytes = DATA_OFFSET + 2 * half
+    assert dispatch_v2_layout(num_bytes, hidden_bytes, num_topk, _V2_TOPK_IDX_BYTES, 0)[1] >= rows
+    assert combine_v2_layout(num_bytes, hidden_bytes, num_topk)[1] >= rows
+    return num_bytes
+
+
+class FlyDSLIntranodeV2Runtime(FlyDSLIntranodeRuntime):
+    """Backend ``flydsl_v2``: the V2 kernels of ``intranode_v2_kernel``, direct writes into fixed slots
+    instead of channel rings. Its outputs match V1's; its handles are its own (``send_head`` holds
+    stream indices, and a channel is one block, ``num_sms`` of them)."""
+
+    FULL_RANK_MATRIX = True
+
+    def __init__(self, group: dist.ProcessGroup, num_nvl_bytes: int, comm_stream: torch.cuda.Stream) -> None:
+        # V2 moves rows with TDM, which gfx942 / gfx950 lack; its non-TDM path has never run there
+        _check(
+            default_intranode_backend() != "cpp",
+            f"the V2 backend (flydsl_v2) does not run on {' / '.join(CPP_DEEPEP_ARCHS)}; "
+            f"leave intranode_backend unset, which takes this GPU's '{default_intranode_backend()}'",
+        )
+        super().__init__(group, num_nvl_bytes, comm_stream)
+
+    def _init_state(self) -> None:
+        _check(self.num_nvl_bytes > DATA_OFFSET, f"the V2 heap needs more than {DATA_OFFSET} bytes")
+        # the combine's row flags hold epochs, which start at 1
+        self.symm.get_buffer(
+            self.rank, ((DATA_OFFSET - META_BYTES) // 4,), torch.int32, META_BYTES // 4
+        ).zero_()
+        self.dispatch_epoch = 0
+        self.combine_epoch = 0
+        # the combine's reduce queue; it only ever grows, each combine claims from where the
+        # previous one left it
+        self.reduce_counter = torch.zeros(1, dtype=torch.int32, device="cuda")
+        self.reduce_grabs = 0
+        # a combine may push into a peer's combine region only once that peer is done reducing
+        # the previous combine: the notify of a dispatch in between is a barrier that ensures it
+        self.combine_needs_barrier = False
+
+    @staticmethod
+    def _check_not_capturing() -> None:
+        # a V2 launch takes host state that every call advances (the epoch its flags carry, the base of
+        # the reduce queue): a graph replay would rerun the old values and take stale flags as fresh
+        _check(
+            not torch.cuda.is_current_stream_capturing(),
+            "flydsl_v2 cannot be captured in a CUDA graph: each call advances host-side epochs; "
+            "to capture the MoE token exchange on MI455X, use the all-to-all (RCCL) token dispatcher",
+        )
+
+    def _num_channels(self, config) -> int:
+        self._check_not_capturing()
+        return config.num_sms
+
+    def _notify_memset_ints(self, num_channels: int) -> int:
+        # V2 has no channel queues to reset
+        return 0
+
+    def _launch_dispatch(self, args: _DispatchArgs, launch_stream: torch.cuda.Stream) -> None:
+        _, capacity = dispatch_v2_layout(
+            self.num_nvl_bytes, args.hidden_bytes, args.num_topk, args.topk_idx_bytes, args.num_scales
+        )
+        _check(
+            args.num_recv_tokens <= capacity,
+            f"V2 dispatch receives {args.num_recv_tokens} tokens > the heap's {capacity}; raise num_nvl_bytes",
+        )
+        _check(
+            (args.num_tokens + args.num_channels - 1) // args.num_channels < TAIL_DONE_BIT,
+            f"V2 dispatch takes fewer than {TAIL_DONE_BIT} tokens per channel",
+        )
+        self.dispatch_epoch = self.dispatch_epoch % MAX_EPOCH + 1
+        self.combine_needs_barrier = False
+        dummy_i32 = args.rank_prefix_matrix
+        dummy_f32 = dummy_i32.view(torch.float32)
+        run_launcher(
+            launch_dispatch_v2,
+            args.recv_x.view(torch.uint8),
+            args.recv_x_scales if args.recv_x_scales is not None else dummy_i32,
+            args.recv_src_idx,
+            args.recv_topk_idx if args.recv_topk_idx is not None else dummy_i32,
+            args.recv_topk_weights if args.recv_topk_weights is not None else dummy_f32,
+            args.recv_channel_prefix_matrix,
+            args.send_head,
+            args.x.view(torch.uint8),
+            args.x_scales if args.x_scales is not None else dummy_i32,
+            args.topk_idx if args.topk_idx is not None else dummy_i32,
+            args.topk_weights if args.topk_weights is not None else dummy_f32,
+            args.is_token_in_rank_u8,
+            args.channel_prefix_matrix,
+            args.rank_prefix_matrix,
+            self.buffer_ptrs,
+            args.num_tokens,
+            args.num_worst_tokens,
+            args.scale_token_stride,
+            args.scale_hidden_stride,
+            self.rank,
+            self.dispatch_epoch,
+            self.num_ranks,
+            args.num_channels,
+            args.hidden_bytes,
+            args.num_topk,
+            args.num_experts,
+            args.num_scales,
+            args.topk_idx_bytes,
+            self.num_nvl_bytes,
+            launch_stream,
+        )
+
+    def _launch_combine(self, args: _CombineArgs, launch_stream: torch.cuda.Stream) -> None:
+        num_ranks, num_recv_tokens, num_channels = self.num_ranks, args.num_recv_tokens, args.num_channels
+        _, capacity = combine_v2_layout(self.num_nvl_bytes, args.hidden_bytes, args.num_topk)
+        # a token comes back from at most every rank
+        _check(
+            num_recv_tokens * num_ranks <= capacity,
+            f"V2 combine may receive {num_recv_tokens * num_ranks} rows > the heap's {capacity}; "
+            "raise num_nvl_bytes",
+        )
+        _check(
+            num_recv_tokens * num_ranks * 4 <= COMBINE_FLAGS_BYTES,
+            f"V2 combine of {num_recv_tokens} tokens needs more than {COMBINE_FLAGS_BYTES} flag bytes",
+        )
+        self.combine_epoch = self.combine_epoch % (2**31 - 1) + 1
+        grab_base = self.reduce_grabs
+        self.reduce_grabs += combine_v2_grabs(num_recv_tokens, num_channels)
+        if self.combine_needs_barrier:
+            run_launcher(launch_barrier, self.barrier_ptrs, self.rank, num_ranks, launch_stream)
+        self.combine_needs_barrier = True
+        dummy_f32 = args.rank_prefix_matrix.view(torch.float32)
+        run_launcher(
+            launch_combine_v2,
+            args.recv_x,
+            args.recv_topk_weights if args.recv_topk_weights is not None else dummy_f32,
+            args.x,
+            args.topk_weights if args.topk_weights is not None else dummy_f32,
+            args.bias_0 if args.bias_0 is not None else args.x,
+            args.bias_1 if args.bias_1 is not None else args.x,
+            args.rank_prefix_matrix,
+            args.send_head,
+            self.buffer_ptrs,
+            self.reduce_counter,
+            args.num_tokens,
+            num_recv_tokens,
+            self.rank,
+            self.combine_epoch,
+            _as_i32(grab_base),
+            num_ranks,
+            num_channels,
+            args.hidden,
+            args.x.element_size(),
+            args.num_topk,
+            args.bias_0 is not None,
+            args.bias_1 is not None,
+            self.num_nvl_bytes,
+            launch_stream,
+        )
