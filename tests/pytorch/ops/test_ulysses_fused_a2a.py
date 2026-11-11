@@ -261,6 +261,55 @@ def check_poisoned(group, failures, hq=32, hkv=8, d=128, b=2, s_local=300, hidde
             check_o_gemm(group, hq, d, b, s_local, hidden, qkv_format, True, 1, failures)
 
 
+_TL_LIB_VARS = [f"PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_{s}" for s in ("PRE", "POST", "PRE_BWD", "POST_BWD")]
+
+
+def _set_envs(values):
+    """``envs.set_env`` for each name (None removes it), then drop the backend tables built from them."""
+    import primus_turbo.common.envs as envs
+    from primus_turbo.pytorch.core.backend import GlobalBackendManager
+
+    for name, value in values.items():
+        envs.set_env(name, value)
+    GlobalBackendManager.reset()
+
+
+def check_tensilelite(group, failures):
+    """The TENSILELITE backend (attn-a2a-demo), forward and backward, when its extension is installed.
+
+    Without kernel libraries every call falls back to FLYDSL and still has to match the reference. With
+    PRIMUS_TURBO_TEST_ULYSSES_TENSILELITE_SHAPE="hq,hkv,d,s_local,hidden,world" (a shape the libraries
+    named by the four PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_* variables are tuned for, b = 1) the demo
+    kernels run when the group has ``world`` ranks.
+    """
+    from primus_turbo.pytorch.kernels.attention import ulysses_a2a_impl as impl
+
+    if not impl.TensileLiteUlyssesA2ABackend.is_available():
+        return
+    saved = {k: os.environ.get(k) for k in ["PRIMUS_TURBO_ULYSSES_A2A_BACKEND", *_TL_LIB_VARS]}
+    try:
+        _set_envs({"PRIMUS_TURBO_ULYSSES_A2A_BACKEND": "TENSILELITE", **{k: None for k in _TL_LIB_VARS}})
+        check_qkv(group, 32, 8, 128, 1, 300, 1024, "sbhd", "interleaved", 1, failures)
+        check_o_gemm(group, 32, 128, 1, 300, 1024, "sbhd", True, 1, failures)
+
+        shape = os.environ.get("PRIMUS_TURBO_TEST_ULYSSES_TENSILELITE_SHAPE")
+        hq, hkv, d, s_local, hidden, world = (int(v) for v in shape.split(",")) if shape else (0,) * 6
+        if world == group.size() and all(saved[k] for k in _TL_LIB_VARS):
+            _set_envs({k: saved[k] for k in _TL_LIB_VARS})
+            for qkv_format, weight_layout in itertools.product(("sbhd", "bshd"), ("interleaved", "concat")):
+                check_qkv(group, hq, hkv, d, 1, s_local, hidden, qkv_format, weight_layout, 2, failures)
+            for qkv_format in ("sbhd", "bshd"):
+                check_o_gemm(group, hq, d, 1, s_local, hidden, qkv_format, True, 2, failures)
+            built = {(key[1], key[-1]) for key in impl._get_backend_instance("TENSILELITE")._hops}
+            for hop in (("GemmA2A", True), ("A2AGemm", True), ("A2AGemm", False), ("GemmA2A", False)):
+                if hop not in built:
+                    failures.append(
+                        f"[tensilelite] the {hop[0]} trans_a={hop[1]} hop never ran (fell back to FLYDSL)"
+                    )
+    finally:
+        _set_envs(saved)
+
+
 def run_suite(quick):
     group = dist.group.WORLD
     n = group.size()
@@ -292,6 +341,7 @@ def run_suite(quick):
     check_o_gemm(group, 96, 128, 1, 512, 5120, "sbhd", True, 2, failures)
     check_scenarios(group, failures)
     check_poisoned(group, failures)
+    check_tensilelite(group, failures)
 
     gathered = [None] * n
     dist.all_gather_object(gathered, failures, group=group)

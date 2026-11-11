@@ -12,9 +12,9 @@ with the local heads over the full sequence; ``ulysses_a2a_o_gemm`` replaces
 ``flash_attn_func``. Sequence order matches ``flash_attn_usp_func``: rank r holds the r-th contiguous
 chunk of the sequence.
 
-The forward pass runs on the backend chosen in ``kernels/attention/ulysses_a2a_impl.py`` (``FLYDSL`` by
+Both passes run on the backend chosen in ``kernels/attention/ulysses_a2a_impl.py`` (``FLYDSL`` by
 default, or ``TENSILELITE``; ``GlobalBackendManager.set_ulysses_a2a_backend`` or
-``PRIMUS_TURBO_ULYSSES_A2A_BACKEND``); the backward pass always runs the FlyDSL kernels.
+``PRIMUS_TURBO_ULYSSES_A2A_BACKEND``), resolved once in forward and kept for that call's backward.
 """
 
 from dataclasses import dataclass
@@ -24,6 +24,7 @@ import torch
 import torch.distributed as dist
 
 from primus_turbo.pytorch.kernels.attention.ulysses_a2a_impl import (
+    resolve_ulysses_a2a_backend,
     ulysses_a2a_o_gemm_bwd_impl,
     ulysses_a2a_o_gemm_fwd_impl,
     ulysses_qkv_gemm_a2a_bwd_impl,
@@ -85,8 +86,10 @@ def _check(group, hq, hkv, d, qkv_format, weight_layout):
 class UlyssesQKVGemmA2AFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, fwd_tuning, bwd_tuning):
+        # one backend for the forward and the backward of this call
+        ctx.backend = resolve_ulysses_a2a_backend()
         q, k, v = ulysses_qkv_gemm_a2a_fwd_impl(
-            x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, fwd_tuning
+            x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, fwd_tuning, backend=ctx.backend
         )
         ctx.save_for_backward(x, w_qkv)
         ctx.hq, ctx.hkv, ctx.d, ctx.group = hq, hkv, d, group
@@ -116,6 +119,7 @@ class UlyssesQKVGemmA2AFunction(torch.autograd.Function):
             ctx.b,
             *ctx.needs_input_grad[:2],
             ctx.bwd_tuning,
+            backend=ctx.backend,
         )
         return dx, dw, None, None, None, None, None, None, None, None
 
@@ -139,7 +143,7 @@ def ulysses_qkv_gemm_a2a(
         w_qkv: ``[(hq + 2 * hkv) * d, hidden]``; ``interleaved`` is Megatron's ``[ng, hq/ng + 2, d]``
             row order, ``concat`` is ``[q; k; v]``.
         fwd_tuning: launch knobs of the forward FlyDSL GemmA2A (the TENSILELITE backend ignores them).
-        bwd_tuning: launch knobs of the backward A2AGemm (dgrad + in-kernel wgrad).
+        bwd_tuning: launch knobs of the backward FlyDSL A2AGemm (dgrad + in-kernel wgrad; TENSILELITE ignores them).
 
     Returns:
         q, k, v: local heads over the full sequence, ``[s, b, h/n, d]`` (sbhd) or ``[b, s, h/n, d]``.
@@ -162,8 +166,16 @@ def ulysses_qkv_gemm_a2a(
 class UlyssesA2AOGemmFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, o, w_o, residual, group, qkv_format, fwd_tuning, bwd_tuning):
+        ctx.backend = resolve_ulysses_a2a_backend()
         y, o_gathered = ulysses_a2a_o_gemm_fwd_impl(
-            o, w_o, residual, group, qkv_format, save_o=w_o.requires_grad, tuning=fwd_tuning
+            o,
+            w_o,
+            residual,
+            group,
+            qkv_format,
+            save_o=w_o.requires_grad,
+            tuning=fwd_tuning,
+            backend=ctx.backend,
         )
         ctx.save_for_backward(w_o, o_gathered)
         ctx.group, ctx.qkv_format, ctx.has_residual = group, qkv_format, residual is not None
@@ -193,6 +205,7 @@ class UlyssesA2AOGemmFunction(torch.autograd.Function):
             qkv_format,
             *ctx.needs_input_grad[:2],
             tuning=ctx.bwd_tuning,
+            backend=ctx.backend,
         )
         d_residual = dy if ctx.has_residual and ctx.needs_input_grad[2] else None
         return do, dw, d_residual, None, None, None, None
@@ -215,7 +228,7 @@ def ulysses_a2a_o_gemm(
         w_o: ``[hidden, h * d]``.
         residual: ``[s/n, b, hidden]`` (sbhd) / ``[b, s/n, hidden]`` (bshd), or ``None``.
         fwd_tuning: launch knobs of the forward FlyDSL A2AGemm (the TENSILELITE backend ignores them).
-        bwd_tuning: launch knobs of the backward GemmA2A (dgrad + in-kernel wgrad).
+        bwd_tuning: launch knobs of the backward FlyDSL GemmA2A (dgrad + in-kernel wgrad; TENSILELITE ignores them).
 
     Returns:
         y = o_gathered @ w_o^T + residual, shaped like ``residual``. The K accumulation order is

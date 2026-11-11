@@ -7,13 +7,16 @@
 """Backends of the Ulysses fused GEMM + all-to-all ops in ``ops/attention/ulysses_fused_a2a.py``.
 
 Laid out like ``kernels/moe/moe_dispatch_combine_impl.py``: one class per backend, each owning its
-communication state, a name registry, and ``_resolve_backend_name()``, which reads the code setting
-(``GlobalBackendManager.set_ulysses_a2a_backend``), then ``PRIMUS_TURBO_ULYSSES_A2A_BACKEND``, and
-defaults to ``FLYDSL``. There is no auto-tune: every rank of the group has to run the same backend.
+communication state, a name registry, and ``resolve_ulysses_a2a_backend()``, which reads the code
+setting (``GlobalBackendManager.set_ulysses_a2a_backend``), then ``PRIMUS_TURBO_ULYSSES_A2A_BACKEND``,
+and defaults to ``FLYDSL``. There is no auto-tune: every rank of the group has to run the same backend.
 
-Only the forward pass is dispatched. The backward pass always runs the FlyDSL kernels, which need
-nothing but what every forward saves: ``(x, w_qkv)`` for QKV, and ``(w_o, o_gathered)`` for o_proj,
-where ``o_gathered`` is the gathered o_proj input ``[s/n * b, h * d]`` in the output's token order.
+One switch selects the forward and the backward pass. The autograd functions resolve the backend
+once in forward and hand the same name to backward. Every backend's backward needs only what the
+forward saves: ``(x, w_qkv)`` for QKV, and ``(w_o, o_gathered)`` for o_proj, where ``o_gathered`` is
+the gathered o_proj input ``[s/n * b, h * d]`` in the output's token order. A call a backend cannot
+take (``UlyssesA2AUnsupported``: no kernel for the shape, a missing library) runs on ``FLYDSL``, with
+one warning per reason; the decision depends only on shapes and settings, so every rank makes it.
 """
 
 import glob
@@ -25,6 +28,7 @@ import torch
 import torch.distributed as dist
 
 import primus_turbo.common.envs as envs
+from primus_turbo.common.logger import logger
 from primus_turbo.flydsl.ulysses.a2a_gemm_kernel import (
     a2a_gemm_bank_bytes,
     ulysses_a2a_gemm,
@@ -47,12 +51,18 @@ from primus_turbo.pytorch.core.backend import (
 )
 
 __all__ = [
+    "UlyssesA2AUnsupported",
     "register_ulysses_a2a_backend",
+    "resolve_ulysses_a2a_backend",
     "ulysses_qkv_gemm_a2a_fwd_impl",
     "ulysses_qkv_gemm_a2a_bwd_impl",
     "ulysses_a2a_o_gemm_fwd_impl",
     "ulysses_a2a_o_gemm_bwd_impl",
 ]
+
+
+class UlyssesA2AUnsupported(Exception):
+    """A backend cannot take this call (raised before any rank launches a kernel for it)."""
 
 
 def _launch_kwargs(tuning, **defaults):
@@ -125,6 +135,34 @@ class UlyssesA2ABackend(Protocol):
 
     def a2a_o_gemm(self, o, w_o, residual, group, qkv_format, save_o, tuning):
         """Return ``(y, o_gathered)``; ``o_gathered`` is None unless ``save_o``."""
+        ...
+
+    def qkv_gemm_a2a_bwd(
+        self,
+        x,
+        w_qkv,
+        dq,
+        dk,
+        dv,
+        hq,
+        hkv,
+        d,
+        group,
+        qkv_format,
+        weight_layout,
+        s_local,
+        b,
+        need_dx,
+        need_dw,
+        tuning,
+    ):
+        """Return ``(dx, dw_qkv)`` (None where not needed)."""
+        ...
+
+    def a2a_o_gemm_bwd(
+        self, dy2d, w_o, o_gathered, group, heads, d, s_local, b, qkv_format, need_do, need_dw, tuning
+    ):
+        """Return ``(dO, dw_o)`` (None where not needed); ``dy2d`` is ``[s/n * b, hidden]``."""
         ...
 
 
@@ -201,6 +239,51 @@ class FlyDSLUlyssesA2ABackend:
         )
         return y.view(y_shape), o_gathered
 
+    def qkv_gemm_a2a_bwd(
+        self,
+        x,
+        w_qkv,
+        dq,
+        dk,
+        dv,
+        hq,
+        hkv,
+        d,
+        group,
+        qkv_format,
+        weight_layout,
+        s_local,
+        b,
+        need_dx,
+        need_dw,
+        tuning,
+    ):
+        return _flydsl_qkv_bwd(
+            x,
+            w_qkv,
+            dq,
+            dk,
+            dv,
+            hq,
+            hkv,
+            d,
+            group,
+            qkv_format,
+            weight_layout,
+            s_local,
+            b,
+            need_dx,
+            need_dw,
+            tuning,
+        )
+
+    def a2a_o_gemm_bwd(
+        self, dy2d, w_o, o_gathered, group, heads, d, s_local, b, qkv_format, need_do, need_dw, tuning
+    ):
+        return _flydsl_o_bwd(
+            dy2d, w_o, o_gathered, group, heads, d, s_local, b, qkv_format, need_do, need_dw, tuning
+        )
+
 
 # =========================================================================
 # TENSILELITE: TensileLite GemmA2A / A2AGemm, data moved by SDMA (attn-a2a-demo)
@@ -215,17 +298,27 @@ def _tl_module():
     return _aa
 
 
+# (mode, trans_a) -> the library variable suffix: forward QKV / o_proj, then their backward (dgrad) hops,
+# which read the weight as stored (TensileLite's NN layout, TransposeA False)
+_TL_LIBRARY_SIDE = {
+    ("GemmA2A", True): "PRE",
+    ("A2AGemm", True): "POST",
+    ("A2AGemm", False): "PRE_BWD",
+    ("GemmA2A", False): "POST_BWD",
+}
+
+
 def _tl_library(root: Optional[str], side: str):
     """``(dat, co_dir, co)`` of a TensileLite kernel library built for gfx950."""
     if not root:
-        raise ValueError(
+        raise UlyssesA2AUnsupported(
             f"TENSILELITE Ulysses backend: PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_{side} is not set "
             "(path to a TensileCreateLibrary output tuned for these shapes)"
         )
     lib_dir = os.path.join(root, "library", "gfx950")
     co = glob.glob(os.path.join(lib_dir, "TensileLibrary_*Contraction*.co"))
     if len(co) != 1:
-        raise ValueError(f"{lib_dir}: expected one Contraction code object, found {co}")
+        raise UlyssesA2AUnsupported(f"{lib_dir}: expected one Contraction code object, found {co}")
     return os.path.join(lib_dir, "TensileLibrary_lazy_gfx950.dat"), lib_dir, co[0]
 
 
@@ -250,17 +343,23 @@ class _TLComm:
 class _TLHop:
     """One FusedHop shape with its flags, counter and IPC buffers (adapted from the demo's hops.py)."""
 
-    def __init__(self, comm, mode, m, n, k, extent, lib, beta):
+    def __init__(self, comm, mode, m, n, k, extent, lib, beta, trans_a=True):
         aa = comm.aa
         self.comm, self.mode, self.m, self.n, self.k = comm, mode, m, n, k
+        # trans_a=False (the weight read as stored) needs an _aa whose FusedHop takes the layout
+        layout = {} if trans_a else {"trans_a": False}
         try:
             self.hop = aa.FusedHop.for_selection(
-                comm.rank, comm.world, mode, m, n, k, extent, *lib, beta=beta
+                comm.rank, comm.world, mode, m, n, k, extent, *lib, beta=beta, **layout
             )
+        except TypeError as e:
+            raise UlyssesA2AUnsupported(
+                f"TENSILELITE Ulysses backend: this attn_demo._aa cannot select the NN layout the backward needs: {e}"
+            ) from e
         except RuntimeError as e:
-            raise ValueError(
+            raise UlyssesA2AUnsupported(
                 f"TENSILELITE Ulysses backend has no tuned {mode} kernel for m={m} n={n} k={k} "
-                f"world={comm.world} extent={extent}: {e}"
+                f"world={comm.world} extent={extent} trans_a={trans_a}: {e}"
             ) from e
         self.flags = aa.alloc(_TL_CHANNELS * aa.FLAG_BLOCK_BYTES, True)
         self.flags.zero_()
@@ -329,15 +428,27 @@ class TensileLiteUlyssesA2ABackend:
     """TensileLite GemmA2A / A2AGemm, forward only, with SDMA moving the data (attn-a2a-demo).
 
     Needs the ``attn_demo._aa`` extension (built against a TensileLite host library with
-    ``TENSILELITE_ENABLE_SDMA=ON``) and kernel libraries tuned for the exact shapes, named by
-    ``PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_PRE`` (GemmA2A) and ``..._LIB_POST`` (A2AGemm). A shape
-    without a tuned kernel raises ``ValueError``. Every rank must see every peer GPU of its group.
+    ``TENSILELITE_ENABLE_SDMA=ON``; the backward also needs its ``FusedHop.for_selection(trans_a=)``)
+    and kernel libraries tuned for the exact shapes, named by ``PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_PRE``
+    (forward QKV, GemmA2A), ``..._LIB_POST`` (forward o_proj, A2AGemm), ``..._LIB_PRE_BWD`` (QKV dgrad,
+    A2AGemm, NN) and ``..._LIB_POST_BWD`` (o_proj dgrad, GemmA2A, NN). A missing library or a shape
+    without a tuned kernel raises ``UlyssesA2AUnsupported``. Every rank must see every peer GPU.
+
+    Backward: dgrad on the fused hops; wgrad on hipBLASLt, on a second stream where it does not
+    wait for the exchange (all of o_proj's, this rank's own block of QKV's).
     """
 
     def __init__(self):
         self._aa = _tl_module()
         self._comms: Dict[int, _TLComm] = {}
         self._hops: Dict[tuple, _TLHop] = {}
+        self._side_streams: Dict[int, torch.cuda.Stream] = {}
+
+    def _side_stream(self):
+        dev = torch.cuda.current_device()
+        if dev not in self._side_streams:
+            self._side_streams[dev] = torch.cuda.Stream()
+        return self._side_streams[dev]
 
     @staticmethod
     def is_available() -> bool:
@@ -347,16 +458,16 @@ class TensileLiteUlyssesA2ABackend:
         except ImportError:
             return False
 
-    def _hop(self, group, mode, m, n, k, extent, beta):
-        key = (id(group), mode, m, n, k, extent, beta)
+    def _hop(self, group, mode, m, n, k, extent, beta, trans_a=True):
+        key = (id(group), mode, m, n, k, extent, beta, trans_a)
         hop = self._hops.get(key)
         if hop is None:
+            side = _TL_LIBRARY_SIDE[(mode, trans_a)]
+            lib = _tl_library(getattr(envs, f"PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_{side}"), side)
             comm = self._comms.get(id(group))
             if comm is None:
                 comm = self._comms[id(group)] = _TLComm(self._aa, group)
-            side = "PRE" if mode == "GemmA2A" else "POST"
-            root = getattr(envs, f"PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_{side}")
-            hop = self._hops[key] = _TLHop(comm, mode, m, n, k, extent, _tl_library(root, side), beta)
+            hop = self._hops[key] = _TLHop(comm, mode, m, n, k, extent, lib, beta, trans_a)
         return hop
 
     def qkv_gemm_a2a(self, x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, tuning):
@@ -414,13 +525,101 @@ class TensileLiteUlyssesA2ABackend:
             og[:, r].copy_(hop.x[r])
         return y.view(y_shape), o_gathered
 
+    def qkv_gemm_a2a_bwd(
+        self,
+        x,
+        w_qkv,
+        dq,
+        dk,
+        dv,
+        hq,
+        hkv,
+        d,
+        group,
+        qkv_format,
+        weight_layout,
+        s_local,
+        b,
+        need_dx,
+        need_dw,
+        tuning,
+    ):
+        n, r = group.size(), group.rank()
+        M, hidden = s_local * b, w_qkv.shape[1]
+        K = (hq + 2 * hkv) * d
+        K_r = K // n
+        w = _qkv_weight(w_qkv, hq, hkv, d, n, weight_layout)
+        # A2AGemm, NN: dx = gather(dqkv) @ w, w [qkv rows (rank-major), hidden] read as stored
+        hop = self._hop(group, "A2AGemm", hidden, M, K, K, 0.0, trans_a=False)
+        G, nq, nk, nv = _qkv_rank_block(hq, hkv, d, n, weight_layout)
+        # x[j] holds this rank's heads of rank j's tokens, in rank j's row order and the weight's row order
+        if qkv_format == "sbhd":
+            dst = hop.x.view(n, s_local, b, G, nq + nk + nv, d)
+            src = [t.reshape(n, s_local, b, G, c, d) for t, c in ((dq, nq), (dk, nk), (dv, nv))]
+        else:
+            dst = hop.x.view(n, b, s_local, G, nq + nk + nv, d)
+            src = [
+                t.reshape(b, n, s_local, G, c, d).transpose(0, 1) for t, c in ((dq, nq), (dk, nk), (dv, nv))
+            ]
+        torch.cat(src, dim=4, out=dst)
+        dw = None
+        if need_dw:
+            x2d = x.reshape(M, hidden)
+            dw_rank_major = torch.empty(K, hidden, dtype=x.dtype, device=x.device)
+            # this rank's own block needs no exchange: its wgrad runs beside the A2AGemm
+            cur, side = torch.cuda.current_stream(), self._side_stream()
+            side.wait_stream(cur)
+            with torch.cuda.stream(side):
+                torch.matmul(hop.x[r].t(), x2d, out=dw_rank_major[r * K_r : (r + 1) * K_r])
+        dx = hop.run_a2a_gemm(w, None).clone()
+        if need_dw:
+            # B buffer slot s holds source rank (r + s) % n's block (the forward's o_gathered layout)
+            slots = hop.b.view(n, M, K_r)
+            for s in range(1, n):
+                src_rank = (r + s) % n
+                torch.matmul(slots[s].t(), x2d, out=dw_rank_major[src_rank * K_r : (src_rank + 1) * K_r])
+            cur.wait_stream(side)
+            if weight_layout == "interleaved":
+                dw = dw_rank_major
+            else:
+                dw = torch.empty_like(dw_rank_major)
+                dw.index_copy_(0, _rank_major_concat_rows(hq, hkv, d, n, x.device), dw_rank_major)
+        return (dx.view_as(x) if need_dx else None), dw
+
+    def a2a_o_gemm_bwd(
+        self, dy2d, w_o, o_gathered, group, heads, d, s_local, b, qkv_format, need_do, need_dw, tuning
+    ):
+        if not need_do:
+            return None, (dy2d.t() @ o_gathered if need_dw else None)
+        n = group.size()
+        M = s_local * b
+        hidden, K = w_o.shape
+        # GemmA2A, NN: dO = dY @ w_o, w_o [hidden, heads * d] read as stored; columns go to their head owner
+        hop = self._hop(group, "GemmA2A", K, M, hidden, K, 0.0, trans_a=False)
+        dw = None
+        if need_dw:
+            # wgrad does not depend on the exchange
+            cur, side = torch.cuda.current_stream(), self._side_stream()
+            side.wait_stream(cur)
+            with torch.cuda.stream(side):
+                dw = dy2d.t() @ o_gathered
+        recv = hop.run_gemm_a2a(w_o.contiguous(), dy2d)  # [n, M, heads * d]: source rank j's tokens
+        if qkv_format == "sbhd":
+            do = recv.view(n * s_local, b, heads, d).clone()
+        else:
+            do = recv.view(n, b, s_local, heads, d).transpose(0, 1).reshape(b, n * s_local, heads, d)
+        if need_dw:
+            cur.wait_stream(side)
+            dw.record_stream(cur)
+        return do, dw
+
 
 # =========================================================================
-# Backward (FlyDSL for every backend)
+# Backward on the FlyDSL kernels
 # =========================================================================
 
 
-def ulysses_qkv_gemm_a2a_bwd_impl(
+def _flydsl_qkv_bwd(
     x, w_qkv, dq, dk, dv, hq, hkv, d, group, qkv_format, weight_layout, s_local, b, need_dx, need_dw, tuning
 ):
     """A2AGemm: the local heads' grads over the full sequence are pushed into the sequence owner's
@@ -497,7 +696,7 @@ def _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format, wgrad=None
     return do.view(*shape, heads, d)
 
 
-def ulysses_a2a_o_gemm_bwd_impl(
+def _flydsl_o_bwd(
     dy2d, w_o, o_gathered, group, heads, d, s_local, b, qkv_format, need_do, need_dw, tuning=None
 ):
     """``(dO, dW_o)``: dO by GemmA2A, ``dW_o = dY^T @ O_gathered``."""
@@ -535,7 +734,7 @@ _BACKEND_TYPE_TO_NAME: Dict[BackendType, str] = {
 
 
 def register_ulysses_a2a_backend(name: str, cls: Type[UlyssesA2ABackend]) -> None:
-    """Register a new Ulysses fused-forward backend class."""
+    """Register a new Ulysses fused GEMM + all-to-all backend class."""
     _BACKEND_REGISTRY[name] = cls
 
 
@@ -555,8 +754,8 @@ def _get_backend_instance(name: str) -> UlyssesA2ABackend:
     return _backend_instances[name]
 
 
-def _resolve_backend_name() -> str:
-    """Determine which Ulysses fused-forward backend to use.
+def resolve_ulysses_a2a_backend() -> str:
+    """Determine which Ulysses fused GEMM + all-to-all backend to use (forward and backward).
 
     Priority (high -> low):
       1. ``GlobalBackendManager`` code-level setting (via ``set_ulysses_a2a_backend``)
@@ -575,15 +774,103 @@ def _resolve_backend_name() -> str:
     return "FLYDSL"
 
 
+def _call(backend_name: Optional[str], method: str, *args):
+    """``method`` on the named backend (the resolved one if None); on ``UlyssesA2AUnsupported``, on FLYDSL."""
+    name = backend_name or resolve_ulysses_a2a_backend()
+    backend = _get_backend_instance(name)
+    if name == "FLYDSL":
+        return getattr(backend, method)(*args)
+    try:
+        return getattr(backend, method)(*args)
+    except UlyssesA2AUnsupported as e:
+        if not torch.compiler.is_compiling():
+            logger.warning(
+                f"Ulysses A2A backend {name} cannot run {method}, falling back to FLYDSL: {e}", once=True
+            )
+        return getattr(_get_backend_instance("FLYDSL"), method)(*args)
+
+
 def ulysses_qkv_gemm_a2a_fwd_impl(
-    x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, tuning=None
+    x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, tuning=None, backend=None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    backend = _get_backend_instance(_resolve_backend_name())
-    return backend.qkv_gemm_a2a(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, tuning)
+    return _call(backend, "qkv_gemm_a2a", x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, tuning)
 
 
 def ulysses_a2a_o_gemm_fwd_impl(
-    o, w_o, residual, group, qkv_format, save_o, tuning=None
+    o, w_o, residual, group, qkv_format, save_o, tuning=None, backend=None
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    backend = _get_backend_instance(_resolve_backend_name())
-    return backend.a2a_o_gemm(o, w_o, residual, group, qkv_format, save_o, tuning)
+    return _call(backend, "a2a_o_gemm", o, w_o, residual, group, qkv_format, save_o, tuning)
+
+
+def ulysses_qkv_gemm_a2a_bwd_impl(
+    x,
+    w_qkv,
+    dq,
+    dk,
+    dv,
+    hq,
+    hkv,
+    d,
+    group,
+    qkv_format,
+    weight_layout,
+    s_local,
+    b,
+    need_dx,
+    need_dw,
+    tuning,
+    backend=None,
+):
+    return _call(
+        backend,
+        "qkv_gemm_a2a_bwd",
+        x,
+        w_qkv,
+        dq,
+        dk,
+        dv,
+        hq,
+        hkv,
+        d,
+        group,
+        qkv_format,
+        weight_layout,
+        s_local,
+        b,
+        need_dx,
+        need_dw,
+        tuning,
+    )
+
+
+def ulysses_a2a_o_gemm_bwd_impl(
+    dy2d,
+    w_o,
+    o_gathered,
+    group,
+    heads,
+    d,
+    s_local,
+    b,
+    qkv_format,
+    need_do,
+    need_dw,
+    tuning=None,
+    backend=None,
+):
+    return _call(
+        backend,
+        "a2a_o_gemm_bwd",
+        dy2d,
+        w_o,
+        o_gathered,
+        group,
+        heads,
+        d,
+        s_local,
+        b,
+        qkv_format,
+        need_do,
+        need_dw,
+        tuning,
+    )

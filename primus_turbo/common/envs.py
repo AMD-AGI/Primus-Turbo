@@ -48,6 +48,8 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_ULYSSES_A2A_BACKEND: str | None = None
     PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_PRE: str | None = None
     PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_POST: str | None = None
+    PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_PRE_BWD: str | None = None
+    PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_POST_BWD: str | None = None
     PRIMUS_TURBO_AUTO_TUNE: bool = False
     PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32: bool = True
     PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT: bool = False
@@ -187,16 +189,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MoE dispatch/combine EP backend: TURBO (the default when unset), DEEP_EP, or a custom EP name
     # such as UCCL_EP. "autotune" is rejected with an AssertionError.
     "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend_spec("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"),
-    # Forward backend of the Ulysses fused GEMM + all-to-all ops (``ulysses_qkv_gemm_a2a``,
-    # ``ulysses_a2a_o_gemm``): FLYDSL (the default when unset) or TENSILELITE. "autotune" is
-    # rejected with an AssertionError. The backward pass always runs FlyDSL.
+    # Backend of the Ulysses fused GEMM + all-to-all ops (``ulysses_qkv_gemm_a2a``,
+    # ``ulysses_a2a_o_gemm``), forward and backward: FLYDSL (the default when unset) or TENSILELITE.
+    # "autotune" is rejected with an AssertionError.
     "PRIMUS_TURBO_ULYSSES_A2A_BACKEND": backend_spec("PRIMUS_TURBO_ULYSSES_A2A_BACKEND"),
     # TensileLite kernel libraries (TensileCreateLibrary output, tuned for the exact shapes) that the
-    # TENSILELITE Ulysses backend loads for the GemmA2A (QKV) and A2AGemm (o_proj) side. Read when
-    # the backend first builds a kernel for a shape.
+    # TENSILELITE Ulysses backend loads: PRE for the forward QKV GemmA2A, POST for the forward o_proj
+    # A2AGemm, PRE_BWD for the QKV dgrad A2AGemm and POST_BWD for the o_proj dgrad GemmA2A (both NN:
+    # the weight read as stored). Read when the backend first builds a kernel for a shape; a call
+    # without its library runs on FLYDSL.
     "PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_PRE": lambda: os.getenv("PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_PRE"),
     "PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_POST": lambda: os.getenv(
         "PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_POST"
+    ),
+    "PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_PRE_BWD": lambda: os.getenv(
+        "PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_PRE_BWD"
+    ),
+    "PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_POST_BWD": lambda: os.getenv(
+        "PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_POST_BWD"
     ),
     # ================== Auto-tune ==================
     # "1" turns auto-tuning across registered kernel backends on for every op, and the FlyDSL
