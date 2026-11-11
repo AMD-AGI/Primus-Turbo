@@ -36,7 +36,7 @@ from primus_turbo.flydsl.utils.prims import LOG2E
 # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
 # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
 # kernel, or a warm cache keeps serving the old one.
-CODEGEN_REV = 1057
+CODEGEN_REV = 1064
 
 # Room a later key has above a tile's row max before it forces another rebase.
 REF_MARGIN = 96.0
@@ -721,6 +721,11 @@ def _make_dualwave_swp_traits(
         Q_HEADS_PER_WG=q_heads_per_wg,
         ROWS_PER_WAVE=rows_per_wave,
         Q_TILES=rows_per_wave // 16,
+        # Block rows of q tile qt of wave w: WAVE_ROW_STRIDE w + QT_ROW_STRIDE qt + [0, 16). The
+        # kernel may interleave them (ROW_INTERLEAVE: 16 w + 64 qt) to share the causal diagonal.
+        ROW_INTERLEAVE=False,
+        QT_ROW_STRIDE=16,
+        WAVE_ROW_STRIDE=rows_per_wave,
         PV_AGPR=rows_per_wave == 64,
         # One wave per SIMD: no partner wave hides the softmax VALU, so both compute clusters
         # interleave it with their own MFMAs (the P*V site takes its exp2 half speculatively).
@@ -793,6 +798,7 @@ def _make_dualwave_swp_traits(
         SCHED_MFMA_MASK=0x008,
         SCHED_VALU_MASK=0x002,
         SCHED_EXP_MASK=0x400,
+        SCHED_DS_READ_MASK=0x100,
         LDS_SCOPE_NAMES=("lds_k0", "lds_k1", "lds_v0", "lds_v1"),
         NEG_INF_F32_BITS=0xFF800000,
         LGKMCNT_0_ONLY=0xC07F,
@@ -993,7 +999,7 @@ class DualwaveKernelContext:
             self.wave_row_group = self.wave_id % traits.WAVE_ROW_GROUPS
         else:
             self.wave_row_group = self.wave_id
-        self.wave_q_offset = self.wave_row_group * traits.ROWS_PER_WAVE
+        self.wave_q_offset = self.wave_row_group * traits.WAVE_ROW_STRIDE
 
         if const_expr(traits.QK_MFMA16):
             # 16x16x32 A operand: row r = lane % 16 of kv tile kt holds kv 16 kt + [0, 8, 4, 12][r // 4]
@@ -1104,13 +1110,27 @@ class DualwaveKernelContext:
             q_block_idx = _q_rank
         return h_idx, q_block_idx, fx.Index(gpu.block_idx.z)
 
+    def block_row0(self, q_block_idx):
+        """First q row of a q block. ROW_INTERLEAVE pulls a block that runs past the sequence end
+        (rounded up to the drain's two KV tiles) back to end there, so every causal band is the
+        block's full diagonal; the rows it shares with the block before get the same values."""
+        traits = self.traits
+        row0 = q_block_idx * traits.BLOCK_M
+        if const_expr(traits.ROW_INTERLEAVE):
+            span = 2 * traits.BLOCK_N
+            end = (self.seq_len_v + fx.Index(span - 1)) // fx.Index(span) * fx.Index(span)
+            end = fx.Index(ArithValue(end < fx.Index(traits.BLOCK_M)).select(fx.Index(traits.BLOCK_M), end))
+            last = end - fx.Index(traits.BLOCK_M)
+            row0 = fx.Index(ArithValue(row0 < last).select(row0, last))
+        return row0
+
     def bind_item(self, h_idx, q_block_idx, batch_idx):
         """Point every per-job value (heads, rows, tensor views, KV tile span) at one job."""
         traits = self.traits
         self.h_idx = h_idx
         self.q_block_idx = q_block_idx
         self.batch_idx = batch_idx
-        self.q_start = self.q_block_idx * traits.BLOCK_M
+        self.q_start = self.block_row0(q_block_idx)
         tid = self._job_tid()
         self._bind_lanes(tid)
         if const_expr(getattr(traits, "PERSISTENT", 0)):
@@ -1301,11 +1321,14 @@ class DualwaveKernelContext:
         """This lane's q row (one q per lane) and the wave's first row, for the bound job."""
         traits = self.traits
         lane = self.job_lane
-        if const_expr(traits.Q_TILES == 4):
+        if const_expr(traits.ROW_INTERLEAVE):
+            self.q_row_in_block = self.wave_q_offset + lane // 16 * traits.QT_ROW_STRIDE + lane % 16
+        elif const_expr(traits.Q_TILES == 4):
             self.q_row_in_block = self.wave_q_offset + lane
         else:
             self.q_row_in_block = self.wave_q_offset + lane % 32
-        self.q_start_pos_i32 = fx.Int32(self.q_start + self.wave_row_group_uni * traits.ROWS_PER_WAVE)
+        # The wave's first row (with ROW_INTERLEAVE its rows are not contiguous after it).
+        self.q_start_pos_i32 = fx.Int32(self.q_start + self.wave_row_group_uni * traits.WAVE_ROW_STRIDE)
         self.q_row = self.q_start + self.q_row_in_block
         self.q_row_i32 = fx.Int32(self.q_row)
 
@@ -1323,7 +1346,7 @@ class DualwaveKernelContext:
             batch_idx * self.seq_len_v,
         )
         q_head = (h_idx % traits.NUM_HEADS_KV) * traits.GQA_GROUP_SIZE + h_idx // traits.NUM_HEADS_KV
-        offset = q_block_idx * traits.BLOCK_M * self.stride_q_n_v + q_head * traits.HEAD_DIM
+        offset = self.block_row0(q_block_idx) * self.stride_q_n_v + q_head * traits.HEAD_DIM
         return q_div, offset
 
     def prefetch_q_raw(self, h_idx, q_block_idx, batch_idx):
@@ -1333,7 +1356,7 @@ class DualwaveKernelContext:
         tid = self._job_tid()
         self._bind_lanes(tid)
         q_div, offset = self._q_job_view(h_idx, q_block_idx, batch_idx)
-        return self.load_q_raw(q_div, offset, tid // traits.WARP_SIZE * traits.ROWS_PER_WAVE)
+        return self.load_q_raw(q_div, offset, tid // traits.WARP_SIZE * traits.WAVE_ROW_STRIDE)
 
     def stage_q_dma(self, h_idx, q_block_idx, batch_idx):
         """The paired k-steps' Q of the job at (h_idx, q_block_idx, batch_idx), by DMA into the
@@ -1361,33 +1384,41 @@ class DualwaveKernelContext:
             j = (lane % 16 + 32 - lane // 16 - rows_per_dma * i) % 16
             chunk_offs.append(j % 8 * traits.VEC_KV + j // 8 * 128)
 
+        # Stage rows come in q tiles of 16: past each, the block row jumps to the next q tile.
+        tile_rows = 16
+        wrap_rows = rows_per_dma + traits.QT_ROW_STRIDE - tile_rows
+
         def _issue(tile_bytes, first_row, n_dma):
+            """n_dma DMAs from block row first_row, the start of a q tile."""
             m0_base = rocdl.readfirstlane(T.i32, as_mlir_value(fx.Int32(self.lds_o_base_idx + tile_bytes)))
             # A running sum: separate i * stride products are job-invariant and get hoisted.
             row_elem = offset + (first_row + lane // 16) * self.stride_q_n_v
             row_step = rows_per_dma * self.stride_q_n_v
+            wrap_step = row_step if wrap_rows == rows_per_dma else wrap_rows * self.stride_q_n_v
             for i in range_constexpr(n_dma):
                 lds_ptr = fx.inttoptr(self.lds_ptr_ty, fx.Int32(m0_base) + fx.Int32(i * dma_bytes))
                 dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
                 src = fx.slice(q_div, (None, fx.Int32(row_elem + chunk_offs[i % 4])))
                 fx.copy(self.dma_atom, src, dst, soffset=fx.Int32(0))
-                row_elem = row_elem + row_step
+                row_elem = row_elem + (wrap_step if (i + 1) * rows_per_dma % tile_rows == 0 else row_step)
 
         last = traits.NUM_WAVES - 1
         dmas_per_tile = traits.ROWS_PER_WAVE // rows_per_dma
         share = dmas_per_tile // Q_STAGE_LAST_SPLIT
+        share_rows = share * rows_per_dma
+        assert share_rows % tile_rows == 0
 
         @flyc.jit
         def _own():
             if wave < fx.Index(last):
-                _issue(wave * wave_bytes, wave * traits.ROWS_PER_WAVE, dmas_per_tile)
+                _issue(wave * wave_bytes, wave * traits.WAVE_ROW_STRIDE, dmas_per_tile)
 
         @flyc.jit
         def _last_share():
             if wave < fx.Index(Q_STAGE_LAST_SPLIT):
                 _issue(
                     last * wave_bytes + wave * (share * dma_bytes),
-                    last * traits.ROWS_PER_WAVE + wave * (share * rows_per_dma),
+                    last * traits.WAVE_ROW_STRIDE + wave * (share_rows // tile_rows * traits.QT_ROW_STRIDE),
                     share,
                 )
 
@@ -1401,7 +1432,7 @@ class DualwaveKernelContext:
         tid = self._job_tid()
         self._bind_lanes(tid)
         q_div, offset = self._q_job_view(h_idx, q_block_idx, batch_idx)
-        wave_q_offset = tid // traits.WARP_SIZE * traits.ROWS_PER_WAVE
+        wave_q_offset = tid // traits.WARP_SIZE * traits.WAVE_ROW_STRIDE
         return self.load_q_raw(q_div, offset, wave_q_offset, keep=lambda ks16: ks16 >= QK16_PAIRED_STEPS)
 
     @property
@@ -1455,7 +1486,8 @@ class DualwaveKernelContext:
                 qt, ks16 = ks // _qk16_k_steps(traits), ks % _qk16_k_steps(traits)
                 lane_d = paired_d if ks16 < QK16_PAIRED_STEPS else middle_d
                 elem_index = q_elem_offset + (
-                    (wave_q_offset + lane % 16 + 16 * qt) * self.stride_q_n_v + (_qk16_step_d(ks16) + lane_d)
+                    (wave_q_offset + lane % 16 + traits.QT_ROW_STRIDE * qt) * self.stride_q_n_v
+                    + (_qk16_step_d(ks16) + lane_d)
                 )
             else:
                 elem_index = q_elem_offset + (
@@ -1578,8 +1610,8 @@ class DualwaveKernelContext:
     def _qk16_chain(self, k_part, q_all, acc16, ks_lo, ks_hi):
         return self._qk16_halves([(k_part, acc16)], q_all, ks_lo, ks_hi)[0]
 
-    def _qk16_both(self, k_lo, k_hi, q_all, s_lo, s_hi, ks_lo, ks_hi):
-        return tuple(self._qk16_halves([(k_lo, s_lo), (k_hi, s_hi)], q_all, ks_lo, ks_hi))
+    def _qk16_both(self, k_lo, k_hi, q_all, s_lo, s_hi, ks_lo, ks_hi, qts=None, after_mfma=None):
+        return tuple(self._qk16_halves([(k_lo, s_lo), (k_hi, s_hi)], q_all, ks_lo, ks_hi, qts, after_mfma))
 
     def qk_scores(self, v_s):
         """A finished QK's scores in the 32x32x16 layout every consumer expects.
@@ -1631,18 +1663,20 @@ class DualwaveKernelContext:
         m13 = _fmax(*_permlane32_swap_f32(m[1], m[3]), self.fm_fast)
         return _fmax(*_permlane16_swap_f32(m02, m13), self.fm_fast)
 
-    def _qk16_halves(self, halves, q_all, ks_lo, ks_hi):
-        """16x16x32 QK over K slots [ks_lo, ks_hi) for (k_part, acc) 32-kv halves, on the raw
-        accumulator layout (see `qk_scores`)."""
+    def _qk16_halves(self, halves, q_all, ks_lo, ks_hi, qts=None, after_mfma=None):
+        """16x16x32 QK over K slots [ks_lo, ks_hi) and q tiles `qts` (all by default) for
+        (k_part, acc) 32-kv halves, on the raw accumulator layout (see `qk_scores`)."""
         traits = self.traits
         nqt = self.QT
+        qts = tuple(range(nqt)) if qts is None else tuple(qts)
         accs = []
         for _, acc16 in halves:
             v = Vec(acc16)
             accs.append([v.shuffle(v, [4 * i + e for e in range(4)]).ir_value() for i in range(2 * nqt)])
         q_vec = Vec(q_all)
+        n_mfma = 0
         for ks in range_constexpr(ks_lo, ks_hi):
-            for qt in range_constexpr(nqt):
+            for qt in qts:
                 base = (qt * _qk16_k_steps(traits) + ks // 2) * traits.MFMA_LANE_K
                 q_pack = q_vec.shuffle(q_vec, [base + i for i in range(traits.MFMA_LANE_K)]).ir_value()
                 a = nqt * (ks % 2) + qt
@@ -1650,6 +1684,9 @@ class DualwaveKernelContext:
                     accs[h][a] = _mfma_acc(
                         halves[h][0][ks], q_pack, accs[h][a], self.qk16_mma_atom, self.rowsum_acc_vec_type
                     )
+                    if const_expr(after_mfma is not None):
+                        after_mfma(n_mfma)
+                    n_mfma += 1
         return [_concat_tree(acc) for acc in accs]
 
     def _qk16_to_score_layout(self, raw16):
@@ -1686,7 +1723,9 @@ class DualwaveKernelContext:
         self.ref_neg = _fsub(self.c_zero_f, self.seed_offset(ref), self.fm_fast)
         self.ref_seed_vec = None
 
-    def qk(self, v_k, q_all_scaled_bf16, v_s=None, ks_range=None):
+    def qk(self, v_k, q_all_scaled_bf16, v_s=None, ks_range=None, qts=None, after_mfma=None):
+        """`qts` (16x16x32 only): the q tiles to compute; the others keep their accumulators.
+        `after_mfma(j)` (16x16x32 only) emits code right after the call's j-th MFMA."""
         k_lo, k_hi = v_k
         ks_lo, ks_hi = (0, self.traits.K_STEPS_QK) if ks_range is None else ks_range
         if v_s is None:
@@ -1695,7 +1734,10 @@ class DualwaveKernelContext:
         else:
             v_s_lo, v_s_hi = v_s
         if const_expr(self.traits.QK_MFMA16):
-            return self._qk16_both(k_lo, k_hi, q_all_scaled_bf16, v_s_lo, v_s_hi, ks_lo, ks_hi)
+            return self._qk16_both(
+                k_lo, k_hi, q_all_scaled_bf16, v_s_lo, v_s_hi, ks_lo, ks_hi, qts, after_mfma
+            )
+        assert qts is None and after_mfma is None
         for ks in range_constexpr(ks_lo, ks_hi):
             _q_vec = Vec(q_all_scaled_bf16)
             _base = ks * self.traits.MFMA_LANE_K
@@ -1710,7 +1752,7 @@ class DualwaveKernelContext:
         traits = self.traits
         kv0 = fx.Int32(self.tile_start(tile_idx))
         q_lo = fx.Int32(self.q_start_pos_i32 + self.delta_i32)
-        q_hi = fx.Int32(q_lo + fx.Int32(traits.ROWS_PER_WAVE - 1))
+        q_hi = fx.Int32(q_lo + fx.Int32((traits.Q_TILES - 1) * traits.QT_ROW_STRIDE + 15))
         live_hi = ArithValue(fx.Int32(kv0 + fx.Int32(32)) <= q_hi)
         if const_expr(traits.WINDOW_LEFT >= 0):
             win_lo = fx.Int32(q_lo - fx.Int32(traits.WINDOW_LEFT))
@@ -1760,19 +1802,22 @@ class DualwaveKernelContext:
         v_s_hi = _qk_hi(s_hi_in, live_hi)
         return (v_s_lo, v_s_hi)
 
-    def pv_step_k(self, step, v_p, v_v, v_o, after_mfma=None):
+    def pv_step_k(self, step, v_p, v_v, v_o, after_mfma=None, qts=None):
+        """`qts` (16x16x32 only): the q tiles to accumulate; the others keep their O."""
         v_p_lo, v_p_hi = v_p
         v_pk = v_v[step]
         if const_expr(self.traits.PV_MFMA16):
             # Step s: kv half s // 2 against dv tiles 4 (s % 2) + dc. v_o[dc] holds the 16x16
             # accumulators [(dc, qt) for qt] + [(dc + 4, qt) for qt] of O^T.
             nqt = self.QT
+            qts = tuple(range(nqt)) if qts is None else tuple(qts)
+            assert after_mfma is None or len(qts) == nqt
             p_packs = v_p_lo if step < 2 else v_p_hi
             g = step % 2
             for dc in range_constexpr(self.traits.D_CHUNKS):
                 v = Vec(v_o[dc])
                 accs = [v.shuffle(v, [4 * i + e for e in range(4)]).ir_value() for i in range(2 * nqt)]
-                for qt in range_constexpr(nqt):
+                for qt in qts:
                     if const_expr(self.traits.PV_AGPR):
                         accs[nqt * g + qt] = _mfma16_acc_agpr(v_pk[dc], p_packs[qt], accs[nqt * g + qt])
                     else:
@@ -1860,19 +1905,21 @@ class DualwaveKernelContext:
 
     def finish_p_pieces(self, l_row, v_p, exps_per_piece=4):
         """The carried P's second exp2 half, then its cast and row sum, as pieces for the
-        caller to slot into a QK; after the last piece, result() is (v_p, l_row)."""
+        caller to slot into a QK; after the last piece, result() is (v_p, l_row). An exp2
+        piece called with `i` emits only its i-th exp2."""
         n = _numel(v_p[1])
         lo = [Vec(v_p[0])[r] for r in range_constexpr(n)]
         hi = [Vec(v_p[1])[r] for r in range_constexpr(n)]
         out = {}
 
-        def _exps(r0):
+        def _exps(r0, i):
             for r in range_constexpr(r0, r0 + exps_per_piece):
-                hi[r] = self._exp2_clamped(hi[r])
+                if const_expr(i is None or r == r0 + i):
+                    hi[r] = self._exp2_clamped(hi[r])
 
         pieces = []
         for r0 in range_constexpr(0, n, exps_per_piece):
-            pieces.append(lambda r0=r0: _exps(r0))
+            pieces.append(lambda i=None, r0=r0: _exps(r0, i))
         pieces.append(lambda: out.update(r=self.cast_p_and_sum(l_row, (lo, hi), fence=False)))
         return pieces, lambda: out["r"]
 
@@ -2207,13 +2254,14 @@ class DualwaveKernelContext:
         kv_start_i32 = fx.Int32(kv_tile_start)
         if const_expr(traits.PV_MFMA16):
             # Raw 16x16 element (kt, qt, e) of half h is kv 32 h + 16 kt + pv16_kv_offset + e and
-            # q = q_row - 16 pv16_owned_qt + 16 qt (q_row is the one-q-per-lane row).
+            # q = q_row + QT_ROW_STRIDE (qt - pv16_owned_qt) (q_row is the one-q-per-lane row).
+            qt_rows = traits.QT_ROW_STRIDE
             rel0_i32 = fx.Int32(
                 q_row_i32
                 + self.delta_i32
                 - kv_start_i32
                 - fx.Int32(self.pv16_kv_offset)
-                - fx.Int32(self.pv16_owned_qt) * fx.Int32(16)
+                - fx.Int32(self.pv16_owned_qt) * fx.Int32(qt_rows)
             )
             neg_inf_i32 = fx.Int32(traits.NEG_INF_F32_BITS)
             pairs = [(0, 1), (2, 3), (16, 17), (18, 19)]
@@ -2227,7 +2275,7 @@ class DualwaveKernelContext:
                     idx = _pv16_qt_elems(qt, self.QT)
                     vals = [half[i] for i in idx]
                     for w, cmp in edges:
-                        rel = fx.Int32(rel0_i32 + fx.Int32(16 * qt - 32 * h - w))
+                        rel = fx.Int32(rel0_i32 + fx.Int32(qt_rows * qt - 32 * h - w))
                         _apply_dualwave_mask_pair(vals, rel, neg_inf_i32, pairs, cmp)
                     for i, v in zip(idx, vals):
                         half[i] = v
@@ -2654,10 +2702,17 @@ class DualwaveKernelContext:
             rows_per_store = traits.WARP_SIZE // lanes_per_row
             row, chunk = lane // lanes_per_row, lane % lanes_per_row
             read_lane = self.lds_o_byte_ptr(wave_tile + row * row_bytes + chunk * 16)
-            o_row = (q_row - lane + row) * self.stride_o_n_v + self.q_head_idx * traits.HEAD_DIM_V
+            # Stage row r is q row r of the wave (one q per lane): q tile r // 16, row r % 16.
+            if const_expr(traits.ROW_INTERLEAVE):
+                wave_row0 = q_row - lane // 16 * traits.QT_ROW_STRIDE - lane % 16
+            else:
+                wave_row0 = q_row - lane
+            o_row = (wave_row0 + row) * self.stride_o_n_v + self.q_head_idx * traits.HEAD_DIM_V
             o_row = o_row + chunk * (16 // traits.BF16_BYTES)
             # A running sum: separate i * stride products are job-invariant and get hoisted.
             o_step = rows_per_store * self.stride_o_n_v
+            wrap_rows = rows_per_store + traits.QT_ROW_STRIDE - 16
+            wrap_step = o_step if wrap_rows == rows_per_store else wrap_rows * self.stride_o_n_v
             for i in range_constexpr(traits.ROWS_PER_WAVE // rows_per_store):
                 _buffer_store_128(
                     _lds_load_o_128(traits, read_lane, i * rows_per_store * row_bytes),
@@ -2666,7 +2721,7 @@ class DualwaveKernelContext:
                     _store_atom_128=self.store_atom_128,
                     o_div=self.o_div,
                 )
-                o_row = o_row + o_step
+                o_row = o_row + (wrap_step if (i + 1) * rows_per_store % 16 == 0 else o_step)
 
     def lds_o_byte_ptr(self, byte_offset):
         return buffer_ops.get_element_ptr(
@@ -2723,3 +2778,13 @@ def _interleave(traits, n_mfma, per_mfma, group, mask=None):
     for _ in range_constexpr(n_mfma):
         rocdl.sched_group_barrier(traits.SCHED_MFMA_MASK, 1, group)
         rocdl.sched_group_barrier(mask, per_mfma, group)
+
+
+def _qk16_slot(traits, n_reads, n_pairs, group):
+    """One 16x16x32 QK k-slot in full order: its `n_reads` K reads, `n_pairs` (MFMA, EXP) pairs,
+    then the slot's other MFMAs. With only the pairs pinned, IGroupLP may hoist the other MFMAs
+    ahead of them or split the reads, and does so or not depending on unrelated code."""
+    if const_expr(n_reads > 0):
+        rocdl.sched_group_barrier(traits.SCHED_DS_READ_MASK, n_reads, group)
+    _interleave(traits, n_pairs, 1, group, traits.SCHED_EXP_MASK)
+    rocdl.sched_group_barrier(traits.SCHED_MFMA_MASK, 2 * traits.Q_TILES - n_pairs, group)

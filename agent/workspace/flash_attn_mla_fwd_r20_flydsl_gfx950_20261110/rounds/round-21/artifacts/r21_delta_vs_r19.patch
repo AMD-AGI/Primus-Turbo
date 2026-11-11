@@ -1,0 +1,140 @@
+diff -u -x __pycache__ rounds/round-19/kernel_snapshot/branch_mla/attn_helper_mla.py src/branch_mla/attn_helper_mla.py
+--- rounds/round-19/kernel_snapshot/branch_mla/attn_helper_mla.py	2026-11-11 04:32:55.163530763 +0000
++++ src/branch_mla/attn_helper_mla.py	2026-11-11 04:57:55.929452827 +0000
+@@ -36,7 +36,7 @@
+ # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
+ # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
+ # kernel, or a warm cache keeps serving the old one.
+-CODEGEN_REV = 1057
++CODEGEN_REV = 1059
+ 
+ # Room a later key has above a tile's row max before it forces another rebase.
+ REF_MARGIN = 96.0
+@@ -1532,6 +1532,29 @@
+             q_all_scaled_bf16 = _concat_vectors(q_all_scaled_bf16, pack)
+         return Vec(q_all_scaled_bf16, (n_elems,), self.elem_dtype)
+ 
++    def scale_q_packs(self, q_raw_packs, idx, scaled=None):
++        """`scale_all` of the raw packs at `idx` only, into the pack list `scaled` (None where not
++        yet scaled), so a QK can start on its first k-step's packs; `assemble_q` joins the list."""
++        assert not self.use_score_bound, "the score bound needs the norm of every q pack at once"
++        traits = self.traits
++        fm_fast_attr = ir.Attribute.parse("#llvm.fastmath<fast>")
++        n = traits.MFMA_LANE_K
++        scale_vec = Vec.from_elements([self.c_sm_scale_log2e], fx.Float32).broadcast_to(n)
++        out = [None] * len(q_raw_packs) if scaled is None else list(scaled)
++        packs = []
++        for i in idx:
++            ext_op = llvm.FPExtOp(Vec.make_type(n, fx.Float32), as_mlir_value(q_raw_packs[i]))
++            ext_op.operation.attributes["fastmathFlags"] = fm_fast_attr
++            mul = arith.mulf(as_mlir_value(scale_vec), ext_op.result, fastmath=self.fm_fast)
++            trunc_op = llvm.FPTruncOp(Vec.make_type(n, self.elem_dtype), mul)
++            trunc_op.operation.attributes["fastmathFlags"] = fm_fast_attr
++            packs.append(trunc_op.result)
++        if const_expr(traits.PV_AGPR):
++            packs = _pin_regs(packs, "=a")
++        for i, pack in zip(idx, packs):
++            out[i] = pack
++        return out
++
+     def score_bound(self):
+         """Cauchy-Schwarz upper bound on every logit this lane's q row can ever produce."""
+         traits = self.traits
+@@ -1640,11 +1663,17 @@
+         for _, acc16 in halves:
+             v = Vec(acc16)
+             accs.append([v.shuffle(v, [4 * i + e for e in range(4)]).ir_value() for i in range(2 * nqt)])
+-        q_vec = Vec(q_all)
++        # q_all is the joined Q, or its pack list (`scale_q_packs`) while later packs are unscaled.
++        q_list = q_all if isinstance(q_all, list) else None
++        q_vec = None if q_list is not None else Vec(q_all)
+         for ks in range_constexpr(ks_lo, ks_hi):
+             for qt in range_constexpr(nqt):
+-                base = (qt * _qk16_k_steps(traits) + ks // 2) * traits.MFMA_LANE_K
+-                q_pack = q_vec.shuffle(q_vec, [base + i for i in range(traits.MFMA_LANE_K)]).ir_value()
++                pack_idx = qt * _qk16_k_steps(traits) + ks // 2
++                if const_expr(q_list is not None):
++                    q_pack = q_list[pack_idx]
++                else:
++                    base = pack_idx * traits.MFMA_LANE_K
++                    q_pack = q_vec.shuffle(q_vec, [base + i for i in range(traits.MFMA_LANE_K)]).ir_value()
+                 a = nqt * (ks % 2) + qt
+                 for h in range_constexpr(len(halves)):
+                     accs[h][a] = _mfma_acc(
+diff -u -x __pycache__ rounds/round-19/kernel_snapshot/branch_mla/flash_attn_fwd_mla.py src/branch_mla/flash_attn_fwd_mla.py
+--- rounds/round-19/kernel_snapshot/branch_mla/flash_attn_fwd_mla.py	2026-11-11 04:32:55.163530763 +0000
++++ src/branch_mla/flash_attn_fwd_mla.py	2026-11-11 04:58:45.342797443 +0000
+@@ -234,6 +234,16 @@
+         loop_masks = traits.CAUSAL and (
+             traits.CROSS_SEQLEN or traits.WINDOW_LEFT >= 0 or traits.BLOCK_M > 3 * traits.BLOCK_N
+         )
++        # A persistent job's raw Q is scaled under its first QK (`_qk0_scaling`).
++        LAZY_Q_SCALE = bool(
++            traits.PERSISTENT
++            and traits.QK_MFMA16
++            and traits.SOLO_WAVE
++            and split_k_reads
++            and not short_drain
++            and not ctx.use_score_bound
++        )
++        QK16_STEPS = traits.K_STEPS_QK // 2
+ 
+         def _mem_cluster_sync():
+             if const_expr(fold_mem_barriers):
+@@ -305,12 +315,17 @@
+             _sched_barrier(0)
+             _s_barrier()
+ 
++            q_packs = None
+             if const_expr(q_raw is None):
+-                q_all_bf16 = ctx.load_all()
++                q_all_scaled_bf16 = ctx.scale_all(ctx.load_all())
+             else:
+                 ctx.bind_q_rows()
+-                q_all_bf16 = ctx.assemble_q(q_raw)
+-            q_all_scaled_bf16 = ctx.scale_all(q_all_bf16)
++                if const_expr(LAZY_Q_SCALE):
++                    # k-step 0 only; `_qk0_scaling` scales the rest under QK0's MFMAs.
++                    q_packs = ctx.scale_q_packs(q_raw, [qt * QK16_STEPS for qt in range(traits.Q_TILES)])
++                    q_all_scaled_bf16 = None
++                else:
++                    q_all_scaled_bf16 = ctx.scale_all(ctx.assemble_q(q_raw))
+ 
+             def _load_k_head(buf_id):
+                 if const_expr(split_k_reads):
+@@ -338,6 +353,25 @@
+                 v_k = ctx.lds_load_k(buf_id, ks_range=ks_tail, k_regs=v_k)
+                 return ctx.qk_live(v_k, q_all_scaled_bf16, live_lo, live_hi, v_s=v_s, ks_range=ks_tail)
+ 
++            def _qk0_scaling(v_k, q_packs):
++                """The job's first QK one k-slot at a time (as `_qk_finish_p`), each slot scaling
++                half the q tiles of the next 16x16x32 k-step under its MFMAs: alone on its SIMD,
++                the wave otherwise runs the whole Q scale before the first MFMA."""
++                half = traits.Q_TILES // 2
++                v_s = None
++                for ks in range_constexpr(traits.K_STEPS_QK):
++                    nxt = ks + K_HEAD
++                    if const_expr(nxt < traits.K_STEPS_QK):
++                        v_k = ctx.lds_load_k(0, ks_range=(nxt, nxt + 1), k_regs=v_k)
++                    v_s = ctx.qk(v_k, q_packs, v_s=v_s, ks_range=(ks, ks + 1))
++                    step = ks // 2 + 1
++                    if const_expr(step < QK16_STEPS):
++                        qts = range(ks % 2 * half, ks % 2 * half + half)
++                        q_packs = ctx.scale_q_packs(q_raw, [qt * QK16_STEPS + step for qt in qts], q_packs)
++                        _interleave(traits, 2 * traits.Q_TILES, 5, 0)
++                    _sched_barrier(0)
++                return v_s, q_packs
++
+             def _load_v_head(buf_id):
+                 if const_expr(split_kv_reads):
+                     return ctx.lds_load_v(buf_id, substeps=(0, V_HEAD))
+@@ -454,6 +488,9 @@
+ 
+             if const_expr(short_drain):
+                 v_s_0 = _qk(v_k, 0, tile_idx=ctx.split_tile(0))
++            elif const_expr(LAZY_Q_SCALE):
++                v_s_0, q_packs = _qk0_scaling(v_k, q_packs)
++                q_all_scaled_bf16 = ctx.assemble_q(q_packs)
+             else:
+                 v_s_0 = _qk(v_k, 0)
+             _sched_barrier(0)

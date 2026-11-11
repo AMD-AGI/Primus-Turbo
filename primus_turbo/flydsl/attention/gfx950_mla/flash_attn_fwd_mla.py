@@ -43,6 +43,7 @@ from .attn_helper_mla import (
     _interleave,
     _make_dualwave_swp_traits,
     _numel,
+    _qk16_slot,
     _s_barrier,
     _s_nop,
     _s_setprio,
@@ -154,6 +155,21 @@ def build_flash_attn_dualwave_swp_module(
     traits.Q_LDS_STAGE = bool(
         traits.PERSISTENT and traits.O_LDS_STAGE and traits.QK_MFMA16 and traits.HEAD_DIM == 192
     )
+    # Persistent dense causal with four q tiles a wave: q tile qt of wave w takes block rows
+    # 64 qt + 16 w, not 64 w + 16 qt. Every wave then holds the same share of the diagonal, and
+    # the drain's dead q tiles are the same static ones on every wave (`_qk_diag`).
+    traits.ROW_INTERLEAVE = bool(
+        traits.PERSISTENT
+        and traits.CAUSAL
+        and traits.Q_TILES == 4
+        and traits.QK_MFMA16
+        and traits.PV_MFMA16
+        and traits.Q_HEADS_PER_WG == 1
+        and traits.NUM_WAVES * 16 == traits.BLOCK_M // traits.Q_TILES == traits.BLOCK_N
+    )
+    if traits.ROW_INTERLEAVE:
+        traits.QT_ROW_STRIDE = traits.BLOCK_M // traits.Q_TILES
+        traits.WAVE_ROW_STRIDE = 16
     _dualwave_swp_cache_tag = traits.cache_tag
 
     _lds_elem_dtype = dtype_to_elem_type(traits.DTYPE_STR)
@@ -317,15 +333,17 @@ def build_flash_attn_dualwave_swp_module(
                     return ctx.lds_load_k(buf_id, ks_range=(0, K_HEAD))
                 return ctx.lds_load_k(buf_id)
 
-            def _qk(v_k, buf_id, tile_idx=None, live=None):
-                """QK for one KV tile. `tile_idx`/`live` skip a wave-uniform dead 32-col half."""
+            def _qk(v_k, buf_id, tile_idx=None, live=None, qts=None):
+                """QK for one KV tile. `tile_idx`/`live` skip a wave-uniform dead 32-col half,
+                `qts` (16x16x32) computes those q tiles only."""
                 if const_expr(tile_idx is None and live is None):
                     if const_expr(not split_k_reads):
-                        return ctx.qk(v_k, q_all_scaled_bf16)
+                        return ctx.qk(v_k, q_all_scaled_bf16, qts=qts)
                     ks_tail = (K_HEAD, traits.K_STEPS_QK)
-                    v_s = ctx.qk(v_k, q_all_scaled_bf16, ks_range=(0, K_HEAD))
+                    v_s = ctx.qk(v_k, q_all_scaled_bf16, ks_range=(0, K_HEAD), qts=qts)
                     v_k = ctx.lds_load_k(buf_id, ks_range=ks_tail, k_regs=v_k)
-                    return ctx.qk(v_k, q_all_scaled_bf16, v_s=v_s, ks_range=ks_tail)
+                    return ctx.qk(v_k, q_all_scaled_bf16, v_s=v_s, ks_range=ks_tail, qts=qts)
+                assert qts is None
                 # Pass live=(None, pred) to skip the always-true half (avoids a dead scf.if).
                 if const_expr(live is None):
                     live_lo, live_hi = ctx.chunk_live(tile_idx)
@@ -343,20 +361,24 @@ def build_flash_attn_dualwave_swp_module(
                     return ctx.lds_load_v(buf_id, substeps=(0, V_HEAD))
                 return ctx.lds_load_v(buf_id)
 
-            def _pv_step(step, v_p, v_v, v_o, buf_id):
+            def _pv_step(step, v_p, v_v, v_o, buf_id, qts=None):
                 """One P*V k-substep, trailed by the read of the substep V_HEAD ahead so
                 that read is covered by this MFMA and only V_HEAD + 1 substeps are live."""
-                v_o = ctx.pv_step_k(step, v_p, v_v, v_o)
+                v_o = ctx.pv_step_k(step, v_p, v_v, v_o, qts=qts)
                 nxt = step + V_HEAD
                 if const_expr(split_kv_reads and nxt < 4):
                     ctx.lds_load_v(buf_id, substeps=(nxt, nxt + 1), packs=v_v)
                 return v_o
 
-            def _pv(v_p, v_v, v_o, buf_id):
-                if const_expr(not split_kv_reads):
+            def _pv(v_p, v_v, v_o, buf_id, qts=None):
+                if const_expr(not split_kv_reads and qts is None):
                     return ctx.pv(v_p, v_v, v_o)
+                if const_expr(not split_kv_reads):
+                    for step in range_constexpr(4):
+                        v_o = ctx.pv_step_k(step, v_p, v_v, v_o, qts=qts)
+                    return v_o
                 for step in range_constexpr(4):
-                    v_o = _pv_step(step, v_p, v_v, v_o, buf_id)
+                    v_o = _pv_step(step, v_p, v_v, v_o, buf_id, qts)
                 return v_o
 
             # Skip P*V + V LDS reads on a wave-uniform dead 32-col half (P is 0 after the mask).
@@ -506,6 +528,8 @@ def build_flash_attn_dualwave_swp_module(
             # The compute-cluster rendezvous sits this many k-slots before the QK's end: the K
             # reads are all issued by then, and the V head read after it lands under the rest.
             QK_SYNC_TAIL = 2
+            # (MFMA, exp2) pairs in each SOLO_WAVE QK k-slot: one `finish_p_pieces` piece.
+            QK_SLOT_EXPS = 4
 
             def _qk_finish_p(v_k, buf_id, v_p, l_row, group, v_buf=None):
                 """QK of the next tile next to the carried P's second exp2 half, cast and row sum.
@@ -537,13 +561,27 @@ def build_flash_attn_dualwave_swp_module(
                     nxt = ks + K_HEAD
                     if const_expr(nxt < traits.K_STEPS_QK):
                         v_k = ctx.lds_load_k(buf_id, ks_range=(nxt, nxt + 1), k_regs=v_k)
-                    v_s = ctx.qk(v_k, q_all_scaled_bf16, v_s=v_s, ks_range=(ks, ks + 1))
-                    if const_expr(ks < len(pieces) - 1):
-                        pieces[ks]()
-                        _interleave(traits, 4, 1, group, traits.SCHED_EXP_MASK)
-                    elif const_expr(ks == len(pieces) - 1):
-                        pieces[ks]()
-                        _interleave(traits, 16, 2, group)
+                    if const_expr(ks < len(pieces) - 1 and traits.QK_MFMA16):
+                        # Emitted in the pinned order (exp i right after MFMA i): the pin acts
+                        # post-RA only, and a register the RA reuses within the slot must not
+                        # tie a pinned exp behind a later MFMA.
+                        piece = pieces[ks]
+                        v_s = ctx.qk(
+                            v_k,
+                            q_all_scaled_bf16,
+                            v_s=v_s,
+                            ks_range=(ks, ks + 1),
+                            after_mfma=lambda i, piece=piece: piece(i) if i < QK_SLOT_EXPS else None,
+                        )
+                        _qk16_slot(traits, 2 if nxt < traits.K_STEPS_QK else 0, QK_SLOT_EXPS, group)
+                    else:
+                        v_s = ctx.qk(v_k, q_all_scaled_bf16, v_s=v_s, ks_range=(ks, ks + 1))
+                        if const_expr(ks < len(pieces) - 1):
+                            pieces[ks]()
+                            _interleave(traits, 4, 1, group, traits.SCHED_EXP_MASK)
+                        elif const_expr(ks == len(pieces) - 1):
+                            pieces[ks]()
+                            _interleave(traits, 16, 2, group)
                     _sched_barrier(0)
                 v_p, l_row = finish_p()
                 return v_s, v_p, l_row, v_v
@@ -915,17 +953,25 @@ def build_flash_attn_dualwave_swp_module(
                     """chunk_live of the k-th last KV tile; None for a half no wave can find dead
                     (its start never passes wave 0's last row), which saves an always-true branch."""
                     lo_start = traits.BLOCK_M - k * traits.BLOCK_N
-                    if const_expr(lo_start + traits.BLOCK_N // 2 < traits.ROWS_PER_WAVE):
+                    if const_expr(
+                        traits.ROW_INTERLEAVE or lo_start + traits.BLOCK_N // 2 < traits.ROWS_PER_WAVE
+                    ):
                         return (None, None)
                     live_lo, live_hi = ctx.chunk_live(split_t_end - k)
                     return (live_lo if lo_start >= traits.ROWS_PER_WAVE else None, live_hi)
 
-                def _qk_diag(v_k, buf_id, live):
+                # ROW_INTERLEAVE: the k-th last KV tile is the block's diagonal tile 4 - k (every
+                # band is full, `block_row0`), so the q tiles below it are dead on every wave.
+                def _qk_diag(v_k, buf_id, live, k):
+                    if const_expr(traits.ROW_INTERLEAVE):
+                        return _qk(v_k, buf_id, qts=range(traits.Q_TILES - k, traits.Q_TILES))
                     if const_expr(live[1] is None):
                         return _qk(v_k, buf_id)
                     return _qk(v_k, buf_id, live=live)
 
-                def _pv_diag(v_p, v_v, v_o, buf_id, live):
+                def _pv_diag(v_p, v_v, v_o, buf_id, live, k):
+                    if const_expr(traits.ROW_INTERLEAVE):
+                        return _pv(v_p, v_v, v_o, buf_id, qts=range(traits.Q_TILES - k, traits.Q_TILES))
                     if const_expr(live[1] is None):
                         return _pv(v_p, v_v, v_o, buf_id)
                     if const_expr(live[0] is None):
@@ -949,7 +995,7 @@ def build_flash_attn_dualwave_swp_module(
                 # Epilogue C1 (compute): finish v_p_0 softmax, then MMA0 -> v_s_1 (like C1).
                 v_p_0 = ctx.exp2(v_p_0, 16, 16)
                 v_p_0, l_row = ctx.cast_p_and_sum(l_row, v_p_0)
-                v_s_1 = _qk_diag(v_k, 1, _live_m3)
+                v_s_1 = _qk_diag(v_k, 1, _live_m3, 3)
                 _sched_barrier_pairs(traits, 6, 3, 5, traits.SCHED_EXP_MASK)
                 _sched_barrier_pairs(traits, 10, 5, 5)
                 _dualwave_sync_barrier()
@@ -975,7 +1021,7 @@ def build_flash_attn_dualwave_swp_module(
                 # Epilogue C3 (compute): P*V of max_m4 + unconditional rescale
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
-                v_o = _pv_diag(v_p_0, v_packs_e3, v_o, 0, _live_m4)
+                v_o = _pv_diag(v_p_0, v_packs_e3, v_o, 0, _live_m4, 4)
                 m_row, l_row, v_s_1, v_o = ctx.rebase_if_needed(m_row, l_row, v_s_1, v_o)
                 v_p_1 = ctx.exp2(v_s_1, 0, 16)
                 _sched_barrier_pairs(traits, 10, 5, 6)
@@ -999,7 +1045,7 @@ def build_flash_attn_dualwave_swp_module(
                 # Epilogue C5 finishes the v_p_1 softmax, then computes MMA0.
                 v_p_1 = ctx.exp2(v_p_1, 16, 16)
                 v_p_1, l_row = ctx.cast_p_and_sum(l_row, v_p_1)
-                v_s_0 = _qk_diag(v_k, 0, _live_m2)
+                v_s_0 = _qk_diag(v_k, 0, _live_m2, 2)
                 _sched_barrier_pairs(traits, 6, 3, 7, traits.SCHED_EXP_MASK)
                 _sched_barrier_pairs(traits, 10, 5, 7)
                 _dualwave_sync_barrier()
@@ -1022,7 +1068,7 @@ def build_flash_attn_dualwave_swp_module(
                 # Epilogue C7 (compute, mirror of C3): P*V of max_m3 + unconditional rescale.
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
-                v_o = _pv_diag(v_p_1, v_packs_e7, v_o, 1, _live_m3)
+                v_o = _pv_diag(v_p_1, v_packs_e7, v_o, 1, _live_m3, 3)
                 m_row, l_row, v_s_0, v_o = ctx.rebase_if_needed(m_row, l_row, v_s_0, v_o)
                 v_p_0 = ctx.exp2(v_s_0, 0, 16)
                 _sched_barrier_pairs(traits, 10, 5, 8)
@@ -1049,7 +1095,7 @@ def build_flash_attn_dualwave_swp_module(
                     ctx.stage_q_dma(*_job_coords(next_job))
                 v_p_0 = ctx.exp2(v_p_0, 16, 16)
                 v_p_0, l_row = ctx.cast_p_and_sum(l_row, v_p_0)
-                v_s_1 = _qk_diag(v_k, 1, _live_m1)
+                v_s_1 = _qk_diag(v_k, 1, _live_m1, 1)
                 _sched_barrier_pairs(traits, 6, 3, 9, traits.SCHED_EXP_MASK)
                 _sched_barrier_pairs(traits, 10, 5, 9)
                 _dualwave_sync_barrier()
@@ -1077,7 +1123,7 @@ def build_flash_attn_dualwave_swp_module(
 
                 # Epilogue C11: final rescale and complete the last tile's softmax in-place.
                 # v_p_0 belongs to max_m2, whose HI half is dead for row group 0.
-                v_o = _pv_diag(v_p_0, v_packs_e11, v_o, 0, _live_m2)
+                v_o = _pv_diag(v_p_0, v_packs_e11, v_o, 0, _live_m2, 2)
                 m_row, l_row, v_s_1, v_o = ctx.rebase_if_needed(m_row, l_row, v_s_1, v_o)
                 v_p_1 = ctx.exp2(v_s_1, 0, 16)
                 _sched_barrier_pairs(traits, 9, 6, 10)
@@ -1097,7 +1143,7 @@ def build_flash_attn_dualwave_swp_module(
 
                 # Epilogue C13 (compute): final P*V -> v_o holds the unnormalized output.
                 # v_p_1 belongs to max_m1; both halves are dead for row groups 0 and 32.
-                v_o = _pv_diag(v_p_1, v_packs_e13, v_o, 1, _live_m1)
+                v_o = _pv_diag(v_p_1, v_packs_e13, v_o, 1, _live_m1, 1)
 
             # Normalize O; split-K stores normalized partials for later w_s * l_s reweighting.
             # finalize_o_scale folds the learned sink into the denominator when HAS_SINK

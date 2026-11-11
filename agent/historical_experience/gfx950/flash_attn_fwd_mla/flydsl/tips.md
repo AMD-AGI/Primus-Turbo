@@ -230,3 +230,44 @@
   (wave-uniform `scf.if` on the readfirstlane'd wave id; the existing vmcnt + barrier before the
   read publishes it). Moving the Q stage DMAs from a memory cluster into C9 this way: drain -2.1K
   cycles per job, +1.6 % dsv3, +1.1 % geomean.
+- One wave per SIMD: a "memory-bound" block (LDS staging writes, buffer stores) does not hide
+  VALU appended to it. Issue is in order, so a ds_write / buffer_store stalled on a full queue
+  blocks the VALU behind it, and no other wave fills the slot. Moving the persistent kernel's Q
+  scaling (~500 VALU) from the job top into the previous O store block just moved ~2K cycles
+  (-0.3 % net). Overlap needs explicit interleaving at the queue drain rate, or MFMA to hide under.
+- gfx950 single-wave issue around MFMA: the instruction right after an MFMA costs 8 cycles, and
+  `v_pk_mul_f32` / packed-FP32 within ~3 instructions of an MFMA waits 15-20 cycles (it does not
+  overlap the MFMA in flight). Scalar / integer VALU (v_and, v_lshl, v_cvt_pk, accvgpr_write)
+  fill MFMA shadows at 4 cycles. Keep pk FP32 ops >= 4 instructions after an MFMA.
+- Partial sched_group_barrier patterns are fragile. If a slot pins only 4 (MFMA, EXP) pairs of its
+  8 MFMAs, IGroupLP places the free MFMAs and DS reads differently whenever unrelated IR changes
+  (a job-top edit moved them in the KV loop). That cost the loop-bound S64K shape 2-3 %. Pin
+  the whole slot.
+- Causal drain balance (FlyDSL MLA fwd R23, gfx950): with wave w owning block rows 64w..64w+63,
+  the diagonal tiles leave waves < t idle at the chunk barriers while the last wave does all the
+  work. Interleave the q tiles across waves instead (q tile qt of wave w = rows 64 qt + 16 w). On
+  a full band, tile t's dead q tiles are then qt < t on every wave, so they can be skipped
+  statically. The drain fell 17 % (27.8K -> 23.1K cycles per job), almost all of it from the
+  barrier wait, not the skipped MFMAs. Keep every band full by pulling a sequence-end block back
+  (the shared rows get identical values). A runtime fix-up branch that adds the dead q tiles back
+  merges into the accumulators and spilled 64 VGPRs.
+- Measure a drain change with ATT (drain cycles per job) as well as end to end. Any edit to the
+  IR around the KV loop can re-roll the loop's partially pinned slot schedule and mask the gain
+  (R23: S64K -3.5 % from 2-3 re-chosen slots against a +17 % drain).
+- Long-sequence losses can be clock rather than cycles (FlyDSL MLA fwd R24, gfx950 MI355X). Two
+  builds with the same ATT cycles (+0.2 %) ran S64K at 1860 vs 1800 MHz. The fast one sat at the
+  PPT limit (~1345 W, throttle share 0.9); the slow one drew ~45 W less with throttle share 0.3,
+  so another, unexposed limiter capped it, depending on the KV-loop instruction order. Check
+  `power_probe.py` (clock, power, PPT share, TFLOPS/MHz) whenever a loop-bound shape moves while
+  its ATT cycles do not.
+- sched_group_barrier pins can act post-RA only. With `max-memory-clause` at ~500 / 512 VGPRs,
+  the pre-RA schedule stayed in source order (see the ISA with `enable-post-misched` off). The RA
+  then may give a later-pinned instruction a register freed by an earlier one of the same slot
+  (exp dest = a rotated MFMA srcC), and the post-RA pin cannot be met. Emit the slot in the
+  pinned order in the IR itself so the RA's reuse always agrees with the pin.
+- Emit a pinned slot in its pinned order in the IR (FlyDSL MLA fwd R25): an `after_mfma(i)` hook
+  in the QK emitter puts exp i right after MFMA i. Then the RA can only reuse a register in an
+  order the post-RA pin also wants, and the slot pattern held in 15 of 16 hot slots whatever the
+  surrounding code. A regular slot pattern did not restore the S64K sustained clock, though
+  (R25: 1805 vs 1863 MHz). That cap has another trigger, so bisect it with `power_probe.py`, not
+  with the ISA slot pattern.

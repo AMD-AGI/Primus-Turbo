@@ -1,0 +1,99 @@
+diff -u -x __pycache__ rounds/round-19/kernel_snapshot/branch_mla/attn_helper_mla.py src/branch_mla/attn_helper_mla.py
+--- rounds/round-19/kernel_snapshot/branch_mla/attn_helper_mla.py	2026-11-11 04:32:55.163530763 +0000
++++ src/branch_mla/attn_helper_mla.py	2026-11-11 04:47:37.323687948 +0000
+@@ -36,7 +36,7 @@
+ # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
+ # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
+ # kernel, or a warm cache keeps serving the old one.
+-CODEGEN_REV = 1057
++CODEGEN_REV = 1058
+ 
+ # Room a later key has above a tile's row max before it forces another rebase.
+ REF_MARGIN = 96.0
+@@ -1486,7 +1486,8 @@
+             q_all = _concat_vectors(q_all, pack)
+         return Vec(q_all, (n_packs * traits.MFMA_LANE_K,), self.elem_dtype)
+ 
+-    def scale_all(self, q_all_bf16):
++    def scale_q_packs(self, q_all_bf16):
++        """Q times the softmax scale (log2 domain), as bf16 MFMA packs."""
+         traits = self.traits
+         n_elems = q_all_bf16.numel
+         fm_fast_attr = ir.Attribute.parse("#llvm.fastmath<fast>")
+@@ -1521,16 +1522,16 @@
+             # Q is only ever an MFMA operand, which reads AGPRs directly; defined in VGPRs it is
+             # parked in AGPRs anyway and copied back before every QK MFMA.
+             q_packs = _pin_regs(q_packs, "=a")
+-        q_16_packs = []
+-        for pair in range_constexpr(n_packs // 2):
+-            q_16_packs.append(_concat_vectors(q_packs[pair * 2], q_packs[pair * 2 + 1]))
+-        q_32_packs = []
+-        for pair in range_constexpr(n_packs // 4):
+-            q_32_packs.append(_concat_vectors(q_16_packs[pair * 2], q_16_packs[pair * 2 + 1]))
+-        q_all_scaled_bf16 = q_32_packs[0]
+-        for pack in q_32_packs[1:]:
+-            q_all_scaled_bf16 = _concat_vectors(q_all_scaled_bf16, pack)
+-        return Vec(q_all_scaled_bf16, (n_elems,), self.elem_dtype)
++        return q_packs
++
++    def scale_all(self, q_all_bf16):
++        return self.assemble_q(self.scale_q_packs(q_all_bf16))
++
++    def scale_q_raw(self, q_raw_packs):
++        """`scale_all` of raw Q packs, kept as packs (`assemble_q` joins them). The score bound's
++        q norm is not computed: its users would see another job's value."""
++        assert not self.use_score_bound
++        return self.scale_q_packs(self.assemble_q(q_raw_packs))
+ 
+     def score_bound(self):
+         """Cauchy-Schwarz upper bound on every logit this lane's q row can ever produce."""
+diff -u -x __pycache__ rounds/round-19/kernel_snapshot/branch_mla/flash_attn_fwd_mla.py src/branch_mla/flash_attn_fwd_mla.py
+--- rounds/round-19/kernel_snapshot/branch_mla/flash_attn_fwd_mla.py	2026-11-11 04:32:55.163530763 +0000
++++ src/branch_mla/flash_attn_fwd_mla.py	2026-11-11 04:47:26.994826187 +0000
+@@ -288,6 +288,10 @@
+                 return ctx.prefetch_q_staged(*_job_coords(job))
+             return ctx.prefetch_q_raw(*_job_coords(job))
+ 
++        # Persistent jobs get their Q scaled by the previous job, under its O store (`q_raw` are
++        # then scaled packs); the score bound's q norm would have to cross the job edge too.
++        PRESCALE_Q = traits.PERSISTENT and not ctx.use_score_bound
++
+         def _main_body(next_job=None, q_raw=None):
+             """With `next_job` (persistent), this job's first two K tiles and its Q (`q_raw`) were
+             prefetched by the previous job's drain, and this drain prefetches the next job's, which
+@@ -306,11 +310,13 @@
+             _s_barrier()
+ 
+             if const_expr(q_raw is None):
+-                q_all_bf16 = ctx.load_all()
++                q_all_scaled_bf16 = ctx.scale_all(ctx.load_all())
++            elif const_expr(PRESCALE_Q):
++                ctx.bind_q_rows()
++                q_all_scaled_bf16 = ctx.assemble_q(q_raw)
+             else:
+                 ctx.bind_q_rows()
+-                q_all_bf16 = ctx.assemble_q(q_raw)
+-            q_all_scaled_bf16 = ctx.scale_all(q_all_bf16)
++                q_all_scaled_bf16 = ctx.scale_all(ctx.assemble_q(q_raw))
+ 
+             def _load_k_head(buf_id):
+                 if const_expr(split_k_reads):
+@@ -1117,6 +1123,9 @@
+             if const_expr(traits.EMIT_LSE):
+                 ctx.store_lse(m_lse, l_lse, ctx.q_row)
+             ctx.store_final_o(v_o, ctx.q_row)
++            if const_expr(q_next is not None and PRESCALE_Q):
++                # This job's Q is dead since C9; the VALU fills the O store's LDS / VMEM waits.
++                q_next = ctx.scale_q_raw(q_next)
+             return q_next
+ 
+         if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN):
+@@ -1138,6 +1147,8 @@
+             q_first = _prefetch_q(job_first)
+             # No O stores follow the first job's prefetch for the job-top wait to count past.
+             _s_waitcnt(0)
++            if const_expr(PRESCALE_Q):
++                q_first = ctx.scale_q_raw(q_first)
+             n_q = len(q_first)
+             for k, job_args in range(fx.Index(0), fx.Index(n_jobs), fx.Index(1), init=[job_first] + q_first):
+                 job = fx.Int32(job_args[0])

@@ -210,3 +210,60 @@ in two processes, bitwise, smoke 8/8, every shape up; 4K +0.9-1.6 %. ATT: drain 
 job, C10 -> 2.2-2.8K. VGPR 492 -> 508 (loop rescheduled). Non-persistent ISA identical. 1.222x
 aiter.
 Next: the next job's K tile 0 (K buf0 free after C5) from the off-diagonal waves too.
+
+## Round 20 — ROLLBACK — 12:53
+R19 ATT: job top 4.3K cycles per job, ~2.0K of it Q scaling VALU (~500 instructions) that QK0
+waits on. Moved the scale to the previous job's epilogue right after the O store (same block,
+scheduler's choice), carrying scaled AGPR packs over the job edge. -0.36 % / -0.32 % geomean,
+bitwise. ATT: job top -2.06K, O store +1.96K per job: no overlap. With one wave per SIMD a
+stalled ds_write / buffer_store blocks the VALU behind it. Rolled back to R19.
+Next: interleave the scale with QK0's MFMAs at the job top (sched_group_barrier pairs).
+
+## Round 21 — ROLLBACK
+Scaled the job's Q under QK0's MFMAs (k-step 0 at the job top, k-step ks+1 inside k-step ks's
+slot with (MFMA, 5 VALU) interleave). Bitwise; -0.27 % / -0.35 % geomean, S64K -2.4 / -2.9 %.
+ATT: job top 4286 -> 4036 per job. The MFMAs are hidden but VALU-issue bound now: 8 cycles per
+post-MFMA slot, and v_pk_mul_f32 stalls 15-20 cycles within 3 instructions of an MFMA. The KV
+loop's slot pattern was perturbed: only R19 has every slot `RR w (M e)x4 MMMM`, and S64K follows it
+(R19 ~1365 vs ~1330 otherwise). Rolled back to R19.
+Next: pin the full loop slot pattern (K reads, pairs, remaining MFMAs).
+
+## Round 22 — ROLLBACK
+Pinned the whole KV-loop QK slot (2 K reads, 4 (MFMA, EXP) pairs, 4 MFMAs) via `_qk16_slot`.
+R19's slots 0-6 unchanged and the last exp slot regularized: +0.003 % / -0.03 %, bitwise, so it
+does not improve on R19. Kept on record (snapshot) as a neutral pin for later rounds that perturb
+the loop. Third consecutive rollback: escalate to ISA-level comparison / drain balance.
+
+## Round 23 — ROLLBACK
+Drain balance. Interleaved q rows across waves (`ROW_INTERLEAVE`: q tile qt of wave w = block
+rows 64 qt + 16 w). Every wave now has the same diagonal share, and on a full band tile t's dead
+q tiles are qt < t on all waves, so `_qk_diag` / `_pv_diag` skip them statically
+(MFMAs 1008 -> 768). `block_row0` pulls a sequence-end block back so its band is full; the
+shared rows are written twice with identical values. A clipped-band fix-up branch spilled 64
+VGPRs at the merge and was dropped. Bitwise, smoke 10/10. ATT: drain 27.8K -> 23.1K per job
+(barrier wait 2-8.8K -> 0.2-3.3K). But IGroupLP re-chose 2-3 KV-loop QK slots: S64K -3.1 /
+-3.8 %, 4K +0.6-1.0 %, geomean -0.21 % / -0.24 %. Rolled back per Rule 3 (fourth consecutive).
+Next: R23 + R22's whole-slot `_qk16_slot` pin (neutral on R19) to keep R19's loop schedule.
+
+## Round 24 — ROLLBACK
+R23 + R22's whole-slot QK pin. One hot-block slot stays irregular. -0.17 % / -0.26 %, S64K
+-3.2 / -3.6 %, 4K +0.7-1.1 %. New: the S64K loss is clock, not cycles. ATT CU 0 +0.2 % cycles
+only. power_probe S64K: R19 / R22 ~1860 MHz at the PPT limit (~1345 W, throttle 0.9). R21 / R23 /
+R24 1750-1840 MHz at ~1300 W with PPT throttle 0.2-0.3, i.e. another, unexposed cap that tracks
+the loop schedule. The loop IR is identical (R19 vs R23, `wip/ir_loop_cmp.py`). The pre-RA
+schedule keeps source order (`dd M x8 e x4`; pins only act post-RA), so the RA can hand an exp a
+register freed by its slot's MFMA chain and the post-RA pin becomes unsatisfiable (R24 slot 5).
+Fifth consecutive rollback.
+Next: emit the QK slot in pin order in the IR (exp j after MFMA j via an after_mfma hook).
+
+## Round 25 — ACCEPTED WITH NOTE
+Each pinned SOLO_WAVE QK k-slot is now emitted in the pin's order in the IR (`qk(...,
+after_mfma=)`, exp i right after MFMA i), so the RA's in-slot register reuse always agrees with
+the post-RA pin. First hot block 8/8 regular slots (R19 7, R24 6), second 7/8; VGPR 499, MFMA 768.
+Bitwise, smoke 10/10, non-persistent bitwise vs np19. +0.19 % / +0.27 % geomean vs R19. 4K
++1.2-1.8 % (R23's drain balance comes through). S64K -3.3 / -3.0 %, S32K -0.7 / -1.0 %: power_probe
+S64K ~1805 MHz / ~1310 W / PPT 0.37 vs R19 1863 MHz / 1350 W / 0.9, with the same TFLOPS/MHz. So
+the clock cap does not follow the QK slot pattern (corrects R24); its trigger is open. New best:
+1232.09 = 1.226x aiter. Synced to the fwd worktree.
+Next: bisect R19 -> R25 on S64K clock (row mapping only / + block_row0 / + drain skip), and check
+the PV / softmax blocks' VALU order.

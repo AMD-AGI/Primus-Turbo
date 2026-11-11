@@ -1,0 +1,14 @@
+rounds/round-19/kernel_snapshot/branch_mla b1_s64k: 133.7625 ms (1315.2 TFLOPS) | clk 1819 MHz (min 1716 max 2120) | power 1327 W | PPT throttle 0.67 | TFLOPS/MHz 0.7230 | 89 samples, 80 calls
+src/branch_mla b1_s64k: 134.3478 ms (1309.5 TFLOPS) | clk 1794 MHz (min 1762 max 2180) | power 1305 W | PPT throttle 0.27 | TFLOPS/MHz 0.7299 | 89 samples, 80 calls
+rounds/round-19/kernel_snapshot/branch_mla b1_s64k: 130.9052 ms (1343.9 TFLOPS) | clk 1860 MHz (min 1841 max 1897) | power 1341 W | PPT throttle 0.89 | TFLOPS/MHz 0.7225 | 87 samples, 80 calls
+src/branch_mla b1_s64k: 133.8397 ms (1314.4 TFLOPS) | clk 1807 MHz (min 1771 max 2184) | power 1310 W | PPT throttle 0.33 | TFLOPS/MHz 0.7274 | 90 samples, 80 calls
+src/branch_mla b1_s64k: 134.3304 ms (1309.6 TFLOPS) | clk 1795 MHz (min 1761 max 2131) | power 1299 W | PPT throttle 0.27 | TFLOPS/MHz 0.7296 | 89 samples, 80 calls
+rounds/round-19/kernel_snapshot/branch_mla b1_s64k: 130.3190 ms (1350.0 TFLOPS) | clk 1862 MHz (min 1842 max 2038) | power 1344 W | PPT throttle 0.90 | TFLOPS/MHz 0.7248 | 86 samples, 80 calls
+src/branch_mla b1_s64k: 133.8834 ms (1314.0 TFLOPS) | clk 1809 MHz (min 1775 max 1945) | power 1310 W | PPT throttle 0.33 | TFLOPS/MHz 0.7264 | 89 samples, 80 calls
+rounds/round-19/kernel_snapshot/branch_mla b1_s64k: 129.9316 ms (1354.0 TFLOPS) | clk 1861 MHz (min 1842 max 2090) | power 1348 W | PPT throttle 0.90 | TFLOPS/MHz 0.7276 | 86 samples, 80 calls
+src/branch_mla b1_s64k: 133.7731 ms (1315.1 TFLOPS) | clk 1809 MHz (min 1779 max 1865) | power 1307 W | PPT throttle 0.33 | TFLOPS/MHz 0.7270 | 89 samples, 80 calls
+rounds/round-19/kernel_snapshot/branch_mla b1_s64k: 129.4967 ms (1358.5 TFLOPS) | clk 1861 MHz (min 1847 max 2177) | power 1348 W | PPT throttle 0.90 | TFLOPS/MHz 0.7300 | 86 samples, 80 calls
+rounds/round-21/kernel_snapshot/branch_mla b1_s64k: 134.9952 ms (1303.2 TFLOPS) | clk 1747 MHz (min 1687 max 2006) | power 1300 W | PPT throttle 0.21 | TFLOPS/MHz 0.7460 | 88 samples, 80 calls
+rounds/round-22/kernel_snapshot/branch_mla b1_s64k: 131.4145 ms (1338.7 TFLOPS) | clk 1858 MHz (min 1827 max 2106) | power 1336 W | PPT throttle 0.88 | TFLOPS/MHz 0.7203 | 86 samples, 80 calls
+rounds/round-23/kernel_snapshot/branch_mla b1_s64k: 134.1505 ms (1311.4 TFLOPS) | clk 1841 MHz (min 1809 max 2204) | power 1300 W | PPT throttle 0.32 | TFLOPS/MHz 0.7123 | 88 samples, 80 calls
+rounds/round-19/kernel_snapshot/branch_mla b1_s64k: 130.4704 ms (1348.4 TFLOPS) | clk 1862 MHz (min 1847 max 2101) | power 1345 W | PPT throttle 0.89 | TFLOPS/MHz 0.7242 | 86 samples, 80 calls
