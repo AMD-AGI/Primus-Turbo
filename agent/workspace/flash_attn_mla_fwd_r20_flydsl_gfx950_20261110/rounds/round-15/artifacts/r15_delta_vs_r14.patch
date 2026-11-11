@@ -1,0 +1,52 @@
+diff -ru --exclude __pycache__ rounds/round-14/kernel_snapshot/branch_mla/attn_helper_mla.py src/branch_mla/attn_helper_mla.py
+--- rounds/round-14/kernel_snapshot/branch_mla/attn_helper_mla.py	2026-11-11 01:54:52.810825791 +0000
++++ src/branch_mla/attn_helper_mla.py	2026-11-11 02:05:08.077759855 +0000
+@@ -36,7 +36,7 @@
+ # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
+ # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
+ # kernel, or a warm cache keeps serving the old one.
+-CODEGEN_REV = 1051
++CODEGEN_REV = 1052
+ 
+ # Room a later key has above a tile's row max before it forces another rebase.
+ REF_MARGIN = 96.0
+@@ -2399,6 +2399,13 @@
+ 
+         _zero_o_block_if_needed()
+ 
++    @property
++    def o_stores_per_lane(self):
++        """buffer_store instructions `store_final_o` issues per lane (16 B each on every path)."""
++        if self.traits.PV_MFMA16 and self.QT == 4:
++            return self.traits.D_CHUNKS * 4
++        return self.traits.D_CHUNKS * 2
++
+     def store_final_o(self, v_o, q_row):
+         if const_expr(self.traits.PV_MFMA16 and self.QT == 4):
+             return self._store_final_o16x4(v_o, q_row)
+diff -ru --exclude __pycache__ rounds/round-14/kernel_snapshot/branch_mla/flash_attn_fwd_mla.py src/branch_mla/flash_attn_fwd_mla.py
+--- rounds/round-14/kernel_snapshot/branch_mla/flash_attn_fwd_mla.py	2026-11-11 01:54:51.347844847 +0000
++++ src/branch_mla/flash_attn_fwd_mla.py	2026-11-11 02:05:06.651778630 +0000
+@@ -272,7 +272,12 @@
+             split_t_end = ctx.split_t_end
+             if const_expr(next_job is None):
+                 ctx.load_k_split(0, 0)
+-            _s_waitcnt(0)
++                _s_waitcnt(0)
++            else:
++                # The previous job issued its O stores after this job's K prefetch, and vmcnt retires
++                # in order: wait for the prefetch only, so the stores drain under the Q loads.
++                _s_waitcnt(traits.LGKMCNT_0_ONLY)
++                _waitcnt_vm_n(ctx.o_stores_per_lane)
+             _sched_barrier(0)
+             _s_barrier()
+ 
+@@ -1091,6 +1096,8 @@
+             n_jobs = _sched_load(sched_row)
+             job_first = _sched_load(sched_row + 1)
+             _prefetch_k(job_first)
++            # No O stores follow the first job's prefetch for the job-top wait to count past.
++            _s_waitcnt(0)
+             for k, job_args in range(fx.Index(0), fx.Index(n_jobs), fx.Index(1), init=[job_first]):
+                 job = fx.Int32(job_args[0])
+                 job_next = _sched_load(sched_row + fx.Int32(k) + 2)

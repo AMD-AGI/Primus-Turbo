@@ -1,0 +1,184 @@
+diff -ru -x __pycache__ rounds/round-16/kernel_snapshot/branch_mla/attn_helper_mla.py src/branch_mla/attn_helper_mla.py
+--- rounds/round-16/kernel_snapshot/branch_mla/attn_helper_mla.py	2026-11-11 03:01:03.283879552 +0000
++++ src/branch_mla/attn_helper_mla.py	2026-11-11 03:17:49.820941078 +0000
+@@ -36,7 +36,7 @@
+ # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
+ # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
+ # kernel, or a warm cache keeps serving the old one.
+-CODEGEN_REV = 1054
++CODEGEN_REV = 1055
+ 
+ # Room a later key has above a tile's row max before it forces another rebase.
+ REF_MARGIN = 96.0
+@@ -1290,6 +1290,11 @@
+     # Pipeline helpers
+ 
+     def load_all(self):
++        self.bind_q_rows()
++        return self.assemble_q(self.load_q_raw(self.q_div, self.q_gmem_elem_offset, self.wave_q_offset))
++
++    def bind_q_rows(self):
++        """This lane's q row (one q per lane) and the wave's first row, for the bound job."""
+         traits = self.traits
+         lane = self.job_lane
+         if const_expr(traits.Q_TILES == 4):
+@@ -1300,6 +1305,35 @@
+         self.q_row = self.q_start + self.q_row_in_block
+         self.q_row_i32 = fx.Int32(self.q_row)
+ 
++    def prefetch_q_raw(self, h_idx, q_block_idx, batch_idx):
++        """`load_q_raw` of the job at (h_idx, q_block_idx, batch_idx), ahead of its bind_item.
++        Rebinds the lane terms; persistent jobs only (never varlen, one q head per WG)."""
++        traits = self.traits
++        assert traits.Q_HEADS_PER_WG == 1
++        tid = self._job_tid()
++        self._bind_lanes(tid)
++        q_div = self._batch_view(
++            self.Q,
++            self.seq_len_v,
++            self.stride_q_n_v,
++            traits.NUM_HEADS_Q,
++            traits.HEAD_DIM,
++            batch_idx,
++            batch_idx * self.seq_len_v,
++        )
++        q_head = (h_idx % traits.NUM_HEADS_KV) * traits.GQA_GROUP_SIZE + h_idx // traits.NUM_HEADS_KV
++        offset = q_block_idx * traits.BLOCK_M * self.stride_q_n_v + q_head * traits.HEAD_DIM
++        return self.load_q_raw(q_div, offset, tid // traits.WARP_SIZE * traits.ROWS_PER_WAVE)
++
++    def load_q_raw(self, q_div, q_elem_offset, wave_q_offset):
++        """This lane's Q packs as loaded (one vector per 16-byte load), before `assemble_q`."""
++        traits = self.traits
++        lane = self.job_lane
++        if const_expr(traits.Q_TILES == 4):
++            q_row_in_block = wave_q_offset + lane
++        else:
++            q_row_in_block = wave_q_offset + lane % 32
++
+         n_packs = traits.Q_TILES * _qk16_k_steps(traits) if traits.QK_MFMA16 else traits.K_STEPS_QK
+         if const_expr(traits.QK_MFMA16):
+             # Per-lane d terms of the 16x16x32 B operand, matching the K reads (QK16_PAIRED_STEPS).
+@@ -1313,21 +1347,25 @@
+                 # d chunk K reads at k-step ks16 (QK16_PAIRED_STEPS).
+                 qt, ks16 = ks // _qk16_k_steps(traits), ks % _qk16_k_steps(traits)
+                 lane_d = paired_d if ks16 < QK16_PAIRED_STEPS else middle_d
+-                elem_index = self.q_gmem_elem_offset + (
+-                    (self.wave_q_offset + lane % 16 + 16 * qt) * self.stride_q_n_v
+-                    + (_qk16_step_d(ks16) + lane_d)
++                elem_index = q_elem_offset + (
++                    (wave_q_offset + lane % 16 + 16 * qt) * self.stride_q_n_v + (_qk16_step_d(ks16) + lane_d)
+                 )
+             else:
+-                elem_index = self.q_gmem_elem_offset + (
+-                    self.q_row_in_block * self.stride_q_n_v
++                elem_index = q_elem_offset + (
++                    q_row_in_block * self.stride_q_n_v
+                     + (ks * self.traits.K_STEP_QK + lane // 32 * self.traits.MFMA_LANE_K)
+                 )
+             q_i32_pack = fly.copy_atom_call_ssa(
+                 [self.q_load_i32x4_type],
+                 self.load_atom_128,
+-                fx.slice(self.q_div, (None, fx.Int32(elem_index))),
++                fx.slice(q_div, (None, fx.Int32(elem_index))),
+             )
+             q_raw_packs.append(Vec(q_i32_pack, (4,), fx.Int32).bitcast(self.elem_dtype).ir_value())
++        return q_raw_packs
++
++    def assemble_q(self, q_raw_packs):
++        traits = self.traits
++        n_packs = len(q_raw_packs)
+         q_16_packs = []
+         for pair in range_constexpr(n_packs // 2):
+             q_16_packs.append(_concat_vectors(q_raw_packs[pair * 2], q_raw_packs[pair * 2 + 1]))
+diff -ru -x __pycache__ rounds/round-16/kernel_snapshot/branch_mla/flash_attn_fwd_mla.py src/branch_mla/flash_attn_fwd_mla.py
+--- rounds/round-16/kernel_snapshot/branch_mla/flash_attn_fwd_mla.py	2026-11-11 03:01:03.283879552 +0000
++++ src/branch_mla/flash_attn_fwd_mla.py	2026-11-11 03:17:49.815941141 +0000
+@@ -268,22 +268,36 @@
+             for t in range_constexpr(2):
+                 ctx.prefetch_k_tile(h_idx, batch_idx, fx.Index(t), t)
+ 
+-        def _main_body(next_job=None):
+-            """With `next_job` (persistent), this job's first two K tiles were prefetched by the
+-            previous job's drain, and this drain prefetches the next job's."""
++        def _prefetch_q(job):
++            """Raw Q packs of a packed persistent job, for its `_main_body(q_raw=...)`."""
++            return ctx.prefetch_q_raw(
++                fx.Index(job & JOB_HEAD_MASK),
++                fx.Index((job >> JOB_QBLOCK_SHIFT) & JOB_QBLOCK_MASK),
++                fx.Index(job >> JOB_BATCH_SHIFT),
++            )
++
++        def _main_body(next_job=None, q_raw=None):
++            """With `next_job` (persistent), this job's first two K tiles and its Q (`q_raw`) were
++            prefetched by the previous job's drain, and this drain prefetches the next job's, which
++            it returns."""
+             split_t_end = ctx.split_t_end
++            q_next = None
+             if const_expr(next_job is None):
+                 ctx.load_k_split(0, 0)
+                 _s_waitcnt(0)
+             else:
+-                # The previous job issued its O stores after this job's K prefetch, and vmcnt retires
+-                # in order: wait for the prefetch only, so the stores drain under the Q loads.
++                # The previous job issued its O stores after this job's K and Q prefetch, and vmcnt
++                # retires in order: wait for the prefetch only, so the stores drain under the prologue.
+                 _s_waitcnt(traits.LGKMCNT_0_ONLY)
+                 _waitcnt_vm_n(ctx.o_stores_per_lane)
+             _sched_barrier(0)
+             _s_barrier()
+ 
+-            q_all_bf16 = ctx.load_all()
++            if const_expr(q_raw is None):
++                q_all_bf16 = ctx.load_all()
++            else:
++                ctx.bind_q_rows()
++                q_all_bf16 = ctx.assemble_q(q_raw)
+             q_all_scaled_bf16 = ctx.scale_all(q_all_bf16)
+ 
+             def _load_k_head(buf_id):
+@@ -1039,8 +1053,10 @@
+                 _waitcnt_vm_n(0)
+                 if const_expr(next_job is not None):
+                     # K buf0 was last read in C5, buf1 in C9; nothing waits on these until the
+-                    # next job's prologue, so they land under C11-C13 and the O store.
++                    # next job's prologue, so they land under C11-C13 and the O store. C9 was also
++                    # the last QK, so this job's Q is dead and the next job's can load.
+                     _prefetch_k(next_job)
++                    q_next = _prefetch_q(next_job)
+                 _dualwave_sync_barrier()
+ 
+                 # Epilogue C11: final rescale and complete the last tile's softmax in-place.
+@@ -1081,6 +1097,7 @@
+             if const_expr(traits.EMIT_LSE):
+                 ctx.store_lse(m_lse, l_lse, ctx.q_row)
+             ctx.store_final_o(v_o, ctx.q_row)
++            return q_next
+ 
+         if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN):
+             ctx.zero_o_block_if_needed()
+@@ -1098,10 +1115,13 @@
+             n_jobs = _sched_load(sched_row)
+             job_first = _sched_load(sched_row + 1)
+             _prefetch_k(job_first)
++            q_first = _prefetch_q(job_first)
+             # No O stores follow the first job's prefetch for the job-top wait to count past.
+             _s_waitcnt(0)
+-            for k, job_args in range(fx.Index(0), fx.Index(n_jobs), fx.Index(1), init=[job_first]):
++            n_q = len(q_first)
++            for k, job_args in range(fx.Index(0), fx.Index(n_jobs), fx.Index(1), init=[job_first] + q_first):
+                 job = fx.Int32(job_args[0])
++                q_cur = [job_args[1 + i] for i in range_constexpr(n_q)]
+                 job_next = _sched_load(sched_row + fx.Int32(k) + 2)
+                 # The last job's drain re-fetches its own tiles rather than whatever follows the row.
+                 job_prefetch = fx.Int32(ArithValue(fx.Int32(k) + 1 < n_jobs).select(job_next, job))
+@@ -1110,8 +1130,8 @@
+                     fx.Index((job >> JOB_QBLOCK_SHIFT) & JOB_QBLOCK_MASK),
+                     fx.Index(job >> JOB_BATCH_SHIFT),
+                 )
+-                _main_body(next_job=job_prefetch)
+-                _ = yield [job_next]
++                q_next = _main_body(next_job=job_prefetch, q_raw=q_cur)
++                _ = yield [job_next] + q_next
+             _s_waitcnt(0)
+         elif active is None:
+             _main_body()

@@ -1,0 +1,21 @@
+== warmq
+dsv3      PASS o_rel nan lse nan  cand  1152.6  base  1137.9  cand/base 1.0129  bitwise False  spread% 0.18/0.15
+dsv2lite  PASS o_rel nan lse nan  cand  1109.9  base  1100.9  cand/base 1.0082  bitwise False  spread% 0.27/0.15
+kimik3    PASS o_rel nan lse nan  cand  1236.6  base  1234.0  cand/base 1.0021  bitwise False  spread% 0.43/0.16
+b1_s16k   PASS o_rel nan lse nan  cand  1289.6  base  1288.4  cand/base 1.0009  bitwise False  spread% 0.26/0.15
+b1_s64k   PASS o_rel nan lse nan  cand  1346.3  base  1324.4  cand/base 1.0165  bitwise False  spread% 0.86/0.3
+PASS 5/5  geomean cand 1223.93  base 1214.08  cand/base 1.0081  bitwise 0/5
+== warmqh
+dsv3      PASS o_rel nan lse nan  cand  1147.1  base  1137.4  cand/base 1.0085  bitwise False  spread% 0.2/0.15
+dsv2lite  PASS o_rel nan lse nan  cand  1108.3  base  1101.5  cand/base 1.0062  bitwise False  spread% 0.2/0.13
+kimik3    PASS o_rel nan lse nan  cand  1241.0  base  1237.5  cand/base 1.0028  bitwise False  spread% 0.4/0.14
+b1_s16k   PASS o_rel nan lse nan  cand  1297.3  base  1294.0  cand/base 1.0026  bitwise False  spread% 0.11/0.09
+b1_s64k   PASS o_rel nan lse nan  cand  1359.7  base  1327.9  cand/base 1.0239  bitwise False  spread% 0.65/0.15
+PASS 5/5  geomean cand 1227.16  base 1216.49  cand/base 1.0088  bitwise 0/5
+== coalq
+dsv3      PASS o_rel nan lse nan  cand  1169.6  base  1137.9  cand/base 1.0279  bitwise False  spread% 0.16/0.18
+dsv2lite  PASS o_rel nan lse nan  cand  1120.0  base  1099.0  cand/base 1.0191  bitwise False  spread% 0.25/0.12
+kimik3    PASS o_rel nan lse nan  cand  1247.9  base  1237.1  cand/base 1.0087  bitwise False  spread% 0.28/0.04
+b1_s16k   PASS o_rel nan lse nan  cand  1296.6  base  1291.8  cand/base 1.0037  bitwise False  spread% 0.52/0.21
+b1_s64k   PASS o_rel nan lse nan  cand  1346.1  base  1324.8  cand/base 1.0161  bitwise False  spread% 0.56/0.24
+PASS 5/5  geomean cand 1233.29  base 1214.98  cand/base 1.0151  bitwise 0/5

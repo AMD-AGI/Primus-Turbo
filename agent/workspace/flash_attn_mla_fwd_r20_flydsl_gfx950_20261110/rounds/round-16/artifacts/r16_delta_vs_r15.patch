@@ -1,0 +1,143 @@
+diff -ru -x __pycache__ rounds/round-15/kernel_snapshot/branch_mla/attn_helper_mla.py src/branch_mla/attn_helper_mla.py
+--- rounds/round-15/kernel_snapshot/branch_mla/attn_helper_mla.py	2026-11-11 02:05:08.077759855 +0000
++++ src/branch_mla/attn_helper_mla.py	2026-11-11 02:50:53.311673660 +0000
+@@ -36,7 +36,7 @@
+ # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
+ # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
+ # kernel, or a warm cache keeps serving the old one.
+-CODEGEN_REV = 1052
++CODEGEN_REV = 1054
+ 
+ # Room a later key has above a tile's row max before it forces another rebase.
+ REF_MARGIN = 96.0
+@@ -467,6 +467,25 @@
+     ).result
+ 
+ 
++def _lds_o_scopes(traits):
++    # One-sided: scoped AA separates either way, and leaving "lds_o" out of the K / V noalias
++    # lists keeps their metadata (and the loop schedule) as without the O stage.
++    return dict(
++        alias_scopes=_dualwave_lds_alias_scopes("lds_o"),
++        noalias_scopes=_lds_alias_scope_array(traits.LDS_SCOPE_NAMES),
++    )
++
++
++def _lds_store_o_128(traits, pack_i32_vec, lane_ptr, imm_bytes):
++    ptr = buffer_ops.get_element_ptr(lane_ptr, byte_offset=int(imm_bytes), elem_type=T.i8)
++    llvm.StoreOp(pack_i32_vec.ir_value(), ptr, alignment=16, **_lds_o_scopes(traits))
++
++
++def _lds_load_o_128(traits, lane_ptr, imm_bytes):
++    ptr = buffer_ops.get_element_ptr(lane_ptr, byte_offset=int(imm_bytes), elem_type=T.i8)
++    return Vec(llvm.LoadOp(Vec.make_type(4, fx.Int32), ptr, alignment=16, **_lds_o_scopes(traits)).result)
++
++
+ def _buffer_store_128(pack_i32_vec, elem_index, _o_store_reg_128, _store_atom_128, o_div):
+     fx.memref_store_vec(pack_i32_vec, _o_store_reg_128)
+     fx.copy(_store_atom_128, _o_store_reg_128, fx.slice(o_div, (None, fx.Int32(elem_index))))
+@@ -744,6 +763,11 @@
+         SMEM_K_TILE_ELEMS=smem_k_tile_elems,
+         DUALWAVE_SWP_KV_PER_BUFFER=dualwave_swp_kv_per_buffer,
+         LDS_KV_TOTAL_SIZE=2 * dualwave_swp_kv_per_buffer,
++        # The 64-row O store (`_store_final_o16x4`) goes through a per-wave LDS tile so each
++        # buffer_store covers four whole q rows; rows are padded 16 B off the 64-bank period.
++        O_LDS_STAGE=bool(pv_mfma16) and rows_per_wave == 64,
++        O_STAGE_ROW_ELEMS=head_dim_v + 16 // bf16_bytes,
++        LDS_O_STAGE_SIZE=num_waves * rows_per_wave * (head_dim_v + 16 // bf16_bytes),
+         DUALWAVE_SWP_K_BUF_BASE=(0, dualwave_swp_kv_per_buffer),
+         DUALWAVE_SWP_V_BUF_BASE=(smem_k_tile_elems, smem_k_tile_elems + dualwave_swp_kv_per_buffer),
+         # K LDS->VGPR reads: hi half jumps one N strip; ks uses inner then d_rpt stride.
+@@ -880,6 +904,10 @@
+         self.lds = lds
+         self.lds_kv_base_idx = fx.Index(fx.ptrtoint(lds.kv.ptr))
+         self.lds_kv_base_ptr = buffer_ops.create_llvm_ptr(self.lds_kv_base_idx, address_space=3)
++        if const_expr(traits.O_LDS_STAGE):
++            self.lds_o_base_ptr = buffer_ops.create_llvm_ptr(
++                fx.Index(fx.ptrtoint(lds.o.ptr)), address_space=3
++            )
+ 
+         self.tid = fx.Index(gpu.thread_idx.x)
+         self._bind_lane_layout(self.tid)
+@@ -2439,9 +2467,18 @@
+     def _store_final_o16x4(self, v_o, q_row):
+         """Four q tiles: lane row c holds dv 16 t + 4 c + [0, 4) of q lane % 16 + 16 qt. A 4x4
+         transpose across lane rows (half-wave swaps join rows c and c ^ 2, then row-pair swaps
+-        c and c ^ 1) gives every lane all 16 dv of tile t for its own q = lane: two 16-byte stores."""
++        c and c ^ 1) gives every lane all 16 dv of tile t for its own q = lane: two 16-byte stores.
++        Those touch 64 q rows each, 16 B per row; with O_LDS_STAGE they go to the wave's LDS
++        tile instead, which is then stored four whole rows (16 lanes each) per buffer_store."""
+         traits = self.traits
+         o_base = q_row * self.stride_o_n_v + self.q_head_idx * traits.HEAD_DIM_V
++        if const_expr(traits.O_LDS_STAGE):
++            # Fresh lane terms: CSE with the job's own would keep them live across the KV loop.
++            tid = self._job_tid()
++            lane = tid % traits.WARP_SIZE
++            row_bytes = traits.O_STAGE_ROW_ELEMS * traits.BF16_BYTES
++            wave_tile = tid // traits.WARP_SIZE * (traits.ROWS_PER_WAVE * row_bytes)
++            stage_lane = self.lds_o_byte_ptr(wave_tile + lane * row_bytes)
+         for dc in range_constexpr(traits.D_CHUNKS):
+             for g in range_constexpr(2):
+                 x = [_o_pack_2dw(traits, v_o, dc, 4 * g + qt, self.elem_dtype) for qt in range(4)]
+@@ -2454,13 +2491,42 @@
+                     words = [None] * 4
+                     for w in range_constexpr(2):
+                         words[w], words[2 + w] = _permlane16_swap_i32(z[0][a][w], z[1][a][w])
+-                    _buffer_store_128(
+-                        Vec.from_elements([fx.Int32(v) for v in words], fx.Int32),
+-                        o_base + 16 * (dc + 4 * g) + 8 * a,
+-                        _o_store_reg_128=self.o_store_reg_128,
+-                        _store_atom_128=self.store_atom_128,
+-                        o_div=self.o_div,
+-                    )
++                    pack = Vec.from_elements([fx.Int32(v) for v in words], fx.Int32)
++                    dv = 16 * (dc + 4 * g) + 8 * a
++                    if const_expr(traits.O_LDS_STAGE):
++                        _lds_store_o_128(traits, pack, stage_lane, dv * traits.BF16_BYTES)
++                    else:
++                        _buffer_store_128(
++                            pack,
++                            o_base + dv,
++                            _o_store_reg_128=self.o_store_reg_128,
++                            _store_atom_128=self.store_atom_128,
++                            o_div=self.o_div,
++                        )
++        if const_expr(traits.O_LDS_STAGE):
++            # The wave reads back only its own tile, and its DS ops complete in order: no barrier.
++            lanes_per_row = traits.HEAD_DIM_V * traits.BF16_BYTES // 16
++            rows_per_store = traits.WARP_SIZE // lanes_per_row
++            row, chunk = lane // lanes_per_row, lane % lanes_per_row
++            read_lane = self.lds_o_byte_ptr(wave_tile + row * row_bytes + chunk * 16)
++            o_row = (q_row - lane + row) * self.stride_o_n_v + self.q_head_idx * traits.HEAD_DIM_V
++            o_row = o_row + chunk * (16 // traits.BF16_BYTES)
++            # A running sum: separate i * stride products are job-invariant and get hoisted.
++            o_step = rows_per_store * self.stride_o_n_v
++            for i in range_constexpr(traits.ROWS_PER_WAVE // rows_per_store):
++                _buffer_store_128(
++                    _lds_load_o_128(traits, read_lane, i * rows_per_store * row_bytes),
++                    o_row,
++                    _o_store_reg_128=self.o_store_reg_128,
++                    _store_atom_128=self.store_atom_128,
++                    o_div=self.o_div,
++                )
++                o_row = o_row + o_step
++
++    def lds_o_byte_ptr(self, byte_offset):
++        return buffer_ops.get_element_ptr(
++            self.lds_o_base_ptr, byte_offset=as_mlir_value(fx.Int32(byte_offset)), elem_type=T.i8
++        )
+ 
+     def store_lse(self, m_row, l_row, q_row):
+         """LSE: m_row/l_row live in the log2 domain, hence LSE_natural =
+diff -ru -x __pycache__ rounds/round-15/kernel_snapshot/branch_mla/flash_attn_fwd_mla.py src/branch_mla/flash_attn_fwd_mla.py
+--- rounds/round-15/kernel_snapshot/branch_mla/flash_attn_fwd_mla.py	2026-11-11 02:05:06.651778630 +0000
++++ src/branch_mla/flash_attn_fwd_mla.py	2026-11-11 02:43:49.327463312 +0000
+@@ -156,6 +156,8 @@
+     @fx.struct
+     class SharedStorage:
+         kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
++        if traits.O_LDS_STAGE:
++            o: fx.Array[_lds_elem_dtype, traits.LDS_O_STAGE_SIZE, 16]
+ 
+     @flyc.kernel(known_block_size=[traits.BLOCK_SIZE, 1, 1])
+     def flash_attn_dualwave_swp_gfx950_kernel(

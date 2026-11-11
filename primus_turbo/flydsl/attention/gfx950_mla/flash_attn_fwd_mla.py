@@ -29,6 +29,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
@@ -148,6 +149,11 @@ def build_flash_attn_dualwave_swp_module(
     assert 1 <= traits.K_HEAD <= traits.K_STEPS_QK
     traits.PERSISTENT = int(persistent)
     assert not traits.PERSISTENT or not (varlen or cross_seqlen or window_left >= 0)
+    # Persistent drains DMA part of the next job's Q through the O stage tiles (stage_q_dma);
+    # its geometry is the D_QK 192 paired-step split.
+    traits.Q_LDS_STAGE = bool(
+        traits.PERSISTENT and traits.O_LDS_STAGE and traits.QK_MFMA16 and traits.HEAD_DIM == 192
+    )
     _dualwave_swp_cache_tag = traits.cache_tag
 
     _lds_elem_dtype = dtype_to_elem_type(traits.DTYPE_STR)
@@ -155,6 +161,8 @@ def build_flash_attn_dualwave_swp_module(
     @fx.struct
     class SharedStorage:
         kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
+        if traits.O_LDS_STAGE:
+            o: fx.Array[_lds_elem_dtype, traits.LDS_O_STAGE_SIZE, 16]
 
     @flyc.kernel(known_block_size=[traits.BLOCK_SIZE, 1, 1])
     def flash_attn_dualwave_swp_gfx950_kernel(
@@ -259,14 +267,49 @@ def build_flash_attn_dualwave_swp_module(
             l_row_init = ctx.c_zero_f
         v_o_zero = ctx.c_zero_o if traits.PV_MFMA16 else ctx.c_zero_v16f32
 
-        def _main_body():
+        def _prefetch_k(job):
+            """First two K tiles of a packed persistent job (split_t0 is 0 there) into buf0 / buf1."""
+            h_idx, batch_idx = fx.Index(job & JOB_HEAD_MASK), fx.Index(job >> JOB_BATCH_SHIFT)
+            for t in range_constexpr(2):
+                ctx.prefetch_k_tile(h_idx, batch_idx, fx.Index(t), t)
+
+        def _job_coords(job):
+            """(head, q block, batch) of a packed persistent job."""
+            return (
+                fx.Index(job & JOB_HEAD_MASK),
+                fx.Index((job >> JOB_QBLOCK_SHIFT) & JOB_QBLOCK_MASK),
+                fx.Index(job >> JOB_BATCH_SHIFT),
+            )
+
+        def _prefetch_q(job, staged=False):
+            """Raw Q packs of a packed persistent job, for its `_main_body(q_raw=...)`; `staged`
+            leaves the O-stage ones None for `read_q_stage`."""
+            if const_expr(staged):
+                return ctx.prefetch_q_staged(*_job_coords(job))
+            return ctx.prefetch_q_raw(*_job_coords(job))
+
+        def _main_body(next_job=None, q_raw=None):
+            """With `next_job` (persistent), this job's first two K tiles and its Q (`q_raw`) were
+            prefetched by the previous job's drain, and this drain prefetches the next job's, which
+            it returns."""
             split_t_end = ctx.split_t_end
-            ctx.load_k_split(0, 0)
-            _s_waitcnt(0)
+            q_next = None
+            if const_expr(next_job is None):
+                ctx.load_k_split(0, 0)
+                _s_waitcnt(0)
+            else:
+                # The previous job issued its O stores after this job's K and Q prefetch, and vmcnt
+                # retires in order: wait for the prefetch only, so the stores drain under the prologue.
+                _s_waitcnt(traits.LGKMCNT_0_ONLY)
+                _waitcnt_vm_n(ctx.o_stores_per_lane)
             _sched_barrier(0)
             _s_barrier()
 
-            q_all_bf16 = ctx.load_all()
+            if const_expr(q_raw is None):
+                q_all_bf16 = ctx.load_all()
+            else:
+                ctx.bind_q_rows()
+                q_all_bf16 = ctx.assemble_q(q_raw)
             q_all_scaled_bf16 = ctx.scale_all(q_all_bf16)
 
             def _load_k_head(buf_id):
@@ -395,12 +438,16 @@ def build_flash_attn_dualwave_swp_module(
 
                 return _pv_branch(v_o, live_hi, _tail)
 
-            ctx.load_k_split(1, 1)
+            if const_expr(next_job is None):
+                ctx.load_k_split(1, 1)
             ctx.load_v_split(0, 0)
             v_k = _load_k_head(0)
             _sched_barrier(0)
             _s_waitcnt(traits.LGKMCNT_0_ONLY)
-            _waitcnt_vm_n(ctx.VM_DRAIN_V)
+            # This drain is for K1. A prefetched K1 is already resident, and V0 is first read after
+            # the next cluster's drain, so it stays in flight under QK0.
+            if const_expr(next_job is None):
+                _waitcnt_vm_n(ctx.VM_DRAIN_V)
 
             _sched_barrier(0)
             _dualwave_sync_barrier()
@@ -996,6 +1043,10 @@ def build_flash_attn_dualwave_swp_module(
                 _dualwave_sync_barrier()
 
                 # Epilogue C9 finishes v_p_0, then computes the last-tile MMA0.
+                if const_expr(next_job is not None and traits.Q_LDS_STAGE):
+                    # Only the last wave's QK half is live in this cluster; the other waves fill
+                    # the next job's Q stage meanwhile. C10's vmcnt(0) and sync publish it.
+                    ctx.stage_q_dma(*_job_coords(next_job))
                 v_p_0 = ctx.exp2(v_p_0, 16, 16)
                 v_p_0, l_row = ctx.cast_p_and_sum(l_row, v_p_0)
                 v_s_1 = _qk_diag(v_k, 1, _live_m1)
@@ -1016,6 +1067,12 @@ def build_flash_attn_dualwave_swp_module(
                     v_s_1 = ctx.seq_pad_mask_if_needed(v_s_1, max_m1)
                 _s_waitcnt(traits.LGKMCNT_0_ONLY)
                 _waitcnt_vm_n(0)
+                if const_expr(next_job is not None):
+                    # K buf0 was last read in C5, buf1 in C9; nothing waits on these until the
+                    # next job's prologue, so they land under C11-C13 and the O store. C9 was also
+                    # the last QK, so this job's Q is dead and the next job's can load.
+                    _prefetch_k(next_job)
+                    q_next = _prefetch_q(next_job, staged=traits.Q_LDS_STAGE)
                 _dualwave_sync_barrier()
 
                 # Epilogue C11: final rescale and complete the last tile's softmax in-place.
@@ -1052,10 +1109,15 @@ def build_flash_attn_dualwave_swp_module(
 
             _s_barrier()
 
+            if const_expr(q_next is not None and traits.Q_LDS_STAGE):
+                # The O store below reuses the stage, so read it back first.
+                q_next = ctx.read_q_stage(q_next)
+
             # Store LSE before O so sink+LSE temps are not live across the O-store register peak.
             if const_expr(traits.EMIT_LSE):
                 ctx.store_lse(m_lse, l_lse, ctx.q_row)
             ctx.store_final_o(v_o, ctx.q_row)
+            return q_next
 
         if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN):
             ctx.zero_o_block_if_needed()
@@ -1071,18 +1133,26 @@ def build_flash_attn_dualwave_swp_module(
                 return fx.Int32(buffer_ops.buffer_load(sched_rsrc, idx, vec_width=1, is_scalar=True))
 
             n_jobs = _sched_load(sched_row)
-            for k, job_args in range(
-                fx.Index(0), fx.Index(n_jobs), fx.Index(1), init=[_sched_load(sched_row + 1)]
-            ):
+            job_first = _sched_load(sched_row + 1)
+            _prefetch_k(job_first)
+            q_first = _prefetch_q(job_first)
+            # No O stores follow the first job's prefetch for the job-top wait to count past.
+            _s_waitcnt(0)
+            n_q = len(q_first)
+            for k, job_args in range(fx.Index(0), fx.Index(n_jobs), fx.Index(1), init=[job_first] + q_first):
                 job = fx.Int32(job_args[0])
+                q_cur = [job_args[1 + i] for i in range_constexpr(n_q)]
                 job_next = _sched_load(sched_row + fx.Int32(k) + 2)
+                # The last job's drain re-fetches its own tiles rather than whatever follows the row.
+                job_prefetch = fx.Int32(ArithValue(fx.Int32(k) + 1 < n_jobs).select(job_next, job))
                 ctx.bind_item(
                     fx.Index(job & JOB_HEAD_MASK),
                     fx.Index((job >> JOB_QBLOCK_SHIFT) & JOB_QBLOCK_MASK),
                     fx.Index(job >> JOB_BATCH_SHIFT),
                 )
-                _main_body()
-                _ = yield [job_next]
+                q_next = _main_body(next_job=job_prefetch, q_raw=q_cur)
+                _ = yield [job_next] + q_next
+            _s_waitcnt(0)
         elif active is None:
             _main_body()
         else:

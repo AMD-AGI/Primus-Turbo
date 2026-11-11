@@ -1,0 +1,134 @@
+--- rounds/round-11/kernel_snapshot/branch_mla/attn_helper_mla.py	2026-11-11 01:32:08.359792217 +0000
++++ src/branch_mla/attn_helper_mla.py	2026-11-11 01:36:18.937450500 +0000
+@@ -36,7 +36,7 @@
+ # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
+ # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
+ # kernel, or a warm cache keeps serving the old one.
+-CODEGEN_REV = 1048
++CODEGEN_REV = 1049
+ 
+ # Room a later key has above a tile's row max before it forces another rebase.
+ REF_MARGIN = 96.0
+@@ -882,11 +882,7 @@
+         self.lds_kv_base_ptr = buffer_ops.create_llvm_ptr(self.lds_kv_base_idx, address_space=3)
+ 
+         self.tid = fx.Index(gpu.thread_idx.x)
+-
+-        self.wave_id = self.tid // traits.WARP_SIZE
+-        self.lane = self.tid % traits.WARP_SIZE
+-        self.lane_mod_32 = self.lane % 32
+-        self.lane_div_32 = self.lane // 32
++        self._bind_lane_layout(self.tid)
+ 
+         _tid_i32 = as_mlir_value(fx.Int32(self.tid))
+         _wave_id_uni_i32 = rocdl.readfirstlane(
+@@ -894,16 +890,10 @@
+             arith.divsi(_tid_i32, as_mlir_value(fx.Int32(traits.WARP_SIZE))),
+         )
+         self.wave_id_uni = fx.Index(_wave_id_uni_i32)
+-
+-        # Merged CTAs stack Q_HEADS_PER_WG sharers of one kv-head on top of the row groups:
+-        # the low wave bits pick the row group, the high bits pick the sharer.
+         if const_expr(traits.Q_HEADS_PER_WG > 1):
+-            self.wave_row_group = self.wave_id % traits.WAVE_ROW_GROUPS
+             self.wave_row_group_uni = self.wave_id_uni % traits.WAVE_ROW_GROUPS
+         else:
+-            self.wave_row_group = self.wave_id
+             self.wave_row_group_uni = self.wave_id_uni
+-        self.wave_q_offset = self.wave_row_group * traits.ROWS_PER_WAVE
+ 
+         self.buf_flags_i32 = fx.Int32(buffer_ops._get_buffer_flags())
+         self.elem_ir = self.elem_dtype.ir_type
+@@ -949,6 +939,30 @@
+ 
+         self.kv_tile_size = traits.BLOCK_N
+ 
++        self.k_dma_m0 = self.dma_m0_table(
++            lambda b, w, d: self._dma_base(b, w, d, _k_buf_base, traits.SMEM_K_LINE_STRIDE), self.NUM_DMA_K
++        )
++        self.v_dma_m0 = self.dma_m0_table(
++            lambda b, w, d: self._dma_base(b, w, d, _v_buf_base, traits.SMEM_V_LINE_STRIDE), self.NUM_DMA_V
++        )
++        if bind_block:
++            self.bind_item(*self.block_item())
++
++    def _bind_lane_layout(self, tid):
++        """Lane / wave terms of thread `tid`: q rows, LDS read bases, mask and store lanes."""
++        traits = self.traits
++        self.wave_id = tid // traits.WARP_SIZE
++        self.lane = tid % traits.WARP_SIZE
++        self.lane_mod_32 = self.lane % 32
++        self.lane_div_32 = self.lane // 32
++        # Merged CTAs stack Q_HEADS_PER_WG sharers of one kv-head on top of the row groups:
++        # the low wave bits pick the row group, the high bits pick the sharer.
++        if const_expr(traits.Q_HEADS_PER_WG > 1):
++            self.wave_row_group = self.wave_id % traits.WAVE_ROW_GROUPS
++        else:
++            self.wave_row_group = self.wave_id
++        self.wave_q_offset = self.wave_row_group * traits.ROWS_PER_WAVE
++
+         if const_expr(traits.QK_MFMA16):
+             # 16x16x32 A operand: row r = lane % 16 of kv tile kt holds kv 16 kt + [0, 8, 4, 12][r // 4]
+             # + r % 4 (bits 2 and 3 of r swapped), which is the row order the permlane16 swap in
+@@ -1000,15 +1014,6 @@
+             )
+             self.v16_read_base = (_v_lane + 16 * (_c % 2), _v_lane + 16 - 16 * (_c % 2))
+ 
+-        self.k_dma_m0 = self.dma_m0_table(
+-            lambda b, w, d: self._dma_base(b, w, d, _k_buf_base, traits.SMEM_K_LINE_STRIDE), self.NUM_DMA_K
+-        )
+-        self.v_dma_m0 = self.dma_m0_table(
+-            lambda b, w, d: self._dma_base(b, w, d, _v_buf_base, traits.SMEM_V_LINE_STRIDE), self.NUM_DMA_V
+-        )
+-        if bind_block:
+-            self.bind_item(*self.block_item())
+-
+     def block_item(self):
+         """(head, q block, batch) this CTA owns in the one-job-per-CTA grid."""
+         traits = self.traits
+@@ -1065,7 +1070,10 @@
+         self.q_block_idx = q_block_idx
+         self.batch_idx = batch_idx
+         self.q_start = self.q_block_idx * traits.BLOCK_M
+-        self._bind_lanes()
++        tid = self._job_tid()
++        self._bind_lanes(tid)
++        if const_expr(getattr(traits, "PERSISTENT", 0)):
++            self._bind_lane_layout(tid)
+ 
+         self.h_kv_idx = self.h_idx % traits.NUM_HEADS_KV
+         self.group_id = self.h_idx // traits.NUM_HEADS_KV
+@@ -1174,14 +1182,17 @@
+         else:
+             self.active = None
+ 
+-    def _bind_lanes(self):
+-        """Lane terms of the global Q / K / V offsets. They are job-invariant, so in the persistent
+-        job loop LICM hoists them out and they spill across it (~70 VGPRs at D_QK 192); an
+-        opaque tid per binding keeps them next to their uses."""
++    def _job_tid(self):
++        """The thread id; opaque in persistent jobs. Lane terms are job-invariant, so in the job
++        loop LICM hoists them out and they spill across it (~70 VGPRs at D_QK 192); deriving them
++        from an opaque tid per job keeps them next to their uses."""
++        if const_expr(getattr(self.traits, "PERSISTENT", 0)):
++            return fx.Index(_pin_regs([fx.Int32(self.tid)], "=v")[0])
++        return self.tid
++
++    def _bind_lanes(self, tid):
++        """Lane terms of the global Q / K / V offsets."""
+         traits = self.traits
+-        tid = self.tid
+-        if const_expr(getattr(traits, "PERSISTENT", 0)):
+-            tid = fx.Index(_pin_regs([fx.Int32(tid)], "=v")[0])
+         self.job_lane = tid % traits.WARP_SIZE
+         self.dma_wave = tid // traits.WARP_SIZE
+         self.n_in_warp = self.job_lane // traits.VEC_KV
+@@ -2186,7 +2197,7 @@
+         """K tile `tile_idx` of the job at (head h_idx, batch_idx) into `buf_id`, ahead of that
+         job's bind_item. Rebinds the lane terms; persistent jobs only (never varlen)."""
+         traits = self.traits
+-        self._bind_lanes()
++        self._bind_lanes(self._job_tid())
+         k_div = self._batch_view(
+             self.K,
+             self.seq_len_kv_v,

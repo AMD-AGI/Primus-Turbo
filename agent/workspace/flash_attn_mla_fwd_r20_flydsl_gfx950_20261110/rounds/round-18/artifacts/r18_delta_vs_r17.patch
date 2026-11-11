@@ -1,0 +1,198 @@
+diff -u -x __pycache__ rounds/round-17/kernel_snapshot/branch_mla/attn_helper_mla.py src/branch_mla/attn_helper_mla.py
+--- rounds/round-17/kernel_snapshot/branch_mla/attn_helper_mla.py	2026-11-11 03:23:42.701466366 +0000
++++ src/branch_mla/attn_helper_mla.py	2026-11-11 04:07:26.586080640 +0000
+@@ -36,7 +36,7 @@
+ # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
+ # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
+ # kernel, or a warm cache keeps serving the old one.
+-CODEGEN_REV = 1055
++CODEGEN_REV = 1056
+ 
+ # Room a later key has above a tile's row max before it forces another rebase.
+ REF_MARGIN = 96.0
+@@ -507,6 +507,9 @@
+ # in lane row groups 0 and 3 at chunk m ^ 4 (`_k_mid_swizzled`), which moves those rows' banks
+ # by 64 bytes; the remaining steps then read d = 64 + 16 (s - 4) + 32 (c % 2) + 8 (c // 2).
+ QK16_PAIRED_STEPS = 4
++# Q_LDS_STAGE: a stage row is the paired steps' part of a Q row, d blocks 0 and 2 (256 bytes).
++Q_STAGE_ROW_BYTES = 256
++Q_STAGE_ROW_CHUNKS = Q_STAGE_ROW_BYTES // 16
+ 
+ 
+ def _qk16_step_d(step):
+@@ -905,9 +908,8 @@
+         self.lds_kv_base_idx = fx.Index(fx.ptrtoint(lds.kv.ptr))
+         self.lds_kv_base_ptr = buffer_ops.create_llvm_ptr(self.lds_kv_base_idx, address_space=3)
+         if const_expr(traits.O_LDS_STAGE):
+-            self.lds_o_base_ptr = buffer_ops.create_llvm_ptr(
+-                fx.Index(fx.ptrtoint(lds.o.ptr)), address_space=3
+-            )
++            self.lds_o_base_idx = fx.Index(fx.ptrtoint(lds.o.ptr))
++            self.lds_o_base_ptr = buffer_ops.create_llvm_ptr(self.lds_o_base_idx, address_space=3)
+ 
+         self.tid = fx.Index(gpu.thread_idx.x)
+         self._bind_lane_layout(self.tid)
+@@ -1305,13 +1307,10 @@
+         self.q_row = self.q_start + self.q_row_in_block
+         self.q_row_i32 = fx.Int32(self.q_row)
+ 
+-    def prefetch_q_raw(self, h_idx, q_block_idx, batch_idx):
+-        """`load_q_raw` of the job at (h_idx, q_block_idx, batch_idx), ahead of its bind_item.
+-        Rebinds the lane terms; persistent jobs only (never varlen, one q head per WG)."""
++    def _q_job_view(self, h_idx, q_block_idx, batch_idx):
++        """Q view and block element offset of the persistent job at (h_idx, q_block_idx, batch_idx)."""
+         traits = self.traits
+         assert traits.Q_HEADS_PER_WG == 1
+-        tid = self._job_tid()
+-        self._bind_lanes(tid)
+         q_div = self._batch_view(
+             self.Q,
+             self.seq_len_v,
+@@ -1323,10 +1322,77 @@
+         )
+         q_head = (h_idx % traits.NUM_HEADS_KV) * traits.GQA_GROUP_SIZE + h_idx // traits.NUM_HEADS_KV
+         offset = q_block_idx * traits.BLOCK_M * self.stride_q_n_v + q_head * traits.HEAD_DIM
++        return q_div, offset
++
++    def prefetch_q_raw(self, h_idx, q_block_idx, batch_idx):
++        """`load_q_raw` of the job at (h_idx, q_block_idx, batch_idx), ahead of its bind_item.
++        Rebinds the lane terms; persistent jobs only (never varlen, one q head per WG)."""
++        traits = self.traits
++        tid = self._job_tid()
++        self._bind_lanes(tid)
++        q_div, offset = self._q_job_view(h_idx, q_block_idx, batch_idx)
+         return self.load_q_raw(q_div, offset, tid // traits.WARP_SIZE * traits.ROWS_PER_WAVE)
+ 
+-    def load_q_raw(self, q_div, q_elem_offset, wave_q_offset):
+-        """This lane's Q packs as loaded (one vector per 16-byte load), before `assemble_q`."""
++    def prefetch_q_staged(self, h_idx, q_block_idx, batch_idx):
++        """`prefetch_q_raw` with the paired k-steps' packs left as None: their d blocks 0 and 2 are
++        lines 0 and 2 of every 384-byte Q row, and go by DMA into the wave's O stage tile, whole
++        lines per quarter-wave, where a gather spends a line on every 16 bytes. Once the DMA has
++        landed `read_q_stage` fills them in; the middle block stays a gather."""
++        traits = self.traits
++        assert traits.Q_LDS_STAGE
++        tid = self._job_tid()
++        self._bind_lanes(tid)
++        q_div, offset = self._q_job_view(h_idx, q_block_idx, batch_idx)
++        wave, lane = tid // traits.WARP_SIZE, tid % traits.WARP_SIZE
++        wave_q_offset = wave * traits.ROWS_PER_WAVE
++        m0_base = rocdl.readfirstlane(
++            T.i32, as_mlir_value(fx.Int32(self.lds_o_base_idx + wave * self._o_stage_wave_bytes))
++        )
++        # DMA i fills stage rows 4 i + lane // 16; chunk lane % 16 of row r holds the row's
++        # part-A chunk (lane % 16 - r) % 16, so `read_q_stage` meets 16 distinct chunks per k-step.
++        rows_per_dma = traits.WARP_SIZE // Q_STAGE_ROW_CHUNKS
++        chunk_offs = []
++        for i in range_constexpr(4):
++            j = (lane % 16 + 32 - lane // 16 - rows_per_dma * i) % 16
++            chunk_offs.append(j % 8 * traits.VEC_KV + j // 8 * 128)
++        row_elem = offset + (wave_q_offset + lane // 16) * self.stride_q_n_v
++        row_step = rows_per_dma * self.stride_q_n_v
++        for i in range_constexpr(traits.ROWS_PER_WAVE // rows_per_dma):
++            lds_ptr = fx.inttoptr(self.lds_ptr_ty, fx.Int32(m0_base) + fx.Int32(i * traits.WARP_SIZE * 16))
++            dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
++            src = fx.slice(q_div, (None, fx.Int32(row_elem + chunk_offs[i % 4])))
++            fx.copy(self.dma_atom, src, dst, soffset=fx.Int32(0))
++            row_elem = row_elem + row_step
++        return self.load_q_raw(q_div, offset, wave_q_offset, keep=lambda ks16: ks16 >= QK16_PAIRED_STEPS)
++
++    @property
++    def _o_stage_wave_bytes(self):
++        return self.traits.ROWS_PER_WAVE * self.traits.O_STAGE_ROW_ELEMS * self.traits.BF16_BYTES
++
++    def read_q_stage(self, q_raw):
++        """The packs `prefetch_q_staged` left as None, from the wave's O stage tile, whose DMA the
++        caller has waited for. The wave reads only its own tile and the O store after it is
++        ordered behind these reads, so the stage needs no barrier on either side."""
++        traits = self.traits
++        tid = self._job_tid()
++        wave, lane = tid // traits.WARP_SIZE, tid % traits.WARP_SIZE
++        # Lane group c reads part-A chunk 8 (c % 2) + 2 s + c // 2 of q row lane % 16 + 16 qt.
++        c = lane // 16
++        row = wave * self._o_stage_wave_bytes + lane % 16 * Q_STAGE_ROW_BYTES
++        steps = _qk16_k_steps(traits)
++        out = list(q_raw)
++        for s in range_constexpr(QK16_PAIRED_STEPS):
++            chunk = (c % 2 * 8 + c // 2 + 2 * s + lane % 16) % 16
++            ptr = self.lds_o_byte_ptr(row + chunk * 16)
++            for qt in range_constexpr(traits.Q_TILES):
++                pack = _lds_load_o_128(traits, ptr, qt * 16 * Q_STAGE_ROW_BYTES)
++                assert out[qt * steps + s] is None
++                out[qt * steps + s] = pack.bitcast(self.elem_dtype).ir_value()
++        return out
++
++    def load_q_raw(self, q_div, q_elem_offset, wave_q_offset, keep=None):
++        """This lane's Q packs as loaded (one vector per 16-byte load), before `assemble_q`; with
++        `keep`, only the k-steps it accepts are loaded and the rest are None."""
+         traits = self.traits
+         lane = self.job_lane
+         if const_expr(traits.Q_TILES == 4):
+@@ -1342,6 +1408,9 @@
+             middle_d = (_c % 2) * 4 * traits.VEC_KV + (_c // 2) * traits.VEC_KV
+         q_raw_packs = []
+         for ks in range_constexpr(n_packs):
++            if const_expr(keep is not None and not keep(ks % _qk16_k_steps(traits))):
++                q_raw_packs.append(None)
++                continue
+             if const_expr(traits.QK_MFMA16):
+                 # 16x16x32 B operand, pack qt * _qk16_k_steps + ks16: q row 16 qt + lane % 16, the
+                 # d chunk K reads at k-step ks16 (QK16_PAIRED_STEPS).
+diff -u -x __pycache__ rounds/round-17/kernel_snapshot/branch_mla/flash_attn_fwd_mla.py src/branch_mla/flash_attn_fwd_mla.py
+--- rounds/round-17/kernel_snapshot/branch_mla/flash_attn_fwd_mla.py	2026-11-11 03:23:42.701466366 +0000
++++ src/branch_mla/flash_attn_fwd_mla.py	2026-11-11 04:07:41.681868330 +0000
+@@ -149,6 +149,11 @@
+     assert 1 <= traits.K_HEAD <= traits.K_STEPS_QK
+     traits.PERSISTENT = int(persistent)
+     assert not traits.PERSISTENT or not (varlen or cross_seqlen or window_left >= 0)
++    # Persistent drains DMA part of the next job's Q through the O stage tile (prefetch_q_staged);
++    # its geometry is the D_QK 192 paired-step split.
++    traits.Q_LDS_STAGE = bool(
++        traits.PERSISTENT and traits.O_LDS_STAGE and traits.QK_MFMA16 and traits.HEAD_DIM == 192
++    )
+     _dualwave_swp_cache_tag = traits.cache_tag
+ 
+     _lds_elem_dtype = dtype_to_elem_type(traits.DTYPE_STR)
+@@ -268,13 +273,17 @@
+             for t in range_constexpr(2):
+                 ctx.prefetch_k_tile(h_idx, batch_idx, fx.Index(t), t)
+ 
+-        def _prefetch_q(job):
+-            """Raw Q packs of a packed persistent job, for its `_main_body(q_raw=...)`."""
+-            return ctx.prefetch_q_raw(
++        def _prefetch_q(job, staged=False):
++            """Raw Q packs of a packed persistent job, for its `_main_body(q_raw=...)`; `staged`
++            leaves the O-stage ones None for `read_q_stage`."""
++            job_idx = (
+                 fx.Index(job & JOB_HEAD_MASK),
+                 fx.Index((job >> JOB_QBLOCK_SHIFT) & JOB_QBLOCK_MASK),
+                 fx.Index(job >> JOB_BATCH_SHIFT),
+             )
++            if const_expr(staged):
++                return ctx.prefetch_q_staged(*job_idx)
++            return ctx.prefetch_q_raw(*job_idx)
+ 
+         def _main_body(next_job=None, q_raw=None):
+             """With `next_job` (persistent), this job's first two K tiles and its Q (`q_raw`) were
+@@ -1056,7 +1065,7 @@
+                     # next job's prologue, so they land under C11-C13 and the O store. C9 was also
+                     # the last QK, so this job's Q is dead and the next job's can load.
+                     _prefetch_k(next_job)
+-                    q_next = _prefetch_q(next_job)
++                    q_next = _prefetch_q(next_job, staged=traits.Q_LDS_STAGE)
+                 _dualwave_sync_barrier()
+ 
+                 # Epilogue C11: final rescale and complete the last tile's softmax in-place.
+@@ -1093,6 +1102,12 @@
+ 
+             _s_barrier()
+ 
++            if const_expr(q_next is not None and traits.Q_LDS_STAGE):
++                # The stage DMA went out before the middle-block gathers and vmcnt retires in
++                # order; the O store below reuses the stage, so read it back first.
++                _waitcnt_vm_n(sum(p is not None for p in q_next))
++                q_next = ctx.read_q_stage(q_next)
++
+             # Store LSE before O so sink+LSE temps are not live across the O-store register peak.
+             if const_expr(traits.EMIT_LSE):
+                 ctx.store_lse(m_lse, l_lse, ctx.q_row)

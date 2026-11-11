@@ -1,0 +1,234 @@
+--- rounds/round-10/kernel_snapshot/branch_mla/attn_helper_mla.py	2026-11-11 00:51:25.764057212 +0000
++++ src/branch_mla/attn_helper_mla.py	2026-11-11 01:24:55.687581862 +0000
+@@ -36,7 +36,7 @@
+ # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
+ # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
+ # kernel, or a warm cache keeps serving the old one.
+-CODEGEN_REV = 1047
++CODEGEN_REV = 1048
+ 
+ # Room a later key has above a tile's row max before it forces another rebase.
+ REF_MARGIN = 96.0
+@@ -1065,19 +1065,7 @@
+         self.q_block_idx = q_block_idx
+         self.batch_idx = batch_idx
+         self.q_start = self.q_block_idx * traits.BLOCK_M
+-
+-        # Lane terms of the global Q / K / V offsets. They are job-invariant, so in the persistent
+-        # job loop LICM hoists them out and they spill across it (~70 VGPRs at D_QK 192); an
+-        # opaque per-job tid keeps them next to their per-job uses.
+-        tid = self.tid
+-        if const_expr(getattr(traits, "PERSISTENT", 0)):
+-            tid = fx.Index(_pin_regs([fx.Int32(tid)], "=v")[0])
+-        self.job_lane = tid % traits.WARP_SIZE
+-        self.dma_wave = tid // traits.WARP_SIZE
+-        self.n_in_warp = self.job_lane // traits.VEC_KV
+-        self.d_bucket = self.job_lane % traits.VEC_KV
+-        if const_expr(traits.PV_MFMA16):
+-            self.v16_dma_d_bucket = _v_pv16_chunk(self.d_bucket, self.n_in_warp)
++        self._bind_lanes()
+ 
+         self.h_kv_idx = self.h_idx % traits.NUM_HEADS_KV
+         self.group_id = self.h_idx // traits.NUM_HEADS_KV
+@@ -1120,37 +1108,12 @@
+         self.kv_gmem_elem_offset = self.kv_head_idx * traits.HEAD_DIM
+         self.v_gmem_elem_offset = self.kv_head_idx * traits.HEAD_DIM_V
+ 
+-        def _view(tensor, byte_off, nrec, layout):
+-            base_iter = fx.get_iter(tensor)
+-            base_i64 = fx.Int64(fx.ptrtoint(base_iter))
+-            shifted = fx.inttoptr(base_iter.type, base_i64 + fx.Int64(byte_off))
+-            buf_ptr_ty = fx.PointerType.get(
+-                elem_ty=self.elem_ir,
+-                address_space=_TargetAddressSpace.BufferDesc,
+-                alignment=base_iter.alignment,
+-            )
+-            buf_ptr = fx.make_ptr(
+-                buf_ptr_ty,
+-                [shifted, fx.Int16(0).ir_value(), fx.Int64(nrec).ir_value(), self.buf_flags_i32.ir_value()],
+-            )
+-            return fx.logical_divide(fx.make_view(buf_ptr, layout), fx.make_layout(1, 1))
+-
+-        def _batch_view(tensor, seqlen, stride, sbhd_heads, head_dim, tok_base):
+-            per_batch = seqlen * stride
+-            nrec_bytes = per_batch * fx.Index(traits.BF16_BYTES)
+-            layout = fx.make_layout(fx.Int32(per_batch), fx.Int32(1))
+-            # SBHD [S,B,H,D]: per-batch base is only heads*D (the seq-step lives in the row stride).
+-            if const_expr(traits.SBHD):
+-                off = self.batch_idx * fx.Index(sbhd_heads * head_dim) * fx.Index(traits.BF16_BYTES)
+-            else:
+-                off = tok_base * stride * fx.Index(traits.BF16_BYTES)
+-            return _view(tensor, off, nrec_bytes, layout)
+-
+         hq, hkv, d_qk, d_v = traits.NUM_HEADS_Q, traits.NUM_HEADS_KV, traits.HEAD_DIM, traits.HEAD_DIM_V
+-        self.q_div = _batch_view(self.Q, self.seqlen_q_v, self.stride_q_n_v, hq, d_qk, self.q_tok_base)
+-        self.o_div = _batch_view(self.O, self.seqlen_q_v, self.stride_o_n_v, hq, d_v, self.q_tok_base)
+-        self.k_div = _batch_view(self.K, self.seqlen_kv_v, self.stride_kv_n_v, hkv, d_qk, self.kv_tok_base)
+-        self.v_div = _batch_view(self.V, self.seqlen_kv_v, self.stride_v_n_v, hkv, d_v, self.kv_tok_base)
++        b, q_tok, kv_tok = self.batch_idx, self.q_tok_base, self.kv_tok_base
++        self.q_div = self._batch_view(self.Q, self.seqlen_q_v, self.stride_q_n_v, hq, d_qk, b, q_tok)
++        self.o_div = self._batch_view(self.O, self.seqlen_q_v, self.stride_o_n_v, hq, d_v, b, q_tok)
++        self.k_div = self._batch_view(self.K, self.seqlen_kv_v, self.stride_kv_n_v, hkv, d_qk, b, kv_tok)
++        self.v_div = self._batch_view(self.V, self.seqlen_kv_v, self.stride_v_n_v, hkv, d_v, b, kv_tok)
+ 
+         self.num_kv_tiles = (self.seqlen_kv_v + self.kv_tile_size - 1) // self.kv_tile_size
+         if const_expr(traits.CAUSAL):
+@@ -1211,6 +1174,48 @@
+         else:
+             self.active = None
+ 
++    def _bind_lanes(self):
++        """Lane terms of the global Q / K / V offsets. They are job-invariant, so in the persistent
++        job loop LICM hoists them out and they spill across it (~70 VGPRs at D_QK 192); an
++        opaque tid per binding keeps them next to their uses."""
++        traits = self.traits
++        tid = self.tid
++        if const_expr(getattr(traits, "PERSISTENT", 0)):
++            tid = fx.Index(_pin_regs([fx.Int32(tid)], "=v")[0])
++        self.job_lane = tid % traits.WARP_SIZE
++        self.dma_wave = tid // traits.WARP_SIZE
++        self.n_in_warp = self.job_lane // traits.VEC_KV
++        self.d_bucket = self.job_lane % traits.VEC_KV
++        if const_expr(traits.PV_MFMA16):
++            self.v16_dma_d_bucket = _v_pv16_chunk(self.d_bucket, self.n_in_warp)
++
++    def _view(self, tensor, byte_off, nrec, layout):
++        base_iter = fx.get_iter(tensor)
++        base_i64 = fx.Int64(fx.ptrtoint(base_iter))
++        shifted = fx.inttoptr(base_iter.type, base_i64 + fx.Int64(byte_off))
++        buf_ptr_ty = fx.PointerType.get(
++            elem_ty=self.elem_ir,
++            address_space=_TargetAddressSpace.BufferDesc,
++            alignment=base_iter.alignment,
++        )
++        buf_ptr = fx.make_ptr(
++            buf_ptr_ty,
++            [shifted, fx.Int16(0).ir_value(), fx.Int64(nrec).ir_value(), self.buf_flags_i32.ir_value()],
++        )
++        return fx.logical_divide(fx.make_view(buf_ptr, layout), fx.make_layout(1, 1))
++
++    def _batch_view(self, tensor, seqlen, stride, sbhd_heads, head_dim, batch_idx, tok_base):
++        traits = self.traits
++        per_batch = seqlen * stride
++        nrec_bytes = per_batch * fx.Index(traits.BF16_BYTES)
++        layout = fx.make_layout(fx.Int32(per_batch), fx.Int32(1))
++        # SBHD [S,B,H,D]: per-batch base is only heads*D (the seq-step lives in the row stride).
++        if const_expr(traits.SBHD):
++            off = batch_idx * fx.Index(sbhd_heads * head_dim) * fx.Index(traits.BF16_BYTES)
++        else:
++            off = tok_base * stride * fx.Index(traits.BF16_BYTES)
++        return self._view(tensor, off, nrec_bytes, layout)
++
+     def _dma_base(self, buf_id, w_rep, d, buf_base_fn, line_stride):
+         traits = self.traits
+         wave_id_uni = self.wave_id_uni + fx.Index(w_rep * self.traits.NUM_WAVES)
+@@ -2177,6 +2182,31 @@
+             pieces=pieces,
+         )
+ 
++    def prefetch_k_tile(self, h_idx, batch_idx, tile_idx, buf_id):
++        """K tile `tile_idx` of the job at (head h_idx, batch_idx) into `buf_id`, ahead of that
++        job's bind_item. Rebinds the lane terms; persistent jobs only (never varlen)."""
++        traits = self.traits
++        self._bind_lanes()
++        k_div = self._batch_view(
++            self.K,
++            self.seq_len_kv_v,
++            self.stride_kv_n_v,
++            traits.NUM_HEADS_KV,
++            traits.HEAD_DIM,
++            batch_idx,
++            batch_idx * self.seq_len_kv_v,
++        )
++        self._load_kv(
++            self.tile_start(tile_idx),
++            buf_id,
++            self.k_dma_m0,
++            k_div,
++            self.NUM_DMA_K,
++            (h_idx % traits.NUM_HEADS_KV) * traits.HEAD_DIM,
++            self.stride_kv_n_v,
++            chunk_fn=self._k_dma_chunk if traits.QK_MFMA16 else None,
++        )
++
+     def _k_dma_chunk(self, d, line):
+         if d != 1:
+             return self.d_bucket
+--- rounds/round-10/kernel_snapshot/branch_mla/flash_attn_fwd_mla.py	2026-11-11 00:51:25.764057212 +0000
++++ src/branch_mla/flash_attn_fwd_mla.py	2026-11-11 01:25:11.645367674 +0000
+@@ -29,6 +29,7 @@
+ import flydsl.expr as fx
+ from flydsl.compiler.kernel_function import CompilationContext
+ from flydsl.expr import const_expr, gpu, range_constexpr
++from flydsl.expr.utils.arith import ArithValue
+ from flydsl.expr.utils.arith import _to_raw as as_mlir_value
+ from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+ 
+@@ -259,9 +260,18 @@
+             l_row_init = ctx.c_zero_f
+         v_o_zero = ctx.c_zero_o if traits.PV_MFMA16 else ctx.c_zero_v16f32
+ 
+-        def _main_body():
++        def _prefetch_k(job):
++            """First two K tiles of a packed persistent job (split_t0 is 0 there) into buf0 / buf1."""
++            h_idx, batch_idx = fx.Index(job & JOB_HEAD_MASK), fx.Index(job >> JOB_BATCH_SHIFT)
++            for t in range_constexpr(2):
++                ctx.prefetch_k_tile(h_idx, batch_idx, fx.Index(t), t)
++
++        def _main_body(next_job=None):
++            """With `next_job` (persistent), this job's first two K tiles were prefetched by the
++            previous job's drain, and this drain prefetches the next job's."""
+             split_t_end = ctx.split_t_end
+-            ctx.load_k_split(0, 0)
++            if const_expr(next_job is None):
++                ctx.load_k_split(0, 0)
+             _s_waitcnt(0)
+             _sched_barrier(0)
+             _s_barrier()
+@@ -395,7 +405,8 @@
+ 
+                 return _pv_branch(v_o, live_hi, _tail)
+ 
+-            ctx.load_k_split(1, 1)
++            if const_expr(next_job is None):
++                ctx.load_k_split(1, 1)
+             ctx.load_v_split(0, 0)
+             v_k = _load_k_head(0)
+             _sched_barrier(0)
+@@ -1016,6 +1027,10 @@
+                     v_s_1 = ctx.seq_pad_mask_if_needed(v_s_1, max_m1)
+                 _s_waitcnt(traits.LGKMCNT_0_ONLY)
+                 _waitcnt_vm_n(0)
++                if const_expr(next_job is not None):
++                    # K buf0 was last read in C5, buf1 in C9; nothing waits on these until the
++                    # next job's prologue, so they land under C11-C13 and the O store.
++                    _prefetch_k(next_job)
+                 _dualwave_sync_barrier()
+ 
+                 # Epilogue C11: final rescale and complete the last tile's softmax in-place.
+@@ -1071,18 +1086,21 @@
+                 return fx.Int32(buffer_ops.buffer_load(sched_rsrc, idx, vec_width=1, is_scalar=True))
+ 
+             n_jobs = _sched_load(sched_row)
+-            for k, job_args in range(
+-                fx.Index(0), fx.Index(n_jobs), fx.Index(1), init=[_sched_load(sched_row + 1)]
+-            ):
++            job_first = _sched_load(sched_row + 1)
++            _prefetch_k(job_first)
++            for k, job_args in range(fx.Index(0), fx.Index(n_jobs), fx.Index(1), init=[job_first]):
+                 job = fx.Int32(job_args[0])
+                 job_next = _sched_load(sched_row + fx.Int32(k) + 2)
++                # The last job's drain re-fetches its own tiles rather than whatever follows the row.
++                job_prefetch = fx.Int32(ArithValue(fx.Int32(k) + 1 < n_jobs).select(job_next, job))
+                 ctx.bind_item(
+                     fx.Index(job & JOB_HEAD_MASK),
+                     fx.Index((job >> JOB_QBLOCK_SHIFT) & JOB_QBLOCK_MASK),
+                     fx.Index(job >> JOB_BATCH_SHIFT),
+                 )
+-                _main_body()
++                _main_body(next_job=job_prefetch)
+                 _ = yield [job_next]
++            _s_waitcnt(0)
+         elif active is None:
+             _main_body()
+         else:

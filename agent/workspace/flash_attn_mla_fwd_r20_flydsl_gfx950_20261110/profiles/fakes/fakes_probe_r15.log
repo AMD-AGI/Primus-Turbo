@@ -1,0 +1,17 @@
+# R15 fakes, 10 s each, 2026-11-11 10:30 UTC+8
+src/branch_mla b1_s16k: 8.6045 ms (1277.9 TFLOPS) | clk 1879 MHz (min 1860 max 2112) | power 1323 W | PPT throttle 0.69 | TFLOPS/MHz 0.6801 | 82 samples, 1170 calls
+profiles/fakes/noexp/branch_mla b1_s16k: 8.0957 ms (1358.2 TFLOPS) | clk 2170 MHz (min 2164 max 2325) | power 1307 W | PPT throttle 0.50 | TFLOPS/MHz 0.6259 | 83 samples, 1240 calls
+profiles/fakes/nokv/branch_mla b1_s16k: 7.8647 ms (1398.1 TFLOPS) | clk 1951 MHz (min 1948 max 1963) | power 1241 W | PPT throttle 0.00 | TFLOPS/MHz 0.7166 | 82 samples, 1280 calls
+profiles/fakes/both/branch_mla b1_s16k: 7.4197 ms (1482.0 TFLOPS) | clk 2295 MHz (min 2293 max 2366) | power 1248 W | PPT throttle 0.03 | TFLOPS/MHz 0.6457 | 84 samples, 1350 calls
+profiles/fakes/ldshalf/branch_mla b1_s16k: 8.2046 ms (1340.2 TFLOPS) | clk 1898 MHz (min 1891 max 2165) | power 1331 W | PPT throttle 0.73 | TFLOPS/MHz 0.7061 | 83 samples, 1220 calls
+src/branch_mla b1_s16k: 8.5384 ms (1287.8 TFLOPS) | clk 1887 MHz (min 1875 max 1998) | power 1332 W | PPT throttle 0.76 | TFLOPS/MHz 0.6825 | 82 samples, 1180 calls
+src/branch_mla dsv3: 1.2422 ms (1106.7 TFLOPS) | clk 1988 MHz (min 1986 max 2185) | power 1351 W | PPT throttle 0.31 | TFLOPS/MHz 0.5567 | 83 samples, 8060 calls
+profiles/fakes/noexp/branch_mla dsv3: 1.1894 ms (1155.8 TFLOPS) | clk 2251 MHz (min 2246 max 2256) | power 1336 W | PPT throttle 0.24 | TFLOPS/MHz 0.5135 | 83 samples, 8410 calls
+profiles/fakes/nokv/branch_mla dsv3: 1.1844 ms (1160.7 TFLOPS) | clk 2027 MHz (min 2025 max 2250) | power 1245 W | PPT throttle 0.00 | TFLOPS/MHz 0.5726 | 84 samples, 8450 calls
+profiles/fakes/both/branch_mla dsv3: 1.1168 ms (1230.9 TFLOPS) | clk 2339 MHz (min 2336 max 2365) | power 1261 W | PPT throttle 0.02 | TFLOPS/MHz 0.5263 | 83 samples, 8960 calls
+profiles/fakes/ldshalf/branch_mla dsv3: 1.1833 ms (1161.7 TFLOPS) | clk 1987 MHz (min 1985 max 2067) | power 1357 W | PPT throttle 0.34 | TFLOPS/MHz 0.5847 | 83 samples, 8460 calls
+src/branch_mla dsv3: 1.2441 ms (1105.0 TFLOPS) | clk 1987 MHz (min 1985 max 1999) | power 1350 W | PPT throttle 0.31 | TFLOPS/MHz 0.5561 | 82 samples, 8040 calls
+src/branch_mla dsv3: 1.2417 ms (1107.1 TFLOPS) | clk 1988 MHz (min 1986 max 2246) | power 1345 W | PPT throttle 0.27 | TFLOPS/MHz 0.5569 | 84 samples, 8060 calls
+profiles/fakes/nostore/branch_mla dsv3: 1.1818 ms (1163.3 TFLOPS) | clk 1972 MHz (min 1969 max 2201) | power 1350 W | PPT throttle 0.27 | TFLOPS/MHz 0.5899 | 83 samples, 8470 calls
+src/branch_mla b1_s16k: 8.5418 ms (1287.3 TFLOPS) | clk 1886 MHz (min 1873 max 2136) | power 1332 W | PPT throttle 0.75 | TFLOPS/MHz 0.6825 | 84 samples, 1180 calls
+profiles/fakes/nostore/branch_mla b1_s16k: 8.4507 ms (1301.2 TFLOPS) | clk 1885 MHz (min 1871 max 1929) | power 1323 W | PPT throttle 0.72 | TFLOPS/MHz 0.6903 | 83 samples, 1190 calls

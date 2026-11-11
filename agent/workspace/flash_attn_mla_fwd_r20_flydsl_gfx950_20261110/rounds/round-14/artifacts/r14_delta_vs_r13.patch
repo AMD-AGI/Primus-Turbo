@@ -1,0 +1,27 @@
+diff -ru --exclude __pycache__ rounds/round-13/kernel_snapshot/branch_mla/attn_helper_mla.py src/branch_mla/attn_helper_mla.py
+--- rounds/round-13/kernel_snapshot/branch_mla/attn_helper_mla.py	2026-11-11 01:53:47.671673409 +0000
++++ src/branch_mla/attn_helper_mla.py	2026-11-11 01:54:52.810825791 +0000
+@@ -36,7 +36,7 @@
+ # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
+ # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
+ # kernel, or a warm cache keeps serving the old one.
+-CODEGEN_REV = 1050
++CODEGEN_REV = 1051
+ 
+ # Room a later key has above a tile's row max before it forces another rebase.
+ REF_MARGIN = 96.0
+diff -ru --exclude __pycache__ rounds/round-13/kernel_snapshot/branch_mla/flash_attn_fwd_mla.py src/branch_mla/flash_attn_fwd_mla.py
+--- rounds/round-13/kernel_snapshot/branch_mla/flash_attn_fwd_mla.py	2026-11-11 01:53:47.671673409 +0000
++++ src/branch_mla/flash_attn_fwd_mla.py	2026-11-11 01:54:51.347844847 +0000
+@@ -411,7 +411,10 @@
+             v_k = _load_k_head(0)
+             _sched_barrier(0)
+             _s_waitcnt(traits.LGKMCNT_0_ONLY)
+-            _waitcnt_vm_n(ctx.VM_DRAIN_V)
++            # This drain is for K1. A prefetched K1 is already resident, and V0 is first read after
++            # the next cluster's drain, so it stays in flight under QK0.
++            if const_expr(next_job is None):
++                _waitcnt_vm_n(ctx.VM_DRAIN_V)
+ 
+             _sched_barrier(0)
+             _dualwave_sync_barrier()

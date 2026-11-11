@@ -1,6 +1,7 @@
 """Build wrong-result upper-bound variants of src/branch_mla under profiles/fakes/<name>/branch_mla.
 
-noexp: exp2 -> one FMA; nokv: no K / V DMA inside the main loop (lines 440-575); both: the two.
+noexp: exp2 -> one FMA; nokv: no K / V DMA inside the main loop (the `load_[kv]_tile(j_idx ...)`
+calls; the drain's use max_m*); both: the two.
 """
 
 import os
@@ -61,7 +62,7 @@ for name, (noexp, nokv, rev) in VARIANTS.items():
         path = os.path.join(dst, "flash_attn_fwd_mla.py")
         lines = open(path).read().split("\n")
         hits = 0
-        for i in range(439, 575):
+        for i in range(len(lines)):
             if re.match(r"^\s+ctx\.load_[kv]_tile\(j_idx", lines[i]):
                 lines[i] = re.sub(r"ctx\.load_[kv]_tile\(.*\)", "pass", lines[i])
                 hits += 1

@@ -113,3 +113,100 @@ Round 9 + lane terms re-derived per job from an opaque `tid` (`_pin_regs` in `bi
 slots 9, +2.62 % geomean (1168.05 vs 1138.20), 4K +4.2-4.5 %, B1 S64K -0.34 %, bitwise 11/11, edge
 smoke 8/8 bitwise. `persistent=False` vs round 7: 1.0000, bitwise (the kept path is neutral).
 1.162x aiter. Next: overlap the next job's K / V DMAs and Q load with the current job's drain.
+
+## Round 11 — ACCEPTED — 09:55
+Persistent drain C10 issues the next job's K tiles 0 / 1 (buffers free after C9); the prologue drops
+its own two K DMAs (`prefetch_k_tile`, `_bind_lanes`): +0.32 % geomean (1172.27 vs 1168.53), repeat
++0.29 %, bitwise 11/11, edge smoke 8/8, spill slots 9. 4K only +0.1-0.2 % (the prologue `vmcnt(0)`
+still waits for the previous job's O stores); B1 S64K +1.7 % / B2 S16K -0.35 % are a KV-loop register
+allocation shift, not the prefetch. `persistent=False` ISA identical to round 10. 1.166x aiter.
+Next: wait only for the prefetch in the prologue (`vmcnt(<O stores>)`), leaving the O stores in flight.
+
+## Round 12 — ACCEPTED (trade-off) — 10:30
+The whole lane / wave layout (`_bind_lane_layout`: wave_q_offset, LDS read bases, PV16 lane terms)
+re-derived per job from the opaque tid: spill slots 9 -> 3 (H=128: 11 -> 3), no scratch reload left in
+the prologue. +0.36 % geomean (1175.99 vs 1171.82), bitwise 11/11, smoke 8/8. H=128 binary: S4K
++1.6-1.9 %, S8K +1.8 %, S64K -2.4 % (loop register allocation: the parked K / V DMA voffset AGPR reads
+split 8 + 8 instead of one block); kimik2 -0.5 %, kimik3 -1.0 % (other binaries). `persistent=False`
+ISA identical. 1.170x aiter. Next: one DMA voffset VGPR per chunk pattern (row rep in soffset, d in
+the immediate) to take the voffsets out of the loop's register budget.
+
+## Round 13 — ACCEPTED — 11:05
+Correction to round 12: the loop's parked AGPR values are the V buffer-1 `ds_read_b64_tr_b16`
+addresses, not DMA voffsets. V buffer 1 starts at byte 65536, past the 16-bit DS offset field, so
+none of its reads folded an offset (96 / 192 transposed reads had one). An opaque base for buffer 1's
+two read bases (`v16_read_off`, `_pin_regs`): 186 / 192 fold, VGPRs 512 -> 497, spills 3 -> 0, loop
+AGPR reads 16 -> 0. +1.80 % geomean (1196.85 vs 1175.70), every shape up (+1.1-3.3 %), bitwise 11/11,
+smoke 8/8. `persistent=False`: +1.57 %, bitwise. 1.191x aiter. Next: leave V0 in flight before QK0.
+
+## Round 14 — ACCEPTED (trade-off) — 10:05
+Note: the clock times on the round 10-13 entries above are wrong (ahead of the real clock). From the
+artifact times, round 10 finished ~08:55, 11 ~09:30, 12 ~09:45, 13 ~09:55. The round summaries'
+headers were corrected.
+Persistent prologue: dropped the pre-QK0 `vmcnt(VM_DRAIN_V)`. K1 has been prefetched since round 11,
+so the wait only held half of V0, and V0 is first read after the next cluster's drain. +0.06 % /
++0.20 % geomean in two processes, bitwise. Short-job shapes +0.12-0.28 % in both runs; B1 S16K -0.2 %
+in both runs; B1 S64K bistable (-0.4 % / +1.2 %). Non-persistent ISA identical. Next: job-top
+`vmcnt(16)` so the O stores drain under the Q loads.
+
+## Round 15 — ACCEPTED (trade-off) — 10:15
+Persistent job top: `vmcnt(o_stores_per_lane)` (16) + `lgkmcnt(0)` instead of `s_waitcnt 0`, so the
+previous job's O stores drain under the Q loads (the first job waits `s_waitcnt 0` before the loop).
++0.09 % / +0.10 % geomean in two processes, bitwise, per-shape deltas reproduce. H16 +0.2 %, H64
++0.4 %, long S +0.1-0.8 %; H128 4K -0.10 to -0.20 % in both runs (not explained; no counter run).
+The O stores were mostly off the critical path. Non-persistent ISA identical. 1.192x aiter.
+Next: the next job's Q in the drain, or back to the KV loop (round 8 with 15 VGPRs free).
+
+## Round 16 — ACCEPTED (trade-off) — 11:05
+`_store_final_o16x4` wrote 64 q rows x 16 B per `buffer_store` (64 lines per instruction; the
+`nostore` fake bounded it at +5.1 % on dsv3). Now each wave writes its O rows to its own LDS tile
+(272 B rows), reads back 16 B per lane and stores four whole rows per instruction, still 16 stores
+per lane, no barrier. +0.92 % / +1.02 % geomean in two processes, bitwise, smoke 8/8. 4K shapes
++1.8-2.3 %; B1 S64K -1.2 % / -1.3 %, S32K -0.4 % in both runs: identical loop IR, but the QK halves
+reschedule (V head ds_reads behind two MFMAs) at the lower register pressure (497 -> 488 VGPRs).
+`persistent=False`: +1.55 %, every shape up (S64K +0.4 %). LDS 154368 B. 1.203x aiter.
+Inside the round: staging lane terms from the job's own lane values cost 14 VGPRs + loop AGPR reads
+(CSE across the KV loop), fixed with a fresh `_job_tid()`; 16 `i * stride` products hoisted into
+SGPRs, fixed with a running sum. Sustained 10 s loops (`profiles/power_r16.log`) show no S64K loss
+(+0.3 % / -0.3 %, R16 15-25 W lower), so the -1.3 % is ab_bench's short S64K windows (3 calls).
+Next: balance the causal diagonal across waves (interleave the 16-row q tiles).
+
+## Round 17 — ACCEPTED — 11:25
+Persistent: the next job's 24 Q loads issue in drain C10 right after its K prefetch (this job's last
+QK was C9) and the raw packs ride the job loop's iter_args; the first job's Q loads before the loop.
+`load_all` split into `bind_q_rows` / `load_q_raw` / `assemble_q`, plus `prefetch_q_raw`. Job-top
+`vmcnt(16)` now also retires the Q loads; ISA has no wait between the loads and it (half land in
+AGPRs directly). +0.36 % / +0.35 % geomean in two processes, bitwise, no shape down, 4K +0.4-0.7 %.
+`noq` fake (+8 % dsv3, +3.2 % S64K) overstated it: constant Q also removes the scale and MFMA
+switching power. Non-persistent ISA identical. 1.208x aiter.
+Next: measure the drain's barrier wait on dsv3 (ATT) before attempting the q-tile interleave.
+
+## Between rounds 17 and 18 — HipKittens survey, ATT, fakes — 12:00
+Read HK's gfx950 attention (`dev/mi455x_v4` in Primus-Turbo: `hk_attn_fwd_d128_gfx950.cu` etc.).
+Not applicable: fixed zero max (overflows above ~88 logits), third K/V buffer (LDS 148 / 160 KB),
+V read swizzle (ATT: LDS bank conflicts 1.2 % of LDS-active cycles). ATT on R17 dsv3: loop ~71 % of
+cycles, MFMA ~84 % busy in it; `s_nop` 2.64 % (MFMA SrcC WAR, cvt RAW, M0 before DMA); drain ~31K
+cycles per job per wave regardless of job length; C10 (next job's Q gathers) 5.8-7K of it, TA bound
+(16 rows x 16 B per quarter-wave). Fakes: `coalq` +1.5 % quick geomean (+2.8 % dsv3), `warmq`
++0.8 %, `warmqh` +0.9 %: the access pattern costs, not the miss.
+
+## Round 18 — ACCEPTED — 12:15
+Persistent: the next job's paired-k-step Q (d blocks 0 and 2, 16 of 24 packs) goes by 16 LDS DMAs
+per wave into the wave's O stage tile at C10 (rotation swizzle, conflict-free read back), read back
+in the epilogue after `vmcnt(8)` and before the O stage; the middle block stays 8 gathers. ISA:
+prefetch block 12 K + 16 Q DMAs and 8 gathers, VGPR 490 -> 492. +0.45 % / +0.68 % geomean in two
+processes (quick run 3 +0.88 %), bitwise, smoke 8/8, no shape down; 4K +0.2-1.2 %. ~1/4 of the
+`coalq` bound on dsv3. S64K bistable (+0.2 / +2.7 / +2.8 %). Non-persistent ISA identical.
+1.210x aiter.
+Next: issue the Q stage DMA earlier than C10 (it holds no registers; the O stage is free all job).
+
+## Round 19 — ACCEPTED — 12:32
+R18 ATT: C10 still 4.5-5.1K cycles per job (12 K + 16 Q DMAs + 8 gathers, VMEM queue full); fakes
+`nostage` +2.6 % dsv3, `noqc10` +3.3 % (stale-LDS Q, may overstate). In drain C9 only the last
+wave's QK is live and the others wait ~2.7K at the barrier, and the staged Q holds no registers,
+so `stage_q_dma` now runs at the start of C9 on waves 0-2 (own tiles; waves 0 / 1 split the last
+wave's). C10's `vmcnt(0)` + sync publish it; the epilogue wait is gone. +1.05 % / +1.14 % geomean
+in two processes, bitwise, smoke 8/8, every shape up; 4K +0.9-1.6 %. ATT: drain -2.1K cycles per
+job, C10 -> 2.2-2.8K. VGPR 492 -> 508 (loop rescheduled). Non-persistent ISA identical. 1.222x
+aiter.
+Next: the next job's K tile 0 (K buf0 free after C5) from the off-diagonal waves too.

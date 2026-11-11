@@ -36,7 +36,7 @@ from primus_turbo.flydsl.utils.prims import LOG2E
 # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
 # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
 # kernel, or a warm cache keeps serving the old one.
-CODEGEN_REV = 1047
+CODEGEN_REV = 1057
 
 # Room a later key has above a tile's row max before it forces another rebase.
 REF_MARGIN = 96.0
@@ -467,6 +467,25 @@ def _load_k_pack_aligned(traits, lds_kv_base_ptr, elem_idx, buf_id, kv_mfma_pack
     ).result
 
 
+def _lds_o_scopes(traits):
+    # One-sided: scoped AA separates either way, and leaving "lds_o" out of the K / V noalias
+    # lists keeps their metadata (and the loop schedule) as without the O stage.
+    return dict(
+        alias_scopes=_dualwave_lds_alias_scopes("lds_o"),
+        noalias_scopes=_lds_alias_scope_array(traits.LDS_SCOPE_NAMES),
+    )
+
+
+def _lds_store_o_128(traits, pack_i32_vec, lane_ptr, imm_bytes):
+    ptr = buffer_ops.get_element_ptr(lane_ptr, byte_offset=int(imm_bytes), elem_type=T.i8)
+    llvm.StoreOp(pack_i32_vec.ir_value(), ptr, alignment=16, **_lds_o_scopes(traits))
+
+
+def _lds_load_o_128(traits, lane_ptr, imm_bytes):
+    ptr = buffer_ops.get_element_ptr(lane_ptr, byte_offset=int(imm_bytes), elem_type=T.i8)
+    return Vec(llvm.LoadOp(Vec.make_type(4, fx.Int32), ptr, alignment=16, **_lds_o_scopes(traits)).result)
+
+
 def _buffer_store_128(pack_i32_vec, elem_index, _o_store_reg_128, _store_atom_128, o_div):
     fx.memref_store_vec(pack_i32_vec, _o_store_reg_128)
     fx.copy(_store_atom_128, _o_store_reg_128, fx.slice(o_div, (None, fx.Int32(elem_index))))
@@ -488,6 +507,11 @@ def _qk16_k_steps(traits):
 # in lane row groups 0 and 3 at chunk m ^ 4 (`_k_mid_swizzled`), which moves those rows' banks
 # by 64 bytes; the remaining steps then read d = 64 + 16 (s - 4) + 32 (c % 2) + 8 (c // 2).
 QK16_PAIRED_STEPS = 4
+# Q_LDS_STAGE: a stage row is the paired steps' part of a Q row, d blocks 0 and 2 (256 bytes).
+Q_STAGE_ROW_BYTES = 256
+Q_STAGE_ROW_CHUNKS = Q_STAGE_ROW_BYTES // 16
+# Waves that split the last wave's stage DMAs between them.
+Q_STAGE_LAST_SPLIT = 2
 
 
 def _qk16_step_d(step):
@@ -744,6 +768,11 @@ def _make_dualwave_swp_traits(
         SMEM_K_TILE_ELEMS=smem_k_tile_elems,
         DUALWAVE_SWP_KV_PER_BUFFER=dualwave_swp_kv_per_buffer,
         LDS_KV_TOTAL_SIZE=2 * dualwave_swp_kv_per_buffer,
+        # The 64-row O store (`_store_final_o16x4`) goes through a per-wave LDS tile so each
+        # buffer_store covers four whole q rows; rows are padded 16 B off the 64-bank period.
+        O_LDS_STAGE=bool(pv_mfma16) and rows_per_wave == 64,
+        O_STAGE_ROW_ELEMS=head_dim_v + 16 // bf16_bytes,
+        LDS_O_STAGE_SIZE=num_waves * rows_per_wave * (head_dim_v + 16 // bf16_bytes),
         DUALWAVE_SWP_K_BUF_BASE=(0, dualwave_swp_kv_per_buffer),
         DUALWAVE_SWP_V_BUF_BASE=(smem_k_tile_elems, smem_k_tile_elems + dualwave_swp_kv_per_buffer),
         # K LDS->VGPR reads: hi half jumps one N strip; ks uses inner then d_rpt stride.
@@ -880,13 +909,12 @@ class DualwaveKernelContext:
         self.lds = lds
         self.lds_kv_base_idx = fx.Index(fx.ptrtoint(lds.kv.ptr))
         self.lds_kv_base_ptr = buffer_ops.create_llvm_ptr(self.lds_kv_base_idx, address_space=3)
+        if const_expr(traits.O_LDS_STAGE):
+            self.lds_o_base_idx = fx.Index(fx.ptrtoint(lds.o.ptr))
+            self.lds_o_base_ptr = buffer_ops.create_llvm_ptr(self.lds_o_base_idx, address_space=3)
 
         self.tid = fx.Index(gpu.thread_idx.x)
-
-        self.wave_id = self.tid // traits.WARP_SIZE
-        self.lane = self.tid % traits.WARP_SIZE
-        self.lane_mod_32 = self.lane % 32
-        self.lane_div_32 = self.lane // 32
+        self._bind_lane_layout(self.tid)
 
         _tid_i32 = as_mlir_value(fx.Int32(self.tid))
         _wave_id_uni_i32 = rocdl.readfirstlane(
@@ -894,16 +922,10 @@ class DualwaveKernelContext:
             arith.divsi(_tid_i32, as_mlir_value(fx.Int32(traits.WARP_SIZE))),
         )
         self.wave_id_uni = fx.Index(_wave_id_uni_i32)
-
-        # Merged CTAs stack Q_HEADS_PER_WG sharers of one kv-head on top of the row groups:
-        # the low wave bits pick the row group, the high bits pick the sharer.
         if const_expr(traits.Q_HEADS_PER_WG > 1):
-            self.wave_row_group = self.wave_id % traits.WAVE_ROW_GROUPS
             self.wave_row_group_uni = self.wave_id_uni % traits.WAVE_ROW_GROUPS
         else:
-            self.wave_row_group = self.wave_id
             self.wave_row_group_uni = self.wave_id_uni
-        self.wave_q_offset = self.wave_row_group * traits.ROWS_PER_WAVE
 
         self.buf_flags_i32 = fx.Int32(buffer_ops._get_buffer_flags())
         self.elem_ir = self.elem_dtype.ir_type
@@ -948,6 +970,30 @@ class DualwaveKernelContext:
         self.dma_wave_reps = self.traits.SMEM_N_RPT // self.traits.NUM_WAVES
 
         self.kv_tile_size = traits.BLOCK_N
+
+        self.k_dma_m0 = self.dma_m0_table(
+            lambda b, w, d: self._dma_base(b, w, d, _k_buf_base, traits.SMEM_K_LINE_STRIDE), self.NUM_DMA_K
+        )
+        self.v_dma_m0 = self.dma_m0_table(
+            lambda b, w, d: self._dma_base(b, w, d, _v_buf_base, traits.SMEM_V_LINE_STRIDE), self.NUM_DMA_V
+        )
+        if bind_block:
+            self.bind_item(*self.block_item())
+
+    def _bind_lane_layout(self, tid):
+        """Lane / wave terms of thread `tid`: q rows, LDS read bases, mask and store lanes."""
+        traits = self.traits
+        self.wave_id = tid // traits.WARP_SIZE
+        self.lane = tid % traits.WARP_SIZE
+        self.lane_mod_32 = self.lane % 32
+        self.lane_div_32 = self.lane // 32
+        # Merged CTAs stack Q_HEADS_PER_WG sharers of one kv-head on top of the row groups:
+        # the low wave bits pick the row group, the high bits pick the sharer.
+        if const_expr(traits.Q_HEADS_PER_WG > 1):
+            self.wave_row_group = self.wave_id % traits.WAVE_ROW_GROUPS
+        else:
+            self.wave_row_group = self.wave_id
+        self.wave_q_offset = self.wave_row_group * traits.ROWS_PER_WAVE
 
         if const_expr(traits.QK_MFMA16):
             # 16x16x32 A operand: row r = lane % 16 of kv tile kt holds kv 16 kt + [0, 8, 4, 12][r // 4]
@@ -999,15 +1045,15 @@ class DualwaveKernelContext:
                 + (self.lane % 4) * 4
             )
             self.v16_read_base = (_v_lane + 16 * (_c % 2), _v_lane + 16 - 16 * (_c % 2))
-
-        self.k_dma_m0 = self.dma_m0_table(
-            lambda b, w, d: self._dma_base(b, w, d, _k_buf_base, traits.SMEM_K_LINE_STRIDE), self.NUM_DMA_K
-        )
-        self.v_dma_m0 = self.dma_m0_table(
-            lambda b, w, d: self._dma_base(b, w, d, _v_buf_base, traits.SMEM_V_LINE_STRIDE), self.NUM_DMA_V
-        )
-        if bind_block:
-            self.bind_item(*self.block_item())
+            # Byte offsets of those bases per V buffer. Buffer 1 starts at the 64 KiB limit of the
+            # DS offset field, so a constant base cannot fold there and every read would get its own
+            # loop-invariant address register; an opaque base leaves only the read's offset.
+            v16_off = [
+                [fx.Int32((_v_buf_base(traits, b) + base) * traits.BF16_BYTES) for base in self.v16_read_base]
+                for b in range(2)
+            ]
+            v16_off[1] = [fx.Int32(v) for v in _pin_regs(v16_off[1], "=v")]
+            self.v16_read_off = v16_off
 
     def block_item(self):
         """(head, q block, batch) this CTA owns in the one-job-per-CTA grid."""
@@ -1065,19 +1111,10 @@ class DualwaveKernelContext:
         self.q_block_idx = q_block_idx
         self.batch_idx = batch_idx
         self.q_start = self.q_block_idx * traits.BLOCK_M
-
-        # Lane terms of the global Q / K / V offsets. They are job-invariant, so in the persistent
-        # job loop LICM hoists them out and they spill across it (~70 VGPRs at D_QK 192); an
-        # opaque per-job tid keeps them next to their per-job uses.
-        tid = self.tid
+        tid = self._job_tid()
+        self._bind_lanes(tid)
         if const_expr(getattr(traits, "PERSISTENT", 0)):
-            tid = fx.Index(_pin_regs([fx.Int32(tid)], "=v")[0])
-        self.job_lane = tid % traits.WARP_SIZE
-        self.dma_wave = tid // traits.WARP_SIZE
-        self.n_in_warp = self.job_lane // traits.VEC_KV
-        self.d_bucket = self.job_lane % traits.VEC_KV
-        if const_expr(traits.PV_MFMA16):
-            self.v16_dma_d_bucket = _v_pv16_chunk(self.d_bucket, self.n_in_warp)
+            self._bind_lane_layout(tid)
 
         self.h_kv_idx = self.h_idx % traits.NUM_HEADS_KV
         self.group_id = self.h_idx // traits.NUM_HEADS_KV
@@ -1120,37 +1157,12 @@ class DualwaveKernelContext:
         self.kv_gmem_elem_offset = self.kv_head_idx * traits.HEAD_DIM
         self.v_gmem_elem_offset = self.kv_head_idx * traits.HEAD_DIM_V
 
-        def _view(tensor, byte_off, nrec, layout):
-            base_iter = fx.get_iter(tensor)
-            base_i64 = fx.Int64(fx.ptrtoint(base_iter))
-            shifted = fx.inttoptr(base_iter.type, base_i64 + fx.Int64(byte_off))
-            buf_ptr_ty = fx.PointerType.get(
-                elem_ty=self.elem_ir,
-                address_space=_TargetAddressSpace.BufferDesc,
-                alignment=base_iter.alignment,
-            )
-            buf_ptr = fx.make_ptr(
-                buf_ptr_ty,
-                [shifted, fx.Int16(0).ir_value(), fx.Int64(nrec).ir_value(), self.buf_flags_i32.ir_value()],
-            )
-            return fx.logical_divide(fx.make_view(buf_ptr, layout), fx.make_layout(1, 1))
-
-        def _batch_view(tensor, seqlen, stride, sbhd_heads, head_dim, tok_base):
-            per_batch = seqlen * stride
-            nrec_bytes = per_batch * fx.Index(traits.BF16_BYTES)
-            layout = fx.make_layout(fx.Int32(per_batch), fx.Int32(1))
-            # SBHD [S,B,H,D]: per-batch base is only heads*D (the seq-step lives in the row stride).
-            if const_expr(traits.SBHD):
-                off = self.batch_idx * fx.Index(sbhd_heads * head_dim) * fx.Index(traits.BF16_BYTES)
-            else:
-                off = tok_base * stride * fx.Index(traits.BF16_BYTES)
-            return _view(tensor, off, nrec_bytes, layout)
-
         hq, hkv, d_qk, d_v = traits.NUM_HEADS_Q, traits.NUM_HEADS_KV, traits.HEAD_DIM, traits.HEAD_DIM_V
-        self.q_div = _batch_view(self.Q, self.seqlen_q_v, self.stride_q_n_v, hq, d_qk, self.q_tok_base)
-        self.o_div = _batch_view(self.O, self.seqlen_q_v, self.stride_o_n_v, hq, d_v, self.q_tok_base)
-        self.k_div = _batch_view(self.K, self.seqlen_kv_v, self.stride_kv_n_v, hkv, d_qk, self.kv_tok_base)
-        self.v_div = _batch_view(self.V, self.seqlen_kv_v, self.stride_v_n_v, hkv, d_v, self.kv_tok_base)
+        b, q_tok, kv_tok = self.batch_idx, self.q_tok_base, self.kv_tok_base
+        self.q_div = self._batch_view(self.Q, self.seqlen_q_v, self.stride_q_n_v, hq, d_qk, b, q_tok)
+        self.o_div = self._batch_view(self.O, self.seqlen_q_v, self.stride_o_n_v, hq, d_v, b, q_tok)
+        self.k_div = self._batch_view(self.K, self.seqlen_kv_v, self.stride_kv_n_v, hkv, d_qk, b, kv_tok)
+        self.v_div = self._batch_view(self.V, self.seqlen_kv_v, self.stride_v_n_v, hkv, d_v, b, kv_tok)
 
         self.num_kv_tiles = (self.seqlen_kv_v + self.kv_tile_size - 1) // self.kv_tile_size
         if const_expr(traits.CAUSAL):
@@ -1211,6 +1223,51 @@ class DualwaveKernelContext:
         else:
             self.active = None
 
+    def _job_tid(self):
+        """The thread id; opaque in persistent jobs. Lane terms are job-invariant, so in the job
+        loop LICM hoists them out and they spill across it (~70 VGPRs at D_QK 192); deriving them
+        from an opaque tid per job keeps them next to their uses."""
+        if const_expr(getattr(self.traits, "PERSISTENT", 0)):
+            return fx.Index(_pin_regs([fx.Int32(self.tid)], "=v")[0])
+        return self.tid
+
+    def _bind_lanes(self, tid):
+        """Lane terms of the global Q / K / V offsets."""
+        traits = self.traits
+        self.job_lane = tid % traits.WARP_SIZE
+        self.dma_wave = tid // traits.WARP_SIZE
+        self.n_in_warp = self.job_lane // traits.VEC_KV
+        self.d_bucket = self.job_lane % traits.VEC_KV
+        if const_expr(traits.PV_MFMA16):
+            self.v16_dma_d_bucket = _v_pv16_chunk(self.d_bucket, self.n_in_warp)
+
+    def _view(self, tensor, byte_off, nrec, layout):
+        base_iter = fx.get_iter(tensor)
+        base_i64 = fx.Int64(fx.ptrtoint(base_iter))
+        shifted = fx.inttoptr(base_iter.type, base_i64 + fx.Int64(byte_off))
+        buf_ptr_ty = fx.PointerType.get(
+            elem_ty=self.elem_ir,
+            address_space=_TargetAddressSpace.BufferDesc,
+            alignment=base_iter.alignment,
+        )
+        buf_ptr = fx.make_ptr(
+            buf_ptr_ty,
+            [shifted, fx.Int16(0).ir_value(), fx.Int64(nrec).ir_value(), self.buf_flags_i32.ir_value()],
+        )
+        return fx.logical_divide(fx.make_view(buf_ptr, layout), fx.make_layout(1, 1))
+
+    def _batch_view(self, tensor, seqlen, stride, sbhd_heads, head_dim, batch_idx, tok_base):
+        traits = self.traits
+        per_batch = seqlen * stride
+        nrec_bytes = per_batch * fx.Index(traits.BF16_BYTES)
+        layout = fx.make_layout(fx.Int32(per_batch), fx.Int32(1))
+        # SBHD [S,B,H,D]: per-batch base is only heads*D (the seq-step lives in the row stride).
+        if const_expr(traits.SBHD):
+            off = batch_idx * fx.Index(sbhd_heads * head_dim) * fx.Index(traits.BF16_BYTES)
+        else:
+            off = tok_base * stride * fx.Index(traits.BF16_BYTES)
+        return self._view(tensor, off, nrec_bytes, layout)
+
     def _dma_base(self, buf_id, w_rep, d, buf_base_fn, line_stride):
         traits = self.traits
         wave_id_uni = self.wave_id_uni + fx.Index(w_rep * self.traits.NUM_WAVES)
@@ -1237,6 +1294,11 @@ class DualwaveKernelContext:
     # Pipeline helpers
 
     def load_all(self):
+        self.bind_q_rows()
+        return self.assemble_q(self.load_q_raw(self.q_div, self.q_gmem_elem_offset, self.wave_q_offset))
+
+    def bind_q_rows(self):
+        """This lane's q row (one q per lane) and the wave's first row, for the bound job."""
         traits = self.traits
         lane = self.job_lane
         if const_expr(traits.Q_TILES == 4):
@@ -1247,6 +1309,135 @@ class DualwaveKernelContext:
         self.q_row = self.q_start + self.q_row_in_block
         self.q_row_i32 = fx.Int32(self.q_row)
 
+    def _q_job_view(self, h_idx, q_block_idx, batch_idx):
+        """Q view and block element offset of the persistent job at (h_idx, q_block_idx, batch_idx)."""
+        traits = self.traits
+        assert traits.Q_HEADS_PER_WG == 1
+        q_div = self._batch_view(
+            self.Q,
+            self.seq_len_v,
+            self.stride_q_n_v,
+            traits.NUM_HEADS_Q,
+            traits.HEAD_DIM,
+            batch_idx,
+            batch_idx * self.seq_len_v,
+        )
+        q_head = (h_idx % traits.NUM_HEADS_KV) * traits.GQA_GROUP_SIZE + h_idx // traits.NUM_HEADS_KV
+        offset = q_block_idx * traits.BLOCK_M * self.stride_q_n_v + q_head * traits.HEAD_DIM
+        return q_div, offset
+
+    def prefetch_q_raw(self, h_idx, q_block_idx, batch_idx):
+        """`load_q_raw` of the job at (h_idx, q_block_idx, batch_idx), ahead of its bind_item.
+        Rebinds the lane terms; persistent jobs only (never varlen, one q head per WG)."""
+        traits = self.traits
+        tid = self._job_tid()
+        self._bind_lanes(tid)
+        q_div, offset = self._q_job_view(h_idx, q_block_idx, batch_idx)
+        return self.load_q_raw(q_div, offset, tid // traits.WARP_SIZE * traits.ROWS_PER_WAVE)
+
+    def stage_q_dma(self, h_idx, q_block_idx, batch_idx):
+        """The paired k-steps' Q of the job at (h_idx, q_block_idx, batch_idx), by DMA into the
+        waves' O stage tiles: d blocks 0 and 2 are lines 0 and 2 of every 384-byte Q row, so each
+        quarter-wave moves whole lines where a gather spends a line on every 16 bytes.
+
+        The last wave issues none: in the dense drain it runs the diagonal QK alone while the
+        others wait at its barrier. Every other wave fills its own tile and the first
+        Q_STAGE_LAST_SPLIT share the last one's. The owner may read a tile (`read_q_stage`) after
+        the issuers' vmcnt wait and a barrier."""
+        traits = self.traits
+        assert traits.Q_LDS_STAGE and Q_STAGE_LAST_SPLIT < traits.NUM_WAVES
+        tid = self._job_tid()
+        q_div, offset = self._q_job_view(h_idx, q_block_idx, batch_idx)
+        lane = tid % traits.WARP_SIZE
+        wave = self.wave_id_uni
+        wave_bytes = self._o_stage_wave_bytes
+        rows_per_dma = traits.WARP_SIZE // Q_STAGE_ROW_CHUNKS
+        dma_bytes = traits.WARP_SIZE * 16
+        # Stage row r is q row r of its tile; its chunk p holds the row's part-A chunk
+        # (p - r) % 16, so `read_q_stage` meets 16 distinct chunks per k-step. A DMA fills 4 rows
+        # from a multiple of 4, so its lane chunks only depend on the DMA's index mod 4.
+        chunk_offs = []
+        for i in range_constexpr(4):
+            j = (lane % 16 + 32 - lane // 16 - rows_per_dma * i) % 16
+            chunk_offs.append(j % 8 * traits.VEC_KV + j // 8 * 128)
+
+        def _issue(tile_bytes, first_row, n_dma):
+            m0_base = rocdl.readfirstlane(T.i32, as_mlir_value(fx.Int32(self.lds_o_base_idx + tile_bytes)))
+            # A running sum: separate i * stride products are job-invariant and get hoisted.
+            row_elem = offset + (first_row + lane // 16) * self.stride_q_n_v
+            row_step = rows_per_dma * self.stride_q_n_v
+            for i in range_constexpr(n_dma):
+                lds_ptr = fx.inttoptr(self.lds_ptr_ty, fx.Int32(m0_base) + fx.Int32(i * dma_bytes))
+                dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
+                src = fx.slice(q_div, (None, fx.Int32(row_elem + chunk_offs[i % 4])))
+                fx.copy(self.dma_atom, src, dst, soffset=fx.Int32(0))
+                row_elem = row_elem + row_step
+
+        last = traits.NUM_WAVES - 1
+        dmas_per_tile = traits.ROWS_PER_WAVE // rows_per_dma
+        share = dmas_per_tile // Q_STAGE_LAST_SPLIT
+
+        @flyc.jit
+        def _own():
+            if wave < fx.Index(last):
+                _issue(wave * wave_bytes, wave * traits.ROWS_PER_WAVE, dmas_per_tile)
+
+        @flyc.jit
+        def _last_share():
+            if wave < fx.Index(Q_STAGE_LAST_SPLIT):
+                _issue(
+                    last * wave_bytes + wave * (share * dma_bytes),
+                    last * traits.ROWS_PER_WAVE + wave * (share * rows_per_dma),
+                    share,
+                )
+
+        _own()
+        _last_share()
+
+    def prefetch_q_staged(self, h_idx, q_block_idx, batch_idx):
+        """`prefetch_q_raw` with the paired k-steps' packs left as None, for `read_q_stage` to
+        fill in from what `stage_q_dma` moved; only the middle block is gathered."""
+        traits = self.traits
+        tid = self._job_tid()
+        self._bind_lanes(tid)
+        q_div, offset = self._q_job_view(h_idx, q_block_idx, batch_idx)
+        wave_q_offset = tid // traits.WARP_SIZE * traits.ROWS_PER_WAVE
+        return self.load_q_raw(q_div, offset, wave_q_offset, keep=lambda ks16: ks16 >= QK16_PAIRED_STEPS)
+
+    @property
+    def _o_stage_wave_bytes(self):
+        return self.traits.ROWS_PER_WAVE * self.traits.O_STAGE_ROW_ELEMS * self.traits.BF16_BYTES
+
+    def read_q_stage(self, q_raw):
+        """The packs `prefetch_q_staged` left as None, from the wave's O stage tile once its
+        `stage_q_dma` is visible. The wave's own O store after this is ordered behind the reads."""
+        traits = self.traits
+        tid = self._job_tid()
+        wave, lane = tid // traits.WARP_SIZE, tid % traits.WARP_SIZE
+        # Lane group c reads part-A chunk 8 (c % 2) + 2 s + c // 2 of q row lane % 16 + 16 qt.
+        c = lane // 16
+        row = wave * self._o_stage_wave_bytes + lane % 16 * Q_STAGE_ROW_BYTES
+        steps = _qk16_k_steps(traits)
+        out = list(q_raw)
+        for s in range_constexpr(QK16_PAIRED_STEPS):
+            chunk = (c % 2 * 8 + c // 2 + 2 * s + lane % 16) % 16
+            ptr = self.lds_o_byte_ptr(row + chunk * 16)
+            for qt in range_constexpr(traits.Q_TILES):
+                pack = _lds_load_o_128(traits, ptr, qt * 16 * Q_STAGE_ROW_BYTES)
+                assert out[qt * steps + s] is None
+                out[qt * steps + s] = pack.bitcast(self.elem_dtype).ir_value()
+        return out
+
+    def load_q_raw(self, q_div, q_elem_offset, wave_q_offset, keep=None):
+        """This lane's Q packs as loaded (one vector per 16-byte load), before `assemble_q`; with
+        `keep`, only the k-steps it accepts are loaded and the rest are None."""
+        traits = self.traits
+        lane = self.job_lane
+        if const_expr(traits.Q_TILES == 4):
+            q_row_in_block = wave_q_offset + lane
+        else:
+            q_row_in_block = wave_q_offset + lane % 32
+
         n_packs = traits.Q_TILES * _qk16_k_steps(traits) if traits.QK_MFMA16 else traits.K_STEPS_QK
         if const_expr(traits.QK_MFMA16):
             # Per-lane d terms of the 16x16x32 B operand, matching the K reads (QK16_PAIRED_STEPS).
@@ -1255,26 +1446,33 @@ class DualwaveKernelContext:
             middle_d = (_c % 2) * 4 * traits.VEC_KV + (_c // 2) * traits.VEC_KV
         q_raw_packs = []
         for ks in range_constexpr(n_packs):
+            if const_expr(keep is not None and not keep(ks % _qk16_k_steps(traits))):
+                q_raw_packs.append(None)
+                continue
             if const_expr(traits.QK_MFMA16):
                 # 16x16x32 B operand, pack qt * _qk16_k_steps + ks16: q row 16 qt + lane % 16, the
                 # d chunk K reads at k-step ks16 (QK16_PAIRED_STEPS).
                 qt, ks16 = ks // _qk16_k_steps(traits), ks % _qk16_k_steps(traits)
                 lane_d = paired_d if ks16 < QK16_PAIRED_STEPS else middle_d
-                elem_index = self.q_gmem_elem_offset + (
-                    (self.wave_q_offset + lane % 16 + 16 * qt) * self.stride_q_n_v
-                    + (_qk16_step_d(ks16) + lane_d)
+                elem_index = q_elem_offset + (
+                    (wave_q_offset + lane % 16 + 16 * qt) * self.stride_q_n_v + (_qk16_step_d(ks16) + lane_d)
                 )
             else:
-                elem_index = self.q_gmem_elem_offset + (
-                    self.q_row_in_block * self.stride_q_n_v
+                elem_index = q_elem_offset + (
+                    q_row_in_block * self.stride_q_n_v
                     + (ks * self.traits.K_STEP_QK + lane // 32 * self.traits.MFMA_LANE_K)
                 )
             q_i32_pack = fly.copy_atom_call_ssa(
                 [self.q_load_i32x4_type],
                 self.load_atom_128,
-                fx.slice(self.q_div, (None, fx.Int32(elem_index))),
+                fx.slice(q_div, (None, fx.Int32(elem_index))),
             )
             q_raw_packs.append(Vec(q_i32_pack, (4,), fx.Int32).bitcast(self.elem_dtype).ir_value())
+        return q_raw_packs
+
+    def assemble_q(self, q_raw_packs):
+        traits = self.traits
+        n_packs = len(q_raw_packs)
         q_16_packs = []
         for pair in range_constexpr(n_packs // 2):
             q_16_packs.append(_concat_vectors(q_raw_packs[pair * 2], q_raw_packs[pair * 2 + 1]))
@@ -2177,6 +2375,31 @@ class DualwaveKernelContext:
             pieces=pieces,
         )
 
+    def prefetch_k_tile(self, h_idx, batch_idx, tile_idx, buf_id):
+        """K tile `tile_idx` of the job at (head h_idx, batch_idx) into `buf_id`, ahead of that
+        job's bind_item. Rebinds the lane terms; persistent jobs only (never varlen)."""
+        traits = self.traits
+        self._bind_lanes(self._job_tid())
+        k_div = self._batch_view(
+            self.K,
+            self.seq_len_kv_v,
+            self.stride_kv_n_v,
+            traits.NUM_HEADS_KV,
+            traits.HEAD_DIM,
+            batch_idx,
+            batch_idx * self.seq_len_kv_v,
+        )
+        self._load_kv(
+            self.tile_start(tile_idx),
+            buf_id,
+            self.k_dma_m0,
+            k_div,
+            self.NUM_DMA_K,
+            (h_idx % traits.NUM_HEADS_KV) * traits.HEAD_DIM,
+            self.stride_kv_n_v,
+            chunk_fn=self._k_dma_chunk if traits.QK_MFMA16 else None,
+        )
+
     def _k_dma_chunk(self, d, line):
         if d != 1:
             return self.d_bucket
@@ -2261,7 +2484,7 @@ class DualwaveKernelContext:
             packs = [[None] * self.traits.D_CHUNKS for _ in range(4)]
         if const_expr(self.traits.PV_MFMA16):
             assert urv_base is self.v_lds_read_base_per_lane, "PV_MFMA16 reads V from its own two bases"
-            return self._lds_load_v16(v_base, ks_lo, ks_hi, packs, buf_id, dcs)
+            return self._lds_load_v16(ks_lo, ks_hi, packs, buf_id, dcs)
         assert dcs is None, "only the PV_MFMA16 read splits by d chunk"
         pair_off = self.traits.V_LDS_TO_REG_TRANSPOSE_PAIR_STRIDE * self.traits.BF16_BYTES
         lane_ptr = buffer_ops.get_element_ptr(
@@ -2286,18 +2509,14 @@ class DualwaveKernelContext:
                 packs[k_substep][dc] = Vec(a).shuffle(Vec(b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
         return packs
 
-    def _lds_load_v16(self, v_base, ks_lo, ks_hi, packs, buf_id, dcs=None):
+    def _lds_load_v16(self, ks_lo, ks_hi, packs, buf_id, dcs=None):
         """V^T packs of P*V step s (kv half s // 2, dv tiles 4 (s % 2) + dc): kv tile 0 of the half,
         then kv tile 1 (16 kv = two LDS rows on), each a ds_read_b64_tr_b16."""
         traits = self.traits
         dc_lo, dc_hi = (0, traits.D_CHUNKS) if dcs is None else dcs
         lane_ptrs = [
-            buffer_ops.get_element_ptr(
-                self.lds_kv_base_ptr,
-                byte_offset=as_mlir_value(fx.Int32((v_base + base) * traits.BF16_BYTES)),
-                elem_type=T.i8,
-            )
-            for base in self.v16_read_base
+            buffer_ops.get_element_ptr(self.lds_kv_base_ptr, byte_offset=as_mlir_value(off), elem_type=T.i8)
+            for off in self.v16_read_off[buf_id]
         ]
         for step in range_constexpr(ks_lo, ks_hi):
             for dc in range_constexpr(dc_lo, dc_hi):
@@ -2353,6 +2572,13 @@ class DualwaveKernelContext:
 
         _zero_o_block_if_needed()
 
+    @property
+    def o_stores_per_lane(self):
+        """buffer_store instructions `store_final_o` issues per lane (16 B each on every path)."""
+        if self.traits.PV_MFMA16 and self.QT == 4:
+            return self.traits.D_CHUNKS * 4
+        return self.traits.D_CHUNKS * 2
+
     def store_final_o(self, v_o, q_row):
         if const_expr(self.traits.PV_MFMA16 and self.QT == 4):
             return self._store_final_o16x4(v_o, q_row)
@@ -2386,9 +2612,18 @@ class DualwaveKernelContext:
     def _store_final_o16x4(self, v_o, q_row):
         """Four q tiles: lane row c holds dv 16 t + 4 c + [0, 4) of q lane % 16 + 16 qt. A 4x4
         transpose across lane rows (half-wave swaps join rows c and c ^ 2, then row-pair swaps
-        c and c ^ 1) gives every lane all 16 dv of tile t for its own q = lane: two 16-byte stores."""
+        c and c ^ 1) gives every lane all 16 dv of tile t for its own q = lane: two 16-byte stores.
+        Those touch 64 q rows each, 16 B per row; with O_LDS_STAGE they go to the wave's LDS
+        tile instead, which is then stored four whole rows (16 lanes each) per buffer_store."""
         traits = self.traits
         o_base = q_row * self.stride_o_n_v + self.q_head_idx * traits.HEAD_DIM_V
+        if const_expr(traits.O_LDS_STAGE):
+            # Fresh lane terms: CSE with the job's own would keep them live across the KV loop.
+            tid = self._job_tid()
+            lane = tid % traits.WARP_SIZE
+            row_bytes = traits.O_STAGE_ROW_ELEMS * traits.BF16_BYTES
+            wave_tile = tid // traits.WARP_SIZE * (traits.ROWS_PER_WAVE * row_bytes)
+            stage_lane = self.lds_o_byte_ptr(wave_tile + lane * row_bytes)
         for dc in range_constexpr(traits.D_CHUNKS):
             for g in range_constexpr(2):
                 x = [_o_pack_2dw(traits, v_o, dc, 4 * g + qt, self.elem_dtype) for qt in range(4)]
@@ -2401,13 +2636,42 @@ class DualwaveKernelContext:
                     words = [None] * 4
                     for w in range_constexpr(2):
                         words[w], words[2 + w] = _permlane16_swap_i32(z[0][a][w], z[1][a][w])
-                    _buffer_store_128(
-                        Vec.from_elements([fx.Int32(v) for v in words], fx.Int32),
-                        o_base + 16 * (dc + 4 * g) + 8 * a,
-                        _o_store_reg_128=self.o_store_reg_128,
-                        _store_atom_128=self.store_atom_128,
-                        o_div=self.o_div,
-                    )
+                    pack = Vec.from_elements([fx.Int32(v) for v in words], fx.Int32)
+                    dv = 16 * (dc + 4 * g) + 8 * a
+                    if const_expr(traits.O_LDS_STAGE):
+                        _lds_store_o_128(traits, pack, stage_lane, dv * traits.BF16_BYTES)
+                    else:
+                        _buffer_store_128(
+                            pack,
+                            o_base + dv,
+                            _o_store_reg_128=self.o_store_reg_128,
+                            _store_atom_128=self.store_atom_128,
+                            o_div=self.o_div,
+                        )
+        if const_expr(traits.O_LDS_STAGE):
+            # The wave reads back only its own tile, and its DS ops complete in order: no barrier.
+            lanes_per_row = traits.HEAD_DIM_V * traits.BF16_BYTES // 16
+            rows_per_store = traits.WARP_SIZE // lanes_per_row
+            row, chunk = lane // lanes_per_row, lane % lanes_per_row
+            read_lane = self.lds_o_byte_ptr(wave_tile + row * row_bytes + chunk * 16)
+            o_row = (q_row - lane + row) * self.stride_o_n_v + self.q_head_idx * traits.HEAD_DIM_V
+            o_row = o_row + chunk * (16 // traits.BF16_BYTES)
+            # A running sum: separate i * stride products are job-invariant and get hoisted.
+            o_step = rows_per_store * self.stride_o_n_v
+            for i in range_constexpr(traits.ROWS_PER_WAVE // rows_per_store):
+                _buffer_store_128(
+                    _lds_load_o_128(traits, read_lane, i * rows_per_store * row_bytes),
+                    o_row,
+                    _o_store_reg_128=self.o_store_reg_128,
+                    _store_atom_128=self.store_atom_128,
+                    o_div=self.o_div,
+                )
+                o_row = o_row + o_step
+
+    def lds_o_byte_ptr(self, byte_offset):
+        return buffer_ops.get_element_ptr(
+            self.lds_o_base_ptr, byte_offset=as_mlir_value(fx.Int32(byte_offset)), elem_type=T.i8
+        )
 
     def store_lse(self, m_row, l_row, q_row):
         """LSE: m_row/l_row live in the log2 domain, hence LSE_natural =

@@ -1,0 +1,58 @@
+--- rounds/round-12/kernel_snapshot/branch_mla/attn_helper_mla.py	2026-11-11 01:42:58.208134151 +0000
++++ src/branch_mla/attn_helper_mla.py	2026-11-11 01:47:39.889415173 +0000
+@@ -36,7 +36,7 @@
+ # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
+ # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
+ # kernel, or a warm cache keeps serving the old one.
+-CODEGEN_REV = 1049
++CODEGEN_REV = 1050
+ 
+ # Room a later key has above a tile's row max before it forces another rebase.
+ REF_MARGIN = 96.0
+@@ -1013,6 +1013,15 @@
+                 + (self.lane % 4) * 4
+             )
+             self.v16_read_base = (_v_lane + 16 * (_c % 2), _v_lane + 16 - 16 * (_c % 2))
++            # Byte offsets of those bases per V buffer. Buffer 1 starts at the 64 KiB limit of the
++            # DS offset field, so a constant base cannot fold there and every read would get its own
++            # loop-invariant address register; an opaque base leaves only the read's offset.
++            v16_off = [
++                [fx.Int32((_v_buf_base(traits, b) + base) * traits.BF16_BYTES) for base in self.v16_read_base]
++                for b in range(2)
++            ]
++            v16_off[1] = [fx.Int32(v) for v in _pin_regs(v16_off[1], "=v")]
++            self.v16_read_off = v16_off
+ 
+     def block_item(self):
+         """(head, q block, batch) this CTA owns in the one-job-per-CTA grid."""
+@@ -2302,7 +2311,7 @@
+             packs = [[None] * self.traits.D_CHUNKS for _ in range(4)]
+         if const_expr(self.traits.PV_MFMA16):
+             assert urv_base is self.v_lds_read_base_per_lane, "PV_MFMA16 reads V from its own two bases"
+-            return self._lds_load_v16(v_base, ks_lo, ks_hi, packs, buf_id, dcs)
++            return self._lds_load_v16(ks_lo, ks_hi, packs, buf_id, dcs)
+         assert dcs is None, "only the PV_MFMA16 read splits by d chunk"
+         pair_off = self.traits.V_LDS_TO_REG_TRANSPOSE_PAIR_STRIDE * self.traits.BF16_BYTES
+         lane_ptr = buffer_ops.get_element_ptr(
+@@ -2327,18 +2336,14 @@
+                 packs[k_substep][dc] = Vec(a).shuffle(Vec(b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+         return packs
+ 
+-    def _lds_load_v16(self, v_base, ks_lo, ks_hi, packs, buf_id, dcs=None):
++    def _lds_load_v16(self, ks_lo, ks_hi, packs, buf_id, dcs=None):
+         """V^T packs of P*V step s (kv half s // 2, dv tiles 4 (s % 2) + dc): kv tile 0 of the half,
+         then kv tile 1 (16 kv = two LDS rows on), each a ds_read_b64_tr_b16."""
+         traits = self.traits
+         dc_lo, dc_hi = (0, traits.D_CHUNKS) if dcs is None else dcs
+         lane_ptrs = [
+-            buffer_ops.get_element_ptr(
+-                self.lds_kv_base_ptr,
+-                byte_offset=as_mlir_value(fx.Int32((v_base + base) * traits.BF16_BYTES)),
+-                elem_type=T.i8,
+-            )
+-            for base in self.v16_read_base
++            buffer_ops.get_element_ptr(self.lds_kv_base_ptr, byte_offset=as_mlir_value(off), elem_type=T.i8)
++            for off in self.v16_read_off[buf_id]
+         ]
+         for step in range_constexpr(ks_lo, ks_hi):
+             for dc in range_constexpr(dc_lo, dc_hi):

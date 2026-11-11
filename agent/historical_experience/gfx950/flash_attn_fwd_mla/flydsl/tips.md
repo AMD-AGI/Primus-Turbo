@@ -176,3 +176,57 @@
   XCD c % 8, job i to queue i % 8, cost = KV tiles + ~8 tiles fixed) keeps the per-XCD L2 grouping
   and the dynamic-dispatch balance with no atomics; a static snake / chunked split was -10 % on
   dsv2lite in simulation. Read the table with `s_buffer_load`, one job ahead.
+- Cross-job K prefetch in a persistent loop (issue the next job's first K tiles in the drain once both
+  buffers are free): only +0.1-0.2 % at 4K for causal MLA fwd (R11), because the first prologue wait is
+  also the previous job's O-store drain. Separate the two waits (vmcnt is in order: prefetch first,
+  stores after) before counting on the K latency. Removing prologue DMAs also reshuffled the KV loop's
+  register allocation (+1.7 % S64K, -0.35 % B2 S16K, deterministic): repeat the A/B in a second
+  process and attribute per-shape moves that do not scale with the per-job share to codegen.
+- Per-head-count binaries: `NUM_HEADS_Q` is a compile-time trait, so H=8 / 16 / 64 / 96 / 128 each get
+  their own register allocation. Inspect the ISA of the head count you are attributing (R12: the H=8
+  dump looked fine while the H=128 and H=64 loops had moved). Decompose a prologue change by sequence
+  length inside one binary: S64K is ~pure loop, so its delta is the loop codegen effect and the 4K
+  delta minus that is the per-job saving.
+- DS instructions carry a 16-bit byte offset. An LDS buffer at or past 64 KiB (V buffer 1 of the
+  D_QK 192 / D_V 128 QT4 layout starts at exactly 65536) never folds its constant base, so every
+  read gets its own address register; LICM hoists ~16 of them out of the KV loop and at 512
+  registers they park in AGPRs, read back in the loop. Where those reads land swung the loop by
+  +-2 % between rounds (R10-R12). An opaque per-lane base for that buffer (`_pin_regs`) folds every
+  offset: 512 -> 497 VGPRs, 0 spills, +1.8 % (+1.6 % on the one-job-per-CTA path). Check
+  `grep -c 'ds_read.*offset:'` against the total in any LDS-heavy kernel.
+- Measurement: with the same binary, B1 S64K (few, long persistent jobs) moves by up to +-1.5 %
+  between processes, while the 4K shapes repeat within 0.05 %. For prologue / per-job changes worth
+  < 0.5 %, judge on the short-job shapes and confirm the geomean sign in a second process.
+- Persistent job top on gfx9 (loads and stores share vmcnt, retired in order): with the next
+  job's K prefetched before the current job's O stores, `vmcnt(<stores per lane>)` waits for the
+  prefetch only. The first job needs its own full wait, since no stores follow its prefetch. Worth
+  only +0.1 % here (H128 4K -0.15 %): at ~80 us jobs the O stores were mostly off the critical path.
+- Transposed accumulator stores: a layout where every lane holds one whole output row makes each
+  16 B `buffer_store` touch one cache line per lane (64 rows x 16 B). Staging through a per-wave LDS
+  tile (rows padded 16 B off the 64-bank period, no barrier since each wave reads only its own
+  tile) and storing 4 whole rows per instruction gave +1.8-2.3 % on 4K causal MLA fwd shapes, ~40 %
+  of a no-store fake's bound. Derive the staging lane terms from a fresh opaque tid and step the
+  row offset as a running sum: reusing the job's lane values CSEs them across the KV loop (+14
+  VGPRs, AGPR read-backs in the loop), and `i * stride` products hoist into SGPRs. Even then the
+  loop rescheduled at the lower register pressure (identical IR, S64K -1.2 %): diff the loop ISA
+  for any epilogue change.
+- Persistent cross-job Q prefetch: load the next job's Q right after this job's last QK (here with
+  the next job's K prefetch in the drain) and carry the raw packs over the job loop as iter_args.
+  LLVM kept them untouched (half loaded straight into AGPRs) until the next prologue's scale, with
+  no wait in between; the job-top `vmcnt(<O stores>)` covers them since they issue before the
+  stores. Worth +0.4-0.7 % at 4K (~1K cycles per job). A fake that replaces Q with a constant
+  promised +8 %: constant MFMA operands also cut switching power, so don't use operand-changing
+  fakes as latency bounds.
+- Scattered 16 B-per-lane gathers (16 rows per quarter-wave) are TA-throughput bound, not latency
+  bound: in the d192 MLA fwd, 24 Q gathers per job cost ~6K issue cycles. A fake with the same 24
+  loads made contiguous beat an L2-hot one (+2.8 % vs +1.3 % dsv3). Fix: LDS DMA (1 KB contiguous per
+  `buffer_load_dwordx4 ... lds`) into a free per-wave LDS tile, then `ds_read_b128` into the MFMA
+  layout. A rotation swizzle (chunk p of row r holds (p - r) % 16) makes the read back conflict-free
+  with plain arithmetic; FlyDSL values have no `^`. The persistent O stage tile is free between
+  epilogues and fits 256 B of each Q row: +0.45-0.68 % geomean, +1.0-1.2 % at H64 4K.
+- Causal drain imbalance is free issue time: on the last diagonal KV tile only the last wave has
+  live QK, the others wait at the barrier. Work that holds no registers until later (LDS DMA into a
+  free tile) can go there, issued by the idle waves, including for the busy wave's tile
+  (wave-uniform `scf.if` on the readfirstlane'd wave id; the existing vmcnt + barrier before the
+  read publishes it). Moving the Q stage DMAs from a memory cluster into C9 this way: drain -2.1K
+  cycles per job, +1.6 % dsv3, +1.1 % geomean.

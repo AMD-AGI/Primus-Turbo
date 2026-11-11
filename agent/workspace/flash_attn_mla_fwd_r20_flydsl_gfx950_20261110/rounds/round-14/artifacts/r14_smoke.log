@@ -1,0 +1,8 @@
+B=1 S=1024 H=4: o_rel 2.474e-03 lse_max 3.229e-03 finite True | bitwise_vs_base True
+B=2 S=2048 H=8: o_rel 2.538e-03 lse_max 3.847e-03 finite True | bitwise_vs_base True
+B=1 S=4096 H=16: o_rel 1.995e-03 lse_max 3.645e-03 finite True | bitwise_vs_base True
+B=1 S=1000 H=8: o_rel 2.474e-03 lse_max 3.249e-03 finite True | bitwise_vs_base True
+B=3 S=1536 H=24: o_rel 2.501e-03 lse_max 4.514e-03 finite True | bitwise_vs_base True
+B=2 S=4096 H=128: o_rel 1.969e-03 lse_max 4.750e-03 finite True | bitwise_vs_base True
+B=1 S=300 H=8: o_rel 2.369e-03 lse_max 3.249e-03 finite True | bitwise_vs_base True
+B=4 S=777 H=64: o_rel 2.457e-03 lse_max 5.137e-03 finite True | bitwise_vs_base True

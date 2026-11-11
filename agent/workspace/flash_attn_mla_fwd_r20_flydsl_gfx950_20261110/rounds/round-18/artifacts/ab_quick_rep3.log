@@ -1,0 +1,7 @@
+aiter /tmp/aiter_0124/aiter/__init__.py | cand /home/xiaompen/Turbo/agent/workspace/flash_attn_mla_fwd_r20_flydsl_gfx950_20261110/src/branch_mla | base rounds/round-17/kernel_snapshot/branch_mla
+dsv3      PASS o_rel nan lse nan  cand  1144.5  base  1138.5  cand/base 1.0053  bitwise True  spread% 0.19/0.22
+dsv2lite  PASS o_rel nan lse nan  cand  1105.0  base  1101.8  cand/base 1.0029  bitwise True  spread% 0.15/0.07
+kimik3    PASS o_rel nan lse nan  cand  1248.1  base  1240.9  cand/base 1.0058  bitwise True  spread% 0.23/0.19
+b1_s16k   PASS o_rel nan lse nan  cand  1300.8  base  1297.6  cand/base 1.0025  bitwise True  spread% 0.14/0.15
+b1_s64k   PASS o_rel nan lse nan  cand  1366.1  base  1329.0  cand/base 1.0279  bitwise True  spread% 0.13/0.16
+PASS 5/5  geomean cand 1229.09  base 1218.34  cand/base 1.0088  bitwise 5/5
