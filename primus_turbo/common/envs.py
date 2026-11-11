@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_ODC_GDA_BLOCK: int = 256
     PRIMUS_TURBO_ODC_GDA_PIPE: int = 1
     PRIMUS_TURBO_ODC_GDA_NUM_QP: int = 1
+    PRIMUS_TURBO_DGATE_ACC_ATOMIC: bool = True
 
 
 def backend_spec(name: str) -> Callable[[], str | None]:
@@ -270,6 +271,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rocSHMEM QPs/contexts for multi-QP NIC concurrency, clamped to [1, 256]; above 1 selects
     # the multi-QP path.
     "PRIMUS_TURBO_ODC_GDA_NUM_QP": env_clamped_int("PRIMUS_TURBO_ODC_GDA_NUM_QP", 1, 1, 256),
+    # ================== Flux ==================
+    # "0" makes the Flux dgate epilogue accumulate without atomics. Unset and any other value
+    # keep the atomic path. Read once, when the MXFP4 quant kernel module is imported.
+    "PRIMUS_TURBO_DGATE_ACC_ATOMIC": lambda: os.getenv("PRIMUS_TURBO_DGATE_ACC_ATOMIC", "1") != "0",
 }
 
 

@@ -50,8 +50,10 @@ ALLOW_RE = re.compile(r"#\s*envs:\s*allow\b")
 # entry when new code reads another project's variable.
 THIRD_PARTY_PREFIXES = (
     "AMDGCN_",  # Triton's AMD backend
+    "FLUX_",  # MLPerf Flux recipe flags, owned by Primus
     "FLYDSL_",
     "NVSHMEM_",  # NVSHMEM / rocSHMEM, configured by the DeepEP buffer
+    "PRIMUS_MXFP4_",  # MXFP4 packing flag, owned by Primus
     "TRITON_",
 )
 THIRD_PARTY_NAMES = frozenset({"RANK", "WORLD_SIZE"})  # set by torchrun and other launchers
