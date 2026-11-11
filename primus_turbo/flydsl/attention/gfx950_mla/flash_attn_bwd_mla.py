@@ -1858,6 +1858,22 @@ def build_flash_attn_bwd_dkdv_module(
     assert G3_ST_W in (0, 1, 2), "a hand-off carries one row, a pair, or the whole emission"
     G3_SB = 0 if g3_sb is None else int(g3_sb)
     G3S_SLOTS = 2 if (G3_DEFER or QDO_RING or DMA_GRP > 1) else 1
+    # DS_PAR: with one head per kv group, head_local % 2 puts every head-step's dS in slot 0,
+    # so G3_QCARRY's deferred GEMM3 at the top of a trip reads the slot that the same trip
+    # writes after GEMM1 and the softmax, with no barrier between the read and the write.
+    # The slots then alternate per trip instead: the q loop carries the pinned dS write base
+    # and the deferred read base, each stepped by one slot stride per trip in opposite
+    # directions, so a slot is only rewritten after the next trip's leading barrier, and the
+    # two bases stay the same two registers HOIST_PIN already keeps live over the loop.
+    # An odd group size above one would need the step per head-step; no caller has one.
+    DS_PAR = G3_QCARRY and GQA_GROUP_SIZE == 1
+    assert not (G3_QCARRY and GQA_GROUP_SIZE % 2 == 1 and not DS_PAR)
+    assert not (DS_PAR and G3_SPLIT)
+    # The step is added to XOR-addressed bases, which commutes only while the slot stride's
+    # lowest set bit lies above every XOR mask applied to them afterwards.
+    assert not DS_PAR or (G3S_GRP_ELEMS & -G3S_GRP_ELEMS) > max(
+        (G3_QT - 1) * G3_SPL_STRIDE * D_TILE, (PV_K_STEPS - 1) * 2 * M_TILE
+    )
     # G3_SHADOW: emit the deferred GEMM3 INSIDE the rendezvous, between the Q/dO DMA issue
     # and its drain, since GEMM3 is the only work that reads neither the slot being filled
     # nor GEMM1's output. Disabled: a pending buffer_load ... lds forces vmcnt(0) before
@@ -2915,6 +2931,7 @@ def build_flash_attn_bwd_dkdv_module(
             st_sink=None,
             poff=None,
             pre=None,
+            sbase=None,
         ):
             """Run the dQ pass on its carrier waves (see G3_WAVES).
 
@@ -2927,12 +2944,12 @@ def build_flash_attn_bwd_dkdv_module(
             """
             if const_expr(G3_WAVES < NUM_WAVES):
                 if wave_id < fx.Index(G3_WAVES):
-                    _gemm3_tiles(q_start, head_local, slot, drain, qsel, depth, poff=poff)
+                    _gemm3_tiles(q_start, head_local, slot, drain, qsel, depth, poff=poff, sbase=sbase)
                 if const_expr(drain is not None):
                     if wave_id >= fx.Index(G3_WAVES):
                         drain()
             else:
-                _gemm3_tiles(q_start, head_local, slot, drain, qsel, depth, st_sink, poff, pre)
+                _gemm3_tiles(q_start, head_local, slot, drain, qsel, depth, st_sink, poff, pre, sbase)
 
         def _gemm3_tiles(
             q_start,
@@ -2944,6 +2961,7 @@ def build_flash_attn_bwd_dkdv_module(
             st_sink=None,
             poff=None,
             pre=None,
+            sbase=None,
         ):
             """dQ^T[m=D][n=q] += K^T . dS^T over this band's kv rows, for ONE head.
 
@@ -2958,6 +2976,10 @@ def build_flash_attn_bwd_dkdv_module(
             else:
                 _kb, _sb = _g3_kbase(_g3d0), _g3_sbase(_g3q0)
             _soff = slot * G3S_GRP_ELEMS
+            if const_expr(sbase is not None):
+                # DS_PAR: the loop-carried read base already points at the slot.
+                _sb = sbase
+                _soff = 0
             # qsel picks ONE of the wave's q-tiles (its dS columns come from that q-half
             # alone), so the pass can run as soon as that half's softmax has published.
             _qs = list(range_constexpr(G3_QT)) if qsel is None else [qsel]
@@ -3422,6 +3444,7 @@ def build_flash_attn_bwd_dkdv_module(
             nq=None,
             st_io=None,
             g3_prev=None,
+            ds_bases=None,
         ):
             # The next head's Q/dO fetch: the earlier it is issued the more of this step
             # covers it, and the longer its 16 B per tensor stay live over the body's
@@ -3582,6 +3605,7 @@ def build_flash_attn_bwd_dkdv_module(
                         _h,
                         const_expr(_h % G3S_SLOTS),
                         st_sink=_g3_pend if const_expr(G3_ST_AT >= 0) else None,
+                        sbase=ds_bases[1] if const_expr(DS_PAR) else None,
                     )
                 )
                 if const_expr(G3_SB & 1):
@@ -3606,6 +3630,12 @@ def build_flash_attn_bwd_dkdv_module(
                 _g3wb = _pins["g3w"]
             else:
                 _g3wb = _g3s_wbase()
+            # The dS write slot: an element offset folded into the ds_write offset field, or under
+            # DS_PAR already in the loop-carried base.
+            _g3w_slot = (head_local % G3S_SLOTS) * G3S_GRP_ELEMS
+            if const_expr(DS_PAR):
+                _g3wb = ds_bases[0]
+                _g3w_slot = 0
 
             def _flat_accs():
                 _h = _H[0]
@@ -3966,11 +3996,7 @@ def build_flash_attn_bwd_dkdv_module(
                                 _ds = _scale()
                             _dw[pks][nt] = bf16_trunc_pack_v8(_ds[0] + _ds[1])
                             _dsv = _dw[pks][nt]
-                        _g3wo = (
-                            nt * N_TILE * BLOCK_Q
-                            + (head_local % G3S_SLOTS) * G3S_GRP_ELEMS
-                            + _h0 * G3S_SLOT_ELEMS
-                        )
+                        _g3wo = nt * N_TILE * BLOCK_Q + _g3w_slot + _h0 * G3S_SLOT_ELEMS
                         if const_expr(FQ_PAIR and _hs is not None):
                             _qx = _hs * fx.Index(2 * M_TILE)
                             _ds_write_vec(_g3wb ^ _qx, _g3wo, _dsv)
@@ -4134,11 +4160,7 @@ def build_flash_attn_bwd_dkdv_module(
                                 [fx.Int32(0) for _ in range_constexpr(4)], fx.Int32
                             ).bitcast(elem_dtype)
                             for nt in range_constexpr(NT):
-                                _zo = (
-                                    nt * N_TILE * BLOCK_Q
-                                    + (head_local % G3S_SLOTS) * G3S_GRP_ELEMS
-                                    + _H[0] * G3S_SLOT_ELEMS
-                                )
+                                _zo = nt * N_TILE * BLOCK_Q + _g3w_slot + _H[0] * G3S_SLOT_ELEMS
                                 for pks in range_constexpr(PV_K_STEPS):
                                     _ds_write_vec(_g3wb ^ fx.Index(pks * 2 * M_TILE), _zo, _z)
 
@@ -4226,8 +4248,10 @@ def build_flash_attn_bwd_dkdv_module(
             _bases = _dma_bases(q_start, poff) if const_expr(ENABLE_DMA and not Q_PREF) else None
             _ldv = None
             _g3_prev = inner[H_ACCS_V + H_ACCS] if const_expr(G3_QCARRY) else None
+            # DS_PAR: (dS write base, deferred GEMM3 read base, slot step) -- see _carry.
+            _dsb = list(inner[H_ACCS_V + H_ACCS + 1 : H_ACCS_V + H_ACCS + 4]) if const_expr(DS_PAR) else None
             if const_expr(PF_QB):
-                _pfb = H_ACCS_V + H_ACCS + (1 if G3_QCARRY else 0)
+                _pfb = H_ACCS_V + H_ACCS + (1 if G3_QCARRY else 0) + (3 if DS_PAR else 0)
                 _nqdo = NUM_DMA_Q + NUM_DMA_DO
                 _qdo = list(inner[_pfb : _pfb + _nqdo])
                 _ldv = list(inner[_pfb + _nqdo :])
@@ -4283,6 +4307,7 @@ def build_flash_attn_bwd_dkdv_module(
                     nq=nq,
                     st_io=_st_carry,
                     g3_prev=_g3_prev,
+                    ds_bases=[fx.Index(_dsb[0]), fx.Index(_dsb[1])] if const_expr(DS_PAR) else None,
                 )
                 _qdo = _pf[0]
                 if const_expr(_pf[1] is not None):
@@ -4308,6 +4333,9 @@ def build_flash_attn_bwd_dkdv_module(
             ]
             if const_expr(G3_QCARRY):
                 out += [q_start]
+            if const_expr(DS_PAR):
+                _w, _r, _d = (fx.Int32(v) for v in _dsb)
+                out += [_w + _d, _r - _d, fx.Int32(0) - _d]
             if const_expr(PF_QB):
                 out += list(_qdo) + list(_ldv)
             return out
@@ -4325,6 +4353,16 @@ def build_flash_attn_bwd_dkdv_module(
             # Priming trip: one q row past the sequence end, so the dQ atomics of the
             # not-yet-written dS slot every first head-step reads all clip on num_records.
             _carry = _carry + [seq_len_q_v]
+        if const_expr(DS_PAR):
+            # Trip 0 writes slot 0 and its deferred GEMM3 (the priming trip, every store of
+            # which clips) reads slot 1; each trip then steps the write base by +d and the read
+            # base by -d and flips d, so the read base always trails the write base by one trip.
+            assert HOIST_PIN
+            _carry = _carry + [
+                fx.Int32(_pins["g3w"]),
+                fx.Int32(_pins["g3s"]) + fx.Int32(G3S_GRP_ELEMS),
+                fx.Int32(G3S_GRP_ELEMS),
+            ]
         if const_expr(PF_QB):
             # Prologue fetch for the first q-block; every later one is issued a head-step
             # early inside the body. The masked loop hands its pending fetch to the
@@ -4427,6 +4465,8 @@ def build_flash_attn_bwd_dkdv_module(
                 loop_results[H_ACCS_V + H_ACCS],
                 GQA_GROUP_SIZE - 1,
                 (GQA_GROUP_SIZE - 1) % G3S_SLOTS,
+                # After the last trip's step the read base points at that trip's slot.
+                sbase=fx.Index(loop_results[H_ACCS_V + H_ACCS + 2]) if const_expr(DS_PAR) else None,
             )
         _dk_base = H_ACCS_V
         dv_accs = [loop_results[i] for i in range_constexpr(H_ACCS_V)]

@@ -1,0 +1,6 @@
+B1 S1024 dK bitwise True dV bitwise True | dQ snr b vs a 62.03 61.44 61.28 dB | a repeats 61.96 61.76 dB | b repeats dK/dV bitwise True
+B1 S2112 dK bitwise True dV bitwise True | dQ snr b vs a 55.63 55.31 55.33 dB | a repeats 55.67 56.05 dB | b repeats dK/dV bitwise True
+B1 S4096 dK bitwise True dV bitwise True | dQ snr b vs a 52.82 52.68 52.82 dB | a repeats 52.89 53.06 dB | b repeats dK/dV bitwise True
+B1 S4224 dK bitwise True dV bitwise True | dQ snr b vs a 52.68 52.61 52.80 dB | a repeats 52.82 52.98 dB | b repeats dK/dV bitwise True
+B2 S4096 dK bitwise True dV bitwise True | dQ snr b vs a 53.02 52.97 52.80 dB | a repeats 53.29 53.44 dB | b repeats dK/dV bitwise True
+B1 S8192 dK bitwise True dV bitwise True | dQ snr b vs a 49.85 49.88 49.82 dB | a repeats 50.01 50.12 dB | b repeats dK/dV bitwise True

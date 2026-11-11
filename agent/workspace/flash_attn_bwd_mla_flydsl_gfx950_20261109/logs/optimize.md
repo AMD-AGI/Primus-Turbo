@@ -216,3 +216,30 @@ absolute), finite, dK/dV bitwise repeat; a FAIL shape is excluded from the geome
 - Finding: on the MLA path (one q head per kv head) the deferred GEMM3 and the trip's own dS
   writes share dS slot 0 with no barrier between them; ~2200-cycle margin in the r15 ATT against
   ~100 cycles of barrier skew. Formal race, not observed. Rollback count 1.
+
+## Round 18 — 2026-11-10 15:18 — ACCEPT (correctness fix, user-authorized cost)
+
+- Machine: n02-29 expired; from here on n01-33 GPU 0, same container toolchain (r16 and r18
+  reproduce their dkdv ISA hashes c587bf720b / ae8b324271).
+- Change: DS_PAR. On the GQA = 1 path the q loop carries the dS write base, the deferred GEMM3
+  read base and a slot step, so the dS slots alternate per trip and the slot-0 WAR race found in
+  round 17 is closed. dK / dV bitwise equal to r16 on 6 shapes, D128 regression PASS, full set 7 / 7.
+- Cost: per-process A/B -1.71 % gm (3 shapes, 6 rounds, every round same order); full set rotated
+  r18 x3 / r16 x2: step 917.409 vs 929.769 (-1.329 %), bwd 840.501 vs 855.185 (-1.717 %), every
+  shape -0.9 .. -1.8 % step. Cause: spills 94 -> 98 and GEMM1a's third K-pack scratch reload lost
+  its MFMA cover (5 -> 0; dev/isa_reload_cover.py). Accepted under the fix_now decision; r18 is the
+  new baseline. Rollback count 0.
+
+## Round 19 — 2026-11-11 09:14 — ACCEPT
+
+- Machine: screens on n01-33 (before it expired); full-set A/B on n02-29 again (new allocation),
+  r18 dkdv ISA hash reproduces there (ae8b324271), r18 re-measured in the same session.
+- Change: knob re-sweep on the r18 base; MLA `ops_bwd` g2d 1 -> 2 (GEMM2 transpose-read prefetch
+  depth; kernel source unchanged). Spills 98 / scratch 396 B unchanged; hot-loop reload minimum
+  MFMA cover 0 -> 12.
+- Screening: 22-config ISA screen, only g2d=2 / llvm L2 only / llvm none restore a nonzero cover,
+  and all three time positive (+2.12 / +1.56 / +1.83 % gm, 3 shapes); combinations add nothing
+  (g2d=2 + L2 only -0.31 %, g2d=2 + g3d 2/3 or L1 only +1.0..+1.7 %).
+- Result: 7 / 7 PASS, dK/dV bitwise vs r18, D128 regression PASS; full set rotated r19 x3 / r18 x2:
+  step 925.220 (median) vs 913.303 (mean), +1.305 %; bwd +1.650 %; every shape +0.66..+1.63 % step.
+  Step ratio vs aiter 0.9292 (bwd 0.9125); -0.23 % vs the n02-29 R16 row. Rollback count 0.

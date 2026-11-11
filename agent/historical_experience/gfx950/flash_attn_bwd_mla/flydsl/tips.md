@@ -123,3 +123,16 @@
   reloads: gfx950's in-order vmcnt then makes the reload wait cover the prefetch latency). Also:
   with one q head per kv head, a dS "double buffer" indexed by head_local % 2 degenerates to one
   slot; check the slot index math whenever the GQA group size can be 1.
+- 2026-11-10 (same campaign, round 18): a register-neutral fix can still cost through the register
+  allocator. Alternating the MLA dS slots per trip (two loop-carried VGPR bases replacing two
+  pinned ones, one SGPR step) added 7 instructions to a 604-instruction hot loop but moved spills
+  94 -> 98, and one of GEMM1a's K-pack scratch reloads landed right before its vmcnt(0) and MFMA:
+  -1.3 % step on every shape. Instruction and scratch_load counts do not show this; count the MFMAs
+  between each hot-loop reload and the first `s_waitcnt vmcnt(k)` that guarantees it (vmcnt is in
+  issue order on gfx950; dev/isa_reload_cover.py in the campaign) and screen variants on that.
+- 2026-11-11 (same campaign, round 19): the hot-loop reload cover is a good ISA-only screen for
+  knob re-sweeps after an allocator-perturbing change. Of 22 knob variants on the MLA dkdv, the only
+  three that brought the minimum cover back above 0 (12-13 MFMAs) were also the only three that
+  timed positive (+1.6..+2.1 % gm); the winner (GEMM2 prefetch depth g2d 1 -> 2) kept the spill count
+  (98) and scratch_load count identical and still recovered the whole -1.3 % of the fix. Knob gains
+  do not add: stacking a second cover-restoring knob on the winner lost 0.3-1.2 %.

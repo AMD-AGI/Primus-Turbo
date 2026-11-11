@@ -1,0 +1,6 @@
+det=False dk: bitwise=True maxdiff=0.000e+00
+det=False dv: bitwise=True maxdiff=0.000e+00
+mla-shaped D128 ws_dk: bitwise=True maxdiff=0.000e+00
+mla-shaped D128 ws_dv: bitwise=True maxdiff=0.000e+00
+mla-shaped D128 img: bitwise=False maxdiff=1.250e-01
+REGRESS PASS

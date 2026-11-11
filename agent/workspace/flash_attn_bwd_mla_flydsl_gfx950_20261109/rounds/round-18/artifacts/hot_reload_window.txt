@@ -1,0 +1,66 @@
+Hot loop (last MFMA-heavy loop of the dkdv ISA), instruction index within the loop.
+Landmarks: barriers, scratch loads, vmcnt waits; mfma_before = MFMAs issued earlier in the trip.
+
+== r16: 604 instructions
+  @  10 mfma_before=  0  s_barrier
+  @  52 mfma_before=  0  s_barrier
+  @  68 mfma_before=  0  scratch_load_dwordx4 a[88:91], off, off
+  @  80 mfma_before=  1  scratch_load_dwordx4 a[92:95], off, off offset:16
+  @ 257 mfma_before= 36  s_waitcnt vmcnt(1) lgkmcnt(3)
+  @ 262 mfma_before= 39  s_waitcnt vmcnt(0)
+  @ 269 mfma_before= 45  scratch_load_dwordx4 v[36:39], off, off offset:240
+  @ 276 mfma_before= 50  s_waitcnt vmcnt(0)
+  window:
+     255 v_accvgpr_read_b32 v20, a226
+     256 ds_read_b128 a[84:87], v20
+     257 s_waitcnt vmcnt(1) lgkmcnt(3)
+     258 v_mfma_f32_16x16x32_bf16 v[20:23], v[28:31], a[88:91], v[12:15]
+     259 ds_read_b128 v[16:19], v70 offset:192
+     260 v_mfma_f32_16x16x32_bf16 v[24:27], v[28:31], a[228:231], v[12:15]
+     261 v_mfma_f32_16x16x32_bf16 v[12:15], v[28:31], a[184:187], v[12:15]
+     262 s_waitcnt vmcnt(0)
+     263 v_mfma_f32_16x16x32_bf16 v[20:23], v[32:35], a[92:95], v[20:23]
+     264 v_mfma_f32_16x16x32_bf16 v[24:27], v[32:35], a[236:239], v[24:27]
+     265 v_mfma_f32_16x16x32_bf16 v[12:15], v[32:35], a[196:199], v[12:15]
+     266 v_mfma_f32_16x16x32_bf16 v[20:23], v[36:39], a[192:195], v[20:23]
+     267 v_mfma_f32_16x16x32_bf16 v[24:27], v[36:39], a[244:247], v[24:27]
+     268 v_mfma_f32_16x16x32_bf16 v[12:15], v[36:39], a[216:219], v[12:15]
+     269 scratch_load_dwordx4 v[36:39], off, off offset:240
+     270 s_waitcnt lgkmcnt(0)
+     271 v_mfma_f32_16x16x32_bf16 v[28:31], v[52:55], a[88:91], v[16:19]
+     272 v_mfma_f32_16x16x32_bf16 v[32:35], v[52:55], a[228:231], v[16:19]
+     273 v_mfma_f32_16x16x32_bf16 v[16:19], v[52:55], a[184:187], v[16:19]
+     274 v_mfma_f32_16x16x32_bf16 v[16:19], v[56:59], a[196:199], v[16:19]
+     275 v_mfma_f32_16x16x32_bf16 v[16:19], a[72:75], a[216:219], v[16:19]
+     276 s_waitcnt vmcnt(0)
+     277 v_mfma_f32_16x16x32_bf16 v[12:15], v[40:43], v[36:39], v[12:15]
+     278 v_mfma_f32_16x16x32_bf16 v[28:31], v[56:59], a[92:95], v[28:31]
+     279 v_mfma_f32_16x16x32_bf16 v[32:35], v[56:59], a[236:239], v[32:35]
+     280 v_mfma_f32_16x16x32_bf16 v[16:19], a[76:79], v[36:39], v[16:19]
+     281 ds_read_b128 v[36:39], v70
+
+== r18b: 611 instructions
+  @  10 mfma_before=  0  s_barrier
+  @  52 mfma_before=  0  s_barrier
+  @  82 mfma_before=  1  scratch_load_dwordx4 a[88:91], off, off
+  @ 176 mfma_before= 21  scratch_load_dwordx4 a[92:95], off, off offset:16
+  @ 257 mfma_before= 36  s_waitcnt vmcnt(1) lgkmcnt(3)
+  @ 263 mfma_before= 39  scratch_load_dwordx4 v[28:31], off, off offset:208
+  @ 264 mfma_before= 39  s_waitcnt vmcnt(0)
+  window:
+     255 v_accvgpr_read_b32 v20, a234
+     256 ds_read_b128 a[84:87], v20
+     257 s_waitcnt vmcnt(1) lgkmcnt(3)
+     258 v_mfma_f32_16x16x32_bf16 v[20:23], v[28:31], a[88:91], v[12:15]
+     259 ds_read_b128 v[16:19], v70 offset:192
+     260 s_sub_u32 s38, s7, s38
+     261 v_mfma_f32_16x16x32_bf16 v[24:27], v[28:31], a[228:231], v[12:15]
+     262 v_mfma_f32_16x16x32_bf16 v[12:15], v[28:31], a[184:187], v[12:15]
+     263 scratch_load_dwordx4 v[28:31], off, off offset:208
+     264 s_waitcnt vmcnt(0)
+     265 v_mfma_f32_16x16x32_bf16 v[12:15], v[32:35], v[28:31], v[12:15]
+     266 v_mfma_f32_16x16x32_bf16 v[20:23], v[32:35], a[92:95], v[20:23]
+     267 v_mfma_f32_16x16x32_bf16 v[24:27], v[32:35], a[236:239], v[24:27]
+     268 v_mfma_f32_16x16x32_bf16 v[12:15], v[36:39], a[208:211], v[12:15]
+     269 v_mfma_f32_16x16x32_bf16 v[20:23], v[36:39], a[192:195], v[20:23]
+

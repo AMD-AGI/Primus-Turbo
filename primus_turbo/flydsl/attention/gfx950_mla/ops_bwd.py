@@ -11,6 +11,7 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
+
 """Host side of the FlyDSL MLA backward (D_QK != D_V), dense causal SBHD, a16 dQ."""
 
 import torch
@@ -37,7 +38,7 @@ def _dkdv_kwargs(B, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, **ove
         batch_size=B,
         sbhd=True,
         waves_per_eu=1,
-        g2d=1,
+        g2d=2,
         g1_ks_outer=False,
         dma_grp=1,
         pf_ring=False,

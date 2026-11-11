@@ -1,0 +1,2 @@
+r18                                                        98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 1 | hot reloads 0:35 16:18 208:0 | min cover 0
+g2d=2                                                      98 scratch 396 B | masked loop: scratch_load 17 vmcnt(0) 2 | hot loop: scratch_load 3 vmcnt(0) 2 | hot reloads 0:35 16:37 256:12 | min cover 12

@@ -1,0 +1,11 @@
+--- /perf_apps/xiaoming/Primus-Turbo/agent/workspace/flash_attn_bwd_mla_flydsl_gfx950_20261109/rounds/round-18/kernel_snapshot/ops_bwd.py	2026-11-10 07:09:48.900399500 +0000
++++ /perf_apps/xiaoming/megaattention_overlap_bench/flydsl_mla/ops_bwd.py	2026-11-11 01:01:46.847823100 +0000
+@@ -24,7 +24,7 @@
+         batch_size=B,
+         sbhd=True,
+         waves_per_eu=1,
+-        g2d=1,
++        g2d=2,
+         g1_ks_outer=False,
+         dma_grp=1,
+         pf_ring=False,

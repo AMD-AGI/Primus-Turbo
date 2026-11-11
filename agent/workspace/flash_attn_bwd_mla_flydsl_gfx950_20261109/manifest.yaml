@@ -25,7 +25,9 @@ benchmark_command: "HIP_VISIBLE_DEVICES=0 python <campaign_dir>/quick_test_bench
 quick_command: "HIP_VISIBLE_DEVICES=0 python <campaign_dir>/quick_test_bench.py --set quick --summary-csv <round_dir>/artifacts/benchmark.csv"
 representative_shapes: [b1_s4k, b1_s16k, b1_s64k, b2_s4k]
 rebuild: "none (FlyDSL JIT; cache_tag / source hash pick up edits)"
-run_env: "ssh smci355-ccs-aus-n02-29, docker exec xiaoming-dev bash -lc '...'; GPU 0 pinned for every round"
+run_env: >-
+  ssh smci355-ccs-aus-n02-29 (rounds 1-17), smci355-ccs-aus-n01-33 (round 18 and the round-19 screens; r16 and r18 dkdv
+  ISA hashes reproduce there), smci355-ccs-aus-n02-29 again (round-19 full-set A/B on; r18 hash reproduces), docker exec xiaoming-dev bash -lc '...'; GPU 0 pinned for every round
 constraints:
   - "Do not modify existing Primus-Turbo / Megatron / Primus kernels; work only in megaattention_overlap_bench/flydsl_mla/"
   - "No git commit without explicit instruction"

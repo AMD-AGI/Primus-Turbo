@@ -1,0 +1,26 @@
+_L1 = ("amdgpu-disable-unclustered-high-rp-reschedule", True)
+_L2 = ("greedy-regclass-priority-trumps-globalness", True)
+CONFIGS = [
+    ("r18", {}),
+    ("g3d=2", {"g3d": 2}),
+    ("g3d=3", {"g3d": 3}),
+    ("g3d=5", {"g3d": 5}),
+    ("g3d=6", {"g3d": 6}),
+    ("g3_sb=1", {"g3_sb": 1}),
+    ("g3_sb=2", {"g3_sb": 2}),
+    ("g3_sb=3", {"g3_sb": 3}),
+    ("g3_st_n=2", {"g3_st_n": 2}),
+    ("g3_st_n=3", {"g3_st_n": 3}),
+    ("g3_st_at=0", {"g3_st_at": 0}),
+    ("g3_st_at=2", {"g3_st_at": 2}),
+    ("g3_st_at=None", {"g3_st_at": None}),
+    ("g3_dbat=6", {"g3_dbat": 6}),
+    ("mfma_tie=1", {"mfma_tie": 1}),
+    ("mfma_tie=2", {"mfma_tie": 2}),
+    ("g2d=2", {"g2d": 2}),
+    ("g1_ks_outer=True", {"g1_ks_outer": True}),
+    ("dv_pin=True", {"dv_pin": True}),
+    ("llvm_opts=L1 only", {"llvm_opts": (_L1,)}),
+    ("llvm_opts=L2 only", {"llvm_opts": (_L2,)}),
+    ("llvm_opts=none", {"llvm_opts": ()}),
+]
