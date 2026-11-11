@@ -36,6 +36,7 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
+from primus_turbo.flydsl.deep_ep.common import ld_lds, st_lds
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
     grouped_gemm_bf16_variable_k_tile,
@@ -50,6 +51,8 @@ from primus_turbo.flydsl.ulysses.common import (
     SYS_NT,
     VEC_BF16,
     VEC_I32,
+    WARP,
+    _all_reached,
     claim_unit,
     exit_and_bump_epoch,
     i64_base,
@@ -76,13 +79,15 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     make_row_band_resource,
     make_value_attrs,
 )
-from primus_turbo.flydsl.utils.prims import ceildiv, ld, memory_fence, st
+from primus_turbo.flydsl.utils.prims import _readfirstlane_i32, ceildiv, ld, memory_fence, st
 
 # 16 B vectors whose loads are issued before their stores
 _BATCH = 8
 # K chunk of the variable-K wgrad tile (CHUNK x BLOCK_K rows) and its LDS chunk stride
 _WGRAD_CHUNK_ROWS = 256
 _WGRAD_LDS_CHUNK_STRIDE = 1152
+# m-tile flags a wgrad tile polls at its start
+_LOOKAHEAD = 16
 
 
 def _residual_store_c(residual):
@@ -283,34 +288,76 @@ def _arrival_k_seg(flag_base, tile_m, epoch, trace_base=None, trace_idx=None, **
     return _ArrivalKSeg()
 
 
-def _wgrad_k_hook(flag_base, src, epoch, **c):
+def _wgrad_k_hook(flag_base, src, epoch, horizon_slot, **c):
     """Waits of a weight-gradient tile, whose ``A`` columns all come from source ``src``: before the
     loads of K chunk ``k`` (``_WGRAD_CHUNK_ROWS`` rows, two 64-row steps prefetched past it), the
-    m-tiles those loads reach; only ``src``'s flags."""
+    m-tiles those loads reach; only ``src``'s flags. Returns ``(hook, k_hook_from)``.
+
+    A wait drains the wave's prefetches and costs a system-scope round trip, and a hook in the chunk
+    loop slows it even when it does not wait (a wgrad tile ran 2.4x as long). So the tile first polls
+    the flags of its first ``_LOOKAHEAD`` m-tiles at once: the chunks they cover run a loop without
+    the hook (all of them once the exchange is done). Past them each wave keeps a horizon in LDS
+    (``horizon_slot``), every m-tile below which has landed: the prologue polls the next
+    ``_LOOKAHEAD`` m-tiles without blocking and moves it past them when all have landed, and chunks
+    below the horizon skip the wait. A wait itself does not poll ahead: with the rows still in
+    flight that only costs (Qwen3-30B bwd QKV 8K +3 %)."""
     num_ranks, S, rank, BM = c["num_ranks"], c["push_split"], c["rank"], c["BM"]
     m_tiles = ceildiv(c["M"], BM)
     per_chunk = _WGRAD_CHUNK_ROWS // BM
     # last row a chunk loads: (k + 1) * CHUNK_ROWS + 2 * 64 - 1
     lead = (_WGRAD_CHUNK_ROWS + 2 * 64 - 1) // BM
+    look = max(1, _LOOKAHEAD // S)
+    wave_slot = fx.Int32(1) + fx.thread_idx.x // fx.Int32(WARP)
 
-    def wait(tiles):
-        slots = [
+    def clip(t):
+        return arith.select(t < fx.Int32(m_tiles), t, fx.Int32(m_tiles - 1))
+
+    def slots(tiles):
+        return [
             (t * fx.Int32(S) + fx.Int32(sub)) * fx.Int32(num_ranks) + src for t in tiles for sub in range(S)
         ]
-        spin_flags(flag_base, slots, epoch, rank, src, "a2a_gemm wgrad")
+
+    def wait(tiles):
+        spin_flags(flag_base, slots(tiles), epoch, rank, src, "a2a_gemm wgrad")
+
+    def advance(nxt):
+        """m-tiles below ``nxt`` have landed: the horizon is ``nxt``, or ``nxt + look`` if those have too."""
+        ahead = _all_reached(flag_base, slots([clip(nxt + fx.Int32(i)) for i in range(look)]), epoch)
+        st_lds(horizon_slot, wave_slot, arith.select(ahead, nxt + fx.Int32(look), nxt))
+
+    # m-tiles [0, landed) have landed; ordered before the loads by the prologue's acquire
+    first = min(look, m_tiles)
+    first_landed = _all_reached(flag_base, slots([fx.Int32(t) for t in range(first)]), epoch)
+    landed = arith.select(first_landed, fx.Int32(first), fx.Int32(0))
+    # first chunk whose loads reach m-tile ``landed``: hi(k) = k * per_chunk + lead >= landed
+    k_hook_from = arith.select(
+        landed >= fx.Int32(m_tiles),
+        fx.Int32(2**30),
+        arith.select(
+            landed > fx.Int32(lead),
+            (landed - fx.Int32(lead - per_chunk + 1)) // fx.Int32(per_chunk),
+            fx.Int32(0),
+        ),
+    )
 
     def hook(k):
         if const_expr(isinstance(k, int)):
             # prologue: the first two 64-row steps; see _arrival_k_seg.wait for the sys scope
             wait([fx.Int32(0)])
+            advance(arith.select(landed > fx.Int32(1), landed, fx.Int32(1)))
             memory_fence(order="acquire", scope="sys")
         else:
             hi = k * fx.Int32(per_chunk) + fx.Int32(lead)
-            tiles = [hi - fx.Int32(i) for i in range(per_chunk)]
-            wait([arith.select(t < fx.Int32(m_tiles), t, fx.Int32(m_tiles - 1)) for t in tiles])
-            memory_fence(order="acquire", scope="wavefront")
 
-    return hook
+            def wait_chunk():
+                wait([clip(hi - fx.Int32(i)) for i in range(per_chunk)])
+                st_lds(horizon_slot, wave_slot, hi + fx.Int32(1))
+                memory_fence(order="acquire", scope="wavefront")
+
+            horizon = _readfirstlane_i32(ld_lds(horizon_slot, wave_slot))
+            emit_if_then(clip(hi) >= horizon, wait_chunk)
+
+    return hook, k_hook_from
 
 
 def _claimed_tile(q, **c):
@@ -341,7 +388,7 @@ def _wait_all(thread_index, flag_base, tile_m, epoch, **c):
 
 
 @ASTRewriter.transform
-def _wgrad_tile(thread_index, w, flag_base, recv_addr, XB, DW, lds, epoch, trace_base, **c):
+def _wgrad_tile(thread_index, w, flag_base, recv_addr, XB, DW, lds, horizon_slot, epoch, trace_base, **c):
     """``DW[tile] = A[:, tile rows]^T @ XB[:, tile cols]`` over all of M (the variable-K wgrad tile),
     in row order, each chunk after the m-tiles it reads have landed (``_wgrad_k_hook``)."""
     M, K, N, BMw, BN = c["M"], c["K"], c["N"], c["BMw"], c["BN"]
@@ -351,6 +398,7 @@ def _wgrad_tile(thread_index, w, flag_base, recv_addr, XB, DW, lds, epoch, trace
         if thread_index == fx.Int32(0):
             st(trace_base, fx.Int32(c["trace_wgrad_at"]) + w * fx.Int32(2), read_clock())
     src = tile_k * fx.Int32(BMw) // fx.Int32(c["K_r"])
+    k_hook, k_hook_from = _wgrad_k_hook(flag_base, src, epoch, horizon_slot, **c)
     grouped_gemm_bf16_variable_k_tile(
         None,
         XB,
@@ -371,7 +419,8 @@ def _wgrad_tile(thread_index, w, flag_base, recv_addr, XB, DW, lds, epoch, trace
         persistent="staggered",
         lds_chunk_stride=_WGRAD_LDS_CHUNK_STRIDE,
         a_base=recv_addr,
-        k_hook=_wgrad_k_hook(flag_base, src, epoch, **c),
+        k_hook=k_hook,
+        k_hook_from=k_hook_from,
     )
     if const_expr(trace_base is not None):
         fx.rocdl.s_waitcnt(0)
@@ -405,7 +454,9 @@ def _tile_loop(
         if const_expr(num_wtiles > 0):
             w = q - fx.Int32(w_at)
             if (w >= fx.Int32(0)) & (w < fx.Int32(num_wtiles)):
-                _wgrad_tile(thread_index, w, flag_base, recv_addr, XB, DW, lds, epoch, trace_base, **c)
+                _wgrad_tile(
+                    thread_index, w, flag_base, recv_addr, XB, DW, lds, claim_slot, epoch, trace_base, **c
+                )
             else:
                 qd = arith.select(q < fx.Int32(w_at), q, q - fx.Int32(num_wtiles))
                 _gemm_tile(thread_index, qd, flag_base, recv_addr, W, Y, RES, OG, lds, epoch, trace_base, **c)
@@ -543,9 +594,12 @@ def _make_kernel(
     push_split = push_split if stagger else 1
     assert not stagger or K_r % 64 == 0, "a staggered K walk needs whole K chunks per source"
     progressive = K_r % 64 == 0
-    # one extra i32: the block-wide broadcast of a claimed push unit
+    # i32 slots: the block-wide broadcast of a claimed unit, then each wave's wgrad horizon
     SharedStorage = _make_shared_storage(
-        max(BM, BMw), BN, chunk_stride=_WGRAD_LDS_CHUNK_STRIDE if BMw else 1024, num_lds_row_idx_entries=1
+        max(BM, BMw),
+        BN,
+        chunk_stride=_WGRAD_LDS_CHUNK_STRIDE if BMw else 1024,
+        num_lds_row_idx_entries=1 + BLOCK_THREADS // WARP,
     )
     consts = dict(
         M=M,

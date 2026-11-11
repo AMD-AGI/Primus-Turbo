@@ -158,11 +158,14 @@ def grouped_gemm_bf16_variable_k_tile(
     mask_m=None,
     a_base=None,
     k_hook=None,
+    k_hook_from=None,
 ):
     """``a_base`` (i64 address) replaces ``A``'s. ``k_hook(c)`` runs on every wave before the A
     loads of K chunk ``c`` (``CHUNK * BLOCK_K`` rows, prefetching two ``BLOCK_K`` steps ahead) and
-    ``k_hook(-1)`` before the prologue's. ``persistent="staggered"`` keeps the one-barrier offset
-    of the two wave halves and realigns them at the tile's end (cf. ``dense_mma_pipeline_bf16``)."""
+    ``k_hook(-1)`` before the prologue's; chunks below ``k_hook_from`` (an i32) skip it and run a
+    loop without it, as a hook in the loop body slows every chunk even when it does nothing.
+    ``persistent="staggered"`` keeps the one-barrier offset of the two wave halves and realigns them
+    at the tile's end (cf. ``dense_mma_pipeline_bf16``)."""
     CHUNK = 4
     WGRAD_WAVES = 8  # fixed 8 waves per block
     assert BLOCK_M >= 128 and BLOCK_N >= 64 and BLOCK_M % 128 == 0 and BLOCK_N % 64 == 0
@@ -285,13 +288,13 @@ def grouped_gemm_bf16_variable_k_tile(
     n_chunks = (k_iters + (CHUNK - 1)) // CHUNK
 
     # nested to isolate Python-level buffer rotation from the runtime chunk loop
-    def _chunk(chunk_iv, live):
+    def _chunk(chunk_iv, live, hooked=True):
         chunk_idx = ArithValue(chunk_iv)
         a_cur0, a_cur1 = lds.A_lds_cur_0, lds.A_lds_cur_1
         a_next0, a_next1 = lds.A_lds_next_0, lds.A_lds_next_1
         b_cur0, b_cur1 = lds.B_lds_cur_0, lds.B_lds_cur_1
         b_next0, b_next1 = lds.B_lds_next_0, lds.B_lds_next_1
-        if const_expr(k_hook is not None):
+        if const_expr(k_hook is not None and hooked):
             k_hook(chunk_idx)
         for j in range_constexpr(CHUNK):
             k = chunk_idx * CHUNK + j
@@ -343,7 +346,12 @@ def grouped_gemm_bf16_variable_k_tile(
         boundary = n_bd if boundary is None else arith.ori(boundary, n_bd)
 
     def _loop(live):
-        emit_for(n_chunks, lambda iv: _chunk(iv, live))
+        if const_expr(k_hook is None or k_hook_from is None):
+            emit_for(n_chunks, lambda iv: _chunk(iv, live))
+        else:
+            split = arith.select(k_hook_from < n_chunks, k_hook_from, n_chunks)
+            emit_for(split, lambda iv: _chunk(iv, live, hooked=False))
+            emit_for(n_chunks, lambda iv: _chunk(iv, live), start=split)
 
     if const_expr(interior is None):
         _loop(all_live)
