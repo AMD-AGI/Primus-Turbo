@@ -290,6 +290,9 @@ def run_suite(quick):
     # GLM-4.7 widths: over two waves of dw tiles (1120 QKV, 960 o_proj) change both launch orders
     check_qkv(group, 96, 8, 128, 1, 512, 5120, "sbhd", "interleaved", 2, failures)
     check_o_gemm(group, 96, 128, 1, 512, 5120, "sbhd", True, 2, failures)
+    # Llama-70B widths: more GEMM tiles than CUs, GEMM-bound launch (256-row tiles, K walk in step)
+    check_qkv(group, 64, 8, 128, 1, 1024, 8192, "sbhd", "interleaved", 1, failures)
+    check_o_gemm(group, 64, 128, 1, 2048, 8192, "bshd", True, 1, failures)
     check_scenarios(group, failures)
     check_poisoned(group, failures)
 
