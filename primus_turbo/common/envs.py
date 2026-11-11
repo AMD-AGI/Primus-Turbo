@@ -45,6 +45,9 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_SPARSE_ATTN_BACKEND: str | None = None
     PRIMUS_TURBO_MLA_BWD_IMPL: str = "flydsl"
     PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND: str | None = None
+    PRIMUS_TURBO_ULYSSES_A2A_BACKEND: str | None = None
+    PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_PRE: str | None = None
+    PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_POST: str | None = None
     PRIMUS_TURBO_AUTO_TUNE: bool = False
     PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32: bool = True
     PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT: bool = False
@@ -184,6 +187,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MoE dispatch/combine EP backend: TURBO (the default when unset), DEEP_EP, or a custom EP name
     # such as UCCL_EP. "autotune" is rejected with an AssertionError.
     "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend_spec("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"),
+    # Forward backend of the Ulysses fused GEMM + all-to-all ops (``ulysses_qkv_gemm_a2a``,
+    # ``ulysses_a2a_o_gemm``): FLYDSL (the default when unset) or TENSILELITE. "autotune" is
+    # rejected with an AssertionError. The backward pass always runs FlyDSL.
+    "PRIMUS_TURBO_ULYSSES_A2A_BACKEND": backend_spec("PRIMUS_TURBO_ULYSSES_A2A_BACKEND"),
+    # TensileLite kernel libraries (TensileCreateLibrary output, tuned for the exact shapes) that the
+    # TENSILELITE Ulysses backend loads for the GemmA2A (QKV) and A2AGemm (o_proj) side. Read when
+    # the backend first builds a kernel for a shape.
+    "PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_PRE": lambda: os.getenv("PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_PRE"),
+    "PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_POST": lambda: os.getenv(
+        "PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_POST"
+    ),
     # ================== Auto-tune ==================
     # "1" turns auto-tuning across registered kernel backends on for every op, and the FlyDSL
     # kernel-level tuners with it. An explicit per-op backend still wins over it, and so does

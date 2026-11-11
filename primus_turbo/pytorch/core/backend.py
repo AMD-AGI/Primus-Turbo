@@ -95,6 +95,7 @@ class GlobalBackendManager:
     _moe_dispatch_combine_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
     _attn_backend: Optional[Dict[PrecisionType, Optional[BackendType]]] = None
     _sparse_attn_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
+    _ulysses_a2a_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
     _auto_tune: Optional[bool] = None
     _env_cache: Dict[str, Dict["PrecisionType", "BackendChoice"]] = {}
 
@@ -262,6 +263,20 @@ class GlobalBackendManager:
         )
 
     @classmethod
+    def set_ulysses_a2a_backend(
+        cls,
+        backend: Optional[BackendType] = None,
+        precision: Optional[PrecisionType] = None,
+        auto_tune: bool = False,
+    ) -> None:
+        """Set the backend of the Ulysses fused GEMM + all-to-all forward in code."""
+        assert auto_tune is False, "Auto-tune is not supported for the Ulysses A2A backend"
+
+        cls._ulysses_a2a_backend = cls._updated_backend_table(
+            cls._ulysses_a2a_backend, backend, precision, auto_tune
+        )
+
+    @classmethod
     def set_auto_tune(cls, enabled: Optional[bool]) -> None:
         """Set whether auto-tune is enabled in code."""
         cls._auto_tune = enabled
@@ -362,6 +377,30 @@ class GlobalBackendManager:
         return choice
 
     @classmethod
+    def get_ulysses_a2a_backend(cls, precision: PrecisionType) -> Optional[BackendChoice]:
+        """Get the Ulysses fused GEMM + all-to-all backend configuration. Returns None if not set.
+
+        A value that is not a ``BackendType`` (e.g. ``TENSILELITE``) returns ``None`` here, so the
+        registry in ``ulysses_a2a_impl`` reads it from the environment variable itself.
+        """
+        if cls._ulysses_a2a_backend is not None:
+            return cls._ulysses_a2a_backend.get(precision)
+
+        choice = cls._backend_from_env(
+            "PRIMUS_TURBO_ULYSSES_A2A_BACKEND", precision, allow_unknown_backend=True
+        )
+        if choice is None:
+            return None
+
+        # Every rank of the group has to run the same collective kernels, so there is no per-call
+        # profiling to pick one.
+        assert not choice.auto_tune, (
+            "PRIMUS_TURBO_ULYSSES_A2A_BACKEND=AUTOTUNE is not supported: "
+            "the Ulysses fused GEMM + all-to-all has no auto-tune path."
+        )
+        return choice
+
+    @classmethod
     def auto_tune_enabled(cls) -> bool:
         """Check whether the global auto-tune switch is on.
 
@@ -383,6 +422,7 @@ class GlobalBackendManager:
         cls._moe_dispatch_combine_backend = None
         cls._attn_backend = None
         cls._sparse_attn_backend = None
+        cls._ulysses_a2a_backend = None
         cls._auto_tune = None
         cls._env_cache = {}
         envs.reset_cache(
@@ -391,6 +431,7 @@ class GlobalBackendManager:
             "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND",
             "PRIMUS_TURBO_ATTN_BACKEND",
             "PRIMUS_TURBO_SPARSE_ATTN_BACKEND",
+            "PRIMUS_TURBO_ULYSSES_A2A_BACKEND",
             "PRIMUS_TURBO_AUTO_TUNE",
         )
         AutoKernelDispatcher.clear_all_caches()
