@@ -174,6 +174,7 @@ def build_ops(cfg, seq, b, group):
         b=b,
         qkv_format="bshd",
         needs_input_grad=(True, True),
+        bwd_tuning=None,
     )
     # name: (gemm, wgrad or None, exchanged elements, pack, unfused, fused, FLOPs)
     return {

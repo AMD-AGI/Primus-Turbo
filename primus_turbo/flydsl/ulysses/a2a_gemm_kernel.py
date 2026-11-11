@@ -18,8 +18,9 @@ Every rank holds rows of the full sequence for its ``K_r`` columns (its heads), 
 tensors (``q``, ``k``, ``v`` grads ``[n * M, h_x, d]``) whose heads interleave in ``G`` groups of
 ``(nq, nk, nv) / G`` heads, the weight's row order; the output projection is ``G = 1``, ``nk = nv = 0``. Push work moves the rows of destination ``dst``'s sequence slice into ``dst``'s symmetric
 recv bank at column block ``rank`` and raises ``dst``'s flag ``(m_tile, rank)``. The recv bank is
-row-major ``[M, n * K_r]``: the GEMM's ``A``. A GEMM tile waits for the flags of its m-tile from all
-sources, then runs the plain K loop, so the accumulation order is fixed (bitwise deterministic).
+row-major ``[M, n * K_r]``: the GEMM's ``A``. A GEMM tile walks K one source segment at a time in
+the order the segments land, waiting for each segment's flag before its first load of it; the order
+is fixed per (m-tile, rank), so the accumulation is bitwise deterministic.
 
 The first ``num_push`` blocks claim push units (m-major, so early m-tiles complete first) until none
 are left, then compute the last tiles. A block only waits once every unit is claimed by a running
@@ -246,8 +247,10 @@ def _arrival_k_seg(flag_base, tile_m, epoch, trace_base=None, trace_idx=None, **
 
     Source ``s`` pushes m-tile ``i`` at position ``(i - s * D) mod m_tiles`` of its walk, so the
     earliest source of ``i`` is ``first = min(i // D, n - 1)`` and the rest follow ``first - 1, ...``
-    cyclically. The order depends on ``i`` only: the accumulation stays bitwise deterministic. Each
-    wave waits for a segment's flags itself before its first load of it."""
+    cyclically. In step (``D = 0``) every source pushes ``i`` to itself first, then to ``s + 1, ...``,
+    so this rank's own rows land first and source ``rank - j`` lands ``j``-th. The order depends on
+    ``i`` and the rank only: the accumulation stays bitwise deterministic. Each wave waits for a
+    segment's flags itself before its first load of it."""
     num_ranks, D, S, rank = c["num_ranks"], c["stagger"], c["push_split"], c["rank"]
 
     class _ArrivalKSeg:
@@ -258,7 +261,7 @@ def _arrival_k_seg(flag_base, tile_m, epoch, trace_base=None, trace_idx=None, **
                 lead = tile_m // fx.Int32(D)
                 self.first = arith.select(lead < fx.Int32(num_ranks - 1), lead, fx.Int32(num_ranks - 1))
             else:
-                self.first = fx.Int32(0)
+                self.first = fx.Int32(rank)
 
         def src(self, seg):
             return (self.first + fx.Int32(num_ranks) - seg) % fx.Int32(num_ranks)
@@ -413,10 +416,10 @@ def _tile_loop(
 
 @ASTRewriter.transform
 def _gemm_tile(thread_index, q, flag_base, recv_addr, W, Y, RES, OG, lds, epoch, trace_base, **c):
-    """GEMM tile of claim ``q``. Staggered (``D > 0``), it walks K by arrival (``_arrival_k_seg``);
-    in step, it waits for the whole m-tile, copies it out, then runs."""
+    """GEMM tile of claim ``q``. With whole K chunks per source it walks K by arrival
+    (``_arrival_k_seg``); otherwise it waits for the whole m-tile, copies it out, then runs."""
     M, M_pad, K, N, BM, BN = c["M"], c["M_pad"], c["K"], c["N"], c["BM"], c["BN"]
-    n_tiles, progressive = c["n_tiles"], c["stagger"] > 0
+    n_tiles, progressive = c["n_tiles"], c["progressive"]
     gemm_tile = functools.partial(gemm_bf16_tile, c["layout"], pair_n=True)
     epilogue = {}
     if const_expr(c["has_residual"]):
@@ -539,6 +542,7 @@ def _make_kernel(
     # in step, one m-tile per pusher unit: sub-tiles only pace the staggered arrivals
     push_split = push_split if stagger else 1
     assert not stagger or K_r % 64 == 0, "a staggered K walk needs whole K chunks per source"
+    progressive = K_r % 64 == 0
     # one extra i32: the block-wide broadcast of a claimed push unit
     SharedStorage = _make_shared_storage(
         max(BM, BMw), BN, chunk_stride=_WGRAD_LDS_CHUNK_STRIDE if BMw else 1024, num_lds_row_idx_entries=1
@@ -566,6 +570,7 @@ def _make_kernel(
         num_wtiles=num_wtiles,
         wgrad_at=wgrad_at,
         stagger=stagger,
+        progressive=progressive,
         N=N,
         BN=BN,
         n_tiles=n_tiles,
