@@ -166,3 +166,13 @@
   loop back edge lost -0.25 %: with a full 512-register file, extra live values cost AGPR spill moves.
 - Under the power cap (B1 S16K ~1275 W), cycle savings that slightly raise energy per FLOP lose
   their clock back (R6: +0.5 % work/cycle, -0.8 % clock); pure stall removal converts best.
+- Persistent job loop (FlyDSL `range(..., init=[...])` around the whole kernel body): LICM hoists every
+  job-invariant lane term of the global offsets (Q-load `row * stride + d`, K / V DMA voffsets) out of
+  the job loop, where they live across the KV loop next to the per-job sums. At 512 registers that was
+  8 -> 77 spill slots and ~40 scratch reloads per job, which ate the whole launch saving (R9 -0.26 %).
+  Re-derive those terms per job from an opaque tid (`_pin_regs([tid], "=v")` in the per-job bind):
+  9 spill slots, +2.6 % (4K +4.5 %). Always diff the spill count of persistent vs one-job-per-CTA ISA.
+- Persistent schedule for causal MLA fwd: a host-side LPT replay of the hardware dispatch (CTA c on
+  XCD c % 8, job i to queue i % 8, cost = KV tiles + ~8 tiles fixed) keeps the per-XCD L2 grouping
+  and the dynamic-dispatch balance with no atomics; a static snake / chunked split was -10 % on
+  dsv2lite in simulation. Read the table with `s_buffer_load`, one job ahead.

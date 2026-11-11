@@ -1,0 +1,110 @@
+--- rounds/round-9/kernel_snapshot/branch_mla/attn_helper_mla.py	2026-11-11 00:51:50.700745164 +0000
++++ rounds/round-10/kernel_snapshot/branch_mla/attn_helper_mla.py	2026-11-11 00:51:25.764057212 +0000
+@@ -36,7 +36,7 @@
+ # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
+ # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
+ # kernel, or a warm cache keeps serving the old one.
+-CODEGEN_REV = 1045
++CODEGEN_REV = 1047
+ 
+ # Room a later key has above a tile's row max before it forces another rebase.
+ REF_MARGIN = 96.0
+@@ -945,10 +945,6 @@
+             self.rowsum_ones_a = Vec.from_elements([_dword] * 4, fx.Int32).bitcast(self.elem_dtype).ir_value()
+         self.o_store_reg_128 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+         self.lds_ptr_ty = fx.PointerType.get(self.elem_dtype.ir_type, 2, self.traits.DMA_BYTES)
+-
+-        self.lane_in_warp = self.tid % self.traits.WARP_SIZE
+-        self.n_in_warp = self.lane_in_warp // self.traits.VEC_KV
+-        self.d_bucket = self.lane_in_warp % self.traits.VEC_KV
+         self.dma_wave_reps = self.traits.SMEM_N_RPT // self.traits.NUM_WAVES
+ 
+         self.kv_tile_size = traits.BLOCK_N
+@@ -964,8 +960,6 @@
+             _c = self.lane // 16
+             _line = (_r_grp // 2) * 4 + self.lane % 4
+             _rows = _line * traits.SMEM_K_LINE_STRIDE + (_r_grp % 2) * traits.D_128B_SIZE
+-            self.qk16_paired_d = (_c % 2) * 128 + (_c // 2) * traits.VEC_KV
+-            self.qk16_middle_d = (_c % 2) * 4 * traits.VEC_KV + (_c // 2) * traits.VEC_KV
+             self.k_lds_read_base_per_lane = (
+                 _rows + (_c % 2) * 2 * traits.K_LDS_TO_REG_KSTEP_OUTER_STRIDE + (_c // 2) * traits.VEC_KV
+             )
+@@ -1005,7 +999,6 @@
+                 + (self.lane % 4) * 4
+             )
+             self.v16_read_base = (_v_lane + 16 * (_c % 2), _v_lane + 16 - 16 * (_c % 2))
+-            self.v16_dma_d_bucket = _v_pv16_chunk(self.d_bucket, self.n_in_warp)
+ 
+         self.k_dma_m0 = self.dma_m0_table(
+             lambda b, w, d: self._dma_base(b, w, d, _k_buf_base, traits.SMEM_K_LINE_STRIDE), self.NUM_DMA_K
+@@ -1073,6 +1066,19 @@
+         self.batch_idx = batch_idx
+         self.q_start = self.q_block_idx * traits.BLOCK_M
+ 
++        # Lane terms of the global Q / K / V offsets. They are job-invariant, so in the persistent
++        # job loop LICM hoists them out and they spill across it (~70 VGPRs at D_QK 192); an
++        # opaque per-job tid keeps them next to their per-job uses.
++        tid = self.tid
++        if const_expr(getattr(traits, "PERSISTENT", 0)):
++            tid = fx.Index(_pin_regs([fx.Int32(tid)], "=v")[0])
++        self.job_lane = tid % traits.WARP_SIZE
++        self.dma_wave = tid // traits.WARP_SIZE
++        self.n_in_warp = self.job_lane // traits.VEC_KV
++        self.d_bucket = self.job_lane % traits.VEC_KV
++        if const_expr(traits.PV_MFMA16):
++            self.v16_dma_d_bucket = _v_pv16_chunk(self.d_bucket, self.n_in_warp)
++
+         self.h_kv_idx = self.h_idx % traits.NUM_HEADS_KV
+         self.group_id = self.h_idx // traits.NUM_HEADS_KV
+         if const_expr(traits.Q_HEADS_PER_WG > 1):
+@@ -1232,30 +1238,36 @@
+ 
+     def load_all(self):
+         traits = self.traits
++        lane = self.job_lane
+         if const_expr(traits.Q_TILES == 4):
+-            self.q_row_in_block = self.wave_q_offset + self.lane
++            self.q_row_in_block = self.wave_q_offset + lane
+         else:
+-            self.q_row_in_block = self.wave_q_offset + self.lane_mod_32
++            self.q_row_in_block = self.wave_q_offset + lane % 32
+         self.q_start_pos_i32 = fx.Int32(self.q_start + self.wave_row_group_uni * traits.ROWS_PER_WAVE)
+         self.q_row = self.q_start + self.q_row_in_block
+         self.q_row_i32 = fx.Int32(self.q_row)
+ 
+         n_packs = traits.Q_TILES * _qk16_k_steps(traits) if traits.QK_MFMA16 else traits.K_STEPS_QK
++        if const_expr(traits.QK_MFMA16):
++            # Per-lane d terms of the 16x16x32 B operand, matching the K reads (QK16_PAIRED_STEPS).
++            _c = lane // 16
++            paired_d = (_c % 2) * 128 + (_c // 2) * traits.VEC_KV
++            middle_d = (_c % 2) * 4 * traits.VEC_KV + (_c // 2) * traits.VEC_KV
+         q_raw_packs = []
+         for ks in range_constexpr(n_packs):
+             if const_expr(traits.QK_MFMA16):
+                 # 16x16x32 B operand, pack qt * _qk16_k_steps + ks16: q row 16 qt + lane % 16, the
+                 # d chunk K reads at k-step ks16 (QK16_PAIRED_STEPS).
+                 qt, ks16 = ks // _qk16_k_steps(traits), ks % _qk16_k_steps(traits)
+-                lane_d = self.qk16_paired_d if ks16 < QK16_PAIRED_STEPS else self.qk16_middle_d
++                lane_d = paired_d if ks16 < QK16_PAIRED_STEPS else middle_d
+                 elem_index = self.q_gmem_elem_offset + (
+-                    (self.wave_q_offset + self.lane % 16 + 16 * qt) * self.stride_q_n_v
++                    (self.wave_q_offset + lane % 16 + 16 * qt) * self.stride_q_n_v
+                     + (_qk16_step_d(ks16) + lane_d)
+                 )
+             else:
+                 elem_index = self.q_gmem_elem_offset + (
+                     self.q_row_in_block * self.stride_q_n_v
+-                    + (ks * self.traits.K_STEP_QK + self.lane_div_32 * self.traits.MFMA_LANE_K)
++                    + (ks * self.traits.K_STEP_QK + lane // 32 * self.traits.MFMA_LANE_K)
+                 )
+             q_i32_pack = fly.copy_atom_call_ssa(
+                 [self.q_load_i32x4_type],
+@@ -2132,7 +2144,7 @@
+         soffset = tile_start * row_stride
+         # w_rep: each wave fills DMA_WAVE_REPS LDS lines (1 for 8-wave, 2 for 4-wave).
+         for wr in range_constexpr(self.dma_wave_reps):
+-            eff_wave = self.wave_id + fx.Index(wr * self.traits.NUM_WAVES)
++            eff_wave = self.dma_wave + fx.Index(wr * self.traits.NUM_WAVES)
+             for d in range_constexpr(num_dma):
+                 # LDS line stride = SMEM_N_RPT (# lines, always 8), NOT NUM_WAVES: at the 8-wave
+                 # CTA they coincide, but a 4-wave CTA needs each wave to fill 2 lines, with

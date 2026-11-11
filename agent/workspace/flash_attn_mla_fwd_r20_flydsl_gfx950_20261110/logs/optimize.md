@@ -101,3 +101,15 @@ keep only the forward files in `rounds/*/kernel_snapshot/branch_mla/`; copy `fla
 Non-causal is wrong on both R20 and round 7 (`wip/noncausal_check.py`, fp32 reference: o rel 0.22-0.42,
 LSE max 0.07-0.18 at B1 S1K H4 / B2 S2K H8 / B1 S4K H2; the same script with `CAUSAL=1` gives 2.5e-3).
 Pre-existing on the branch and outside this campaign's causal-only validation set; not addressed here.
+
+## Round 9 — ROLLED BACK — 08:45
+Persistent job loop (one CTA per CU, host LPT replay of the per-XCD dispatch, shape-cached table):
+-0.26 % geomean (kimik2 -2.5 %), bitwise 11/11. ISA: spill slots 8 -> 77. LICM hoisted the job-
+invariant lane terms of the Q / K / V global offsets out of the job loop; they spill across the KV
+loop and each job reloads ~40 dwordx2, partly behind `s_waitcnt vmcnt(0)` ahead of the first DMA.
+
+## Round 10 — ACCEPTED — 09:20
+Round 9 + lane terms re-derived per job from an opaque `tid` (`_pin_regs` in `bind_item`): spill
+slots 9, +2.62 % geomean (1168.05 vs 1138.20), 4K +4.2-4.5 %, B1 S64K -0.34 %, bitwise 11/11, edge
+smoke 8/8 bitwise. `persistent=False` vs round 7: 1.0000, bitwise (the kept path is neutral).
+1.162x aiter. Next: overlap the next job's K / V DMAs and Q load with the current job's drain.
