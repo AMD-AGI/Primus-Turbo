@@ -853,10 +853,14 @@ def ulysses_a2a_gemm(
             and tuple(dw.shape) == (K, N)
         )
         num_wtiles = K // BMw * (N // BN)
-    # Over two waves of weight-gradient tiles (GLM-4.7: 1120): taken first they fill the CUs and the
-    # GEMM tiles run after the exchange, so the GEMM goes first, keeps its 256-row tiles and gets 32
-    # pushers. Not below that: Qwen3-30B (160) and MiniMax-M2.5 (384) are slower this way.
+    # Weight-gradient tiles reduce over all of M, so taken first they hold their CUs at the pace the
+    # rows land. That pays while the exchange dominates (Qwen3-30B: 25-45 % slower otherwise); once
+    # the GEMM outweighs it (N * n >= 4096 * (n - 1), see gemm_bound below) the GEMM tiles go first
+    # with 256-row tiles and the wgrad tiles run on landed rows (Llama3.1-8B bwd QKV 4K 592 -> 516 us,
+    # MiniMax-M2.5 689 -> 612 us). Over two waves of wgrad tiles (GLM-4.7: 1120) they always go last
+    # and get 32 pushers (GLM-4.7 16 pushers: +16 %).
     many_wtiles = num_wtiles > 2 * num_cus
+    wgrad_last = wgrad is not None and (many_wtiles or N * num_ranks >= 4096 * (num_ranks - 1))
     # GEMM / exchange time grows with N * n / (n - 1): ~1.1 for Llama-70B (hidden 8192, n = 4), 0.55
     # for Llama3.1-8B, 0.3 for Qwen3-30B. Past ~1 the CUs, not the links, bound the launch: 128-row
     # tiles cost 35 % more GEMM time than 256-row ones and pushers beyond what keeps ahead of the K walk
@@ -874,9 +878,9 @@ def ulysses_a2a_gemm(
         # 256-row tiles while every tile has a CU (the staggered K walk) or the GEMM dominates;
         # otherwise 128 rows halve the tail of the m-tile that lands last
         fits = ceildiv(M, 256) * ceildiv(N, BN) + num_wtiles + num_push <= num_cus
-        BM = 256 if fits or many_wtiles or gemm_bound else 128
+        BM = 256 if fits or wgrad_last or gemm_bound else 128
     if wgrad_at is None:
-        wgrad_at = ceildiv(M, BM) * ceildiv(N, BN) if many_wtiles else 0
+        wgrad_at = ceildiv(M, BM) * ceildiv(N, BN) if wgrad_last else 0
     run_launcher(
         _launch,
         oq,
