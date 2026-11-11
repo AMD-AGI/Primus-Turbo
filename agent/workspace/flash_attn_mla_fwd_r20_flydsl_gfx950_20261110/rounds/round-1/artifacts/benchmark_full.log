@@ -1,0 +1,13 @@
+aiter /tmp/aiter_0124/aiter/__init__.py | cand /home/xiaompen/Turbo/agent/workspace/flash_attn_mla_fwd_r20_flydsl_gfx950_20261110/src/branch_mla | base None
+dsv3      PASS o_rel 2.012e-03 lse 4.750e-03  cand  1014.1  aiter   960.4  cand/aiter 1.0559  spread% 0.36/0.58
+dsv2lite  PASS o_rel 1.986e-03 lse 3.172e-03  cand   981.4  aiter   942.9  cand/aiter 1.0408  spread% 0.21/0.52
+kimik2    PASS o_rel 1.972e-03 lse 4.007e-03  cand  1017.5  aiter   967.6  cand/aiter 1.0516  spread% 0.15/0.57
+kimik3    PASS o_rel 1.830e-03 lse 4.732e-03  cand  1124.7  aiter   989.2  cand/aiter 1.1370  spread% 0.34/0.28
+b1_s4k    PASS o_rel 1.948e-03 lse 4.596e-03  cand  1004.8  aiter   948.4  cand/aiter 1.0595  spread% 0.07/0.42
+b1_s8k    PASS o_rel 1.803e-03 lse 4.750e-03  cand  1135.2  aiter  1018.3  cand/aiter 1.1148  spread% 0.06/0.28
+b1_s16k   PASS o_rel 1.752e-03 lse 4.933e-03  cand  1189.8  aiter  1055.1  cand/aiter 1.1277  spread% 0.16/0.04
+b1_s32k   PASS o_rel 1.605e-03 lse 4.818e-03  cand  1218.5  aiter  1072.9  cand/aiter 1.1357  spread% 0.08/0.1
+b1_s64k   PASS o_rel 1.578e-03 lse 5.136e-03  cand  1232.6  aiter  1084.2  cand/aiter 1.1369  spread% 0.15/0.04
+b2_s4k    PASS o_rel 2.012e-03 lse 4.750e-03  cand  1013.1  aiter   974.8  cand/aiter 1.0393  spread% 0.23/0.24
+b2_s16k   PASS o_rel 1.764e-03 lse 4.818e-03  cand  1192.0  aiter  1057.6  cand/aiter 1.1271  spread% 0.09/0.08
+PASS 11/11  geomean cand 1098.25  aiter 1005.24  cand/aiter 1.0925

@@ -1,0 +1,4 @@
+src/branch_mla b1_s16k: 9.3423 ms (1177.0 TFLOPS) | clk 1899 MHz (min 1895 max 1989) | power 1278 W | PPT throttle 0.05 | TFLOPS/MHz 0.6198 | 84 samples, 1080 calls
+aiter b1_s16k: 10.5049 ms (1046.7 TFLOPS) | clk 1266 MHz (min 1257 max 1619) | power 1332 W | PPT throttle 0.30 | TFLOPS/MHz 0.8268 | 83 samples, 960 calls
+src/branch_mla dsv3: 1.3569 ms (1013.1 TFLOPS) | clk 1990 MHz (min 1987 max 2188) | power 1318 W | PPT throttle 0.14 | TFLOPS/MHz 0.5091 | 83 samples, 7370 calls
+aiter dsv3: 1.4280 ms (962.7 TFLOPS) | clk 1412 MHz (min 1408 max 1465) | power 1400 W | PPT throttle 0.97 | TFLOPS/MHz 0.6818 | 83 samples, 7010 calls

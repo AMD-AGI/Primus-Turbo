@@ -1,0 +1,4 @@
+src/branch_mla b1_s16k: 8.7984 ms (1249.8 TFLOPS) | clk 1972 MHz (min 1970 max 2119) | power 1281 W | PPT throttle 0.01 | TFLOPS/MHz 0.6337 | 82 samples, 1140 calls
+rounds/round-1/kernel_snapshot/branch_mla b1_s16k: 9.2949 ms (1183.0 TFLOPS) | clk 1911 MHz (min 1901 max 2171) | power 1291 W | PPT throttle 0.09 | TFLOPS/MHz 0.6190 | 83 samples, 1080 calls
+src/branch_mla dsv3: 1.3527 ms (1016.3 TFLOPS) | clk 2053 MHz (min 2050 max 2088) | power 1277 W | PPT throttle 0.03 | TFLOPS/MHz 0.4950 | 82 samples, 7400 calls
+rounds/round-1/kernel_snapshot/branch_mla dsv3: 1.3610 ms (1010.1 TFLOPS) | clk 2000 MHz (min 1998 max 2256) | power 1323 W | PPT throttle 0.17 | TFLOPS/MHz 0.5050 | 83 samples, 7350 calls

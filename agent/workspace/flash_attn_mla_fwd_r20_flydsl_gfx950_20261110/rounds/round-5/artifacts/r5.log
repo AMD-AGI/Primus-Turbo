@@ -1,0 +1,13 @@
+aiter /tmp/aiter_0124/aiter/__init__.py | cand /home/xiaompen/Turbo/agent/workspace/flash_attn_mla_fwd_r20_flydsl_gfx950_20261110/rounds/round-5/kernel_snapshot/branch_mla | base rounds/round-4/kernel_snapshot/branch_mla
+dsv3      PASS o_rel 2.012e-03 lse 4.750e-03  cand  1003.8  base  1021.2  cand/base 0.9830  bitwise True  spread% 0.09/0.1
+dsv2lite  PASS o_rel 1.986e-03 lse 3.172e-03  cand   984.8  base  1002.9  cand/base 0.9820  bitwise True  spread% 0.13/0.06
+kimik2    PASS o_rel 1.972e-03 lse 4.007e-03  cand  1003.7  base  1015.9  cand/base 0.9880  bitwise True  spread% 0.15/0.03
+kimik3    PASS o_rel 1.830e-03 lse 4.732e-03  cand  1128.5  base  1148.4  cand/base 0.9827  bitwise True  spread% 0.17/0.06
+b1_s4k    PASS o_rel 1.948e-03 lse 4.596e-03  cand   991.5  base  1008.1  cand/base 0.9835  bitwise True  spread% 0.1/0.09
+b1_s8k    PASS o_rel 1.803e-03 lse 4.750e-03  cand  1138.1  base  1161.4  cand/base 0.9799  bitwise True  spread% 0.12/0.07
+b1_s16k   PASS o_rel 1.752e-03 lse 4.933e-03  cand  1230.6  base  1259.5  cand/base 0.9771  bitwise True  spread% 0.12/0.07
+b1_s32k   PASS o_rel 1.605e-03 lse 4.818e-03  cand  1284.3  base  1305.6  cand/base 0.9837  bitwise True  spread% 0.06/0.13
+b1_s64k   PASS o_rel 1.578e-03 lse 5.136e-03  cand  1307.2  base  1322.7  cand/base 0.9883  bitwise True  spread% 0.1/0.05
+b2_s4k    PASS o_rel 2.012e-03 lse 4.750e-03  cand  1004.9  base  1020.7  cand/base 0.9845  bitwise True  spread% 0.04/0.03
+b2_s16k   PASS o_rel 1.764e-03 lse 4.818e-03  cand  1234.0  base  1262.8  cand/base 0.9772  bitwise True  spread% 0.06/0.09
+PASS 11/11  geomean cand 1112.69  base 1132.28  cand/base 0.9827  bitwise 11/11

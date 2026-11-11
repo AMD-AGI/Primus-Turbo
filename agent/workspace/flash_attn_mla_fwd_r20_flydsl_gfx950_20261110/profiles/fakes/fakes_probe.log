@@ -1,0 +1,15 @@
+src/branch_mla b1_s16k: 9.3845 ms (1171.7 TFLOPS) | clk 1899 MHz (min 1894 max 2013) | power 1274 W | PPT throttle 0.06 | TFLOPS/MHz 0.6170 | 83 samples, 1070 calls
+profiles/fakes/noexp/branch_mla b1_s16k: 8.6722 ms (1267.9 TFLOPS) | clk 2125 MHz (min 2121 max 2303) | power 1265 W | PPT throttle 0.02 | TFLOPS/MHz 0.5967 | 84 samples, 1160 calls
+profiles/fakes/nokv/branch_mla b1_s16k: 8.7227 ms (1260.6 TFLOPS) | clk 1956 MHz (min 1953 max 2216) | power 1218 W | PPT throttle 0.00 | TFLOPS/MHz 0.6446 | 84 samples, 1150 calls
+profiles/fakes/both/branch_mla b1_s16k: 8.1487 ms (1349.4 TFLOPS) | clk 2186 MHz (min 2182 max 2239) | power 1205 W | PPT throttle 0.00 | TFLOPS/MHz 0.6173 | 83 samples, 1230 calls
+src/branch_mla b1_s16k: 9.3326 ms (1178.2 TFLOPS) | clk 1902 MHz (min 1897 max 2071) | power 1285 W | PPT throttle 0.09 | TFLOPS/MHz 0.6196 | 84 samples, 1080 calls
+src/branch_mla dsv3: 1.3604 ms (1010.5 TFLOPS) | clk 1999 MHz (min 1996 max 2209) | power 1323 W | PPT throttle 0.18 | TFLOPS/MHz 0.5055 | 84 samples, 7360 calls
+profiles/fakes/noexp/branch_mla dsv3: 1.3001 ms (1057.4 TFLOPS) | clk 2194 MHz (min 2189 max 2304) | power 1292 W | PPT throttle 0.06 | TFLOPS/MHz 0.4820 | 84 samples, 7700 calls
+profiles/fakes/nokv/branch_mla dsv3: 1.3113 ms (1048.4 TFLOPS) | clk 2032 MHz (min 2029 max 2083) | power 1222 W | PPT throttle 0.00 | TFLOPS/MHz 0.5159 | 83 samples, 7630 calls
+profiles/fakes/both/branch_mla dsv3: 1.2392 ms (1109.3 TFLOPS) | clk 2254 MHz (min 2249 max 2267) | power 1207 W | PPT throttle 0.00 | TFLOPS/MHz 0.4922 | 84 samples, 8070 calls
+src/branch_mla dsv3: 1.3604 ms (1010.5 TFLOPS) | clk 1999 MHz (min 1997 max 2070) | power 1324 W | PPT throttle 0.18 | TFLOPS/MHz 0.5055 | 83 samples, 7360 calls
+# ldshalf (odd K slots / V steps reuse previous packs) vs R20, 10 s each, 2026-11-10 18:55 UTC+8
+rounds/round-1/kernel_snapshot/branch_mla b1_s16k: 9.3187 ms (1180.0 TFLOPS) | clk 1898 MHz (min 1891 max 2010) | power 1284 W | PPT throttle 0.06 | TFLOPS/MHz 0.6217 | 82 samples, 1080 calls
+profiles/fakes/ldshalf/branch_mla b1_s16k: 8.5403 ms (1287.5 TFLOPS) | clk 1943 MHz (min 1939 max 2201) | power 1285 W | PPT throttle 0.06 | TFLOPS/MHz 0.6626 | 84 samples, 1180 calls
+rounds/round-1/kernel_snapshot/branch_mla dsv3: 1.3601 ms (1010.8 TFLOPS) | clk 2000 MHz (min 1997 max 2212) | power 1321 W | PPT throttle 0.17 | TFLOPS/MHz 0.5054 | 82 samples, 7360 calls
+profiles/fakes/ldshalf/branch_mla dsv3: 1.2594 ms (1091.6 TFLOPS) | clk 2019 MHz (min 2018 max 2229) | power 1316 W | PPT throttle 0.11 | TFLOPS/MHz 0.5407 | 84 samples, 7950 calls

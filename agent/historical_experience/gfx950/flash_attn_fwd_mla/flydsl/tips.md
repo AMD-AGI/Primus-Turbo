@@ -137,3 +137,32 @@
   dearer per byte than `ds_read_b128`). The same probe for the ones-MFMA row sum read ~0 %: don't
   move hidden MFMA work to VALU. `SQ_INSTS_LDS_LOAD_BANDWIDTH` counts 64 B units and matched the
   analytic LDS byte count within 1 %.
+- 64 q rows per wave / one wave per SIMD (QT4) for MLA fwd 192/128 on gfx950: +5.8-7.3 % at S >= 16K,
+  only +0.1-2 % at S = 4K (per-WG prologue and causal drain are no longer hidden by a second wave).
+  O must live in AGPRs written by asm MFMAs ("=a,v,v,0", has_side_effects); the arch VGPR file is then
+  full (256), so any extra live f32 (VALU row sums, seed dedupe) spills.
+- IGroupLP `sched_group_barrier` does not count inline-asm MFMAs: hand-place asm sites with
+  `sched_barrier(0)` after each slot; builtin MFMAs can also drift across `s_barrier` unless fenced.
+- The hazard recognizer does not see inline asm: if a VALU result (e.g. a cvt) is scheduled right before
+  an asm MFMA reading it, no wait states are inserted and the MFMA reads stale data (inf rows). Keep
+  producers pinned away from asm sites (side-effect asm pins also stop MachineSink).
+- `v_dot2c_f32_bf16` runs on the MFMA pipe on gfx950 (28 cycles after an MFMA, 4 after another dot2c):
+  not a way to offload softmax row sums from the matrix core. The ones-MFMA row sum is the cheapest.
+- ATT solo-wave costs on gfx950: VALU right after an MFMA +4 cycles, v_exp_f32 ~8 issue cycles (~12 after
+  an MFMA), every s_waitcnt / s_setprio / s_nop >= 4 cycles of issue. With one wave per SIMD the loop is
+  bound by total issue slots in the MFMA shadows (16-cycle 16x16x32 MFMA leaves 12 free).
+- Solo-wave loops: measure per-MFMA-slot overflow, not instruction totals. `wip/att_bubbles.py`-style
+  map from ATT stats: slot content = MFMA issue + following instructions' latency; > 16 cycles
+  (16x16x32) is a pipe bubble, < 16 is spare that cannot be banked. Removing an instruction only helps
+  in an overflowing slot (R5: filling an M0 hazard nop by adding a softmax piece to a full DMA slot
+  cost -1.7 %).
+- A `sched_barrier(0)` only after each slot's work is not enough to place work behind an asm MFMA:
+  the scheduler hoists the next slot's VALU above its own asm MFMA (into the previous shadow). Fence
+  both sides of the work for exact placement.
+- The hazard recognizer counts inline asm as zero wait states: `s_mov m0` -> asm MFMA -> LDS DMA still
+  gets an `s_nop 0`. Harmless unless the slot overflows.
+- Reading the next QK's first K k-step inside the preceding P*V site (buffer already visible, not
+  being refilled) removed an exposed ~48-cycle LDS wait: +0.34 %. Carrying the other one over the
+  loop back edge lost -0.25 %: with a full 512-register file, extra live values cost AGPR spill moves.
+- Under the power cap (B1 S16K ~1275 W), cycle savings that slightly raise energy per FLOP lose
+  their clock back (R6: +0.5 % work/cycle, -0.8 % clock); pure stall removal converts best.

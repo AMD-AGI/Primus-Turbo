@@ -33,7 +33,9 @@ from .attn_helper_mla import (
     DualwaveKernelContext,
     _anchor_v_o,
     _dualwave_sync_barrier,
+    _interleave,
     _make_dualwave_swp_traits,
+    _numel,
     _s_barrier,
     _s_nop,
     _s_setprio,
@@ -67,6 +69,8 @@ def build_flash_attn_dualwave_swp_module(
     k_head=None,
     qk_mfma16=None,
     pv_mfma16=None,
+    rows_per_wave=32,
+    fold_barriers=None,
 ):
     """Build a DUALWAVE_SWP flash_attn launcher for (D_QK, D_V) in {64/64, 128/128, 192/128}.
 
@@ -75,7 +79,8 @@ def build_flash_attn_dualwave_swp_module(
     ``k_head`` is the number of QK k-steps whose K packs are read before the first MFMA
     group (default K_STEPS_QK - 2). ``qk_mfma16`` runs QK on 16x16x32 MFMAs (default: on
     for D_QK 192 without a causal window); ``pv_mfma16`` runs P*V on them too (default: with
-    ``qk_mfma16``).
+    ``qk_mfma16``). ``rows_per_wave`` 64 halves the waves per q block (one per SIMD at
+    block_m 256). ``fold_barriers`` drops the memory-cluster rendezvous (default: above 4 waves).
     """
     gpu_arch = get_hip_arch()
 
@@ -116,7 +121,9 @@ def build_flash_attn_dualwave_swp_module(
         head_dim_v=head_dim_v,
         qk_mfma16=qk_mfma16,
         pv_mfma16=pv_mfma16,
+        rows_per_wave=rows_per_wave,
     )
+    traits.FOLD_BARRIERS = traits.NUM_WAVES > 4 if fold_barriers is None else bool(fold_barriers)
     traits.K_HEAD = max(1, traits.K_STEPS_QK - 2) if k_head is None else int(k_head)
     assert 1 <= traits.K_HEAD <= traits.K_STEPS_QK
     _dualwave_swp_cache_tag = traits.cache_tag
@@ -185,7 +192,7 @@ def build_flash_attn_dualwave_swp_module(
         # The write-after-read edge is already covered by the compute-cluster barrier preceding each
         # overwrite DMA, so the memory-cluster rendezvous protects nothing (and costs at 8 waves,
         # whether two merged q-heads or one block_m 256 head).
-        fold_mem_barriers = sink_drains and traits.NUM_WAVES > 4
+        fold_mem_barriers = sink_drains and traits.FOLD_BARRIERS
         fold_pv_barriers = fold_mem_barriers and late_dma
         vm_drain_sync = 0 if fold_pv_barriers else ctx.VM_DRAIN_KV
         # Two-tile drain admits odd KV spans (windowed); three-tile drain needs even N.
@@ -221,13 +228,13 @@ def build_flash_attn_dualwave_swp_module(
                 _qk_cluster_sync()
 
         if const_expr(traits.PV_MFMA16):
-            l_row_init = ctx.c_zero_v8f32
+            l_row_init = ctx.c_zero_l16
         elif const_expr(traits.DUALWAVE_SWP_MFMA_ROWSUM):
             l_row_init = ctx.c_zero_v4f32
         else:
             l_row_init = ctx.c_zero_f
         split_t_end = ctx.split_t_end
-        v_o_zero = ctx.c_zero_v16f32
+        v_o_zero = ctx.c_zero_o if traits.PV_MFMA16 else ctx.c_zero_v16f32
 
         def _main_body():
             ctx.load_k_split(0, 0)
@@ -421,8 +428,124 @@ def build_flash_attn_dualwave_swp_module(
             init_args.append(ctx.score_acc_seed())
 
             split_rebase = ctx.use_score_bound
+            spec_exp = traits.SOLO_WAVE and not split_rebase
             if const_expr(split_rebase):
                 init_args.append(ctx.no_rescale())
+
+            # The compute-cluster rendezvous sits this many k-slots before the QK's end: the K
+            # reads are all issued by then, and the V head read after it lands under the rest.
+            QK_SYNC_TAIL = 2
+
+            def _qk_finish_p(v_k, buf_id, v_p, l_row, group, v_buf=None):
+                """QK of the next tile next to the carried P's second exp2 half, cast and row sum.
+
+                SOLO_WAVE takes the cluster sync and the next P*V's V head read (buffer v_buf)
+                into the QK, and returns that read too."""
+                if const_expr(not traits.SOLO_WAVE):
+                    # MMA0 issues after cast_p so its 32 fresh score regs never coexist with the
+                    # 32 f32 of the carried P; sched_group_barrier still interleaves the two.
+                    v_p = ctx.exp2(v_p, 16, 16)
+                    v_p, l_row = ctx.cast_p_and_sum(l_row, v_p)
+                    _sched_barrier(0)
+                    v_s = _qk(v_k, buf_id)
+                    _sched_barrier_pairs(traits, 6, 3, group, traits.SCHED_EXP_MASK)
+                    _sched_barrier_pairs(traits, 10, 5, group)
+                    return v_s, v_p, l_row
+                # Alone on its SIMD the wave must hide both its LDS latency and this VALU under
+                # the QK itself. Left to the scheduler, the K tail is read just in time and the
+                # VALU bunches; fencing each k-slot keeps every read K_HEAD slots ahead and one
+                # piece of the P work in each slot.
+                pieces, finish_p = ctx.finish_p_pieces(l_row, v_p)
+                v_s = None
+                v_v = None
+                for ks in range_constexpr(traits.K_STEPS_QK):
+                    if const_expr(ks == traits.K_STEPS_QK - QK_SYNC_TAIL):
+                        _qk_cluster_sync()
+                        _sched_barrier(0)
+                        v_v = _load_v_head(v_buf)
+                    nxt = ks + K_HEAD
+                    if const_expr(nxt < traits.K_STEPS_QK):
+                        v_k = ctx.lds_load_k(buf_id, ks_range=(nxt, nxt + 1), k_regs=v_k)
+                    v_s = ctx.qk(v_k, q_all_scaled_bf16, v_s=v_s, ks_range=(ks, ks + 1))
+                    if const_expr(ks < len(pieces) - 1):
+                        pieces[ks]()
+                        _interleave(traits, 4, 1, group, traits.SCHED_EXP_MASK)
+                    elif const_expr(ks == len(pieces) - 1):
+                        pieces[ks]()
+                        _interleave(traits, 16, 2, group)
+                    _sched_barrier(0)
+                v_p, l_row = finish_p()
+                return v_s, v_p, l_row, v_v
+
+            # One slot follows each asm P*V MFMA (16 cycles of pipe, 4 to issue): a VALU piece of
+            # ~12 cycles, or one of the cluster's DMAs, spaced so their issue stalls drain.
+            PV_DMA_EVERY = 6
+
+            # P*V slot that reads the next QK's K head, early enough to land by that QK.
+            PV_K_HEAD_SLOT = 56
+
+            def _pv_spec_site(v_p, v_v, v_o, buf_id, v_s, m_row, l_row, dma, k_head_buf=None):
+                """The carried P's P*V with the new tile's max tree, first exp2 half and the
+                cluster's DMAs slotted between its asm MFMAs by hand, then the rebase branch.
+
+                Each substep reads the next one's V one d chunk per slot (slots 3, 5, 7, 9 of
+                the substep), early enough to land before that chunk's MFMAs. A slot holds
+                about one 12-cycle MFMA shadow of work, so V-read slots take a max-tree piece
+                (two max3) and never an exp2; the exp2 pieces go first everywhere else.
+
+                ``k_head_buf``: also read the next QK's K head from that (already visible, not
+                being refilled) buffer and return it."""
+                pieces, spec = ctx.spec_softmax(v_s, max_chunk=4, exps_per_piece=1)
+                n_exp = _numel(v_s[0])
+                folds, exps = pieces[: len(pieces) - n_exp], pieces[len(pieces) - n_exp :]
+                v_slots = {}
+                if const_expr(split_kv_reads):
+                    for pvs in range_constexpr(4 - V_HEAD):
+                        for dc in range_constexpr(traits.D_CHUNKS):
+                            v_slots[16 * pvs + 3 + 2 * dc] = (pvs + V_HEAD, dc)
+                slots = []
+                for s in range_constexpr(16 * 4):
+                    work = []
+                    if const_expr(s in v_slots):
+                        nxt, dc = v_slots[s]
+                        work.append(
+                            lambda nxt=nxt, dc=dc: ctx.lds_load_v(
+                                buf_id, substeps=(nxt, nxt + 1), packs=v_v, dcs=(dc, dc + 1)
+                            )
+                        )
+                        if const_expr(len(folds) > 0):
+                            work.append(folds.pop(0))
+                    elif const_expr(s % PV_DMA_EVERY == 0 and len(dma) > 0):
+                        work.append(dma.pop(0))
+                    elif const_expr(len(exps) > 0):
+                        work.append(exps.pop(0))
+                    elif const_expr(len(folds) > 0):
+                        work.append(folds.pop(0))
+                    slots.append(work)
+                rest = dma + folds + exps
+                got = {}
+                if const_expr(k_head_buf is not None):
+                    slots[PV_K_HEAD_SLOT].append(lambda: got.update(v_k=_load_k_head(k_head_buf)))
+                for pvs in range_constexpr(4):
+
+                    def _after(i, pvs=pvs):
+                        # Fenced on both sides: otherwise the scheduler hoists a slot's VALU
+                        # above its own MFMA, into the previous (V-read) slot's shadow.
+                        work = slots[16 * pvs + i]
+                        if const_expr(len(work) > 0):
+                            _sched_barrier(0)
+                        for w in work:
+                            w()
+                        if const_expr(len(work) > 0):
+                            _sched_barrier(0)
+
+                    v_o = ctx.pv_step_k(pvs, v_p, v_v, v_o, after_mfma=_after)
+                for w in rest:
+                    w()
+                m_row, l_row, v_p_new, v_o = ctx.rebase_if_needed(m_row, l_row, v_s, v_o, spec=spec())
+                if const_expr(k_head_buf is not None):
+                    return v_o, m_row, l_row, v_p_new, got["v_k"]
+                return v_o, m_row, l_row, v_p_new
 
             for j, loop_args in range(
                 loop_lb,
@@ -453,21 +576,18 @@ def build_flash_attn_dualwave_swp_module(
                 # Cluster 1 finishes v_p_0 softmax, updates l_row, casts P, then computes MMA0.
                 if const_expr(late_dma and not fold_pv_barriers):
                     ctx.load_v_tile(j_idx - 2, 1)
-                # MMA0 issues after cast_p so its 32 fresh score regs never coexist with the
-                # 32 f32 of the carried P; sched_group_barrier still interleaves the two.
-                v_p_0 = ctx.exp2(v_p_0, 16, 16)
-                v_p_0, l_row = ctx.cast_p_and_sum(l_row, v_p_0)
-                _sched_barrier(0)
-                v_s_1 = _qk(v_k, 1)
-                _sched_barrier_pairs(traits, 6, 3, 1, traits.SCHED_EXP_MASK)
-                _sched_barrier_pairs(traits, 10, 5, 1)
-                _qk_cluster_sync()
+                if const_expr(traits.SOLO_WAVE):
+                    v_s_1, v_p_0, l_row, v_v = _qk_finish_p(v_k, 1, v_p_0, l_row, 1, v_buf=0)
+                else:
+                    v_s_1, v_p_0, l_row = _qk_finish_p(v_k, 1, v_p_0, l_row, 1)
+                    _qk_cluster_sync()
 
                 # Cluster 2 prefetches next K, reads this tile's V for P*V, then waits and syncs.
                 _sched_barrier(0)
                 if const_expr(not late_dma):
                     ctx.load_k_tile(j_idx, 1)
-                v_v = _load_v_head(0)
+                if const_expr(not traits.SOLO_WAVE):
+                    v_v = _load_v_head(0)
                 v_s_1 = ctx.qk_scores(v_s_1)
                 if const_expr(not sink_drains):
                     _s_waitcnt(traits.LGKMCNT_0_ONLY)
@@ -475,13 +595,14 @@ def build_flash_attn_dualwave_swp_module(
                 _mem_cluster_sync()
 
                 # Cluster 3 computes P*V, row max, rescale, sub row, and first-half exp2.
+                dma = [] if spec_exp else None
                 if const_expr(late_dma):
-                    ctx.load_k_tile(j_idx, 1)
+                    ctx.load_k_tile(j_idx, 1, pieces=dma)
                 if const_expr(fold_pv_barriers):
-                    ctx.load_v_tile(j_idx - 2, 1)
+                    ctx.load_v_tile(j_idx - 2, 1, pieces=dma)
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
-                if const_expr(not split_rebase):
+                if const_expr(not split_rebase and not spec_exp):
                     v_o = _pv_step(0, v_p_0, v_v, v_o, 0)
                 # Cross-seqlen can put a diagonal tile in v_s_1; so can SWA's lower window edge.
                 if const_expr(loop_masks):
@@ -492,20 +613,27 @@ def build_flash_attn_dualwave_swp_module(
                     )
                 else:
                     v_s_1 = ctx.scores_for_softmax(v_s_1)
-                if const_expr(split_rebase):
-                    m_row, l_row, v_s_1, v_o, pending = ctx.rebase_if_needed(
-                        m_row, l_row, v_s_1, v_o, pending
+                v_k = None
+                if const_expr(spec_exp):
+                    # K buffer 0 is visible since C1's sync and this cluster's DMAs fill buffer 1.
+                    v_o, m_row, l_row, v_p_1, v_k = _pv_spec_site(
+                        v_p_0, v_v, v_o, 0, v_s_1, m_row, l_row, dma, k_head_buf=0
                     )
-                    v_o = _pv_step(0, v_p_0, v_v, v_o, 0)
-                for pvs in range_constexpr(1, 4):
-                    v_o = _pv_step(pvs, v_p_0, v_v, v_o, 0)
-                if const_expr(not split_rebase):
-                    m_row, l_row, v_s_1, v_o = ctx.rebase_if_needed(m_row, l_row, v_s_1, v_o)
-                v_p_1 = ctx.exp2(v_s_1, 0, 16)
+                else:
+                    if const_expr(split_rebase):
+                        m_row, l_row, v_s_1, v_o, pending = ctx.rebase_if_needed(
+                            m_row, l_row, v_s_1, v_o, pending
+                        )
+                        v_o = _pv_step(0, v_p_0, v_v, v_o, 0)
+                    for pvs in range_constexpr(1, 4):
+                        v_o = _pv_step(pvs, v_p_0, v_v, v_o, 0)
+                    if const_expr(not split_rebase):
+                        m_row, l_row, v_s_1, v_o = ctx.rebase_if_needed(m_row, l_row, v_s_1, v_o)
+                    v_p_1 = ctx.exp2(v_s_1, 0, 16)
 
-                _sched_barrier_pairs(traits, 6, 6, 2)
-                # IGroupLP group 2 keeps softmax exp2 near its MFMA window.
-                _sched_barrier_pairs(traits, 6, 3, 2, traits.SCHED_EXP_MASK)
+                    _sched_barrier_pairs(traits, 6, 6, 2)
+                    # IGroupLP group 2 keeps softmax exp2 near its MFMA window.
+                    _sched_barrier_pairs(traits, 6, 3, 2, traits.SCHED_EXP_MASK)
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(0)
                 _pv_cluster_sync()
@@ -514,7 +642,8 @@ def build_flash_attn_dualwave_swp_module(
                 _sched_barrier(0)
                 if const_expr(not late_dma):
                     ctx.load_v_tile(j_idx - 1, 0)
-                v_k = _load_k_head(0)
+                if const_expr(v_k is None):
+                    v_k = _load_k_head(0)
                 if const_expr(not sink_drains):
                     _s_waitcnt(traits.LGKMCNT_0_ONLY)
                     _waitcnt_vm_n(ctx.VM_DRAIN_KV)
@@ -523,19 +652,18 @@ def build_flash_attn_dualwave_swp_module(
                 # Cluster 5 mirrors C1: finish v_p_1 softmax, update l_row, cast P, then MMA0.
                 if const_expr(late_dma and not fold_pv_barriers):
                     ctx.load_v_tile(j_idx - 1, 0)
-                v_p_1 = ctx.exp2(v_p_1, 16, 16)
-                v_p_1, l_row = ctx.cast_p_and_sum(l_row, v_p_1)
-                _sched_barrier(0)
-                v_s_0 = _qk(v_k, 0)
-                _sched_barrier_pairs(traits, 6, 3, 3, traits.SCHED_EXP_MASK)
-                _sched_barrier_pairs(traits, 10, 5, 3)
-                _qk_cluster_sync()
+                if const_expr(traits.SOLO_WAVE):
+                    v_s_0, v_p_1, l_row, v_v = _qk_finish_p(v_k, 0, v_p_1, l_row, 3, v_buf=1)
+                else:
+                    v_s_0, v_p_1, l_row = _qk_finish_p(v_k, 0, v_p_1, l_row, 3)
+                    _qk_cluster_sync()
 
                 # Cluster 6 prefetches next K, reads V packs, optionally masks v_s_0, waits, and syncs.
                 _sched_barrier(0)
                 if const_expr(not late_dma):
                     ctx.load_k_tile(j_idx + 1, 0)
-                v_v = _load_v_head(1)
+                if const_expr(not traits.SOLO_WAVE):
+                    v_v = _load_v_head(1)
                 v_s_0 = ctx.qk_scores(v_s_0)
                 # Dense causal: Cluster 6 is before the diagonal band; mask only on SWA / cross-seqlen.
                 if const_expr(loop_masks):
@@ -552,24 +680,28 @@ def build_flash_attn_dualwave_swp_module(
                 _mem_cluster_sync()
 
                 # Cluster 7 mirrors C3 and carries m_row, l_row, v_o, and packed v_p_0.
+                dma = [] if spec_exp else None
                 if const_expr(late_dma):
-                    ctx.load_k_tile(j_idx + 1, 0)
+                    ctx.load_k_tile(j_idx + 1, 0, pieces=dma)
                 if const_expr(fold_pv_barriers):
-                    ctx.load_v_tile(j_idx - 1, 0)
+                    ctx.load_v_tile(j_idx - 1, 0, pieces=dma)
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
-                if const_expr(split_rebase):
-                    m_row, l_row, v_s_0, v_o, pending = ctx.rebase_if_needed(
-                        m_row, l_row, v_s_0, v_o, pending
-                    )
-                v_o = _pv_step(0, v_p_1, v_v, v_o, 1)
-                for pvs in range_constexpr(1, 4):
-                    v_o = _pv_step(pvs, v_p_1, v_v, v_o, 1)
-                if const_expr(not split_rebase):
-                    m_row, l_row, v_s_0, v_o = ctx.rebase_if_needed(m_row, l_row, v_s_0, v_o)
-                v_p_0 = ctx.exp2(v_s_0, 0, 16)
-                _sched_barrier_pairs(traits, 6, 5, 4)
-                _sched_barrier_pairs(traits, 6, 3, 4, traits.SCHED_EXP_MASK)
+                if const_expr(spec_exp):
+                    v_o, m_row, l_row, v_p_0 = _pv_spec_site(v_p_1, v_v, v_o, 1, v_s_0, m_row, l_row, dma)
+                else:
+                    if const_expr(split_rebase):
+                        m_row, l_row, v_s_0, v_o, pending = ctx.rebase_if_needed(
+                            m_row, l_row, v_s_0, v_o, pending
+                        )
+                    v_o = _pv_step(0, v_p_1, v_v, v_o, 1)
+                    for pvs in range_constexpr(1, 4):
+                        v_o = _pv_step(pvs, v_p_1, v_v, v_o, 1)
+                    if const_expr(not split_rebase):
+                        m_row, l_row, v_s_0, v_o = ctx.rebase_if_needed(m_row, l_row, v_s_0, v_o)
+                    v_p_0 = ctx.exp2(v_s_0, 0, 16)
+                    _sched_barrier_pairs(traits, 6, 5, 4)
+                    _sched_barrier_pairs(traits, 6, 3, 4, traits.SCHED_EXP_MASK)
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(0)
                 _pv_cluster_sync()
@@ -589,7 +721,6 @@ def build_flash_attn_dualwave_swp_module(
             ctx.set_seed_vec(loop_results[4 + traits.D_CHUNKS])
             if const_expr(split_rebase):
                 v_o = ctx.rebase_acc(v_o, (ctx.bound_over_ref, loop_results[5 + traits.D_CHUNKS]))
-
             max_m3 = split_t_end - 3
             max_m2 = split_t_end - 2
             max_m1 = split_t_end - 1
