@@ -18,3 +18,6 @@ primus_turbo/_version.py
 .coverage*
 !csrc/kernels/attention/hipkittens/gfx1250_mla/src/*.hip
 primus_turbo/lib/hk_gfx1250_mla/
+!csrc/ulysses_tensilelite/src/*.hip
+primus_turbo/lib/ulysses_tl/
+primus_turbo/lib/libtensilelite-host.so*

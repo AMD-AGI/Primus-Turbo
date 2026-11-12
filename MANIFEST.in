@@ -7,6 +7,7 @@ include requirements.txt
 include .gitmodules
 
 recursive-include tools *.py
+include tools/build_tensilelite.sh
 recursive-include csrc *
 recursive-include primus_turbo *.py
 recursive-include 3rdparty/composable_kernel/include *

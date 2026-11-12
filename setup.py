@@ -5,9 +5,11 @@
 ###############################################################################
 
 import importlib.util
+import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import warnings
@@ -24,7 +26,9 @@ from tools.build_ext import TurboBuildExt, _join_rocm_home
 from tools.build_utils import (
     HIPExtension,
     build_ck_backend,
+    find_rocm_home,
     find_rocshmem_library,
+    find_tensilelite_library,
     get_gpu_arch,
     is_package_installed,
 )
@@ -128,6 +132,66 @@ def build_hk_mla_hsaco(offload_arch_list):
         print(f"[Primus-Turbo Setup] WARNING: gfx1250 MLA HIP kernels not built: {type(e).__name__}: {e}")
         return []
     return ["lib/hk_gfx1250_mla/*.hsaco"]
+
+
+# -------- TENSILELITE Ulysses backend (TensileLite GemmA2A / A2AGemm over SDMA, gfx950) --------
+# Built against the TensileLite toolkit that tools/build_tensilelite.sh installs (TENSILELITE_HOME, default
+# /opt/tensilelite), only when its STAMP.json is the commit and toolchain csrc/ulysses_tensilelite/manifest.json
+# pins: the extension primus_turbo.pytorch._ulysses_tl, a copy of the toolkit's host library in primus_turbo/lib,
+# and the kernel libraries csrc/ulysses_tensilelite/kernels.py generates from the committed logic. Anything that
+# is missing or does not build disables the backend with a warning (it falls back to FLYDSL) and never fails the
+# install. PRIMUS_TURBO_BUILD_ULYSSES_TL=0 (or false, off, empty) skips it.
+ULYSSES_TL_DIR = PROJECT_ROOT / "csrc" / "ulysses_tensilelite"
+ULYSSES_TL_HOST_LIBRARY = "libtensilelite-host.so.1"
+
+
+def build_ulysses_tl_extension(offload_arch_list):
+    """The TENSILELITE Ulysses extension for a gfx950 PyTorch build and its package_data patterns, or (None, [])."""
+    if not BUILD_TORCH or "--offload-arch=gfx950" not in offload_arch_list:
+        return None, []
+    if os.environ.get("PRIMUS_TURBO_BUILD_ULYSSES_TL", "1").strip().lower() in ("0", "false", "off", ""):
+        return None, []
+    manifest = json.loads((ULYSSES_TL_DIR / "manifest.json").read_text())
+    tensilelite = find_tensilelite_library(manifest)
+    if tensilelite is None:
+        return None, []
+    host_library_dir = Path(tensilelite.library_dirs[0])
+    try:
+        spec = importlib.util.spec_from_file_location("_ulysses_tl_kernels", ULYSSES_TL_DIR / "kernels.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.build(
+            host_library_dir.parent,
+            rocm_path=find_rocm_home(),
+            log=lambda msg: print(f"[Primus-Turbo Setup] {msg}"),
+        )
+        lib_dir = PROJECT_ROOT / "primus_turbo" / "lib"
+        lib_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(host_library_dir / ULYSSES_TL_HOST_LIBRARY, lib_dir / ULYSSES_TL_HOST_LIBRARY)
+    except Exception as e:  # noqa: BLE001 -- optional backend: never fail the install
+        print(f"[Primus-Turbo Setup] WARNING: TENSILELITE Ulysses backend not built: {type(e).__name__}: {e}")
+        return None, []
+
+    from torch.utils.cpp_extension import CUDAExtension
+
+    extra_flags = get_common_flags()
+    extra_flags["extra_link_args"] = [
+        "-Wl,-rpath,$ORIGIN/../lib",
+        *tensilelite.extra_link_args,
+        *extra_flags.get("extra_link_args", []),
+    ]
+    sources = sorted(str(p) for p in (ULYSSES_TL_DIR / "src").iterdir() if p.suffix in (".cpp", ".hip"))
+    extension = CUDAExtension(
+        name=TurboBuildExt.ULYSSES_TL_EXT_NAME,
+        sources=sources,
+        include_dirs=[ULYSSES_TL_DIR / "src", *tensilelite.include_dirs],
+        **extra_flags,
+    )
+    return extension, [
+        f"lib/{ULYSSES_TL_HOST_LIBRARY}",
+        "lib/ulysses_tl/manifest.json",
+        "lib/ulysses_tl/*/library/*/*",
+    ]
 
 
 def get_extras_require():
@@ -543,7 +607,10 @@ if __name__ == "__main__":
 
     torch_ext = build_torch_extension()
     jax_ext = build_jax_extension()
-    ext_modules = [kernels_ext] + [e for e in (torch_ext, jax_ext) if e is not None]
+
+    offload_arch_list, _ = get_offload_archs()
+    ulysses_tl_ext, ulysses_tl_package_data = build_ulysses_tl_extension(offload_arch_list)
+    ext_modules = [kernels_ext] + [e for e in (torch_ext, ulysses_tl_ext, jax_ext) if e is not None]
 
     # Entry points and Install Requires
     entry_points = {}
@@ -551,7 +618,6 @@ if __name__ == "__main__":
         "scipy",
     ]
 
-    offload_arch_list, _ = get_offload_archs()
     hk_mla_package_data = build_hk_mla_hsaco(offload_arch_list)
 
     # flydsl 0.3.4.1 does support gfx1250: the four symbols the gfx1250 kernels need
@@ -583,7 +649,7 @@ if __name__ == "__main__":
         long_description=(PROJECT_ROOT / "README.md").read_text(encoding="utf-8"),
         long_description_content_type="text/markdown",
         packages=find_packages(exclude=["tests", "tests.*"]),
-        package_data={"primus_turbo": ["lib/*.so", *hk_mla_package_data]},
+        package_data={"primus_turbo": ["lib/*.so", *hk_mla_package_data, *ulysses_tl_package_data]},
         ext_modules=ext_modules,
         cmdclass={"build_ext": TurboBuildExt.with_options(use_ninja=True)},
         entry_points=entry_points,

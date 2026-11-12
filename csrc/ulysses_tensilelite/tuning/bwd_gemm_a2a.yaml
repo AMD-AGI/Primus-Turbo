@@ -1,0 +1,73 @@
+# Tuning config of the backward o_proj dgrad hop: dO = dY @ W_o as a GemmA2A (GEMM, then the head columns go
+# to their owner rank), with the weight read as stored (TransposeA False: NN).
+# Search space of the forward GemmA2A plus DirectToLds 0; to add a shape, edit ProblemSizes only.
+#   M = hq * d, N = tokens per rank, K = hidden, a2aExtent = M
+#   Llama-3-70B [8192, n, 1, 8192], Llama3.1-8B [4096, n, 1, 4096], Qwen3-30B-A3B [4096, n, 1, 2048]
+# Run (see README.md): Tensile <this file> <out dir> --prebuilt-client $TENSILELITE_HOME/bin/tensilelite-client
+GlobalParameters:
+  SyncsPerBenchmark: 1
+  SleepPercent: 0
+  NumElementsToValidate: 0
+  NumElementsToValidateWinner: -1
+  NumBenchmarks: 10
+  EnqueuesPerSync: 40
+  NumWarmups: 40
+  RotatingBufferSize: 4096  # MB; 0 (no rotation) when the client stops with "Insufficient rotating buffer size" (large shapes)
+  UseEffLike: False
+  DataInitTypeAlpha: 1
+  DataInitTypeBeta: 0
+  Device: 0
+  PrintSolutionRejectionReason: True
+  Architecture: gfx950
+  ISA: [[9, 5, 0]]
+  LibraryFormat: msgpack
+
+BenchmarkProblems:
+  -
+    - OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: False
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      FusedA2A: GemmA2A
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+        - MaxOccupancy: [40]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1,  1, 8, 8,  2, 2]
+        - DepthU: [64]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [0]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [0, 1]
+        - StaggerU: [0]
+        - TileProcessingStrategy: ["None"]
+        - WorkGroupMapping: [1]
+        - MIArchVgpr: [False]
+        - UseSubtileImpl: [True, False]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: {sizes: [8192, 2048, 1, 8192], world: 4, a2aExtent: 8192}
+          - Exact: {sizes: [8192, 4096, 1, 8192], world: 4, a2aExtent: 8192}
+          - Exact: {sizes: [8192, 8192, 1, 8192], world: 4, a2aExtent: 8192}
+          - Exact: {sizes: [4096, 4096, 1, 4096], world: 4, a2aExtent: 4096}
+          - Exact: {sizes: [4096, 8192, 1, 4096], world: 4, a2aExtent: 4096}
+          - Exact: {sizes: [4096, 4096, 1, 2048], world: 4, a2aExtent: 4096}
+          - Exact: {sizes: [4096, 8192, 1, 2048], world: 4, a2aExtent: 4096}
+          - Exact: {sizes: [4096, 16384, 1, 2048], world: 4, a2aExtent: 4096}
+          - Exact: {sizes: [4096, 32768, 1, 2048], world: 4, a2aExtent: 4096}
+
+LibraryLogic:
+    ScheduleName: "gfx950"
+    DeviceNames: ["Device 75a0"]
+    ArchitectureName: "gfx950"
+    LibraryType: "Equality"
+
+LibraryClient:

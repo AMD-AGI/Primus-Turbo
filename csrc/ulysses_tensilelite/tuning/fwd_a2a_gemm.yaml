@@ -1,0 +1,70 @@
+# Tuning config of the forward o_proj hop: A2AGemm (the second all-to-all, then the o_proj GEMM), TN.
+# Search space of attn-a2a-demo tuning/a2a_gemm_tune.yaml; to add a shape, edit ProblemSizes only.
+#   M = hidden, N = tokens per rank, K = hq * d
+#   Llama-3-70B [8192, n, 1, 8192], Llama3.1-8B [4096, n, 1, 4096], Qwen3-30B-A3B [2048, n, 1, 4096]
+# The shipped logic also has world-8 entries from the demo's own logic, which need 8 GPUs to tune.
+# Run (see README.md): Tensile <this file> <out dir> --prebuilt-client $TENSILELITE_HOME/bin/tensilelite-client
+GlobalParameters:
+  SyncsPerBenchmark: 1
+  SleepPercent: 0
+  NumElementsToValidate: 0
+  NumElementsToValidateWinner: -1
+  NumBenchmarks: 10
+  EnqueuesPerSync: 40
+  NumWarmups: 40
+  RotatingBufferSize: 4096  # MB; 0 (no rotation) when the client stops with "Insufficient rotating buffer size" (large shapes)
+  UseEffLike: False
+  DataInitTypeAlpha: 1
+  DataInitTypeBeta: 0
+  Device: 0
+  PrintSolutionRejectionReason: True
+  Architecture: gfx950
+  ISA: [[9, 5, 0]]
+  LibraryFormat: msgpack
+
+BenchmarkProblems:
+  -
+    - OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      FusedA2A: A2AGemm
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1,  1, 8, 8,  2, 2]
+        - DepthU: [64]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - ExpandPointerSwap: [False]
+        - DirectToLds: [1]
+        - StaggerU: [0]
+        - WorkGroupMapping: [1]
+        - A2ASubRounds: [1, 2]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: {sizes: [8192, 2048, 1, 8192], world: 4}
+          - Exact: {sizes: [8192, 4096, 1, 8192], world: 4}
+          - Exact: {sizes: [8192, 8192, 1, 8192], world: 4}
+          - Exact: {sizes: [4096, 4096, 1, 4096], world: 4}
+          - Exact: {sizes: [4096, 8192, 1, 4096], world: 4}
+          - Exact: {sizes: [2048, 4096, 1, 4096], world: 4}
+          - Exact: {sizes: [2048, 8192, 1, 4096], world: 4}
+          - Exact: {sizes: [2048, 16384, 1, 4096], world: 4}
+          - Exact: {sizes: [2048, 32768, 1, 4096], world: 4}
+
+LibraryLogic:
+    ScheduleName: "gfx950"
+    DeviceNames: ["Device 75a0"]
+    ArchitectureName: "gfx950"
+    LibraryType: "Equality"
+
+LibraryClient:

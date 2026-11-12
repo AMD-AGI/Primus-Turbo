@@ -1,0 +1,72 @@
+# Tuning config of the forward QKV hop: GemmA2A (QKV projection, then the first all-to-all), TN.
+# Search space of attn-a2a-demo tuning/gemm_a2a_n4096_tune.yaml; to add a shape, edit ProblemSizes only.
+#   M = (hq + 2 * hkv) * d, N = tokens per rank, K = hidden, a2aExtent = M
+#   Llama-3-70B [10240, n, 1, 8192], Llama3.1-8B [6144, n, 1, 4096], Qwen3-30B-A3B [5120, n, 1, 2048]
+# Run (see README.md): Tensile <this file> <out dir> --prebuilt-client $TENSILELITE_HOME/bin/tensilelite-client
+GlobalParameters:
+  SyncsPerBenchmark: 1
+  SleepPercent: 0
+  NumElementsToValidate: 0
+  NumElementsToValidateWinner: -1
+  NumBenchmarks: 10
+  EnqueuesPerSync: 40
+  NumWarmups: 40
+  RotatingBufferSize: 4096  # MB; 0 (no rotation) when the client stops with "Insufficient rotating buffer size" (large shapes)
+  UseEffLike: False
+  DataInitTypeAlpha: 1
+  DataInitTypeBeta: 0
+  Device: 0
+  PrintSolutionRejectionReason: True
+  Architecture: gfx950
+  ISA: [[9, 5, 0]]
+  LibraryFormat: msgpack
+
+BenchmarkProblems:
+  -
+    - OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: True
+      TransposeB: False
+      UseBeta: True
+      Batched: True
+      FusedA2A: GemmA2A
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+        - MaxOccupancy: [40]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 32, 1,  1, 8, 8,  2, 2]
+        - DepthU: [64]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [0]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StaggerU: [0]
+        - TileProcessingStrategy: ["None"]
+        - WorkGroupMapping: [1]
+        - MIArchVgpr: [False]
+        - UseSubtileImpl: [True, False]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: {sizes: [10240, 2048, 1, 8192], world: 4, a2aExtent: 10240}
+          - Exact: {sizes: [10240, 4096, 1, 8192], world: 4, a2aExtent: 10240}
+          - Exact: {sizes: [10240, 8192, 1, 8192], world: 4, a2aExtent: 10240}
+          - Exact: {sizes: [6144, 4096, 1, 4096], world: 4, a2aExtent: 6144}
+          - Exact: {sizes: [6144, 8192, 1, 4096], world: 4, a2aExtent: 6144}
+          - Exact: {sizes: [5120, 4096, 1, 2048], world: 4, a2aExtent: 5120}
+          - Exact: {sizes: [5120, 8192, 1, 2048], world: 4, a2aExtent: 5120}
+          - Exact: {sizes: [5120, 16384, 1, 2048], world: 4, a2aExtent: 5120}
+          - Exact: {sizes: [5120, 32768, 1, 2048], world: 4, a2aExtent: 5120}
+
+LibraryLogic:
+    ScheduleName: "gfx950"
+    DeviceNames: ["Device 75a0"]
+    ArchitectureName: "gfx950"
+    LibraryType: "Equality"
+
+LibraryClient:

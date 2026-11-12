@@ -563,6 +563,8 @@ BaseBuildExtension = _select_base_build_ext()
 
 class TurboBuildExt(BaseBuildExtension):
     KERNEL_EXT_NAME = "libprimus_turbo_kernels"
+    # Optional: when it does not build, its backend is disabled (it falls back to FLYDSL) instead of failing the build.
+    ULYSSES_TL_EXT_NAME = "primus_turbo.pytorch._ulysses_tl"
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
     def finalize_options(self):
@@ -584,6 +586,17 @@ class TurboBuildExt(BaseBuildExtension):
         return filename
 
     def build_extension(self, ext):
+        if ext.name == self.ULYSSES_TL_EXT_NAME:
+            try:
+                super().build_extension(ext)
+            except Exception as e:  # noqa: BLE001 -- an optional backend that does not build must not fail the build
+                Path(self.get_ext_fullpath(ext.name)).unlink(missing_ok=True)
+                print(
+                    f"[TurboBuildExt] WARNING: {ext.name} failed to build, the TENSILELITE Ulysses backend is "
+                    f"disabled: {type(e).__name__}: {e}"
+                )
+            return
+
         super().build_extension(ext)
 
         if ext.name == self.KERNEL_EXT_NAME:

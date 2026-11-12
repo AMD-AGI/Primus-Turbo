@@ -6,6 +6,7 @@
 
 import importlib.metadata
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -322,6 +323,73 @@ def find_rocshmem_library() -> Library:
         extra_link_args=extra_link_args,
     )
     return rocshmem_library
+
+
+def find_tensilelite_home() -> Optional[str]:
+    return _find_library_home(["TENSILELITE_HOME"], fallback_path="/opt/tensilelite")
+
+
+def find_tensilelite_library(manifest: dict) -> Optional[Library]:
+    """The TensileLite toolkit (``tools/build_tensilelite.sh``) the TENSILELITE Ulysses backend builds against.
+
+    None, with a warning, when there is none or its ``STAMP.json`` is not the commit, arch and toolchain that
+    ``manifest`` (``csrc/ulysses_tensilelite/manifest.json``) pins. ``library_dirs[0]`` holds the host library.
+    """
+    tensilelite_home = find_tensilelite_home()
+    if tensilelite_home is None:
+        warnings.warn(
+            "TensileLite toolkit is not found, the TENSILELITE Ulysses backend will be disabled. Build it with "
+            "tools/build_tensilelite.sh, set 'TENSILELITE_HOME' and reinstall."
+        )
+        return None
+
+    tensilelite_home = Path(tensilelite_home).resolve()
+    stamp_path = tensilelite_home / "STAMP.json"
+    try:
+        stamp = json.loads(stamp_path.read_text())
+    except (OSError, ValueError) as e:
+        warnings.warn(f"{stamp_path}: {e}; the TENSILELITE Ulysses backend will be disabled.")
+        return None
+    for key in ("rocm_libraries_commit", "arch", "toolchain"):
+        if stamp.get(key) != manifest[key]:
+            warnings.warn(
+                f"TensileLite toolkit {tensilelite_home} was built with {key} {stamp.get(key)!r}, not the pinned "
+                f"{manifest[key]!r}; the TENSILELITE Ulysses backend will be disabled. Rebuild it with "
+                "tools/build_tensilelite.sh."
+            )
+            return None
+
+    rocm_home = Path(find_rocm_home())
+    rocm_library_dir = rocm_home / "lib"
+    library_dirs = [str(tensilelite_home / "lib"), str(rocm_library_dir)]
+    extra_link_args = [
+        "-ltensilelite-host",
+        # SDMA queues are created through hsakmt, which only ships as a static library; keep its symbols local
+        "-l:libhsakmt.a",
+        "-Wl,--exclude-libs,libhsakmt.a",
+        "-lhsa-runtime64",
+        "-ldrm",
+        "-ldrm_amdgpu",
+        "-lnuma",
+        "-lpthread",
+        "-lrt",
+        "-ldl",
+        *[f"-L{d}" for d in library_dirs],
+        f"-Wl,-rpath,{rocm_library_dir}",
+    ]
+    return Library(
+        name="tensilelite",
+        include_dirs=[
+            str(tensilelite_home / "include"),
+            str(tensilelite_home / "rocisa"),
+            str(tensilelite_home / "origami" / "include"),
+            str(tensilelite_home / "origami" / "build-include"),
+            str(rocm_home / "include"),
+        ],
+        libraries=[],
+        library_dirs=library_dirs,
+        extra_link_args=extra_link_args,
+    )
 
 
 def get_gpu_arch(gpu_id: int = 0) -> str:
