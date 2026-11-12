@@ -47,7 +47,7 @@ the FlyDSL kernels do not cover (other rank counts, `num_nvl_bytes == 0`), raise
 the all-to-all (RCCL) token dispatcher. Both backends return the same tensors; `flydsl_v2` handles work
 with `flydsl_v2` only. Design and kernel numbers: `docs/flydsl_deepep_mi455.md`.
 
-FlyDSL V1 (`flydsl`, the channel protocol of `cpp` on FlyDSL: `primus_turbo/flydsl/deep_ep/intranode_kernel.py`)
+FlyDSL V1 (`flydsl`, the channel protocol of `cpp` on FlyDSL: `primus_turbo/flydsl/deep_ep/intranode_v1_kernel.py`)
 is kept for the tests, through `Buffer(..., intranode_backend="flydsl")`. `intranode_backend` and the
 `backend` argument of `get_dispatch_config` / `get_combine_config` / `get_token_buffer_size_hint` are for
 the tests only; users leave them unset. On MI455X it is 2.2–5.1×

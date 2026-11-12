@@ -32,10 +32,13 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import ( 
     WMMA_K_ENTRY,
     _pick_config,
     _pick_config_nn,
+    _pick_lds_cosched,
+    _pick_variable_k_config,
     grouped_gemm_bf16_nn_flydsl_kernel,
     grouped_gemm_bf16_nn_supported,
     grouped_gemm_bf16_nt_flydsl_kernel,
     grouped_gemm_bf16_nt_supported,
+    grouped_gemm_bf16_variable_k_flydsl_kernel,
     nn_native_unsupported_reason,
 )
 
@@ -376,3 +379,78 @@ def test_nt_entry_refuses_what_the_gate_refuses():
     assert not grouped_gemm_bf16_nt_supported(N, K, avg_m, G)
     with pytest.raises(AssertionError, match="not a multiple of 32"):
         grouped_gemm_bf16_nt_flydsl_kernel(a, b, offs)
+
+
+@needs_gfx1250
+@pytest.mark.parametrize("avg_m", [16, 64])
+def test_small_avg_m_numeric(avg_m):
+    """``avg_m <= 64`` picks the (64, 128) tile, forward and dgrad alike.
+
+    Its sub-step has 8 matrix ops against 12 fragment reads, so it can never carry a
+    ``head_pipe`` chain -- and with the chain off the launcher must not hold it to the
+    chain's budget, or the tile refuses every call.
+    """
+    G, N, K = 8, 2048, 1536
+    torch.manual_seed(0)
+    device = "cuda"
+    a = torch.randn(G * avg_m, K, dtype=torch.bfloat16, device=device)
+    offs = _group_offs(G, avg_m, device)
+    assert _pick_config(N, K, avg_m, G)[:2] == (64, 128)
+    assert _pick_config_nn(N, K, avg_m, G)[:2] == (64, 128)
+
+    b = torch.randn(G, N, K, dtype=torch.bfloat16, device=device)
+    _assert_matches_ref(_run_nt(a, b, offs), a, b, offs, trans_b=True)
+    b = torch.randn(G, K, N, dtype=torch.bfloat16, device=device)
+    _assert_matches_ref(_run_nn(a, b, offs), a, b, offs, trans_b=False)
+
+
+@needs_gfx1250
+@pytest.mark.parametrize("out_m, out_n", [(128, 2048), (2048, 192)])
+def test_variable_k_narrow_output_numeric(out_m, out_n):
+    """An output axis under 256 picks the (64, 64) variable-K tile: 4 matrix ops, 8 fragment reads."""
+    G, avg_m = 8, 256
+    torch.manual_seed(0)
+    device = "cuda"
+    a = torch.randn(G * avg_m, out_m, dtype=torch.bfloat16, device=device)
+    b = torch.randn(G * avg_m, out_n, dtype=torch.bfloat16, device=device)
+    offs = _group_offs(G, avg_m, device)
+    assert _pick_variable_k_config(out_m, out_n, avg_m)[:2] == (64, 64)
+
+    for _ in range(3):
+        grouped_gemm_bf16_variable_k_flydsl_kernel(a, b, offs)
+    got = grouped_gemm_bf16_variable_k_flydsl_kernel(a, b, offs).cpu()
+    bounds = offs.cpu().tolist()
+    a32, b32 = a.float().cpu(), b.float().cpu()
+    ref = torch.stack([a32[lo:hi].t() @ b32[lo:hi] for lo, hi in zip(bounds[:-1], bounds[1:])]).to(a.dtype)
+    snr = compute_snr(ref, got)
+    assert snr > 45, f"out SNR {snr:.2f} dB is below the bf16 threshold of 45 dB"
+    torch.testing.assert_close(got, ref, **get_tolerances(a.dtype))
+
+
+@needs_gfx1250
+@pytest.mark.parametrize(
+    "direction, N, K",
+    [("nt", 4096, 7168), ("nt", 7168, 2048), ("nn", 7168, 4096), ("nn", 2048, 7168)],
+    ids=["nt-fc1", "nt-fc2", "nn-fc1", "nn-fc2"],
+)
+def test_one_expert_at_a_keyed_shape_numeric(direction, N, K):
+    """One expert at a keyed ``(N, K, avg_m)`` gets the 128x128 tile, which ``lds_cosched=3`` cannot run.
+
+    The level is keyed on the shape, and ``n_groups * ceil(avg_m / 256) <= 8`` sends a single expert
+    at 2048 rows to the narrow tile: its 4x4 warp tile has 16 fragment reads per sub-step against 16
+    matrix ops. The entry has to step the level down to one the tile can build.
+    """
+    G, avg_m = 1, 2048
+    picker = _pick_config if direction == "nt" else _pick_config_nn
+    assert _pick_lds_cosched(direction, N, K, avg_m) == 3, "the case needs a shape the table keys"
+    assert picker(N, K, avg_m, G)[:2] == (128, 128), "and the tile one expert gets there"
+    torch.manual_seed(0)
+    device = "cuda"
+    a = torch.randn(G * avg_m, K, dtype=torch.bfloat16, device=device)
+    offs = _group_offs(G, avg_m, device)
+    if direction == "nt":
+        b = torch.randn(G, N, K, dtype=torch.bfloat16, device=device)
+        _assert_matches_ref(_run_nt(a, b, offs), a, b, offs, trans_b=True)
+    else:
+        b = torch.randn(G, K, N, dtype=torch.bfloat16, device=device)
+        _assert_matches_ref(_run_nn(a, b, offs), a, b, offs, trans_b=False)

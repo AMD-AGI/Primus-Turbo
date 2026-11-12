@@ -153,7 +153,7 @@ fence; only their waits take the gfx12 form.
   source rank, laid out as [destination rank][index in the stream sent to it], so the slot of (rank
   `r`, token `t`) is `base_r + send_head[t, r]`; this rank's own rows stay in `x`. Only the rows a
   rank actually received are pushed, also under a `num_worst_tokens` allocation. Once a row has
-  landed, the pushing warp sets its flag to the epoch of this combine. Reduce warps take 4 tokens at
+  landed, the pushing warp sets its flag to the epoch of this combine. Reduce warps take one token at
   a time, in token order, from an atomic queue and add them as their flags arrive (bias first, then
   ranks in ascending order, the summation order of HIP / V1), so push and reduce overlap.
 - **TDM**: rows go through LDS (one load, then one store per destination rank); wide rows (e.g.
@@ -322,15 +322,20 @@ GPT-OSS shape (EP4, T 32768, H 2880, top-4, 160 SMs): V2 dispatch 353 µs, combi
 | Component | File |
 | --- | --- |
 | Per-arch traits | `primus_turbo/flydsl/deep_ep/arch.py` |
-| gfx1250-aware helpers (`read_clock`, `wait_mem_all`, `copy_warp`, timeouts) | `primus_turbo/flydsl/deep_ep/common.py` |
-| V1 kernels (notify, dispatch, combine) | `primus_turbo/flydsl/deep_ep/intranode_kernel.py` |
+| Device helpers of V1 and V2: the gfx1250-aware ones (`read_clock`, `wait_mem_all`, `copy_warp`, timeouts), heap access (`_addr`, `_ld_sys` / `_st_sys`, `_load_ptr`), `_copy_row`, `barrier_block` | `primus_turbo/flydsl/deep_ep/common.py` |
+| notify / cached notify (V1 and V2) | `primus_turbo/flydsl/deep_ep/notify_kernel.py` |
 | Dispatch layout kernel | `primus_turbo/flydsl/deep_ep/layout_kernel.py` |
+| V1 kernels (dispatch, combine) | `primus_turbo/flydsl/deep_ep/intranode_v1_kernel.py` |
 | V2 kernels | `primus_turbo/flydsl/deep_ep/intranode_v2_kernel.py` |
 | Launcher cache | `primus_turbo/flydsl/deep_ep/launch_cache.py` |
-| Host runtime (V1 / V2) | `primus_turbo/pytorch/deep_ep/flydsl_intranode.py` |
+| Host runtime: the shared base `FlyDSLIntranodeRuntime`, `FlyDSLIntranodeV1Runtime`, `FlyDSLIntranodeV2Runtime` | `primus_turbo/pytorch/deep_ep/flydsl_intranode.py` |
 | `Buffer`, backend selection, configs | `primus_turbo/pytorch/deep_ep/buffer.py` |
 | No-C++ fallbacks (`PyConfig`, `PyEventHandle`) | `primus_turbo/pytorch/deep_ep/_compat.py` |
 | Buffer sizing in `moe_dispatch` / `DeepEPTokenDispatcher` | `primus_turbo/pytorch/kernels/moe/moe_dispatch_combine_impl.py` |
+
+V1 and V2 share only `arch`, `common`, `notify_kernel` and `layout_kernel`, and neither imports the
+other; in the host runtime only the V1 class uses the V1 kernels and only the V2 class the V2 ones.
+`tests/pytorch/deep_ep/test_module_layering.py` checks both from the source.
 
 ## Acknowledgements
 

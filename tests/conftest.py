@@ -36,6 +36,8 @@ if _worker_id is not None:
 _GFX1250_ENABLED_TESTS = (
     # FlyDSL intranode DeepEP (primus_turbo/flydsl/deep_ep); the C++ DeepEP is not loaded here.
     "tests/pytorch/deep_ep/test_intranode.py",
+    # Source-only: the imports between the FlyDSL DeepEP modules, the same on every GPU.
+    "tests/pytorch/deep_ep/test_module_layering.py",
     # bf16 grouped GEMM through the backend registry: Triton, plus the FlyDSL
     # WMMA/TDM kernels in grouped_gemm_bf16_kernel_gfx1250.py.
     "tests/pytorch/ops/test_grouped_gemm.py",
@@ -48,8 +50,13 @@ _GFX1250_ENABLED_TESTS = (
     # stack off is left with. Mostly host-only as well; its numeric cases are the DeepSeek-V3
     # delivery shapes, which are the only shapes in this suite that take the keyed path.
     "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_keys.py",
+    # The kwargs-mode shape keys of the same kernel (the MiniMax-M3 shapes): which calls get a key's
+    # whole argument set, and that the keyed result is bit-identical to the untuned one.
+    "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_kwargs_keys.py",
     # FlyDSL attention at the DeepSeek-V3 MLA head dims (primus_turbo/flydsl/attention/gfx1250_mla).
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla.py",
+    # HipKittens kernels of its backward (csrc/kernels/attention/hipkittens/gfx1250_mla).
+    "tests/pytorch/ops/test_attention_hipkittens_gfx1250_mla.py",
     # Dense FlyDSL attention (primus_turbo/flydsl/attention/gfx1250), bf16 head_dim 128.
     "tests/pytorch/ops/test_attention_flydsl_gfx1250.py",
     # Sparse MLA (primus_turbo/flydsl/attention/gfx1250_sparse_mla); every backend it can pick
@@ -60,6 +67,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_bf16_gfx1250_prims.py",
     # The BF16 Mega NT GEMM tile (gathered A, LDS-staged buffer-store epilogue).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_gemm.py",
+    # beta = 1 on the BF16 Mega variable-K wgrad (dW1 / dW2 straight into main_grad).
+    "tests/pytorch/ops/test_mega_bf16_gfx1250_variable_k_accum.py",
     # The fused Mega dispatch + L1 GEMM, single GPU (EP1).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_dispatch_gemm.py",
     # The fused Mega L2 GEMM + combine, single GPU (EP1).

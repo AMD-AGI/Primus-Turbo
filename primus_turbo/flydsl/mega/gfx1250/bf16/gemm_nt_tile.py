@@ -100,6 +100,28 @@ def tile_geometry(tile_m: int, tile_n: int, tile_k: int, b_nn: bool = False):
     return lds_row, stage, pitch, arena
 
 
+def resolve_lds_cosched(
+    lds_cosched: int, issue_first: int, tile_m: int, tile_n: int, m_warp: int, n_warp: int
+):
+    """``lds_cosched`` as ``nt_gemm_tile`` takes it: -1 turns it on where the tile allows it.
+
+    It issues one fragment read per matrix op of the previous sub-step, so it needs ``issue_first``
+    and fewer reads per sub-step (two per fragment row and column) than matrix ops."""
+    m_rep, n_rep = tile_m // m_warp // WMMA_M, tile_n // n_warp // WMMA_N
+    allowed = bool(issue_first) and 2 * (m_rep + n_rep) < m_rep * n_rep
+    if lds_cosched == -1:
+        return int(allowed)
+    if lds_cosched not in (0, 1):
+        raise ValueError(f"lds_cosched must be -1 (auto), 0 or 1, got {lds_cosched}")
+    if lds_cosched and not allowed:
+        raise ValueError(
+            f"lds_cosched=1 needs issue_first=1 and fewer fragment reads per sub-step than matrix ops, "
+            f"got issue_first={int(issue_first)} and {2 * (m_rep + n_rep)} reads for {m_rep * n_rep} "
+            f"matrix ops (tile {tile_m}x{tile_n}, {m_warp}x{n_warp} waves)"
+        )
+    return lds_cosched
+
+
 def check_gather_rows(a_rows: int, lda: int, tile_m: int, tile_k: int):
     """The async A gather's limits: some row to read, and 32-bit byte offsets into A."""
     assert a_rows > 0, "a gathered A needs a row"
@@ -139,6 +161,8 @@ def nt_gemm_tile(
     c_cache_modifier: int = 0,
     b_nn: bool = False,
     i32_n=None,
+    issue_first: bool = False,
+    lds_cosched: bool = False,
 ):
     """One ``tile_m x tile_n`` block; must be called by all ``m_warp * n_warp`` waves.
 
@@ -151,7 +175,11 @@ def nt_gemm_tile(
     read. C is written at byte address ``c_addr`` with row stride
     ``ldc``, ``m_rows`` rows and ``n_valid`` columns kept. ``live`` (wave-uniform i1) turns the
     tile into a no-op. ``c_cache_modifier`` is the C stores' cache policy (``CPOL_DEVICE_STREAM``
-    when another workgroup consumes C in the same launch).
+    when another workgroup consumes C in the same launch). ``issue_first`` issues the next
+    k-tile's loads at the top of the k-tile body, ahead of its fragment reads; the buffer they fill
+    was drained by the previous k-tile's fence. ``lds_cosched`` (needs ``issue_first``) issues each
+    sub-step's fragment reads one per matrix op of the previous sub-step, one scheduling region per
+    sub-step, holding the running sub-step's fragments live to its end.
     """
     KB = tile_k * EB
     KSB = WMMA_K * EB
@@ -165,6 +193,9 @@ def nt_gemm_tile(
     LDS_B_ROW = tile_n * EB + _nn_b_pad(tile_n, EB)
     B_DELTA = STAGE_A
     R = 2  # fragment ring depth
+    # Not an assert: without issue_first the co-scheduled loop never issues the next k-tile's
+    # loads, so `python -O` would turn a bad combination into stale LDS reads.
+    resolve_lds_cosched(int(lds_cosched), issue_first, tile_m, tile_n, m_warp, n_warp)
     assert ldc % 2 == 0, "the epilogue stores whole i32 words"
 
     tid = fx.Int32(fx.thread_idx.x)
@@ -379,15 +410,44 @@ def nt_gemm_tile(
                 idx = wm * wmma_n_rep + wn
                 fx.gemm(wmma_atom, c_frags[idx], wt[wn], act[wm], c_frags[idx])
 
+    def _hold_live(state):
+        # `llvm.fake.use` emits nothing; it keeps the running sub-step's fragments allocated until its
+        # last matrix op, so the interleaved reads of the next sub-step get other registers
+        act, wt = state
+        for t in act + wt:
+            _llvm.call_intrinsic(None, "llvm.fake.use", [_raw(t.load())], [], [])
+
     def compute_ktile(buf, prefetch_kt):
         """K_WS sub-steps; the last one is returned to run inside the barrier window."""
         ring = [None] * R
+        if const_expr(issue_first and prefetch_kt is not None):
+            rocdl.sched_barrier(0)
+            issue(prefetch_kt % NUM_BUFFERS, prefetch_kt)
+            rocdl.sched_barrier(0)
         ring[0] = _load_ks(buf, 0)
+        if const_expr(lds_cosched):
+            rocdl.sched_dsrd(KS_DS)
+            rocdl.sched_barrier(0)
+            for ks in range_constexpr(K_WS):
+                # only this sub-step's reads are in flight here (R = 2)
+                rocdl.s_wait_dscnt(0)
+                if const_expr(ks + 1 < K_WS):
+                    ring[(ks + 1) % R] = _load_ks(buf, ks + 1)
+                if const_expr(ks < K_WS - 1):
+                    _mma_ks(ring[ks % R])
+                    for _j in range_constexpr(KS_DS):
+                        rocdl.sched_dsrd(1)
+                        rocdl.sched_mfma(1)
+                    rocdl.sched_mfma(n_acc - KS_DS)
+                    # after the group hints: placed before them, the hints are ignored
+                    _hold_live(ring[ks % R])
+                rocdl.sched_barrier(0)
+            return ring[(K_WS - 1) % R]
         for ks in range_constexpr(K_WS):
             if const_expr(ks + 1 < K_WS):
                 ring[(ks + 1) % R] = _load_ks(buf, ks + 1)
             rocdl.s_wait_dscnt(min(K_WS - 1 - ks, R - 1) * KS_DS)
-            if const_expr(ks == 0 and prefetch_kt is not None):
+            if const_expr(ks == 0 and prefetch_kt is not None and not issue_first):
                 rocdl.sched_barrier(0)
                 issue(prefetch_kt % NUM_BUFFERS, prefetch_kt)
                 rocdl.sched_barrier(0)

@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_GROUPED_GEMM_BACKEND: str | None = None
     PRIMUS_TURBO_ATTN_BACKEND: str | None = None
     PRIMUS_TURBO_SPARSE_ATTN_BACKEND: str | None = None
+    PRIMUS_TURBO_MLA_BWD_IMPL: str = "flydsl"
     PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND: str | None = None
     PRIMUS_TURBO_AUTO_TUNE: bool = False
     PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32: bool = True
@@ -79,6 +80,7 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_HB_GG_PICK_NT: int = 0
     PRIMUS_TURBO_HB_GG_PICK_TN: int = 0
     PRIMUS_TURBO_HB_GG_VERBOSE: bool = False
+    PRIMUS_TURBO_DGATE_ACC_ATOMIC: bool = True
 
 
 def backend_spec(name: str) -> Callable[[], str | None]:
@@ -151,6 +153,15 @@ def env_clamped_int(name: str, default: int, lo: int, hi: int) -> Callable[[], i
     return _get
 
 
+def _mla_bwd_impl() -> str:
+    """PRIMUS_TURBO_MLA_BWD_IMPL: "flydsl" (also unset or blank) or "hk", any case."""
+    raw = os.getenv("PRIMUS_TURBO_MLA_BWD_IMPL", "")
+    value = raw.strip().lower() or "flydsl"
+    if value not in ("flydsl", "hk"):
+        raise ValueError(f"PRIMUS_TURBO_MLA_BWD_IMPL={raw!r}: expected flydsl or hk")
+    return value
+
+
 def _deepep_cpu_timeout() -> int:
     raw = os.getenv("PRIMUS_TURBO_DEEPEP_CPU_TIMEOUT")
     if not raw:
@@ -184,6 +195,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PRIMUS_TURBO_ATTN_BACKEND": backend_spec("PRIMUS_TURBO_ATTN_BACKEND"),
     # Sparse-attention (DeepSeek-V4 sparse-MLA) backend, e.g. FLYDSL, TRITON, or "autotune".
     "PRIMUS_TURBO_SPARSE_ATTN_BACKEND": backend_spec("PRIMUS_TURBO_SPARSE_ATTN_BACKEND"),
+    # Kernels of the gfx1250 DeepSeek-V3 MLA attention backward (qk 192 / v 128) under the FLYDSL
+    # backend: "flydsl" (unset or blank) or "hk", the HipKittens kernels, which hand a call they
+    # cannot take to FlyDSL (e.g. seqlen_q % 384 not 0 or 256, see their README). Read at the first
+    # MLA backward (attention_flydsl_gfx1250_mla_impl.mla_bwd_impl); another value raises ValueError.
+    "PRIMUS_TURBO_MLA_BWD_IMPL": _mla_bwd_impl,
     # MoE dispatch/combine EP backend: TURBO (the default when unset), DEEP_EP, or a custom EP name
     # such as UCCL_EP. "autotune" is rejected with an AssertionError.
     "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend_spec("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"),
@@ -328,6 +344,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PRIMUS_TURBO_HB_GG_PICK_TN": env_clamped_int("PRIMUS_TURBO_HB_GG_PICK_TN", 0, -(2**31), 2**31 - 1),
     # Set (to any value): log the plans and tuning of the hipBLASLt grouped GEMM.
     "PRIMUS_TURBO_HB_GG_VERBOSE": lambda: os.getenv("PRIMUS_TURBO_HB_GG_VERBOSE") is not None,
+    # ================== Flux ==================
+    # "0" makes the Flux dgate epilogue accumulate without atomics. Unset and any other value
+    # keep the atomic path. Read once, when the MXFP4 quant kernel module is imported.
+    "PRIMUS_TURBO_DGATE_ACC_ATOMIC": lambda: os.getenv("PRIMUS_TURBO_DGATE_ACC_ATOMIC", "1") != "0",
 }
 
 

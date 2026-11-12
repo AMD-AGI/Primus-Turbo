@@ -168,7 +168,7 @@ registration order, with the arch / format limits from each backend's `can_handl
 | `grouped_gemm_fp4` | FLYDSL (gfx950), TRITON (not gfx942) |
 | `grouped_mlp_fp8` | FLYDSL (gfx950), TRITON |
 | `grouped_mlp_fp4` | FLYDSL (gfx950) |
-| `flash_attn_func` | FLYDSL (gfx950: causal, head dim 64/128, sbhd; gfx1250: head dim 128 GQA and DeepSeek-V3 MLA 192/128), AITER (general fallback; default on gfx942), HIPKITTENS (gfx950, causal, sbhd), GLUON (gfx950, fwd only), TRITON (gfx1250) |
+| `flash_attn_func` | FLYDSL (gfx950: causal, head dim 64/128, sbhd; gfx1250: head dim 128 GQA and DeepSeek-V3 MLA 192/128, the MLA backward on HipKittens kernels with `PRIMUS_TURBO_MLA_BWD_IMPL=hk` where seqlen_q % 384 is 0 or 256), AITER (general fallback; default on gfx942), HIPKITTENS (gfx950, causal, sbhd), GLUON (gfx950, fwd only), TRITON (gfx1250) |
 | `flash_attn_varlen_func` | FLYDSL (gfx950), AITER |
 | `flash_attn_fp8_func` | TRITON |
 | `sparse_mla_func` | FLYDSL (gfx950, gfx1250), TRITON |
