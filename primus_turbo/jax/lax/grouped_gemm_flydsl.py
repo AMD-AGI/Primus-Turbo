@@ -1,3 +1,9 @@
+###############################################################################
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
 """JAX grouped GEMM (bf16) on the Primus-Turbo FlyDSL kernels (gfx950), callable inside jit/shard_map.
 
 FlyDSL kernels are MLIR-JIT'd host launchers `void f(void **packed_args)`. We compile them once per shape (at trace
@@ -8,6 +14,7 @@ buffer pointers and stream. Group sizes stay on the device; the per-tile (expert
   grouped_gemm_flydsl(a[M,K], b[G,K,N], group_lens[G] int32) -> [M,N]   (rows past sum(group_lens) are zero)
 with a custom VJP (dA via the NT kernel on the same weight tensor, dB via the variable-K kernel).
 """
+
 import ctypes
 import functools
 import os
@@ -17,6 +24,8 @@ import threading
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+import primus_turbo.common.envs as envs
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _LIB = None
@@ -30,13 +39,23 @@ def _build_and_register():
         if _LIB is not None:
             return
         src = os.path.join(_HERE, "flydsl_launch.cc")
-        out_dir = os.environ.get("PRIMUS_TURBO_CACHE", os.path.expanduser("~/.cache/primus_turbo"))
+        out_dir = envs.PRIMUS_TURBO_CACHE
         os.makedirs(out_dir, exist_ok=True)
         so = os.path.join(out_dir, "libflydsl_launch.so")
         if not os.path.exists(so) or os.path.getmtime(so) < os.path.getmtime(src):
             tmp = so + f".{os.getpid()}"
             subprocess.check_call(
-                ["hipcc", "-shared", "-fPIC", "-O2", "-std=c++17", f"-I{jax.ffi.include_dir()}", src, "-o", tmp]
+                [
+                    "hipcc",
+                    "-shared",
+                    "-fPIC",
+                    "-O2",
+                    "-std=c++17",
+                    f"-I{jax.ffi.include_dir()}",
+                    src,
+                    "-o",
+                    tmp,
+                ]
             )
             os.replace(tmp, so)
         _LIB = ctypes.cdll.LoadLibrary(so)
@@ -49,6 +68,7 @@ def _build_and_register():
 def _flydsl():
     import flydsl.compiler as flyc
     import torch
+
     from primus_turbo.flydsl.grouped_gemm import grouped_gemm_bf16_kernel as K
 
     return flyc, torch, K
@@ -84,9 +104,13 @@ class _Kernel:
     def __init__(self, make_launch, make_args, buf_arg_idx, compile_fn=None):
         flyc, torch, _ = _flydsl()
         import sys
-        ndev = jax.local_device_count()   # local ordinals only: with several hosts jax.devices() lists all processes' GPUs
-        sys.stderr.write(f'[flydsl_gmm] jax devices={ndev} torch device_count={torch.cuda.device_count()} '
-                         f'env={ {k: v for k, v in os.environ.items() if "VISIBLE" in k} }\n')
+
+        # local ordinals only: with several hosts jax.devices() lists all processes' GPUs
+        ndev = jax.local_device_count()
+        sys.stderr.write(
+            f"[flydsl_gmm] jax devices={ndev} torch device_count={torch.cuda.device_count()} "
+            f"env={ {k: v for k, v in os.environ.items() if 'VISIBLE' in k} }\n"  # envs: allow
+        )
         cur = torch.cuda.current_device()
         torch.cuda.set_device(0)
         launch = make_launch()
@@ -114,7 +138,9 @@ class _Kernel:
 
     def call(self, operands, out_shapes, zero_ret=0, ptr_off=(), buf_slot=None, aliases=None):
         _build_and_register()
-        call = jax.ffi.ffi_call(TARGET, out_shapes, vmap_method="sequential", input_output_aliases=aliases or {})
+        call = jax.ffi.ffi_call(
+            TARGET, out_shapes, vmap_method="sequential", input_output_aliases=aliases or {}
+        )
         return call(
             *operands,
             fns=np.asarray(self.fns, np.int64),
@@ -136,14 +162,30 @@ def _nt_kernel(m_upper, N, K, G, BM=256, BN=256, GROUP_M=4, num_xcd=8, xcd_band=
     flyc, torch, KM = _flydsl()
 
     def make_launch():
-        return KM._compile_grouped_bf16_nt(m_upper, N, K, G, BLOCK_M=BM, BLOCK_N=BN, GROUP_M=GROUP_M, num_xcd=num_xcd,
-                                           xcd_band=xcd_band, cap_cu=cap_cu, ab_ty=KM._ab_ty(torch.bfloat16))
+        return KM._compile_grouped_bf16_nt(
+            m_upper,
+            N,
+            K,
+            G,
+            BLOCK_M=BM,
+            BLOCK_N=BN,
+            GROUP_M=GROUP_M,
+            num_xcd=num_xcd,
+            xcd_band=xcd_band,
+            cap_cu=cap_cu,
+            ab_ty=KM._ab_ty(torch.bfloat16),
+        )
 
     def make_args(dev):
         z = lambda n, dt=torch.bfloat16: torch.zeros(n, dtype=dt, device=f"cuda:{dev}")
-        return (_i32_view(torch, 4096, dev), flyc.from_torch_tensor(z(G * N * K)),
-                flyc.from_torch_tensor(torch.zeros(256, N, dtype=torch.bfloat16, device=f'cuda:{dev}')), z(3 * m_upper, torch.int32), N,
-                torch.cuda.current_stream())
+        return (
+            _i32_view(torch, 4096, dev),
+            flyc.from_torch_tensor(z(G * N * K)),
+            flyc.from_torch_tensor(torch.zeros(256, N, dtype=torch.bfloat16, device=f"cuda:{dev}")),
+            z(3 * m_upper, torch.int32),
+            N,
+            torch.cuda.current_stream(),
+        )
 
     # args order: (A, B, C, m_tiles, N, stream) ; XLA buffers: a, b, m_tiles | out
     return _Kernel(make_launch, make_args, buf_arg_idx=[0, 1, 3, 2])
@@ -156,14 +198,30 @@ def _nn_kernel(m_upper, N, K, G, BM=256, BN=256, GROUP_M=0, num_xcd=8, xcd_band=
         GROUP_M = 8 if K * N * 2 > 24 << 20 else 4
 
     def make_launch():
-        return KM._compile_grouped_bf16_nn(m_upper, N, K, G, BLOCK_M=BM, BLOCK_N=BN, GROUP_M=GROUP_M, num_xcd=num_xcd,
-                                           xcd_band=xcd_band, cap_cu=cap_cu, ab_ty=KM._ab_ty(torch.bfloat16))
+        return KM._compile_grouped_bf16_nn(
+            m_upper,
+            N,
+            K,
+            G,
+            BLOCK_M=BM,
+            BLOCK_N=BN,
+            GROUP_M=GROUP_M,
+            num_xcd=num_xcd,
+            xcd_band=xcd_band,
+            cap_cu=cap_cu,
+            ab_ty=KM._ab_ty(torch.bfloat16),
+        )
 
     def make_args(dev):
         z = lambda n, dt=torch.bfloat16: torch.zeros(n, dtype=dt, device=f"cuda:{dev}")
-        return (_i32_view(torch, 4096, dev), flyc.from_torch_tensor(z(G * N * K)),
-                flyc.from_torch_tensor(torch.zeros(256, N, dtype=torch.bfloat16, device=f'cuda:{dev}')), z(3 * m_upper, torch.int32), N,
-                torch.cuda.current_stream())
+        return (
+            _i32_view(torch, 4096, dev),
+            flyc.from_torch_tensor(z(G * N * K)),
+            flyc.from_torch_tensor(torch.zeros(256, N, dtype=torch.bfloat16, device=f"cuda:{dev}")),
+            z(3 * m_upper, torch.int32),
+            N,
+            torch.cuda.current_stream(),
+        )
 
     return _Kernel(make_launch, make_args, buf_arg_idx=[0, 1, 3, 2])
 
@@ -173,14 +231,33 @@ def _wgrad_kernel(OUT_M, OUT_N, G, BM=256, BN=256, num_xcd=8, group_m=4, xcd_ban
     flyc, torch, KM = _flydsl()
 
     def make_launch():
-        return KM._compile_grouped_bf16_wgrad(OUT_M, OUT_N, G, BLOCK_M=BM, BLOCK_N=BN, num_xcd=num_xcd,
-                                              ab_ty=KM._ab_ty(torch.bfloat16), out_fp16=False, trans_c=False,
-                                              group_m=group_m, xcd_band=xcd_band, cap_cu=cap_cu)
+        return KM._compile_grouped_bf16_wgrad(
+            OUT_M,
+            OUT_N,
+            G,
+            BLOCK_M=BM,
+            BLOCK_N=BN,
+            num_xcd=num_xcd,
+            ab_ty=KM._ab_ty(torch.bfloat16),
+            out_fp16=False,
+            trans_c=False,
+            group_m=group_m,
+            xcd_band=xcd_band,
+            cap_cu=cap_cu,
+        )
 
     def make_args(dev):
         z = lambda *s, dt=torch.bfloat16: torch.zeros(*s, dtype=dt, device=f"cuda:{dev}")
-        return (_i32_view(torch, 4096, dev), _i32_view(torch, 4096, dev), flyc.from_torch_tensor(z(G, OUT_M, OUT_N)),
-                z(G + 1, dt=torch.int64), z(G, dt=torch.int64), OUT_M, OUT_N, torch.cuda.current_stream())
+        return (
+            _i32_view(torch, 4096, dev),
+            _i32_view(torch, 4096, dev),
+            flyc.from_torch_tensor(z(G, OUT_M, OUT_N)),
+            z(G + 1, dt=torch.int64),
+            z(G, dt=torch.int64),
+            OUT_M,
+            OUT_N,
+            torch.cuda.current_stream(),
+        )
 
     # args: (A, B, out, offsets, masked_k, OUT_M, OUT_N, stream); XLA buffers: a, b, offsets, masked_k | out
     return _Kernel(make_launch, make_args, buf_arg_idx=[0, 1, 3, 4, 2])
@@ -217,7 +294,7 @@ def _upper(M, block_m, G):
 # Ring-of-experts EP hands the kernels a buffer of M = ep x (local rows) rows of which only ~M/ep are valid: the grid is sized by M, and the
 # ~(M/BM) dead tiles cost ~3x the useful work (profile: 4 ms vs 0.95 ms per call at M=2.1M). PRIMUS_FLYDSL_ROWS_CAP_DIV=d launches a grid sized for
 # M/d rows whenever sum(group_lens) <= M/d (exact), and the full grid otherwise (lax.cond on the device value), so dropless semantics are unchanged.
-ROWS_CAP_DIV = int(os.environ.get("PRIMUS_FLYDSL_ROWS_CAP_DIV", "0"))
+ROWS_CAP_DIV = envs.PRIMUS_FLYDSL_ROWS_CAP_DIV
 
 
 def _capped(M, BM, G, group_lens, run):
@@ -238,7 +315,7 @@ def _i64_of(x32):
 
 def _cfg(name, **kw):
     """Tile configuration overrides: env PRIMUS_FLYDSL_<NAME>='BM=128,GROUP_M=2' (applies to every shape)."""
-    env = os.environ.get(f"PRIMUS_FLYDSL_{name}", "")
+    env = getattr(envs, f"PRIMUS_FLYDSL_{name}")
     for item in filter(None, env.split(",")):
         k, v = item.split("=")
         kw.setdefault(k, int(v))
@@ -248,7 +325,7 @@ def _cfg(name, **kw):
 def _zero_pad(kw):
     z = kw.pop("zero_pad", None)
     if z is None:
-        z = os.environ.get("PRIMUS_FLYDSL_ZERO_PAD", "1") != "0"
+        z = envs.PRIMUS_FLYDSL_ZERO_PAD
     return int(bool(z))
 
 
@@ -262,7 +339,9 @@ def gg_nn(a, b, group_lens, **kw):
 
     def run(up):
         k = _nn_kernel(up, N, K, G, **kw)
-        (out,) = k.call((a, b, _m_tiles(group_lens, BM, up)), [jax.ShapeDtypeStruct((M, N), a.dtype)], zero_ret=zero)
+        (out,) = k.call(
+            (a, b, _m_tiles(group_lens, BM, up)), [jax.ShapeDtypeStruct((M, N), a.dtype)], zero_ret=zero
+        )
         return out
 
     return _capped(M, BM, G, group_lens, run)
@@ -278,13 +357,17 @@ def gg_nt(a, b, group_lens, **kw):
 
     def run(up):
         k = _nt_kernel(up, N, K, G, **kw)
-        (out,) = k.call((a, b, _m_tiles(group_lens, BM, up)), [jax.ShapeDtypeStruct((M, N), a.dtype)], zero_ret=zero)
+        (out,) = k.call(
+            (a, b, _m_tiles(group_lens, BM, up)), [jax.ShapeDtypeStruct((M, N), a.dtype)], zero_ret=zero
+        )
         return out
 
     return _capped(M, BM, G, group_lens, run)
 
 
-WG_MAX_G = int(os.environ.get('PRIMUS_FLYDSL_WG_MAX_G', '64'))  # (64 = correct; larger reproduces the old wrong-gradient bug, for sensitivity tests)  # the variable-K kernel ranks groups with one 64-lane wave: groups >= 64 are mis-assigned (verified wrong from G=65)
+# The variable-K kernel ranks groups with one 64-lane wave: groups >= 64 are mis-assigned (verified wrong from G=65).
+# 64 is correct; larger values reproduce the old wrong-gradient bug, for sensitivity tests.
+WG_MAX_G = envs.PRIMUS_FLYDSL_WG_MAX_G
 
 
 def gg_wgrad(a, dy, group_lens, **kw):
@@ -297,17 +380,23 @@ def gg_wgrad(a, dy, group_lens, **kw):
     lens32 = group_lens.astype(jnp.int32)
     if G <= WG_MAX_G:
         k = _wgrad_kernel(K, N, G, **kw)
-        (out,) = k.call((a, dy, _i64_of(offs), _i64_of(lens32)), [jax.ShapeDtypeStruct((G, K, N), a.dtype)], zero_ret=1)
+        (out,) = k.call(
+            (a, dy, _i64_of(offs), _i64_of(lens32)), [jax.ShapeDtypeStruct((G, K, N), a.dtype)], zero_ret=1
+        )
         return out
     out = jnp.zeros((G, K, N), a.dtype)
     for c0 in range(0, G, WG_MAX_G):
         gc = min(WG_MAX_G, G - c0)
         k = _wgrad_kernel(K, N, gc, **kw)
         # buffers: a, dy, offsets, masked_k, out_in (aliased, not passed to the kernel) | out
-        (out,) = k.call((a, dy, _i64_of(offs[c0:c0 + gc]), _i64_of(lens32[c0:c0 + gc]), out),
-                        [jax.ShapeDtypeStruct((G, K, N), a.dtype)], zero_ret=0,
-                        ptr_off=[0, 0, 0, 0, 0, c0 * K * N * a.dtype.itemsize],
-                        buf_slot=list(k.buf_slot[:4]) + [-1] + [k.buf_slot[4]], aliases={4: 0})
+        (out,) = k.call(
+            (a, dy, _i64_of(offs[c0 : c0 + gc]), _i64_of(lens32[c0 : c0 + gc]), out),
+            [jax.ShapeDtypeStruct((G, K, N), a.dtype)],
+            zero_ret=0,
+            ptr_off=[0, 0, 0, 0, 0, c0 * K * N * a.dtype.itemsize],
+            buf_slot=list(k.buf_slot[:4]) + [-1] + [k.buf_slot[4]],
+            aliases={4: 0},
+        )
     return out
 
 
@@ -334,7 +423,14 @@ def supported(a, b):
     """The FlyDSL kernels need the contraction dims of every pass to be multiples of 64 and >= 128: K (fwd, dW rows are free)
     and N (dA contracts over N). Anything else would fail an assert while tracing."""
     K, N = a.shape[1], b.shape[2]
-    return a.dtype == jnp.bfloat16 and b.dtype == jnp.bfloat16 and K % 64 == 0 and K >= 128 and N % 64 == 0 and N >= 128
+    return (
+        a.dtype == jnp.bfloat16
+        and b.dtype == jnp.bfloat16
+        and K % 64 == 0
+        and K >= 128
+        and N % 64 == 0
+        and N >= 128
+    )
 
 
 _warned = set()
@@ -346,7 +442,7 @@ def grouped_gemm_flydsl(a, b, group_lens, zero_pad=True):
     # Skipping the output memset (~2% of a Mixtral step) is only valid when sum(group_lens) == M, i.e. no padding rows are left
     # unwritten (checked with a NaN-poisoned allocator: test_nozero_poison.py). It is off by default; PRIMUS_FLYDSL_ALLOW_NOZERO=1
     # honours zero_pad=False (MaxText passes it for dropless runs without expert parallelism).
-    if os.environ.get('PRIMUS_FLYDSL_ALLOW_NOZERO') != '1':
+    if not envs.PRIMUS_FLYDSL_ALLOW_NOZERO:
         zero_pad = True
     if supported(a, b):
         return _gg_flydsl(a, b, group_lens, zero_pad)
@@ -354,7 +450,10 @@ def grouped_gemm_flydsl(a, b, group_lens, zero_pad=True):
     if key not in _warned:
         _warned.add(key)
         import warnings
-        warnings.warn(f"grouped_gemm_flydsl: unsupported shape/dtype K={a.shape[1]} N={b.shape[2]} {a.dtype}; using jax.lax.ragged_dot")
+
+        warnings.warn(
+            f"grouped_gemm_flydsl: unsupported shape/dtype K={a.shape[1]} N={b.shape[2]} {a.dtype}; using jax.lax.ragged_dot"
+        )
     gl = group_lens.astype(jnp.int32)
     out = jax.lax.ragged_dot(a, b, gl)
     rows = jax.lax.broadcasted_iota(jnp.int32, (a.shape[0], 1), 0)

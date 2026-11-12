@@ -25,7 +25,10 @@ from tests.jax.test_utils import compute_snr
 
 def _is_gfx950():
     try:
-        return "gfx950" in jax.devices()[0].device_kind.lower() or "mi355" in jax.devices()[0].device_kind.lower()
+        return (
+            "gfx950" in jax.devices()[0].device_kind.lower()
+            or "mi355" in jax.devices()[0].device_kind.lower()
+        )
     except Exception:  # pylint: disable=broad-except
         return False
 
@@ -46,7 +49,9 @@ def _backend(name):
 
 def _fwd_bwd(fn, a, b, group_lens):
     out = fn(a, b, group_lens)
-    grad_a, grad_b = jax.grad(lambda a, b: jnp.sum(fn(a, b, group_lens).astype(jnp.float32)), argnums=(0, 1))(a, b)
+    grad_a, grad_b = jax.grad(lambda a, b: jnp.sum(fn(a, b, group_lens).astype(jnp.float32)), argnums=(0, 1))(
+        a, b
+    )
     return out, grad_a, grad_b
 
 

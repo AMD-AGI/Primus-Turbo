@@ -60,6 +60,25 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_ODC_GDA_BLOCK: int = 256
     PRIMUS_TURBO_ODC_GDA_PIPE: int = 1
     PRIMUS_TURBO_ODC_GDA_NUM_QP: int = 1
+    PRIMUS_TURBO_CACHE: str = "~/.cache/primus_turbo"
+    PRIMUS_TURBO_HB_GG_TUNE: str = "subprocess"
+    PRIMUS_TURBO_HB_GG_TUNE_CANDIDATES: int = 256
+    PRIMUS_TURBO_HB_GG_TUNE_CACHE: str = "~/.cache/primus_turbo/hipblaslt_grouped_gemm_tune.json"
+    PRIMUS_TURBO_HB_GG_DEBUG: bool = False
+    PRIMUS_FLYDSL_ROWS_CAP_DIV: int = 0
+    PRIMUS_FLYDSL_ZERO_PAD: bool = True
+    PRIMUS_FLYDSL_ALLOW_NOZERO: bool = False
+    PRIMUS_FLYDSL_WG_MAX_G: int = 64
+    PRIMUS_FLYDSL_NN: str = ""
+    PRIMUS_FLYDSL_NT: str = ""
+    PRIMUS_FLYDSL_WG: str = ""
+    PRIMUS_FP8_BWD: str = "all"
+    PRIMUS_TURBO_HB_GG_TUNE_MAX_ROWS: int = 131072
+    PRIMUS_TURBO_HB_GG_HOST_ROWS: str | None = None
+    PRIMUS_TURBO_HB_GG_PICK_NN: int = 0
+    PRIMUS_TURBO_HB_GG_PICK_NT: int = 0
+    PRIMUS_TURBO_HB_GG_PICK_TN: int = 0
+    PRIMUS_TURBO_HB_GG_VERBOSE: bool = False
 
 
 def backend_spec(name: str) -> Callable[[], str | None]:
@@ -231,6 +250,47 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PT_MEGA_FP8_L2_COMBINE_CU": env_positive_int(
         "PT_MEGA_FP8_L2_COMBINE_CU", None, "the combine CU split must be a positive block count"
     ),
+    # ================== JAX grouped GEMM (hipBLASLt / FlyDSL) ==================
+    # Directory for the FlyDSL FFI trampoline library (libflydsl_launch.so), built with hipcc on
+    # first use. Read when the trampoline is first built.
+    "PRIMUS_TURBO_CACHE": lambda: os.getenv(
+        "PRIMUS_TURBO_CACHE", os.path.expanduser("~/.cache/primus_turbo")
+    ),
+    # How the hipBLASLt grouped GEMM picks its kernel at trace time: "subprocess" (the default;
+    # time the candidates in a child process on the same GPU), "inproc", or "0" to keep
+    # hipBLASLt's heuristic choice.
+    "PRIMUS_TURBO_HB_GG_TUNE": lambda: os.getenv("PRIMUS_TURBO_HB_GG_TUNE", "subprocess"),
+    # Maximum number of hipBLASLt grouped GEMM candidates the tuner times.
+    "PRIMUS_TURBO_HB_GG_TUNE_CANDIDATES": lambda: int(os.getenv("PRIMUS_TURBO_HB_GG_TUNE_CANDIDATES", "256")),
+    # On-disk cache of tuned hipBLASLt grouped GEMM algorithms (JSON).
+    "PRIMUS_TURBO_HB_GG_TUNE_CACHE": lambda: os.getenv(
+        "PRIMUS_TURBO_HB_GG_TUNE_CACHE",
+        os.path.join(os.path.expanduser("~"), ".cache", "primus_turbo", "hipblaslt_grouped_gemm_tune.json"),
+    ),
+    # Any non-empty value prints the tuner's results and its subprocess's stderr.
+    "PRIMUS_TURBO_HB_GG_DEBUG": lambda: bool(os.getenv("PRIMUS_TURBO_HB_GG_DEBUG")),
+    # d > 1: with ring-of-experts EP, launch the FlyDSL grouped GEMM with a tile grid for M/d rows
+    # when sum(group_lens) <= M/d, and the full grid otherwise. 0 (the default) always uses the
+    # full grid. Read once, at import of grouped_gemm_flydsl.
+    "PRIMUS_FLYDSL_ROWS_CAP_DIV": lambda: int(os.getenv("PRIMUS_FLYDSL_ROWS_CAP_DIV", "0")),
+    # Whether the FlyDSL grouped GEMM zeroes output rows past sum(group_lens) when the caller does
+    # not say. Only "0" turns it off.
+    "PRIMUS_FLYDSL_ZERO_PAD": lambda: os.getenv("PRIMUS_FLYDSL_ZERO_PAD", "1") != "0",
+    # "1" honours zero_pad=False in grouped_gemm_flydsl (valid only when sum(group_lens) == M);
+    # otherwise the output is always zero-padded.
+    "PRIMUS_FLYDSL_ALLOW_NOZERO": lambda: os.getenv("PRIMUS_FLYDSL_ALLOW_NOZERO") == "1",
+    # Largest group count the FlyDSL variable-K (wgrad) kernel is used for. It ranks groups with
+    # one 64-lane wave, so 64 is the correct value; larger values are for sensitivity tests only.
+    # Read once, at import of grouped_gemm_flydsl.
+    "PRIMUS_FLYDSL_WG_MAX_G": lambda: int(os.getenv("PRIMUS_FLYDSL_WG_MAX_G", "64")),
+    # FlyDSL grouped GEMM tile overrides for the forward (NN), input-gradient (NT) and
+    # weight-gradient (WG) kernels, e.g. "BM=128,GROUP_M=2"; they apply to every shape.
+    "PRIMUS_FLYDSL_NN": lambda: os.getenv("PRIMUS_FLYDSL_NN", ""),
+    "PRIMUS_FLYDSL_NT": lambda: os.getenv("PRIMUS_FLYDSL_NT", ""),
+    "PRIMUS_FLYDSL_WG": lambda: os.getenv("PRIMUS_FLYDSL_WG", ""),
+    # Backward of the FlyDSL FP8 grouped GEMM: "all" (FP8 dA and dW, the default), "dgrad" (FP8 dA,
+    # bf16 dW) or "bf16" (bf16 for both). Read once, at import of grouped_gemm_flydsl_fp8.
+    "PRIMUS_FP8_BWD": lambda: os.getenv("PRIMUS_FP8_BWD", "all"),
     # ================== Read by the C++ extension ==================
     # These getters mirror the C++ parsing so Python can report the effective value; C++ reads
     # the variable itself and caches it once per process.
@@ -255,6 +315,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rocSHMEM QPs/contexts for multi-QP NIC concurrency, clamped to [1, 256]; above 1 selects
     # the multi-QP path.
     "PRIMUS_TURBO_ODC_GDA_NUM_QP": env_clamped_int("PRIMUS_TURBO_ODC_GDA_NUM_QP", 1, 1, 256),
+    # JAX hipBLASLt grouped GEMM (csrc/jax/grouped_gemm/hipblaslt_grouped_gemm.cpp).
+    #
+    # Rows of the tuning problem; larger M share one tuned entry. Python's tuner reads it too.
+    "PRIMUS_TURBO_HB_GG_TUNE_MAX_ROWS": lambda: int(os.getenv("PRIMUS_TURBO_HB_GG_TUNE_MAX_ROWS", "131072")),
+    # "max" sizes the launch for M rows per group instead of ceil(M/G) plus one macro tile.
+    "PRIMUS_TURBO_HB_GG_HOST_ROWS": lambda: os.getenv("PRIMUS_TURBO_HB_GG_HOST_ROWS"),
+    # k: use the k-th supported heuristic candidate for the forward (NN), input-gradient (NT) or
+    # weight-gradient (TN) product instead of the first (kernel sweeps). C++ reads it at every call.
+    "PRIMUS_TURBO_HB_GG_PICK_NN": env_clamped_int("PRIMUS_TURBO_HB_GG_PICK_NN", 0, -(2**31), 2**31 - 1),
+    "PRIMUS_TURBO_HB_GG_PICK_NT": env_clamped_int("PRIMUS_TURBO_HB_GG_PICK_NT", 0, -(2**31), 2**31 - 1),
+    "PRIMUS_TURBO_HB_GG_PICK_TN": env_clamped_int("PRIMUS_TURBO_HB_GG_PICK_TN", 0, -(2**31), 2**31 - 1),
+    # Set (to any value): log the plans and tuning of the hipBLASLt grouped GEMM.
+    "PRIMUS_TURBO_HB_GG_VERBOSE": lambda: os.getenv("PRIMUS_TURBO_HB_GG_VERBOSE") is not None,
 }
 
 

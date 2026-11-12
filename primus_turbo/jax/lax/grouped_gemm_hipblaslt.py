@@ -29,6 +29,7 @@ from functools import lru_cache, partial
 import jax
 import jax.numpy as jnp
 
+import primus_turbo.common.envs as envs
 from primus_turbo.jax._C import (
     register_hipblaslt_grouped_gemm_algo,
     tune_hipblaslt_grouped_gemm,
@@ -43,10 +44,7 @@ _tuned = {}
 
 
 def _cache_path():
-    return os.environ.get(
-        "PRIMUS_TURBO_HB_GG_TUNE_CACHE",
-        os.path.join(os.path.expanduser("~"), ".cache", "primus_turbo", "hipblaslt_grouped_gemm_tune.json"),
-    )
+    return envs.PRIMUS_TURBO_HB_GG_TUNE_CACHE
 
 
 @lru_cache(maxsize=1)
@@ -102,8 +100,8 @@ def _tune_in_subprocess(key, max_candidates):
         proc = subprocess.run(
             [sys.executable, "-c", _TUNE_SCRIPT, *args], capture_output=True, text=True, timeout=900
         )
-        if os.environ.get('PRIMUS_TURBO_HB_GG_DEBUG'):
-            print('[primus_turbo] tune subprocess stderr:', proc.stderr[-1500:], flush=True)
+        if envs.PRIMUS_TURBO_HB_GG_DEBUG:
+            print("[primus_turbo] tune subprocess stderr:", proc.stderr[-1500:], flush=True)
         for line in proc.stdout.splitlines():
             if line.startswith("PRIMUS_TURBO_TUNE_RESULT"):
                 _, idx, ms, name = line.split(" ", 3)
@@ -119,7 +117,7 @@ def _tune(lhs, rhs, group_lens, transA, transB):
     to use hipBLASLt's heuristic (much slower kernels for grouped problems). Results are kept in an on-disk
     cache (PRIMUS_TURBO_HB_GG_TUNE_CACHE, default ~/.cache/primus_turbo/hipblaslt_grouped_gemm_tune.json).
     """
-    mode = os.environ.get("PRIMUS_TURBO_HB_GG_TUNE", "subprocess")
+    mode = envs.PRIMUS_TURBO_HB_GG_TUNE
     if mode == "0":
         return
     m, a_cols = lhs.shape
@@ -132,9 +130,9 @@ def _tune(lhs, rhs, group_lens, transA, transB):
     key = (g, m, a_cols, b_d1, b_d2, c_rows, transA, transB, dtype)
     if key in _tuned:
         return
-    max_candidates = int(os.environ.get("PRIMUS_TURBO_HB_GG_TUNE_CANDIDATES", "256"))
+    max_candidates = envs.PRIMUS_TURBO_HB_GG_TUNE_CANDIDATES
     # The tuner times at most PRIMUS_TURBO_HB_GG_TUNE_MAX_ROWS rows, so larger M share one cache entry.
-    tune_m = max(g, min(m, int(os.environ.get("PRIMUS_TURBO_HB_GG_TUNE_MAX_ROWS", "131072"))) // g * g)
+    tune_m = max(g, min(m, envs.PRIMUS_TURBO_HB_GG_TUNE_MAX_ROWS) // g * g)
     tune_key = (g, tune_m, a_cols, tune_m if transA else b_d1, b_d2, c_rows, transA, transB, dtype)
     key_str = f"{_fingerprint()}|{max_candidates}|{','.join(str(int(x)) for x in tune_key)}"
     cached = _load_cache().get(key_str)
@@ -153,7 +151,7 @@ def _tune(lhs, rhs, group_lens, transA, transB):
                 )
         if _tuned[key][0] >= 0:
             _save_cache(key_str, list(_tuned[key]))
-        if os.environ.get("PRIMUS_TURBO_HB_GG_DEBUG"):
+        if envs.PRIMUS_TURBO_HB_GG_DEBUG:
             print(f"[primus_turbo] tuned {key}: {_tuned[key]}", flush=True)
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         _tuned[key] = None

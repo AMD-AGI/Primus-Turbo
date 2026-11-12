@@ -1,3 +1,9 @@
+###############################################################################
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
 """FP8 (e4m3, per-tensor scales) grouped GEMM on hipBLASLt (gfx950) for JAX, with autodiff.
 
 Same contract as flydsl_fp8.grouped_gemm_fp8_flydsl: bf16 in / bf16 out, a [M, K], b [G, K, N], group_lens [G];
@@ -5,6 +11,7 @@ operands are quantised per tensor to e4m3 (scale = 448 / amax), the kernels appl
 their epilogue. Needs the Primus-Turbo FFI handler `hipblaslt_grouped_gemm_fp8` and a hipBLASLt that has FP8
 grouped kernels for gfx950 (see hipblaslt/tensile_gfx950_f8_gg.yaml).
 """
+
 from functools import partial
 
 import jax
@@ -78,8 +85,8 @@ def _fwd(a, b, group_lens):
 def _bwd(res, dy):
     aq, sa, bq, sb, group_lens = res
     dyq, sdy = quantize(_mask(dy, group_lens))
-    da = _bind(dyq, bq, sdy, sb, group_lens, False, True)      # dy [M, N] x b[g]^T
-    db = _bind(aq, dyq, sa, sdy, group_lens, True, False)      # a[g]^T x dy[g] -> [G, K, N]
+    da = _bind(dyq, bq, sdy, sb, group_lens, False, True)  # dy [M, N] x b[g]^T
+    db = _bind(aq, dyq, sa, sdy, group_lens, True, False)  # a[g]^T x dy[g] -> [G, K, N]
     return da, db, None
 
 

@@ -54,7 +54,13 @@ THIRD_PARTY_PREFIXES = (
     "NVSHMEM_",  # NVSHMEM / rocSHMEM, configured by the DeepEP buffer
     "TRITON_",
 )
-THIRD_PARTY_NAMES = frozenset({"RANK", "WORLD_SIZE"})  # set by torchrun and other launchers
+THIRD_PARTY_NAMES = frozenset(
+    {
+        "RANK",  # set by torchrun and other launchers
+        "ROCM_PATH",
+        "WORLD_SIZE",
+    }
+)
 OWN_PREFIXES = ("PRIMUS_TURBO_", "PT_")
 
 _LOOP_SCOPES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.For, ast.AsyncFor)
