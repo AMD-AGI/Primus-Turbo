@@ -1,0 +1,7 @@
+{
+  "arch": "gfx950",
+  "rocm_libraries_commit": "511cc84bb2f40db4ef24b9257c49bc9d339fc6f4",
+  "attn_a2a_demo_commit": "7a7343ef47ba68989e69ece76f652bd106c0252b",
+  "toolchain": "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)",
+  "libraries": {}
+}
