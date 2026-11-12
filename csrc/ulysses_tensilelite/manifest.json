@@ -5,28 +5,28 @@
   "toolchain": "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)",
   "libraries": {
     "fwd_gemm_a2a": {
-      "library/gfx950/Kernels.so-000-gfx950.hsaco": "210cc1f90bd1c048d807c1a13914b89d5af79d2b673b3b518023e244d8db092c",
+      "library/gfx950/Kernels.so-000-gfx950.hsaco": "4e19a716bf75948ca10e49335e725b98dfb9ea19a9602f26f8ac0ad6471365e2",
       "library/gfx950/TensileLibrary_BB_BB_UA_Type_BB_HPA_Contraction_l_Alik_Bljk_Cijk_Dijk_ID75a0_gfx950.co": "e306e48d8987ab918020f74d9d025b9882fa468882b6114ca864a7e31a3977bf",
       "library/gfx950/TensileLibrary_BB_BB_UA_Type_BB_HPA_Contraction_l_Alik_Bljk_Cijk_Dijk_ID75a0_gfx950.dat.zlib": "37bbf69357ac5ab57d9e0d13bbf219ce8ac6a52f010dfff69846fc2568ed170c",
       "library/gfx950/TensileLibrary_lazy_gfx950.dat.zlib": "6e27f59e3956c45e21f7456ef91f145be8dbbf47d4d57f1b02f741b67363f195",
       "library/gfx950/TensileLiteLibrary_lazy_gfx950_Mapping.dat.zlib": "ff5966b348f3efa516a8209556f16d047a297cc02b3a44af02070548e4c98597"
     },
     "fwd_a2a_gemm": {
-      "library/gfx950/Kernels.so-000-gfx950.hsaco": "210cc1f90bd1c048d807c1a13914b89d5af79d2b673b3b518023e244d8db092c",
+      "library/gfx950/Kernels.so-000-gfx950.hsaco": "4e19a716bf75948ca10e49335e725b98dfb9ea19a9602f26f8ac0ad6471365e2",
       "library/gfx950/TensileLibrary_BB_BB_UA_Type_BB_HPA_Contraction_l_Alik_Bljk_Cijk_Dijk_ID75a0_gfx950.co": "7190ae4d724211e089d5319d235e32723cb393dba59cbaabc41b7401f90aafff",
       "library/gfx950/TensileLibrary_BB_BB_UA_Type_BB_HPA_Contraction_l_Alik_Bljk_Cijk_Dijk_ID75a0_gfx950.dat.zlib": "e304fcfe74fd089ea421928ddc82829158d902b8f8484836aa35be24da08e22e",
       "library/gfx950/TensileLibrary_lazy_gfx950.dat.zlib": "c2ed3aa340812c5596e12cba5fc435373ce9a804514959fbf0403aa590269bf0",
       "library/gfx950/TensileLiteLibrary_lazy_gfx950_Mapping.dat.zlib": "ff5966b348f3efa516a8209556f16d047a297cc02b3a44af02070548e4c98597"
     },
     "bwd_gemm_a2a": {
-      "library/gfx950/Kernels.so-000-gfx950.hsaco": "210cc1f90bd1c048d807c1a13914b89d5af79d2b673b3b518023e244d8db092c",
+      "library/gfx950/Kernels.so-000-gfx950.hsaco": "4e19a716bf75948ca10e49335e725b98dfb9ea19a9602f26f8ac0ad6471365e2",
       "library/gfx950/TensileLibrary_BB_BB_UA_Type_BB_HPA_Contraction_l_Ailk_Bljk_Cijk_Dijk_ID75a0_gfx950.co": "4ac22a2055eb39703a47a070176b1edd87e19d4ad69ec80e2c52722aa02986bb",
       "library/gfx950/TensileLibrary_BB_BB_UA_Type_BB_HPA_Contraction_l_Ailk_Bljk_Cijk_Dijk_ID75a0_gfx950.dat.zlib": "7d18b85301cada5686ce46bd35fde2ead0c397b0128037f41b471878e22d8fba",
       "library/gfx950/TensileLibrary_lazy_gfx950.dat.zlib": "89de14d1dadd80625fa9a2011ad9270074e2d5e00890f6c3485bb573877b3054",
       "library/gfx950/TensileLiteLibrary_lazy_gfx950_Mapping.dat.zlib": "a15b18ca2dccc9e005d448bd83d51ba3f5ef0a2f6bda73efa39d3942b2e9c710"
     },
     "bwd_a2a_gemm": {
-      "library/gfx950/Kernels.so-000-gfx950.hsaco": "210cc1f90bd1c048d807c1a13914b89d5af79d2b673b3b518023e244d8db092c",
+      "library/gfx950/Kernels.so-000-gfx950.hsaco": "4e19a716bf75948ca10e49335e725b98dfb9ea19a9602f26f8ac0ad6471365e2",
       "library/gfx950/TensileLibrary_BB_BB_UA_Type_BB_HPA_Contraction_l_Ailk_Bljk_Cijk_Dijk_ID75a0_gfx950.co": "9314f079155101c90297182fa61689815b338285c44c9dce05bf831af4626889",
       "library/gfx950/TensileLibrary_BB_BB_UA_Type_BB_HPA_Contraction_l_Ailk_Bljk_Cijk_Dijk_ID75a0_gfx950.dat.zlib": "30acbabed8155d688c0c66c62a56cfbabafdf28e162f404ee14728cf014ae4e0",
       "library/gfx950/TensileLibrary_lazy_gfx950.dat.zlib": "5da7fcf3b8dceef9f2f731b7c543c79fee95cfc9506abc50e4ff25866fc5c385",

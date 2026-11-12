@@ -63,8 +63,10 @@ By hand:
 python csrc/ulysses_tensilelite/kernels.py [--toolkit DIR] [--check] [--force] [--update-pins] [--strict]
 ```
 
-**Fail-closed.** `TensileCreateLibrary` output is byte-identical across runs and directories. A library is installed
-only when all of its files have the pinned sha256, one that does not is removed, and another compiler generates nothing.
+**Fail-closed.** `kernels.py` makes `TensileCreateLibrary` output byte-identical across runs, directories and machines
+(the helper kernels are compiled with `-fuse-cuid=none` and without TensileLite's per-user helper cache). A library
+is installed only when all of its files have the pinned sha256, one that does not is removed, and another compiler
+generates nothing.
 At run time a hop whose files are not the pinned ones runs on FLYDSL.
 
 ## Adding a shape
