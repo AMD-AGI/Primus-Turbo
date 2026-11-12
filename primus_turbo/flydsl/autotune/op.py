@@ -16,6 +16,7 @@ compile), its :class:`Compile`, and the :class:`Build` a search builds its candi
 search itself -- the candidates, the race, the probe -- is the call site's (see :class:`Op`)."""
 
 import contextlib
+import functools
 from typing import Any, Callable, Optional
 
 import flydsl.compiler as flyc
@@ -26,6 +27,7 @@ from flydsl.compiler.kernel_function import CompilationContext
 from primus_turbo.flydsl.autotune import runtime
 from primus_turbo.flydsl.autotune.engine import Entry, Space, Tuner, request_release
 from primus_turbo.flydsl.autotune.policies import Probe
+from primus_turbo.flydsl.utils.launch_cache import run_launcher
 
 __all__ = ["Build", "Compile", "Op"]
 
@@ -112,7 +114,7 @@ class Compile:
 
             def run(*a):
                 with CompilationContext.compile_hints(hints):
-                    launch(*a)
+                    run_launcher(launch, *a)
 
             return run, False
         if not isinstance(launch, JitFunction) and not self.static_layout:
@@ -139,8 +141,11 @@ class Compile:
 
     def race(self, launch, args):
         """What the race times for ``launch``: its static compile (see :meth:`scratch`), else the
-        raw launch itself."""
-        return self.scratch(launch, args) if self.static_layout else launch
+        launch through the launch cache (a direct ``@flyc.jit`` call retraces on every launch, so
+        a back-to-back timing window would time the host)."""
+        if self.static_layout:
+            return self.scratch(launch, args)
+        return functools.partial(run_launcher, launch) if isinstance(launch, JitFunction) else launch
 
 
 class Build:

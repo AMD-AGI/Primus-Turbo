@@ -25,6 +25,7 @@ happens when none survives (see :class:`Stage`). All timing goes through :func:`
 """
 
 import contextlib
+import functools
 import math
 import threading
 from abc import ABC, abstractmethod
@@ -32,9 +33,11 @@ from dataclasses import dataclass
 from typing import Callable, ContextManager, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
+from flydsl.compiler.jit_function import JitFunction
 
 from primus_turbo.common.logger import logger
 from primus_turbo.flydsl.autotune import runtime
+from primus_turbo.flydsl.utils.launch_cache import run_launcher
 
 __all__ = [
     "Point",
@@ -196,6 +199,12 @@ class Synthetic(Probe):
         yield self._make()
 
 
+def _cached(launch):
+    """A ``@flyc.jit`` candidate through the launch cache: a direct call retraces it on every
+    launch (flydsl >= 0.5), which a back-to-back timing window would time instead of the kernel."""
+    return functools.partial(run_launcher, launch) if isinstance(launch, JitFunction) else launch
+
+
 # ── checks ──────────────────────────────────────────────────────────────────
 
 
@@ -224,6 +233,7 @@ class Finite(Check):
         self.n = n
 
     def check(self, launch, points: Sequence[Point], ref=None) -> bool:
+        launch = _cached(launch)
         for p in points:
             launch(*p.args)
             torch.cuda.synchronize()
@@ -283,6 +293,7 @@ class Reproducible(Finite):
     def check(self, launch, points: Sequence[Point], ref=None) -> bool:
         if not super().check(launch, points):
             return False
+        launch = _cached(launch)
         for p in points:
             if p.out is None:
                 continue
@@ -322,6 +333,7 @@ class MatchBase(ReferenceCheck):
         self.n = n
 
     def reference(self, launch, points: Sequence[Point]):
+        launch = _cached(launch)
         refs = []
         for p in points:
             p.out.zero_()
@@ -335,6 +347,7 @@ class MatchBase(ReferenceCheck):
         return refs
 
     def check(self, launch, points: Sequence[Point], ref=None) -> bool:
+        launch = _cached(launch)
         for p, (r, rn) in zip(points, ref):
             p.out.zero_()
             launch(*p.args)
@@ -421,8 +434,9 @@ class Interleaved(Bench):
         cols = [self._at(launches, p.args) for p in points]
         return [list(row) for row in zip(*cols)] if cols else [[] for _ in launches]
 
-    def _at(self, launches, args):
-        n = len(launches)
+    def _at(self, built, args):
+        n = len(built)
+        launches = [_cached(l) for l in built]
         best = [INF] * n
         dead = set()
 
@@ -432,7 +446,7 @@ class Interleaved(Bench):
             try:
                 return fn(*a)
             except Exception as ex:  # noqa: BLE001 - a launch that faults loses the race
-                note_fault(launches[i], ex)
+                note_fault(built[i], ex)
                 dead.add(i)
                 return None
 
