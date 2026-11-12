@@ -190,14 +190,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # such as UCCL_EP. "autotune" is rejected with an AssertionError.
     "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend_spec("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"),
     # Backend of the Ulysses fused GEMM + all-to-all ops (``ulysses_qkv_gemm_a2a``,
-    # ``ulysses_a2a_o_gemm``), forward and backward: FLYDSL (the default when unset) or TENSILELITE.
-    # "autotune" is rejected with an AssertionError.
+    # ``ulysses_a2a_o_gemm``), forward and backward, when GlobalBackendManager.set_ulysses_a2a_backend
+    # is not called: FLYDSL (the default when unset) or TENSILELITE. "autotune" is rejected with an
+    # AssertionError.
     "PRIMUS_TURBO_ULYSSES_A2A_BACKEND": backend_spec("PRIMUS_TURBO_ULYSSES_A2A_BACKEND"),
-    # TensileLite kernel libraries (TensileCreateLibrary output, tuned for the exact shapes) that the
-    # TENSILELITE Ulysses backend loads: PRE for the forward QKV GemmA2A, POST for the forward o_proj
-    # A2AGemm, PRE_BWD for the QKV dgrad A2AGemm and POST_BWD for the o_proj dgrad GemmA2A (both NN:
-    # the weight read as stored). Read when the backend first builds a kernel for a shape; a call
-    # without its library runs on FLYDSL.
+    # Development only: TensileLite kernel libraries (TensileCreateLibrary output) the TENSILELITE
+    # Ulysses backend loads instead of the ones setup.py generated into primus_turbo/lib/ulysses_tl (for
+    # shapes not committed yet; their sha256 is not checked): PRE for the forward QKV GemmA2A, POST for
+    # the forward o_proj A2AGemm, PRE_BWD for the QKV dgrad A2AGemm and POST_BWD for the o_proj dgrad
+    # GemmA2A (both NN: the weight read as stored). Read when the backend first meets a shape.
     "PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_PRE": lambda: os.getenv("PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_PRE"),
     "PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_POST": lambda: os.getenv(
         "PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_POST"

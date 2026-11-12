@@ -69,6 +69,10 @@ class BackendType(Enum):
     # launch (see is_gfx950()/hipkittens_attn_supported_impl).
     HIPKITTENS = auto()
     GLUON = auto()
+    # TensileLite GemmA2A / A2AGemm with SDMA transfers, the Ulysses fused GEMM + all-to-all only.
+    # gfx950-only, and only in builds that found the TensileLite toolkit (see
+    # csrc/ulysses_tensilelite); a call it cannot take runs on FLYDSL (ulysses_a2a_impl).
+    TENSILELITE = auto()
 
 
 @dataclass
@@ -269,7 +273,7 @@ class GlobalBackendManager:
         precision: Optional[PrecisionType] = None,
         auto_tune: bool = False,
     ) -> None:
-        """Set the backend of the Ulysses fused GEMM + all-to-all forward in code."""
+        """Set the backend of the Ulysses fused GEMM + all-to-all ops (forward and backward) in code."""
         assert auto_tune is False, "Auto-tune is not supported for the Ulysses A2A backend"
 
         cls._ulysses_a2a_backend = cls._updated_backend_table(
@@ -378,17 +382,11 @@ class GlobalBackendManager:
 
     @classmethod
     def get_ulysses_a2a_backend(cls, precision: PrecisionType) -> Optional[BackendChoice]:
-        """Get the Ulysses fused GEMM + all-to-all backend configuration. Returns None if not set.
-
-        A value that is not a ``BackendType`` (e.g. ``TENSILELITE``) returns ``None`` here, so the
-        registry in ``ulysses_a2a_impl`` reads it from the environment variable itself.
-        """
+        """Get the Ulysses fused GEMM + all-to-all backend configuration. Returns None if not set."""
         if cls._ulysses_a2a_backend is not None:
             return cls._ulysses_a2a_backend.get(precision)
 
-        choice = cls._backend_from_env(
-            "PRIMUS_TURBO_ULYSSES_A2A_BACKEND", precision, allow_unknown_backend=True
-        )
+        choice = cls._backend_from_env("PRIMUS_TURBO_ULYSSES_A2A_BACKEND", precision)
         if choice is None:
             return None
 

@@ -14,7 +14,8 @@ chunk of the sequence.
 
 Both passes run on the backend chosen in ``kernels/attention/ulysses_a2a_impl.py`` (``FLYDSL`` by
 default, or ``TENSILELITE``; ``GlobalBackendManager.set_ulysses_a2a_backend`` or
-``PRIMUS_TURBO_ULYSSES_A2A_BACKEND``), resolved once in forward and kept for that call's backward.
+``PRIMUS_TURBO_ULYSSES_A2A_BACKEND``), picked once in forward and kept for that call's backward. A call
+TENSILELITE cannot take runs on FLYDSL, with a warning.
 """
 
 from dataclasses import dataclass
@@ -24,9 +25,10 @@ import torch
 import torch.distributed as dist
 
 from primus_turbo.pytorch.kernels.attention.ulysses_a2a_impl import (
-    resolve_ulysses_a2a_backend,
+    ulysses_a2a_o_gemm_backend,
     ulysses_a2a_o_gemm_bwd_impl,
     ulysses_a2a_o_gemm_fwd_impl,
+    ulysses_qkv_gemm_a2a_backend,
     ulysses_qkv_gemm_a2a_bwd_impl,
     ulysses_qkv_gemm_a2a_fwd_impl,
 )
@@ -87,7 +89,8 @@ class UlyssesQKVGemmA2AFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, fwd_tuning, bwd_tuning):
         # one backend for the forward and the backward of this call
-        ctx.backend = resolve_ulysses_a2a_backend()
+        need_bwd = x.requires_grad or w_qkv.requires_grad
+        ctx.backend = ulysses_qkv_gemm_a2a_backend(x, w_qkv, hq, hkv, d, group, need_bwd)
         q, k, v = ulysses_qkv_gemm_a2a_fwd_impl(
             x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, fwd_tuning, backend=ctx.backend
         )
@@ -166,7 +169,7 @@ def ulysses_qkv_gemm_a2a(
 class UlyssesA2AOGemmFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, o, w_o, residual, group, qkv_format, fwd_tuning, bwd_tuning):
-        ctx.backend = resolve_ulysses_a2a_backend()
+        ctx.backend = ulysses_a2a_o_gemm_backend(o, w_o, residual, group, need_do=o.requires_grad)
         y, o_gathered = ulysses_a2a_o_gemm_fwd_impl(
             o,
             w_o,

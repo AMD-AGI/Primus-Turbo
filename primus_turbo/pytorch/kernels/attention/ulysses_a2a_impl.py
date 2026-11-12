@@ -7,22 +7,27 @@
 """Backends of the Ulysses fused GEMM + all-to-all ops in ``ops/attention/ulysses_fused_a2a.py``.
 
 Laid out like ``kernels/moe/moe_dispatch_combine_impl.py``: one class per backend, each owning its
-communication state, a name registry, and ``resolve_ulysses_a2a_backend()``, which reads the code
-setting (``GlobalBackendManager.set_ulysses_a2a_backend``), then ``PRIMUS_TURBO_ULYSSES_A2A_BACKEND``,
-and defaults to ``FLYDSL``. There is no auto-tune: every rank of the group has to run the same backend.
+communication state, and a registry keyed by ``BackendType``. ``resolve_ulysses_a2a_backend()`` is the
+requested backend: the code setting (``GlobalBackendManager.set_ulysses_a2a_backend``), then
+``PRIMUS_TURBO_ULYSSES_A2A_BACKEND``, then ``FLYDSL``. There is no auto-tune: every rank of the group
+has to run the same backend.
 
-One switch selects the forward and the backward pass. The autograd functions resolve the backend
-once in forward and hand the same name to backward. Every backend's backward needs only what the
-forward saves: ``(x, w_qkv)`` for QKV, and ``(w_o, o_gathered)`` for o_proj, where ``o_gathered`` is
-the gathered o_proj input ``[s/n * b, h * d]`` in the output's token order. A call a backend cannot
-take (``UlyssesA2AUnsupported``: no kernel for the shape, a missing library) runs on ``FLYDSL``, with
-one warning per reason; the decision depends only on shapes and settings, so every rank makes it.
+One switch selects the forward and the backward pass. The autograd functions pick the backend of a call
+once in forward (``ulysses_qkv_gemm_a2a_backend`` / ``ulysses_a2a_o_gemm_backend``) and hand it to
+backward. Every backend's backward needs only what the forward saves: ``(x, w_qkv)`` for QKV, and
+``(w_o, o_gathered)`` for o_proj, where ``o_gathered`` is the gathered o_proj input ``[s/n * b, h * d]``
+in the output's token order. A call TENSILELITE cannot take (no extension, not gfx950, not bf16, CUDA
+graph capture, no pinned library or tuned kernel for a hop of the forward or the backward, SDMA queues or
+peer buffers that cannot be set up) runs on ``FLYDSL``, with one warning per reason: the ranks of the
+group agree on it before any of them launches a kernel. Once TENSILELITE runs, an error raises.
 """
 
-import glob
-import os
+import functools
+import hashlib
+import json
 from dataclasses import asdict
-from typing import Dict, Optional, Protocol, Tuple, Type
+from pathlib import Path
+from typing import Dict, Optional, Protocol, Sequence, Tuple, Type
 
 import torch
 import torch.distributed as dist
@@ -54,6 +59,8 @@ __all__ = [
     "UlyssesA2AUnsupported",
     "register_ulysses_a2a_backend",
     "resolve_ulysses_a2a_backend",
+    "ulysses_qkv_gemm_a2a_backend",
+    "ulysses_a2a_o_gemm_backend",
     "ulysses_qkv_gemm_a2a_fwd_impl",
     "ulysses_qkv_gemm_a2a_bwd_impl",
     "ulysses_a2a_o_gemm_fwd_impl",
@@ -62,7 +69,7 @@ __all__ = [
 
 
 class UlyssesA2AUnsupported(Exception):
-    """A backend cannot take this call (raised before any rank launches a kernel for it)."""
+    """A backend cannot take this call (found while the call's backend is chosen, before any kernel runs)."""
 
 
 def _launch_kwargs(tuning, **defaults):
@@ -290,110 +297,157 @@ class FlyDSLUlyssesA2ABackend:
 # =========================================================================
 
 _TL_CHANNELS = 2
-
-
-def _tl_module():
-    from attn_demo import _aa
-
-    return _aa
-
-
-# (mode, trans_a) -> the library variable suffix: forward QKV / o_proj, then their backward (dgrad) hops,
-# which read the weight as stored (TensileLite's NN layout, TransposeA False)
-_TL_LIBRARY_SIDE = {
-    ("GemmA2A", True): "PRE",
-    ("A2AGemm", True): "POST",
-    ("A2AGemm", False): "PRE_BWD",
-    ("GemmA2A", False): "POST_BWD",
+# setup.py generates one kernel library per hop here (csrc/ulysses_tensilelite/kernels.py), next to the
+# manifest that pins its files
+_TL_LIB_DIR = Path(__file__).resolve().parents[3] / "lib" / "ulysses_tl"
+# (mode, trans_a) -> (generated library, suffix of the variable that overrides it): forward QKV / o_proj,
+# then their backward (dgrad) hops, which read the weight as stored (TensileLite's NN layout, TransposeA False)
+_TL_LIBRARIES = {
+    ("GemmA2A", True): ("fwd_gemm_a2a", "PRE"),
+    ("A2AGemm", True): ("fwd_a2a_gemm", "POST"),
+    ("A2AGemm", False): ("bwd_a2a_gemm", "PRE_BWD"),
+    ("GemmA2A", False): ("bwd_gemm_a2a", "POST_BWD"),
 }
 
 
-def _tl_library(root: Optional[str], side: str):
-    """``(dat, co_dir, co)`` of a TensileLite kernel library built for gfx950."""
-    if not root:
-        raise UlyssesA2AUnsupported(
-            f"TENSILELITE Ulysses backend: PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_{side} is not set "
-            "(path to a TensileCreateLibrary output tuned for these shapes)"
-        )
-    lib_dir = os.path.join(root, "library", "gfx950")
-    co = glob.glob(os.path.join(lib_dir, "TensileLibrary_*Contraction*.co"))
+def _tl_module():
+    from primus_turbo.pytorch import _ulysses_tl
+
+    return _ulysses_tl
+
+
+@functools.lru_cache(maxsize=None)
+def _tl_unpinned_reason(name: str) -> Optional[str]:
+    """Why the generated library ``name`` is not the one the install pinned, or None."""
+    manifest_path = _TL_LIB_DIR / "manifest.json"
+    try:
+        pins = json.loads(manifest_path.read_text())["libraries"][name]
+    except (OSError, ValueError, KeyError) as e:
+        return f"{manifest_path} pins no {name} library ({type(e).__name__}: {e})"
+    for rel, sha256 in pins.items():
+        path = _TL_LIB_DIR / name / rel
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != sha256:
+            return f"{path} is missing or not the pinned file"
+    return None
+
+
+def _tl_library(mode: str, trans_a: bool):
+    """``(dat, co_dir, co)`` of the gfx950 kernel library of one hop."""
+    name, side = _TL_LIBRARIES[(mode, trans_a)]
+    override = getattr(envs, f"PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_{side}")
+    if override:
+        root = Path(override)
+    else:
+        reason = _tl_unpinned_reason(name)
+        if reason is not None:
+            raise UlyssesA2AUnsupported(reason)
+        root = _TL_LIB_DIR / name
+    lib_dir = root / "library" / "gfx950"
+    co = sorted(lib_dir.glob("TensileLibrary_*Contraction*.co"))
     if len(co) != 1:
         raise UlyssesA2AUnsupported(f"{lib_dir}: expected one Contraction code object, found {co}")
-    return os.path.join(lib_dir, "TensileLibrary_lazy_gfx950.dat"), lib_dir, co[0]
+    return str(lib_dir / "TensileLibrary_lazy_gfx950.dat"), str(lib_dir), str(co[0])
+
+
+def _tl_agree(group, reason: Optional[str]) -> Optional[str]:
+    """None when no rank of ``group`` has a reason, else the reasons (every rank gets the same answer)."""
+    reasons = [None] * group.size()
+    dist.all_gather_object(reasons, reason, group=group)
+    failed = {r: why for r, why in enumerate(reasons) if why is not None}
+    if not failed:
+        return None
+    if len(failed) == group.size() and len(set(failed.values())) == 1:
+        return reasons[0]
+    return "; ".join(f"rank {r}: {why}" for r, why in failed.items())
 
 
 class _TLComm:
-    """SDMA queues to every peer of one group, and IPC exchange over it."""
+    """SDMA queues to every peer of one group."""
 
-    def __init__(self, aa, group):
+    def __init__(self, aa, group, devices):
         self.aa, self.group = aa, group
         self.rank, self.world = group.rank(), group.size()
-        devices = [None] * self.world
-        dist.all_gather_object(devices, torch.cuda.current_device(), group=group)
         self.devices = devices
         self.ctx = aa.CommContext(self.rank, self.world, devices, -1)
         self.queues = [self.ctx.queue_fields(j) for j in range(self.world)]
 
-    def exchange(self, t):
-        handles = [None] * self.world
-        dist.all_gather_object(handles, self.aa.ipc_handle(t), group=self.group)
-        return [t.data_ptr() if j == self.rank else self.aa.ipc_open(h) for j, h in enumerate(handles)]
-
 
 class _TLHop:
-    """One FusedHop shape with its flags, counter and IPC buffers (adapted from the demo's hops.py)."""
+    """One FusedHop shape with its flags, counter and IPC buffers (adapted from the demo's hops.py).
 
-    def __init__(self, comm, mode, m, n, k, extent, lib, beta, trans_a=True):
-        aa = comm.aa
-        self.comm, self.mode, self.m, self.n, self.k = comm, mode, m, n, k
-        # trans_a=False (the weight read as stored) needs an _aa whose FusedHop takes the layout
-        layout = {} if trans_a else {"trans_a": False}
+    Set up in three steps so that the ranks can agree after each: ``__init__`` selects the kernel and
+    ``allocate()`` the buffers (both local), ``connect()`` maps the peers' buffers after the exchange."""
+
+    def __init__(self, aa, rank, world, mode, m, n, k, extent, beta, trans_a):
+        self.aa, self.mode, self.m, self.n, self.k, self.extent = aa, mode, m, n, k, extent
+        self.rank, self.world = rank, world
+        lib = _tl_library(mode, trans_a)
         try:
             self.hop = aa.FusedHop.for_selection(
-                comm.rank, comm.world, mode, m, n, k, extent, *lib, beta=beta, **layout
+                rank, world, mode, m, n, k, extent, *lib, beta=beta, trans_a=trans_a
             )
-        except TypeError as e:
-            raise UlyssesA2AUnsupported(
-                f"TENSILELITE Ulysses backend: this attn_demo._aa cannot select the NN layout the backward needs: {e}"
-            ) from e
         except RuntimeError as e:
             raise UlyssesA2AUnsupported(
-                f"TENSILELITE Ulysses backend has no tuned {mode} kernel for m={m} n={n} k={k} "
-                f"world={comm.world} extent={extent} trans_a={trans_a}: {e}"
+                f"no tuned {mode} kernel for m={m} n={n} k={k} world={world} extent={extent} "
+                f"trans_a={trans_a}: {e}"
             ) from e
+        self.comm = None
+        self.bound = None
+        self.launches = 0
+
+    def allocate(self):
+        """The buffers the peers write into, in the order ``connect()`` takes their peer pointers."""
+        aa, world, m, n, k = self.aa, self.world, self.m, self.n, self.k
         self.flags = aa.alloc(_TL_CHANNELS * aa.FLAG_BLOCK_BYTES, True)
         self.flags.zero_()
         self.counter = aa.alloc(self.hop.counter_bytes(), False)
         self.counter.zero_()
-        self.flag_ptrs = comm.exchange(self.flags)
-        self.bound = None
-        self.launches = 0
-        world = comm.world
-        if mode == "GemmA2A":
+        if self.mode == "GemmA2A":
             self.d = torch.empty(n, m, dtype=torch.bfloat16, device="cuda")
-            slice_bytes = world * n * (extent // world) * 2
+            slice_bytes = world * n * (self.extent // world) * 2
             self._recv = [aa.alloc(slice_bytes, False) for _ in range(_TL_CHANNELS)]
-            self._recv_ptrs = [comm.exchange(r) for r in self._recv]
-            self.shard = extent // world
+            self.shard = self.extent // world
         else:
             shard = k // world
             self._x = aa.alloc(world * n * shard * 2, False)
             self.x = self._x.view(torch.bfloat16).view(world, n, shard)
-            self._x_ptrs = comm.exchange(self._x)
-            self.b = torch.empty(n, k, dtype=torch.bfloat16, device="cuda")
+            # where the peers' shards are gathered (this rank's own one is read from x in place)
+            self.gathered = torch.empty(n, k, dtype=torch.bfloat16, device="cuda")
             self.d = torch.empty(n, m, dtype=torch.bfloat16, device="cuda")
             self._arrival = aa.alloc(aa.ARRIVAL_BYTES, True)
             self._arrival.zero_()
-            self._arrival_ptrs = comm.exchange(self._arrival)
+        return self._buffers()
+
+    def connect(self, comm, handles):
+        """Map the peers' buffers: ``handles[j]`` are rank j's IPC handles of ``allocate()``'s buffers."""
+        own = self._buffers()
+        ptrs = [
+            [own[i].data_ptr() if j == self.rank else self.aa.ipc_open(h[i]) for j, h in enumerate(handles)]
+            for i in range(len(own))
+        ]
+        self.comm = comm
+        self.flag_ptrs = ptrs[0]
+        if self.mode == "GemmA2A":
+            self._recv_ptrs = ptrs[1:]
+        else:
+            # the peers' x, and this rank's own entry is the gathered buffer (the kernel reads x as B)
+            self._buf_ptrs = list(ptrs[1])
+            self._buf_ptrs[self.rank] = self.gathered.data_ptr()
+            self._arrival_ptrs = ptrs[2]
         torch.cuda.synchronize()
 
-    def _bind(self, recv_ptrs, a, b, c=0):
+    def _buffers(self):
+        if self.mode == "GemmA2A":
+            return [self.flags, *self._recv]
+        return [self.flags, self._x, self._arrival]
+
+    def _bind(self, buf_ptrs, a, b, c=0):
         fb = self.comm.aa.FLAG_BLOCK_BYTES
         for ch in range(_TL_CHANNELS):
             flags = [p + ch * fb for p in self.flag_ptrs]
-            rp = recv_ptrs[ch] if self.mode == "GemmA2A" else recv_ptrs
+            bufs = buf_ptrs[ch] if self.mode == "GemmA2A" else buf_ptrs
             self.hop.bind(
-                ch, flags, rp, self.comm.queues, a, b, self.d.data_ptr(), self.counter.data_ptr(), c
+                ch, flags, bufs, self.comm.queues, a, b, self.d.data_ptr(), self.counter.data_ptr(), c
             )
 
     def _next_channel(self):
@@ -415,7 +469,7 @@ class _TLHop:
         """``D = gather(x) @ w^T (+ c)`` after every rank has written its ``x``."""
         key = (w.data_ptr(), 0 if c is None else c.data_ptr())
         if key != self.bound:
-            self._bind(self._x_ptrs, w.data_ptr(), self.b.data_ptr(), key[1])
+            self._bind(self._buf_ptrs, w.data_ptr(), self._x.data_ptr(), key[1])
             self.bound = key
         stream = torch.cuda.current_stream().cuda_stream
         self.comm.aa.boundary_barrier(self._arrival_ptrs, self.comm.rank, self.comm.world, stream)
@@ -425,14 +479,12 @@ class _TLHop:
 
 
 class TensileLiteUlyssesA2ABackend:
-    """TensileLite GemmA2A / A2AGemm, forward only, with SDMA moving the data (attn-a2a-demo).
+    """TensileLite GemmA2A / A2AGemm with SDMA moving the data (attn-a2a-demo), forward and backward.
 
-    Needs the ``attn_demo._aa`` extension (built against a TensileLite host library with
-    ``TENSILELITE_ENABLE_SDMA=ON``; the backward also needs its ``FusedHop.for_selection(trans_a=)``)
-    and kernel libraries tuned for the exact shapes, named by ``PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_PRE``
-    (forward QKV, GemmA2A), ``..._LIB_POST`` (forward o_proj, A2AGemm), ``..._LIB_PRE_BWD`` (QKV dgrad,
-    A2AGemm, NN) and ``..._LIB_POST_BWD`` (o_proj dgrad, GemmA2A, NN). A missing library or a shape
-    without a tuned kernel raises ``UlyssesA2AUnsupported``. Every rank must see every peer GPU.
+    Needs the ``primus_turbo.pytorch._ulysses_tl`` extension and the kernel libraries setup.py builds and
+    generates against the TensileLite toolkit (``csrc/ulysses_tensilelite``), one per hop: forward QKV
+    (GemmA2A), forward o_proj (A2AGemm), QKV dgrad (A2AGemm, NN) and o_proj dgrad (GemmA2A, NN). Every
+    hop of a call is set up by ``prepare()`` before the call runs. Every rank must see every peer GPU.
 
     Backward: dgrad on the fused hops; wgrad on hipBLASLt, on a second stream where it does not
     wait for the exchange (all of o_proj's, this rank's own block of QKV's).
@@ -441,8 +493,68 @@ class TensileLiteUlyssesA2ABackend:
     def __init__(self):
         self._aa = _tl_module()
         self._comms: Dict[int, _TLComm] = {}
+        self._comm_errors: Dict[int, str] = {}
         self._hops: Dict[tuple, _TLHop] = {}
         self._side_streams: Dict[int, torch.cuda.Stream] = {}
+
+    def prepare(self, group, specs: Sequence[tuple], tensors: Sequence[torch.Tensor]) -> Optional[str]:
+        """Set up the hops ``specs`` (``(mode, m, n, k, extent, beta, trans_a)``) on every rank of ``group``.
+
+        None when they are ready, else why the group cannot run them. Collective: every rank of the group
+        calls it with the same ``specs``, and the ranks agree after each step, so that no rank goes on to
+        a kernel its peers do not run: the checks and kernel selection, then the SDMA queues and the
+        buffers, then the mapping of the peers' buffers."""
+        rank, world = group.rank(), group.size()
+        todo = [s for s in specs if (id(group), *s) not in self._hops]
+        reason, hops = None, []
+        try:
+            arch = torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0]
+            if arch != "gfx950":
+                raise UlyssesA2AUnsupported(f"the GPU is {arch}, TENSILELITE runs on gfx950 only")
+            dtypes = sorted({str(t.dtype) for t in tensors})
+            if dtypes != [str(torch.bfloat16)]:
+                raise UlyssesA2AUnsupported(f"the tensors are {dtypes}, TENSILELITE runs bf16 only")
+            hops = [_TLHop(self._aa, rank, world, *s) for s in todo]
+        except UlyssesA2AUnsupported as e:
+            reason = str(e)
+        reason = _tl_agree(group, reason)
+        if reason is not None or not todo:
+            return reason
+
+        # SDMA queues (once per group, after the device exchange) and the buffers: local
+        if id(group) not in self._comms and id(group) not in self._comm_errors:
+            devices = [None] * world
+            dist.all_gather_object(devices, torch.cuda.current_device(), group=group)
+            try:
+                self._comms[id(group)] = _TLComm(self._aa, group, devices)
+            except Exception as e:  # noqa: BLE001 -- told to every rank below
+                self._comm_errors[id(group)] = f"SDMA queues: {type(e).__name__}: {e}"
+        buffers = []
+        reason = self._comm_errors.get(id(group))
+        if reason is None:
+            try:
+                buffers = [hop.allocate() for hop in hops]
+            except Exception as e:  # noqa: BLE001 -- told to every rank below
+                reason = f"buffers: {type(e).__name__}: {e}"
+        reason = _tl_agree(group, reason)
+        if reason is not None:
+            return reason
+
+        handles = [None] * world
+        dist.all_gather_object(
+            handles, [[self._aa.ipc_handle(t) for t in bufs] for bufs in buffers], group=group
+        )
+        try:
+            comm = self._comms[id(group)]
+            for i, hop in enumerate(hops):
+                hop.connect(comm, [handles[j][i] for j in range(world)])
+        except Exception as e:  # noqa: BLE001 -- told to every rank below
+            reason = f"peer buffers: {type(e).__name__}: {e}"
+        reason = _tl_agree(group, reason)
+        if reason is None:
+            for spec, hop in zip(todo, hops):
+                self._hops[(id(group), *spec)] = hop
+        return reason
 
     def _side_stream(self):
         dev = torch.cuda.current_device()
@@ -459,16 +571,8 @@ class TensileLiteUlyssesA2ABackend:
             return False
 
     def _hop(self, group, mode, m, n, k, extent, beta, trans_a=True):
-        key = (id(group), mode, m, n, k, extent, beta, trans_a)
-        hop = self._hops.get(key)
-        if hop is None:
-            side = _TL_LIBRARY_SIDE[(mode, trans_a)]
-            lib = _tl_library(getattr(envs, f"PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_{side}"), side)
-            comm = self._comms.get(id(group))
-            if comm is None:
-                comm = self._comms[id(group)] = _TLComm(self._aa, group)
-            hop = self._hops[key] = _TLHop(comm, mode, m, n, k, extent, lib, beta, trans_a)
-        return hop
+        """The hop ``prepare()`` set up for this call."""
+        return self._hops[(id(group), mode, m, n, k, extent, beta, trans_a)]
 
     def qkv_gemm_a2a(self, x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout, tuning):
         n = group.size()
@@ -518,7 +622,7 @@ class TensileLiteUlyssesA2ABackend:
             # this rank's own shard, is never written (the hop reads it from x in place)
             o_gathered = torch.empty(M, K, dtype=o.dtype, device=o.device)
             og = o_gathered.view(M, n, K_r)
-            slots = hop.b.view(n, M, K_r)
+            slots = hop.gathered.view(n, M, K_r)
             r = group.rank()
             og[:, r:].copy_(slots[: n - r].transpose(0, 1))
             og[:, :r].copy_(slots[n - r :].transpose(0, 1))
@@ -574,7 +678,7 @@ class TensileLiteUlyssesA2ABackend:
         dx = hop.run_a2a_gemm(w, None).clone()
         if need_dw:
             # B buffer slot s holds source rank (r + s) % n's block (the forward's o_gathered layout)
-            slots = hop.b.view(n, M, K_r)
+            slots = hop.gathered.view(n, M, K_r)
             for s in range(1, n):
                 src_rank = (r + s) % n
                 torch.matmul(slots[s].t(), x2d, out=dw_rank_major[src_rank * K_r : (src_rank + 1) * K_r])
@@ -721,73 +825,113 @@ def _flydsl_o_bwd(
 # Backend registry and selection
 # =========================================================================
 
-_BACKEND_REGISTRY: Dict[str, Type[UlyssesA2ABackend]] = {
-    "FLYDSL": FlyDSLUlyssesA2ABackend,
-    "TENSILELITE": TensileLiteUlyssesA2ABackend,
+_BACKEND_REGISTRY: Dict[BackendType, Type[UlyssesA2ABackend]] = {
+    BackendType.FLYDSL: FlyDSLUlyssesA2ABackend,
+    BackendType.TENSILELITE: TensileLiteUlyssesA2ABackend,
 }
 
-_backend_instances: Dict[str, UlyssesA2ABackend] = {}
-
-_BACKEND_TYPE_TO_NAME: Dict[BackendType, str] = {
-    BackendType.FLYDSL: "FLYDSL",
-}
+_backend_instances: Dict[BackendType, UlyssesA2ABackend] = {}
 
 
-def register_ulysses_a2a_backend(name: str, cls: Type[UlyssesA2ABackend]) -> None:
+def register_ulysses_a2a_backend(backend: BackendType, cls: Type[UlyssesA2ABackend]) -> None:
     """Register a new Ulysses fused GEMM + all-to-all backend class."""
-    _BACKEND_REGISTRY[name] = cls
+    _BACKEND_REGISTRY[backend] = cls
 
 
-def _get_backend_instance(name: str) -> UlyssesA2ABackend:
+def _get_backend_instance(backend: BackendType) -> UlyssesA2ABackend:
     """Lazily create and cache a backend singleton."""
-    if name not in _backend_instances:
-        if name not in _BACKEND_REGISTRY:
+    if backend not in _backend_instances:
+        if backend not in _BACKEND_REGISTRY:
             raise ValueError(
-                f"Unknown Ulysses A2A backend '{name}'. Available: {list(_BACKEND_REGISTRY.keys())}"
+                f"Ulysses A2A backend {backend.name} is not registered. "
+                f"Available: {[b.name for b in _BACKEND_REGISTRY]}"
             )
-        cls = _BACKEND_REGISTRY[name]
+        cls = _BACKEND_REGISTRY[backend]
         if not cls.is_available():
             raise RuntimeError(
-                f"Ulysses A2A backend '{name}' is registered but its dependencies are not installed."
+                f"Ulysses A2A backend {backend.name} is registered but its dependencies are not installed."
             )
-        _backend_instances[name] = cls()
-    return _backend_instances[name]
+        _backend_instances[backend] = cls()
+    return _backend_instances[backend]
 
 
-def resolve_ulysses_a2a_backend() -> str:
-    """Determine which Ulysses fused GEMM + all-to-all backend to use (forward and backward).
+def resolve_ulysses_a2a_backend() -> BackendType:
+    """The requested Ulysses fused GEMM + all-to-all backend (forward and backward).
 
     Priority (high -> low):
       1. ``GlobalBackendManager`` code-level setting (via ``set_ulysses_a2a_backend``)
-      2. ``PRIMUS_TURBO_ULYSSES_A2A_BACKEND`` env var (supports names beyond ``BackendType``)
+      2. ``PRIMUS_TURBO_ULYSSES_A2A_BACKEND`` env var
       3. Default: ``FLYDSL``
+
+    A call runs on the backend ``ulysses_qkv_gemm_a2a_backend`` / ``ulysses_a2a_o_gemm_backend`` pick,
+    which is FLYDSL when TENSILELITE cannot take it.
     """
     user_backend_choice = GlobalBackendManager.get_ulysses_a2a_backend(PrecisionType.BF16_FP16_FP32)
     if user_backend_choice is not None and user_backend_choice.backend is not None:
-        user_backend = user_backend_choice.backend
-        return _BACKEND_TYPE_TO_NAME.get(user_backend, user_backend.name)
-
-    env_val = envs.PRIMUS_TURBO_ULYSSES_A2A_BACKEND
-    if env_val is not None:
-        return env_val.strip().upper()
-
-    return "FLYDSL"
+        return user_backend_choice.backend
+    return BackendType.FLYDSL
 
 
-def _call(backend_name: Optional[str], method: str, *args):
-    """``method`` on the named backend (the resolved one if None); on ``UlyssesA2AUnsupported``, on FLYDSL."""
-    name = backend_name or resolve_ulysses_a2a_backend()
-    backend = _get_backend_instance(name)
-    if name == "FLYDSL":
-        return getattr(backend, method)(*args)
-    try:
-        return getattr(backend, method)(*args)
-    except UlyssesA2AUnsupported as e:
-        if not torch.compiler.is_compiling():
-            logger.warning(
-                f"Ulysses A2A backend {name} cannot run {method}, falling back to FLYDSL: {e}", once=True
-            )
-        return getattr(_get_backend_instance("FLYDSL"), method)(*args)
+# (op, id(group), hop specs, dtypes) -> the reason TENSILELITE cannot run that call, or None
+_TL_DECISIONS: Dict[tuple, Optional[str]] = {}
+
+
+def _select(op: str, group, specs: Tuple[tuple, ...], tensors: Sequence[torch.Tensor]) -> BackendType:
+    """The backend of one call: the requested one, or FLYDSL (with one warning per reason) when it is
+    TENSILELITE and the group cannot run every hop in ``specs`` on it. Collective the first time a shape
+    is seen (see ``TensileLiteUlyssesA2ABackend.prepare``)."""
+    requested = resolve_ulysses_a2a_backend()
+    if requested != BackendType.TENSILELITE:
+        return requested
+    if torch.cuda.is_current_stream_capturing():
+        # every rank captures, so they all land here; no collective is possible inside the capture
+        reason = "CUDA graph capture is not supported"
+    else:
+        key = (op, id(group), specs, tuple(str(t.dtype) for t in tensors))
+        if key not in _TL_DECISIONS:
+            cls = _BACKEND_REGISTRY[BackendType.TENSILELITE]
+            if cls.is_available():
+                _TL_DECISIONS[key] = _get_backend_instance(BackendType.TENSILELITE).prepare(
+                    group, specs, tensors
+                )
+            else:
+                # still agree, so that a rank that has the extension does not wait for this one
+                why = "the primus_turbo.pytorch._ulysses_tl extension is not built (see csrc/ulysses_tensilelite)"
+                _TL_DECISIONS[key] = _tl_agree(group, why)
+        reason = _TL_DECISIONS[key]
+    if reason is None:
+        return BackendType.TENSILELITE
+    if not torch.compiler.is_compiling():
+        logger.warning(
+            f"Ulysses A2A backend TENSILELITE cannot run {op}, falling back to FLYDSL: {reason}", once=True
+        )
+    return BackendType.FLYDSL
+
+
+def ulysses_qkv_gemm_a2a_backend(x, w_qkv, hq, hkv, d, group, need_bwd: bool) -> BackendType:
+    """The backend one ``ulysses_qkv_gemm_a2a`` call runs on, forward and (when ``need_bwd``) backward."""
+    hidden = x.shape[-1]
+    M, N = x.numel() // hidden, (hq + 2 * hkv) * d
+    specs = [("GemmA2A", N, M, hidden, N, 0.0, True)]
+    if need_bwd:
+        specs.append(("A2AGemm", hidden, M, N, N, 0.0, False))
+    return _select("ulysses_qkv_gemm_a2a", group, tuple(specs), (x, w_qkv))
+
+
+def ulysses_a2a_o_gemm_backend(o, w_o, residual, group, need_do: bool) -> BackendType:
+    """The backend one ``ulysses_a2a_o_gemm`` call runs on, forward and (when ``need_do``) the dgrad."""
+    N, K = w_o.shape
+    M = o.numel() // (o.shape[-2] * o.shape[-1]) // group.size()
+    specs = [("A2AGemm", N, M, K, K, 0.0 if residual is None else 1.0, True)]
+    if need_do:
+        specs.append(("GemmA2A", K, M, N, K, 0.0, False))
+    tensors = (o, w_o) if residual is None else (o, w_o, residual)
+    return _select("ulysses_a2a_o_gemm", group, tuple(specs), tensors)
+
+
+def _call(backend: Optional[BackendType], method: str, *args):
+    """``method`` on ``backend`` (FLYDSL when None), which the call's ``*_backend()`` picked."""
+    return getattr(_get_backend_instance(backend or BackendType.FLYDSL), method)(*args)
 
 
 def ulysses_qkv_gemm_a2a_fwd_impl(

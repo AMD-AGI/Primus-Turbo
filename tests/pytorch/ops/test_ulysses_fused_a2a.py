@@ -265,7 +265,8 @@ _TL_LIB_VARS = [f"PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_{s}" for s in ("PRE", "PO
 
 
 def _set_envs(values):
-    """``envs.set_env`` for each name (None removes it), then drop the backend tables built from them."""
+    """``envs.set_env`` for each name (None removes it), then drop the backend tables built from them
+    (``GlobalBackendManager.reset`` also drops code settings)."""
     import primus_turbo.common.envs as envs
     from primus_turbo.pytorch.core.backend import GlobalBackendManager
 
@@ -274,40 +275,90 @@ def _set_envs(values):
     GlobalBackendManager.reset()
 
 
-def check_tensilelite(group, failures):
-    """The TENSILELITE backend (attn-a2a-demo), forward and backward, when its extension is installed.
+def _tl_qkv_backend(group, hq, hkv, d, s_local, hidden):
+    """The backend a bf16 ``ulysses_qkv_gemm_a2a`` call of this shape (b = 1, with a backward) runs on."""
+    from primus_turbo.pytorch.kernels.attention import ulysses_a2a_impl as impl
 
-    Without kernel libraries every call falls back to FLYDSL and still has to match the reference. With
-    PRIMUS_TURBO_TEST_ULYSSES_TENSILELITE_SHAPE="hq,hkv,d,s_local,hidden,world" (a shape the libraries
-    named by the four PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_* variables are tuned for, b = 1) the demo
-    kernels run when the group has ``world`` ranks.
+    x = torch.empty(s_local, 1, hidden, dtype=torch.bfloat16, device="cuda")
+    w = torch.empty((hq + 2 * hkv) * d, hidden, dtype=torch.bfloat16, device="cuda")
+    return impl.ulysses_qkv_gemm_a2a_backend(x, w, hq, hkv, d, group, need_bwd=True)
+
+
+def _tl_forget(impl):
+    """Drop the TENSILELITE decisions and hops, so that the next call decides again."""
+    impl._TL_DECISIONS.clear()
+    impl._get_backend_instance(impl.BackendType.TENSILELITE)._hops.clear()
+
+
+def check_tensilelite(group, failures):
+    """The TENSILELITE backend, forward and backward, when its extension is built.
+
+    Calls it cannot take fall back to FLYDSL and still have to match the reference: shapes without a
+    tuned kernel, a group in which one rank cannot run the call, CUDA graph capture. With
+    PRIMUS_TURBO_TEST_ULYSSES_TENSILELITE_SHAPE="hq,hkv,d,s_local,hidden,world" (a shape the kernel
+    libraries are tuned for, b = 1: the ones setup.py generated, or the four
+    PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_* overrides) the TensileLite kernels run when the group has
+    ``world`` ranks.
     """
+    from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
     from primus_turbo.pytorch.kernels.attention import ulysses_a2a_impl as impl
 
     if not impl.TensileLiteUlyssesA2ABackend.is_available():
         return
+    rank = group.rank()
     saved = {k: os.environ.get(k) for k in ["PRIMUS_TURBO_ULYSSES_A2A_BACKEND", *_TL_LIB_VARS]}
     try:
-        _set_envs({"PRIMUS_TURBO_ULYSSES_A2A_BACKEND": "TENSILELITE", **{k: None for k in _TL_LIB_VARS}})
+        _set_envs({"PRIMUS_TURBO_ULYSSES_A2A_BACKEND": "TENSILELITE"})
+        if impl.resolve_ulysses_a2a_backend() != BackendType.TENSILELITE:
+            failures.append("[tensilelite] PRIMUS_TURBO_ULYSSES_A2A_BACKEND=TENSILELITE is not resolved")
+        _set_envs({"PRIMUS_TURBO_ULYSSES_A2A_BACKEND": None})
+        GlobalBackendManager.set_ulysses_a2a_backend(BackendType.TENSILELITE)
+
+        # no tuned kernel for these shapes: FLYDSL
+        if _tl_qkv_backend(group, 32, 8, 128, 300, 1024) != BackendType.FLYDSL:
+            failures.append("[tensilelite] a shape without a tuned kernel did not fall back to FLYDSL")
         check_qkv(group, 32, 8, 128, 1, 300, 1024, "sbhd", "interleaved", 1, failures)
         check_o_gemm(group, 32, 128, 1, 300, 1024, "sbhd", True, 1, failures)
 
         shape = os.environ.get("PRIMUS_TURBO_TEST_ULYSSES_TENSILELITE_SHAPE")
         hq, hkv, d, s_local, hidden, world = (int(v) for v in shape.split(",")) if shape else (0,) * 6
-        if world == group.size() and all(saved[k] for k in _TL_LIB_VARS):
-            _set_envs({k: saved[k] for k in _TL_LIB_VARS})
-            for qkv_format, weight_layout in itertools.product(("sbhd", "bshd"), ("interleaved", "concat")):
-                check_qkv(group, hq, hkv, d, 1, s_local, hidden, qkv_format, weight_layout, 2, failures)
-            for qkv_format in ("sbhd", "bshd"):
-                check_o_gemm(group, hq, d, 1, s_local, hidden, qkv_format, True, 2, failures)
-            built = {(key[1], key[-1]) for key in impl._get_backend_instance("TENSILELITE")._hops}
-            for hop in (("GemmA2A", True), ("A2AGemm", True), ("A2AGemm", False), ("GemmA2A", False)):
-                if hop not in built:
-                    failures.append(
-                        f"[tensilelite] the {hop[0]} trans_a={hop[1]} hop never ran (fell back to FLYDSL)"
-                    )
+        if world != group.size():
+            return
+        if _tl_qkv_backend(group, hq, hkv, d, s_local, hidden) != BackendType.TENSILELITE:
+            failures.append(f"[tensilelite] the tuned shape {shape} did not select TENSILELITE")
+        for qkv_format, weight_layout in itertools.product(("sbhd", "bshd"), ("interleaved", "concat")):
+            check_qkv(group, hq, hkv, d, 1, s_local, hidden, qkv_format, weight_layout, 2, failures)
+        for qkv_format in ("sbhd", "bshd"):
+            check_o_gemm(group, hq, d, 1, s_local, hidden, qkv_format, True, 2, failures)
+        built = {(key[1], key[-1]) for key in impl._get_backend_instance(BackendType.TENSILELITE)._hops}
+        for hop in (("GemmA2A", True), ("A2AGemm", True), ("A2AGemm", False), ("GemmA2A", False)):
+            if hop not in built:
+                failures.append(
+                    f"[tensilelite] the {hop[0]} trans_a={hop[1]} hop never ran (fell back to FLYDSL)"
+                )
+
+        # under CUDA graph capture: FLYDSL, without the collective
+        torch.cuda.synchronize()
+        with torch.cuda.graph(torch.cuda.CUDAGraph()):
+            captured = _tl_qkv_backend(group, hq, hkv, d, s_local, hidden)
+        if captured != BackendType.FLYDSL:
+            failures.append("[tensilelite] a call under CUDA graph capture did not fall back to FLYDSL")
+
+        # one rank cannot load a library: the whole group runs FLYDSL
+        _tl_forget(impl)
+        if rank == group.size() - 1:
+            _set_envs({"PRIMUS_TURBO_ULYSSES_TENSILELITE_LIB_PRE": "/nonexistent"})
+        # every rank has to request TENSILELITE (_set_envs dropped the code setting on that rank)
+        GlobalBackendManager.set_ulysses_a2a_backend(BackendType.TENSILELITE)
+        if _tl_qkv_backend(group, hq, hkv, d, s_local, hidden) != BackendType.FLYDSL:
+            failures.append(
+                "[tensilelite] the group did not fall back to FLYDSL when one rank could not run it"
+            )
+        check_qkv(group, hq, hkv, d, 1, s_local, hidden, "sbhd", "interleaved", 1, failures)
     finally:
         _set_envs(saved)
+        GlobalBackendManager.reset()
+        _tl_forget(impl)
 
 
 def run_suite(quick):
