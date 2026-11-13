@@ -36,10 +36,14 @@ def _k8():
 
 def _compile_with_hints(launch, args, out_index=2):
     import flydsl.compiler as flyc  # noqa: F401
+    from flydsl.compiler.kernel_function import CompilationContext
+
+    # The kernel module no longer re-exports these (FlyDSL autotune unification, #587).
+    from primus_turbo.flydsl.utils.gemm_helper import compile_with_scratch_out
 
     K8 = _k8()
-    with K8.CompilationContext.compile_hints(K8._GG_SCHED_HINTS):
-        return K8.compile_with_scratch_out(launch, args, out_index=out_index)
+    with CompilationContext.compile_hints(K8._GG_SCHED_HINTS):
+        return compile_with_scratch_out(launch, args, out_index=out_index)
 
 
 def _dummies(torch, dev, a_shape, b_shape, c_shape, G, a_scale=True):
