@@ -125,6 +125,16 @@ These are fwd-only utilities; the `_with_trans` variants also emit the transpose
 | `primus_turbo.pytorch.dist.FP8AllToAll` | ✅ | ✅ | — | All-to-all on FP8 payloads, with backward |
 | `primus_turbo.pytorch.deep_ep.Buffer` | ✅ | ✅ | — | Intra-node and inter-node EP buffers (needs rocSHMEM). See [DeepEP guide](../primus_turbo/pytorch/deep_ep/README.md) |
 
+### 2.8 FLUX.1 transformer blocks
+
+Fused ops for diffusers' FLUX.1 blocks (head dim 128), each computing what the unfused block computes.
+
+| Op | Precision | gfx942 | gfx950 | gfx1250 | Notes |
+|---|---|:-:|:-:|:-:|---|
+| `flux_gelu_linear` | BF16 | — | ✅ | — | MLP up-projection + tanh GELU, optionally written after a prefix (the single-stream block's concat); bias gradient fused into the GELU backward |
+| `flux_adaln_single` | BF16 | — | ✅ | — | Single-stream block's cat + LayerNorm + modulation |
+| `flux_adaln_dual` | BF16 | — | ✅ | — | Dual-stream block's gated residual + second LayerNorm + modulation, both streams |
+
 ## 3. Supported modules (PyTorch)
 
 `primus_turbo.pytorch.modules`:
@@ -177,4 +187,6 @@ registration order, with the arch / format limits from each backend's `can_handl
 | MegaMoE (`fused_mega_moe*`) | FLYDSL |
 | `rmsnorm*`, `swiglu_with_probs`, `geglu_with_probs`, `cross_entropy`, router | TRITON (`rmsnorm_residual_fp4`: FLYDSL) |
 | `fused_qkv_rope`, `fused_qkv_rmsnorm_rope` | FLYDSL |
+| `flux_gelu_linear` | FLYDSL GELU (gfx950, tiled shapes; unfused otherwise), TRITON GELU backward |
+| `flux_adaln_single`, `flux_adaln_dual` | FLYDSL (gfx950), eager PyTorch otherwise |
 | Quantization | TURBO (HIP), TRITON (blockwise), FLYDSL (MXFP8 / MXFP4) |
