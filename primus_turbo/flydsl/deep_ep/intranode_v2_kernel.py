@@ -62,6 +62,7 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr.rocdl import tdm_ops
 
+import primus_turbo.common.envs as envs
 from primus_turbo.flydsl.deep_ep.arch import TRAITS
 from primus_turbo.flydsl.deep_ep.common import (
     IS_GFX1250,
@@ -132,8 +133,10 @@ USE_TDM = IS_GFX1250
 # A TDM op in flight when the queue is evicted (a context save and restore; the KFD evicts every queue of
 # a process e.g. when NUMA balancing unmaps host pages registered with the GPU, every few seconds) can be
 # lost: the wave resumes past it with nothing outstanding, s_wait_tensorcnt does not wait for it, a load
-# leaves the LDS buffer as it was and a store never lands. The dispatch and the combine's push move a row
-# again when its TDM ops took more than TDM_REDO_TICKS of the realtime counter (read_clock, 100 MHz): an
+# leaves the LDS buffer as it was and a store never lands. PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD=redo / all makes
+# the dispatch and the combine's push move a row again when its TDM ops took more than TDM_REDO_TICKS of the
+# realtime counter (read_clock, 100 MHz); the default "off" assumes that the process's GPU queues are not
+# evicted. An
 # eviction takes milliseconds, a row tens of microseconds. Not the shader cycle counter: it belongs to the
 # unit a wave runs on, mostly stands still while the queues are evicted and the wave comes back to the
 # same unit, and jumps when it comes back to another, so about 4 in 10 evictions looked shorter than the
@@ -218,22 +221,33 @@ def _tdm_moved(start, redo_ticks: int):
     return arith.select(in_time, fx.Int32(1), fx.Int32(0))
 
 
-def _tdm_pass_done(start, passes, redo_ticks: int, redo_max: int):
+def _tdm_pass_done(start, passes, redo_ticks: int, redo_max: int, redo: bool):
     """After the tensor_wait(0) that ends pass ``passes`` (1 for the first) of a row's TDM ops, issued after
     ``read_clock()`` read ``start``: 1 if that pass was in time (``_tdm_moved``) or the row has already been
-    moved ``redo_max`` times more (TDM_REDO_MAX), else 0."""
+    moved ``redo_max`` times more (TDM_REDO_MAX), else 0. With the timed redo disabled, every first pass is
+    accepted."""
+    if fx.const_expr(not redo):
+        return fx.Int32(1)
     return arith.select(passes > fx.Int32(redo_max), fx.Int32(1), _tdm_moved(start, redo_ticks))
 
 
 @ASTRewriter.transform
-def _tdm_load_checked(lds_addr, global_addr, num_bytes: int, sys_load: bool):
+def _tdm_load_checked(lds_addr, global_addr, num_bytes: int, sys_load: bool, check: bool):
     """``_tdm_load`` of ``num_bytes`` from ``global_addr`` into LDS ``lds_addr`` and a tensor_wait(0), issued
     again until LDS holds what ``global_addr`` does at 32 words from the first to the last (a lane each, read
     beside the load; ``sys_load``: system scope, for a heap the peers write). An eviction can drop a queued
     TDM load, all of it or a part, after s_wait_tensorcnt, and the warp would store its buffer's previous
     contents; the redo (TDM_REDO_TICKS) moves the row again after an eviction, this check does not depend
-    on how long the wave was away. A TDM load that follows outstanding stores is lost far more often. A
-    check that keeps failing goes to the watchdog: taking the load anyway would let the stale row through."""
+    on how long the wave was away. A TDM load that follows outstanding stores is lost far more often. With
+    ``check`` false, issue the load once. A check that keeps failing goes to the watchdog: taking the load
+    anyway would let the stale row through."""
+    if fx.const_expr(not check):
+        if fx.const_expr(sys_load):
+            _tdm_load(lds_addr, global_addr, num_bytes, cache_policy=SYS_LOAD)
+        else:
+            _tdm_load(lds_addr, global_addr, num_bytes)
+        tdm_ops.tensor_wait(0)
+        return
     lane_id = fx.thread_idx.x % fx.Int32(WARP_SIZE)
     check_word = (lane_id * fx.Int32(num_bytes // 4 - 1)) // fx.Int32(WARP_SIZE - 1)
     landed = fx.Int32(0)
@@ -413,6 +427,8 @@ def _copy_received_x(
     row_buffer_bytes: int,
     redo_ticks: int,
     redo_max: int,
+    redo: bool,
+    load_check: bool,
 ):
     """``_tdm_copy_received_x``, repeated until a pass of it was in time or it reached the cap (see
     TDM_REDO_TICKS, TDM_REDO_MAX)."""
@@ -420,20 +436,26 @@ def _copy_received_x(
     passes = fx.Int32(0)
     while moved == fx.Int32(0):
         start = read_clock()
-        _tdm_copy_received_x(local, layout, outputs, row, hidden_bytes, row_lds, row_buffer_bytes)
+        _tdm_copy_received_x(local, layout, outputs, row, hidden_bytes, row_lds, row_buffer_bytes, load_check)
         tdm_ops.tensor_wait(0)
         passes = passes + fx.Int32(1)
-        moved = _tdm_pass_done(start, passes, redo_ticks, redo_max)
+        moved = _tdm_pass_done(start, passes, redo_ticks, redo_max, redo)
 
 
 @ASTRewriter.transform
-def _tdm_copy_received_x(local, layout, outputs, row, hidden_bytes: int, row_lds, row_buffer_bytes: int):
+def _tdm_copy_received_x(
+    local, layout, outputs, row, hidden_bytes: int, row_lds, row_buffer_bytes: int, load_check: bool
+):
     """Received row ``row``'s data from the heap into the output through the warp's LDS row buffer."""
     for p in range_constexpr(0, hidden_bytes, row_buffer_bytes):
         piece = min(row_buffer_bytes, hidden_bytes - p)
         tdm_ops.tensor_wait(0)
         _tdm_load_checked(
-            row_lds, _uniform_i64(_addr(local, layout["x"] + p, row, layout["stride"])), piece, True
+            row_lds,
+            _uniform_i64(_addr(local, layout["x"] + p, row, layout["stride"])),
+            piece,
+            True,
+            load_check,
         )
         _tdm_store(row_lds, _uniform_i64(_addr(outputs["x"], p, row, hidden_bytes)), piece)
 
@@ -455,6 +477,8 @@ def _send_x_row(
     slot_bytes: int,
     redo_ticks: int,
     redo_max: int,
+    redo: bool,
+    load_check: bool,
 ):
     """``_tdm_send_row``, repeated until a pass of it was in time or it reached the cap (see TDM_REDO_TICKS,
     TDM_REDO_MAX)."""
@@ -476,10 +500,11 @@ def _send_x_row(
             meta_values,
             meta_bytes,
             slot_bytes,
+            load_check,
         )
         tdm_ops.tensor_wait(0)
         passes = passes + fx.Int32(1)
-        moved = _tdm_pass_done(start, passes, redo_ticks, redo_max)
+        moved = _tdm_pass_done(start, passes, redo_ticks, redo_max, redo)
 
 
 @ASTRewriter.transform
@@ -497,6 +522,7 @@ def _tdm_send_row(
     meta_values,
     meta_bytes: int,
     slot_bytes: int,
+    load_check: bool,
 ):
     """Token ``t``'s row of x, loaded once a piece at a time into the warp's LDS row buffer and stored from
     there to row ``rows[d]`` of every destination ``d`` it is ``routed`` to. A peer (``is_peer[d]``) gets it
@@ -512,7 +538,7 @@ def _tdm_send_row(
         with_meta = attach and i == num_pieces - 1
         # the previous stores are done with the buffer
         tdm_ops.tensor_wait(0)
-        _tdm_load_checked(row_lds, _uniform_i64(_addr(x_base, p, t, hidden_bytes)), piece, False)
+        _tdm_load_checked(row_lds, _uniform_i64(_addr(x_base, p, t, hidden_bytes)), piece, False, load_check)
         if fx.const_expr(with_meta):
             # only once the load is in: LDS stores issued just before a TDM load were followed by a lost load
             # under evictions
@@ -604,6 +630,8 @@ def _copy_received(
     row_buffer_bytes: int,
     redo_ticks: int,
     redo_max: int,
+    redo: bool,
+    load_check: bool,
     rank,
     num_experts_per_rank: int,
 ):
@@ -637,7 +665,17 @@ def _copy_received(
             row = arith.select(j >= cums[s], starts[s] + j - cums[s], row)
         if fx.const_expr(row_lds is not None):
             _copy_received_x(
-                local, layout, outputs, row, hidden_bytes, row_lds, row_buffer_bytes, redo_ticks, redo_max
+                local,
+                layout,
+                outputs,
+                row,
+                hidden_bytes,
+                row_lds,
+                row_buffer_bytes,
+                redo_ticks,
+                redo_max,
+                redo,
+                load_check,
             )
         else:
             _copy_row(
@@ -739,7 +777,11 @@ def _make_dispatch_v2(
     )
     if USE_TDM:
         lds_words = (lds_rows + NUM_WARPS * row_buffer_bytes) // 4
-    # read here and passed down, not read in the helpers, so that they are part of FlyDSL's kernel cache key
+    # Read here and pass down, rather than reading in a helper, so these values are part of the kernel.
+    # The environment is process-wide and cached (common.envs); changing it needs a new process.
+    tdm_guard = envs.PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD
+    redo = tdm_guard in ("redo", "all")
+    load_check = tdm_guard == "all"
     redo_ticks = TDM_REDO_TICKS
     redo_max = TDM_REDO_MAX
     grid_threads = num_channels * NUM_THREADS
@@ -949,6 +991,8 @@ def _make_dispatch_v2(
                         layout["stride"],
                         redo_ticks,
                         redo_max,
+                        redo,
+                        load_check,
                     )
                 else:
                     dst_resources = [
@@ -1063,6 +1107,8 @@ def _make_dispatch_v2(
                 row_buffer_bytes,
                 redo_ticks,
                 redo_max,
+                redo,
+                load_check,
                 rank,
                 num_experts_per_rank,
             )
@@ -1216,6 +1262,7 @@ def _tdm_push_row(
     x_offset: int,
     slot_bytes: int,
     push_bytes: int,
+    load_check: bool,
 ):
     """Combine: row ``row`` of x with its top-k weights, through the warp's LDS row buffer, into slot
     ``slot`` of the peer's heap."""
@@ -1228,7 +1275,13 @@ def _tdm_push_row(
             vec_width=1,
             dtype=fx.T.f32,
         )
-    _tdm_load_checked(row_lds, _uniform_i64(_addr(x_base, 0, row, hidden_bytes)), hidden_bytes, False)
+    _tdm_load_checked(
+        row_lds,
+        _uniform_i64(_addr(x_base, 0, row, hidden_bytes)),
+        hidden_bytes,
+        False,
+        load_check,
+    )
     if fx.const_expr(num_topk > 0):
         if lane_id < fx.Int32(num_topk):
             st_lds(row_lds, fx.Int32(hidden_bytes // 4) + lane_id, weight)
@@ -1242,20 +1295,20 @@ def _tdm_push_row(
 
 
 @ASTRewriter.transform
-def _tdm_push_again(pushed, row, start, redo_ticks: int, redo_max: int, *push_args):
+def _tdm_push_again(pushed, row, start, redo_ticks: int, redo_max: int, redo: bool, *push_args):
     """Combine, after a tensor_wait(0): row ``row``'s push into slot ``pushed`` (none if < 0), issued after
     ``read_clock()`` read ``start``, done again until a pass is in time or the row reached the cap (see
     TDM_REDO_TICKS, TDM_REDO_MAX)."""
     passes = fx.Int32(1)
     moved = arith.select(
-        pushed >= fx.Int32(0), _tdm_pass_done(start, passes, redo_ticks, redo_max), fx.Int32(1)
+        pushed >= fx.Int32(0), _tdm_pass_done(start, passes, redo_ticks, redo_max, redo), fx.Int32(1)
     )
     while moved == fx.Int32(0):
         again = read_clock()
         _tdm_push_row(row, pushed, *push_args)
         tdm_ops.tensor_wait(0)
         passes = passes + fx.Int32(1)
-        moved = _tdm_pass_done(again, passes, redo_ticks, redo_max)
+        moved = _tdm_pass_done(again, passes, redo_ticks, redo_max, redo)
 
 
 @ASTRewriter.transform
@@ -1370,7 +1423,11 @@ def _make_combine_v2(
     steps_per_pass = max(1, TRAITS.combine_loads_in_flight // (num_ranks + int(has_bias_0) + int(has_bias_1)))
     row_buffer_bytes = slot_bytes
     lds_grab = (push_warps * row_buffer_bytes if USE_TDM else 0) // 4
-    # read here and passed down, not read in the helpers, so that they are part of FlyDSL's kernel cache key
+    # Read here and pass down, rather than reading in a helper, so these values are part of the kernel.
+    # The environment is process-wide and cached (common.envs); changing it needs a new process.
+    tdm_guard = envs.PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD
+    redo = tdm_guard in ("redo", "all")
+    load_check = tdm_guard == "all"
     redo_ticks = TDM_REDO_TICKS
     redo_max = TDM_REDO_MAX
     smem_bytes = lds_grab * 4 + NUM_WARPS * 4
@@ -1461,6 +1518,7 @@ def _make_combine_v2(
             layout["x"],
             slot_bytes,
             push_bytes,
+            load_check,
         )
         pushed_row = row
         pushed_start = read_clock() if USE_TDM else fx.Int64(0)
@@ -1473,7 +1531,7 @@ def _make_combine_v2(
                 wait_mem_all()
             if fx.const_expr(USE_TDM):
                 # before its flag goes up
-                _tdm_push_again(pushed, pushed_row, pushed_start, redo_ticks, redo_max, *push_args)
+                _tdm_push_again(pushed, pushed_row, pushed_start, redo_ticks, redo_max, redo, *push_args)
                 pushed_start = read_clock()
             weight = fx.Float32(0.0)
             if fx.const_expr(num_topk > 0):
@@ -1486,7 +1544,11 @@ def _make_combine_v2(
                 )
             if fx.const_expr(USE_TDM):
                 _tdm_load_checked(
-                    row_lds, _uniform_i64(_addr(x_base, 0, row, hidden_bytes)), hidden_bytes, False
+                    row_lds,
+                    _uniform_i64(_addr(x_base, 0, row, hidden_bytes)),
+                    hidden_bytes,
+                    False,
+                    load_check,
                 )
                 if fx.const_expr(num_topk > 0):
                     if lane_id < fx.Int32(num_topk):
@@ -1521,7 +1583,7 @@ def _make_combine_v2(
         else:
             wait_mem_all()
         if fx.const_expr(USE_TDM):
-            _tdm_push_again(pushed, pushed_row, pushed_start, redo_ticks, redo_max, *push_args)
+            _tdm_push_again(pushed, pushed_row, pushed_start, redo_ticks, redo_max, redo, *push_args)
         if (pushed >= fx.Int32(0)) & (lane_id == fx.Int32(0)):
             _st_sys(peer_flags, pushed, epoch)
         if fx.const_expr(push_done):

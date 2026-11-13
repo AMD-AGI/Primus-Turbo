@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     PT_MEGA_FP8_L2_COMBINE_CU: int | None = None
     PRIMUS_TURBO_DEEPEP_CPU_TIMEOUT: int = 300
     PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE: bool = False
+    PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD: str = "off"
     PRIMUS_TURBO_ODC_GDA_BLOCK: int = 256
     PRIMUS_TURBO_ODC_GDA_PIPE: int = 1
     PRIMUS_TURBO_ODC_GDA_NUM_QP: int = 1
@@ -83,6 +84,18 @@ def _positive_int(name: str, raw: str, what: str) -> int:
     if value <= 0:
         raise ValueError(f"{name}={raw!r}: {what}")
     return value
+
+
+def env_choice(name: str, default: str, choices: tuple[str, ...]) -> Callable[[], str]:
+    """A getter for one of ``choices``; unset or empty reads as ``default``."""
+
+    def _get() -> str:
+        value = (os.getenv(name) or default).strip().lower()
+        if value not in choices:
+            raise ValueError(f"{name}={value!r}: must be one of {', '.join(choices)}")
+        return value
+
+    return _get
 
 
 def env_positive_int(
@@ -243,6 +256,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # C++ caches it separately in the dispatch and combine launchers, each at its first call.
     "PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE": lambda: (
         int(os.getenv("PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE") or "0") != 0
+    ),
+    # The flydsl_v2 guards for TDM operations lost while KFD evicts a queue. "off" (default):
+    # neither guard; "redo": move a row again when one pass takes more than 0.5 ms; "all":
+    # also compare 32 words of every TDM load with its source and reload stale data.
+    "PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD": env_choice(
+        "PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD", "off", ("off", "redo", "all")
     ),
     # ODC (on-demand-comm) rocSHMEM GDA device-kernel knobs, consumed by
     # csrc/kernels/odc_rocshmem/odc_rocshmem_gda.cu for the multi-node reduce-scatter /
