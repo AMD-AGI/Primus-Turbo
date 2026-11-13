@@ -419,20 +419,21 @@ def test_flydsl_version_requirement(monkeypatch, version, ok, packaging):
 
 
 def test_setup_py_pins_a_flydsl_the_kernels_accept():
-    """The flydsl that setup.py pins must satisfy FLYDSL_REQUIREMENT. Under any other release the
-    gate declines every call and the tests that need the kernels skip, so a version bump that
-    the kernels have not been checked against would otherwise go unnoticed."""
+    """The lowest flydsl that setup.py admits (its ``==`` pin or ``>=`` bound) must satisfy
+    FLYDSL_REQUIREMENT. Under any other release the gate declines every call and the tests that
+    need the kernels skip, so a version bump that the kernels have not been checked against would
+    otherwise go unnoticed."""
     from primus_turbo.flydsl.attention.gfx1250 import flydsl_version as ver
 
     setup_py = os.path.join(os.path.dirname(__file__), "..", "..", "..", "setup.py")
     if not os.path.isfile(setup_py):
         pytest.skip("no setup.py next to the tests")
     with open(setup_py) as f:
-        pins = re.findall(r"""["']flydsl==([^"']+)["']""", f.read())
+        pins = re.findall(r"""["']flydsl(?:==|>=)([^"',]+)[^"']*["']""", f.read())
     assert pins, "setup.py pins no flydsl"
     for pin in pins:
         assert ver._satisfies(pin), (
-            f"setup.py pins flydsl=={pin}, outside the gfx1250 attention kernels' "
+            f"setup.py admits flydsl {pin}, outside the gfx1250 attention kernels' "
             f"FLYDSL_REQUIREMENT {ver.FLYDSL_REQUIREMENT}: check the kernels on that release, then "
             "update flydsl_version.py"
         )

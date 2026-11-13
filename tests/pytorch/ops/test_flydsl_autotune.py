@@ -11,6 +11,7 @@ here is deterministic; only the op-level cases at the bottom touch a GPU kernel.
 """
 
 import gc
+import types
 import weakref
 
 import pytest
@@ -790,7 +791,8 @@ def _mxfp4_gemm(M=2048, N=2048, K=4096):
 
 @pytest.fixture
 def raw_calls(monkeypatch):
-    """Top-level calls per ``@flyc.jit`` launch; flyc.compile makes one itself."""
+    """Top-level traces per ``@flyc.jit`` launch: a raw call or a flyc.compile. flydsl 0.5 runs
+    both through ``_compile_or_execute``; 0.3.4 compiles through one ``__call__``."""
     from flydsl._mlir import ir
     from flydsl.compiler.jit_function import JitFunction
 
@@ -798,7 +800,8 @@ def raw_calls(monkeypatch):
     # Holds every counted launch: one freed mid-test (a clear() drops it) could hand its id
     # to a new launch, which would then look like a second raw call.
     counted_launches = []
-    call = JitFunction.__call__
+    name = "_compile_or_execute" if hasattr(JitFunction, "_compile_or_execute") else "__call__"
+    call = getattr(JitFunction, name)
 
     def counted(self, *args, **kwargs):
         if ir.Context.current is None:
@@ -807,7 +810,7 @@ def raw_calls(monkeypatch):
             calls[id(self)] = calls.get(id(self), 0) + 1
         return call(self, *args, **kwargs)
 
-    monkeypatch.setattr(JitFunction, "__call__", counted)
+    monkeypatch.setattr(JitFunction, name, counted)
     return calls
 
 
@@ -927,11 +930,22 @@ def test_op_retunes_after_clear(shape, layout, op, raw_calls, monkeypatch, tmp_p
     assert raw_calls and max(raw_calls.values()) == again, sorted(raw_calls.values())
 
 
-# flydsl snapshots every global a launch reads (a dict, list or set by value) on its first call,
-# rejects a later raw call once that value changed, and folds the snapshot into the disk-cache
-# key. A mutable one would break re-tunes and tie the key to whatever the process traced before,
-# so no launch may read one; the whole-loop launches below must be among those checked.
+# A compiled launch never re-reads the globals its trace read, so a mutable one (a dict, list or
+# set) changed after the compile leaves it running a stale specialization (and flydsl 0.3.4
+# snapshots such a global into its disk-cache key). No launch may read one; the whole-loop
+# launches below must be among those checked.
 _WHOLE_LOOP_LAUNCHES = {"launch_dense_wave4", "launch_dense_tn_wave4", "launch_grouped_tn_wgrad_4wave"}
+
+
+def _global_refs(fn):
+    """(name, module name, globals) of every global name ``fn`` and its nested functions use."""
+    g = fn.__globals__
+    names, todo = set(), [fn.__code__]
+    while todo:
+        code = todo.pop()
+        names.update(code.co_names)
+        todo.extend(c for c in code.co_consts if isinstance(c, types.CodeType))
+    return [(name, g.get("__name__"), g) for name in sorted(names) if name in g]
 
 
 @requires_gfx950
@@ -954,7 +968,7 @@ def test_no_launch_reads_a_mutable_global():
     mutable = sorted(
         f"{o.func.__qualname__} reads {mod}.{name}"
         for o in launches
-        for name, mod, g in o._get_global_refs(None)
+        for name, mod, g in _global_refs(o.func)
         if isinstance(g.get(name), (dict, list, set, bytearray))
     )
     assert mutable == []
