@@ -23,7 +23,10 @@ V1 receiver produces, so ``recv_x`` and every per-token output match V1 exactly.
 one channel (a contiguous token range); it scans the range a tile at a time for the per-destination
 indices (also returned as ``send_head``), then each warp loads a token's row once and stores it to
 every rank the token goes to -- our own rank's straight into the outputs, the others' into their
-heap. When its rows are visible, the block tells each rank how many rows its channel sent there;
+heap, where a row's slot ends in the token's metadata (source index, top-k indices and weights,
+scales). The metadata goes with the row's last store, so no store of its own trails the row, in one
+form for every peer: each receiver keeps the top-k entries of its own experts. When its rows are
+visible, the block tells each rank how many rows its channel sent there;
 then it copies, from our heap into the outputs, the rows the same channel of every other rank sent
 us, as soon as that rank's count is in.
 
@@ -275,20 +278,31 @@ def _half_bytes(num_nvl_bytes):
     return (num_nvl_bytes - DATA_OFFSET) // 2 // 4096 * 4096
 
 
+def dispatch_v2_meta_bytes(num_topk, topk_idx_bytes, num_scales):
+    """A received row's metadata in the heap: its source index, top-k indices and weights and scales, in a
+    slot of whole 128-byte lines right behind the row."""
+    return _align(4 + num_topk * (topk_idx_bytes + 4) + num_scales * 4, 128)
+
+
+def _meta_words(num_topk, topk_idx_bytes):
+    """First i32 words of the top-k indices, the top-k weights and the scales in a metadata slot (word 0 is
+    the source index)."""
+    weights = 1 + num_topk * (topk_idx_bytes // 4)
+    return 1, weights, weights + num_topk
+
+
 @functools.lru_cache(maxsize=None)
 def dispatch_v2_layout(num_nvl_bytes, hidden_bytes, num_topk, topk_idx_bytes, num_scales):
-    """``({region: offset}, capacity in tokens)`` of the dispatch receive region."""
+    """``({"x", "meta": offset, "stride": bytes}, capacity in tokens)`` of the dispatch receive region: a slot
+    a row, ``stride`` apart, each the row and then its metadata (``dispatch_v2_meta_bytes``); ``meta`` is row
+    0's metadata."""
     half = _half_bytes(num_nvl_bytes)
-    regions = (
-        ("x", hidden_bytes),
-        ("src_idx", 4),
-        ("topk_idx", num_topk * topk_idx_bytes),
-        ("topk_weights", num_topk * 4),
-        ("x_scales", num_scales * 4),
-    )
-    capacity = max(0, (half - 16 * len(regions)) // sum(b for _, b in regions))
+    stride = hidden_bytes + dispatch_v2_meta_bytes(num_topk, topk_idx_bytes, num_scales)
+    regions = (("x", stride),)
+    capacity = max(0, (half - 16 * len(regions)) // stride)
     layout, end = _regions(DATA_OFFSET, capacity, regions)
     assert end <= DATA_OFFSET + half
+    layout.update(meta=layout["x"] + hidden_bytes, stride=stride)
     return layout, capacity
 
 
@@ -419,7 +433,7 @@ def _tdm_copy_received_x(local, layout, outputs, row, hidden_bytes: int, row_lds
         piece = min(row_buffer_bytes, hidden_bytes - p)
         tdm_ops.tensor_wait(0)
         _tdm_load_checked(
-            row_lds, _uniform_i64(_addr(local, layout["x"] + p, row, hidden_bytes)), piece, True
+            row_lds, _uniform_i64(_addr(local, layout["x"] + p, row, layout["stride"])), piece, True
         )
         _tdm_store(row_lds, _uniform_i64(_addr(outputs["x"], p, row, hidden_bytes)), piece)
 
@@ -434,6 +448,11 @@ def _send_x_row(
     dst_x,
     rows,
     routed,
+    is_peer,
+    is_own,
+    meta_values,
+    meta_bytes: int,
+    slot_bytes: int,
     redo_ticks: int,
     redo_max: int,
 ):
@@ -443,27 +462,89 @@ def _send_x_row(
     passes = fx.Int32(0)
     while moved == fx.Int32(0):
         start = read_clock()
-        _tdm_send_row(row_lds, x_base, t, hidden_bytes, row_buffer_bytes, dst_x, rows, routed)
+        _tdm_send_row(
+            row_lds,
+            x_base,
+            t,
+            hidden_bytes,
+            row_buffer_bytes,
+            dst_x,
+            rows,
+            routed,
+            is_peer,
+            is_own,
+            meta_values,
+            meta_bytes,
+            slot_bytes,
+        )
         tdm_ops.tensor_wait(0)
         passes = passes + fx.Int32(1)
         moved = _tdm_pass_done(start, passes, redo_ticks, redo_max)
 
 
 @ASTRewriter.transform
-def _tdm_send_row(row_lds, x_base, t, hidden_bytes: int, row_buffer_bytes: int, dst_x, rows, routed):
+def _tdm_send_row(
+    row_lds,
+    x_base,
+    t,
+    hidden_bytes: int,
+    row_buffer_bytes: int,
+    dst_x,
+    rows,
+    routed,
+    is_peer,
+    is_own,
+    meta_values,
+    meta_bytes: int,
+    slot_bytes: int,
+):
     """Token ``t``'s row of x, loaded once a piece at a time into the warp's LDS row buffer and stored from
-    there to row ``rows[d]`` of every destination ``d`` it is ``routed`` to."""
-    for p in range_constexpr(0, hidden_bytes, row_buffer_bytes):
+    there to row ``rows[d]`` of every destination ``d`` it is ``routed`` to. A peer (``is_peer[d]``) gets it
+    into its heap slot (``slot_bytes`` apart) with the token's metadata slot behind it (``meta_values``: a
+    word a lane, a value per WARP_SIZE words), which goes with the row's last piece when the buffer has room
+    for both; our own rank (``is_own[d]``) gets the row alone into the output."""
+    lane_id = fx.thread_idx.x % fx.Int32(WARP_SIZE)
+    num_pieces = (hidden_bytes + row_buffer_bytes - 1) // row_buffer_bytes
+    attach = hidden_bytes - (num_pieces - 1) * row_buffer_bytes + meta_bytes <= row_buffer_bytes
+    for i in range_constexpr(num_pieces):
+        p = i * row_buffer_bytes
         piece = min(row_buffer_bytes, hidden_bytes - p)
+        with_meta = attach and i == num_pieces - 1
         # the previous stores are done with the buffer
         tdm_ops.tensor_wait(0)
         _tdm_load_checked(row_lds, _uniform_i64(_addr(x_base, p, t, hidden_bytes)), piece, False)
+        if fx.const_expr(with_meta):
+            # only once the load is in: LDS stores issued just before a TDM load were followed by a lost load
+            # under evictions
+            for u in range_constexpr(len(meta_values)):
+                st_lds(row_lds, fx.Int32(piece // 4 + u * WARP_SIZE) + lane_id, meta_values[u])
+            _wait_lds()
         for d in range_constexpr(len(rows)):
-            if routed[d]:
+            if routed[d] & is_peer[d]:
+                _tdm_store(
+                    row_lds,
+                    _uniform_i64(_addr(dst_x[d], p, rows[d], slot_bytes)),
+                    piece + (meta_bytes if with_meta else 0),
+                    cache_policy=SYS_STORE,
+                )
+            if routed[d] & is_own[d]:
                 _tdm_store(
                     row_lds,
                     _uniform_i64(_addr(dst_x[d], p, rows[d], hidden_bytes)),
                     piece,
+                    cache_policy=SYS_STORE,
+                )
+    if fx.const_expr(not attach):
+        tdm_ops.tensor_wait(0)
+        for u in range_constexpr(len(meta_values)):
+            st_lds(row_lds, fx.Int32(u * WARP_SIZE) + lane_id, meta_values[u])
+        _wait_lds()
+        for d in range_constexpr(len(rows)):
+            if routed[d] & is_peer[d]:
+                _tdm_store(
+                    row_lds,
+                    _uniform_i64(_addr(dst_x[d], hidden_bytes, rows[d], slot_bytes)),
+                    meta_bytes,
                     cache_policy=SYS_STORE,
                 )
 
@@ -523,12 +604,19 @@ def _copy_received(
     row_buffer_bytes: int,
     redo_ticks: int,
     redo_max: int,
+    rank,
+    num_experts_per_rank: int,
 ):
     """The block copies the rows that have arrived and it has not copied yet, with their metadata,
     from the heap into the outputs."""
     thread_id = fx.thread_idx.x
     lane_id = thread_id % fx.Int32(WARP_SIZE)
     warp_id = thread_id // fx.Int32(WARP_SIZE)
+    idx_bytes = idx_dtype.width // 8
+    idx_words = idx_bytes // 4
+    meta_bytes = dispatch_v2_meta_bytes(num_topk, idx_bytes, num_scales)
+    idx_w, weight_w, scale_w = _meta_words(num_topk, idx_bytes)
+    expert_begin = rank * fx.Int32(num_experts_per_rank)
     cums = []
     pendings = []
     starts = []
@@ -554,32 +642,58 @@ def _copy_received(
         else:
             _copy_row(
                 _addr(outputs["x"], 0, row, hidden_bytes),
-                _addr(local, layout["x"], row, hidden_bytes),
+                _addr(local, layout["x"], row, layout["stride"]),
                 hidden_bytes,
                 FANOUT_PIECE_BYTES,
                 load_cache_modifier=SYS_LOAD,
             )
-        if lane_id == fx.Int32(0):
-            _st_sys(outputs["src_idx"], row, _ld_sys(local + fx.Int64(layout["src_idx"]), row))
-        if fx.const_expr(num_topk > 0):
-            if lane_id < fx.Int32(num_topk):
-                elem = row * fx.Int32(num_topk) + lane_id
-                _st_sys(
-                    outputs["topk_idx"],
-                    elem,
-                    _ld_sys(local + fx.Int64(layout["topk_idx"]), elem, dtype=idx_dtype),
-                )
-                _st_sys(
-                    outputs["topk_weights"],
-                    elem,
-                    _ld_sys(local + fx.Int64(layout["topk_weights"]), elem, dtype=fx.T.f32),
-                )
-        if fx.const_expr(num_scales > 0):
-            for u in range_constexpr((num_scales + WARP_SIZE - 1) // WARP_SIZE):
-                scale_idx = lane_id + fx.Int32(u * WARP_SIZE)
-                if scale_idx < fx.Int32(num_scales):
-                    elem = row * fx.Int32(num_scales) + scale_idx
-                    _st_sys(outputs["x_scales"], elem, _ld_sys(local + fx.Int64(layout["x_scales"]), elem))
+        # the metadata slot, a word a lane, into the outputs: of the global expert indices only ours stay,
+        # the others read -1 and weigh 0
+        meta = _addr(local, layout["meta"], row, layout["stride"])
+        for u in range_constexpr(meta_bytes // (4 * WARP_SIZE)):
+            w = lane_id + fx.Int32(u * WARP_SIZE)
+            if w < fx.Int32(scale_w + num_scales):
+                value = _ld_sys(meta, w)
+                if w == fx.Int32(0):
+                    _st_sys(outputs["src_idx"], row, value)
+                if fx.const_expr(num_topk > 0 and u * WARP_SIZE < scale_w):
+                    in_idx = (w >= fx.Int32(idx_w)) & (w < fx.Int32(weight_w))
+                    in_weight = (w >= fx.Int32(weight_w)) & (w < fx.Int32(scale_w))
+                    if in_idx | in_weight:
+                        k = arith.select(
+                            in_idx, (w - fx.Int32(idx_w)) // fx.Int32(idx_words), w - fx.Int32(weight_w)
+                        )
+                        expert = _ld_sys(meta, fx.Int32(idx_w) + k * fx.Int32(idx_words))
+                        is_local = (expert >= expert_begin) & (
+                            expert < expert_begin + fx.Int32(num_experts_per_rank)
+                        )
+                        local_expert = arith.select(is_local, expert - expert_begin, fx.Int32(-1))
+                        if in_idx:
+                            word = local_expert
+                            if fx.const_expr(idx_words == 2):
+                                # an int64 index: its high word is the sign of the low one
+                                high = (w - fx.Int32(idx_w)) % fx.Int32(2) == fx.Int32(1)
+                                word = arith.select(
+                                    high,
+                                    arith.select(local_expert < fx.Int32(0), fx.Int32(-1), fx.Int32(0)),
+                                    word,
+                                )
+                            _st_sys(
+                                outputs["topk_idx"],
+                                row * fx.Int32(weight_w - idx_w) + w - fx.Int32(idx_w),
+                                word,
+                            )
+                        if in_weight:
+                            _st_sys(
+                                outputs["topk_weights"],
+                                row * fx.Int32(num_topk) + k,
+                                arith.select(is_local, value, fx.Int32(0)),
+                            )
+                if fx.const_expr(num_scales > 0 and (u + 1) * WARP_SIZE > scale_w):
+                    if w >= fx.Int32(scale_w):
+                        _st_sys(
+                            outputs["x_scales"], row * fx.Int32(num_scales) + w - fx.Int32(scale_w), value
+                        )
         j = j + fx.Int32(NUM_WARPS)
     fx.gpu.barrier()
     if thread_id < fx.Int32(num_ranks):
@@ -604,6 +718,9 @@ def _make_dispatch_v2(
     assert WARP_SIZE % NUM_WARPS == 0
     num_experts_per_rank = num_experts // num_ranks if num_topk > 0 else 0
     layout, _ = dispatch_v2_layout(num_nvl_bytes, hidden_bytes, num_topk, topk_idx_bytes, num_scales)
+    meta_bytes = dispatch_v2_meta_bytes(num_topk, topk_idx_bytes, num_scales)
+    idx_w, weight_w, scale_w = _meta_words(num_topk, topk_idx_bytes)
+    idx_words = topk_idx_bytes // 4
     tile = NUM_THREADS
     # LDS: [num_ranks] running stream indices, [num_ranks] the channel's first stream indices,
     # [NUM_WARPS][num_ranks] warp bases, [tile][num_ranks] slots, and per source rank its received
@@ -614,9 +731,12 @@ def _make_dispatch_v2(
     lds_slot = lds_warp + NUM_WARPS * num_ranks
     lds_recv = lds_slot + tile * num_ranks
     lds_words = lds_recv + 4 * num_ranks
-    # with TDM, a row buffer per warp; a row that does not fit moves through it in pieces
+    # with TDM, a row buffer per warp, room for the row and its metadata slot; a row that does not fit moves
+    # through it in pieces
     lds_rows = _align(lds_words * 4, 128)
-    row_buffer_bytes = min(_align(hidden_bytes, 128), (MAX_LDS_BYTES - lds_rows) // NUM_WARPS // 128 * 128)
+    row_buffer_bytes = min(
+        _align(hidden_bytes + meta_bytes, 128), (MAX_LDS_BYTES - lds_rows) // NUM_WARPS // 128 * 128
+    )
     if USE_TDM:
         lds_words = (lds_rows + NUM_WARPS * row_buffer_bytes) // 4
     # read here and passed down, not read in the helpers, so that they are part of FlyDSL's kernel cache key
@@ -691,10 +811,12 @@ def _make_dispatch_v2(
             st_lds(lds, fx.Int32(lds_recv + 3 * num_ranks) + thread_id, fx.Int32(-1))
         fx.gpu.barrier()
 
-        # per destination: where our rank's tokens start in its receive order, and where each
-        # output goes -- its heap, or for our own rank the output tensors themselves
+        # per destination: where our rank's tokens start in its receive order, and where its rows go --
+        # its heap, or for our own rank the output tensors themselves
         rank_offsets = []
-        dst_bases = {name: [] for name in ("x", "src_idx", "topk_idx", "topk_weights", "x_scales")}
+        dst_x = []
+        is_peer = []
+        is_own = []
         outputs = {
             "x": tensor_addr(RECV_X),
             "src_idx": tensor_addr(RECV_SRC_IDX),
@@ -704,9 +826,9 @@ def _make_dispatch_v2(
         }
         for d in range_constexpr(num_ranks):
             peer = _load_ptr(buffer_ptrs_res, fx.Int32(d))
-            is_own = rank == fx.Int32(d)
-            for name, bases in dst_bases.items():
-                bases.append(arith.select(is_own, outputs[name], peer + fx.Int64(layout[name])))
+            dst_x.append(arith.select(rank == fx.Int32(d), outputs["x"], peer + fx.Int64(layout["x"])))
+            is_peer.append(rank != fx.Int32(d))
+            is_own.append(rank == fx.Int32(d))
             offset = _uniform_load_i32(
                 rank_prefix_res,
                 arith.select(rank > fx.Int32(0), (rank - fx.Int32(1)) * fx.Int32(num_ranks), fx.Int32(0))
@@ -722,6 +844,9 @@ def _make_dispatch_v2(
             )
         tail_base = (epoch << fx.Int32(TAIL_EPOCH_SHIFT)) - ld_lds(lds, fx.Int32(lds_chan_start) + thread_id)
 
+        meta_topk_idx_res = create_buffer_resource(TOPK_IDX, max_size=True)
+        meta_topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
+        meta_x_scales_res = create_buffer_resource(X_SCALES, max_size=True)
         tile_start = token_start
         while tile_start < token_end:
             # ---- the stream index of each token of the tile, per destination ----
@@ -770,6 +895,43 @@ def _make_dispatch_v2(
                     is_routed = slot >= fx.Int32(0)
                     rows.append(rank_offsets[d] + arith.select(is_routed, slot, fx.Int32(0)))
                     routed.append(is_routed)
+                # the token's metadata slot as every peer gets it, a word a lane (_meta_words): its global
+                # expert indices and every weight, of which each receiver keeps its own experts'
+                meta_values = []
+                for u in range_constexpr(meta_bytes // (4 * WARP_SIZE)):
+                    w = lane_id + fx.Int32(u * WARP_SIZE)
+                    value = arith.select(w == fx.Int32(0), t, fx.Int32(0))
+                    if fx.const_expr(num_topk > 0 and u * WARP_SIZE < scale_w):
+                        in_idx = (w >= fx.Int32(idx_w)) & (w < fx.Int32(weight_w))
+                        in_weight = (w >= fx.Int32(weight_w)) & (w < fx.Int32(scale_w))
+                        k = arith.select(
+                            in_idx,
+                            (w - fx.Int32(idx_w)) // fx.Int32(idx_words),
+                            arith.select(in_weight, w - fx.Int32(weight_w), fx.Int32(0)),
+                        )
+                        elem = t * fx.Int32(num_topk) + k
+                        expert = load_index(meta_topk_idx_res, elem, TOPK_IDX.element_type)
+                        weight = buffer_load(meta_topk_weights_res, elem, vec_width=1, dtype=fx.T.f32)
+                        idx_word = expert
+                        if fx.const_expr(idx_words == 2):
+                            # an int64 index: its high word is the sign of the low one
+                            high = (w - fx.Int32(idx_w)) % fx.Int32(2) == fx.Int32(1)
+                            idx_word = arith.select(
+                                high, arith.select(expert < fx.Int32(0), fx.Int32(-1), fx.Int32(0)), expert
+                            )
+                        value = arith.select(in_idx, idx_word, value)
+                        value = arith.select(
+                            in_weight, fx.arith.ArithValue(weight).bitcast(fx.Int32.ir_type), value
+                        )
+                    if fx.const_expr(num_scales > 0 and (u + 1) * WARP_SIZE > scale_w):
+                        in_scale = (w >= fx.Int32(scale_w)) & (w < fx.Int32(scale_w + num_scales))
+                        scale_idx = arith.select(in_scale, w - fx.Int32(scale_w), fx.Int32(0))
+                        scale = load_i32(
+                            meta_x_scales_res, t * scale_token_stride + scale_idx * scale_hidden_stride
+                        )
+                        value = arith.select(in_scale, scale, value)
+                    meta_values.append(value)
+
                 if fx.const_expr(USE_TDM):
                     _send_x_row(
                         row_lds,
@@ -777,16 +939,27 @@ def _make_dispatch_v2(
                         t,
                         hidden_bytes,
                         row_buffer_bytes,
-                        dst_bases["x"],
+                        dst_x,
                         rows,
                         routed,
+                        is_peer,
+                        is_own,
+                        meta_values,
+                        meta_bytes,
+                        layout["stride"],
                         redo_ticks,
                         redo_max,
                     )
                 else:
                     dst_resources = [
                         create_buffer_resource_from_addr(
-                            _uniform_i64(_addr(dst_bases["x"][d], 0, rows[d], hidden_bytes)),
+                            _uniform_i64(
+                                arith.select(
+                                    is_own[d],
+                                    _addr(dst_x[d], 0, rows[d], hidden_bytes),
+                                    _addr(dst_x[d], 0, rows[d], layout["stride"]),
+                                )
+                            ),
                             num_records_bytes=arith.select(routed[d], fx.Int32(hidden_bytes), fx.Int32(0)),
                         )
                         for d in range(num_ranks)
@@ -795,11 +968,18 @@ def _make_dispatch_v2(
                         _uniform_i64(_addr(x_base, 0, t, hidden_bytes)), num_records_bytes=hidden_bytes
                     )
                     _fanout_row(dst_resources, src_res, hidden_bytes)
+                    for d in range_constexpr(num_ranks):
+                        if routed[d] & is_peer[d]:
+                            meta = _addr(dst_x[d], hidden_bytes, rows[d], layout["stride"])
+                            for u in range_constexpr(len(meta_values)):
+                                # every lane stores: whole lines
+                                _st_sys(meta, lane_id + fx.Int32(u * WARP_SIZE), meta_values[u])
 
                 for d in range_constexpr(num_ranks):
-                    if routed[d]:
+                    # our own rows: their metadata straight into the outputs
+                    if routed[d] & is_own[d]:
                         if lane_id == fx.Int32(0):
-                            _st_sys(dst_bases["src_idx"][d], rows[d], t)
+                            _st_sys(outputs["src_idx"], rows[d], t)
                         if fx.const_expr(num_topk > 0):
                             if lane_id < fx.Int32(num_topk):
                                 topk_idx_res = create_buffer_resource(TOPK_IDX, max_size=True)
@@ -814,11 +994,11 @@ def _make_dispatch_v2(
                                 local_expert = arith.select(is_local, expert - expert_begin, fx.Int32(-1))
                                 weight = buffer_load(topk_weights_res, elem, vec_width=1, dtype=fx.T.f32)
                                 if fx.const_expr(topk_idx_bytes == 8):
-                                    _st_sys(dst_bases["topk_idx"][d], dst_elem, _i64(local_expert))
+                                    _st_sys(outputs["topk_idx"], dst_elem, _i64(local_expert))
                                 else:
-                                    _st_sys(dst_bases["topk_idx"][d], dst_elem, local_expert)
+                                    _st_sys(outputs["topk_idx"], dst_elem, local_expert)
                                 _st_sys(
-                                    dst_bases["topk_weights"][d],
+                                    outputs["topk_weights"],
                                     dst_elem,
                                     arith.select(is_local, weight, fx.Float32(0.0)),
                                 )
@@ -832,7 +1012,7 @@ def _make_dispatch_v2(
                                         t * scale_token_stride + scale_idx * scale_hidden_stride,
                                     )
                                     _st_sys(
-                                        dst_bases["x_scales"][d],
+                                        outputs["x_scales"],
                                         rows[d] * fx.Int32(num_scales) + scale_idx,
                                         value,
                                     )
@@ -883,6 +1063,8 @@ def _make_dispatch_v2(
                 row_buffer_bytes,
                 redo_ticks,
                 redo_max,
+                rank,
+                num_experts_per_rank,
             )
             remaining = fx.Int32(0)
             for s in range_constexpr(num_ranks):
