@@ -6164,8 +6164,39 @@ _KWARGS_KEYS = {
         },
     },
     # The variable-K wgrad with accumulate=1 (fp32 main_grad). It runs the plain non-persistent epilogue,
-    # so only the knobs that leave that path are keyed here: tile order and XCD remap. Bit-identical.
+    # so only the knobs that keep that path are keyed here: tile shape / ring depth, tile order and XCD remap.
+    # Bit-identical: none of them changes an element's reduction order.
     "vk_accum": {
+        # Muse Spark wgrad fc1 (OUT 8192 x 4096): a 128 x 128 x 64 tile, whose ~144 KB LDS arena and smaller
+        # accumulator let two workgroups share a CU, so one computes while the other runs the main_grad
+        # read-modify-write epilogue (half the fp32 tile still fits a ring buffer, so it stays on "tdm").
+        (8192, 4096, 512): {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "m_warp": 2,
+            "n_warp": 2,
+            "num_buffers": 2,
+            "group_m": 8,
+            "num_xcd": 8,
+            "xcd_band": 512,
+        },
+        (8192, 4096, 1024): {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "m_warp": 2,
+            "n_warp": 2,
+            "num_buffers": 4,
+        },
+        (8192, 4096, 2048): {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "m_warp": 2,
+            "n_warp": 2,
+            "num_buffers": 4,
+        },
         # Muse Spark wgrad fc2 (OUT 4096 x 4096) at 512 / 1024 / 2048 rows per expert (EP4 / EP8, MBS 1 / 2)
         (4096, 4096, 512): {"group_m": 8, "num_xcd": 8, "xcd_band": 256},
         (4096, 4096, 1024): {"group_m": 8, "num_xcd": 8, "xcd_band": 256},

@@ -240,24 +240,41 @@ def test_backend_takes_accumulating_calls(impl, monkeypatch):
     assert _max_rel_err(out, old + ref) < 1e-5
 
 
-MUSE_FC2_KEYS = [(LATENT, FFN, avg) for avg in (512, 1024, 2048)]
+MUSE_WGRAD_KEYS = [
+    (out_m, out_n, avg) for out_m, out_n in ((2 * FFN, LATENT), (LATENT, FFN)) for avg in (512, 1024, 2048)
+]
+# knobs the non-persistent accumulate path keeps
+ACCUM_KNOBS = {
+    "BLOCK_M",
+    "BLOCK_N",
+    "BLOCK_K",
+    "m_warp",
+    "n_warp",
+    "num_buffers",
+    "group_m",
+    "num_xcd",
+    "xcd_band",
+}
 
 
-def test_muse_fc2_keys_reach_accumulating_calls_only():
-    """The wgrad fc2 keys (tile order / XCD remap) apply to accumulate=1 calls; overwrites keep theirs."""
+def test_muse_wgrad_keys_reach_accumulating_calls_only():
+    """The Muse wgrad keys apply to accumulate=1 calls; overwrites keep theirs."""
     vk = _vk()
-    for key in MUSE_FC2_KEYS:
+    for key in MUSE_WGRAD_KEYS:
         want = vk._KWARGS_KEYS["vk_accum"][key]
-        assert set(want) <= {"group_m", "num_xcd", "xcd_band"}, "only knobs the accumulate path keeps"
+        assert set(want) <= ACCUM_KNOBS
         assert vk._keyed_kwargs("vk_accum", key, NUM_EXPERTS, 0, {"out": None, "accumulate": 1}) == want
         assert vk._keyed_kwargs("vk", key, NUM_EXPERTS, 0, {}) == {}
         assert vk._keyed_kwargs("vk_accum", key, NUM_EXPERTS, 0, {"accumulate": 1, "group_m": 16}) == {}
+        tm, tn = want.get("BLOCK_M", 256), want.get("BLOCK_N", 256)
+        assert key[0] % tm == 0 and key[1] % tn == 0, "accumulate needs whole output tiles"
 
 
-def test_muse_fc2_key_is_bit_identical():
-    """The keyed tile order and XCD remap move a schedule, never a reduction order."""
-    a, b, lens, offs, _ = _problem(LATENT, FFN, None)
-    old = _old_out((lens.numel(), LATENT, FFN))
+@pytest.mark.parametrize("out_m, out_n", [(2 * FFN, LATENT), (LATENT, FFN)], ids=["fc1", "fc2"])
+def test_muse_wgrad_key_is_bit_identical(out_m, out_n):
+    """The keyed tile shape, ring depth, tile order and XCD remap never change a reduction order."""
+    a, b, lens, offs, _ = _problem(out_m, out_n, None)
+    old = _old_out((lens.numel(), out_m, out_n))
     keyed, untuned = old.clone(), old.clone()
     run = _vk().grouped_gemm_bf16_variable_k_flydsl_kernel
     run(a, b, offs, masked_k=lens, out=keyed, accumulate=1)
