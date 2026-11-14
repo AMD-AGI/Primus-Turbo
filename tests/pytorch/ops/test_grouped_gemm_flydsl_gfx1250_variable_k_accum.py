@@ -240,6 +240,31 @@ def test_backend_takes_accumulating_calls(impl, monkeypatch):
     assert _max_rel_err(out, old + ref) < 1e-5
 
 
+MUSE_FC2_KEYS = [(LATENT, FFN, avg) for avg in (512, 1024, 2048)]
+
+
+def test_muse_fc2_keys_reach_accumulating_calls_only():
+    """The wgrad fc2 keys (tile order / XCD remap) apply to accumulate=1 calls; overwrites keep theirs."""
+    vk = _vk()
+    for key in MUSE_FC2_KEYS:
+        want = vk._KWARGS_KEYS["vk_accum"][key]
+        assert set(want) <= {"group_m", "num_xcd", "xcd_band"}, "only knobs the accumulate path keeps"
+        assert vk._keyed_kwargs("vk_accum", key, NUM_EXPERTS, 0, {"out": None, "accumulate": 1}) == want
+        assert vk._keyed_kwargs("vk", key, NUM_EXPERTS, 0, {}) == {}
+        assert vk._keyed_kwargs("vk_accum", key, NUM_EXPERTS, 0, {"accumulate": 1, "group_m": 16}) == {}
+
+
+def test_muse_fc2_key_is_bit_identical():
+    """The keyed tile order and XCD remap move a schedule, never a reduction order."""
+    a, b, lens, offs, _ = _problem(LATENT, FFN, None)
+    old = _old_out((lens.numel(), LATENT, FFN))
+    keyed, untuned = old.clone(), old.clone()
+    run = _vk().grouped_gemm_bf16_variable_k_flydsl_kernel
+    run(a, b, offs, masked_k=lens, out=keyed, accumulate=1)
+    run(a, b, offs, masked_k=lens, out=untuned, accumulate=1, group_m=16)
+    assert torch.equal(keyed, untuned)
+
+
 def test_refuses_what_it_cannot_add_into():
     vk = _vk()
     run = vk.grouped_gemm_bf16_variable_k_flydsl_kernel

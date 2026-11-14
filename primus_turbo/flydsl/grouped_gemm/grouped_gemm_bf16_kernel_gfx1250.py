@@ -6107,18 +6107,27 @@ _KWARGS_KEYS = {
             "xcd_band": 256,
         },
     },
+    # The variable-K wgrad with accumulate=1 (fp32 main_grad). It runs the plain non-persistent epilogue,
+    # so only the knobs that leave that path are keyed here: tile order and XCD remap. Bit-identical.
+    "vk_accum": {
+        # Muse Spark wgrad fc2 (OUT 4096 x 4096) at 512 / 1024 / 2048 rows per expert (EP4 / EP8, MBS 1 / 2)
+        (4096, 4096, 512): {"group_m": 8, "num_xcd": 8, "xcd_band": 256},
+        (4096, 4096, 1024): {"group_m": 8, "num_xcd": 8, "xcd_band": 256},
+        (4096, 4096, 2048): {"group_m": 8, "num_xcd": 8, "xcd_band": 512},
+    },
 }
 _KWARGS_PASSTHROUGH = {
     "nt": frozenset({"out", "out_dtype", "m_tiles"}),
     "nn": frozenset({"out", "out_dtype", "m_tiles"}),
     "vk": frozenset({"out", "out_dtype", "masked_k", "expert_table"}),
+    "vk_accum": frozenset({"out", "out_dtype", "masked_k", "expert_table", "accumulate", "accum_impl"}),
 }
 
 
 def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:
     """The key's kwargs for this call, or {} when the call tunes anything or the shape is not a key."""
     # The positional extras the entry points take: out_dtype (NT / NN), masked_k and out_dtype (variable-K).
-    if n_pos > (2 if kind == "vk" else 1) or not set(kw) <= _KWARGS_PASSTHROUGH[kind]:
+    if n_pos > (2 if kind in ("vk", "vk_accum") else 1) or not set(kw) <= _KWARGS_PASSTHROUGH[kind]:
         return {}
     keyed = _KWARGS_KEYS[kind].get(key)
     if keyed is None:
@@ -6130,7 +6139,7 @@ def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:
         tiles = G * (-(-key[0] // tm)) * (-(-key[1] // tn))
         if tiles % keyed["persist"] or tiles // keyed["persist"] < 2:
             return {}
-    if kind != "vk" and keyed.get("vec_dec") and G > 32:
+    if kind in ("nt", "nn") and keyed.get("vec_dec") and G > 32:
         # The NT and NN launchers drop vec_dec above 32 experts, and nt_seam bit 2 then refuses the set.
         return {}
     return dict(keyed)
@@ -6166,7 +6175,8 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
 ):
     if a.dim() == 2 and b.dim() == 2:
         G = max(group_k_offsets.numel() - 1, 1)
-        kw.update(_keyed_kwargs("vk", (a.shape[1], b.shape[1], max(1, a.shape[0] // G)), G, len(args), kw))
+        kind = "vk_accum" if kw.get("accumulate") else "vk"
+        kw.update(_keyed_kwargs(kind, (a.shape[1], b.shape[1], max(1, a.shape[0] // G)), G, len(args), kw))
     return _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(a, b, group_k_offsets, *args, **kw)
 
 
