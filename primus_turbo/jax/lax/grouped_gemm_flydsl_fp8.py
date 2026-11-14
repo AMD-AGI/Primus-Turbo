@@ -35,15 +35,16 @@ def _k8():
 
 
 def _compile_with_hints(launch, args, out_index=2):
-    import flydsl.compiler as flyc  # noqa: F401
+    import flydsl.compiler as flyc
+    import torch
     from flydsl.compiler.kernel_function import CompilationContext
 
-    # The kernel module no longer re-exports these (FlyDSL autotune unification, #587).
-    from primus_turbo.flydsl.utils.gemm_helper import compile_with_scratch_out
-
+    # Compile against a scratch output (the compile runs the kernel once), under the kernel's schedule
+    # hints. Done here rather than through the kernel module, which no longer re-exports these (#587).
     K8 = _k8()
+    scratch = torch.zeros_like(args[out_index])
     with CompilationContext.compile_hints(K8._GG_SCHED_HINTS):
-        return compile_with_scratch_out(launch, args, out_index=out_index)
+        return flyc.compile(launch, *args[:out_index], scratch, *args[out_index + 1 :])
 
 
 def _dummies(torch, dev, a_shape, b_shape, c_shape, G, a_scale=True):
