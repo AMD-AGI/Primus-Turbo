@@ -159,10 +159,16 @@ def grouped_gemm_bf16_variable_k_tile(
     a_base=None,
     k_hook=None,
     k_hook_from=None,
+    a_split=None,
+    store_c=None,
 ):
-    """``a_base`` (i64 address) replaces ``A``'s. ``k_hook(c)`` runs on every wave before the A
-    loads of K chunk ``c`` (``CHUNK * BLOCK_K`` rows, prefetching two ``BLOCK_K`` steps ahead) and
-    ``k_hook(-1)`` before the prologue's; chunks below ``k_hook_from`` (an i32) skip it and run a
+    """``a_split=(A_hi, lo_stride, hi_stride, lo_col, hi_col)``: the tile's two A column halves
+    (``BLOCK_M // 2`` each) start at column ``lo_col`` of ``A`` and ``hi_col`` of ``A_hi``, whose
+    rows are ``lo_stride`` / ``hi_stride`` elements apart (compile time), instead of ``A``'s
+    ``block_m * BLOCK_M`` onward. ``store_c`` (an object with ``StoreCBf16.store_band16``) replaces
+    the bf16 store of ``C``. ``a_base`` (i64 address) replaces ``A``'s. ``k_hook(c)`` runs on every
+    wave before the A loads of K chunk ``c`` (``CHUNK * BLOCK_K`` rows, prefetching two ``BLOCK_K``
+    steps ahead) and ``k_hook(-1)`` before the prologue's; chunks below ``k_hook_from`` (an i32) skip it and run a
     loop without it, as a hook in the loop body slows every chunk even when it does nothing.
     ``persistent="staggered"`` keeps the one-barrier offset of the two wave halves and realigns them
     at the tile's end (cf. ``dense_mma_pipeline_bf16``)."""
@@ -193,6 +199,11 @@ def grouped_gemm_bf16_variable_k_tile(
     b_base_off = _i64(m_start) * fx.Int64(OUT_N * 2)
     a_span = _i64(group_tokens) * _i64(out_m_rt) * fx.Int64(2)
     b_span = _i64(group_tokens) * _i64(out_n_rt) * fx.Int64(2)
+    a_stride = OUT_M if a_split is None else a_split[1]
+    if const_expr(a_split is not None):
+        assert a_base is None
+        a_base_off = _i64(m_start) * fx.Int64(a_stride * 2)
+        a_span = _i64(group_tokens) * fx.Int64(a_stride * 2)
     if const_expr(a_base is None):
         gA = make_bf16_buffer_tensor_rebased(A, bf16_ir, a_base_off, a_span)
     else:
@@ -201,15 +212,43 @@ def grouped_gemm_bf16_variable_k_tile(
     a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
     b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
-    gl_off_a = compute_global_swizzle_nn_bf16_wide(lane_id, wave_id, OUT_M, N_LDS_STEPS_A)
+    gl_off_a = compute_global_swizzle_nn_bf16_wide(lane_id, wave_id, a_stride, N_LDS_STEPS_A)
     gl_off_b = compute_global_swizzle_nn_bf16_wide(lane_id, wave_id, OUT_N, N_LDS_STEPS_B)
 
-    a0_off = block_m * BLOCK_M
-    a1_off = a0_off + LDS_BLOCK_M
     b0_off = block_n * BLOCK_N
     b1_off = b0_off + LDS_BLOCK_N
-    a_k_step = fx.Int32(BLOCK_K) * out_m_rt
     b_k_step = fx.Int32(BLOCK_K) * out_n_rt
+    a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, bf16_ir, wave_id, chunk_stride=lds_chunk_stride)
+    if const_expr(a_split is None):
+        a0_off = block_m * BLOCK_M
+        a1_off = a0_off + LDS_BLOCK_M
+        a_k_step = fx.Int32(BLOCK_K) * out_m_rt
+        a_halves = ((a_g2s, a0_off, a_k_step), (a_g2s, a1_off, a_k_step))
+    else:
+        A_hi, lo_stride, hi_stride, lo_col, hi_col = a_split
+        g_hi = make_bf16_buffer_tensor_rebased(
+            A_hi,
+            bf16_ir,
+            _i64(m_start) * fx.Int64(hi_stride * 2),
+            _i64(group_tokens) * fx.Int64(hi_stride * 2),
+        )
+        gl_off_hi = compute_global_swizzle_nn_bf16_wide(lane_id, wave_id, hi_stride, N_LDS_STEPS_A)
+        a_hi_g2s = G2SLoader(
+            fx.logical_divide(g_hi, fx.make_layout(1, 1)),
+            gl_off_hi,
+            N_LDS_STEPS_A,
+            bf16_ir,
+            wave_id,
+            chunk_stride=lds_chunk_stride,
+        )
+        a_halves = (
+            (a_g2s, lo_col, fx.Int32(BLOCK_K * lo_stride)),
+            (a_hi_g2s, hi_col, fx.Int32(BLOCK_K * hi_stride)),
+        )
+
+    def a_load(half, dst, k):
+        g2s, col, step = a_halves[half]
+        g2s.load(dst, col + k * step)
 
     NTA16 = N_TILES_A * 2
     NTB16 = (BLOCK_N // 16) // (2 * N_WAVE_N)
@@ -219,10 +258,11 @@ def grouped_gemm_bf16_variable_k_tile(
     b_s2r = S2RLoaderTr16x32Bf16Wide(wave_n, NTB16, chunk_stride=lds_chunk_stride)
     ACC_VEC_N = 4
     N_ACCUMS_EFF = N_ACCUMS16
-    a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, bf16_ir, wave_id, chunk_stride=lds_chunk_stride)
     b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, bf16_ir, wave_id, chunk_stride=lds_chunk_stride)
     out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-    if const_expr(trans_c):
+    if const_expr(store_c is not None):
+        assert not trans_c
+    elif const_expr(trans_c):
         store_c = StoreCBf16(C, G * OUT_N, OUT_M, out_ty, cache_modifier=c_cache_modifier)
     else:
         store_c = StoreCBf16(C, G * OUT_M, OUT_N, out_ty, cache_modifier=c_cache_modifier)
@@ -267,9 +307,9 @@ def grouped_gemm_bf16_variable_k_tile(
         b_g2s.load(lds.B_lds_cur_0, b0_off + 0 * b_k_step)
         if const_expr(k_hook is not None):
             k_hook(-1)
-        a_g2s.load(lds.A_lds_cur_0, a0_off + 0 * a_k_step)
+        a_load(0, lds.A_lds_cur_0, 0)
         b_g2s.load(lds.B_lds_cur_1, b1_off + 0 * b_k_step)
-        a_g2s.load(lds.A_lds_cur_1, a1_off + 0 * a_k_step)
+        a_load(1, lds.A_lds_cur_1, 0)
         # Divergent only holds for one tile per WG; a persistent loop needs every wave to
         # stop before the next tile's g2s reuses this LDS. Cf. dense_mma_pipeline_bf16.
         if const_expr(persistent is True):
@@ -278,7 +318,7 @@ def grouped_gemm_bf16_variable_k_tile(
             rocdl.s_barrier()
         wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
         b_g2s.load(lds.B_lds_next_0, b0_off + 1 * b_k_step)
-        a_g2s.load(lds.A_lds_next_0, a0_off + 1 * a_k_step)
+        a_load(0, lds.A_lds_next_0, 1)
         b_g2s.load(lds.B_lds_next_1, b1_off + 1 * b_k_step)
         wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
@@ -301,7 +341,7 @@ def grouped_gemm_bf16_variable_k_tile(
             # 4-buffer pipelined body: interleave s2r/g2s with the 4 mfma quadrants
             b0 = b_s2r.load(b_cur0)
             a0 = a_s2r.load(a_cur0)
-            a_g2s.load(a_next1, a1_off + (k + 1) * a_k_step)
+            a_load(1, a_next1, k + 1)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
             _mma_quad(acc00, a0, b0, live[0, 0])
@@ -321,7 +361,7 @@ def grouped_gemm_bf16_variable_k_tile(
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             # Both k+2 refills sit in the last phase, most-urgent first; issuing earlier only ages the line.
-            a_g2s.load(a_cur0, a0_off + (k + 2) * a_k_step)
+            a_load(0, a_cur0, k + 2)
             b_g2s.load(b_cur1, b1_off + (k + 2) * b_k_step)
             wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
             rocdl.sched_barrier(0)

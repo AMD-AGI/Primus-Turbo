@@ -15,6 +15,7 @@
 epoch bump of the last block out (see ``workspace.py`` for the protocol)."""
 
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith
 
@@ -46,10 +47,40 @@ STATE_EPOCH = 0
 STATE_EXIT = 1
 STATE_CLAIM = 2
 STATE_TILE = 3
+# AgGemm: own-row copy pieces claimed / done
+STATE_ASSIST = 4
+STATE_ASSIST_DONE = 5
+# AgGemm: tile claim counter of each XCD (MI355X: 8 XCDs, block i runs on XCD i % 8)
+NUM_XCDS = 8
+STATE_XCD_TILE = 6
 
 
 def i64_base(tensor):
     return fx.arith.ArithValue(arith.index_cast(fx.T.i64, extract_base_index(tensor)), signed=True)
+
+
+def opaque_tid(thread_index):
+    """``thread_index`` through an opaque move. Inside a claim loop over several unit kinds LICM
+    hoists every unit body's lane offsets out of their branches, and all of them live across the
+    loop and spill."""
+    return fx.arith.ArithValue(
+        _llvm.inline_asm(
+            fx.T.i32,
+            [fx.as_ir_value(cast(thread_index, fx.T.i32))],
+            "v_mov_b32 $0, $1",
+            "=v,v",
+            has_side_effects=True,
+        )
+    )
+
+
+def opaque_base(tensor):
+    """``i64_base(tensor)`` through an opaque move, for the same reason as ``opaque_tid``."""
+    return fx.arith.ArithValue(
+        _llvm.inline_asm(
+            fx.T.i64, [fx.as_ir_value(i64_base(tensor))], "s_mov_b64 $0, $1", "=s,s", has_side_effects=True
+        )
+    )
 
 
 @ASTRewriter.transform
@@ -117,13 +148,17 @@ def claim_unit(thread_index, state_base, claim_slot, counter=STATE_CLAIM):
 
 
 @ASTRewriter.transform
-def exit_and_bump_epoch(thread_index, state_base, epoch, grid):
-    """The last block out resets the counters and bumps the epoch; every block read it on entry."""
+def exit_and_bump_epoch(thread_index, state_base, epoch, grid, order="acq_rel", extra_counters=()):
+    """The last block out resets the counters and bumps the epoch; every block read it on entry.
+    ``order="relaxed"`` skips the L2 writeback / invalidate around the count; enough when every
+    claim of the block has returned before it exits and its flags carry their own release."""
     fx.gpu.barrier()
     if thread_index == fx.Int32(0):
-        arrived = atomic_add(state_base, fx.Int32(STATE_EXIT), fx.Int64(1), scope="agent", order="acq_rel")
+        arrived = atomic_add(state_base, fx.Int32(STATE_EXIT), fx.Int64(1), scope="agent", order=order)
         if arrived == fx.Int64(grid - 1):
             st(state_base, fx.Int32(STATE_EXIT), fx.Int64(0))
             st(state_base, fx.Int32(STATE_CLAIM), fx.Int64(0))
             st(state_base, fx.Int32(STATE_TILE), fx.Int64(0))
+            for counter in extra_counters:
+                st(state_base, fx.Int32(counter), fx.Int64(0))
             st(state_base, fx.Int32(STATE_EPOCH), epoch + fx.Int64(1))

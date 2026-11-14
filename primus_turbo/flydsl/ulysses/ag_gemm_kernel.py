@@ -19,8 +19,9 @@ Every rank holds ``T`` tokens of ``[q_latent | c_kv | k_pe]``. Push work copies 
 sequence (``src * T + t``), and raises the destination's flag ``(src, sub)``. The bank holds three
 row-major regions, each the ``A`` of one GEMM: ``Lq [R, Cq]``, ``Lc [R, Ckv]`` and ``PE [R, dr]``.
 
-GEMM tiles (claimed m-major, m-tiles in the order their rows land) wait for the flags of their rows
-and then read ``A`` straight from the bank:
+GEMM tiles wait for the flags of their rows and then read ``A`` straight from the bank. Every XCD
+claims from its own list: a fixed eighth of the columns of every m-tile, m-tiles in the order their
+rows land; a block whose list is drained takes from the other XCDs' lists.
 
     q tiles     q = Lq @ Wq^T                                   ``[R, h * (dn + dr)]``
     k tiles     k[..., :dn] = Lc @ Wk^T                         ``[R, h, dn]`` of ``k``
@@ -43,6 +44,7 @@ import torch
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr
 
+from primus_turbo.flydsl.deep_ep.common import ld_lds, st_lds
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
 from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
     _make_shared_storage,
@@ -51,13 +53,18 @@ from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
 from primus_turbo.flydsl.ulysses.a2a_gemm_kernel import _copy_rows
 from primus_turbo.flydsl.ulysses.common import (
     BLOCK_THREADS,
-    STATE_TILE,
+    NUM_XCDS,
+    STATE_ASSIST,
+    STATE_ASSIST_DONE,
+    STATE_XCD_TILE,
     SYS_NT,
     VEC_BF16,
     VEC_I32,
     claim_unit,
     exit_and_bump_epoch,
     i64_base,
+    opaque_base,
+    opaque_tid,
     spin_flags,
 )
 from primus_turbo.flydsl.ulysses.workspace import (
@@ -79,6 +86,8 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 )
 from primus_turbo.flydsl.utils.prims import (
     _readfirstlane_i32,
+    atomic_add,
+    cast,
     ceildiv,
     ld,
     memory_fence,
@@ -86,8 +95,10 @@ from primus_turbo.flydsl.utils.prims import (
     st,
 )
 
-# 16 B loads in flight per thread in a copy unit: under the GEMM's traffic a copy is latency bound
+# 16 B loads in flight per thread in a copy or push: under the GEMM's traffic a copy is latency bound
 _COPY_BATCH = 32
+# rows of a piece of the own rows that the compute blocks copy into the own bank at the start
+_ASSIST_ROWS = 32
 
 
 def _k_nope_store_c(dn, dr):
@@ -110,10 +121,9 @@ def _k_nope_store_c(dn, dr):
     return _StoreCKNope
 
 
-@ASTRewriter.transform
-def _push_unit(thread_index, sub, dst, dst_heap, bank_offset, xq_res, xkv_res, epoch, **c):
-    """Local rows of sub-tile ``sub`` into ``dst``'s three bank regions, then ``dst``'s flag."""
-    T, R_pad, Cq, Ckv, dr, SUB, rank = (c[k] for k in ("T", "R_pad", "Cq", "Ckv", "dr", "SUB", "rank"))
+def _copy_latent_rows(thread_index, t0, rows, dst_heap, bank_offset, xq_res, xkv_res, **c):
+    """Local rows ``[t0, t0 + rows)`` into ``dst``'s three bank regions (stores issued, not waited)."""
+    T, R_pad, Cq, Ckv, dr, rank = (c[k] for k in ("T", "R_pad", "Cq", "Ckv", "dr", "rank"))
     bank_res = create_buffer_resource_from_addr(
         dst_heap + bank_offset, num_records_bytes=R_pad * (Cq + Ckv + dr) * 2
     )
@@ -130,30 +140,41 @@ def _push_unit(thread_index, sub, dst, dst_heap, bank_offset, xq_res, xkv_res, e
         def coords(v, src_vpr=src_vpr, src_v0=src_v0, region=region, vpr=vpr):
             r = v // fx.Int32(vpr)
             col = v % fx.Int32(vpr)
-            t = sub * fx.Int32(SUB) + r
+            t = t0 + r
             src_word = (t * fx.Int32(src_vpr) + fx.Int32(src_v0) + col) * fx.Int32(VEC_I32)
             dst_word = fx.Int32(region) + ((t + fx.Int32(rank * T)) * fx.Int32(vpr) + col) * fx.Int32(VEC_I32)
             return src_word, dst_word, t < fx.Int32(T)
 
-        _copy_rows(thread_index, SUB * vpr, coords, src_res, bank_res, 0, SYS_NT)
+        _copy_rows(thread_index, rows * vpr, coords, src_res, bank_res, 0, SYS_NT, _COPY_BATCH)
+
+
+@ASTRewriter.transform
+def _push_unit(thread_index, sub, dst, dst_heap, bank_offset, xq_res, xkv_res, epoch, **c):
+    """Local rows of sub-tile ``sub`` into ``dst``'s three bank regions, then ``dst``'s flag."""
+    SUB, rank = c["SUB"], c["rank"]
+    _copy_latent_rows(thread_index, sub * fx.Int32(SUB), SUB, dst_heap, bank_offset, xq_res, xkv_res, **c)
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
     if thread_index == fx.Int32(0):
         flag_base = dst_heap + fx.Int64(c["flag_region"] * FLAG_REGION_BYTES)
-        st(flag_base, fx.Int32(rank * c["n_sub"]) + sub, epoch, scope="sys", order="release")
+        # no release (an L2 writeback per unit): the bank stores are system scope (SYS_NT), and the
+        # wait above retired them before the flag goes out
+        st(flag_base, fx.Int32(rank * c["n_sub"]) + sub, epoch, scope="sys", order="relaxed")
 
 
 @ASTRewriter.transform
 def _push_loop(
     thread_index, state_base, claim_slot, peers_base, bank_offset, xq_res, xkv_res, epoch, trace_base, **c
 ):
-    """Claim ``(sub, dst = rank + i)`` units, sub-major so every rank's early rows land first."""
+    """Claim ``(sub, dst = rank + 1 + i)`` units, sub-major so every rank's early rows land first (the
+    own rows go through ``_assist_loop``)."""
     num_ranks = c["num_ranks"]
-    num_units = c["n_sub"] * num_ranks
+    peers = max(1, num_ranks - 1)
+    num_units = c["n_sub"] * (num_ranks - 1)
     unit = claim_unit(thread_index, state_base, claim_slot)
     while unit < fx.Int32(num_units):
-        sub = unit // fx.Int32(num_ranks)
-        dst = (fx.Int32(c["rank"]) + unit % fx.Int32(num_ranks)) % fx.Int32(num_ranks)
+        sub = unit // fx.Int32(peers)
+        dst = (fx.Int32(c["rank"] + 1) + unit % fx.Int32(peers)) % fx.Int32(num_ranks)
         dst_heap = ld(peers_base, dst, dtype=fx.T.i64)
         if const_expr(trace_base is not None):
             if thread_index == fx.Int32(0):
@@ -163,6 +184,26 @@ def _push_loop(
             if thread_index == fx.Int32(0):
                 st(trace_base, fx.Int32(c["trace_units_at"]) + unit * fx.Int32(2) + 1, read_clock())
         unit = claim_unit(thread_index, state_base, claim_slot)
+
+
+@ASTRewriter.transform
+def _assist_loop(thread_index, state_base, assist_slot, my_base, bank_offset, xq_res, xkv_res, epoch, **c):
+    """Compute blocks first copy the own rows into the own bank, ``AR``-row pieces over every block
+    (a push unit is one latency-bound block, ~25 us for 64 rows); the last piece to finish raises
+    the own sub-tiles' flags."""
+    AR, n_assist, n_sub, rank = c["AR"], c["n_assist"], c["n_sub"], c["rank"]
+    piece = claim_unit(thread_index, state_base, assist_slot, STATE_ASSIST)
+    while piece < fx.Int32(n_assist):
+        _copy_latent_rows(thread_index, piece * fx.Int32(AR), AR, my_base, bank_offset, xq_res, xkv_res, **c)
+        fx.rocdl.s_waitcnt(0)
+        fx.gpu.barrier()
+        if thread_index == fx.Int32(0):
+            done = atomic_add(state_base, fx.Int32(STATE_ASSIST_DONE), fx.Int64(1), scope="agent")
+            if done == fx.Int64(n_assist - 1):
+                flag_base = my_base + fx.Int64(c["flag_region"] * FLAG_REGION_BYTES)
+                for j in range_constexpr(n_sub):
+                    st(flag_base, fx.Int32(rank * n_sub + j), epoch, scope="sys", order="relaxed")
+        piece = claim_unit(thread_index, state_base, assist_slot, STATE_ASSIST)
 
 
 def _row_slots(tile_m, BM, SUB, T, R, n_sub, i32=fx.Int32, select=arith.select, **_):
@@ -288,12 +329,12 @@ def _unit(
     bank_res = create_buffer_resource_from_addr(bank_addr, num_records_bytes=R_pad * (Cq + Ckv + dr) * 2)
     lc_bytes = R_pad * Cq * 2
     if tile_n >= fx.Int32(n_tiles):
-        _copy_unit(thread_index, bank_res, tile_m, tile_n - fx.Int32(n_tiles), OK, LQ, LC, **c)
+        _copy_unit(opaque_tid(thread_index), bank_res, tile_m, tile_n - fx.Int32(n_tiles), OK, LQ, LC, **c)
     elif tile_n < fx.Int32(nq_tiles):
         gemm_tile(
             make_bf16_fp16_tile_tensor(bank_addr, fx.Int64(0), R_pad * Cq),
-            make_bf16_fp16_tile_tensor(i64_base(WQ), fx.Int64(0), Nq * Cq),
-            make_bf16_fp16_tile_tensor(i64_base(OQ), fx.Int64(0), R * Nq),
+            make_bf16_fp16_tile_tensor(opaque_base(WQ), fx.Int64(0), Nq * Cq),
+            make_bf16_fp16_tile_tensor(opaque_base(OQ), fx.Int64(0), R * Nq),
             fx.Int32(R),
             fx.Int32(Nq),
             lds,
@@ -302,6 +343,7 @@ def _unit(
             K=Cq,
             n_tail=Nq % BN,
             persistent="staggered",
+            tid=opaque_tid(thread_index),
         )
     else:
         tk = tile_n - fx.Int32(nq_tiles)
@@ -309,8 +351,8 @@ def _unit(
         if tk < fx.Int32(nk_tiles):
             gemm_tile(
                 a_c,
-                make_bf16_fp16_tile_tensor(i64_base(WKV), fx.Int64(0), hl * dn * Ckv),
-                make_bf16_fp16_tile_tensor(i64_base(OK), fx.Int64(0), R * hl * (dn + dr)),
+                make_bf16_fp16_tile_tensor(opaque_base(WKV), fx.Int64(0), hl * dn * Ckv),
+                make_bf16_fp16_tile_tensor(opaque_base(OK), fx.Int64(0), R * hl * (dn + dr)),
                 fx.Int32(R),
                 fx.Int32(hl * (dn + dr)),
                 lds,
@@ -320,12 +362,13 @@ def _unit(
                 n_tail=0,
                 persistent="staggered",
                 store_c_cls=_k_nope_store_c(dn, dr),
+                tid=opaque_tid(thread_index),
             )
         else:
             gemm_tile(
                 a_c,
-                make_bf16_fp16_tile_tensor(i64_base(WKV), fx.Int64(hl * dn * Ckv * 2), hl * dv * Ckv),
-                make_bf16_fp16_tile_tensor(i64_base(OV), fx.Int64(0), R * hl * dv),
+                make_bf16_fp16_tile_tensor(opaque_base(WKV), fx.Int64(hl * dn * Ckv * 2), hl * dv * Ckv),
+                make_bf16_fp16_tile_tensor(opaque_base(OV), fx.Int64(0), R * hl * dv),
                 fx.Int32(R),
                 fx.Int32(hl * dv),
                 lds,
@@ -334,11 +377,43 @@ def _unit(
                 K=Ckv,
                 n_tail=0,
                 persistent="staggered",
+                tid=opaque_tid(thread_index),
             )
     if const_expr(trace_base is not None):
         fx.rocdl.s_waitcnt(0)
         if thread_index == fx.Int32(0):
             st(trace_base, q * fx.Int32(3) + 2, read_clock())
+
+
+@ASTRewriter.transform
+def _claim_xcd_unit(thread_index, state_base, claim_slot, UNITS, **c):
+    """Next claim of the block's XCD list (``_xcd_lists``); once that one is drained, of the other
+    XCDs' lists in turn. ``num_units`` when every list is drained."""
+    L, num_units = c["xcd_len"], c["num_units"]
+    if thread_index == fx.Int32(0):
+        units_res = create_buffer_resource(UNITS, num_records_bytes=NUM_XCDS * L * 4)
+        block_index, _b, _c = fx.block_idx
+        xcd = block_index % fx.Int32(NUM_XCDS)
+        s = fx.Int32(0)
+        unit = fx.Int32(num_units)
+        while s < fx.Int32(NUM_XCDS):
+            v = (xcd + s) % fx.Int32(NUM_XCDS)
+            i = cast(
+                atomic_add(state_base, fx.Int32(STATE_XCD_TILE) + v, fx.Int64(1), scope="agent"), fx.T.i32
+            )
+            inside = i < fx.Int32(L)
+            u = buffer_load(units_res, v * fx.Int32(L) + i, vec_width=1, dtype=fx.T.i32, mask=inside)
+            found = inside & (u < fx.Int32(num_units))
+            unit = arith.select(found, u, unit)
+            s = arith.select(found, fx.Int32(NUM_XCDS), s + fx.Int32(1))
+        st_lds(claim_slot, 0, unit)
+    # s_barrier does not wait for LDS traffic: drain the store, then the reads
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    unit = _readfirstlane_i32(ld_lds(claim_slot, 0))
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    return unit
 
 
 @ASTRewriter.transform
@@ -353,13 +428,14 @@ def _tile_loop(
     lds,
     epoch,
     trace_base,
+    UNITS,
     **c,
 ):
     num_units = c["num_units"]
-    q = claim_unit(thread_index, state_base, claim_slot, STATE_TILE)
+    q = _claim_xcd_unit(thread_index, state_base, claim_slot, UNITS, **c)
     while q < fx.Int32(num_units):
         _unit(thread_index, q, order_res, flag_base, bank_addr, *tensors, lds, epoch, trace_base, **c)
-        q = claim_unit(thread_index, state_base, claim_slot, STATE_TILE)
+        q = _claim_xcd_unit(thread_index, state_base, claim_slot, UNITS, **c)
 
 
 @functools.lru_cache(maxsize=64)
@@ -401,7 +477,8 @@ def _make_kernel(
     assert R * hl * (dn + dr) < 2**31, "i32 element offsets overflow"
     grid = min(num_units + num_push, num_cus)
     num_push = min(num_push, grid)
-    SharedStorage = _make_shared_storage(BM, BN, num_lds_row_idx_entries=1)
+    SharedStorage = _make_shared_storage(BM, BN, num_lds_row_idx_entries=3)
+    n_assist = ceildiv(T, _ASSIST_ROWS)
     consts = dict(
         T=T,
         R=R,
@@ -427,6 +504,9 @@ def _make_kernel(
         flag_region=flag_region,
         nt_vmcnt=nt_vmcnt,
         trace_units_at=3 * num_units,
+        AR=_ASSIST_ROWS,
+        n_assist=n_assist,
+        xcd_len=len(_xcd_lists(m_tiles, nq_tiles, nk_tiles, nv_tiles, copy_parts)[0]),
     )
 
     @flyc.kernel(name="ulysses_mla_ag_gemm_kernel", known_block_size=[BLOCK_THREADS, 1, 1])
@@ -441,6 +521,7 @@ def _make_kernel(
         LQ: fx.Tensor,
         LC: fx.Tensor,
         ORDER: fx.Tensor,
+        UNITS: fx.Tensor,
         PEER_PTRS: fx.Tensor,
         STATE: fx.Tensor,
         TRACE: fx.Tensor,
@@ -457,9 +538,21 @@ def _make_kernel(
         # debug timeline (s_memrealtime): [start, ready, end] per GEMM tile, then [start, end] per push unit
         trace_base = i64_base(TRACE) if trace else None
 
+        xq_res = create_buffer_resource(XQ, num_records_bytes=T * Cq * 2)
+        xkv_res = create_buffer_resource(XKV, num_records_bytes=T * (Ckv + dr) * 2)
+        if block_index >= fx.Int32(num_push):
+            _assist_loop(
+                thread_index,
+                state_base,
+                claim_slot + fx.Int32(8),
+                my_base,
+                bank_offset,
+                xq_res,
+                xkv_res,
+                epoch,
+                **consts,
+            )
         if block_index < fx.Int32(num_push):
-            xq_res = create_buffer_resource(XQ, num_records_bytes=T * Cq * 2)
-            xkv_res = create_buffer_resource(XKV, num_records_bytes=T * (Ckv + dr) * 2)
             _push_loop(
                 thread_index,
                 state_base,
@@ -488,9 +581,21 @@ def _make_kernel(
             lds,
             epoch,
             trace_base,
+            UNITS,
             **consts,
         )
-        exit_and_bump_epoch(thread_index, state_base, epoch, grid)
+        exit_and_bump_epoch(
+            thread_index,
+            state_base,
+            epoch,
+            grid,
+            order="relaxed",
+            extra_counters=(
+                STATE_ASSIST,
+                STATE_ASSIST_DONE,
+                *range(STATE_XCD_TILE, STATE_XCD_TILE + NUM_XCDS),
+            ),
+        )
 
     return kernel, grid
 
@@ -507,6 +612,7 @@ def _launch(
     LQ,
     LC,
     ORDER,
+    UNITS,
     PEER_PTRS,
     STATE,
     TRACE,
@@ -565,6 +671,7 @@ def _launch(
         LQ,
         LC,
         ORDER,
+        UNITS,
         PEER_PTRS,
         STATE,
         TRACE,
@@ -585,7 +692,8 @@ def ag_gemm_trace_len(T, num_ranks, hl, dn, dr, dv, BM=256, BN=256, SUB=64, copy
 
 @functools.lru_cache(maxsize=64)
 def _tile_order(T, num_ranks, rank, BM, SUB, device):
-    """m-tiles by the push step their last row lands at (all ranks push in step), own rows first."""
+    """The m-tiles of only own rows first (copied at the start by every compute block), then the
+    others by the push step their last row lands at (all ranks push in step)."""
     R = num_ranks * T
     keys = []
     for m in range(ceildiv(R, BM)):
@@ -595,8 +703,40 @@ def _tile_order(T, num_ranks, rank, BM, SUB, device):
             ((last if s == src_last else (s + 1) * T - 1) - s * T) // SUB
             for s in range(src_first, src_last + 1)
         )
-        keys.append((land, (src_first - rank) % num_ranks, m))
+        keys.append((src_first != rank or src_last != rank, land, (src_first - rank) % num_ranks, m))
     return torch.tensor([m for *_, m in sorted(keys)], dtype=torch.int32, device=device)
+
+
+@functools.lru_cache(maxsize=64)
+def _xcd_lists(m_tiles, nq, nk, nv, copy_parts):
+    """The claims (``pos * per_m + col``, ``pos`` in landing order) each XCD walks, padded to one
+    length with ``num_units``: XCD ``x`` takes column set ``x`` (an eighth of the q, k and v tiles and
+    of the copy units) of every m-tile, so its share of the weights stays in its L2. Measured on
+    MI355X against splitting the m-tiles too (an XCD takes a few m-tiles x a quarter / half / all of
+    the columns): 496 vs 507 / 507 / 528 us; the A rows read by all 8 XCDs at about the same time cost
+    less than weights fetched again per m-tile."""
+    per_m = nq + nk + nv + copy_parts
+    bounds = (0, nq, nq + nk, nq + nk + nv, per_m)
+    sets = [[] for _ in range(NUM_XCDS)]
+    for lo, hi in zip(bounds, bounds[1:]):
+        for x in range(NUM_XCDS):
+            sets[x] += range(lo + (hi - lo) * x // NUM_XCDS, lo + (hi - lo) * (x + 1) // NUM_XCDS)
+    lists = [[pos * per_m + col for pos in range(m_tiles) for col in cols] for cols in sets]
+    # the last tenth of a list (claimed after every row has landed) goes largest first: q tiles,
+    # then k / v tiles, then copy units, so the launch ends on short units. A fifth or more runs q
+    # tiles of rows that have not landed yet at n=4
+    kind = lambda u: 0 if u % per_m < nq else 1 if u % per_m < nq + nk + nv else 2  # noqa: E731
+    for lst in lists:
+        cut = len(lst) - len(lst) // 10
+        lst[cut:] = sorted(lst[cut:], key=lambda u: (kind(u), u))
+    L = max(map(len, lists))
+    return [lst + [m_tiles * per_m] * (L - len(lst)) for lst in lists]
+
+
+@functools.lru_cache(maxsize=64)
+def _xcd_table(m_tiles, nq, nk, nv, copy_parts, device):
+    lists = _xcd_lists(m_tiles, nq, nk, nv, copy_parts)
+    return torch.tensor([u for lst in lists for u in lst], dtype=torch.int32, device=device)
 
 
 def ulysses_mla_ag_gemm(
@@ -629,8 +769,10 @@ def ulysses_mla_ag_gemm(
     unless they are ``None``. ``trace`` (debug): an int64 tensor of ``ag_gemm_trace_len(...)``
     entries receiving the ``s_memrealtime`` timeline."""
     num_ranks, rank = workspace.num_ranks, workspace.rank
-    # enough push blocks to keep the links busy, measured on MI355X: 8 / 16 / 32 for 2 / 4 / 8 ranks
-    num_push = 4 * num_ranks if num_push is None else num_push
+    # push blocks, measured on MI355X at 32 loads in flight per thread: 3 per rank. At 8 ranks 2 per
+    # rank leave the push on the critical path (it ends past 85% of the launch), 4 take CUs from the
+    # GEMMs; 1 per rank starves the links
+    num_push = 3 * num_ranks if num_push is None else num_push
     T, Cq = xq.shape
     Ckv = xkv.shape[1] - dr
     hl = wq.shape[0] // (dn + dr)
@@ -645,12 +787,15 @@ def ulysses_mla_ag_gemm(
     )
     num_cus = torch.cuda.get_device_properties(xq.device).multi_processor_count
     order = _tile_order(T, num_ranks, rank, BM, SUB, xq.device)
+    nq_tiles, nk_tiles, nv_tiles = ceildiv(hl * (dn + dr), BN), hl * dn // BN, hl * dv // BN
+    units = _xcd_table(ceildiv(R, BM), nq_tiles, nk_tiles, nv_tiles, copy_parts, xq.device)
     run_launcher(
         _launch,
         *tensors,
         lq if save else q,
         lc if save else q,
         order,
+        units,
         workspace.peer_ptrs,
         workspace.state,
         workspace.state if trace is None else trace,

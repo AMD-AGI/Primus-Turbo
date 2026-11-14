@@ -19,6 +19,7 @@ gradients only fill the rank's head rows (zero elsewhere); the data/context-para
 all-reduce sums them into the full gradient.
 """
 
+import weakref
 from typing import Optional, Tuple
 
 import torch
@@ -59,20 +60,112 @@ def _rank_rows(w, n, rank):
     return w.view(n, w.shape[0] // n, w.shape[1])[rank]
 
 
+def _weight_cached(cache, weights, params, build):
+    """``build()`` cached per weight tensor and version. The entry holds weak references: a weight
+    freed and another allocated at its address (same pointer, version 0) must not hit."""
+    key = (*(w.data_ptr() for w in weights), *params)
+    versions = tuple(w._version for w in weights)
+    cached = cache.get(key)
+    if cached is not None and cached[1] == versions and all(r() is w for r, w in zip(cached[0], weights)):
+        return cached[2]
+    value = build()
+    cache[key] = (tuple(weakref.ref(w) for w in weights), versions, value)
+    return value
+
+
 _SPLIT_KV_WEIGHTS = {}
 
 
 def _split_kv_rows(w_kv_b, n, rank, heads, dn, dv):
     """The rank's ``kv_b`` rows as ``[k_nope of every local head; v of every local head]``, rebuilt
     only when the weight changes."""
-    key = (w_kv_b.data_ptr(), n, rank, heads, dn, dv)
-    cached = _SPLIT_KV_WEIGHTS.get(key)
-    if cached is not None and cached[0] == w_kv_b._version:
-        return cached[1]
+
+    def build():
+        w = _rank_rows(w_kv_b.detach(), n, rank).view(heads, dn + dv, -1)
+        return torch.cat((w[:, :dn].reshape(heads * dn, -1), w[:, dn:].reshape(heads * dv, -1)))
+
+    return _weight_cached(_SPLIT_KV_WEIGHTS, (w_kv_b,), (n, rank, heads, dn, dv), build)
+
+
+_DGRAD_WEIGHTS = {}
+
+
+def _dgrad_weights(w_q_b, w_kv_b, n, rank, heads, dn, dr, dv):
+    """The GemmRS operands (``gemm_rs_kernel``), rebuilt only when a weight changes: the rank's ``q_b``
+    rows transposed, ``B'`` transposed (every head's ``Wk_nope`` and the identity block summing the
+    heads' ``k_pe`` gradients) and the ``v`` rows transposed."""
+    return _weight_cached(
+        _DGRAD_WEIGHTS,
+        (w_q_b, w_kv_b),
+        (n, rank, heads, dn, dr, dv),
+        lambda: _build_dgrad_weights(w_q_b, w_kv_b, n, rank, heads, dn, dr, dv),
+    )
+
+
+def _build_dgrad_weights(w_q_b, w_kv_b, n, rank, heads, dn, dr, dv):
     w = _rank_rows(w_kv_b.detach(), n, rank).view(heads, dn + dv, -1)
-    split = torch.cat((w[:, :dn].reshape(heads * dn, -1), w[:, dn:].reshape(heads * dv, -1)))
-    _SPLIT_KV_WEIGHTS[key] = (w_kv_b._version, split)
-    return split
+    ckv = w.shape[-1]
+    wq_t = _rank_rows(w_q_b.detach(), n, rank).t().contiguous()
+    wk_t = torch.zeros(ckv + dr, heads, dn + dr, dtype=w.dtype, device=w.device)
+    wk_t[:ckv, :, :dn] = w[:, :dn].permute(2, 0, 1)
+    wk_t[ckv:, :, dn:] = torch.eye(dr, dtype=w.dtype, device=w.device)[:, None, :]
+    wv_t = w[:, dn:].permute(2, 0, 1).reshape(ckv, heads * dv).contiguous()
+    return wq_t, wk_t.view(ckv + dr, heads * (dn + dr)), wv_t
+
+
+def _dgrad_fused_supported(n, heads, cq, ckv, dn, dr, dv):
+    """Shapes the FlyDSL GemmRS covers (``gemm_rs_kernel``), on top of the AgGemm's; ``heads`` per
+    rank. A reduce unit polls one flag per lane: ``2 * (Cq / 256 + Ckv / 256 + 1)`` per source."""
+    return (
+        cq % 256 == 0
+        and ckv % 256 == 0
+        and 0 < dr <= 128
+        and dr % 8 == 0
+        and dn % 8 == 0
+        and (heads * (dn + dr)) % 64 == 0
+        and (heads * dv) % 64 == 0
+        and n * 2 * (cq // 256 + ckv // 256 + 1) <= 256
+    )
+
+
+def _dgrad_fused(
+    gq, gk, gv, w_q_b, w_kv_b, group, local_shape, heads, dn, dr, dv, kv_wgrad=None, q_wgrad=None
+):
+    """``d_q_latent`` / ``d_kv_latent`` (sbhd) through the GemmRS: the latent-gradient GEMMs with the
+    reduce-scatter of their partials fused in; ``kv_wgrad=(lc, d_w_kv)`` / ``q_wgrad=(lq, d_w_q)`` add
+    the weight gradients."""
+    from primus_turbo.flydsl.ulysses.gemm_rs_kernel import (
+        gemm_rs_bank_bytes,
+        ulysses_mla_gemm_rs,
+    )
+    from primus_turbo.flydsl.ulysses.workspace import (
+        REGION_MLA_GEMM_RS,
+        get_ulysses_workspace,
+    )
+
+    n, rank = group.size(), group.rank()
+    cq = w_q_b.shape[1]
+    ckv = w_kv_b.shape[1]
+    T = gq.shape[0] // n
+    d_q_latent = torch.empty(*local_shape[:-1], cq, dtype=gq.dtype, device=gq.device)
+    d_kv_latent = torch.empty(*local_shape[:-1], ckv + dr, dtype=gq.dtype, device=gq.device)
+    workspace = get_ulysses_workspace(group, gemm_rs_bank_bytes(n * T, cq, ckv, dr))
+    ulysses_mla_gemm_rs(
+        gq.contiguous(),
+        gk.contiguous(),
+        gv.contiguous(),
+        *_dgrad_weights(w_q_b, w_kv_b, n, rank, heads, dn, dr, dv),
+        d_q_latent.view(T, cq),
+        d_kv_latent.view(T, ckv + dr),
+        workspace,
+        dn=dn,
+        dr=dr,
+        dv=dv,
+        flag_region=REGION_MLA_GEMM_RS,
+        kv_wgrad=kv_wgrad,
+        q_wgrad=q_wgrad,
+    )
+    return d_q_latent, d_kv_latent
 
 
 def _fused_supported(qkv_format, heads, cq, ckv, dn, dr, dv):
@@ -183,6 +276,7 @@ class UlyssesMLALatentUpProjFunction(torch.autograd.Function):
         ctx.dims = (heads, cq, ckv, dn, dr, dv)
         ctx.group, ctx.qkv_format = group, qkv_format
         ctx.local_shape = q_latent.shape
+        ctx.fused = fused
         return q.view(*lead, heads, dn + dr), k.view(*lead, heads, dn + dr), v.view(*lead, heads, dv)
 
     @staticmethod
@@ -195,24 +289,53 @@ class UlyssesMLALatentUpProjFunction(torch.autograd.Function):
 
         gq = grad_q.reshape(rows, heads * (dn + dr))
         gk = grad_k.reshape(rows, heads, dn + dr)
-        gkv = torch.cat((gk[..., :dn], grad_v.reshape(rows, heads, dv)), dim=-1).view(rows, -1)
+        gv = grad_v.reshape(rows, heads, dv)
         wq_r, wkv_r = _rank_rows(w_q_b, n, rank), _rank_rows(w_kv_b, n, rank)
+        # the fused path never packs [dk_nope | dv]: the kv wgrad reads them in place
+        gkv = kv_wgrad = q_wgrad = None
+        d_w_q_b = torch.zeros_like(w_q_b) if ctx.needs_input_grad[2] else None
+        d_w_kv_b = torch.zeros_like(w_kv_b) if ctx.needs_input_grad[3] else None
 
-        partial = torch.empty(rows, cq + ckv + dr, dtype=grad_q.dtype, device=grad_q.device)
-        torch.matmul(gq, wq_r, out=partial[:, :cq])
-        torch.matmul(gkv, wkv_r, out=partial[:, cq : cq + ckv])
-        partial[:, cq + ckv :] = gk[..., dn:].float().sum(dim=1)
-        local_shape = (*ctx.local_shape[:-1], cq + ckv + dr)
-        local = _scatter_rows(partial, group, qkv_format, local_shape)
-        d_q_latent, d_kv_latent = local[..., :cq].contiguous(), local[..., cq:].contiguous()
+        if ctx.fused and _dgrad_fused_supported(n, heads, cq, ckv, dn, dr, dv):
+            # the weight gradients' split-K tiles ride in the GemmRS launch, on the CUs its tail leaves idle
+            if d_w_q_b is not None and (heads * (dn + dr)) % 256 == 0:
+                q_wgrad = (lq.contiguous(), _rank_rows(d_w_q_b, n, rank))
+            if d_w_kv_b is not None and dn == 128 and dv == 128:
+                kv_wgrad = (lc.contiguous(), _rank_rows(d_w_kv_b, n, rank).view(heads, dn + dv, ckv))
+            d_q_latent, d_kv_latent = _dgrad_fused(
+                gq,
+                gk.view(rows, -1),
+                gv.view(rows, -1),
+                w_q_b,
+                w_kv_b,
+                group,
+                ctx.local_shape,
+                heads,
+                dn,
+                dr,
+                dv,
+                kv_wgrad,
+                q_wgrad,
+            )
+        else:
+            gkv = torch.cat((gk[..., :dn], gv), dim=-1).view(rows, -1)
+            partial = torch.empty(rows, cq + ckv + dr, dtype=grad_q.dtype, device=grad_q.device)
+            torch.matmul(gq, wq_r, out=partial[:, :cq])
+            torch.matmul(gkv, wkv_r, out=partial[:, cq : cq + ckv])
+            partial[:, cq + ckv :] = gk[..., dn:].float().sum(dim=1)
+            local_shape = (*ctx.local_shape[:-1], cq + ckv + dr)
+            local = _scatter_rows(partial, group, qkv_format, local_shape)
+            d_q_latent, d_kv_latent = local[..., :cq].contiguous(), local[..., cq:].contiguous()
 
-        d_w_q_b = d_w_kv_b = None
-        if ctx.needs_input_grad[2]:
-            d_w_q_b = torch.zeros_like(w_q_b)
+        if d_w_q_b is not None and q_wgrad is None:
             torch.matmul(gq.t(), lq, out=_rank_rows(d_w_q_b, n, rank))
-        if ctx.needs_input_grad[3]:
-            d_w_kv_b = torch.zeros_like(w_kv_b)
-            torch.matmul(gkv.t(), lc, out=_rank_rows(d_w_kv_b, n, rank))
+        if d_w_kv_b is not None and kv_wgrad is None:
+            if gkv is not None:
+                torch.matmul(gkv.t(), lc, out=_rank_rows(d_w_kv_b, n, rank))
+            else:
+                d_w_kv = _rank_rows(d_w_kv_b, n, rank).view(heads, dn + dv, ckv)
+                d_w_kv[:, :dn] = torch.matmul(gk[..., :dn].permute(1, 2, 0), lc)
+                d_w_kv[:, dn:] = (gv.view(rows, -1).t() @ lc).view(heads, dv, ckv)
         return d_q_latent, d_kv_latent, d_w_q_b, d_w_kv_b, None, None, None, None, None, None, None
 
 

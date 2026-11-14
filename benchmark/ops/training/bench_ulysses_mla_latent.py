@@ -19,7 +19,9 @@ Columns (us, median over iterations, max over ranks; ranks aligned and host laun
     serial    gemm + wgrad + comm
     overlap   max(gemm + wgrad, comm): the best a fused GEMM + exchange can reach
     op        the whole stage as one call: plain torch ops (pack / copies included) per head,
-              ``ulysses_mla_latent_up_proj`` (sbhd, RCCL or the fused AgGemm) for the latent forward
+              ``ulysses_mla_latent_up_proj`` (sbhd, RCCL or the fused AgGemm) for the latent forward,
+              its backward (RCCL or the fused GemmRS, wgrad in hipBLASLt) for the latent backward;
+              ``dgrad`` rows leave the weight grads out
     roofline  max(FLOPs / GEMM peak, off-rank bytes / link peak)
 
 plus the causal attention of the local heads over the full sequence as the scale of the stage.
@@ -136,17 +138,18 @@ def build(cfg, seq, b, group):
     def lat_bwd_wgrad():
         return gq_lat.t() @ lq_full, gkv_lat.t() @ lkv_full[:, :ckv]
 
-    ctx = SimpleNamespace(
-        saved_tensors=(lq_full, lkv_full[:, :ckv], wq, wkv),
-        dims=(hl, cq, ckv, dn, dr, dv),
-        group=group,
-        qkv_format="bshd",
-        local_shape=(b, s_local, cq),
-        needs_input_grad=(True, True, True, True),
-    )
-
-    def lat_bwd_unfused():
-        return UlyssesMLALatentUpProjFunction.backward(ctx, gq_full, gk_full, gv_full)
+    def lat_bwd(fused, wgrad=True):
+        # sbhd and bshd lay the rows out alike at mbs 1
+        ctx = SimpleNamespace(
+            saved_tensors=(lq_full, lkv_full[:, :ckv], wq, wkv),
+            dims=(hl, cq, ckv, dn, dr, dv),
+            group=group,
+            qkv_format="sbhd" if fused else "bshd",
+            local_shape=(s_local, b, cq) if fused else (b, s_local, cq),
+            needs_input_grad=(True, True, wgrad, wgrad),
+            fused=fused,
+        )
+        return lambda: UlyssesMLALatentUpProjFunction.backward(ctx, gq_full, gk_full, gv_full)
 
     up_flops = 2 * T * h * (cq * dq + ckv * (dn + dv))
     q_att, k_att, v_att = rnd(b, seq, hl, dq), rnd(b, seq, hl, dq), rnd(b, seq, hl, dv)
@@ -166,8 +169,29 @@ def build(cfg, seq, b, group):
             lat_bwd_gemm,
             lat_bwd_wgrad,
             ("reduce_scatter", lat_numel * n),
-            lat_bwd_unfused,
+            lat_bwd(False),
             2 * up_flops,
+        ),
+        "latent bwd (fused GemmRS)": (
+            lat_bwd_gemm,
+            lat_bwd_wgrad,
+            ("reduce_scatter", lat_numel * n),
+            lat_bwd(True),
+            2 * up_flops,
+        ),
+        "latent dgrad (reduce-scatter)": (
+            lat_bwd_gemm,
+            None,
+            ("reduce_scatter", lat_numel * n),
+            lat_bwd(False, wgrad=False),
+            up_flops,
+        ),
+        "latent dgrad (fused GemmRS)": (
+            lat_bwd_gemm,
+            None,
+            ("reduce_scatter", lat_numel * n),
+            lat_bwd(True, wgrad=False),
+            up_flops,
         ),
     }
     return stages, (q_att, k_att, v_att)

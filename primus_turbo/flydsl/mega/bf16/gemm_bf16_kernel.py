@@ -94,6 +94,14 @@ def _make_a_g2s(a_div, a_gl_offsets, a_row_idx, lane_id, wave_id, K, n_steps, LD
     )
 
 
+class _KExt:
+    """The second operand pair of a ``k_ext`` K loop (see ``dense_mma_pipeline_bf16``)."""
+
+    def __init__(self, a_g2s, b_g2s, a_base, b_base, num_chunks):
+        self.a_g2s, self.b_g2s, self.a_base, self.b_base = a_g2s, b_g2s, a_base, b_base
+        self.num_chunks = num_chunks
+
+
 @ASTRewriter.transform
 def dense_mma_pipeline_bf16(
     lds,
@@ -128,6 +136,7 @@ def dense_mma_pipeline_bf16(
     persistent=False,
     merge_tile_pairs=False,
     k_seg=None,
+    k_ext=None,
 ):
     """Shared 4-quadrant pipelined MMA loop and store epilogue for the fixed-K bf16 tile.
     Keyword flags select the feed and epilogue variants a ragged N needs; each is explained at
@@ -135,9 +144,16 @@ def dense_mma_pipeline_bf16(
 
     ``k_seg`` (optional) walks K in segments of ``k_seg.seg_len`` chunks: chunk ``c`` reads K chunk
     ``k_seg.chunk_base(seg) + c % seg_len`` of ``seg = c // seg_len``, and every wave runs
-    ``k_seg.wait(seg)`` before its first A load of a segment (each wave orders its own loads)."""
+    ``k_seg.wait(seg)`` before its first A load of a segment (each wave orders its own loads).
+    ``k_seg.num_chunks`` (optional) walks that many chunks instead of ``K // BLOCK_K``; ``K`` stays
+    the operands' row stride.
+
+    ``k_ext`` (optional) appends ``k_ext.num_chunks`` chunks from a second operand pair into the
+    same accumulators: its loaders ``a_g2s`` (two halves) / ``b_g2s`` from offsets ``a_base`` /
+    ``b_base`` (two halves each), with this call's K steps."""
     MFMA_MN = 16
-    K_ITERS = K // BLOCK_K
+    K1_ITERS = K // BLOCK_K if getattr(k_seg, "num_chunks", None) is None else k_seg.num_chunks
+    K_ITERS = K1_ITERS + (0 if k_ext is None else k_ext.num_chunks)
     assert K_ITERS >= 2, f"K_ITERS={K_ITERS} too small; need K >= {2 * BLOCK_K}"
     N_TILES_A = BLOCK_M // 128 if n_tiles_a is None else n_tiles_a
     N_TILES_B = BLOCK_N // 256 if n_tiles_b is None else n_tiles_b
@@ -161,11 +177,11 @@ def dense_mma_pipeline_bf16(
 
     PRED = quad_conds is not None
     if const_expr(k_seg is None):
-        seg_len, seg_base = K_ITERS, [0]
+        seg_len, seg_base = K1_ITERS, [0]
     else:
         seg_len = k_seg.seg_len
-        assert K_ITERS % seg_len == 0
-        seg_base = [k_seg.chunk_base(seg) for seg in range_constexpr(K_ITERS // seg_len)]
+        assert K1_ITERS % seg_len == 0
+        seg_base = [k_seg.chunk_base(seg) for seg in range_constexpr(K1_ITERS // seg_len)]
 
     def a_off(base, c):
         return base + (seg_base[c // seg_len] + c % seg_len) * a_k_step
@@ -173,8 +189,20 @@ def dense_mma_pipeline_bf16(
     def b_off(base, c):
         return base + (seg_base[c // seg_len] + c % seg_len) * b_k_step
 
+    def a_load(half, dst, c):
+        if const_expr(c >= K1_ITERS):
+            k_ext.a_g2s[half].load(dst, k_ext.a_base[half] + (c - K1_ITERS) * a_k_step)
+        else:
+            (a_g2s0, a_g2s1)[half].load(dst, a_off((A0_gl_offset, A1_gl_offset)[half], c))
+
+    def b_load(half, dst, c):
+        if const_expr(c >= K1_ITERS):
+            k_ext.b_g2s.load(dst, k_ext.b_base[half] + (c - K1_ITERS) * b_k_step)
+        else:
+            b_g2s.load(dst, b_off((B0_gl_offset, B1_gl_offset)[half], c))
+
     def k_wait(c):
-        if const_expr(k_seg is not None and c % seg_len == 0):
+        if const_expr(k_seg is not None and c < K1_ITERS and c % seg_len == 0):
             k_seg.wait(c // seg_len)
 
     c00_frag = [mfma.zero_value] * N_ACCUMS
@@ -215,12 +243,12 @@ def dense_mma_pipeline_bf16(
         # ``nt_vmcnt`` counts the full body's issue stream, so a narrowed feed retires a different load.
         ITER_DRAIN = N_LDS_STEPS_A
 
-    b_g2s.load(b_cur0, b_off(B0_gl_offset, 0))
+    b_load(0, b_cur0, 0)
     k_wait(0)
-    a_g2s0.load(a_cur0, a_off(A0_gl_offset, 0))
+    a_load(0, a_cur0, 0)
     if const_expr(not half_n):
-        b_g2s.load(b_cur1, b_off(B1_gl_offset, 0))
-    a_g2s1.load(a_cur1, a_off(A1_gl_offset, 0))
+        b_load(1, b_cur1, 0)
+    a_load(1, a_cur1, 0)
 
     # One tile per WG: only the high half has to wait here, and the divergence is harmless
     # because the WG ends right after. Inside a persistent tile loop it is not -- the next
@@ -232,11 +260,11 @@ def dense_mma_pipeline_bf16(
         rocdl.s_barrier()
     wait_barrier(N_LDS_STEPS_A + B1_STEPS)
 
-    b_g2s.load(b_next0, b_off(B0_gl_offset, 1))
+    b_load(0, b_next0, 1)
     k_wait(1)
-    a_g2s0.load(a_next0, a_off(A0_gl_offset, 1))
+    a_load(0, a_next0, 1)
     if const_expr(not half_n):
-        b_g2s.load(b_next1, b_off(B1_gl_offset, 1))
+        b_load(1, b_next1, 1)
 
     # K_ITERS == 2 skips the main loop, leaving the tail's b_next0 read with no vmcnt wait.
     # B1_STEPS lands it either way: full-N leaves b_next1 behind it, half-N issues nothing after.
@@ -245,7 +273,7 @@ def dense_mma_pipeline_bf16(
     for k in range_constexpr(K_ITERS - 2):
         b0_frag = b_s2r.load(b_cur0)
         a0_frag = a_s2r.load(a_cur0)
-        a_g2s1.load(a_next1, a_off(A1_gl_offset, (k + 1)))
+        a_load(1, a_next1, (k + 1))
         rocdl.s_barrier()
 
         rocdl.sched_barrier(0)
@@ -255,7 +283,7 @@ def dense_mma_pipeline_bf16(
 
         if const_expr(not half_n):
             b1_frag = b_s2r.load(b_cur1)
-        b_g2s.load(b_cur0, b_off(B0_gl_offset, (k + 2)))
+        b_load(0, b_cur0, (k + 2))
         if const_expr(not half_n):
             rocdl.s_barrier()
 
@@ -267,7 +295,7 @@ def dense_mma_pipeline_bf16(
 
         a1_frag = a_s2r.load(a_cur1)
         k_wait(k + 2)
-        a_g2s0.load(a_cur0, a_off(A0_gl_offset, (k + 2)))
+        a_load(0, a_cur0, (k + 2))
         rocdl.s_barrier()
 
         rocdl.sched_barrier(0)
@@ -275,7 +303,7 @@ def dense_mma_pipeline_bf16(
         rocdl.sched_barrier(0)
         if const_expr(not half_n):
             rocdl.s_barrier()
-            b_g2s.load(b_cur1, b_off(B1_gl_offset, (k + 2)))
+            b_load(1, b_cur1, (k + 2))
         wait_barrier(LOOP_DRAIN)
 
         if const_expr(not half_n):
@@ -322,7 +350,7 @@ def dense_mma_pipeline_bf16(
     rocdl.s_barrier()
 
     b0_frag = b_s2r.load(b_next0)
-    a_g2s1.load(a_next1, a_off(A1_gl_offset, (k + 1)))
+    a_load(1, a_next1, (k + 1))
     if const_expr(not half_n):
         rocdl.s_barrier()
         rocdl.sched_barrier(0)
@@ -443,7 +471,11 @@ def gemm_bf16_nt_tile(
     a_row_idx=None,
     store_c_cls=StoreCBf16,
     k_seg=None,
+    k_ext=None,
+    tid=None,
 ):
+    """``k_ext=(A2, B2_T, K2)`` (optional) accumulates ``A2 @ B2_T^T`` (row stride ``K2``) after the
+    first product, in the same K loop: one epilogue for ``C = A @ B_T^T + A2 @ B2_T^T``."""
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
     assert K % BLOCK_K == 0, f"bf16 NT needs K % {BLOCK_K} == 0 (got K={K})"
     N_TILES_A = BLOCK_M // 128
@@ -454,8 +486,9 @@ def gemm_bf16_nt_tile(
     N_LDS_STEPS_B = LDS_BLOCK_N // 64
     N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
 
-    lane_id = fx.thread_idx.x % 64
-    wave_id = fx.thread_idx.x // 64
+    tid = fx.thread_idx.x if tid is None else tid
+    lane_id = tid % 64
+    wave_id = tid // 64
     wave_m = wave_id // 4
     wave_n = wave_id % 4
     # Two waves share a SIMD (``wave_id % 4``) and must share wave_n to read one B fragment.
@@ -496,18 +529,48 @@ def gemm_bf16_nt_tile(
     b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, fx.BFloat16.ir_type, wave_id)
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
     store_c = store_c_cls(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier)
+    if k_ext is not None:
+        A2, B2_T, K2 = k_ext
+        assert K2 % BLOCK_K == 0 and a_row_idx is None and b_group_base is None
+        a2_div = fx.logical_divide(make_fp16_bf16_buffer_tensor(A2), fx.make_layout(1, 1))
+        b2_div = fx.logical_divide(make_fp16_bf16_buffer_tensor(B2_T), fx.make_layout(1, 1))
+        a2_g2s = _make_a_g2s(
+            a2_div,
+            compute_global_swizzle_bf16(lane_id, wave_id, K2, N_LDS_ROUNDS),
+            None,
+            lane_id,
+            wave_id,
+            K2,
+            N_LDS_STEPS_A,
+            LDS_BLOCK_M,
+        )
+        b2_g2s = G2SLoader(b2_div, None, N_LDS_STEPS_B, fx.BFloat16.ir_type, wave_id)
+
+    def _b_offsets(k_stride, pair_cols, pair_tiles):
+        if pair_cols:
+            return compute_global_swizzle_bf16(lane_id, wave_id, k_stride, N_LDS_ROUNDS, row_step=2)
+        if pair_tiles:
+            return compute_global_swizzle_bf16(lane_id, wave_id, k_stride, N_LDS_ROUNDS, pair_span=32)
+        return compute_global_swizzle_bf16(lane_id, wave_id, k_stride, N_LDS_ROUNDS)
 
     def _run(pair_cols, grid, half_n, col_safe=False, b_steps=N_LDS_STEPS_B, pair_tiles=False):
         # The bodies differ only in B's column layout, so the loader is re-pointed, not duplicated.
         n_a, n_b, w_m, w_n = grid
-        if pair_cols:
-            b_g2s.gl_offsets = compute_global_swizzle_bf16(lane_id, wave_id, K, N_LDS_ROUNDS, row_step=2)
-        elif pair_tiles:
-            assert n_b == 1, "pair_tiles pairs a wave's two 16-column tiles"
-            b_g2s.gl_offsets = compute_global_swizzle_bf16(lane_id, wave_id, K, N_LDS_ROUNDS, pair_span=32)
-        else:
-            b_g2s.gl_offsets = gl_off_b
+        assert not pair_tiles or n_b == 1, "pair_tiles pairs a wave's two 16-column tiles"
+        b_g2s.gl_offsets = gl_off_b if not (pair_cols or pair_tiles) else _b_offsets(K, pair_cols, pair_tiles)
         b_g2s.n_load_steps = b_steps
+        ext = None
+        if k_ext is not None:
+            b2_g2s.gl_offsets = _b_offsets(K2, pair_cols, pair_tiles)
+            b2_g2s.n_load_steps = b_steps
+            b2_base = (block_n * BLOCK_N) * K2
+            ext = _KExt(
+                a_g2s=a2_g2s,
+                b_g2s=b2_g2s,
+                a_base=((block_m * BLOCK_M) * K2, (block_m * BLOCK_M + LDS_BLOCK_M) * K2),
+                b_base=(b2_base, b2_base + (K2 if pair_cols else LDS_BLOCK_N * K2)),
+                num_chunks=K2 // BLOCK_K,
+            )
         n_a16, n_b16 = 2 * n_a, 2 * n_b
         dense_mma_pipeline_bf16(
             lds,
@@ -540,6 +603,7 @@ def gemm_bf16_nt_tile(
             col_safe=col_safe,
             persistent=persistent,
             k_seg=k_seg,
+            k_ext=ext,
         )
 
     TAIL_QUADS = 0 if n_tail is None else ceildiv(n_tail, 32)

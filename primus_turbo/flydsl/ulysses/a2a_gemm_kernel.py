@@ -155,13 +155,14 @@ def _residual_store_c(residual):
     return _StoreCBf16Residual
 
 
-def _copy_rows(thread_index, num_vecs, vec_coords, src_res, dst_res, src_cm, dst_cm):
-    """Copy ``num_vecs`` 16 B vectors; ``vec_coords(v)`` gives ``(src_word, dst_word, valid)``."""
-    per_iter = BLOCK_THREADS * _BATCH
+def _copy_rows(thread_index, num_vecs, vec_coords, src_res, dst_res, src_cm, dst_cm, batch=_BATCH):
+    """Copy ``num_vecs`` 16 B vectors, ``batch`` loads in flight per thread; ``vec_coords(v)`` gives
+    ``(src_word, dst_word, valid)``."""
+    per_iter = BLOCK_THREADS * batch
     for it in range_constexpr(ceildiv(num_vecs, per_iter)):
         coords = [
             vec_coords(fx.Int32(it * per_iter + j * BLOCK_THREADS) + thread_index)
-            for j in range_constexpr(_BATCH)
+            for j in range_constexpr(batch)
             if it * per_iter + j * BLOCK_THREADS < num_vecs
         ]
         vals = [

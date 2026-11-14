@@ -60,8 +60,9 @@ class UlyssesWorkspace:
         self.num_bytes = FLAG_BYTES + 2 * self.bank_bytes
         self.symm_mem = SymmetricMemory(group, self.num_bytes, signal_pad_size=0)
         self.peer_ptrs = torch.tensor(self.symm_mem.buffer_ptrs, dtype=torch.int64, device="cuda")
-        # [0] epoch, [1] exit counter, [2] / [3] push-unit / tile claim counters of the running fused kernel
-        self.state = torch.tensor([1, 0, 0, 0], dtype=torch.int64, device="cuda")
+        # [0] epoch, [1] exit counter, [2] / [3] push-unit / tile claim counters of the running fused kernel,
+        # [4] / [5] AgGemm own-row pieces claimed / done, [6, 14) AgGemm tile claim counter per XCD
+        self.state = torch.tensor([1] + [0] * 13, dtype=torch.int64, device="cuda")
         torch.cuda.synchronize()
         dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
 
