@@ -8,6 +8,8 @@
 
 #include "ffi.h"
 #include "primus_turbo/common.h"
+#include <string>
+#include <tuple>
 #include <vector>
 #include <xla/ffi/api/ffi.h>
 
@@ -27,6 +29,15 @@ XLA_FFI_DECLARE_HANDLER_SYMBOL(RMSNormBwdHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(CKGroupedGemmHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(CKGroupedGemmVariableKHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(ComputeGroupOffsHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(HipblasltGroupedGemmHandler);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(HipblasltGroupedGemmFp8Handler);
+int64_t GetHipblasltGroupedGemmWorkspaceSize(int64_t group_num);
+std::tuple<int, double, std::string>
+     TuneHipblasltGroupedGemm(int64_t G, int64_t M, int64_t a_cols, int64_t b_d1, int64_t b_d2,
+                              int64_t c_rows, bool transA, bool transB, int dtype, int max_candidates);
+void RegisterHipblasltGroupedGemmAlgo(int64_t G, int64_t a_cols, int64_t b_d1, int64_t b_d2,
+                                      int64_t c_rows, bool transA, bool transB, int dtype,
+                                      int algo_index);
 
 XLA_FFI_DECLARE_HANDLER_SYMBOL(CKGroupedGemmFP8Handler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(CKGroupedGemmFP8VariableKHandler);

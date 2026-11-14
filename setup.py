@@ -524,6 +524,7 @@ def build_jax_extension():
             ffi.include_dir(),
             pybind11.get_include(),
         ],
+        libraries=["hipblaslt"],
         **extra_flags,
     )
 
