@@ -5974,8 +5974,58 @@ def _grouped_gemm_bf16_nn_flydsl_kernel_entry(
 #
 # MiniMax-M3 MoE: hidden 6144, gated expert FFN 3072 (fc1 N = 6144), 128 experts, top-4. At EP4 and
 # sequence 4096 each GPU holds G = 32 experts and receives M = 16384 rows, avg_m = 512.
+# Muse Spark key sets, shared by several (N, K, avg_m) rows below.
+_MUSE_NT = {
+    "GROUP_M": 4,
+    "head_pipe": 32,
+    "hp_epi": 0,
+    "issue_first": 1,
+    "lds_cosched": 3,
+    "mc_m": 2,
+    "mc_n": 4,
+    "mc_tile_sync": 1,
+    "nt_c1": 4,
+    "nt_deal": 1,
+    "nt_ovl": 1,
+    "nt_seam": 13,
+    "ntp_flags": 3,
+    "num_xcd": 8,
+    "persist": 256,
+    "tdm_assign": 1,
+    "tdm_balance": 1,
+    "tt_dec": 1,
+    "xcd_band": 32,
+}
+_MUSE_NN = {
+    "GROUP_M": 8,
+    "head_pipe": 32,
+    "issue_first": 1,
+    "lds_cosched": 3,
+    "mc_m": 2,
+    "mc_n": 4,
+    "mc_tile_sync": 1,
+    "nt_c1": 3,
+    "nt_deal": 1,
+    "nt_ovl": 1,
+    "nt_seam": 13,
+    "ntp_flags": 3,
+    "num_xcd": 8,
+    "persist": 256,
+    "tdm_assign": 1,
+    "tdm_nn": 1,
+    "tt_dec": 1,
+    "xcd_band": 32,
+}
+
 _KWARGS_KEYS = {
     "nt": {
+        # Muse Spark (EP4 / EP8, MBS 1 / 2): the MiniMax-M3 fc1 set with the table decode (tt_dec) in place of
+        # vec_dec, which the launcher drops above 32 experts. fwd fc1 at 512 / 1024 / 2048 rows per expert,
+        # fwd fc2 at 2048 (at 512 / 1024 it is within +-2% of the untuned path).
+        (8192, 4096, 512): _MUSE_NT,
+        (8192, 4096, 1024): _MUSE_NT,
+        (8192, 4096, 2048): _MUSE_NT,
+        (4096, 4096, 2048): _MUSE_NT,
         # MiniMax-M3 fwd fc2, avg_m = 512
         (6144, 3072, 512): {
             "GROUP_M": 4,
@@ -6020,6 +6070,12 @@ _KWARGS_KEYS = {
         },
     },
     "nn": {
+        # Muse Spark: the MiniMax-M3 dgrad fc1 set. dgrad fc1 and fc2 at 1024 / 2048 rows per expert (at 512 it
+        # is within +-1% on fc1 and loses on a skewed fc2).
+        (4096, 8192, 1024): _MUSE_NN,
+        (4096, 8192, 2048): _MUSE_NN,
+        (4096, 4096, 1024): _MUSE_NN,
+        (4096, 4096, 2048): _MUSE_NN,
         # MiniMax-M3 dgrad fc2, avg_m = 512
         (3072, 6144, 512): {
             "GROUP_M": 8,
