@@ -20,6 +20,8 @@ from primus_turbo.flydsl.rope.qk_rmsnorm_rope_kernel import (
     flydsl_qkv_rmsnorm_rope_forward,
 )
 
+_SUPPORTED_ARCHS = ("gfx942", "gfx950")
+
 
 def qk_rmsnorm_rope_shape_error(
     qkv: torch.Tensor,
@@ -65,8 +67,8 @@ def qk_rmsnorm_rope_shape_error(
     if not (qkv.device == q_gamma.device == k_gamma.device == freqs.device):
         return "qkv, q/k gamma, and freqs must be on the same device"
     arch = str(torch.cuda.get_device_properties(qkv.device).gcnArchName).split(":", 1)[0]
-    if arch != "gfx950":
-        return f"fused QK RMSNorm + RoPE requires gfx950, got {arch}"
+    if arch not in _SUPPORTED_ARCHS:
+        return f"fused QK RMSNorm + RoPE requires one of {_SUPPORTED_ARCHS}, got {arch}"
     return None
 
 
