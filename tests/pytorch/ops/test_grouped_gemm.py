@@ -17,6 +17,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
     grouped_gemm_variable_k_impl,
 )
 from primus_turbo.pytorch.ops import grouped_gemm
+from primus_turbo.triton.grouped_gemm import grouped_gemm_kernel as gg_kernel
 from tests.pytorch.ops.determinism_helper import (  # noqa: F401  (_det_seed: fixture)
     ACCUM_GROUPED_SHAPE,
     DET_DTYPES,
@@ -648,6 +649,38 @@ def test_grouped_gemm_variable_k_backend(B, M, N, K, dtype, trans_c, backend):
     snr = compute_snr(ref, out)
     assert snr > 45.0, f"snr {snr:.2f} dB too low"
     torch.testing.assert_close(out, ref, **get_tolerances(dtype))
+
+
+# The gfx942 variable-K tile choice is plain arithmetic on (G, OUT_M, OUT_N, num_sms); it runs the
+# function body only, so no kernel is launched and the arch lookup is patched.
+@pytest.fixture
+def gfx942_vk_config(monkeypatch):
+    monkeypatch.setattr(gg_kernel, "is_gfx950", lambda: False)
+
+    def config(G, OUT_M, OUT_N, num_sms=304):
+        # __wrapped__ skips the lru_cache, which is keyed without the patched arch.
+        args = (OUT_M, OUT_N, 4096, torch.bfloat16, torch.bfloat16, G, num_sms)
+        return gg_kernel._get_gg_bf16_vk_config.__wrapped__(*args)[:3]
+
+    return config
+
+
+def test_gfx942_variable_k_tile_wave_inefficient(gfx942_vk_config):
+    # Qwen3-30B-A3B EP8 fc2 wgrad: 384 tiles of 256x256 need two rounds on 304 CUs (63%).
+    assert gfx942_vk_config(16, 2048, 768) == (256, 128, 64)
+
+
+@pytest.mark.parametrize("G, OUT_M, OUT_N", [(16, 2048, 2880), (4, 256, 320)], ids=["N2880", "N320"])
+def test_gfx942_variable_k_tile_keeps_partial_n_tile_off(gfx942_vk_config, G, OUT_M, OUT_N):
+    # A 256x128 tile would cut rounds x area by more than 15% here, but OUT_N % 128 != 0.
+    assert gfx942_vk_config(G, OUT_M, OUT_N) == (256, 256, 32)
+
+
+@pytest.mark.parametrize(
+    "G, OUT_M, OUT_N", [(16, 1536, 2048), (16, 4864, 256)], ids=["fc1", "one-full-round"]
+)
+def test_gfx942_variable_k_tile_keeps_default_when_rounds_are_full(gfx942_vk_config, G, OUT_M, OUT_N):
+    assert gfx942_vk_config(G, OUT_M, OUT_N) == (256, 256, 32)
 
 
 # ---------------------------------------------------------------------------
