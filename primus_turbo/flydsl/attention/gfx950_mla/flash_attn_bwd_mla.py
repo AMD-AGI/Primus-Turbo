@@ -1345,6 +1345,8 @@ def build_flash_attn_bwd_dkdv_module(
     # g3_kreg: hold GEMM3's whole K^T fragment set live for the band instead of reading it
     # back per head-step. K^T is head-invariant, so this is pure read removal. See G3_KREG.
     g3_kreg=False,
+    # g3_sd: MLA a16 GEMM3 patch of 3 strided d-tiles x both q-tiles per wave. See G3_SD.
+    g3_sd=False,
     g3_dbat=None,
     # g1_pf: GEMM2 d-tiles of cover to give the next q-half's GEMM1 A reads (0 = off).
     # See G1_PF.
@@ -1532,11 +1534,22 @@ def build_flash_attn_bwd_dkdv_module(
         # needs whole d-tile pairs, so the wave takes one q-tile and twice the d-tiles.
         G3_QT = 1
     G3_DT = G3_TILES // G3_QT  # D 16-tiles per wave
+    # G3_SD: wave w takes d-tiles {w, w+W, w+2W} and every q-tile instead of a 6x1 run of
+    # interleaved pairs, so the two waves of a D group stop transpose-reading the same K^T:
+    # 3+2 fragments per kstep instead of 6+1. GEMM3 is ds_read_b64_tr_b16 throughput bound
+    # at MLA (126-138 B/clk/CU). The dQ a16 image is unchanged: an unpaired tile adds its
+    # 8 B into its half (dwords 2p, 2p+1) of the pair's slot (see _g3_a16_one).
+    G3_SD = bool(g3_sd) and MLA and WSQ_A16 and not A16_NATIVE and G3_TILES % MT == 0
+    if G3_SD:
+        G3_QT = MT
+        G3_DT = G3_TILES // MT
     G3_DBAT = G3_DT if g3_dbat is None else int(g3_dbat)
+    if G3_SD and G3_DT % G3_DBAT:
+        G3_DBAT = 1
     G3_QGRP = MT // G3_QT  # q-tile groups; wave -> (D group, q group)
     G3_DGRP = max(1, G3_WAVES // G3_QGRP)
     # A non-power-of-two d-tile run per wave (MLA: 6) is taken as interleaved pairs (see _g3_toff).
-    G3_PAIR_ILV = MLA and (G3_DT & (G3_DT - 1)) != 0
+    G3_PAIR_ILV = MLA and not G3_SD and (G3_DT & (G3_DT - 1)) != 0
     assert not G3_PAIR_ILV or (G3_DGRP & (G3_DGRP - 1) == 0 and G3_DT % 2 == 0 and not g3_kreg)
     # G3_SPLIT: run GEMM3 as one pass per q-half instead of once at the head-step's end,
     # to fill this body's one bare-MFMA VALU window. Disabled: LLVM hoists the early
@@ -1556,8 +1569,9 @@ def build_flash_attn_bwd_dkdv_module(
     # A wave's D-tiles must pair up (and start even) for the permuted partial layout
     # the store in _gemm3_tiles and the reduce in build_flash_attn_bwd_dqred_module
     # both assume; G3_DT even makes _g3d0 = (wave/G3_QGRP)*G3_DT even too.
-    assert G3_DT % 2 == 0, "permuted dQ partial layout needs an even G3_DT"
-    assert G3_DBAT % 2 == 0 and G3_DT % G3_DBAT == 0, "a D-tile group holds whole pairs"
+    assert G3_SD or G3_DT % 2 == 0, "permuted dQ partial layout needs an even G3_DT"
+    assert G3_SD or (G3_DBAT % 2 == 0 and G3_DT % G3_DBAT == 0), "a D-tile group holds whole pairs"
+    assert not G3_SD or G3_DT % G3_DBAT == 0
     assert BLOCK_KV % PV_K_STEP == 0
     assert batch_size is not None, "fused dQ needs compile-time B for the workspace stride"
     # D128's occ-1 recipe (dma_grp=2 + pf_ring) does not port here even though the
@@ -2818,7 +2832,7 @@ def build_flash_attn_bwd_dkdv_module(
             # per q-half; otherwise they are the contiguous G3_QT run. Either way the
             # (D group, q group) product is a partition of the DT x MT output tiles.
             return (
-                (wave_id // fx.Index(G3_QGRP)) * fx.Index(2 if G3_PAIR_ILV else G3_DT),
+                (wave_id // fx.Index(G3_QGRP)) * fx.Index(1 if G3_SD else (2 if G3_PAIR_ILV else G3_DT)),
                 (wave_id % fx.Index(G3_QGRP)) * fx.Index(1 if G3_SPLIT else G3_QT),
             )
 
@@ -2826,6 +2840,8 @@ def build_flash_attn_bwd_dkdv_module(
             """d-tile of the wave's i-th GEMM3 tile, relative to its first one. The tile index
             reaches the K^T read by XOR, so it must not share bits with the first tile: a
             power-of-two run already does; an MLA run of 6 takes the D groups' pairs in turn."""
+            if const_expr(G3_SD):
+                return i * G3_DGRP
             if const_expr(G3_PAIR_ILV):
                 return (i // 2) * 2 * G3_DGRP + (i % 2)
             return i
@@ -3065,6 +3081,24 @@ def build_flash_attn_bwd_dkdv_module(
                         0,
                     )
 
+            def _g3_a16_one(_g3p, i, j):
+                """One unpaired d-tile's 8 B: its half of the pair slot _g3_a16 fills."""
+                _t = _g3d0 + fx.Index(_g3_toff(i))
+                _qt = (q_start >> fx.Index(4)) + _g3q0 + fx.Index(j * G3_SPL_STRIDE)
+                _blk = (_qt * fx.Index(NUM_HEADS_Q) + _g3qh) * fx.Index(DT // 2) + (_t >> fx.Index(1))
+                _a16 = ArithValue(
+                    _raw(_blk * fx.Index(1024) + (_t & fx.Index(1)) * fx.Index(512) + lane * fx.Index(4))
+                ).index_cast(fx.Int32.ir_type)
+                _pk = Vec(_g3p)
+                for _w in range_constexpr(2):
+                    rocdl.raw_ptr_buffer_atomic_fadd(
+                        _pk.shuffle(_pk, [_w]).bitcast(elem_dtype).ir_value(),
+                        wsq16_rsrc,
+                        _a16,
+                        256 * _w,
+                        0,
+                    )
+
             def _g3_nat(_tv, i, j, lo=0, n=4):
                 """Add this emission's 16 B into dQ at its own native SBHD address.
 
@@ -3121,7 +3155,15 @@ def build_flash_attn_bwd_dkdv_module(
                                 _g3[i][jj] = mfma_acc(_g3k[i], _g3s[jj], _g3[i][jj])
                 if const_expr(drain is not None and _pi == 0):
                     drain()
-                for i2 in range_constexpr(len(_dg) // 2):
+                if const_expr(G3_SD):
+                    for i in range_constexpr(len(_dg)):
+                        for jj in range_constexpr(len(_qs)):
+                            _g3p1 = bf16_trunc_scored_v4(_g3[i][jj])
+                            if const_expr(st_sink is None):
+                                _g3_a16_one(_g3p1, _dg[i], _qs[jj])
+                            else:
+                                st_sink.append(lambda p=_g3p1, _i=_dg[i], _j=_qs[jj]: _g3_a16_one(p, _i, _j))
+                for i2 in range_constexpr(0 if G3_SD else len(_dg) // 2):
                     i = 2 * i2
                     for jj in range_constexpr(len(_qs)):
                         j = _qs[jj]

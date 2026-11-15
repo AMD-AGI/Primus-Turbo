@@ -1496,8 +1496,10 @@ def test_flydsl_gfx950_mla_attention_compile_fullgraph(qkv_format):
     torch.testing.assert_close(out, out_eager, rtol=0, atol=0)
     for name, g, g_eager in zip(("dq", "dk", "dv"), grads, grads_eager):
         assert g.shape == g_eager.shape, name
-        # dQ sums bf16 atomics, whose order varies run to run.
-        assert compute_snr(g_eager, g) > 60, f"{name} compiled vs eager snr {compute_snr(g_eager, g):.2f}"
+        # dQ sums bf16 atomics, whose order varies run to run: two eager runs already differ by
+        # 59-62 dB (dQ vs an fp32 reference is ~46 dB), so dQ gets the looser bound.
+        bound = 50 if name == "dq" else 60
+        assert compute_snr(g_eager, g) > bound, f"{name} compiled vs eager snr {compute_snr(g_eager, g):.2f}"
 
 
 @pytest.mark.parametrize("qkv_format", ["bshd", "sbhd", "bhsd"])
