@@ -1370,6 +1370,8 @@ def build_flash_attn_bwd_dkdv_module(
     q_dma=False,
     # Q_DMA with a second Q/dO slot, filled one q-block ahead (see Q_RING).
     q_ring=False,
+    # ring_at: the _qdo_pf position Q_RING's fill is issued at. See RING_AT.
+    ring_at=None,
     # Causal MLA: walk the grid in groups of lpt_grid kv tiles, longest group first (0: off).
     lpt_grid=0,
     g3_dbat=None,
@@ -1979,13 +1981,16 @@ def build_flash_attn_bwd_dkdv_module(
     # drain before its publishing barrier is the only wait. Freeing the staging VGPRs takes
     # the spill from 101 to 68.
     Q_RING = bool(q_ring) and Q_DMA and K_SUB and PF_QB and not V_LDS
-    # The fill issues at _qdo_pf position 2, the last point of the head-step every wave
-    # reaches (MASK_SKIP's wave classes branch right after it; a wave that skips its share
-    # leaves a quarter of the tile unfilled). The one in-order vmcnt is why not earlier:
-    # any VMEM wait between the fill and the next trip's barrier -- the spill reloads at
-    # GEMM1's top are one -- waits for the fill too. Issued in GEMM3's shadow, the reloads
-    # cost back 2-3 % of the 3-4 % this ring wins.
-    RING_AT = 2
+    # The fill is wave-uniform and must precede MASK_SKIP's per-wave branch (a wave that skips
+    # its share leaves a quarter of the tile unfilled), and the one in-order vmcnt keeps it
+    # after every VMEM op the trip waits on -- the spill reloads at GEMM1's top included, or
+    # they wait for the fill. _qdo_pf positions 0..2 count from the publishing barrier to the
+    # end of the softmax; 5 issues it right after GEMM1 on unmasked trips and at 2 on masked
+    # ones, so the tile gets a softmax more of cover. Its next-trip drain then waits only on
+    # the dQ atomics issued after it; flushing those ahead of the fill instead costs more in
+    # atomic bursts than the drain saves.
+    RING_AT = 2 if ring_at is None else int(ring_at)
+    assert RING_AT in (0, 1, 2, 5)
     if Q_RING:
         RING_DQ = LDS_VIEW_ELEMS
         RING_DDO = G3K_BASE + BLOCK_KV * K_SUB_ROW - LDS_DO_BASE
@@ -3697,7 +3702,7 @@ def build_flash_attn_bwd_dkdv_module(
             _qdo_next = [None, None]
 
             def _qdo_pf(at=0):
-                if const_expr(Q_RING and at == RING_AT):
+                if const_expr(Q_RING and (at == RING_AT or (RING_AT == 5 and at == 2 and apply_mask))):
                     _ring_fill()
                 if const_expr(not Q_PREF or at != QPF_AT):
                     return
@@ -4319,6 +4324,8 @@ def build_flash_attn_bwd_dkdv_module(
                         _gemm3(q_start, head_local, 0, qsel=pks - 1, depth=G3D_E)
                     _st, _dpt = _half_gemm1(half, cls, _apf[0])
                     _apf[0] = None
+                    if const_expr(hooks and not apply_mask and pks == _pk_list[-1]):
+                        _qdo_pf(5)
                     if const_expr(g3_split and pks > 0 and G3_SPL_AT == 1):
                         _gemm3(q_start, head_local, 0, qsel=pks - 1, depth=G3D_E)
                     if const_expr(hooks):
@@ -4386,6 +4393,8 @@ def build_flash_attn_bwd_dkdv_module(
                         _st, _dpt = _half_gemm1(half, cls, _apre, _ipre)
                         if const_expr(_h == 0):
                             _hs_hook(_at + 1)
+                            if const_expr(pks == _pk_list[-1]):
+                                _qdo_pf(5)
                         _r = _half_soft(pks, half, _st, _dpt, cls, prime=const_expr(_h == _hl[-1]))
                         if const_expr(_r is not None):
                             _rings = _r

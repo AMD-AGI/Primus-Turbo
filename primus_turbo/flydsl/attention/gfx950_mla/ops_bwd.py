@@ -53,6 +53,7 @@ def _dkdv_kwargs(B, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, **ove
         k_sub=True,
         q_dma=True,
         q_ring=True,
+        ring_at=5,
         k_reg=True,
         dv_pin=False,
         g3_st_at=1,
