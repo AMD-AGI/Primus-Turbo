@@ -605,3 +605,56 @@ def test_torch_compile_fullgraph():
     _check(got, _reference(q, k, v, dout, MLA_SCALE))
     for a, b in zip(got, eager):
         assert torch.equal(a, b)
+
+
+@needs_gfx1250
+@pytest.mark.parametrize(
+    "dims",
+    [
+        pytest.param((1, 4096, 4096, 32), id="two_blocks_per_cu"),
+        pytest.param((1, 4096, 4096, 256), id="dsv3_b2_folded"),
+        pytest.param((2, 8192, 8192, 16), id="b2_two_q_groups"),
+    ],
+)
+def test_persistent_forward_equals_one_block_per_workgroup(monkeypatch, dims):
+    """The persistent forward (one workgroup per CU on the static schedule, the TDM ring running on across a
+    workgroup's blocks) gives the bits of one workgroup per q block. NaN-filled outputs expose a block no workgroup
+    took."""
+    from primus_turbo.flydsl.attention.gfx1250_mla import fwd
+
+    b, sq, skv, h = dims
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q, k, v = (
+        torch.randn(b, s, h, d, device="cuda", generator=g).to(torch.bfloat16)
+        for s, d in ((sq, D_QK), (skv, D_QK), (skv, D_V))
+    )
+    assert fwd.launch_grid(q, k)[0], "not a persistent shape"
+    with _nan_filled_outputs():
+        got = fwd.flash_attn_mla_fwd(q, k, v, MLA_SCALE)
+        monkeypatch.setattr(fwd, "PERSIST", False)
+        ref = fwd.flash_attn_mla_fwd(q, k, v, MLA_SCALE)
+    torch.cuda.synchronize()
+    for name, x, r in zip(("out", "lse"), got, ref):
+        assert torch.isfinite(x).all(), name
+        assert torch.equal(x, r), name
+
+
+@needs_gfx1250
+def test_persistent_forward_under_cuda_graphs():
+    """Two graphs captured on torch's shared capture stream, the second replayed first, give the eager bits (the
+    persistent schedule is static: a launch keeps no state on the device)."""
+    from primus_turbo.flydsl.attention.gfx1250_mla import fwd
+
+    q, k, v = (t.cuda() for t in _inputs(1, 4096, 4096, 32, layout="bshd")[:3])
+    assert fwd.launch_grid(q, k)[0], "not a persistent shape"
+    eager = fwd.flash_attn_mla_fwd(q, k, v, MLA_SCALE)
+    graphs, outs = [], []
+    for _ in range(2):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outs.append(fwd.flash_attn_mla_fwd(q, k, v, MLA_SCALE))
+        graphs.append(graph)
+    for graph, got in zip(graphs[::-1], outs[::-1]):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert all(torch.equal(a, b) for a, b in zip(got, eager))
