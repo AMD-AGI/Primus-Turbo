@@ -101,6 +101,23 @@ def _a16_imgs_for(Skv, block_kv):
     return min(_A16_MAX_IMGS, max(1, -(-bands // _A16_ADDS_PER_IMG)))
 
 
+def _lpt_grid_for(B, Hkv, Skv, block_kv, device):
+    """Longest-kv-band-first dispatch (lpt_grid=1) or the default band-fastest walk (0).
+
+    Causal bands differ up to Skv/block_kv-fold in length, and a 1-WG/CU grid dispatched in mixed
+    lengths leaves each CU idle while the next work-group is placed. Longest-first removes that
+    but spreads an XCD's resident work-groups over B*Hkv/8 heads instead of one, which costs L2
+    sharing of Q/dO. Measured: it wins at <= 2 heads per XCD at every length (16 heads: +1.4% at
+    32K, +3% at 16K), and at 4 heads only while the grid is <= ~8 work-groups per CU (32 heads:
+    +5% at 4K, +1.4% at 12K, flat at 16K, -2% at 32K); 5+ heads per XCD always lose (64: -3% to -5%)."""
+    if (B * Hkv) % fb._NUM_XCD:
+        return 0
+    per_xcd = B * Hkv // fb._NUM_XCD
+    grid = B * Hkv * -(-Skv // block_kv)
+    n_cu = torch.cuda.get_device_properties(device).multi_processor_count
+    return int(per_xcd <= 2 or (per_xcd <= 4 and grid * 2 <= 17 * n_cu))
+
+
 def mla_bwd_sbhd(dout, q, k, v, out, lse, softmax_scale=None, block_kv=192, block_q=32, q_split=1, **over):
     """dQ, dK, dV for causal MLA in SBHD.
 
@@ -117,6 +134,7 @@ def mla_bwd_sbhd(dout, q, k, v, out, lse, softmax_scale=None, block_kv=192, bloc
     assert Sq % (block_q * q_split) == 0
     scale = (1.0 / d_qk**0.5) if softmax_scale is None else float(softmax_scale)
     n_img = _a16_imgs_for(Skv, block_kv)
+    over = {"lpt_grid": _lpt_grid_for(B, Hkv, Skv, block_kv, q.device), **over}
     dkdv, odo, dqa16 = _launchers(B, Sq, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, n_img, over)
     st = torch.cuda.current_stream()
 

@@ -1347,6 +1347,8 @@ def build_flash_attn_bwd_dkdv_module(
     g3_kreg=False,
     # g3_sd: MLA a16 GEMM3 patch of 3 strided d-tiles x both q-tiles per wave. See G3_SD.
     g3_sd=False,
+    # Causal MLA: walk the grid in groups of lpt_grid kv tiles, longest group first (0: off).
+    lpt_grid=0,
     g3_dbat=None,
     # g1_pf: GEMM2 d-tiles of cover to give the next q-half's GEMM1 A reads (0 = off).
     # See G1_PF.
@@ -1470,6 +1472,7 @@ def build_flash_attn_bwd_dkdv_module(
     K_STEPS_QK = head_dim // K_STEP_QK  # d64 -> 2
     HD_V = head_dim if head_dim_v is None else int(head_dim_v)
     MLA = HD_V != head_dim
+    LPT_GRID = int(lpt_grid) if (MLA and causal and N_QSP == 1 and not varlen) else 0
     # GEMM1b (dP = dO V^T) contracts over the V width; GEMM1a over the Q/K width.
     K_STEPS_V = HD_V // K_STEP_QK
     NT = ROWS_PER_WAVE_KV // N_TILE  # kv 16-tiles per wave: 32/16 = 2
@@ -2025,8 +2028,20 @@ def build_flash_attn_bwd_dkdv_module(
                 _slot = _slot // fx.Index(N_QSP)
             else:
                 split_idx = fx.Index(QSP_LO)
-            kv_tile_idx = _slot % num_kv_tiles
-            _u = _slot // num_kv_tiles
+            if const_expr(LPT_GRID):
+                # kv tile slowest: every unit's tile 0 (the longest causal job) dispatches
+                # first. Mixed-length work-groups in dispatch order leave ~15 us refill gaps
+                # per work-group on a 1-WG/CU kernel; longest-first removes them.
+                _nu = gpu.grid_dim.x // (fx.Index(NUM_XCD) * num_kv_tiles)
+                _gb = _slot // (fx.Index(LPT_GRID) * _nu) * fx.Index(LPT_GRID)
+                _gr = num_kv_tiles - _gb
+                _gr = fx.Index(ArithValue(_gr < fx.Index(LPT_GRID)).select(_gr, fx.Index(LPT_GRID)))
+                _rem = _slot - _gb * _nu
+                kv_tile_idx = _gb + _rem % _gr
+                _u = _rem // _gr
+            else:
+                kv_tile_idx = _slot % num_kv_tiles
+                _u = _slot // num_kv_tiles
             _bkv = _u * fx.Index(NUM_XCD) + _xcd
             kv_head_idx = _bkv % NUM_HEADS_KV
             batch_idx = _bkv // NUM_HEADS_KV
