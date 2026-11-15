@@ -11,7 +11,6 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-
 """Helpers shared by the gfx1250 MLA kernels' host code and FlyDSL shells."""
 
 import flydsl.compiler as flyc

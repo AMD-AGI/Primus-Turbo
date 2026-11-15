@@ -11,7 +11,6 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-
 """Host entry of the gfx1250 MLA attention forward."""
 
 import contextlib
