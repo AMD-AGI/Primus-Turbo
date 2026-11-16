@@ -38,7 +38,7 @@ REGIONS = {
     ("fwd", "TILE_D2"): "84c397c6ffb5d547d494436682111fe5f9b198e708a2197005e4f0ad21fcae1e",
     ("fwd", "TILE_D3F"): "5c079c9d73cf4cc3f623865529f54b6d776331ffb3d319f13ffb867ae14257eb",
     ("fwd", "FINAL_A"): "4570480af899fa78f2cb5b33af663c32a2d7343dcb0f524547eae3704d6bf09f",
-    ("bwd_dkdv", "MAIN"): "6443989428f1c2fe2dc5cb27d0a2e3eeb27a4896c6673d143dba36f153cd873f",
+    ("bwd_dkdv", "MAIN"): "d03f886b0d5a37f3f5f0ea1930d098e7997facb911f8c5410493b17cbbe20c6c",
 }
 _EVERY_REGION = pytest.mark.parametrize(("sched", "name"), list(REGIONS), ids=["_".join(k) for k in REGIONS])
 
@@ -371,6 +371,9 @@ def test_asm_model_counts_within_a_class():
     assert _emit(st0, st1, move) == [st0, st1, "s_wait_alu depctr_vm_vsrc(1)", move]
     load = f"ds_load_b128 {_vr(20, 4)}, {_vr(3)}"
     assert _emit(st0, load, move) == [st0, load, "s_wait_alu depctr_vm_vsrc(0)", move]
+    # a TDM op reads no VGPR and is in none of these classes: it does not stand in for a buffer instruction
+    tdm = "tensor_load_to_lds s[4:7], s[8:15]"
+    assert _emit(st0, tdm, tdm, move) == [st0, tdm, tdm, "s_wait_alu depctr_vm_vsrc(0)", move]
 
 
 def test_asm_model_loop_block_waits_for_its_back_edge():

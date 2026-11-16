@@ -24,7 +24,7 @@ lines that order implies in expert scheduling mode, as LLVM would:
     is pending, except for a write that only an in-flight WMMA still reads;
   * ``s_wait_alu depctr_vm_vsrc(N)`` before a write of a register an in-flight memory instruction still reads:
     LDS, FLAT and buffer instructions read their VGPR sources in order within their class, so N is the number of
-    instructions of that class issued since (``vm_need``).
+    instructions of that class issued since (``vm_need``; a TDM op reads no VGPR and counts in none of them).
     LLVM takes N = 0 while more than one class is pending; the class's own N holds there too (an instruction that
     has not read its sources has its N younger classmates behind it, so more than N are outstanding);
     ``s_wait_dscnt`` / ``loadcnt`` / ``storecnt`` before an access to a register an in-flight load writes, and
@@ -306,7 +306,8 @@ def sgpr_defs_uses(x):
 # ----------------------------------------------------------------------------------------------------------------
 class Rec:
     """An in-flight instruction. VALU: cls XDL / TRANS / CSMACC / UNK, seq = its number in its class. Memory op:
-    cls LDS / VMEM / FLAT, seq = its number there, ctr / cseq = its wait counter and its number there."""
+    cls LDS / VMEM / FLAT (the class its VGPR source reads are ordered in), seq = its number there, ctr / cseq =
+    its wait counter and its number there."""
 
     __slots__ = ("cls", "reads", "writes", "counted", "done", "seq", "ctr", "cseq")
 
@@ -422,7 +423,9 @@ def issue(st, x):
         st.vcnt[cls] += counted
         st.valu.append(Rec(cls, x.uses, x.defs, counted, st.vcnt[cls]))
     elif x.cls in MEM:
-        mc = {"DS": "LDS", "FLAT": "FLAT", "VMEM": "VMEM", "TDM": "VMEM"}[x.cls]
+        # the class whose order bounds vm_vsrc; a TDM op reads no VGPR and is in a class of its own: counted among
+        # the buffer instructions it would loosen the waits for their sources (LLVM does not count it either)
+        mc = {"DS": "LDS", "FLAT": "FLAT", "VMEM": "VMEM", "TDM": "TDM"}[x.cls]
         st.mcnt[mc] += 1
         if x.cls == "DS":
             k = "dscnt"
