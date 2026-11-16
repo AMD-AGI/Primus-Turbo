@@ -14,7 +14,7 @@
 """gfx950 FlyDSL attention for D_QK != D_V (DeepSeek-V3 MLA 192 / 128): dual-wave forward and fused
 backward, standalone (not wired into ``turbo.ops`` dispatch)."""
 
-from .ops import mla_fwd_sbhd
-from .ops_bwd import mla_bwd_sbhd
+from .ops import mla_fwd_bshd, mla_fwd_sbhd
+from .ops_bwd import mla_bwd_bshd, mla_bwd_sbhd
 
-__all__ = ["mla_bwd_sbhd", "mla_fwd_sbhd"]
+__all__ = ["mla_bwd_bshd", "mla_bwd_sbhd", "mla_fwd_bshd", "mla_fwd_sbhd"]

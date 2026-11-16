@@ -22,7 +22,7 @@ _BWD_CACHE: dict = {}
 _PRIMED: set = set()
 
 
-def _dkdv_kwargs(B, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, **over):
+def _dkdv_kwargs(B, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, sbhd=True, **over):
     kw = dict(
         num_heads=Hq,
         head_dim=d_qk,
@@ -35,7 +35,7 @@ def _dkdv_kwargs(B, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, **ove
         q_split=q_split,
         block_kv=block_kv,
         batch_size=B,
-        sbhd=True,
+        sbhd=sbhd,
         waves_per_eu=1,
         g2d=2,
         g1_ks_outer=False,
@@ -77,17 +77,33 @@ def _dkdv_kwargs(B, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, **ove
     return kw
 
 
-def _launchers(B, Sq, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, n_img, over):
-    key = (B, Sq, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, n_img, tuple(sorted(over.items())))
+def _launchers(B, Sq, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, n_img, over, sbhd=True):
+    key = (
+        B,
+        Sq,
+        Hq,
+        Hkv,
+        d_qk,
+        d_v,
+        scale,
+        block_kv,
+        block_q,
+        q_split,
+        n_img,
+        tuple(sorted(over.items())),
+        sbhd,
+    )
     hit = _BWD_CACHE.get(key)
     if hit is None:
-        kw = _dkdv_kwargs(B, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, a16_imgs=n_img, **over)
+        kw = _dkdv_kwargs(
+            B, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, sbhd=sbhd, a16_imgs=n_img, **over
+        )
         dkdv = fb.build_flash_attn_bwd_dkdv_module(**kw)
-        odo = fb.build_flash_attn_bwd_odo_module(num_heads=Hq, head_dim=d_v, sbhd=True)
+        odo = fb.build_flash_attn_bwd_odo_module(num_heads=Hq, head_dim=d_v, sbhd=sbhd)
         # K is staged in LDS prescaled by sm*log2e, so the image carries dQ*log2e; under k_lds
         # the tile is raw K and the image carries dQ/sm.
         dq_scale = scale if kw.get("k_lds") else 1.0 / _LOG2E
-        dqa16 = fb.build_flash_attn_bwd_dqa16_module(B, Sq, Hq, d_qk, dq_scale, n_img=n_img)
+        dqa16 = fb.build_flash_attn_bwd_dqa16_module(B, Sq, Hq, d_qk, dq_scale, n_img=n_img, sbhd=sbhd)
         hit = (dkdv, odo, dqa16)
         _BWD_CACHE[key] = hit
     return hit
@@ -149,16 +165,34 @@ def mla_bwd_sbhd(dout, q, k, v, out, lse, softmax_scale=None, block_kv=192, bloc
     than block_kv lies wholly inside the causal mask; its K/V rows past Skv read 0 and its
     dK/dV rows past Skv clip on the buffer bound.
     """
-    Sq, B, Hq, d_qk = q.shape
-    Skv, _, Hkv, d_v = v.shape
+    return _mla_bwd(dout, q, k, v, out, lse, softmax_scale, block_kv, block_q, q_split, True, over)
+
+
+def mla_bwd_bshd(dout, q, k, v, out, lse, softmax_scale=None, block_kv=192, block_q=32, q_split=1, **over):
+    """As mla_bwd_sbhd on contiguous [B,S,H,D] tensors (lse is the same [B*Sq, Hq])."""
+    return _mla_bwd(dout, q, k, v, out, lse, softmax_scale, block_kv, block_q, q_split, False, over)
+
+
+def _mla_bwd(dout, q, k, v, out, lse, softmax_scale, block_kv, block_q, q_split, sbhd, over):
+    if sbhd:
+        Sq, B, Hq, d_qk = q.shape
+        Skv, _, Hkv, d_v = v.shape
+        kshape, doshape = (Skv, B, Hkv, d_qk), (Sq, B, Hq, d_v)
+    else:
+        B, Sq, Hq, d_qk = q.shape
+        _, Skv, Hkv, d_v = v.shape
+        kshape, doshape = (B, Skv, Hkv, d_qk), (B, Sq, Hq, d_v)
     # The dK slot workspace is one flat kernel argument, whose length is packed as int32.
     assert q_split * Skv * B * Hkv * d_qk <= _I32_MAX
-    assert Sq == Skv and k.shape == (Skv, B, Hkv, d_qk) and dout.shape == (Sq, B, Hq, d_v)
+    assert Sq == Skv and k.shape == kshape and dout.shape == doshape
     assert Sq % (block_q * q_split) == 0
+    assert sbhd or q_split == 1
     scale = (1.0 / d_qk**0.5) if softmax_scale is None else float(softmax_scale)
     n_img = _a16_imgs_for(Skv, block_kv, B, Hkv)
     over = {"lpt_grid": _lpt_grid_for(B, Hkv, Skv, block_kv, q.device), **over}
-    dkdv, odo, dqa16 = _launchers(B, Sq, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, n_img, over)
+    dkdv, odo, dqa16 = _launchers(
+        B, Sq, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, n_img, over, sbhd=sbhd
+    )
     st = torch.cuda.current_stream()
 
     qf = fb._prescale_q(q, scale)
@@ -173,8 +207,13 @@ def mla_bwd_sbhd(dout, q, k, v, out, lse, softmax_scale=None, block_kv=192, bloc
     img0 = img[0]
     lse_bhsq = lse.view(B, Sq, Hq).permute(0, 2, 1)
     lsef = fb._prescale_lse(lse_bhsq, st).reshape(-1)
-    ws_dk = torch.empty(q_split, Skv, B, Hkv, d_qk, device=q.device, dtype=k.dtype)
-    ws_dv = torch.empty(q_split, Skv, B, Hkv, d_v, device=q.device, dtype=v.dtype)
+    if sbhd:
+        ws_dk = torch.empty(q_split, Skv, B, Hkv, d_qk, device=q.device, dtype=k.dtype)
+        ws_dv = torch.empty(q_split, Skv, B, Hkv, d_v, device=q.device, dtype=v.dtype)
+    else:
+        # One [Skv, Hkv, D] slot per batch (q_split == 1), which is the gradient's own layout.
+        ws_dk = torch.empty(1, B, Skv, Hkv, d_qk, device=q.device, dtype=k.dtype)
+        ws_dv = torch.empty(1, B, Skv, Hkv, d_v, device=q.device, dtype=v.dtype)
     cu_ph = fb._cu_placeholder(q.device)
     args = (
         qf,

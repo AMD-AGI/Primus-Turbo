@@ -35,8 +35,10 @@ from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_varlen_forward_impl,
 )
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx950_mla_impl import (
+    flash_attn_flydsl_gfx950_mla_forward_bshd_impl,
     flash_attn_flydsl_gfx950_mla_forward_impl,
     flydsl_gfx950_mla_unsupported_reason,
+    mla_bshd_native,
 )
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_impl import (
     flash_attn_flydsl_gfx1250_forward_impl,
@@ -298,8 +300,8 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         if k is None or v is None or return_softmax:
             return False
         if is_mla_head_dims(q, k, v):
-            # The DeepSeek-V3 MLA head dims (qk 192 / v 128) have their own kernels. They read
-            # contiguous sbhd, which the op layer copies other byte orders into.
+            # The DeepSeek-V3 MLA head dims (qk 192 / v 128) have their own kernels, compiled for
+            # contiguous bshd and for contiguous sbhd; the op layer copies any other byte order.
             return (
                 get_device_compute_capability() == _GFX950
                 and dropout_p == 0.0
@@ -327,6 +329,9 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
                 out, lse, _ = flash_attn_flydsl_gfx1250_mla_forward_impl(q, k, v, softmax_scale, causal)
             else:
                 out, lse = flash_attn_flydsl_gfx1250_forward_impl(q, k, v, softmax_scale, causal)
+            return (out, lse) if return_lse else out
+        if is_mla_head_dims(q, k, v) and mla_bshd_native(q, k, v):
+            out, lse = flash_attn_flydsl_gfx950_mla_forward_bshd_impl(q, k, v)
             return (out, lse) if return_lse else out
         # Under autotune, off the op layer's path, so the sbhd view is taken here too.
         q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))

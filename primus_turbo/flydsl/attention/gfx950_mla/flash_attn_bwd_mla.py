@@ -1191,7 +1191,7 @@ _A16_BLOCK = 256
 _DQA16_CACHE: dict = {}
 
 
-def build_flash_attn_bwd_dqa16_module(B, Sq, Hq, D, sm_scale, n_img=1):
+def build_flash_attn_bwd_dqa16_module(B, Sq, Hq, D, sm_scale, n_img=1, sbhd=True):
     """Un-permute the a16 dQ image (see ``_g3_a16``) into dQ, scaled: a pure bit permutation of the
     flat index, no LDS and no cross-lane step. The lane map looks scrambled on the READ side on
     purpose -- it is picked so a lane's dwords are consecutive and each store fills a write granule.
@@ -1262,7 +1262,8 @@ def build_flash_attn_bwd_dqa16_module(B, Sq, Hq, D, sm_scale, n_img=1):
             + (lane16 >> fx.Index(3)) * fx.Index(4)
             + (lane16 & fx.Index(3))
         )
-        _row = q * fx.Index(B) + bb
+        # dQ row: [Sq, B, Hq, D] (SBHD) or [B, Sq, Hq, D] (BSHD). The image is batch-major either way.
+        _row = (q * fx.Index(B) + bb) if const_expr(sbhd) else (bb * fx.Index(Sq) + q)
         obase = (_row * fx.Index(Hq) + qh) * fx.Index(D) + w1 * fx.Index(16) + kgh * fx.Index(8)
         sm_vec = Vec.filled(8, sm_scale, fx.Float32)
 
@@ -1728,7 +1729,7 @@ def build_flash_attn_bwd_dkdv_module(
     RD_STRIDE_DO = (batch_size * STRIDE_TOKEN_DO) if sbhd else STRIDE_TOKEN_DO
     RD_STRIDE_V = (batch_size * STRIDE_TOKEN_V) if sbhd else STRIDE_TOKEN_V
     if MLA:
-        assert sbhd and not varlen and window_left < 0 and not band_span, "MLA: dense causal SBHD only"
+        assert not varlen and window_left < 0 and not band_span, "MLA: dense causal only"
         assert bool(q_pref) and not bool(pf_ring) and int(dma_grp) == 1, "MLA: VGPR-staged Q/dO only"
         assert int(kv_halves) == 1 and not bool(g3_kreg), "MLA: single kv half, K^T re-read per head"
         assert bool(k_reg), "MLA: GEMM1a reads K from the register packs"
@@ -2456,7 +2457,9 @@ def build_flash_attn_bwd_dkdv_module(
                 V,
                 max_size=False,
                 num_records_bytes=_v_nrec_bytes,
-                base_byte_offset=_raw(batch_idx * fx.Index(STRIDE_TOKEN_V * 2)),
+                base_byte_offset=_raw(
+                    (batch_idx if const_expr(sbhd) else kv_tok_base) * fx.Index(STRIDE_TOKEN_V * 2)
+                ),
             )
         else:
             v_rsrc = buffer_ops.create_buffer_resource(
@@ -2492,7 +2495,7 @@ def build_flash_attn_bwd_dkdv_module(
         dk_rsrc = buffer_ops.create_buffer_resource(
             DK, max_size=False, num_records_bytes=_kv_nrec_bytes, base_byte_offset=_dkv_ws_byte_off
         )
-        if const_expr(MLA):
+        if const_expr(MLA and sbhd):
             # dV slot of the [q_split, Skv, B, Hkv, Dv] workspace.
             dv_rsrc = buffer_ops.create_buffer_resource(
                 DV,
@@ -2501,6 +2504,16 @@ def build_flash_attn_bwd_dkdv_module(
                 base_byte_offset=_raw(
                     (split_idx * seq_len_k_v * fx.Index(RD_STRIDE_V) + batch_idx * fx.Index(STRIDE_TOKEN_V))
                     * fx.Index(2)
+                ),
+            )
+        elif const_expr(MLA):
+            # BSHD: dV slot of the [B, q_split, Skv, Hkv, Dv] workspace, as dK's above.
+            dv_rsrc = buffer_ops.create_buffer_resource(
+                DV,
+                max_size=False,
+                num_records_bytes=_v_nrec_bytes,
+                base_byte_offset=_raw(
+                    (batch_idx * fx.Index(Q_SPLIT) + split_idx) * seq_len_k_v * fx.Index(STRIDE_TOKEN_V * 2)
                 ),
             )
         else:

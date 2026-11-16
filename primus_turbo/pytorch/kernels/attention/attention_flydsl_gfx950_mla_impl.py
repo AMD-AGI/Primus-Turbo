@@ -6,9 +6,10 @@
 
 """FlyDSL attention for the DeepSeek-V3 MLA head dims (qk 192 / v 128) on gfx950 (MI355X).
 
-Dense causal self-attention, bf16, Hq == Hkv, on contiguous SBHD. Forward and backward share the LSE
-layout of the other gfx950 FlyDSL kernels ([B*Sq, Hq] fp32, natural log), so the op layer saves and
-hands it over the same way. Dispatch and autograd wiring belong to the caller.
+Dense causal self-attention, bf16, Hq == Hkv, on contiguous SBHD or contiguous BSHD: the kernels are
+compiled for either byte order, so neither needs a copy. Forward and backward share the LSE layout of
+the other gfx950 FlyDSL kernels ([B*Sq, Hq] fp32, natural log), so the op layer saves and hands it over
+the same way. Dispatch and autograd wiring belong to the caller.
 """
 
 import math
@@ -32,6 +33,15 @@ def _kernels():
     from primus_turbo.flydsl.attention import gfx950_mla
 
     return gfx950_mla
+
+
+def mla_bshd_native(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    """Whether these [b, s, h, d]-shaped tensors are contiguous as they stand (bshd bytes).
+
+    Then the bshd kernels read them in place. Anything else goes through the [s, b, h, d] view,
+    which is free for sbhd storage and a copy for any other byte order.
+    """
+    return all(t.is_contiguous() for t in (q, k, v))
 
 
 def is_mla_head_dims(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
@@ -119,3 +129,43 @@ def flash_attn_flydsl_gfx950_mla_backward_impl(dout, q, k, v, out, lse, softmax_
     """sbhd tensors as in the forward, ``lse`` [B*Sq,H] as the forward returned it."""
     scale = 1.0 / math.sqrt(D_QK) if softmax_scale is None else float(softmax_scale)
     return _backward_op(dout.contiguous(), q, k, v, out, lse, scale)
+
+
+@_eager_custom_op("primus_turbo::flash_attn_flydsl_gfx950_mla_bshd_forward")
+def _forward_bshd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _kernels().mla_fwd_bshd(q, k, v, causal=True, return_lse=True)
+
+
+@_forward_bshd_op.register_fake
+def _forward_bshd_op_fake(q, k, v):
+    B, Sq, Hq, _ = q.shape
+    return q.new_empty((B, Sq, Hq, D_V)), q.new_empty((B * Sq, Hq), dtype=torch.float32)
+
+
+@_eager_custom_op("primus_turbo::flash_attn_flydsl_gfx950_mla_bshd_backward")
+def _backward_bshd_op(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    softmax_scale: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _kernels().mla_bwd_bshd(dout, q, k, v, out, lse, softmax_scale=softmax_scale)
+
+
+@_backward_bshd_op.register_fake
+def _backward_bshd_op_fake(dout, q, k, v, out, lse, softmax_scale):
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+
+def flash_attn_flydsl_gfx950_mla_forward_bshd_impl(q, k, v):
+    """q/k [B,Sq,H,192], v [B,Sq,H,128], contiguous. Returns O [B,Sq,H,128] and LSE [B*Sq,H] fp32."""
+    return _forward_bshd_op(q, k, v)
+
+
+def flash_attn_flydsl_gfx950_mla_backward_bshd_impl(dout, q, k, v, out, lse, softmax_scale=None):
+    """bshd tensors as in the forward, ``lse`` [B*Sq,H] as the forward returned it."""
+    scale = 1.0 / math.sqrt(D_QK) if softmax_scale is None else float(softmax_scale)
+    return _backward_bshd_op(dout.contiguous(), q, k, v, out, lse, scale)

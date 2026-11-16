@@ -20,7 +20,19 @@ from .flash_attn_fwd_mla import build_flash_attn_dualwave_swp_module
 
 @functools.lru_cache(maxsize=64)
 def _fwd_module(
-    hq, hkv, d_qk, d_v, causal, emit_lse, block_m, waves_per_eu, stagger, k_head, rows_per_wave, persistent
+    hq,
+    hkv,
+    d_qk,
+    d_v,
+    causal,
+    emit_lse,
+    block_m,
+    waves_per_eu,
+    stagger,
+    k_head,
+    rows_per_wave,
+    persistent,
+    sbhd=True,
 ):
     return build_flash_attn_dualwave_swp_module(
         num_heads=hq,
@@ -33,7 +45,7 @@ def _fwd_module(
         cross_seqlen=False,
         emit_lse=emit_lse,
         window_left=-1,
-        sbhd=True,
+        sbhd=sbhd,
         has_sink=False,
         block_m=block_m,
         waves_per_eu=waves_per_eu,
@@ -71,17 +83,23 @@ def mla_fwd_sbhd(
     k_head=1,
     rows_per_wave=64,
     persistent=True,
+    sbhd=True,
 ):
     """q [Sq,B,Hq,Dqk], k [Skv,B,Hkv,Dqk], v [Skv,B,Hkv,Dv], contiguous bf16.
 
     Returns O [Sq,B,Hq,Dv] (and LSE [B*Sq,Hq] fp32, natural log). Softmax scale is 1/sqrt(Dqk).
     ``rows_per_wave`` 64 runs a 256-row q block on one wave per SIMD (512 registers each).
     ``persistent`` launches one CTA per CU, each running a host-scheduled list of q blocks.
+    ``sbhd=False`` takes and returns contiguous [B,S,H,D] tensors instead (see mla_fwd_bshd).
     """
     if waves_per_eu is None:
         waves_per_eu = 1 if rows_per_wave == 64 else 2
-    Sq, B, Hq, d_qk = q.shape
-    Skv, Bk, Hkv, d_k = k.shape
+    if sbhd:
+        Sq, B, Hq, d_qk = q.shape
+        Skv, Bk, Hkv, d_k = k.shape
+    else:
+        B, Sq, Hq, d_qk = q.shape
+        Bk, Skv, Hkv, d_k = k.shape
     d_v = v.shape[-1]
     assert Bk == B and d_k == d_qk and v.shape[:3] == k.shape[:3]
     assert q.dtype == k.dtype == v.dtype == torch.bfloat16
@@ -101,13 +119,14 @@ def mla_fwd_sbhd(
         k_head,
         rows_per_wave,
         _num_cus(device_index) if persistent else 0,
+        bool(sbhd),
     )
-    out = q.new_empty((Sq, B, Hq, d_v))
+    out = q.new_empty((Sq, B, Hq, d_v) if sbhd else (B, Sq, Hq, d_v))
     lse = torch.empty((B * Sq, Hq) if return_lse else (0,), device=q.device, dtype=torch.float32)
     kw = {
         "seq_len_kv": Skv,
-        "stride_q_n": B * Hq * d_qk,
-        "stride_kv_n": B * Hkv * d_qk,
+        "stride_q_n": (B if sbhd else 1) * Hq * d_qk,
+        "stride_kv_n": (B if sbhd else 1) * Hkv * d_qk,
         "stream": torch.cuda.current_stream(q.device),
     }
     if return_lse:
@@ -116,3 +135,8 @@ def mla_fwd_sbhd(
         kw["sched"] = _schedule(mod, B, Sq, device_index)
     mod(q, k, v, out, B, Sq, **kw)
     return (out, lse) if return_lse else out
+
+
+def mla_fwd_bshd(q, k, v, **kw):
+    """mla_fwd_sbhd on contiguous [B,S,H,D] tensors: O [B,Sq,Hq,Dv], LSE in the same [B*Sq,Hq] layout."""
+    return mla_fwd_sbhd(q, k, v, sbhd=False, **kw)
