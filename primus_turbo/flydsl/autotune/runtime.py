@@ -18,6 +18,7 @@ The switch is ``PRIMUS_TURBO_AUTO_TUNE`` (default off), read through
 well. When it is off a tuner times nothing and returns its base config (see ``Tuner``'s ``off``).
 """
 
+import contextlib
 import threading
 import time
 import weakref
@@ -32,6 +33,8 @@ __all__ = [
     "enabled",
     "force",
     "blocked",
+    "rewritten_call",
+    "is_rewritten_call",
     "warn_blocked",
     "warn_unverified",
     "empty_cache",
@@ -74,6 +77,26 @@ def force(value: Optional[bool]) -> None:
     """Pin the kernel-level switch for tests and tools; ``None`` follows the backend switch again."""
     global _forced
     _forced = value
+
+
+_rewritten = threading.local()
+
+
+@contextlib.contextmanager
+def rewritten_call():
+    """Held while a caller runs a kernel on arguments it rewrote for its own timing (e.g. the
+    grouped-GEMM backend profiler's load-balanced group layout): a tune whose probe is the call's
+    own arguments (:class:`RealArgs`) takes base uncached there and searches at the next call."""
+    prev = getattr(_rewritten, "on", False)
+    _rewritten.on = True
+    try:
+        yield
+    finally:
+        _rewritten.on = prev
+
+
+def is_rewritten_call() -> bool:
+    return getattr(_rewritten, "on", False)
 
 
 def _is_compiling() -> bool:
