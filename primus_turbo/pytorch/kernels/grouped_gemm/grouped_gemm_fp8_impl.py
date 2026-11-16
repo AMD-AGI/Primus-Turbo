@@ -1084,11 +1084,15 @@ def grouped_gemm_fp8_variable_k_accum_impl(
         n_real=n_real,
     )
 
+    disp = GroupedGEMMFP8VariableKKernelDispatcher
     if (
         GlobalBackendManager.auto_tune_enabled()
-        and not GroupedGEMMFP8VariableKKernelDispatcher._is_graph_capturing()
+        and not disp._is_graph_capturing()
+        # The scratch is main_grad-sized: zeroing it on every call costs as much as a
+        # quarter of the wgrad, so build it only when the backend is not picked yet.
+        and disp._cache.get(disp.make_key(**kwargs)) is None
     ):
-        GroupedGEMMFP8VariableKKernelDispatcher.tune(**{**kwargs, "out": torch.zeros_like(out)})
+        disp.tune(**{**kwargs, "out": torch.zeros_like(out)})
 
     GroupedGEMMFP8VariableKKernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
 
