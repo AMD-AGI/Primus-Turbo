@@ -1357,6 +1357,8 @@ def build_flash_attn_bwd_dkdv_module(
     # band decode and the workspace all size themselves to the group.
     band_span=0,
     k_reg=True,  # feed GEMM1a's B from the K register packs, not the LDS tile (see K_REG)
+    # k_lds: GEMM1a fragments read back from the staged K tile instead of held live (see K_LDS).
+    k_lds=0,
     # g3_kreg: hold GEMM3's whole K^T fragment set live for the band instead of reading it
     # back per head-step. K^T is head-invariant, so this is pure read removal. See G3_KREG.
     g3_kreg=False,
@@ -1882,6 +1884,18 @@ def build_flash_attn_bwd_dkdv_module(
         and G3_SD
         and G3_DGRP == 4
         and BLOCK_KV * K_SUB_ROW <= K_SUB_STRIDE
+    )
+    # K_LDS: the staged tile then holds K raw (dQ's sm*log2e fold moves to the dQ reduce, which
+    # the caller passes sm instead of 1/log2e), so it equals the register packs bit for bit and
+    # GEMM1a can take any of a wave's own fragments from it: no other wave reads those rows, so
+    # each costs one ds_read_b128 per head-step against four registers held over the whole loop.
+    # The latest-used fragments (highest D step) go first; they have the most MFMAs of cover.
+    K_LDS = int(k_lds) if K_SUB else 0
+    assert 0 <= K_LDS <= NT * K_STEPS_QK
+    K_LDS_SET = set(
+        sorted(((nt, ks) for nt in range(NT) for ks in range(K_STEPS_QK)), key=lambda p: (-p[1], -p[0]))[
+            :K_LDS
+        ]
     )
     K_TILE_ELEMS = 2 * K_SUB_STRIDE + BLOCK_KV * K_SUB_ROW if K_SUB else BLOCK_KV * QK_ROW
     G3K_BASE = LDS_VIEW_ELEMS  # prescaled K [BLOCK_KV][HEAD_DIM]
@@ -2714,6 +2728,8 @@ def build_flash_attn_bwd_dkdv_module(
             # Native dQ cannot land here: it only builds at D=64, whose band never pairs.
             assert not A16_NATIVE, "native dQ needs a scaled LDS K tile, which GEMM1a cannot share"
             _g3ks_v8 = None
+        elif const_expr(K_LDS > 0):
+            _g3ks_v8 = None
         elif const_expr(A16_NATIVE):
             # Native dQ wants k*sm, which it used to reach by scaling an ALREADY-rounded
             # k*sm*log2e back down by 1/log2e -- two roundings where one will do.
@@ -2759,6 +2775,9 @@ def build_flash_attn_bwd_dkdv_module(
                         Vec(v_b_packs[h][nt][ks]).store(lds, [_kv_lds_idx(_vb_h, nt, ks)])
         if const_expr(not K_REG):
             k_b_packs = [G3K_BASE + h * BKV_H * HEAD_DIM for h in range_constexpr(KV_HALVES)]
+        for h in range_constexpr(KV_HALVES):
+            for nt, ks in sorted(K_LDS_SET):
+                k_b_packs[h][nt][ks] = None
         if const_expr(V_LDS):
             v_b_packs = [G3V_BASE + h * BKV_H * HEAD_DIM for h in range_constexpr(KV_HALVES)]
 
@@ -4106,6 +4125,18 @@ def build_flash_attn_bwd_dkdv_module(
                 """A q-half's Q and dO A fragments, read ahead of its GEMM1 (see G1_PF)."""
                 return (_read_a(q_lds, half, _q_apin), _read_a(do_lds, half, _do_apin, v=True))
 
+            def _k_b(h):
+                """GEMM1a's B fragments: the register packs, with K_LDS_SET read back from the tile."""
+                if const_expr(K_LDS == 0):
+                    return k_b_packs[h]
+                _out = [list(k_b_packs[h][nt]) for nt in range_constexpr(NT)]
+                for nt, ks in sorted(K_LDS_SET):
+                    _kr = fx.Index(h * BKV_H) + wave_id * ROWS_PER_WAVE_KV + fx.Index(nt * N_TILE) + lane16
+                    _kc = fx.Index((ks % 2) * K_STEP_QK) + kg * fx.Index(MFMA_LANE_K)
+                    _ki = fx.Index(G3K_BASE + (ks // 2) * K_SUB_STRIDE) + _kr * fx.Index(K_SUB_ROW)
+                    _out[nt][ks] = Vec.load(mfma_pack_type, lds, [_ki + (_kc ^ _ksub_swz(_kr))])
+                return _out
+
             def _half_gemm1(half, cls, a_pre=None, i_pre=None):
                 """The MFMA-only front of a q-half: S = Q@K^T and, fused, dP = dO@V^T.
 
@@ -4133,7 +4164,7 @@ def build_flash_attn_bwd_dkdv_module(
 
                 _st = _gemm_qk(
                     q_lds,
-                    k_b_packs[_H[0]],
+                    _k_b(_H[0]),
                     inits={mt: _ld_rd(mt, 1) for mt in half} if const_expr(i_pre is None) else i_pre[0],
                     mts=half,
                     pin=_q_apin,
@@ -4738,6 +4769,10 @@ def build_flash_attn_bwd_dkdv_module(
                     True,
                     nq=fx.Index(ArithValue(_m_nxt < _masked_upper).select(_m_nxt, _desc_q(fx.Index(0)))),
                 )
+            if const_expr(K_LDS > 0):
+                # The waitcnt pass merges the loop header's entry state with its back edge, so a
+                # load the entry leaves young turns the head-step's lse wait into a full drain.
+                rocdl.s_waitcnt(0)
             for q_start, inner in range(_unmask_start, seq_len_q_v, _step, init=loop_results):
                 _t = (q_start - _unmask_start) // fx.Index(_step)
                 loop_results = yield _q_body(_desc_q(_t), inner, False, nq=_desc_q(_t + fx.Index(1)))

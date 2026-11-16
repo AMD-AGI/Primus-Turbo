@@ -55,6 +55,7 @@ def _dkdv_kwargs(B, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, **ove
         q_ring=True,
         ring_at=5,
         k_reg=True,
+        k_lds=2,
         dv_pin=False,
         g3_st_at=1,
         g3_st_n=1,
@@ -77,12 +78,13 @@ def _launchers(B, Sq, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, n_i
     key = (B, Sq, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, n_img, tuple(sorted(over.items())))
     hit = _BWD_CACHE.get(key)
     if hit is None:
-        dkdv = fb.build_flash_attn_bwd_dkdv_module(
-            **_dkdv_kwargs(B, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, a16_imgs=n_img, **over)
-        )
+        kw = _dkdv_kwargs(B, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, a16_imgs=n_img, **over)
+        dkdv = fb.build_flash_attn_bwd_dkdv_module(**kw)
         odo = fb.build_flash_attn_bwd_odo_module(num_heads=Hq, head_dim=d_v, sbhd=True)
-        # K is staged in LDS prescaled by sm*log2e, so the image carries dQ*log2e.
-        dqa16 = fb.build_flash_attn_bwd_dqa16_module(B, Sq, Hq, d_qk, 1.0 / _LOG2E, n_img=n_img)
+        # K is staged in LDS prescaled by sm*log2e, so the image carries dQ*log2e; under k_lds
+        # the tile is raw K and the image carries dQ/sm.
+        dq_scale = scale if kw.get("k_lds") else 1.0 / _LOG2E
+        dqa16 = fb.build_flash_attn_bwd_dqa16_module(B, Sq, Hq, d_qk, dq_scale, n_img=n_img)
         hit = (dkdv, odo, dqa16)
         _BWD_CACHE[key] = hit
     return hit
