@@ -1,0 +1,34 @@
+glm-4.7 n4 32K fwd o_proj default                              1532
+glm-4.7 n4 32K fwd o_proj BM=128 push=8 split=4                1917
+glm-4.7 n4 32K fwd o_proj BM=128 push=8 split=8                1897
+glm-4.7 n4 32K fwd o_proj BM=128 push=16 split=4               1476
+glm-4.7 n4 32K fwd o_proj BM=128 push=16 split=8               1473
+glm-4.7 n4 32K fwd o_proj BM=128 push=32 split=4               1528
+glm-4.7 n4 32K fwd o_proj BM=128 push=32 split=8               1525
+glm-4.7 n4 32K fwd o_proj BM=128 push=48 split=4               1655
+glm-4.7 n4 32K fwd o_proj BM=128 push=48 split=8               1653
+glm-4.7 n4 32K fwd o_proj BM=256 push=8 split=4                2685
+glm-4.7 n4 32K fwd o_proj BM=256 push=8 split=8                2693
+glm-4.7 n4 32K fwd o_proj BM=256 push=16 split=4               1717
+glm-4.7 n4 32K fwd o_proj BM=256 push=16 split=8               1723
+glm-4.7 n4 32K fwd o_proj BM=256 push=32 split=4               1337
+glm-4.7 n4 32K fwd o_proj BM=256 push=32 split=8               1355
+glm-4.7 n4 32K fwd o_proj BM=256 push=48 split=4               1428
+glm-4.7 n4 32K fwd o_proj BM=256 push=48 split=8               1431
+glm-4.7 n4 32K bwd QKV default                                 2461
+glm-4.7 n4 32K bwd QKV BM=128 push=8 wgrad=first               4363
+glm-4.7 n4 32K bwd QKV BM=128 push=8 wgrad=last                3403
+glm-4.7 n4 32K bwd QKV BM=128 push=16 wgrad=first              3491
+glm-4.7 n4 32K bwd QKV BM=128 push=16 wgrad=last               2753
+glm-4.7 n4 32K bwd QKV BM=128 push=32 wgrad=first              3348
+glm-4.7 n4 32K bwd QKV BM=128 push=32 wgrad=last               2773
+glm-4.7 n4 32K bwd QKV BM=128 push=48 wgrad=first              3367
+glm-4.7 n4 32K bwd QKV BM=128 push=48 wgrad=last               3000
+glm-4.7 n4 32K bwd QKV BM=256 push=8 wgrad=first               5204
+glm-4.7 n4 32K bwd QKV BM=256 push=8 wgrad=last                4345
+glm-4.7 n4 32K bwd QKV BM=256 push=16 wgrad=first              3758
+glm-4.7 n4 32K bwd QKV BM=256 push=16 wgrad=last               2987
+glm-4.7 n4 32K bwd QKV BM=256 push=32 wgrad=first              3121
+glm-4.7 n4 32K bwd QKV BM=256 push=32 wgrad=last               2456
+glm-4.7 n4 32K bwd QKV BM=256 push=48 wgrad=first              3034
+glm-4.7 n4 32K bwd QKV BM=256 push=48 wgrad=last               2513

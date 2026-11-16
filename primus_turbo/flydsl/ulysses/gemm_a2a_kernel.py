@@ -423,11 +423,13 @@ def _make_kernel(
             fx.gpu.barrier()
             if thread_index == fx.Int32(0):
                 flag_base = my_base + fx.Int64(flag_region * FLAG_REGION_BYTES)
-                st(flag_base, tile_m * fx.Int32(n_tiles) + tile_n, epoch, scope="sys", order="release")
+                # no release (an L2 writeback per tile): the staging stores are system scope (SYS_NT),
+                # and the waits above retired them before the flag goes out
+                st(flag_base, tile_m * fx.Int32(n_tiles) + tile_n, epoch, scope="sys", order="relaxed")
                 if const_expr(trace):
                     st(trace_base, (tile_m * fx.Int32(n_tiles) + tile_n) * fx.Int32(2) + 1, read_clock())
 
-        exit_and_bump_epoch(thread_index, state_base, epoch, grid)
+        exit_and_bump_epoch(thread_index, state_base, epoch, grid, order="relaxed")
 
     return kernel, grid
 

@@ -1,0 +1,14 @@
+== glm-4.7 n4 32K fwd o_proj (A2AGemm): M=8192 K=12288 N=5120 BM=128 tiles=1280 wgrad_tiles=0 push=32 split=1 stagger=0 grid=256
+   hipBLASLt gemm 852 us  wgrad 0 us -> 256-CU work 218052 CU-us, 170.4 CU-us per 128x256 tile
+   rank   timed  kernel  pushEnd  lastLand   tail | CU-us:    tiles   wgrad    push    idle | landed pureTile  vsHip | tile eff
+      0    1542    1503      862      1322    181 |          330238       0   26142   28311 |    990    251.4   1.48 |  0.66
+      1    1542    1516      916      1333    182 |          332603       0   27680   27695 |   1047    249.1   1.46 |  0.66
+      2    1542    1477      872      1293    184 |          324371       0   26335   27532 |   1048    245.0   1.44 |  0.67
+      3    1542    1502      877      1317    185 |          328086       0   26349   30080 |   1005    246.5   1.45 |  0.66
+== glm-4.7 n4 32K bwd QKV (A2AGemm+wgrad): M=8192 K=14336 N=5120 BM=256 tiles=640 wgrad_tiles=1120 push=32 split=1 stagger=0 grid=256
+   hipBLASLt gemm 956 us  wgrad 947 us -> 256-CU work 487126 CU-us, 382.4 CU-us per 256x256 tile
+   rank   timed  kernel  pushEnd  lastLand   tail | CU-us:    tiles   wgrad    push    idle | landed pureTile  vsHip | tile eff
+      0    2604    2522     1226      1398   1124 |          303634  286434   34471   21083 |    128    319.7   0.84 |  0.81
+      1    2604    2567     1111      1434   1133 |          314502  282435   31037   29181 |      6    325.6   0.85 |  0.78
+      2    2604    2524     1088      1340   1184 |          297270  283099   30426   35320 |      0      nan    nan |  0.82
+      3    2604    2570     1102      1380   1189 |          303609  282528   31029   40687 |      2    340.4   0.89 |  0.81

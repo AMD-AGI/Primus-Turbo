@@ -1,0 +1,26 @@
+llama3.1-8b n4 32K fwd o_proj default                               444
+llama3.1-8b n4 32K fwd o_proj BM=128 push=8 split=8                 531
+llama3.1-8b n4 32K fwd o_proj BM=128 push=16 split=8                424
+llama3.1-8b n4 32K fwd o_proj BM=128 push=32 split=8                445
+llama3.1-8b n4 32K fwd o_proj BM=128 push=48 split=8                482
+llama3.1-8b n4 32K fwd o_proj BM=256 push=8 split=8                 564
+llama3.1-8b n4 32K fwd o_proj BM=256 push=16 split=8                455
+llama3.1-8b n4 32K fwd o_proj BM=256 push=32 split=8                463
+llama3.1-8b n4 32K fwd o_proj BM=256 push=48 split=8                495
+llama3.1-8b n4 32K bwd QKV default                                  934
+llama3.1-8b n4 32K bwd QKV BM=128 push=8 wgrad=first               1237
+llama3.1-8b n4 32K bwd QKV BM=128 push=8 wgrad=last                1149
+llama3.1-8b n4 32K bwd QKV BM=128 push=16 wgrad=first              1121
+llama3.1-8b n4 32K bwd QKV BM=128 push=16 wgrad=last               1048
+llama3.1-8b n4 32K bwd QKV BM=128 push=32 wgrad=first              1151
+llama3.1-8b n4 32K bwd QKV BM=128 push=32 wgrad=last               1104
+llama3.1-8b n4 32K bwd QKV BM=128 push=48 wgrad=first              1188
+llama3.1-8b n4 32K bwd QKV BM=128 push=48 wgrad=last               1160
+llama3.1-8b n4 32K bwd QKV BM=256 push=8 wgrad=first               1107
+llama3.1-8b n4 32K bwd QKV BM=256 push=8 wgrad=last                1049
+llama3.1-8b n4 32K bwd QKV BM=256 push=16 wgrad=first               998
+llama3.1-8b n4 32K bwd QKV BM=256 push=16 wgrad=last                933
+llama3.1-8b n4 32K bwd QKV BM=256 push=32 wgrad=first              1026
+llama3.1-8b n4 32K bwd QKV BM=256 push=32 wgrad=last                970
+llama3.1-8b n4 32K bwd QKV BM=256 push=48 wgrad=first              1064
+llama3.1-8b n4 32K bwd QKV BM=256 push=48 wgrad=last               1014

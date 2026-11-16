@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""MLA under Ulysses: per-head all-to-all vs latent all-gather, on DeepSeek-V3 dimensions.
+"""MLA under Ulysses: per-head all-to-all vs latent all-gather, on DeepSeek-V3 / Kimi K2 dimensions.
 
 per-head   up-project the local tokens for every head, then all-to-all q / k / v (forward) and
            dq / dk / dv back (backward); what ``flash_attn_usp_func`` / a GemmA2A would exchange
@@ -46,6 +46,7 @@ from primus_turbo.pytorch.ops.attention.usp.attention_a2a_helper import (
 )
 
 DSV3 = dict(heads=128, q_lora=1536, kv_lora=512, nope=128, rope=64, v=128)
+MODELS = {"deepseek-v3": DSV3, "kimi-k2": dict(DSV3, heads=64)}
 
 
 def rnd(*shape, scale=1.0):
@@ -226,6 +227,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    parser.add_argument("--model", default="deepseek-v3", choices=sorted(MODELS))
     parser.add_argument("--seq", nargs="+", type=int, default=[32768])
     parser.add_argument("--mbs", type=int, default=1)
     parser.add_argument("--no-attn", action="store_true")
@@ -243,11 +245,12 @@ def main():
         print(
             f"peaks: GEMM {peak_flops / 1e12:.0f} TFLOP/s, link {peak_link / 1e9:.0f} GB/s per rank off-rank"
         )
+    cfg = MODELS[args.model]
     cols = ("gemm", "wgrad", "comm", "serial", "overlap", "op", "roofline")
     for seq in args.seq:
-        stages, qkv = build(DSV3, seq, args.mbs, group)
+        stages, qkv = build(cfg, seq, args.mbs, group)
         if rank == 0:
-            print(f"\n== DeepSeek-V3 MLA seq={seq} ulysses={n} mbs={args.mbs}  (us, max over ranks)")
+            print(f"\n== {args.model} MLA seq={seq} ulysses={n} mbs={args.mbs}  (us, max over ranks)")
             print(f"  {'stage':<30}" + "".join(f"{c:>9}" for c in cols) + f"{'off-rank MB':>13}")
         for name, (gemm, wgrad, (kind, numel), op, flops) in stages.items():
             t = {
@@ -267,10 +270,10 @@ def main():
             fwd, bwd = attention_times(qkv, group)
             if rank == 0:
                 fmt = lambda t: "-" if t is None else f"{t:.0f} us"  # noqa: E731
-                print(f"  causal attention, {DSV3['heads'] // n} local heads: fwd {fmt(fwd)}, bwd {fmt(bwd)}")
+                print(f"  causal attention, {cfg['heads'] // n} local heads: fwd {fmt(fwd)}, bwd {fmt(bwd)}")
         if rank == 0:
-            heads = DSV3["heads"] // n
-            dqk, dv = DSV3["nope"] + DSV3["rope"], DSV3["v"]
+            heads = cfg["heads"] // n
+            dqk, dv = cfg["nope"] + cfg["rope"], cfg["v"]
             fwd_flops = args.mbs * heads * seq * seq / 2 * 2 * (dqk + dv)
             print(
                 f"  causal attention fwd at {args.attn_tflops:.0f} TFLOP/s: {fwd_flops / args.attn_tflops / 1e6:.0f} us"

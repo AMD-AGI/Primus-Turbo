@@ -220,7 +220,9 @@ def _push_unit(thread_index, m_sub, dst, dst_heap, bank_offset, o_res, epoch, **
     fx.gpu.barrier()
     if thread_index == fx.Int32(0):
         flag_base = dst_heap + fx.Int64(c["flag_region"] * FLAG_REGION_BYTES)
-        st(flag_base, m_sub * fx.Int32(num_ranks) + fx.Int32(rank), epoch, scope="sys", order="release")
+        # no release (an L2 writeback per unit): the bank stores are system scope (SYS_NT), and the
+        # wait above retired them before the flag goes out
+        st(flag_base, m_sub * fx.Int32(num_ranks) + fx.Int32(rank), epoch, scope="sys", order="relaxed")
 
 
 @ASTRewriter.transform
@@ -248,7 +250,7 @@ def _push_loop(thread_index, state_base, claim_slot, peers_base, bank_offset, o_
         unit = claim_unit(thread_index, state_base, claim_slot)
 
 
-def _arrival_k_seg(flag_base, tile_m, epoch, trace_base=None, trace_idx=None, **c):
+def _arrival_k_seg(flag_base, tile_m, epoch, trace_base=None, trace_idx=None, landed=False, **c):
     """The K walk of an m-tile: one segment per source, in the order the sources' rows land.
 
     Source ``s`` pushes m-tile ``i`` at position ``(i - s * D) mod m_tiles`` of its walk, so the
@@ -256,7 +258,8 @@ def _arrival_k_seg(flag_base, tile_m, epoch, trace_base=None, trace_idx=None, **
     cyclically. In step (``D = 0``) every source pushes ``i`` to itself first, then to ``s + 1, ...``,
     so this rank's own rows land first and source ``rank - j`` lands ``j``-th. The order depends on
     ``i`` and the rank only: the accumulation stays bitwise deterministic. Each wave waits for a
-    segment's flags itself before its first load of it."""
+    segment's flags itself before its first load of it; ``landed`` (every flag already checked) walks
+    the same order without the waits."""
     num_ranks, D, S, rank = c["num_ranks"], c["stagger"], c["push_split"], c["rank"]
 
     class _ArrivalKSeg:
@@ -276,6 +279,8 @@ def _arrival_k_seg(flag_base, tile_m, epoch, trace_base=None, trace_idx=None, **
             return self.src(seg) * fx.Int32(self.seg_len)
 
         def wait(self, seg):
+            if const_expr(landed):
+                return
             src = self.src(seg)
             slots = [(tile_m * fx.Int32(S) + fx.Int32(sub)) * fx.Int32(num_ranks) + src for sub in range(S)]
             spin_flags(flag_base, slots, epoch, rank, src, "a2a_gemm")
@@ -376,6 +381,23 @@ def _claimed_tile(q, **c):
 
 
 @ASTRewriter.transform
+def _all_landed(thread_index, flag_base, claim_slot, tile_m, epoch, **c):
+    """1 when every source's rows of ``tile_m`` have landed (all its sub-tiles), else 0; one poll by
+    thread 0, broadcast so the whole block takes the same tile body."""
+    num_ranks, S = c["num_ranks"], c["push_split"]
+    if thread_index == fx.Int32(0):
+        slots = [tile_m * fx.Int32(S * num_ranks) + fx.Int32(i) for i in range(S * num_ranks)]
+        ok = _all_reached(flag_base, slots, epoch)
+        st_lds(claim_slot, 0, arith.select(ok, fx.Int32(1), fx.Int32(0)))
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    landed = _readfirstlane_i32(ld_lds(claim_slot, 0))
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    return landed
+
+
+@ASTRewriter.transform
 def _wait_all(thread_index, flag_base, tile_m, epoch, **c):
     """Every source's rows of ``tile_m`` have landed (all its sub-tiles)."""
     num_ranks, S = c["num_ranks"], c["push_split"]
@@ -460,16 +482,37 @@ def _tile_loop(
                 )
             else:
                 qd = arith.select(q < fx.Int32(w_at), q, q - fx.Int32(num_wtiles))
-                _gemm_tile(thread_index, qd, flag_base, recv_addr, W, Y, RES, OG, lds, epoch, trace_base, **c)
+                _gemm_tile(
+                    thread_index,
+                    qd,
+                    flag_base,
+                    claim_slot,
+                    recv_addr,
+                    W,
+                    Y,
+                    RES,
+                    OG,
+                    lds,
+                    epoch,
+                    trace_base,
+                    **c,
+                )
         else:
-            _gemm_tile(thread_index, q, flag_base, recv_addr, W, Y, RES, OG, lds, epoch, trace_base, **c)
+            _gemm_tile(
+                thread_index, q, flag_base, claim_slot, recv_addr, W, Y, RES, OG, lds, epoch, trace_base, **c
+            )
         q = claim_unit(thread_index, state_base, claim_slot, STATE_TILE)
 
 
 @ASTRewriter.transform
-def _gemm_tile(thread_index, q, flag_base, recv_addr, W, Y, RES, OG, lds, epoch, trace_base, **c):
+def _gemm_tile(thread_index, q, flag_base, claim_slot, recv_addr, W, Y, RES, OG, lds, epoch, trace_base, **c):
     """GEMM tile of claim ``q``. With whole K chunks per source it walks K by arrival
-    (``_arrival_k_seg``); otherwise it waits for the whole m-tile, copies it out, then runs."""
+    (``_arrival_k_seg``); otherwise it waits for the whole m-tile, copies it out, then runs.
+
+    The arrival walk first polls all of the m-tile's flags: once its rows have landed (most tiles
+    when the GEMM outweighs the exchange) it runs the same K order without the per-segment waits.
+    A wait inside the unrolled K loop costs even when the flag is set: it drains the prefetches and
+    spills accumulators around the poll (DeepSeek-V3 o_proj n=4 128K: ~18 % of the kernel)."""
     M, M_pad, K, N, BM, BN = c["M"], c["M_pad"], c["K"], c["N"], c["BM"], c["BN"]
     n_tiles, progressive = c["n_tiles"], c["progressive"]
     gemm_tile = functools.partial(gemm_bf16_tile, c["layout"], pair_n=True)
@@ -498,9 +541,39 @@ def _gemm_tile(thread_index, q, flag_base, recv_addr, W, Y, RES, OG, lds, epoch,
     if const_expr(trace_base is not None):
         if thread_index == fx.Int32(0):
             st(trace_base, tile_index * fx.Int32(3), read_clock())
-    k_seg = None
+
+    def run(k_seg):
+        gemm_tile(
+            make_bf16_fp16_tile_tensor(recv_addr, fx.Int64(0), M_pad * K),
+            make_bf16_fp16_tile_tensor(i64_base(W), fx.Int64(0), K * N),
+            make_bf16_fp16_tile_tensor(i64_base(Y), fx.Int64(0), M * N),
+            fx.Int32(M),
+            fx.Int32(N),
+            lds,
+            tile_m,
+            tile_n,
+            K=K,
+            BLOCK_M=BM,
+            BLOCK_N=BN,
+            out_fp16=False,
+            nt_vmcnt=c["nt_vmcnt"],
+            n_tail=N % BN,
+            persistent="staggered",
+            k_seg=k_seg,
+            **epilogue,
+        )
+
     if const_expr(progressive):
-        k_seg = _arrival_k_seg(flag_base, tile_m, epoch, trace_base, tile_index * fx.Int32(3) + 1, **c)
+        landed = _all_landed(thread_index, flag_base, claim_slot, tile_m, epoch, **c)
+        if landed != fx.Int32(0):
+            # see _arrival_k_seg.wait for the sys scope
+            memory_fence(order="acquire", scope="sys")
+            if const_expr(trace_base is not None):
+                if thread_index == fx.Int32(0):
+                    st(trace_base, tile_index * fx.Int32(3) + 1, read_clock())
+            run(_arrival_k_seg(flag_base, tile_m, epoch, landed=True, **c))
+        else:
+            run(_arrival_k_seg(flag_base, tile_m, epoch, trace_base, tile_index * fx.Int32(3) + 1, **c))
     else:
         _wait_all(thread_index, flag_base, tile_m, epoch, **c)
         if const_expr(trace_base is not None):
@@ -508,25 +581,7 @@ def _gemm_tile(thread_index, q, flag_base, recv_addr, W, Y, RES, OG, lds, epoch,
                 st(trace_base, tile_index * fx.Int32(3) + 1, read_clock())
         if const_expr(c["save_o"]):
             copy_o(tile_m, tile_n)
-    gemm_tile(
-        make_bf16_fp16_tile_tensor(recv_addr, fx.Int64(0), M_pad * K),
-        make_bf16_fp16_tile_tensor(i64_base(W), fx.Int64(0), K * N),
-        make_bf16_fp16_tile_tensor(i64_base(Y), fx.Int64(0), M * N),
-        fx.Int32(M),
-        fx.Int32(N),
-        lds,
-        tile_m,
-        tile_n,
-        K=K,
-        BLOCK_M=BM,
-        BLOCK_N=BN,
-        out_fp16=False,
-        nt_vmcnt=c["nt_vmcnt"],
-        n_tail=N % BN,
-        persistent="staggered",
-        k_seg=k_seg,
-        **epilogue,
-    )
+        run(None)
     if const_expr(progressive and c["save_o"]):
         # every wave has waited for all of the m-tile's sources inside the K walk
         copy_o(tile_m, tile_n)
@@ -697,7 +752,7 @@ def _make_kernel(
             trace_base,
             **consts,
         )
-        exit_and_bump_epoch(thread_index, state_base, epoch, grid)
+        exit_and_bump_epoch(thread_index, state_base, epoch, grid, order="relaxed")
 
     return kernel, grid
 
@@ -867,11 +922,13 @@ def ulysses_a2a_gemm(
     # tiles cost 35 % more GEMM time than 256-row ones and pushers beyond what keeps ahead of the K walk
     # take CUs from it (Llama-70B o_proj 4K: 844 -> 748 us, 8K: 1506 -> 1252 us). Not with in-kernel
     # wgrad: its tiles read the recv bank too, and fewer pushers starve them (Llama-70B bwd QKV 8K
-    # +12 %).
+    # +12 %). From 8192 rows, 8 pushers suffice for a single peer but fall behind three or more once
+    # landed tiles skip the per-segment waits (DeepSeek-V3 32K n = 4: 2130 -> 2003 us with 16; n = 2:
+    # 4801 -> 5030 us).
     gemm_bound = wgrad is None and N * num_ranks >= 8192 * (num_ranks - 1)
     if num_push is None:
         if gemm_bound:
-            num_push = 8 if M >= 8192 else 16
+            num_push = 8 if M >= 8192 and num_ranks == 2 else 16
         else:
             # with few weight-gradient tiles the launch is compute-bound: 16 pushers still fill the links
             num_push = 32 if wgrad is None or many_wtiles else 16

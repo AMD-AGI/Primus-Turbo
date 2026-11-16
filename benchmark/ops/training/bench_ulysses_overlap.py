@@ -51,6 +51,12 @@ MODELS = {
     "llama3.1-70b": dict(hidden=8192, hq=64, hkv=8, d=128),
     "wan2.1-14b": dict(hidden=5120, hq=40, hkv=40, d=128),
     "qwen3-30b-a3b": dict(hidden=2048, hq=32, hkv=4, d=128),
+    "qwen3-235b-a22b": dict(hidden=4096, hq=64, hkv=4, d=128),
+    "glm-4.7": dict(hidden=5120, hq=96, hkv=8, d=128),
+    "minimax-m2.5": dict(hidden=3072, hq=48, hkv=8, d=128),
+    # MLA: only the exit (o_proj) ops; the entry is the latent AgGemm / GemmRS (bench_ulysses_mla_latent.py)
+    "deepseek-v3": dict(hidden=7168, hq=128, hkv=128, d=128, exit_only=True),
+    "kimi-k2": dict(hidden=7168, hq=64, hkv=64, d=128, exit_only=True),
 }
 
 
@@ -177,7 +183,7 @@ def build_ops(cfg, seq, b, group):
         bwd_tuning=None,
     )
     # name: (gemm, wgrad or None, exchanged elements, pack, unfused, fused, FLOPs)
-    return {
+    ops = {
         "fwd QKV (GemmA2A)": (
             lambda: F.linear(x, w_qkv),
             None,
@@ -217,6 +223,9 @@ def build_ops(cfg, seq, b, group):
             4 * T * Kq * hidden,
         ),
     }
+    if cfg.get("exit_only"):
+        ops = {k: v for k, v in ops.items() if "o_proj" in k}
+    return ops
 
 
 def main():

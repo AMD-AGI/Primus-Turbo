@@ -1,0 +1,25 @@
+peaks: GEMM 1268 TFLOP/s (hipBLASLt 8192^3), link 340 GB/s per rank off-rank (RCCL 1 GiB a2a)
+== glm-4.7 seq=16384 ulysses=8 mbs=1  (us, max over ranks)
+  op                               gemm    wgrad      a2a     pack   serial  unfused  overlap    fused roofline  hidden fused/roof
+  fwd QKV (GemmA2A)                 262        0      197      138      459      596      262      338      237    62%      1.42x
+  fwd o_proj (A2AGemm)              227        0      169       51      396      440      227      462      203   -39%      2.27x
+  bwd o_proj (GemmA2A+wgrad)        220      237      171       51      627      673      457      479      406    87%      1.18x
+  bwd QKV (A2AGemm+wgrad)           256      280      195       94      731      888      536      709      474    11%      1.50x
+== glm-4.7 seq=32768 ulysses=8 mbs=1  (us, max over ranks)
+  op                               gemm    wgrad      a2a     pack   serial  unfused  overlap    fused roofline  hidden fused/roof
+  fwd QKV (GemmA2A)                 495        0      340      282      835     1117      495      662      474    51%      1.40x
+  fwd o_proj (A2AGemm)              435        0      304       93      739      825      435      744      406    -2%      1.83x
+  bwd o_proj (GemmA2A+wgrad)        415      439      304       93     1158     1252      854      924      813    77%      1.14x
+  bwd QKV (A2AGemm+wgrad)           505      500      340      202     1345     1645     1005     1234      948    33%      1.30x
+== glm-4.7 seq=65536 ulysses=8 mbs=1  (us, max over ranks)
+  op                               gemm    wgrad      a2a     pack   serial  unfused  overlap    fused roofline  hidden fused/roof
+  fwd QKV (GemmA2A)                 993        0      642      547     1635     2182      993     1293      948    53%      1.36x
+  fwd o_proj (A2AGemm)              852        0      558      178     1410     1589      852     1473      813   -11%      1.81x
+  bwd o_proj (GemmA2A+wgrad)        821      848      556      180     2226     2398     1669     1757     1626    84%      1.08x
+  bwd QKV (A2AGemm+wgrad)           951      951      642      384     2544     3131     1902     2319     1897    35%      1.22x
+== glm-4.7 seq=131072 ulysses=8 mbs=1  (us, max over ranks)
+  op                               gemm    wgrad      a2a     pack   serial  unfused  overlap    fused roofline  hidden fused/roof
+  fwd QKV (GemmA2A)                1929        0     1235     1071     3164     4322     1929     2524     1897    52%      1.33x
+  fwd o_proj (A2AGemm)             1667        0     1061      345     2728     3096     1667     2843     1626   -11%      1.75x
+  bwd o_proj (GemmA2A+wgrad)       1637     1664     1061      346     4362     4734     3301     3585     3251    73%      1.10x
+  bwd QKV (A2AGemm+wgrad)          1877     1855     1232      734     4964     5995     3732     4885     3793     6%      1.29x

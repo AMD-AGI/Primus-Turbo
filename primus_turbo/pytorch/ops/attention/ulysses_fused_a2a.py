@@ -46,9 +46,14 @@ class GemmA2ATuning:
     """Launch knobs of a GemmA2A (forward QKV, backward o_proj); ``None`` keeps the default.
 
     Attributes:
-        BM: GEMM tile rows (128); smaller tiles finish, and get pulled, earlier.
+        BM: GEMM tile rows (128; backward o_proj 256). Smaller tiles finish, and get pulled, earlier;
+            the backward o_proj GEMM (N = h * d) outweighs its exchange, and a 128-row tile runs it
+            ~25 % slower (DeepSeek-V3 dO 65536 x 16384 x 7168: 14.6 vs 11.7 ms alone).
         num_lead: GEMM blocks dispatched ahead of the pull blocks (CU count, one wave).
-        num_pull_cu: pull blocks queued after the lead wave (16; forward QKV 24).
+        num_pull_cu: pull blocks queued after the lead wave (16; forward QKV 24; backward o_proj at
+            n = 2: 8). With one peer, 12+ pull blocks keep the link saturated with remote reads that
+            slow the concurrent GEMM tiles (DeepSeek-V3 128K: 28.9 vs 25.7 ms); at n >= 4 the reads
+            spread over the peers and 8 blocks fall behind.
         num_tail_pull: pull blocks queued after all GEMM blocks, for the last wave (16; forward QKV 8).
         wgrad_at: GEMM tile after which the in-kernel wgrad tiles are dispatched (backward o_proj
             only; ``num_lead + gemm_tiles // 8``, or last when there are more wgrad tiles than CUs).
@@ -69,7 +74,7 @@ class A2AGemmTuning:
         BM: GEMM tile rows, 128 or 256 (256 when every tile fits on the CUs, the wgrad tiles go
             last or, without wgrad, the GEMM outweighs the exchange, ``N * n >= 8192 * (n - 1)``).
         num_push: push blocks, which run the last GEMM tiles once done (32; 16 with few wgrad tiles;
-            GEMM-bound without wgrad: 16, 8 from 8192 rows).
+            GEMM-bound without wgrad: 16, 8 from 8192 rows at n = 2).
         push_split: sub-tiles a ``BM``-row m-tile is pushed in, so its rows land in pieces (8).
         wgrad_at: claim slot of the in-kernel wgrad tiles (backward QKV only; 0, or after every
             dgrad tile when the GEMM outweighs the exchange, ``N * n >= 4096 * (n - 1)``, or there
@@ -324,7 +329,7 @@ def _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format, wgrad=None
         qkv_format=qkv_format,
         flag_region=REGION_O_GEMM_A2A,
         wgrad=None if wgrad is None else (dy2d, *wgrad),
-        **_launch_kwargs(tuning),
+        **_launch_kwargs(tuning, BM=256, num_pull_cu=8 if n == 2 else 16),
     )
     shape = (seq, b) if qkv_format == "sbhd" else (b, seq)
     return do.view(*shape, heads, d)
