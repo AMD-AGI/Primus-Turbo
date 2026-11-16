@@ -94,18 +94,31 @@ _I32_MAX = 2**31 - 1
 # bf16 atomic adds one dQ image takes per element at most, and the most images a call spreads over.
 _A16_ADDS_PER_IMG = 32
 _A16_MAX_IMGS = 4
+# From 4 heads per XCD on (see _a16_imgs_for): adds per image, and the image cap below that.
+_A16_ADDS_PER_IMG_DENSE = 128
+_A16_MAX_IMGS_SPARSE = 3
 
 
-def _a16_imgs_for(Skv, block_kv):
+def _a16_imgs_for(Skv, block_kv, B=1, Hkv=1):
     """A dQ row collects one bf16 atomic per kv band, and the running-sum rounding grows with that
     count (measured: about -2 dB of dQ SNR per doubling), so long sequences spread the bands.
 
-    Spreading also pays in time: the bands running at once add into the same dQ rows, and at 128
-    adds per image a 16K context (86 bands, one image) lost 10% to that contention at 16 heads.
-    32 measured best on the 16K-32K quick set; 16 costs more in image zeroing and reduce traffic
-    than it saves."""
+    Spreading also pays in time when few heads share an XCD: the bands running at once add into
+    the same dQ rows, and at 128 adds per image a 16K context (86 bands, one image) lost 10% to
+    that contention at 16 heads (2 per XCD, 16 bands of a head in flight). There 32 adds per
+    image measured best, capped at 3 images: a 4th costs more in zeroing and reduce traffic than
+    it saves (16 heads 32K: 14104 vs 14248 us; 8 heads 32K: 7226 vs 7255).
+
+    From 4 heads per XCD on at most 8 bands of a head are in flight and the contention is gone,
+    so every extra image is pure zero-fill, reduce and cache footprint: one image instead of
+    three is 1.9% faster at 32 heads 16K and 1.7% at 64 heads 16K. Those shapes keep 128 adds per
+    image (dQ SNR ~45 dB at 16K, against AITER a16's 46.0)."""
     bands = -(-Skv // block_kv)
-    return min(_A16_MAX_IMGS, max(1, -(-bands // _A16_ADDS_PER_IMG)))
+    dense = min(_A16_MAX_IMGS, max(1, -(-bands // _A16_ADDS_PER_IMG_DENSE)))
+    if (B * Hkv) % fb._NUM_XCD == 0 and B * Hkv // fb._NUM_XCD >= 4:
+        return dense
+    # Past 128 adds per image the SNR floor takes over again (128K context: 4 images).
+    return max(min(_A16_MAX_IMGS_SPARSE, -(-bands // _A16_ADDS_PER_IMG)), dense)
 
 
 def _lpt_grid_for(B, Hkv, Skv, block_kv, device):
@@ -140,7 +153,7 @@ def mla_bwd_sbhd(dout, q, k, v, out, lse, softmax_scale=None, block_kv=192, bloc
     assert Sq == Skv and k.shape == (Skv, B, Hkv, d_qk) and dout.shape == (Sq, B, Hq, d_v)
     assert Sq % (block_q * q_split) == 0
     scale = (1.0 / d_qk**0.5) if softmax_scale is None else float(softmax_scale)
-    n_img = _a16_imgs_for(Skv, block_kv)
+    n_img = _a16_imgs_for(Skv, block_kv, B, Hkv)
     over = {"lpt_grid": _lpt_grid_for(B, Hkv, Skv, block_kv, q.device), **over}
     dkdv, odo, dqa16 = _launchers(B, Sq, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, n_img, over)
     st = torch.cuda.current_stream()
