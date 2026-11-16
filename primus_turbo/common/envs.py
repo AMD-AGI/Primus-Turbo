@@ -31,6 +31,10 @@ other projects (FlyDSL, Triton, NVSHMEM, the launcher's ``RANK`` / ``WORLD_SIZE`
 writes those through ``os.environ`` directly. The C++ extension reads its variables with
 ``getenv``; they are declared below so Python can discover and inspect them, but C++ reads and
 caches them itself, so ``set_env()`` reaches C++ only before C++ first reads the variable.
+
+``docs/env.md`` is generated from the declarations and the comments above each entry below: after
+changing either, run ``python tools/gen_env_docs.py`` (the ``check-env-docs`` pre-commit hook fails
+until the two agree).
 """
 
 import os

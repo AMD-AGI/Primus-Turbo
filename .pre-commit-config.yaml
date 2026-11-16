@@ -20,6 +20,12 @@ repos:
         language: system
         files: ^primus_turbo/.*\.py$
         exclude: ^primus_turbo/common/envs\.py$
+      - id: check-env-docs
+        name: Keep docs/env.md in sync with primus_turbo/common/envs.py
+        entry: python tools/gen_env_docs.py --check
+        language: system
+        files: ^(primus_turbo/common/envs\.py|tools/gen_env_docs\.py|docs/env\.md)$
+        pass_filenames: false
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
