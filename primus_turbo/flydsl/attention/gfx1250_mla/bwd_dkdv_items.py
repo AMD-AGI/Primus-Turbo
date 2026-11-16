@@ -209,8 +209,8 @@ def item_rows(hb, bid, sq, skv, h, h0, hc):
     nv_b, nk_b = skv * h * 2 * D_V, skv * h * 2 * D_QK  # one batch of v / k
     for name, off, nr in (
         ("rds", ds_off, nrec),
-        ("rdv", bat * nv_b, nv_b + 0 * bat),
-        ("rdk", bat * nk_b, nk_b + 0 * bat),
+        ("rdv", bat * nv_b, nv_b),
+        ("rdk", bat * nk_b, nk_b),
     ):
         row[..., R[name]] = off & 0xFFFFFFFF
         row[..., R[name] + 1] = (off >> 32) | ((nr << 25) & 0xFFFFFFFF)

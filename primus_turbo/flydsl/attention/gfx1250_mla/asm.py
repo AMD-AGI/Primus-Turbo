@@ -22,7 +22,11 @@ lines that order implies in expert scheduling mode, as LLVM would:
     writes, or writes one it reads. WMMA, TRANS and core VALU complete in order within their class, so N may be the
     number of same-class instructions issued since; LLVM's rule (``va_need``) takes N = 0 once more than one class
     is pending, except for a write that only an in-flight WMMA still reads;
-  * ``s_wait_alu depctr_vm_vsrc(N)`` before a write of a register an in-flight memory instruction still reads;
+  * ``s_wait_alu depctr_vm_vsrc(N)`` before a write of a register an in-flight memory instruction still reads:
+    LDS, FLAT and buffer instructions read their VGPR sources in order within their class, so N is the number of
+    instructions of that class issued since (``vm_need``).
+    LLVM takes N = 0 while more than one class is pending; the class's own N holds there too (an instruction that
+    has not read its sources has its N younger classmates behind it, so more than N are outstanding);
     ``s_wait_dscnt`` / ``loadcnt`` / ``storecnt`` before an access to a register an in-flight load writes, and
     ``s_wait_dscnt 0`` before ``s_barrier_signal`` while LDS operations are in flight;
   * ``s_wait_xcnt 0`` before a write of a scalar register an in-flight VMEM / TDM instruction still reads;
@@ -32,6 +36,28 @@ lines that order implies in expert scheduling mode, as LLVM would:
 Every wait and v_nop holds for everything that may reach the block (a ``Flow``). An ``s_wait_alu`` among the
 instructions (a wait the generator places itself, e.g. va_vdst(N) behind N core VALUs so that the ones before them
 count as written) is applied to that state like a derived one.
+
+What the model covers, and what it leaves out (the reference is LLVM's AMDGPU backend for gfx1250: SIInsertWaitcnts
+for the waits, GCNHazardRecognizer for the wait states):
+  * VGPRs only. Expert scheduling mode hands the compiler the hazards between VALU and memory instructions on
+    VGPRs. The scalar side stays with the hardware in both directions (a VALU that reads an SGPR, vcc or scc a
+    SALU just wrote; a SALU or branch that reads one a VALU just wrote, as s_cmp behind v_readlane): LLVM places
+    no va_sdst / sa_sdst / va_vcc wait for gfx1250, and neither does the model. Two rules of LLVM's that the model
+    does not implement hold by the generators' construction, and the codegen test checks them on the regions: a
+    buffer, global or TDM instruction that reads an SGPR a VALU wrote wants 5 instructions between the two (such
+    SGPRs reach memory instructions through SALU copies, or long after the write), and a TDM op is issued with
+    at most 10 others in flight (s_wait_tensorcnt);
+  * the classes the generators emit: every ``v_`` instruction of theirs is a WMMA (XDL), a transcendental (TRANS)
+    or a core VALU (CSMACC), the packed f32 operations and the bf16 conversions included; none is DPMACC (f64),
+    which ``classify`` only tells apart by name;
+  * the v_nop counts are those of ``v_wmma_f32_16x16x32_bf16`` on gfx1250 (8 cycles in the XDL pipe; gfx1251 runs
+    it in 16 and needs 9 / 8), for a WMMA whose accumulator is +0 or its own destination (``wmma_regs`` checks both);
+  * a block entered from code the model does not follow (``State(unknown=True)``, an empty VALU history) waits for
+    VALU writes, memory source reads and LDS loads on the VGPRs it touches, but it knows neither a buffer / global
+    load still in flight into one of them (the generators place ``s_wait_loadcnt`` where the kernel leaves one) nor
+    the VALU-class instructions issued just before it: the v_nop rules hold across such an entry only when a
+    va_vdst(0) wait stands before the block's first VALU-class instruction, or no WMMA / TRANS can be in flight
+    there (test_attention_flydsl_gfx1250_mla_codegen pins which regions rely on which).
 
 The generators' common pieces are here too: ``vr`` (operand text of VGPRs), ``add_order`` and ``dag_ranks`` (the
 dependence graph their list schedulers rank nodes by)."""
@@ -236,7 +262,8 @@ def sregs(tok):
 
 def sgpr_defs_uses(x):
     """Scalar defs and uses of an instruction (s<N>, scc, vcc, exec, m0; conservative). A VALU's scalar operands are
-    all uses, v_div_scale_f32's vcc carry-out included (read only by the v_div_fmas_f32 of the same division)."""
+    uses; the destination of a compare / v_readlane is its def too (and stays among the uses), v_div_scale's
+    carry-out (its operand 1: vcc or null) is a def only, and v_div_fmas reads vcc implicitly."""
     if not x.mn or x.cls in ("LABEL", "DIR"):
         return [], []
     ops, mn = x.ops, x.mn.split("::")[0]
@@ -259,12 +286,15 @@ def sgpr_defs_uses(x):
         if mn.startswith("s_cbranch_exec"):
             u.append("exec")
     else:
-        for o in ops:
-            if o != "::":
+        carry_out = mn.startswith("v_div_scale")
+        for p, o in enumerate(ops):
+            if carry_out and p == 1:
+                d += sregs(first_tok(o))
+            elif o != "::":
                 u += sregs(first_tok(o))
         if mn.startswith(("v_cmp", "v_readlane", "v_readfirstlane")):
             d = u[:1] if u else ["vcc"]
-        if "_dpp" in mn or mn.startswith(("v_cndmask", "v_addc", "v_subb")):
+        if "_dpp" in mn or mn.startswith(("v_cndmask", "v_addc", "v_subb", "v_div_fmas")):
             u.append("vcc")
         if x.cls in ("CSMACC", "DPMACC", "TRANS", "XDL", "DS", "VMEM", "FLAT", "TDM"):
             u.append("exec")
@@ -289,8 +319,9 @@ class Rec:
 
 
 class State:
-    """In-flight VALU, memory source reads and load writes; unknown: entered from unknown code (anything in flight
-    on every VGPR)."""
+    """In-flight VALU, memory source reads and load writes. unknown: entered from code the model does not follow, where
+    a VALU write, a memory instruction's source read or an LDS load may be in flight on every VGPR (not a buffer or
+    global load, and no VALU history for the v_nop rules: the module docstring)."""
 
     def __init__(self, unknown=False):
         self.valu, self.msrc, self.loads = [], [], []
@@ -551,14 +582,21 @@ def msb_line(new, old):
     )
 
 
+WMMA = "v_wmma_f32_16x16x32_bf16"  # the XDL instruction the wait states of nops_needed are for
+
+
 def wmma_regs(x):
-    """(D, A | B) of a WMMA."""
+    """(D, A | B) of a WMMA: every register it reads or writes, as its accumulator C is +0 or D itself (LLVM's rule
+    for a VALU that writes a register of an in-flight WMMA looks at C too)."""
     o = [regs_of(first_tok(t)) for t in x.ops]
+    if x.mn != WMMA or len(o) != 4 or (o[3] and o[3] != o[0]):
+        raise ValueError(f"the WMMA hazard rules cover {WMMA} with C = 0 or C = D only: {x.text.strip()}")
     return set(o[0]), set(o[1]) | set(o[2])
 
 
 def nops_needed(prev, x):
-    """The v_nops x needs after the VALU-class instructions prev (newest first)."""
+    """The v_nops x needs after the VALU-class instructions prev (newest first): 5 / 4 behind a WMMA (wmma_regs;
+    gfx1250's counts for an 8-cycle WMMA), 1 behind a transcendental."""
     need = 0
     if x.cls == "XDL":
         _, ab = wmma_regs(x)

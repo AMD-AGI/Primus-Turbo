@@ -66,7 +66,8 @@ def reserve_vgprs(cond, lds, count):
     (volatile LDS loads at immediate offsets from ``lds``, stored back in reverse order): LLVM's register allocation
     then reaches 4 * count VGPRs on top of the kernel's own. This rests on how LLVM allocates registers, which
     nothing in the language pins down: a new compiler must show at least 1009 VGPRs (the kernel descriptor rounds up
-    to 1024) in the kernel's final ISA (``.num_vgpr``: 1018 and 1022 in the builds that were validated)."""
+    to 1024: a gfx1250 wave gets its VGPRs in blocks of 16) in the kernel's final ISA (``.num_vgpr``: 1018 and 1022
+    in the builds that were validated)."""
 
     @flyc.jit
     def reserve(cond):

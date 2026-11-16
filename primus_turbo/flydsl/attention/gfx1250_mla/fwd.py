@@ -36,6 +36,8 @@ def launch_grid(q: torch.Tensor, k: torch.Tensor) -> Tuple[int, int]:
     q-block rows and an even number of steps (two steps pair q block i with nqb - 1 - i: equal work per workgroup)."""
     b, sq, h, _ = q.shape
     nqb = -(-sq // BM)
+    # (whole q blocks of seqlen_q == seqlen_kv also give every block of a persistent workgroup BM / NB = 4 kv tiles
+    # or more; the kernel's prologue needs 3: the assertion in fwd_kernel)
     if not PERSIST or k.shape[1] != sq or sq % BM:
         return 0, nqb
     cus = num_cus(q.device)

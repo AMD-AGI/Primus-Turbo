@@ -11,7 +11,13 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""FlyDSL flash attention for gfx1250 (MI455X) at the DeepSeek-V3 MLA head dims (qk 192, v 128)."""
+"""FlyDSL flash attention for gfx1250 (MI455X) at the DeepSeek-V3 MLA head dims (qk 192, v 128).
+
+The kernels' tile math is generated code (fwd_sched and bwd_dkdv_sched on the assembly model asm), pinned by its
+sha256 in tests/pytorch/ops/test_attention_flydsl_gfx1250_mla_codegen.py. A change to a generator or to the model
+changes code that was validated on an MI455X: that test's docstring has the procedure (dump the regions and read the
+difference, rerun the MLA tests and timings on the card, update the digests).
+"""
 
 import hashlib
 import pathlib

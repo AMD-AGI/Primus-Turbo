@@ -68,6 +68,10 @@ BM = 256  # q rows per block
 QT = 4  # 16-row q tiles per wave
 NB = 64  # kv rows per tile (ring stage)
 NWAVES = 4
+# The prologue fills ring slots 0..2 with the first block's own tiles, without looking at a next block: a workgroup
+# that runs more than one block (the persistent grid: seqlen_q == seqlen_kv in whole q blocks, fwd.launch_grid)
+# needs 3 tiles in every block, and has BM / NB of them at least.
+assert BM // NB >= 3
 XK, XV = fwd_sched.XK, fwd_sched.XV  # LDS row strides of K / Q and V (bytes)
 K_B = NB * XK
 V_B = NB * XV
@@ -427,7 +431,8 @@ def _attention(a):
     def run():
         ok0, qb0, hh0, bb0 = sc.first
         if ok0:
-            # the first block's prologue loads: Q (waves 1, 2), then its tiles 0..2 = ring slots 0..2 (waves 0..2)
+            # the first block's prologue loads: Q (waves 1, 2), then its tiles 0..2 = ring slots 0..2 (waves 0..2;
+            # past its last tile copies of that one, never a next block's tiles: the assertion on BM / NB above)
             pb.issue_q(lds0, wv, qb0, hh0, bb0)
             n0 = pb.ntiles(qb0)
             op0 = pb.slot_ops(wv, *pb.kv_base(hh0, bb0))
