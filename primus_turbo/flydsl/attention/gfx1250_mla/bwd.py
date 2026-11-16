@@ -72,14 +72,26 @@ def shape_unsupported_reason(batch: int, seqlen_q: int, seqlen_kv: int, num_head
     if seqlen_q > seqlen_kv:
         # bottom-right causal leaves the first seqlen_q - seqlen_kv queries without keys
         return f"causal needs seqlen_q <= seqlen_kv, got {seqlen_q} > {seqlen_kv}"
-    # The size limit is the 32-bit byte offsets of k / dk (k_dkdv) and q / dq (k_dqds): under 2 GiB each, so
-    # k's, as seqlen_q <= seqlen_kv. The other tensors with 32-bit offsets or byte counts are smaller than q: o / dO
-    # (k_delta_bshd), o and lse (the forward), NL / ND (k_dkdv). The rest (q / k / v in the forward, Q / dO in
-    # k_dkdv, K in k_dqds, the dS scratch) take 64-bit addresses.
+    # The size limit is the 32-bit byte offsets of k / dk (k_dkdv) and of q / dq (k_dqds; k_dkdv too reaches a Q
+    # tile by a 32-bit offset from q's 64-bit base): under 2 GiB each, so k's, as seqlen_q <= seqlen_kv. The other
+    # tensors with 32-bit offsets or byte counts are smaller than q: o / dO (k_delta_bshd, k_dkdv's dO tiles), o and
+    # lse (the forward), NL / ND (k_dkdv). The rest (q / k / v in the forward, K in k_dqds, the dS scratch) take
+    # 64-bit addresses.
     if batch * num_heads * seqlen_kv * _dkdv.D_QK * 2 >= 1 << 31:
         return (
             "k must be under 2 GiB (the kernels' 32-bit byte offsets), got batch * seqlen_kv * heads = "
             f"{batch} * {seqlen_kv} * {num_heads} rows of {_dkdv.D_QK * 2} bytes"
+        )
+    # k_dkdv pads the last kv block to ROWS_B rows and leaves the dK / dV stores of its rows past seqlen_kv to the
+    # buffer range check. Their 32-bit offsets must not wrap back into range for that, so k padded to whole blocks
+    # stays under 4 GiB (dV's rows are shorter). Only seqlen_kv 64 gets there, where the padding triples k. The
+    # rule is on batch * heads, like the one above: b > 1 SBHD storage reaches the kernels as [1, s, b * h, d], and
+    # the gate (the op's shape) and the entry (the kernels') must agree.
+    padded_kv = _items.nblk_kv(seqlen_kv) * _items.ROWS_B
+    if batch * num_heads * padded_kv * _dkdv.D_QK * 2 >= 1 << 32:
+        return (
+            f"k padded to k_dkdv's {_items.ROWS_B}-row kv blocks must be under 4 GiB (32-bit store offsets), got "
+            f"batch * rows * heads = {batch} * {padded_kv} * {num_heads} rows of {_dkdv.D_QK * 2} bytes"
         )
     return None
 

@@ -145,6 +145,7 @@ def _inputs(b, sq, skv, h, layout="sbhd", seed=0):
         pytest.param((1, 32768, 32768, 170), {}, id="k_just_under_2gib"),
         pytest.param((1, 256, 512, 2), {}, id="sq_lt_skv"),
         pytest.param((1, 64, 64, 1), {"window_size": (-1, 0)}, id="smallest_causal_as_window"),
+        pytest.param((1, 64, 64, 58254), {}, id="s64_padded_k_just_under_4gib"),
     ],
 )
 def test_gate_accepts(monkeypatch, dims, kwargs, layout):
@@ -165,6 +166,9 @@ def test_gate_accepts(monkeypatch, dims, kwargs, layout):
         pytest.param({"sq": 512}, {}, id="sq_gt_skv"),
         pytest.param({"sq": 32768, "skv": 32768, "h": 171}, {}, id="k_over_2gib"),
         pytest.param({"b": 2, "sq": 32768, "skv": 32768, "h": 128}, {}, id="dsv3_b2_s32768"),
+        # seqlen_kv 64: k_dkdv pads k to 192 rows, three times its size (under 2 GiB here)
+        pytest.param({"sq": 64, "skv": 64, "h": 58255}, {}, id="s64_padded_k_over_4gib"),
+        pytest.param({"b": 512, "sq": 64, "skv": 64, "h": 128}, {}, id="s64_padded_k_over_4gib_b512"),
         pytest.param({"b": 0}, {}, id="empty_batch"),
         pytest.param({"h": 0}, {}, id="no_heads"),
         pytest.param({}, {"causal": False}, id="non_causal"),
@@ -183,6 +187,27 @@ def test_gate_accepts(monkeypatch, dims, kwargs, layout):
 def test_gate_refuses(monkeypatch, tensors, kwargs):
     q, k, v = _meta(**tensors)
     assert _gate(monkeypatch, q, k, v, **kwargs) is False
+
+
+@pytest.mark.parametrize(
+    ("b", "s", "h", "accepted"),
+    [
+        (2, 4096, 128, True),
+        (2, 32768, 128, False),
+        (3, 128, 14563, True),  # k just under 2 GiB
+        (3, 128, 14564, False),
+        (2, 64, 29127, True),  # k padded to 192 rows just under 4 GiB
+        (2, 64, 29128, False),
+        (512, 64, 128, False),
+    ],
+)
+def test_gate_verdict_depends_on_batch_times_heads(b, s, h, accepted):
+    """b > 1 SBHD storage reaches the kernels as [1, s, b * h, d]. The gate judges the op's shape and the backward's
+    entry the kernels': they give one verdict because every size rule is on batch * heads."""
+    from primus_turbo.flydsl.attention.gfx1250_mla import bwd
+
+    assert (bwd.shape_unsupported_reason(b, s, s, h) is None) == accepted
+    assert (bwd.shape_unsupported_reason(1, s, s, b * h) is None) == accepted
 
 
 def test_gate_refuses_mismatched_tensors(monkeypatch):
@@ -283,6 +308,18 @@ def test_flash_attn_func_refuses_mixed_devices_without_the_gate(monkeypatch):
         ),
         pytest.param(
             "bwd", {"dout": torch.empty(1, 256, 2, D_V, device="meta")}, "dout must be", id="bwd_fp32_dout"
+        ),
+        pytest.param(
+            "bwd",
+            {
+                **{
+                    name: torch.empty(1, 64, 65536, d, dtype=torch.bfloat16, device="meta")
+                    for name, d in (*_QKV_DIMS, ("dout", D_V), ("out", D_V))
+                },
+                "lse": torch.empty(1, 65536, 64, device="meta"),
+            },
+            "under 4 GiB",
+            id="bwd_s64_padded_k_4gib",
         ),
     ],
 )
@@ -512,6 +549,7 @@ def _check(got, ref):
         pytest.param((2, 128, 384, 2), "bshd", MLA_SCALE, id="b2_bshd_sq_lt_skv"),
         pytest.param((2, 256, 256, 2), "bhsd", MLA_SCALE, id="b2_bhsd_copied"),
         pytest.param((1, 64, 128, 2), "sbhd", MLA_SCALE, id="sq64_skv128"),
+        pytest.param((2, 64, 64, 3), "sbhd", MLA_SCALE, id="b2_s64_one_third_of_a_kv_block"),
         pytest.param((1, 320, 576, 2), "bshd", MLA_SCALE, id="sq320_skv576_partial_dq_head_tile"),
         pytest.param((2, 576, 576, 2), "sbhd", MLA_SCALE, id="b2_s576_main_and_head_tiles"),
         pytest.param((1, 256, 256, 2), "bshd", None, id="default_scale"),
@@ -519,7 +557,8 @@ def _check(got, ref):
 )
 def test_matches_reference(dims, layout, scale):
     """The dQ head tiles start below query 0 at seqlen_q 64, 128, 192 (sq % 384 of 64, 128, 192) and 320; s576
-    has a 384-query tile and one head tile."""
+    has a 384-query tile and one head tile. At seqlen_kv 64 two thirds of k_dkdv's one kv block are rows past the
+    sequence (idle: nothing of theirs is read or stored)."""
     q, k, v, dout = _inputs(*dims, layout=layout)
     ref = _reference(q, k, v, dout, D_QK**-0.5 if scale is None else scale)
     _check(_run(q, k, v, dout, scale), ref)
@@ -608,12 +647,14 @@ def test_persistent_forward_equals_one_block_per_workgroup(monkeypatch, dims):
         pytest.param((1, 32768, 32768, 128), 16, id="dsv3_s32768"),
         pytest.param((1, 4096, 4096, 1360), 170, id="q_and_k_just_under_2gib"),
         pytest.param((1, 512, 32768, 170), 34, id="k_just_under_2gib_sq_lt_skv"),
+        pytest.param((1, 64, 64, 58254), 9709, id="s64_padded_k_just_under_4gib"),
     ],
 )
 def test_largest_sizes_equal_head_slices(dims, heads):
     """Up to the 2 GiB of q and k the kernels' 32-bit byte offsets allow, the forward and the backward give the bits
     of the same problem run ``heads`` heads at a time, each slice far below that. NaN-filled outputs expose an element
-    no launch wrote."""
+    no launch wrote. At seqlen_kv 64 the bound is k_dkdv's padded kv block: the dK stores of its 128 idle rows reach
+    just under 4 GiB, where the range check must still drop them."""
     from primus_turbo.flydsl.attention.gfx1250_mla import bwd, fwd
 
     b, sq, skv, h = dims
