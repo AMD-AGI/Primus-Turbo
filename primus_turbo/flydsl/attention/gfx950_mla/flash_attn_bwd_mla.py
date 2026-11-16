@@ -1374,6 +1374,8 @@ def build_flash_attn_bwd_dkdv_module(
     q_ring=False,
     # ring_at: the _qdo_pf position Q_RING's fill is issued at. See RING_AT.
     ring_at=None,
+    # drain_vm: the drain ahead of the Q/dO publishing barrier waits on vmcnt alone. See DRAIN_VM.
+    drain_vm=False,
     # Causal MLA: walk the grid in groups of lpt_grid kv tiles, longest group first (0: off).
     lpt_grid=0,
     g3_dbat=None,
@@ -1863,6 +1865,11 @@ def build_flash_attn_bwd_dkdv_module(
     # MFMA-run density, not LDS latency or read count.
     K_REG = bool(k_reg)
     G3_KREG = bool(g3_kreg)
+    # DRAIN_VM: the barrier ahead of GEMM1 publishes the ring fill, which is a vmcnt matter. A
+    # full s_waitcnt(0) also retires the deferred GEMM3's last transpose reads, which the
+    # scheduler issues ahead of it while their MFMAs sink below: ~170 cycles with the matrix
+    # pipe idle. Those reads keep their own lgkmcnt waits at the MFMAs that consume them.
+    DRAIN_VM = bool(drain_vm)
     # D-tiles of the band-resident K^T set; the rest are re-read every head-step.
     G3_KRT = G3_DT if G3_KREG else 0
     # K_SUB: under K_REG only GEMM3 transpose-reads the K tile, and only in whole 64-column
@@ -1927,11 +1934,15 @@ def build_flash_attn_bwd_dkdv_module(
     # G3_ST_G2: GEMM2 beats the phase boundaries as a spreading site -- DT d-tiles per q-half is
     # exactly one position per store, each between two MFMA groups. Reaching it from a DEFERRED
     # GEMM3 instead costs spill: the payload would live across a whole GEMM1 and softmax.
-    G3_ST_G2 = G3_ST_HS and bool(g3_st_g2)
+    # A deferred GEMM3's stores reach it too once the phase hooks take the first ones: the rest
+    # would otherwise issue as a bare atomic burst after GEMM2, and in GEMM2 they live no longer.
+    G3_ST_G2 = (G3_ST_HS or (G3_DEFER and G3_ST_AT >= 0)) and bool(g3_st_g2)
     assert not G3_ST_HS or G3_ST_G2 or G3_ST_AT >= 0, "the handed-on stores need a site"
     # G3_ST_W: a whole emission is four dQ rows, so one hand-off per emission still issues four
     # atomics back to back. Pairs match the hand-off count to ONE q-half's d-tile sites; finer
     # reaches the second half and puts a vm op in every d-tile, costing more of GEMM1's cover.
+    # The MLA strided patch (G3_SD) emits two atomics per tile; 1 hands them on one at a time,
+    # which is what a GEMM2 d-tile's MFMA group has issue room for.
     G3_ST_W = int(g3_st_w) if G3_ST_G2 else 0
     assert G3_ST_W in (0, 1, 2), "a hand-off carries one row, a pair, or the whole emission"
     G3_SB = 0 if g3_sb is None else int(g3_sb)
@@ -3249,7 +3260,7 @@ def build_flash_attn_bwd_dkdv_module(
                         0,
                     )
 
-            def _g3_a16_one(_g3p, i, j):
+            def _g3_a16_one(_g3p, i, j, ws=(0, 1)):
                 """One unpaired d-tile's 8 B: its half of the pair slot _g3_a16 fills."""
                 _t = _g3d0 + fx.Index(_g3_toff(i))
                 _qt = (q_start >> fx.Index(4)) + _g3q0 + fx.Index(j * G3_SPL_STRIDE)
@@ -3258,7 +3269,7 @@ def build_flash_attn_bwd_dkdv_module(
                     _raw(_blk * fx.Index(1024) + (_t & fx.Index(1)) * fx.Index(512) + lane * fx.Index(4))
                 ).index_cast(fx.Int32.ir_type)
                 _pk = Vec(_g3p)
-                for _w in range_constexpr(2):
+                for _w in ws:
                     rocdl.raw_ptr_buffer_atomic_fadd(
                         _pk.shuffle(_pk, [_w]).bitcast(elem_dtype).ir_value(),
                         wsq16_rsrc,
@@ -3329,6 +3340,13 @@ def build_flash_attn_bwd_dkdv_module(
                             _g3p1 = bf16_trunc_scored_v4(_g3[i][jj])
                             if const_expr(st_sink is None):
                                 _g3_a16_one(_g3p1, _dg[i], _qs[jj])
+                            elif const_expr(G3_ST_W == 1):
+                                for _w in range_constexpr(2):
+                                    st_sink.append(
+                                        lambda p=_g3p1, _i=_dg[i], _j=_qs[jj], _w=_w: _g3_a16_one(
+                                            p, _i, _j, (_w,)
+                                        )
+                                    )
                             else:
                                 st_sink.append(lambda p=_g3p1, _i=_dg[i], _j=_qs[jj]: _g3_a16_one(p, _i, _j))
                 for i2 in range_constexpr(0 if G3_SD else len(_dg) // 2):
@@ -3903,8 +3921,15 @@ def build_flash_attn_bwd_dkdv_module(
                 if const_expr(G3_SB & 2):
                     rocdl.sched_barrier(0)
             if const_expr(Q_DMA):
-                rocdl.s_waitcnt(0)
-                gpu.barrier()  # Q/dO + ld_lds commit visible before GEMM1 reads
+                if const_expr(DRAIN_VM):
+                    rocdl.s_waitcnt(0x0F70)  # vmcnt(0), expcnt and lgkmcnt left at their maxima
+                    # As inline asm the waitcnt pass does not see a barrier, so it adds no lgkmcnt(0)
+                    # of its own. The reads still in flight are GEMM3's (K^T and the previous dS
+                    # slot), which nothing rewrites before the next head-step's top barrier.
+                    llvm.inline_asm(ir.Type.parse("!llvm.void"), [], "s_barrier", "", has_side_effects=True)
+                else:
+                    rocdl.s_waitcnt(0)
+                    gpu.barrier()  # Q/dO + ld_lds commit visible before GEMM1 reads
                 _qdo_pf(0)
 
             _qdo_pf(1)
