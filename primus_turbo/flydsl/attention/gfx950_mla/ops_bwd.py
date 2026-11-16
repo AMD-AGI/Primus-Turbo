@@ -18,6 +18,8 @@ import torch
 from . import flash_attn_bwd_mla as fb
 
 _LOG2E = fb._LOG2E
+# The sm*log2e score fold rides on the kernel's K packs (see K_PRE) instead of a host pass over Q.
+_K_PRE = True
 _BWD_CACHE: dict = {}
 _PRIMED: set = set()
 
@@ -56,6 +58,7 @@ def _dkdv_kwargs(B, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, sbhd=
         ring_at=1,
         k_reg=True,
         k_lds=2,
+        k_pre=_K_PRE,
         dv_pin=False,
         g3_st_at=1,
         g3_st_n=1,
@@ -101,8 +104,8 @@ def _launchers(B, Sq, Hq, Hkv, d_qk, d_v, scale, block_kv, block_q, q_split, n_i
         dkdv = fb.build_flash_attn_bwd_dkdv_module(**kw)
         odo = fb.build_flash_attn_bwd_odo_module(num_heads=Hq, head_dim=d_v, sbhd=sbhd)
         # K is staged in LDS prescaled by sm*log2e, so the image carries dQ*log2e; under k_lds
-        # the tile is raw K and the image carries dQ/sm.
-        dq_scale = scale if kw.get("k_lds") else 1.0 / _LOG2E
+        # without k_pre the tile is raw K and the image carries dQ/sm.
+        dq_scale = scale if kw.get("k_lds") and not kw.get("k_pre") else 1.0 / _LOG2E
         dqa16 = fb.build_flash_attn_bwd_dqa16_module(B, Sq, Hq, d_qk, dq_scale, n_img=n_img, sbhd=sbhd)
         hit = (dkdv, odo, dqa16)
         _BWD_CACHE[key] = hit
@@ -195,7 +198,8 @@ def _mla_bwd(dout, q, k, v, out, lse, softmax_scale, block_kv, block_q, q_split,
     )
     st = torch.cuda.current_stream()
 
-    qf = fb._prescale_q(q, scale)
+    # Under k_pre the score fold rides on the kernel's K packs and Q goes in as it is.
+    qf = q.reshape(-1) if over.get("k_pre", _K_PRE) else fb._prescale_q(q, scale)
     kf, vf = k.reshape(-1), v.reshape(-1)
     dof = dout.reshape(-1)
     o16 = out.reshape(-1)

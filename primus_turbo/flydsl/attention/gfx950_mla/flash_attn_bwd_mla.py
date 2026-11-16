@@ -1377,6 +1377,8 @@ def build_flash_attn_bwd_dkdv_module(
     ring_at=None,
     # drain_vm: the drain ahead of the Q/dO publishing barrier waits on vmcnt alone. See DRAIN_VM.
     drain_vm=False,
+    # k_pre: Q arrives raw and the sm*log2e fold is applied to the K packs at load. See K_PRE.
+    k_pre=False,
     # Causal MLA: walk the grid in groups of lpt_grid kv tiles, longest group first (0: off).
     lpt_grid=0,
     g3_dbat=None,
@@ -1871,6 +1873,13 @@ def build_flash_attn_bwd_dkdv_module(
     # scheduler issues ahead of it while their MFMAs sink below: ~170 cycles with the matrix
     # pipe idle. Those reads keep their own lgkmcnt waits at the MFMAs that consume them.
     DRAIN_VM = bool(drain_vm)
+    # K_PRE: K is loaded once per work-group against every head-step's Q tile, so the score fold
+    # rides on the K packs instead of a host pass over Q (see _prescale_q), which at 4K contexts is
+    # 3 % of the backward. The staged tile then holds K*sm*log2e (dQ reduce by 1/log2e) and dK's
+    # fold is sm. The scaled packs are VALU results, and held as such they pin 72 VGPRs for the band
+    # (spill 8 -> 68, -4 %); they are instead re-read from the staged tile, so they land wherever a
+    # plain LDS load can.
+    K_PRE = bool(k_pre) and K_REG and not A16_NATIVE
     # D-tiles of the band-resident K^T set; the rest are re-read every head-step.
     G3_KRT = G3_DT if G3_KREG else 0
     # K_SUB: under K_REG only GEMM3 transpose-reads the K tile, and only in whole 64-column
@@ -2748,11 +2757,20 @@ def build_flash_attn_bwd_dkdv_module(
         # on Q instead -- see _prescale_q) -- but only while this tile is GEMM3's alone.
         # Without K_REG the score GEMM's B operand IS this tile, so it goes in raw and the
         # fold moves to the dQ reduce, which reads `dkdv_l.dq_scale` instead of assuming.
+        if const_expr(K_PRE):
+            _kpre_v8 = Vec.filled(MFMA_LANE_K, sm_scale * _LOG2E, fx.Float32)
+            for h in range_constexpr(KV_HALVES):
+                for nt in range_constexpr(NT):
+                    for ks in range_constexpr(K_STEPS_QK):
+                        k_b_packs[h][nt][ks] = (
+                            (Vec(k_b_packs[h][nt][ks]).to(fx.Float32) * _kpre_v8).to(elem_dtype).ir_value()
+                        )
+
         if const_expr(not K_REG):
             # Native dQ cannot land here: it only builds at D=64, whose band never pairs.
             assert not A16_NATIVE, "native dQ needs a scaled LDS K tile, which GEMM1a cannot share"
             _g3ks_v8 = None
-        elif const_expr(K_LDS > 0):
+        elif const_expr(K_LDS > 0 or K_PRE):
             _g3ks_v8 = None
         elif const_expr(A16_NATIVE):
             # Native dQ wants k*sm, which it used to reach by scaling an ALREADY-rounded
@@ -2797,6 +2815,26 @@ def build_flash_attn_bwd_dkdv_module(
                         Vec(_kst).store(lds, [_kv_lds_idx(_kb_h, nt, ks)])
                     if const_expr(V_LDS):
                         Vec(v_b_packs[h][nt][ks]).store(lds, [_kv_lds_idx(_vb_h, nt, ks)])
+        if const_expr(K_PRE):
+            assert K_SUB, "the pack reload reads the K sub-tile layout"
+            for h in range_constexpr(KV_HALVES):
+                for nt in range_constexpr(NT):
+                    for ks in range_constexpr(K_STEPS_QK):
+                        _kr = (
+                            fx.Index(h * BKV_H) + wave_id * ROWS_PER_WAVE_KV + fx.Index(nt * N_TILE) + lane16
+                        )
+                        _kc = fx.Index((ks % 2) * K_STEP_QK) + kg * fx.Index(MFMA_LANE_K)
+                        _ki = fx.Index(G3K_BASE + (ks // 2) * K_SUB_STRIDE) + _kr * fx.Index(K_SUB_ROW)
+                        # Opaque address: the pack must be this load, not the stored VALU result
+                        # forwarded to it.
+                        _ka = llvm.inline_asm(
+                            ir.IntegerType.get_signless(32),
+                            [_raw(fx.Int32(_ki + (_kc ^ _ksub_swz(_kr))))],
+                            "",
+                            "=v,0",
+                            has_side_effects=True,
+                        )
+                        k_b_packs[h][nt][ks] = Vec.load(mfma_pack_type, lds, [fx.Index(_ka)])
         if const_expr(not K_REG):
             k_b_packs = [G3K_BASE + h * BKV_H * HEAD_DIM for h in range_constexpr(KV_HALVES)]
         for h in range_constexpr(KV_HALVES):
@@ -4839,7 +4877,9 @@ def build_flash_attn_bwd_dkdv_module(
         # CONTIGUOUS D values (D = dt*16 + kg*4 + t) at kv = nt*16 + lane16, so the
         # store is direct (no permlane32 transpose needed, unlike the 32x32 path). ----
         # Q came in prescaled by sm*log2e (see _prescale_q), so dK's fold is 1/log2e.
-        dk_fold_v4 = Vec.from_elements([fx.Float32(1.0 / _LOG2E)], fx.Float32).broadcast_to(4)
+        dk_fold_v4 = Vec.from_elements(
+            [fx.Float32(sm_scale if K_PRE else 1.0 / _LOG2E)], fx.Float32
+        ).broadcast_to(4)
 
         def _store(accs, rsrc, scale):
             _dt_n = DT if scale else DT_V
