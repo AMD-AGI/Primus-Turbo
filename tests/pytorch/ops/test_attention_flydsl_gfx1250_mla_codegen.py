@@ -38,7 +38,7 @@ REGIONS = {
     ("fwd", "TILE_D2"): "84c397c6ffb5d547d494436682111fe5f9b198e708a2197005e4f0ad21fcae1e",
     ("fwd", "TILE_D3F"): "5c079c9d73cf4cc3f623865529f54b6d776331ffb3d319f13ffb867ae14257eb",
     ("fwd", "FINAL_A"): "4570480af899fa78f2cb5b33af663c32a2d7343dcb0f524547eae3704d6bf09f",
-    ("bwd_dkdv", "MAIN"): "d03f886b0d5a37f3f5f0ea1930d098e7997facb911f8c5410493b17cbbe20c6c",
+    ("bwd_dkdv", "MAIN"): "a1bde80d5608aa170089223aadfcf869f26c18761bbc88ab05a27d127614c631",
 }
 _EVERY_REGION = pytest.mark.parametrize(("sched", "name"), list(REGIONS), ids=["_".join(k) for k in REGIONS])
 

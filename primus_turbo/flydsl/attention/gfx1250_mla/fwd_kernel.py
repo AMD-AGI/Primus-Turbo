@@ -24,7 +24,7 @@ state lives in v[fwd_sched.BASE:1024]. This file is the rest: the schedule of q 
 the loop control and the output stores. Its own code must stay below BASE VGPRs between the regions of a block: a
 region clobbers v[BASE:256), so LLVM keeps nothing there across one, and between two regions it takes the lowest
 free VGPRs. This code needs v0..v38 in the build that was validated, so after any change here the final ISA must be
-checked: outside the regions only the warm-up loads and the never-taken reserve block may name a VGPR >= BASE (the
+checked: outside the regions only the warm-up block and the never-taken reserve block may name a VGPR >= BASE (the
 numeric tests fail if another instruction does).
 
 LDS: a 4-stage ring of kv tiles (a stage holds K 64 x 400 B and V 64 x 272 B), the Q block (256 x 400 B) and the
@@ -63,6 +63,7 @@ from primus_turbo.flydsl.utils.prims import LOG2E
 from . import SOURCE_DIGEST, fwd_sched
 from .common import inline_region, lds_ptr, reserve_vgprs
 
+KERNEL_NAME = "mla_fwd_kernel"  # also the function's symbol (_warm_code)
 D_QK, D_V = 192, 128
 BM = 256  # q rows per block
 QT = 4  # 16-row q tiles per wave
@@ -365,32 +366,30 @@ def _warm_code(wv):
     there). Loaded as data it is in L2 before the first block starts (the workgroup waits for its first TDM loads
     meanwhile), and the fetches hit L2. One global_load_b128 per WARM_PIECE bytes, its 32 lanes 64 bytes apart,
     counted back from each region's end label over the region's size bound (so never past the kernel's code: before
-    a region is the kernel's own code), plus WARM_OWN_PIECES before INIT_C0. The loads' data goes to v[BASE:], which
-    no code uses before the first region; _warm_code_landed() ends them.
-
-    The pieces before INIT_C0 take that much of the kernel's own code to stand before it: 4.6 KB in the build that
-    was validated, and the code object holds another 2 KB before the function. With a compiler that lays the kernel
-    out otherwise, check that INIT_C0 still starts that far into the code object (a load before it is a fault)."""
-    pieces = []
+    a region is the kernel's own code), plus WARM_OWN_PIECES before INIT_C0. A piece that would begin before the
+    function's start begins there instead: every load reads the function's own bytes, however the compiler lays
+    the kernel out. The loads' data goes to v[BASE:], which no code uses before the first region (each load's
+    address offset is first written to its own destination); _warm_code_landed() ends them."""
+    pieces = []  # (label, bytes before it)
     for name in WARM_REGIONS:
         end = f"{fwd_sched.region_label(name)}_end"
         pieces += [
-            (end, -WARM_PIECE * k) for k in range(1, -(-fwd_sched.region_bytes(name) // WARM_PIECE) + 1)
+            (end, WARM_PIECE * k) for k in range(1, -(-fwd_sched.region_bytes(name) // WARM_PIECE) + 1)
         ]
     first = fwd_sched.region_label(WARM_REGIONS[0])
-    pieces += [(first, -WARM_PIECE * k) for k in range(1, WARM_OWN_PIECES + 1)]
+    pieces += [(first, WARM_PIECE * k) for k in range(1, WARM_OWN_PIECES + 1)]
     assert fwd_sched.BASE + 4 * len(pieces) <= 256
-    lines, cur = ["s_getpc_b64 s[90:91]", "fwd_warm_pc:"], None
-    for i, (label, off) in enumerate(pieces):
-        if label != cur:
-            # s[92:93]: the label's address (the loads in flight have read the previous one). A signed 64-bit add:
-            # the compiler may place this block behind the regions (a negative label distance)
-            lines += ["s_wait_xcnt 0x0"] if cur else []
-            lines += [f"s_mov_b32 s94, {label}-fwd_warm_pc", "s_ashr_i32 s95, s94, 31"]
-            lines.append("s_add_nc_u64 s[92:93], s[90:91], s[94:95]")
-            cur = label
-        r = fwd_sched.BASE + 4 * i
-        lines.append(f"global_load_b128 v[{r}:{r + 3}], $0, s[92:93] offset:{off}")
+    regs = [fwd_sched.BASE + 4 * i for i in range(len(pieces))]
+    # s[92:93]: the function's start, as a signed 64-bit add to the pc. Per piece, its first byte from there (not
+    # before it) + the lane's line, then one wait for these offsets (expert scheduling mode) and the loads
+    lines = ["s_getpc_b64 s[90:91]", "fwd_warm_pc:"]
+    lines += [f"s_mov_b32 s94, {KERNEL_NAME}-fwd_warm_pc", "s_ashr_i32 s95, s94, 31"]
+    lines.append("s_add_nc_u64 s[92:93], s[90:91], s[94:95]")
+    for r, (label, back) in zip(regs, pieces):
+        lines += [f"s_mov_b32 s94, {label}-{KERNEL_NAME}-{back}", "s_max_i32 s94, s94, 0"]
+        lines.append(f"v_add_nc_u32 v{r}, s94, $0")
+    lines.append("s_wait_alu depctr_va_vdst(0)")
+    lines += [f"global_load_b128 v[{r}:{r + 3}], v{r}, s[92:93]" for r in regs]
     lines.append("s_wait_xcnt 0x0")
     clobbers = [f"~{{v{r}}}" for r in range(fwd_sched.BASE, fwd_sched.BASE + 4 * len(pieces))]
     clobbers += [f"~{{s{r}}}" for r in range(90, 96)] + ["~{scc}"]
@@ -645,7 +644,7 @@ def _store_out(pb, stg, wv, q0, hh, bb):
     rocdl.sched_barrier(0)
 
 
-@flyc.kernel(name="mla_fwd_kernel", known_block_size=[NWAVES * 32, 1, 1])
+@flyc.kernel(name=KERNEL_NAME, known_block_size=[NWAVES * 32, 1, 1])
 def mla_fwd_kernel(
     O: fx.Tensor,
     Q: fx.Tensor,

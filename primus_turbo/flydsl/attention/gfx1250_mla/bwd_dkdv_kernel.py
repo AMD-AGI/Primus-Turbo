@@ -95,7 +95,7 @@ def _uniform(x):
     return fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, fx.as_ir_value(x)))
 
 
-@flyc.kernel(name="k_mla_bwd_dkdv", known_block_size=[32 * NW, 1, 1])
+@flyc.kernel(name=sched.KERNEL, known_block_size=[32 * NW, 1, 1])
 def k_dkdv(
     Q: fx.Tensor,
     K: fx.Tensor,

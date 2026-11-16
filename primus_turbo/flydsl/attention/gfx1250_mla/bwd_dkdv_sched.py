@@ -144,6 +144,7 @@ POOL = {
     "do": 17, "q": 19, "k": 21, "v": 23, "ds": 25, "dv": 27, "dk": 29,
 }  # fmt: skip
 WARM_PIECE = 2048  # code bytes per warm-up load: 32 lanes, one 64-byte line each
+KERNEL = "k_mla_bwd_dkdv"  # the kernel's name, so its function's symbol: where its code starts (region_warm)
 SG_FV, SG_FK = (
     "s[88:91]",
     "s[92:95]",
@@ -536,11 +537,9 @@ def code_bytes(lines):
     """An upper bound of the encoded size of the instruction lines (a few hundred bytes over at most: 4 bytes, 8
     for VOP3 / DS / SMEM encodings or a 32-bit literal, 12 for buffer, global and TDM instructions)."""
 
-    def literal(text):
+    def literal(text):  # a label expression, or a number that is not an inline constant
         for tok in re.split(r"[,\s]+", text.partition(" ")[2]):
-            if tok.startswith(".") or (
-                re.fullmatch(r"-?(0x[0-9a-fA-F]+|\d+)", tok) and not -16 <= int(tok, 0) <= 64
-            ):
+            if ".L" in tok or (re.fullmatch(r"-?(0x[0-9a-fA-F]+|\d+)", tok) and not -16 <= int(tok, 0) <= 64):
                 return True
         return False
 
@@ -566,27 +565,35 @@ def region_warm(ops, lp, pieces):
     kernel ran since this one's last launch (every call in training) its code is neither in the instruction caches
     nor in L2, and each line's first fetch comes from HBM behind the kernel's own data stream (s_prefetch_inst and
     global_prefetch_b8 do nothing there). `pieces` loads of WARM_PIECE bytes of code each (32 lanes, 64 bytes
-    apart), counted back from {lp}_END over the code's size bound: never past the code, and before it is the
-    kernel's own code (5.0 KB of it in the build that was validated, where the loads start 0.3 KB before MAIN; the
-    size bound and the rounding allow up to 2.3 KB). Their data goes to v[BASE + 4:], unused until the first item's
-    accumulators are cleared (region_init waits for them there)."""
+    apart), counted back from {lp}_END over the code's size bound: never past the code. Before it is the kernel's
+    own code (the size bound and the rounding reach up to 2.3 KB into it), and a piece that would begin before the
+    function's start begins there instead: every load reads the function's own bytes, however the compiler lays
+    the kernel out. Their data goes to v[BASE + 4:], unused until the first item's accumulators are cleared
+    (region_init waits for them there); each load's address offset is first written to its own destination."""
     pool = ops["pool"]
     if BASE + 4 + 4 * pieces > 256:
         raise ValueError("too many warm-up loads for the low VGPRs")
+    regs = [BASE + 4 + 4 * k for k in range(pieces)]
     out = [
         f"v_readlane_b32 s100, {pool}, {POOL['wv']}",
         "s_cmp_lg_u32 s100, 0",
         f"s_cbranch_scc1 {lp}_WARM",
         "s_getpc_b64 s[100:101]",
         f"{lp}_PC:",
-        f"s_mov_b32 s102, {lp}_END-{lp}_PC",  # a signed 64-bit add: right wherever the assembler puts the label
+        f"s_mov_b32 s102, {KERNEL}-{lp}_PC",  # s[102:103]: the function's start (a signed 64-bit add)
         "s_ashr_i32 s103, s102, 31",
         "s_add_nc_u64 s[102:103], s[100:101], s[102:103]",
         f"v_lshlrev_b32 {vr(BASE)}, 2, {ops['vds']}",  # the lane's line: 64 * lane (vds = 16 * lane)
     ]
-    for k in range(pieces):
-        r = BASE + 4 + 4 * k
-        out.append(f"global_load_b128 {vr(r, 4)}, {vr(BASE)}, s[102:103] offset:{-WARM_PIECE * (k + 1)}")
+    # per piece: its first byte from the function's start, not before it, + the lane's line
+    for k, r in enumerate(regs):
+        out += [
+            f"s_mov_b32 s96, {lp}_END-{KERNEL}-{WARM_PIECE * (k + 1)}",
+            "s_max_i32 s96, s96, 0",
+            f"v_add_nc_u32 {vr(r)}, s96, {vr(BASE)}",
+        ]
+    out.append("s_wait_alu depctr_va_vdst(0)")  # the offsets are written: one wait for all the loads
+    out += [f"global_load_b128 {vr(r, 4)}, {vr(r)}, s[102:103]" for r in regs]
     return out
 
 

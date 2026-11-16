@@ -196,8 +196,9 @@ def _warm_code():
     v4i = fx.Vector.make_type(4, fx.Int32)
 
     def go():
-        # the function's end, pc + (.Lfunc_end0 - here), and its size: a piece never starts before the function
-        # (.Lfunc_end0: the kernel is its module's only function)
+        # the function's end, pc + (.Lfunc_end0 - here), and its size: a piece never starts before the function.
+        # (.Lfunc_end0 is the end of the module's first function, this kernel, its only one. Behind another one
+        # the size would not be positive: as 0, every load reads the code from that label on.)
         end = fx.Int64(
             llvm.inline_asm(
                 fx.Int64.ir_type,
@@ -212,6 +213,7 @@ def _warm_code():
                 fx.Int32.ir_type, [], f"s_mov_b32 $0, .Lfunc_end0-{KERNEL_NAME}", "=s", has_side_effects=True
             )
         )
+        size = fx.max(size, fx.Int32(0))
         got = []
         for k in range(WARM_PIECES):
             back = fx.min(fx.Int32(WARM_PIECE * (k + 1)), size)
