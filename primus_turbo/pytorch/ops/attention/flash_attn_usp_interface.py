@@ -472,6 +472,7 @@ class AttentionTritonFunctionCPA2A(torch.autograd.Function):
             -1,
             alibi_slopes,
             ctx.use_fp8,
+            None,
         )
 
         dqkv = attn_helper.combine_dqkv_before_a2a(dq_local_heads, dk_local_heads, dv_local_heads)
