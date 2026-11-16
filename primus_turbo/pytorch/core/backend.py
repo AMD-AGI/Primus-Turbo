@@ -4,13 +4,16 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import atexit
+import json
+import os
 import statistics
 import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, Dict, Hashable, List, Optional, Type
+from typing import Any, Dict, Hashable, List, Optional, Tuple, Type
 
 import torch
 
@@ -29,11 +32,15 @@ __all__ = [
     "BackendChoice",
     "BackendEntry",
     "BackendType",
+    "DispatchSource",
     "GlobalBackendManager",
     "KernelBackend",
     "PrecisionType",
     "TuneCache",
     "AutoKernelDispatcher",
+    "dispatch_report",
+    "dump_dispatch_report",
+    "reset_dispatch_report",
 ]
 
 
@@ -486,13 +493,21 @@ def _format_kwargs(kwargs: Dict[str, Any]) -> str:
     return ", ".join(f"{k}={_format_value(v)}" for k, v in kwargs.items())
 
 
-def _warn_fallback(backend_enum: BackendType, kwargs: dict) -> None:
-    """Say once that the default backend was not eligible and we fell back.
+def _on_fallback(
+    dispatcher: str, default_enum: Optional[BackendType], backend_enum: BackendType, kwargs: dict
+) -> None:
+    """Raise under PRIMUS_TURBO_STRICT_DISPATCH, otherwise say once that we fell back.
 
-    Skipped under torch.compile: dynamo cannot trace a logging.Logger call, and backend
-    selection is host-side dispatch, so tracing into it would fail the compile over a
+    The warning is skipped under torch.compile: dynamo cannot trace a logging.Logger call, and
+    backend selection is host-side dispatch, so tracing into it would fail the compile over a
     diagnostic. Formatting the kwargs is not cheap either, and it sits inside the guard.
     """
+    if envs.PRIMUS_TURBO_STRICT_DISPATCH:
+        default_name = default_enum.name if default_enum is not None else None
+        raise RuntimeError(
+            f"{dispatcher}: default backend {default_name} cannot handle inputs: {_format_kwargs(kwargs)}; "
+            f"PRIMUS_TURBO_STRICT_DISPATCH=1 forbids falling back to {backend_enum.name}."
+        )
     if torch.compiler.is_compiling():
         return
     logger.warning(
@@ -500,6 +515,116 @@ def _warn_fallback(backend_enum: BackendType, kwargs: dict) -> None:
         f"fallback backend {backend_enum.name} is selected. The fallback backend may hurt performance!",
         once=True,
     )
+
+
+class DispatchSource(Enum):
+    """Why a dispatcher picked the backend it did, in priority order."""
+
+    USER = "user"  # set_*_backend() or PRIMUS_TURBO_*_BACKEND
+    AUTOTUNE = "autotune"
+    DEFAULT = "default"
+    FALLBACK = "fallback"  # the default could not handle the inputs
+
+
+# (dispatcher, backend, source) -> calls. Always kept: one dict update per dispatch.
+# Keyed by names, not members: Enum.__hash__ is Python code, and hashing two of them would cost
+# more than the rest of the update.
+_dispatch_counts: Dict[Tuple[type, str, str], int] = {}
+# (dispatcher, make_key(), backend, source) -> calls. Only under PRIMUS_TURBO_DISPATCH_REPORT.
+_dispatch_shapes: Dict[Tuple[type, Hashable, str, str], int] = {}
+# Shape-varying ops (varlen attention, MoE) mint a key per batch; past this, keep counting
+# totals but stop adding shapes rather than grow without bound.
+_DISPATCH_SHAPES_CAPACITY = 10000
+_dispatch_atexit_registered = False
+
+
+def _record_dispatch(
+    dispatcher: Type["AutoKernelDispatcher"], backend: BackendType, source: DispatchSource, kwargs: dict
+) -> None:
+    # Same reason as _on_fallback: nothing host-side should be traced into the graph.
+    if torch.compiler.is_compiling():
+        return
+    backend_name, source_name = backend._name_, source._value_
+    counts_key = (dispatcher, backend_name, source_name)
+    _dispatch_counts[counts_key] = _dispatch_counts.get(counts_key, 0) + 1
+
+    if envs.PRIMUS_TURBO_DISPATCH_REPORT is None:
+        return
+    _register_dispatch_atexit()
+    try:
+        shape = dispatcher.make_key(**kwargs)
+    except Exception:  # noqa: BLE001 -- a diagnostic must never fail the op it describes
+        shape = None
+    shape_key = (dispatcher, shape, backend_name, source_name)
+    seen = _dispatch_shapes.get(shape_key)
+    if seen is not None:
+        _dispatch_shapes[shape_key] = seen + 1
+        return
+    if len(_dispatch_shapes) >= _DISPATCH_SHAPES_CAPACITY:
+        logger.warning(
+            f"Dispatch report holds {_DISPATCH_SHAPES_CAPACITY} shapes; new shapes are no longer "
+            f"recorded, per-dispatcher totals still are.",
+            once=True,
+        )
+        return
+    _dispatch_shapes[shape_key] = 1
+    logger.info(f"[dispatch] {dispatcher.__name__} {shape!r} -> {backend_name} ({source_name})")
+
+
+def _register_dispatch_atexit() -> None:
+    global _dispatch_atexit_registered
+    if not _dispatch_atexit_registered:
+        _dispatch_atexit_registered = True
+        atexit.register(_dump_dispatch_report_at_exit)
+
+
+def _dump_dispatch_report_at_exit() -> None:
+    path = envs.PRIMUS_TURBO_DISPATCH_REPORT
+    if path is None:
+        return
+    path = path.replace("{rank}", os.environ.get("RANK", "0")).replace("{pid}", str(os.getpid()))
+    try:
+        dump_dispatch_report(path)
+    except OSError as e:
+        logger.warning(f"Could not write the dispatch report to {path}: {e}")
+
+
+def dispatch_report(by_shape: bool = False) -> List[Dict[str, Any]]:
+    """Return the backend choices made so far, most-called first.
+
+    Each row is ``{"dispatcher", "backend", "source", "calls"}``; ``source`` is one of the
+    ``DispatchSource`` values. With ``by_shape=True`` the rows are per input shape (the
+    dispatcher's ``make_key``, as a string) and need PRIMUS_TURBO_DISPATCH_REPORT to have been
+    set while dispatching -- without it there are none.
+    """
+    if by_shape:
+        rows = [
+            {"dispatcher": d.__name__, "shape": repr(s), "backend": b, "source": src, "calls": n}
+            for (d, s, b, src), n in _dispatch_shapes.items()
+        ]
+    else:
+        rows = [
+            {"dispatcher": d.__name__, "backend": b, "source": src, "calls": n}
+            for (d, b, src), n in _dispatch_counts.items()
+        ]
+    rows.sort(key=lambda r: (-r["calls"], r["dispatcher"]))
+    return rows
+
+
+def dump_dispatch_report(path: str) -> None:
+    """Write ``dispatch_report()`` and its per-shape rows to ``path`` as JSON."""
+    report = {"totals": dispatch_report(), "shapes": dispatch_report(by_shape=True)}
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(report, f, indent=2)
+
+
+def reset_dispatch_report() -> None:
+    """Forget every recorded choice."""
+    _dispatch_counts.clear()
+    _dispatch_shapes.clear()
 
 
 class AutoKernelDispatcher(ABC):  # noqa: B024
@@ -644,6 +769,7 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
                     f"User specified backend {user_backend_enum.name} cannot handle the given inputs: {_format_kwargs(kwargs)}. "
                     f"Please check input constraints or choose a different backend."
                 )
+            _record_dispatch(cls, user_backend_enum, DispatchSource.USER, kwargs)
             return entry.impl.execute(**kwargs)
 
         # 2. Auto tune
@@ -656,17 +782,22 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
             # Mutating ops can profile with scratch tensors while executing with ``kwargs``.
             backend_cls = cls.tune(**(tuning_kwargs if tuning_kwargs is not None else kwargs))
             if backend_cls is not None:
+                tuned_enum = cls._enum_for_impl(backend_cls)
+                if tuned_enum is not None:
+                    _record_dispatch(cls, tuned_enum, DispatchSource.AUTOTUNE, kwargs)
                 return backend_cls.execute(**kwargs)
 
         # 3. Default backend
         default_entry = cls._backends.get(default_backend_choice.backend)
         if default_entry is not None and default_entry.impl.can_handle(**kwargs):
+            _record_dispatch(cls, default_backend_choice.backend, DispatchSource.DEFAULT, kwargs)
             return default_entry.impl.execute(**kwargs)
 
         # 4. Fallback: try all backends
         for fallback_backend_enum, fallback_backend_entry in cls._backends.items():
             if fallback_backend_entry.impl.can_handle(**kwargs):
-                _warn_fallback(fallback_backend_enum, kwargs)
+                _on_fallback(cls.__name__, default_backend_choice.backend, fallback_backend_enum, kwargs)
+                _record_dispatch(cls, fallback_backend_enum, DispatchSource.FALLBACK, kwargs)
                 return fallback_backend_entry.impl.execute(**kwargs)
 
         raise ValueError(
@@ -691,6 +822,7 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         default > fallback. Exposed so callers that run a kernel across multiple
         passes (e.g. an autograd forward/backward pair) can pin the *same*
         backend for every pass by resolving once and threading the enum through.
+        The choice is recorded in ``dispatch_report()`` as if it had been dispatched.
         """
         # 1. User specified backend (env or code) - highest priority
         if user_backend_enum is not None:
@@ -704,6 +836,7 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
                     f"User specified backend {user_backend_enum.name} cannot handle the given inputs: {_format_kwargs(kwargs)}. "
                     f"Please check input constraints or choose a different backend."
                 )
+            _record_dispatch(cls, user_backend_enum, DispatchSource.USER, kwargs)
             return user_backend_enum
 
         # 2. Auto tune
@@ -712,17 +845,20 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
             backend_cls = cls.tune(**kwargs)
             tuned_enum = cls._enum_for_impl(backend_cls) if backend_cls is not None else None
             if tuned_enum is not None:
+                _record_dispatch(cls, tuned_enum, DispatchSource.AUTOTUNE, kwargs)
                 return tuned_enum
 
         # 3. Default backend
         default_entry = cls._backends.get(default_backend_enum)
         if default_entry is not None and default_entry.impl.can_handle(**kwargs):
+            _record_dispatch(cls, default_backend_enum, DispatchSource.DEFAULT, kwargs)
             return default_backend_enum
 
         # 4. Fallback: try all backends
         for fallback_backend_enum, fallback_backend_entry in cls._backends.items():
             if fallback_backend_entry.impl.can_handle(**kwargs):
-                _warn_fallback(fallback_backend_enum, kwargs)
+                _on_fallback(cls.__name__, default_backend_enum, fallback_backend_enum, kwargs)
+                _record_dispatch(cls, fallback_backend_enum, DispatchSource.FALLBACK, kwargs)
                 return fallback_backend_enum
 
         raise ValueError(

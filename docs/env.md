@@ -37,6 +37,13 @@ Variables owned by other projects (FlyDSL, Triton, NVSHMEM, the launcher's `RANK
 |---|---|---|---|
 | `PRIMUS_TURBO_AUTO_TUNE` | `bool` | `False` | "1" turns auto-tuning across registered kernel backends on for every op, and the FlyDSL kernel-level tuners with it. An explicit per-op backend still wins over it, and so does `GlobalBackendManager.set_auto_tune`. Read at the first dispatch or FlyDSL launch. |
 
+### Dispatch diagnostics
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `PRIMUS_TURBO_DISPATCH_REPORT` | `str \| None` | unset | A file path: record which backend every dispatcher picked for every input shape, and why (user, autotune, default or fallback), log each new choice at INFO, and write the report there as JSON when the process exits. "{rank}" in the path is replaced by $RANK (0 when unset) and "{pid}" by the process id. Unset keeps only the per-dispatcher totals of `dispatch_report()`. |
+| `PRIMUS_TURBO_STRICT_DISPATCH` | `bool` | `False` | "1" makes a fallback an error: when the default backend cannot handle the inputs, dispatch raises RuntimeError instead of warning and running another registered backend. |
+
 ### Kernel behavior
 
 | Variable | Type | Default | Description |
