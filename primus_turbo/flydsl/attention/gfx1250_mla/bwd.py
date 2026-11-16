@@ -64,6 +64,15 @@ def shape_unsupported_reason(batch: int, seqlen_q: int, seqlen_kv: int, num_head
     """Why the backward cannot run these MHA sizes, or None. The forward takes every size this accepts."""
     if batch <= 0 or num_heads <= 0:
         return f"batch and num_heads must be positive, got {batch} / {num_heads}"
+    # batch * heads is a dimension of k_delta_bshd's launch grid, and heads and batch (batch * heads and 1 for
+    # b > 1 SBHD storage, which is folded) are dimensions of the forward's. They are 16-bit: at 65536 a launch
+    # wraps to no workgroup at all, without an error. (Today the size rules below stop before that: they take
+    # at most 58254, at seqlen_kv 64.)
+    if batch * num_heads >= 1 << 16:
+        return (
+            "batch * heads must be under 65536 (a 16-bit dimension of the kernels' launch grids), got "
+            f"{batch} * {num_heads}"
+        )
     # multiples of 64: the forward's q tiles (4 waves x 16 rows), k_dqds's kv units, k_dkdv's last kv block
     if seqlen_q <= 0 or seqlen_q % 64:
         return f"seqlen_q must be a positive multiple of 64, got {seqlen_q}"

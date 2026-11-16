@@ -168,7 +168,8 @@ def test_gate_accepts(monkeypatch, dims, kwargs, layout):
         pytest.param({"b": 2, "sq": 32768, "skv": 32768, "h": 128}, {}, id="dsv3_b2_s32768"),
         # seqlen_kv 64: k_dkdv pads k to 192 rows, three times its size (under 2 GiB here)
         pytest.param({"sq": 64, "skv": 64, "h": 58255}, {}, id="s64_padded_k_over_4gib"),
-        pytest.param({"b": 512, "sq": 64, "skv": 64, "h": 128}, {}, id="s64_padded_k_over_4gib_b512"),
+        pytest.param({"b": 456, "sq": 64, "skv": 64, "h": 128}, {}, id="s64_padded_k_over_4gib_b456"),
+        pytest.param({"b": 512, "sq": 64, "skv": 64, "h": 128}, {}, id="batch_times_heads_65536"),
         pytest.param({"b": 0}, {}, id="empty_batch"),
         pytest.param({"h": 0}, {}, id="no_heads"),
         pytest.param({}, {"causal": False}, id="non_causal"),
@@ -208,6 +209,16 @@ def test_gate_verdict_depends_on_batch_times_heads(b, s, h, accepted):
 
     assert (bwd.shape_unsupported_reason(b, s, s, h) is None) == accepted
     assert (bwd.shape_unsupported_reason(1, s, s, b * h) is None) == accepted
+
+
+def test_gate_keeps_batch_times_heads_in_the_16_bit_grid():
+    """batch * heads is a dimension of the kernels' launch grids, which are 16-bit there: a launch of 65536 runs no
+    workgroup and reports nothing. The rule is the first size rule, whatever the others allow."""
+    from primus_turbo.flydsl.attention.gfx1250_mla import bwd
+
+    for dims in ((1, 64, 64, 65536), (256, 64, 64, 256), (65536, 64, 64, 1), (1, 4096, 4096, 65536)):
+        assert "under 65536" in bwd.shape_unsupported_reason(*dims), dims
+    assert "under 65536" not in bwd.shape_unsupported_reason(1, 64, 64, 65535)  # (k padded to 192 rows)
 
 
 def test_gate_refuses_mismatched_tensors(monkeypatch):
@@ -300,6 +311,24 @@ def test_flash_attn_func_refuses_mixed_devices_without_the_gate(monkeypatch):
             "under 2 GiB",
             id="fwd_out_2gib",
         ),
+        pytest.param(
+            "fwd",
+            {
+                name: torch.empty(1, 64, 65536, d, dtype=torch.bfloat16, device="meta")
+                for name, d in _QKV_DIMS
+            },
+            "under 65536",
+            id="fwd_heads_16_bit_grid",
+        ),
+        pytest.param(
+            "fwd",
+            {
+                name: torch.empty(65536, 64, 1, d, dtype=torch.bfloat16, device="meta")
+                for name, d in _QKV_DIMS
+            },
+            "under 65536",
+            id="fwd_batch_16_bit_grid",
+        ),
         pytest.param("bwd", {"causal": False}, "causal attention only", id="bwd_non_causal"),
         pytest.param("bwd", {"lse": torch.empty(1, 2, 256)}, "one device", id="bwd_devices"),
         pytest.param("bwd", {"b": 0}, "must be positive", id="bwd_empty_batch"),
@@ -313,10 +342,10 @@ def test_flash_attn_func_refuses_mixed_devices_without_the_gate(monkeypatch):
             "bwd",
             {
                 **{
-                    name: torch.empty(1, 64, 65536, d, dtype=torch.bfloat16, device="meta")
+                    name: torch.empty(1, 64, 58255, d, dtype=torch.bfloat16, device="meta")
                     for name, d in (*_QKV_DIMS, ("dout", D_V), ("out", D_V))
                 },
-                "lse": torch.empty(1, 65536, 64, device="meta"),
+                "lse": torch.empty(1, 58255, 64, device="meta"),
             },
             "under 4 GiB",
             id="bwd_s64_padded_k_4gib",

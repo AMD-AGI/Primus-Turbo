@@ -55,7 +55,7 @@ def flash_attn_mla_fwd(
 
     q [B, Sq, H, 192], k [B, Skv, H, 192], v [B, Skv, H, 128]: contiguous bf16 on one gfx1250
     device, Sq and Skv multiples of 64 (the kernel's kv tiles and its mask's diagonal tiles), Sq <= Skv,
-    out under 2 GiB. The mask is bottom-right: query i attends keys j <= i + Skv - Sq. Returns
+    out under 2 GiB, B and H under 65536. The mask is bottom-right: query i attends keys j <= i + Skv - Sq. Returns
     o [B, Sq, H, 128] bf16 and lse [B, H, Sq] fp32 (natural log).
     """
     if not causal:
@@ -73,6 +73,10 @@ def flash_attn_mla_fwd(
         )
     if b == 0 or h == 0:
         raise ValueError(f"batch and heads must be positive, got {b} / {h}")
+    if b >= 1 << 16 or h >= 1 << 16:  # the grid (nqb, heads, batch): its last two dimensions wrap at 65536
+        raise ValueError(
+            f"batch and heads must be under 65536 each (16-bit dimensions of the kernel's launch grid), got {b} / {h}"
+        )
     if sq == 0 or sq % 64 or skv % 64 or sq > skv:
         raise ValueError(
             f"seqlen_q and seqlen_kv must be positive multiples of 64 with seqlen_q <= seqlen_kv, got {sq} / {skv}"
