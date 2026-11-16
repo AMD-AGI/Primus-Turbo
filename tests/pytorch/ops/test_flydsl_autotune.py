@@ -153,6 +153,35 @@ def test_capture_returns_base_then_tunes(monkeypatch):
     assert t.pick("k", sp, probe=one_point(), build=ident()).config == "b"
 
 
+def test_rewritten_call_defers_a_real_args_tune():
+    rt.force(True)
+    bench = FakeBench({"a": 2.0, "b": 1.0})
+    t = Tuner("test.op")
+    sp = space(["a", "b"], bench, Fastest())
+    with rt.rewritten_call():
+        res = t.pick("k", sp, probe=one_point(), build=ident())
+    assert res.config == "a" and res.tuned is None and t.cache == {} and bench.calls == 0
+    assert t.pick("k", sp, probe=one_point(), build=ident()).config == "b"
+
+
+def test_rewritten_call_keeps_a_synthetic_tune():
+    rt.force(True)
+    t = Tuner("test.op")
+    sp = space(["a", "b"], FakeBench({"a": 2.0, "b": 1.0}), Fastest())
+    with rt.rewritten_call():
+        res = t.pick("k", sp, probe=policies.Synthetic(lambda: [Point(())]), build=ident())
+    assert res.config == "b" and res.tuned and t.cache == {"k": "b"}
+
+
+def test_rewritten_call_reuses_its_provisional_entry():
+    rt.force(True)
+    t = Tuner("test.op")
+    with rt.rewritten_call():
+        e = t.entry("k", lambda: Entry("a", Launch("a"), tuned=None))
+        assert t.hit("k") is e
+    assert t.hit("k") is None
+
+
 def test_pick_is_cached():
     rt.force(True)
     bench = FakeBench({"a": 3.0, "b": 1.0, "c": 2.0})

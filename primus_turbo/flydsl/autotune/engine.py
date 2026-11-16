@@ -33,6 +33,7 @@ from primus_turbo.flydsl.autotune.policies import (
     Bench,
     Check,
     Probe,
+    RealArgs,
     ReferenceCheck,
     Select,
     Stage,
@@ -423,6 +424,8 @@ class Tuner:
         cfg = self.cache.get(key, _UNSET)
         if cfg is not _UNSET:
             return Pick(cfg)
+        if isinstance(probe, RealArgs) and runtime.is_rewritten_call():
+            return Pick(space.base, tuned=None)
         if not runtime.enabled():
             if self.off == "base":
                 return Pick(space.base, tuned=False)
@@ -488,14 +491,15 @@ class Tuner:
     @staticmethod
     def stale(e: Optional[Entry]) -> bool:
         """Whether an op's cached artifact has to be picked again now: it is missing, provisional
-        (made under capture) and this call is outside capture, or untuned and tuning can run.
+        (made under capture or a ``runtime.rewritten_call``) and this call is outside both, or
+        untuned and tuning can run.
         Outside those cases it is reused, under capture too, so nothing is rebuilt there."""
         if e is None:
             return True
         if e.tuned:
             return False
         if e.tuned is None:
-            return runtime.blocked() is None
+            return runtime.blocked() is None and not runtime.is_rewritten_call()
         return runtime.enabled() and runtime.blocked() is None
 
     def hit(self, ekey) -> Optional[Entry]:
