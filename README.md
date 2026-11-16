@@ -148,6 +148,8 @@ PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e ".[jax]" -v
 # Just install ccache or sccache and the build will use it automatically.
 ```
 
+See [Environment variables](./docs/env.md) for every build-time and runtime variable Primus-Turbo reads.
+
 ### 3. Testing
 
 **Option 1: Single-process mode (slow but simple)**
