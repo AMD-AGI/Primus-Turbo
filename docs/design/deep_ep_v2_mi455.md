@@ -2,13 +2,13 @@
 
 ## Overview
 
-DeepEP's intranode dispatch / combine for MI455X (`gfx1250`), written in FlyDSL. Two versions of
-the kernels exist:
+DeepEP's intranode dispatch / combine for MI455X (`gfx1250`), written in FlyDSL. The kernels
+implement the data transfer of the two versions of upstream DeepEP:
 
-- **V1**: DeepEP's ring protocol. gfx942 / gfx950 run it; on gfx1250 a port of it is kept for the
-  tests.
-- **V2**: gfx1250 only. It replaces the rings with fixed per-token slots and moves rows with TDM. It
-  is what gfx1250 runs.
+- **V1**, after DeepEP V1's normal mode: one ring per (channel, destination rank), with a head / tail
+  handshake per chunk. gfx942 / gfx950 run it; on gfx1250 a port of it is kept for the tests.
+- **V2**, after DeepEP V2's direct mode (`ElasticBuffer`): fixed per-token slots instead of rings,
+  rows moved with TDM. It is what gfx1250 runs.
 
 On gfx942 / gfx950 nothing changes: they run V1, and its kernels compile to the same ISA as before.
 

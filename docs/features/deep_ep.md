@@ -9,11 +9,20 @@ fewer bytes than an all-to-all that sends one copy per expert. It is for trainin
 dispatch / combine backward, and no low-latency (inference) kernels. The kernels derive from
 [DeepEP](https://github.com/deepseek-ai/DeepEP).
 
-The intranode kernels come in two versions, chosen by the GPU's architecture:
+The intranode kernels implement the data transfer of the two versions of upstream DeepEP:
 
-- **V1** (MI300X / MI325X / MI355X): DeepEP's protocol, one ring per channel and destination rank.
-- **V2** (MI455X): every token is written straight into a fixed slot on its destination rank, with no
-  rings, and the combine reduces rows as they land. Outputs are bit-identical to V1.
+- **V1**, after DeepEP V1's normal mode: the tokens are split into channels, and each channel has a
+  ring on every destination rank. The sender writes a chunk and advances the ring's tail; the
+  receiver copies it out into the output and advances the head. The rings have a fixed size,
+  independent of the token count.
+- **V2**, after DeepEP V2's direct mode (`ElasticBuffer`): a notify step computes how many tokens
+  each rank receives from each rank, so every token has a fixed slot on each destination rank. The
+  sender writes the token straight into its slot without waiting for the receiver; the combine
+  pushes the rows back the same way and reduces them as they land. The buffer holds the whole batch,
+  so it is sized by the token count and is larger than V1's rings.
+
+Both versions take the same `Buffer` API and give bit-identical outputs. Today Primus-Turbo runs V1
+on MI300X / MI325X / MI355X and V2 on MI455X; the version is picked by the GPU, not by the user.
 
 ## Support matrix
 
@@ -49,9 +58,10 @@ Full example: [Examples § DeepEP](../examples.md#4-deepep).
 
 ### Buffer size
 
-- V1: the rings, `Config.get_nvl_buffer_size_hint(hidden_bytes, num_ranks)`.
-- V2: the whole batch, `Buffer.get_token_buffer_size_hint(num_max_tokens_per_rank, hidden_bytes,
-  num_ranks, num_topk)` (0 on V1), with the same `num_max_tokens_per_rank` on every rank.
+- V1 (MI300X / MI355X): the rings, `Config.get_nvl_buffer_size_hint(hidden_bytes, num_ranks)`.
+- V2 (MI455X): the whole batch, `Buffer.get_token_buffer_size_hint(num_max_tokens_per_rank,
+  hidden_bytes, num_ranks, num_topk)` (0 where V1 runs), with the same `num_max_tokens_per_rank`
+  on every rank.
 
 `turbo.ops.moe_dispatch` sizes the buffer from the group's largest first dispatch (an all-reduce at
 allocation, so ranks may dispatch different numbers of tokens) and reallocates it for a larger one,
@@ -110,11 +120,11 @@ training-step gain not recorded yet.
   and raises. It also raises when the detected architecture is not that of its GPU, for example when
   `rocm_agent_enumerator` fails, which makes it report gfx942.
 - MI455X: intranode only, with 2, 4 or 8 ranks and `num_nvl_bytes > 0`; other buffers raise.
-- MI455X, CUDA graphs: V2 raises under capture, because every call advances host-side state that a
-  replay would reuse.
-- MI455X, token counts that change per step without a known maximum (packed THD sequences, dynamic
-  context parallelism): the buffer holds whole batches, and a larger dispatch grows it only once
-  every rank of the group grows it.
+- V2 (MI455X), CUDA graphs: V2 raises under capture, because every call advances host-side state
+  that a replay would reuse.
+- V2 (MI455X), token counts that change per step without a known maximum (packed THD sequences,
+  dynamic context parallelism): the buffer holds whole batches, and a larger dispatch grows it only
+  once every rank of the group grows it.
 
 In these cases use the all-to-all (RCCL) token dispatcher; in Primus, `use_turbo_deepep: false`.
 
