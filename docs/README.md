@@ -29,7 +29,6 @@ To add one, copy [the template](./features/_template.md).
 ## Design
 
 - [MegaMoE](./design/mega_moe.md)
-- [DeepEP: backends and buffer sizing](../primus_turbo/pytorch/deep_ep/README.md)
 - [FlyDSL DeepEP on MI455X](./design/flydsl_deepep_mi455.md)
 - [MoE gather and MXFP4 quantization fusion](./design/moe_gather_quantization.md)
 - [Single-rank fused cross entropy](./design/cross_entropy.md)
