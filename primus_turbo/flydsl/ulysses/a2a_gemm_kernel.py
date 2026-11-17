@@ -939,9 +939,16 @@ def ulysses_a2a_gemm(
     if num_push is None:
         if gemm_bound:
             num_push = 8 if M >= 8192 and num_ranks == 2 else 16
+        elif wgrad is None:
+            # ~5 pushers per peer keep the links busy, more take CUs from the K walk (32K, n = 4:
+            # GLM-4.7 1627 -> 1441 us with 16, Qwen3-235B 923 -> 806, MiniMax-M2.5 609 -> 587; n = 2
+            # MiniMax-M2.5 1942 -> 1874). n = 8 and the exchange-dominated launches below half the
+            # GEMM-bound ratio need 32 (GLM-4.7 n = 8: 760 us with 16, 732; Qwen3-30B: 388, 383)
+            exchange_bound = 2 * N * num_ranks < 8192 * (num_ranks - 1)
+            num_push = 32 if num_ranks > 4 or exchange_bound else 16
         else:
             # with few weight-gradient tiles the launch is compute-bound: 16 pushers still fill the links
-            num_push = 32 if wgrad is None or many_wtiles else 16
+            num_push = 32 if many_wtiles else 16
     if BM is None:
         # 256-row tiles while every tile has a CU (the staggered K walk) or the GEMM dominates;
         # otherwise 128 rows halve the tail of the m-tile that lands last
