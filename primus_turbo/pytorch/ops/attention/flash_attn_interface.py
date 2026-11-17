@@ -692,13 +692,9 @@ def flash_attn_fp8_func(
     logical_seqlen_q = physical_seqlen_q if logical_seqlen_q is None else logical_seqlen_q
     logical_seqlen_k = physical_seqlen_k if logical_seqlen_k is None else logical_seqlen_k
     if not 0 < logical_seqlen_q <= physical_seqlen_q:
-        raise ValueError(
-            f"logical q length must be in [1, {physical_seqlen_q}], got {logical_seqlen_q}"
-        )
+        raise ValueError(f"logical q length must be in [1, {physical_seqlen_q}], got {logical_seqlen_q}")
     if not 0 < logical_seqlen_k <= physical_seqlen_k:
-        raise ValueError(
-            f"logical k/v length must be in [1, {physical_seqlen_k}], got {logical_seqlen_k}"
-        )
+        raise ValueError(f"logical k/v length must be in [1, {physical_seqlen_k}], got {logical_seqlen_k}")
     if v.shape[1] != physical_seqlen_k:
         raise ValueError(
             f"k and v physical sequence lengths must match, got {physical_seqlen_k} and {v.shape[1]}"

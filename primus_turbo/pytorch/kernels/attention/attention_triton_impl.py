@@ -63,13 +63,9 @@ def _validate_logical_seqlens(
             f"k and v physical sequence lengths must match, got {physical_seqlen_k} and {v.shape[1]}"
         )
     if not 0 < logical_seqlen_q <= physical_seqlen_q:
-        raise ValueError(
-            f"logical q length must be in [1, {physical_seqlen_q}], got {logical_seqlen_q}"
-        )
+        raise ValueError(f"logical q length must be in [1, {physical_seqlen_q}], got {logical_seqlen_q}")
     if not 0 < logical_seqlen_k <= physical_seqlen_k:
-        raise ValueError(
-            f"logical k/v length must be in [1, {physical_seqlen_k}], got {logical_seqlen_k}"
-        )
+        raise ValueError(f"logical k/v length must be in [1, {physical_seqlen_k}], got {logical_seqlen_k}")
 
 
 @_torch_custom_op_wrapper("primus_turbo::attention_triton_forward_impl", mutates_args=(), device_types="cuda")
@@ -320,9 +316,7 @@ def _attention_triton_forward_impl_fake(
     else:
         exp_scores = torch.empty([], device=q.device, dtype=torch.float32)
 
-    softmax_lse = torch.empty(
-        (batch_q, nheads_q, logical_seqlen_q * 2), device=q.device, dtype=torch.float32
-    )
+    softmax_lse = torch.empty((batch_q, nheads_q, logical_seqlen_q * 2), device=q.device, dtype=torch.float32)
 
     return o, softmax_lse, exp_scores
 
