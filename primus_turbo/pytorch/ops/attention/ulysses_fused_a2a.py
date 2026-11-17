@@ -79,12 +79,16 @@ class A2AGemmTuning:
         wgrad_at: claim slot of the in-kernel wgrad tiles (backward QKV only; 0, or after every
             dgrad tile when the GEMM outweighs the exchange, ``N * n >= 4096 * (n - 1)``, or there
             are more than 2x CU wgrad tiles).
+        split_m: last m-tiles whose tiles run as ``split_k`` K parts (forward o_proj only; 0).
+        split_k: K parts of a split tile, dividing ``n`` (2).
     """
 
     BM: Optional[int] = None
     num_push: Optional[int] = None
     push_split: Optional[int] = None
     wgrad_at: Optional[int] = None
+    split_m: Optional[int] = None
+    split_k: Optional[int] = None
 
 
 def _launch_kwargs(tuning, **defaults):
