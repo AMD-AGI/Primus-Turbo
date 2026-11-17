@@ -5974,8 +5974,58 @@ def _grouped_gemm_bf16_nn_flydsl_kernel_entry(
 #
 # MiniMax-M3 MoE: hidden 6144, gated expert FFN 3072 (fc1 N = 6144), 128 experts, top-4. At EP4 and
 # sequence 4096 each GPU holds G = 32 experts and receives M = 16384 rows, avg_m = 512.
+# Muse Spark key sets, shared by several (N, K, avg_m) rows below.
+_MUSE_NT = {
+    "GROUP_M": 4,
+    "head_pipe": 32,
+    "hp_epi": 0,
+    "issue_first": 1,
+    "lds_cosched": 3,
+    "mc_m": 2,
+    "mc_n": 4,
+    "mc_tile_sync": 1,
+    "nt_c1": 4,
+    "nt_deal": 1,
+    "nt_ovl": 1,
+    "nt_seam": 13,
+    "ntp_flags": 3,
+    "num_xcd": 8,
+    "persist": 256,
+    "tdm_assign": 1,
+    "tdm_balance": 1,
+    "tt_dec": 1,
+    "xcd_band": 32,
+}
+_MUSE_NN = {
+    "GROUP_M": 8,
+    "head_pipe": 32,
+    "issue_first": 1,
+    "lds_cosched": 3,
+    "mc_m": 2,
+    "mc_n": 4,
+    "mc_tile_sync": 1,
+    "nt_c1": 3,
+    "nt_deal": 1,
+    "nt_ovl": 1,
+    "nt_seam": 13,
+    "ntp_flags": 3,
+    "num_xcd": 8,
+    "persist": 256,
+    "tdm_assign": 1,
+    "tdm_nn": 1,
+    "tt_dec": 1,
+    "xcd_band": 32,
+}
+
 _KWARGS_KEYS = {
     "nt": {
+        # Muse Spark (EP4 / EP8, MBS 1 / 2): the MiniMax-M3 fc1 set with the table decode (tt_dec) in place of
+        # vec_dec, which the launcher drops above 32 experts. fwd fc1 at 512 / 1024 / 2048 rows per expert,
+        # fwd fc2 at 2048 (at 512 / 1024 it is within +-2% of the untuned path).
+        (8192, 4096, 512): _MUSE_NT,
+        (8192, 4096, 1024): _MUSE_NT,
+        (8192, 4096, 2048): _MUSE_NT,
+        (4096, 4096, 2048): _MUSE_NT,
         # MiniMax-M3 fwd fc2, avg_m = 512
         (6144, 3072, 512): {
             "GROUP_M": 4,
@@ -6020,6 +6070,12 @@ _KWARGS_KEYS = {
         },
     },
     "nn": {
+        # Muse Spark: the MiniMax-M3 dgrad fc1 set. dgrad fc1 and fc2 at 1024 / 2048 rows per expert (at 512 it
+        # is within +-1% on fc1 and loses on a skewed fc2).
+        (4096, 8192, 1024): _MUSE_NN,
+        (4096, 8192, 2048): _MUSE_NN,
+        (4096, 4096, 1024): _MUSE_NN,
+        (4096, 4096, 2048): _MUSE_NN,
         # MiniMax-M3 dgrad fc2, avg_m = 512
         (3072, 6144, 512): {
             "GROUP_M": 8,
@@ -6107,18 +6163,58 @@ _KWARGS_KEYS = {
             "xcd_band": 256,
         },
     },
+    # The variable-K wgrad with accumulate=1 (fp32 main_grad). It runs the plain non-persistent epilogue,
+    # so only the knobs that keep that path are keyed here: tile shape / ring depth, tile order and XCD remap.
+    # Bit-identical: none of them changes an element's reduction order.
+    "vk_accum": {
+        # Muse Spark wgrad fc1 (OUT 8192 x 4096): a 128 x 128 x 64 tile, whose ~144 KB LDS arena and smaller
+        # accumulator let two workgroups share a CU, so one computes while the other runs the main_grad
+        # read-modify-write epilogue (half the fp32 tile still fits a ring buffer, so it stays on "tdm").
+        (8192, 4096, 512): {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "m_warp": 2,
+            "n_warp": 2,
+            "num_buffers": 2,
+            "group_m": 8,
+            "num_xcd": 8,
+            "xcd_band": 512,
+        },
+        (8192, 4096, 1024): {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "m_warp": 2,
+            "n_warp": 2,
+            "num_buffers": 4,
+        },
+        (8192, 4096, 2048): {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "m_warp": 2,
+            "n_warp": 2,
+            "num_buffers": 4,
+        },
+        # Muse Spark wgrad fc2 (OUT 4096 x 4096) at 512 / 1024 / 2048 rows per expert (EP4 / EP8, MBS 1 / 2)
+        (4096, 4096, 512): {"group_m": 8, "num_xcd": 8, "xcd_band": 256},
+        (4096, 4096, 1024): {"group_m": 8, "num_xcd": 8, "xcd_band": 256},
+        (4096, 4096, 2048): {"group_m": 8, "num_xcd": 8, "xcd_band": 512},
+    },
 }
 _KWARGS_PASSTHROUGH = {
     "nt": frozenset({"out", "out_dtype", "m_tiles"}),
     "nn": frozenset({"out", "out_dtype", "m_tiles"}),
     "vk": frozenset({"out", "out_dtype", "masked_k", "expert_table"}),
+    "vk_accum": frozenset({"out", "out_dtype", "masked_k", "expert_table", "accumulate", "accum_impl"}),
 }
 
 
 def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:
     """The key's kwargs for this call, or {} when the call tunes anything or the shape is not a key."""
     # The positional extras the entry points take: out_dtype (NT / NN), masked_k and out_dtype (variable-K).
-    if n_pos > (2 if kind == "vk" else 1) or not set(kw) <= _KWARGS_PASSTHROUGH[kind]:
+    if n_pos > (2 if kind in ("vk", "vk_accum") else 1) or not set(kw) <= _KWARGS_PASSTHROUGH[kind]:
         return {}
     keyed = _KWARGS_KEYS[kind].get(key)
     if keyed is None:
@@ -6130,7 +6226,7 @@ def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:
         tiles = G * (-(-key[0] // tm)) * (-(-key[1] // tn))
         if tiles % keyed["persist"] or tiles // keyed["persist"] < 2:
             return {}
-    if kind != "vk" and keyed.get("vec_dec") and G > 32:
+    if kind in ("nt", "nn") and keyed.get("vec_dec") and G > 32:
         # The NT and NN launchers drop vec_dec above 32 experts, and nt_seam bit 2 then refuses the set.
         return {}
     return dict(keyed)
@@ -6166,7 +6262,8 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
 ):
     if a.dim() == 2 and b.dim() == 2:
         G = max(group_k_offsets.numel() - 1, 1)
-        kw.update(_keyed_kwargs("vk", (a.shape[1], b.shape[1], max(1, a.shape[0] // G)), G, len(args), kw))
+        kind = "vk_accum" if kw.get("accumulate") else "vk"
+        kw.update(_keyed_kwargs(kind, (a.shape[1], b.shape[1], max(1, a.shape[0] // G)), G, len(args), kw))
     return _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(a, b, group_k_offsets, *args, **kw)
 
 
