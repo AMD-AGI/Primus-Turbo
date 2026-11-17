@@ -147,6 +147,11 @@ def _qkv_gemm_a2a_forward(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout
     q, k, v = (torch.empty(seq * b, h // n, d, dtype=x.dtype, device=x.device) for h in (hq, hkv, hkv))
     workspace = get_ulysses_workspace(group, gemm_a2a_bank_bytes(M, N, 256))
     G, nq, nk, nv = _qkv_rank_block(hq, hkv, d, n, weight_layout)
+    # 256-row tiles run ~15 % faster but double the first wave the pulls wait behind and the last-wave
+    # tail: they pay from ~3 waves on (GLM-4.7 CP8 3.5 waves 638 -> 557 us; MiniMax-M2.5 CP8 2 waves
+    # 253 -> 274 us, Qwen3-30B 2.5 waves 428 -> 446 us)
+    num_cus = torch.cuda.get_device_properties(x.device).multi_processor_count
+    BM = 256 if -(-M // 256) * -(-N // 256) >= 3 * num_cus else 128
     ulysses_gemm_a2a(
         a,
         w,
@@ -161,7 +166,7 @@ def _qkv_gemm_a2a_forward(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout
         seq_local=s_local,
         qkv_format=qkv_format,
         flag_region=REGION_QKV_GEMM_A2A,
-        **_launch_kwargs(tuning, num_pull_cu=24, num_tail_pull=8),
+        **_launch_kwargs(tuning, BM=BM, num_pull_cu=24, num_tail_pull=8),
     )
     return tuple(t.view(*shape, *t.shape[1:]) for t in (q, k, v))
 
