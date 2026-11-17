@@ -75,14 +75,13 @@ class A2AGemmTuning:
             last or, without wgrad, the GEMM outweighs the exchange, ``N * n >= 8192 * (n - 1)``).
         num_push: push blocks, which run the last GEMM tiles once done (without wgrad: 16, 32 at
             n = 8 or below ``2 * N * n < 8192 * (n - 1)``, 8 when GEMM-bound from 8192 rows at n = 2;
-            with wgrad: 16, 32 over 2x CU wgrad tiles).
+            with wgrad: 16, 32 at n = 8 or over 3x CU wgrad tiles).
         push_split: sub-tiles a ``BM``-row m-tile is pushed in, so its rows land in pieces (8).
         wgrad_at: claim slot of the in-kernel wgrad tiles (backward QKV only; 0, or after every
-            dgrad tile when the GEMM outweighs the exchange, ``N * n >= 4096 * (n - 1)``, or there
-            are more than 2x CU wgrad tiles).
+            dgrad tile from ``N * n >= 3072 * (n - 1)`` or over 3x CU wgrad tiles).
         wgrad_split: row ranges of M the wgrad tiles run in, each part after that range's GEMM tiles
             and handing its fp32 accumulators to the next, bitwise equal to one pass (backward QKV
-            only; 2 when the wgrad tiles go last and fit in two waves, else 1).
+            only; 2 when the wgrad tiles go last in at most 3x CU tiles, else 1).
     """
 
     BM: Optional[int] = None

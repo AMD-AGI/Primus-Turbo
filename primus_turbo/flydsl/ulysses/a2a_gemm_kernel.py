@@ -1059,10 +1059,12 @@ def ulysses_a2a_gemm(
     # rows land. That pays while the exchange dominates (Qwen3-30B: 25-45 % slower otherwise); once
     # the GEMM outweighs it (N * n >= 4096 * (n - 1), see gemm_bound below) the GEMM tiles go first
     # with 256-row tiles and the wgrad tiles run on landed rows (Llama3.1-8B bwd QKV 4K 592 -> 516 us,
-    # MiniMax-M2.5 689 -> 612 us). Over two waves of wgrad tiles (GLM-4.7: 1120) they always go last
-    # and get 32 pushers (GLM-4.7 16 pushers: +16 %).
-    many_wtiles = num_wtiles > 2 * num_cus
-    wgrad_last = wgrad is not None and (many_wtiles or N * num_ranks >= 4096 * (num_ranks - 1))
+    # MiniMax-M2.5 689 -> 612 us); split in two halves of M (wgrad_split below) they also win from
+    # 3072 * (n - 1) (MiniMax-M2.5 n = 8 32K: 596 -> 504 us; Qwen3-30B n = 4, at 2048 * 3, stays first:
+    # 491 vs 530). Over three waves of wgrad tiles (GLM-4.7: 1120) they always go last in one part
+    # with 32 pushers (GLM-4.7 16 pushers: +16 %).
+    many_wtiles = num_wtiles > 3 * num_cus
+    wgrad_last = wgrad is not None and (many_wtiles or N * num_ranks >= 3072 * (num_ranks - 1))
     # GEMM / exchange time grows with N * n / (n - 1): ~1.1 for Llama-70B (hidden 8192, n = 4), 0.55
     # for Llama3.1-8B, 0.3 for Qwen3-30B. Past ~1 the CUs, not the links, bound the launch: 128-row
     # tiles cost 35 % more GEMM time than 256-row ones and pushers beyond what keeps ahead of the K walk
@@ -1083,8 +1085,9 @@ def ulysses_a2a_gemm(
             exchange_bound = 2 * N * num_ranks < 8192 * (num_ranks - 1)
             num_push = 32 if num_ranks > 4 or exchange_bound else 16
         else:
-            # with few weight-gradient tiles the launch is compute-bound: 16 pushers still fill the links
-            num_push = 32 if many_wtiles else 16
+            # with few weight-gradient tiles 16 pushers still fill the links at n <= 4 (Qwen3-235B n = 4,
+            # 576 wgrad tiles: 1379 -> 1302 us with 16), n = 8 needs 32 (MiniMax-M2.5: 558 -> 504 us)
+            num_push = 32 if many_wtiles or num_ranks > 4 else 16
     if BM is None:
         # 256-row tiles while every tile has a CU (the staggered K walk) or the GEMM dominates;
         # otherwise 128 rows halve the tail of the m-tile that lands last
@@ -1096,10 +1099,10 @@ def ulysses_a2a_gemm(
         wgrad_split = 1
     elif wgrad_split is None:
         # Behind all GEMM tiles the wgrad tiles run after the last rows land; in two halves of M the
-        # first runs on landed rows during the exchange (32K bwd QKV n = 4: MiniMax-M2.5 1106 -> 1018 us).
-        # Not over two waves of wgrad tiles (GLM-4.7 n = 4 2413 -> 2470: the GEMM dominates and each
-        # hand-over moves 256 KB per tile), nor with the wgrad tiles first (Qwen3-30B 529 -> 535);
-        # 4 parts lose to 2 everywhere.
+        # first runs on landed rows during the exchange (32K bwd QKV n = 4 MiniMax-M2.5 1106 -> 1018 us,
+        # Qwen3-235B 1332 -> 1302 with 16 pushers). Not with many wgrad tiles (GLM-4.7 n = 4 2413 ->
+        # 2470: the GEMM dominates and each hand-over moves 256 KB per tile), nor with the wgrad tiles
+        # first (Qwen3-30B 529 -> 535); 4 parts lose to 2 everywhere.
         flags = ceildiv(M, BM) * push_split * num_ranks + num_wtiles
         halves = wgrad_last and not many_wtiles and M % (2 * 256) == 0 and flags <= FLAGS_PER_REGION
         wgrad_split = 2 if halves else 1
