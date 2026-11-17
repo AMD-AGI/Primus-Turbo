@@ -473,7 +473,7 @@ print(c.shape)  # [128, 256]
 
 We added some new params for DeepEP buffer and dispatch. The normal kernels can be used in model training as the below example code shows.
 
-The intranode kernels default to `flydsl_v2` on MI455X (gfx1250) and to `cpp` on MI300 / MI355; see [Intranode backend](../primus_turbo/pytorch/deep_ep/README.md#intranode-backend) for the known issues on MI455X. `flydsl_v2` keeps the whole batch in its buffer, so size the buffer from the tokens per rank as `get_buffer` below does (`turbo.ops.moe_dispatch` does this by itself).
+MI455X (gfx1250) runs DeepEP V2 and MI300 / MI355 run V1; see [DeepEP](./features/deep_ep.md) for both and for the known issues on MI455X. V2 keeps the whole batch in its buffer, so size the buffer from the tokens per rank as `get_buffer` below does (`turbo.ops.moe_dispatch` does this by itself).
 
 ```python
 import torch
@@ -501,7 +501,7 @@ def get_buffer(group: dist.ProcessGroup,
     for config in (Buffer.get_dispatch_config(group.size()), Buffer.get_combine_config(group.size())):
         num_nvl_bytes = max(config.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes)
         num_rdma_bytes = max(config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes)
-    # `flydsl_v2` holds the whole batch; the hint is 0 for the ring backends (`cpp`, `flydsl`)
+    # V2 (MI455X) holds the whole batch; the hint is 0 on V1
     num_nvl_bytes = max(Buffer.get_token_buffer_size_hint(num_max_tokens_per_rank, hidden_bytes,
                                                           group.size(), num_topk), num_nvl_bytes)
 

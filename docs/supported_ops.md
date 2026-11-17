@@ -123,7 +123,7 @@ These are fwd-only utilities; the `_with_trans` variants also emit the transpose
 |---|:-:|:-:|:-:|---|
 | `turbo.ops.fused_all_gather_matmul`, `turbo.ops.fused_all_gather_scaled_matmul`, `turbo.ops.fused_matmul_reduce_scatter` | ✅ | ✅ | — | Async tensor parallelism; fwd only, the training integration supplies the backward |
 | `primus_turbo.pytorch.dist.FP8AllToAll` | ✅ | ✅ | — | All-to-all on FP8 payloads, with backward |
-| `primus_turbo.pytorch.deep_ep.Buffer` | ✅ | ✅ | — | Intra-node and inter-node EP buffers (needs rocSHMEM). See [DeepEP guide](../primus_turbo/pytorch/deep_ep/README.md) |
+| `primus_turbo.pytorch.deep_ep.Buffer` | ✅ | ✅ | — | Intra-node and inter-node EP buffers (needs rocSHMEM). See [DeepEP](./features/deep_ep.md) |
 
 ## 3. Supported modules (PyTorch)
 

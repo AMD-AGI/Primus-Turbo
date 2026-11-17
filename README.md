@@ -41,7 +41,7 @@ Note: JAX support is under active development. Optim support is planned but not 
 - **[2026/07/15]** 🔥 **MegaMoE (BF16)** — FlyDSL fused MoE layer with comm–compute overlap inside the grouped GEMMs ([overview](./docs/mega_moe.md)) (#412).
 - **[2026/07]** 🔥 **MXFP4 GEMM & grouped GEMM** — FlyDSL and hipBLASLt stacks for dense and expert GEMMs in low-precision training (#424, #483).
 - **[2026/07/30]** 🔥 **Release v0.4.0** — grouped GEMM autotune, MXFP4 correctness, and MegaMoE stability fixes on gfx950.
-- **[2026/06/10]** 🔥 **DeepEP** — JAX intranode/internode token dispatch (#344); PyTorch `DeepEPTokenDispatcher` (introduced in #114). The separate rocSHMEM backend integration is tracked in #409 ([guide](./primus_turbo/pytorch/deep_ep/README.md)).
+- **[2026/06/10]** 🔥 **DeepEP** — JAX intranode/internode token dispatch (#344); PyTorch `DeepEPTokenDispatcher` (introduced in #114). The separate rocSHMEM backend integration is tracked in #409 ([DeepEP](./docs/features/deep_ep.md)).
 - **[2025/12/16]** 🔥 [MoE training best practices on AMD GPUs](https://rocm.blogs.amd.com/software-tools-optimization/primus-moe-package/README.html) — DeepEP, grouped GEMM, and Primus recipes end to end.
 
 ## 📦 Quick Start
@@ -54,7 +54,7 @@ Note: JAX support is under active development. Optim support is planned but not 
 - PyTorch >= 2.6.0 (with ROCm support)
 - [AITER](https://github.com/ROCm/aiter) (required for some operators, e.g. FlashAttention / FP8): `pip3 install "amd-aiter @ git+https://github.com/ROCm/aiter.git@v0.1.24.post1"`
 - [FlyDSL](https://github.com/ROCm/FlyDSL) (required; provides the FlyDSL kernel backend for GEMM / GroupedGEMM / Attention / MoE)
-- rocSHMEM (optional, required for **experimental DeepEP**). Please refer to our [DeepEP Installation Guide](primus_turbo/pytorch/deep_ep/README.md) for instructions.
+- rocSHMEM (optional, required for **internode [DeepEP](./docs/features/deep_ep.md)**). See [Install rocSHMEM](./docs/install_dependencies.md).
 
 #### Hardware
 | Architecture | Supported GPUs      |

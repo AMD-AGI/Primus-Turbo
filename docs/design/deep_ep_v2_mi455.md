@@ -1,33 +1,31 @@
-# FlyDSL Intranode DeepEP on MI455X (gfx1250)
+# DeepEP V2 on MI455X (gfx1250)
 
 ## Overview
 
-DeepEP's intranode dispatch / combine for MI455X (`gfx1250`), written in **FlyDSL**. Two backends
-run on gfx1250:
+DeepEP's intranode dispatch / combine for MI455X (`gfx1250`), written in FlyDSL. Two versions of
+the kernels exist:
 
-- **`flydsl` (V1)**: the FlyDSL port of the DeepEP intranode kernels, the same ring protocol as the
-  C++ (HIP) DeepEP, ported from gfx942 / gfx950 to gfx1250.
-- **`flydsl_v2` (V2)**: a gfx1250-only backend that replaces the rings with fixed per-token slots
-  and moves rows with TDM. It is the backend gfx1250 runs; V1 is kept for the tests.
+- **V1**: DeepEP's ring protocol. gfx942 / gfx950 run it; on gfx1250 a port of it is kept for the
+  tests.
+- **V2**: gfx1250 only. It replaces the rings with fixed per-token slots and moves rows with TDM. It
+  is what gfx1250 runs.
 
-On gfx942 / gfx950 nothing changes: the default stays `cpp`, and the V1 kernels compile to the same
-ISA as before.
+On gfx942 / gfx950 nothing changes: they run V1, and its kernels compile to the same ISA as before.
 
 ### Key points
 
-- **No C++ dependency** — the FlyDSL path runs without the C++ `deep_ep` module, which is not loaded
-  on gfx1250.
+- **No C++ dependency** — V2 runs without the C++ `deep_ep` module, which is not loaded on gfx1250.
 - **One set of kernels, per-arch traits** — the gfx1250 differences (wave32, split wait counters,
   cache-policy bits, copy-piece sizes, watchdog) live in one `ArchTraits` table; the gfx9 values are
   the constants from before.
 - **Fixed slots instead of rings (V2)** — every token has a fixed slot on each rank it goes to, so
   the sender writes without waiting for the receiver, and the combine reduces rows as they land.
-- **Fast** — on the DeepSeek-V3 shape at EP2, `flydsl_v2` notify + dispatch takes 183 µs and
+- **Fast** — on the DeepSeek-V3 shape at EP2, V2 notify + dispatch takes 183 µs and
   combine 150 µs: 3.0× and 3.3× faster than the RCCL all-to-all of Megatron's alltoall dispatcher.
 - **Drop-in** — same `Buffer` API and outputs bit-identical to V1; `moe_dispatch` /
   `DeepEPTokenDispatcher` size the buffer from the dispatched tokens.
 
-How to choose, size and tune a backend: [the DeepEP README](../primus_turbo/pytorch/deep_ep/README.md#intranode-backend).
+How to size and tune DeepEP: [DeepEP § Configuration](../features/deep_ep.md#configuration).
 
 ## Background
 
@@ -35,7 +33,7 @@ MI455X had no intranode DeepEP:
 
 - The C++ (HIP) DeepEP assumes gfx9 (wave64, a unified `s_waitcnt`, gfx9 cache-policy bits) and does
   not run correctly on gfx1250 without changes; porting it is a separate change.
-- The FlyDSL V1 kernels were written for gfx942 / gfx950 and make the same assumptions.
+- The FlyDSL port of V1 was written for gfx942 / gfx950 and makes the same assumptions.
 - V1's rings are latency bound: each (channel, rank) pair is a ring with a head / tail handshake per
   chunk, and the receiver copies from the ring into `recv_x` in a second pass. On MI455X, V1 needs
   224 CUs to reach 410 / 226 µs (dispatch / combine) on the DeepSeek-V3 shape at EP2, while the
@@ -56,20 +54,19 @@ What differs on gfx1250, and how it is handled:
 
 ## Core Design
 
-### 1. Backends and the host side
+### 1. Version selection and the host side
 
 - **Selection**: by architecture, from FlyDSL's `get_rocm_arch()` (`primus_turbo/flydsl/deep_ep/arch.py`):
-  `cpp` on gfx942 / gfx950 (`CPP_DEEPEP_ARCHS`), `flydsl_v2` on gfx1250 (`FLYDSL_DEEPEP_ARCHS`); other
-  architectures are not supported: they log an error pointing to the all-to-all (RCCL) token dispatcher and
-  raise. No environment variable picks the backend; a `Buffer` raises when `get_rocm_arch()` is not its
-  GPU's `gcnArchName`. `Buffer(intranode_backend=...)` is for the tests only, which take another one
-  with it (V1 on gfx1250); users leave it unset. `flydsl_v2` on gfx942 / gfx950 raises and names the default.
+  V1 on gfx942 / gfx950, V2 on gfx1250; other architectures are not supported: they log an error
+  pointing to the all-to-all (RCCL) token dispatcher and raise. Nothing a user sets picks the version;
+  a `Buffer` raises when `get_rocm_arch()` is not its GPU's `gcnArchName`. The tests can select
+  another version through a test-only `Buffer` argument (V1 on gfx1250); V2 on gfx942 / gfx950 raises.
 - **No C++ `deep_ep`** (`primus_turbo/pytorch/deep_ep/_compat.py`): the C++ `Config` / `EventHandle`
   are used when the module can be imported, Python versions otherwise (`PyConfig` with
   `get_nvl_buffer_size_hint`, `PyEventHandle` over `torch.cuda.Event`). On gfx1250 the C++ module is
   not loaded even if `_C` was built with it (decided with FlyDSL's `get_rocm_arch()`, which does not
   initialize the GPU).
-- **`Buffer`** with a FlyDSL backend constructs no C++ `Buffer`; the comm stream is
+- **`Buffer`** on gfx1250 constructs no C++ `Buffer`; the comm stream is
   `torch.cuda.Stream(priority=-1)`, and internode / low-latency calls raise a clear error.
   `Buffer.destroy()` is collective: every rank waits for the others before it frees its heap.
 
@@ -165,7 +162,7 @@ fence; only their waits take the gfx12 form.
 For callers:
 
 - Outputs are bit-identical to V1. Handles use V2's own format (`send_head` holds stream indices)
-  and cannot be mixed with `flydsl` / `cpp` handles.
+  and cannot be mixed with V1 handles.
 - `num_sms` blocks are `num_sms` channels (need not be even); the chunk fields of `Config` are not
   used.
 - **No CUDA-graph capture**: every call advances host state that its launch takes (the epochs of the
@@ -184,7 +181,7 @@ The V2 heap scales with the token count, unlike V1's rings:
 - DeepSeek-V3 at EP4 (T 8192, H 7168 bf16, top-8) needs about 0.95 GB; GPT-OSS at EP4 (T 32768, H
   2880, top-4) about 1.55 GB, against about 128 MB for V1's rings at 32 CUs.
 - `Buffer.get_token_buffer_size_hint(num_max_tokens_per_rank, hidden_bytes, num_ranks, num_topk)`
-  gives the V2 size (0 for the ring backends). `init_buffer`, behind `moe_dispatch` /
+  gives the V2 size (0 on V1). `init_buffer`, behind `moe_dispatch` /
   `DeepEPTokenDispatcher`, takes the larger of it and the ring hint.
 - As Megatron does with DeepEP V2's `ElasticBuffer`, the token count comes from the first dispatch,
   and a larger dispatch reallocates the heap after a device sync and a barrier.
@@ -238,20 +235,20 @@ Notify + dispatch / combine, µs, at the same number of workgroups:
 | RCCL all-to-all, defaults (Megatron alltoall dispatcher: one copy per expert) | 32,956 | 472.5 | 3420 / 3372 | 1778 / 1733 | 652 / 603 |
 | RCCL all-to-all, tuned (Megatron alltoall dispatcher: one copy per expert) | 32,956 | 472.5 | 2421 / 2375 | 1285 / 1239 | 544 / 491 |
 | RCCL all-to-all, tuned (deduplicated control: one copy per GPU) | 8,071 | 115.7 | 660 / 613 | 381 / 333 | 215 / 164 |
-| `flydsl_v2` (one copy per GPU) | 8,071 | 115.7 | 331 / 346 | 216 / 195 | 183 / 150 |
+| DeepEP V2 (one copy per GPU) | 8,071 | 115.7 | 331 / 346 | 216 / 195 | 183 / 150 |
 
 - Megatron's alltoall dispatcher sends a token once per expert (about 4 of its 8 experts sit on the
   other GPU); DeepEP sends it once per GPU and copies it per expert on the receiver, so it moves 4.1×
   fewer bytes. The deduplicated row is a control: tuned RCCL moving exactly the bytes DeepEP moves.
-- CUs are workgroups per kernel: `flydsl_v2` runs one 1024-thread workgroup per CU; RCCL runs
+- CUs are workgroups per kernel: V2 runs one 1024-thread workgroup per CU; RCCL runs
   256-thread workgroups, 128 at most at EP2, fewer with `NCCL_MAX_P2P_NCHANNELS` (checked with
   rocprofv3).
 - notify + dispatch includes DeepEP's notify and its host wait; the RCCL rows include the all_gather
   of the counts and the device-to-host copy of the splits that Megatron does before its all-to-all.
-- With the receive counts known (a cached handle, as in the backward pass) `flydsl_v2` takes 124 µs
+- With the receive counts known (a cached handle, as in the backward pass) V2 takes 124 µs
   at 128 CUs against tuned RCCL's 492 µs; without the host wait (`num_worst_tokens`), 146 µs at 160
   CUs. It saturates at 160 CUs (within 5% of 256): 179 / 146 µs.
-- V1 (`flydsl`) on the same input: 1691 / 1067 µs at 32 CUs, 410 / 226 µs at its saturation point
+- The V1 port on the same input: 1691 / 1067 µs at 32 CUs, 410 / 226 µs at its saturation point
   of 224 CUs.
 
 ### Distance to the link
@@ -260,8 +257,8 @@ Per GPU and direction with both directions busy, receive counts known:
 
 | | µs | GB/s | of the link |
 |---|---:|---:|---:|
-| `flydsl_v2` 160 CUs, cached dispatch | 123 | 943 | 61% |
-| `flydsl_v2` 160 CUs, combine | 146 | 795 | 52% |
+| V2 160 CUs, cached dispatch | 123 | 943 | 61% |
+| V2 160 CUs, combine | 146 | 795 | 52% |
 | RCCL all-to-all as Megatron does it, defaults | 602 | 785 | 51% |
 | RCCL all-to-all as Megatron does it, tuned | 492 | 960 | 62% |
 | RCCL all-to-all, deduplicated, defaults | 195 | 593 | 38% |
@@ -271,7 +268,7 @@ Per GPU and direction with both directions busy, receive counts known:
 - A copy kernel on V2's own data path (TDM through LDS into the uncached heap, without slots,
   counts or flags) reaches 1491 GB/s at 256 blocks and 1462 GB/s at 160.
 - Fitting time = fixed + bytes / bandwidth over 256 to 32768 tokens per rank at 160 CUs: the
-  `flydsl_v2` dispatch streams at 1.28–1.32 TB/s and the combine at 1.24 TB/s, plus a fixed 36 µs
+  V2 dispatch streams at 1.28–1.32 TB/s and the combine at 1.24 TB/s, plus a fixed 36 µs
   (cached dispatch) and 59 µs (combine), against 15 µs for the bare copy kernel. At 8192 tokens the
   fixed part is 30–40% of the time. Tuned RCCL has a fixed 48–58 µs and streams at up to 1.07–1.12
   TB/s.
@@ -311,8 +308,8 @@ GPT-OSS shape (EP4, T 32768, H 2880, top-4, 160 SMs): V2 dispatch 353 µs, combi
   8 KiB is 16 steps on wave32 at 64 VGPRs per lane; anything larger exceeds 128 VGPRs.
 - **Combine chunks** (8 KiB pieces): EP2 24/10 → 24/48 takes 3.86 / 2.19 / 1.07 to 2.83 / 1.55 /
   0.80 ms (the combine halves); EP4 6/9 → 6/24 takes 10.27 / 3.67 / 1.64 to 6.35 / 3.50 / 1.62 ms.
-  `Buffer.get_dispatch_config` / `get_combine_config(num_ranks, backend=None)` return the defaults
-  of the backend in use.
+  `Buffer.get_dispatch_config` / `get_combine_config(num_ranks)` return the defaults of the version
+  in use.
 - **Combine loads in flight** (`combine_loads_in_flight`, V1 and V2): 16, 12 and 8 remove the VGPR
   spills of 32 but are slower (V2 EP2 at 32 SMs: 0.352 ms at 32, 0.38–0.39 ms otherwise), so 32 is
   kept.
@@ -329,7 +326,7 @@ GPT-OSS shape (EP4, T 32768, H 2880, top-4, 160 SMs): V2 dispatch 353 µs, combi
 | V2 kernels | `primus_turbo/flydsl/deep_ep/intranode_v2_kernel.py` |
 | Launcher cache | `primus_turbo/flydsl/deep_ep/launch_cache.py` |
 | Host runtime: the shared base `FlyDSLIntranodeRuntime`, `FlyDSLIntranodeV1Runtime`, `FlyDSLIntranodeV2Runtime` | `primus_turbo/pytorch/deep_ep/flydsl_intranode.py` |
-| `Buffer`, backend selection, configs | `primus_turbo/pytorch/deep_ep/buffer.py` |
+| `Buffer`, version selection, configs | `primus_turbo/pytorch/deep_ep/buffer.py` |
 | No-C++ fallbacks (`PyConfig`, `PyEventHandle`) | `primus_turbo/pytorch/deep_ep/_compat.py` |
 | Buffer sizing in `moe_dispatch` / `DeepEPTokenDispatcher` | `primus_turbo/pytorch/kernels/moe/moe_dispatch_combine_impl.py` |
 

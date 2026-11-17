@@ -1,0 +1,124 @@
+# DeepEP
+
+## Summary
+
+DeepEP moves MoE tokens between expert-parallel (EP) ranks: `dispatch` sends each token to the
+ranks that hold its experts, and `combine` brings the expert outputs back and sums them per token.
+A token goes to each destination GPU once and is copied per expert on the receiver, so it moves
+fewer bytes than an all-to-all that sends one copy per expert. It is for training only: it has
+dispatch / combine backward, and no low-latency (inference) kernels. The kernels derive from
+[DeepEP](https://github.com/deepseek-ai/DeepEP).
+
+The intranode kernels come in two versions, chosen by the GPU's architecture:
+
+- **V1** (MI300X / MI325X / MI355X): DeepEP's protocol, one ring per channel and destination rank.
+- **V2** (MI455X): every token is written straight into a fixed slot on its destination rank, with no
+  rings, and the combine reduces rows as they land. Outputs are bit-identical to V1.
+
+## Support matrix
+
+| | gfx942 (MI300X / MI325X) | gfx950 (MI350X / MI355X) | gfx1250 (MI455X) |
+|---|:-:|:-:|:-:|
+| Intranode (one node, 2 / 4 / 8 ranks) | ✅ V1 | ✅ V1 | ✅ V2 |
+| Internode (rocSHMEM) | ✅ | ✅ | — |
+
+Frameworks: PyTorch, and JAX (`primus_turbo.jax.lax.moe.moe_dispatch` / `moe_combine`, intra- and
+inter-node). See [Supported Operators § MoE](../supported_ops.md#24-moe).
+
+## Usage
+
+Install Primus-Turbo as in the [Quick Start](../../README.md#-quick-start). The internode path also
+needs rocSHMEM: see [Install rocSHMEM](../install_dependencies.md).
+
+- `turbo.ops.moe_dispatch` / `turbo.ops.moe_combine`, or the `DeepEPTokenDispatcher` module, which
+  also permutes the tokens per expert. These size the buffer from the dispatched tokens.
+- `primus_turbo.pytorch.deep_ep.Buffer` for direct control of the buffer:
+
+  ```python
+  from primus_turbo.pytorch.deep_ep import Buffer
+
+  # MI455X (V2): sized for 8192 tokens per rank, hidden 7168 bf16, top-8
+  buffer = Buffer(group, Buffer.get_token_buffer_size_hint(8192, 7168 * 2, group.size(), 8))
+  # MI300X / MI355X (V1): num_nvl_bytes from Config.get_nvl_buffer_size_hint
+  buffer = Buffer(group, num_nvl_bytes)
+  ```
+
+Full example: [Examples § DeepEP](../examples.md#4-deepep).
+
+## Configuration
+
+### Buffer size
+
+- V1: the rings, `Config.get_nvl_buffer_size_hint(hidden_bytes, num_ranks)`.
+- V2: the whole batch, `Buffer.get_token_buffer_size_hint(num_max_tokens_per_rank, hidden_bytes,
+  num_ranks, num_topk)` (0 on V1), with the same `num_max_tokens_per_rank` on every rank.
+
+`turbo.ops.moe_dispatch` sizes the buffer from the group's largest first dispatch (an all-reduce at
+allocation, so ranks may dispatch different numbers of tokens) and reallocates it for a larger one,
+after a device sync and a barrier that waits for every rank to grow it. With a known maximum,
+`set_buffer_global_config(num_max_tokens_per_rank=...)` allocates for it up front.
+
+If a rank receives more than the buffer holds, that rank raises
+`V2 dispatch receives ... > the heap's ...; raise num_nvl_bytes`, and the others stop at the
+kernels' timeout (300 s).
+
+### Number of CUs
+
+`Buffer.set_num_sms(n)`, `set_buffer_global_config(num_use_cu=n)`, or `turbo_deepep_num_cu` in
+Primus. On MI455X (EP2 / EP4) V2 saturates at 160 CUs, and 64–160 CUs train within 0.6% of each
+other; at 32 CUs its kernels take about twice as long as at 128. Use 128–160 there, and set it
+explicitly in Primus, whose default is 32 (Primus also limits it to 32 at EP >= 16, for the
+internode kernels).
+
+### Environment variables
+
+See [Environment variables](../env.md):
+
+- `PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND`: the implementation behind `moe_dispatch` /
+  `moe_combine`: `TURBO` (the default) runs this DeepEP, `DEEP_EP` an installed upstream `deep_ep`
+  package.
+- `PRIMUS_TURBO_DEEPEP_CPU_TIMEOUT`: seconds the host waits for the other ranks before it raises
+  (default 300).
+- `PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM`: run the kernels on the caller's stream.
+- `PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE`: use the full memory fence in the intranode channels.
+- `PRIMUS_TURBO_JAX_DEEPEP_MODE`: JAX launch mode.
+
+## Performance
+
+MI455X, EP2 of one node, Primus's DeepSeek-V3 proxy shape (8192 tokens per rank, hidden 7168 BF16,
+top-8 of 128 experts), 128 CUs. Notify + dispatch / combine:
+
+| | µs |
+|---|---|
+| DeepEP V2 | 183 / 150 |
+| RCCL all-to-all as Megatron's alltoall dispatcher runs it | 652 / 603 |
+
+Stack, timing method, and the other CU counts: [DeepEP V2 on MI455X](../design/deep_ep_v2_mi455.md#performance).
+No published numbers for MI300X / MI355X yet. Benchmark: see [Benchmarks § DeepEP](../../benchmark/README.md#deepep).
+
+## End-to-end impact
+
+Used as the MoE token dispatcher in Primus-LM's MoE recipes (`use_turbo_deepep: true`). Measured
+training-step gain not recorded yet.
+
+## Known limitations
+
+- No low-latency kernels.
+- Internode needs rocSHMEM, which is still under development; compatibility and performance on the
+  bnxt, mlx5 and ionic NIC drivers are not guaranteed.
+- Architectures other than gfx942, gfx950 and gfx1250 are not supported: a `Buffer` logs an error
+  and raises. It also raises when the detected architecture is not that of its GPU, for example when
+  `rocm_agent_enumerator` fails, which makes it report gfx942.
+- MI455X: intranode only, with 2, 4 or 8 ranks and `num_nvl_bytes > 0`; other buffers raise.
+- MI455X, CUDA graphs: V2 raises under capture, because every call advances host-side state that a
+  replay would reuse.
+- MI455X, token counts that change per step without a known maximum (packed THD sequences, dynamic
+  context parallelism): the buffer holds whole batches, and a larger dispatch grows it only once
+  every rank of the group grows it.
+
+In these cases use the all-to-all (RCCL) token dispatcher; in Primus, `use_turbo_deepep: false`.
+
+## Further reading
+
+- Design of V2: [DeepEP V2 on MI455X](../design/deep_ep_v2_mi455.md)
+- Tests: `tests/pytorch/deep_ep/`
