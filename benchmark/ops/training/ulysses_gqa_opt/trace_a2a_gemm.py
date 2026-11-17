@@ -29,6 +29,7 @@ p.add_argument("--ops", nargs="+", default=["fwd_o", "bwd_qkv"], choices=["fwd_o
 p.add_argument("--BM", type=int, default=None)
 p.add_argument("--num_push", type=int, default=None)
 p.add_argument("--wgrad_at", type=int, default=None)
+p.add_argument("--dump", default=None, help="directory for the raw stamps of every rank (torch.save)")
 a = p.parse_args()
 OVERRIDE = {
     k: v for k, v in (("BM", a.BM), ("num_push", a.num_push), ("wgrad_at", a.wgrad_at)) if v is not None
@@ -106,6 +107,12 @@ for name in (NAMES[o] for o in a.ops):
     push_split = push_split if stagger else 1
     units = n * m_tiles * push_split
     t = last["buf"].cpu()
+    if a.dump:
+        os.makedirs(a.dump, exist_ok=True)
+        meta = dict(num_tiles=num_tiles, units=units, num_wtiles=num_wtiles, grid=grid, n_tiles=n_tiles)
+        used = 3 * num_tiles + 2 * units + 2 * num_wtiles
+        tag = f"{a.model}_{a.seq // 1024}K_n{n}_{name.split()[0]}_{name.split()[1]}_r{rank}"
+        torch.save(dict(meta=meta, stamps=t[:used].clone()), os.path.join(a.dump, tag + ".pt"))
     tiles = t[: 3 * num_tiles].view(num_tiles, 3).double()
     pu = t[3 * num_tiles : 3 * num_tiles + 2 * units].view(units, 2).double()
     wstart = 3 * num_tiles + 2 * units
