@@ -926,17 +926,27 @@ def ulysses_a2a_gemm(
     # landed tiles skip the per-segment waits (DeepSeek-V3 32K n = 4: 2130 -> 2003 us with 16; n = 2:
     # 4801 -> 5030 us).
     gemm_bound = wgrad is None and N * num_ranks >= 8192 * (num_ranks - 1)
+    # From 2.5 waves of 256-row tiles on the CUs 32 pushers leave, their last-wave tail costs less than
+    # the ~25 % slower 128-row tiles; they need 32 pushers to stay ahead of the K walk (GLM-4.7 o_proj
+    # n = 4 32K: 1536 -> 1350 us, 128K: 5870 -> 4455 us; with 16 pushers 1716 us).
+    many_tiles = wgrad is None and 2 * ceildiv(M, 256) * ceildiv(N, BN) >= 5 * (num_cus - 32)
     if num_push is None:
         if gemm_bound:
             num_push = 8 if M >= 8192 and num_ranks == 2 else 16
+        elif wgrad is None and not many_tiles and num_ranks <= 4 and N * num_ranks >= 4096 * (num_ranks - 1):
+            # 128-row tiles: up to three peers' links fill with 16 pushers, and the GEMM is large enough
+            # to use the CUs (n = 4 32K: Qwen3-235B 903 -> 802 us, MiniMax-M2.5 591 -> 573 us; n = 2:
+            # MiniMax-M2.5 1900 -> 1815 us). Seven peers need 32 (GLM-4.7 n = 8: 16 pushers +4 %), and an
+            # exchange-dominated launch keeps them (Qwen3-30B n = 4: +3 %).
+            num_push = 16
         else:
             # with few weight-gradient tiles the launch is compute-bound: 16 pushers still fill the links
             num_push = 32 if wgrad is None or many_wtiles else 16
     if BM is None:
-        # 256-row tiles while every tile has a CU (the staggered K walk) or the GEMM dominates;
-        # otherwise 128 rows halve the tail of the m-tile that lands last
+        # 256-row tiles while every tile has a CU (the staggered K walk), the GEMM dominates or the tiles
+        # make enough waves; otherwise 128 rows halve the tail of the m-tile that lands last
         fits = ceildiv(M, 256) * ceildiv(N, BN) + num_wtiles + num_push <= num_cus
-        BM = 256 if fits or wgrad_last or gemm_bound else 128
+        BM = 256 if fits or wgrad_last or gemm_bound or many_tiles else 128
     if wgrad_at is None:
         wgrad_at = ceildiv(M, BM) * ceildiv(N, BN) if wgrad_last else 0
     run_launcher(
