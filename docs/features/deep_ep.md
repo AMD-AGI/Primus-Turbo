@@ -75,10 +75,12 @@ kernels' timeout (300 s).
 ### Number of CUs
 
 `Buffer.set_num_sms(n)`, `set_buffer_global_config(num_use_cu=n)`, or `turbo_deepep_num_cu` in
-Primus. On MI455X (EP2 / EP4) V2 saturates at 160 CUs, and 64–160 CUs train within 0.6% of each
-other; at 32 CUs its kernels take about twice as long as at 128. Use 128–160 there, and set it
-explicitly in Primus, whose default is 32 (Primus also limits it to 32 at EP >= 16, for the
-internode kernels).
+Primus, whose default is 32 (Primus also limits it to 32 at EP >= 16, for the internode kernels).
+
+- MI355X, EP8 (V1): 64 CUs are within 4% of 128 and 14–18% faster than 32 (see
+  [Performance](#performance)).
+- MI455X, EP2 / EP4 (V2): V2 saturates at 160 CUs, and 64–160 CUs train within 0.6% of each other;
+  at 32 CUs its kernels take about twice as long as at 128. Use 128–160 there.
 
 ### Environment variables
 
@@ -95,16 +97,45 @@ See [Environment variables](../env.md):
 
 ## Performance
 
-MI455X, EP2 of one node, Primus's DeepSeek-V3 proxy shape (8192 tokens per rank, hidden 7168 BF16,
-top-8 of 128 experts), 128 CUs. Notify + dispatch / combine:
+Against the RCCL all-to-all of Megatron's alltoall token dispatcher, which sends a token once per
+expert; DeepEP sends it once per GPU, so it moves about half the bytes at EP8. The DeepEP times
+include the layout, the notify and its host wait; the all-to-all times include the all-gather of the
+counts and the device-to-host copy of the splits that Megatron does before it. Neither includes the
+local permute.
+
+### V1: 8 × MI355X, EP8
+
+DeepSeek-V3 MoE layer: hidden 7168 BF16, top-8 of 256 experts, routing limited to the top 4 of 8
+expert groups, random router logits. Notify + dispatch / combine, µs:
+
+| | 4096 tokens per rank | 8192 tokens per rank |
+|---|---|---|
+| DeepEP V1, 32 CUs | 929 / 912 | 1732 / 1673 |
+| DeepEP V1, 64 CUs | 785 / 756 | 1426 / 1432 |
+| DeepEP V1, 128 CUs | 777 / 735 | 1391 / 1384 |
+| RCCL all-to-all | 1357 / 1292 | 2605 / 2542 |
+| MB received per GPU, DeepEP / all-to-all | 235 / 475 | 469 / 946 |
+
+At 64 CUs and more, DeepEP is 1.7–1.9× faster than the all-to-all; at 32 CUs, 1.4–1.5×.
+
+- Stack: Primus-Turbo `72ae7f91`, torch 2.14.0 with ROCm 10.1, RCCL 2.30.7.
+- Timing: a 512 MB flush before every iteration, the slowest rank of each iteration, median of 30
+  iterations, mean of 3 rounds.
+- Reproduce: `python benchmark/ops/training/bench_deepep_vs_alltoall.py --tokens 4096 8192 --num-cus 32 64 128`
+
+### V2: 2 × MI455X, EP2
+
+Primus's DeepSeek-V3 proxy shape: 8192 tokens per rank, hidden 7168 BF16, top-8 of 128 experts,
+routing limited to the top 4 of 8 expert groups. 128 CUs. Notify + dispatch / combine, µs:
 
 | | µs |
 |---|---|
 | DeepEP V2 | 183 / 150 |
-| RCCL all-to-all as Megatron's alltoall dispatcher runs it | 652 / 603 |
+| RCCL all-to-all | 652 / 603 |
 
 Stack, timing method, and the other CU counts: [DeepEP V2 on MI455X](../design/deep_ep_v2_mi455.md#performance).
-No published numbers for MI300X / MI355X yet. Benchmark: see [Benchmarks § DeepEP](../../benchmark/README.md#deepep).
+
+Other benchmarks: [Benchmarks § DeepEP](../../benchmark/README.md#deepep).
 
 ## End-to-end impact
 
