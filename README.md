@@ -3,16 +3,13 @@
 [![Primus-Turbo-CI](https://github.com/AMD-AGI/Primus-Turbo/actions/workflows/ci.yaml/badge.svg)](https://github.com/AMD-AGI/Primus-Turbo/actions/workflows/ci.yaml)
 [![Primus-Turbo-Benchmark](https://github.com/AMD-AGI/Primus-Turbo/actions/workflows/benchmark.yaml/badge.svg)](https://github.com/AMD-AGI/Primus-Turbo/actions/workflows/benchmark.yaml)
 
-[What's Primus-Turbo?](#-whats-primus-turbo) | [What's New](#-whats-new) | [Quick Start](#-quick-start) | [Documentation](#-documentation) | [Performance](#-performance) | [Roadmap](#-roadmap) | [Primus Ecosystem](#-primus-ecosystem) | [Acknowledgements](#-acknowledgements) | [License](#-license)
+[What's Primus-Turbo?](#-whats-primus-turbo) | [What's New](#-whats-new) | [Quick Start](#-quick-start) | [Documentation](#-documentation) | [Performance](#-performance) | [Roadmap](#-roadmap) | [Acknowledgements](#-acknowledgements) | [License](#-license)
 
 ## 🔍 What's Primus-Turbo?
 **Primus-Turbo** is a high-performance acceleration library dedicated to large-scale model training on AMD GPUs. Built and optimized for the AMD ROCm platform, it covers the full training stack — including core compute operators (GEMM, Attention, GroupedGEMM), communication primitives (DeepEP), fused MoE layers (MegaMoE), low-precision computation (FP8), and compute–communication overlap kernels.
 
 With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its guiding principles, Primus-Turbo is designed to fully unleash the potential of AMD GPUs for large-scale training workloads, offering a robust and complete acceleration foundation for next-generation AI systems.
 
-<p align="center">
-  <img src="docs/images/Primus-Turbo-Architecture.png" width="500"/>
-</p>
 Note: JAX support is under active development. Optim support is planned but not yet available.
 
 👉 **[Supported Operators](./docs/supported_ops.md)** — every operator, its maturity level (Experimental / Beta / Stable) on each GPU, and its kernel backends. All other docs: [Documentation](#-documentation).
@@ -27,7 +24,7 @@ Note: JAX support is under active development. Optim support is planned but not 
 | Quantization | `quantize_fp8` / `quantize_fp4` (+ `_with_trans`, grouped, dequantize), `weight_deosc_*` |
 | Communication | `fused_all_gather_matmul`, `fused_matmul_reduce_scatter`, `FP8AllToAll`, DeepEP `Buffer` |
 
-> **Part of the Primus Ecosystem**: Primus-Turbo is the high-performance operator layer of the [Primus ecosystem](#-primus-ecosystem), working together with [Primus-LM](https://github.com/AMD-AGI/Primus) (training framework) and [Primus-SaFE](https://github.com/AMD-AGI/Primus-SaFE) (stability & platform).
+> **Part of the Primus stack**: [Primus-LM](https://github.com/AMD-AGI/Primus), the training framework, calls Primus-Turbo's operators; [Primus-SaFE](https://github.com/AMD-AGI/Primus-SaFE) runs the cluster underneath.
 
 ## 🚀 What's New
 
@@ -234,49 +231,6 @@ See [Benchmarks](./benchmark/README.md) for detailed performance results and com
 [Roadmap: Primus-Turbo Roadmap H1 2026](https://github.com/AMD-AGI/Primus-Turbo/issues/211)
 
 ---
-
-## 🌐 Primus Ecosystem
-
-Primus-Turbo is part of a comprehensive stack for large-model training on AMD GPUs:
-
-### 🏗️ Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────┐
-│                   Primus-SaFE                       │
-│         (Stability & Platform Layer)                │
-│   Cluster Management | Fault Tolerance | Scheduling │
-└────────────────────────┬────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────┐
-│                   Primus-LM                         │
-│              (Training Framework)                   │
-│    Megatron | TorchTitan | Unified CLI | Workflows  │
-└────────────────────────┬────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────┐
-│                  Primus-Turbo                       │
-│           (High-Performance Operators)              │
-│  Attention | GEMM | GroupedGEMM | MoE | DeepEP      │
-│  MegaMoE | FP8/MXFP8/MXFP4 | AITER | CK | FlyDSL    │
-└─────────────────────────────────────────────────────┘
-```
-
-### 📦 Component Details
-
-| Component | Role | Key Features | Repository |
-|-----------|------|--------------|------------|
-| **Primus (Primus-LM)** | Training framework | Multi-backend training (Megatron, TorchTitan, MaxText), unified CLI, projection and tuning agent, MegaMoE integration in Megatron recipes | [Primus](https://github.com/AMD-AGI/Primus) |
-| **Primus-Turbo** | Performance layer | FlashAttention-class kernels, GEMM / GroupedGEMM (BF16, FP8, MXFP8, MXFP4), **MegaMoE** (BF16 + MXFP8, GPT-OSS shapes/biases), DeepEP, fused GroupedMLP; backends CK, hipBLASLt, AITER, Triton, FlyDSL | [This repo](https://github.com/AMD-AGI/Primus-Turbo) |
-| **Primus-SaFE** | Platform layer | Cluster sanity checks, topology-aware scheduling, fault tolerance | [Primus-SaFE](https://github.com/AMD-AGI/Primus-SaFE) |
-
-### 🔗 How They Work Together
-
-1. **Primus-LM** provides the training framework and workflow orchestration.
-2. **Primus-Turbo** supplies the optimized compute kernels (for example MegaMoE, grouped GEMM, attention, and low-precision GEMMs) that Primus recipes call into.
-3. **Primus-SaFE** ensures stability and efficient resource utilization at scale.
-
-This separation of concerns allows each component to evolve independently while staying integrated through pinned versions in Primus training images.
 
 ## 🙏 Acknowledgements
 
