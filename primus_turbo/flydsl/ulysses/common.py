@@ -39,8 +39,9 @@ VEC_I32 = 4
 VEC_BF16 = 8
 # sc0|sc1|nt: system-coherent, streaming; staging is read by peers, recv reuses a bank every 2 epochs
 SYS_NT = 19
-# s_memrealtime ticks at 100 MHz: 5 s
-SPIN_TIMEOUT = 500_000_000
+# s_memrealtime ticks at 100 MHz: 60 s. A kernel's first launch compiles it on every rank (the rank is a
+# constexpr) with no cross-rank sync, so peers can start tens of seconds apart (5 s tripped the n = 8 test)
+SPIN_TIMEOUT = 6_000_000_000
 
 # state: [epoch, exit counter, unit claim counter, tile claim counter]
 STATE_EPOCH = 0
