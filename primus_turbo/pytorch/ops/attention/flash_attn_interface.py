@@ -508,6 +508,8 @@ class TritonFlashAttnFunc(torch.autograd.Function):
         return_softmax,
         is_grad_enabled,
         use_fp8,
+        logical_seqlen_q,
+        logical_seqlen_k,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -535,6 +537,8 @@ class TritonFlashAttnFunc(torch.autograd.Function):
             alibi_slopes,
             return_softmax,
             use_fp8,
+            logical_seqlen_q,
+            logical_seqlen_k,
         )
 
         if is_grad:
@@ -549,8 +553,8 @@ class TritonFlashAttnFunc(torch.autograd.Function):
             ctx.use_fp8 = use_fp8
             ctx.cu_seqlens_q = None
             ctx.cu_seqlens_k = None
-            ctx.max_seqlens_q = q.shape[1]
-            ctx.max_seqlens_k = k.shape[1]
+            ctx.max_seqlens_q = logical_seqlen_q
+            ctx.max_seqlens_k = logical_seqlen_k
 
         result = [output]
         if return_lse:
@@ -591,7 +595,7 @@ class TritonFlashAttnFunc(torch.autograd.Function):
             ctx.use_fp8,
         )
 
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_func(
@@ -671,10 +675,34 @@ def flash_attn_fp8_func(
     return_lse=False,
     return_attn_probs=False,
     fp8_config: Optional[Float8QuantConfig] = None,
+    logical_seqlen_q: Optional[int] = None,
+    logical_seqlen_k: Optional[int] = None,
 ):
+    """Run block-scaled FP8 attention on physically padded BSHD tensors.
+
+    ``logical_seqlen_q`` and ``logical_seqlen_k`` describe the unpadded
+    sequence bounds. Forward and backward mask tiles beyond those bounds while
+    q/k/v remain padded to the 64-token quantization block.
+    """
     # q/k/v are logically [b, s, h, d] in every layout; only their storage differs.
     # block_scaling_node repacks any storage into the bshd-contiguous FP8 the kernel reads.
     qkv_format = _infer_qkv_format(q, k, v)
+    physical_seqlen_q = q.shape[1]
+    physical_seqlen_k = k.shape[1]
+    logical_seqlen_q = physical_seqlen_q if logical_seqlen_q is None else logical_seqlen_q
+    logical_seqlen_k = physical_seqlen_k if logical_seqlen_k is None else logical_seqlen_k
+    if not 0 < logical_seqlen_q <= physical_seqlen_q:
+        raise ValueError(
+            f"logical q length must be in [1, {physical_seqlen_q}], got {logical_seqlen_q}"
+        )
+    if not 0 < logical_seqlen_k <= physical_seqlen_k:
+        raise ValueError(
+            f"logical k/v length must be in [1, {physical_seqlen_k}], got {logical_seqlen_k}"
+        )
+    if v.shape[1] != physical_seqlen_k:
+        raise ValueError(
+            f"k and v physical sequence lengths must match, got {physical_seqlen_k} and {v.shape[1]}"
+        )
 
     # Default config: blockwise with block_size=64
     if fp8_config is None:
@@ -707,6 +735,8 @@ def flash_attn_fp8_func(
         return_attn_probs,
         torch.is_grad_enabled(),
         True,
+        logical_seqlen_q,
+        logical_seqlen_k,
     )
 
     return _restore_qkv_storage(o, qkv_format)

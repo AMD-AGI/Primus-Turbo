@@ -382,6 +382,8 @@ class AttentionTritonFunctionCPA2A(torch.autograd.Function):
             alibi_slopes,
             return_softmax,
             use_fp8,
+            q_local_heads.shape[1],
+            k_local_heads.shape[1],
         )
 
         # save_ctx for backward

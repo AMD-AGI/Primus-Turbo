@@ -48,6 +48,30 @@ F8_FWD_MAX: tl.constexpr = torch.finfo(get_f8_fwd_dtype()).max
 F8_BWD_MAX: tl.constexpr = torch.finfo(get_f8_bwd_dtype()).max
 
 
+def _validate_logical_seqlens(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    logical_seqlen_q: int,
+    logical_seqlen_k: int,
+) -> None:
+    """Validate logical lengths carried by physically padded BSHD tensors."""
+    physical_seqlen_q = q.shape[1]
+    physical_seqlen_k = k.shape[1]
+    if v.shape[1] != physical_seqlen_k:
+        raise ValueError(
+            f"k and v physical sequence lengths must match, got {physical_seqlen_k} and {v.shape[1]}"
+        )
+    if not 0 < logical_seqlen_q <= physical_seqlen_q:
+        raise ValueError(
+            f"logical q length must be in [1, {physical_seqlen_q}], got {logical_seqlen_q}"
+        )
+    if not 0 < logical_seqlen_k <= physical_seqlen_k:
+        raise ValueError(
+            f"logical k/v length must be in [1, {physical_seqlen_k}], got {logical_seqlen_k}"
+        )
+
+
 @_torch_custom_op_wrapper("primus_turbo::attention_triton_forward_impl", mutates_args=(), device_types="cuda")
 def attention_triton_forward_impl(
     q: torch.Tensor,
@@ -66,6 +90,8 @@ def attention_triton_forward_impl(
     alibi_slopes: Optional[torch.Tensor],
     return_softmax: bool,
     use_fp8: bool,
+    logical_seqlen_q: int,
+    logical_seqlen_k: int,
     sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
@@ -74,12 +100,13 @@ def attention_triton_forward_impl(
     assert v.is_contiguous()
     assert q_descale.is_contiguous()
     assert k_descale.is_contiguous()
+    _validate_logical_seqlens(q, k, v, logical_seqlen_q, logical_seqlen_k)
 
     layout = "bshd"
     cu_seqlens_q = 0
     cu_seqlens_k = 0
-    max_seqlens_q = q.shape[1]
-    max_seqlens_k = k.shape[1]
+    max_seqlens_q = logical_seqlen_q
+    max_seqlens_k = logical_seqlen_k
     return_scores = return_softmax
     use_exp2 = True
 
@@ -99,7 +126,7 @@ def attention_triton_forward_impl(
     if bias is not None:
         assert bias.numel() < 2**31
 
-    batch, nheads_q, nheads_k, head_size_qk, head_size_v, seqlen_q, seqlen_k = get_shape_from_layout(
+    batch, nheads_q, nheads_k, head_size_qk, head_size_v, _, _ = get_shape_from_layout(
         q, k, v, layout, cu_seqlens_q, cu_seqlens_k, max_seqlens_q, max_seqlens_k
     )
     q_strides = get_strides_from_layout(q, layout)
@@ -269,6 +296,8 @@ def _attention_triton_forward_impl_fake(
     alibi_slopes: Optional[torch.Tensor],
     return_softmax: bool,
     use_fp8: bool,
+    logical_seqlen_q: int,
+    logical_seqlen_k: int,
     sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     o_shape = list(q.shape)
@@ -280,17 +309,20 @@ def _attention_triton_forward_impl_fake(
         requires_grad=True,
     )
 
-    batch_q, max_seqlen_q, nheads_q, head_size_q = q.shape
-    batch_k, max_seqlen_k, nheads_k, head_size_k = k.shape
+    batch_q, _, nheads_q, _ = q.shape
 
     if return_softmax:
         exp_scores = torch.zeros(
-            (batch_q, nheads_q, max_seqlen_q, max_seqlen_k), device=q.device, dtype=torch.float32
+            (batch_q, nheads_q, logical_seqlen_q, logical_seqlen_k),
+            device=q.device,
+            dtype=torch.float32,
         )
     else:
         exp_scores = torch.empty([], device=q.device, dtype=torch.float32)
 
-    softmax_lse = torch.empty((batch_q, nheads_q, max_seqlen_q * 2), device=q.device, dtype=torch.float32)
+    softmax_lse = torch.empty(
+        (batch_q, nheads_q, logical_seqlen_q * 2), device=q.device, dtype=torch.float32
+    )
 
     return o, softmax_lse, exp_scores
 
@@ -329,8 +361,10 @@ def attention_triton_backward_impl(
     sequence_parallel = True
     do = do.contiguous()
 
-    # get strides and shape
-    batch, nheads_q, nheads_k, head_size_qk, head_size_v, max_seqlen_q, max_seqlen_k = get_shape_from_layout(
+    _validate_logical_seqlens(q, k, v, max_seqlen_q, max_seqlen_k)
+    # Read physical tensor metadata without replacing the logical lengths that
+    # bound every forward and backward tile.
+    batch, nheads_q, nheads_k, head_size_qk, head_size_v, _, _ = get_shape_from_layout(
         q, k, v, layout, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
     )
     q_strides = get_strides_from_layout(q, layout)
@@ -705,6 +739,8 @@ def dense_forward(
         None,
         False,
         False,
+        q.shape[1],
+        k.shape[1],
         None if sink is None else sink.contiguous().float(),
     )
     return out, lse

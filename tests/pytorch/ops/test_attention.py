@@ -1206,6 +1206,53 @@ def test_attention_fp8_strided_layout(qkv_format, causal, return_lse):
     assert compute_snr(value_ref.grad, value.grad) > 20, "value_grad_snr too low"
 
 
+@pytest.mark.parametrize("causal", [True, False])
+def test_attention_fp8_masks_physically_padded_tail_in_forward_and_backward(causal):
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch, q_len, kv_len, padded_len, heads, head_dim = 1, 100, 77, 128, 4, 128
+    torch.manual_seed(1234)
+
+    q = torch.randn(batch, q_len, heads, head_dim, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(batch, kv_len, heads, head_dim, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(batch, kv_len, heads, head_dim, device=device, dtype=dtype, requires_grad=True)
+    q_ref, k_ref, v_ref = (tensor.detach().clone().requires_grad_() for tensor in (q, k, v))
+    q_pad = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, padded_len - q_len))
+    k_pad = torch.nn.functional.pad(k, (0, 0, 0, 0, 0, padded_len - kv_len))
+    v_pad = torch.nn.functional.pad(v, (0, 0, 0, 0, 0, padded_len - kv_len))
+    for tensor in (q_pad, k_pad, v_pad):
+        tensor.retain_grad()
+    grad_out = torch.randn_like(q)
+    sm_scale = head_dim**-0.5
+
+    out_ref = attention_vanilla_forward_pytorch_ref_impl(q_ref, k_ref, v_ref, sm_scale, causal)
+    out_ref.backward(grad_out)
+    out_padded = flash_attn_fp8_func(
+        q_pad,
+        k_pad,
+        v_pad,
+        softmax_scale=sm_scale,
+        causal=causal,
+        logical_seqlen_q=q_len,
+        logical_seqlen_k=kv_len,
+    )
+    out = out_padded[:, :q_len]
+    out.backward(grad_out)
+    torch.cuda.synchronize()
+
+    assert out_padded.shape[1] == padded_len
+    assert compute_snr(out_ref, out) > 20, "out_snr too low"
+    assert compute_snr(q_ref.grad, q.grad) > 20, "query_grad_snr too low"
+    assert compute_snr(k_ref.grad, k.grad) > 20, "key_grad_snr too low"
+    assert compute_snr(v_ref.grad, v.grad) > 20, "value_grad_snr too low"
+    for name, tensor, logical_len in (
+        ("query", q_pad, q_len),
+        ("key", k_pad, kv_len),
+        ("value", v_pad, kv_len),
+    ):
+        assert torch.count_nonzero(tensor.grad[:, logical_len:]) == 0, f"{name} padded-tail grad is not zero"
+
+
 @pytest.mark.parametrize("batch", [4])
 @pytest.mark.parametrize("config", test_cases)
 @pytest.mark.parametrize("causal", [True, False])
@@ -1260,6 +1307,8 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
         None,
         False,
         True,
+        seqlen_q,
+        seqlen_kv,
     )
 
     dq, dk, dv = attention_triton_backward_impl(
