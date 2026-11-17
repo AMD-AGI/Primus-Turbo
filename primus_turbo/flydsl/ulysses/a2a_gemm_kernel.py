@@ -56,6 +56,8 @@ from primus_turbo.flydsl.ulysses.common import (
     claim_unit,
     exit_and_bump_epoch,
     i64_base,
+    opaque_base,
+    opaque_tid,
     read_clock,
     spin_flags,
 )
@@ -542,11 +544,19 @@ def _gemm_tile(thread_index, q, flag_base, claim_slot, recv_addr, W, Y, RES, OG,
         if thread_index == fx.Int32(0):
             st(trace_base, tile_index * fx.Int32(3), read_clock())
 
+    # 128-row nt tiles: keep the lane offsets and bases out of LICM (see opaque_tid), which otherwise
+    # spills them around the claim loop (GLM-4.7 o_proj: 182 scratch ops -> 0). The accumulators of a
+    # 256-row tile leave no room to re-materialise them: there it spills more (DeepSeek-V3: 247 -> 445)
+    opaque = c["layout"] == "nt" and BM == 128
+    base = opaque_base if opaque else i64_base
+
     def run(k_seg):
+        if const_expr(opaque):
+            epilogue["tid"] = opaque_tid(thread_index)
         gemm_tile(
             make_bf16_fp16_tile_tensor(recv_addr, fx.Int64(0), M_pad * K),
-            make_bf16_fp16_tile_tensor(i64_base(W), fx.Int64(0), K * N),
-            make_bf16_fp16_tile_tensor(i64_base(Y), fx.Int64(0), M * N),
+            make_bf16_fp16_tile_tensor(base(W), fx.Int64(0), K * N),
+            make_bf16_fp16_tile_tensor(base(Y), fx.Int64(0), M * N),
             fx.Int32(M),
             fx.Int32(N),
             lds,
