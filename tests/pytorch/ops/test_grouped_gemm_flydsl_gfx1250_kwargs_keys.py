@@ -89,6 +89,7 @@ PASSTHROUGH = {
     "nt": {"out", "out_dtype", "m_tiles"},
     "nn": {"out", "out_dtype", "m_tiles"},
     "vk": {"out", "out_dtype", "masked_k", "expert_table"},
+    "vk_accum": {"out", "out_dtype", "masked_k", "expert_table", "accumulate", "accum_impl"},
 }
 
 
@@ -112,11 +113,16 @@ def _picked_tile(kind: str, n: int, k: int, avg_m: int, G: int):
 
 
 def test_only_the_minimax_m3_shapes_are_keyed():
-    """Exactly the six shapes at avg_m = 512; another row count needs its own measurement."""
+    """At the MiniMax-M3 (N, K) shapes, exactly the six keys at avg_m = 512; another row count needs its own
+    measurement. Other models' keys (other (N, K)) are covered by their own tests."""
     want = {
         kind: {(n, k, KEYED_AVG_M) for kd, _, n, k in SHAPES if kd == kind} for kind in ("nt", "nn", "vk")
     }
-    got = {kind: set(rows) for kind, rows in gg._KWARGS_KEYS.items()}
+    minimax = {kind: {(n, k) for kd, _, n, k in SHAPES if kd == kind} for kind in ("nt", "nn", "vk")}
+    got = {
+        kind: {row for row in gg._KWARGS_KEYS.get(kind, {}) if row[:2] in minimax[kind]}
+        for kind in ("nt", "nn", "vk")
+    }
     assert got == want
 
 
