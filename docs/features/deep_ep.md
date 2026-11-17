@@ -55,7 +55,7 @@ top-8 of 128 experts), 128 CUs. Notify + dispatch / combine:
 | `flydsl_v2` | 183 / 150 |
 | RCCL all-to-all as Megatron's alltoall dispatcher runs it | 652 / 603 |
 
-Stack, timing method, and the other CU counts: [FlyDSL DeepEP on MI455X](../flydsl_deepep_mi455.md#performance).
+Stack, timing method, and the other CU counts: [FlyDSL DeepEP on MI455X](../design/flydsl_deepep_mi455.md#performance).
 No published numbers for gfx942 / gfx950 yet. Benchmark: see [Benchmarks § DeepEP](../../benchmark/README.md#deepep).
 
 ## End-to-end impact
@@ -77,5 +77,5 @@ training-step gain not recorded yet. Required for Stable.
 ## Further reading
 
 - [DeepEP guide](../../primus_turbo/pytorch/deep_ep/README.md): installation, backends, buffer sizing
-- Design of the gfx1250 backend: [FlyDSL DeepEP on MI455X](../flydsl_deepep_mi455.md)
+- Design of the gfx1250 backend: [FlyDSL DeepEP on MI455X](../design/flydsl_deepep_mi455.md)
 - Tests: `tests/pytorch/deep_ep/`

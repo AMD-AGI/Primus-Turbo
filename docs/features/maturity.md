@@ -2,8 +2,8 @@
 
 Every public feature of Primus-Turbo carries one of four maturity levels. The level tells a user how
 far to trust the feature: whether its API can change, where it has been tested, and whether it has
-been shown to speed up real training. The current level of each feature is in the
-[feature index](./README.md).
+been shown to speed up real training. The level of each operator on each architecture is in
+[Supported Operators](../supported_ops.md).
 
 ## Levels
 
@@ -16,14 +16,15 @@ Each level includes the requirements of the levels below it.
 | **Stable** | Production use. The API changes only under the deprecation policy below. | Validated end to end: at least one real training run shows a measured training-step gain, recorded in the Feature Card. API reviewed and frozen. May become a default backend. |
 | **Deprecated** | Still works, but is going away. | Has a named replacement, and the release notes say when it will be removed. |
 
-A feature can claim fewer architectures or precisions than it runs on. The claim is what the
-Feature Card's support matrix says, and only claimed cells count toward the requirements.
+A level is given per architecture and precision: each cell of [Supported Operators](../supported_ops.md)
+is one claim, and a feature can hold a lower level on some architectures than on others. A cell's
+requirements count only that architecture and precision.
 
 ## Changing a level
 
 A level changes through a pull request that:
 
-1. updates the level in the Feature Card and in the [feature index](./README.md);
+1. updates the level in the Feature Card and in [Supported Operators](../supported_ops.md);
 2. lists the requirements of the new level, each with its evidence: test runs per architecture,
    the benchmark entry, and for Stable the training run (model, scale, and step time before and
    after);
@@ -36,8 +37,8 @@ The release notes of each version list every level change in that version.
 
 ## Initial levels
 
-The first version of the feature index gave some features a level from how they are used today,
-before their evidence was written down. The index marks these as *provisional*. A provisional
+The first levels in [Supported Operators](../supported_ops.md) gave some features a level from how
+they are used today, before their evidence was written down. These are marked *provisional*. A provisional
 feature gets its Feature Card and evidence by the next minor release, or moves down to the level
 its evidence supports.
 

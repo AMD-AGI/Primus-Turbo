@@ -17,8 +17,8 @@ One paragraph: what the feature does, which training workload it is for, and wha
 
 ## Support matrix
 
-What the feature claims. Only claimed cells count toward the [maturity requirements](./maturity.md).
-Link the matching rows of [Supported Operators](../supported_ops.md) for operator-level detail.
+Where the feature runs. The level of each cell is in the matching rows of
+[Supported Operators](../supported_ops.md); link them, and keep the two in sync.
 
 | | gfx942 (MI300X / MI325X) | gfx950 (MI350X / MI355X) | gfx1250 (MI455X) |
 |---|:-:|:-:|:-:|

@@ -27,7 +27,7 @@ torchrun --nproc_per_node 1 --nnodes "${NNODES}" -node_rank "${NODE_RANK}" --mas
 
 ## MegaMoE
 
-Intra-node EP benchmarks of the fused BF16 MegaMoE kernels. See [MegaMoE](../docs/mega_moe.md) for the design.
+Intra-node EP benchmarks of the fused BF16 MegaMoE kernels. See [MegaMoE](../docs/features/mega_moe.md).
 
 ### 1. gfx950 (MI355X)
 

@@ -45,7 +45,7 @@ there (`use_turbo_deepep: false` in Primus). `buffer.intranode_backend` tells wh
 gfx1250 the C++ DeepEP is not loaded, so the internode and low-latency paths, and an intranode buffer
 the FlyDSL kernels do not cover (other rank counts, `num_nvl_bytes == 0`), raise an error that points to
 the all-to-all (RCCL) token dispatcher. Both backends return the same tensors; `flydsl_v2` handles work
-with `flydsl_v2` only. Design and kernel numbers: `docs/flydsl_deepep_mi455.md`.
+with `flydsl_v2` only. Design and kernel numbers: [FlyDSL DeepEP on MI455X](../../../docs/design/flydsl_deepep_mi455.md).
 
 FlyDSL V1 (`flydsl`, the channel protocol of `cpp` on FlyDSL: `primus_turbo/flydsl/deep_ep/intranode_v1_kernel.py`)
 is kept for the tests, through `Buffer(..., intranode_backend="flydsl")`. `intranode_backend` and the

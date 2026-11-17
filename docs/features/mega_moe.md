@@ -77,6 +77,6 @@ Not recorded yet. Required for Stable.
 
 ## Further reading
 
-- Design: [MegaMoE](../mega_moe.md)
+- Design: [MegaMoE](../design/mega_moe.md)
 - Tests: `tests/pytorch/ops/test_fused_mega_moe.py`, `tests/pytorch/ops/test_fused_mega_moe_fp8.py`
 - Benchmark: `benchmark/ops/training/bench_mega_moe.py`

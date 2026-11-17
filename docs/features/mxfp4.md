@@ -86,6 +86,6 @@ training-step gain not recorded yet. Required for Stable.
 
 ## Further reading
 
-- MoE gather fused into MXFP4 quantization: [MoE gather quantization](../moe_gather_quantization.md)
+- MoE gather fused into MXFP4 quantization: [MoE gather quantization](../design/moe_gather_quantization.md)
 - Tests: `tests/pytorch/ops/test_gemm_fp4.py`, `test_grouped_gemm_fp4.py`, `test_grouped_mlp_fp4.py`
 - Benchmark: `benchmark/ops/training/bench_gemm_turbo.py`

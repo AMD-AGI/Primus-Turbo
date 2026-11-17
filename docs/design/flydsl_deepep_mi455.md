@@ -27,7 +27,7 @@ ISA as before.
 - **Drop-in** — same `Buffer` API and outputs bit-identical to V1; `moe_dispatch` /
   `DeepEPTokenDispatcher` size the buffer from the dispatched tokens.
 
-How to choose, size and tune a backend: [the DeepEP README](../primus_turbo/pytorch/deep_ep/README.md#intranode-backend).
+How to choose, size and tune a backend: [the DeepEP README](../../primus_turbo/pytorch/deep_ep/README.md#intranode-backend).
 
 ## Background
 
