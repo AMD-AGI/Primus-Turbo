@@ -61,6 +61,69 @@ def timed(fn, flush):
     return sum(rounds) / len(rounds) * 1000
 
 
+def bench_deepep(buffer, x, topk_idx, topk_weights, num_ranks, num_cus, flush):
+    """DeepEP layout + dispatch (no cached handle) and combine at ``num_cus`` CUs."""
+    from primus_turbo.pytorch.deep_ep import Buffer
+
+    Buffer.set_num_sms(num_cus)
+    dispatch_config = Buffer.get_dispatch_config(num_ranks)
+    combine_config = Buffer.get_combine_config(num_ranks)
+    state = {}
+
+    def dispatch():
+        per_rank, _, per_expert, in_rank, _ = buffer.get_dispatch_layout(topk_idx, NUM_EXPERTS)
+        recv_x, _, recv_weights, _, handle, _ = buffer.dispatch(
+            x,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            num_tokens_per_rank=per_rank,
+            is_token_in_rank=in_rank,
+            num_tokens_per_expert=per_expert,
+            config=dispatch_config,
+        )
+        state.update(recv_x=recv_x, recv_weights=recv_weights, handle=handle)
+
+    def combine():
+        buffer.combine(
+            state["recv_x"],
+            state["handle"],
+            topk_weights=state["recv_weights"],
+            config=combine_config,
+        )
+
+    t_dispatch = timed(dispatch, flush)
+    dispatch()
+    t_combine = timed(combine, flush)
+    return t_dispatch, t_combine, state["recv_x"].shape[0]
+
+
+def bench_alltoall(x, topk_idx, local_rank, num_ranks, flush):
+    """Megatron's alltoall dispatcher: count all_gather, splits to the host, all_to_all_single."""
+    experts_per_rank = NUM_EXPERTS // num_ranks
+    flat = topk_idx.flatten()
+    permuted = x.index_select(0, flat.argsort(stable=True) // TOPK)
+    tokens_per_expert = torch.bincount(flat, minlength=NUM_EXPERTS).to(torch.int64)
+    combined = torch.empty_like(permuted)
+    state = {}
+
+    def dispatch():
+        counts = torch.empty((num_ranks, NUM_EXPERTS), dtype=torch.int64, device="cuda")
+        dist.all_gather_into_tensor(counts, tokens_per_expert)
+        local = counts[:, local_rank * experts_per_rank : (local_rank + 1) * experts_per_rank]
+        input_splits = tokens_per_expert.view(num_ranks, experts_per_rank).sum(1).cpu().tolist()
+        output_splits = local.sum(1).cpu().tolist()
+        out = torch.empty((sum(output_splits), HIDDEN), dtype=x.dtype, device="cuda")
+        dist.all_to_all_single(out, permuted, output_splits, input_splits)
+        state.update(out=out, input_splits=input_splits, output_splits=output_splits)
+
+    def combine():
+        dist.all_to_all_single(combined, state["out"], state["input_splits"], state["output_splits"])
+
+    t_dispatch = timed(dispatch, flush)
+    t_combine = timed(combine, flush)
+    return t_dispatch, t_combine, state["out"].shape[0]
+
+
 def run(local_rank, num_ranks, args):
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29533")
@@ -80,68 +143,17 @@ def run(local_rank, num_ranks, args):
         Buffer.get_token_buffer_size_hint(max(args.tokens), hidden_bytes, num_ranks, TOPK), num_nvl_bytes
     )
     buffer = Buffer(dist.group.WORLD, num_nvl_bytes, 0, explicitly_destroy=True)
-    experts_per_rank = NUM_EXPERTS // num_ranks
     results = []
 
     for num_tokens in args.tokens:
         gen = torch.Generator(device="cuda").manual_seed(1234 + local_rank)
         x = torch.randn((num_tokens, HIDDEN), dtype=torch.bfloat16, device="cuda", generator=gen)
         topk_idx, topk_weights = route(num_tokens, gen)
-        state = {}
-
         for num_cus in args.num_cus:
-            Buffer.set_num_sms(num_cus)
-            dispatch_config = Buffer.get_dispatch_config(num_ranks)
-            combine_config = Buffer.get_combine_config(num_ranks)
-
-            def dispatch():
-                per_rank, _, per_expert, in_rank, _ = buffer.get_dispatch_layout(topk_idx, NUM_EXPERTS)
-                recv_x, _, recv_weights, _, handle, _ = buffer.dispatch(
-                    x,
-                    topk_idx=topk_idx,
-                    topk_weights=topk_weights,
-                    num_tokens_per_rank=per_rank,
-                    is_token_in_rank=in_rank,
-                    num_tokens_per_expert=per_expert,
-                    config=dispatch_config,
-                )
-                state.update(recv_x=recv_x, recv_weights=recv_weights, handle=handle)
-
-            def combine():
-                buffer.combine(
-                    state["recv_x"],
-                    state["handle"],
-                    topk_weights=state["recv_weights"],
-                    config=combine_config,
-                )
-
-            t_dispatch = timed(dispatch, flush)
-            dispatch()
-            t_combine = timed(combine, flush)
-            received = state["recv_x"].shape[0]
-            results.append((num_tokens, f"DeepEP, {num_cus} CUs", t_dispatch, t_combine, received))
-
-        flat = topk_idx.flatten()
-        permuted = x.index_select(0, flat.argsort(stable=True) // TOPK)
-        tokens_per_expert = torch.bincount(flat, minlength=NUM_EXPERTS).to(torch.int64)
-        combined = torch.empty_like(permuted)
-
-        def a2a_dispatch():
-            counts = torch.empty((num_ranks, NUM_EXPERTS), dtype=torch.int64, device="cuda")
-            dist.all_gather_into_tensor(counts, tokens_per_expert)
-            local = counts[:, local_rank * experts_per_rank : (local_rank + 1) * experts_per_rank]
-            input_splits = tokens_per_expert.view(num_ranks, experts_per_rank).sum(1).cpu().tolist()
-            output_splits = local.sum(1).cpu().tolist()
-            out = torch.empty((sum(output_splits), HIDDEN), dtype=x.dtype, device="cuda")
-            dist.all_to_all_single(out, permuted, output_splits, input_splits)
-            state.update(a2a_out=out, input_splits=input_splits, output_splits=output_splits)
-
-        def a2a_combine():
-            dist.all_to_all_single(combined, state["a2a_out"], state["input_splits"], state["output_splits"])
-
-        t_dispatch = timed(a2a_dispatch, flush)
-        t_combine = timed(a2a_combine, flush)
-        results.append((num_tokens, "RCCL all-to-all", t_dispatch, t_combine, state["a2a_out"].shape[0]))
+            timing = bench_deepep(buffer, x, topk_idx, topk_weights, num_ranks, num_cus, flush)
+            results.append((num_tokens, f"DeepEP, {num_cus} CUs", *timing))
+        timing = bench_alltoall(x, topk_idx, local_rank, num_ranks, flush)
+        results.append((num_tokens, "RCCL all-to-all", *timing))
 
     rows = torch.tensor([r[4] for r in results], device="cuda")
     dist.all_reduce(rows, op=dist.ReduceOp.MAX)

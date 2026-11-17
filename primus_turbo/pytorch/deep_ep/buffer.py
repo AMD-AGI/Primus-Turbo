@@ -167,9 +167,7 @@ class Buffer:
             # like the C++ runtime's comm stream, a high-priority one from the pool
             self._comm_stream = torch.cuda.Stream(priority=-1)
             runtime_cls = (
-                FlyDSLIntranodeV2Runtime
-                if self.intranode_backend == "v2"
-                else FlyDSLIntranodeV1Runtime
+                FlyDSLIntranodeV2Runtime if self.intranode_backend == "v2" else FlyDSLIntranodeV1Runtime
             )
             self.intranode_runtime = runtime_cls(group, num_nvl_bytes, self._comm_stream)
             return
