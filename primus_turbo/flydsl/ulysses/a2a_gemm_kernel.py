@@ -47,6 +47,7 @@ from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
 )
 from primus_turbo.flydsl.ulysses.common import (
     BLOCK_THREADS,
+    STATE_ASSIST,
     STATE_TILE,
     SYS_NT,
     VEC_BF16,
@@ -56,6 +57,7 @@ from primus_turbo.flydsl.ulysses.common import (
     claim_unit,
     exit_and_bump_epoch,
     i64_base,
+    opaque_tid,
     read_clock,
     spin_flags,
 )
@@ -82,6 +84,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 from primus_turbo.flydsl.utils.prims import (
     _readfirstlane_i32,
     _wave_count_le_i32,
+    atomic_add,
     ceildiv,
     ld,
     memory_fence,
@@ -95,6 +98,10 @@ _WGRAD_CHUNK_ROWS = 256
 _WGRAD_LDS_CHUNK_STRIDE = 1152
 # m-tile flags a wgrad tile polls at its start
 _LOOKAHEAD = 16
+# rows of one piece of the own-row copy, and the flag slot of the first m-tile's piece counter (the
+# flags of every launch stay below it)
+_SELF_ROWS = 32
+_SELF_COUNTERS_AT = FLAGS_PER_REGION // 2
 
 
 def _residual_store_c(residual):
@@ -180,6 +187,24 @@ def _copy_rows(thread_index, num_vecs, vec_coords, src_res, dst_res, src_cm, dst
             buffer_store(val, dst_res, dst, mask=valid, cache_modifier=dst_cm)
 
 
+def _claim(thread_index, state_base, claim_slot, counter):
+    """``claim_unit`` evaluating ``thread_index == 0`` anew, for the claim loops below that claim once at
+    the top of every pass. The usual ``claim; while: ...; claim`` shape lost its loop structure after
+    the own-row copy loop: the two claims merged into one shared ``thread_index == 0`` diamond entered
+    from both the entry and the latch, and the irreducible loop ran lanes 1-63 of wave 0 through the
+    barriers without lane 0's claim (stale claims, no tile claimed, a hang). The opaque lane index
+    keeps jump threading from carrying an earlier ``thread_index == 0`` across the back edge."""
+    return claim_unit(opaque_tid(thread_index), state_base, claim_slot, counter)
+
+
+def _o_resources(tensors, rows, **c):
+    """Buffer resources of the ``q``, ``k``, ``v`` row tensors (``rows`` rows each)."""
+    return [
+        create_buffer_resource(t, num_records_bytes=max(rows * h * c["head_dim"] * 2, 4))
+        for t, h in zip(tensors, (c["nq"], c["nk"], c["nv"]))
+    ]
+
+
 def _o_row(t, dst, M, seq_local, num_ranks, is_bshd):
     """Row of ``O`` (full sequence) holding token ``t`` of ``dst``'s sequence slice."""
     if is_bshd:
@@ -189,10 +214,9 @@ def _o_row(t, dst, M, seq_local, num_ranks, is_bshd):
 
 
 @ASTRewriter.transform
-def _push_unit(thread_index, m_sub, dst, dst_heap, bank_offset, o_res, epoch, **c):
-    """Rows of sub-tile ``m_sub`` of ``dst``'s sequence slice into ``dst``'s recv bank, then ``dst``'s flag."""
+def _copy_rows_to(thread_index, t0, rows, dst, dst_heap, bank_offset, o_res, **c):
+    """Rows ``[t0, t0 + rows)`` of ``dst``'s sequence slice into ``dst``'s recv bank, retired on return."""
     M, K, K_r, rank, num_ranks = c["M"], c["K"], c["K_r"], c["rank"], c["num_ranks"]
-    rows = c["BM"] // c["push_split"]
     G, d = c["G"], c["head_dim"]
     recv_res = create_buffer_resource_from_addr(dst_heap + bank_offset, num_records_bytes=c["M_pad"] * K * 2)
     heads = (c["nq"], c["nk"], c["nv"])
@@ -214,7 +238,7 @@ def _push_unit(thread_index, m_sub, dst, dst_heap, bank_offset, o_res, epoch, **
                     + (head % fx.Int32(per_group) + fx.Int32(head_off)) * fx.Int32(vecs_per_head)
                     + col % fx.Int32(vecs_per_head)
                 )
-                t = m_sub * fx.Int32(rows) + r
+                t = t0 + r
                 o_row = _o_row(t, dst, M, c["seq_local"], num_ranks, c["is_bshd"])
                 src_word = (o_row * fx.Int32(vecs_per_row) + col) * fx.Int32(VEC_I32)
                 dst_word = t * fx.Int32(K // 2) + (fx.Int32(rank * K_r // VEC_BF16) + dst_col) * fx.Int32(
@@ -225,27 +249,82 @@ def _push_unit(thread_index, m_sub, dst, dst_heap, bank_offset, o_res, epoch, **
             _copy_rows(thread_index, rows * vecs_per_row, coords, o_res[x], recv_res, 0, SYS_NT)
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
+
+
+@ASTRewriter.transform
+def _push_unit(thread_index, m_sub, dst, dst_heap, bank_offset, o_res, epoch, **c):
+    """Rows of sub-tile ``m_sub`` of ``dst``'s sequence slice into ``dst``'s recv bank, then ``dst``'s flag."""
+    rows = c["BM"] // c["push_split"]
+    _copy_rows_to(thread_index, m_sub * fx.Int32(rows), rows, dst, dst_heap, bank_offset, o_res, **c)
     if thread_index == fx.Int32(0):
         flag_base = dst_heap + fx.Int64(c["flag_region"] * FLAG_REGION_BYTES)
         # no release (an L2 writeback per unit): the bank stores are system scope (SYS_NT), and the
         # wait above retired them before the flag goes out
-        st(flag_base, m_sub * fx.Int32(num_ranks) + fx.Int32(rank), epoch, scope="sys", order="relaxed")
+        st(
+            flag_base,
+            m_sub * fx.Int32(c["num_ranks"]) + fx.Int32(c["rank"]),
+            epoch,
+            scope="sys",
+            order="relaxed",
+        )
+
+
+@ASTRewriter.transform
+def _self_copy(thread_index, state_base, claim_slot, flag_base, my_base, bank_offset, o_res, epoch, **c):
+    """This rank's own rows into its recv bank, in ``_SELF_ROWS``-row pieces claimed by every block
+    before its first tile; the block finishing an m-tile's last piece raises its flag. Spread over
+    all the CUs the local copy is short, so the own-source wgrad tiles claimed next start on landed
+    rows, and the pushers keep to the peers."""
+    rank, num_ranks = c["rank"], c["num_ranks"]
+    per_tile = c["BM"] // _SELF_ROWS
+    num_pieces = fx.Int32(c["M"] // _SELF_ROWS)
+    more = fx.Int32(1)
+    while more == fx.Int32(1):
+        piece = _claim(thread_index, state_base, claim_slot, STATE_ASSIST)
+        if piece < num_pieces:
+            _copy_rows_to(
+                thread_index,
+                piece * fx.Int32(_SELF_ROWS),
+                _SELF_ROWS,
+                fx.Int32(rank),
+                my_base,
+                bank_offset,
+                o_res,
+                **c,
+            )
+            if thread_index == fx.Int32(0):
+                m_tile = piece // fx.Int32(per_tile)
+                counter = fx.Int32(_SELF_COUNTERS_AT) + m_tile
+                # every piece retired its stores before its count, as _push_unit before its flag
+                done = atomic_add(flag_base, counter, fx.Int64(1), scope="agent")
+                if done == fx.Int64(per_tile - 1):
+                    st(flag_base, counter, fx.Int64(0))
+                    st(
+                        flag_base,
+                        m_tile * fx.Int32(num_ranks) + fx.Int32(rank),
+                        epoch,
+                        scope="sys",
+                        order="relaxed",
+                    )
+        more = arith.select(piece < num_pieces, fx.Int32(1), fx.Int32(0))
 
 
 @ASTRewriter.transform
 def _push_loop(thread_index, state_base, claim_slot, peers_base, bank_offset, o_res, epoch, trace_base, **c):
     """Claim ``(m_sub, dst = rank + i)`` units (``m_sub``: a ``BM / push_split``-row sub-tile) until
     none are left and push each one. Rank ``r`` walks the m-tiles from ``r * stagger`` on, so the
-    sources of one m-tile land at ``n`` different times (see ``_arrival_k_seg``)."""
-    num_ranks, S = c["num_ranks"], c["push_split"]
+    sources of one m-tile land at ``n`` different times (see ``_arrival_k_seg``). With ``self_first``
+    the own rows are copied by the tile blocks (``_self_copy``): only the peers' units."""
+    num_ranks, S, skip = c["num_ranks"], c["push_split"], int(c["self_first"])
     m_tiles = ceildiv(c["M"], c["BM"])
-    num_units = num_ranks * m_tiles * S
+    dsts = num_ranks - skip
+    num_units = dsts * m_tiles * S
     unit = claim_unit(thread_index, state_base, claim_slot)
     while unit < fx.Int32(num_units):
-        pos = unit // fx.Int32(num_ranks)
+        pos = unit // fx.Int32(dsts)
         m_tile = (pos // fx.Int32(S) + fx.Int32(c["rank"] * c["stagger"])) % fx.Int32(m_tiles)
         m_sub = m_tile * fx.Int32(S) + pos % fx.Int32(S)
-        dst = (fx.Int32(c["rank"]) + unit % fx.Int32(num_ranks)) % fx.Int32(num_ranks)
+        dst = (fx.Int32(c["rank"] + skip) + unit % fx.Int32(dsts)) % fx.Int32(num_ranks)
         dst_heap = ld(peers_base, dst, dtype=fx.T.i64)
         if const_expr(trace_base is not None):
             if thread_index == fx.Int32(0):
@@ -433,16 +512,35 @@ def _wait_all(thread_index, flag_base, tile_m, epoch, **c):
 
 
 @ASTRewriter.transform
+def _wait_src_rows(flag_base, src, epoch, **c):
+    """Every m-tile of source ``src`` has landed (step: one flag each); each lane spins on its own."""
+    num_ranks, m_tiles = c["num_ranks"], ceildiv(c["M"], c["BM"])
+    lane = fx.thread_idx.x % fx.Int32(WARP)
+    for j in range_constexpr(ceildiv(m_tiles, WARP)):
+        t = lane + fx.Int32(j * WARP)
+        t = arith.select(t < fx.Int32(m_tiles), t, fx.Int32(m_tiles - 1))
+        spin_flags(flag_base, [t * fx.Int32(num_ranks) + src], epoch, c["rank"], src, "a2a_gemm own wgrad")
+
+
+@ASTRewriter.transform
 def _wgrad_tile(thread_index, w, flag_base, recv_addr, XB, DW, lds, horizon_slot, epoch, trace_base, **c):
     """``DW[tile] = A[:, tile rows]^T @ XB[:, tile cols]`` over all of M (the variable-K wgrad tile),
-    in row order, each chunk after the m-tiles it reads have landed (``_wgrad_k_hook``)."""
+    in row order, each chunk after the m-tiles it reads have landed (``_wgrad_k_hook``). With
+    ``self_first`` the claims start at this rank's own columns, whose rows all land within the
+    own-row copy: those tiles wait for all of them and run without the hook."""
     M, K, N, BMw, BN = c["M"], c["K"], c["N"], c["BMw"], c["BN"]
     wn_tiles = N // BN
     tile_k, tile_n = w // fx.Int32(wn_tiles), w % fx.Int32(wn_tiles)
+    if const_expr(c["self_first"]):
+        tile_k = (tile_k + fx.Int32(c["rank"] * c["K_r"] // BMw)) % fx.Int32(K // BMw)
+    w = tile_k * fx.Int32(wn_tiles) + tile_n
     if const_expr(trace_base is not None):
         if thread_index == fx.Int32(0):
             st(trace_base, fx.Int32(c["trace_wgrad_at"]) + w * fx.Int32(2), read_clock())
     src = tile_k * fx.Int32(BMw) // fx.Int32(c["K_r"])
+    if const_expr(c["self_first"]):
+        if src == fx.Int32(c["rank"]):
+            _wait_src_rows(flag_base, src, epoch, **c)
     k_hook, k_hook_from = _wgrad_k_hook(flag_base, src, epoch, horizon_slot, **c)
     grouped_gemm_bf16_variable_k_tile(
         None,
@@ -491,22 +589,16 @@ def _tile_loop(
     trace_base,
     **c,
 ):
-    """Claim tiles until none are left: the ``num_wtiles`` weight-gradient tiles sit at claim
-    positions ``[wgrad_at, wgrad_at + num_wtiles)``, the GEMM tiles around them."""
-    num_tiles, num_wtiles, w_at = c["num_tiles"], c["num_wtiles"], c["wgrad_at"]
-    q = claim_unit(thread_index, state_base, claim_slot, STATE_TILE)
-    while q < fx.Int32(num_tiles + num_wtiles):
-        if const_expr(num_wtiles > 0):
-            w = q - fx.Int32(w_at)
-            if (w >= fx.Int32(0)) & (w < fx.Int32(num_wtiles)):
-                _wgrad_tile(
-                    thread_index, w, flag_base, recv_addr, XB, DW, lds, claim_slot, epoch, trace_base, **c
-                )
-            else:
-                qd = arith.select(q < fx.Int32(w_at), q, q - fx.Int32(num_wtiles))
-                _gemm_tile(
+    """Claim tiles until none are left (``_run_tile``)."""
+    total = fx.Int32(c["num_tiles"] + c["num_wtiles"])
+    if const_expr(c["self_first"]):
+        more = fx.Int32(1)
+        while more == fx.Int32(1):
+            q = _claim(thread_index, state_base, claim_slot, STATE_TILE)
+            if q < total:
+                _run_tile(
                     thread_index,
-                    qd,
+                    q,
                     flag_base,
                     claim_slot,
                     recv_addr,
@@ -514,16 +606,66 @@ def _tile_loop(
                     Y,
                     RES,
                     OG,
+                    XB,
+                    DW,
                     lds,
                     epoch,
                     trace_base,
                     **c,
                 )
-        else:
-            _gemm_tile(
-                thread_index, q, flag_base, claim_slot, recv_addr, W, Y, RES, OG, lds, epoch, trace_base, **c
-            )
+            more = arith.select(q < total, fx.Int32(1), fx.Int32(0))
+    else:
         q = claim_unit(thread_index, state_base, claim_slot, STATE_TILE)
+        while q < total:
+            _run_tile(
+                thread_index,
+                q,
+                flag_base,
+                claim_slot,
+                recv_addr,
+                W,
+                Y,
+                RES,
+                OG,
+                XB,
+                DW,
+                lds,
+                epoch,
+                trace_base,
+                **c,
+            )
+            q = claim_unit(thread_index, state_base, claim_slot, STATE_TILE)
+
+
+@ASTRewriter.transform
+def _run_tile(
+    thread_index, q, flag_base, claim_slot, recv_addr, W, Y, RES, OG, XB, DW, lds, epoch, trace_base, **c
+):
+    """Tile of claim ``q``: the ``num_wtiles`` weight-gradient tiles sit at claim positions
+    ``[wgrad_at, wgrad_at + num_wtiles)``, the GEMM tiles around them; the first ``wgrad_head`` of them
+    (the own-source ones, ``self_first``) go before everything."""
+    num_wtiles, w_at, H = c["num_wtiles"], c["wgrad_at"], c["wgrad_head"]
+    if const_expr(num_wtiles > 0):
+        qh = q - fx.Int32(H)
+        if const_expr(H > 0):
+            w = arith.select(q < fx.Int32(H), q, qh - fx.Int32(w_at - H))
+            is_w = (q < fx.Int32(H)) | ((qh >= fx.Int32(w_at)) & (qh < fx.Int32(w_at + num_wtiles - H)))
+        else:
+            w = q - fx.Int32(w_at)
+            is_w = (w >= fx.Int32(0)) & (w < fx.Int32(num_wtiles))
+        if is_w:
+            _wgrad_tile(
+                thread_index, w, flag_base, recv_addr, XB, DW, lds, claim_slot, epoch, trace_base, **c
+            )
+        else:
+            qd = arith.select(qh < fx.Int32(w_at), qh, qh - fx.Int32(num_wtiles - H))
+            _gemm_tile(
+                thread_index, qd, flag_base, claim_slot, recv_addr, W, Y, RES, OG, lds, epoch, trace_base, **c
+            )
+    else:
+        _gemm_tile(
+            thread_index, q, flag_base, claim_slot, recv_addr, W, Y, RES, OG, lds, epoch, trace_base, **c
+        )
 
 
 @ASTRewriter.transform
@@ -671,7 +813,14 @@ def _make_kernel(
     # in step, one m-tile per pusher unit: sub-tiles only pace the staggered arrivals
     push_split = push_split if stagger else 1
     assert not stagger or K_r % 64 == 0, "a staggered K walk needs whole K chunks per source"
+    assert m_tiles * push_split * num_ranks <= _SELF_COUNTERS_AT
     progressive = K_r % 64 == 0
+    # In step with the GEMM tiles before the wgrad ones, the CUs mostly wait for rows during the
+    # exchange, and the own source's wgrad tiles need none but this rank's: copied first by all the
+    # blocks, those rows let them fill the wait.
+    self_first = bool(BMw) and wgrad_at > 0 and not stagger
+    if self_first:
+        assert BM % _SELF_ROWS == 0 and m_tiles <= FLAGS_PER_REGION - _SELF_COUNTERS_AT
     # i32 slots: the block-wide broadcast of a claimed unit, then each wave's wgrad horizon
     SharedStorage = _make_shared_storage(
         max(BM, BMw),
@@ -701,6 +850,8 @@ def _make_kernel(
         BMw=BMw,
         num_wtiles=num_wtiles,
         wgrad_at=wgrad_at,
+        self_first=self_first,
+        wgrad_head=num_wtiles // num_ranks if self_first else 0,
         stagger=stagger,
         progressive=progressive,
         N=N,
@@ -741,22 +892,23 @@ def _make_kernel(
         trace_base = i64_base(TRACE) if trace else None
 
         if block_index < fx.Int32(num_push):
-            o_res = [
-                create_buffer_resource(t, num_records_bytes=max(num_ranks * M * h * head_dim * 2, 4))
-                for t, h in ((OQ, nq), (OK, nk), (OV, nv))
-            ]
             _push_loop(
                 thread_index,
                 state_base,
                 claim_slot,
                 peers_base,
                 bank_offset,
-                o_res,
+                _o_resources((OQ, OK, OV), num_ranks * M, **consts),
                 epoch,
                 trace_base,
                 **consts,
             )
         flag_base = my_base + fx.Int64(flag_region * FLAG_REGION_BYTES)
+        if const_expr(self_first):
+            o_res = _o_resources((OQ, OK, OV), num_ranks * M, **consts)
+            _self_copy(
+                thread_index, state_base, claim_slot, flag_base, my_base, bank_offset, o_res, epoch, **consts
+            )
         _tile_loop(
             thread_index,
             state_base,
@@ -774,7 +926,14 @@ def _make_kernel(
             trace_base,
             **consts,
         )
-        exit_and_bump_epoch(thread_index, state_base, epoch, grid, order="relaxed")
+        exit_and_bump_epoch(
+            thread_index,
+            state_base,
+            epoch,
+            grid,
+            order="relaxed",
+            extra_counters=(STATE_ASSIST,) if self_first else (),
+        )
 
     return kernel, grid
 
