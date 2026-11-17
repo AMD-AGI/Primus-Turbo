@@ -360,9 +360,17 @@ def _build_grouped_mxfp8_nt_kernel(
     blgp: int = 0,
     out_fp16: bool = False,
     persistent: bool = False,
+    b_kblk: bool = False,
 ):
-    """Grouped MXFP8 NT (out = a @ b^T) with grouped per-tile addressing."""
+    """Grouped MXFP8 NT (out = a @ b^T) with grouped per-tile addressing.
+
+    ``b_kblk``: each group's B is stored K-blocked, [K/128, N, 128], so one K step of a
+    tile is a single contiguous run instead of 128 B from each of its rows.
+    """
     BLOCK_K = 128
+    # B row pitch within one K step, and the B offset of one K step.
+    B_ROW = BLOCK_K if b_kblk else K
+    B_KSTEP = N * BLOCK_K if b_kblk else BLOCK_K
     assert BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0 and BLOCK_M >= 128 and BLOCK_N >= 256
     assert K % BLOCK_K == 0 and G >= 1
     K_ITERS = K // BLOCK_K
@@ -477,9 +485,9 @@ def _build_grouped_mxfp8_nt_kernel(
 
             cn_i = arith.index_cast(T.index, c_n)
             a_base = arith.index_cast(T.index, m_row_a) * arith.index(K)
-            b_base = (
-                arith.index_cast(T.index, group_idx) * cn_i + arith.index_cast(T.index, block_n * BLOCK_N)
-            ) * arith.index(K)
+            b_base = arith.index_cast(T.index, group_idx) * cn_i * arith.index(K) + arith.index_cast(
+                T.index, block_n * BLOCK_N
+            ) * arith.index(B_ROW)
             a_nrec = (
                 arith.index_cast(T.index, m_total_pad) - arith.index_cast(T.index, m_row_a)
             ) * arith.index(K)
@@ -487,7 +495,7 @@ def _build_grouped_mxfp8_nt_kernel(
             A0_gl_offset = 0
             A1_gl_offset = LDS_BLOCK_M * K
             B0_gl_offset = 0
-            B1_gl_offset = LDS_BLOCK_N * K
+            B1_gl_offset = LDS_BLOCK_N * B_ROW
 
             gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, a_nrec)
             gB = make_fp8_buffer_tensor_rebased(B_T, F8_IR_t, b_base, b_nrec)
@@ -495,7 +503,7 @@ def _build_grouped_mxfp8_nt_kernel(
             b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
             gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
-            gl_off_b = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
+            gl_off_b = compute_global_swizzle(lane_id, wave_id, B_ROW, N_LDS_ROUNDS, preshuffled=False)
 
             mfma = MfmaScale16x16x128(N_TILES_A, N_TILES_B, cbsz=cbsz, blgp=blgp)
 
@@ -522,9 +530,9 @@ def _build_grouped_mxfp8_nt_kernel(
             c10_frag = [mfma.zero_value] * N_ACCUMS
             c11_frag = [mfma.zero_value] * N_ACCUMS
 
-            b_g2s.load(b_cur0, B0_gl_offset + 0 * BLOCK_K)
+            b_g2s.load(b_cur0, B0_gl_offset + 0 * B_KSTEP)
             a_g2s.load(a_cur0, A0_gl_offset + 0 * BLOCK_K)
-            b_g2s.load(b_cur1, B1_gl_offset + 0 * BLOCK_K)
+            b_g2s.load(b_cur1, B1_gl_offset + 0 * B_KSTEP)
             a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K)
             if const_expr(persistent):
                 rocdl.s_barrier()
@@ -533,9 +541,9 @@ def _build_grouped_mxfp8_nt_kernel(
                 # it and a dynamic ``if`` has to be emitted through the rewrite's primitive.
                 emit_if_then(wave_m == 1, rocdl.s_barrier)
             wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
-            b_g2s.load(b_next0, B0_gl_offset + 1 * BLOCK_K)
+            b_g2s.load(b_next0, B0_gl_offset + 1 * B_KSTEP)
             a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
-            b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K)
+            b_g2s.load(b_next1, B1_gl_offset + 1 * B_KSTEP)
             # K_ITERS == 2 skips the main loop, so nothing drains k=1's b_next0/a_next0 before
             # the tails read them.
             wait_barrier(N_LDS_STEPS_B if K_ITERS == 2 else N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
@@ -557,7 +565,7 @@ def _build_grouped_mxfp8_nt_kernel(
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 b1_frag = b_s2r.load(b_cur1)
-                b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * BLOCK_K)
+                b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * B_KSTEP)
                 sb_alln = sb_s2r.load(sb_base0, k + 1, slab=group_idx)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
@@ -572,7 +580,7 @@ def _build_grouped_mxfp8_nt_kernel(
                 c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
-                b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * BLOCK_K)
+                b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_KSTEP)
                 wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
                 rocdl.s_setprio(1)
                 c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1)
@@ -689,12 +697,18 @@ _GNT_FUSED_CACHE: dict = {}  # (K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, 
 _GNT_WS_CACHE: dict = {}  # (M_pad, N, K128, G, device, stream) -> (a_sp, b_sp, a_blocks, a_ngrp)
 
 # fwd/dgrad NT autotune. The launch is M-generic (M is a runtime arg), so the config race
-# keys on the static shape only (no M_pad) and is reused for every M.
+# keys on the static shape plus a coarse token regime (no M_pad) and is reused for every M
+# in that regime.
 
 # tokens/group points the race times on (geomean). The swizzle is not M-invariant: a single
 # midpoint mis-picks a cfg that wins there but loses at the range ends, so two spread steady
 # points reward range-robust cfgs.
 _GNT_PM_CANON = (2048, 8192)
+# Below this many average padded tokens/group most tile rows are padding and the ranking follows
+# the group-size distribution (tile count per group, tail, occupancy), which no balanced point
+# reproduces: bm=128 loses on balanced 192+ tokens/group yet wins on skewed ~100-token layouts.
+# That regime races on the first call's own layout instead (NT overwrites C, so it is idempotent).
+_GNT_SMALL_M = 1024
 
 
 def _gnt_nt_candidates(N):
@@ -708,11 +722,13 @@ def _gnt_nt_candidates(N):
     ]
 
 
-def _get_nt_launch(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent):
-    fk = (K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent)
+def _get_nt_launch(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent, b_kblk=False):
+    fk = (K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent, b_kblk)
     launch = _GNT_FUSED_CACHE.get(fk)
     if launch is None:
-        launch = _compile_grouped_mxfp8_nt_fused(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent)
+        launch = _compile_grouped_mxfp8_nt_fused(
+            K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent, b_kblk
+        )
         _GNT_FUSED_CACHE[fk] = launch
     return launch
 
@@ -766,24 +782,29 @@ _GNT_RACE = Race.interleaved(1, 50, warmup=250, visit=(0, 5), margin=0.985, chec
 _GROUPED_GEMM_MXFP8 = Op("grouped_gemm_mxfp8")
 
 
-def _gnt_entry(cfg, K, G, N, cbsz, blgp, out_fp16, persistent, tuned=True):
-    return Entry(cfg, _get_nt_launch(K, G, N, *cfg, cbsz, blgp, out_fp16, persistent), tuned=tuned)
+def _gnt_entry(cfg, K, G, N, cbsz, blgp, out_fp16, persistent, tuned=True, b_kblk=False):
+    return Entry(cfg, _get_nt_launch(K, G, N, *cfg, cbsz, blgp, out_fp16, persistent, b_kblk), tuned=tuned)
 
 
-def _gnt_probe(args, K, G, N):
-    """Canonical synthetic tensors: the race needs only the static shape (``args``' b-side)."""
+def _gnt_probe(args, K, G, N, call_point=None):
+    """Canonical synthetic tensors (the race needs only the static shape, ``args``' b-side), or
+    in the small-M regime the call's own ``call_point``."""
+    if call_point is not None:
+        return RealArgs(call_point)
     return Synthetic(lambda: [Point(*_canon_nt_targs(args, K, G, N, pm)) for pm in _GNT_PM_CANON])
 
 
-def _pick_gnt(key, args, K, G, N, cbsz, blgp, out_fp16, persistent):
+def _pick_gnt(key, args, K, G, N, cbsz, blgp, out_fp16, persistent, call_point=None, b_kblk=False):
     cfgs = _gnt_nt_candidates(N)
     space = staged(Refine(lambda _prev: cfgs, _GNT_RACE), base=cfgs[0])
-    build = _GROUPED_GEMM_MXFP8.build(lambda cfg: _gnt_entry(cfg, K, G, N, cbsz, blgp, out_fp16, persistent))
-    res = _GROUPED_GEMM_MXFP8.pick(key, space, probe=_gnt_probe(args, K, G, N), build=build)
+    build = _GROUPED_GEMM_MXFP8.build(
+        lambda cfg: _gnt_entry(cfg, K, G, N, cbsz, blgp, out_fp16, persistent, b_kblk=b_kblk)
+    )
+    res = _GROUPED_GEMM_MXFP8.pick(key, space, probe=_gnt_probe(args, K, G, N, call_point), build=build)
     return build.winner(res)
 
 
-def _compile_grouped_mxfp8_nt_fused(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent):
+def _compile_grouped_mxfp8_nt_fused(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent, b_kblk=False):
     K128 = K // 128
     pre_kern, n_kt, b_blocks_pg = _build_grouped_preshuffle_kernel(K128, G, N)
     gemm_kern, BM, BN, wpe = _build_grouped_mxfp8_nt_kernel(
@@ -799,6 +820,7 @@ def _compile_grouped_mxfp8_nt_fused(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp
         blgp=blgp,
         out_fp16=out_fp16,
         persistent=persistent,
+        b_kblk=b_kblk,
     )
 
     @flyc.jit
@@ -874,12 +896,15 @@ def grouped_gemm_mxfp8_flydsl_kernel(
     out_dtype: torch.dtype = torch.bfloat16,
     num_cu: "int | None" = -1,
     out: "torch.Tensor | None" = None,
+    b_k_blocked: bool = False,
 ) -> "torch.Tensor":
     """FlyDSL MXFP8 grouped NT GEMM (fwd / dgrad).
 
     By default returns a newly allocated C [M_pad, N].  ``out`` lets fused
     multi-stage callers provide the tight [M, N] destination used with
     ``group_offs_out`` and avoid an otherwise redundant allocation/copy.
+    ``b_k_blocked``: ``b`` keeps its [G, N, K] shape but each group's bytes are laid
+    out [K/128, N, 128] (see ``quant_mxfp8_raw_batched(kblk=True)``).
     """
     assert a.ndim == 2 and b.ndim == 3
     M_pad = a.shape[0]
@@ -937,10 +962,18 @@ def grouped_gemm_mxfp8_flydsl_kernel(
             stream,
         )
 
-    key = (N, K, G, cbsz, blgp, out_fp16, persistent)
-    entry = _GROUPED_GEMM_MXFP8.entry(
-        key, lambda: _pick_gnt(key, _args(0), K, G, N, cbsz, blgp, out_fp16, persistent)
-    )
+    small_m = M_pad < _GNT_SMALL_M * G
+    key = (N, K, G, cbsz, blgp, out_fp16, persistent, small_m, b_k_blocked)
+
+    def _make():
+        # small M races on this call, with the grid sized for the smallest candidate tile
+        call_point = None
+        if small_m:
+            min_bm = min(c[0] for c in _gnt_nt_candidates(N))
+            call_point = Point(_args(((M_pad + min_bm - 1) // min_bm + G) * n_blocks), out)
+        return _pick_gnt(key, _args(0), K, G, N, cbsz, blgp, out_fp16, persistent, call_point, b_k_blocked)
+
+    entry = _GROUPED_GEMM_MXFP8.entry(key, _make)
     # The device-side tile count sums ceildiv(tight length, bm) over the groups, so the
     # grid has to follow the chosen bm or the trailing tiles never launch.
     bm = entry.config[0]
@@ -1041,6 +1074,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
     out_fp16: bool = False,
     chunk: int = 8,
     beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
+    out_fp32: bool = False,  # C is fp32 (fused main_grad accumulate target)
 ):
     """Grouped MXFP8 variable-K wgrad (runtime per-group contraction M_g)."""
     BLOCK_K = 128
@@ -1086,7 +1120,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
         m_total: fx.Int32,  # total padded contraction length (LHS/RHS leading dim)
     ):
         F8_IR_t = fx.Float8E4M3FN.ir_type
-        _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
+        _out_ty = fx.Float32 if out_fp32 else (fx.Float16 if out_fp16 else fx.BFloat16)
         go = fx.rocdl.make_buffer_tensor(group_offs, max_size=False, num_records_bytes=(G + 1) * 8)
         go_div = fx.logical_divide(go, fx.make_layout(1, 1))
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -1101,7 +1135,14 @@ def _build_grouped_mxfp8_wgrad_kernel(
             m_end = _load_go(go_div, group_idx + 1)
             k_iters = (m_end - m_start) // BLOCK_K  # runtime; M_g padded to 128 -> exact
             ks0 = m_start // BLOCK_K  # scale K128-block base for this group
+            if const_expr(beta_is_one):
+                # An empty group adds nothing to C: skip its slab's read-modify-write.
+                if k_iters > fx.Int32(0):
+                    _tile_body(group_idx, block_m, block_n, m_start, k_iters, ks0)
+            else:
+                _tile_body(group_idx, block_m, block_n, m_start, k_iters, ks0)
 
+        def _tile_body(group_idx, block_m, block_n, m_start, k_iters, ks0):
             lane_id = fx.thread_idx.x % 64
             wave_id = fx.thread_idx.x // 64
             wave_m = wave_id // 4
@@ -1290,7 +1331,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
 
 # ── wgrad host wrapper ───────────────────────────────────────────────────────
 
-_GWG_FUSED_CACHE: dict = {}  # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta1) -> launch
+_GWG_FUSED_CACHE: dict = {}  # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta1, out_fp32) -> launch
 _GWG_WS_CACHE: dict = {}  # (OUT_M, OUT_N, device, stream) -> (a_sp, b_sp), sized to the largest K128 seen
 
 # variable-K wgrad config autotune (mirrors the fwd/dgrad NT path).
@@ -1313,12 +1354,14 @@ def _gwg_wgrad_candidates():
     ]
 
 
-def _get_wgrad_launch(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one):
-    fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one)
+def _get_wgrad_launch(
+    OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one, out_fp32=False
+):
+    fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one, out_fp32)
     launch = _GWG_FUSED_CACHE.get(fk)
     if launch is None:
         launch = _compile_grouped_mxfp8_wgrad_fused(
-            OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one
+            OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one, out_fp32
         )
         _GWG_FUSED_CACHE[fk] = launch
     return launch
@@ -1333,8 +1376,10 @@ _GWG_RACE = Race.interleaved(1, 50, warmup=250, visit=(0, 5), margin=0.985, chec
 _GROUPED_GEMM_MXFP8_VARIABLE_K = Op("grouped_gemm_mxfp8_variable_k", release=True)
 
 
-def _gwg_entry(cfg, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one, tuned=True):
-    launch = _get_wgrad_launch(OUT_M, OUT_N, G, *cfg, cbsz, blgp, out_fp16, beta_is_one=beta_is_one)
+def _gwg_entry(cfg, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one, tuned=True, out_fp32=False):
+    launch = _get_wgrad_launch(
+        OUT_M, OUT_N, G, *cfg, cbsz, blgp, out_fp16, beta_is_one=beta_is_one, out_fp32=out_fp32
+    )
     return Entry(cfg, launch, tuned=tuned)
 
 
@@ -1351,21 +1396,21 @@ def _gwg_probe(args, beta_is_one):
     return Synthetic(scratch)
 
 
-def _pick_gwg(key, args, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one):
+def _pick_gwg(key, args, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one, out_fp32=False):
     """The beta=0 entry for the shape (a beta=1 call runs it with the accumulating epilogue).
     Timed at beta=0 for either beta, unlike the fp8 wgrad, which times at beta=1 because the C
     read-back reorders its candidates; whether it reorders these is unmeasured."""
     cfgs = _gwg_wgrad_candidates()
     space = staged(Refine(lambda _prev: cfgs, _GWG_RACE), base=cfgs[0])
     build = _GROUPED_GEMM_MXFP8_VARIABLE_K.build(
-        lambda cfg: _gwg_entry(cfg, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, False)
+        lambda cfg: _gwg_entry(cfg, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, False, out_fp32=out_fp32)
     )
     res = _GROUPED_GEMM_MXFP8_VARIABLE_K.pick(key, space, probe=_gwg_probe(args, beta_is_one), build=build)
     return build.winner(res)
 
 
 def _compile_grouped_mxfp8_wgrad_fused(
-    OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one=False
+    OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one=False, out_fp32=False
 ):
     pre_kern, a_ngrp, b_ngrp = _build_grouped_wgrad_preshuffle_kernel(OUT_M, OUT_N)
     gemm_kern, BM, BN, wpe, TOTAL = _build_grouped_mxfp8_wgrad_kernel(
@@ -1381,6 +1426,7 @@ def _compile_grouped_mxfp8_wgrad_fused(
         blgp=blgp,
         out_fp16=out_fp16,
         beta_is_one=beta_is_one,
+        out_fp32=out_fp32,
     )
 
     @flyc.jit
@@ -1458,6 +1504,7 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     assert rhs.shape[1] == M_total
     assert M_total % 128 == 0
     out_fp16 = out_dtype == torch.float16
+    out_fp32 = out_dtype == torch.float32
     cbsz = 1 if lhs.dtype == torch.float8_e5m2 else 0
     blgp = 1 if rhs.dtype == torch.float8_e5m2 else 0
     K128 = M_total // 128
@@ -1485,16 +1532,16 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go, M_total, K128, n_kt, a_blocks, pre_grid, stream)
     # beta=1 takes the beta=0 pick for the shape (the same kernel with the accumulating
     # epilogue), and that race runs on a scratch output when beta=0 has not been picked yet.
-    key = (OUT_M, OUT_N, G, cbsz, blgp, out_fp16, False)
+    key = (OUT_M, OUT_N, G, cbsz, blgp, out_fp16, False, out_fp32)
     entry = _GROUPED_GEMM_MXFP8_VARIABLE_K.entry(
-        key, lambda: _pick_gwg(key, args, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one)
+        key, lambda: _pick_gwg(key, args, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one, out_fp32)
     )
     if beta_is_one:
         entry = _GROUPED_GEMM_MXFP8_VARIABLE_K.derived(
             key,
             True,
             entry,
-            lambda e: _gwg_entry(e.config, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, True, e.tuned),
+            lambda e: _gwg_entry(e.config, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, True, e.tuned, out_fp32),
         )
     _GROUPED_GEMM_MXFP8_VARIABLE_K.launch(entry, args)
     return out
