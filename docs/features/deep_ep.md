@@ -29,8 +29,12 @@ and `buffer.intranode_backend` reports it (`"v1"` or `"v2"`).
 
 | | gfx942 (MI300X / MI325X) | gfx950 (MI350X / MI355X) | gfx1250 (MI455X) |
 |---|:-:|:-:|:-:|
-| Intranode (one node, 2 / 4 / 8 ranks) | ✅ V1 | ✅ V1 | ✅ V2 |
+| Intranode: the GPUs of one host, 2 / 4 / 8 ranks | ✅ V1 | ✅ V1 | ✅ V2 (tested at EP2 / EP4) |
 | Internode (rocSHMEM) | ✅ | ✅ | — |
+
+On MI455X, a Helios rack connects its 72 GPUs in one scale-up domain, so expert parallelism seldom
+has to leave the rack. DeepEP covers only the GPUs of one host there today; a larger EP uses the
+all-to-all (RCCL) token dispatcher (see [Known limitations](#known-limitations)).
 
 Frameworks: PyTorch, and JAX (`primus_turbo.jax.lax.moe.moe_dispatch` / `moe_combine`, intra- and
 inter-node). See [Supported Operators § MoE](../supported_ops.md#24-moe).
@@ -151,7 +155,13 @@ training-step gain not recorded yet.
 - Architectures other than gfx942, gfx950 and gfx1250 are not supported: a `Buffer` logs an error
   and raises. It also raises when the detected architecture is not that of its GPU, for example when
   `rocm_agent_enumerator` fails, which makes it report gfx942.
-- MI455X: intranode only, with 2, 4 or 8 ranks and `num_nvl_bytes > 0`; other buffers raise.
+- MI455X: the GPUs of one host only, with 2, 4 or 8 ranks and `num_nvl_bytes > 0`; other buffers
+  raise. The 72-GPU scale-up domain of a Helios rack is not covered yet:
+  - the buffer is shared through HIP IPC, which does not cross hosts;
+  - the kernels take at most 32 ranks (one lane per rank);
+  - the buffer is sized for the worst case, every rank sending all its tokens to this one: 2 ×
+    tokens × ranks rows, about 17 GB per GPU at EP72 on the DeepSeek-V3 shape, where top-8 routing
+    receives about 8 × tokens rows.
 - V2 (MI455X), CUDA graphs: V2 raises under capture, because every call advances host-side state
   that a replay would reuse.
 - V2 (MI455X), token counts that change per step without a known maximum (packed THD sequences,

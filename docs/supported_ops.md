@@ -85,7 +85,7 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | `fused_group_topk_routing_with_aux_score` | – | ✅ | ✅ | ✅ | Group top-k router with aux-loss scores |
 | `tokens_per_expert_to_mask` | – | ✅ | ✅ | ✅ | Index helper, fwd only |
 | `moe_permute`, `moe_unpermute` | BF16 / FP8 tensorwise | ✅ | ✅ | ✅ | |
-| `moe_dispatch`, `moe_combine` | – | ✅ | ✅ | — | Expert-parallel token dispatch / combine (intra- and inter-node) |
+| `moe_dispatch`, `moe_combine` | – | ✅ | ✅ | ✅ | Expert-parallel token dispatch / combine (intra- and inter-node; gfx1250 within one host) |
 | **MegaMoE**<br>`fused_mega_moe` (+ `_stage1` / `_stage2`) | BF16 | — | ✅ | ✅ | Dispatch + FC1 and FC2 + combine fused, intra-node EP. See [MegaMoE](./mega_moe.md) |
 | **MegaMoE**<br>`fused_mega_moe_fp8_stage1` / `_stage2` | MXFP8 | — | ✅ | — | Staged API only |
 
@@ -123,7 +123,7 @@ These are fwd-only utilities; the `_with_trans` variants also emit the transpose
 |---|:-:|:-:|:-:|---|
 | `turbo.ops.fused_all_gather_matmul`, `turbo.ops.fused_all_gather_scaled_matmul`, `turbo.ops.fused_matmul_reduce_scatter` | ✅ | ✅ | — | Async tensor parallelism; fwd only, the training integration supplies the backward |
 | `primus_turbo.pytorch.dist.FP8AllToAll` | ✅ | ✅ | — | All-to-all on FP8 payloads, with backward |
-| `primus_turbo.pytorch.deep_ep.Buffer` | ✅ | ✅ | — | Intra-node and inter-node EP buffers (needs rocSHMEM). See [DeepEP](./features/deep_ep.md) |
+| `primus_turbo.pytorch.deep_ep.Buffer` | ✅ | ✅ | ✅ | Intra-node EP buffers, and inter-node on gfx942 / gfx950 (needs rocSHMEM); gfx1250 covers one host. See [DeepEP](./features/deep_ep.md) |
 
 ## 3. Supported modules (PyTorch)
 
