@@ -1,0 +1,58 @@
+name: MI355 runner probe
+
+on:
+  push:
+    branches:
+      - ci/mi355-probe
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: primus-turbo-mi355
+    timeout-minutes: 90
+    env:
+      TEST_IMAGE: harbor.global.primus-safe.amd.com/sync/rocm/primus:v26.8
+    steps:
+      - name: Runner container
+        run: |
+          set -x
+          id; hostname; nproc; free -g; df -h / /home/runner/_work || true
+          ls -l /dev/kfd /dev/dri 2>&1 || true
+          env | grep -iE "^(POD_NAME|SAFE_|GITHUB_RUNNER|DOCKER_HOST|HIP_|ROCR_|CUDA_|NVIDIA_|AMD_)" | sort || true
+      - name: Shared storage
+        run: |
+          set -x
+          mount | grep -iE "nfs|shared|wekafs|lustre" || true
+          ls -la /shared_nfs 2>&1 | head -30 || true
+          df -h /shared_nfs 2>&1 || true
+          [ -w /shared_nfs ] && echo "shared_nfs writable" || echo "shared_nfs NOT writable"
+      - name: Network
+        run: |
+          for u in https://github.com https://pypi.org/simple/pip/ https://registry-1.docker.io/v2/ https://harbor.global.primus-safe.amd.com/v2/ https://huggingface.co; do
+            printf '%-55s ' "$u"; curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' --max-time 20 "$u" || echo FAIL
+          done
+      - name: Docker in docker
+        run: |
+          set -x
+          docker info | grep -E "Server Version|Storage Driver|Docker Root Dir|Total Memory|CPUs"
+          time docker pull -q docker.io/library/busybox:latest
+          time docker pull -q "$TEST_IMAGE"
+          docker images
+      - name: GPU inside dind container
+        run: |
+          docker run --rm --network host --ipc host --privileged \
+            --group-add video --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
+            --device /dev/kfd --device /dev/dri --shm-size 64G \
+            "$TEST_IMAGE" bash -lc '
+              set -x
+              ls /dev/dri | head; rocm-smi --showproductname 2>/dev/null | head -20 || amd-smi static -a 2>/dev/null | head -20
+              python3 - <<PY
+          import torch
+          n = torch.cuda.device_count()
+          print("device_count", n)
+          for i in range(n):
+              p = torch.cuda.get_device_properties(i)
+              print(i, p.name, p.gcnArchName, round(p.total_memory / 2**30), "GiB")
+          a = torch.randn(4096, 4096, device="cuda:0", dtype=torch.bfloat16)
+          print("matmul ok", float((a @ a).float().abs().mean()))
+          PY'
