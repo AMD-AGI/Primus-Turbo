@@ -79,7 +79,14 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     make_row_band_resource,
     make_value_attrs,
 )
-from primus_turbo.flydsl.utils.prims import _readfirstlane_i32, ceildiv, ld, memory_fence, st
+from primus_turbo.flydsl.utils.prims import (
+    _readfirstlane_i32,
+    _wave_count_le_i32,
+    ceildiv,
+    ld,
+    memory_fence,
+    st,
+)
 
 # 16 B vectors whose loads are issued before their stores
 _BATCH = 8
@@ -301,9 +308,9 @@ def _wgrad_k_hook(flag_base, src, epoch, horizon_slot, **c):
 
     A wait drains the wave's prefetches and costs a system-scope round trip, and a hook in the chunk
     loop slows it even when it does not wait (a wgrad tile ran 2.4x as long). So the tile first polls
-    the flags of its first ``_LOOKAHEAD`` m-tiles at once: the chunks they cover run a loop without
-    the hook (all of them once the exchange is done). Past them each wave keeps a horizon in LDS
-    (``horizon_slot``), every m-tile below which has landed: the prologue polls the next
+    the flags of its first ``_LOOKAHEAD`` m-tiles at once, and of all of them: the chunks they cover
+    run a loop without the hook (all of them once the exchange is done). Past them each wave keeps a
+    horizon in LDS (``horizon_slot``), every m-tile below which has landed: the prologue polls the next
     ``_LOOKAHEAD`` m-tiles without blocking and moves it past them when all have landed, and chunks
     below the horizon skip the wait. A wait itself does not poll ahead: with the rows still in
     flight that only costs (Qwen3-30B bwd QKV 8K +3 %)."""
@@ -335,6 +342,21 @@ def _wgrad_k_hook(flag_base, src, epoch, horizon_slot, **c):
     first = min(look, m_tiles)
     first_landed = _all_reached(flag_base, slots([fx.Int32(t) for t in range(first)]), epoch)
     landed = arith.select(first_landed, fx.Int32(first), fx.Int32(0))
+    if m_tiles > first:
+        # Started after the exchange (most wgrad tiles): the whole walk without the hook. Past the
+        # horizon every chunk would wait, and each wait drains the prefetches (GLM-4.7 128K: ~100
+        # per tile, 1230 vs 790 us). One flag per lane and m-tile, one ballot.
+        lane = fx.thread_idx.x % fx.Int32(WARP)
+        ok = None
+        for j in range(ceildiv(m_tiles, WARP)):
+            t = lane + fx.Int32(j * WARP)
+            r = _all_reached(
+                flag_base, slots([arith.select(t < fx.Int32(m_tiles), t, fx.Int32(m_tiles - 1))]), epoch
+            )
+            ok = r if ok is None else ok & r
+        missing = arith.select(ok, fx.Int32(0), fx.Int32(1))
+        all_landed = _wave_count_le_i32(missing, fx.Int32(0)) == fx.Int32(WARP)
+        landed = arith.select(all_landed, fx.Int32(m_tiles), landed)
     # first chunk whose loads reach m-tile ``landed``: hi(k) = k * per_chunk + lead >= landed
     k_hook_from = arith.select(
         landed >= fx.Int32(m_tiles),
