@@ -161,8 +161,15 @@ def grouped_gemm_bf16_variable_k_tile(
     k_hook_from=None,
     a_split=None,
     store_c=None,
+    acc_in=None,
+    acc_out=None,
 ):
-    """``a_split=(A_hi, lo_stride, hi_stride, lo_col, hi_col)``: the tile's two A column halves
+    """``acc_in=(cond, load)``: when ``cond`` (block-uniform i1) the accumulators start from
+    ``load(i)`` (fp32 x 4 vector ``i`` of a lane's accumulators) instead of zero; ``acc_out=(save_cond,
+    store_cond, save)``: ``save(i, vec)`` each vector when ``save_cond``, the store of ``C`` only when
+    ``store_cond``. A tile run over consecutive
+    row ranges that hands its accumulators on this way computes the bits of one pass.
+    ``a_split=(A_hi, lo_stride, hi_stride, lo_col, hi_col)``: the tile's two A column halves
     (``BLOCK_M // 2`` each) start at column ``lo_col`` of ``A`` and ``hi_col`` of ``A_hi``, whose
     rows are ``lo_stride`` / ``hi_stride`` elements apart (compile time), instead of ``A``'s
     ``block_m * BLOCK_M`` onward. ``store_c`` (an object with ``StoreCBf16.store_band16``) replaces
@@ -274,6 +281,13 @@ def grouped_gemm_bf16_variable_k_tile(
     for quad in (acc00, acc01, acc10, acc11):
         for reg in quad:
             fx.memref_store_vec(mfma.zero_value, reg)
+    if const_expr(acc_in is not None):
+
+        def _restore():
+            for i, reg in enumerate(acc00 + acc01 + acc10 + acc11):
+                fx.memref_store_vec(acc_in[1](i), reg)
+
+        emit_if_then(acc_in[0], _restore)
 
     # Predicate the over-launched quadrants behind one wave-uniform branch, not a second tile class.
     quad_live = _tail_quad_conds(
@@ -404,33 +418,48 @@ def grouped_gemm_bf16_variable_k_tile(
     c10 = [Vec(fx.memref_load_vec(reg)) for reg in acc10]
     c11 = [Vec(fx.memref_load_vec(reg)) for reg in acc11]
 
-    if const_expr(trans_c):
-        local_m = block_m * BLOCK_M + wave_m * (NTA16 * 16)
-        local_n = block_n * BLOCK_N + wave_n * (NTB16 * 16)
-        for cfrag, q_row, q_col in (
-            (c00, local_m, local_n),
-            (c01, local_m, local_n + LDS_BLOCK_N),
-            (c10, local_m + LDS_BLOCK_M, local_n),
-            (c11, local_m + LDS_BLOCK_M, local_n + LDS_BLOCK_N),
-        ):
-            for i in range_constexpr(NTA16):
-                for j in range_constexpr(NTB16):
-                    store_c.store_trans16(
-                        [cfrag[i * NTB16 + j]],
-                        group_idx,
-                        q_row + i * 16,
-                        q_col + j * 16,
-                        OUT_M,
-                        OUT_N,
-                        mask_m=MASK_M,
-                    )
+    def _store():
+        if const_expr(trans_c):
+            local_m = block_m * BLOCK_M + wave_m * (NTA16 * 16)
+            local_n = block_n * BLOCK_N + wave_n * (NTB16 * 16)
+            for cfrag, q_row, q_col in (
+                (c00, local_m, local_n),
+                (c01, local_m, local_n + LDS_BLOCK_N),
+                (c10, local_m + LDS_BLOCK_M, local_n),
+                (c11, local_m + LDS_BLOCK_M, local_n + LDS_BLOCK_N),
+            ):
+                for i in range_constexpr(NTA16):
+                    for j in range_constexpr(NTB16):
+                        store_c.store_trans16(
+                            [cfrag[i * NTB16 + j]],
+                            group_idx,
+                            q_row + i * 16,
+                            q_col + j * 16,
+                            OUT_M,
+                            OUT_N,
+                            mask_m=MASK_M,
+                        )
+        else:
+            base_row = group_idx * OUT_M + block_m * BLOCK_M + wave_m * (NTA16 * 16)
+            row_bound = (group_idx + 1) * OUT_M
+            base_col = block_n * BLOCK_N + wave_n * (NTB16 * 16)
+            # Both column halves share the band SRD and every row address; only the store immediate differs.
+            for cfrags, q_row in (((c00, c01), base_row), ((c10, c11), base_row + LDS_BLOCK_M)):
+                store_c.store_band16(
+                    cfrags, q_row, base_col, LDS_BLOCK_N, NTA16, NTB16, row_bound, mask_n=MASK_N
+                )
+
+    if const_expr(acc_out is None):
+        _store()
     else:
-        base_row = group_idx * OUT_M + block_m * BLOCK_M + wave_m * (NTA16 * 16)
-        row_bound = (group_idx + 1) * OUT_M
-        base_col = block_n * BLOCK_N + wave_n * (NTB16 * 16)
-        # Both column halves share the band SRD and every row address; only the store immediate differs.
-        for cfrags, q_row in (((c00, c01), base_row), ((c10, c11), base_row + LDS_BLOCK_M)):
-            store_c.store_band16(cfrags, q_row, base_col, LDS_BLOCK_N, NTA16, NTB16, row_bound, mask_n=MASK_N)
+        save_cond, store_cond, save = acc_out
+
+        def _save():
+            for i, v in enumerate(c00 + c01 + c10 + c11):
+                save(i, v)
+
+        emit_if_then(save_cond, _save)
+        emit_if_then(store_cond, _store)
     if const_expr(persistent == "staggered"):
         # pairs with the high half's last barrier: past it no wave reads this tile's LDS
         if (wave_m == 0) & (group_tokens > 0):

@@ -59,6 +59,7 @@ from primus_turbo.flydsl.ulysses.common import (
     opaque_base,
     opaque_tid,
     read_clock,
+    spin_flag,
     spin_flags,
 )
 from primus_turbo.flydsl.ulysses.workspace import (
@@ -81,7 +82,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     make_row_band_resource,
     make_value_attrs,
 )
-from primus_turbo.flydsl.utils.prims import _readfirstlane_i32, ceildiv, ld, memory_fence, st
+from primus_turbo.flydsl.utils.prims import _i64, _readfirstlane_i32, ceildiv, ld, memory_fence, st
 
 # 16 B vectors whose loads are issued before their stores
 _BATCH = 8
@@ -296,10 +297,11 @@ def _arrival_k_seg(flag_base, tile_m, epoch, trace_base=None, trace_idx=None, la
     return _ArrivalKSeg()
 
 
-def _wgrad_k_hook(flag_base, src, epoch, horizon_slot, **c):
-    """Waits of a weight-gradient tile, whose ``A`` columns all come from source ``src``: before the
-    loads of K chunk ``k`` (``_WGRAD_CHUNK_ROWS`` rows, two 64-row steps prefetched past it), the
-    m-tiles those loads reach; only ``src``'s flags. Returns ``(hook, k_hook_from)``.
+def _wgrad_k_hook(flag_base, src, epoch, horizon_slot, m0, **c):
+    """Waits of a weight-gradient tile part, whose ``A`` columns all come from source ``src`` and
+    rows from the m-tiles ``[m0, m0 + m_tiles / wgrad_split)``: before the loads of its K chunk
+    ``k`` (``_WGRAD_CHUNK_ROWS`` rows, two 64-row steps prefetched past it), the m-tiles those loads
+    reach; only ``src``'s flags. Returns ``(hook, k_hook_from)``.
 
     A wait drains the wave's prefetches and costs a system-scope round trip, and a hook in the chunk
     loop slows it even when it does not wait (a wgrad tile ran 2.4x as long). So the tile first polls
@@ -310,7 +312,8 @@ def _wgrad_k_hook(flag_base, src, epoch, horizon_slot, **c):
     below the horizon skip the wait. A wait itself does not poll ahead: with the rows still in
     flight that only costs (Qwen3-30B bwd QKV 8K +3 %)."""
     num_ranks, S, rank, BM = c["num_ranks"], c["push_split"], c["rank"], c["BM"]
-    m_tiles = ceildiv(c["M"], BM)
+    # m-tiles of the part, counted from m0
+    m_tiles = ceildiv(c["M"], BM) // c["wgrad_split"]
     per_chunk = _WGRAD_CHUNK_ROWS // BM
     # last row a chunk loads: (k + 1) * CHUNK_ROWS + 2 * 64 - 1
     lead = (_WGRAD_CHUNK_ROWS + 2 * 64 - 1) // BM
@@ -322,7 +325,9 @@ def _wgrad_k_hook(flag_base, src, epoch, horizon_slot, **c):
 
     def slots(tiles):
         return [
-            (t * fx.Int32(S) + fx.Int32(sub)) * fx.Int32(num_ranks) + src for t in tiles for sub in range(S)
+            ((t + m0) * fx.Int32(S) + fx.Int32(sub)) * fx.Int32(num_ranks) + src
+            for t in tiles
+            for sub in range(S)
         ]
 
     def wait(tiles):
@@ -412,18 +417,75 @@ def _wait_all(thread_index, flag_base, tile_m, epoch, **c):
     memory_fence(order="acquire", scope="sys")
 
 
+def _part_flag(w, part, **c):
+    """This rank's flag of part ``part`` of wgrad tile ``w`` being done, past the push flags."""
+    return fx.Int32(c["wflag_at"]) + part * fx.Int32(c["num_wtiles"]) + w
+
+
 @ASTRewriter.transform
-def _wgrad_tile(thread_index, w, flag_base, recv_addr, XB, DW, lds, horizon_slot, epoch, trace_base, **c):
-    """``DW[tile] = A[:, tile rows]^T @ XB[:, tile cols]`` over all of M (the variable-K wgrad tile),
-    in row order, each chunk after the m-tiles it reads have landed (``_wgrad_k_hook``)."""
-    M, K, N, BMw, BN = c["M"], c["K"], c["N"], c["BMw"], c["BN"]
+def _wait_flag(thread_index, flag_base, slot, epoch, **c):
+    """Block-wide wait for one of this rank's own flags (agent scope: no peer wrote what it guards)."""
+    if thread_index == fx.Int32(0):
+        spin_flag(flag_base, slot, epoch, c["rank"], -1, "a2a_gemm wgrad part")
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    memory_fence(order="acquire", scope="agent")
+
+
+@ASTRewriter.transform
+def _raise_flag(thread_index, flag_base, slot, epoch):
+    """This block's stores so far (system scope) are retired, then ``slot`` = ``epoch``."""
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    if thread_index == fx.Int32(0):
+        st(flag_base, slot, epoch, scope="sys", order="relaxed")
+
+
+@ASTRewriter.transform
+def _wgrad_tile(
+    thread_index, w, part, flag_base, recv_addr, XB, DW, WACC, lds, horizon_slot, epoch, trace_base, **c
+):
+    """``DW[tile] = A[:, tile rows]^T @ XB[:, tile cols]`` (the variable-K wgrad tile) over part
+    ``part`` of the ``wgrad_split`` row ranges of M, in row order, each chunk after the m-tiles it reads
+    have landed (``_wgrad_k_hook``). A part starts from the fp32 accumulators the previous part of the
+    tile left in ``WACC`` and leaves its own there, so the result has the bits of one pass over M."""
+    M, K, N, BMw, BN, S_w = c["M"], c["K"], c["N"], c["BMw"], c["BN"], c["wgrad_split"]
     wn_tiles = N // BN
     tile_k, tile_n = w // fx.Int32(wn_tiles), w % fx.Int32(wn_tiles)
+    # trace slot of the part
+    tw = part * fx.Int32(c["num_wtiles"]) + w
     if const_expr(trace_base is not None):
         if thread_index == fx.Int32(0):
-            st(trace_base, fx.Int32(c["trace_wgrad_at"]) + w * fx.Int32(2), read_clock())
+            st(trace_base, fx.Int32(c["trace_wgrad_at"]) + tw * fx.Int32(2), read_clock())
     src = tile_k * fx.Int32(BMw) // fx.Int32(c["K_r"])
-    k_hook, k_hook_from = _wgrad_k_hook(flag_base, src, epoch, horizon_slot, **c)
+    seg_rows = M // S_w
+    k_hook, k_hook_from = _wgrad_k_hook(
+        flag_base, src, epoch, horizon_slot, part * fx.Int32(seg_rows // c["BM"]), **c
+    )
+    acc_in, acc_out = None, None
+    if const_expr(S_w > 1):
+        tile_bytes = BMw * BN * 4
+        # a lane's accumulator vectors, each 16 B apart across the block
+        acc_res = create_buffer_resource_from_addr(
+            i64_base(WACC) + _i64(w) * fx.Int64(tile_bytes), num_records_bytes=tile_bytes
+        )
+
+        # one lane offset, the vector's in soffset: per-vector lane offsets get hoisted, spilled and
+        # reloaded before each access, which serialises the 32 of them (a part ran ~25 us longer)
+        lane_f32 = thread_index * fx.Int32(4)
+
+        def save(i, v):
+            buffer_store(v, acc_res, lane_f32, cache_modifier=SYS_NT, soffset_bytes=i * BLOCK_THREADS * 16)
+
+        def load(i):
+            return buffer_load(
+                acc_res, lane_f32, vec_width=4, dtype=fx.T.f32, soffset_bytes=i * BLOCK_THREADS * 16
+            )
+
+        acc_in = (part > fx.Int32(0), load)
+        acc_out = (part < fx.Int32(S_w - 1), part == fx.Int32(S_w - 1), save)
+        if part > fx.Int32(0):
+            _wait_flag(thread_index, flag_base, _part_flag(w, part - fx.Int32(1), **c), epoch, **c)
     grouped_gemm_bf16_variable_k_tile(
         None,
         XB,
@@ -431,8 +493,8 @@ def _wgrad_tile(thread_index, w, flag_base, recv_addr, XB, DW, lds, horizon_slot
         fx.Int32(0),
         tile_k,
         tile_n,
-        fx.Int32(0),
-        fx.Int32(M),
+        part * fx.Int32(seg_rows),
+        part * fx.Int32(seg_rows) + fx.Int32(seg_rows),
         lds,
         fx.Int32(K),
         fx.Int32(N),
@@ -446,11 +508,16 @@ def _wgrad_tile(thread_index, w, flag_base, recv_addr, XB, DW, lds, horizon_slot
         a_base=recv_addr,
         k_hook=k_hook,
         k_hook_from=k_hook_from,
+        acc_in=acc_in,
+        acc_out=acc_out,
     )
+    if const_expr(S_w > 1):
+        if part < fx.Int32(S_w - 1):
+            _raise_flag(thread_index, flag_base, _part_flag(w, part, **c), epoch)
     if const_expr(trace_base is not None):
         fx.rocdl.s_waitcnt(0)
         if thread_index == fx.Int32(0):
-            st(trace_base, fx.Int32(c["trace_wgrad_at"]) + w * fx.Int32(2) + 1, read_clock())
+            st(trace_base, fx.Int32(c["trace_wgrad_at"]) + tw * fx.Int32(2) + 1, read_clock())
 
 
 @ASTRewriter.transform
@@ -466,21 +533,71 @@ def _tile_loop(
     OG,
     XB,
     DW,
+    WACC,
     lds,
     epoch,
     trace_base,
     **c,
 ):
     """Claim tiles until none are left: the ``num_wtiles`` weight-gradient tiles sit at claim
-    positions ``[wgrad_at, wgrad_at + num_wtiles)``, the GEMM tiles around them."""
-    num_tiles, num_wtiles, w_at = c["num_tiles"], c["num_wtiles"], c["wgrad_at"]
+    positions ``[wgrad_at, wgrad_at + num_wtiles)``, the GEMM tiles around them. Split over
+    ``wgrad_split`` row ranges, each range's GEMM tiles come first, then that part of every wgrad tile."""
+    num_tiles, num_wtiles, w_at, S_w = c["num_tiles"], c["num_wtiles"], c["wgrad_at"], c["wgrad_split"]
+    seg_tiles = num_tiles // S_w
     q = claim_unit(thread_index, state_base, claim_slot, STATE_TILE)
-    while q < fx.Int32(num_tiles + num_wtiles):
-        if const_expr(num_wtiles > 0):
+    while q < fx.Int32(num_tiles + S_w * num_wtiles):
+        if const_expr(num_wtiles > 0 and S_w > 1):
+            part = q // fx.Int32(seg_tiles + num_wtiles)
+            r = q - part * fx.Int32(seg_tiles + num_wtiles)
+            if r >= fx.Int32(seg_tiles):
+                _wgrad_tile(
+                    thread_index,
+                    r - fx.Int32(seg_tiles),
+                    part,
+                    flag_base,
+                    recv_addr,
+                    XB,
+                    DW,
+                    WACC,
+                    lds,
+                    claim_slot,
+                    epoch,
+                    trace_base,
+                    **c,
+                )
+            else:
+                _gemm_tile(
+                    thread_index,
+                    part * fx.Int32(seg_tiles) + r,
+                    flag_base,
+                    claim_slot,
+                    recv_addr,
+                    W,
+                    Y,
+                    RES,
+                    OG,
+                    lds,
+                    epoch,
+                    trace_base,
+                    **c,
+                )
+        elif const_expr(num_wtiles > 0):
             w = q - fx.Int32(w_at)
             if (w >= fx.Int32(0)) & (w < fx.Int32(num_wtiles)):
                 _wgrad_tile(
-                    thread_index, w, flag_base, recv_addr, XB, DW, lds, claim_slot, epoch, trace_base, **c
+                    thread_index,
+                    w,
+                    fx.Int32(0),
+                    flag_base,
+                    recv_addr,
+                    XB,
+                    DW,
+                    WACC,
+                    lds,
+                    claim_slot,
+                    epoch,
+                    trace_base,
+                    **c,
                 )
             else:
                 qd = arith.select(q < fx.Int32(w_at), q, q - fx.Int32(num_wtiles))
@@ -628,6 +745,7 @@ def _make_kernel(
     num_cus,
     BMw=0,
     wgrad_at=0,
+    wgrad_split=1,
     trace=False,
 ):
     assert K % num_ranks == 0 and N % VEC_BF16 == 0 and head_dim % VEC_BF16 == 0
@@ -660,6 +778,14 @@ def _make_kernel(
     push_split = push_split if stagger else 1
     assert not stagger or K_r % 64 == 0, "a staggered K walk needs whole K chunks per source"
     progressive = K_r % 64 == 0
+    # a part's rows are whole m-tiles and whole wgrad K chunks; its done flags follow the push flags
+    wflag_at = m_tiles * push_split * num_ranks
+    assert wgrad_split == 1 or (
+        BMw
+        and m_tiles % wgrad_split == 0
+        and (M // wgrad_split) % _WGRAD_CHUNK_ROWS == 0
+        and wflag_at + (wgrad_split - 1) * num_wtiles <= FLAGS_PER_REGION
+    )
     # i32 slots: the block-wide broadcast of a claimed unit, then each wave's wgrad horizon
     SharedStorage = _make_shared_storage(
         max(BM, BMw),
@@ -689,6 +815,8 @@ def _make_kernel(
         BMw=BMw,
         num_wtiles=num_wtiles,
         wgrad_at=wgrad_at,
+        wgrad_split=wgrad_split,
+        wflag_at=wflag_at,
         stagger=stagger,
         progressive=progressive,
         N=N,
@@ -712,6 +840,7 @@ def _make_kernel(
         OG: fx.Tensor,
         XB: fx.Tensor,
         DW: fx.Tensor,
+        WACC: fx.Tensor,
         PEER_PTRS: fx.Tensor,
         STATE: fx.Tensor,
         TRACE: fx.Tensor,
@@ -757,6 +886,7 @@ def _make_kernel(
             OG,
             XB,
             DW,
+            WACC,
             lds,
             epoch,
             trace_base,
@@ -778,6 +908,7 @@ def _launch(
     OG,
     XB,
     DW,
+    WACC,
     PEER_PTRS,
     STATE,
     TRACE,
@@ -806,6 +937,7 @@ def _launch(
     num_cus: fx.Constexpr[int],
     BMw: fx.Constexpr[int],
     wgrad_at: fx.Constexpr[int],
+    wgrad_split: fx.Constexpr[int],
     trace: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
@@ -835,6 +967,7 @@ def _launch(
         num_cus,
         BMw,
         wgrad_at,
+        wgrad_split,
         trace,
     )
     kernel(
@@ -847,6 +980,7 @@ def _launch(
         OG,
         XB,
         DW,
+        WACC,
         PEER_PTRS,
         STATE,
         TRACE,
@@ -879,6 +1013,7 @@ def ulysses_a2a_gemm(
     wgrad=None,
     BMw=256,
     wgrad_at=None,
+    wgrad_split=None,
     trace=None,
 ):
     """``o`` this rank's heads over the full sequence (``qkv_format`` row order): one ``[n * M, K_r]``
@@ -889,7 +1024,8 @@ def ulysses_a2a_gemm(
 
     ``wgrad=(x, dw)`` (``nn`` only) also computes ``dw = A^T @ x`` (``x`` ``[M, N]``, ``dw``
     ``[K, N]``) in the same kernel, from ``BMw x 256`` tiles placed at claim position ``wgrad_at``
-    (default: by shape, see below)."""
+    (default: by shape, see below), or with ``wgrad_split > 1`` in that many parts over consecutive
+    row ranges of M, part ``j`` claimed after range ``j``'s GEMM tiles (``wgrad_at`` unused)."""
     num_ranks = workspace.num_ranks
     if isinstance(o, torch.Tensor):
         head_dim = head_dim or o.shape[-1]
@@ -956,6 +1092,19 @@ def ulysses_a2a_gemm(
         BM = 256 if fits or wgrad_last or gemm_bound else 128
     if wgrad_at is None:
         wgrad_at = ceildiv(M, BM) * ceildiv(N, BN) if wgrad_last else 0
+    if wgrad is None:
+        wgrad_split = 1
+    elif wgrad_split is None:
+        # Behind all GEMM tiles the wgrad tiles run after the last rows land; in two halves of M the
+        # first runs on landed rows during the exchange (32K bwd QKV n = 4: MiniMax-M2.5 1106 -> 1018 us).
+        # Not over two waves of wgrad tiles (GLM-4.7 n = 4 2413 -> 2470: the GEMM dominates and each
+        # hand-over moves 256 KB per tile), nor with the wgrad tiles first (Qwen3-30B 529 -> 535);
+        # 4 parts lose to 2 everywhere.
+        flags = ceildiv(M, BM) * push_split * num_ranks + num_wtiles
+        halves = wgrad_last and not many_wtiles and M % (2 * 256) == 0 and flags <= FLAGS_PER_REGION
+        wgrad_split = 2 if halves else 1
+    # fp32 accumulators a wgrad tile part hands to the next (one buffer: the parts run in order)
+    wacc = torch.empty(K * N, dtype=torch.float32, device=y.device) if wgrad_split > 1 else y
     run_launcher(
         _launch,
         oq,
@@ -967,6 +1116,7 @@ def ulysses_a2a_gemm(
         y if o_gathered is None else o_gathered,
         y if wgrad is None else wgrad[0],
         y if wgrad is None else wgrad[1],
+        wacc,
         workspace.peer_ptrs,
         workspace.state,
         workspace.state if trace is None else trace,
@@ -993,6 +1143,7 @@ def ulysses_a2a_gemm(
         num_cus,
         BMw if wgrad is not None else 0,
         wgrad_at if wgrad is not None else 0,
+        wgrad_split,
         trace is not None,
         torch.cuda.current_stream(),
     )

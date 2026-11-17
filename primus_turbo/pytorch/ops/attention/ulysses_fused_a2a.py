@@ -80,12 +80,16 @@ class A2AGemmTuning:
         wgrad_at: claim slot of the in-kernel wgrad tiles (backward QKV only; 0, or after every
             dgrad tile when the GEMM outweighs the exchange, ``N * n >= 4096 * (n - 1)``, or there
             are more than 2x CU wgrad tiles).
+        wgrad_split: row ranges of M the wgrad tiles run in, each part after that range's GEMM tiles
+            and handing its fp32 accumulators to the next, bitwise equal to one pass (backward QKV
+            only; 2 when the wgrad tiles go last and fit in two waves, else 1).
     """
 
     BM: Optional[int] = None
     num_push: Optional[int] = None
     push_split: Optional[int] = None
     wgrad_at: Optional[int] = None
+    wgrad_split: Optional[int] = None
 
 
 def _launch_kwargs(tuning, **defaults):
