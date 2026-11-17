@@ -8,17 +8,16 @@ on:
 
 jobs:
   probe:
-    runs-on: primus-turbo-mi355
-    timeout-minutes: 90
-    env:
-      TEST_IMAGE: harbor.global.primus-safe.amd.com/sync/rocm/primus:v26.8
+    runs-on: turbo-torch-ut-mi355-v2608
+    timeout-minutes: 30
     steps:
       - name: Runner container
         run: |
           set -x
-          id; hostname; nproc; free -g; df -h / /home/runner/_work || true
+          id; hostname; nproc; free -g; df -h / "$GITHUB_WORKSPACE" || true
           ls -l /dev/kfd /dev/dri 2>&1 || true
-          env | grep -iE "^(POD_NAME|SAFE_|GITHUB_RUNNER|DOCKER_HOST|HIP_|ROCR_|CUDA_|NVIDIA_|AMD_)" | sort || true
+          df -h /dev/shm
+          env | grep -iE "^(POD_NAME|SAFE_|HIP_|ROCR_|AMD_|NVTE_|PRIMUS_)" | sort || true
       - name: Shared storage
         run: |
           set -x
@@ -31,22 +30,10 @@ jobs:
           for u in https://github.com https://pypi.org/simple/pip/ https://registry-1.docker.io/v2/ https://harbor.global.primus-safe.amd.com/v2/ https://huggingface.co; do
             printf '%-55s ' "$u"; curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' --max-time 20 "$u" || echo FAIL
           done
-      - name: Docker in docker
+      - name: GPU
         run: |
-          set -x
-          docker info | grep -E "Server Version|Storage Driver|Docker Root Dir|Total Memory|CPUs"
-          time docker pull -q docker.io/library/busybox:latest
-          time docker pull -q "$TEST_IMAGE"
-          docker images
-      - name: GPU inside dind container
-        run: |
-          docker run --rm --network host --ipc host --privileged \
-            --group-add video --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
-            --device /dev/kfd --device /dev/dri --shm-size 64G \
-            "$TEST_IMAGE" bash -lc '
-              set -x
-              ls /dev/dri | head; rocm-smi --showproductname 2>/dev/null | head -20 || amd-smi static -a 2>/dev/null | head -20
-              python3 - <<PY
+          rocm-smi --showproductname 2>/dev/null | head -20 || amd-smi static -a 2>/dev/null | head -20
+          python3 - <<'PY'
           import torch
           n = torch.cuda.device_count()
           print("device_count", n)
@@ -55,4 +42,4 @@ jobs:
               print(i, p.name, p.gcnArchName, round(p.total_memory / 2**30), "GiB")
           a = torch.randn(4096, 4096, device="cuda:0", dtype=torch.bfloat16)
           print("matmul ok", float((a @ a).float().abs().mean()))
-          PY'
+          PY
