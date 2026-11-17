@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_ATTN_BACKEND: str | None = None
     PRIMUS_TURBO_SPARSE_ATTN_BACKEND: str | None = None
     PRIMUS_TURBO_MLA_BWD_IMPL: str = "flydsl"
+    PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB: int = 5120
     PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND: str | None = None
     PRIMUS_TURBO_AUTO_TUNE: bool = False
     PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32: bool = True
@@ -58,6 +59,7 @@ if TYPE_CHECKING:
     PT_MEGA_FP8_L2_COMBINE_CU: int | None = None
     PRIMUS_TURBO_DEEPEP_CPU_TIMEOUT: int = 300
     PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE: bool = False
+    PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD: str = "off"
     PRIMUS_TURBO_ODC_GDA_BLOCK: int = 256
     PRIMUS_TURBO_ODC_GDA_PIPE: int = 1
     PRIMUS_TURBO_ODC_GDA_NUM_QP: int = 1
@@ -77,14 +79,30 @@ def backend_spec(name: str) -> Callable[[], str | None]:
     return _get
 
 
-def _positive_int(name: str, raw: str, what: str) -> int:
+def _int_at_least(name: str, raw: str, what: str, minimum: int) -> int:
     try:
         value = int(raw)
     except ValueError:
-        value = 0
-    if value <= 0:
+        value = minimum - 1
+    if value < minimum:
         raise ValueError(f"{name}={raw!r}: {what}")
     return value
+
+
+def _positive_int(name: str, raw: str, what: str) -> int:
+    return _int_at_least(name, raw, what, 1)
+
+
+def env_choice(name: str, default: str, choices: tuple[str, ...]) -> Callable[[], str]:
+    """A getter for one of ``choices``; unset or empty reads as ``default``."""
+
+    def _get() -> str:
+        value = (os.getenv(name) or default).strip().lower()
+        if value not in choices:
+            raise ValueError(f"{name}={value!r}: must be one of {', '.join(choices)}")
+        return value
+
+    return _get
 
 
 def env_positive_int(
@@ -96,6 +114,19 @@ def env_positive_int(
     def _get() -> int | None:
         raw = os.getenv(name)
         return _positive_int(name, raw, what) if raw else default
+
+    return _get
+
+
+def env_non_negative_int(
+    name: str, default: int, what: str = "must be a non-negative integer"
+) -> Callable[[], int]:
+    """A getter for a non-negative integer; unset or empty reads as ``default``, anything else that is
+    not a non-negative integer raises ``ValueError`` naming the variable."""
+
+    def _get() -> int:
+        raw = os.getenv(name)
+        return _int_at_least(name, raw, what, 0) if raw else default
 
     return _get
 
@@ -181,6 +212,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # cannot take to FlyDSL (e.g. seqlen_q % 384 not 0 or 256, see their README). Read at the first
     # MLA backward (attention_flydsl_gfx1250_mla_impl.mla_bwd_impl); another value raises ValueError.
     "PRIMUS_TURBO_MLA_BWD_IMPL": _mla_bwd_impl,
+    # Most dS scratch, in MiB, the FlyDSL gfx1250 MLA backward holds at once (5120 when unset). The backward stores dS
+    # between its dK / dV and dQ kernels, about batch * heads * seqlen_q * seqlen_kv bytes in all (4.33 GB at b2 s4096
+    # h128): all heads on one scratch when that is within this, else the heads in chunks, two in flight, that are
+    # (gfx1250_mla.bwd.ds_chunkings; a few percent slower); below two heads' scratch (0 included) it runs one head at
+    # a time, on that one head's scratch even when it is over this (about batch * seqlen_q * seqlen_kv bytes: 16 GiB
+    # at seqlen 131072; a device without that much free memory raises torch.OutOfMemoryError). Read at every MLA
+    # backward (through the cache); a value that is not a non-negative integer raises ValueError.
+    "PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB": env_non_negative_int(
+        "PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB", 5120, "expected a non-negative integer (MiB)"
+    ),
     # MoE dispatch/combine EP backend: TURBO (the default when unset), DEEP_EP, or a custom EP name
     # such as UCCL_EP. "autotune" is rejected with an AssertionError.
     "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend_spec("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"),
@@ -259,6 +300,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # C++ caches it separately in the dispatch and combine launchers, each at its first call.
     "PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE": lambda: (
         int(os.getenv("PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE") or "0") != 0
+    ),
+    # The flydsl_v2 guards for TDM operations lost while KFD evicts a queue. "off" (default):
+    # neither guard; "redo": move a row again when one pass takes more than 0.5 ms; "all":
+    # also compare 32 words of every TDM load with its source and reload stale data.
+    "PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD": env_choice(
+        "PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD", "off", ("off", "redo", "all")
     ),
     # ODC (on-demand-comm) rocSHMEM GDA device-kernel knobs, consumed by
     # csrc/kernels/odc_rocshmem/odc_rocshmem_gda.cu for the multi-node reduce-scatter /
