@@ -22,7 +22,8 @@ The intranode kernels implement the data transfer of the two versions of upstrea
   so it is sized by the token count and is larger than V1's rings.
 
 Both versions take the same `Buffer` API and give bit-identical outputs. Today Primus-Turbo runs V1
-on MI300X / MI325X / MI355X and V2 on MI455X; the version is picked by the GPU, not by the user.
+on MI300X / MI325X / MI355X and V2 on MI455X; the version is picked by the GPU, not by the user,
+and `buffer.intranode_backend` reports it (`"v1"` or `"v2"`).
 
 ## Support matrix
 
