@@ -17,6 +17,8 @@ Note: JAX support is under active development. Optim support is planned but not 
 
 👉 **[Scope and Supported Operators](./docs/supported_ops.md)** — the full list of operators, modules, precisions, and kernel backends.
 
+👉 **[Feature Index](./docs/features/README.md)** — the maturity level (Experimental / Beta / Stable) of each feature, and its Feature Card.
+
 | Category | Operators |
 |---|---|
 | GEMM | `gemm` (BF16/FP16), `gemm_fp8` (tensorwise / rowwise / blockwise / MXFP8), `gemm_fp4` (MXFP4), `mlp_fp4` |
@@ -54,7 +56,7 @@ Note: JAX support is under active development. Optim support is planned but not 
 - PyTorch >= 2.6.0 (with ROCm support)
 - [AITER](https://github.com/ROCm/aiter) (required for some operators, e.g. FlashAttention / FP8): `pip3 install "amd-aiter @ git+https://github.com/ROCm/aiter.git@v0.1.24.post1"`
 - [FlyDSL](https://github.com/ROCm/FlyDSL) (required; provides the FlyDSL kernel backend for GEMM / GroupedGEMM / Attention / MoE)
-- rocSHMEM (optional, required for **experimental DeepEP**). Please refer to our [DeepEP Installation Guide](primus_turbo/pytorch/deep_ep/README.md) for instructions.
+- rocSHMEM (optional, required for **internode DeepEP**). Please refer to our [DeepEP Installation Guide](primus_turbo/pytorch/deep_ep/README.md) for instructions.
 
 #### Hardware
 | Architecture | Supported GPUs      |

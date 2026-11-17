@@ -1,6 +1,6 @@
-## DeepEP (experimental)
+## DeepEP
 
-DeepEP of Primus-Turbo is in the experimental stage.
+Maturity: Beta, see the [DeepEP Feature Card](../../../docs/features/deep_ep.md).
 The kernel code of DeepEP is primarily derived from ROCm internal DeepEP (it's still under development). It's **only used for training** and doesn't support low-latency kernels.
 
 ### Installation
@@ -20,12 +20,12 @@ docker.io/rocm/megatron-lm:v25.5_py310
 
 #### 3. Install rocSHMEM (optional)
 
-rocSHMEM is required for internode api of experimental DeepEP. Please refer to [our rocSHMEM Installation Guide](../../../docs/install_dependencies.md) for instructions.
+rocSHMEM is required for internode api of DeepEP. Please refer to [our rocSHMEM Installation Guide](../../../docs/install_dependencies.md) for instructions.
 
 > **Please Note: rocSHMEM is under development, no guarantee of full compatibility and performance for bnxt,mlx5 and ionic NIC driver.**
 
 #### 4. Install from source
-Please following [Primus-Turbo Install from Source](../../../README.md#3-install-from-source) instructions to install.
+Please following [Primus-Turbo Install from Source](../../../README.md#install-from-source) instructions to install.
 
 ### Intranode backend
 
