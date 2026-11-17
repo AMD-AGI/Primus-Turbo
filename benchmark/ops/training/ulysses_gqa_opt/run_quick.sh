@@ -9,7 +9,7 @@ W=${TURBO_ROOT:-$(cd "$HERE/../../../.." && pwd)}
 OUT=$1; shift
 mkdir -p "$OUT"
 : > "$OUT/results.jsonl"
-if pgrep -f torchrun >/dev/null; then echo "stale torchrun"; exit 1; fi
+if pgrep -r D,R,S -f torchrun >/dev/null; then echo "stale torchrun"; exit 1; fi
 export PYTHONPATH=$W FLYDSL_EXTRA_SOURCE_DIRS=$W/primus_turbo/flydsl
 ulimit -c 0
 run() {

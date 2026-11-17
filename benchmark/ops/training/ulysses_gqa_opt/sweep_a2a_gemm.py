@@ -20,11 +20,18 @@ import os
 import torch
 import torch.distributed as dist
 from bench_ulysses_overlap import MODELS, build_ops, timeit
+
 from primus_turbo.pytorch.ops.attention.ulysses_fused_a2a import A2AGemmTuning, _o_gemm_forward, _qkv_backward
 
 p = argparse.ArgumentParser()
 p.add_argument("--model", required=True)
 p.add_argument("--seq", type=int, default=32768)
+p.add_argument("--only", choices=("fwd", "bwd"), default=None)
+p.add_argument("--bm", type=int, nargs="*", default=[128, 256])
+p.add_argument("--push", type=int, nargs="+", default=[8, 16, 32, 48])
+p.add_argument(
+    "--wat", type=float, nargs="+", default=None, help="bwd wgrad_at as fractions of the dgrad tiles"
+)
 a = p.parse_args()
 torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
 dist.init_process_group("nccl")
@@ -50,16 +57,29 @@ def out(tag, us):
         print(f"{a.model} n{n} {a.seq // 1024}K {tag:<44}{us:>8.0f}", flush=True)
 
 
-out("fwd o_proj default", timeit(fwd_default, g))
-for bm, npush, split in itertools.product((128, 256), (8, 16, 32, 48), (8,)):
-    t = A2AGemmTuning(BM=bm, num_push=npush, push_split=split)
+if a.only != "bwd":
+    out("fwd o_proj default", timeit(fwd_default, g))
+    y_ref, og_ref = (t.clone() for t in _o_gemm_forward(o, w_o, res, g, "bshd", True))
+
+
+def fwd_diff(t):
+    y, og = _o_gemm_forward(o, w_o, res, g, "bshd", True, tuning=t)
+    torch.cuda.synchronize()
+    d = torch.tensor([(y.float() - y_ref.float()).abs().max().item(), float(not torch.equal(og, og_ref))])
+    d = d.cuda()
+    dist.all_reduce(d, op=dist.ReduceOp.MAX)
+    return f" maxdiff={d[0].item():.3g}{' OG-MISMATCH' if d[1].item() else ''} (|y| {y_ref.abs().max().item():.3g})"
+
+
+fwd_grid = itertools.product(a.bm, a.push) if a.only != "bwd" else ()
+for bm, npush in fwd_grid:
+    t = A2AGemmTuning(BM=bm, num_push=npush)
+    tag = f"fwd o_proj BM={bm} push={npush}"
     try:
-        out(
-            f"fwd o_proj BM={bm} push={npush} split={split}",
-            timeit(lambda: _o_gemm_forward(o, w_o, res, g, "bshd", True, tuning=t), g),
-        )
+        us = timeit(lambda t=t: _o_gemm_forward(o, w_o, res, g, "bshd", True, tuning=t), g)
+        out(tag + fwd_diff(t), us)
     except Exception as e:
-        out(f"fwd o_proj BM={bm} push={npush} split={split} ERR {type(e).__name__}", -1)
+        out(f"{tag} ERR {type(e).__name__}: {e}"[:200], -1)
 
 
 def bwd_with(t):
@@ -68,15 +88,18 @@ def bwd_with(t):
 
 
 ctx.bwd_tuning = None
-out("bwd QKV default", timeit(bwd_default, g))
-for bm, npush, last in itertools.product((128, 256), (8, 16, 32, 48), (False, True)):
-    t = A2AGemmTuning(BM=bm, num_push=npush, wgrad_at=dgrad_tiles(bm) if last else 0)
+if a.only != "fwd":
+    out("bwd QKV default", timeit(bwd_default, g))
+fracs = a.wat if a.wat is not None else (0.0, 1.0)
+for bm, npush, frac in itertools.product(a.bm, a.push, fracs) if a.only != "fwd" else ():
+    t = A2AGemmTuning(BM=bm, num_push=npush, wgrad_at=int(dgrad_tiles(bm) * frac))
+    last = f"{frac:.2f}"
     try:
         out(
-            f"bwd QKV BM={bm} push={npush} wgrad={'last' if last else 'first'}",
-            timeit(lambda: bwd_with(t), g),
+            f"bwd QKV BM={bm} push={npush} wgrad_at={last}",
+            timeit(lambda t=t: bwd_with(t), g),
         )
     except Exception as e:
-        out(f"bwd QKV BM={bm} push={npush} wgrad={'last' if last else 'first'} ERR {type(e).__name__}", -1)
+        out(f"bwd QKV BM={bm} push={npush} wgrad_at={last} ERR {type(e).__name__}", -1)
 dist.barrier()
 dist.destroy_process_group()
