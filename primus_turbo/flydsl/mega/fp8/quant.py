@@ -63,6 +63,7 @@ from primus_turbo.flydsl.mega.fp8.gemm_helper import (
 )
 from primus_turbo.flydsl.utils import buffer_ops as _buffer_ops
 from primus_turbo.flydsl.utils.buffer_ops import buffer_load, buffer_store, create_buffer_resource
+from primus_turbo.flydsl.utils.launch_cache import run_launcher
 from primus_turbo.flydsl.utils.prims import ceildiv
 
 MXFP8_BLOCK = 32  # mxfp8 block (elements per E8M0 scale)
@@ -646,7 +647,8 @@ def colwise_requant_mxfp8_grouped_fp8in_flydsl(
     n_mwg = n_pblk // MB
     xq = q_in.view(torch.uint8)
     xs = s_in.contiguous().view(torch.uint8)
-    _compile_colwise_requant_grouped_fp8in(F, is_e5m2_out, BT, MB)(
+    run_launcher(
+        _compile_colwise_requant_grouped_fp8in(F, is_e5m2_out, BT, MB),
         xq,
         xs,
         q,
@@ -699,7 +701,8 @@ def _compile_dw2_colwise_dual_launch(
         n_mwg,
         stream: fx.Stream,
     ):
-        launch_a(
+        run_launcher(
+            launch_a,
             XQ,
             XS,
             QA,
@@ -713,7 +716,8 @@ def _compile_dw2_colwise_dual_launch(
             n_mwg,
             stream=stream,
         )
-        launch_b(
+        run_launcher(
+            launch_b,
             XB,
             QB,
             SB,

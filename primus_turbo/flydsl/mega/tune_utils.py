@@ -16,11 +16,15 @@
 import json
 import os
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 # subclass flydsl's autotuner; reuse its Config verbatim
 from flydsl import Config
 from flydsl.autotune import Autotuner as _BaseAutotuner
+from flydsl.compiler.jit_function import JitFunction
+from flydsl.compiler.kernel_function import CompilationContext
+
+from primus_turbo.flydsl.utils.launch_cache import bind_args, run_launcher
 
 try:
     import fcntl  # POSIX advisory file lock for the shared config cache
@@ -86,13 +90,26 @@ class Autotuner(_BaseAutotuner):
             return super().__call__(*args, **kwargs)
 
     def _run_config(self, config, args, kwargs):
-        # The base class switches to the call's stream (torch.cuda.stream) on every launch, ~10 us of
-        # host time; only the reset_to_zero zeroing needs it, the kernel launches on its explicit stream.
-        if self.reset_to_zero:
+        # The base class calls the @flyc.jit function directly, which retraces it on every launch
+        # under flydsl >= 0.5 (see launch_cache), and switches to the call's stream
+        # (torch.cuda.stream), ~10 us; only the reset_to_zero zeroing needs the stream, the kernel
+        # launches on its explicit one.
+        if not isinstance(self.fn, JitFunction):
             return super()._run_config(config, args, kwargs)
         merged = dict(kwargs)
         merged.update(config.all_kwargs())
-        return self._run_with_hints(config.compiler_opts(), args, merged)
+        launch_args = bind_args(self.fn, args, merged)
+        if self.reset_to_zero:
+            with self._stream_context(args, merged):
+                self._reset_tensors(args, merged)
+                self._launch(config, launch_args)
+        else:
+            self._launch(config, launch_args)
+
+    def _launch(self, config, launch_args):
+        opts = config.compiler_opts()
+        with CompilationContext.compile_hints(opts) if opts else nullcontext():
+            run_launcher(self.fn, *launch_args)
 
     def _lock_file(self):
         return self._cache_file.with_suffix(".lock")

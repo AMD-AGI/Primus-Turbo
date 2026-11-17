@@ -33,6 +33,7 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from primus_turbo.flydsl.utils import buffer_ops
 from primus_turbo.flydsl.utils.gemm_helper import xcd_remap_pid
+from primus_turbo.flydsl.utils.launch_cache import run_launcher_cached
 
 _LOG2E = host_math.log2(host_math.e)
 # q rows one dkdv work-group folds per q-loop step. A wider tile, and warp specialisation,
@@ -204,24 +205,13 @@ def _pointer_load(result_type: ir.Type, ptr: ir.Value) -> ir.Value:
 
 
 def _cached_launch(cache, jit_fn, hints, args, kwargs):
-    """Reuse the compiled artifact across calls that share a scalar signature."""
-    if kwargs:
-        if hints is None:
-            return jit_fn(*args, **kwargs)
-        with CompilationContext.compile_hints(hints):
-            return jit_fn(*args, **kwargs)
-    key = tuple(type(a) for a in args[:-1] if not isinstance(a, torch.Tensor))
-    fn = cache.get(key)
-    if fn is None:
-        if len(cache) >= 64:
-            cache.clear()
-        if hints is None:
-            fn = flyc.compile(jit_fn, *args)
-        else:
-            with CompilationContext.compile_hints(hints):
-                fn = flyc.compile(jit_fn, *args)
-        cache[key] = fn
-    return fn(*args)
+    """Launch through the build's own compiled-object cache, which goes with the build."""
+    if len(cache) >= 64:
+        cache.clear()
+    if hints is None:
+        return run_launcher_cached(cache, jit_fn, *args, **kwargs)
+    with CompilationContext.compile_hints(hints):
+        return run_launcher_cached(cache, jit_fn, *args, **kwargs)
 
 
 def _if_wave(cond, vals, then_fn, else_fn):
@@ -5728,9 +5718,10 @@ def _flash_dsink(sink, lse_bhsq, delta, B, Hq, Sq, stream):
     if compiled is None:
         if len(_DSINK_CACHE) >= 64:
             _DSINK_CACHE.clear()
-        compiled = flyc.compile(build_flash_dsink_module(B, Sq, Hq), *args)
-        _DSINK_CACHE[key] = compiled
-    compiled(*args)
+        # the compile runs this launch
+        _DSINK_CACHE[key] = flyc.compile(build_flash_dsink_module(B, Sq, Hq), *args)
+    else:
+        compiled(*args)
     return d_sink
 
 

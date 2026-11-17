@@ -44,6 +44,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     make_bf16_fp16_tile_tensor,
     make_value_attrs,
 )
+from primus_turbo.flydsl.utils.launch_cache import run_launcher
 from primus_turbo.flydsl.utils.prims import (
     atomic_add,
     cast,
@@ -537,7 +538,8 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
         torch.empty(int(symm.num_max_routes), dtype=torch.float32, device=x.device) if has_grad_gate else None
     )
 
-    _compiled_grouped_gemm_combine(
+    run_launcher(
+        _compiled_grouped_gemm_combine,
         x.contiguous(),
         flyc.from_torch_tensor(weight_flat),
         handle.tile_to_expert,

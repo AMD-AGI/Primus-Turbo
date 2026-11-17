@@ -78,6 +78,7 @@ from primus_turbo.flydsl.utils.glu_activation import (
     GLUActivation,
     activation_constexpr,
 )
+from primus_turbo.flydsl.utils.launch_cache import run_launcher
 from primus_turbo.flydsl.utils.prims import ceildiv
 
 _POOL_BLOCK_M = 256
@@ -847,7 +848,8 @@ def swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
     g_part = torch.zeros((n_part, P), dtype=torch.float32, device=l1.device)
     grad_gate = torch.empty((P,), dtype=torch.float32, device=l1.device)
 
-    launch(
+    run_launcher(
+        launch,
         l1,
         dact,
         scale,
@@ -870,5 +872,7 @@ def swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
         stream=fx.Stream(None),  # default stream, unchanged
     )
     # default stream, unchanged
-    _compile_gate_partial_reduce(n_part)(grad_gate, g_part, P, ceildiv(P, 256), stream=fx.Stream(None))
+    run_launcher(
+        _compile_gate_partial_reduce(n_part), grad_gate, g_part, P, ceildiv(P, 256), stream=fx.Stream(None)
+    )
     return q_row, a_sp, q_col, s_col, grad_gate, act_w

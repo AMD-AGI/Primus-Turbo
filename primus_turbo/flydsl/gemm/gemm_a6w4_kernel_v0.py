@@ -40,6 +40,8 @@ from flydsl.expr.typing import (
 )
 from flydsl.expr.typing import Vector as Vec
 
+from primus_turbo.flydsl.utils.launch_cache import run_launcher
+
 _A_ELEM = {"fp4": Float4E2M1FN, "fp6": Float6E2M3FN, "fp8": Float8E4M3FN}
 
 
@@ -538,7 +540,8 @@ def gemm_a6w4(aq, wq, sa, sb, n, k, bias=None):
     ptr = lambda t: flyc.from_c_void_p(fx.Uint8, t.data_ptr())
     if bias is not None:
         bias = bias.to(torch.bfloat16).contiguous()
-    launch_gemm(
+    run_launcher(
+        launch_gemm,
         ptr(c),
         ptr(aq),
         ptr(wq),

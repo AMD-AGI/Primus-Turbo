@@ -558,7 +558,9 @@ if __name__ == "__main__":
     # (rocdl.WMMA, rocdl.make_tdm_atom, rocdl.tdm_ops, rocdl.ds_load_tr16_b128) are all
     # present in it, and the gfx1250 bf16 grouped-GEMM entry points compile under it
     # (0.2.4 was also checked for correct results on gfx1250). Installed on every arch.
-    install_requires.append("flydsl==0.3.4.1")
+    # 0.5.x is admitted too (checked on gfx950); amd-aiter still pins 0.3.4.1, which the range keeps
+    # resolvable. The gfx1250 attention kernels gate on their own FLYDSL_REQUIREMENT.
+    install_requires.append("flydsl>=0.3.4.1,<0.6")
 
     # TODO(ruibin): Triton 3.7.0 does not support gfx1250, so we skip its
     # installation when building for gfx1250.

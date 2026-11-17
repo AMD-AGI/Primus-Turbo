@@ -56,6 +56,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 )
 from primus_turbo.flydsl.utils.prims import ceildiv
 from primus_turbo.flydsl.utils import buffer_ops
+from primus_turbo.flydsl.utils.launch_cache import run_launcher
 from primus_turbo.flydsl.autotune import Compile, NoWorkingConfig, Op, Race, Refine
 from primus_turbo.flydsl.autotune.engine import Entry
 from primus_turbo.flydsl.autotune.policies import Point, Synthetic
@@ -944,7 +945,7 @@ def _pick_mxfp8(key, out, args_for, M, N, K, out_dtype, cbsz, blgp):
     def build(cfg):
         e = _mxfp8_entry(M, N, K, cfg, out_dtype, cbsz, blgp, False)
         args = args_for(e, scratch["out"])
-        return lambda: e.raw(*args)
+        return lambda: run_launcher(e.raw, *args)
 
     def pick(k, space):
         return _GEMM_MXFP8.pick(k, space, probe=Synthetic(probe), build=build)

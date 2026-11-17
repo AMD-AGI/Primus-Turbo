@@ -80,24 +80,16 @@ round-robining across all 8; measured neutral once the contiguous row map
 already collapses a cycle's cos/sin reuse to one 128 B line, but it costs
 nothing extra, so it rides along unconditionally.
 
-Host-side launches go through a small per-configuration call-state cache
-(``_CALL_STATE_CACHE``, keyed on device/shape/dtype — never on tensor ``id()``, see
-Rule 11) that re-dispatches a previously bound FlyDSL launcher directly instead
-of re-binding the signature on every call.
+Host-side launches go through ``flyc.compile``'d objects (``run_compiled``),
+one per configuration in ``_COMPILED``, keyed on device/shape/dtype — never on
+tensor ``id()``, see Rule 11 — so a launch skips the trace a direct
+``@flyc.jit`` call pays.
 
 Campaign round Q6 (host/Python issue cost): the ruler brackets the whole
 Python call, so every per-call Python-side op not strictly needed on the hot
-(already-cached) path is scored.  Two fixes, both preserving every external
-contract: (1) ``_cached_cos_sin`` used to call ``torch.cuda.current_stream``
-itself, redundant with the wrapper's own call for the kernel launch -- the
-wrapper now reads the stream once and threads it in.  (2) ``_launch``'s hot
-path (``state(args)``, the common case once a shape/dtype has been seen
-once) never reads its ``kwargs`` dict at all -- only the cold path
-(``compiled(**kwargs)`` / signature re-binding) does -- so the wrapper now
-passes a zero-arg callable instead of a pre-built dict, and ``_launch`` only
-calls it on the cold path; building a ~15-key dict every call just to throw
-it away on every steady-state call (the overwhelming majority, in both the
-benchmark loop and real training once a shape stabilizes) was pure waste.
+(already-cached) path is scored.  ``_cached_cos_sin`` used to call
+``torch.cuda.current_stream`` itself, redundant with the wrapper's own call for
+the kernel launch -- the wrapper now reads the stream once and threads it in.
 Both the forward and backward wrapper also had the same configuration value
 (``eps``/the stream) recomputed 2-3x per call; each is now computed once and
 reused.  None of this changes which tensors are read, written, or cached --
@@ -146,6 +138,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.utils import buffer_ops
+from primus_turbo.flydsl.utils.launch_cache import run_compiled
 
 # CODE-REVIEW fix: `arith` (flydsl.expr.arith, imported above) already
 # re-exports `_to_raw` as its own public (if deprecated) surface; reach
@@ -1002,30 +995,7 @@ def _compiled_fold(
     )
 
 
-_CALL_STATE_CACHE = {}
-
-
-def _launch(compiled, key, kwargs_fn, args):
-    """`kwargs_fn` is a zero-arg callable building the kwargs dict, not the
-    dict itself (Q6: the hot `state(args)` path below never reads kwargs at
-    all -- only the two cold paths do -- so building a ~15-key dict on every
-    call just to discard it on every steady-state call was pure waste; see
-    module docstring)."""
-    state = _CALL_STATE_CACHE.get(key)
-    if state is None:
-        kwargs = kwargs_fn()
-        compiled(**kwargs)
-        signature = compiled._sig
-        bound = signature.bind(**kwargs)
-        bound.apply_defaults()
-        cache_key = compiled._build_full_cache_key(bound.arguments, owner_cls=None, bound_self=None)
-        state = compiled._call_state_cache.get(cache_key)
-        _CALL_STATE_CACHE[key] = state if state is not None else False
-        return
-    if state is False:
-        compiled(**kwargs_fn())
-        return
-    state(args)
+_COMPILED = {}
 
 
 def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, eps):
@@ -1051,28 +1021,8 @@ def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, e
     # module docstring) instead of two independent current-stream queries.
     cosine, sine = _cached_cos_sin(freqs, stream)
     args = (qkv, q_gamma, k_gamma, cosine, sine, q, k, q_rstd, k_rstd, S, B, NG, npg, D, eps_f, stream)
-    _launch(
-        _compiled_fwd,
-        ("fwd", qkv.device.index, S, B, NG, npg, D, eps_f, qkv.dtype),
-        lambda: dict(
-            PACKED=qkv,
-            QG=q_gamma,
-            KG=k_gamma,
-            COSINE=cosine,
-            SINE=sine,
-            QOUT=q,
-            KOUT=k,
-            QRSTD=q_rstd,
-            KRSTD=k_rstd,
-            S=S,
-            B=B,
-            NG=NG,
-            NPG=npg,
-            D=D,
-            EPS=eps_f,
-            stream=stream,
-        ),
-        args,
+    run_compiled(
+        _COMPILED, ("fwd", qkv.device.index, S, B, NG, npg, D, eps_f, qkv.dtype), _compiled_fwd, *args
     )
     return q, k, v, q_rstd, k_rstd
 
@@ -1119,32 +1069,7 @@ def flydsl_qkv_rmsnorm_rope_backward(dq, dk, dv, qkv, q_gamma, k_gamma, freqs, q
         D,
         stream,
     )
-    _launch(
-        _compiled_bwd,
-        ("bwd", qkv.device.index, S, B, NG, npg, D, qkv.dtype),
-        lambda: dict(
-            DQ=dq,
-            DK=dk,
-            DV=dv,
-            PACKED=qkv,
-            QG=q_gamma,
-            KG=k_gamma,
-            COSINE=cosine,
-            SINE=sine,
-            QRSTD=q_rstd,
-            KRSTD=k_rstd,
-            DPACKED=dqkv,
-            DQG_PART=dqg_part,
-            DKG_PART=dkg_part,
-            S=S,
-            B=B,
-            NG=NG,
-            NPG=npg,
-            D=D,
-            stream=stream,
-        ),
-        args,
-    )
+    run_compiled(_COMPILED, ("bwd", qkv.device.index, S, B, NG, npg, D, qkv.dtype), _compiled_bwd, *args)
 
     # Q2: fold-reduce the large dgamma partials down to a tiny tensor before
     # handing them to the un-editable wrapper's `.sum(dim=0).to(dtype)` --
@@ -1163,20 +1088,5 @@ def flydsl_qkv_rmsnorm_rope_backward(dq, dk, dv, qkv, q_gamma, k_gamma, freqs, q
         D,
         stream,
     )
-    _launch(
-        _compiled_fold,
-        ("fold", qkv.device.index, B, NG, npg, D),
-        lambda: dict(
-            DQG_PART=dqg_part,
-            DKG_PART=dkg_part,
-            DQG_SMALL=dqg_small,
-            DKG_SMALL=dkg_small,
-            FOLD_WAVES_Q=fold_waves_q,
-            FOLD_WAVES_K=fold_waves_k,
-            ROWS_PER_WAVE=_FOLD_ROWS_PER_WAVE,
-            D=D,
-            stream=stream,
-        ),
-        fold_args,
-    )
+    run_compiled(_COMPILED, ("fold", qkv.device.index, B, NG, npg, D), _compiled_fold, *fold_args)
     return dqkv, dqg_small, dkg_small

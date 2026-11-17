@@ -126,7 +126,6 @@ def _make_kernel(
         n_blocks = ceildiv(out_features, BLOCK_N)
         worst_case_tiles = num_max_pool_tokens // BLOCK_M
     num_pool_blocks = num_max_pool_tokens // BLOCK_M
-    row_idx_ptr_ty = PointerType.get(elem_ty=fx.T.i32, address_space=AddressSpace.Global, alignment=4)
 
     @flyc.kernel(name="dispatch_grouped_gemm_kernel", known_block_size=[_BLOCK_THREADS, 1, 1])
     def dispatch_grouped_gemm_kernel(
@@ -312,6 +311,11 @@ def _make_kernel(
                 B_tile = make_bf16_fp16_tile_tensor(w_base, b_off, K * out_features)
                 C_tile = make_bf16_fp16_tile_tensor(out_base, c_off, 0x40000000)
                 row_idx_byte_offset = cast(block_m, fx.T.i64) * fx.Int64(BLOCK_M * 4)
+                # built per trace: this builder is lru-cached across traces, and an MLIR type
+                # belongs to the context that created it
+                row_idx_ptr_ty = PointerType.get(
+                    elem_ty=fx.T.i32, address_space=AddressSpace.Global, alignment=4
+                )
                 row_idx_ptr = fx.inttoptr(
                     row_idx_ptr_ty, _readfirstlane_i32(pool_row_to_recv_token_base + row_idx_byte_offset)
                 )
