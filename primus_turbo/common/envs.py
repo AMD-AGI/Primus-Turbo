@@ -50,6 +50,8 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_MLA_BWD_IMPL: str = "flydsl"
     PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND: str | None = None
     PRIMUS_TURBO_AUTO_TUNE: bool = False
+    PRIMUS_TURBO_DISPATCH_REPORT: str | None = None
+    PRIMUS_TURBO_STRICT_DISPATCH: bool = False
     PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32: bool = True
     PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT: bool = False
     PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM: bool = False
@@ -193,6 +195,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel-level tuners with it. An explicit per-op backend still wins over it, and so does
     # ``GlobalBackendManager.set_auto_tune``. Read at the first dispatch or FlyDSL launch.
     "PRIMUS_TURBO_AUTO_TUNE": lambda: os.getenv("PRIMUS_TURBO_AUTO_TUNE", "0") == "1",
+    # ================== Dispatch diagnostics ==================
+    # A file path: record which backend every dispatcher picked for every input shape, and why
+    # (user, autotune, default or fallback), log each new choice at INFO, and write the report
+    # there as JSON when the process exits. "{rank}" in the path is replaced by $RANK (0 when
+    # unset) and "{pid}" by the process id. Unset keeps only the per-dispatcher totals of
+    # ``dispatch_report()``.
+    "PRIMUS_TURBO_DISPATCH_REPORT": lambda: os.getenv("PRIMUS_TURBO_DISPATCH_REPORT") or None,
+    # "1" makes a fallback an error: when the default backend cannot handle the inputs, dispatch
+    # raises RuntimeError instead of warning and running another registered backend.
+    "PRIMUS_TURBO_STRICT_DISPATCH": lambda: os.getenv("PRIMUS_TURBO_STRICT_DISPATCH", "0") == "1",
     # ================== Kernel behavior ==================
     # Whether the attention V3 (CK) backward accumulates with FP32 atomics. Only "0" disables it;
     # unset, "1" and any other value keep it on. Read at the first forward that does not pass
