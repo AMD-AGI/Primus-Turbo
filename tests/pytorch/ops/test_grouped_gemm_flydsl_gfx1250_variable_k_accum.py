@@ -240,39 +240,26 @@ def test_backend_takes_accumulating_calls(impl, monkeypatch):
     assert _max_rel_err(out, old + ref) < 1e-5
 
 
-MUSE_WGRAD_KEYS = [
-    (out_m, out_n, avg) for out_m, out_n in ((2 * FFN, LATENT), (LATENT, FFN)) for avg in (512, 1024, 2048)
-]
-# knobs the non-persistent accumulate path keeps
-ACCUM_KNOBS = {
-    "BLOCK_M",
-    "BLOCK_N",
-    "BLOCK_K",
-    "m_warp",
-    "n_warp",
-    "num_buffers",
-    "group_m",
-    "num_xcd",
-    "xcd_band",
-}
+MUSE_WGRAD_OUTS = [(2 * FFN, LATENT), (LATENT, FFN)]  # fc1, fc2
+MUSE_WGRAD_KEYS = [(m, n, avg) for m, n in MUSE_WGRAD_OUTS for avg in (512, 1024, 2048)]
 
 
 def test_muse_wgrad_keys_reach_accumulating_calls_only():
-    """The Muse wgrad keys apply to accumulate=1 calls; overwrites keep theirs."""
+    """The wgrad fc1 / fc2 keys apply to accumulate=1 calls; overwrites keep theirs."""
     vk = _vk()
     for key in MUSE_WGRAD_KEYS:
         want = vk._KWARGS_KEYS["vk_accum"][key]
-        assert set(want) <= ACCUM_KNOBS
+        assert set(want) <= {"group_m", "num_xcd", "xcd_band", "lds_cosched"}, (
+            "only knobs the accumulate path keeps"
+        )
         assert vk._keyed_kwargs("vk_accum", key, NUM_EXPERTS, 0, {"out": None, "accumulate": 1}) == want
         assert vk._keyed_kwargs("vk", key, NUM_EXPERTS, 0, {}) == {}
         assert vk._keyed_kwargs("vk_accum", key, NUM_EXPERTS, 0, {"accumulate": 1, "group_m": 16}) == {}
-        tm, tn = want.get("BLOCK_M", 256), want.get("BLOCK_N", 256)
-        assert key[0] % tm == 0 and key[1] % tn == 0, "accumulate needs whole output tiles"
 
 
-@pytest.mark.parametrize("out_m, out_n", [(2 * FFN, LATENT), (LATENT, FFN)], ids=["fc1", "fc2"])
+@pytest.mark.parametrize("out_m, out_n", MUSE_WGRAD_OUTS, ids=["fc1", "fc2"])
 def test_muse_wgrad_key_is_bit_identical(out_m, out_n):
-    """The keyed tile shape, ring depth, tile order and XCD remap never change a reduction order."""
+    """The keyed knobs move a schedule, never a reduction order."""
     a, b, lens, offs, _ = _problem(out_m, out_n, None)
     old = _old_out((lens.numel(), out_m, out_n))
     keyed, untuned = old.clone(), old.clone()

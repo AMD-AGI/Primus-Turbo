@@ -6024,14 +6024,20 @@ _MUSE_NN = {
     "xcd_band": 32,
 }
 
+_MUSE_COSCHED = {"lds_cosched": 3, "issue_first": 1}
+
 _KWARGS_KEYS = {
     "nt": {
-        # Muse Spark (EP4 / EP8, MBS 1 / 2): the MiniMax-M3 fc1 set with the table decode (tt_dec) in place of
-        # vec_dec, which the launcher drops above 32 experts. fwd fc1 at 512 / 1024 / 2048 rows per expert,
-        # fwd fc2 at 2048 (at 512 / 1024 it is within +-2% of the untuned path).
-        (8192, 4096, 512): _MUSE_NT,
-        (8192, 4096, 1024): _MUSE_NT,
-        (8192, 4096, 2048): _MUSE_NT,
+        # Muse Spark (EP4 / EP8, MBS 1 / 2) fwd fc1 at 512 / 1024 / 2048 rows and fwd fc2 at 512 / 1024: the
+        # non-persistent path with the LDS co-scheduled fragment reads and the next stage issued first (fc1 +2.5%
+        # to +5.4% on the op, at both G = 64 and G = 32; the persistent sets lose at MBS 1 and trail it at MBS 2).
+        (8192, 4096, 512): _MUSE_COSCHED,
+        (8192, 4096, 1024): _MUSE_COSCHED,
+        (8192, 4096, 2048): _MUSE_COSCHED,
+        (4096, 4096, 512): _MUSE_COSCHED,
+        (4096, 4096, 1024): _MUSE_COSCHED,
+        # fwd fc2 at 2048: the MiniMax-M3 fc1 set with the table decode (tt_dec) in place of vec_dec, which the
+        # launcher drops above 32 experts.
         (4096, 4096, 2048): _MUSE_NT,
         # MiniMax-M3 fwd fc2, avg_m = 512
         (6144, 3072, 512): {
@@ -6083,6 +6089,9 @@ _KWARGS_KEYS = {
         (4096, 8192, 2048): _MUSE_NN,
         (4096, 4096, 1024): _MUSE_NN,
         (4096, 4096, 2048): _MUSE_NN,
+        # Muse dgrad fc1 / fc2 at 512 rows: as fwd fc2 at 512 (+4.0% to +5.5% on fc1, +0.8% to +4.7% on fc2).
+        (4096, 8192, 512): _MUSE_COSCHED,
+        (4096, 4096, 512): _MUSE_COSCHED,
         # MiniMax-M3 dgrad fc2, avg_m = 512
         (3072, 6144, 512): {
             "GROUP_M": 8,
@@ -6171,43 +6180,16 @@ _KWARGS_KEYS = {
         },
     },
     # The variable-K wgrad with accumulate=1 (fp32 main_grad). It runs the plain non-persistent epilogue,
-    # so only the knobs that keep that path are keyed here: tile shape / ring depth, tile order and XCD remap.
-    # Bit-identical: none of them changes an element's reduction order.
+    # so only knobs that leave that path are keyed here. Bit-identical.
     "vk_accum": {
-        # Muse Spark wgrad fc1 (OUT 8192 x 4096): a 128 x 128 x 64 tile, whose ~144 KB LDS arena and smaller
-        # accumulator let two workgroups share a CU, so one computes while the other runs the main_grad
-        # read-modify-write epilogue (half the fp32 tile still fits a ring buffer, so it stays on "tdm").
-        (8192, 4096, 512): {
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
-            "BLOCK_K": 64,
-            "m_warp": 2,
-            "n_warp": 2,
-            "num_buffers": 2,
-            "group_m": 8,
-            "num_xcd": 8,
-            "xcd_band": 512,
-        },
-        (8192, 4096, 1024): {
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
-            "BLOCK_K": 64,
-            "m_warp": 2,
-            "n_warp": 2,
-            "num_buffers": 4,
-        },
-        (8192, 4096, 2048): {
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
-            "BLOCK_K": 64,
-            "m_warp": 2,
-            "n_warp": 2,
-            "num_buffers": 4,
-        },
-        # Muse Spark wgrad fc2 (OUT 4096 x 4096) at 512 / 1024 / 2048 rows per expert (EP4 / EP8, MBS 1 / 2)
-        (4096, 4096, 512): {"group_m": 8, "num_xcd": 8, "xcd_band": 256},
-        (4096, 4096, 1024): {"group_m": 8, "num_xcd": 8, "xcd_band": 256},
-        (4096, 4096, 2048): {"group_m": 8, "num_xcd": 8, "xcd_band": 512},
+        # Muse Spark wgrad fc1 (OUT 8192 x 4096) and fc2 (OUT 4096 x 4096) at 512 / 1024 / 2048 rows per expert
+        # (EP4 / EP8, MBS 1 / 2): the fragment reads co-scheduled with the matrix ops (+4% to +15% on the op).
+        (8192, 4096, 512): {"lds_cosched": 2},
+        (8192, 4096, 1024): {"lds_cosched": 2},
+        (8192, 4096, 2048): {"lds_cosched": 2},
+        (4096, 4096, 512): {"lds_cosched": 2},
+        (4096, 4096, 1024): {"lds_cosched": 2},
+        (4096, 4096, 2048): {"lds_cosched": 2},
     },
 }
 _KWARGS_PASSTHROUGH = {
