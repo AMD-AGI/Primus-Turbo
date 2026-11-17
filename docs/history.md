@@ -20,7 +20,7 @@ Every What's New entry, grouped by the release it first shipped in, newest first
 
 [v0.5.0](https://github.com/AMD-AGI/Primus-Turbo/releases/tag/v0.5.0), 2026/09/16 · [changes since v0.4.0](https://github.com/AMD-AGI/Primus-Turbo/compare/v0.4.0...v0.5.0)
 
-- **[2026/08/25–09/14]** 🔥 **Fused GroupedMLP (FP8 / MXFP8)** — expert MLP with SwiGLU folded into grouped GEMM; pad-aware paths for GPT-OSS-20B-style MoE ([#476](https://github.com/AMD-AGI/Primus-Turbo/pull/476), [#488](https://github.com/AMD-AGI/Primus-Turbo/pull/488), [#503](https://github.com/AMD-AGI/Primus-Turbo/pull/503)).
+- **[2026/08/25–09/14]** 🔥 **Fused GroupedMLP (FP8 / MXFP8 / MXFP4)** — expert MLP with SwiGLU folded into grouped GEMM; pad-aware paths for GPT-OSS-20B-style MoE ([#476](https://github.com/AMD-AGI/Primus-Turbo/pull/476), [#488](https://github.com/AMD-AGI/Primus-Turbo/pull/488), [#503](https://github.com/AMD-AGI/Primus-Turbo/pull/503)); `grouped_mlp_fp4` for MXFP4 ([#483](https://github.com/AMD-AGI/Primus-Turbo/pull/483)).
 - **[2026/08/18]** 🔥 **MegaMoE (MXFP8)** — fused forward and backward in the MXFP8 MegaMoE path: dispatch+FC1 and FC2+combine with intra-node EP ([#456](https://github.com/AMD-AGI/Primus-Turbo/pull/456)).
 
 ## v0.4.0
@@ -28,13 +28,13 @@ Every What's New entry, grouped by the release it first shipped in, newest first
 [v0.4.0](https://github.com/AMD-AGI/Primus-Turbo/releases/tag/v0.4.0), 2026/07/30 · [changes since v0.3.1](https://github.com/AMD-AGI/Primus-Turbo/compare/v0.3.1...v0.4.0)
 
 - **[2026/07/15]** 🔥 **MegaMoE (BF16)** — FlyDSL fused MoE layer with comm–compute overlap inside the grouped GEMMs ([overview](./mega_moe.md)) ([#412](https://github.com/AMD-AGI/Primus-Turbo/pull/412)).
-- **[2026/07]** 🔥 **MXFP4 GEMM & grouped GEMM** — FlyDSL and hipBLASLt stacks for dense and expert GEMMs in low-precision training ([#424](https://github.com/AMD-AGI/Primus-Turbo/pull/424), [#483](https://github.com/AMD-AGI/Primus-Turbo/pull/483)).
+- **[2026/07/27]** 🔥 **MXFP4 GEMM & grouped GEMM** — FlyDSL and hipBLASLt stacks for dense and expert GEMMs in low-precision training ([#424](https://github.com/AMD-AGI/Primus-Turbo/pull/424)).
 
 ## v0.3.x
 
 [v0.3.0](https://github.com/AMD-AGI/Primus-Turbo/releases/tag/v0.3.0), 2026/04/13, and [v0.3.1](https://github.com/AMD-AGI/Primus-Turbo/releases/tag/v0.3.1), 2026/06/12 · [changes since v0.2.0](https://github.com/AMD-AGI/Primus-Turbo/compare/v0.2.0...v0.3.1)
 
-- **[2026/06/10]** 🔥 **DeepEP** — JAX intranode/internode token dispatch ([#344](https://github.com/AMD-AGI/Primus-Turbo/pull/344)); PyTorch `DeepEPTokenDispatcher` (introduced in [#114](https://github.com/AMD-AGI/Primus-Turbo/pull/114)). The separate rocSHMEM backend integration is tracked in [#409](https://github.com/AMD-AGI/Primus-Turbo/pull/409) ([guide](../primus_turbo/pytorch/deep_ep/README.md)).
+- **[2026/05/27]** 🔥 **DeepEP** — JAX intranode/internode token dispatch ([#344](https://github.com/AMD-AGI/Primus-Turbo/pull/344)); PyTorch `DeepEPTokenDispatcher` (introduced in [#114](https://github.com/AMD-AGI/Primus-Turbo/pull/114)). The rocSHMEM communication backend followed in v0.4.0 ([#409](https://github.com/AMD-AGI/Primus-Turbo/pull/409)) ([guide](../primus_turbo/pytorch/deep_ep/README.md)).
 - **[2026/04/17–05/11]** 🔥 **Attention layouts and varlen** — `sbhd` / `bhsd` layouts and AITER `flash_attn_varlen_func` ([#275](https://github.com/AMD-AGI/Primus-Turbo/pull/275), [#304](https://github.com/AMD-AGI/Primus-Turbo/pull/304), [#332](https://github.com/AMD-AGI/Primus-Turbo/pull/332)).
 - **[2026/01/26–04/10]** 🔥 **Sink attention** — attention sinks with sliding window, as GPT-OSS uses ([#208](https://github.com/AMD-AGI/Primus-Turbo/pull/208), [#262](https://github.com/AMD-AGI/Primus-Turbo/pull/262)).
 - **[2025/12/15–2026/01/05]** 🔥 **MXFP4 GEMM** — MXFP4 GEMM and MXFP8 / MXFP4 quantization with fused transpose and Hadamard transform ([#179](https://github.com/AMD-AGI/Primus-Turbo/pull/179), [#195](https://github.com/AMD-AGI/Primus-Turbo/pull/195)).

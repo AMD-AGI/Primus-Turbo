@@ -38,7 +38,7 @@ Note: JAX support is under active development. Optim support is planned but not 
 - **[2026/10/08]** 🔥 **MiniMax-M3 in MegaMoE** — MiniMax-M3's SwiGLU-OAI activation in the BF16 and MXFP8 MegaMoE kernels ([#538](https://github.com/AMD-AGI/Primus-Turbo/pull/538)).
 - **[2026/09/21]** 🔥 **Grouped GEMM on MI455X (gfx1250)** — FlyDSL BF16 grouped GEMM for MoE, the first grouped GEMM on gfx1250 ([#508](https://github.com/AMD-AGI/Primus-Turbo/pull/508)).
 - **[2026/09/17]** 🔥 **`mlp_fp4` and `rmsnorm_residual_fp4`** — MXFP4 dense MLP with SwiGLU fused into its GEMMs, and RMSNorm + residual in the MXFP4 path ([#509](https://github.com/AMD-AGI/Primus-Turbo/pull/509)).
-- **[2026/08/25–09/14]** 🔥 **Fused GroupedMLP (FP8 / MXFP8)** — expert MLP with SwiGLU folded into grouped GEMM; pad-aware paths for GPT-OSS-20B-style MoE ([#476](https://github.com/AMD-AGI/Primus-Turbo/pull/476), [#488](https://github.com/AMD-AGI/Primus-Turbo/pull/488), [#503](https://github.com/AMD-AGI/Primus-Turbo/pull/503)).
+- **[2026/08/25–09/14]** 🔥 **Fused GroupedMLP (FP8 / MXFP8 / MXFP4)** — expert MLP with SwiGLU folded into grouped GEMM; pad-aware paths for GPT-OSS-20B-style MoE ([#476](https://github.com/AMD-AGI/Primus-Turbo/pull/476), [#488](https://github.com/AMD-AGI/Primus-Turbo/pull/488), [#503](https://github.com/AMD-AGI/Primus-Turbo/pull/503)); `grouped_mlp_fp4` for MXFP4 ([#483](https://github.com/AMD-AGI/Primus-Turbo/pull/483)).
 - **[2026/08/18]** 🔥 **MegaMoE (MXFP8)** — fused forward and backward in the MXFP8 MegaMoE path: dispatch+FC1 and FC2+combine with intra-node EP ([#456](https://github.com/AMD-AGI/Primus-Turbo/pull/456)).
 
 👉 **[Full history](./docs/history.md)** — every update, grouped by the release it shipped in.
