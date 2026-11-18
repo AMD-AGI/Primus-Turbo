@@ -369,7 +369,7 @@ def _arrival_k_seg(flag_base, tile_m, epoch, trace_base=None, trace_idx=None, la
                 return
             src = self.src(seg)
             slots = [(tile_m * fx.Int32(S) + fx.Int32(sub)) * fx.Int32(num_ranks) + src for sub in range(S)]
-            spin_flags(flag_base, slots, epoch, rank, src, "a2a_gemm")
+            spin_flags(flag_base, slots, epoch, rank, src, "a2a_gemm", report=False)
             # recv rows are rewritten by peers every 2 epochs: the tile's first wait drops what this CU /
             # XCD still caches of them. No block reads a row before its flag, so later segments only
             # need their loads ordered after the flag.

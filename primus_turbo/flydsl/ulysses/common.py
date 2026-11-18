@@ -17,7 +17,7 @@ epoch bump of the last block out (see ``workspace.py`` for the protocol)."""
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl.expr import arith
+from flydsl.expr import arith, const_expr
 
 from primus_turbo.flydsl.deep_ep.common import _asm, ld_lds, st_lds
 from primus_turbo.flydsl.utils.buffer_ops import extract_base_index
@@ -113,20 +113,23 @@ def _all_reached(flag_base, flag_idxs, expected):
 
 
 @ASTRewriter.transform
-def spin_flags(flag_base, flag_idxs, expected, rank, src, tag):
-    """``spin_flag`` over several flags, polled together (one round trip per poll)."""
+def spin_flags(flag_base, flag_idxs, expected, rank, src, tag, report=True):
+    """``spin_flag`` over several flags, polled together (one round trip per poll). ``report=False``
+    traps on timeout without the printf: inside a GEMM K loop its hostcall code needs the registers the
+    accumulators and prefetches hold, and what it evicts is reloaded after every wait."""
     spin_start = read_clock()
     fx.rocdl.s_waitcnt(0)
     ready = _all_reached(flag_base, flag_idxs, expected)
     while not ready:
         fx.rocdl.s_sleep(fx.Int32(1))
         if spin_timed_out(spin_start, SPIN_TIMEOUT):
-            fx.printf(
-                f"[ulysses rank={rank} {tag}] flag wait timeout: src={{}} first flag_idx={{}} expected={{}}\n",
-                src,
-                flag_idxs[0],
-                expected,
-            )
+            if const_expr(report):
+                fx.printf(
+                    f"[ulysses rank={rank} {tag}] flag wait timeout: src={{}} first flag_idx={{}} expected={{}}\n",
+                    src,
+                    flag_idxs[0],
+                    expected,
+                )
             _asm("s_trap 2")
         fx.rocdl.s_waitcnt(0)
         ready = _all_reached(flag_base, flag_idxs, expected)
