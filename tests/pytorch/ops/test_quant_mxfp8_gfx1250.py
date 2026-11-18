@@ -80,11 +80,12 @@ def _same(got, ref, lay, what):
         assert torch.equal(a, b), f"{what}: lens / offsets"
 
 
-# K: 33 / 300 (K % 8 != 0: the input gets storage past its end), 336 / 576 (K % 128 != 0: the last row's partial
-# k-tile by masked loads), 7168; M: 100, 130, 160, 257, 300 (M % 128 / 32 / 16).
+# K: 1 / 33 / 300 (K % 8 != 0: the input gets storage past its end), 336 / 576 (K % 128 != 0: the last row's partial
+# k-tile by masked loads), 7168; M: 1, 100, 130, 160, 257, 300 (M % 128 / 32 / 16).
 @gpu
 @pytest.mark.parametrize(
-    "M,K,lay", [(100, 33, GRAD), (130, 300, GRAD), (160, 336, WGT), (257, 576, ACT), (300, 7168, ACT)]
+    "M,K,lay",
+    [(1, 1, GRAD), (100, 33, GRAD), (130, 300, GRAD), (160, 336, WGT), (257, 576, ACT), (300, 7168, ACT)],
 )
 def test_dense(M, K, lay):
     x = _x(M, K, seed=M * 7 + K)
