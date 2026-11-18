@@ -4,6 +4,8 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import importlib
+
 import pytest
 import torch
 
@@ -772,6 +774,65 @@ def test_float8_quant_config_default_backend_validation_and_fx_repr():
     for config in (Float8QuantConfig(), Float8QuantConfig(default_backend=BackendType.FLYDSL)):
         source, globals_ = config.__fx_repr__()
         assert eval(source, globals_) == config
+
+
+# ---------------------------------------------------------------------------
+# torch.compile: the tensorwise path is traced into the caller's graph.
+# ---------------------------------------------------------------------------
+_gemm_fp8_module = importlib.import_module("primus_turbo.pytorch.ops.gemm_fp8")
+
+
+# (256, 512, 64): K = 64, which FlyDSL leaves to another backend. (16384, 3072, 4096): FLUX.1's
+# context_embedder, whose weight gradient FlyDSL's TN split once got wrong (#589).
+@pytest.mark.parametrize("m, n, k", [(256, 512, 64), (1032, 1536, 1024), (16384, 3072, 4096)])
+@pytest.mark.parametrize(
+    "layout, nt_bwd",
+    [("NT", True), ("NT", False), ("NN", False), ("TN", False)],
+    ids=["NT-nt_bwd", "NT", "NN", "TN"],
+)
+@pytest.mark.parametrize("format", [Format.E4M3, Format.HYBRID])
+@pytest.mark.parametrize("default_backend", [None, BackendType.FLYDSL], ids=["default", "FLYDSL"])
+def test_gemm_fp8_tensorwise_compile(monkeypatch, m, n, k, layout, nt_bwd, format, default_backend):
+    """fullgraph compile of forward and backward, bit-identical to eager.
+
+    ``nt_bwd`` picks the backward layout independently of the arch: transposed operands saved in
+    forward for NT GEMMs (gfx950's choice for an NT forward) or the operands themselves (gfx942's).
+    """
+    monkeypatch.setattr(_gemm_fp8_module, "_deter_use_nt_layout_gemm_in_bwd", lambda trans_a, trans_b: nt_bwd)
+    torch._dynamo.reset()
+    dtype = torch.bfloat16
+    trans_a, trans_b = layout[0] == "T", layout[1] == "T"
+    a0 = torch.randn((k, m) if trans_a else (m, k), dtype=dtype, device="cuda")
+    b0 = torch.randn((n, k) if trans_b else (k, n), dtype=dtype, device="cuda")
+    grad_c = torch.randn(m, n, dtype=dtype, device="cuda")
+    config = Float8QuantConfig(format=format, default_backend=default_backend)
+
+    eager = _gemm_fp8_fwd_bwd(gemm_fp8, a0, b0, grad_c, trans_a, trans_b, config)
+    compiled = _gemm_fp8_fwd_bwd(
+        torch.compile(gemm_fp8, fullgraph=True), a0, b0, grad_c, trans_a, trans_b, config
+    )
+    _assert_bitwise_equal(compiled, eager)
+
+    c_ref = (a0.T if trans_a else a0).float() @ (b0.T if trans_b else b0).float()
+    snr_threshold = 25 if format == Format.E4M3 else 20
+    assert compute_snr(c_ref, eager[0]) > snr_threshold
+
+
+@pytest.mark.parametrize("layout", ["NT", "NN"])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.HYBRID])
+def test_gemm_fp8_tensorwise_plain_matches_prequantized(layout, format):
+    """Plain operands and the same operands passed pre-quantized give bit-identical outputs."""
+    trans_b = layout[1] == "T"
+    m, n, k = 1032, 1536, 1024
+    a = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn((n, k) if trans_b else (k, n), dtype=torch.bfloat16, device="cuda")
+    config = Float8QuantConfig(format=format)
+    fwd_dtype = _get_fp8_dtype(format, True)
+
+    out = gemm_fp8(a, b, False, trans_b, torch.bfloat16, config)
+    a_q = QuantizedTensor.quantize(a, fwd_dtype, ScalingGranularity.TENSORWISE)
+    b_q = QuantizedTensor.quantize(b, fwd_dtype, ScalingGranularity.TENSORWISE)
+    assert torch.equal(out, gemm_fp8(a_q, b_q, False, trans_b, torch.bfloat16, config))
 
 
 # ---------------------------------------------------------------------------
