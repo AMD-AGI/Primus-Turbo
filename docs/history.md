@@ -4,7 +4,7 @@ Every What's New entry, grouped by the release it first shipped in, newest first
 
 ## Unreleased (main)
 
-Nothing since v0.7.0 yet.
+- **[2026/11/18]** 🔥 **MXFP8 training on MI455X (gfx1250)** — `gemm_fp8`, `grouped_gemm_fp8`, `grouped_mlp_fp8` and the staged MXFP8 MegaMoE run on FlyDSL MXFP8 kernels on gfx1250 (E4M3, BF16 activations), with the weight gradients added straight into a bf16 or fp32 `main_grad` ([Supported Operators](./supported_ops.md)).
 
 ## v0.7.0
 

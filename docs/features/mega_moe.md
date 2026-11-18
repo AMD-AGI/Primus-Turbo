@@ -19,8 +19,8 @@ ranks exchange tokens through is allocated and cached by the ops; the caller doe
 | | gfx942 (MI300X / MI325X) | gfx950 (MI350X / MI355X) | gfx1250 (MI455X) |
 |---|:-:|:-:|:-:|
 | BF16: `fused_mega_moe`, `fused_mega_moe_stage1` / `_stage2` | — | ✅ (tested at EP8) | ✅ (tested at EP1 / EP2 / EP4) |
-| MXFP8: `fused_mega_moe_fp8_stage1` / `_stage2` | — | ✅ (tested at EP8) | — |
-| `fuse_wgrad_accum_pattern="megatron"` (BF16 staged ops) | — | ignored | ✅ |
+| MXFP8: `fused_mega_moe_fp8_stage1` / `_stage2` | — | ✅ (tested at EP8) | ✅ (tested at EP1) |
+| `fuse_wgrad_accum_pattern="megatron"` (staged ops) | — | ignored | ✅ (BF16 and MXFP8) |
 
 Intranode EP only: the GPUs of one host. On MI455X, a Helios rack connects its 72 GPUs in one
 scale-up domain, so expert parallelism seldom has to leave the rack; MegaMoE covers only the GPUs of
@@ -55,7 +55,7 @@ Inputs, per rank: `x` [T, H] bf16; `topk_idx` [T, K], global expert ids (cast to
   y = fused_mega_moe_stage2(l1_out, dispatch_weights, handle, topk_idx, topk_weights, w2, group)
   ```
 
-- MXFP8 (gfx950), staged only. Pass the bf16 weights; their MXFP8 copies are cached inside, and
+- MXFP8 (gfx950, gfx1250), staged only. Pass the bf16 weights; their MXFP8 copies are cached inside, and
   the caller must invalidate the cache once per optimizer step:
 
   ```python
@@ -98,7 +98,8 @@ MI455X the expert wgrads are then added straight into the weights' bf16 `main_gr
 no separate dW buffer), and the op returns a dummy gradient with `grad_added_to_main_grad` set, so
 Megatron DDP's hook skips its own add. A weight keeps the ordinary gradient when its `main_grad` is
 not a contiguous bf16 tensor of the weight's shape, or when the weight's shape is not a whole number
-of the wgrad's output tiles. On MI355X the option is accepted and has no effect.
+of the wgrad's output tiles. The MXFP8 staged ops take the option the same way on MI455X. On MI355X
+the option is accepted and has no effect.
 
 ### Buffers
 
@@ -202,9 +203,14 @@ Source: [#582](https://github.com/AMD-AGI/Primus-Turbo/pull/582), Primus-Turbo `
     of 0, 64 or 128 modulo 256 (the GEMM tile is 256 wide and takes a 64- or 128-column tail, so
     GPT-OSS's 2880 runs).
   - BF16 on MI455X: NT weights, hidden and intermediate multiples of 64 and at least 128.
-  - MXFP8: the kernels need hidden % 1024 == 0 and intermediate % 256 == 0. Other shapes run
-    zero-padded up to that grid (2880 runs as 3072), which is exact but does the padded work.
-- MXFP8: staged ops only, on MI355X only; `advance_weight_generation()` must be called once per
+  - MXFP8 on MI355X: the kernels need hidden % 1024 == 0 and intermediate % 256 == 0. Other shapes
+    run zero-padded up to that grid (2880 runs as 3072), which is exact but does the padded work.
+  - MXFP8 on MI455X: hidden % 512 == 0 and intermediate % 128 == 0, not padded; SiLU-SwiGLU given
+    explicitly as the activation, no expert biases, at most 256 experts per rank.
+  - MI455X, BF16 and MXFP8: the token count of a call, rounded up to 128, times top-k times hidden
+    stays below 2^31 per rank (37,376 tokens for DeepSeek-V3's top-8 at hidden 7168); a larger call
+    raises `ValueError`.
+- MXFP8: staged ops only; `advance_weight_generation()` must be called once per
   optimizer step, and a forward can be backpropagated only once (no `retain_graph`).
 - `fuse_wgrad_accum_pattern="megatron"` follows Megatron DDP's `main_grad` contract, which clears
   `grad_added_to_main_grad` once per step. Do not use it under Megatron-FSDP, which clears the flag

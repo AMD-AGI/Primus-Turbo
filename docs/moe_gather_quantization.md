@@ -1,7 +1,8 @@
-# MoE gather and MXFP4 quantization fusion
+# MoE gather and MXFP4 / MXFP8 quantization fusion
 
 This experimental, opt-in path avoids materializing the BF16 expert-ordered
-activation and output-gradient tensors before grouped MXFP4 quantization.
+activation and output-gradient tensors before grouped MXFP4 quantization
+(MI355X) or grouped MXFP8 quantization (MI455X).
 The quantizer reads original token rows through a destination-to-source map.
 Required expert output combination and input-gradient reduction remain unchanged.
 
@@ -14,6 +15,10 @@ merging probabilities or capacity padding at unpermute, and ordinary first-order
 backward outside CUDA graph capture. Unsupported backward consumers materialize
 the existing gather. Tensor hooks and aliases share that materialized storage.
 Changing routing/source tensors before consumption raises an error.
+
+On MI455X/gfx1250 Turbo's fused grouped MXFP8 MLP (`grouped_mlp_fp8`) takes the same handoffs
+and gathers in its MXFP8 quantizer; there the backward plan takes any hidden width, the expert
+count of `row_id_map` and the top-k of `dest2src`.
 
 Both repositories need their paired gather-fusion implementation. Enable in the
 training process only when the permutation output goes directly to the supported
@@ -33,6 +38,8 @@ moe_skip_identity_sort: true
 moe_permute_quant_fusion: true
 moe_backward_permute_quant_fusion: true
 ```
+
+For the MXFP8 path on MI455X, `fp8: e4m3` and `fp8_recipe: mxfp8` take the place of the two `fp4` keys.
 
 Set `moe_backward_permute_quant_fusion: false` for forward-only fusion. Both fusion arguments are false
 by default; they are not a general-purpose replacement for every permutation
@@ -61,7 +68,7 @@ Full training-to-target/convergence equivalence has not been established.
 ## Implementation and tests
 
 `primus_turbo/pytorch/ops/moe_gather.py` owns the handoff and deferred-gradient
-state. `grouped_mlp_fp4.py` consumes it in forward and backward. The dual
+state. `grouped_mlp_fp4.py` (and, on gfx1250, `grouped_mlp_fp8.py`) consumes it in forward and backward. The dual
 quantizer accepts `dest2src`, optional `permuted_probs`, and `total_m`; the FlyDSL
 kernel applies the map during tile loads and preserves the destination layout,
 zero-probability padding convention, and quantization recipe. Unsupported fused
