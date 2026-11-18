@@ -296,6 +296,8 @@ def run_suite(quick):
     # Llama-70B widths: more GEMM tiles than CUs, GEMM-bound launch (256-row tiles, K walk in step)
     check_qkv(group, 64, 8, 128, 1, 1024, 8192, "sbhd", "interleaved", 1, failures)
     check_o_gemm(group, 64, 128, 1, 2048, 8192, "bshd", True, 1, failures)
+    # long sequence, narrow QKV (M > K): a wave of GEMM tiles after the longer wgrad tiles
+    check_qkv(group, 16, 8, 64, 1, 4096, 4096, "sbhd", "interleaved", 2, failures)
     check_scenarios(group, failures)
     check_poisoned(group, failures)
 

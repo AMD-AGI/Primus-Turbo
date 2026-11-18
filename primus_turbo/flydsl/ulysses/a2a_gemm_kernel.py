@@ -1129,7 +1129,11 @@ def ulysses_a2a_gemm(
         fits = ceildiv(M, 256) * ceildiv(N, BN) + num_wtiles + num_push <= num_cus
         BM = 256 if fits or wgrad_last or gemm_bound or many_tiles else 128
     if wgrad_at is None:
-        wgrad_at = ceildiv(M, BM) * ceildiv(N, BN) if wgrad_last else 0
+        # wgrad tiles reduce over the M rows, GEMM tiles over K: past M > K the wgrad tiles are the long
+        # ones and their last partial wave idles most CUs. One wave of GEMM tiles (of the m-tiles that
+        # land last) after them drains the launch on short tiles (GLM-4.7 n = 4 128K: 8410 -> 8050 us)
+        num_tiles = ceildiv(M, BM) * ceildiv(N, BN)
+        wgrad_at = num_tiles - (min(num_cus, num_tiles // 2) if M > K else 0) if wgrad_last else 0
     run_launcher(
         _launch,
         oq,

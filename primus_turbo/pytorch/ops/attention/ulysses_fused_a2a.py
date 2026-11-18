@@ -80,7 +80,7 @@ class A2AGemmTuning:
         push_split: sub-tiles a ``BM``-row m-tile is pushed in, so its rows land in pieces (8).
         wgrad_at: claim slot of the in-kernel wgrad tiles (backward QKV only; 0, or after every
             dgrad tile when the GEMM outweighs the exchange, ``N * n >= 4096 * (n - 1)``, or there
-            are more than 2x CU wgrad tiles).
+            are more than 2x CU wgrad tiles; with ``M > K`` a wave of dgrad tiles follows them).
     """
 
     BM: Optional[int] = None
