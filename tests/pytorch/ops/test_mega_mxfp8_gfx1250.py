@@ -306,19 +306,23 @@ def test_bf16_combine_after_combine_only_ep1(ep1_group):
     h, _ = run_dispatch_prologue(x, w1, ep1_group, topk_idx, topk_w)
     h = DispatchHandle(*h)
     P = h.pool_row_to_route.numel()
-    pool = torch.randn(P, H, device="cuda").to(torch.bfloat16)
+    g = torch.Generator(device="cuda").manual_seed(43)
+    pool = torch.randn(P, H, generator=g, device="cuda").to(torch.bfloat16)
     # NaN at the padding rows: the combine-only launch reads none of them
     pool[h.pool_row_to_recv_token[:P].long() >= T] = float("nan")
-    act = torch.randn(P, I, device="cuda").to(torch.bfloat16)
+    act = torch.randn(P, I, generator=g, device="cuda").to(torch.bfloat16)
     expert = h.tile_to_expert.long().repeat_interleave(256)[:P]
     l2 = torch.zeros(P, H, dtype=torch.bfloat16, device="cuda")
     for e in range(E):
         rows = expert == e
         l2[rows] = (act[rows].float() @ w2[e].float().T).to(torch.bfloat16)
+    # the kernel's GEMM sums in another order than torch's, so a bf16 L2 term can round the other way (one ulp, at
+    # most |term| / 128), and then the folded sum too
+    want, slack = _fold(l2, h, T).float(), _fold(l2.abs(), h, T).float() / 32
     for _ in range(2):
         _eq(combine_only_gfx1250(pool, h, topk_idx), _fold(pool, h, T), "combine-only y")
         y = gemm_combine_nt_gfx1250(act, w2, h, topk_idx)
-        torch.testing.assert_close(y.float(), _fold(l2, h, T).float(), rtol=2e-2, atol=2e-2)
+        assert ((y.float() - want).abs() <= slack).all(), "bf16 combine after a combine-only launch"
 
 
 def test_padding_rows_zero_weight_ep1(ep1_group):
