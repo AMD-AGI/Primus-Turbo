@@ -1,8 +1,14 @@
 # Primus-Turbo History
 
-Every What's New entry, grouped by the release it first shipped in, newest first. The [README](../README.md#-whats-new) shows the latest eight; each new entry goes both there and under "Unreleased" here, and at a release that section takes the release's name. An entry is a new feature or a capability a new model needs; optimizations, wider shape or dtype coverage, fixes and dependency bumps are left to the release notes, which list every merged pull request.
+Every What's New entry, grouped by the release it first shipped in, newest first. The [README](../README.md#-whats-new) shows the latest release and the latest seven entries; each new entry goes both there and under "Unreleased" here, and at a release that section takes the release's name. An entry is a new feature or a capability a new model needs; optimizations, wider shape or dtype coverage, fixes and dependency bumps are left to the [CHANGELOG](../CHANGELOG.md) and the release notes, which list every merged pull request.
 
 ## Unreleased (main)
+
+Nothing since v0.7.0 yet.
+
+## v0.7.0
+
+[v0.7.0](https://github.com/AMD-AGI/Primus-Turbo/releases/tag/v0.7.0), 2026/11/18 · [changes since v0.6.0](https://github.com/AMD-AGI/Primus-Turbo/compare/v0.6.0...v0.7.0) · [CHANGELOG](../CHANGELOG.md#v070--20261118)
 
 - **[2026/11/17]** 🔥 **Backend choice report and strict dispatch** — every operator dispatch records which backend it picked and why (user, autotune, default or fallback); `PRIMUS_TURBO_DISPATCH_REPORT=<path>` writes the per-shape report as JSON at exit, and `PRIMUS_TURBO_STRICT_DISPATCH=1` turns a fallback into an error ([#646](https://github.com/AMD-AGI/Primus-Turbo/pull/646), [env](./env.md#dispatch-diagnostics)).
 - **[2026/11/10–11/17]** 🔥 **Gradient-accumulation fusion on MI455X (gfx1250)** — expert wgrads added straight into Megatron's `main_grad`, with no separate dW buffer or add: MegaMoE's BF16 staged ops into a bf16 `main_grad` ([#632](https://github.com/AMD-AGI/Primus-Turbo/pull/632), [MegaMoE](./features/mega_moe.md)), and the BF16 grouped GEMM into an fp32 `main_grad` ([#647](https://github.com/AMD-AGI/Primus-Turbo/pull/647)).
@@ -10,6 +16,7 @@ Every What's New entry, grouped by the release it first shipped in, newest first
 - **[2026/11/02]** 🔥 **DeepEP on MI455X (gfx1250)** — intranode dispatch / combine on MI455X: the V1 kernels ported to gfx1250, and a new V2 that writes every token straight into a fixed slot on its destination, the version MI455X runs. EP4 training on 4× MI455X is 1.08–1.10× faster than Megatron's alltoall dispatcher on a DeepSeek-V3 proxy and 1.04–1.07× on GPT-OSS 20B, with 12–16 GB less memory per GPU ([#583](https://github.com/AMD-AGI/Primus-Turbo/pull/583), [DeepEP](./features/deep_ep.md), [design](./design/deep_ep_v2_mi455.md)).
 - **[2026/10/28]** 🔥 **MegaMoE on MI455X (gfx1250)** — BF16 fused MegaMoE forward and backward on gfx1250, including the staged op with per-expert biases for GPT-OSS shapes; validated on 4× MI455X (EP4) ([#582](https://github.com/AMD-AGI/Primus-Turbo/pull/582), [MegaMoE](./features/mega_moe.md)).
 - **[2026/10/19–10/27]** 🔥 **Attention on MI455X (gfx1250)** — FlyDSL MLA attention for DeepSeek-V3 (qk 192 / v 128) ([#567](https://github.com/AMD-AGI/Primus-Turbo/pull/567)); FlyDSL flash attention for head dim 128 (Llama-3.1-8B) and sparse-MLA for DeepSeek-V4 ([#580](https://github.com/AMD-AGI/Primus-Turbo/pull/580)).
+- **[2026/10/20–10/21]** 🔥 **GPT-OSS in MegaMoE** — hidden / intermediate 2880 and per-expert fc1 / fc2 biases in the BF16 and MXFP8 MegaMoE ops ([#571](https://github.com/AMD-AGI/Primus-Turbo/pull/571)), with the per-layer memory sized to the rows dispatched to each rank ([#566](https://github.com/AMD-AGI/Primus-Turbo/pull/566), [#568](https://github.com/AMD-AGI/Primus-Turbo/pull/568), [MegaMoE](./features/mega_moe.md)).
 
 ## v0.6.x
 
@@ -30,8 +37,8 @@ Every What's New entry, grouped by the release it first shipped in, newest first
 
 [v0.4.0](https://github.com/AMD-AGI/Primus-Turbo/releases/tag/v0.4.0), 2026/07/30 · [changes since v0.3.1](https://github.com/AMD-AGI/Primus-Turbo/compare/v0.3.1...v0.4.0)
 
-- **[2026/07/15]** 🔥 **MegaMoE (BF16)** — FlyDSL fused MoE layer with comm–compute overlap inside the grouped GEMMs ([MegaMoE](./features/mega_moe.md)) ([#412](https://github.com/AMD-AGI/Primus-Turbo/pull/412)).
 - **[2026/07/27]** 🔥 **MXFP4 GEMM & grouped GEMM** — FlyDSL and hipBLASLt stacks for dense and expert GEMMs in low-precision training ([#424](https://github.com/AMD-AGI/Primus-Turbo/pull/424)).
+- **[2026/07/15]** 🔥 **MegaMoE (BF16)** — FlyDSL fused MoE layer with comm–compute overlap inside the grouped GEMMs ([MegaMoE](./features/mega_moe.md)) ([#412](https://github.com/AMD-AGI/Primus-Turbo/pull/412)).
 
 ## v0.3.x
 

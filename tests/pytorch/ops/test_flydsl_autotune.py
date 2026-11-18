@@ -11,6 +11,9 @@ here is deterministic; only the op-level cases at the bottom touch a GPU kernel.
 """
 
 import gc
+import os
+import subprocess
+import sys
 import weakref
 
 import pytest
@@ -987,3 +990,52 @@ def test_no_launch_reads_a_mutable_global():
         if isinstance(g.get(name), (dict, list, set, bytearray))
     )
     assert mutable == []
+
+
+# The test above only sees the launches its own process has built, and it is skipped off gfx950.
+# A launch declared at module level exists as soon as its module is imported, whatever the GPU,
+# which is how the gfx1250 kernels came to read plain dicts unnoticed. So every flydsl module is
+# imported here and each of those launches is held to the same rule; in a fresh interpreter,
+# because some of these packages must not be imported into this one
+# (see test_attention_flydsl_gfx1250.py).
+_MODULE_LEVEL_SWEEP = """
+import gc
+import importlib
+import pkgutil
+
+import primus_turbo.flydsl as pkg
+from flydsl.compiler.jit_function import JitFunction
+
+for module in pkgutil.walk_packages(pkg.__path__, pkg.__name__ + ".", onerror=lambda name: None):
+    try:
+        importlib.import_module(module.name)
+    except Exception:  # not importable here (arch, flydsl version): it declares no launch
+        pass
+launches = [o for o in gc.get_objects() if issubclass(type(o), JitFunction)]
+print("launches", len(launches))
+for line in sorted(
+    {
+        f"mutable {o.func.__module__}.{o.func.__qualname__} reads {mod}.{name}"
+        for o in launches
+        for name, mod, g in o._get_global_refs(None)
+        if isinstance(g.get(name), (dict, list, set, bytearray))
+    }
+):
+    print(line)
+"""
+
+
+def test_no_module_level_launch_reads_a_mutable_global():
+    import primus_turbo
+
+    # Run from the tree this process imports, so the sweep reads the same sources however
+    # primus_turbo is installed.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(primus_turbo.__file__)))
+    run = subprocess.run(
+        [sys.executable, "-c", _MODULE_LEVEL_SWEEP], capture_output=True, text=True, cwd=root
+    )
+    assert run.returncode == 0, run.stderr
+    lines = run.stdout.splitlines()
+    found = [int(line.split()[1]) for line in lines if line.startswith("launches ")]
+    assert found and found[-1] > 0, run.stdout + run.stderr
+    assert [line for line in lines if line.startswith("mutable ")] == []

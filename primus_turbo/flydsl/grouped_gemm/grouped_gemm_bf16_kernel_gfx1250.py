@@ -42,6 +42,8 @@ from __future__ import annotations
 import functools
 import warnings
 import weakref
+from collections.abc import Mapping
+from types import MappingProxyType
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -509,13 +511,18 @@ def _decode_m_tile_span(mt, blk_m_idx, n_groups: int, block_m: int):
 # 128-bit load per lane with no transpose and no diagnostic.
 
 
-# TDM cache policy (SCOPE / TH)
-_TDM_TH_LOAD = {0: "RT", 1: "NT", 2: "HT", 3: "LU", 4: "NT_RT", 5: "RT_NT", 6: "NT_HT"}
-_TDM_TH_STORE = {0: "RT", 1: "NT", 2: "HT", 3: "WB", 4: "NT_RT", 5: "RT_NT", 6: "NT_HT", 7: "NT_WB"}
-_TDM_SCOPE = {0: "WGP", 1: "SE", 2: "DEV", 3: "SYS"}
+# TDM cache policy (SCOPE / TH). Read-only views rather than dicts: the launches check their
+# tdm_*_cache arguments against these, flydsl snapshots every global a launch reads and folds it
+# into the disk-cache key, and a launch must not read a mutable one (see
+# test_no_launch_reads_a_mutable_global in tests/pytorch/ops/test_flydsl_autotune.py).
+_TDM_TH_LOAD = MappingProxyType({0: "RT", 1: "NT", 2: "HT", 3: "LU", 4: "NT_RT", 5: "RT_NT", 6: "NT_HT"})
+_TDM_TH_STORE = MappingProxyType(
+    {0: "RT", 1: "NT", 2: "HT", 3: "WB", 4: "NT_RT", 5: "RT_NT", 6: "NT_HT", 7: "NT_WB"}
+)
+_TDM_SCOPE = MappingProxyType({0: "WGP", 1: "SE", 2: "DEV", 3: "SYS"})
 
 
-def _check_tdm_cache(value: int, table: dict, what: str) -> None:
+def _check_tdm_cache(value: int, table: Mapping, what: str) -> None:
     if value == 0:
         return
     th, scope = value & 0x7, (value >> 3) & 0x3
