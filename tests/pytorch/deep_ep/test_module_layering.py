@@ -10,13 +10,28 @@ Read from the source with ``ast``, so it needs neither a GPU nor an import of pr
 """
 
 import ast
+import importlib.util
 import unittest
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[3]
-KERNELS = REPO / "primus_turbo" / "flydsl" / "deep_ep"
+
+def _package_root() -> Path:
+    """The source tree's ``primus_turbo``, or the installed one (the release job deletes the source)."""
+    source = Path(__file__).resolve().parents[3] / "primus_turbo"
+    if source.is_dir():
+        return source
+    # Locating the top-level package does not execute its __init__ (which loads the extension).
+    spec = importlib.util.find_spec("primus_turbo")
+    for location in (spec.submodule_search_locations or []) if spec else []:
+        if (Path(location) / "flydsl" / "deep_ep").is_dir():
+            return Path(location)
+    raise FileNotFoundError("primus_turbo is neither in the source tree nor installed")
+
+
+PACKAGE = _package_root()
+KERNELS = PACKAGE / "flydsl" / "deep_ep"
 KERNEL_PACKAGE = "primus_turbo.flydsl.deep_ep"
-HOST_RUNTIME = REPO / "primus_turbo" / "pytorch" / "deep_ep" / "flydsl_intranode.py"
+HOST_RUNTIME = PACKAGE / "pytorch" / "deep_ep" / "flydsl_intranode.py"
 
 
 def _imported_modules(path: Path) -> set:
