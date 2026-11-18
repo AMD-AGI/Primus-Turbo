@@ -15,10 +15,10 @@ A runtime exposes the three intranode methods of the C++ ``Buffer`` runtime with
 and return tuples, so ``Buffer`` can route to either, and owns its own uncached HIP-IPC heap.
 ``FlyDSLIntranodeRuntime`` holds what both versions share; each version is a subclass:
 
-- ``FlyDSLIntranodeV1Runtime`` (backend ``flydsl``) runs the V1 kernels of ``intranode_v1_kernel``,
-  the channel rings of the HIP kernels; its handles are plain tensors, interchangeable with the C++
-  backend's.
-- ``FlyDSLIntranodeV2Runtime`` (backend ``flydsl_v2``) runs the V2 kernels of ``intranode_v2_kernel``:
+- ``FlyDSLIntranodeV1Runtime`` (``v1`` on gfx1250, for the tests) runs the V1 kernels of
+  ``intranode_v1_kernel``, the channel rings of the HIP kernels; its handles are plain tensors,
+  interchangeable with the C++ runtime's.
+- ``FlyDSLIntranodeV2Runtime`` (``v2``) runs the V2 kernels of ``intranode_v2_kernel``:
   direct writes into fixed slots instead of channel rings. Its outputs match V1's; its handles are its
   own (``send_head`` holds stream indices, and a channel is one block, ``num_sms`` of them).
 """
@@ -67,7 +67,7 @@ from ._compat import NUM_MAX_NVL_PEERS, EventHandle
 
 NUM_MAX_LOCAL_EXPERTS = 1024
 SUPPORTED_NUM_RANKS = (2, 4, 8)
-INTRANODE_BACKENDS = ("cpp", "flydsl", "flydsl_v2")
+INTRANODE_BACKENDS = ("v1", "v2")
 
 
 def _as_i32(value: int) -> int:
@@ -77,8 +77,8 @@ def _as_i32(value: int) -> int:
 
 
 def get_intranode_backend(backend: Optional[str] = None) -> str:
-    """``backend`` (``cpp`` | ``flydsl`` | ``flydsl_v2``), else ``default_intranode_backend()``; either
-    way an unsupported GPU raises."""
+    """``backend`` (``v1`` | ``v2``), else ``default_intranode_backend()``; either way an unsupported
+    GPU raises. ``v1`` runs the C++ kernels on gfx942 / gfx950 and their FlyDSL port on gfx1250."""
     default_backend = default_intranode_backend()
     backend = (backend or default_backend).strip().lower()
     if backend not in INTRANODE_BACKENDS:
@@ -664,8 +664,8 @@ class FlyDSLIntranodeRuntime:
 
 
 class FlyDSLIntranodeV1Runtime(FlyDSLIntranodeRuntime):
-    """Backend ``flydsl``: the V1 kernels of ``intranode_v1_kernel``, whose channel rings, buffer
-    layout and handles are the C++ backend's. A channel is a pair of blocks, ``num_sms // 2`` of them."""
+    """``v1`` on gfx1250: the V1 kernels of ``intranode_v1_kernel``, whose channel rings, buffer
+    layout and handles are the C++ runtime's. A channel is a pair of blocks, ``num_sms // 2`` of them."""
 
     def _num_channels(self, config) -> int:
         _check(config.num_sms % 2 == 0, "num_sms must be even")
@@ -819,7 +819,7 @@ def v2_heap_bytes(num_max_tokens_per_rank: int, num_ranks: int, hidden_bytes: in
 
 
 class FlyDSLIntranodeV2Runtime(FlyDSLIntranodeRuntime):
-    """Backend ``flydsl_v2``: the V2 kernels of ``intranode_v2_kernel``, direct writes into fixed slots
+    """``v2``: the V2 kernels of ``intranode_v2_kernel``, direct writes into fixed slots
     instead of channel rings. Its outputs match V1's; its handles are its own (``send_head`` holds
     stream indices, and a channel is one block, ``num_sms`` of them)."""
 
@@ -828,8 +828,8 @@ class FlyDSLIntranodeV2Runtime(FlyDSLIntranodeRuntime):
     def __init__(self, group: dist.ProcessGroup, num_nvl_bytes: int, comm_stream: torch.cuda.Stream) -> None:
         # V2 moves rows with TDM, which gfx942 / gfx950 lack; its non-TDM path has never run there
         _check(
-            default_intranode_backend() != "cpp",
-            f"the V2 backend (flydsl_v2) does not run on {' / '.join(CPP_DEEPEP_ARCHS)}; "
+            default_intranode_backend() != "v1",
+            f"DeepEP v2 does not run on {' / '.join(CPP_DEEPEP_ARCHS)}; "
             f"leave intranode_backend unset, which takes this GPU's '{default_intranode_backend()}'",
         )
         super().__init__(group, num_nvl_bytes, comm_stream)
@@ -856,7 +856,7 @@ class FlyDSLIntranodeV2Runtime(FlyDSLIntranodeRuntime):
         # the reduce queue): a graph replay would rerun the old values and take stale flags as fresh
         _check(
             not torch.cuda.is_current_stream_capturing(),
-            "flydsl_v2 cannot be captured in a CUDA graph: each call advances host-side epochs; "
+            "DeepEP v2 cannot be captured in a CUDA graph: each call advances host-side epochs; "
             "to capture the MoE token exchange on MI455X, use the all-to-all (RCCL) token dispatcher",
         )
 

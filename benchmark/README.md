@@ -7,6 +7,15 @@ This document presents performance benchmarks for **Primus-Turbo**.
 
 ## DeepEP
 
+### DeepEP vs all-to-all, DeepSeek-V3 shape
+
+Intranode DeepEP against the RCCL all-to-all of Megatron's alltoall token dispatcher, on one node.
+Results: [DeepEP § Performance](../docs/features/deep_ep.md#performance).
+
+```bash
+python benchmark/ops/training/bench_deepep_vs_alltoall.py --tokens 4096 8192 --num-cus 32 64 128
+```
+
 ### 1. benchmark intranode
 
 ```bash

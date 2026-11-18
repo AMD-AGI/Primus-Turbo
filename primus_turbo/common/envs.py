@@ -260,8 +260,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A non-zero integer runs the EP dispatch/combine kernels on the caller's current stream
     # instead of the Buffer's comm stream. Parsed as C++ does (``is_ep_force_current_stream`` in
     # deep_ep/configs.h, which caches it once per process): unset is off, and an empty
-    # or non-integer value is an error (ValueError here, std::stoi throws in C++). The FlyDSL
-    # intranode backend (``FlyDSLIntranodeRuntime``) reads it when it is constructed.
+    # or non-integer value is an error (ValueError here, std::stoi throws in C++). On gfx1250
+    # the intranode runtime reads it when it is constructed.
     # ``DeepEPTokenDispatcher`` writes "1" with ``set_env()`` when a dispatcher asks for
     # ``deepep_use_comm_stream=False``.
     "PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM": lambda: (

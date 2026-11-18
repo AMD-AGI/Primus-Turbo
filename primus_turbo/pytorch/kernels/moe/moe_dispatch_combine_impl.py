@@ -50,7 +50,7 @@ class EPBufferConfig:
         combine_config: Optional user-provided combine config.  Same fallback
             behaviour as *dispatch_config*.
         num_max_tokens_per_rank: Tokens per rank to allocate up front for a
-            backend whose buffer holds whole batches (``flydsl_v2``). ``0``
+            version whose buffer holds whole batches (DeepEP ``v2``). ``0``
             sizes it from the group's largest first dispatch and grows it
             when a larger dispatch comes, as Megatron does for DeepEP V2.
             Ranks may dispatch different numbers of tokens, but a growth
