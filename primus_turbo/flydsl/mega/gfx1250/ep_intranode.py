@@ -122,14 +122,22 @@ def dispatch_bf16_tile(
     rank: int,
     block_threads: int = _BLOCK_THREADS,
     experts_per_publish: int = 1,
+    scale_res: Optional[ArithValue] = None,
 ):
     """Push this block's chunk of every expert's task to one dst rank, in ascending expert order.
 
     ``experts_per_publish`` experts share one store retire + barrier before their flags go out (in
-    ascending order, so the single-flag wait still holds); it must divide ``num_experts_per_rank``."""
+    ascending order, so the single-flag wait still holds); it must divide ``num_experts_per_rank``.
+
+    With ``scale_res`` the tokens are MXFP8: ``input_res`` holds E4M3 rows of ``hidden_size`` bytes and
+    ``scale_res`` their raw E8M0 scale rows (``hidden_size / 32`` bytes); they land in the dispatch
+    token buffer's fp8 view (``SymmBuffer.dispatch_fp8_views``)."""
     assert num_experts_per_rank % experts_per_publish == 0, "publish groups tile the local experts"
-    hidden_bytes = hidden_size * 2
-    assert hidden_bytes % 16 == 0, "hidden*2 must be a multiple of 16 bytes -> hidden % 8 == 0"
+    mx = scale_res is not None
+    hidden_bytes = hidden_size * (1 if mx else 2)
+    assert hidden_bytes % 16 == 0, "a token row is whole 16-byte words"
+    assert not mx or hidden_size % 512 == 0, "an E8M0 scale row is whole 16-byte words: hidden % 512 == 0"
+    scale_i32 = hidden_size // 128  # i32 words of an E8M0 scale row
     assert block_threads % _WARP == 0, "a block is a whole number of 64-lane copy warps"
     num_warps = block_threads // _WARP
     hidden_i32 = hidden_bytes // 4  # row stride in i32 words
@@ -138,6 +146,10 @@ def dispatch_bf16_tile(
     recv_token_base = rank * int(workspace.num_max_tokens_per_rank)
     # hoist workspace-derived values before any dynamic control flow (rewriter can't carry Workspace)
     token_buffer_ptr = workspace.get_dispatch_token_buffer_ptr()
+    # MXFP8: the scale plane follows the receive rows
+    scale_buffer_ptr = (
+        token_buffer_ptr + int(workspace.num_max_recv_tokens) * hidden_size if const_expr(mx) else None
+    )
     dispatch_flag_ptr = workspace.get_dispatch_flag_ptr()
 
     block_dst_rank = block_index % fx.Int32(num_ranks)
@@ -153,6 +165,7 @@ def dispatch_bf16_tile(
             source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=fx.T.i32)
             token_count = buffer_load(expert_send_count_res, task_index, vec_width=1, dtype=fx.T.i32)
             token_buffer_address = sym.map(token_buffer_ptr, dst_rank)
+            scale_buffer_address = sym.map(scale_buffer_ptr, dst_rank) if const_expr(mx) else None
 
             local_count = (token_count - warp_id + fx.Int32(row_stride - 1)) // fx.Int32(row_stride)
 
@@ -173,6 +186,16 @@ def dispatch_bf16_tile(
                     load_cache_modifier=CPOL_DEVICE_STREAM,  # read data produced by the same agent
                     store_cache_modifier=CPOL_SYSTEM_STREAM,
                 )
+                if const_expr(mx):
+                    copy_warp(
+                        scale_buffer_address,
+                        scale_res,
+                        scale_i32 * 4,
+                        dst_off=(fx.Int32(recv_token_base) + token_idx) * fx.Int32(scale_i32),
+                        src_off=token_idx * fx.Int32(scale_i32),
+                        load_cache_modifier=CPOL_DEVICE_STREAM,
+                        store_cache_modifier=CPOL_SYSTEM_STREAM,
+                    )
 
         wait_mem_all()
         fx.gpu.barrier()

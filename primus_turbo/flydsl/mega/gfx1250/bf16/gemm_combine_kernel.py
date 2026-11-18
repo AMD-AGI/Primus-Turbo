@@ -25,6 +25,9 @@ The three roles of the gfx950 ``grouped_gemm_combine_bf16_kernel``, in one launc
   second counter, waits for each token's primary-route rows to land and sums them into ``out``
   (``topk_reduce_bf16_tile``); it also tops up the flags of the pool blocks this call left empty.
 
+``COMBINE_ONLY`` (``combine_only_gfx1250``) is the combine and the reduce over an L2 output computed
+elsewhere: the GEMM role is compiled out and every workgroup combines.
+
 Workgroup order: the GEMM tiles, then the tail combine workgroups (one per CU; they start as the
 GEMM drains), so nothing that spins can keep a GEMM tile from a CU. ``num_lead_combine`` > 0 moves
 that many combine workgroups to after ``lead_gemm_percent`` of the tiles, to push while the GEMM
@@ -72,6 +75,8 @@ from primus_turbo.flydsl.mega.gfx1250.prims import (
 )
 from primus_turbo.flydsl.mega.gfx1250.symm_buffer import (
     BLOCK_M,
+    EPOCH_SLOT_WORDS,
+    EPOCH_SLOTS,
     TOKEN_DTYPE,
     Workspace,
     get_symm_buffer_for_mega_moe,
@@ -107,6 +112,7 @@ def _launch_gemm_combine_nt(
     arg_parity: fx.Pointer,
     arg_combine_expected: fx.Pointer,
     arg_reduce_expected: fx.Pointer,
+    arg_epoch: fx.Pointer,
     arg_chunk_counter: fx.Pointer,
     arg_grad_gate: fx.Pointer,
     arg_grad_topk_weights: fx.Pointer,
@@ -138,9 +144,12 @@ def _launch_gemm_combine_nt(
     issue_first: Constexpr[int],
     wmma_b2b: Constexpr[int],
     lds_cosched: Constexpr[int],
+    COMBINE_ONLY: Constexpr[bool],
 ):
     block = m_warp * n_warp * WAVE
-    arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
+    # COMBINE_ONLY: the L2 output comes in through ``arg_l2``, computed elsewhere (the MXFP8 Mega's grouped
+    # GEMM); every workgroup combines, and the LDS holds only the combine's chunk table
+    arena_bytes = (NUM_EXPERTS + 3) * 4 if COMBINE_ONLY else tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
     if arena_bytes > GFX1250_LDS_BYTES:
         raise ValueError(f"LDS arena {arena_bytes} B exceeds {GFX1250_LDS_BYTES} B")
     NUM_COMBINE = NUM_LEAD_COMBINE + NUM_TAIL_COMBINE
@@ -151,21 +160,33 @@ def _launch_gemm_combine_nt(
         arg_parity: fx.Pointer,
         arg_combine_expected: fx.Pointer,
         arg_reduce_expected: fx.Pointer,
+        arg_epoch: fx.Pointer,
         arg_chunk_counter: fx.Pointer,
     ):
         """Flip the parity; the new bank expects N_BLOCKS_N more per pool block and one more per route.
 
-        Also rearms the combine and reduce work counters for this launch."""
-        if fx.Int32(fx.thread_idx.x) == fx.Int32(0):
+        Also rearms the combine and reduce work counters for this launch, and copies the epoch into every
+        workgroup's slot."""
+        tid = fx.Int32(fx.thread_idx.x)
+        parity_addr = _addr(arg_parity)
+        combine_addr, reduce_addr = _addr(arg_combine_expected), _addr(arg_reduce_expected)
+        new_parity = ld(parity_addr, fx.Int32(0), dtype=fx.T.i64) ^ fx.Int64(1)
+        bank = cast(new_parity, fx.T.i32)
+        new_combine = ld(combine_addr, bank, dtype=fx.T.i64) + fx.Int64(N_BLOCKS_N)
+        new_reduce = ld(reduce_addr, bank, dtype=fx.T.i64) + fx.Int64(1)
+        fx.gpu.barrier()  # every lane read the old epoch before lane 0 replaces it
+        if tid == fx.Int32(0):
             st(_addr(arg_chunk_counter), fx.Int32(0), fx.Int32(0))
             st(_addr(arg_chunk_counter), fx.Int32(1), fx.Int32(0))
-            parity_addr = _addr(arg_parity)
-            new_parity = ld(parity_addr, fx.Int32(0), dtype=fx.T.i64) ^ fx.Int64(1)
             st(parity_addr, fx.Int32(0), new_parity)
-            bank = cast(new_parity, fx.T.i32)
-            combine_addr, reduce_addr = _addr(arg_combine_expected), _addr(arg_reduce_expected)
-            st(combine_addr, bank, ld(combine_addr, bank, dtype=fx.T.i64) + fx.Int64(N_BLOCKS_N))
-            st(reduce_addr, bank, ld(reduce_addr, bank, dtype=fx.T.i64) + fx.Int64(1))
+            st(combine_addr, bank, new_combine)
+            st(reduce_addr, bank, new_reduce)
+        slot = tid
+        while slot < fx.Int32(EPOCH_SLOTS):
+            st(_addr(arg_epoch), slot * fx.Int32(EPOCH_SLOT_WORDS), new_parity)
+            st(_addr(arg_epoch), slot * fx.Int32(EPOCH_SLOT_WORDS) + fx.Int32(1), new_combine)
+            st(_addr(arg_epoch), slot * fx.Int32(EPOCH_SLOT_WORDS) + fx.Int32(2), new_reduce)
+            slot = slot + fx.Int32(64)
 
     @flyc.kernel(name="gemm_combine_nt", known_block_size=[block, 1, 1])
     def gemm_combine_nt(
@@ -186,6 +207,7 @@ def _launch_gemm_combine_nt(
         arg_parity: fx.Pointer,
         arg_combine_expected: fx.Pointer,
         arg_reduce_expected: fx.Pointer,
+        arg_epoch: fx.Pointer,
         arg_chunk_counter: fx.Pointer,
         arg_grad_gate: fx.Pointer,
         arg_grad_topk_weights: fx.Pointer,
@@ -225,15 +247,19 @@ def _launch_gemm_combine_nt(
             if HAS_GRAD_GATE
             else None
         )
-        # this launch's epoch, already bumped
-        parity = cast(ld(_addr(arg_parity), fx.Int32(0), dtype=fx.T.i64), fx.T.i32)
+        # this launch's epoch, already bumped, from this workgroup's own slot
+        epoch_slot = _addr(arg_epoch) + fx.Int64(bid % fx.Int32(EPOCH_SLOTS)) * fx.Int64(EPOCH_SLOT_WORDS * 8)
+        parity = cast(ld(epoch_slot, fx.Int32(0), dtype=fx.T.i64), fx.T.i32)
         combine_bank = parity * fx.Int32(MAX_TILES)
         reduce_bank = parity * fx.Int32(num_max_routes)
-        expected_combine = ld(_addr(arg_combine_expected), parity, dtype=fx.T.i64)
-        expected_reduce = ld(_addr(arg_reduce_expected), parity, dtype=fx.T.i64)
+        expected_combine = ld(epoch_slot, fx.Int32(1), dtype=fx.T.i64)
+        expected_reduce = ld(epoch_slot, fx.Int32(2), dtype=fx.T.i64)
         l2_base = _addr(fx.recast_iter(fx.Int8, arg_l2))
 
         num_tiles_m = rocdl.readfirstlane(T.i32, _i32_table(arg_num_tile_blocks)[fx.Int32(0)])
+        if const_expr(COMBINE_ONLY):
+            # no GEMM tile: no combine waits, and the flags of every pool block topped up
+            num_tiles_m = fx.Int32(0)
         combine_start = num_tiles_m * fx.Int32(N_BLOCKS_N * LEAD_GEMM_PERCENT // 100)
         tail_combine_start = num_tiles_m * fx.Int32(N_BLOCKS_N) + fx.Int32(NUM_LEAD_COMBINE)
         is_lead_combine = (bid >= combine_start) & (bid < combine_start + fx.Int32(NUM_LEAD_COMBINE))
@@ -254,44 +280,45 @@ def _launch_gemm_combine_nt(
         expert = live.select(expert, fx.Int32(0))
         blk_n = block_n * fx.Int32(tile_n)
         m_row = block_m * fx.Int32(tile_m)
-        nt_gemm_tile(
-            base_ptr,
-            gA_base=fx.recast_iter(fx.Int8, arg_act),
-            lda=K,
-            a_row0=m_row,
-            a_rows=fx.Int32(0),
-            row_idx_table=_i32_table(arg_tile_to_expert),
-            row_idx_base=fx.Int32(0),
-            gB_base=fx.recast_iter(fx.Int8, arg_w),
-            ldb=N if B_NN else K,
-            b_slab=fx.Int64(expert) * fx.Int64(N * K * EB),
-            blk_n=blk_n,
-            c_addr=l2_base + (fx.Int64(m_row) * fx.Int64(N) + fx.Int64(blk_n)) * fx.Int64(EB),
-            ldc=N,
-            m_rows=fx.Int32(tile_m),
-            n_valid=fx.Int32(N) - blk_n,
-            i32_k=fx.Int32(K),
-            live=live,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            m_warp=m_warp,
-            n_warp=n_warp,
-            gather=False,
-            c_cache_modifier=CPOL_DEVICE_STREAM,  # read by combine workgroups on other CUs
-            b_nn=B_NN,
-            issue_first=bool(issue_first),
-            lds_cosched=bool(lds_cosched),
-            i32_n=fx.Int32(N),
-        )
-        # every wave's C stores retire before the flag; two rendezvous, which LLVM would fold
-        wait_mem_all()
-        fx.gpu.barrier()
-        wait_mem_all()
-        fx.gpu.barrier()
-        if live:
-            if fx.Int32(tid) == fx.Int32(0):
-                atomic_add(combine_flag_base, combine_bank + block_m, fx.Int64(1))
+        if const_expr(not COMBINE_ONLY):
+            nt_gemm_tile(
+                base_ptr,
+                gA_base=fx.recast_iter(fx.Int8, arg_act),
+                lda=K,
+                a_row0=m_row,
+                a_rows=fx.Int32(0),
+                row_idx_table=_i32_table(arg_tile_to_expert),
+                row_idx_base=fx.Int32(0),
+                gB_base=fx.recast_iter(fx.Int8, arg_w),
+                ldb=N if B_NN else K,
+                b_slab=fx.Int64(expert) * fx.Int64(N * K * EB),
+                blk_n=blk_n,
+                c_addr=l2_base + (fx.Int64(m_row) * fx.Int64(N) + fx.Int64(blk_n)) * fx.Int64(EB),
+                ldc=N,
+                m_rows=fx.Int32(tile_m),
+                n_valid=fx.Int32(N) - blk_n,
+                i32_k=fx.Int32(K),
+                live=live,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                m_warp=m_warp,
+                n_warp=n_warp,
+                gather=False,
+                c_cache_modifier=CPOL_DEVICE_STREAM,  # read by combine workgroups on other CUs
+                b_nn=B_NN,
+                issue_first=bool(issue_first),
+                lds_cosched=bool(lds_cosched),
+                i32_n=fx.Int32(N),
+            )
+            # every wave's C stores retire before the flag; two rendezvous, which LLVM would fold
+            wait_mem_all()
+            fx.gpu.barrier()
+            wait_mem_all()
+            fx.gpu.barrier()
+            if live:
+                if fx.Int32(tid) == fx.Int32(0):
+                    atomic_add(combine_flag_base, combine_bank + block_m, fx.Int64(1))
 
         if is_combine:
             # Work items are _FOLD_CHUNK_ROWS-row chunks of the fold rows of all segments, in pool
@@ -342,17 +369,18 @@ def _launch_gemm_combine_nt(
                 # a fold row's other pool rows lie in lower blocks, so wait for the whole prefix
                 last_tile_m = (start_row + part_offset + num_part_rows - fx.Int32(1)) // fx.Int32(BLOCK_M)
                 if fx.Int32(tid) == fx.Int32(0):
-                    polled_tile_m = next_tile_m
-                    while polled_tile_m <= last_tile_m:
-                        spin_until_flag_reaches(
-                            combine_flag_base,
-                            combine_bank + polled_tile_m,
-                            expected_combine,
-                            "agent",
-                            RANK,
-                            "combine",
-                        )
-                        polled_tile_m = polled_tile_m + fx.Int32(1)
+                    if const_expr(not COMBINE_ONLY):
+                        polled_tile_m = next_tile_m
+                        while polled_tile_m <= last_tile_m:
+                            spin_until_flag_reaches(
+                                combine_flag_base,
+                                combine_bank + polled_tile_m,
+                                expected_combine,
+                                "agent",
+                                RANK,
+                                "combine",
+                            )
+                            polled_tile_m = polled_tile_m + fx.Int32(1)
                     # take the next chunk now, so its counter round trip overlaps this one's push
                     taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(0), fx.Int32(1))
                     st(lds, fx.Int32(1), taken, scope="workgroup", space=3)
@@ -452,7 +480,7 @@ def _launch_gemm_combine_nt(
                 take = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(1), scope="workgroup", space=3))
                 fx.gpu.barrier()  # every wave has the take before thread 0 takes the next one
 
-    epoch_bump(arg_parity, arg_combine_expected, arg_reduce_expected, arg_chunk_counter).launch(
+    epoch_bump(arg_parity, arg_combine_expected, arg_reduce_expected, arg_epoch, arg_chunk_counter).launch(
         grid=(1, 1, 1), block=(64, 1, 1), stream=stream
     )
     gemm_combine_nt(
@@ -473,6 +501,7 @@ def _launch_gemm_combine_nt(
         arg_parity,
         arg_combine_expected,
         arg_reduce_expected,
+        arg_epoch,
         arg_chunk_counter,
         arg_grad_gate,
         arg_grad_topk_weights,
@@ -493,12 +522,12 @@ def _chunk_counter(device: torch.device) -> torch.Tensor:
     return torch.zeros(2, dtype=torch.int32, device=device)
 
 
-_CONSTEXPR0 = 25
+_CONSTEXPR0 = 26
 
 
 def gemm_combine_nt_gfx1250(
     act: torch.Tensor,
-    w2: torch.Tensor,
+    w2: torch.Tensor | None,
     handle: DispatchHandle,
     topk_idx: torch.Tensor,
     *,
@@ -532,19 +561,29 @@ def gemm_combine_nt_gfx1250(
     ``issue_first`` issues each k-tile's prefetch at the top of the previous one, ``lds_cosched``
     interleaves the fragment reads with the matrix ops (``nt_gemm_tile``; -1: wherever the tile and
     ``issue_first`` allow it) and ``wmma_b2b`` turns the WMMA arbitration stall off (None: on for NT,
-    off with ``b_nn``)."""
+    off with ``b_nn``).
+
+    ``w2`` None (``combine_only_gfx1250``): ``act`` is the L2 output already, ``[pool rows, N]`` computed
+    elsewhere, and the launch is the combine and the reduce alone."""
     if wmma_b2b is None:
         wmma_b2b = 0 if b_nn else 1
     lds_cosched = resolve_lds_cosched(lds_cosched, issue_first, tile_m, tile_n, m_warp, n_warp)
     _require_gfx1250(act.device)
     symm = get_symm_buffer_for_mega_moe()
+    combine_only = w2 is None
+    if combine_only:
+        assert not b_nn and bias is None and num_lead_combine == 0, "the combine-only launch has no GEMM"
+        # only the GEMM's shape is read: an identity-shaped w2
+        experts, hidden = int(symm.num_experts) // int(symm.num_ranks), act.shape[1]
+        w2 = act.new_empty(hidden).as_strided((experts, hidden, hidden), (0, 0, 1))
     G, N, K = w2.shape
     if b_nn:
         K, N = N, K
         assert N >= tile_n, "an NN block backs its B read off into the row, so N >= tile_n"
     rows = act.shape[0]
     tile_k = tile_k or (128 if K % 128 == 0 else 64)
-    assert act.dtype == w2.dtype == torch.bfloat16 and act.is_contiguous() and w2.is_contiguous()
+    assert act.dtype == w2.dtype == torch.bfloat16 and act.is_contiguous()
+    assert combine_only or w2.is_contiguous()
     assert act.shape[1] == K and N == int(symm.hidden), "w2's output dim is the model hidden"
     assert rows == handle.pool_row_to_route.numel(), "act holds the rows dispatched to this rank"
     assert tile_m == BLOCK_M, "a GEMM tile is one Mega pool block"
@@ -575,7 +614,7 @@ def gemm_combine_nt_gfx1250(
         assert bias_scale is not None and bias_scale.dtype == torch.float32 and bias_scale.numel() == rows
         bias, bias_scale = bias.contiguous(), bias_scale.contiguous()
     # local stage of the L2 output: only this rank's combine workgroups read it
-    l2 = torch.empty(rows, N, dtype=torch.bfloat16, device=act.device)
+    l2 = act if combine_only else torch.empty(rows, N, dtype=torch.bfloat16, device=act.device)
     args = (
         _as_ptr(out),
         _as_ptr(act),
@@ -594,6 +633,7 @@ def gemm_combine_nt_gfx1250(
         _as_ptr(symm._combine_parity),
         _as_ptr(symm._combine_expected),
         _as_ptr(symm._reduce_expected),
+        _as_ptr(symm._combine_epoch),
         _as_ptr(_chunk_counter(act.device)),
         # traced out without a grad gate; any device tensor fills them
         _as_ptr(grad_gate if has_grad_gate else out),
@@ -604,7 +644,9 @@ def gemm_combine_nt_gfx1250(
         torch.cuda.current_stream(),
         # GEMM tiles of this call's pool (the prologue's num_tile_blocks), then the combine
         # workgroups: a worst-case grid would queue idle tiles ahead of the tail combine
-        rows // BLOCK_M * ((N + tile_n - 1) // tile_n) + num_lead_combine + num_tail_combine,
+        (0 if combine_only else rows // BLOCK_M * ((N + tile_n - 1) // tile_n))
+        + num_lead_combine
+        + num_tail_combine,
         N,
         K,
         int(symm.num_max_pool_tokens) // BLOCK_M,
@@ -628,6 +670,7 @@ def gemm_combine_nt_gfx1250(
         issue_first,
         wmma_b2b,
         lds_cosched,
+        combine_only,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)
@@ -640,3 +683,10 @@ def gemm_combine_nt_gfx1250(
     if has_grad_gate:
         return out[:num_tokens], grad_topk_weights[: num_tokens * topk_idx.shape[1]].view(num_tokens, -1)
     return out[:num_tokens]
+
+
+def combine_only_gfx1250(l2: torch.Tensor, handle: DispatchHandle, topk_idx: torch.Tensor, *, grad_gate=None):
+    """The combine and reduce of ``gemm_combine_nt_gfx1250`` over an L2 output computed elsewhere: ``l2`` [pool rows,
+    hidden] bf16 in pool order (padding rows unread) -> ``out [tokens, hidden]``, and with ``grad_gate`` (f32 per
+    pool row) also ``grad_topk_weights [tokens, topk]``, as that call returns them."""
+    return gemm_combine_nt_gfx1250(l2, None, handle, topk_idx, grad_gate=grad_gate)

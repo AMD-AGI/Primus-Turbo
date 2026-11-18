@@ -25,7 +25,14 @@ from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
 from primus_turbo.flydsl.mega.gfx1250.barrier import grid_sync, xgmi_barrier
 from primus_turbo.flydsl.mega.gfx1250.ep_intranode import same_rank_order
-from primus_turbo.flydsl.mega.gfx1250.prims import atomic_add, ld, st
+from primus_turbo.flydsl.mega.gfx1250.prims import (
+    WAVE,
+    atomic_add,
+    ceildiv,
+    ld,
+    st,
+    wave_match_rank,
+)
 from primus_turbo.flydsl.mega.gfx1250.symm_buffer import (
     BLOCK_M,
     TOKEN_DTYPE,
@@ -82,9 +89,12 @@ DISPATCH_HANDLE_DTYPES = DispatchHandle(
     recv_token_to_pool_rows=torch.int32,
 )
 
-# SCRATCH holds these per-expert i32 fields; the first six are counts reset at the end of every launch.
-_NUM_SCRATCH_FIELDS = 9
-_NUM_SCRATCH_COUNT_FIELDS = 6
+# SCRATCH holds these per-expert i32 fields; the first three are counts reset at the end of every launch. After
+# them, each block's own three counts per expert (``[field][expert][block]``), rewritten by every launch.
+_NUM_SCRATCH_FIELDS = 6
+_NUM_SCRATCH_COUNT_FIELDS = 3
+# grid sizes the prologue tunes over; the per-block counts take room for the largest
+_GRID_BLOCKS = (32, 64, 96)
 # LDS holds these per-expert i32 fields.
 _NUM_LDS_FIELDS = 6
 
@@ -105,6 +115,10 @@ def _make_dispatch_prologue(
 ):
     total_pairs = num_tokens * num_topk
     grid_stride = grid_blocks * block_threads
+    # each block takes a contiguous range of routes, whole waves of them
+    routes_per_block = ceildiv(ceildiv(total_pairs, grid_blocks), WAVE) * WAVE
+    num_route_iters = ceildiv(routes_per_block, block_threads)
+    num_waves = block_threads // WAVE
     num_pool_blocks = num_max_pool_tokens // block_m
     num_max_recv_tokens = num_ranks * num_max_tokens_per_rank
     expert_count_bytes = num_ranks * 2 * num_experts * 4
@@ -113,13 +127,12 @@ def _make_dispatch_prologue(
         SCRATCH_NUM_ROUTES,
         SCRATCH_NUM_FOLD_ROWS,
         SCRATCH_NUM_SEND_ROWS,
-        SCRATCH_NUM_FOLD_ROWS_RESERVED,
-        SCRATCH_NUM_OTHER_ROWS_RESERVED,
-        SCRATCH_NUM_SEND_ROWS_RESERVED,
         SCRATCH_SEGMENT_START,
         SCRATCH_SEND_OFFSET,
         SCRATCH_POOL_BASE,
     ) = (field * num_experts for field in range(_NUM_SCRATCH_FIELDS))
+    SCRATCH_BLOCK_COUNTS = _NUM_SCRATCH_FIELDS * num_experts
+    assert grid_blocks <= max(_GRID_BLOCKS), "the per-block counts are sized for the largest tuned grid"
     # Phase D reuses the three phase-A counts as within-block positions (routes -> other rows).
     (
         LDS_NUM_ROUTES,
@@ -209,6 +222,13 @@ def _make_dispatch_prologue(
         def load_scratch(field, index):
             return buffer_load(scratch_resource, fx.Int32(field) + index, vec_width=1, dtype=fx.T.i32)
 
+        def block_count_idx(field, expert_idx, block):
+            return (
+                fx.Int32(SCRATCH_BLOCK_COUNTS + field * num_experts * grid_blocks)
+                + expert_idx * fx.Int32(grid_blocks)
+                + block
+            )
+
         def load_lds(field, index):
             return ld(lds_base, fx.Int32(field) + index, scope="workgroup", space=3)
 
@@ -231,6 +251,10 @@ def _make_dispatch_prologue(
         pool_row_to_recv_token_resource = create_buffer_resource_from_addr(
             pool_row_to_recv_token_base, num_records_bytes=pool_row_to_recv_token_bytes
         )
+        # exact size: the sentinel rows past the last expert's pool fall out of range here
+        weight_recv_resource = create_buffer_resource_from_addr(
+            weight_recv_base, num_records_bytes=pool_rows_bytes
+        )
         # combine recv-segment table: one (local_expert, source_rank) entry each
         combine_recv_dst_rank_resource = create_buffer_resource(COMBINE_RECV_DST_RANK, max_size=True)
         combine_recv_start_row_resource = create_buffer_resource(COMBINE_RECV_START_ROW, max_size=True)
@@ -246,8 +270,13 @@ def _make_dispatch_prologue(
             st(lds_base, lds_clear_idx, fx.Int32(0), scope="workgroup", space=3)
             lds_clear_idx = lds_clear_idx + fx.Int32(block_threads)
         fx.gpu.barrier()
-        route_idx = block_index * fx.Int32(block_threads) + thread_index
-        while route_idx < fx.Int32(total_pairs):
+        block_route_begin = block_index * fx.Int32(routes_per_block)
+        block_route_end = block_route_begin + fx.Int32(routes_per_block)
+        block_route_end = fx.arith.select(
+            block_route_end < fx.Int32(total_pairs), block_route_end, fx.Int32(total_pairs)
+        )
+        route_idx = block_route_begin + thread_index
+        while route_idx < block_route_end:
             expert_id = load_expert_id(route_idx)
             if expert_id >= fx.Int32(0):
                 same_rank_position, num_same_rank_routes = route_order(route_idx)
@@ -256,13 +285,18 @@ def _make_dispatch_prologue(
                     atomic_add(lds_base, fx.Int32(LDS_NUM_FOLD_ROWS) + expert_id, fx.Int32(1), "workgroup", 3)
                 if same_rank_position == fx.Int32(0):
                     atomic_add(lds_base, fx.Int32(LDS_NUM_SEND_ROWS) + expert_id, fx.Int32(1), "workgroup", 3)
-            route_idx = route_idx + fx.Int32(grid_stride)
+            route_idx = route_idx + fx.Int32(block_threads)
         fx.gpu.barrier()
         lds_flush_idx = thread_index
         while lds_flush_idx < fx.Int32(num_experts):
             for field in fx.range_constexpr(len(phase_a_counts)):
                 lds_field, scratch_field = phase_a_counts[field]
                 block_count = load_lds(lds_field, lds_flush_idx)
+                # this block's own count as well (zeros included: nothing resets them), after which phase D puts
+                # the block's rows of each segment part
+                buffer_store(
+                    block_count, scratch_resource, block_count_idx(field, lds_flush_idx, block_index)
+                )
                 if block_count > fx.Int32(0):
                     atomic_add(scratch_base, fx.Int32(scratch_field) + lds_flush_idx, block_count, "agent", 1)
             lds_flush_idx = lds_flush_idx + fx.Int32(block_threads)
@@ -422,7 +456,9 @@ def _make_dispatch_prologue(
                     )
                     within_expert_offset = within_expert_offset + count_value
                 is_last_expert = local_expert_idx == fx.Int32(num_experts_per_rank - 1)
-                # padding rows, plus BLOCK_M rows past the last expert, gather out of bounds and read 0
+                # padding rows, plus BLOCK_M rows past the last expert, gather out of bounds and read 0; their
+                # routing weight is 0, not a value left by an earlier call: the MXFP8 stages scale the
+                # activation by it and contract their wgrads over the padding rows
                 sentinel_end = (
                     expert_pool_base
                     + padded_count
@@ -431,6 +467,7 @@ def _make_dispatch_prologue(
                 sentinel_row = expert_pool_base + expert_total_count
                 while sentinel_row < sentinel_end:
                     buffer_store(fx.Int32(num_max_recv_tokens), pool_row_to_recv_token_resource, sentinel_row)
+                    buffer_store(fx.Float32(0.0), weight_recv_resource, sentinel_row)
                     sentinel_row = sentinel_row + fx.Int32(1)
                 if is_last_expert:
                     total_rows = expert_pool_base + padded_count
@@ -443,70 +480,90 @@ def _make_dispatch_prologue(
 
         grid_sync(workspace, thread_index, block_index, grid_blocks, rank, "dispatch_prologue/C:table-built")
 
-        # Reuse Phase A's per-block counts in LDS (untouched by barriers) -- skip clear + recount.
+        # Phase D places the rows in route (= token) order, not in the order atomics return: within a segment part
+        # (an expert's fold rows from this rank, then its other rows) and within an expert's send list, each block's
+        # rows follow those of the blocks before it, and a block's rows go a pass of block_threads routes at a time,
+        # wave by wave, by lane. The wgrads contract over the pool rows in this order (in MXFP8 they also quantize
+        # it in 32-row blocks), so they are reproducible, whatever grid the tuner picked.
+        # Phase A's per-block counts in LDS (untouched by barriers) become the within-block positions.
         reserve_idx = thread_index
         while reserve_idx < fx.Int32(num_experts):
             num_routes = load_lds(LDS_NUM_ROUTES, reserve_idx)
             if num_routes > fx.Int32(0):
-                num_fold_rows = load_lds(LDS_NUM_FOLD_ROWS, reserve_idx)
-                num_send_rows = load_lds(LDS_NUM_SEND_ROWS, reserve_idx)
                 segment_start = load_scratch(SCRATCH_SEGMENT_START, reserve_idx)
                 # fold rows lead each segment, so the other rows start after this rank's fold total
                 segment_num_fold_rows = load_scratch(SCRATCH_NUM_FOLD_ROWS, reserve_idx)
                 send_offset = load_scratch(SCRATCH_SEND_OFFSET, reserve_idx)
-                fold_rows_offset = atomic_add(
-                    scratch_base,
-                    fx.Int32(SCRATCH_NUM_FOLD_ROWS_RESERVED) + reserve_idx,
-                    num_fold_rows,
-                    "agent",
-                    1,
-                )
-                other_rows_offset = atomic_add(
-                    scratch_base,
-                    fx.Int32(SCRATCH_NUM_OTHER_ROWS_RESERVED) + reserve_idx,
-                    num_routes - num_fold_rows,
-                    "agent",
-                    1,
-                )
-                send_rows_offset = atomic_add(
-                    scratch_base,
-                    fx.Int32(SCRATCH_NUM_SEND_ROWS_RESERVED) + reserve_idx,
-                    num_send_rows,
-                    "agent",
-                    1,
-                )
-                store_lds(LDS_FOLD_ROWS_BASE, reserve_idx, segment_start + fold_rows_offset)
+                rows_before = [fx.Int32(0), fx.Int32(0), fx.Int32(0)]  # routes, fold rows, send rows
+                for other_block in fx.range_constexpr(grid_blocks):
+                    is_before = fx.Int32(other_block) < block_index
+                    for field in fx.range_constexpr(len(phase_a_counts)):
+                        count_value = buffer_load(
+                            scratch_resource,
+                            block_count_idx(field, reserve_idx, fx.Int32(other_block)),
+                            vec_width=1,
+                            dtype=fx.T.i32,
+                        )
+                        rows_before[field] = rows_before[field] + fx.arith.select(
+                            is_before, count_value, fx.Int32(0)
+                        )
+                routes_before, fold_rows_before, send_rows_before = rows_before
+                store_lds(LDS_FOLD_ROWS_BASE, reserve_idx, segment_start + fold_rows_before)
                 store_lds(
                     LDS_OTHER_ROWS_BASE,
                     reserve_idx,
-                    segment_start + segment_num_fold_rows + other_rows_offset,
+                    segment_start + segment_num_fold_rows + routes_before - fold_rows_before,
                 )
-                store_lds(LDS_SEND_ROWS_BASE, reserve_idx, send_offset + send_rows_offset)
+                store_lds(LDS_SEND_ROWS_BASE, reserve_idx, send_offset + send_rows_before)
                 for field in fx.range_constexpr(len(phase_a_counts)):
                     store_lds(phase_a_counts[field][0], reserve_idx, fx.Int32(0))
             reserve_idx = reserve_idx + fx.Int32(block_threads)
         fx.gpu.barrier()
-        route_idx = block_index * fx.Int32(block_threads) + thread_index
-        while route_idx < fx.Int32(total_pairs):
+        wave = thread_index // fx.Int32(WAVE)
+        # the same number of passes for every thread: the waves take turns at the counters behind barriers
+        route_iter = fx.Int32(0)
+        while route_iter < fx.Int32(num_route_iters):
+            route_idx = block_route_begin + route_iter * fx.Int32(block_threads) + thread_index
+            in_range = route_idx < block_route_end
+            route_idx = fx.arith.select(in_range, route_idx, fx.Int32(0))
             expert_id = load_expert_id(route_idx)
-            if expert_id >= fx.Int32(0):
-                same_rank_position, num_same_rank_routes = route_order(route_idx)
+            is_route = in_range & (expert_id >= fx.Int32(0))
+            same_rank_position, num_same_rank_routes = route_order(route_idx)
+            is_fold = same_rank_position == num_same_rank_routes - fx.Int32(1)
+            is_send = is_route & (same_rank_position == fx.Int32(0))
+            # the LDS position counter of the route's pool row and of its send entry (-1: none)
+            row_counter = fx.arith.select(
+                is_route,
+                fx.arith.select(is_fold, fx.Int32(LDS_NUM_FOLD_ROWS), fx.Int32(LDS_NUM_ROUTES)) + expert_id,
+                fx.Int32(-1),
+            )
+            send_counter = fx.arith.select(is_send, fx.Int32(LDS_NUM_SEND_ROWS) + expert_id, fx.Int32(-1))
+            row_rank, row_is_last = wave_match_rank(row_counter)
+            send_rank, send_is_last = wave_match_rank(send_counter)
+            local_position = fx.Int32(0)
+            send_position = fx.Int32(0)
+            for turn in fx.range_constexpr(num_waves):
+                if wave == fx.Int32(turn):
+                    # a counter's lanes all read it before its last lane moves it past them
+                    local_position = (
+                        load_lds(0, fx.arith.select(is_route, row_counter, fx.Int32(0))) + row_rank
+                    )
+                    send_position = (
+                        load_lds(0, fx.arith.select(is_send, send_counter, fx.Int32(0))) + send_rank
+                    )
+                    if row_is_last:
+                        store_lds(0, row_counter, local_position + fx.Int32(1))
+                    if send_is_last:
+                        store_lds(0, send_counter, send_position + fx.Int32(1))
+                fx.gpu.barrier()
+            if is_route:
                 token_idx = route_idx // fx.Int32(num_topk)
-                is_fold = same_rank_position == num_same_rank_routes - fx.Int32(1)
-                row_position_idx = (
-                    fx.arith.select(is_fold, fx.Int32(LDS_NUM_FOLD_ROWS), fx.Int32(LDS_NUM_ROUTES))
-                    + expert_id
-                )
                 row_base_idx = (
                     fx.arith.select(is_fold, fx.Int32(LDS_FOLD_ROWS_BASE), fx.Int32(LDS_OTHER_ROWS_BASE))
                     + expert_id
                 )
-                local_position = atomic_add(lds_base, row_position_idx, fx.Int32(1), "workgroup", 3)
                 destination_row = ld(lds_base, row_base_idx, scope="workgroup", space=3) + local_position
                 if same_rank_position == fx.Int32(0):
-                    send_position = atomic_add(
-                        lds_base, fx.Int32(LDS_NUM_SEND_ROWS) + expert_id, fx.Int32(1), "workgroup", 3
-                    )
                     send_idx = load_lds(LDS_SEND_ROWS_BASE, expert_id) + send_position
                     buffer_store(token_idx, dispatched_token_idx_resource, send_idx)
                 routing_weight = buffer_load(topk_weight_resource, route_idx, vec_width=1, dtype=fx.T.f32)
@@ -550,7 +607,7 @@ def _make_dispatch_prologue(
                             fx.Int32(num_max_recv_tokens * num_topk),
                         ),
                     )
-            route_idx = route_idx + fx.Int32(grid_stride)
+            route_iter = route_iter + fx.Int32(1)
 
         grid_sync(workspace, thread_index, block_index, grid_blocks, rank, "dispatch_prologue/D:scatter-done")
 
@@ -576,7 +633,9 @@ def _make_dispatch_prologue(
 
 @functools.lru_cache(maxsize=8)
 def _dispatch_prologue_scratch_cached(num_experts, device):
-    return torch.zeros(_NUM_SCRATCH_FIELDS * num_experts, dtype=torch.int32, device=device)
+    return torch.zeros(
+        (_NUM_SCRATCH_FIELDS + 3 * max(_GRID_BLOCKS)) * num_experts, dtype=torch.int32, device=device
+    )
 
 
 def get_dispatch_prologue_scratch(num_experts, device="cuda"):
@@ -589,7 +648,7 @@ def get_dispatch_prologue_scratch(num_experts, device="cuda"):
 @autotune(
     configs=[
         Config(num_cu=num_cu, num_threads=num_threads)
-        for num_cu, num_threads in itertools.product((32, 64, 96), (256, 512, 1024))
+        for num_cu, num_threads in itertools.product(_GRID_BLOCKS, (256, 512, 1024))
     ],
     rep=5,
     # Retune per shape; topk_idx dtype auto-joins the key via the tensor arg. A tuning run launches
@@ -676,7 +735,8 @@ def _compiled_dispatch_prologue(
 
 
 def dispatch_prologue_flydsl_kernel(symm, topk_idx, topk_weight):
-    """Build the routing tables on ``symm``; returns ``(handle, dispatch_weights)``."""
+    """Build the routing tables on ``symm``; returns ``(handle, dispatch_weights)``. The tables are a function of
+    the routing alone (no atomic sets a row's place), so the same inputs give the same pool order in every run."""
     if topk_idx.dtype not in (torch.int32, torch.int64):
         raise TypeError(f"topk_idx must be int32 or int64, got {topk_idx.dtype}")
     num_tokens, num_topk = topk_idx.shape

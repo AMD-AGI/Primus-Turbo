@@ -48,6 +48,12 @@ class GLUActivation(NamedTuple):
     up_clamp: Optional[float] = ACTIVATION_CLAMP
 
     @classmethod
+    def swiglu(cls, limit: Optional[float] = None):
+        """Megatron's SiLU-SwiGLU: ``silu(gate) * up``, plain (DeepSeek-V3) or, with ``limit``
+        (``activation_func_clamp_value``), the gate clamped from above and ``up`` on both sides."""
+        return cls(gate_clamp_lo=None, gate_clamp_hi=limit, up_clamp=limit)
+
+    @classmethod
     def swigluoai(cls, alpha: float = 1.702, limit: Optional[float] = 7.0, glu_offset: float = 1.0):
         """GPT-OSS-style ``swigluoai`` (MiniMax-M3's ``hidden_act``) on the chunked gate||up layout.
 

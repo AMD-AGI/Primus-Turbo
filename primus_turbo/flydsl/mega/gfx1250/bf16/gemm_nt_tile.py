@@ -122,6 +122,14 @@ def resolve_lds_cosched(
     return lds_cosched
 
 
+# A gathered row whose byte size is not a multiple of this shares its first or last 128 bytes with
+# the neighbouring row: reading this row's edge pulls in the neighbour's, which the dispatch may not
+# have written yet, and the stale bytes then serve the tile that reads the neighbour (GPT-OSS's
+# hidden 2880: 5760-byte rows). With 64-wide k-tiles (hidden % 128 == 64, the only way a 64-multiple
+# row misses this size) those edges are exactly the first and the last k-tile.
+GATHER_LINE_BYTES = 256
+
+
 def check_gather_rows(a_rows: int, lda: int, tile_m: int, tile_k: int):
     """The async A gather's limits: some row to read, and 32-bit byte offsets into A."""
     assert a_rows > 0, "a gathered A needs a row"
@@ -163,6 +171,7 @@ def nt_gemm_tile(
     i32_n=None,
     issue_first: bool = False,
     lds_cosched: bool = False,
+    edge_a_cache_modifier: int = 0,
 ):
     """One ``tile_m x tile_n`` block; must be called by all ``m_warp * n_warp`` waves.
 
@@ -180,6 +189,8 @@ def nt_gemm_tile(
     was drained by the previous k-tile's fence. ``lds_cosched`` (needs ``issue_first``) issues each
     sub-step's fragment reads one per matrix op of the previous sub-step, one scheduling region per
     sub-step, holding the running sub-step's fragments live to its end.
+    ``edge_a_cache_modifier`` (gather only) is the cache policy of the first and the last k-tile's A
+    loads, where a gathered row can share a cache line with its neighbour (see ``GATHER_LINE_BYTES``).
     """
     KB = tile_k * EB
     KSB = WMMA_K * EB
@@ -296,18 +307,27 @@ def nt_gemm_tile(
             lds = _llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), _raw(fx.Int32(_bidx(pa)) + a_lane_lds))
             koff32 = fx.Int32(kt) * fx.Int32(KB)
 
-            def _a_loads():
+            def _a_loads(cache_modifier=0):
+                aux = ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_modifier)
                 for i in range_constexpr(N_LD):
                     g = std_arith.AddIOp(
                         a_base, std_arith.ExtUIOp(i64, _raw(a_off[i] + koff32)).result
                     ).result
                     gp = _llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), g)
-                    _rocdl.global_load_async_to_lds_b128(gp, lds, i * RPI * LDS_ROW)
+                    if const_expr(cache_modifier):
+                        _rocdl.global_load_async_to_lds_b128(gp, lds, i * RPI * LDS_ROW, aux=aux)
+                    else:
+                        _rocdl.global_load_async_to_lds_b128(gp, lds, i * RPI * LDS_ROW)
 
             if const_expr(prologue):
                 # a dead tile waits on no flag, so it reads no A at all (only the prologue runs
-                # for it); its LDS stays garbage and its store is dropped
+                # for it); its LDS stays garbage and its store is dropped. The prologue is k-tile 0.
                 if live:
+                    _a_loads(edge_a_cache_modifier)
+            elif const_expr(edge_a_cache_modifier):
+                if fx.Int32(kt) == K_TILES - fx.Int32(1):
+                    _a_loads(edge_a_cache_modifier)
+                else:
                     _a_loads()
             else:
                 _a_loads()

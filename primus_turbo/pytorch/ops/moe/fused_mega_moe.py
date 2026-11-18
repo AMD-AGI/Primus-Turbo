@@ -26,6 +26,9 @@ The gated activation defaults to SiLU-SwiGLU; pass a :class:`GLUActivation` (e.g
 Each forward reads the rows dispatched to this rank back once (a D2H) and sizes every per-layer
 tensor to them, so neither entry point is CUDA-graph capturable.
 
+On gfx1250 the combine buffer is addressed with 32-bit offsets: ``align(tokens, 128) x topk x hidden``
+must stay below 2**31 (37,376 tokens per rank for DeepSeek-V3's top-8 and hidden 7168), else ValueError.
+
 The staged ops take ``fuse_wgrad_accum_pattern`` (``"megatron"`` or None), the same switch as the
 grouped GEMM ops: on gfx1250 the wgrad then adds dW straight into the weight's bf16 ``main_grad``
 (one rounding, no dW buffer, no separate add) and the op returns a dummy gradient, with
@@ -189,8 +192,11 @@ def fused_mega_moe(
     return FusedMegaMoEFunction.apply(x, topk_idx, topk_weights, w1, w2, group, activation)
 
 
-def _wgrad_accum_target(w: torch.Tensor, pattern: Optional[str], needs_grad: bool) -> Optional[torch.Tensor]:
+def _wgrad_accum_target(
+    w: torch.Tensor, pattern: Optional[str], needs_grad: bool, supported=None
+) -> Optional[torch.Tensor]:
     """``w.main_grad`` when this op's wgrad can accumulate into it, else None (ordinary gradient).
+    ``supported(w)``: whether the wgrad kernel can (default: the bf16 gfx1250 variable-K's check).
 
     Checked BEFORE ``_setup_fused_grad_accum``, which marks the weight as already accumulated as a
     side effect: marking a weight whose gradient then takes the ordinary path would drop it.
@@ -206,11 +212,12 @@ def _wgrad_accum_target(w: torch.Tensor, pattern: Optional[str], needs_grad: boo
         and main_grad.is_contiguous()
     ):
         return None
-    from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_gfx1250_impl import (
-        wgrad_accum_supported,
-    )
+    if supported is None:
+        from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_gfx1250_impl import (
+            wgrad_accum_supported as supported,
+        )
 
-    if not wgrad_accum_supported(w):
+    if not supported(w):
         return None
     _, main_grad = _setup_fused_grad_accum(w, pattern)
     return main_grad
