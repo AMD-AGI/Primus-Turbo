@@ -6,19 +6,11 @@
 
 """MegaMoE in MXFP8 on gfx1250 across every visible GPU (EP2+). Written for a multi-GPU node; skipped below two GPUs.
 
-Every call uses fresh tokens, routing and weights and is checked, and between calls the dispatch and combine token
-buffers are filled with NaN bytes, so a wait the protocol lacks reads NaN instead of a right value an earlier call
-left. Some cases hold one rank back before its launches.
-
-* The per-row stages bit for bit on every rank against the grouped path's kernels run on that rank's pool
-  (``check_stages`` of the EP1 suite: l1, the activation's copies, the x / dy column copies, grad_gate, grad_l1's
-  copies, dW1, dW2), which do not depend on the EP size.
-* The ops against the fp32 reference of the single-GPU bf16 suite: each rank's tokens and its experts' gradients
-  above 20 dB (the MX recipe gives ~23 dB) and every row of y / dx within 0.5 relative; a non-finite output fails,
-  and an all-zero reference (a rank whose experts got no route) needs an all-zero gradient.
-* Every output, the wgrads included, bitwise between two calls on the same inputs with another call between them
-  (the prologue's pool order is the token order); two layers interleaved (forward A, forward B, backward B,
-  backward A) bitwise as each alone; the wgrads into a bf16 main_grad.
+Every call uses fresh tokens, routing and weights, and between calls the dispatch and combine token buffers are
+filled with NaN bytes, so a wait the protocol lacks reads NaN instead of a right value an earlier call left; some
+cases hold one rank back before its launches. The per-row stages are checked bit for bit on every rank
+(``check_stages`` of the EP1 suite), the ops against the fp32 reference of the single-GPU bf16 suite (20 dB, the MX
+recipe gives ~23 dB; every row of y / dx within 0.5 relative), and determinism and two interleaved layers bitwise.
 """
 
 from datetime import timedelta

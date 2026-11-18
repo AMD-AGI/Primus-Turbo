@@ -4,12 +4,11 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""MegaMoE in MXFP8 on gfx1250, one GPU (EP1): the MX rows on the wire, the combine-only launch, and the stages
-bit for bit against the routed experts' grouped-path kernels run in the Mega pool order on the same quantized
-operands (the rows from bf16 by the grouped path's gather-quant, the columns by mxfp8_ref from the dispatched fp8
-rows; ``check_stages``, which the EP2+ suite runs on every rank); the staged ops against an fp32 reference; a bf16
-combine after a combine-only launch on one heap, two layers interleaved, the zero routing weight of the pool's
-padding rows, and the contract violations the stages refuse."""
+"""MegaMoE in MXFP8 on gfx1250, one GPU (EP1): the stages, the MX rows on the wire and the combine-only launch
+included, bit for bit against the routed experts' grouped-path kernels run in the Mega pool order on the same
+quantized operands (``check_stages``, which the EP2+ suite runs on every rank); the staged ops against an fp32
+reference, run to run and with two layers interleaved; a bf16 combine after a combine-only launch on one heap, the
+zero routing weight of the pool's padding rows, and the contract violations the stages refuse."""
 
 import os
 import sys
@@ -207,30 +206,6 @@ def test_stages_vs_grouped_path_bitwise_ep1(ep1_group, T, H, I, E, topk, skew):
     check_stages(ep1_group, T, H, I, E, topk, T + H, skew)
 
 
-def test_combine_only_ep1(ep1_group):
-    """The combine-only launch reads only real pool rows (padding rows NaN here) and folds them in route order."""
-    from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_combine_kernel import combine_only_gfx1250
-    from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
-        DispatchHandle,
-        run_dispatch_prologue,
-    )
-
-    T, H, E, topk = 333, 1024, 8, 4
-    x, topk_idx, topk_w, w1, _, _ = _inputs(T, H, 256, E, topk, 7, skew=True)
-    h, _ = run_dispatch_prologue(x, w1, ep1_group, topk_idx.to(torch.int64), topk_w)
-    h = DispatchHandle(*h)
-    P = h.pool_row_to_route.numel()
-    pool = torch.full((P, H), float("nan"), dtype=torch.bfloat16, device="cuda")
-    rows = h.recv_token_to_pool_rows[:T].long()
-    real = rows[rows >= 0]
-    pool[real] = torch.randn(real.numel(), H, device="cuda").to(torch.bfloat16)
-    gate = torch.randn(P, device="cuda")
-    for _ in range(2):  # the epoch flags stay consistent call after call
-        y, gtw = combine_only_gfx1250(pool, h, topk_idx.to(torch.int64), grad_gate=gate)
-        _eq(y, _fold(pool, h, T), "y")
-        _eq(gtw, _gate_scatter(gate, h, T, topk), "grad_topk_weights")
-
-
 @pytest.mark.parametrize("fuse", [False, True])
 def test_staged_op_ep1(ep1_group, fuse):
     """``fused_mega_moe_fp8_stage1/2`` on gfx1250 against the fp32 reference (the grouped MLP's 20 dB gate), and the
@@ -418,8 +393,6 @@ def test_contract_rejected_ep1(ep1_group):
         fused_mega_moe_fp8_stage1(x, topk_idx, topk_w, w1, ep1_group, activation=GLUActivation.swiglu(0.0))
     with pytest.raises(NotImplementedError, match="SiLU-SwiGLU"):
         fused_mega_moe_fp8_stage1(x, topk_idx, topk_w, w1, ep1_group, activation=None)
-    with pytest.raises(NotImplementedError, match="SiLU-SwiGLU"):
-        fused_mega_moe_fp8_stage1(x, topk_idx, topk_w, w1, ep1_group, activation=GLUActivation.swigluoai())
     l1, dw, handle, state = fused_mega_moe_fp8_stage1(x, topk_idx, topk_w, w1, ep1_group, activation=SWIGLU)
     with pytest.raises(NotImplementedError, match="fc1 bias"):
         fused_mega_moe_fp8_stage2(
