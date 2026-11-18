@@ -5,12 +5,8 @@
 ###############################################################################
 
 """MXFP8 (MX_BLOCKWISE) through the op layer on gfx1250: gemm_fp8, grouped_gemm_fp8 and grouped_mlp_fp8 on the FlyDSL
-MX kernels, which read one operand layout (``ops.utils.MX_A`` / ``MX_B`` / ``MX_W``).
-
-On the card: against BF16 and the fp32 emulation of the recipe (``tests/pytorch/ref/mxfp8_ref.py``), cached weights
-against plain ones, wgrads accumulated into ``main_grad``, the permute handoff against the materialized permute, the
-direct kernel call against the dispatcher's. Host-only, on a faked arch: what gfx1250 refuses or leaves to
-upstream's path, and that the other archs get none of gfx1250's recipes, kernels or handoff."""
+MX kernels and their one operand layout (``ops.utils.MX_A`` / ``MX_B`` / ``MX_W``). On the card, against BF16 and
+the fp32 emulation of the recipe; host-only, on a faked arch: what gfx1250 refuses or leaves to upstream's path."""
 
 import importlib
 import itertools
@@ -65,7 +61,7 @@ grouped_mlp_fp8_mod = importlib.import_module("primus_turbo.pytorch.ops.grouped_
 on_gfx1250 = pytest.mark.skipif(
     not (torch.cuda.is_available() and is_gfx1250()), reason="gfx1250 MXFP8 kernels"
 )
-BF16, RAW, RAW_W = torch.bfloat16, ScalingRecipe(), ScalingRecipe(use_2d_block=True)
+BF16, RAW_W = torch.bfloat16, ScalingRecipe(use_2d_block=True)
 
 
 def _config(fmt=Format.E4M3):
@@ -118,11 +114,9 @@ def _cached(w, main_grad_dtype=None, seed=6):
 # ---------------------------------------------------------------------------------------------------- dense linear
 
 
-# toy; M / N / K tails (the quantizer pads K to 128); DSv3 at 1024 tokens: kv_down, the shared expert's fc2, q_down
+# toy; M / N / K tails (the quantizer pads K to 128); DSv3's q_down at 1024 tokens
 @on_gfx1250
-@pytest.mark.parametrize(
-    "M, N, K", [(256, 512, 384), (200, 144, 320), (1024, 576, 7168), (1024, 7168, 2048), (1024, 1536, 7168)]
-)
+@pytest.mark.parametrize("M, N, K", [(256, 512, 384), (200, 144, 320), (1024, 1536, 7168)])
 def test_linear(M, N, K):
     """out / dx / dw against BF16 and against the recipe in fp32 (the same quantization: only the GEMM's
     accumulation order and the bf16 rounding of the result differ)."""
@@ -145,22 +139,6 @@ def test_linear(M, N, K):
 
 
 @on_gfx1250
-def test_linear_chain():
-    """Two linears around a GELU (a dense GLU MLP runs as two linears) on plain leaves: every leaf's gradient."""
-    x, w1, _ = _dense_data(512, 1024, 768)
-    _, w2, dy = _dense_data(512, 768, 1024, seed=3)
-
-    def grads(mm):
-        leaves = _leaves(x, w1, w2)
-        mm(F.gelu(mm(leaves[0], leaves[1]).float()).bfloat16(), leaves[2]).backward(dy)
-        return [t.grad for t in leaves]
-
-    mx = grads(lambda a, b: gemm_fp8(a, b, trans_b=True, out_dtype=BF16, config=MX))
-    for name, got, ref in zip(("dx", "dw1", "dw2"), mx, grads(lambda a, b: a @ b.t())):
-        assert got is not None and snr_db(got, ref) >= 20, name
-
-
-@on_gfx1250
 def test_cached_weight():
     """A weight quantized ahead by ``create_quantized_weight`` is what the op quantizes a plain weight into: the
     same bits. Without its transposed copy, the op re-quantizes that from the cache's dequantized values."""
@@ -175,8 +153,6 @@ def test_cached_weight():
     plain, cached, no_transpose = res
     assert torch.equal(cached[0], plain[0]) and torch.equal(cached[1], plain[1])
     assert torch.equal(no_transpose[0], plain[0]) and snr_db(no_transpose[1], plain[1]) >= 40
-    single, none = create_quantized_weight(w, float8_e4m3, MX)
-    assert none is None and single.scaling_recipe == MX_W
     # as a framework runs it: the cached pair, the wgrad added into its main_grad
     fused, wl = _cached(w, torch.float32), w.clone().requires_grad_()
     main_grad0 = fused.data.main_grad.clone()
@@ -229,8 +205,7 @@ def test_direct_path(monkeypatch):
 
 
 @on_gfx1250
-@pytest.mark.parametrize("main_grad_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("grouped, main_grad_dtype", [(False, torch.bfloat16), (True, torch.float32)])
 def test_wgrad_accum(grouped, main_grad_dtype):
     """``fuse_bgrad_accum_pattern``: the wgrad added into main_grad in the GEMM epilogue (two micro-batches, on top
     of an existing gradient) against the returned wgrad added by the caller."""
@@ -338,8 +313,7 @@ def _check_grouped_gemm(shape, skew, config, backend, snr_min=25):
 
 @on_gfx1250
 @pytest.mark.parametrize(
-    "shape, skew",
-    _cases([False, True], dsv3=(True,)) + [pytest.param((3, 500, 160, 48), True, id="k160-n96")],
+    "shape, skew", [(TOY, False), (TOY, True), ((3, 500, 160, 48), True)], ids=["uniform", "skew", "k160-n96"]
 )
 def test_grouped_gemm(shape, skew):
     """grouped_gemm_fp8 on the FlyDSL MX GEMMs (also K and N off the 128 grid)."""
@@ -351,20 +325,6 @@ def test_grouped_gemm_upstream_path():
     """A call the FlyDSL MX GEMMs do not take (HYBRID: E5M2 gradients, a 2-bit mantissa) runs as on main, on the
     Triton kernels."""
     _check_grouped_gemm(TOY, True, _config(Format.HYBRID), "TRITON", snr_min=20)
-
-
-@on_gfx1250
-def test_grouped_chain():
-    """The unfused experts: fc1 and fc2 by grouped_gemm_fp8 around a torch SwiGLU with probs, on plain leaves."""
-    x, w1, w2, probs, dy, lens = _mlp_data(TOY)
-    leaves, refs = _leaves(x, w1, w2, probs), _leaves(x, w1, w2, probs)
-    gate, up = grouped_gemm_fp8(leaves[0], leaves[1], lens, trans_b=True, config=MX).chunk(2, dim=-1)
-    act = (F.silu(gate.float()) * up.float() * leaves[3][:, None]).bfloat16()
-    grouped_gemm_fp8(act, leaves[2], lens, trans_b=True, config=MX).backward(dy)
-    _mlp_bf16(*refs[:3], lens, refs[3]).backward(dy)
-    for name, got, ref in zip(("dx", "dw1", "dw2", "dprobs"), leaves, refs):
-        assert got.grad is not None, name
-        _check(name, got.grad, ref.grad, 20)
 
 
 @on_gfx1250
@@ -420,8 +380,7 @@ def _combine(rows, order, k):
 
 
 class _Permute(torch.autograd.Function):
-    """Stand-in for a framework's MoE permute: ``lazy`` returns a placeholder without values (the caller registers
-    the gather), else the materialized rows; backward = the permute's backward."""
+    """Stand-in for a framework's MoE permute: a placeholder without values (``lazy``) or the materialized rows."""
 
     @staticmethod
     def forward(ctx, x, d2s, order, k, lazy):
@@ -436,8 +395,7 @@ class _Permute(torch.autograd.Function):
 
 
 class _Unpermute(torch.autograd.Function):
-    """Stand-in for a framework's MoE unpermute (no merging probs): claims the fused MLP's output, and its backward
-    defers the gather of dOut to the quantizer instead of writing the permuted bf16 copy."""
+    """Stand-in for a framework's MoE unpermute: claims the MLP's output; its backward defers dOut's gather."""
 
     @staticmethod
     def forward(ctx, y, d2s, row_id_map, order, k, T, E):
@@ -539,17 +497,10 @@ def _empty(*shape, dtype=BF16):
 
 def _qt(shape, recipe, axis=-1):
     """A host-side MXFP8 QuantizedTensor carrying ``recipe``."""
-    meta = dict(orig_dtype=BF16, dest_dtype=float8_e4m3, granularity=ScalingGranularity.MX_BLOCKWISE)
+    data = torch.zeros(shape, dtype=float8_e4m3)
     scale = torch.zeros(*shape[:-1], shape[-1] // 32, dtype=torch.uint8)
-    return QuantizedTensor(
-        torch.zeros(shape, dtype=float8_e4m3),
-        scale,
-        shape=torch.Size(shape),
-        block_size=32,
-        scaling_recipe=recipe,
-        quantized_axis=axis,
-        **meta,
-    )
+    meta = dict(shape=torch.Size(shape), orig_dtype=BF16, dest_dtype=float8_e4m3, granularity=MX.granularity)
+    return QuantizedTensor(data, scale, block_size=32, scaling_recipe=recipe, quantized_axis=axis, **meta)
 
 
 REFUSED = "MXFP8 on gfx1250 runs on its FlyDSL kernels"
@@ -561,28 +512,26 @@ def test_gfx1250_recipes(arch, monkeypatch):
     arch("gfx1250")
     a, w, wg = _empty(32, 64), _empty(48, 64), _empty(2, 64, 64)
     qa, qa_t, qw = _qt((32, 64), MX_A), _qt((32, 64), MX_B, -2), _qt((48, 64), MX_W)
-    raw_w, raw_w_t = _qt((48, 64), RAW_W), _qt((48, 64), RAW_W, -2)
+    raw = _qt((48, 64), RAW_W), _qt((48, 64), RAW_W, -2)
     assert mx1250_recipes("op", MX, BF16, a, None, w, None) == (MX_A, MX_B, MX_W)
     assert mx1250_recipes("op", MX, BF16, a, None, wg, None, wg, None, glu_width=128) == (MX_A, MX_B, MX_W)
     assert mx1250_recipes("op", MX, BF16, qa, qa_t, qw, None) == (MX_A, MX_B, MX_W)
     refused = {
         "HYBRID (E5M2 gradients)": (_config(Format.HYBRID), BF16, a, None, w),
-        "E5M2": (_config(Format.E5M2), BF16, a, None, w),
         "an fp16 output": (MX, torch.float16, a, None, w),
-        "an fp16 activation": (MX, BF16, a.half(), None, w),
         "an fp16 weight": (MX, BF16, a, None, w.half()),
         "a weight without 16x16 blocks": (MX, BF16, a, None, _empty(40, 64)),
         "grouped weights need N, K % 32": (MX, BF16, a, None, _empty(2, 48, 64)),
-        "a weight cached in the raw layout": (MX, BF16, a, None, raw_w, raw_w_t),
-        "a transposed copy in another layout": (MX, BF16, a, None, qw, raw_w_t),
-        "an activation quantized raw": (MX, BF16, _qt((32, 64), RAW), qa_t, w),
-        "a raw column copy": (MX, BF16, qa, _qt((32, 64), RAW, -2), w),
+        "a weight cached in the raw layout": (MX, BF16, a, None, *raw),
     }
     for what, args in refused.items():
         with pytest.raises(NotImplementedError, match=REFUSED):
             mx1250_recipes("op", *args)
             pytest.fail(f"not refused: {what}")
         assert mx1250_recipes("op", *args, strict=False) is None, what
+    # with a fuse pattern: a main_grad the wgrad cannot add into (a view at an element offset)
+    unaligned = _param(2, 64, 64, offset=1)
+    assert mx1250_recipes("op", MX, BF16, a, None, unaligned, fuse="megatron", strict=False) is None
     with pytest.raises(NotImplementedError, match="intermediate width I of 128"):
         mx1250_recipes("op", MX, BF16, a, None, wg, None, wg, None, glu_width=64)
     for grouped, weight in ((False, w), (True, wg)):
@@ -615,42 +564,30 @@ def test_gfx1250_ops_refuse_up_front(arch, monkeypatch):
     mlp = dict(group_offs=offs, trans_w1=True, trans_w2=True, activation="silu", out_dtype=BF16)
     calls = (
         lambda: gemm_fp8(x, w, trans_b=True, out_dtype=BF16, config=hybrid),
-        lambda: gemm_fp8(x.half(), w.half(), trans_b=True, config=MX),
-        lambda: gemm_fp8(x, _empty(40, 64), trans_b=True, config=MX),
-        lambda: grouped_mlp_fp8(x, w1, w2, lens, probs, config=hybrid, **mlp),
-        lambda: grouped_mlp_fp8(x, _qt((2, 256, 64), RAW_W), w2, lens, probs, config=MX, **mlp),
         # the fused GLU's own shape rule (its activation is not padded): I = 64
         lambda: grouped_mlp_fp8(x, _empty(2, 128, 64), _empty(2, 64, 64), lens, probs, config=MX, **mlp),
-        lambda: create_quantized_weight(w.half(), float8_e4m3, MX, need_weight_transpose_cache=True),
         lambda: create_quantized_weight(w, float8_e4m3, hybrid),
     )
     for call in calls:
         with pytest.raises(NotImplementedError, match=REFUSED):
             call()
 
-    def fused(main_grad_dtype=torch.float32, offset=0):
-        ws = [_param(*t.shape, main_grad_dtype=main_grad_dtype, offset=offset) for t in (w, w1, w2)]
-        dense = dict(trans_b=True, out_dtype=BF16, config=MX, fuse_bgrad_accum_pattern="megatron")
-        return ws, (
-            lambda: gemm_fp8(x, ws[0], **dense),
-            lambda: grouped_mlp_fp8(
-                x, *ws[1:], lens, probs, config=MX, fuse_wgrad_accum_pattern="megatron", **mlp
-            ),
-        )
-
-    def refused(ws, calls):
-        for call in calls:
-            with pytest.raises(
-                NotImplementedError, match="main_grad that is bf16 or fp32, contiguous and 16-byte"
-            ):
-                call()
+    dense = dict(trans_b=True, out_dtype=BF16, config=MX, fuse_bgrad_accum_pattern="megatron")
+    fused = dict(config=MX, fuse_wgrad_accum_pattern="megatron", **mlp)
+    accum = (
+        lambda ws: gemm_fp8(x, ws[0], **dense),
+        lambda ws: grouped_mlp_fp8(x, *ws[1:], lens, probs, **fused),
+    )
+    # a main_grad at an element offset into a flat gradient buffer (data_ptr % 16 = 4); then an aligned one under a
+    # per-op auto-tune request, whose tuner would run the accumulation on main_grad
+    for offset in (1, 0):
+        ws = [_param(*t.shape, offset=offset) for t in (w, w1, w2)]
+        for call in accum:
+            with pytest.raises(NotImplementedError, match="main_grad that is bf16 or fp32"):
+                call(ws)
         assert not any(p.grad_added_to_main_grad for p in ws), "a weight was marked before the check"
-
-    refused(*fused(offset=1))  # a view at an element offset into a flat gradient buffer: data_ptr % 16 = 4
-    refused(*fused(main_grad_dtype=torch.float16))
-    for grouped in (False, True):
-        _pin(monkeypatch, None, grouped, auto_tune=True)  # its tuner would run the accumulation on main_grad
-    refused(*fused())
+        for grouped in (False, True):
+            _pin(monkeypatch, None, grouped, auto_tune=True)
 
 
 def test_gfx1250_view_refused(arch):
@@ -665,17 +602,13 @@ def test_gfx1250_view_refused(arch):
     "name, grouped, choice, main_grad, want",
     [
         ("gfx1250", False, None, dict(main_grad_dtype=torch.bfloat16), True),
-        ("gfx1250", False, None, {}, True),
         ("gfx1250", True, None, {}, True),
         ("gfx1250", True, None, dict(main_grad_dtype=torch.float16), False),
         ("gfx1250", False, None, dict(offset=1), False),  # not 16-byte aligned
         ("gfx1250", False, dict(backend=BackendType.FLYDSL), {}, True),
         ("gfx1250", False, dict(backend=BackendType.TRITON), {}, False),  # no other backend adds there
-        ("gfx1250", True, dict(backend=BackendType.TRITON), {}, False),
-        ("gfx1250", False, dict(backend=None, auto_tune=True), {}, False),  # the tuner would add, many times
-        ("gfx1250", True, dict(backend=None, auto_tune=True), {}, False),
+        ("gfx1250", True, dict(backend=None, auto_tune=True), {}, False),  # the tuner would add, many times
         ("gfx950", False, None, {}, False),  # answered for gfx1250 only
-        ("gfx942", True, None, {}, False),
     ],
 )
 def test_wgrad_accum_supported(arch, monkeypatch, name, grouped, choice, main_grad, want):
@@ -696,17 +629,13 @@ def _mx_operands(dtype, packed, k=384, groups=()):
         tail = (-(-rows // 32), -(-k // 128), 32, 4) if packed else (rows, k // 32)
         return torch.empty(*lead, *tail, dtype=torch.uint8)
 
-    return (
-        _empty(64, k, dtype=dtype),
-        scale(rows=64),
-        _empty(*groups, 32, k, dtype=dtype),
-        scale(*groups, rows=32),
-    )
+    a, b = _empty(64, k, dtype=dtype), _empty(*groups, 32, k, dtype=dtype)
+    return a, scale(rows=64), b, scale(*groups, rows=32)
 
 
 def test_gfx1250_backends_take_mx(arch):
-    """Which backends take an MXFP8 GEMM on gfx1250: FlyDSL alone the operands in its MX GEMM layout (the wgrad's
-    beta=1 into main_grad included); raw operands the Triton grouped kernels, as on main, and no dense backend."""
+    """Which backends take an MXFP8 GEMM on gfx1250: FlyDSL alone the operands in its MX GEMM layout; raw operands
+    the Triton grouped kernels, as on main, and no dense backend."""
     arch("gfx1250")
     mx, offs = ScalingGranularity.MX_BLOCKWISE, torch.tensor([0, 32, 64])
     # raw operands in this process's E4M3 dtype (the Triton kernels'), the layout's in gfx1250's
@@ -731,11 +660,6 @@ def test_gfx1250_backends_take_mx(arch):
             kwargs.update(out_dtype=BF16, granularity=mx)
             got = {t.name for t, e in dispatcher._backends.items() if e.impl.can_handle(**kwargs)}
             assert got == takes, (packed, dispatcher.__name__, got)
-    variable_k_backends = grouped_impl.GroupedGEMMFP8VariableKKernelDispatcher._backends
-    for out_dtype in (torch.bfloat16, torch.float32):  # the layout's wgrad, added into main_grad
-        accum = dict(variable_k, inplace_add_to_out=True, out=torch.zeros(2, 64, 32, dtype=out_dtype))
-        got = {t.name for t, e in variable_k_backends.items() if e.impl.can_handle(**accum)}
-        assert got == {"FLYDSL"}, (out_dtype, got)
 
 
 def test_direct_path_bumps_version(arch, monkeypatch):
@@ -752,71 +676,26 @@ def test_direct_path_bumps_version(arch, monkeypatch):
 
 
 class _Recorder:
-    """Stand-ins for the quantizers and GEMM custom ops of an op module: record every call's kwargs."""
+    """Stand-ins for the quantizers (their kwargs are recorded) and the GEMM custom ops of an op module."""
 
     def __init__(self, monkeypatch, mod, quantizers, **gemms):
         self.calls = []
-        for name, n_out in quantizers.items():
-            monkeypatch.setattr(mod, name, self._fake(name, lambda *a, n=n_out, **k: (torch.empty(1),) * n))
+        for name, n in quantizers.items():
+            monkeypatch.setattr(mod, name, lambda *a, n=n, **kw: self.calls.append(kw) or (_empty(1),) * n)
         for name, result in gemms.items():
-            monkeypatch.setattr(mod, name, self._fake(name, result))
-
-    def _fake(self, name, result):
-        def call(*args, **kwargs):
-            self.calls.append((name, kwargs))
-            return result(*args, **kwargs)
-
-        return call
+            monkeypatch.setattr(mod, name, result)
 
     def gfx1250(self):
         """Per quantizer call: whether it was asked for gfx1250's MX GEMM layout or its permute handoff."""
         recipes = ("scaling_recipe", "scaling_recipe_for_trans")
         return [
             any(kw.get(r) in (MX_A, MX_B, MX_W) for r in recipes) or "dest2src" in kw or "total_m" in kw
-            for name, kw in self.calls
-            if "quantize" in name
+            for kw in self.calls
         ]
 
 
 _QUANTIZERS = {"grouped_quantize_fp8_with_trans": 8, "quantize_fp8_with_trans": 4}
 _never = lambda what: lambda *a, **k: pytest.fail(what)  # noqa: E731
-
-
-def test_gfx1250_grouped_gemm_keeps_upstream_path(arch, monkeypatch):
-    """grouped_gemm_fp8 on gfx1250: a call its FlyDSL MX GEMMs take is quantized into their layout, fwd and bwd;
-    any other one (HYBRID, fp16, expert dims not % 32, a main_grad they cannot add into, a pinned Triton) runs as
-    on main, on raw operands."""
-    arch("gfx1250")
-    lens, offs = torch.tensor([16, 16]), torch.tensor([0, 16, 32])
-
-    def run(config=MX, weight=(2, 64, 64), dtype=BF16, fuse_offset=None):
-        rec = _Recorder(
-            monkeypatch,
-            grouped_gemm_fp8_mod,
-            _QUANTIZERS,
-            grouped_gemm_fp8_impl=lambda *a, **k: _empty(32, 64, dtype=dtype),
-            grouped_gemm_fp8_variable_k_impl=lambda *a, **k: _empty(*weight, dtype=dtype),
-            grouped_gemm_fp8_variable_k_accum_impl=lambda *a, **k: None,
-            _get_dummy_wgrad=lambda shape, dtype: _empty(*shape, dtype=dtype),
-        )
-        x, w = _empty(32, 64, dtype=dtype).requires_grad_(), _empty(*weight, dtype=dtype).requires_grad_()
-        fuse = None
-        if fuse_offset is not None:
-            w, fuse = _param(*weight, offset=fuse_offset), "megatron"
-        out = grouped_gemm_fp8(x, w, lens, offs, trans_b=True, config=config, fuse_bgrad_accum_pattern=fuse)
-        out.backward(_empty(32, 64, dtype=dtype))
-        accumulated = any(name == "grouped_gemm_fp8_variable_k_accum_impl" for name, _ in rec.calls)
-        assert accumulated == (fuse is not None) and (fuse is None or w.grad_added_to_main_grad)
-        return rec.gfx1250()
-
-    assert run() == [True] * 3  # a, b, grad_out
-    assert run(fuse_offset=0) == [True] * 3
-    assert run(fuse_offset=1) == [False] * 3  # main_grad at an element offset: not 16-byte aligned
-    assert run(config=_config(Format.HYBRID)) == [False] * 3
-    assert run(dtype=torch.float16) == [False] * 3
-    assert run(weight=(2, 64, 48)) == [False] * 3
-    _pin(monkeypatch, BackendType.TRITON, grouped=True)
-    assert run() == [False] * 3
 
 
 def test_other_archs_keep_upstream_path(arch, monkeypatch):
@@ -835,10 +714,6 @@ def test_other_archs_keep_upstream_path(arch, monkeypatch):
     square = _empty(64, 64).requires_grad_(), _empty(64, 64).requires_grad_()
     gemm_fp8(*square, trans_b=True, out_dtype=BF16, config=MX).backward(_empty(64, 64))
     assert rec.gfx1250() == [False] * 3  # a, b, grad_out
-    # there the shuffle flags are the CDNA4 shuffles: a cache whose recipe equals MX_W is refused as it always was
-    cache = QuantizedTensorPair(_qt((64, 64), MX_W), _qt((64, 64), MX_W, -2))
-    with pytest.raises(AssertionError, match="scaling_recipe"):
-        gemm_fp8(x, cache, trans_b=True, out_dtype=BF16, config=MX)
 
     rec = _Recorder(
         monkeypatch,

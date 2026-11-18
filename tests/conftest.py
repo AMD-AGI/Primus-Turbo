@@ -67,14 +67,11 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_attention_flydsl_gfx1250.py",
     # MXFP8 quantization (primus_turbo/flydsl/quantization/mxfp8_quant_gfx1250.py), bitwise vs the reference.
     "tests/pytorch/ops/test_quant_mxfp8_gfx1250.py",
-    # The MXFP8 GEMM kernel (primus_turbo/flydsl/gemm/gemm_mxfp8_kernel_gfx1250.py): dense, grouped-M and
-    # variable-K modes.
+    # The MXFP8 GEMM kernel (primus_turbo/flydsl/gemm/gemm_mxfp8_kernel_gfx1250.py).
     "tests/pytorch/ops/test_gemm_mxfp8_gfx1250.py",
-    # MXFP8 through the op layer on those kernels: gemm_fp8, grouped_gemm_fp8, grouped_mlp_fp8, wgrads into
-    # main_grad, the MoE permute handoff.
+    # MXFP8 through the op layer on those kernels: gemm_fp8, grouped_gemm_fp8, grouped_mlp_fp8.
     "tests/pytorch/ops/test_mxfp8_ops_gfx1250.py",
-    # The MoE gather handoffs' host-side contract (primus_turbo/pytorch/ops/moe_gather.py), gfx1250's
-    # backward-plan gate included.
+    # The MoE gather handoffs' host-side contract (primus_turbo/pytorch/ops/moe_gather.py).
     "tests/pytorch/ops/test_moe_gather_handoff.py",
     # The MXFP8 quantization ops with their raw recipes, which HIP's quantizer runs on gfx1250 as on main: a
     # regression guard for the edited quantize_mxfp8_impl / dequantize_mxfp8_impl. Not
