@@ -13,8 +13,8 @@
 
 """gfx950 backward of ``dit_qk_norm_rope`` (q / k RMSNorm + interleaved RoPE), FlyDSL.
 
-Same arithmetic and roundings as the Triton backward (``primus_turbo/triton/normalization/
-dit_qk_norm_rope_kernel.py``), same addressing (token stride ``TS``, head stride ``HS``, q / k / v column offsets,
+Same arithmetic and roundings as the Triton backward (``primus_turbo/triton/rope/dit_qk_norm_rope_kernel.py``),
+same addressing (token stride ``TS``, head stride ``HS``, q / k / v column offsets,
 token order ``SB``), so it reads both the diffusers ``[B, S, 3*H*D]`` and the Megatron ``[S, B, H, 3D]`` QKV
 GEMM output in place. The op that dispatches to it is in ``primus_turbo/pytorch/kernels/rope/
 dit_qk_norm_rope_impl.py``.

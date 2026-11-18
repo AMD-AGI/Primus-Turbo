@@ -6,9 +6,9 @@
 
 """``primus_turbo::dit_qk_norm_rope`` / ``dit_qk_norm_rope_backward``: operand checks, layout, dispatch.
 
-Kernels: Triton forward and backward (every arch) in ``primus_turbo/triton/normalization/
-dit_qk_norm_rope_kernel.py``; FlyDSL backward (gfx950) in ``primus_turbo/flydsl/rope/dit_qk_norm_rope_kernel.py``.
-The public function is ``primus_turbo.pytorch.ops.dit_qk_norm_rope``.
+Kernels: Triton forward and backward (every arch) in ``primus_turbo/triton/rope/dit_qk_norm_rope_kernel.py``;
+FlyDSL backward (gfx950) in ``primus_turbo/flydsl/rope/dit_qk_norm_rope_kernel.py``. The public function is
+``primus_turbo.pytorch.ops.rope.dit_qk_norm_rope``.
 
 Source forms. ``layout`` names the token order of the QKV GEMM output and of q / k / v:
 
@@ -31,7 +31,8 @@ from typing import List, Optional, Tuple
 import torch
 import triton
 
-from primus_turbo.triton.normalization.dit_qk_norm_rope_kernel import (
+from primus_turbo.pytorch.core.utils import is_gfx950
+from primus_turbo.triton.rope.dit_qk_norm_rope_kernel import (
     colsum_kernel,
     dit_qk_norm_rope_bwd_kernel,
     dit_qk_norm_rope_fwd_kernel,
@@ -43,7 +44,7 @@ _MAX_INDEX = 2**31  # the FlyDSL kernel and the cos / sin rows use 32-bit offset
 _LAYOUTS = ("sbhd", "bshd")
 _ROPES = ("interleaved", "half")
 
-# Triton launch shape (her kernels' choices): BLOCK_H heads per program; forward TOKENS tokens per program;
+# Triton launch shape: BLOCK_H heads per program; forward TOKENS tokens per program;
 # backward programs per stream (fewer with the bias: each writes a 3*H*D-wide fp32 row of partial sums).
 _BLOCK_H = 8
 _FWD_TOKENS = 4
@@ -178,19 +179,6 @@ def _cs_row_stride(cos):
     return cos.stride(0) if cos.shape[0] > 1 else cos.shape[1]
 
 
-def _gcn_arch(device: torch.device) -> str:
-    return _arch_of(device.index if device.index is not None else torch.cuda.current_device())
-
-
-_ARCH = {}
-
-
-def _arch_of(index: int) -> str:
-    if index not in _ARCH:
-        _ARCH[index] = str(torch.cuda.get_device_properties(index).gcnArchName).split(":", 1)[0]
-    return _ARCH[index]
-
-
 # --------------------------------------------------------------------------------------------------- forward
 def _rstd_shape(metas, return_rstd):
     return (sum(m["n_tok"] for m in metas) * metas[0]["H"],) if return_rstd else (0,)
@@ -221,7 +209,7 @@ def dit_qk_norm_rope_fwd_impl(
     p0, p1 = triton.cdiv(m0["n_tok"], _FWD_TOKENS), triton.cdiv(m1["n_tok"], _FWD_TOKENS)
     nseg = len(srcs)
     # gfx950: streaming (non-temporal) loads and stores; every byte is touched once.
-    cm = ".cs" if qkv.is_cuda and _gcn_arch(qkv.device) == "gfx950" else ""
+    cm = ".cs" if qkv.is_cuda and is_gfx950() else ""
     dit_qk_norm_rope_fwd_kernel[(p0 + (p1 if nseg == 2 else 0), triton.cdiv(H, _BLOCK_H))](
         srcs[0], srcs[-1], q, k, v, ws[0][0], ws[0][1], ws[-1][0], ws[-1][1], cos, sin, rstd_q, rstd_k,
         m0["n_tok"], m0["S"], m1["n_tok"], m1["S"], p0, S_out, eps,
@@ -246,7 +234,7 @@ def flydsl_backward_supported(qkv, cos, metas, D, rope, S_out) -> bool:
     from primus_turbo.flydsl.rope.dit_qk_norm_rope_kernel import D as FD
 
     m0 = metas[0]
-    if not (qkv.is_cuda and _gcn_arch(qkv.device) == "gfx950"):
+    if not (qkv.is_cuda and is_gfx950()):
         return False
     if qkv.dtype != torch.bfloat16 or cos.dtype != torch.bfloat16 or D != FD or rope != "interleaved":
         return False
