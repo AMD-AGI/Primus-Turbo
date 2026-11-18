@@ -1123,8 +1123,10 @@ def ulysses_a2a_gemm(
             # exchange-dominated launch keeps them (Qwen3-30B n = 4: +3 %).
             num_push = 16
         else:
-            # with few weight-gradient tiles the launch is compute-bound: 16 pushers still fill the links
-            num_push = 32 if wgrad is None or many_wtiles else 16
+            # with wgrad, 16 pushers fill up to three peers' links while the wgrad tiles make at most three
+            # waves (Qwen3-235B n = 4, 576 tiles: 1260 -> 1194 us); GLM-4.7's 1120 need 32 (n = 8 16
+            # pushers: +6 %), and so do seven peers (MiniMax-M2.5 n = 8: 478 -> 465 us)
+            num_push = 32 if wgrad is None or num_wtiles > 3 * num_cus or num_ranks > 4 else 16
     if BM is None:
         # 256-row tiles while every tile has a CU (the staggered K walk), the GEMM dominates, the tiles
         # make enough waves or over two waves of wgrad tiles follow them; otherwise 128 rows halve the
