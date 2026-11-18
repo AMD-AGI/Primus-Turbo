@@ -59,7 +59,7 @@ def _rope_ref(y, c, s, rope):
 
 
 def _reference(srcs, ws, biases, cos, sin, eps, layout, rope, H, D):
-    """fp64 q, k, v (joint, text first) from fp64 leaves; ``biases`` are added to the sources (as the GEMM does)."""
+    """fp64 q, k, v (joint, text first) from fp64 leaves; ``biases`` are added to the sources, as the op does."""
     qs, ks, vs = [], [], []
     for x, (wq, wk), b in zip(srcs, ws, biases):
         if b is not None:
@@ -105,11 +105,21 @@ def _make(layout, form, dual, H=16, D=128, S=(128, 128), B=2, dtype=torch.bfloat
     return srcs, ws, angs, S_out
 
 
+def _clone_strided(x):
+    """A leaf copy of x with x's strides (``clone`` makes a source with gaps between its rows contiguous)."""
+    return torch.empty_strided(x.shape, x.stride(), device=x.device, dtype=x.dtype).copy_(x.detach())
+
+
+def _biases(srcs, seed=5):
+    """One QKV bias per stream, [3*H*D] in the source's column order, the source's dtype."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    return [(0.5 * torch.randn(x.shape[2:].numel(), generator=g)).to(x.dtype).to(x.device) for x in srcs]
+
+
 def _run(srcs, ws, cos, sin, eps, layout, rope, round_normed, bias, v_out="copy", seed=1):
-    leaves = [x.detach().clone().requires_grad_() for x in srcs]
+    leaves = [_clone_strided(x).requires_grad_() for x in srcs]
     wl = [tuple(w.detach().clone().requires_grad_() for w in p) for p in ws]
-    bl = [torch.zeros(x.shape[2:], device=x.device, dtype=x.dtype).flatten().requires_grad_() for x in srcs] \
-        if bias else [None] * len(srcs)  # fmt: skip
+    bl = [b.clone().requires_grad_() for b in _biases(srcs)] if bias else [None] * len(srcs)
     kw = dict(layout=layout, rope=rope, round_normed=round_normed, v_out=v_out)
     if len(srcs) == 2:
         kw.update(txt_qkv=leaves[0], w_txt_q=wl[0][0], w_txt_k=wl[0][1], txt_bias=bl[0])
@@ -129,10 +139,7 @@ def _check_vs_reference(srcs, ws, cos, sin, eps, layout, rope, res, H, D, bias):
     tol = _TOL[dt]
     leaves = [x.detach().double().requires_grad_() for x in srcs]
     wl = [tuple(w.detach().double().requires_grad_() for w in p) for p in ws]
-    bl = [
-        torch.zeros(x.shape[2:], dtype=torch.float64, device=x.device).flatten().requires_grad_()
-        for x in srcs
-    ]
+    bl = [b.double().requires_grad_() for b in _biases(srcs)] if bias else [None] * len(srcs)
     q, k, v = _reference(leaves, wl, bl, cos.double(), sin.double(), eps, layout, rope, H, D)
     torch.autograd.backward((q, k, v), [g.double() for g in res["grads"]])
     for name, a, b in (("q", res["q"], q), ("k", res["k"], k), ("v", res["v"], v)):
@@ -225,86 +232,104 @@ def test_v_out_none():
         assert torch.equal(a[key], b[key])
     assert torch.equal(a["d_src"][0], b["d_src"][0])
     assert all(torch.equal(x, y) for x, y in zip(a["dw"][0], b["dw"][0]))
-    with pytest.raises(ValueError, match="adjacent"):  # two separate buffers: no view spans them
+    with pytest.raises(ValueError, match="one buffer"):  # two separate tensors: no view spans them
         srcs2, ws2, angs2, _ = _make("sbhd", 4, True, H=H, D=D)
         cos2, sin2 = _tables(angs2, "interleaved", srcs2[0].dtype)
         dit_qk_norm_rope(srcs2[1], *ws2[1], cos2, sin2, txt_qkv=srcs2[0], w_txt_q=ws2[0][0], w_txt_k=ws2[0][1],
                          v_out="none")  # fmt: skip
 
 
-def _joint_buffer(form, H, D, S=(128, 128), B=2, seed=0):
-    """One [S_txt + S_img, B, ..] buffer; its two slices are the adjacent streams."""
+def _joint_buffer(form, H, D, S=(128, 128), B=2, seed=0, wide=False):
+    """One [S_txt + S_img, B, ..] buffer of both streams (``wide``: a slice of a wider GEMM output)."""
     g = torch.Generator(device="cpu").manual_seed(seed)
-    shape = (sum(S), B) + ((H, 3 * D) if form == 4 else (3 * H * D,))
-    buf = torch.randn(shape, generator=g).to(torch.bfloat16).cuda()
-    return buf[: S[0]], buf[S[0] :], buf
+    row = (H, 3 * D) if form == 4 else (3 * H * D,)
+    # Wider token rows, each head's q | k | v still adjacent (as the bias needs).
+    n0 = (row[0] + 1 if form == 4 else 2 * row[0]) if wide else row[0]
+    buf = torch.randn((sum(S), B, n0) + row[1:], generator=g).to(torch.bfloat16).cuda()
+    return buf[:, :, : row[0]] if wide else buf
+
+
+def _joint_inputs(D, n_txt=128, n=256, seed=3):
+    g = torch.Generator().manual_seed(seed)
+    ws = [
+        tuple((1 + 0.3 * torch.randn(D, generator=g)).bfloat16().cuda() for _ in range(2)) for _ in range(2)
+    ]
+    ang = (torch.randn(n, D // 2, generator=g, dtype=torch.float64) * 3).repeat_interleave(2, dim=-1)
+    return ws, torch.cos(ang).bfloat16().cuda(), torch.sin(ang).bfloat16().cuda()
 
 
 @requires_gpu
 @pytest.mark.parametrize("form", [4, 3])
-def test_joint_v_view(form):
-    """v_out='none' with two adjacent streams: one strided view over both, bitwise the copy path, gradients too."""
+@pytest.mark.parametrize("wide", [False, True])
+def test_joint_buffer(form, wide):
+    """Both streams in one buffer (txt_seq_len): bitwise the two-tensor call, one gradient for the buffer; with
+    v_out='none' v is one strided view of the buffer over both streams, bitwise the copy, gradients too."""
     H, D, eps = 16, 128, 1e-6
-    txt, img, buf = _joint_buffer(form, H, D)
-    ws = [tuple((1 + 0.3 * torch.randn(D)).bfloat16().cuda() for _ in range(2)) for _ in range(2)]
-    ang = (torch.randn(256 * 2, D // 2, dtype=torch.float64) * 3).repeat_interleave(2, dim=-1)
-    cos, sin = torch.cos(ang).bfloat16().cuda(), torch.sin(ang).bfloat16().cuda()
+    buf = _joint_buffer(form, H, D, wide=wide)
+    ws, cos, sin = _joint_inputs(D)
 
-    storages = []
-
-    def run(v_out):
-        lb = buf.detach().clone().requires_grad_()
-        storages.append(lb.untyped_storage().data_ptr())
+    def run(v_out, joint, bias=False):
+        lb = _clone_strided(buf).requires_grad_()
         wl = [tuple(w.detach().clone().requires_grad_() for w in p) for p in ws]
-        t, i = lb[:128], lb[128:]
-        out = dit_qk_norm_rope(i, *wl[1], cos, sin, eps, txt_qkv=t, w_txt_q=wl[0][0], w_txt_k=wl[0][1],
-                               v_out=v_out)  # fmt: skip
-        q, k, v = out
+        bl = [b.requires_grad_() for b in _biases([lb[:128], lb[128:]])] if bias else [None, None]
+        kw = dict(w_txt_q=wl[0][0], w_txt_k=wl[0][1], v_out=v_out, bias=bl[1], txt_bias=bl[0])
+        if joint:
+            out = dit_qk_norm_rope(lb, *wl[1], cos, sin, eps, txt_seq_len=128, **kw)
+        else:
+            out = dit_qk_norm_rope(lb[128:], *wl[1], cos, sin, eps, txt_qkv=lb[:128], **kw)
         gen = torch.Generator().manual_seed(9)
-        grads = [torch.randn(x.shape, generator=gen).bfloat16().cuda() for x in (q, k, v)]
-        torch.autograd.backward((q, k, v), grads)
-        return out, lb.grad, [x.grad for p in wl for x in p]
+        grads = [torch.randn(x.shape, generator=gen).bfloat16().cuda() for x in out]
+        torch.autograd.backward(out, grads)
+        return out, lb, [x.grad for p in wl for x in p] + [b.grad for b in bl if b is not None]
 
-    (a, ga, wa), (b, gb, wb) = run("copy"), run("none")
-    assert b[2]._base is not None and not b[2].is_contiguous() and a[2].is_contiguous()
-    assert b[2].shape == a[2].shape and b[2].untyped_storage().data_ptr() == storages[1]
-    for x, y in zip(a, b):
-        assert torch.equal(x, y)
-    assert torch.equal(ga, gb) and all(torch.equal(x, y) for x, y in zip(wa, wb))
+    (a, la, wa), (b, lb, wb), (c, lc, wc) = run("copy", False), run("copy", True), run("none", True)
+    assert c[2]._base is not None and not c[2].is_contiguous() and a[2].is_contiguous()
+    assert c[2].shape == a[2].shape and c[2].untyped_storage().data_ptr() == lc.untyped_storage().data_ptr()
+    for x, y, z in zip(a, b, c):
+        assert torch.equal(x, y) and torch.equal(x, z)
+    assert la.stride() == buf.stride() and la.grad.stride() == lb.grad.stride() == lc.grad.stride()
+    assert torch.equal(la.grad, lb.grad) and torch.equal(la.grad, lc.grad)
+    assert all(torch.equal(x, y) and torch.equal(x, z) for x, y, z in zip(wa, wb, wc))
+    (a, la, wa), (b, lb, wb) = run("copy", False, True), run("copy", True, True)  # with both biases
+    assert all(torch.equal(x, y) for x, y in zip(a, b)) and torch.equal(la.grad, lb.grad)
+    assert all(torch.equal(x, y) for x, y in zip(wa, wb)) and len(wa) == 6
 
 
 @requires_gpu
-def test_joint_v_view_validation():
+def test_joint_buffer_validation():
     H, D = 16, 128
-    txt, img, buf = _joint_buffer(4, H, D)
+    buf = _joint_buffer(4, H, D)
     w = torch.ones(D, dtype=torch.bfloat16, device="cuda")
-    cos = sin = torch.zeros(512, D, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="adjacent"):  # swapped: the image stream first
-        dit_qk_norm_rope(buf[:128], w, w, cos, sin, txt_qkv=buf[128:], w_txt_q=w, w_txt_k=w, v_out="none")
-    with pytest.raises(ValueError, match="adjacent"):  # a gap between the streams
-        big = torch.randn(256 + 16, 2, H, 3 * D, dtype=torch.bfloat16, device="cuda")
-        dit_qk_norm_rope(big[144:], w, w, cos, sin, txt_qkv=big[:128], w_txt_q=w, w_txt_k=w, v_out="none")
-    bs = torch.randn(2, 128, 3 * H * D, dtype=torch.bfloat16, device="cuda")
+    cos = sin = torch.zeros(256, D, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="txt_qkv must be None"):
+        dit_qk_norm_rope(buf, w, w, cos, sin, txt_qkv=buf[:128], w_txt_q=w, w_txt_k=w, txt_seq_len=128)
+    for n in (256, -1):
+        with pytest.raises(ValueError, match="txt_seq_len must be"):
+            dit_qk_norm_rope(buf, w, w, cos, sin, w_txt_q=w, w_txt_k=w, txt_seq_len=n)
+    with pytest.raises(ValueError, match="text stream needs w_txt_q"):
+        dit_qk_norm_rope(buf, w, w, cos, sin, txt_seq_len=128)
+    bs = torch.randn(2, 256, 3 * H * D, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="sbhd"):
-        dit_qk_norm_rope(bs, w, w, cos, sin, layout="bshd", txt_qkv=bs.clone(), w_txt_q=w, w_txt_k=w,
-                         v_out="none")  # fmt: skip
+        dit_qk_norm_rope(bs, w, w, cos, sin, layout="bshd", w_txt_q=w, w_txt_k=w, txt_seq_len=128)
+    b = torch.zeros(3 * H * D, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="no bias"):
+        dit_qk_norm_rope(buf, w, w, cos, sin, w_txt_q=w, w_txt_k=w, txt_seq_len=128, v_out="none", bias=b,
+                         txt_bias=b)  # fmt: skip
 
 
 @requires_gpu
-def test_joint_v_view_torch_compile():
+def test_joint_buffer_torch_compile():
     H, D, eps = 16, 128, 1e-6
-    txt, img, buf = _joint_buffer(4, H, D)
-    ws = [(1 + 0.3 * torch.randn(D)).bfloat16().cuda() for _ in range(4)]
-    ang = (torch.randn(512, D // 2, dtype=torch.float64) * 3).repeat_interleave(2, dim=-1)
-    cos, sin = torch.cos(ang).bfloat16().cuda(), torch.sin(ang).bfloat16().cuda()
+    buf = _joint_buffer(4, H, D)
+    ws, cos, sin = _joint_inputs(D)
 
     def f(b, w0, w1, w2, w3):
-        q, k, v = dit_qk_norm_rope(b[128:], w2, w3, cos, sin, eps, txt_qkv=b[:128], w_txt_q=w0, w_txt_k=w1,
-                                   v_out="none")  # fmt: skip
-        return q, k, v
+        return dit_qk_norm_rope(
+            b, w2, w3, cos, sin, eps, txt_seq_len=128, w_txt_q=w0, w_txt_k=w1, v_out="none"
+        )
 
     def run(fn):
-        leaves = [t.detach().clone().requires_grad_() for t in (buf, *ws)]
+        leaves = [t.detach().clone().requires_grad_() for t in (buf, *ws[0], *ws[1])]
         out = fn(*leaves)
         loss = sum(o.float().square().sum() * 1e-3 for o in out)
         loss.backward()
@@ -314,11 +339,21 @@ def test_joint_v_view_torch_compile():
         assert torch.equal(a, b)
 
 
-def _bwd(srcs, ws, cos, sin, grads, layout, rope, round_normed, bias, backend):
+def _fwd(srcs, ws, cos, sin, biases, layout, round_normed=True):
+    dual = len(srcs) == 2
+    return dit_qk_norm_rope_fwd_impl(
+        srcs[-1], *ws[-1], cos, sin, srcs[0] if dual else None, *(ws[0] if dual else (None, None)),
+        biases[-1] if biases else None, biases[0] if biases and dual else None, 1e-6, layout, "interleaved",
+        round_normed, True,
+    )  # fmt: skip
+
+
+def _bwd(srcs, ws, cos, sin, grads, layout, rope, round_normed, biases, bias_grad, backend):
     dual = len(srcs) == 2
     return dit_qk_norm_rope_bwd_impl(
         *grads, srcs[-1], ws[-1][0], ws[-1][1], cos, sin, srcs[0] if dual else None, ws[0][0] if dual else None,
-        ws[0][1] if dual else None, 1e-6, layout, rope, round_normed, bias, backend=backend,
+        ws[0][1] if dual else None, biases[-1] if biases else None, biases[0] if biases and dual else None, 1e-6,
+        layout, rope, round_normed, bias_grad, backend=backend,
     )  # fmt: skip
 
 
@@ -328,11 +363,11 @@ def _bwd(srcs, ws, cos, sin, grads, layout, rope, round_normed, bias, backend):
 def test_deterministic(backend, layout, form, dual):
     srcs, ws, angs, _ = _make(layout, form, dual, H=24, D=128, S=(256, 256), B=4)
     cos, sin = _tables(angs, "interleaved", srcs[0].dtype)
-    q, _, _ = dit_qk_norm_rope_fwd_impl(srcs[-1], *ws[-1], cos, sin, srcs[0] if dual else None,
-                                        *(ws[0] if dual else (None, None)), 1e-6, layout, "interleaved", True, True)  # fmt: skip
+    bs = _biases(srcs)
+    q, _, _ = _fwd(srcs, ws, cos, sin, bs, layout)
     grads = [torch.randn_like(q) for _ in range(3)]
-    a = _bwd(srcs, ws, cos, sin, grads, layout, "interleaved", True, True, backend)
-    b = _bwd(srcs, ws, cos, sin, grads, layout, "interleaved", True, True, backend)
+    a = _bwd(srcs, ws, cos, sin, grads, layout, "interleaved", True, bs, True, backend)
+    b = _bwd(srcs, ws, cos, sin, grads, layout, "interleaved", True, bs, True, backend)
     assert all(torch.equal(x, y) for x, y in zip(a, b))
 
 
@@ -341,16 +376,18 @@ def test_deterministic(backend, layout, form, dual):
                                               ("bshd", 3, True)])  # fmt: skip
 @pytest.mark.parametrize("round_normed", [True, False])
 @pytest.mark.parametrize("per_batch", [False, True])
-def test_flydsl_matches_triton(layout, form, dual, round_normed, per_batch):
+@pytest.mark.parametrize("bias", ["none", "grad", "frozen"])
+def test_flydsl_matches_triton(layout, form, dual, round_normed, per_batch, bias):
     """The two backward backends: d(qkv) and db differ only in fp32 summation order (the 128-element row sums;
     the bias partials); dw in its partial-sum order."""
     srcs, ws, angs, _ = _make(layout, form, dual, H=24, D=128, S=(256, 256), B=2, per_batch=per_batch)
     cos, sin = _tables(angs, "interleaved", srcs[0].dtype)
-    q, _, _ = dit_qk_norm_rope_fwd_impl(srcs[-1], *ws[-1], cos, sin, srcs[0] if dual else None,
-                                        *(ws[0] if dual else (None, None)), 1e-6, layout, "interleaved", True, True)  # fmt: skip
+    bs = _biases(srcs) if bias != "none" else None
+    q, _, _ = _fwd(srcs, ws, cos, sin, bs, layout, round_normed)
     grads = [torch.randn_like(q) for _ in range(3)]
-    a = _bwd(srcs, ws, cos, sin, grads, layout, "interleaved", round_normed, True, "triton")
-    b = _bwd(srcs, ws, cos, sin, grads, layout, "interleaved", round_normed, True, "flydsl")
+    a = _bwd(srcs, ws, cos, sin, grads, layout, "interleaved", round_normed, bs, bias == "grad", "triton")
+    b = _bwd(srcs, ws, cos, sin, grads, layout, "interleaved", round_normed, bs, bias == "grad", "flydsl")
+    assert a[-1].shape[1] == 2 * 128 + (3 * 24 * 128 if bias == "grad" else 0)
     for x, y in zip(a, b):
         assert x.shape == y.shape and x.stride() == y.stride()
         assert _rel(y, x) < 2e-3, _rel(y, x)
@@ -361,16 +398,89 @@ def test_flydsl_matches_triton(layout, form, dual, round_normed, per_batch):
 
 
 @requires_gpu
+@pytest.mark.parametrize("backend", ["triton", pytest.param("flydsl", marks=requires_gfx950)])
+@pytest.mark.parametrize("layout,form,dual", [("sbhd", 4, False), ("sbhd", 4, True), ("bshd", 3, False),
+                                              ("bshd", 3, True)])  # fmt: skip
+def test_bias_is_the_added_bias(backend, layout, form, dual):
+    """With round_normed, the op with ``bias`` computes exactly what it computes on ``qkv + bias`` (a separate
+    bias add, rounded to the storage dtype): q, k, v, d(qkv) and dw bitwise; db is the column sum of d(qkv)."""
+    H, D = 24, 128
+    srcs, ws, angs, _ = _make(layout, form, dual, H=H, D=D, S=(256, 256), B=2)
+    cos, sin = _tables(angs, "interleaved", srcs[0].dtype)
+    bs = _biases(srcs)
+    added = [x + b.view(x.shape[2:]) for x, b in zip(srcs, bs)]
+    a, b = _fwd(srcs, ws, cos, sin, bs, layout), _fwd(added, ws, cos, sin, None, layout)
+    assert all(torch.equal(x, y) for x, y in zip(a, b))
+    grads = [torch.randn_like(a[0]) for _ in range(3)]
+    ga = _bwd(srcs, ws, cos, sin, grads, layout, "interleaved", True, bs, True, backend)
+    gb = _bwd(added, ws, cos, sin, grads, layout, "interleaved", True, None, False, backend)
+    for x, y in zip(ga[:-1], gb[:-1]):
+        assert torch.equal(x, y)
+    if backend == "flydsl":  # 256 blocks either way: the same dw summation order
+        assert torch.equal(ga[-1][:, : 2 * D], gb[-1])
+    else:  # the Triton backward runs fewer programs with the bias gradient: another dw summation order
+        assert _rel(ga[-1][:, : 2 * D], gb[-1]) < 1e-2
+    for i, d in enumerate(ga[:-1]):
+        colsum = d.double().reshape(-1, 3 * H * D).sum(0)
+        assert _rel(ga[-1][i, 2 * D :], colsum) < 1e-2, _rel(ga[-1][i, 2 * D :], colsum)
+
+
+@requires_gpu
+def test_frozen_bias():
+    """A bias that needs no gradient is still added; the gradients of everything else are unchanged."""
+    srcs, ws, angs, _ = _make("bshd", 3, True, H=16, D=128)
+    cos, sin = _tables(angs, "interleaved", srcs[0].dtype)
+    bs = _biases(srcs)
+
+    def run(trainable):
+        x = [s.detach().clone().requires_grad_() for s in srcs]
+        bl = [b.detach().clone().requires_grad_(trainable) for b in bs]
+        out = dit_qk_norm_rope(x[1], *ws[1], cos, sin, layout="bshd", txt_qkv=x[0], w_txt_q=ws[0][0],
+                               w_txt_k=ws[0][1], bias=bl[1], txt_bias=bl[0])  # fmt: skip
+        torch.autograd.backward(out, [torch.ones_like(o) for o in out])
+        return out, [t.grad for t in x], [b.grad for b in bl]
+
+    (oa, ga, ba), (ob, gb, bb) = run(True), run(False)
+    assert all(torch.equal(x, y) for x, y in zip(oa, ob)) and all(torch.equal(x, y) for x, y in zip(ga, gb))
+    assert all(b is not None for b in ba) and all(b is None for b in bb)
+
+
+@requires_gpu
+def test_bias_validation():
+    D, H = 128, 4
+    x = torch.zeros(8, 2, H, 3 * D, dtype=torch.bfloat16, device="cuda")
+    w = torch.ones(D, dtype=torch.bfloat16, device="cuda")
+    cos = torch.zeros(8, D, dtype=torch.bfloat16, device="cuda")
+    b = torch.zeros(3 * H * D, dtype=torch.bfloat16, device="cuda")
+    for bad in (b.float(), torch.zeros(2 * 3 * H * D, dtype=torch.bfloat16, device="cuda")[::2], b[:-1]):
+        with pytest.raises(ValueError, match="bias must have"):
+            dit_qk_norm_rope(x, w, w, cos, cos, bias=bad)
+    with pytest.raises(ValueError, match="no bias"):
+        dit_qk_norm_rope(x, w, w, cos, cos, bias=b, v_out="none")
+    wide_heads = torch.zeros(8, 2, H, 4 * D, dtype=torch.bfloat16, device="cuda")[..., : 3 * D]
+    with pytest.raises(ValueError, match="adjacent"):
+        dit_qk_norm_rope(wide_heads, w, w, cos, cos, bias=b)
+    txt = torch.zeros(4, 2, H, 3 * D, dtype=torch.bfloat16, device="cuda")
+    cos12 = torch.zeros(12, D, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="both biases or neither"):
+        dit_qk_norm_rope(x, w, w, cos12, cos12, txt_qkv=txt, w_txt_q=w, w_txt_k=w, bias=b)
+    with pytest.raises(ValueError, match="txt_bias needs"):
+        dit_qk_norm_rope(x, w, w, cos, cos, txt_bias=b)
+
+
+@requires_gpu
 def test_torch_compile():
     srcs, ws, angs, _ = _make("sbhd", 4, True, H=16, D=128)
     cos, sin = _tables(angs, "interleaved", srcs[0].dtype)
+    bs = _biases(srcs)
 
-    def f(x_txt, x, wq0, wk0, wq1, wk1):
-        q, k, v = dit_qk_norm_rope(x, wq1, wk1, cos, sin, 1e-6, txt_qkv=x_txt, w_txt_q=wq0, w_txt_k=wk0)
+    def f(x_txt, x, wq0, wk0, wq1, wk1, b0, b1):
+        q, k, v = dit_qk_norm_rope(x, wq1, wk1, cos, sin, 1e-6, txt_qkv=x_txt, w_txt_q=wq0, w_txt_k=wk0, bias=b1,
+                                   txt_bias=b0)  # fmt: skip
         return (q.float().square().sum() + k.float().sum() * 0.5 + v.float().sum()).to(x.dtype)
 
     def run(fn):
-        leaves = [t.detach().clone().requires_grad_() for t in (srcs[0], srcs[1], *ws[0], *ws[1])]
+        leaves = [t.detach().clone().requires_grad_() for t in (srcs[0], srcs[1], *ws[0], *ws[1], *bs)]
         fn(*leaves).backward()
         return [t.grad for t in leaves]
 
@@ -381,20 +491,31 @@ def test_torch_compile():
 
 
 @requires_gpu
-def test_fake_tensors():
+@pytest.mark.parametrize("joint", [False, True])
+def test_fake_tensors(joint):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    srcs, ws, angs, _ = _make("bshd", 3, True, H=16, D=128)
-    cos, sin = _tables(angs, "interleaved", srcs[0].dtype)
-    args = (srcs[1], *ws[1], cos, sin, srcs[0], *ws[0], 1e-6, "bshd", "interleaved", True, True)
-    real = torch.ops.primus_turbo.dit_qk_norm_rope(*args)
+    if joint:
+        buf = _joint_buffer(4, 16, 128)
+        (wt, wi), cos, sin = _joint_inputs(128)
+        bs = _biases([buf[:128], buf[128:]])
+        args = (buf, *wi, cos, sin, None, *wt, bs[1], bs[0], 1e-6, "sbhd", "interleaved", True)
+        n_txt = 128
+    else:
+        srcs, ws, angs, _ = _make("bshd", 3, True, H=16, D=128)
+        cos, sin = _tables(angs, "interleaved", srcs[0].dtype)
+        bs = _biases(srcs)
+        args = (srcs[1], *ws[1], cos, sin, srcs[0], *ws[0], bs[1], bs[0], 1e-6, "bshd", "interleaved", True)
+        n_txt = 0
+    real = torch.ops.primus_turbo.dit_qk_norm_rope(*args, True, n_txt)
     grads = [torch.randn_like(real[0]) for _ in range(3)]
-    breal = torch.ops.primus_turbo.dit_qk_norm_rope_backward(*grads, *args[:-1], True)
+    breal = torch.ops.primus_turbo.dit_qk_norm_rope_backward(*grads, *args, True, n_txt)
+    assert len(breal) == (2 if joint else 3)
     with FakeTensorMode(allow_non_fake_inputs=True) as mode:
         fargs = [mode.from_tensor(a) if isinstance(a, torch.Tensor) else a for a in args]
-        fake = torch.ops.primus_turbo.dit_qk_norm_rope(*fargs)
+        fake = torch.ops.primus_turbo.dit_qk_norm_rope(*fargs, True, n_txt)
         fgrads = [mode.from_tensor(g) for g in grads]
-        bfake = torch.ops.primus_turbo.dit_qk_norm_rope_backward(*fgrads, *fargs[:-1], True)
+        bfake = torch.ops.primus_turbo.dit_qk_norm_rope_backward(*fgrads, *fargs, True, n_txt)
     for r, f in zip(list(real) + list(breal), list(fake) + list(bfake)):
         assert r.shape == f.shape and r.dtype == f.dtype and r.stride() == f.stride()
 
@@ -453,6 +574,7 @@ _ISA_SCRIPT = textwrap.dedent(
     class _Stream:
         cuda_stream = 0
 
+    # bias: 0 none, 1 added with its gradient, 2 added only (frozen)
     lay, B, dual, bias = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
     H, D, S = 24, 128, 512
     segs = [S // 2, S // 2] if dual else [S]
@@ -461,9 +583,10 @@ _ISA_SCRIPT = textwrap.dedent(
     g = bf(S, B, H, D) if lay == "sbhd" else bf(B, S, H, D)
     ms = [source_layout(x, D, lay) for x in srcs]
     w = bf(D)
-    part = torch.zeros(GRID_X, partial_row_width(H, len(srcs), bool(bias)), dtype=torch.float32)
+    part = torch.zeros(GRID_X, partial_row_width(H, len(srcs), bias == 1), dtype=torch.float32)
     dit_qk_norm_rope_bwd_launch(srcs, [torch.empty_like(x) for x in srcs], g, g, g, [(w, w)] * len(srcs),
-                                bf(S, D), bf(S, D), part, H=H, s_out=S, eps=1e-6, bias=bool(bias),
+                                bf(S, D), bf(S, D), part, H=H, s_out=S, eps=1e-6,
+                                biases=[bf(3 * H * D)] * len(srcs) if bias else None, bias_grad=bias == 1,
                                 layout=dict(ms[0], segs=[(m["n_tok"], m["S"]) for m in ms]), cs_row_stride=D,
                                 cs_per_batch=False, round_normed=True, stream=_Stream())
     """
@@ -483,6 +606,7 @@ def _hot_loop(lines):
 
 @pytest.mark.skipif(not _flydsl_ok(), reason="needs FlyDSL")
 @pytest.mark.parametrize("lay,B,dual,bias", [("sbhd", 32, 0, 1), ("sbhd", 32, 0, 0), ("sbhd", 32, 1, 1),
+                                             ("sbhd", 32, 1, 2),
                                              ("bshd", 32, 0, 1), ("bshd", 32, 1, 1), ("bshd", 32, 1, 0)])  # fmt: skip
 def test_flydsl_backward_isa(tmp_path, lay, B, dual, bias):
     """Compile only, gfx950 (no GPU needed). The backward must keep <= 128 VGPRs (four waves per SIMD), touch no

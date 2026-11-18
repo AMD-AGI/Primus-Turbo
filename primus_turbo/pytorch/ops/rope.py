@@ -24,6 +24,7 @@ from primus_turbo.pytorch.kernels.rope.dit_qk_norm_rope_impl import (
     dit_qk_norm_rope_backward_op,
     dit_qk_norm_rope_op,
     source_layout,
+    split_streams,
 )
 from primus_turbo.pytorch.kernels.rope.qk_rmsnorm_rope_impl import (
     qk_rmsnorm_rope_bwd_impl,
@@ -160,79 +161,42 @@ def _v_view(qkv: torch.Tensor, D: int, layout: str) -> torch.Tensor:
     return qkv[..., m["VO"] : m["VO"] + m["H"] * D].unflatten(-1, (m["H"], D))
 
 
-def _joint_v_view(txt_qkv: torch.Tensor, qkv: torch.Tensor, D: int, layout: str) -> torch.Tensor:
-    """v of two streams as one strided view, when the streams are adjacent slices of one buffer.
-
-    ``txt_qkv`` and ``qkv`` (``"sbhd"``) must lie back to back in one storage with the same strides, as
-    ``buf[:S_txt]`` and ``buf[S_txt:]`` of one ``[S_txt + S, B, ...]`` GEMM output do; then v of the joint
-    sequence (text first) is the view of that buffer's v columns. Raises ``ValueError`` otherwise (the caller
-    then asks for ``v_out="copy"``)."""
-    if layout != "sbhd":
-        raise ValueError(
-            "dit_qk_norm_rope: v_out='none' with a text stream needs layout='sbhd' (in 'bshd' the two streams "
-            "are not adjacent in memory)"
-        )
-    vt, vi = _v_view(txt_qkv, D, layout), _v_view(qkv, D, layout)
-    # torch.compile cannot read storage offsets or pointers, so a traced call checks the strides and shapes only
-    # and leaves "adjacent slices of one buffer" to the caller; eagerly the storage and the offsets are checked too.
-    adjacent = vt.stride() == vi.stride() and vt.shape[1:] == vi.shape[1:]
-    if adjacent and not torch.compiler.is_compiling():
-        adjacent = (
-            vt.untyped_storage().data_ptr() == vi.untyped_storage().data_ptr()
-            and vi.storage_offset() == vt.storage_offset() + vt.shape[0] * vt.stride(0)
-        )
-    if not adjacent:
-        raise ValueError(
-            "dit_qk_norm_rope: v_out='none' with a text stream needs txt_qkv and qkv to be adjacent slices of one "
-            "buffer (qkv[:S_txt] and qkv[S_txt:] of one GEMM output) with the same strides; use v_out='copy'"
-        )
-    shape = (vt.shape[0] + vi.shape[0],) + tuple(vt.shape[1:])
-    return vt.as_strided(shape, vt.stride())  # offset defaults to the text stream's: the view starts there
-
-
 class _DitQkNormRope(torch.autograd.Function):
     @staticmethod
     def forward(ctx, qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, bias, txt_bias, eps, layout, rope,
-                round_normed, v_out):  # fmt: skip
+                round_normed, v_out, txt_seq_len):  # fmt: skip
         v_copy = v_out == "copy"
         q, k, v = dit_qk_norm_rope_op(
-            qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, eps, layout, rope, round_normed, v_copy
-        )
-        if not v_copy:
-            D = w_q.shape[0]
-            v = _v_view(qkv, D, layout) if txt_qkv is None else _joint_v_view(txt_qkv, qkv, D, layout)
-        ctx.has_txt = txt_qkv is not None
-        ctx.bias_grad = bias is not None
-        ctx.bias_meta = [(b.shape, b.dtype) if b is not None else None for b in (bias, txt_bias)]
-        ctx.args = (eps, layout, rope, round_normed)
-        ctx.save_for_backward(qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k)
+            qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, bias, txt_bias, eps, layout, rope, round_normed,
+            v_copy, txt_seq_len,
+        )  # fmt: skip
+        if not v_copy:  # one stream, or both in one joint buffer: v is a view of qkv's v columns
+            v = _v_view(qkv, w_q.shape[0], layout)
+        ctx.two_streams = txt_qkv is not None or txt_seq_len > 0
+        ctx.args = (eps, layout, rope, round_normed, txt_seq_len)
+        ctx.save_for_backward(qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, bias, txt_bias)
         return q, k, v
 
     @staticmethod
     def backward(ctx, dq, dk, dv):
-        qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k = ctx.saved_tensors
-        eps, layout, rope, round_normed = ctx.args
+        qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, bias, txt_bias = ctx.saved_tensors
+        eps, layout, rope, round_normed, txt_seq_len = ctx.args
         dq, dk, dv = (
             torch.zeros_like(dq if dq is not None else dk) if g is None else g for g in (dq, dk, dv)
         )
+        bias_grad = bias is not None and (ctx.needs_input_grad[8] or ctx.needs_input_grad[9])
         out = dit_qk_norm_rope_backward_op(
-            dq, dk, dv, qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, eps, layout, rope, round_normed,
-            ctx.bias_grad,
+            dq, dk, dv, qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, bias, txt_bias, eps, layout, rope,
+            round_normed, bias_grad, txt_seq_len,
         )  # fmt: skip
         D = w_q.shape[0]
         red = out[-1]
-        if ctx.has_txt:
-            d_txt, d_qkv = out[0], out[1]
-            r_txt, r_img = red[0], red[1]
-        else:
-            d_txt, d_qkv = None, out[0]
-            r_txt, r_img = None, red[0]
+        d_txt, d_qkv = (out[0], out[1]) if txt_qkv is not None else (None, out[0])
+        r_txt, r_img = (red[0], red[1]) if ctx.two_streams else (None, red[0])
 
-        def bias_of(r, meta):
-            return None if meta is None or r is None else r[2 * D :].view(meta[0]).to(meta[1])
+        def bias_grad_of(r, b):
+            return r[2 * D :].view(b.shape) if bias_grad and b is not None else None
 
-        db = bias_of(r_img, ctx.bias_meta[0]) if ctx.bias_grad else None
-        db_txt = bias_of(r_txt, ctx.bias_meta[1]) if ctx.bias_grad else None
         return (
             d_qkv,
             r_img[:D],
@@ -242,8 +206,9 @@ class _DitQkNormRope(torch.autograd.Function):
             d_txt,
             None if r_txt is None else r_txt[:D],
             None if r_txt is None else r_txt[D : 2 * D],
-            db,
-            db_txt,
+            bias_grad_of(r_img, bias),
+            None if r_txt is None else bias_grad_of(r_txt, txt_bias),
+            None,
             None,
             None,
             None,
@@ -264,6 +229,7 @@ def dit_qk_norm_rope(
     txt_qkv: Optional[torch.Tensor] = None,
     w_txt_q: Optional[torch.Tensor] = None,
     w_txt_k: Optional[torch.Tensor] = None,
+    txt_seq_len: int = 0,
     rope: str = "interleaved",
     round_normed: bool = True,
     v_out: str = "copy",
@@ -284,12 +250,14 @@ def dit_qk_norm_rope(
     RoPE, forward and backward. That op is the LLM GQA one: ``[S, B, NG, (NPG + 2) * D]`` groups, half-split RoPE
     from fp32 ``freqs``, FlyDSL on gfx950. This one is for DiTs: one q / k / v per head, both token orders,
     interleaved (Flux) or half-split RoPE from cos / sin tables, a text and an image stream written into one
-    joint sequence, an optional fused QKV-bias gradient, Triton on every arch and a FlyDSL backward on gfx950.
+    joint sequence, the QKV bias added and its gradient fused, Triton on every arch and a FlyDSL backward on
+    gfx950.
 
     Args:
         qkv: the (image) stream's QKV GEMM output. ``layout="sbhd"``: ``[S, B, H, 3*D]`` (Megatron, per head
             q | k | v) or ``[S, B, 3*H*D]``; ``"bshd"``: ``[B, S, 3*H*D]`` (diffusers, q heads | k heads | v heads)
             or ``[B, S, H, 3*D]``. Read in place at its strides (unit last stride, one uniform token stride).
+            With ``txt_seq_len``: both streams' output in one ``[S_txt + S, B, ..]`` buffer, text first.
         w_q, w_k: RMSNorm weights ``[D]``, qkv's dtype.
         cos, sin: ``[S_out, D]`` (per position) or ``[S_out * B, D]`` (per position and batch element, row
             ``s * B + b``), each RoPE pair's angle twice; see ``dit_qk_norm_rope_cos_sin``.
@@ -297,19 +265,22 @@ def dit_qk_norm_rope(
         layout: token order of qkv and of the outputs, ``"sbhd"`` or ``"bshd"``.
         txt_qkv, w_txt_q, w_txt_k: a text stream (dual-stream blocks), same form as qkv; its tokens come first in
             the joint sequence ``S_out = S_txt + S``, in one launch each way.
+        txt_seq_len: ``S_txt`` when ``qkv`` holds both streams (``layout="sbhd"``, ``txt_qkv`` None, the text
+            weights given): its first ``S_txt`` positions are the text stream. The backward returns one gradient
+            for the whole buffer. 0 (default): ``qkv`` is one stream.
         rope: ``"interleaved"`` pairs (2i, 2i+1) (Flux, Megatron's ``rotary_interleaved``); ``"half"`` pairs
             (i, i + D/2).
         round_normed: round the normalised, weighted q / k to qkv's dtype before RoPE, and the inverse-RoPE
             gradient before the RMSNorm backward. True is what an RMSNorm module followed by RoPE computes
-            (diffusers, #556); False keeps both in fp32 (one rounding per output; closer to fp64).
+            (diffusers, #556); False keeps both in fp32 (one rounding per output; closer to fp64). With a bias,
+            True also rounds ``qkv + bias`` before the norm, as a separate bias add does.
         v_out: ``"copy"`` writes v into a fresh ``[.., .., H, D]`` tensor; ``"none"`` returns v as a strided view of
             the source instead (no copy), and its gradient is written into d(qkv) by this op's backward. With a
-            text stream, the view spans both streams as one joint sequence, which needs ``layout="sbhd"`` and
-            ``txt_qkv`` / ``qkv`` to be adjacent slices of one buffer with the same strides (``buf[:S_txt]`` and
-            ``buf[S_txt:]`` of one ``[S_txt + S, B, ..]`` GEMM output); otherwise ``ValueError``.
-        bias, txt_bias: the QKV GEMMs' biases, when the GEMM adds them without differentiating them (e.g. a
-            detached bias). The backward then returns their gradients (the column sums of d(qkv)), summed in the
-            same pass.
+            text stream the view spans both streams as one joint sequence, so both must come in one buffer
+            (``txt_seq_len``). Not with a bias (the source does not hold it).
+        bias, txt_bias: the QKV GEMMs' biases, ``[3*H*D]`` in the source's column order, qkv's dtype; the GEMMs
+            then run without them. The op adds them to q, k and v and returns their gradients (the column sums
+            of d(qkv)), summed in the same pass. With a text stream, both or neither.
 
     Returns:
         q, k, v: ``[S_out, B, H, D]`` (``"sbhd"``) or ``[B, S_out, H, D]`` (``"bshd"``).
@@ -321,19 +292,19 @@ def dit_qk_norm_rope(
     """
     if v_out not in _V_OUT:
         raise ValueError(f"dit_qk_norm_rope: v_out must be one of {_V_OUT}, got {v_out!r}")
-    if txt_bias is not None and (bias is None or txt_qkv is None):
-        raise ValueError("dit_qk_norm_rope: txt_bias needs txt_qkv and bias")
-    if bias is not None and txt_qkv is not None and txt_bias is None:
-        raise ValueError("dit_qk_norm_rope: with a text stream, pass both biases or neither")
-    metas, D, _, _ = check_operands(
-        qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, layout, rope, bias_grad=bias is not None
-    )
     if v_out == "none" and txt_qkv is not None:
-        _joint_v_view(txt_qkv, qkv, D, layout)  # raises before any launch when the streams are not adjacent
-    for name, b, m in (("bias", bias, metas[-1]), ("txt_bias", txt_bias, metas[0])):
-        if b is not None and b.numel() != m["ROW_W"]:
-            raise ValueError(f"dit_qk_norm_rope: {name} must have {m['ROW_W']} elements, got {list(b.shape)}")
+        raise ValueError(
+            "dit_qk_norm_rope: v_out='none' with a text stream needs both streams in one buffer: pass the joint "
+            "[S_txt + S, B, ..] QKV output as qkv with txt_seq_len=S_txt, or use v_out='copy'"
+        )
+    if v_out == "none" and bias is not None:
+        raise ValueError(
+            "dit_qk_norm_rope: v_out='none' returns v as a view of qkv, which has no bias; use 'copy'"
+        )
+    txt_seq_len = int(txt_seq_len)
+    txt, img = split_streams(qkv, txt_qkv, txt_seq_len, layout)
+    check_operands(img, w_q, w_k, cos, sin, txt, w_txt_q, w_txt_k, layout, rope, bias, txt_bias)
     return _DitQkNormRope.apply(
         qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, bias, txt_bias, float(eps), layout, rope,
-        bool(round_normed), v_out,
+        bool(round_normed), v_out, txt_seq_len,
     )  # fmt: skip

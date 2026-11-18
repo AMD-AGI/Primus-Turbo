@@ -99,7 +99,7 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | `swiglu_with_probs`, `geglu_with_probs` | BF16 / FP16 | ✅ | ✅ | ✅ | GLU scaled by routing probability, optional row mask and clamp |
 | `fused_qkv_rope` | BF16 | ✅ | ✅ | — | RoPE on packed QKV |
 | `fused_qkv_rmsnorm_rope` | BF16 | — | ✅ | — | QK RMSNorm + RoPE on packed QKV |
-| `dit_qk_norm_rope` | BF16 / FP16 / FP32 | — | ✅ | — | DiT q / k RMSNorm + RoPE from the QKV GEMM output (`sbhd` / `bshd`, one or two streams, interleaved or half-split RoPE, optional fused QKV-bias gradient; `v_out="none"` returns v as one strided view over both streams instead of a copy) |
+| `dit_qk_norm_rope` | BF16 / FP16 / FP32 | — | ✅ | — | DiT q / k RMSNorm + RoPE from the QKV GEMM output (`sbhd` / `bshd`, one or two streams, interleaved or half-split RoPE, the QKV bias added in the op and its gradient fused; `v_out="none"` returns v as a strided view of the QKV output instead of a copy, over both streams when they come in one buffer with `txt_seq_len`) |
 | `cross_entropy` | BF16 / FP32 | ✅ | ✅ | ✅ | Label smoothing, ignore index, in-place logits. See [Cross Entropy](./cross_entropy.md) |
 
 ### 2.6 Quantization and low-precision training support

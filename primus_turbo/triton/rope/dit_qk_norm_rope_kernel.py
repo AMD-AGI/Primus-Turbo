@@ -26,8 +26,13 @@ Flux, #556). ``INTERLEAVED`` pairs (2i, 2i+1), as Megatron's ``rotary_interleave
 otherwise (i, i + D/2). The cos / sin rows hold each pair's angle twice, as both libraries build them; the
 kernels read the first copy.
 
+``ADD_BIAS``: the QKV GEMM ran without its bias and the kernels add it, in the source's column order (``bias[QO +
+h * HS + d]`` for q, likewise k and v), in fp32 to every q / k / v value they read; ``ROUND`` rounds the sum to
+the storage dtype first, as a separate bias add does. The v copy is ``v + bias`` rounded once. The backward
+adds the bias again where it recomputes rstd.
+
 The backward writes d(qkv) in the source layout (dv into the v columns), and fp32 partials of the norm-weight
-gradients and, with ``BIAS``, of the QKV bias gradient (the column sums of d(qkv)). ``reduce_partials_kernel``
+gradients and, with ``BIAS_GRAD``, of the QKV bias gradient (the column sums of d(qkv)). ``reduce_partials_kernel``
 turns the partials of every stream into dw and db in one launch, in a fixed order, so the result is
 deterministic.
 """
@@ -88,6 +93,7 @@ def _norm_rope(
     x_ptrs,
     out_ptrs,
     w,
+    b,
     c,
     s,
     eps,
@@ -96,9 +102,14 @@ def _norm_rope(
     D: tl.constexpr,
     INTERLEAVED: tl.constexpr,
     ROUND: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
     CM: tl.constexpr,
 ):
     x = tl.load(x_ptrs, mask=hmask, other=0.0, cache_modifier=CM).to(tl.float32)
+    if ADD_BIAS:
+        x = x + b
+        if ROUND:
+            x = x.to(out_ptrs.dtype.element_ty).to(tl.float32)
     rstd = tl.rsqrt(tl.sum(x * x, axis=1) / D + eps)
     y = x * rstd[:, None] * w[None, :]
     if ROUND:
@@ -117,6 +128,7 @@ def _fwd_segment(
     wk_ptr,
     cos_ptr,
     sin_ptr,
+    bias_ptr,
     prog,
     n_tok,
     s_src,
@@ -139,6 +151,7 @@ def _fwd_segment(
     ROUND: tl.constexpr,
     V_COPY: tl.constexpr,
     CS_PER_BATCH: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
     CM: tl.constexpr,
 ):
     h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -152,6 +165,13 @@ def _fwd_segment(
         cs_cols = tl.arange(0, D // 2)
     wq = tl.load(wq_ptr + d).to(tl.float32)
     wk = tl.load(wk_ptr + d).to(tl.float32)
+    bq = tl.zeros([BLOCK_H, D], dtype=tl.float32)
+    bk = bq
+    bv = bq
+    if ADD_BIAS:
+        bq = tl.load(bias_ptr + QO + hs, mask=hmask, other=0.0).to(tl.float32)
+        bk = tl.load(bias_ptr + KO + hs, mask=hmask, other=0.0).to(tl.float32)
+        bv = tl.load(bias_ptr + VO + hs, mask=hmask, other=0.0).to(tl.float32)
     for i in tl.static_range(TOKENS):
         tok = prog * TOKENS + i
         if tok < n_tok:
@@ -160,13 +180,17 @@ def _fwd_segment(
             c = tl.load(cos_ptr + cs_row * CSS + cs_cols).to(tl.float32)
             s = tl.load(sin_ptr + cs_row * CSS + cs_cols).to(tl.float32)
             _norm_rope(
-                src + QO + hs, q_ptr + dst + hd, wq, c, s, eps, hmask, BLOCK_H, D, INTERLEAVED, ROUND, CM
-            )
+                src + QO + hs, q_ptr + dst + hd, wq, bq, c, s, eps, hmask, BLOCK_H, D, INTERLEAVED, ROUND,
+                ADD_BIAS, CM,
+            )  # fmt: skip
             _norm_rope(
-                src + KO + hs, k_ptr + dst + hd, wk, c, s, eps, hmask, BLOCK_H, D, INTERLEAVED, ROUND, CM
-            )
+                src + KO + hs, k_ptr + dst + hd, wk, bk, c, s, eps, hmask, BLOCK_H, D, INTERLEAVED, ROUND,
+                ADD_BIAS, CM,
+            )  # fmt: skip
             if V_COPY:
                 vv = tl.load(src + VO + hs, mask=hmask, cache_modifier=CM)
+                if ADD_BIAS:
+                    vv = (vv.to(tl.float32) + bv).to(v_ptr.dtype.element_ty)
                 tl.store(v_ptr + dst + hd, vv, mask=hmask, cache_modifier=CM)
 
 
@@ -183,6 +207,8 @@ def dit_qk_norm_rope_fwd_kernel(
     wk1_ptr,
     cos_ptr,
     sin_ptr,
+    b0_ptr,
+    b1_ptr,
     n_tok0,
     s_src0,
     n_tok1,
@@ -207,6 +233,7 @@ def dit_qk_norm_rope_fwd_kernel(
     ROUND: tl.constexpr,
     V_COPY: tl.constexpr,
     CS_PER_BATCH: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
     CM: tl.constexpr,
 ):
     """Grid (n_prog0 [+ n_prog1], cdiv(H, BLOCK_H)); a program normalises and rotates TOKENS tokens' q and k
@@ -223,6 +250,7 @@ def dit_qk_norm_rope_fwd_kernel(
                 wk0_ptr,
                 cos_ptr,
                 sin_ptr,
+                b0_ptr,
                 pid,
                 n_tok0,
                 s_src0,
@@ -245,6 +273,7 @@ def dit_qk_norm_rope_fwd_kernel(
                 ROUND,
                 V_COPY,
                 CS_PER_BATCH,
+                ADD_BIAS,
                 CM,
             )
         else:
@@ -257,6 +286,7 @@ def dit_qk_norm_rope_fwd_kernel(
                 wk1_ptr,
                 cos_ptr,
                 sin_ptr,
+                b1_ptr,
                 pid - n_prog0,
                 n_tok1,
                 s_src1,
@@ -279,6 +309,7 @@ def dit_qk_norm_rope_fwd_kernel(
                 ROUND,
                 V_COPY,
                 CS_PER_BATCH,
+                ADD_BIAS,
                 CM,
             )
     else:
@@ -291,6 +322,7 @@ def dit_qk_norm_rope_fwd_kernel(
             wk0_ptr,
             cos_ptr,
             sin_ptr,
+            b0_ptr,
             pid,
             n_tok0,
             s_src0,
@@ -313,6 +345,7 @@ def dit_qk_norm_rope_fwd_kernel(
             ROUND,
             V_COPY,
             CS_PER_BATCH,
+            ADD_BIAS,
             CM,
         )
 
@@ -323,6 +356,7 @@ def _norm_rope_bwd(
     go_ptrs,
     dx_ptrs,
     w,
+    b,
     c,
     s,
     eps,
@@ -331,8 +365,13 @@ def _norm_rope_bwd(
     D: tl.constexpr,
     INTERLEAVED: tl.constexpr,
     ROUND: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     x = tl.load(x_ptrs, mask=hmask, other=0.0).to(tl.float32)
+    if ADD_BIAS:  # the forward's input, as it formed it
+        x = x + b
+        if ROUND:
+            x = x.to(dx_ptrs.dtype.element_ty).to(tl.float32)
     rstd = tl.rsqrt(tl.sum(x * x, axis=1) / D + eps)
     xhat = x * rstd[:, None]
     go = tl.load(go_ptrs, mask=hmask, other=0.0).to(tl.float32)
@@ -356,6 +395,7 @@ def _bwd_segment(
     wk_ptr,
     cos_ptr,
     sin_ptr,
+    bias_ptr,
     part_ptr,
     bpart_ptr,
     prog,
@@ -377,7 +417,8 @@ def _bwd_segment(
     H: tl.constexpr,
     D: tl.constexpr,
     BLOCK_H: tl.constexpr,
-    BIAS: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
+    BIAS_GRAD: tl.constexpr,
     SB: tl.constexpr,
     INTERLEAVED: tl.constexpr,
     ROUND: tl.constexpr,
@@ -395,6 +436,11 @@ def _bwd_segment(
         cs_cols = tl.arange(0, D // 2)
     wq = tl.load(wq_ptr + d).to(tl.float32)
     wk = tl.load(wk_ptr + d).to(tl.float32)
+    bq = tl.zeros([BLOCK_H, D], dtype=tl.float32)
+    bk = bq
+    if ADD_BIAS:
+        bq = tl.load(bias_ptr + QO + hs, mask=hmask, other=0.0).to(tl.float32)
+        bk = tl.load(bias_ptr + KO + hs, mask=hmask, other=0.0).to(tl.float32)
     acc_q = tl.zeros([D], dtype=tl.float32)
     acc_k = tl.zeros([D], dtype=tl.float32)
     # Column sums of d(qkv) as written (the QKV bias gradient).
@@ -413,6 +459,7 @@ def _bwd_segment(
             dq_ptr + dst + hd,
             dsrc_ptr + row + QO + hs,
             wq,
+            bq,
             c,
             s,
             eps,
@@ -421,12 +468,14 @@ def _bwd_segment(
             D,
             INTERLEAVED,
             ROUND,
+            ADD_BIAS,
         )
         dw_k, dx_k = _norm_rope_bwd(
             src_ptr + row + KO + hs,
             dk_ptr + dst + hd,
             dsrc_ptr + row + KO + hs,
             wk,
+            bk,
             c,
             s,
             eps,
@@ -435,12 +484,13 @@ def _bwd_segment(
             D,
             INTERLEAVED,
             ROUND,
+            ADD_BIAS,
         )
         acc_q += dw_q
         acc_k += dw_k
         dv = tl.load(dv_ptr + dst + hd, mask=hmask)
         tl.store(dsrc_ptr + row + VO + hs, dv, mask=hmask)
-        if BIAS:
+        if BIAS_GRAD:
             acc_bq += dx_q
             acc_bk += dx_k
             acc_bv += dv.to(tl.float32)
@@ -448,7 +498,7 @@ def _bwd_segment(
     base = part_ptr + (prow * tl.num_programs(1) + pid_h) * (2 * D)
     tl.store(base + d, acc_q)
     tl.store(base + D + d, acc_k)
-    if BIAS:
+    if BIAS_GRAD:
         bbase = bpart_ptr + prow.to(tl.int64) * ROW_W
         tl.store(bbase + QO + hs, acc_bq, mask=hmask)
         tl.store(bbase + KO + hs, acc_bk, mask=hmask)
@@ -470,6 +520,8 @@ def dit_qk_norm_rope_bwd_kernel(
     wk1_ptr,
     cos_ptr,
     sin_ptr,
+    b0_ptr,
+    b1_ptr,
     part_ptr,
     bpart_ptr,
     n_tok0,
@@ -492,7 +544,8 @@ def dit_qk_norm_rope_bwd_kernel(
     H: tl.constexpr,
     D: tl.constexpr,
     BLOCK_H: tl.constexpr,
-    BIAS: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
+    BIAS_GRAD: tl.constexpr,
     SB: tl.constexpr,
     NSEG: tl.constexpr,
     INTERLEAVED: tl.constexpr,
@@ -500,7 +553,8 @@ def dit_qk_norm_rope_bwd_kernel(
     CS_PER_BATCH: tl.constexpr,
 ):
     """Grid (n_prog0 [+ n_prog1], cdiv(H, BLOCK_H)); a program walks ``per`` consecutive tokens of its segment
-    and writes one partial row: dw [prow, pid_h, 2, D] and, with BIAS, db [prow, 3*H*D] (source column order)."""
+    and writes one partial row: dw [prow, pid_h, 2, D] and, with BIAS_GRAD, db [prow, 3*H*D] (source column
+    order)."""
     pid = tl.program_id(0)
     if NSEG == 2:
         if pid < n_prog0:
@@ -514,6 +568,7 @@ def dit_qk_norm_rope_bwd_kernel(
                 wk0_ptr,
                 cos_ptr,
                 sin_ptr,
+                b0_ptr,
                 part_ptr,
                 bpart_ptr,
                 pid,
@@ -535,7 +590,8 @@ def dit_qk_norm_rope_bwd_kernel(
                 H,
                 D,
                 BLOCK_H,
-                BIAS,
+                ADD_BIAS,
+                BIAS_GRAD,
                 SB,
                 INTERLEAVED,
                 ROUND,
@@ -552,6 +608,7 @@ def dit_qk_norm_rope_bwd_kernel(
                 wk1_ptr,
                 cos_ptr,
                 sin_ptr,
+                b1_ptr,
                 part_ptr,
                 bpart_ptr,
                 pid - n_prog0,
@@ -573,7 +630,8 @@ def dit_qk_norm_rope_bwd_kernel(
                 H,
                 D,
                 BLOCK_H,
-                BIAS,
+                ADD_BIAS,
+                BIAS_GRAD,
                 SB,
                 INTERLEAVED,
                 ROUND,
@@ -590,6 +648,7 @@ def dit_qk_norm_rope_bwd_kernel(
             wk0_ptr,
             cos_ptr,
             sin_ptr,
+            b0_ptr,
             part_ptr,
             bpart_ptr,
             pid,
@@ -611,7 +670,8 @@ def dit_qk_norm_rope_bwd_kernel(
             H,
             D,
             BLOCK_H,
-            BIAS,
+            ADD_BIAS,
+            BIAS_GRAD,
             SB,
             INTERLEAVED,
             ROUND,

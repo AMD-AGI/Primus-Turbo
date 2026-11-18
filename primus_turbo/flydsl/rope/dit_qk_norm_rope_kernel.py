@@ -28,8 +28,12 @@ per lane, D = 128); block ``bx`` walks tokens ``bx, bx + 256, ...`` of each segm
 - the four 16-lane row sums (rstd and the dot product, for q and for k) are DPP butterflies
   (``flydsl.extension.coop.warp_reduce``), not LDS-pipe swizzles.
 
+With ``add_bias`` (the op adds the QKV bias in its forward) each lane loads its q and k bias columns once per
+segment, before the token loop, and adds them to x where rstd is recomputed, rounded as the forward rounds.
+The bias and w then stay bf16 across the loop and are widened to fp32 where used, to fit the 128-VGPR cap.
+
 At the end of a segment a block sums its heads' dw in LDS, in head order, and writes one fp32 row
-``[2 * D]``; with the bias it also writes its fp32 column sums of d(qkv) ``[3 * H * D]``. The block rows of
+``[2 * D]``; with ``bias_grad`` it also writes its fp32 column sums of d(qkv) ``[3 * H * D]``. The block rows of
 every segment (per segment ``[2D dw | 3HD db]``) form one ``[256, ROWP]`` buffer that a single column-sum launch reduces to dw and db of every
 stream. The order of dw's fp32 sum is: each block's tokens, then its heads, then the 256 blocks.
 
@@ -54,6 +58,7 @@ def _build():
     import flydsl.expr.math as fmath
     from flydsl._mlir import ir
     from flydsl._mlir.dialects import arith as _marith
+    from flydsl._mlir.dialects import llvm as _llvm
     from flydsl._mlir.dialects import scf as _scf
     from flydsl._mlir.dialects import vector as _vector
     from flydsl.expr import rocdl as _xrocdl
@@ -68,9 +73,9 @@ def _build():
         create_buffer_resource,
     )
 
-    def make(H, NSEG, segs, s_out, eps, bias, TS, HS, QO, KO, VO, NB, SB, CSS, CSB, ROUND):
+    def make(H, NSEG, segs, s_out, eps, add_bias, bias_grad, TS, HS, QO, KO, VO, NB, SB, CSS, CSB, ROUND):
         # One fp32 row per block: per segment [2D dw | 3HD bias] (ROWP floats).
-        SEGW = 2 * D + (3 * H * D if bias else 0)
+        SEGW = 2 * D + (3 * H * D if bias_grad else 0)
         ROWP = NSEG * SEGW
         threads = H * LANES
         hd = H * D
@@ -82,23 +87,26 @@ def _build():
             s = ArithValue(_warp_reduce(fx.Float32(s), _RedOp.ADD, width=LANES).ir_value())
             return _vector.broadcast(f32v, s)
 
-        def sfor(n, fn):
-            """scf.for over [0, n) with fn(i32 induction value) as the body (no loop-carried values)."""
+        def sfor(n, fn, carried=()):
+            """scf.for over [0, n) with fn(i32 induction value, *carried) as the body; fn returns the next
+            iteration's carried values."""
             idx = ir.IndexType.get()
             op = _scf.ForOp(
                 _marith.ConstantOp(idx, 0).result,
                 _marith.ConstantOp(idx, n).result,
                 _marith.ConstantOp(idx, 1).result,
+                list(carried),
             )
             with ir.InsertionPoint(op.body):
-                fn(
+                nxt = fn(
                     ArithValue(
                         _marith.IndexCastOp(ir.IntegerType.get_signless(32), op.induction_variable).result
-                    )
+                    ),
+                    *op.inner_iter_args,
                 )
-                _scf.YieldOp([])
+                _scf.YieldOp(list(nxt) if carried else [])
 
-        def emit(SRC0, SRC1, DSRC0, DSRC1, DQ, DK, DV, WQ0, WK0, WQ1, WK1, COS, SIN, PART, red):
+        def emit(SRC0, SRC1, DSRC0, DSRC1, DQ, DK, DV, WQ0, WK0, WQ1, WK1, COS, SIN, B0, B1, PART, red):
             f32v = ir.VectorType.get([VEC], ir.F32Type.get())
             f32v4 = ir.VectorType.get([4], ir.F32Type.get())
             bf16v = ir.VectorType.get([VEC], ir.BF16Type.get())
@@ -115,10 +123,25 @@ def _build():
             eps_v = fx.arith.constant_vector(eps, f32v)
             zero = fx.arith.constant_vector(0.0, f32v)
             neg1 = fx.arith.constant_vector(-1.0, f32v4)
-            accs = [fx.make_rmem_tensor(fx.make_layout(VEC, 1), fx.Float32) for _ in range(5 if bias else 2)]
+            accs = [
+                fx.make_rmem_tensor(fx.make_layout(VEC, 1), fx.Float32) for _ in range(5 if bias_grad else 2)
+            ]
 
-            def norm_rope_bwd(x_bf, go_bf, w, c, s_signed):
+            i32v4 = ir.VectorType.get([4], ir.IntegerType.get_signless(32))
+
+            def opaque(v):
+                """v, which the compiler can no longer prove loop-invariant (an empty volatile asm)."""
+                return _llvm.inline_asm(i32v4, [v], "", "=v,0", has_side_effects=True)
+
+            def widen(p):
+                return fx.arith.extf(f32v, _vector.bitcast(bf16v, p))
+
+            def norm_rope_bwd(x_bf, go_bf, w, c, s_signed, b):
                 x = fx.arith.extf(f32v, x_bf)
+                if add_bias:  # the forward's input, as it formed it
+                    x = fx.arith.addf(x, widen(b))
+                    if ROUND:
+                        x = fx.arith.extf(f32v, fx.arith.trunc_f(bf16v, x))
                 go = fx.arith.extf(f32v, go_bf)
                 rstd = fmath.rsqrt(
                     fx.arith.addf(fx.arith.mulf(row_sum(fx.arith.mulf(x, x), f32v), inv_d), eps_v)
@@ -128,7 +151,7 @@ def _build():
                 dy = fx.arith.addf(fx.arith.mulf(go, c), fx.arith.mulf(_vector.interleave(g_o, ge), s_signed))
                 if ROUND:  # the gradient of the rounded norm output, rounded as autograd rounds it
                     dy = fx.arith.extf(f32v, fx.arith.trunc_f(bf16v, dy))
-                g = fx.arith.mulf(dy, w)
+                g = fx.arith.mulf(dy, widen(w) if add_bias else w)
                 dot = fx.arith.mulf(row_sum(fx.arith.mulf(g, xhat), f32v), inv_d)
                 dx = fx.arith.trunc_f(bf16v, fx.arith.mulf(rstd, fx.arith.subf(g, fx.arith.mulf(xhat, dot))))
                 return dx, fx.arith.mulf(dy, xhat)
@@ -145,17 +168,25 @@ def _build():
                     )
 
             for si, (n_tok, s_src, seq_off) in enumerate(segs):
-                SRC, DSRC, WQ, WK = (SRC0, DSRC0, WQ0, WK0) if si == 0 else (SRC1, DSRC1, WQ1, WK1)
+                SRC, DSRC, WQ, WK, BIAS = (
+                    (SRC0, DSRC0, WQ0, WK0, B0) if si == 0 else (SRC1, DSRC1, WQ1, WK1, B1)
+                )
                 src_r, dsrc_r = (create_buffer_resource(x, max_size=True) for x in (SRC, DSRC))
                 wq, wk = (
-                    fx.arith.extf(
-                        f32v,
-                        buffer_load(
-                            create_buffer_resource(w, max_size=True), lane8, vec_width=VEC, dtype=bf16
-                        ),
-                    )
+                    buffer_load(create_buffer_resource(w, max_size=True), lane8, vec_width=VEC, dtype=bf16)
                     for w in (WQ, WK)
                 )
+                carried = ()
+                if not add_bias:
+                    wq, wk = fx.arith.extf(f32v, wq), fx.arith.extf(f32v, wk)
+                else:
+                    # w and the bias stay bf16 (4 VGPRs per vector), carried through the loop as opaque values
+                    # and widened where used: hoisted out of the loop, their fp32 copies (16 VGPRs more) spill
+                    # under the 128-VGPR cap next to the bias gradient's accumulators.
+                    bias_r = create_buffer_resource(BIAS, max_size=True)
+                    bq = buffer_load(bias_r, scol, vec_width=VEC, dtype=bf16)
+                    bk = buffer_load(bias_r, scol + fx.Int32(KO - QO), vec_width=VEC, dtype=bf16)
+                    carried = [_vector.bitcast(i32v4, v) for v in (wq, wk, bq, bk)]
                 for a in accs:
                     fx.memref_store_vec(zero, a)
 
@@ -171,7 +202,7 @@ def _build():
                         cs_row * fx.Int32(CSS) + lane8,
                     )
 
-                def trip(it, src_r=src_r, dsrc_r=dsrc_r, wq=wq, wk=wk, offs=offs):
+                def trip(it, *carried, src_r=src_r, dsrc_r=dsrc_r, wq=wq, wk=wk, offs=offs):
                     go_off, src_off, cs_off = offs(it)
 
                     def ld(r, off):
@@ -184,24 +215,29 @@ def _build():
                     dv = ld(dv_r, go_off)
                     _xrocdl.sched_barrier(0)  # keep the seven loads together, ahead of the math
                     _, src_off, _ = offs(it)
+                    bq = bk = None
+                    if add_bias:
+                        carried = [opaque(v) for v in carried]
+                        wq, wk, bq, bk = carried
                     c = fx.arith.extf(f32v, cb)
                     s_e, s_o = _vector.deinterleave(fx.arith.extf(f32v, sb))
                     s_signed = _vector.interleave(s_e, fx.arith.mulf(s_o, neg1))
-                    dxq, dwq = norm_rope_bwd(xq, gq, wq, c, s_signed)
-                    dxk, dwk = norm_rope_bwd(xk, gk, wk, c, s_signed)
+                    dxq, dwq = norm_rope_bwd(xq, gq, wq, c, s_signed, bq)
+                    dxk, dwk = norm_rope_bwd(xk, gk, wk, c, s_signed, bk)
                     buffer_store(dxq, dsrc_r, src_off, cache_modifier=_NT)
                     buffer_store(dxk, dsrc_r, src_off + fx.Int32(KO - QO), cache_modifier=_NT)
                     buffer_store(dv, dsrc_r, src_off + fx.Int32(VO - QO), cache_modifier=_NT)
                     accumulate(accs[0], dwq)
                     accumulate(accs[1], dwk)
-                    if bias:
+                    if bias_grad:
                         accumulate(accs[2], fx.arith.extf(f32v, dxq))
                         accumulate(accs[3], fx.arith.extf(f32v, dxk))
                         accumulate(accs[4], fx.arith.extf(f32v, dv))
+                    return carried
 
-                sfor(n_tok // GRID_X, trip)
+                sfor(n_tok // GRID_X, trip, carried)
 
-                if bias:
+                if bias_grad:
                     bbase = bx * fx.Int32(ROWP) + fx.Int32(si * SEGW + 2 * D) + scol
                     for o, a in zip((0, KO - QO, VO - QO), accs[2:]):
                         store8(fx.memref_load_vec(a), part_r, bbase + fx.Int32(o))
@@ -241,6 +277,8 @@ def _build():
             WK1: fx.Tensor,
             COS: fx.Tensor,
             SIN: fx.Tensor,
+            B0: fx.Tensor,
+            B1: fx.Tensor,
             PART: fx.Tensor,
         ):
             @fx.struct
@@ -248,7 +286,7 @@ def _build():
                 red: fx.Array[fx.Float32, 2 * H * D, 16]
 
             red = fx.SharedAllocator().allocate(Smem).peek().red
-            emit(SRC0, SRC1, DSRC0, DSRC1, DQ, DK, DV, WQ0, WK0, WQ1, WK1, COS, SIN, PART, red)
+            emit(SRC0, SRC1, DSRC0, DSRC1, DQ, DK, DV, WQ0, WK0, WQ1, WK1, COS, SIN, B0, B1, PART, red)
 
         return dit_qk_norm_rope_bwd
 
@@ -267,6 +305,8 @@ def _build():
         WK1,
         COS,
         SIN,
+        B0,
+        B1,
         PART,
         H: fx.Constexpr[int],
         NSEG: fx.Constexpr[int],
@@ -276,7 +316,8 @@ def _build():
         s_src1: fx.Constexpr[int],
         s_out: fx.Constexpr[int],
         eps: fx.Constexpr[float],
-        bias: fx.Constexpr[int],
+        add_bias: fx.Constexpr[int],
+        bias_grad: fx.Constexpr[int],
         TS: fx.Constexpr[int],
         HS: fx.Constexpr[int],
         QO: fx.Constexpr[int],
@@ -296,7 +337,8 @@ def _build():
             segs,
             s_out,
             eps,
-            bool(bias),
+            bool(add_bias),
+            bool(bias_grad),
             TS,
             HS,
             QO,
@@ -308,7 +350,7 @@ def _build():
             bool(CSB),
             bool(ROUND),
         )
-        kernel(SRC0, SRC1, DSRC0, DSRC1, DQ, DK, DV, WQ0, WK0, WQ1, WK1, COS, SIN, PART).launch(
+        kernel(SRC0, SRC1, DSRC0, DSRC1, DQ, DK, DV, WQ0, WK0, WQ1, WK1, COS, SIN, B0, B1, PART).launch(
             grid=(GRID_X, 1, 1), block=(H * LANES, 1, 1), stream=stream
         )
 
@@ -316,9 +358,9 @@ def _build():
     return launch
 
 
-def partial_row_width(H: int, nseg: int, bias: bool) -> int:
+def partial_row_width(H: int, nseg: int, bias_grad: bool) -> int:
     """Floats per block row of the partial buffer: per segment [2D dw | 3HD bias]."""
-    return nseg * (2 * D + (3 * H * D if bias else 0))
+    return nseg * (2 * D + (3 * H * D if bias_grad else 0))
 
 
 def dit_qk_norm_rope_bwd_launch(
@@ -335,7 +377,8 @@ def dit_qk_norm_rope_bwd_launch(
     H,
     s_out,
     eps,
-    bias,
+    biases,
+    bias_grad,
     layout,
     cs_row_stride,
     cs_per_batch,
@@ -343,11 +386,13 @@ def dit_qk_norm_rope_bwd_launch(
     stream,
 ):
     """Launch the backward over one or two segments (text first). ``layout`` holds the addressing of the
-    sources (``TS``, ``HS``, ``QO``, ``KO``, ``VO``, ``SB``, ``NB``) and per segment ``(n_tok, s_src)``; ``part``
-    is fp32 ``[GRID_X, partial_row_width(H, len(srcs), bias)]``."""
+    sources (``TS``, ``HS``, ``QO``, ``KO``, ``VO``, ``SB``, ``NB``) and per segment ``(n_tok, s_src)``; ``biases``
+    is None or the bias of every segment (bf16, ``[3*H*D]`` in the source's column order), added where x is
+    recomputed; ``part`` is fp32 ``[GRID_X, partial_row_width(H, len(srcs), bias_grad)]``."""
     nseg = len(srcs)
     (wq0, wk0), (wq1, wk1) = ws[0], ws[-1]
     (n_tok0, s_src0), (n_tok1, s_src1) = layout["segs"][0], layout["segs"][-1]
+    b0, b1 = (biases[0], biases[-1]) if biases is not None else (wq0, wq0)  # unread without the bias
     _build()(
         srcs[0],
         srcs[-1],
@@ -362,6 +407,8 @@ def dit_qk_norm_rope_bwd_launch(
         wk1,
         cos,
         sin,
+        b0,
+        b1,
         part,
         H=H,
         NSEG=nseg,
@@ -371,7 +418,8 @@ def dit_qk_norm_rope_bwd_launch(
         s_src1=s_src1 if nseg == 2 else 0,
         s_out=s_out,
         eps=float(eps),
-        bias=int(bias),
+        add_bias=int(biases is not None),
+        bias_grad=int(bias_grad),
         TS=layout["TS"],
         HS=layout["HS"],
         QO=layout["QO"],
