@@ -11,15 +11,16 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""FlyDSL kernels for the FLUX single-stream block's adaLN: cat + LayerNorm + modulation.
+"""FlyDSL kernels for the DiT adaLN modulation of two concatenated token segments: cat + LayerNorm
+without affine parameters + ``(1 + scale)`` / ``shift`` modulation.
 
 The forward reads the text and image rows, writes copies of them for the residual add and the
 modulated LayerNorm of their concatenation, ``LN(cat(x_txt, x_img)) * (1 + scale) + shift``, and
 keeps each row's FP32 mean and rstd for the backward. The backward computes the input gradients,
 written as separate text and image tensors, and the shift and scale gradients in the same pass.
 
-One wavefront per token row: 64 lanes x 6 vectors of 8 BF16 cover the 3,072 columns, so the row sums
-are 64-lane butterflies. The backward accumulates the shift and scale gradients per lane over its
+One wavefront per token row: 64 lanes x C / 512 vectors of 8 BF16 cover the C columns (6 vectors at
+C = 3,072), so the row sums are 64-lane butterflies. The backward accumulates the shift and scale gradients per lane over its
 wave's 32 rows (all in one sample); the caller adds the per-wave partials. A backward block's 128 rows
 lie in one segment (text or image), so it selects its input and gradient tensors once.
 
@@ -47,7 +48,7 @@ FWD_ROWS, FWD_WAVES = 8, 4
 BWD_ROWS, BWD_WAVES = 32, 4
 
 
-def adaln_single_supported(
+def adaln_modulate_supported(
     x_txt: torch.Tensor, x_img: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
 ) -> bool:
     if not (x_txt.dim() == 3 and x_img.dim() == 3 and scale.dim() == 2 and shift.dim() == 2):
@@ -83,7 +84,7 @@ def _make_fwd_kernel(c, s_seg, s_out, seq_off, mod_stride, eps):
     nv = c // (LANES * VEC)
     threads = LANES * FWD_WAVES
 
-    @flyc.kernel(name="flux_adaln_single_fwd_kernel", known_block_size=[threads, 1, 1])
+    @flyc.kernel(name="adaln_modulate_fwd_kernel", known_block_size=[threads, 1, 1])
     def fwd(
         SRC: fx.Tensor, SCALE: fx.Tensor, SHIFT: fx.Tensor, RES: fx.Tensor, Y: fx.Tensor, STATS: fx.Tensor
     ):
@@ -153,7 +154,7 @@ def _make_bwd_kernel(c, s_txt, s_img, mod_stride):
     threads = LANES * BWD_WAVES
     s_tok = s_txt + s_img
 
-    @flyc.kernel(name="flux_adaln_single_bwd_kernel", known_block_size=[threads, 1, 1])
+    @flyc.kernel(name="adaln_modulate_bwd_kernel", known_block_size=[threads, 1, 1])
     def bwd(
         G: fx.Tensor,
         XT: fx.Tensor,
@@ -317,9 +318,9 @@ def _compiled_bwd(
     )
 
 
-def flydsl_adaln_single_fwd(x_txt, x_img, scale, shift, eps):
+def flydsl_adaln_modulate_fwd(x_txt, x_img, scale, shift, eps):
     """``(x_txt, x_img)`` copied, ``LN(cat(x_txt, x_img)) * (1 + scale) + shift`` and each row's FP32
-    mean and rstd, ``[B, S, 2]``. The caller checks :func:`adaln_single_supported`."""
+    mean and rstd, ``[B, S, 2]``. The caller checks :func:`adaln_modulate_supported`."""
     x_txt, x_img = x_txt.contiguous(), x_img.contiguous()
     batch, s_txt, c = x_txt.shape
     s_tok = s_txt + x_img.shape[1]
@@ -347,7 +348,7 @@ def flydsl_adaln_single_fwd(x_txt, x_img, scale, shift, eps):
     return r_txt, r_img, y, stats
 
 
-def flydsl_adaln_single_bwd(g_y, g_r_txt, g_r_img, x_txt, x_img, scale, stats):
+def flydsl_adaln_modulate_bwd(g_y, g_r_txt, g_r_img, x_txt, x_img, scale, stats):
     """The input gradients ``(dx_txt, dx_img)`` and the FP32 per-wave partial sums of the shift and
     scale gradients, ``[B, S / BWD_ROWS, 2 C]``, to be summed per sample."""
     g_y, g_r_txt, g_r_img = g_y.contiguous(), g_r_txt.contiguous(), g_r_img.contiguous()

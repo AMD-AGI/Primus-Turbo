@@ -4,8 +4,8 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Custom ops of the FLUX dual-stream block's gated residual + second adaLN (``flux_adaln_dual``):
-per stream ``x1 = x + g * a`` and ``y = LN(x1) * (1 + s) + h``, both streams in one launch.
+"""Custom ops of the DiT gated residual + adaLN modulation (``gated_residual_adaln``): per stream
+``x1 = x + g * a`` and ``y = LN(x1) * (1 + s) + h``, both streams in one launch.
 
 Both passes are FlyDSL kernels (gfx950); a Triton kernel adds the backward's per-workgroup partial
 sums of the shift, scale and gate gradients per sample.
@@ -16,42 +16,50 @@ from typing import Optional, Tuple
 import torch
 import triton
 
-from primus_turbo.flydsl.flux.adaln_dual_kernel import (
+from primus_turbo.flydsl.normalization.gated_residual_adaln_kernel import (
     BWD_ROWS,
     N_SUMS,
-    adaln_dual_supported,
-    flydsl_adaln_dual_bwd,
-    flydsl_adaln_dual_fwd,
+    flydsl_gated_residual_adaln_bwd,
+    flydsl_gated_residual_adaln_fwd,
+    gated_residual_adaln_supported,
 )
 from primus_turbo.pytorch.core.utils import is_gfx950
-from primus_turbo.triton.flux.colsum_kernel import flux_sample_colsum_kernel
+from primus_turbo.triton.reduce.colsum_kernel import sample_colsum_kernel
 
 
 def _require_gfx950():
     if not is_gfx950():
-        raise RuntimeError("flux_adaln_dual: its FlyDSL kernels are built for gfx950")
+        raise RuntimeError("gated_residual_adaln: its FlyDSL kernels are built for gfx950")
 
 
-def adaln_dual_shape_error(
+def gated_residual_adaln_shape_error(
     x_img, a_img, g_img, s_img, h_img, x_txt, a_txt, g_txt, s_txt, h_txt
 ) -> Optional[str]:
-    """Why ``flux_adaln_dual`` cannot take these operands, or None."""
+    """Why ``gated_residual_adaln`` cannot take these operands, or None.
+
+    The limits come from the FlyDSL kernels' tiling and apply on every arch, so a call is accepted or
+    rejected the same way everywhere: BF16 CUDA ``[B, S_*, C]`` streams with the same B and C, each
+    sequence length a multiple of 32 (a backward workgroup's 32 rows lie in one sample), C a multiple of
+    1536 (three waves of 64 lanes x 8 values per row), and ``[B, C]`` modulation vectors with unit column
+    stride and one row stride (chunks of one modulation GEMM output). A caller with other shapes keeps its
+    unfused path.
+    """
     vectors = (g_img, s_img, h_img, g_txt, s_txt, h_txt)
     for name, a, x in (("a_img", a_img, x_img), ("a_txt", a_txt, x_txt)):
         if a.shape != x.shape or a.dtype != x.dtype or a.device != x.device:
             return f"{name} must match its stream's x, got {a.dtype} {tuple(a.shape)} for {x.dtype} {tuple(x.shape)}"
-    if not adaln_dual_supported(x_img, x_txt, vectors):
+    if not gated_residual_adaln_supported(x_img, x_txt, vectors):
         return (
-            "needs BF16 CUDA [B, S, C] streams of equal length, a multiple of 32, with C a multiple of 1536, "
-            "and [B, C] modulation vectors with unit column stride and one row stride; got x_img "
-            f"{x_img.dtype} {tuple(x_img.shape)}, x_txt {x_txt.dtype} {tuple(x_txt.shape)}, vectors "
+            "needs BF16 CUDA [B, S, C] streams with sequence lengths that are multiples of 32 and C a "
+            "multiple of 1536, and [B, C] modulation vectors with unit column stride and one row stride; "
+            f"got x_img {x_img.dtype} {tuple(x_img.shape)}, x_txt {x_txt.dtype} {tuple(x_txt.shape)}, vectors "
             + ", ".join(f"{tuple(v.shape)}/{v.stride()}" for v in vectors)
         )
     return None
 
 
-@torch.library.custom_op("primus_turbo::flux_adaln_dual_fwd_impl", mutates_args=(), device_types="cuda")
-def flux_adaln_dual_fwd_impl(
+@torch.library.custom_op("primus_turbo::gated_residual_adaln_fwd_impl", mutates_args=(), device_types="cuda")
+def gated_residual_adaln_fwd_impl(
     x_img: torch.Tensor,
     a_img: torch.Tensor,
     g_img: torch.Tensor,
@@ -68,11 +76,13 @@ def flux_adaln_dual_fwd_impl(
     ``(x1_img, y_img, x1_txt, y_txt, FP32 [rows, 2] row mean and rstd)``; the statistics are for the
     backward."""
     _require_gfx950()
-    return flydsl_adaln_dual_fwd(x_img, a_img, g_img, s_img, h_img, x_txt, a_txt, g_txt, s_txt, h_txt, eps)
+    return flydsl_gated_residual_adaln_fwd(
+        x_img, a_img, g_img, s_img, h_img, x_txt, a_txt, g_txt, s_txt, h_txt, eps
+    )
 
 
-@flux_adaln_dual_fwd_impl.register_fake
-def _flux_adaln_dual_fwd_impl_fake(
+@gated_residual_adaln_fwd_impl.register_fake
+def _gated_residual_adaln_fwd_impl_fake(
     x_img: torch.Tensor,
     a_img: torch.Tensor,
     g_img: torch.Tensor,
@@ -95,8 +105,8 @@ def _flux_adaln_dual_fwd_impl_fake(
     )
 
 
-@torch.library.custom_op("primus_turbo::flux_adaln_dual_bwd_impl", mutates_args=(), device_types="cuda")
-def flux_adaln_dual_bwd_impl(
+@torch.library.custom_op("primus_turbo::gated_residual_adaln_bwd_impl", mutates_args=(), device_types="cuda")
+def gated_residual_adaln_bwd_impl(
     gy_img: torch.Tensor,
     gx_img: torch.Tensor,
     x_img: torch.Tensor,
@@ -114,22 +124,31 @@ def flux_adaln_dual_bwd_impl(
     """``(gradients of x_img, a_img, x_txt, a_txt, and [2B, 3, C] shift, scale and gate gradients, image
     samples first)`` for the gradients ``gy`` of the LayerNorm outputs and ``gx`` of ``x1``."""
     _require_gfx950()
-    dx_img, da_img, dx_txt, da_txt, part = flydsl_adaln_dual_bwd(
+    dx_img, da_img, dx_txt, da_txt, part = flydsl_gated_residual_adaln_bwd(
         gy_img, gx_img, x_img, a_img, g_img, s_img, gy_txt, gx_txt, x_txt, a_txt, g_txt, s_txt, stats
     )
     batch, n_img, c = x_img.shape
-    # The partials of a sample's rows are consecutive within its stream, image samples first; both
-    # streams have the same number of rows per sample.
-    parts_per_sample = n_img // BWD_ROWS
+    n_txt = x_txt.shape[1]
+    n_cols = N_SUMS * c
     vec = torch.empty((2 * batch, N_SUMS, c), device=x_img.device, dtype=g_img.dtype)
-    flux_sample_colsum_kernel[(2 * batch, triton.cdiv(N_SUMS * c, 256))](
-        part, vec, parts_per_sample, N_SUMS * c, BLOCK_P=8, BLOCK_C=256, num_warps=4
-    )
+    # The partials of a sample's rows are consecutive within its stream, image samples first.
+    if n_img == n_txt:
+        launches = ((part, vec, 2 * batch, n_img // BWD_ROWS),)
+    else:
+        n_img_parts = batch * n_img // BWD_ROWS
+        launches = (
+            (part[:n_img_parts], vec[:batch], batch, n_img // BWD_ROWS),
+            (part[n_img_parts:], vec[batch:], batch, n_txt // BWD_ROWS),
+        )
+    for src, out, n_samples, parts_per_sample in launches:
+        sample_colsum_kernel[(n_samples, triton.cdiv(n_cols, 256))](
+            src, out, parts_per_sample, n_cols, BLOCK_P=8, BLOCK_C=256, num_warps=4
+        )
     return dx_img, da_img, dx_txt, da_txt, vec
 
 
-@flux_adaln_dual_bwd_impl.register_fake
-def _flux_adaln_dual_bwd_impl_fake(
+@gated_residual_adaln_bwd_impl.register_fake
+def _gated_residual_adaln_bwd_impl_fake(
     gy_img: torch.Tensor,
     gx_img: torch.Tensor,
     x_img: torch.Tensor,

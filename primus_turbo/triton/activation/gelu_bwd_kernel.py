@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Triton tanh-GELU backward with the bias gradient's per-program column sums, for FLUX's MLP."""
+"""Triton tanh-GELU backward with the bias gradient's per-program column sums, for ``linear_gelu``."""
 
 import triton
 import triton.language as tl
@@ -12,7 +12,7 @@ from triton.language.extra import libdevice
 
 
 @triton.jit
-def flux_gelu_bwd_bias_kernel(
+def gelu_tanh_bwd_bias_kernel(
     g_ptr,
     h_ptr,
     dh_ptr,

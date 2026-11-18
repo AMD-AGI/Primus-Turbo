@@ -11,15 +11,17 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""FlyDSL kernel for the FLUX MLP's GELU: ``cat([prefix, gelu_tanh(h)], dim=1)`` in one pass.
+"""FlyDSL kernel for an MLP's tanh GELU written after a prefix: ``cat([prefix, gelu_tanh(h)], dim=1)``
+in one pass.
 
-FLUX's single-stream block feeds ``proj_out`` with the attention output and the MLP's GELU output
-side by side. This kernel writes that buffer straight from the up-projection's pre-activation
-``h``: the prefix columns copied, the others through the tanh GELU, which it evaluates as
-Inductor's ``gelu(approximate="tanh")`` does, operation for operation.
+A parallel DiT block (FLUX's single-stream block, for one) feeds its output projection with the
+attention output and the MLP's GELU output side by side. This kernel writes that buffer straight
+from the up-projection's pre-activation ``h``: the prefix columns copied, the others through the
+tanh GELU, which it evaluates as Inductor's ``gelu(approximate="tanh")`` does, operation for
+operation. Without a prefix it is the plain GELU.
 
-One block of 384 threads covers 3,072 columns, 8 BF16 values per thread; each of the 1,024 blocks
-walks its rows two at a time.
+One block of 384 threads covers 3,072 columns per step, 8 BF16 values per thread; each of the 1,024
+blocks walks its rows two at a time.
 """
 
 from typing import Optional
@@ -63,7 +65,7 @@ def _make_fwd_kernel(m: int, p: int, n: int, aux_stride: int):
     width, rows_per_block = p + n, m // _GRID
     copy_steps, gelu_steps = p // GELU_CAT_TILE, n // GELU_CAT_TILE
 
-    @flyc.kernel(name="flux_gelu_cat_fwd_kernel", known_block_size=[_THREADS, 1, 1])
+    @flyc.kernel(name="gelu_cat_fwd_kernel", known_block_size=[_THREADS, 1, 1])
     def kernel(AUX: fx.Tensor, PRE: fx.Tensor, OUT: fx.Tensor):
         f32v = fx.T.vec(_VEC, fx.T.f32)
         bf16v = fx.T.vec(_VEC, fx.T.bf16)

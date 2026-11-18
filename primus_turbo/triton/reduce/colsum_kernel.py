@@ -4,15 +4,15 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Column sums of FP32 partial-sum buffers, which the FLUX kernels write for their weight, bias and
-modulation gradients: over all rows, or per sample. A fixed reduction order keeps them deterministic."""
+"""Column sums of FP32 partial-sum buffers, which fused kernels write for their bias and modulation
+gradients: over all rows, or per sample. A fixed reduction order keeps them deterministic."""
 
 import triton
 import triton.language as tl
 
 
 @triton.jit
-def flux_colsum_kernel(src_ptr, out_ptr, n_rows, n_cols, BLOCK_R: tl.constexpr, BLOCK_C: tl.constexpr):
+def colsum_kernel(src_ptr, out_ptr, n_rows, n_cols, BLOCK_R: tl.constexpr, BLOCK_C: tl.constexpr):
     # out[c] = sum_r src[r, c] for the FP32 partials; faster here than torch's column sum.
     cols = tl.program_id(0) * BLOCK_C + tl.arange(0, BLOCK_C)
     col_mask = cols < n_cols
@@ -28,9 +28,7 @@ def flux_colsum_kernel(src_ptr, out_ptr, n_rows, n_cols, BLOCK_R: tl.constexpr, 
 
 
 @triton.jit
-def flux_sample_colsum_kernel(
-    src_ptr, out_ptr, n_parts, n_cols, BLOCK_P: tl.constexpr, BLOCK_C: tl.constexpr
-):
+def sample_colsum_kernel(src_ptr, out_ptr, n_parts, n_cols, BLOCK_P: tl.constexpr, BLOCK_C: tl.constexpr):
     # out[b, c] = sum_p src[b, p, c] for the FP32 per-wave partials.
     b = tl.program_id(0).to(tl.int64)
     cols = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)

@@ -11,7 +11,7 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""FlyDSL kernels for the FLUX dual-stream block's gated residual + second adaLN.
+"""FlyDSL kernels for the DiT gated residual + adaLN modulation of a two-stream (MMDiT) block.
 
 For both streams in one launch the forward computes ``x1 = x + g * a`` (``a`` the attention's output
 projection), the modulated LayerNorm ``y = LN(x1) * (1 + s) + h`` that feeds the stream's MLP, and
@@ -20,9 +20,10 @@ stream's modulation GEMM output. The backward computes the gradients of ``x1`` (
 and of ``a``, and the column sums for the shift, scale and gate gradients inside the same row pass,
 from the normalized rows it recomputes in registers.
 
-Three waves share each token row, 1,024 columns each (two vectors of 8 BF16 per lane), and add their
-row sums through LDS, double-buffered by row parity so one barrier per row suffices; with one wave per
-row the three column accumulators would spill out of the backward's registers. The backward
+Three waves share each token row, C / 3 columns each (C / 1,536 vectors of 8 BF16 per lane, two at
+C = 3,072), and add their row sums through LDS, double-buffered by row parity so one barrier per row
+suffices; with one wave per row the three column accumulators would spill out of the backward's
+registers. The backward
 accumulates the shift, scale and gate gradients per lane over the workgroup's 32 rows (all in one
 sample of one stream); the caller adds the per-workgroup partials.
 
@@ -47,14 +48,14 @@ from primus_turbo.flydsl.utils.buffer_ops import (
 )
 
 VEC, LANES = 8, 64
-# Three waves share each row, 1,024 columns each (two vectors of 8 per lane); they combine their
-# row sums through LDS, double-buffered by row parity so one barrier per row suffices.
+# Three waves share each row, C / 3 columns each; they combine their row sums through LDS,
+# double-buffered by row parity so one barrier per row suffices.
 WAVES = 3
 FWD_ROWS, BWD_ROWS = 8, 32  # rows per workgroup, in sequence
 N_SUMS = 3  # shift, scale and gate gradients
 
 
-def adaln_dual_supported(x_img: torch.Tensor, x_txt: torch.Tensor, vectors) -> bool:
+def gated_residual_adaln_supported(x_img: torch.Tensor, x_txt: torch.Tensor, vectors) -> bool:
     if not (x_img.dim() == 3 and x_txt.dim() == 3):
         return False
     batch, s_img, c = x_img.shape
@@ -73,7 +74,6 @@ def adaln_dual_supported(x_img: torch.Tensor, x_txt: torch.Tensor, vectors) -> b
         )
         and s_img % BWD_ROWS == 0
         and s_txt % BWD_ROWS == 0
-        and s_img == s_txt
     )
 
 
@@ -129,7 +129,7 @@ def lane_cols(c, wave, lane):
 
 
 def _make_fwd_kernel(c, n_img_rows, s_img, s_txt, mod_stride, eps):
-    @flyc.kernel(name="flux_adaln_dual_fwd_kernel", known_block_size=[LANES * WAVES, 1, 1])
+    @flyc.kernel(name="gated_residual_adaln_fwd_kernel", known_block_size=[LANES * WAVES, 1, 1])
     def fwd(
         XI: fx.Tensor,
         AI: fx.Tensor,
@@ -225,7 +225,7 @@ def _make_fwd_kernel(c, n_img_rows, s_img, s_txt, mod_stride, eps):
 
 
 def _make_bwd_kernel(c, n_img_rows, s_img, s_txt, mod_stride):
-    @flyc.kernel(name="flux_adaln_dual_bwd_kernel", known_block_size=[LANES * WAVES, 1, 1])
+    @flyc.kernel(name="gated_residual_adaln_bwd_kernel", known_block_size=[LANES * WAVES, 1, 1])
     def bwd(
         GYI: fx.Tensor,
         GXI: fx.Tensor,
@@ -424,10 +424,12 @@ def _compiled_bwd(
     ).launch(grid=(n_rows // BWD_ROWS, 1, 1), block=(LANES * WAVES, 1, 1), stream=stream)
 
 
-def flydsl_adaln_dual_fwd(x_img, a_img, g_img, s_img, h_img, x_txt, a_txt, g_txt, s_txt, h_txt, eps):
+def flydsl_gated_residual_adaln_fwd(
+    x_img, a_img, g_img, s_img, h_img, x_txt, a_txt, g_txt, s_txt, h_txt, eps
+):
     """For both streams ``x1 = x + g * a`` and ``y = LN(x1) * (1 + s) + h``, and each row's FP32 mean
     and rstd, ``[B * (S_img + S_txt), 2]`` (image rows first). The caller checks
-    :func:`adaln_dual_supported`."""
+    :func:`gated_residual_adaln_supported`."""
     x_img, a_img, x_txt, a_txt = (t.contiguous() for t in (x_img, a_img, x_txt, a_txt))
     batch, n_img, c = x_img.shape
     n_txt = x_txt.shape[1]
@@ -462,7 +464,7 @@ def flydsl_adaln_dual_fwd(x_img, a_img, g_img, s_img, h_img, x_txt, a_txt, g_txt
     return x1_img, y_img, x1_txt, y_txt, stats
 
 
-def flydsl_adaln_dual_bwd(
+def flydsl_gated_residual_adaln_bwd(
     gy_img, gx_img, x_img, a_img, g_img, s_img, gy_txt, gx_txt, x_txt, a_txt, g_txt, s_txt, stats
 ):
     """The gradients of ``x`` and ``a`` for both streams and the FP32 per-workgroup partial sums of the

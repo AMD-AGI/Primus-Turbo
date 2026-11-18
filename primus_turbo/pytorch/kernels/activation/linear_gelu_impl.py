@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Custom ops of FLUX's MLP up-projection + tanh GELU (``flux_gelu_linear``).
+"""Custom ops of the linear + bias + tanh GELU (``linear_gelu``), optionally written after a prefix.
 
 The forward runs the GEMM as ``torch.addmm`` and writes ``cat([prefix, gelu_tanh(h)])`` with one
 FlyDSL pass on gfx950 (unfused elsewhere and for shapes the kernel does not tile). The backward's
@@ -19,21 +19,23 @@ import torch
 import torch.nn.functional as F
 import triton
 
-from primus_turbo.flydsl.flux.gelu_kernel import (
+from primus_turbo.flydsl.activation.gelu_kernel import (
     flydsl_gelu_cat_forward,
     gelu_cat_supported,
 )
 from primus_turbo.pytorch.core.utils import is_gfx950
-from primus_turbo.triton.flux.colsum_kernel import flux_colsum_kernel
-from primus_turbo.triton.flux.gelu_bwd_kernel import flux_gelu_bwd_bias_kernel
+from primus_turbo.triton.activation.gelu_bwd_kernel import gelu_tanh_bwd_bias_kernel
+from primus_turbo.triton.reduce.colsum_kernel import colsum_kernel
 
 _BIAS_BLOCK_R = 8
 _BIAS_BLOCK_C = 256
 _BIAS_PARTS = 128
 
 
-def gelu_linear_shape_error(x, weight, bias, prefix) -> Optional[str]:
-    """Why ``flux_gelu_linear`` cannot take these operands, or None."""
+def linear_gelu_shape_error(x, weight, bias, prefix) -> Optional[str]:
+    """Why ``linear_gelu`` cannot take these operands, or None. Any 2-D shapes are accepted; the FlyDSL
+    GELU runs on gfx950 when M is a multiple of 2048 and N and the prefix width are multiples of 3072,
+    and the unfused GELU otherwise."""
     operands = [("x", x), ("weight", weight), ("bias", bias)] + (
         [] if prefix is None else [("prefix", prefix)]
     )
@@ -52,8 +54,8 @@ def gelu_linear_shape_error(x, weight, bias, prefix) -> Optional[str]:
     return None
 
 
-@torch.library.custom_op("primus_turbo::flux_gelu_linear_fwd_impl", mutates_args=(), device_types="cuda")
-def flux_gelu_linear_fwd_impl(
+@torch.library.custom_op("primus_turbo::linear_gelu_fwd_impl", mutates_args=(), device_types="cuda")
+def linear_gelu_fwd_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, prefix: Optional[torch.Tensor]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """``(cat([prefix, gelu_tanh(x @ weight.T + bias)], dim=1), x @ weight.T + bias)``."""
@@ -70,8 +72,8 @@ def flux_gelu_linear_fwd_impl(
     return out, aux
 
 
-@flux_gelu_linear_fwd_impl.register_fake
-def _flux_gelu_linear_fwd_impl_fake(
+@linear_gelu_fwd_impl.register_fake
+def _linear_gelu_fwd_impl_fake(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, prefix: Optional[torch.Tensor]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     width = 0 if prefix is None else prefix.shape[1]
@@ -85,7 +87,7 @@ def gelu_bwd_bias_into(grad: torch.Tensor, aux: torch.Tensor, grad_h: torch.Tens
     rows_per_prog = triton.cdiv(triton.cdiv(n_rows, _BIAS_PARTS), _BIAS_BLOCK_R) * _BIAS_BLOCK_R
     n_parts = triton.cdiv(n_rows, rows_per_prog)
     parts = torch.empty((n_parts, n_cols), device=aux.device, dtype=torch.float32)
-    flux_gelu_bwd_bias_kernel[(n_parts, triton.cdiv(n_cols, _BIAS_BLOCK_C))](
+    gelu_tanh_bwd_bias_kernel[(n_parts, triton.cdiv(n_cols, _BIAS_BLOCK_C))](
         grad,
         aux,
         grad_h,
@@ -101,14 +103,14 @@ def gelu_bwd_bias_into(grad: torch.Tensor, aux: torch.Tensor, grad_h: torch.Tens
         num_warps=8,
     )
     grad_bias = torch.empty(n_cols, device=aux.device, dtype=aux.dtype)
-    flux_colsum_kernel[(triton.cdiv(n_cols, 64),)](
+    colsum_kernel[(triton.cdiv(n_cols, 64),)](
         parts, grad_bias, n_parts, n_cols, BLOCK_R=32, BLOCK_C=64, num_warps=4
     )
     return grad_bias
 
 
-@torch.library.custom_op("primus_turbo::flux_gelu_bwd_impl", mutates_args=(), device_types="cuda")
-def flux_gelu_bwd_impl(grad: torch.Tensor, aux: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+@torch.library.custom_op("primus_turbo::linear_gelu_bwd_impl", mutates_args=(), device_types="cuda")
+def linear_gelu_bwd_impl(grad: torch.Tensor, aux: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """``(gelu_backward(grad, aux, "tanh"), its column sums)`` for a 2-D BF16 ``grad``."""
     if grad.stride(1) != 1:
         grad = grad.contiguous()
@@ -117,6 +119,6 @@ def flux_gelu_bwd_impl(grad: torch.Tensor, aux: torch.Tensor) -> Tuple[torch.Ten
     return grad_h, gelu_bwd_bias_into(grad, aux, grad_h)
 
 
-@flux_gelu_bwd_impl.register_fake
-def _flux_gelu_bwd_impl_fake(grad: torch.Tensor, aux: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+@linear_gelu_bwd_impl.register_fake
+def _linear_gelu_bwd_impl_fake(grad: torch.Tensor, aux: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return aux.new_empty(aux.shape), aux.new_empty((aux.shape[1],))
