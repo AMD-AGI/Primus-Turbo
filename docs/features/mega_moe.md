@@ -156,7 +156,9 @@ Other benchmarks: [Benchmarks § MegaMoE](../../benchmark/README.md#megamoe).
 
 ## End-to-end impact
 
-Used as the MoE expert layer in Primus-LM's Megatron recipes.
+Primus-LM's Megatron backend replaces the MoE experts with MegaMoE when `use_turbo_mega_moe` is
+set (off by default; on in the MI455X DeepSeek-V3 BF16 recipe), and `turbo_mega_moe_precision`
+picks BF16 or MXFP8. With MXFP8 it calls `advance_weight_generation()` after every optimizer step.
 
 ### MI355X, MXFP8
 
