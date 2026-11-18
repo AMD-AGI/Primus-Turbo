@@ -410,7 +410,7 @@ def _wgrad_k_hook(flag_base, src, epoch, horizon_slot, **c):
         ]
 
     def wait(tiles):
-        spin_flags(flag_base, slots(tiles), epoch, rank, src, "a2a_gemm wgrad")
+        spin_flags(flag_base, slots(tiles), epoch, rank, src, "a2a_gemm wgrad", report=False)
 
     def advance(nxt):
         """m-tiles below ``nxt`` have landed: the horizon is ``nxt``, or ``nxt + look`` if those have too."""
