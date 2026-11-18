@@ -18,12 +18,6 @@ Source forms. ``layout`` names the token order of the QKV GEMM output and of q /
 The last dimension needs a unit stride and the two token dimensions one uniform token stride; anything else is
 read in place at its strides (a slice of a wider GEMM output, for example). With a text stream, its tokens come
 first in the joint sequence of the outputs, and it must have the image stream's form and strides.
-
-Optional forward output (``return_rstd``): the per-row inverse RMS of q and of k, ``[tokens * H]`` fp32 each,
-the value the rows were normalised with. Flat index ``row * H + head``, with ``row`` the token's index in its
-stream's source (``s * B + b`` for ``"sbhd"``, ``b * S + s`` for ``"bshd"``) and the streams one after the other,
-text first: the row order of the QKV GEMM output read as ``[tokens, H * 3 * D]``, which a kernel that fuses the
-q / k norm backward into its own work indexes.
 """
 
 from typing import List, Optional, Tuple
@@ -180,15 +174,9 @@ def _cs_row_stride(cos):
 
 
 # --------------------------------------------------------------------------------------------------- forward
-def _rstd_shape(metas, return_rstd):
-    return (sum(m["n_tok"] for m in metas) * metas[0]["H"],) if return_rstd else (0,)
-
-
 def dit_qk_norm_rope_fwd_impl(
-    qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, eps, layout, rope, round_normed, v_copy,
-    return_rstd=False,
-):  # fmt: skip
-    """(q, k, v), or (q, k, v, rstd_q, rstd_k) with ``return_rstd`` (see the module docstring)."""
+    qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, eps, layout, rope, round_normed, v_copy
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     metas, D, S_out, cs_per_batch = check_operands(
         qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, layout, rope
     )
@@ -198,11 +186,8 @@ def dit_qk_norm_rope_fwd_impl(
     q = torch.empty(shape, device=qkv.device, dtype=qkv.dtype)
     k = torch.empty(shape, device=qkv.device, dtype=qkv.dtype)
     v = torch.empty(shape if v_copy else (0,), device=qkv.device, dtype=qkv.dtype)
-    rstd_q = torch.empty(_rstd_shape(metas, return_rstd), device=qkv.device, dtype=torch.float32)
-    rstd_k = torch.empty_like(rstd_q)
-    outs = (q, k, v, rstd_q, rstd_k) if return_rstd else (q, k, v)
     if q.numel() == 0:
-        return outs
+        return q, k, v
     srcs = [qkv] if txt_qkv is None else [txt_qkv, qkv]
     ws = [(w_q, w_k)] if txt_qkv is None else [(w_txt_q, w_txt_k), (w_q, w_k)]
     m1 = metas[-1]
@@ -211,14 +196,14 @@ def dit_qk_norm_rope_fwd_impl(
     # gfx950: streaming (non-temporal) loads and stores; every byte is touched once.
     cm = ".cs" if qkv.is_cuda and is_gfx950() else ""
     dit_qk_norm_rope_fwd_kernel[(p0 + (p1 if nseg == 2 else 0), triton.cdiv(H, _BLOCK_H))](
-        srcs[0], srcs[-1], q, k, v, ws[0][0], ws[0][1], ws[-1][0], ws[-1][1], cos, sin, rstd_q, rstd_k,
+        srcs[0], srcs[-1], q, k, v, ws[0][0], ws[0][1], ws[-1][0], ws[-1][1], cos, sin,
         m0["n_tok"], m0["S"], m1["n_tok"], m1["S"], p0, S_out, eps,
         m0["TS"], m0["HS"], m0["QO"], m0["KO"], m0["VO"], B, _cs_row_stride(cos),
         H=H, D=D, BLOCK_H=_BLOCK_H, TOKENS=_FWD_TOKENS, SB=m0["SB"], NSEG=nseg,
         INTERLEAVED=rope == "interleaved", ROUND=bool(round_normed), V_COPY=bool(v_copy),
-        CS_PER_BATCH=bool(cs_per_batch), CM=cm, RSTD=bool(return_rstd), num_warps=4,
+        CS_PER_BATCH=bool(cs_per_batch), CM=cm, num_warps=4,
     )  # fmt: skip
-    return outs
+    return q, k, v
 
 
 # --------------------------------------------------------------------------------------------------- backward
@@ -356,34 +341,18 @@ def dit_qk_norm_rope_op(
     rope: str,
     round_normed: bool,
     v_copy: bool,
-    return_rstd: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """q, k, v (joint, text first), rstd_q, rstd_k; v is empty when not ``v_copy``, the rstd when not
-    ``return_rstd``."""
-    outs = dit_qk_norm_rope_fwd_impl(
-        qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, eps, layout, rope, round_normed, v_copy,
-        return_rstd,
-    )  # fmt: skip
-    if return_rstd:
-        return outs
-    # Two tensors, not one twice: a custom op's outputs must not alias each other.
-    empty = [torch.empty((0,), device=qkv.device, dtype=torch.float32) for _ in range(2)]
-    return outs[0], outs[1], outs[2], empty[0], empty[1]
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """q, k, v (joint, text first); v is empty when not ``v_copy``."""
+    return dit_qk_norm_rope_fwd_impl(
+        qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, eps, layout, rope, round_normed, v_copy
+    )
 
 
 @dit_qk_norm_rope_op.register_fake
-def _(qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, eps, layout, rope, round_normed, v_copy,
-      return_rstd=False):  # fmt: skip
+def _(qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, eps, layout, rope, round_normed, v_copy):
     metas, D, S_out, _ = check_operands(qkv, w_q, w_k, cos, sin, txt_qkv, w_txt_q, w_txt_k, layout, rope)
     shape = _out_shape(layout, S_out, metas[0]["NB"], metas[0]["H"], D)
-    rstd = _rstd_shape(metas, return_rstd)
-    return (
-        qkv.new_empty(shape),
-        qkv.new_empty(shape),
-        qkv.new_empty(shape if v_copy else (0,)),
-        qkv.new_empty(rstd, dtype=torch.float32),
-        qkv.new_empty(rstd, dtype=torch.float32),
-    )
+    return qkv.new_empty(shape), qkv.new_empty(shape), qkv.new_empty(shape if v_copy else (0,))
 
 
 @torch.library.custom_op("primus_turbo::dit_qk_norm_rope_backward", mutates_args=(), device_types="cuda")

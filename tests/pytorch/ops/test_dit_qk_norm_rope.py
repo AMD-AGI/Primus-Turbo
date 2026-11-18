@@ -242,8 +242,7 @@ def _joint_buffer(form, H, D, S=(128, 128), B=2, seed=0):
 
 @requires_gpu
 @pytest.mark.parametrize("form", [4, 3])
-@pytest.mark.parametrize("return_rstd", [False, True])
-def test_joint_v_view(form, return_rstd):
+def test_joint_v_view(form):
     """v_out='none' with two adjacent streams: one strided view over both, bitwise the copy path, gradients too."""
     H, D, eps = 16, 128, 1e-6
     txt, img, buf = _joint_buffer(form, H, D)
@@ -259,8 +258,8 @@ def test_joint_v_view(form, return_rstd):
         wl = [tuple(w.detach().clone().requires_grad_() for w in p) for p in ws]
         t, i = lb[:128], lb[128:]
         out = dit_qk_norm_rope(i, *wl[1], cos, sin, eps, txt_qkv=t, w_txt_q=wl[0][0], w_txt_k=wl[0][1],
-                               v_out=v_out, return_rstd=return_rstd)  # fmt: skip
-        q, k, v = out[:3]
+                               v_out=v_out)  # fmt: skip
+        q, k, v = out
         gen = torch.Generator().manual_seed(9)
         grads = [torch.randn(x.shape, generator=gen).bfloat16().cuda() for x in (q, k, v)]
         torch.autograd.backward((q, k, v), grads)
@@ -400,92 +399,7 @@ def test_fake_tensors():
         assert r.shape == f.shape and r.dtype == f.dtype and r.stride() == f.stride()
 
 
-def _rstd_ref(srcs, H, D, eps):
-    """fp64 rstd_q, rstd_k [tokens * H]: streams one after the other (text first), rows in each source's token
-    order, flat index row * H + head."""
-    outs = []
-    for j in range(2):
-        parts = []
-        for x in srcs:
-            q = _split(x, H, D)[j].double()
-            parts.append(torch.rsqrt(q.pow(2).mean(-1) + eps).reshape(-1))
-        outs.append(torch.cat(parts))
-    return outs
-
-
-@requires_gpu
-@pytest.mark.parametrize("layout,form,dual", [("sbhd", 4, False), ("sbhd", 4, True), ("bshd", 3, False),
-                                              ("bshd", 3, True), ("sbhd", 3, True)])  # fmt: skip
-@pytest.mark.parametrize("rope,round_normed", [("interleaved", True), ("interleaved", False), ("half", True)])
-@pytest.mark.parametrize("v_out", ["copy", "none"])
-def test_return_rstd(layout, form, dual, rope, round_normed, v_out):
-    """return_rstd adds two fp32 outputs and changes nothing else: q, k, v and every gradient are
-    bit-identical to the call without it; the rstd are the norm's inverse RMS, in the layout of the QKV rows."""
-    if dual and v_out == "none":
-        pytest.skip("v_out='none' is one stream")
-    H, D, eps = 16, 128, 1e-6
-    srcs, ws, angs, _ = _make(layout, form, dual, H=H, D=D, per_batch=True)
-    cos, sin = _tables(angs, rope, srcs[0].dtype)
-    base = _run(srcs, ws, cos, sin, eps, layout, rope, round_normed, False, v_out=v_out)
-
-    leaves = [x.detach().clone().requires_grad_() for x in srcs]
-    wl = [tuple(w.detach().clone().requires_grad_() for w in p) for p in ws]
-    kw = dict(layout=layout, rope=rope, round_normed=round_normed, v_out=v_out, return_rstd=True)
-    if dual:
-        kw.update(txt_qkv=leaves[0], w_txt_q=wl[0][0], w_txt_k=wl[0][1])
-    q, k, v, rq, rk = dit_qk_norm_rope(leaves[-1], wl[-1][0], wl[-1][1], cos, sin, eps, **kw)
-    assert not rq.requires_grad and not rk.requires_grad
-    assert rq.dtype == rk.dtype == torch.float32 and rq.is_contiguous() and rk.is_contiguous()
-    for name, a, b in (("q", base["q"], q), ("k", base["k"], k), ("v", base["v"], v)):
-        assert torch.equal(a, b), name
-    torch.autograd.backward((q, k, v), base["grads"])
-    assert all(torch.equal(a, x.grad) for a, x in zip(base["d_src"], leaves))
-    assert all(torch.equal(a[j], b[j].grad) for a, b in zip(base["dw"], wl) for j in range(2))
-
-    ref_q, ref_k = _rstd_ref(srcs, H, D, eps)
-    assert rq.shape == ref_q.shape and rk.shape == ref_k.shape
-    assert _rel(rq, ref_q) < 1e-6 and _rel(rk, ref_k) < 1e-6, (_rel(rq, ref_q), _rel(rk, ref_k))
-
-
-@requires_gpu
-def test_return_rstd_torch_compile():
-    """The op compiles with the option (fullgraph) and equals eager bit for bit."""
-    H, D, eps = 16, 128, 1e-6
-    srcs, ws, angs, _ = _make("sbhd", 4, True, H=H, D=D)
-    cos, sin = _tables(angs, "interleaved", srcs[0].dtype)
-
-    def f(x_txt, x, wq0, wk0, wq1, wk1):
-        return dit_qk_norm_rope(x, wq1, wk1, cos, sin, eps, txt_qkv=x_txt, w_txt_q=wq0, w_txt_k=wk0,
-                                return_rstd=True)  # fmt: skip
-
-    args = (srcs[0], srcs[1], *ws[0], *ws[1])
-    for a, b in zip(f(*args), torch.compile(f, fullgraph=True)(*args)):
-        assert torch.equal(a, b)
-
-
 # --------------------------------------------------------------------------------------------------- CPU tests
-def test_return_rstd_fake_tensors():
-    """The fake of the op returns the rstd shapes (no device needed)."""
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
-    D, H, S, B = 128, 4, 8, 2
-    with FakeTensorMode():
-        x = torch.empty(S, B, H, 3 * D, dtype=torch.bfloat16)
-        t = torch.empty(4, B, H, 3 * D, dtype=torch.bfloat16)
-        w = torch.empty(D, dtype=torch.bfloat16)
-        cos = torch.empty(S + 4, D, dtype=torch.bfloat16)
-        for return_rstd, n in ((False, 0), (True, (S + 4) * B * H)):
-            q, k, v, rq, rk = torch.ops.primus_turbo.dit_qk_norm_rope(
-                x, w, w, cos, cos, t, w, w, 1e-6, "sbhd", "interleaved", True, True, return_rstd
-            )
-            assert q.shape == (S + 4, B, H, D) and v.shape == q.shape
-            assert rq.shape == rk.shape == (n,) and rq.dtype == rk.dtype == torch.float32
-        q, k, v, rq, rk = torch.ops.primus_turbo.dit_qk_norm_rope(
-            x, w, w, cos[:S], cos[:S], None, None, None, 1e-6, "sbhd", "interleaved", True, False, True
-        )
-        assert v.shape == (0,) and rq.shape == (S * B * H,)
-
-
 def test_validation():
     D, H = 128, 4
     x = torch.zeros(8, 2, H, 3 * D, dtype=torch.bfloat16)
