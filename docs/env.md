@@ -77,7 +77,7 @@ These getters mirror the C++ parsing so Python can report the effective value; C
 |---|---|---|---|
 | `PRIMUS_TURBO_DEEPEP_CPU_TIMEOUT` | `int` | `300` | DeepEP host-side timeout in seconds (deep_ep/configs.h). Unset, empty or a non-integer reads as 300. |
 | `PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE` | `bool` | `False` | A non-zero integer makes the intranode dispatch/combine channels publish their tails with a full system-scope release/acquire instead of the cheap per-warp fence (gfx1250 always does). C++ caches it separately in the dispatch and combine launchers, each at its first call. |
-| `PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD` | `str` | `off` | The flydsl_v2 guards for TDM operations lost while KFD evicts a queue. "off" (default): neither guard; "redo": move a row again when one pass takes more than 0.5 ms; "all": also compare 32 words of every TDM load with its source and reload stale data. |
+| `PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD` | `str` | `off` | The guards of DeepEP V2 (MI455X) for TDM operations lost while KFD evicts a queue. "off" (default): neither guard; "redo": move a row again when one pass takes more than 0.5 ms; "all": also compare 32 words of every TDM load with its source and reload stale data. |
 
 ODC (on-demand-comm) rocSHMEM GDA device-kernel knobs, consumed by csrc/kernels/odc_rocshmem/odc_rocshmem_gda.cu for the multi-node reduce-scatter / all-gather device kernels.
 

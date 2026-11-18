@@ -317,9 +317,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE": lambda: (
         int(os.getenv("PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE") or "0") != 0
     ),
-    # The flydsl_v2 guards for TDM operations lost while KFD evicts a queue. "off" (default):
-    # neither guard; "redo": move a row again when one pass takes more than 0.5 ms; "all":
-    # also compare 32 words of every TDM load with its source and reload stale data.
+    # The guards of DeepEP V2 (MI455X) for TDM operations lost while KFD evicts a queue.
+    # "off" (default): neither guard; "redo": move a row again when one pass takes more than
+    # 0.5 ms; "all": also compare 32 words of every TDM load with its source and reload stale data.
     "PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD": env_choice(
         "PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD", "off", ("off", "redo", "all")
     ),
