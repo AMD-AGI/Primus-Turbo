@@ -93,6 +93,30 @@ class TestGatherHandoff(unittest.TestCase):
                 gather._new_backward_gather_plan(self.source, self.indices, self.rowmap, enabled=True)
             )
 
+    def test_backward_plan_routing_gate(self):
+        def routing(tokens, hidden, experts, topk):
+            return (
+                torch.empty(tokens, hidden),
+                torch.empty(tokens * topk, dtype=torch.int32),
+                torch.empty(tokens, 2 * experts + 1, dtype=torch.int32),
+            )
+
+        gptoss, dsv3 = routing(3, 2880, 32, 4), routing(3, 7168, 256, 8)
+        # Off gfx1250 (e.g. gfx950's MXFP4 consumer): only the GPT-OSS routing, as before the MXFP8 consumer.
+        with patch.object(gather, "_any_routing", return_value=False):
+            self.assertTrue(gather._routing_ok(*gptoss))
+            for other in (dsv3, routing(3, 2880, 32, 8), routing(3, 2880, 64, 4), routing(3, 4096, 32, 4)):
+                self.assertFalse(gather._routing_ok(*other))
+        # gfx1250 (the MXFP8 quantizer gathers): any top-k routing.
+        with patch.object(gather, "_any_routing", return_value=True):
+            for ok in (gptoss, dsv3, routing(5, 4096, 128, 1)):
+                self.assertTrue(gather._routing_ok(*ok))
+            src, d2s, rowmap = dsv3
+            self.assertFalse(gather._routing_ok(*routing(3, 7168, 4, 8)))  # top-k > experts
+            self.assertFalse(gather._routing_ok(src, d2s[:-1], rowmap))  # not k rows per token
+            self.assertFalse(gather._routing_ok(src, d2s, rowmap[:, :-1]))  # not 2 * experts + 1 columns
+            self.assertFalse(gather._routing_ok(src, d2s, rowmap[:-1]))  # another token count
+
     def test_forward_payload_mutation_is_rejected(self):
         for index in range(4):
             with self.subTest(index=index):
@@ -183,7 +207,7 @@ class TestGatherHandoff(unittest.TestCase):
             torch.testing.assert_close(resolved, self.materialize(self.source) + 5)
 
     def test_output_registration_does_not_retain_autograd_owner(self):
-        # Production eligibility uses hidden=2880; ownership behavior is shape-independent.
+        # Ownership behavior is shape-independent.
         owner = type("Owner", (), {})()
         out = torch.empty(self.plan.shape)
         gather.enroll_backward_gather_output(out, self.plan, owner)

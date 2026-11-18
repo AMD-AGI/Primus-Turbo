@@ -21,7 +21,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
     check_quantized_tensor,
 )
-from primus_turbo.pytorch.core.utils import is_gfx950
+from primus_turbo.pytorch.core.utils import is_gfx950, is_gfx1250
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_dglu_impl,
     grouped_gemm_fp8_glu_impl,
@@ -29,25 +29,42 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_variable_k_accum_impl,
     grouped_gemm_fp8_variable_k_impl,
     grouped_gemm_mxfp8_dglu_impl,
+    grouped_gemm_mxfp8_glu_gfx1250,
     grouped_gemm_mxfp8_glu_impl,
 )
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     group_offs_from_lens,
+)
+from primus_turbo.pytorch.ops.moe_gather import (
+    enroll_backward_gather_output,
+    lookup_permuted_activation_seam,
+    resolve_backward_gather,
 )
 from primus_turbo.pytorch.ops.quantization import (
     grouped_quantize_fp8_with_trans,
     quantize_fp8_with_trans,
 )
 from primus_turbo.pytorch.ops.utils import (
+    MX_A,
+    MX_W,
     _ensure_contiguous_grad_out,
     _get_dummy_wgrad,
     _get_fp8_dtype,
     _setup_fused_grad_accum,
+    mx1250_recipes,
 )
 
 __all__ = [
+    "CONSUMES_PERMUTE_SEAM_MXFP8",
     "grouped_mlp_fp8",
 ]
+
+# The MXFP8 path takes the MoE permute -> MXFP8 handoff of ops/moe_gather.py, on gfx1250 only: an ``x`` registered
+# as a lazy permute placeholder (no values) is quantized from the un-permuted rows through ``dest2src``, and the
+# unpermute's backward gather is deferred into the quantization of ``grad_out``. A framework checks this flag (this
+# build of the op knows the handoff) and the arch itself (elsewhere a placeholder would be read as data) before it
+# hands one over.
+CONSUMES_PERMUTE_SEAM_MXFP8 = True
 
 
 _SUPPORTED_ACTIVATIONS = ("silu", "gelu")
@@ -460,7 +477,7 @@ def _quantize_weight(
     across the tile keeps the forward and dgrad operands consistent. A cached ``w_t``
     is taken as given; only its absence forces the col-wise pass.
     """
-    recipe = ScalingRecipe(use_2d_block=True)
+    recipe = MX_W if is_gfx1250() else ScalingRecipe(use_2d_block=True)
     w_dtype = _get_fp8_dtype(config.format, True)
     if not isinstance(w, QuantizedTensor):
         return (
@@ -542,12 +559,31 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
                 f"{name} must be a multiple of {MXFP8_BLOCK_SIZE} (got {dim})."
             )
 
+        # gfx1250's MX GEMMs read one operand layout: its recipes, or NotImplementedError before the weights are marked
+        who, fuse = "grouped_mlp_fp8 (MX_BLOCKWISE)", fuse_wgrad_accum_pattern
+        mx1250 = is_gfx1250() and mx1250_recipes(
+            who, config, out_dtype, x, x_t, w1, w1_t, w2, w2_t, fuse=fuse, glu_width=I
+        )
         # Each weight has its own accumulation buffer, so these cannot be shared.
         fuse_w1_accum, w1_main_grad = _setup_fused_grad_accum(w1, fuse_wgrad_accum_pattern)
         fuse_w2_accum, w2_main_grad = _setup_fused_grad_accum(w2, fuse_wgrad_accum_pattern)
 
         M = int(probs.shape[0])
         x_dtype = _get_fp8_dtype(config.format, True)
+        x_rec = x_t_rec = ScalingRecipe()  # the activations' row / column copies
+        quant_kw, glu = {}, grouped_gemm_mxfp8_glu_impl
+        if mx1250:
+            x_rec, x_t_rec, _ = mx1250
+            quant_kw = dict(scaling_recipe=x_rec, scaling_recipe_for_trans=x_t_rec)
+            glu = grouped_gemm_mxfp8_glu_gfx1250
+            # x may be a lazy permute placeholder (ops/moe_gather.py): its rows are quantized straight from the
+            # un-permuted source through dest2src, and the plan lets the unpermute's backward hand grad_out over
+            # the same way.
+            seam = lookup_permuted_activation_seam(x, include_plan=True)
+            ctx.backward_gather_plan = None
+            if seam is not None:
+                quant_kw["total_m"] = int(x.shape[0])
+                x, quant_kw["dest2src"], quant_kw["permuted_probs"], ctx.backward_gather_plan = seam
         if not isinstance(x, QuantizedTensor):
             x_row, x_row_scale, x_col, x_col_scale, _, offs_row, _, _ = grouped_quantize_fp8_with_trans(
                 x,
@@ -556,6 +592,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
                 group_lens,
                 group_offs,
                 block_size=MXFP8_BLOCK_SIZE,
+                **quant_kw,
             )
         else:
             assert x._is_grouped_tensor, "a QuantizedTensor input must be a grouped tensor"
@@ -584,7 +621,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
 
         # The activation is quantised inside the epilogue: it feeds nothing but the
         # quantiser, so staging it in out_dtype would be an [M, I] round trip through HBM.
-        l1, act_row, act_row_scale, act_col, act_col_scale = grouped_gemm_mxfp8_glu_impl(
+        l1, act_row, act_row_scale, act_col, act_col_scale = glu(
             x_row,
             w1_row,
             x_row_scale,
@@ -597,8 +634,8 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             num_cu=num_cu,
             probs=probs,
             config=config,
-            out_row_scaling_recipe=ScalingRecipe(),
-            out_col_scaling_recipe=ScalingRecipe(),
+            out_row_scaling_recipe=x_rec,
+            out_col_scaling_recipe=x_t_rec,
             activation=activation,
             clamp_limit=clamp_limit,
             b_k_blocked=w1_row_kblk,
@@ -650,10 +687,19 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
         # version counter saved tensors are checked against.
         ctx.w1_main_grad = w1_main_grad
         ctx.w2_main_grad = w2_main_grad
+        if mx1250:
+            enroll_backward_gather_output(out, ctx.backward_gather_plan, ctx)
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
+        g_rec, quant_kw, dglu = ScalingRecipe(), {}, grouped_gemm_mxfp8_dglu_impl
+        if is_gfx1250():
+            # grad_out may be a deferred unpermute gradient: the un-permuted dOut + dest2src, gathered inside the
+            # quantizer. Its copies, and grad_l1's, are A operands of gfx1250's MX GEMMs.
+            grad_out, quant_kw = resolve_backward_gather(grad_out, ctx.backward_gather_plan)
+            g_rec, dglu = MX_A, grouped_gemm_mxfp8_glu_gfx1250
+            quant_kw = dict(quant_kw, scaling_recipe=g_rec, scaling_recipe_for_trans=g_rec)
         grad_out = _ensure_contiguous_grad_out(grad_out)
         (
             x_col,
@@ -688,6 +734,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             group_lens,
             group_offs,
             block_size=ctx.config.block_size,
+            **quant_kw,
         )
         default_backend = BackendType.FLYDSL.value
 
@@ -712,7 +759,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
 
         # dgrad against w2_col, contracting K_out; the epilogue turns it into the
         # pre-activation gradient and quantises that, so neither reaches HBM.
-        grad_probs, gl_row, gl_row_scale, gl_col, gl_col_scale = grouped_gemm_mxfp8_dglu_impl(
+        grad_probs, gl_row, gl_row_scale, gl_col, gl_col_scale = dglu(
             go_row,
             w2_col,
             go_row_scale,
@@ -726,8 +773,8 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             probs=probs,
             intermediate=l1,
             config=ctx.config,
-            out_row_scaling_recipe=ScalingRecipe(),
-            out_col_scaling_recipe=ScalingRecipe(),
+            out_row_scaling_recipe=g_rec,
+            out_col_scaling_recipe=g_rec,
             activation=ctx.activation,
             clamp_limit=ctx.clamp_limit,
             b_k_blocked=ctx.w2_col_kblk,
