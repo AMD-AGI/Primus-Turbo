@@ -12,12 +12,12 @@ from primus_turbo.pytorch.ops.rope import fused_qkv_rmsnorm_rope
 _D = 64
 
 
-def _require_gfx950():
+def _require_supported_arch():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     arch = str(torch.cuda.get_device_properties(0).gcnArchName).split(":", 1)[0]
-    if arch != "gfx950":
-        pytest.skip("fused QK RMSNorm + RoPE requires gfx950")
+    if arch not in ("gfx942", "gfx950"):
+        pytest.skip("fused QK RMSNorm + RoPE requires gfx942 or gfx950")
 
 
 def _rmsnorm(x, gamma, eps):
@@ -49,7 +49,7 @@ def _reference(qkv, q_gamma, k_gamma, freqs, split, eps):
 
 
 def _inputs(S=8, B=4, NG=2, NPG=8, seed=123, D=_D):
-    _require_gfx950()
+    _require_supported_arch()
     gen = torch.Generator(device="cuda").manual_seed(seed)
     split = [NPG * D, D, D]
     qkv = torch.randn(S, B, NG, sum(split), device="cuda", generator=gen, dtype=torch.float32).bfloat16()

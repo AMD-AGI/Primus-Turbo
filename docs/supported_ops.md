@@ -98,7 +98,7 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | `rmsnorm_residual_fp4` | BF16 → MXFP4 | — | ✅ | — | Fused residual add + MXFP4 quantization |
 | `swiglu_with_probs`, `geglu_with_probs` | BF16 / FP16 | ✅ | ✅ | ✅ | GLU scaled by routing probability, optional row mask and clamp |
 | `fused_qkv_rope` | BF16 | ✅ | ✅ | — | RoPE on packed QKV |
-| `fused_qkv_rmsnorm_rope` | BF16 | — | ✅ | — | QK RMSNorm + RoPE on packed QKV |
+| `fused_qkv_rmsnorm_rope` | BF16 | ✅ | ✅ | — | QK RMSNorm + RoPE on packed QKV |
 | `cross_entropy` | BF16 / FP32 | ✅ | ✅ | ✅ | Label smoothing, ignore index, in-place logits. See [Cross Entropy](./cross_entropy.md) |
 
 ### 2.6 Quantization and low-precision training support
