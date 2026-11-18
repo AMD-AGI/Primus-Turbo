@@ -260,6 +260,9 @@ def check_poisoned(group, failures, hq=32, hkv=8, d=128, b=2, s_local=300, hidde
             # GLM-4.7 widths: the blocks copy the own rows before the dgrad tiles
             _poison_banks(group)
             check_qkv(group, 96, 8, 128, 1, 512, 5120, qkv_format, "interleaved", 1, failures)
+            # MiniMax-M2.5 widths: the same with few wgrad tiles, after 128-row dgrad tiles
+            _poison_banks(group)
+            check_qkv(group, 48, 8, 128, 1, 512, 3072, qkv_format, "interleaved", 1, failures)
             _poison_banks(group)
             check_o_gemm(group, hq, d, b, s_local, hidden, qkv_format, True, 1, failures)
 

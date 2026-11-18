@@ -1091,13 +1091,15 @@ def ulysses_a2a_gemm(
         )
         num_wtiles = K // BMw * (N // BN)
     # Weight-gradient tiles reduce over all of M, so taken first they hold their CUs at the pace the
-    # rows land. That pays while the exchange dominates (Qwen3-30B: 25-45 % slower otherwise); once
-    # the GEMM outweighs it (N * n >= 4096 * (n - 1), see gemm_bound below) the GEMM tiles go first
-    # with 256-row tiles and the wgrad tiles run on landed rows (Llama3.1-8B bwd QKV 4K 592 -> 516 us,
-    # MiniMax-M2.5 689 -> 612 us). Over two waves of wgrad tiles (GLM-4.7: 1120) they always go last
+    # rows land. That pays while the exchange dominates (Qwen3-30B n = 4: 15-23 % slower otherwise);
+    # once the GEMM outweighs it the GEMM tiles go first, in 128-row tiles, and the wgrad tiles run
+    # on landed rows. The GEMM / exchange ratio grows with N * n / (n - 1) up to n = 4 (see
+    # gemm_bound below) and with N * n past it, as each rank's exchange spreads over n - 1 links
+    # (MiniMax-M2.5 n = 8: 590 -> 497 us; 256-row tiles 536 us; n = 4: 1018 -> 988 us with 128 rows).
+    # Over two waves of wgrad tiles (GLM-4.7: 1120) they always go last, after 256-row GEMM tiles,
     # and get 32 pushers (GLM-4.7 16 pushers: +16 %).
     many_wtiles = num_wtiles > 2 * num_cus
-    wgrad_last = wgrad is not None and (many_wtiles or N * num_ranks >= 4096 * (num_ranks - 1))
+    wgrad_last = wgrad is not None and (many_wtiles or N * num_ranks >= 4096 * min(num_ranks - 1, 3))
     # GEMM / exchange time grows with N * n / (n - 1): ~1.1 for Llama-70B (hidden 8192, n = 4), 0.55
     # for Llama3.1-8B, 0.3 for Qwen3-30B. Past ~1 the CUs, not the links, bound the launch: 128-row
     # tiles cost 35 % more GEMM time than 256-row ones and pushers beyond what keeps ahead of the K walk
@@ -1124,10 +1126,11 @@ def ulysses_a2a_gemm(
             # with few weight-gradient tiles the launch is compute-bound: 16 pushers still fill the links
             num_push = 32 if wgrad is None or many_wtiles else 16
     if BM is None:
-        # 256-row tiles while every tile has a CU (the staggered K walk), the GEMM dominates or the tiles
-        # make enough waves; otherwise 128 rows halve the tail of the m-tile that lands last
+        # 256-row tiles while every tile has a CU (the staggered K walk), the GEMM dominates, the tiles
+        # make enough waves or over two waves of wgrad tiles follow them; otherwise 128 rows halve the
+        # tail of the m-tile that lands last
         fits = ceildiv(M, 256) * ceildiv(N, BN) + num_wtiles + num_push <= num_cus
-        BM = 256 if fits or wgrad_last or gemm_bound or many_tiles else 128
+        BM = 256 if fits or many_wtiles or gemm_bound or many_tiles else 128
     if wgrad_at is None:
         # wgrad tiles reduce over the M rows, GEMM tiles over K: past M > K the wgrad tiles are the long
         # ones and their last partial wave idles most CUs. One wave of GEMM tiles (of the m-tiles that

@@ -71,16 +71,16 @@ class A2AGemmTuning:
     """Launch knobs of an A2AGemm (forward o_proj, backward QKV); ``None`` keeps the shape heuristic.
 
     Attributes:
-        BM: GEMM tile rows, 128 or 256 (256 when every tile fits on the CUs, the wgrad tiles go
-            last or, without wgrad, the GEMM outweighs the exchange, ``N * n >= 8192 * (n - 1)``, or
-            the 256-row tiles make 2.5 waves of the CUs 32 pushers leave).
+        BM: GEMM tile rows, 128 or 256 (256 when every tile fits on the CUs, there are more than 2x
+            CU wgrad tiles or, without wgrad, the GEMM outweighs the exchange, ``N * n >= 8192 * (n - 1)``,
+            or the 256-row tiles make 2.5 waves of the CUs 32 pushers leave).
         num_push: push blocks, which run the last GEMM tiles once done (32; 16 with few wgrad tiles;
             GEMM-bound without wgrad: 16, 8 from 8192 rows at n = 2; without wgrad, 128-row tiles at
             n <= 4 with ``N * n >= 4096 * (n - 1)``: 16).
         push_split: sub-tiles a ``BM``-row m-tile is pushed in, so its rows land in pieces (8).
         wgrad_at: claim slot of the in-kernel wgrad tiles (backward QKV only; 0, or after every
-            dgrad tile when the GEMM outweighs the exchange, ``N * n >= 4096 * (n - 1)``, or there
-            are more than 2x CU wgrad tiles; with ``M > K`` a wave of dgrad tiles follows them).
+            dgrad tile when the GEMM outweighs the exchange, ``N * n >= 4096 * min(n - 1, 3)``, or
+            there are more than 2x CU wgrad tiles; with ``M > K`` a wave of dgrad tiles follows them).
     """
 
     BM: Optional[int] = None
