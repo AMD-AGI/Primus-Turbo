@@ -144,19 +144,19 @@ print(c.shape) # [128, 256]
 ### 1.4 MegaMoE
 
 `fused_mega_moe` is an EP intra-node MoE op that fuses communication with the grouped GEMM
-(`dispatch_grouped_gemm` + `grouped_gemm_combine`). It is a single autograd op; the per-shape
-communication buffer is allocated once and cached internally. See
-[MegaMoE](./mega_moe.md) for the design and performance.
+(`dispatch_grouped_gemm` + `grouped_gemm_combine`). It is a single autograd op; the symmetric
+buffer the ranks exchange tokens through is allocated at the first call and cached for that shape
+(EP size, experts, tokens per rank, top-k, hidden, intermediate). See [MegaMoE](./features/mega_moe.md)
+for the staged and MXFP8 ops, the options and the limitations.
 
-> **Hardware requirements:** `gfx950` (not supported on `gfx1250`), intra-node expert parallelism
-> (one rank per GPU).
+> **Hardware requirements:** BF16 on `gfx950` (MI355X) and `gfx1250` (MI455X), intra-node expert
+> parallelism (one rank per GPU).
 
 ```python
 import torch
 import torch.distributed as dist
 
-from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
-from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe
+from primus_turbo.pytorch.ops.moe import fused_mega_moe
 
 # --- distributed setup (one rank per GPU, intra-node EP) ---
 dist.init_process_group("nccl")
@@ -165,32 +165,23 @@ torch.cuda.set_device(rank)
 group = dist.new_group(list(range(world)))
 
 # --- MoE shape ---
-H = 7168          # hidden size (hidden % 512 == 0)
+H = 7168          # hidden size
 I = 2048          # intermediate size
 E = 256           # total experts (must be divisible by world)
 K = 8             # top-k
-T = 4096          # max tokens per rank
+T = 4096          # tokens per rank, the same on every rank
 epr = E // world  # experts per rank
 
-# Allocate the comm buffer ONCE for this shape; it is cached and reused.
-get_symm_buffer_for_mega_moe(
-    group,
-    num_experts=E,
-    num_max_tokens_per_rank=T,
-    num_topk=K,
-    hidden=H,
-    intermediate_hidden=I,
-)
-
 # --- per-rank weights: this rank owns experts [rank*epr, (rank+1)*epr) ---
-# w1: [epr, 2*I, H], w2: [epr, H, I]  (NT layout)
+# w1: [epr, 2*I, H] (gate rows, then up rows), w2: [epr, H, I]  (NT layout)
 w1 = torch.randn(epr, 2 * I, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 w2 = torch.randn(epr, H, I,   device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
-# --- inputs ---
+# --- inputs: routing is computed outside the op ---
 x = torch.randn(T, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-topk_idx = torch.randint(0, E, (T, K), device="cuda", dtype=torch.int64)   # global expert ids
-topk_w   = torch.rand(T, K, device="cuda", dtype=torch.float32)            # routing weights
+logits = torch.randn(T, E, device="cuda")
+topk_w, topk_idx = logits.softmax(dim=-1).topk(K, dim=-1)   # K distinct global expert ids per token
+topk_w.requires_grad_()
 
 # --- fused forward + backward ---
 y = fused_mega_moe(group, x, topk_idx, topk_w, w1, w2)   # [T, H]
@@ -202,12 +193,15 @@ Input contract:
 
 | Argument | Shape / dtype | Notes |
 | --- | --- | --- |
-| `x` | `[T, H]` bf16, CUDA | `H % 512 == 0` (hidden*2 must be 1024B-aligned) |
-| `topk_idx` | `[T, K]` int (cast to int64) | global expert ids in `[0, num_experts)`|
-| `topk_weights` | `[T, K]` fp32 | routing weights, applied in the top-k reduce |
+| `x` | `[T, H]` bf16, CUDA | `T` the same on every rank |
+| `topk_idx` | `[T, K]` int (cast to int64) | distinct global expert ids in `[0, num_experts)` |
+| `topk_weights` | `[T, K]` float (cast to fp32) | routing weights, applied in the top-k reduce |
 | `w1` | `[E/world, 2*I, H]` bf16 | this rank's expert slice, NT layout |
 | `w2` | `[E/world, H, I]` bf16 | this rank's expert slice, NT layout |
 | `group` | `ProcessGroup` | intra-node EP group |
+
+`H` and `I` are multiples of 64 and at least 128. On `gfx950` they also leave a remainder of 0, 64
+or 128 modulo 256 (GPT-OSS's 2880 runs).
 
 
 ## 2. Modules
@@ -473,7 +467,7 @@ print(c.shape)  # [128, 256]
 
 We added some new params for DeepEP buffer and dispatch. The normal kernels can be used in model training as the below example code shows.
 
-The intranode kernels default to `flydsl_v2` on MI455X (gfx1250) and to `cpp` on MI300 / MI355; see [Intranode backend](../primus_turbo/pytorch/deep_ep/README.md#intranode-backend) for the known issues on MI455X. `flydsl_v2` keeps the whole batch in its buffer, so size the buffer from the tokens per rank as `get_buffer` below does (`turbo.ops.moe_dispatch` does this by itself).
+The intranode kernels implement the data transfer of upstream DeepEP V1 (rings) or V2 (fixed per-token slots); MI300 / MI355 run V1 and MI455X (gfx1250) runs V2. See [DeepEP](./features/deep_ep.md) for how they differ and for the known issues of V2. V2 keeps the whole batch in its buffer, so size the buffer from the tokens per rank as `get_buffer` below does (`turbo.ops.moe_dispatch` does this by itself).
 
 ```python
 import torch
@@ -501,7 +495,7 @@ def get_buffer(group: dist.ProcessGroup,
     for config in (Buffer.get_dispatch_config(group.size()), Buffer.get_combine_config(group.size())):
         num_nvl_bytes = max(config.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes)
         num_rdma_bytes = max(config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes)
-    # `flydsl_v2` holds the whole batch; the hint is 0 for the ring backends (`cpp`, `flydsl`)
+    # V2 (MI455X) holds the whole batch; the hint is 0 where V1 runs
     num_nvl_bytes = max(Buffer.get_token_buffer_size_hint(num_max_tokens_per_rank, hidden_bytes,
                                                           group.size(), num_topk), num_nvl_bytes)
 

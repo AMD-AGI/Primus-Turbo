@@ -35,7 +35,7 @@ from .utils import EventOverlap, check_nvlink_connections
 
 def _require_deep_ep_cpp(what: str):
     if deep_ep_cpp is None:
-        if default_intranode_backend() == "cpp":
+        if default_intranode_backend() == "v1":
             raise RuntimeError(
                 f"{what} needs the C++ DeepEP, which this build of primus_turbo does not include; "
                 f"DeepEP on {' / '.join(CPP_DEEPEP_ARCHS)} needs a build with it"
@@ -121,15 +121,16 @@ class Buffer:
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
                 otherwise, the resources will be released by the destructor.
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
-            intranode_backend: for the tests only; users leave it unset. The kernels of the intranode path
-                (`num_ranks <= 8`, no low-latency mode), `"cpp"` (HIP), `"flydsl"` or `"flydsl_v2"`; unset,
-                the one of this GPU's architecture (`get_rocm_arch()`): `"cpp"` on gfx942 / gfx950,
-                `"flydsl_v2"` on gfx1250; other architectures are not supported and raise. `"cpp"` and `"flydsl"`
-                return interchangeable handles; `"flydsl_v2"` (direct slot writes, no channel rings, not on
-                gfx942 / gfx950) returns the same outputs with handles of its own, is not capturable in a CUDA graph,
-                and needs `num_nvl_bytes` that hold the whole batch of the
-                rank with the most tokens (`get_token_buffer_size_hint` with the same
-                `num_max_tokens_per_rank` on every rank; `moe_dispatch` sizes it itself). The internode and low-latency paths always use `"cpp"`.
+            intranode_backend: for the tests only; users leave it unset. The DeepEP version of the intranode
+                path (`num_ranks <= 8`, no low-latency mode), `"v1"` (channel rings) or `"v2"` (direct slot
+                writes); unset, the one of this GPU's architecture (`get_rocm_arch()`): `"v1"` on gfx942 /
+                gfx950, `"v2"` on gfx1250; other architectures are not supported and raise. `"v1"` runs the
+                C++ kernels on gfx942 / gfx950 and their FlyDSL port on gfx1250, with interchangeable handles;
+                `"v2"` (not on gfx942 / gfx950) returns the same outputs with handles of its own, is not
+                capturable in a CUDA graph, and needs `num_nvl_bytes` that hold the whole batch of the rank
+                with the most tokens (`get_token_buffer_size_hint` with the same `num_max_tokens_per_rank` on
+                every rank; `moe_dispatch` sizes it itself). The internode and low-latency paths always use
+                the C++ `"v1"`. `buffer.intranode_backend` is the version a buffer runs.
 
         Note:
             Controlled by ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM`` (default ``0``).
@@ -148,14 +149,15 @@ class Buffer:
         self.explicitly_destroy = explicitly_destroy
         _check_device_arch()
         self.intranode_backend = get_intranode_backend(intranode_backend)
+        flydsl_kernels = self.intranode_backend == "v2" or rocm_arch() not in CPP_DEEPEP_ARCHS
         use_flydsl = (
-            self.intranode_backend in ("flydsl", "flydsl_v2")
+            flydsl_kernels
             and num_nvl_bytes > 0
             and not low_latency_mode
             and self.group_size in SUPPORTED_NUM_RANKS
         )
-        if self.intranode_backend in ("flydsl", "flydsl_v2") and not use_flydsl:
-            self.intranode_backend = "cpp"
+        if not use_flydsl:
+            self.intranode_backend = "v1"
 
         if use_flydsl:
             # intranode only: the FlyDSL runtime owns the NVL heap, and nothing needs the C++ one
@@ -165,14 +167,12 @@ class Buffer:
             # like the C++ runtime's comm stream, a high-priority one from the pool
             self._comm_stream = torch.cuda.Stream(priority=-1)
             runtime_cls = (
-                FlyDSLIntranodeV2Runtime
-                if self.intranode_backend == "flydsl_v2"
-                else FlyDSLIntranodeV1Runtime
+                FlyDSLIntranodeV2Runtime if self.intranode_backend == "v2" else FlyDSLIntranodeV1Runtime
             )
             self.intranode_runtime = runtime_cls(group, num_nvl_bytes, self._comm_stream)
             return
 
-        self.runtime = _require_deep_ep_cpp("the 'cpp' DeepEP backend").Buffer(
+        self.runtime = _require_deep_ep_cpp("the C++ DeepEP runtime").Buffer(
             self.rank,
             self.group_size,
             num_nvl_bytes,
@@ -356,8 +356,9 @@ class Buffer:
 
         Argument:
             num_ranks: the number of ranks.
-            backend: for the tests only; users leave it unset. The intranode backend the config is for,
-                else this GPU's default one (see `Buffer`). The backends share the dispatch values so far.
+            backend: for the tests only; users leave it unset. The DeepEP version (`"v1"` or `"v2"`) the
+                config is for, else this GPU's default one (see `Buffer`). The versions share the dispatch
+                values so far.
 
         Returns:
             config: the recommended config.
@@ -386,19 +387,19 @@ class Buffer:
 
         Argument:
             num_ranks: the number of ranks.
-            backend: for the tests only; users leave it unset. The intranode backend the config is for,
-                else this GPU's default one (see `Buffer`).
+            backend: for the tests only; users leave it unset. The DeepEP version (`"v1"` or `"v2"`) the
+                config is for, else this GPU's default one (see `Buffer`).
 
         Returns:
             config: the recommended config.
         """
 
-        # FlyDSL V1 on gfx1250 (8 KiB copy pieces): a larger send chunk halves the combine at 2 ranks and
-        # cuts it by up to 60% at 4, DSv3 shape at 32-160 SMs
+        # v1 on gfx1250, the FlyDSL port (8 KiB copy pieces): a larger send chunk halves the combine at 2
+        # ranks and cuts it by up to 60% at 4, DSv3 shape at 32-160 SMs
         if (
             num_ranks in (2, 4)
-            and default_intranode_backend() == "flydsl_v2"
-            and get_intranode_backend(backend) == "flydsl"
+            and default_intranode_backend() == "v2"
+            and get_intranode_backend(backend) == "v1"
         ):
             return Config(Buffer.num_sms, 48 if num_ranks == 2 else 24, 256, 6, 128)
 
@@ -427,26 +428,26 @@ class Buffer:
         backend: Optional[str] = None,
     ) -> int:
         """
-        Get the NVL buffer size of an intranode backend whose heap holds whole batches (`flydsl_v2`),
-        like DeepEP V2's `ElasticBuffer.get_buffer_size_hint`; 0 for the backends sized by their channel
-        rings (`Config.get_nvl_buffer_size_hint`).
+        Get the NVL buffer size of DeepEP `v2`, whose heap holds whole batches, like upstream DeepEP V2's
+        `ElasticBuffer.get_buffer_size_hint`; 0 for `v1`, sized by its channel rings
+        (`Config.get_nvl_buffer_size_hint`).
 
         Arguments:
             num_max_tokens_per_rank: the most tokens a rank dispatches; every rank must use the same value.
             hidden_bytes: the bytes of a bf16 hidden row.
             num_ranks: the number of ranks.
             num_topk: the number of top-k experts per token.
-            backend: for the tests only; users leave it unset. The intranode backend, else this GPU's
+            backend: for the tests only; users leave it unset. The DeepEP version, else this GPU's
                 default one.
 
         Returns:
             size: the NVL buffer size in bytes, or 0.
         """
-        if get_intranode_backend(backend) != "flydsl_v2" or num_ranks not in SUPPORTED_NUM_RANKS:
+        if get_intranode_backend(backend) != "v2" or num_ranks not in SUPPORTED_NUM_RANKS:
             return 0
         if num_max_tokens_per_rank <= 0:
             raise ValueError(
-                "the flydsl_v2 intranode backend sizes its buffer from the number of tokens per rank: "
+                "DeepEP v2 sizes its buffer from the number of tokens per rank: "
                 "dispatch once before combine, or set num_max_tokens_per_rank in set_buffer_global_config"
             )
         return v2_heap_bytes(num_max_tokens_per_rank, num_ranks, hidden_bytes, num_topk)

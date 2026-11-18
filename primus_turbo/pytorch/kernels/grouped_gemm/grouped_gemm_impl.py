@@ -598,8 +598,10 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
         # gfx950 (CDNA4) builds the body on mfma_f32_16x16x32_bf16; gfx1250 on
         # v_wmma_f32_16x16x32_bf16 with the transpose done by ds_load_tr16_b128 in LDS.
         supported &= gfx950 or gfx1250
-        # This backend has no beta=1 accumulate epilogue.
-        supported &= not inplace_add_to_out
+        # beta=1 exists on gfx1250 only, into an fp32 out (a weight's main_grad).
+        out = kwargs.get("out")
+        if inplace_add_to_out:
+            supported &= gfx1250 and out is not None and out.dtype == torch.float32 and out.is_contiguous()
         supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
         supported &= a.dim() == 2 and b.dim() == 2 and a.shape[0] == b.shape[0]
         supported &= a.dtype in (torch.bfloat16, torch.float16) and b.dtype == a.dtype
@@ -617,6 +619,13 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
             lhs, rhs = (b, a) if trans_c else (a, b)
             avg_m = max(1, a.shape[0] // max(group_lens.numel(), 1))
             supported &= grouped_gemm_bf16_variable_k_supported(lhs.shape[1], rhs.shape[1], avg_m)
+            if supported and inplace_add_to_out:
+                from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+                    grouped_gemm_bf16_variable_k_accum_supported,
+                )
+
+                supported &= grouped_gemm_bf16_variable_k_accum_supported(lhs.shape[1], rhs.shape[1], avg_m)
+                supported &= tuple(out.shape) == (group_lens.numel(), lhs.shape[1], rhs.shape[1])
         return supported
 
     @staticmethod
@@ -630,6 +639,8 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
         trans_c: bool,
         num_cu: int | None,
         schedule: str = "static",
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if is_gfx1250():
@@ -643,6 +654,15 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
             # already use, and free: both operands are [M_total, *] over the same rows, so
             # group_offs and masked_k apply unchanged either way.
             lhs, rhs = (b, a) if trans_c else (a, b)
+            if inplace_add_to_out:
+                return grouped_gemm_bf16_variable_k_flydsl_kernel(
+                    lhs,
+                    rhs,
+                    group_offs,
+                    masked_k=group_lens,
+                    out=out,
+                    accumulate=1,
+                )
             return grouped_gemm_bf16_variable_k_flydsl_kernel(
                 lhs,
                 rhs,
@@ -716,8 +736,8 @@ class GroupedGEMMVariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatc
         k = a.shape[0] if trans_a else a.shape[1]
         if trans_c:
             m, n = n, m
-        # CK and FlyDSL cannot accumulate while Triton and hipBLASLt can. A cache hit skips
-        # can_handle, so overwrite and beta=1 calls must never share a backend choice.
+        # CK cannot accumulate and FlyDSL only on gfx1250 into an fp32 out, while Triton and hipBLASLt
+        # can. A cache hit skips can_handle, so overwrite and beta=1 calls must never share a backend choice.
         return (
             bs,
             m,
