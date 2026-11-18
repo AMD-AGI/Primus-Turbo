@@ -845,6 +845,15 @@ def test_grouped_gemm_fp8_blockwise_hipgraph(B, M, N, K, ori_dtype, format, bloc
     )
 
 
+def test_grouped_gemm_fp8_rejects_config_default_backend():
+    a = torch.randn(256, 512, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(2, 256, 512, dtype=torch.bfloat16, device="cuda")
+    group_lens = torch.tensor([128, 128], dtype=torch.int64, device="cuda")
+    config = Float8QuantConfig(default_backend=BackendType.TRITON)
+    with pytest.raises(ValueError, match="default_backend is read by the dense FP8 GEMMs only"):
+        grouped_gemm_fp8(a, b, group_lens, trans_b=True, config=config)
+
+
 # Test case for group_lens containing zeros (MoE scenario where some experts receive no tokens)
 # This matches the actual bug scenario from primus_turbo_ut.py:
 #   E=8, in_features=2048, out_features=8192, group_lens=[8192, 8192, 0, 0, 0, 0, 0, 0]

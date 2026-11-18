@@ -93,6 +93,11 @@ def _bgrad_gemm_fp8_impl_wrapper(
     return _get_dummy_wgrad(out.shape, out_dtype)
 
 
+def _stage_backend(config: Float8QuantConfig, builtin: BackendType) -> int:
+    """The default backend for one GEMM stage: the config's, else the stage's own."""
+    return (config.default_backend or builtin).value
+
+
 class FP8GemmTensorFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -158,7 +163,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             out_dtype,
             False,
             granularity=config.granularity.value,
-            default_backend=BackendType.HIPBLASLT.value,
+            default_backend=_stage_backend(config, BackendType.HIPBLASLT),
         )
 
         if use_nt_layout_gemm_in_bwd:
@@ -213,7 +218,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
                 ctx.out_dtype,
                 False,
                 granularity=ctx.config.granularity.value,
-                default_backend=BackendType.HIPBLASLT.value,
+                default_backend=_stage_backend(ctx.config, BackendType.HIPBLASLT),
             )
         else:
             a_grad = gemm_fp8_impl(
@@ -226,7 +231,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
                 ctx.out_dtype,
                 ctx.trans_a,
                 granularity=ctx.config.granularity.value,
-                default_backend=BackendType.HIPBLASLT.value,
+                default_backend=_stage_backend(ctx.config, BackendType.HIPBLASLT),
             )
 
         if ctx.use_nt_layout_gemm_in_bwd:
@@ -242,7 +247,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
                 ctx.out_dtype,
                 ctx.trans_b,
                 granularity=ctx.config.granularity.value,
-                default_backend=BackendType.HIPBLASLT.value,
+                default_backend=_stage_backend(ctx.config, BackendType.HIPBLASLT),
                 inplace_add_to_out=ctx.fuse_bgrad_accum,
                 out=ctx.main_grad,
             )
@@ -257,7 +262,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
                 ctx.out_dtype,
                 ctx.trans_b,
                 granularity=ctx.config.granularity.value,
-                default_backend=BackendType.HIPBLASLT.value,
+                default_backend=_stage_backend(ctx.config, BackendType.HIPBLASLT),
                 inplace_add_to_out=ctx.fuse_bgrad_accum,
                 out=ctx.main_grad,
             )
@@ -350,7 +355,7 @@ class FP8GemmRowFunction(torch.autograd.Function):
             out_dtype,
             False,
             granularity=config.granularity.value,
-            default_backend=BackendType.TRITON.value,
+            default_backend=_stage_backend(config, BackendType.TRITON),
         )
 
         ctx.save_for_backward(
@@ -393,7 +398,7 @@ class FP8GemmRowFunction(torch.autograd.Function):
             ctx.out_dtype,
             ctx.trans_a,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.TRITON.value,
+            default_backend=_stage_backend(ctx.config, BackendType.TRITON),
         )
 
         quantized_grad_out_t = QuantizedTensor.quantize(
@@ -411,7 +416,7 @@ class FP8GemmRowFunction(torch.autograd.Function):
             ctx.out_dtype,
             ctx.trans_b,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.TRITON.value,
+            default_backend=_stage_backend(ctx.config, BackendType.TRITON),
         )
 
         return (
@@ -485,7 +490,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             out_dtype,
             False,
             granularity=config.granularity.value,
-            default_backend=BackendType.TRITON.value,
+            default_backend=_stage_backend(config, BackendType.TRITON),
         )
         ctx.save_for_backward(a_col, a_col_scale, b_col, b_col_scale)
 
@@ -525,7 +530,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             ctx.out_dtype,
             False,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.TRITON.value,
+            default_backend=_stage_backend(ctx.config, BackendType.TRITON),
         )
 
         grad_b = gemm_fp8_impl(
@@ -538,7 +543,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             ctx.out_dtype,
             ctx.trans_b,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.TRITON.value,
+            default_backend=_stage_backend(ctx.config, BackendType.TRITON),
         )
 
         return (
@@ -642,7 +647,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             out_dtype,
             False,
             granularity=granularity.value,
-            default_backend=BackendType.FLYDSL.value,
+            default_backend=_stage_backend(config, BackendType.FLYDSL),
         )
 
         ctx.save_for_backward(a_col, a_col_scale, b_col, b_col_scale)
@@ -684,7 +689,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             ctx.out_dtype,
             False,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.FLYDSL.value,
+            default_backend=_stage_backend(ctx.config, BackendType.FLYDSL),
         )
 
         grad_b = _bgrad_gemm_fp8_impl_wrapper(
@@ -697,8 +702,8 @@ class FP8GemmMXFunction(torch.autograd.Function):
             ctx.out_dtype,
             False,
             granularity=ctx.config.granularity.value,
-            default_backend=(
-                BackendType.HIPBLASLT.value if ctx.fuse_bgrad_accum else BackendType.FLYDSL.value
+            default_backend=_stage_backend(
+                ctx.config, BackendType.HIPBLASLT if ctx.fuse_bgrad_accum else BackendType.FLYDSL
             ),
             inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,

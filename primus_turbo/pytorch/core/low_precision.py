@@ -11,6 +11,7 @@ from typing import NamedTuple, Optional, Tuple
 import torch
 from torch._library.opaque_object import register_opaque_type
 
+from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 
 try:
@@ -203,16 +204,32 @@ def _quant_config_fx_repr(config) -> Tuple[str, dict]:
 
 @dataclass(unsafe_hash=True)  # hashable so it can be an opaque custom-op argument
 class Float8QuantConfig(metaclass=_OpaqueMeta):
+    """FP8 quantization settings.
+
+    ``default_backend`` (opt-in, ``None`` keeps each GEMM's built-in default): the backend
+    ``gemm_fp8`` tries first for every GEMM it runs, forward and backward, in place of the
+    one hard-coded per stage. It is a default, not a pin: a backend set with
+    ``set_gemm_backend()`` / ``PRIMUS_TURBO_GEMM_BACKEND`` or chosen by auto-tune still
+    takes precedence, and a shape the backend cannot run falls back to another one as any
+    default does (an error under ``PRIMUS_TURBO_STRICT_DISPATCH=1``). Only the dense FP8
+    GEMMs read it; ``grouped_gemm_fp8`` and ``grouped_mlp_fp8`` reject a config that sets it.
+    """
+
     format: Format = Format.E4M3
     granularity: ScalingGranularity = ScalingGranularity.TENSORWISE
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
     scale_dtype: ScaleDtype = ScaleDtype.FP32
     block_size: Optional[int] = None  # Default: not used for tensorwise/rowwise
+    default_backend: Optional[BackendType] = None
 
     def __fx_repr__(self) -> Tuple[str, dict]:
         return _quant_config_fx_repr(self)
 
     def __post_init__(self):
+        assert self.default_backend is None or isinstance(self.default_backend, BackendType), (
+            f"default_backend must be a BackendType or None, got {self.default_backend!r}"
+        )
+
         if self.granularity == ScalingGranularity.BLOCKWISE:
             assert self.block_size is not None, "block_size must be set when granularity is BLOCKWISE"
 

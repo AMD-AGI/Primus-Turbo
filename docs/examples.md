@@ -262,6 +262,10 @@ FP8 (including **MXFP8**) quantization is configured through `Float8QuantConfig`
   - Specifies the size of each block when using `BLOCKWISE` or `MX_BLOCKWISE` granularity.
   - This parameter must be explicitly specified in BLOCKWISE and MX_BLOCKWISE mode; otherwise, an error will be raised.
   - For `MX_BLOCKWISE`, only `block_size=32` is supported.
+- **default_backend** (optional, default `None`)
+  - The backend `gemm_fp8` tries first for its forward and backward GEMMs, e.g. `BackendType.FLYDSL` from `primus_turbo.pytorch.core.backend`. `None` keeps each GEMM's own default.
+  - A backend set with `set_gemm_backend()` / `PRIMUS_TURBO_GEMM_BACKEND`, or chosen by auto-tune, still takes precedence, and a shape the backend cannot run falls back to another backend.
+  - Dense GEMMs only: `grouped_gemm_fp8` and `grouped_mlp_fp8` reject a config that sets it.
 
 FP4 (i.e. **MXFP4**) quantization is configured through `Float4QuantConfig`:
 
