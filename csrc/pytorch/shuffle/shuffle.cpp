@@ -47,14 +47,15 @@ at::Tensor shuffle_scale_impl(const at::Tensor scale, at::IntArrayRef layout) {
     return shuffled_scale.view(at::kFloat8_e8m0fnu);
 }
 
-at::Tensor shuffle_weight_impl(const at::Tensor weight, at::IntArrayRef layout) {
+at::Tensor shuffle_weight_impl(const at::Tensor weight_in, at::IntArrayRef layout) {
     using namespace primus_turbo::detail;
 
-    PRIMUS_TURBO_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
-    PRIMUS_TURBO_CHECK(weight.scalar_type() == at::kFloat4_e2m1fn_x2,
+    PRIMUS_TURBO_CHECK(weight_in.is_cuda(), "Weight must be a CUDA tensor");
+    PRIMUS_TURBO_CHECK(weight_in.scalar_type() == at::kFloat4_e2m1fn_x2,
                        "Weight must be Float4_e2m1fn_x2.");
-    PRIMUS_TURBO_CHECK(weight.dim() == 2, "Weight must be 2D");
-    PRIMUS_TURBO_CHECK(weight.is_contiguous(), "Weight must be contiguous");
+    PRIMUS_TURBO_CHECK(weight_in.dim() == 2, "Weight must be 2D");
+    // The kernel takes no row pitch; the FlyDSL MXFP4 quant's row-wise data has one.
+    const at::Tensor weight = weight_in.contiguous();
 
     int64_t M = weight.size(0);
     int64_t N = weight.size(1);
