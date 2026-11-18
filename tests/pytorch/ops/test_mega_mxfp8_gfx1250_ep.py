@@ -32,10 +32,6 @@ if not is_gfx1250():
     pytest.skip("gfx1250 kernels", allow_module_level=True)
 
 from primus_turbo.pytorch.kernels.fused_mega_moe import advance_weight_generation  # noqa: E402
-from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import (  # noqa: E402
-    fused_mega_moe_fp8_stage1,
-    fused_mega_moe_fp8_stage2,
-)
 from tests.pytorch.ops.mega_gfx1250_ep_utils import (  # noqa: E402
     assert_rows_close_all_ranks,
     assert_snr_all_ranks,
@@ -47,7 +43,11 @@ from tests.pytorch.ops.test_mega_bf16_gfx1250_fused_moe import (  # noqa: E402
     _reference,
     _snr,
 )
-from tests.pytorch.ops.test_mega_mxfp8_gfx1250 import check_stages  # noqa: E402
+from tests.pytorch.ops.test_mega_mxfp8_gfx1250 import (  # noqa: E402
+    _op_forward,
+    _op_grads,
+    check_stages,
+)
 
 SWIGLU = GLUActivation.swiglu()
 
@@ -79,39 +79,15 @@ class FusedMegaMoEMXFP8Gfx1250EPTest(MultiProcContinuousTest):
         return x, topk_idx, topk_w, w1, w2, dy
 
     def _forward(self, x, topk_idx, topk_w, w1, w2, activation, fuse=False, delay_rank=None):
-        """The staged forward on fresh leaves: ``(y, leaves)``. Each call is a step of its own: the MX weight cache is
-        keyed by address, which fresh weight clones may reuse."""
+        """The EP1 suite's staged forward, ``(y, leaves)``, as a step of its own (the MX weight cache is keyed by
+        address, which fresh weight clones may reuse) and after holding ``delay_rank`` back."""
         advance_weight_generation()
-        leaves = [t.clone().requires_grad_() for t in (x, topk_w, w1, w2)]
-        pattern = "megatron" if fuse else None
-        if fuse:
-            for w in leaves[2:]:
-                w.main_grad = torch.zeros_like(w)
-                w.grad_added_to_main_grad = False
-        group = dist.group.WORLD
         late_rank(delay_rank)
-        l1, dw, handle, state = fused_mega_moe_fp8_stage1(
-            leaves[0], topk_idx, leaves[1], leaves[2], group, pattern, activation=activation
-        )
-        y = fused_mega_moe_fp8_stage2(
-            l1,
-            dw,
-            handle,
-            state,
-            topk_idx,
-            leaves[1],
-            leaves[3],
-            group,
-            activation,
-            fuse_wgrad_accum_pattern=pattern,
-        )
-        return y, leaves
+        return _op_forward(dist.group.WORLD, x, topk_idx, topk_w, w1, w2, activation, fuse)
 
     def _grads(self, y, leaves, dy, fuse=False, delay_rank=None):
         late_rank(delay_rank)
-        y.backward(dy)
-        wgrads = [w.main_grad if fuse else w.grad for w in leaves[2:]]
-        return [y.detach(), leaves[0].grad, leaves[1].grad] + wgrads
+        return _op_grads(y, leaves, dy, fuse)
 
     def _step(self, x, topk_idx, topk_w, w1, w2, dy, activation, fuse=False, delay_rank=None):
         """One staged forward + backward; ``(y, dx, d topk_w, dW1, dW2)`` (the wgrads from main_grad with ``fuse``)."""

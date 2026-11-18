@@ -206,69 +206,58 @@ def test_stages_vs_grouped_path_bitwise_ep1(ep1_group, T, H, I, E, topk, skew):
     check_stages(ep1_group, T, H, I, E, topk, T + H, skew)
 
 
-@pytest.mark.parametrize("fuse", [False, True])
-def test_staged_op_ep1(ep1_group, fuse):
-    """``fused_mega_moe_fp8_stage1/2`` on gfx1250 against the fp32 reference (the grouped MLP's 20 dB gate), and the
-    wgrads into a bf16 ``main_grad`` with ``fuse_wgrad_accum_pattern``."""
-    from primus_turbo.pytorch.kernels.fused_mega_moe import advance_weight_generation
+def _op_forward(group, x, topk_idx, topk_w, w1, w2, activation=SWIGLU, fuse=False):
+    """The staged MX op forward on fresh leaves: ``(y, leaves)``; with ``fuse`` the wgrads go into a zeroed bf16
+    ``main_grad`` (``fuse_wgrad_accum_pattern``). The EP2+ suite steps through this too."""
     from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import (
         fused_mega_moe_fp8_stage1,
         fused_mega_moe_fp8_stage2,
     )
 
-    T, H, I, E, topk = 1024, 7168, 2048, 32, 8
-    x, topk_idx, topk_w, w1, w2, dy = _inputs(T, H, I, E, topk, 11)
     leaves = [t.clone().requires_grad_() for t in (x, topk_w, w1, w2)]
     pattern = "megatron" if fuse else None
     if fuse:
         for w in leaves[2:]:
             w.main_grad = torch.zeros_like(w)
             w.grad_added_to_main_grad = False
-    advance_weight_generation()
-    l1, dw, handle, state = fused_mega_moe_fp8_stage1(
-        leaves[0], topk_idx, leaves[1], leaves[2], ep1_group, pattern
+    stage1 = fused_mega_moe_fp8_stage1(  # (l1, dispatch_weights, handle, state)
+        leaves[0], topk_idx, leaves[1], leaves[2], group, pattern, activation=activation
     )
     y = fused_mega_moe_fp8_stage2(
-        l1,
-        dw,
-        handle,
-        state,
-        topk_idx,
-        leaves[1],
-        leaves[3],
-        ep1_group,
-        SWIGLU,
-        fuse_wgrad_accum_pattern=pattern,
+        *stage1, topk_idx, leaves[1], leaves[3], group, activation, fuse_wgrad_accum_pattern=pattern
     )
+    return y, leaves
+
+
+def _op_grads(y, leaves, dy, fuse=False):
+    """The backward of ``_op_forward``: ``(y, dx, d topk_w, dW1, dW2)``, the wgrads from main_grad with ``fuse``."""
     y.backward(dy)
+    assert not fuse or all(w.grad_added_to_main_grad for w in leaves[2:])
+    wgrads = [w.main_grad if fuse else w.grad for w in leaves[2:]]
+    return [y.detach(), leaves[0].grad, leaves[1].grad] + wgrads
+
+
+def _op_step(group, x, topk_idx, topk_w, w1, w2, dy, activation=SWIGLU, fuse=False):
+    """Forward + backward as a training step of its own: the MX weight cache is keyed by address, which fresh
+    weight clones may reuse."""
+    from primus_turbo.pytorch.kernels.fused_mega_moe import advance_weight_generation
+
+    advance_weight_generation()
+    return _op_grads(*_op_forward(group, x, topk_idx, topk_w, w1, w2, activation, fuse), dy, fuse)
+
+
+@pytest.mark.parametrize("fuse", [False, True])
+def test_staged_op_ep1(ep1_group, fuse):
+    """``fused_mega_moe_fp8_stage1/2`` on gfx1250 against the fp32 reference (the grouped MLP's 20 dB gate), and the
+    wgrads into a bf16 ``main_grad`` with ``fuse_wgrad_accum_pattern``."""
+    x, topk_idx, topk_w, w1, w2, dy = _inputs(1024, 7168, 2048, 32, 8, 11)
+    got = _op_step(ep1_group, x, topk_idx, topk_w, w1, w2, dy, fuse=fuse)
     refs = [t.detach().float().requires_grad_() for t in (x, topk_w, w1, w2)]
     ref_y = _reference(refs[0], topk_idx, *refs[1:], SWIGLU)
     ref_y.backward(dy.float())
-    grads = [leaves[0].grad, leaves[1].grad] + [w.main_grad if fuse else w.grad for w in leaves[2:]]
-    snrs = {"y": _snr(y, ref_y.detach())}
-    snrs.update(
-        {name: _snr(got, want.grad) for name, got, want in zip(("dx", "d topk_w", "dW1", "dW2"), grads, refs)}
-    )
-    for name, snr in snrs.items():
-        assert snr > 20, f"{name} SNR {snr:.1f} dB"
-    if fuse:
-        assert all(w.grad_added_to_main_grad for w in leaves[2:])
-
-
-def _op_step(group, x, topk_idx, topk_w, w1, w2, dy, activation=SWIGLU):
-    """One staged MX op forward + backward on fresh leaves: ``(y, dx, d topk_w, dW1, dW2)``."""
-    from primus_turbo.pytorch.kernels.fused_mega_moe import advance_weight_generation
-    from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import (
-        fused_mega_moe_fp8_stage1,
-        fused_mega_moe_fp8_stage2,
-    )
-
-    advance_weight_generation()
-    leaves = [t.clone().requires_grad_() for t in (x, topk_w, w1, w2)]
-    l1, dw, handle, state = fused_mega_moe_fp8_stage1(leaves[0], topk_idx, leaves[1], leaves[2], group)
-    y = fused_mega_moe_fp8_stage2(l1, dw, handle, state, topk_idx, leaves[1], leaves[3], group, activation)
-    y.backward(dy)
-    return [y.detach()] + [t.grad for t in leaves]
+    want = [ref_y.detach()] + [t.grad for t in refs]
+    for name, g, w in zip(("y", "dx", "d topk_w", "dW1", "dW2"), got, want):
+        assert (snr := _snr(g, w)) > 20, f"{name} SNR {snr:.1f} dB"
 
 
 def test_repeat_bitwise_ep1(ep1_group):
@@ -288,31 +277,15 @@ def test_interleaved_layers_ep1(ep1_group):
     """Two layers on one heap, forward A, forward B, backward B, backward A (A's backward after B's prologue and
     dispatches): each layer bit for bit as it is alone."""
     from primus_turbo.pytorch.kernels.fused_mega_moe import advance_weight_generation
-    from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import (
-        fused_mega_moe_fp8_stage1,
-        fused_mega_moe_fp8_stage2,
-    )
 
     layers = [_inputs(512, 1024, 512, 8, 4, seed, skew=seed % 2 == 0) for seed in (31, 32)]
     alone = [_op_step(ep1_group, *inputs) for inputs in layers]
-    advance_weight_generation()
-    runs = []
-    for x, topk_idx, topk_w, w1, w2, _ in layers:
-        leaves = [t.clone().requires_grad_() for t in (x, topk_w, w1, w2)]
-        l1, dw, handle, state = fused_mega_moe_fp8_stage1(
-            leaves[0], topk_idx, leaves[1], leaves[2], ep1_group
-        )
-        y = fused_mega_moe_fp8_stage2(
-            l1, dw, handle, state, topk_idx, leaves[1], leaves[3], ep1_group, SWIGLU
-        )
-        runs.append((y, leaves))
-    for (y, _), (*_, dy) in zip(reversed(runs), reversed(layers)):
-        y.backward(dy)
-    for (y, leaves), want, layer in zip(runs, alone, "AB"):
-        for got, w, what in zip(
-            [y.detach()] + [t.grad for t in leaves], want, ("y", "dx", "d topk_w", "dW1", "dW2")
-        ):
-            _eq(got, w, f"layer {layer} {what}")
+    advance_weight_generation()  # one step: both layers' weights in one generation of the MX weight cache
+    runs = [_op_forward(ep1_group, *inputs[:5]) for inputs in layers]
+    got = [_op_grads(*run, inputs[5]) for run, inputs in zip(reversed(runs), reversed(layers))]  # B, then A
+    for outputs, want, layer in zip(reversed(got), alone, "AB"):
+        for g, w, what in zip(outputs, want, ("y", "dx", "d topk_w", "dW1", "dW2")):
+            _eq(g, w, f"layer {layer} {what}")
 
 
 def test_bf16_combine_after_combine_only_ep1(ep1_group):
@@ -334,6 +307,8 @@ def test_bf16_combine_after_combine_only_ep1(ep1_group):
     h = DispatchHandle(*h)
     P = h.pool_row_to_route.numel()
     pool = torch.randn(P, H, device="cuda").to(torch.bfloat16)
+    # NaN at the padding rows: the combine-only launch reads none of them
+    pool[h.pool_row_to_recv_token[:P].long() >= T] = float("nan")
     act = torch.randn(P, I, device="cuda").to(torch.bfloat16)
     expert = h.tile_to_expert.long().repeat_interleave(256)[:P]
     l2 = torch.zeros(P, H, dtype=torch.bfloat16, device="cuda")
