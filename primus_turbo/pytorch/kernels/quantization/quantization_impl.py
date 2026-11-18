@@ -38,6 +38,50 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
+def _gfx1250_mxfp8(
+    x: torch.Tensor, out_dtype: torch.dtype, row: ScalingRecipe, col: ScalingRecipe, blocks_ok: bool = True
+):
+    """``(the gfx1250 FlyDSL MXFP8 quantizer module, its layout bits)`` when the recipes ask for gfx1250's MX GEMM
+    layout, else None: the call takes its usual path.
+
+    On gfx1250 the shuffle flags of a recipe (``row``: the row copy's, ``col``: the column copy's) name the operand
+    layout of its MX GEMM, not HIP's CDNA4 ones. ``shuffle_scale``, which every operand has: packed scales
+    ``[.., ceil(R/32), C/128, 32, 4]``; ``shuffle_out``, the B operands: codes in 16x16 blocks
+    ``[R/16][C/16][16][16]`` (same shape); C is padded to a multiple of 128. Only the FlyDSL quantizer writes it,
+    from bf16 to E4M3 without SR / RHT and with block shapes it supports (``blocks_ok``): anything else raises."""
+    if not is_gfx1250() or not (row.shuffle_scale or row.shuffle_out or col.shuffle_scale or col.shuffle_out):
+        return None
+    if not (
+        x.dtype == torch.bfloat16
+        and out_dtype == torch.float8_e4m3fn
+        and blocks_ok
+        and row.shuffle_scale
+        and col.shuffle_scale
+        and not (row.use_sr or row.use_rht or col.use_sr or col.use_rht)
+    ):
+        raise NotImplementedError(
+            f"gfx1250 MXFP8: the MX GEMM layout (shuffle_scale on every copy, shuffle_out for B operands) is "
+            f"written from bf16 to E4M3 without SR / RHT, got {x.dtype} -> {out_dtype}, {row}, {col}"
+        )
+    from primus_turbo.flydsl.quantization import mxfp8_quant_gfx1250 as Q
+
+    return Q, Q.SHUF_ROW * row.shuffle_out | Q.SHUF_COL * col.shuffle_out
+
+
+def _gfx1250_unshuffle_mxfp8(x: torch.Tensor, scale_inv: torch.Tensor, recipe: Optional[ScalingRecipe]):
+    """Row-major codes and raw ``[.., R, C/32]`` scales of a tensor in gfx1250's MX GEMM layout (``recipe``: the one
+    it was quantized with, see ``_gfx1250_mxfp8``); others pass through. Dequantization runs on these."""
+    if recipe is None or not (is_gfx1250() and recipe.shuffle_scale):
+        return x, scale_inv
+    *lead, R, C = x.shape
+    if recipe.shuffle_out:
+        u = x.contiguous().view(torch.uint8).view(*lead, R // 16, C // 16, 16, 16).transpose(-3, -2)
+        x = u.reshape(*lead, R, C).view(x.dtype)
+    g, t = scale_inv.shape[-4:-2]
+    u = scale_inv.contiguous().view(torch.uint8).transpose(-3, -2).reshape(*lead, g * 32, t * 4)
+    return x, u[..., :R, :].contiguous().view(scale_inv.dtype)
+
+
 def quantize_fp8_tensorwise_pad_impl(
     x: torch.Tensor,
     out_dtype: torch.dtype,
@@ -538,6 +582,14 @@ def quantize_mxfp8_impl(
     else:
         assert axis is None, "The axis must be None when with_trans is True."
 
+    same_blocks = scaling_recipe.use_2d_block == scaling_recipe_for_trans.use_2d_block
+    q1250 = _gfx1250_mxfp8(x, out_dtype, scaling_recipe, scaling_recipe_for_trans, same_blocks)
+    if q1250 is not None:  # gfx1250's MX GEMM layout: one pass, K and M padded to 128 as HIP does
+        Q, lay = q1250
+        rows, cols = with_trans or axis == x.ndim - 1, with_trans or axis != x.ndim - 1
+        out = Q.quant_mxfp8(x, out_dtype, scaling_recipe.use_2d_block, rows, cols, lay)
+        return out if with_trans else out[:2] if rows else out[2:]
+
     if with_trans:
         # FlyDSL dual-cast quant (raw E8M0 bit-matching the HIP dual, and faster): a 3D
         # [B, M, K] input does all B experts in one launch, and ``use_2d_block`` (per 32x32
@@ -591,6 +643,9 @@ def grouped_quantize_mxfp8_impl(
     with_trans: bool = False,
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+    dest2src: Optional[torch.Tensor] = None,
+    permuted_probs: Optional[torch.Tensor] = None,
+    total_m: Optional[int] = None,
 ) -> Union[
     Tuple[
         torch.Tensor,
@@ -610,6 +665,12 @@ def grouped_quantize_mxfp8_impl(
     Each per-group region of ``x`` (defined by ``group_lens`` / ``group_offs``)
     is virtually zero-padded along M: rowwise to 32 and colwise to 128.  The
     padded per-group layouts are computed on GPU (no D2H sync).
+
+    ``dest2src`` (the routing/permute -> MXFP8 fusion seam, as in
+    :func:`grouped_quantize_mxfp4_impl`): ``x`` is then the pre-permutation source
+    and destination row ``d`` is ``x[dest2src[d]]`` (zero where ``permuted_probs`` is
+    exactly 0); needs ``with_trans`` and ``total_m``. gfx1250's MX GEMM layout (see
+    ``_gfx1250_mxfp8``) gathers inside the quantizer; otherwise the gather is materialized first.
     """
     mxfp8_support, reason = check_mxfp8_support()
     assert mxfp8_support, reason
@@ -617,6 +678,29 @@ def grouped_quantize_mxfp8_impl(
     assert block_size == MXFP8_BLOCK_SIZE, f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
 
     scaling_recipe = ScalingRecipe() if scaling_recipe is None else scaling_recipe
+
+    recipe_t = (scaling_recipe_for_trans or ScalingRecipe()) if with_trans else scaling_recipe
+    blocks_1d = not (scaling_recipe.use_2d_block or recipe_t.use_2d_block)
+    q1250 = _gfx1250_mxfp8(x, out_dtype, scaling_recipe, recipe_t, blocks_1d)
+    if q1250 is not None:
+        Q, lay = q1250
+        if dest2src is not None:
+            assert with_trans and total_m is not None, (
+                "a gathered quantization is the dual one, given total_m"
+            )
+            return Q.grouped_gather_quant_mxfp8(
+                x, dest2src, group_lens, group_offs, permuted_probs, out_dtype, total_m, lay
+            )
+        rows, cols = with_trans or axis == 1, with_trans or axis == 0
+        assert rows or cols, "The axis must be 0 or 1 when with_trans is False."
+        out = Q.grouped_quant_mxfp8(x, group_lens, group_offs, out_dtype, rows, cols, lay)
+        if with_trans:
+            return out
+        return (out[0], out[1], out[4], out[5]) if rows else (out[2], out[3], out[6], out[7])
+    if dest2src is not None:
+        assert total_m is not None, "a gathered quantization needs total_m"
+        probs = None if permuted_probs is None else permuted_probs[:total_m]
+        x = _materialize_gathered_activation(x, dest2src[:total_m], probs)
 
     if with_trans:
         scaling_recipe_for_trans = (
@@ -901,8 +985,14 @@ def grouped_quantize_mxfp4_impl(
 
 
 def dequantize_mxfp8_impl(
-    x: torch.Tensor, out_dtype: torch.dtype, axis: int, block_size: int, scale_inv: torch.Tensor
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    axis: int,
+    block_size: int,
+    scale_inv: torch.Tensor,
+    scaling_recipe: Optional[ScalingRecipe] = None,
 ) -> torch.Tensor:
+    x, scale_inv = _gfx1250_unshuffle_mxfp8(x, scale_inv, scaling_recipe)
     assert x.is_contiguous(), "The x tensor must be contiguous."
     assert x.dim() in (2, 3), "The x must be a 2D or 3D tensor."
     assert scale_inv.dim() == x.dim(), "The scale_inv rank must match x."
@@ -933,7 +1023,9 @@ def grouped_dequantize_mxfp8_impl(
     group_offs: torch.Tensor,
     group_offs_padded: torch.Tensor,
     total_M: Optional[int] = None,
+    scaling_recipe: Optional[ScalingRecipe] = None,
 ) -> torch.Tensor:
+    x, scale_inv = _gfx1250_unshuffle_mxfp8(x, scale_inv, scaling_recipe)
     assert x.is_contiguous(), "The x tensor must be contiguous."
     assert x.dim() == 2, "The x must be 2D tensor."
     assert scale_inv.dim() == 2, "The scale_inv must be 2D tensor."
