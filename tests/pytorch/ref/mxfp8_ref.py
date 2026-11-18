@@ -19,12 +19,6 @@ block is 0xFF, what gfx1250's scaled conversion makes of a NaN scale).
 Scale layout of the GEMM (aiter's mx32 layout): ``[ceil(R/32), ceil(K/128), 32, 4]`` uint8, where
 ``s4[g, t, r, j]`` scales row ``32 g + r`` over K block ``4 t + j`` (elements ``128 t + 32 j ..``).
 One int32 of it is the WMMA scale operand of one row for one 128-wide K step. Pad bytes are 0x00.
-
-MoE (``quant_grouped``): rows as ``quant_rows`` per expert padded to 32 rows, the column copy per expert
-padded to 128 tokens; pad rows and blocks without a token get scale ``PAD_SCALE`` (127). Fused producers:
-``glu_ref`` / ``dglu_ref`` (the grouped MLP's activation and its gradient, bf16 before quantization),
-``gather_rows`` (permute), ``quant_grouped_fp8`` (MegaMoE: gathered MX rows). B operands of the GEMM may be
-16x16-preshuffled (``preshuffle_b16``).
 """
 
 import torch

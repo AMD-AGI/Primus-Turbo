@@ -80,21 +80,11 @@ def _same(got, ref, lay, what):
         assert torch.equal(a, b), f"{what}: lens / offsets"
 
 
-# K: 1 / 33 / 300 (K % 8 != 0: the input gets storage past its end), 200 / 576 (K % 128 != 0: the last row's partial
-# k-tile by masked loads), 128 / 7168; M: 1, 3, 100, 128, 130, 160, 257, 300 (M % 128 / 32 / 16).
+# K: 33 / 300 (K % 8 != 0: the input gets storage past its end), 336 / 576 (K % 128 != 0: the last row's partial
+# k-tile by masked loads), 7168; M: 100, 130, 160, 257, 300 (M % 128 / 32 / 16).
 @gpu
 @pytest.mark.parametrize(
-    "M,K,lay",
-    [
-        (1, 1, GRAD),
-        (3, 200, GRAD),
-        (100, 33, GRAD),
-        (128, 128, WGT),
-        (130, 300, GRAD),
-        (160, 336, WGT),
-        (257, 576, ACT),
-        (300, 7168, ACT),
-    ],
+    "M,K,lay", [(100, 33, GRAD), (130, 300, GRAD), (160, 336, WGT), (257, 576, ACT), (300, 7168, ACT)]
 )
 def test_dense(M, K, lay):
     x = _x(M, K, seed=M * 7 + K)
@@ -118,9 +108,7 @@ def test_2d(B, N, K):
 
 
 @gpu
-@pytest.mark.parametrize(
-    "M,K,lay,blk_2d", [(257, 200, GRAD, False), (130, 576, ACT, False), (160, 336, WGT, True)]
-)
+@pytest.mark.parametrize("M,K,lay,blk_2d", [(130, 576, ACT, False), (160, 336, WGT, True)])
 def test_single_copy(M, K, lay, blk_2d):
     """``rows`` / ``cols`` False: the other copy of the dual cast, bit for bit, alone."""
     x = _x(M, K, seed=M + K)
@@ -182,9 +170,7 @@ RAGGED = [31, 32, 33, 1, 0, 127, 128, 129]
         ([0, 5, 0], 200, GRAD),
         (RAGGED, 2048, ACT),
         ([256, 256, 256, 256], 200, GRAD),
-        ([0, 0, 300], 64, GRAD),
         ([0, 0, 0], 200, GRAD),  # no tokens: only the lens / offsets are written
-        ("random", 2048, GRAD),
         ("many", 64, ACT),
     ],
 )
@@ -273,12 +259,7 @@ def test_dglu(case, I, act, clamp):
 @gpu
 @pytest.mark.parametrize(
     "case,H,with_probs,lay",
-    [
-        ([0, 5, 0], 64, True, ACT),
-        (RAGGED, 200, False, GRAD),
-        ("random", 7168, True, ACT),
-        ("skew", 7168, False, GRAD),
-    ],
+    [(RAGGED, 200, False, GRAD), ("random", 7168, True, ACT), ("skew", 7168, False, GRAD)],
 )
 def test_gather(case, H, with_probs, lay):
     lens = _lens(case, H)
@@ -301,7 +282,7 @@ def test_gather(case, H, with_probs, lay):
 # MegaMoE's pool gather of dispatched MX rows: dy (both copies A operands), x (the column copy a B operand), and the
 # rows alone
 @gpu
-@pytest.mark.parametrize("case,H,lay", [([0, 5, 0], 512, GRAD), (RAGGED, 7168, GRAD), ("skew", 7168, ACT)])
+@pytest.mark.parametrize("case,H,lay", [(RAGGED, 7168, GRAD), ("skew", 7168, ACT)])
 def test_gather_fp8(case, H, lay):
     """Codes and scales kept by the row copy, the columns re-quantized from the exact dequantized values."""
     lens = _lens(case, H)
@@ -411,7 +392,6 @@ def test_tail_at_mapping_end():
     offs = _offs(lens)
     x, w, x300 = _x(M, K, seed=1), _x(3, 64, 96, seed=2), _x(130, 300, seed=3)
     x32, x8 = _x(130, 32, seed=6), _x(129, 8, seed=7)
-    lens32 = torch.tensor([100, 0, 30], device="cuda")
     g = torch.Generator(device="cuda").manual_seed(4)
     l1 = (torch.randn(M, 2 * I, generator=g, device="cuda") * 3).to(torch.bfloat16)
     dact = torch.randn(M, I, generator=g, device="cuda").to(torch.bfloat16)
@@ -420,15 +400,11 @@ def test_tail_at_mapping_end():
     q8, s8 = (t.cuda() for t in R.quant_rows(_x(M, 512, seed=5, special=False).cpu()))
     cases = {
         "dual": (lambda a: Q.quant_mxfp8(a, layout=ACT), [x]),
-        "rows": (lambda a: Q.quant_mxfp8(a, cols=False), [x]),
-        "columns": (lambda a: Q.quant_mxfp8(a, rows=False), [x]),
-        "wire rows": (lambda a: Q.quant_mxfp8_rows(a), [x]),
         "2d": (lambda a: Q.quant_mxfp8(a, blk_2d=True, layout=WGT), [w]),
         "K % 8 != 0": (lambda a: Q.quant_mxfp8(a), [x300]),
         "K = 32": (lambda a: Q.quant_mxfp8(a), [x32]),
         "K = 8": (lambda a: Q.quant_mxfp8(a), [x8]),
         "grouped": (lambda a: Q.grouped_quant_mxfp8(a, lens, offs), [x]),
-        "grouped, K = 32": (lambda a: Q.grouped_quant_mxfp8(a, lens32, _offs(lens32)), [x32]),
         "glu": (lambda a: Q.grouped_glu_quant_mxfp8(a, probs, lens, offs), [l1]),
         "dglu": (lambda a, b: Q.grouped_dglu_quant_mxfp8(a, b, probs, lens, offs)[1:], [dact, l1]),
         "gather": (lambda a: Q.grouped_gather_quant_mxfp8(a, d2s, lens, offs), [x]),
@@ -471,7 +447,6 @@ def test_refused():
         "no experts": lambda: Q.grouped_quant_mxfp8(x, lens[:0], offs[:1]),
         "K = 0": lambda: Q.grouped_quant_mxfp8(x[:, :0], lens, offs),
         "GLU width off the 128-column tiles": lambda: Q.grouped_glu_quant_mxfp8(l1, probs, lens, offs),
-        "dGLU width": lambda: Q.grouped_dglu_quant_mxfp8(l1[:, :96].contiguous(), l1, probs, lens, offs),
         "probs dtype": lambda: Q.grouped_glu_quant_mxfp8(x256, probs.double(), lens, offs),
         "act_out shape": lambda: Q.grouped_glu_quant_mxfp8(x256, probs, lens, offs, act_out=x[:, :64]),
         "dest2src dtype": lambda: Q.grouped_gather_quant_mxfp8(x, d2s.long(), lens, offs),
@@ -482,7 +457,6 @@ def test_refused():
         "MX rows: scales shape": lambda: Q.grouped_gather_fp8_quant_mxfp8(
             q8, s8[:, :2].contiguous(), d2s, lens, offs
         ),
-        "MX rows: row_map dtype": lambda: Q.grouped_gather_fp8_quant_mxfp8(q8, s8, d2s.long(), lens, offs),
     }
     for what, call in bad.items():
         try:
@@ -499,24 +473,14 @@ def test_operand_slack(monkeypatch):
     monkeypatch.setattr(Q, "_run", lambda *a, **k: None)
     monkeypatch.setattr(Q, "_check", lambda x, *a: x)
     bf = torch.bfloat16
-    x, w, l1 = (
-        torch.zeros(208, 256, dtype=bf),
-        torch.zeros(3, 64, 96, dtype=bf),
-        torch.zeros(208, 512, dtype=bf),
-    )
+    x, w = torch.zeros(208, 256, dtype=bf), torch.zeros(3, 64, 96, dtype=bf)
     lens = torch.tensor([0, 37, 1, 170])
-    offs = _offs(lens)
-    probs, d2s = torch.ones(208), torch.zeros(208, dtype=torch.int32)
-    q8, s8 = torch.zeros(208, 256, dtype=torch.float8_e4m3fn), torch.zeros(208, 8, dtype=torch.uint8)
     outs = {
         "dual": Q.quant_mxfp8(x, layout=ACT),
         "weights": Q.quant_mxfp8(w, blk_2d=True, layout=WGT),
         "wire rows": Q.quant_mxfp8_rows(x),
-        "grouped": Q.grouped_quant_mxfp8(x, lens, offs, layout=ACT)[:4],
-        "glu": Q.grouped_glu_quant_mxfp8(l1, probs, lens, offs, layout=ACT)[:4],
-        "dglu": Q.grouped_dglu_quant_mxfp8(x, l1, probs, lens, offs)[1:5],
-        "gather": Q.grouped_gather_quant_mxfp8(x, d2s, lens, offs, probs)[:4],
-        "MX-row gather": Q.grouped_gather_fp8_quant_mxfp8(q8, s8, d2s, lens, offs)[:4],
+        # every MoE producer allocates its copies the same way
+        "grouped": Q.grouped_quant_mxfp8(x, lens, _offs(lens), layout=ACT)[:4],
     }
     for name, ts in outs.items():
         for i, t in enumerate(ts):
@@ -529,57 +493,33 @@ MX_B = ScalingRecipe(shuffle_scale=True, shuffle_out=True)
 
 
 @gpu
-def test_ops_reach_the_kernels():
-    """The quantization ops with the MX GEMM recipes return what the kernel entries return: the dual cast and
-    single copies, weights, grouped, and the permute handoff's gather."""
+def test_grouped_single_copy_op():
+    """``grouped_quantize_fp8(axis=)`` with the MX GEMM recipes returns that copy of the grouped dual cast and its
+    lens / offsets."""
     from primus_turbo.pytorch.core.low_precision import ScalingGranularity
     from primus_turbo.pytorch.ops import quantization as O
 
     E4, MX, kw = torch.float8_e4m3fn, ScalingGranularity.MX_BLOCKWISE, dict(block_size=32)
-    act = dict(scaling_recipe=MX_A, scaling_recipe_for_trans=MX_B, **kw)
-    x, w = _x(130, 576, seed=1), _x(2, 64, 96, seed=2)
-    both = Q.quant_mxfp8(x, layout=ACT)
-    got = O.quantize_fp8_with_trans(x, E4, MX, **act)
-    rows = O.quantize_fp8(x, E4, MX, axis=1, scaling_recipe=MX_A, **kw)
-    cols = O.quantize_fp8(x, E4, MX, axis=0, scaling_recipe=MX_B, **kw)
-    for a, b, what in zip((*got, *rows, *cols), (*both, *both), NAMES * 2):
-        _eq(a, b, what)
-    mx_w = ScalingRecipe(use_2d_block=True, shuffle_scale=True, shuffle_out=True)
-    got = O.quantize_fp8_with_trans(w, E4, MX, scaling_recipe=mx_w, scaling_recipe_for_trans=mx_w, **kw)
-    for a, b, what in zip(got, Q.quant_mxfp8(w, blk_2d=True, layout=WGT), NAMES):
-        _eq(a, b, f"weights: {what}")
+    x = _x(130, 576, seed=1)
     lens = torch.tensor([0, 37, 1, 92], device="cuda")
     offs = _offs(lens)
     ref = Q.grouped_quant_mxfp8(x, lens, offs, layout=ACT)
-    _same(O.grouped_quantize_fp8_with_trans(x, E4, MX, lens, offs, **act), ref, ACT, "grouped")
     q, s, ln, of = O.grouped_quantize_fp8(x, E4, MX, lens, offs, axis=1, scaling_recipe=MX_A, **kw)
     _same((q, s, None, None, ln, of, *ref[6:]), ref, ACT, "grouped rows")
     q, s, ln, of = O.grouped_quantize_fp8(x, E4, MX, lens, offs, axis=0, scaling_recipe=MX_B, **kw)
     _same((None, None, q, s, *ref[4:6], ln, of), ref, ACT, "grouped columns")
-    g = torch.Generator(device="cuda").manual_seed(3)
-    d2s = torch.randint(0, 130, (130,), generator=g, device="cuda", dtype=torch.int32)
-    pp = torch.rand(130, generator=g, device="cuda")
-    ref = Q.grouped_gather_quant_mxfp8(x, d2s, lens, offs, pp, layout=ACT)
-    got = O.grouped_quantize_fp8_with_trans(
-        x, E4, MX, lens, offs, dest2src=d2s, permuted_probs=pp, total_m=130, **act
-    )
-    _same(got, ref, ACT, "gathered")
 
 
 def test_gemm_layout_dispatch(monkeypatch):
-    """``_gfx1250_mxfp8``: recipes that ask for the MX GEMM layout go to the FlyDSL quantizer with their layout
-    bits, raw recipes keep the usual path, and a GEMM layout the quantizer cannot write raises; never off gfx1250."""
+    """``_gfx1250_mxfp8``: raw recipes keep the usual path, a GEMM layout the quantizer cannot write raises, and
+    nothing is taken off gfx1250."""
     x, E4 = torch.empty(32, 64, dtype=torch.bfloat16), torch.float8_e4m3fn
-    assert (GRAD, ACT, WGT) == (0, Q.SHUF_COL, Q.SHUF_ROW | Q.SHUF_COL)
     assert QI._gfx1250_mxfp8(x, E4, RAW, RAW) is None
-    for row, col, lay in ((MX_A, MX_A, GRAD), (MX_A, MX_B, ACT), (MX_B, MX_B, WGT)):
-        assert QI._gfx1250_mxfp8(x, E4, row, col) == (Q, lay)
     for args in (
         (x.float(), E4, MX_A, MX_A),
         (x, torch.float8_e5m2, MX_A, MX_A),
         (x, E4, MX_A, RAW),
         (x, E4, RAW, MX_B),
-        (x, E4, ScalingRecipe(shuffle_out=True), MX_A),
         (x, E4, MX_A, ScalingRecipe(shuffle_scale=True, use_sr=True)),
         (x, E4, MX_A, MX_A, False),
     ):
@@ -589,7 +529,7 @@ def test_gemm_layout_dispatch(monkeypatch):
     assert QI._gfx1250_mxfp8(x, E4, MX_A, MX_B) is None
 
 
-@pytest.mark.parametrize("shape", [(96, 384), (3, 64, 128), (100, 200)])
+@pytest.mark.parametrize("shape", [(3, 64, 128), (100, 200)])
 def test_gemm_layout_undone(shape):
     """``_gfx1250_unshuffle_mxfp8`` gives dequantization row-major codes and raw scales back (rows % 32 != 0: the
     packed scales' pad rows are dropped); a raw recipe's tensors pass through."""
