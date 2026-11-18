@@ -82,6 +82,9 @@ class A2AGemmTuning:
         wgrad_split: row ranges of M the wgrad tiles run in, each part after that range's GEMM tiles
             and handing its fp32 accumulators to the next, bitwise equal to one pass (backward QKV
             only; 2 when the wgrad tiles go last in at most 3x CU tiles, else 1).
+        wgrad_local: push every m-tile's own rows first and claim the own source's wgrad tiles
+            before the GEMM tiles, the others' after them (backward QKV only; when the wgrad tiles go
+            last in one part and the GEMM tiles take at most 4 CU waves).
     """
 
     BM: Optional[int] = None
@@ -89,6 +92,7 @@ class A2AGemmTuning:
     push_split: Optional[int] = None
     wgrad_at: Optional[int] = None
     wgrad_split: Optional[int] = None
+    wgrad_local: Optional[bool] = None
 
 
 def _launch_kwargs(tuning, **defaults):
