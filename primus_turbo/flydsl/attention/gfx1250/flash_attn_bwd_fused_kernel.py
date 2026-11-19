@@ -19,7 +19,8 @@ one (batch, kv head) and does all 5 GEMMs: wave w keeps the K/V fragments of its
 resident, and dQ[32q][32d slice of wave w] = dS[32q][128kv] . K[128kv][32d] is added into an fp32
 workspace with device-scope atomics, so dQ is not bitwise reproducible run to run (dK/dV are).
 interface.flash_attn_bwd takes this path only when the caller does not ask for a deterministic
-backward.
+backward, at head dim 128 (HEAD_DIM) and without a sliding window: at head dim 64 the two-kernel
+backward runs two waves per SIMD and is the faster one, and it is the one that takes a window.
 
 Per step s (one 32-query pair x one q head of the GQA group; descending pairs, heads inner):
   (C) S^T / dP^T: 32 WMMAs on the step's Q/dO B operands, read back from LDS ring slot s % 4
@@ -57,22 +58,20 @@ from flydsl.expr.rocdl import tdm_ops
 
 from .flash_attn_bwd_kernel import (
     BLOCK_KV,
-    DV8,
-    NDO,
-    NDT,
     NEG,
     NKV,
-    NST,
     S_ROW_B,
-    X_ROW_B,
-    D,
     _bv,
     _exp2,
     _ldv,
     _st1,
     _stv,
+    dims,
 )
 from .flash_attn_utils import LOG2E, WAVE_SIZE, create_llvm_ptr
+
+HEAD_DIM = 128  # the one head dim these kernels are built for
+D, DV8, NDT, NDO, NST, X_ROW_B = dims(HEAD_DIM)
 
 _ir = fx.as_ir_value
 

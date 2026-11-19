@@ -127,8 +127,9 @@ def _unresolved_adapter(monkeypatch, import_interface, record_log=True):
         (1, 256, 256, 64, 64),
         (1, 256, 256, 64, 4),
         (1, 131072, 131072, 32, 8),
+        (1, 4096, 4096, 128, 16, 64),
     ],
-    ids=["llama3.1-8b", "smallest", "sq_lt_skv", "mha", "gqa16", "q_1gib"],
+    ids=["llama3.1-8b", "smallest", "sq_lt_skv", "mha", "gqa16", "q_1gib", "muse_spark_d64"],
 )
 @pytest.mark.parametrize("causal", [True, False])
 def test_gate_accepts(monkeypatch, shape, causal):
@@ -144,11 +145,23 @@ def test_gate_accepts_causal_spelled_as_a_window(monkeypatch):
 
 @needs_flydsl
 @pytest.mark.parametrize(
+    "window_size",
+    [(0, 0), (128, -1)],
+    ids=["self_only", "right_unbounded_under_causal"],
+)
+def test_gate_accepts_a_causal_sliding_window(monkeypatch, window_size):
+    """window_size (left, 0); causal makes a right bound of -1 a 0, as in flash-attn."""
+    q, k, v = _meta(1, 4096, 4096, 128, 16, 64)
+    assert _gate(monkeypatch, q, k, v, window_size=window_size) is True
+
+
+@needs_flydsl
+@pytest.mark.parametrize(
     ("shape", "kwargs"),
     [
         ((1, 256, 256, 4, 2, 128, torch.float16), {}),
         ((0, 256, 256, 4, 2), {}),
-        ((1, 256, 256, 4, 2, 64), {}),
+        ((1, 256, 256, 4, 2, 96), {}),
         ((1, 256, 256, 4, 2, 256), {}),
         ((1, 256, 256, 6, 4), {}),
         ((1, 256, 256, 28, 4), {}),
@@ -158,11 +171,13 @@ def test_gate_accepts_causal_spelled_as_a_window(monkeypatch):
         ((1, 512, 256, 4, 2), {}),
         ((2, 131072, 131072, 32, 8), {}),
         ((1, 64, 1048576, 8, 8), {}),
+        ((1, 64, 2097152, 4, 1, 64), {}),
         ((1, 256, 256, 4, 2), {"dropout_p": 0.1}),
         ((1, 256, 256, 4, 2), {"bias": torch.empty(1)}),
         ((1, 256, 256, 4, 2), {"alibi_slopes": torch.empty(4)}),
         ((1, 256, 256, 4, 2), {"sink": torch.empty(4)}),
-        ((1, 256, 256, 4, 2), {"window_size": (128, 0)}),
+        ((1, 256, 256, 4, 2), {"window_size": (128, 64)}),
+        ((1, 256, 256, 4, 2), {"window_size": (128, -1), "causal": False}),
         ((1, 256, 256, 4, 2), {"window_size": (-1, 0), "causal": False}),
         ((1, 256, 256, 4, 2), {"return_softmax": True}),
         ((1, 256, 256, 4, 2), {"softmax_scale": True}),
@@ -170,7 +185,7 @@ def test_gate_accepts_causal_spelled_as_a_window(monkeypatch):
     ids=[
         "fp16",
         "empty_batch",
-        "d64",
+        "d96",
         "d256",
         "hq_not_multiple_of_hkv",
         "gqa_7",
@@ -180,11 +195,13 @@ def test_gate_accepts_causal_spelled_as_a_window(monkeypatch):
         "causal_sq_gt_skv",
         "q_over_1gib",
         "k_over_1gib",
+        "launch_grid_over_16_bits",
         "dropout",
         "bias",
         "alibi",
         "sink",
-        "sliding_window",
+        "window_on_the_right",
+        "sliding_window_without_causal",
         "window_without_causal",
         "return_softmax",
         "bool_scale",
@@ -215,15 +232,21 @@ def test_gfx950_kernels_are_not_offered_to_other_archs(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _resolve_kwargs(q, k, v, causal=True):
-    return dict(q=q, k=k, v=v, causal=causal, window_size=(-1, -1), qkv_format="bshd", needs_backward=True)
+def _resolve_kwargs(q, k, v, causal=True, window_size=(-1, -1)):
+    return dict(q=q, k=k, v=v, causal=causal, window_size=window_size, qkv_format="bshd", needs_backward=True)
 
 
 @needs_flydsl
-def test_unpinned_gfx1250_call_resolves_to_flydsl(monkeypatch):
+@pytest.mark.parametrize(
+    ("shape", "window_size"),
+    [((4, 8192, 8192, 32, 8), (-1, -1)), ((1, 4096, 4096, 128, 16, 64), (2047, 0))],
+    ids=["llama3.1-8b", "muse_spark_sliding"],
+)
+def test_unpinned_gfx1250_call_resolves_to_flydsl(monkeypatch, shape, window_size):
     monkeypatch.setattr(attention_impl, "is_gfx1250", lambda: True)
-    q, k, v = _meta(4, 8192, 8192, 32, 8)
-    assert resolve_flash_attn_backend(False, None, **_resolve_kwargs(q, k, v)) == BackendType.FLYDSL
+    q, k, v = _meta(*shape)
+    kwargs = _resolve_kwargs(q, k, v, window_size=window_size)
+    assert resolve_flash_attn_backend(False, None, **kwargs) == BackendType.FLYDSL
 
 
 @needs_flydsl
@@ -254,20 +277,26 @@ def test_dense_dispatcher_key_tells_apart_what_decides_eligibility():
 
 
 @needs_flydsl
-def test_forward_and_backward_route_to_the_gfx1250_kernels(monkeypatch):
+@pytest.mark.parametrize(
+    ("window_size", "window_left"),
+    [((-1, -1), -1), ((100, 0), 100), ((100, -1), 100)],
+    ids=["causal", "sliding", "sliding_right_unbounded"],
+)
+def test_forward_and_backward_route_to_the_gfx1250_kernels(monkeypatch, window_size, window_left):
     """FlashAttnFunc on "gfx1250": the gfx1250 impls are called with contiguous BSHD tensors
-    and lse [B, Hq, Sq], and the gfx950 sbhd impls are never reached."""
+    and lse [B, Hq, Sq], the backward with the forward's window, and the gfx950 sbhd impls are
+    never reached."""
     monkeypatch.setattr(attention_impl, "is_gfx1250", lambda: True)
     monkeypatch.setattr(flash_attn_interface, "is_gfx1250", lambda: True)
     b, sq, skv, hq, hkv = 2, 128, 256, 4, 2
     calls = []
 
-    def fwd(q, k, v, softmax_scale=None, causal=True):
-        calls.append(("fwd", q.is_contiguous(), k.is_contiguous(), softmax_scale, causal))
+    def fwd(q, k, v, softmax_scale=None, causal=True, window_left=-1):
+        calls.append(("fwd", q.is_contiguous(), k.is_contiguous(), softmax_scale, causal, window_left))
         return torch.zeros_like(q), torch.zeros(b, hq, sq)
 
-    def bwd(dout, q, k, v, out, lse, softmax_scale=None, causal=True, deterministic=False):
-        calls.append(("bwd", tuple(lse.shape), tuple(out.shape), deterministic))
+    def bwd(dout, q, k, v, out, lse, softmax_scale=None, causal=True, deterministic=False, window_left=-1):
+        calls.append(("bwd", tuple(lse.shape), tuple(out.shape), deterministic, window_left))
         return torch.ones_like(q), torch.ones_like(k), torch.ones_like(v)
 
     def forbidden(*args, **kwargs):
@@ -284,13 +313,14 @@ def test_forward_and_backward_route_to_the_gfx1250_kernels(monkeypatch):
     v = torch.randn(skv, b, hkv, D, dtype=torch.bfloat16).permute(1, 0, 2, 3).requires_grad_()
     GlobalBackendManager.set_attn_backend(BackendType.FLYDSL, PrecisionType.BF16_FP16_FP32)
     try:
-        out = flash_attn_func(q, k, v, causal=True)
+        out = flash_attn_func(q, k, v, causal=True, window_size=window_size)
         out.sum().backward()
     finally:
         GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
 
-    assert calls[0] == ("fwd", True, True, None, True)
-    assert calls[1] == ("bwd", (b, hq, sq), (b, sq, hq, D), False)  # flash_attn_func's default
+    assert calls[0] == ("fwd", True, True, None, True, window_left)
+    # deterministic=False is flash_attn_func's default
+    assert calls[1] == ("bwd", (b, hq, sq), (b, sq, hq, D), False, window_left)
     assert k.grad.shape == (b, skv, hkv, D) and torch.all(k.grad == 1)
 
 
@@ -586,7 +616,7 @@ def test_kernel_modules_import():
 
     for m in ("flash_attn_fwd_kernel", "flash_attn_bwd_kernel"):
         assert f"{_PKG}.{m}" in sys.modules
-    assert interface.HEAD_DIM == D
+    assert interface.HEAD_DIMS == (64, 128)
     assert (interface.SEQLEN_Q_MULTIPLE, interface.SEQLEN_KV_MULTIPLE) == (64, 32)
 
 
@@ -848,29 +878,32 @@ def test_backward_kernels_and_streams(monkeypatch, shape, dkdv_chain, dq_chain):
 # ---------------------------------------------------------------------------
 
 
-def _inputs(b, sq, skv, hq, hkv, layout="bshd", seed=0):
+def _inputs(b, sq, skv, hq, hkv, d=D, layout="bshd", seed=0):
     """[b, s, h, d]-shaped bf16 tensors whose bytes are in ``layout`` order."""
     g = torch.Generator(device="cpu").manual_seed(seed)
 
     def make(s, h):
         if layout == "bshd":
-            t = torch.randn(b, s, h, D, generator=g)
+            t = torch.randn(b, s, h, d, generator=g)
         elif layout == "sbhd":
-            t = torch.randn(s, b, h, D, generator=g).permute(1, 0, 2, 3)
+            t = torch.randn(s, b, h, d, generator=g).permute(1, 0, 2, 3)
         else:  # bhsd
-            t = torch.randn(b, h, s, D, generator=g).transpose(1, 2)
+            t = torch.randn(b, h, s, d, generator=g).transpose(1, 2)
         return t.to(torch.bfloat16)
 
     return make(sq, hq), make(skv, hkv), make(skv, hkv), make(sq, hq)
 
 
-def _reference(q, k, v, dout, causal):
-    """fp32 attention and its gradients on the CPU; bottom-right causal; returns lse too."""
+def _reference(q, k, v, dout, causal, window_left=-1):
+    """fp32 attention and its gradients on the CPU; bottom-right causal, with a sliding window of
+    ``window_left`` keys left of the diagonal when >= 0; returns lse too."""
     q, k, v = (t.detach().float().requires_grad_() for t in (q, k, v))
     sq, skv, g = q.shape[1], k.shape[1], q.shape[2] // k.shape[2]
-    s = torch.einsum("bqhd,bkhd->bhqk", q, k.repeat_interleave(g, 2)) / math.sqrt(D)
+    s = torch.einsum("bqhd,bkhd->bhqk", q, k.repeat_interleave(g, 2)) / math.sqrt(q.shape[-1])
     if causal:
         mask = torch.ones(sq, skv, dtype=torch.bool).triu(skv - sq + 1)
+        if window_left >= 0:
+            mask |= torch.ones(sq, skv, dtype=torch.bool).tril(skv - sq - window_left - 1)
         s = s.masked_fill(mask, float("-inf"))
     lse = torch.logsumexp(s, -1)
     out = torch.einsum("bhqk,bkhd->bqhd", s.softmax(-1), v.repeat_interleave(g, 2))
@@ -907,25 +940,40 @@ def _check(got, ref, min_db=40.0):
 
 @needs_flydsl
 @pytest.mark.parametrize(
-    ("shape", "causal", "deterministic", "chain"),
+    ("shape", "causal", "deterministic", "window_left", "chain"),
     [
-        ((4, 8192, 8192, 32, 8), True, False, ["delta", "dkdv_fused", "dq_cvt"]),
-        ((1, 1024, 1024, 8, 2), True, False, ["delta", "dkdv_fused_sp", "redsp", "dq_cvt"]),
-        ((1, 512, 4096, 16, 16), True, False, ["delta", "dkdv_fused", "dq_cvt"]),
-        ((4, 8192, 8192, 32, 8), False, False, None),
-        ((1, 1024, 1088, 8, 2), True, False, None),
-        ((4, 8192, 8192, 32, 8), True, True, None),
+        ((4, 8192, 8192, 32, 8), True, False, -1, ["delta", "dkdv_fused", "dq_cvt"]),
+        ((1, 1024, 1024, 8, 2), True, False, -1, ["delta", "dkdv_fused_sp", "redsp", "dq_cvt"]),
+        ((1, 512, 4096, 16, 16), True, False, -1, ["delta", "dkdv_fused", "dq_cvt"]),
+        ((4, 8192, 8192, 32, 8), False, False, -1, None),
+        ((1, 1024, 1088, 8, 2), True, False, -1, None),
+        ((4, 8192, 8192, 32, 8), True, True, -1, None),
+        ((1, 4096, 4096, 128, 16, 64), True, False, -1, None),
+        ((4, 8192, 8192, 32, 8), True, False, 2047, None),
+        ((4, 8192, 8192, 32, 8), True, False, 8191, ["delta", "dkdv_fused", "dq_cvt"]),
     ],
-    ids=["llama3.1-8b", "small_grid", "sq_lt_skv", "non_causal", "skv_not_x128", "deterministic"],
+    ids=[
+        "llama3.1-8b",
+        "small_grid",
+        "sq_lt_skv",
+        "non_causal",
+        "skv_not_x128",
+        "deterministic",
+        "head_dim_64",
+        "sliding_window",
+        "window_covering_every_key",
+    ],
 )
-def test_fused_backward_launch_plan(monkeypatch, shape, causal, deterministic, chain):
-    """Which calls take the fused backward (dQ inside the dK/dV kernel, fp32 dQ atomics): causal,
-    Skv a multiple of 128 (Sq is always one of 64 here) and not deterministic. Its launches all go to the caller's
-    stream, in order; chain None means the two-kernel path (it forks a side stream)."""
+def test_fused_backward_launch_plan(monkeypatch, shape, causal, deterministic, window_left, chain):
+    """Which calls take the fused backward (dQ inside the dK/dV kernel, fp32 dQ atomics): causal, head dim 128,
+    no sliding window (one that covers every key is none), Skv a multiple of 128 (Sq is always one of 64 here) and
+    not deterministic. Its launches all go to the caller's stream, in order; chain None means the two-kernel path
+    (it forks a side stream), whose launchers get the head dim and the window mode as fx.Constexpr arguments."""
+    from primus_turbo.flydsl.attention.gfx1250 import flash_attn_utils as utils
     from primus_turbo.flydsl.attention.gfx1250 import interface
 
-    b, sq, skv, hq, hkv = shape
-    q, k, v = _meta(b, sq, skv, hq, hkv)
+    q, k, v = _meta(*shape)
+    b, sq, hq, d = q.shape
     lse = torch.empty(b, hq, sq, device="meta")
     launches = []
 
@@ -941,13 +989,29 @@ def test_fused_backward_launch_plan(monkeypatch, shape, causal, deterministic, c
     monkeypatch.setattr(torch.cuda, "Stream", lambda device=None: FakeStream("side"))
     monkeypatch.setattr(interface, "_SIDE_STREAMS", {})
     monkeypatch.setattr(
-        interface, "_launch", lambda name, launcher, args: launches.append((name, args[-1].name))
+        interface, "_launch", lambda name, launcher, args: launches.append((name, launcher, args))
     )
-    dq, dk, dv = interface.flash_attn_bwd(q, q, k, v, q, lse, causal=causal, deterministic=deterministic)
+    dq, dk, dv = interface.flash_attn_bwd(
+        q, q, k, v, q, lse, causal=causal, deterministic=deterministic, window_left=window_left
+    )
     if chain is None:
-        assert not any(name in ("dkdv_fused", "dkdv_fused_sp", "dq_cvt") for name, _ in launches)
+        assert not {"dkdv_fused", "dkdv_fused_sp", "dq_cvt"} & {name for name, _, _ in launches}
+        # the dK/dV and the dQ launch end in (wl, head dim, window mode, stream)
+        tail = (max(window_left, 0), d, int(window_left >= 0))
+        kernels = [(exe, args) for name, exe, args in launches if name in ("dkdv", "dkdv_sp", "dqg", "dq_sp")]
+        assert len(kernels) == 2
+        for exe, args in kernels:
+            assert args[-4:-1] == tail and utils._constexpr_values(exe, args) == tail[1:]
     else:
-        assert launches == [(name, "caller") for name in chain]
+        assert [(name, args[-1].name) for name, _, args in launches] == [(name, "caller") for name in chain]
+    # the forward gets the same effective window: none for one that covers every key
+    seen = {}
+    monkeypatch.setattr(interface, "_num_cu", lambda device: 256)
+    monkeypatch.setattr(
+        interface._fwd, "flash_attn_fwd", lambda q, k, v, tiling, **kwargs: seen.update(kwargs)
+    )
+    interface.flash_attn_fwd(q, k, v, causal=causal, window_left=window_left)
+    assert seen["window_left"] == (-1 if chain else window_left)
     assert (dq.shape, dk.shape, dv.shape) == (q.shape, k.shape, v.shape)
     assert dq.dtype == dk.dtype == dv.dtype == torch.bfloat16
 
@@ -1035,6 +1099,32 @@ def test_matches_reference(shape, causal, deterministic):
 
 
 @needs_gfx1250
+@pytest.mark.parametrize(
+    ("shape", "d", "causal", "window_left"),
+    [
+        ("llama_heads_small_grid", 64, True, -1),
+        ("both_unsplit", 64, True, -1),
+        ("gqa16", 64, False, -1),
+        ("llama_heads_small_grid", 64, True, 31),
+        ("both_unsplit", 64, True, 500),
+        ("sq_lt_skv", 64, True, 100),
+        ("llama_heads_small_grid", 128, True, 100),
+        ("both_unsplit", 128, True, 20),
+    ],
+)
+def test_matches_reference_at_head_dim_64_and_with_a_sliding_window(shape, d, causal, window_left):
+    """Head dim 64 and the causal sliding window (window_size (window_left, 0)) on the split-K
+    kernels of a small grid (SMALL_GRID forward, k_dkdv_sp, k_dq_sp) and the unsplit ones of a
+    large grid (DEFAULT forward, k_dkdv, k_dqg): windows narrower than a tile (every tile they
+    touch runs masked), windows wide enough to leave unmasked tiles inside the band, and Sq < Skv
+    (the last kv tiles are in no query's window)."""
+    q, k, v, dout = _inputs(*_NUMERIC_SHAPES[shape], d=d)
+    window_size = (window_left, 0) if window_left >= 0 else (-1, -1)
+    got = _run(q, k, v, dout, causal, window_size=window_size)
+    _check(got, _reference(q, k, v, dout, causal, window_left))
+
+
+@needs_gfx1250
 def test_matches_reference_with_more_queries_than_keys():
     """Non-causal sq > skv, which the gate accepts (causal refuses it: the first sq - skv
     queries would see no key)."""
@@ -1062,11 +1152,12 @@ def test_explicit_softmax_scale():
 
 @needs_gfx1250
 @pytest.mark.deterministic
-def test_backward_is_deterministic():
-    q, k, v, dout = _inputs(2, 1024, 1024, 32, 8)
-    first = _run(q, k, v, dout, True, deterministic=True)
+@pytest.mark.parametrize(("d", "window_size"), [(128, (-1, -1)), (64, (300, 0))], ids=["d128", "d64_sliding"])
+def test_backward_is_deterministic(d, window_size):
+    q, k, v, dout = _inputs(2, 1024, 1024, 32, 8, d=d)
+    first = _run(q, k, v, dout, True, deterministic=True, window_size=window_size)
     for _ in range(3):
-        again = _run(q, k, v, dout, True, deterministic=True)
+        again = _run(q, k, v, dout, True, deterministic=True, window_size=window_size)
         for a, b in zip(first, again):
             assert torch.equal(a, b)
 
@@ -1119,19 +1210,27 @@ def test_torch_compile_fullgraph():
 @needs_gfx1250
 @pytest.mark.skipif(
     os.environ.get("PRIMUS_TURBO_TEST_LARGE") != "1",
-    reason="Llama-3.1-8B training shape; set PRIMUS_TURBO_TEST_LARGE=1 (about a minute of CPU reference)",
+    reason="model training shapes; set PRIMUS_TURBO_TEST_LARGE=1 (about a minute of CPU reference each)",
 )
-def test_llama31_8b_training_shape():
-    """b4 s8192 hq32 hkv8: every output finite on the card; batch 0, kv head 0 (q heads 0-3,
-    whose dk/dv depend on nothing else) against the CPU reference."""
-    b, s, hq, hkv = 4, 8192, 32, 8
-    q, k, v, dout = _inputs(b, s, s, hq, hkv)
-    got = _run(q, k, v, dout, True)
+@pytest.mark.parametrize(
+    ("shape", "window_left"),
+    [((4, 8192, 8192, 32, 8), -1), ((1, 4096, 4096, 128, 16, 64), -1), ((1, 4096, 4096, 128, 16, 64), 2047)],
+    ids=["llama3.1-8b", "muse_spark_full", "muse_spark_sliding"],
+)
+def test_model_training_shapes(shape, window_left):
+    """Llama-3.1-8B (b4 s8192 hq32 hkv8) and Muse Spark Open (b1 s4096 hq128 hkv16, head dim 64;
+    its layers alternate three sliding-window layers -- HF sliding_window 2048 keys including the
+    query, i.e. window_size (2047, 0) -- and one full causal layer): every output finite on the
+    card; batch 0, kv head 0 (the q heads of its group, whose dk/dv depend on nothing else)
+    against the CPU reference."""
+    q, k, v, dout = _inputs(*shape)
+    window_size = (window_left, 0) if window_left >= 0 else (-1, -1)
+    got = _run(q, k, v, dout, True, window_size=window_size)
     for x in got:
         assert torch.isfinite(x).all()
-    g = hq // hkv
+    g = q.shape[2] // k.shape[2]
     sub = (q[:1, :, :g], k[:1, :, :1], v[:1, :, :1], dout[:1, :, :g])
-    ref = _reference(*sub, True)
+    ref = _reference(*sub, True, window_left)
     out, lse, dq, dk, dv = got
     _check((out[:1, :, :g], lse[:1, :g], dq[:1, :, :g], dk[:1, :, :1], dv[:1, :, :1]), ref)
 

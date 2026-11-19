@@ -252,7 +252,7 @@ class QManager16bV2:
             address_space=fx.AddressSpace.Shared,
             alignment=16,
         )
-        # hdim split into pow2 column segments (TDM pad_interval must be pow2): one copy for 128.
+        # hdim split into pow2 column segments (TDM pad_interval must be pow2): one copy for 64 / 128.
         # Each segment (c0, w): pad_interval=w, pad_amount=row_elems-w so the padded LDS row
         # stride is preserved.
         for c0, w in _pow2_segments(self.qk_hdim):
@@ -399,8 +399,8 @@ class VManager16bV2:
         return self.n_block * self.row_bytes
 
     def load_views(self, *, ptr_lds, ptr_V, stride_v_seq, stride_v_head, kv_head, kv_row0, kv_valid):
-        """Return a LIST of ``(atom, g_view, lds_view)`` TDM copies for this block's V tile (v_hdim=128
-        is pow2 -> one copy). Pure; issue each with ``fx.copy_atom_call(*view)``, drain with
+        """Return a LIST of ``(atom, g_view, lds_view)`` TDM copies for this block's V tile (v_hdim 64 /
+        128 is pow2 -> one copy). Pure; issue each with ``fx.copy_atom_call(*view)``, drain with
         ``tdm_ops.tensor_wait(0)``."""
         return _tdm_load_views(
             ptr_x=ptr_V,

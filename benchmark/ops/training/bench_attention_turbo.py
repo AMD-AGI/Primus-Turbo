@@ -12,6 +12,7 @@ import pandas as pd
 import torch
 import torch.utils.benchmark as benchmark
 from config import (
+    ATTENTION_WINDOW_CONFIGS,
     BATCH_SIZE_LIST,
     compute_snr,
     gen_attention_test_cases,
@@ -658,8 +659,9 @@ def profile_varlen(segments, window_left, num_head_q, num_head_kv, head_dim, bac
 
 
 def _dense_cases():
-    """(batch, causal, Hq, Hkv, Dqk, Dv, Sq, Skv, window_left) for the model shapes."""
-    return [
+    """(batch, causal, Hq, Hkv, Dqk, Dv, Sq, Skv, window_left) for the model shapes, then the
+    sliding-window models' full causal and windowed layers."""
+    cases = [
         (
             batch,
             causal,
@@ -675,6 +677,13 @@ def _dense_cases():
         for case in gen_attention_test_cases()
         for batch in BATCH_SIZE_LIST
     ]
+    cases += [
+        (batch, True, hq, hkv, head_dim, head_dim, seqlen, seqlen, window_left)
+        for _, hq, hkv, head_dim, seqlen, window in ATTENTION_WINDOW_CONFIGS
+        for window_left in (-1, window)
+        for batch in BATCH_SIZE_LIST
+    ]
+    return cases
 
 
 def _forward_only_cases():

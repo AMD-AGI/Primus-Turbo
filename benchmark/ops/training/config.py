@@ -581,6 +581,17 @@ def gen_attention_varlen_test_cases():
     ]
 
 
+# Causal sliding-window attention of models whose layers mix it with full causal attention, as
+# flash-attn window_size (window_left, 0).
+# (name, num_head_q, num_head_kv, head_dim, seqlen, window_left)
+ATTENTION_WINDOW_CONFIGS = [
+    # https://github.com/NVIDIA-NeMo/Automodel/blob/752a71ebf731f84b19ca9af5e7c242be003082bd/nemo_automodel/components/models/muse_spark/configuration_muse_spark.py
+    # Text tower: three sliding-window layers (HF sliding_window 2048 keys, the query included)
+    # to one full causal layer, trained at seqlen 4096.
+    ("Muse-Spark-Open-816B-A42B", 128, 16, 64, 4096, 2047),
+]
+
+
 def gen_attention_test_cases():
     """Generate attention test cases from model configs (deduplicated)."""
     seen = set()
