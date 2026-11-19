@@ -34,6 +34,7 @@ Environment variable: PRIMUS_TURBO_GROUPED_GEMM_BACKEND=TRITON activates these k
 from __future__ import annotations
 
 import functools
+from typing import Sequence
 
 import torch
 import triton
@@ -148,6 +149,29 @@ def _get_gg_bf16_vk_config(OUT_M, OUT_N, avg_k, dtype_lhs, dtype_rhs, G, num_sms
 # ===============================================================================
 
 
+@triton.jit
+def _select_segment(group_idx, X, X1, X2, X3, SEG1, SEG2, SEG3, NUM_SEGS: tl.constexpr):
+    """``(X_s, group_idx - SEG_s)`` for the segment ``s`` holding ``group_idx`` (see ``MAX_SEGMENTS``); with one
+    segment this is ``(X, group_idx)``.
+
+    The pointer a selection returns is no longer a kernel argument, so the AMD backend gives up buffer
+    instructions for accesses through it. That costs nothing on the forward kernel's weight loads, which are
+    global loads anyway, but would on the variable-K store; see ``_process_variable_k_tile_segments``.
+    """
+    X_g = X
+    group_in_seg = group_idx
+    if NUM_SEGS > 1:
+        X_g = tl.where(group_idx >= SEG1, X1, X_g)
+        group_in_seg = tl.where(group_idx >= SEG1, group_idx - SEG1, group_in_seg)
+    if NUM_SEGS > 2:
+        X_g = tl.where(group_idx >= SEG2, X2, X_g)
+        group_in_seg = tl.where(group_idx >= SEG2, group_idx - SEG2, group_in_seg)
+    if NUM_SEGS > 3:
+        X_g = tl.where(group_idx >= SEG3, X3, X_g)
+        group_in_seg = tl.where(group_idx >= SEG3, group_idx - SEG3, group_in_seg)
+    return X_g, group_in_seg
+
+
 # -----------------------------------------------------------------------------
 # Per-tile compute body -- lifted into a @triton.jit helper so both the static
 # and work-stealing persistent loops can call it.
@@ -159,9 +183,15 @@ def _process_grouped_gemm_tile(
     global_tile_id,
     A,
     B,
+    B1,
+    B2,
+    B3,
     C,
     group_offs_ptr,
     G,
+    SEG1,
+    SEG2,
+    SEG3,
     N,
     K,
     stride_am,
@@ -180,8 +210,13 @@ def _process_grouped_gemm_tile(
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
+    NUM_SEGS: tl.constexpr,
 ):
-    """Compute one output tile given its global tile id within the persistent loop."""
+    """Compute one output tile given its global tile id within the persistent loop.
+
+    The weights come in ``NUM_SEGS`` segments: groups ``[SEG_s, SEG_{s+1})`` (``SEG_0 = 0``) read
+    ``B_s[g - SEG_s]``. With one segment the selection below compiles away.
+    """
     group_idx, tile_start, total_tiles = _locate_group(
         global_tile_id, group_offs_ptr, G, num_pid_n, BLOCK_SIZE_M
     )
@@ -202,11 +237,12 @@ def _process_grouped_gemm_tile(
     rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
 
+    B_g, group_in_seg = _select_segment(group_idx, B, B1, B2, B3, SEG1, SEG2, SEG3, NUM_SEGS)
     acc = _gemm_tile_dot(
         A,
-        B,
+        B_g,
         m_start_g,
-        group_idx,
+        group_in_seg,
         rm,
         rn,
         K,
@@ -238,7 +274,7 @@ def _process_grouped_gemm_tile(
 def _grouped_bf16_persistent_gemm_kernel(
     # Pointers
     A,  # [M_total, K]
-    B,  # [G, ?, ?]  -- (K,N) or (N,K) depending on trans_b
+    B,  # [G, ?, ?]  -- (K,N) or (N,K) depending on trans_b; first weight segment
     C,  # [M_total, N]
     group_offs_ptr,  # [G+1] int64
     # Dimensions
@@ -251,6 +287,13 @@ def _grouped_bf16_persistent_gemm_kernel(
     stride_bn,  # B N-stride (within a group)
     stride_cm,  # C row stride
     stride_cn,  # C col stride
+    # Weight segments 1..3 and their first groups (see _process_grouped_gemm_tile); unused when NUM_SEGS <= s
+    B1,
+    B2,
+    B3,
+    SEG1,
+    SEG2,
+    SEG3,
     # Constexpr strides (for compiler optimisation)
     stride_ak: tl.constexpr,  # A K-stride (=1 when trans_a=False, contiguous)
     stride_bk: tl.constexpr,  # B K-stride (=1 when trans_b=True)
@@ -266,6 +309,7 @@ def _grouped_bf16_persistent_gemm_kernel(
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
     ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
+    NUM_SEGS: tl.constexpr = 1,
 ):
     """Persistent grouped GEMM kernel (CPU-sync-free) -- static stride.
 
@@ -292,9 +336,15 @@ def _grouped_bf16_persistent_gemm_kernel(
             global_tile_id,
             A,
             B,
+            B1,
+            B2,
+            B3,
             C,
             group_offs_ptr,
             G,
+            SEG1,
+            SEG2,
+            SEG3,
             N,
             K,
             stride_am,
@@ -313,6 +363,7 @@ def _grouped_bf16_persistent_gemm_kernel(
             CACHE_MODIFIER_A=CACHE_MODIFIER_A,
             CACHE_MODIFIER_B=CACHE_MODIFIER_B,
             ALLOW_TF32=ALLOW_TF32,
+            NUM_SEGS=NUM_SEGS,
         )
 
 
@@ -358,6 +409,12 @@ def _grouped_bf16_persistent_gemm_kernel_ws(
     stride_cm,
     stride_cn,
     local_per_xcd,
+    B1,
+    B2,
+    B3,
+    SEG1,
+    SEG2,
+    SEG3,
     stride_ak: tl.constexpr,
     stride_bk: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -371,6 +428,7 @@ def _grouped_bf16_persistent_gemm_kernel_ws(
     CACHE_MODIFIER_B: tl.constexpr,
     COUNTER_STRIDE: tl.constexpr,
     ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
+    NUM_SEGS: tl.constexpr = 1,
 ):
     """Persistent grouped GEMM with per-XCD + global-fallback work stealing."""
     pid = tl.program_id(0)
@@ -425,9 +483,15 @@ def _grouped_bf16_persistent_gemm_kernel_ws(
                 tile_id,
                 A,
                 B,
+                B1,
+                B2,
+                B3,
                 C,
                 group_offs_ptr,
                 G,
+                SEG1,
+                SEG2,
+                SEG3,
                 N,
                 K,
                 stride_am,
@@ -446,13 +510,56 @@ def _grouped_bf16_persistent_gemm_kernel_ws(
                 CACHE_MODIFIER_A=CACHE_MODIFIER_A,
                 CACHE_MODIFIER_B=CACHE_MODIFIER_B,
                 ALLOW_TF32=ALLOW_TF32,
+                NUM_SEGS=NUM_SEGS,
             )
+
+
+# A grouped GEMM's weights (or variable-K outputs) may come in up to this many segments: each segment is a
+# [G_s, ...] tensor holding groups [sum(G_0..G_{s-1}), sum(G_0..G_s)), e.g. an MoE layer's own experts and
+# its replica slots. The kernels take every segment's pointer as an argument: no device-side pointer table,
+# and no offsets between segments either, which would break the AMD backend's assumption that a buffer access
+# stays within 2 GB of its argument pointer.
+MAX_SEGMENTS = 4
+
+
+def _segments(x, what: str):
+    """``(segments, first group of each segment, total groups, group stride)`` of a tensor or a sequence of
+    up to ``MAX_SEGMENTS`` 3D tensors that agree in every dim but the first, in dtype, device and strides."""
+    segs = [x] if isinstance(x, torch.Tensor) else list(x)
+    assert 1 <= len(segs) <= MAX_SEGMENTS, f"{what}: 1 to {MAX_SEGMENTS} segments, got {len(segs)}"
+    first = segs[0]
+    starts, total = [], 0
+    for s in segs:
+        assert s.ndim == 3, f"{what}: segments must be 3D, got {tuple(s.shape)}"
+        assert s.shape[1:] == first.shape[1:], (
+            f"{what}: segment shapes {tuple(s.shape)} / {tuple(first.shape)}"
+        )
+        assert s.dtype == first.dtype and s.device == first.device, (
+            f"{what}: segments differ in dtype or device"
+        )
+        assert s.stride(1) == first.stride(1) and s.stride(2) == first.stride(2), (
+            f"{what}: segment strides differ"
+        )
+        starts.append(total)
+        total += s.shape[0]
+    # a one-group segment's stride(0) is never used
+    group_strides = {s.stride(0) for s in segs if s.shape[0] > 1}
+    assert len(group_strides) <= 1, f"{what}: segments have different group strides {sorted(group_strides)}"
+    stride_g = group_strides.pop() if group_strides else first.stride(0)
+    return segs, starts, total, stride_g
+
+
+def _segment_args(segs, starts, total):
+    """Kernel arguments ``(seg1..3 pointers, SEG1..3, NUM_SEGS)``; unused slots repeat segment 0 / ``total``."""
+    ptrs = [segs[i] if i < len(segs) else segs[0] for i in range(1, MAX_SEGMENTS)]
+    firsts = [starts[i] if i < len(segs) else total for i in range(1, MAX_SEGMENTS)]
+    return ptrs, firsts, len(segs)
 
 
 @scoped_amd_knobs
 def grouped_gemm_triton_kernel(
     a: torch.Tensor,
-    b: torch.Tensor,
+    b: torch.Tensor | Sequence[torch.Tensor],
     group_offs: torch.Tensor,
     trans_b: bool = False,
     *,
@@ -470,7 +577,8 @@ def grouped_gemm_triton_kernel(
 
     Args:
         a: [M_total, K] BF16/FP16 input (trans_a=False always).
-        b: [G, K, N] or [G, N, K] (if trans_b) BF16/FP16 weights.
+        b: [G, K, N] or [G, N, K] (if trans_b) BF16/FP16 weights, or up to ``MAX_SEGMENTS`` such tensors
+            ([G_s, ...] each, sum(G_s) == G) whose groups follow one another; see ``_segments``.
         group_offs: [G+1] int64 prefix sum of group lengths.
         trans_b: If True, b[g] is [N, K] (transposed).
         num_cu: Cap the persistent-grid size at this many CUs (clamped to the
@@ -495,12 +603,15 @@ def grouped_gemm_triton_kernel(
         [M_total, N] BF16/FP16 output.
     """
     assert a.ndim == 2, f"a must be 2D, got {a.shape}"
-    assert b.ndim == 3, f"b must be 3D, got {b.shape}"
+    segs, seg_starts, G, stride_bg = _segments(b, "b")
+    seg_ptrs, seg_firsts, num_segs = _segment_args(segs, seg_starts, G)
+    b = segs[0]
     assert a.dtype in (torch.bfloat16, torch.float16), f"Unsupported dtype: {a.dtype}"
     assert b.dtype in (torch.bfloat16, torch.float16), f"Unsupported dtype: {b.dtype}"
+    if num_segs > 1:
+        assert group_offs.shape[0] == G + 1, f"group_offs has {group_offs.shape[0]} entries for {G} groups"
 
     M_total, K_a = a.shape
-    G = b.shape[0]
 
     if trans_b:
         N, K_b = b.shape[1], b.shape[2]
@@ -514,7 +625,6 @@ def grouped_gemm_triton_kernel(
     assert K_a == K_b, f"K mismatch: a has K={K_a}, b has K={K_b}"
     K = K_a
 
-    stride_bg = b.stride(0)  # Group stride
     stride_ak = a.stride(1)  # =1 for contiguous a
 
     # Output
@@ -577,6 +687,8 @@ def grouped_gemm_triton_kernel(
             out.stride(0),
             out.stride(1),
             local_per_xcd,
+            *seg_ptrs,
+            *seg_firsts,
             stride_ak=stride_ak,
             stride_bk=stride_bk,
             BLOCK_SIZE_M=BLOCK_M,
@@ -589,6 +701,7 @@ def grouped_gemm_triton_kernel(
             CACHE_MODIFIER_A=cache_a,
             CACHE_MODIFIER_B=cache_b,
             COUNTER_STRIDE=COUNTER_STRIDE,
+            NUM_SEGS=num_segs,
             num_warps=8,
             num_stages=num_stages_val,
             waves_per_eu=0,
@@ -610,6 +723,8 @@ def grouped_gemm_triton_kernel(
         stride_bn,
         out.stride(0),
         out.stride(1),
+        *seg_ptrs,
+        *seg_firsts,
         stride_ak=stride_ak,
         stride_bk=stride_bk,
         BLOCK_SIZE_M=BLOCK_M,
@@ -622,6 +737,7 @@ def grouped_gemm_triton_kernel(
         EVEN_K=even_k,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
+        NUM_SEGS=num_segs,
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,
@@ -656,6 +772,7 @@ def _process_variable_k_tile(
     LHS,
     RHS,
     C,
+    C_FIRST_GROUP,  # group stored at C[0]: group g goes to C[g - C_FIRST_GROUP]
     scale,  # per-CTA constant; ignored when IS_FP8=False
     group_offs_ptr,
     OUT_M,
@@ -759,7 +876,12 @@ def _process_variable_k_tile(
     rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     rn_s = tl.max_contiguous(tl.multiple_of(rn_s % OUT_N, BLOCK_SIZE_N), BLOCK_SIZE_N)
     c_mask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
-    C_ = C + group_idx.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
+    C_ = (
+        C
+        + (group_idx - C_FIRST_GROUP).to(tl.int64) * stride_cg
+        + rm_s[:, None] * stride_cm
+        + rn_s[None, :] * stride_cn
+    )
     if BETA_IS_ONE:
         # Read the previous value of this tile and fold it into the FP32
         # accumulator before the cast. Costs one extra HBM read per output tile,
@@ -771,12 +893,143 @@ def _process_variable_k_tile(
     tl.store(C_, c, c_mask)
 
 
+@triton.jit
+def _pick(s: tl.constexpr, X0, X1, X2, X3):
+    """``X_s``, resolved at compile time, so a pointer comes back as the kernel argument itself."""
+    X = X0
+    if s == 1:
+        X = X1
+    if s == 2:
+        X = X2
+    if s == 3:
+        X = X3
+    return X
+
+
+@triton.jit
+def _process_variable_k_tile_segments(
+    global_tile,
+    LHS,
+    RHS,
+    C,
+    C1,
+    C2,
+    C3,
+    scale,
+    group_offs_ptr,
+    SEG1,
+    SEG2,
+    SEG3,
+    OUT_M,
+    OUT_N,
+    stride_lhs_m,
+    stride_rhs_m,
+    stride_cg,
+    stride_cm,
+    stride_cn,
+    tiles_m,
+    tiles_n,
+    tiles_per_group,
+    stride_lhs_n: tl.constexpr,
+    stride_rhs_n: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    CACHE_MODIFIER_A: tl.constexpr,
+    CACHE_MODIFIER_B: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+    BETA_IS_ONE: tl.constexpr,
+    NUM_SEGS: tl.constexpr,
+):
+    """``_process_variable_k_tile`` with the output in ``NUM_SEGS`` segments, the same way as the forward
+    kernel's weights: group ``g`` in ``[SEG_s, SEG_{s+1})`` writes ``C_s[g - SEG_s]``.
+
+    Each segment gets its own copy of the whole tile, called with that segment's kernel-argument pointer.
+    Through a selected pointer the AMD backend would give up buffer instructions for the output, and a branch
+    around the epilogue alone keeps the accumulator live across it and spills; both measured +13% on a BF16
+    wgrad. An offset between segments from one base pointer is no option either: it breaks the backend's
+    assumption that a buffer access stays within 2 GB of its argument.
+    """
+    if NUM_SEGS == 1:
+        _process_variable_k_tile(
+            global_tile,
+            LHS,
+            RHS,
+            C,
+            0,
+            scale,
+            group_offs_ptr,
+            OUT_M,
+            OUT_N,
+            stride_lhs_m,
+            stride_rhs_m,
+            stride_cg,
+            stride_cm,
+            stride_cn,
+            tiles_m,
+            tiles_n,
+            tiles_per_group,
+            stride_lhs_n,
+            stride_rhs_n,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            GROUP_SIZE_M,
+            IS_FP8,
+            CACHE_MODIFIER_A,
+            CACHE_MODIFIER_B,
+            ALLOW_TF32,
+            BETA_IS_ONE,
+        )
+    else:
+        group_idx = global_tile // tiles_per_group
+        for s in tl.static_range(NUM_SEGS):
+            first = _pick(s, 0, SEG1, SEG2, SEG3)
+            if s == NUM_SEGS - 1:
+                in_segment = group_idx >= first
+            else:
+                in_segment = (group_idx >= first) & (group_idx < _pick(s + 1, 0, SEG1, SEG2, SEG3))
+            if in_segment:
+                _process_variable_k_tile(
+                    global_tile,
+                    LHS,
+                    RHS,
+                    _pick(s, C, C1, C2, C3),
+                    first,
+                    scale,
+                    group_offs_ptr,
+                    OUT_M,
+                    OUT_N,
+                    stride_lhs_m,
+                    stride_rhs_m,
+                    stride_cg,
+                    stride_cm,
+                    stride_cn,
+                    tiles_m,
+                    tiles_n,
+                    tiles_per_group,
+                    stride_lhs_n,
+                    stride_rhs_n,
+                    BLOCK_SIZE_M,
+                    BLOCK_SIZE_N,
+                    BLOCK_SIZE_K,
+                    GROUP_SIZE_M,
+                    IS_FP8,
+                    CACHE_MODIFIER_A,
+                    CACHE_MODIFIER_B,
+                    ALLOW_TF32,
+                    BETA_IS_ONE,
+                )
+
+
 @triton.jit()
 def _grouped_variable_k_gemm_kernel(
     # C[g] = LHS_g^T @ RHS_g [* scale if IS_FP8]
     LHS,
     RHS,
-    C,
+    C,  # first output segment
     LHS_scale_ptr,
     RHS_scale_ptr,  # only used if IS_FP8
     group_offs_ptr,  # [G+1] int64
@@ -789,6 +1042,14 @@ def _grouped_variable_k_gemm_kernel(
     stride_cg,
     stride_cm,
     stride_cn,
+    # Output segments 1..3 and their first groups (see _process_variable_k_tile_segments); unused when
+    # NUM_SEGS <= s
+    C1,
+    C2,
+    C3,
+    SEG1,
+    SEG2,
+    SEG3,
     stride_lhs_n: tl.constexpr,
     stride_rhs_n: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -803,6 +1064,7 @@ def _grouped_variable_k_gemm_kernel(
     CACHE_MODIFIER_B: tl.constexpr,
     ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
     BETA_IS_ONE: tl.constexpr = False,
+    NUM_SEGS: tl.constexpr = 1,
 ):
     """Persistent grouped variable-K GEMM kernel for backward (static stride).
 
@@ -831,13 +1093,19 @@ def _grouped_variable_k_gemm_kernel(
         scale = tl.load(LHS_scale_ptr) * tl.load(RHS_scale_ptr)
 
     for global_tile in range(pid, total_tiles, NUM_SMS):
-        _process_variable_k_tile(
+        _process_variable_k_tile_segments(
             global_tile,
             LHS,
             RHS,
             C,
+            C1,
+            C2,
+            C3,
             scale,
             group_offs_ptr,
+            SEG1,
+            SEG2,
+            SEG3,
             OUT_M,
             OUT_N,
             stride_lhs_m,
@@ -859,6 +1127,7 @@ def _grouped_variable_k_gemm_kernel(
             CACHE_MODIFIER_B=CACHE_MODIFIER_B,
             ALLOW_TF32=ALLOW_TF32,
             BETA_IS_ONE=BETA_IS_ONE,
+            NUM_SEGS=NUM_SEGS,
         )
 
 
@@ -887,6 +1156,12 @@ def _grouped_variable_k_gemm_kernel_ws(
     stride_cm,
     stride_cn,
     local_per_xcd,
+    C1,
+    C2,
+    C3,
+    SEG1,
+    SEG2,
+    SEG3,
     stride_lhs_n: tl.constexpr,
     stride_rhs_n: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -901,6 +1176,7 @@ def _grouped_variable_k_gemm_kernel_ws(
     COUNTER_STRIDE: tl.constexpr,
     ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
     BETA_IS_ONE: tl.constexpr = False,
+    NUM_SEGS: tl.constexpr = 1,
 ):
     """Variable-K persistent GEMM with per-XCD + global-fallback work stealing.
 
@@ -951,13 +1227,19 @@ def _grouped_variable_k_gemm_kernel_ws(
         if tile_id >= total_tiles:
             done = True
         else:
-            _process_variable_k_tile(
+            _process_variable_k_tile_segments(
                 tile_id,
                 LHS,
                 RHS,
                 C,
+                C1,
+                C2,
+                C3,
                 scale,
                 group_offs_ptr,
+                SEG1,
+                SEG2,
+                SEG3,
                 OUT_M,
                 OUT_N,
                 stride_lhs_m,
@@ -979,6 +1261,7 @@ def _grouped_variable_k_gemm_kernel_ws(
                 CACHE_MODIFIER_B=CACHE_MODIFIER_B,
                 ALLOW_TF32=ALLOW_TF32,
                 BETA_IS_ONE=BETA_IS_ONE,
+                NUM_SEGS=NUM_SEGS,
             )
 
 
@@ -996,8 +1279,8 @@ def grouped_gemm_variable_k_triton_kernel(
     ws_mode: str = "auto",
     ws_counter: torch.Tensor | None = None,
     beta: float = 0.0,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
+    out: torch.Tensor | Sequence[torch.Tensor] | None = None,
+) -> torch.Tensor | list[torch.Tensor]:
     """Variable-K grouped BF16/FP16 GEMM (backward) using Triton.
 
     Computes C[g] = beta * C[g] + lhs[offs[g]:offs[g+1]]^T @ rhs[offs[g]:offs[g+1]]
@@ -1023,10 +1306,12 @@ def grouped_gemm_variable_k_triton_kernel(
         out: Optional pre-allocated output buffer of shape ``(G, OUT_M, OUT_N)``.
             When given, the kernel writes (or accumulates, see ``beta``) into it
             instead of allocating, and its dtype decides the output dtype. Strides
-            are read off the tensor, so non-contiguous views are fine.
+            are read off the tensor, so non-contiguous views are fine. May also be
+            up to ``MAX_SEGMENTS`` ``(G_s, OUT_M, OUT_N)`` tensors with sum(G_s) == G
+            (see ``_segments``), e.g. one gradient buffer per weight segment.
 
     Returns:
-        [G, OUT_M, OUT_N] output (the same tensor as ``out`` when it was given).
+        [G, OUT_M, OUT_N] output (``out`` itself when it was given).
     """
     assert lhs.ndim == 2 and rhs.ndim == 2
     assert lhs.shape[0] == rhs.shape[0]
@@ -1038,12 +1323,14 @@ def grouped_gemm_variable_k_triton_kernel(
     if out is None:
         assert beta == 0.0, "beta=1.0 requires an explicit `out` buffer to accumulate into"
         out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=lhs.dtype)
-    else:
-        expected_shape = (G, OUT_M, OUT_N)
-        assert tuple(out.shape) == expected_shape, (
-            f"out shape {tuple(out.shape)} must equal (G, OUT_M, OUT_N) = {expected_shape}"
-        )
-        assert out.device == lhs.device, "out must be on same device as lhs"
+    segs, seg_starts, G_out, stride_cg = _segments(out, "out")
+    seg_ptrs, seg_firsts, num_segs = _segment_args(segs, seg_starts, G_out)
+    c = segs[0]
+    expected_shape = (G, OUT_M, OUT_N)
+    assert (G_out, *c.shape[1:]) == expected_shape, (
+        f"out shape {(G_out, *c.shape[1:])} must equal (G, OUT_M, OUT_N) = {expected_shape}"
+    )
+    assert c.device == lhs.device, "out must be on same device as lhs"
 
     device_num_cus = get_num_cus()
     num_sms = min(num_cu, device_num_cus) if num_cu is not None and num_cu > 0 else device_num_cus
@@ -1088,7 +1375,7 @@ def grouped_gemm_variable_k_triton_kernel(
         _grouped_variable_k_gemm_kernel_ws[(num_sms,)](
             lhs,
             rhs,
-            out,
+            c,
             dummy_scale,
             dummy_scale,
             group_offs,
@@ -1099,10 +1386,12 @@ def grouped_gemm_variable_k_triton_kernel(
             OUT_N,
             lhs.stride(0),
             rhs.stride(0),
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
+            stride_cg,
+            c.stride(1),
+            c.stride(2),
             local_per_xcd,
+            *seg_ptrs,
+            *seg_firsts,
             stride_lhs_n=lhs.stride(1),
             stride_rhs_n=rhs.stride(1),
             BLOCK_SIZE_M=BLOCK_M,
@@ -1116,6 +1405,7 @@ def grouped_gemm_variable_k_triton_kernel(
             CACHE_MODIFIER_B=cache_b,
             COUNTER_STRIDE=COUNTER_STRIDE,
             BETA_IS_ONE=(beta == 1.0),
+            NUM_SEGS=num_segs,
             num_warps=8,
             num_stages=num_stages_val,
             waves_per_eu=0,
@@ -1127,7 +1417,7 @@ def grouped_gemm_variable_k_triton_kernel(
     _grouped_variable_k_gemm_kernel[(num_sms,)](
         lhs,
         rhs,
-        out,
+        c,
         dummy_scale,
         dummy_scale,  # unused for BF16
         group_offs,
@@ -1136,9 +1426,11 @@ def grouped_gemm_variable_k_triton_kernel(
         OUT_N,
         lhs.stride(0),
         rhs.stride(0),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
+        stride_cg,
+        c.stride(1),
+        c.stride(2),
+        *seg_ptrs,
+        *seg_firsts,
         stride_lhs_n=lhs.stride(1),
         stride_rhs_n=rhs.stride(1),
         BLOCK_SIZE_M=BLOCK_M,
@@ -1152,6 +1444,7 @@ def grouped_gemm_variable_k_triton_kernel(
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
         BETA_IS_ONE=(beta == 1.0),
+        NUM_SEGS=num_segs,
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,

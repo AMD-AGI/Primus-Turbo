@@ -141,6 +141,21 @@ print(c)
 print(c.shape) # [128, 256]
 ```
 
+The weights can also come as a list of up to 4 tensors (segments) whose groups follow one another, e.g. an MoE
+layer's own experts and the replicas it holds of other experts. They run in one launch per pass without being
+copied together; with `fuse_bgrad_accum_pattern="megatron"` each segment needs its own `main_grad`, all in one
+dtype. Segments run on the TRITON backend only.
+
+```python
+experts = torch.randn(3, K, N, device=device, dtype=dtype, requires_grad=True)  # groups 0..2
+replicas = torch.randn(1, K, N, device=device, dtype=dtype, requires_grad=True)  # group 3
+c = turbo.ops.grouped_gemm(a, [experts, replicas], group_lens, trans_b=False)
+c.sum().backward()
+
+print(c.shape) # [128, 256]
+print(experts.grad.shape, replicas.grad.shape) # [3, 512, 256] [1, 512, 256]
+```
+
 ### 1.4 MegaMoE
 
 `fused_mega_moe` is an EP intra-node MoE op that fuses communication with the grouped GEMM

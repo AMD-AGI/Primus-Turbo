@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-from typing import Optional, Union
+from typing import Optional, Sequence, Union
 
 import torch
 
@@ -12,8 +12,10 @@ from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.kernels.gemm.gemm_impl import gemm_accum_impl, gemm_impl
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
     grouped_gemm_impl,
+    grouped_gemm_segments_impl,
     grouped_gemm_variable_k_accum_impl,
     grouped_gemm_variable_k_impl,
+    grouped_gemm_variable_k_segments_accum_impl,
 )
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     group_offs_from_lens,
@@ -181,9 +183,90 @@ class GroupedGemmFunc(torch.autograd.Function):
         return grad_a, grad_b, None, None, None, None, None, None
 
 
+class GroupedGemmSegmentsFunc(torch.autograd.Function):
+    """``GroupedGemmFunc`` with the weights split into segments ``b[s]`` of shape [G_s, ...]: group g of
+    segment s is ``b[s][g - sum(G_0..G_{s-1})]``. Every pass is a single launch over all segments, and the
+    fused wgrad accumulates into each segment's own ``main_grad``."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        a: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_b: bool,
+        num_cu: int | None,
+        schedule: str,
+        fuse_bgrad_accum_pattern: Union[None, str],
+        *b: torch.Tensor,
+    ):
+        main_grads = [_setup_fused_grad_accum(s, fuse_bgrad_accum_pattern)[1] for s in b]
+        fuse_bgrad_accum = fuse_bgrad_accum_pattern is not None
+        if fuse_bgrad_accum:
+            assert len({g.dtype for g in main_grads}) == 1, (
+                f"all segments' main_grad must share one dtype, got {[g.dtype for g in main_grads]}"
+            )
+        out = grouped_gemm_segments_impl(
+            a,
+            list(b),
+            group_lens,
+            group_offs,
+            trans_a=False,
+            trans_b=trans_b,
+            num_cu=num_cu,
+            default_backend=BackendType.TRITON.value,
+            maybe_pre_sync=True,
+            schedule=schedule,
+        )
+        ctx.save_for_backward(a, group_lens, group_offs, *b)
+        ctx.trans_b = trans_b
+        ctx.num_cu = num_cu
+        ctx.schedule = schedule
+        ctx.fuse_bgrad_accum = fuse_bgrad_accum
+        ctx.main_grads = main_grads
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        if not grad_out.is_contiguous():
+            grad_out = grad_out.contiguous()
+
+        a, group_lens, group_offs, *b = ctx.saved_tensors
+        grad_a = grouped_gemm_segments_impl(
+            grad_out,
+            b,
+            group_lens,
+            group_offs,
+            trans_a=False,
+            trans_b=not ctx.trans_b,
+            num_cu=ctx.num_cu,
+            default_backend=BackendType.TRITON.value,
+            schedule=ctx.schedule,
+        )
+        wgrad_options = dict(
+            trans_a=True,
+            trans_b=False,
+            trans_c=ctx.trans_b,
+            num_cu=ctx.num_cu,
+            default_backend=BackendType.TRITON.value,
+            schedule=ctx.schedule,
+        )
+        if ctx.fuse_bgrad_accum:
+            grouped_gemm_variable_k_segments_accum_impl(
+                a, grad_out, group_lens, group_offs, out=ctx.main_grads, **wgrad_options
+            )
+            # See _bgrad_grouped_gemm_impl_wrapper for why a dummy rather than None.
+            grad_b = [_get_dummy_wgrad(s.shape, s.dtype) for s in b]
+        else:
+            grad_b = grouped_gemm_variable_k_impl(a, grad_out, group_lens, group_offs, **wgrad_options).split(
+                [s.shape[0] for s in b]
+            )
+        return grad_a, None, None, None, None, None, None, *grad_b
+
+
 def grouped_gemm(
     a: torch.Tensor,
-    b: torch.Tensor,
+    b: Union[torch.Tensor, Sequence[torch.Tensor]],
     group_lens: torch.Tensor,
     group_offs: torch.Tensor | None = None,
     trans_b: bool = False,
@@ -196,7 +279,12 @@ def grouped_gemm(
 
     Args:
         a (torch.Tensor): Shape [sum(group_lens), K], DType float16/bfloat16.
-        b (torch.Tensor): Shape [G, K, N] (or [G, N, K] if trans_b=True), DType float16/bfloat16.
+        b (torch.Tensor | Sequence[torch.Tensor]): Shape [G, K, N] (or [G, N, K] if trans_b=True), DType
+            float16/bfloat16. May also be a list of up to 4 segments of shape [G_s, K, N] (or [G_s, N, K]) with
+            sum(G_s) == G, all in one dtype: group g of segment s uses ``b[s][g - sum(G_0..G_{s-1})]``, so
+            weights held in separate tensors (e.g. an MoE layer's experts and its replicas of other experts)
+            run in a single launch per pass without being copied together. Segments are supported by the
+            Triton backend only.
         group_lens (torch.Tensor): Rows per expert of shape [G], int64. sum(group_lens) == a.size(0).
         group_offs (torch.Tensor | None): Exclusive prefix-sum of group_lens, shape [G+1].
                                           If None, it will be computed internally.
@@ -220,7 +308,8 @@ def grouped_gemm(
             ``b.main_grad`` directly instead of returning a gradient the framework
             then adds. ``"megatron"`` is the only supported pattern; ``b`` must
             carry ``main_grad`` / ``grad_added_to_main_grad``. Defaults to None
-            (no fusion).
+            (no fusion). With segments, every segment must carry its own
+            ``main_grad``, and all of them must share one dtype.
 
     Returns:
         torch.Tensor: Output of shape [sum(group_lens), N], same dtype/device as `a`.
@@ -244,6 +333,26 @@ def grouped_gemm(
 
     if group_offs is None:
         group_offs = group_offs_from_lens(group_lens)
+
+    if not isinstance(b, torch.Tensor):
+        b = list(b)
+        if len(b) == 1:
+            b = b[0]
+        else:
+            num_groups = sum(s.shape[0] for s in b)
+            assert group_lens.numel() == num_groups, (
+                f"group_lens has {group_lens.numel()} groups, the weight segments {num_groups}"
+            )
+            return GroupedGemmSegmentsFunc.apply(
+                a,
+                group_lens,
+                group_offs,
+                trans_b,
+                num_cu,
+                schedule,
+                fuse_bgrad_accum_pattern,
+                *b,
+            )
 
     return GroupedGemmFunc.apply(
         a,

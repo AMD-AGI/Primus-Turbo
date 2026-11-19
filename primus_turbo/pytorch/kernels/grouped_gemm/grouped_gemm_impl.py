@@ -4,9 +4,12 @@
 # See LICENSE for license information.
 ###############################################################################
 
+from typing import List
+
 import torch
 
 from primus_turbo.pytorch.core.backend import (
+    AutoKernelDispatcher,
     BackendChoice,
     BackendEntry,
     BackendType,
@@ -29,6 +32,7 @@ from primus_turbo.triton.grouped_gemm.grouped_gemm_helper import (
     grouped_gemm_output_tail_kernel,
 )
 from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
+    MAX_SEGMENTS,
     grouped_gemm_triton_kernel,
     grouped_gemm_variable_k_triton_kernel,
 )
@@ -754,6 +758,92 @@ class GroupedGEMMVariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatc
         )
 
 
+# -- Segmented weights: b (forward / dgrad) or out (wgrad) is a list of [G_s, ...] tensors whose groups follow
+# one another (see grouped_gemm_kernel.MAX_SEGMENTS). Only the Triton kernels take segments, so the dispatchers
+# below register Triton alone: a pinned backend without segment support raises as for any unregistered backend,
+# and a default other than Triton falls back to it (an error under PRIMUS_TURBO_STRICT_DISPATCH). With a single
+# candidate there is nothing to tune, hence autotune=False.
+
+
+class GroupedGEMMSegmentsTritonBackend(GroupedGEMMTritonBackend):
+    """``GroupedGEMMTritonBackend`` with ``b`` given as a list of weight segments."""
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: List[torch.Tensor],
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        num_cu: int | None,
+        schedule: str = "static",
+        **kwargs,
+    ) -> bool:
+        supported = True
+        supported &= 1 <= len(b) <= MAX_SEGMENTS
+        supported &= a.dim() == 2 and all(s.dim() == 3 for s in b)
+        supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and all(s.dtype == b[0].dtype for s in b)
+        supported &= b[0].dtype in _COMMON_SUPPORTED_DTYPES
+        supported &= not trans_a
+        supported &= schedule in _WS_SUPPORTED_SCHEDULES
+        return supported
+
+
+class GroupedGEMMSegmentsKernelDispatcher(AutoKernelDispatcher):
+    _backends = {BackendType.TRITON: BackendEntry(GroupedGEMMSegmentsTritonBackend, autotune=False)}
+    _cache = TuneCache(1024)
+
+    @classmethod
+    def make_key(cls, a, b, group_lens, group_offs, trans_a, trans_b, num_cu, **kwargs):
+        segment_groups = tuple(s.shape[0] for s in b)
+        m = a.shape[0]
+        n = b[0].shape[-2] if trans_b else b[0].shape[-1]
+        k = a.shape[1]
+        return (segment_groups, m, n, k, a.dtype, b[0].dtype, a.dtype, trans_a, trans_b, False)
+
+
+class GroupedGEMMVariableKSegmentsKernelDispatcher(AutoKernelDispatcher):
+    # The Triton variable-K backend passes ``out`` through to the kernel, which takes segments as they are.
+    _backends = {BackendType.TRITON: BackendEntry(GroupedGEMMVariableKTritonBackend, autotune=False)}
+    _cache = TuneCache(1024)
+
+    @classmethod
+    def make_key(
+        cls,
+        a,
+        b,
+        group_lens,
+        group_offs,
+        trans_a,
+        trans_b,
+        trans_c,
+        num_cu,
+        maybe_pre_sync,
+        inplace_add_to_out=False,
+        out=None,
+        **kwargs,
+    ):
+        segment_groups = tuple(o.shape[0] for o in out)
+        m, n = a.shape[1], b.shape[1]
+        if trans_c:
+            m, n = n, m
+        return (
+            segment_groups,
+            m,
+            n,
+            a.shape[0],
+            a.dtype,
+            b.dtype,
+            out[0].dtype,
+            trans_a,
+            trans_b,
+            trans_c,
+            maybe_pre_sync,
+            inplace_add_to_out,
+        )
+
+
 _torch_custom_op_wrapper = torch.library.custom_op
 
 
@@ -956,3 +1046,119 @@ def grouped_gemm_variable_k_impl_meta(
     if trans_c:
         m, n = n, m
     return torch.empty((bs, m, n), device=a.device, dtype=a.dtype)
+
+
+@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_segments_impl", mutates_args=(), device_types="cuda")
+def grouped_gemm_segments_impl(
+    a: torch.Tensor,
+    b: List[torch.Tensor],
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    num_cu: int | None,
+    default_backend: int,
+    maybe_pre_sync: bool = False,
+    schedule: str = "static",
+) -> torch.Tensor:
+    """``grouped_gemm_impl`` with the weights given as segments ``b[s]`` of shape [G_s, ...], sum(G_s) = G."""
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
+    kwargs = dict(
+        a=a,
+        b=b,
+        group_lens=group_lens,
+        group_offs=group_offs,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        num_cu=num_cu,
+        maybe_pre_sync=maybe_pre_sync,
+        schedule=schedule,
+    )
+    out = GroupedGEMMSegmentsKernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
+    return grouped_gemm_output_tail_kernel(out, group_offs)
+
+
+@grouped_gemm_segments_impl.register_fake
+def grouped_gemm_segments_impl_meta(
+    a: torch.Tensor,
+    b: List[torch.Tensor],
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    num_cu: int | None,
+    default_backend: int,
+    maybe_pre_sync: bool = False,
+    schedule: str = "static",
+) -> torch.Tensor:
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert 1 <= len(b) <= MAX_SEGMENTS, f"b must have 1 to {MAX_SEGMENTS} segments, got {len(b)}"
+    assert all(s.dim() == 3 for s in b), f"b segments must be 3D, got {[tuple(s.shape) for s in b]}"
+    assert a.dtype in [torch.float16, torch.bfloat16], f"a must be float16 or bfloat16, got {a.dtype}"
+    assert trans_a == False, "Only trans_a=False is supported."
+
+    n = b[0].shape[-2] if trans_b else b[0].shape[-1]
+    return torch.empty((a.shape[0], n), device=a.device, dtype=a.dtype)
+
+
+@_torch_custom_op_wrapper(
+    "primus_turbo::grouped_gemm_variable_k_segments_accum_impl", mutates_args={"out"}, device_types="cuda"
+)
+def grouped_gemm_variable_k_segments_accum_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    num_cu: int | None,
+    default_backend: int,
+    out: List[torch.Tensor],
+    maybe_pre_sync: bool = False,
+    schedule: str = "static",
+) -> None:
+    """``grouped_gemm_variable_k_accum_impl`` into output segments: group g of segment s accumulates into
+    ``out[s][g - sum(G_0..G_{s-1})]``, e.g. each weight segment's own gradient buffer. All segments share a dtype.
+    """
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
+    GroupedGEMMVariableKSegmentsKernelDispatcher.dispatch(
+        default_backend_choice,
+        user_backend_choice,
+        a=a,
+        b=b,
+        group_lens=group_lens,
+        group_offs=group_offs,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        trans_c=trans_c,
+        num_cu=num_cu,
+        maybe_pre_sync=maybe_pre_sync,
+        schedule=schedule,
+        inplace_add_to_out=True,
+        out=out,
+    )
+
+
+@grouped_gemm_variable_k_segments_accum_impl.register_fake
+def grouped_gemm_variable_k_segments_accum_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    num_cu: int | None,
+    default_backend: int,
+    out: List[torch.Tensor],
+    maybe_pre_sync: bool = False,
+    schedule: str = "static",
+) -> None:
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 2, f"b must be 2D, got {b.shape}"
+    assert 1 <= len(out) <= MAX_SEGMENTS, f"out must have 1 to {MAX_SEGMENTS} segments, got {len(out)}"
+    assert all(o.dim() == 3 for o in out), f"out segments must be 3D, got {[tuple(o.shape) for o in out]}"
+    return None

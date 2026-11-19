@@ -59,7 +59,7 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 
 | Op | Precision | gfx942 | gfx950 | gfx1250 | Notes |
 |---|---|:-:|:-:|:-:|---|
-| `grouped_gemm` | BF16 / FP16 | ✅ | ✅ | ✅ | |
+| `grouped_gemm` | BF16 / FP16 | ✅ | ✅ | ✅ | Weights may also be a list of up to 4 tensors (segments), run in one launch, each segment with its own `main_grad`; TRITON only. See [Grouped Gemm](./examples.md#13-grouped-gemm) |
 | `grouped_gemm_fp8` | FP8 tensorwise | ✅ | ✅ | ✅ | |
 | | FP8 rowwise | ✅ | ✅ | ✅ | |
 | | FP8 blockwise | ✅ | ✅ | ✅ | |
@@ -167,7 +167,7 @@ registration order, with the arch / format limits from each backend's `can_handl
 | `gemm_fp8` | TURBO (MXFP8, gfx950), HIPBLASLT (tensorwise; MXFP8 not on gfx942), CK (tensorwise / rowwise / blockwise; not gfx1250), TRITON (tensorwise / rowwise / blockwise), FLYDSL (tensorwise / MXFP8; gfx950) |
 | `gemm_fp4` | AITER (gfx950, NT layout), HIPBLASLT (not gfx942), FLYDSL (gfx950) |
 | `mlp_fp4` | FLYDSL (fused GLU + MXFP4 quantization, forward and backward; required, gfx950), HIPBLASLT (remaining GEMMs, default) |
-| `grouped_gemm` | CK (not gfx1250), HIPBLASLT, TRITON, FLYDSL (gfx950, gfx1250) |
+| `grouped_gemm` | CK (not gfx1250), HIPBLASLT, TRITON, FLYDSL (gfx950, gfx1250); weights in segments: TRITON |
 | `grouped_gemm_fp8` | CK (tensorwise / rowwise; not gfx1250), HIPBLASLT (tensorwise), TRITON (all formats; MXFP8 not on gfx942), FLYDSL (tensorwise / MXFP8; gfx950) |
 | `grouped_gemm_fp4` | FLYDSL (gfx950), TRITON (not gfx942) |
 | `grouped_mlp_fp8` | FLYDSL (gfx950), TRITON |
