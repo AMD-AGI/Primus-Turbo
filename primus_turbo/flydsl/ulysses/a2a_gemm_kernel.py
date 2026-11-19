@@ -504,7 +504,7 @@ def _wait_all(thread_index, flag_base, tile_m, epoch, **c):
     num_ranks, S = c["num_ranks"], c["push_split"]
     if thread_index == fx.Int32(0):
         slots = [tile_m * fx.Int32(S * num_ranks) + fx.Int32(i) for i in range(S * num_ranks)]
-        spin_flags(flag_base, slots, epoch, c["rank"], -1, "a2a_gemm")
+        spin_flags(flag_base, slots, epoch, c["rank"], -1, "a2a_gemm", report=False)
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
     # recv rows are rewritten by peers every 2 epochs: drop what this CU / XCD still caches of them
@@ -519,7 +519,15 @@ def _wait_src_rows(flag_base, src, epoch, **c):
     for j in range_constexpr(ceildiv(m_tiles, WARP)):
         t = lane + fx.Int32(j * WARP)
         t = arith.select(t < fx.Int32(m_tiles), t, fx.Int32(m_tiles - 1))
-        spin_flags(flag_base, [t * fx.Int32(num_ranks) + src], epoch, c["rank"], src, "a2a_gemm own wgrad")
+        spin_flags(
+            flag_base,
+            [t * fx.Int32(num_ranks) + src],
+            epoch,
+            c["rank"],
+            src,
+            "a2a_gemm own wgrad",
+            report=False,
+        )
 
 
 @ASTRewriter.transform
