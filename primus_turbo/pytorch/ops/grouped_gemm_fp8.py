@@ -22,7 +22,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
     check_quantized_tensor,
 )
-from primus_turbo.pytorch.core.utils import is_gfx950
+from primus_turbo.pytorch.core.utils import is_gfx950, is_gfx1250
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_impl,
     grouped_gemm_fp8_variable_k_accum_impl,
@@ -40,10 +40,12 @@ from primus_turbo.pytorch.ops.quantization import (
     quantize_fp8_with_trans,
 )
 from primus_turbo.pytorch.ops.utils import (
+    MX_A,
     _ensure_contiguous_grad_out,
     _get_dummy_wgrad,
     _get_fp8_dtype,
     _setup_fused_grad_accum,
+    mx1250_recipes,
 )
 
 __all__ = [
@@ -648,6 +650,12 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         num_cu: int | None,
         fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
+        # gfx1250: a call its FlyDSL MX GEMMs take (with a fuse pattern: one they can add into b's main_grad) runs
+        # in their operand layout, these recipes; any other one as below, on raw operands and the Triton kernels.
+        who, fuse = "grouped_gemm_fp8 (MX_BLOCKWISE)", fuse_bgrad_accum_pattern
+        mx1250 = is_gfx1250() and mx1250_recipes(
+            who, config, out_dtype, a, a_t, b, b_t, fuse=fuse, strict=False
+        )
         fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
 
         supported_mxfp8_backend, reason = check_mxfp8_support()
@@ -660,6 +668,9 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         a_dtype = b_dtype = _get_fp8_dtype(config.format, True)
 
         a_scaling_recipe = ScalingRecipe()
+        a_t_scaling_recipe, b_scaling_recipe = a_scaling_recipe, ScalingRecipe(use_2d_block=True)
+        if mx1250:
+            a_scaling_recipe, a_t_scaling_recipe, b_scaling_recipe = mx1250
         if not isinstance(a, QuantizedTensor):
             # NOTE: If a is not a QuantizedTensor use grouped_quantize_fp8_with_trans to avoid call dequantize.
             (
@@ -679,7 +690,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
                 group_offs,
                 block_size=config.block_size,
                 scaling_recipe=a_scaling_recipe,
-                scaling_recipe_for_trans=a_scaling_recipe,
+                scaling_recipe_for_trans=a_t_scaling_recipe,
             )
         else:
             quantized_a = a
@@ -692,7 +703,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
                     config.granularity,
                     axis=-2,
                     block_size=config.block_size,
-                    scaling_recipe=a_scaling_recipe,
+                    scaling_recipe=a_t_scaling_recipe,
                     group_lens=group_lens,
                 )
             else:
@@ -706,7 +717,6 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
 
             group_offs_padded_rowwise = quantized_a.group_offs
 
-        b_scaling_recipe = ScalingRecipe(use_2d_block=True)
         if not isinstance(b, QuantizedTensor):
             # NOTE: If b is not a QuantizedTensor use quantize_fp8_with_trans to avoid call dequantize.
 
@@ -715,8 +725,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
                 b_dtype,
                 config.granularity,
                 block_size=config.block_size,
-                scaling_recipe=ScalingRecipe(use_2d_block=True),
-                scaling_recipe_for_trans=ScalingRecipe(use_2d_block=True),
+                scaling_recipe=b_scaling_recipe,
+                scaling_recipe_for_trans=b_scaling_recipe,
             )
             b_row_k_blocked = b_col_k_blocked = False
         else:
@@ -780,6 +790,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         ctx.b_col_k_blocked = b_col_k_blocked
         ctx.fuse_bgrad_accum = fuse_bgrad_accum
         ctx.main_grad = main_grad
+        ctx.mx1250 = bool(mx1250)
         return out
 
     @staticmethod
@@ -787,6 +798,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         grad_out = _ensure_contiguous_grad_out(grad_out)
         (a_fp8_col, a_scale_col, b_fp8_col, b_scale_col, group_lens, group_offs) = ctx.saved_tensors
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
+        # gfx1250's MX GEMM layout: grad_out's two copies are A operands
+        grad_out_scaling_recipe = MX_A if ctx.mx1250 else ScalingRecipe()
 
         (
             grad_out_fp8_row,
@@ -804,8 +817,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             group_lens,
             group_offs,
             block_size=ctx.config.block_size,
-            scaling_recipe=ScalingRecipe(),
-            scaling_recipe_for_trans=ScalingRecipe(),
+            scaling_recipe=grad_out_scaling_recipe,
+            scaling_recipe_for_trans=grad_out_scaling_recipe,
         )
 
         # dgrad: grad_a = grad_out @ b_col^T  (same single NT op as fwd)
@@ -902,6 +915,7 @@ def grouped_gemm_fp8(
         config: FP8 quantization config. If None, uses default (TENSORWISE, E4M3, DYNAMIC)
         num_cu: Cap on the number of compute units the grouped GEMM may use
             (limits the persistent-kernel grid). If None, uses all CUs on the device.
+            Not used by gfx1250's MXFP8 kernels, which run on every CU.
 
     Returns:
         Output tensor with shape [m, n] (same dtype as input)

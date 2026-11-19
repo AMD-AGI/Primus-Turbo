@@ -47,6 +47,8 @@ def ep1_group():
 def _clamp(v, lo, hi):
     """``v.clamp(lo, hi)`` whose gradient passes on the bounds too, as the kernels' does; torch's own
     stops there in recent versions, and bf16 lands many values exactly on a bound like 10 or 7."""
+    if lo is None and hi is None:  # an unclamped half (GLUActivation.swiglu())
+        return v
     inside = torch.ones_like(v, dtype=torch.bool)
     if lo is not None:
         inside &= v >= lo

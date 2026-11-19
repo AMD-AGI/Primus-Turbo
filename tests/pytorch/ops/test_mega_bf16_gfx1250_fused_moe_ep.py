@@ -8,7 +8,9 @@
 
 Each rank holds its slice of the experts and routes its tokens over all of them. The reference
 gathers every rank's tokens, routing and expert weights and runs the fp32 MoE of the single-GPU
-suite; each rank compares its own tokens and its own experts' gradients.
+suite; each rank compares its own tokens and its own experts' gradients. Every call uses fresh
+tokens and routing, with the dispatch and combine token buffers filled with NaN bytes in between,
+so a missing wait reads NaN rather than a right value an earlier call left.
 """
 
 from datetime import timedelta
@@ -38,6 +40,11 @@ from primus_turbo.pytorch.ops.moe.fused_mega_moe import (  # noqa: E402
     fused_mega_moe_stage1,
     fused_mega_moe_stage2,
 )
+from tests.pytorch.ops.mega_gfx1250_ep_utils import (  # noqa: E402
+    assert_snr_all_ranks,
+    gather_rows,
+    poison_mega_heap,
+)
 from tests.pytorch.ops.test_mega_bf16_gfx1250_fused_moe import (  # noqa: E402
     _reference,
     _snr,
@@ -57,23 +64,11 @@ class FusedMegaMoEGfx1250EPTest(MultiProcContinuousTest):
         return torch.device("cuda", self.rank)
 
     def _gather_rows(self, t):
-        """Every rank's rows of ``t`` rank-major, and where this rank's start; counts may differ."""
-        n = torch.tensor([t.shape[0]], device=self.device)
-        counts = [torch.empty_like(n) for _ in range(self.world_size)]
-        dist.all_gather(counts, n)
-        counts = [int(c) for c in counts]
-        buf = t.new_zeros((max(counts),) + t.shape[1:])
-        buf[: t.shape[0]] = t
-        out = [torch.empty_like(buf) for _ in counts]
-        dist.all_gather(out, buf)
-        return torch.cat([o[:c] for o, c in zip(out, counts)]), sum(counts[: self.rank])
+        return gather_rows(t)
 
     def _assert_snr(self, results):
-        """Every ``(name, got, want)`` above 40 dB on the weakest rank, so all ranks agree."""
-        snr = torch.tensor([_snr(got, want) for _, got, want in results], device=self.device)
-        dist.all_reduce(snr, op=dist.ReduceOp.MIN)
-        for (name, _, _), s in zip(results, snr.tolist()):
-            self.assertGreater(s, 40, f"{name} SNR {s:.1f} dB on the weakest rank")
+        """Every ``(name, got, want)`` above 40 dB on the weakest rank, so all ranks agree (NaN-safe)."""
+        assert_snr_all_ranks(self, results, 40, _snr)
 
     def _run(
         self,
@@ -123,6 +118,7 @@ class FusedMegaMoEGfx1250EPTest(MultiProcContinuousTest):
         full_weights = [self._gather_rows(w)[0].float() for w in weights]
         experts = slice(rank * experts_per_rank, (rank + 1) * experts_per_rank)
         for _ in range(calls):
+            poison_mega_heap()
             x = randn(num_tokens, hidden)
             logits = torch.randn(num_tokens, num_experts, device=self.device, generator=gen)
             logits[:, :experts_per_rank] += skew  # crowd rank 0's experts
