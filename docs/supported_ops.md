@@ -126,6 +126,7 @@ These are fwd-only utilities; the `_with_trans` variants also emit the transpose
 | API | gfx942 | gfx950 | gfx1250 | Notes |
 |---|:-:|:-:|:-:|---|
 | `turbo.ops.fused_all_gather_matmul`, `turbo.ops.fused_all_gather_scaled_matmul`, `turbo.ops.fused_matmul_reduce_scatter` | ✅ | ✅ | — | Async tensor parallelism; fwd only, the training integration supplies the backward |
+| `ulysses_qkv_gemm_a2a`, `ulysses_a2a_o_gemm` (`primus_turbo.pytorch.ops.attention.ulysses_fused_a2a`) | — | ✅ | — | BF16 Ulysses QKV / output projections with the all-to-all fused in, fwd and bwd, one node. See [Ulysses GEMM + all-to-all](./features/ulysses_gemm_a2a.md) |
 | `primus_turbo.pytorch.dist.FP8AllToAll` | ✅ | ✅ | — | All-to-all on FP8 payloads, with backward |
 | `primus_turbo.pytorch.deep_ep.Buffer` | ✅ | ✅ | ✅ | Intra-node EP buffers, and inter-node on gfx942 / gfx950 (needs rocSHMEM); gfx1250 covers one host. See [DeepEP](./features/deep_ep.md) |
 
