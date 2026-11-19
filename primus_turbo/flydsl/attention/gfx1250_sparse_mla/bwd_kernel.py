@@ -509,6 +509,7 @@ def build_sparse_mla_bwd_gfx1250_w1(
     num_heads, topk, scale, block_k=None, prefetch=8, pin=None, ahead=256, ct_resident=None, batch=4,
     ablate="",
     idx_pf=True,
+    st_group=8,
 ):
     """One wave per SIMD (4 waves), 32 heads per wave; the kv tiles arrive by TDM gather.
 
@@ -556,6 +557,7 @@ def build_sparse_mla_bwd_gfx1250_w1(
     # row; the P / dS mask reads them from LDS instead of a global load on the tile's critical path
     # (ATT: that s_wait_loadcnt and the s_wait_kmcnt of the TDM index loads were ~26% of the stalls).
     VLD_B = 3 * BN * 4 if idx_pf else 0
+    STG = max(1, st_group)  # staged rows loaded per group before their global stores
     fixed = 2 * QO_B + 2 * DS_B + PPH * H * 4 + VLD_B
     NBUF = 2 if fixed + 2 * TILE_B <= _LDS_CAP else 1
     if fixed + NBUF * TILE_B > _LDS_CAP:
@@ -643,9 +645,14 @@ def build_sparse_mla_bwd_gfx1250_w1(
         rsrc_idx = make_rsrc(tensor_addr(TOPK) + fx.Int64(tok) * (topk * 4), topk * 4)
         kv_addr = tensor_addr(KV)
 
-        def load_octs(t):
-            # Past the last walked tile, re-fetch it into a buffer that is not read again.
-            ct = fx.Int32((t < n_tile).select(t, last_t))
+        def load_octs(t, static_tile=None):
+            # Past the last walked tile, re-fetch it into a buffer that is not read again. A static tile
+            # (prologue) needs no clamp, so its scalar loads do not wait for the per-token n_tile load
+            # (ATT: s_wait_kmcnt 0x0 at the prologue was the top per-token stall).
+            if const_expr(static_tile is not None):
+                ct = fx.Int32(min(static_tile, topk // BN - 1))
+            else:
+                ct = fx.Int32((t < n_tile).select(t, last_t))
             base = ct * BN + wave * (OPW * RPO)
             out = []
             for k in range_constexpr(OPW):
@@ -668,7 +675,7 @@ def build_sparse_mla_bwd_gfx1250_w1(
         def issue(t, buf):
             issue_octs(load_octs(t), buf)
 
-        issue(fx.Int32(0), fx.Int32(0))
+        issue_octs(load_octs(None, static_tile=0), fx.Int32(0))
 
         # ---- stage Q and dO (all heads) in LDS; O rows for delta go out alongside.
         h_d = tid // PPH
@@ -852,11 +859,19 @@ def build_sparse_mla_bwd_gfx1250_w1(
                                         lds_store(cur[("o", kt, g)], stg + l16 * SROW + g * 32 + hi * 16)
                                     row0 = t * BN + kt * 16 + lane // LPR
                                     col = (dt - (GW - 1)) * 32 + (lane % LPR) * 16
-                                    for r in range_constexpr(16 // RPS):
-                                        v = lds_load(
-                                            stg + (r * RPS + lane // LPR) * SROW + (lane % LPR) * 16, v4i
-                                        )
-                                        buf_store(v, rsrc_im, fx.Int32(0x7FFFFFF0) if const_expr("st" in ablate) else (row0 + r * RPS) * (DV * 2) + col, aux=CPOL_NT)
+                                    # Loads grouped before their stores (distinct registers): a reload of
+                                    # the register a pending store still reads costs an s_wait_xcnt.
+                                    for r0 in range_constexpr(0, 16 // RPS, STG):
+                                        rr = list(range_constexpr(r0, min(r0 + STG, 16 // RPS)))
+                                        vs = [
+                                            lds_load(stg + (r * RPS + lane // LPR) * SROW + (lane % LPR) * 16, v4i)
+                                            for r in rr
+                                        ]
+                                        for v, r in zip(vs, rr):
+                                            off = (row0 + r * RPS) * (DV * 2) + col
+                                            if const_expr("st" in ablate):
+                                                off = fx.Int32(0x7FFFFFF0)
+                                            buf_store(v, rsrc_im, off, aux=CPOL_NT)
 
                     steps.append((ld, mma))
             run(steps)
@@ -865,7 +880,7 @@ def build_sparse_mla_bwd_gfx1250_w1(
         PF = idx_pf and NBUF == 2  # the next tile's index octets ride in the loop state
         init = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(G * DTQ)]
         if const_expr(PF):
-            init = init + load_octs(fx.Int32(1))
+            init = init + load_octs(None, static_tile=1)
         for t, st in range(fx.Index(0), fx.Index(n_tile), fx.Index(1), init=init):
             ti = fx.Int32(t)
             # Tile t landed, and every wave is done with tile t-1 (its kv buffer and dS / P).
@@ -907,9 +922,13 @@ def build_sparse_mla_bwd_gfx1250_w1(
                 lds_store(zero, row + DV * 2 + hi * (RZ * 16) + ds * (RZ // DS * 16) + j * 16)
         _lds_barrier()
         rsrc_dq = make_rsrc(tensor_addr(DQ) + tok_q, H * DQK * 2)
-        for i in range_constexpr(H * QCPR // BLOCK):
-            c = tid + i * BLOCK
-            buf_store(lds_load(q_lds + (c + c // QCPR) * 16, v4i), rsrc_dq, c * 16)
+        NQS = H * QCPR // BLOCK
+        for i0 in range_constexpr(0, NQS, STG):
+            ii = list(range_constexpr(i0, min(i0 + STG, NQS)))
+            cs = [tid + i * BLOCK for i in ii]
+            vs = [lds_load(q_lds + (c + c // QCPR) * 16, v4i) for c in cs]
+            for v, c in zip(vs, cs):
+                buf_store(v, rsrc_dq, c * 16)
 
     @flyc.jit
     def launch_sparse_mla_bwd_gfx1250_w1(
@@ -969,6 +988,7 @@ def build_sparse_mla_bwd_gfx1250_swa(
     bf_hold=True,
     batch=None,
     qgw=None,
+    qsg=None,
 ):
     """cr0 backward (pure SWA, top-k = the 128-row window ``[t-127, t]`` in slot order).
 
@@ -1048,6 +1068,9 @@ def build_sparse_mla_bwd_gfx1250_swa(
     QSROW = QGW * 32 + 16
     QLPR = QGW * 2  # lanes per staged row (16 B each)
     QRPS = WAVE // QLPR  # rows per buffer_store
+    # staged dq rows loaded per group before their stores: 8 with the pool (cr128: 331.7 -> 316.9 us,
+    # interleaved A/B x4), 1 without (cr0 neutral)
+    QSG = max(1, qsg if qsg is not None else (8 if pool_p > 0 else 1))
     c_log2 = float(scale) * LOG2E
     pin_every = pin if pin > 0 else 1 << 30
     # Row tiles whose shifted dS / P rows can fall outside the 128 slots (read as zeros).
@@ -1421,18 +1444,27 @@ def build_sparse_mla_bwd_gfx1250_swa(
                             if const_expr(POOL):
                                 # One lane-varying address each side, the rest in immediates /
                                 # soffset: hoisted per-store address VGPRs spill here.
-                                for r in range_constexpr(16 // QRPS):
-                                    v = lds_load(q_ld + (g * 16 + r * QRPS) * QSROW, v4i)
-                                    soff = (hp * 32 + g * 16 + r * QRPS) * (DQK * 2) + col
-                                    buf_store(v, rsrc_dq, q_st, soff=soff)
+                                # Rows load in groups of QSG before their stores (distinct registers):
+                                # ATT showed s_wait_xcnt before each store when one register was
+                                # reloaded per row (the store had to read it out first).
+                                for r0 in range_constexpr(0, 16 // QRPS, QSG):
+                                    vs = [
+                                        lds_load(q_ld + (g * 16 + r * QRPS) * QSROW, v4i)
+                                        for r in range_constexpr(r0, min(r0 + QSG, 16 // QRPS))
+                                    ]
+                                    for k, r in enumerate(range_constexpr(r0, min(r0 + QSG, 16 // QRPS))):
+                                        soff = (hp * 32 + g * 16 + r * QRPS) * (DQK * 2) + col
+                                        buf_store(vs[k], rsrc_dq, q_st, soff=soff)
                             else:
                                 col_l = col + (lane % QLPR) * 16
                                 for jj in range_constexpr(QGW):
                                     lds_store(cur[("o", g, jj)], qstg + l16 * QSROW + jj * 32 + hi * 16)
-                                for r in range_constexpr(16 // QRPS):
-                                    row = r * QRPS + lane // QLPR
-                                    v = lds_load(qstg + row * QSROW + (lane % QLPR) * 16, v4i)
-                                    buf_store(v, rsrc_dq, (hp * 32 + g * 16 + row) * (DQK * 2) + col_l)
+                                for r0 in range_constexpr(0, 16 // QRPS, QSG):
+                                    rr = list(range_constexpr(r0, min(r0 + QSG, 16 // QRPS)))
+                                    rows = [r * QRPS + lane // QLPR for r in rr]
+                                    vs = [lds_load(qstg + row * QSROW + (lane % QLPR) * 16, v4i) for row in rows]
+                                    for v, row in zip(vs, rows):
+                                        buf_store(v, rsrc_dq, (hp * 32 + g * 16 + row) * (DQK * 2) + col_l)
 
                 steps.append((ld, mma))
             run(steps)
