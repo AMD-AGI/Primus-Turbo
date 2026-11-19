@@ -84,21 +84,25 @@ def opaque_base(tensor):
 
 
 @ASTRewriter.transform
-def spin_flag(flag_base, flag_idx, expected, rank, src, tag):
-    """Spin until the i64 flag reaches ``expected``; on timeout report and trap (no silent hang)."""
+def spin_flag(flag_base, flag_idx, expected, rank, src, tag, report=True):
+    """Spin until the i64 flag reaches ``expected``; on timeout trap (and printf unless ``report=False``).
+
+    ``report=False`` skips the hostcall printf: inlined into a pull / K path it needs the registers the
+    surrounding loads hold (same as ``spin_flags``)."""
     spin_start = read_clock()
     fx.rocdl.s_waitcnt(0)
     flag = ld(flag_base, flag_idx, scope="sys", dtype=fx.T.i64)
     while flag < expected:
         fx.rocdl.s_sleep(fx.Int32(1))
         if spin_timed_out(spin_start, SPIN_TIMEOUT):
-            fx.printf(
-                f"[ulysses rank={rank} {tag}] flag wait timeout: src={{}} flag_idx={{}} flag={{}} expected={{}}\n",
-                src,
-                flag_idx,
-                flag,
-                expected,
-            )
+            if const_expr(report):
+                fx.printf(
+                    f"[ulysses rank={rank} {tag}] flag wait timeout: src={{}} flag_idx={{}} flag={{}} expected={{}}\n",
+                    src,
+                    flag_idx,
+                    flag,
+                    expected,
+                )
             _asm("s_trap 2")
         fx.rocdl.s_waitcnt(0)
         flag = ld(flag_base, flag_idx, scope="sys", dtype=fx.T.i64)

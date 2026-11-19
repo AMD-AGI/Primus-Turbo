@@ -130,7 +130,13 @@ def _pull_unit(
     if thread_index == fx.Int32(0):
         for tile_n in range_constexpr(first_n, last_n + 1):
             spin_flag(
-                flag_base, m_tile * fx.Int32(n_tiles) + fx.Int32(tile_n), epoch, rank, src, "gemm_a2a pull"
+                flag_base,
+                m_tile * fx.Int32(n_tiles) + fx.Int32(tile_n),
+                epoch,
+                rank,
+                src,
+                "gemm_a2a pull",
+                report=False,
             )
         if const_expr(trace_base is not None):
             st(trace_base, trace_idx, read_clock())
