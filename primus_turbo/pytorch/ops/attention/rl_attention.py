@@ -13,9 +13,31 @@ shares its batch.
 * ``rl_flash_attn_varlen_func`` / ``rl_flash_attn_func``: training, THD / BSHD, forward + backward.
 
 All three are causal (bottom-right aligned) by default, take an optional sliding window
-(``window_left``), per-head attention sinks (``sinks``), and an optional visibility mask built by
-``create_block_mask``. Bits depend on the reduction order (``set_reduce_order``), which must be the
-same in rollout and training; launch parameters never change them.
+(``window_left``), per-head attention sinks (``sinks``), an optional visibility mask built by
+``create_block_mask``, and ``kernel_options``.
+
+Kernel options
+--------------
+``kernel_options`` (a dict, as in FlexAttention) sets kernel parameters per call; the environment
+variable PRIMUS_TURBO_RL_ATTN_KERNEL_OPTIONS ("KEY=VALUE,KEY=VALUE") sets process-wide defaults
+that a call overrides key by key. 0 or "auto" means the backend default.
+
+==============  ===========  ===================================================================
+Key             Bits change  Meaning
+==============  ===========  ===================================================================
+TILE_SIZE       yes          KV tile per inner step (default 64, 32 for head size > 128)
+SEGMENT_SIZE    yes          KV segment length, the split-KV unit (default 1024)
+BACKEND         yes          "TRITON" (FLYDSL to come)
+MODE            no           "auto", "fused" (one pass) or "split" (split-KV + reduce)
+BLOCK_M         no           query rows per program (a multiple of the GQA group)
+num_warps       no           clamped to BLOCK_M / 16 when BLOCK_M > 16 to keep the bits
+num_stages      no           software pipelining depth
+waves_per_eu    no           occupancy hint
+==============  ===========  ===================================================================
+
+Keys that change bits must be the same in the rollout and the training process (set them in the
+environment of both, or pass the same dict); the others may differ per call. The backward always
+uses its own fixed configuration.
 
 Visibility masks
 ----------------
@@ -38,31 +60,107 @@ mask, so a token's output depends only on its own interval. The backward prunes 
 intervals.
 """
 
+import functools
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Union
 
 import torch
 
+from primus_turbo.common import envs
 from primus_turbo.pytorch.kernels.attention import rl_attention_impl
-from primus_turbo.pytorch.kernels.attention.rl_attention_triton_impl import (
-    RLAttentionReduceOrder,
-    get_reduce_order,
-    set_reduce_order,
-)
 
 __all__ = [
-    "RLAttentionReduceOrder",
+    "KERNEL_OPTIONS",
     "RLBlockMask",
     "create_block_mask",
-    "get_reduce_order",
     "rl_flash_attn_func",
     "rl_flash_attn_varlen_func",
     "rl_paged_attention_func",
-    "set_backend",
-    "set_reduce_order",
 ]
 
-set_backend = rl_attention_impl.set_backend
+_INT_OPTIONS = ("TILE_SIZE", "SEGMENT_SIZE", "BLOCK_M", "num_warps", "num_stages", "waves_per_eu")
+KERNEL_OPTIONS = _INT_OPTIONS + ("MODE", "BACKEND")
+
+
+@dataclass(frozen=True)
+class _Options:
+    tile_size: int = 0
+    segment_size: int = 0
+    block_m: int = 0
+    num_warps: int = 0
+    num_stages: int = 0
+    waves_per_eu: int = 0
+    mode: str = "auto"
+    backend: str = "TRITON"
+
+    def fwd_args(self) -> tuple:
+        """In the order of rl_attention_fwd_impl's trailing arguments, after ``return_lse``."""
+        return (
+            self.mode,
+            self.tile_size,
+            self.segment_size,
+            self.block_m,
+            self.num_warps,
+            self.num_stages,
+            self.waves_per_eu,
+            self.backend,
+        )
+
+
+def _merge_options(options: dict, source: str, into: dict) -> dict:
+    unknown = set(options) - set(KERNEL_OPTIONS)
+    if unknown:
+        raise ValueError(f"unsupported {source} keys {sorted(unknown)}; supported: {KERNEL_OPTIONS}")
+    for key, value in options.items():
+        if key in _INT_OPTIONS:
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"{source} {key} must be an integer, got {value!r}") from None
+            if value < 0:
+                raise ValueError(f"{source} {key} must be >= 0, got {value}")
+        elif key == "MODE":
+            value = str(value).lower()
+            if value not in ("auto", "fused", "split"):
+                raise ValueError(f"{source} MODE must be auto, fused or split, got {value!r}")
+        else:
+            value = str(value).upper()
+            if value not in rl_attention_impl.BACKEND_NAMES:
+                raise ValueError(
+                    f"{source} BACKEND must be one of {rl_attention_impl.BACKEND_NAMES}, got {value!r}"
+                )
+        into[key] = value
+    return into
+
+
+@functools.lru_cache(maxsize=8)
+def _env_options(raw: Optional[str]) -> Tuple[Tuple[str, object], ...]:
+    if raw is None:
+        return ()
+    pairs = {}
+    for item in raw.split(","):
+        if not item.strip():
+            continue
+        key, sep, value = item.partition("=")
+        if not sep:
+            raise ValueError(f"PRIMUS_TURBO_RL_ATTN_KERNEL_OPTIONS: expected KEY=VALUE, got {item!r}")
+        pairs[key.strip()] = value.strip()
+    return tuple(_merge_options(pairs, "PRIMUS_TURBO_RL_ATTN_KERNEL_OPTIONS", {}).items())
+
+
+def _resolve_options(kernel_options: Optional[dict]) -> _Options:
+    merged = dict(_env_options(envs.PRIMUS_TURBO_RL_ATTN_KERNEL_OPTIONS))
+    _merge_options(dict(kernel_options or {}), "kernel_options", merged)
+    return _Options(
+        tile_size=merged.get("TILE_SIZE", 0),
+        segment_size=merged.get("SEGMENT_SIZE", 0),
+        block_m=merged.get("BLOCK_M", 0),
+        num_warps=merged.get("num_warps", 0),
+        num_stages=merged.get("num_stages", 0),
+        waves_per_eu=merged.get("waves_per_eu", 0),
+        mode=merged.get("MODE", "auto"),
+        backend=merged.get("BACKEND", "TRITON"),
+    )
 
 
 @dataclass(frozen=True)
@@ -164,15 +262,15 @@ def rl_paged_attention_func(
     window_left: int = -1,
     block_mask: Optional[RLBlockMask] = None,
     sinks: Optional[torch.Tensor] = None,
-    mode: str = "auto",
+    kernel_options: Optional[dict] = None,
 ) -> torch.Tensor:
     """Rollout forward over a paged KV cache.
 
     q [num_tokens, Hq, D]; k_cache, v_cache [num_blocks, block_size, Hkv, D]; block_table
     [num_seqs, max_blocks] int32; seq_lens [num_seqs] int32 (keys per sequence, including this
-    step's queries); cu_seqlens_q [num_seqs + 1] int32. ``mode`` ("auto", "fused" or "split") only
-    changes the schedule. Returns out [num_tokens, Hq, Dv].
+    step's queries); cu_seqlens_q [num_seqs + 1] int32. Returns out [num_tokens, Hq, Dv].
     """
+    opts = _resolve_options(kernel_options)
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
     window_left, block_mask, sinks = _prepare(q.shape[0], q.shape[1], window_left, block_mask, sinks)
@@ -192,7 +290,7 @@ def rl_paged_attention_func(
         block_mask.hi if block_mask is not None else None,
         sinks,
         False,
-        mode,
+        *opts.fwd_args(),
     )
     return out
 
@@ -201,13 +299,14 @@ class RLFlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, window_left, vis_lo,
-        vis_hi, sinks,
+        vis_hi, sinks, opts,
     ):  # fmt: skip
         sinks32 = sinks.to(torch.float32).contiguous() if sinks is not None else None
         out, lse = rl_attention_impl.rl_attention_fwd_impl(
             q, k, v, cu_seqlens_q, cu_seqlens_k, None, None, max_seqlen_q, max_seqlen_k, softmax_scale,
-            window_left, vis_lo, vis_hi, sinks32, True, "fused",
+            window_left, vis_lo, vis_hi, sinks32, True, *opts.fwd_args(),
         )  # fmt: skip
+        ctx.backend = opts.backend
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, vis_lo, vis_hi, sinks32)
         ctx.has_sinks = sinks is not None
         ctx.sinks_dtype = sinks.dtype if sinks is not None else None
@@ -222,10 +321,10 @@ class RLFlashAttnVarlenFunc(torch.autograd.Function):
         q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, vis_lo, vis_hi, sinks = ctx.saved_tensors
         dq, dk, dv, dsink = rl_attention_impl.rl_attention_bwd_impl(
             dout.contiguous(), q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, ctx.max_seqlen_q,
-            ctx.max_seqlen_k, ctx.softmax_scale, ctx.window_left, vis_lo, vis_hi, sinks,
+            ctx.max_seqlen_k, ctx.softmax_scale, ctx.window_left, vis_lo, vis_hi, sinks, ctx.backend,
         )  # fmt: skip
         dsink = dsink.to(ctx.sinks_dtype) if ctx.has_sinks else None
-        return dq, dk, dv, None, None, None, None, None, None, None, None, dsink
+        return dq, dk, dv, None, None, None, None, None, None, None, None, dsink, None
 
 
 def rl_flash_attn_varlen_func(
@@ -241,17 +340,19 @@ def rl_flash_attn_varlen_func(
     block_mask: Optional[RLBlockMask] = None,
     sinks: Optional[torch.Tensor] = None,
     return_lse: bool = False,
+    kernel_options: Optional[dict] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Training forward + backward, THD layout: q [total_q, Hq, D], k, v [total_k, Hkv, D],
     cu_seqlens_q / cu_seqlens_k [num_seqs + 1] int32. Returns out [total_q, Hq, Dv], plus the
     natural-log LSE [total_q, Hq] fp32 with ``return_lse``."""
+    opts = _resolve_options(kernel_options)
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
     window_left, block_mask, _ = _prepare(q.shape[0], q.shape[1], window_left, block_mask, sinks)
     out, lse = RLFlashAttnVarlenFunc.apply(
         q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), int(max_seqlen_k), float(softmax_scale),
         window_left, block_mask.lo if block_mask is not None else None,
-        block_mask.hi if block_mask is not None else None, sinks,
+        block_mask.hi if block_mask is not None else None, sinks, opts,
     )  # fmt: skip
     return (out, lse) if return_lse else out
 
@@ -265,6 +366,7 @@ def rl_flash_attn_func(
     block_mask: Optional[RLBlockMask] = None,
     sinks: Optional[torch.Tensor] = None,
     return_lse: bool = False,
+    kernel_options: Optional[dict] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Training forward + backward, BSHD layout: q [B, Sq, Hq, D], k, v [B, Sk, Hkv, D]. A
     ``block_mask`` has B * Sq rows in batch-major order, in global key indices (row b's keys start
@@ -286,6 +388,7 @@ def rl_flash_attn_func(
         block_mask,
         sinks,
         return_lse,
+        kernel_options,
     )
     if return_lse:
         out, lse = res

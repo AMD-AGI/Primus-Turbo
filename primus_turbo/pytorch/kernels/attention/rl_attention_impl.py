@@ -8,11 +8,13 @@
 
 RL needs the rollout forward and the training forward to produce the same bits, so both must run
 the same backend with the same reduction order. That rules out what other ops do here: no
-per-shape auto-tuning across backends and no silent fallback. The backend is one process-wide
-choice (``set_backend``), TRITON by default, and a backend that cannot take a call raises.
+per-shape auto-tuning across backends and no silent fallback. The backend is the ``BACKEND``
+kernel option (TRITON by default), and a backend that cannot take a call raises.
 
 Each backend provides ``can_handle(**kwargs)``, ``fwd(**kwargs)`` and ``bwd(**kwargs)``; a new one
-(e.g. FLYDSL) is added to ``_BACKENDS``.
+(e.g. FLYDSL) is added to ``_BACKENDS``. The forward receives the resolved kernel options as
+keyword arguments (``tile_size``, ``segment_size``, ``block_m``, ``num_warps``, ``num_stages``,
+``waves_per_eu``, ``mode``; 0 / "auto" = backend default).
 """
 
 from typing import Optional, Tuple
@@ -37,26 +39,15 @@ class RLAttentionTritonBackend:
 
 
 _BACKENDS = {BackendType.TRITON: RLAttentionTritonBackend}
-_backend = BackendType.TRITON
+BACKEND_NAMES = tuple(b.name for b in _BACKENDS)
 
 
-def set_backend(backend: BackendType) -> None:
-    global _backend
-    if backend not in _BACKENDS:
-        raise ValueError(
-            f"RL attention has no {backend.name} backend; available: {[b.name for b in _BACKENDS]}"
-        )
-    _backend = backend
-
-
-def get_backend() -> BackendType:
-    return _backend
-
-
-def _select(**kwargs):
-    impl = _BACKENDS[_backend]
+def _select(backend: str, **kwargs):
+    if backend not in BACKEND_NAMES:
+        raise ValueError(f"RL attention BACKEND must be one of {BACKEND_NAMES}, got {backend!r}")
+    impl = _BACKENDS[BackendType[backend]]
     if not impl.can_handle(**kwargs):
-        raise ValueError(f"RL attention backend {_backend.name} cannot handle these inputs")
+        raise ValueError(f"RL attention backend {backend} cannot handle these inputs")
     return impl
 
 
@@ -78,6 +69,13 @@ def rl_attention_fwd_impl(
     sinks: Optional[torch.Tensor],
     return_lse: bool,
     mode: str,
+    tile_size: int,
+    segment_size: int,
+    block_m: int,
+    num_warps: int,
+    num_stages: int,
+    waves_per_eu: int,
+    backend: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """out [num_tokens, Hq, Dv] and the natural-log LSE [num_tokens, Hq] fp32 (shape [0] unless
     ``return_lse``)."""
@@ -98,14 +96,21 @@ def rl_attention_fwd_impl(
         sinks=sinks,
         return_lse=return_lse,
         mode=mode,
+        tile_size=tile_size,
+        segment_size=segment_size,
+        block_m=block_m,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        waves_per_eu=waves_per_eu,
     )
-    return _select(**kwargs).fwd(**kwargs)
+    return _select(backend, **kwargs).fwd(**kwargs)
 
 
 @rl_attention_fwd_impl.register_fake
 def _rl_attention_fwd_impl_meta(
     q, k, v, cu_seqlens_q, cu_seqlens_k, seq_lens, block_table, max_seqlen_q, max_seqlen_k,
-    softmax_scale, window_left, vis_lo, vis_hi, sinks, return_lse, mode,
+    softmax_scale, window_left, vis_lo, vis_hi, sinks, return_lse, mode, tile_size, segment_size,
+    block_m, num_warps, num_stages, waves_per_eu, backend,
 ):  # fmt: skip
     num_tokens, num_q_heads, _ = q.shape
     lse_shape = (num_tokens, num_q_heads) if return_lse else (0,)
@@ -129,6 +134,7 @@ def rl_attention_bwd_impl(
     vis_lo: Optional[torch.Tensor],
     vis_hi: Optional[torch.Tensor],
     sinks: Optional[torch.Tensor],
+    backend: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """dq, dk, dv, and dsink [Hq] fp32 (shape [0] without sinks, since the schema returns a fixed
     number of tensors)."""
@@ -149,7 +155,7 @@ def rl_attention_bwd_impl(
         vis_hi=vis_hi,
         sinks=sinks,
     )
-    dq, dk, dv, dsink = _select(**kwargs).bwd(**kwargs)
+    dq, dk, dv, dsink = _select(backend, **kwargs).bwd(**kwargs)
     if dsink is None:
         dsink = q.new_empty((0,), dtype=torch.float32)
     return dq, dk, dv, dsink
@@ -158,7 +164,7 @@ def rl_attention_bwd_impl(
 @rl_attention_bwd_impl.register_fake
 def _rl_attention_bwd_impl_meta(
     dout, q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-    softmax_scale, window_left, vis_lo, vis_hi, sinks,
+    softmax_scale, window_left, vis_lo, vis_hi, sinks, backend,
 ):  # fmt: skip
     dsink_shape = (q.shape[1],) if sinks is not None else (0,)
     return (

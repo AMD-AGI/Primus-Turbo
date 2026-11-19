@@ -11,20 +11,15 @@ rollout prefill / decode step or the training forward."""
 
 import pytest
 import torch
-import triton
 
-from primus_turbo.pytorch.kernels.attention import (
-    rl_attention_impl,
-    rl_attention_triton_impl,
-)
+from primus_turbo.common import envs
+from primus_turbo.pytorch.kernels.attention import rl_attention_impl
 from primus_turbo.pytorch.ops.attention.rl_attention import (
-    RLAttentionReduceOrder,
+    _resolve_options,
     create_block_mask,
-    get_reduce_order,
     rl_flash_attn_func,
     rl_flash_attn_varlen_func,
     rl_paged_attention_func,
-    set_reduce_order,
 )
 from tests.pytorch.ref.rl_attention_ref import rl_attention_ref
 
@@ -78,16 +73,17 @@ def _paged(k, v, cu_k, block_size, seed=0, extra_blocks=3):
     return k_cache, v_cache, block_table, torch.tensor(seq_lens, dtype=torch.int32, device=k.device)
 
 
-def _fwd(q, k, v, cu, scale, mode="fused", window_left=-1, mask=None, sinks=None):
+def _fwd(q, k, v, cu, scale, mode="fused", window_left=-1, mask=None, sinks=None, kernel_options=None):
     """Contiguous forward in a given mode, through the same custom op the training path uses."""
     max_len = int((cu[1:] - cu[:-1]).max())
     if mask is not None:
         mask = mask.with_window(window_left)
         window_left = -1
+    opts = _resolve_options({"MODE": mode, **(kernel_options or {})})
     out, _ = rl_attention_impl.rl_attention_fwd_impl(
         q, k, v, cu, cu, None, None, max_len, max_len, scale, window_left,
         mask.lo if mask is not None else None, mask.hi if mask is not None else None,
-        sinks.float() if sinks is not None else None, False, mode,
+        sinks.float() if sinks is not None else None, False, *opts.fwd_args(),
     )  # fmt: skip
     return out
 
@@ -140,13 +136,18 @@ def _sinks(hq, seed=0):
     return (torch.randn(hq, generator=gen) * 2).to(DEVICE)
 
 
+def _set_env_options(value):
+    envs.set_env("PRIMUS_TURBO_RL_ATTN_KERNEL_OPTIONS", value)
+
+
 @pytest.fixture
 def small_segments():
-    """Short KV segments so split mode and multi-segment fused mode are exercised at test sizes."""
-    saved = get_reduce_order()
-    set_reduce_order(RLAttentionReduceOrder(segment_size=128))
+    """Short KV segments, set process-wide through the environment as a rollout and a trainer would,
+    so split mode and multi-segment fused mode are exercised at test sizes."""
+    saved = envs.PRIMUS_TURBO_RL_ATTN_KERNEL_OPTIONS
+    _set_env_options("SEGMENT_SIZE=128")
     yield
-    set_reduce_order(saved)
+    _set_env_options(saved)
 
 
 # ----------------------------------------------------------------------------- causal / window
@@ -175,7 +176,17 @@ def test_paged_split_fused_contiguous_bitwise(dtype, heads, window, block_size, 
     k_cache, v_cache, block_table, seq_lens = _paged(k, v, cu, block_size)
     for mode in ("fused", "split"):
         paged = rl_paged_attention_func(
-            q, k_cache, v_cache, cu, seq_lens, block_table, 300, 300, d**-0.5, window_left=window, mode=mode
+            q,
+            k_cache,
+            v_cache,
+            cu,
+            seq_lens,
+            block_table,
+            300,
+            300,
+            d**-0.5,
+            window_left=window,
+            kernel_options={"MODE": mode},
         )
         assert _bits_equal(paged, contiguous), f"paged {mode} (block_size={block_size})"
 
@@ -183,25 +194,17 @@ def test_paged_split_fused_contiguous_bitwise(dtype, heads, window, block_size, 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("heads", [(8, 1, 64), (6, 2, 64), (8, 2, 128), (32, 8, 128)])
 @pytest.mark.parametrize("with_mask", [False, True])
-def test_launch_invariance(dtype, heads, with_mask, small_segments, monkeypatch):
+def test_launch_invariance(dtype, heads, with_mask, small_segments):
     """Rows per program and warps only schedule work: every (BLOCK_M, num_warps) gives the same bits."""
     hq, hkv, d = heads
     lens = [77, 300, 129]
     q, k, v, cu = _varlen(lens, hq, hkv, d, dtype, seed=2)
     mask = _mixed_mask(lens, seed=2)[2] if with_mask else None
-    real_launch = rl_attention_triton_impl._launch
     outs = {}
     for block_m in (16, 32, 64, 128):
         for warps in (1, 2, 4, 8):
-
-            def forced(queries_per_kv, mode, max_seqlen_q, split_programs=0, _bm=block_m, _w=warps):
-                base = real_launch(queries_per_kv, mode, max_seqlen_q, split_programs)
-                bm = max(_bm, triton.next_power_of_2(queries_per_kv))
-                w = min(_w, bm // 16) if bm > 16 else _w
-                return rl_attention_triton_impl._Launch(bm, w, base.num_stages, base.waves_per_eu)
-
-            monkeypatch.setattr(rl_attention_triton_impl, "_launch", forced)
-            outs[(block_m, warps)] = _fwd(q, k, v, cu, d**-0.5, "fused", mask=mask)
+            options = {"BLOCK_M": block_m, "num_warps": warps}
+            outs[(block_m, warps)] = _fwd(q, k, v, cu, d**-0.5, "fused", mask=mask, kernel_options=options)
     for key, out in outs.items():
         assert _bits_equal(out, outs[(16, 2)]), f"(BLOCK_M, num_warps)={key}"
 
@@ -247,7 +250,7 @@ def test_causal_rollout_matches_training(dtype, window, block_size, small_segmen
         for mode in ("fused", "split"):
             out = rl_paged_attention_func(
                 step_q, k_cache, v_cache, _cu([hi - lo, 1]), seq_lens, block_table, hi - lo,
-                max(hi, other_pos + 1), d**-0.5, window_left=window, mode=mode,
+                max(hi, other_pos + 1), d**-0.5, window_left=window, kernel_options={"MODE": mode},
             )  # fmt: skip
             assert _bits_equal(out[: hi - lo], training[lo:hi]), f"tokens [{lo}, {hi}) ({mode})"
 
@@ -292,7 +295,7 @@ def test_visibility_paged_split_fused_bitwise(dtype, block_size, with_sinks, sma
     for mode in ("fused", "split"):
         paged = rl_paged_attention_func(
             q, k_cache, v_cache, cu, seq_lens, block_table, 300, 300, 0.125, block_mask=mask, sinks=sinks,
-            mode=mode,
+            kernel_options={"MODE": mode},
         )  # fmt: skip
         assert _bits_equal(paged, contiguous), mode
 
@@ -356,7 +359,7 @@ def test_visibility_rollout_matches_training(dtype, block_size, chunk, small_seg
         for mode in ("fused", "split"):
             out = rl_paged_attention_func(
                 step_q, k_cache, v_cache, _cu([t1 - t0, 1]), seq_lens, block_table, t1 - t0,
-                max(keys_known, other_pos + 1), d**-0.5, block_mask=step_mask, sinks=sinks, mode=mode,
+                max(keys_known, other_pos + 1), d**-0.5, block_mask=step_mask, sinks=sinks, kernel_options={"MODE": mode},
             )  # fmt: skip
             assert _bits_equal(out[: t1 - t0], training[t0:t1]), f"tokens [{t0}, {t1}) ({mode})"
 
@@ -465,3 +468,44 @@ def test_bshd_matches_varlen():
     varlen = rl_flash_attn_varlen_func(q, k, v, cu, cu, 96, 96)
     bshd = rl_flash_attn_func(q.view(2, 96, hq, d), k.view(2, 96, hkv, d), v.view(2, 96, hkv, d))
     assert _bits_equal(bshd.reshape_as(varlen), varlen)
+
+
+# ----------------------------------------------------------------------------- kernel options
+
+
+def test_kernel_options_validation():
+    with pytest.raises(ValueError, match="unsupported"):
+        _resolve_options({"BLOCK_N": 64})
+    with pytest.raises(ValueError, match="MODE"):
+        _resolve_options({"MODE": "fast"})
+    with pytest.raises(ValueError, match="BACKEND"):
+        _resolve_options({"BACKEND": "CK"})
+    with pytest.raises(ValueError, match="integer"):
+        _resolve_options({"TILE_SIZE": "big"})
+    q, k, v, cu = _varlen([64], 8, 2, 64, torch.bfloat16)
+    with pytest.raises(ValueError, match="TILE_SIZE"):
+        rl_flash_attn_varlen_func(q, k, v, cu, cu, 64, 64, kernel_options={"TILE_SIZE": 48})
+
+
+def test_env_options_and_per_call_override():
+    """The environment sets defaults; kernel_options overrides them key by key; equal settings
+    through either route give the same bits, and the reduction order does change them."""
+    q, k, v, cu = _varlen(LENS, 8, 2, 64, torch.bfloat16, seed=14)
+    saved = envs.PRIMUS_TURBO_RL_ATTN_KERNEL_OPTIONS
+    try:
+        _set_env_options("TILE_SIZE=32, SEGMENT_SIZE=128,MODE=split")
+        opts = _resolve_options({"MODE": "fused"})
+        assert (opts.tile_size, opts.segment_size, opts.mode) == (32, 128, "fused")
+        from_env = rl_flash_attn_varlen_func(q, k, v, cu, cu, 300, 300)
+        _set_env_options(None)
+        per_call = rl_flash_attn_varlen_func(
+            q, k, v, cu, cu, 300, 300, kernel_options={"TILE_SIZE": 32, "SEGMENT_SIZE": 128}
+        )
+        default = rl_flash_attn_varlen_func(q, k, v, cu, cu, 300, 300)
+        assert _bits_equal(from_env, per_call)
+        assert not _bits_equal(per_call, default)
+        _set_env_options("TILE_SIZE")
+        with pytest.raises(ValueError, match="KEY=VALUE"):
+            rl_flash_attn_varlen_func(q, k, v, cu, cu, 300, 300)
+    finally:
+        _set_env_options(saved)

@@ -6,15 +6,16 @@
 
 """Triton launchers for RL attention (primus_turbo/triton/attention/rl_attention_{fwd,bwd}.py).
 
-Two kinds of parameters, kept apart on purpose:
+Two kinds of kernel options, kept apart on purpose:
 
-* The reduction order (``RLAttentionReduceOrder``: the KV tile size and the KV segment length) sets
-  the order of every floating-point reduction a row performs. It must be the same for rollout and
-  training of one model, so it is a process-wide setting, never derived from the batch.
-* Launch parameters (``_launch``: rows per program, warps, stages, waves, split vs fused mode) only
-  schedule work. They may follow the shape freely; every choice gives the same bits. The one
-  measured constraint is that warps tile only the rows of the score tile
-  (num_warps <= BLOCK_M / 16 when BLOCK_M > 16): warps that also split the columns change the bits.
+* ``tile_size`` (KV tile) and ``segment_size`` (KV segment length) set the order of every
+  floating-point reduction a row performs. They must be the same for rollout and training of one
+  model, and are never derived from the batch. 0 picks the default: tile 64 (32 for head size >
+  128), segment 1024.
+* ``block_m``, ``num_warps``, ``num_stages``, ``waves_per_eu`` and ``mode`` only schedule work. 0 (or
+  "auto") follows the shape; every choice gives the same bits. The one measured constraint is that
+  warps tile only the rows of the score tile, so ``num_warps`` is clamped to BLOCK_M / 16 when
+  BLOCK_M > 16: warps that also split the columns change the bits.
 """
 
 import functools
@@ -29,32 +30,12 @@ from primus_turbo.triton.attention import rl_attention_bwd, rl_attention_fwd
 SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
 
 
-@dataclass(frozen=True)
-class RLAttentionReduceOrder:
-    """KV tile size and KV segment length of the Triton RL attention forward. ``None`` picks the
-    default (tile 64, or 32 for head size > 128; segment 1024)."""
-
-    tile_size: Optional[int] = None
-    segment_size: Optional[int] = None
-
-    def resolve(self, head_size: int) -> Tuple[int, int]:
-        tile = self.tile_size or (32 if head_size > 128 else 64)
-        segment = self.segment_size or 1024
-        if tile & (tile - 1) or segment % tile:
-            raise ValueError(f"tile_size ({tile}) must be a power of 2 dividing segment_size ({segment})")
-        return tile, segment
-
-
-_reduce_order = RLAttentionReduceOrder()
-
-
-def set_reduce_order(order: RLAttentionReduceOrder) -> None:
-    global _reduce_order
-    _reduce_order = order
-
-
-def get_reduce_order() -> RLAttentionReduceOrder:
-    return _reduce_order
+def reduce_order(head_size: int, tile_size: int = 0, segment_size: int = 0) -> Tuple[int, int]:
+    tile = tile_size or (32 if head_size > 128 else 64)
+    segment = segment_size or 1024
+    if tile < 16 or tile & (tile - 1) or segment % tile:
+        raise ValueError(f"TILE_SIZE ({tile}) must be a power of 2 >= 16 dividing SEGMENT_SIZE ({segment})")
+    return tile, segment
 
 
 @dataclass(frozen=True)
@@ -70,9 +51,13 @@ def _num_cus(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def _block_m(queries_per_kv: int, mode: str, max_seqlen_q: int) -> int:
+def _block_m(queries_per_kv: int, mode: str, max_seqlen_q: int, forced: int = 0) -> int:
     """Rows per program, a multiple of the GQA group so a block never splits a token."""
     group = triton.next_power_of_2(queries_per_kv)
+    if forced:
+        if forced & (forced - 1) or forced < 16:
+            raise ValueError(f"BLOCK_M must be a power of 2 >= 16, got {forced}")
+        return max(forced, group)
     if mode == "split" or max_seqlen_q <= 16:
         return max(16, group)
     if max_seqlen_q < 1024:
@@ -80,9 +65,18 @@ def _block_m(queries_per_kv: int, mode: str, max_seqlen_q: int) -> int:
     return max(256, group)
 
 
-def _launch(queries_per_kv: int, mode: str, max_seqlen_q: int, split_programs: int = 0) -> _Launch:
-    """Tuned on MI355X (D=128, GQA 4, bf16), decode first."""
-    block_m = _block_m(queries_per_kv, mode, max_seqlen_q)
+def _launch(
+    queries_per_kv: int,
+    mode: str,
+    max_seqlen_q: int,
+    split_programs: int = 0,
+    block_m: int = 0,
+    num_warps: int = 0,
+    num_stages: int = 0,
+    waves_per_eu: int = 0,
+) -> _Launch:
+    """Defaults tuned on MI355X (D=128, GQA 4, bf16), decode first; nonzero arguments override."""
+    block_m = _block_m(queries_per_kv, mode, max_seqlen_q, block_m)
     if block_m <= 16 and mode == "split" and split_programs > 512:
         launch = _Launch(block_m, num_warps=2, num_stages=1, waves_per_eu=2)
     elif block_m <= 16 and mode == "split":
@@ -91,11 +85,10 @@ def _launch(queries_per_kv: int, mode: str, max_seqlen_q: int, split_programs: i
         launch = _Launch(block_m, num_warps=2, num_stages=3, waves_per_eu=1)
     else:
         launch = _Launch(block_m, num_warps=8, num_stages=2, waves_per_eu=2 if block_m <= 128 else 1)
+    warps = num_warps or launch.num_warps
     if block_m > 16:
-        launch = _Launch(
-            block_m, min(launch.num_warps, block_m // 16), launch.num_stages, launch.waves_per_eu
-        )
-    return launch
+        warps = min(warps, block_m // 16)
+    return _Launch(block_m, warps, num_stages or launch.num_stages, waves_per_eu or launch.waves_per_eu)
 
 
 def _choose_mode(
@@ -134,10 +127,17 @@ def rl_attention_fwd_triton(
     sinks: Optional[torch.Tensor],
     return_lse: bool,
     mode: str = "auto",
+    tile_size: int = 0,
+    segment_size: int = 0,
+    block_m: int = 0,
+    num_warps: int = 0,
+    num_stages: int = 0,
+    waves_per_eu: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward over a paged cache (``block_table`` and ``seq_lens``) or contiguous K/V
     (``cu_seqlens_k``). With visibility, ``cu_seqlens_k`` gives each sequence's first global key
-    index in both layouts. Returns out and the natural-log LSE (empty unless ``return_lse``)."""
+    index in both layouts. Returns out and the natural-log LSE (empty unless ``return_lse``).
+    Kernel options are described in the module docstring."""
     paged = block_table is not None
     if paged:
         assert seq_lens is not None and k.ndim == 4
@@ -155,13 +155,22 @@ def rl_attention_fwd_triton(
     queries_per_kv = num_q_heads // num_kv_heads
     num_seqs = cu_seqlens_q.numel() - 1
 
-    tile_size, segment_size = _reduce_order.resolve(head_size)
+    tile_size, segment_size = reduce_order(head_size, tile_size, segment_size)
+    if mode not in ("auto", "fused", "split"):
+        raise ValueError(f"MODE must be auto, fused or split, got {mode!r}")
     num_segments = triton.cdiv(max(int(max_seqlen_k), 1), segment_size)
-    probe = _launch(queries_per_kv, "fused", int(max_seqlen_q))
+    probe = _launch(queries_per_kv, "fused", int(max_seqlen_q), block_m=block_m)
     probe_blocks = num_tokens // (probe.block_m // queries_per_kv) + num_seqs
     mode = _choose_mode(mode, probe_blocks, num_kv_heads, num_segments, int(max_seqlen_q), q.device)
     launch = _launch(
-        queries_per_kv, mode, int(max_seqlen_q), split_programs=probe_blocks * num_kv_heads * num_segments
+        queries_per_kv,
+        mode,
+        int(max_seqlen_q),
+        split_programs=probe_blocks * num_kv_heads * num_segments,
+        block_m=block_m,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        waves_per_eu=waves_per_eu,
     )
     block_q = launch.block_m // queries_per_kv
     num_q_blocks = num_tokens // block_q + num_seqs
