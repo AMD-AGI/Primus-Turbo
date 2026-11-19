@@ -56,6 +56,7 @@ from primus_turbo.flydsl.fused_collective_gemm.common import (
     VEC_BF16,
     VEC_I32,
     claim_unit,
+    copy_rows,
     exit_and_bump_epoch,
     i64_base,
     opaque_base,
@@ -71,7 +72,6 @@ from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
     _make_shared_storage,
     gemm_bf16_tile,
 )
-from primus_turbo.flydsl.ulysses.a2a_gemm_kernel import _copy_rows
 from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_load,
     buffer_store,
@@ -145,7 +145,7 @@ def _copy_latent_rows(thread_index, t0, rows, dst_heap, bank_offset, xq_res, xkv
             dst_word = fx.Int32(region) + ((t + fx.Int32(rank * T)) * fx.Int32(vpr) + col) * fx.Int32(VEC_I32)
             return src_word, dst_word, t < fx.Int32(T)
 
-        _copy_rows(thread_index, rows * vpr, coords, src_res, bank_res, 0, SYS_NT, _COPY_BATCH)
+        copy_rows(thread_index, rows * vpr, coords, src_res, bank_res, 0, SYS_NT, _COPY_BATCH)
 
 
 @ASTRewriter.transform

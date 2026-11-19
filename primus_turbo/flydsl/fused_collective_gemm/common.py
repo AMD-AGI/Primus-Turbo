@@ -17,14 +17,15 @@ epoch bump of the last block out (see ``workspace.py`` for the protocol)."""
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl.expr import arith, const_expr
+from flydsl.expr import arith, const_expr, range_constexpr
 
 from primus_turbo.flydsl.deep_ep.common import _asm, ld_lds, st_lds
-from primus_turbo.flydsl.utils.buffer_ops import extract_base_index
+from primus_turbo.flydsl.utils.buffer_ops import buffer_load, buffer_store, extract_base_index
 from primus_turbo.flydsl.utils.prims import (
     _readfirstlane_i32,
     atomic_add,
     cast,
+    ceildiv,
     ld,
     read_clock,
     spin_timed_out,
@@ -41,6 +42,8 @@ VEC_BF16 = 8
 SYS_NT = 19
 # s_memrealtime ticks at 100 MHz: 5 s
 SPIN_TIMEOUT = 500_000_000
+# 16 B vectors whose loads are issued before their stores
+_BATCH = 8
 
 # state: [epoch, exit counter, unit claim counter, tile claim counter]
 STATE_EPOCH = 0
@@ -81,6 +84,24 @@ def opaque_base(tensor):
             fx.T.i64, [fx.as_ir_value(i64_base(tensor))], "s_mov_b64 $0, $1", "=s,s", has_side_effects=True
         )
     )
+
+
+def copy_rows(thread_index, num_vecs, vec_coords, src_res, dst_res, src_cm, dst_cm, batch=_BATCH):
+    """Copy ``num_vecs`` 16 B vectors, ``batch`` loads in flight per thread; ``vec_coords(v)`` gives
+    ``(src_word, dst_word, valid)``."""
+    per_iter = BLOCK_THREADS * batch
+    for it in range_constexpr(ceildiv(num_vecs, per_iter)):
+        coords = [
+            vec_coords(fx.Int32(it * per_iter + j * BLOCK_THREADS) + thread_index)
+            for j in range_constexpr(batch)
+            if it * per_iter + j * BLOCK_THREADS < num_vecs
+        ]
+        vals = [
+            buffer_load(src_res, src, vec_width=VEC_I32, dtype=fx.T.i32, mask=valid, cache_modifier=src_cm)
+            for src, _, valid in coords
+        ]
+        for val, (_, dst, valid) in zip(vals, coords):
+            buffer_store(val, dst_res, dst, mask=valid, cache_modifier=dst_cm)
 
 
 @ASTRewriter.transform

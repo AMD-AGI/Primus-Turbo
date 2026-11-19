@@ -48,6 +48,7 @@ from primus_turbo.flydsl.fused_collective_gemm.common import (
     WARP,
     _all_reached,
     claim_unit,
+    copy_rows,
     exit_and_bump_epoch,
     i64_base,
     opaque_tid,
@@ -91,8 +92,6 @@ from primus_turbo.flydsl.utils.prims import (
     st,
 )
 
-# 16 B vectors whose loads are issued before their stores
-_BATCH = 8
 # K chunk of the variable-K wgrad tile (CHUNK x BLOCK_K rows) and its LDS chunk stride
 _WGRAD_CHUNK_ROWS = 256
 _WGRAD_LDS_CHUNK_STRIDE = 1152
@@ -169,24 +168,6 @@ def _residual_store_c(residual):
     return _StoreCBf16Residual
 
 
-def _copy_rows(thread_index, num_vecs, vec_coords, src_res, dst_res, src_cm, dst_cm, batch=_BATCH):
-    """Copy ``num_vecs`` 16 B vectors, ``batch`` loads in flight per thread; ``vec_coords(v)`` gives
-    ``(src_word, dst_word, valid)``."""
-    per_iter = BLOCK_THREADS * batch
-    for it in range_constexpr(ceildiv(num_vecs, per_iter)):
-        coords = [
-            vec_coords(fx.Int32(it * per_iter + j * BLOCK_THREADS) + thread_index)
-            for j in range_constexpr(batch)
-            if it * per_iter + j * BLOCK_THREADS < num_vecs
-        ]
-        vals = [
-            buffer_load(src_res, src, vec_width=VEC_I32, dtype=fx.T.i32, mask=valid, cache_modifier=src_cm)
-            for src, _, valid in coords
-        ]
-        for val, (_, dst, valid) in zip(vals, coords):
-            buffer_store(val, dst_res, dst, mask=valid, cache_modifier=dst_cm)
-
-
 def _claim(thread_index, state_base, claim_slot, counter):
     """``claim_unit`` evaluating ``thread_index == 0`` anew, for the claim loops below that claim once at
     the top of every pass. The usual ``claim; while: ...; claim`` shape lost its loop structure after
@@ -246,7 +227,7 @@ def _copy_rows_to(thread_index, t0, rows, dst, dst_heap, bank_offset, o_res, **c
                 )
                 return src_word, dst_word, (r < fx.Int32(rows)) & (t < fx.Int32(M))
 
-            _copy_rows(thread_index, rows * vecs_per_row, coords, o_res[x], recv_res, 0, SYS_NT)
+            copy_rows(thread_index, rows * vecs_per_row, coords, o_res[x], recv_res, 0, SYS_NT)
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
 
@@ -706,7 +687,7 @@ def _gemm_tile(thread_index, q, flag_base, claim_slot, recv_addr, W, Y, RES, OG,
             valid = (r < fx.Int32(BM)) & (t < fx.Int32(M)) & (col < fx.Int32(og_vecs_per_row))
             return word, word, valid
 
-        _copy_rows(thread_index, BM * og_chunk, og_coords, recv_res, og_res, SYS_NT, 0)
+        copy_rows(thread_index, BM * og_chunk, og_coords, recv_res, og_res, SYS_NT, 0)
 
     tile_m, tile_n = _claimed_tile(q, **c)
     tile_index = tile_m * fx.Int32(n_tiles) + tile_n
