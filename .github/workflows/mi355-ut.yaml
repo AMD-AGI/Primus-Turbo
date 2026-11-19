@@ -37,12 +37,20 @@ jobs:
           pip3 install -r requirements.txt
           pip3 install "amd-aiter @ git+https://github.com/ROCm/aiter.git@${AITER_VERSION}"
           GPU_ARCHS="gfx950" PRIMUS_TURBO_FRAMEWORK="PYTORCH" pip3 install --no-build-isolation -e ".[pytorch]" -v
+      - name: Prepare coverage environment
+        run: |
+          # Enable coverage in test subprocesses (spawned by distributed tests)
+          # and clear stale data files left over from retried/previous runs.
+          echo "COVERAGE_PROCESS_START=$(pwd)/pyproject.toml" >> $GITHUB_ENV
+          SITE_PACKAGES=$(python3 -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+          echo "import coverage; coverage.process_startup()" > "${SITE_PACKAGES}/coverage_subprocess.pth"
+          rm -f .coverage .coverage.*
       - name: Run selected tests
         if: ${{ inputs.tests }}
         env:
           TESTS: ${{ inputs.tests }}
         # TESTS holds pytest targets and options; eval keeps quoted -k expressions intact.
-        run: eval "pytest -v ${TESTS} --timeout=600 --timeout-method=thread --log-cli-level=INFO"
+        run: eval "pytest -v ${TESTS} --timeout=600 --timeout-method=thread --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append"
       - name: Run single-GPU tests (parallel)
         if: ${{ !inputs.tests }}
         uses: nick-fields/retry@v3
@@ -52,7 +60,7 @@ jobs:
           command: >
             timeout -k 60s 130m
             bash -lc
-            "exec pytest -v tests/pytorch -n 8 --timeout=600 --timeout-method=thread --max-worker-restart=8 --log-cli-level=INFO"
+            "exec pytest -v tests/pytorch -n 8 --timeout=600 --timeout-method=thread --max-worker-restart=8 --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append"
       - name: Run deterministic tests (parallel)
         if: ${{ !inputs.tests }}
         uses: nick-fields/retry@v3
@@ -62,11 +70,23 @@ jobs:
           command: >
             timeout -k 60s 55m
             bash -lc
-            "exec pytest -v tests/pytorch -n 8 --deterministic-only --timeout=600 --timeout-method=thread --max-worker-restart=8 --log-cli-level=INFO"
+            "exec pytest -v tests/pytorch -n 8 --deterministic-only --timeout=600 --timeout-method=thread --max-worker-restart=8 --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append"
       - name: Run distributed tests
         if: ${{ !inputs.tests }}
         uses: nick-fields/retry@v3
         with:
           timeout_minutes: 60
           max_attempts: 2
-          command: pytest -v tests/pytorch --dist-only --timeout=600 --timeout-method=thread --log-cli-level=INFO
+          command: pytest -v tests/pytorch --dist-only --timeout=600 --timeout-method=thread --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append
+      - name: Combine and stage coverage data
+        if: always()
+        run: |
+          coverage combine --append || true
+          cp .coverage coverage_data_pytorch_gfx950 || true
+      - name: Upload coverage data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-pytorch-gfx950
+          path: coverage_data_pytorch_gfx950
+          if-no-files-found: warn
