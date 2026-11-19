@@ -50,8 +50,8 @@ notes; the kernel backend behind each cell is in
 | | FP8 rowwise | ✅ | ✅ | ✅ | |
 | | FP8 blockwise | ✅ | ✅ | ✅ | |
 | | MXFP8 | — | ✅ | — | |
-| `gemm_fp4` | MXFP4 | — | ✅ | — | |
-| `mlp_fp4` | MXFP4 | — | ✅ | — | Dense GLU MLP with fused activation |
+| `gemm_fp4` | MXFP4 | — | ✅ | — | See [MXFP4 training](./features/mxfp4.md) |
+| `mlp_fp4` | MXFP4 | — | ✅ | — | Dense GLU MLP with fused activation. See [MXFP4 training](./features/mxfp4.md) |
 
 ### 2.2 Grouped GEMM (MoE experts)
 
@@ -64,9 +64,9 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | | FP8 rowwise | ✅ | ✅ | ✅ | |
 | | FP8 blockwise | ✅ | ✅ | ✅ | |
 | | MXFP8 | — | ✅ | ✅ | |
-| `grouped_gemm_fp4` | MXFP4 | — | ✅ | ✅ | |
+| `grouped_gemm_fp4` | MXFP4 | — | ✅ | ✅ | See [MXFP4 training](./features/mxfp4.md) |
 | `grouped_mlp_fp8` | FP8 tensorwise / MXFP8 | — | ✅ | — | Expert MLP with SwiGLU / GeGLU fused into the grouped GEMM |
-| `grouped_mlp_fp4` | MXFP4 | — | ✅ | — | Same, MXFP4 |
+| `grouped_mlp_fp4` | MXFP4 | — | ✅ | — | Same, MXFP4. See [MXFP4 training](./features/mxfp4.md) |
 
 ### 2.3 Attention
 
@@ -118,7 +118,7 @@ These are fwd-only utilities; the `_with_trans` variants also emit the transpose
 | `grouped_quantize_fp8` / `_with_trans`, `grouped_dequantize_fp8` | MXFP8 | — | ✅ | ✅ | Per-expert |
 | `quantize_fp4`, `quantize_fp4_with_trans`, `dequantize_fp4` | MXFP4 | — | ✅ | ✅ | |
 | `grouped_quantize_fp4` / `_with_trans`, `grouped_dequantize_fp4` | MXFP4 | — | ✅ | ✅ | Fuses MoE gather. See [MoE gather quantization](./moe_gather_quantization.md) |
-| `weight_deosc_update`, `weight_deosc_close` | MXFP4 | ✅ | ✅ | — | Suppresses low-precision weight oscillation during training |
+| `weight_deosc_update`, `weight_deosc_close` | MXFP4 | ✅ | ✅ | — | Suppresses low-precision weight oscillation during training. See [MXFP4 training](./features/mxfp4.md#weight-de-oscillation) |
 | `weight_deosc_qdq` | MXFP4 | — | ✅ | — | Fused MXFP4 QDQ + tracking |
 
 ### 2.7 Communication and overlap
