@@ -235,6 +235,26 @@ def _run_steps(steps, batch, prefetch=0, pin=0):
             fx.rocdl.sched_barrier(0)
 
 
+def _run_steps_with(steps, batch, extras):
+    """``_run_steps`` in batch mode, with ``extras[i]()`` (independent VALU work) emitted between
+    the WMMAs of batch i and its closing ``sched_barrier``, so it is scheduled among them."""
+    n = len(steps)
+    cur = [steps[i][0]() for i in range_constexpr(min(batch, n))]
+    bi = 0
+    for b0 in range_constexpr(0, n, batch):
+        nxt = [steps[i][0]() for i in range_constexpr(b0 + batch, min(b0 + 2 * batch, n))]
+        fx.rocdl.sched_barrier(0)
+        for j in range_constexpr(len(cur)):
+            steps[b0 + j][1](cur[j])
+        if const_expr(bi < len(extras)):
+            extras[bi]()
+        fx.rocdl.sched_barrier(0)
+        cur = nxt
+        bi += 1
+    for k in range_constexpr(bi, len(extras)):
+        extras[k]()
+
+
 @functools.lru_cache(maxsize=64)
 def build_sparse_mla_fwd_gfx1250(
     num_heads,
@@ -247,6 +267,9 @@ def build_sparse_mla_fwd_gfx1250(
     block_k=None,
     persist=None,
     l2_prefetch=True,
+    ablate="",
+    vld_lds=True,
+    sm_overlap=False,
 ):
     """Launcher for fixed (H, topk, scale, sink); see ``sparse_mla_fwd_gfx1250``.
 
@@ -277,7 +300,10 @@ def build_sparse_mla_fwd_gfx1250(
     LDS_B = NBUF * TILE_B
     # O goes out through a per-wave LDS stage of 16 head rows, when it fits at full occupancy.
     STG_B = 16 * ROW
-    STAGE = (LDS_B + WAVES * STG_B) * (4 // WAVES) <= _LDS_MAX
+    # Slot validity of each ring tile (i32 row indices, written when its gather is issued) plus a
+    # per-wave dump row for the lanes that do not store.
+    VLD_B = (NBUF * BN + WAVES * 8) * 4 if vld_lds else 0
+    STAGE = (LDS_B + VLD_B + WAVES * STG_B) * (4 // WAVES) <= _LDS_MAX
     RPO = 16 if idx16 else 8  # rows per TDM op
     if (BN // RPO) % WAVES:
         raise ValueError(f"kv tile {BN} does not split into TDM ops over {WAVES} waves")
@@ -319,9 +345,10 @@ def build_sparse_mla_fwd_gfx1250(
             return bid + fx.Int32((j < n_loc).select(j, n_loc - fx.Int32(1))) * NPROG
 
         arena = fx.SharedAllocator(static=False)
-        arena.allocate(LDS_B + (WAVES * STG_B if STAGE else 0))
+        arena.allocate(LDS_B + VLD_B + (WAVES * STG_B if STAGE else 0))
         lds0 = fx.Int32(fx.Int64(fx.ptrtoint(arena.base_ptr)))
-        stg = lds0 + LDS_B + wave * STG_B
+        vld0 = lds0 + LDS_B
+        stg = lds0 + LDS_B + VLD_B + wave * STG_B
 
         rsrc_idx = make_rsrc(tensor_addr(TOPK), N_TOK * (topk * 4))
         kv_addr = tensor_addr(KV)
@@ -366,6 +393,12 @@ def build_sparse_mla_fwd_gfx1250(
                     words = rows
                 # An unused slot (-1) is out of range: the row lands as zeros, masked below.
                 _tdm_gather(buf_base + (wave * OPW + k) * (RPO * ROW), kv_addr, words, RPO, NKV)
+                if const_expr(vld_lds):
+                    # The tile's row indices, for the softmax mask (LDS instead of a global reload).
+                    va = vld0 + ((t % NBUF) * BN + (wave * OPW + k) * RPO) * 4
+                    va = fx.Int32((lane == fx.Int32(0)).select(va, vld0 + (NBUF * BN + wave * 8) * 4))
+                    for h in range_constexpr(RPO // 4):
+                        lds_store(Vec.from_elements(rows[4 * h : 4 * h + 4], fx.Int32), va + h * 16)
 
         # The prologue gathers go out before the Q loads so the two overlap.
         pro = [load_rows(fx.Int32(s)) for s in range_constexpr(NBUF)]
@@ -394,6 +427,15 @@ def build_sparse_mla_fwd_gfx1250(
         k_lane = l16 * ROW + hi * 16
         v_lane = (hi * 8 + l8) * ROW + (l16 // 8) * 16
         v8e = vec_type(8, fx.BFloat16)
+
+        def valid_lds(g):
+            # Validity from the ring copy of stream tile g's indices (see issue).
+            out = []
+            for kt in range_constexpr(KT):
+                o = vld0 + ((g % NBUF) * BN + kt * 16 + hi * 8) * 4
+                iv = cat(Vec(lds_load(o, v4i)), Vec(lds_load(o + 16, v4i)))
+                out.append([iv[i] >= fx.Int32(0) for i in range_constexpr(8)])
+            return out
 
         def valid_of(tok, t):
             # Validity of the kv rows this lane's score elements cover: kt*16 + hi*8 + i.
@@ -442,6 +484,10 @@ def build_sparse_mla_fwd_gfx1250(
             _run_steps(steps, BATCH)
 
         def softmax(s, valid, m_run, l_run):
+            if const_expr("sm" in ablate):
+                packs = [to_bf16(s[kt]) for kt in range_constexpr(KT)]
+                pf = [cat(packs[2 * pc], packs[2 * pc + 1]) for pc in range_constexpr(PC)]
+                return m_run, l_run, fx.Float32(1.0), pf, fx.Int32(0) != fx.Int32(0)
             vals = []
             for kt in range_constexpr(KT):
                 sv = vmul_scalar(s[kt], c_log2)
@@ -500,7 +546,7 @@ def build_sparse_mla_fwd_gfx1250(
             gpu.barrier()
             s0, steps0 = qk_steps(lds0 + (g0 % NBUF) * TILE_B, q_frag)
             run_steps(steps0)
-            v0 = valid_of(tok, fx.Int32(0))
+            v0 = valid_lds(g0) if const_expr(vld_lds) else valid_of(tok, fx.Int32(0))
             m, l, p = [], [], []  # noqa: E741
             for g in range_constexpr(G):
                 mg, lg, _, pg, _ = softmax(s0[g], v0, fx.Float32(_NEG_INF), fx.Float32(0.0))
@@ -523,27 +569,51 @@ def build_sparse_mla_fwd_gfx1250(
                         # with tile t-1's buffer, which the gather below overwrites.
                         _rocdl.s_wait_tensorcnt((NBUF - 3) * OPW)
                         gpu.barrier()
-                        issue(gt + NBUF - 1, [sm[NS + i] for i in range_constexpr(IW)])
+                        if const_expr("tdm" not in ablate):
+                            issue(gt + NBUF - 1, [sm[NS + i] for i in range_constexpr(IW)])
                         nxt = load_rows(gt + NBUF)
-                        valid = valid_of(tok, ti + 1)
+                        valid = valid_lds(gt + 1) if const_expr(vld_lds) else valid_of(tok, ti + 1)
                         s_n, qk = qk_steps(lds0 + ((gt + 1) % NBUF) * TILE_B, q_frag)
                         pv = pv_steps(lds0 + (gt % NBUF) * TILE_B, p, o)
-                        seq = []
-                        for i in range_constexpr(max(len(qk), len(pv))):
-                            if const_expr(i < len(qk)):
-                                seq.append(qk[i])
-                            if const_expr(i < len(pv)):
-                                seq.append(pv[i])
-                        run_steps(seq)
+                        if const_expr("qk" in ablate):
+                            qk = []
+                        if const_expr("pv" in ablate):
+                            pv = []
                         m2, l2, p2, a2 = [], [], [], []
                         need = None
-                        for g in range_constexpr(G):
-                            mg, lg, ag, pg, ng = softmax(s_n[g], valid, m[g], l[g])
-                            m2.append(mg)
-                            l2.append(lg)
-                            p2.append(pg)
-                            a2.append(ag)
-                            need = ng if need is None else need | ng
+                        if const_expr(sm_overlap and len(qk) > 0 and len(pv) > 0):
+                            # QK of tile t+1 first, then P*V of tile t with the softmax of tile t+1
+                            # emitted inside its WMMA batches: the scheduler hides the VALU / TRANS
+                            # work under the matrix pipe instead of running it after both.
+                            _run_steps(qk, BATCH)
+                            res = {}
+
+                            def sm_piece(g):
+                                res[g] = softmax(s_n[g], valid, m[g], l[g])
+
+                            _run_steps_with(pv, BATCH, [lambda g=g: sm_piece(g) for g in range_constexpr(G)])
+                            for g in range_constexpr(G):
+                                mg, lg, ag, pg, ng = res[g]
+                                m2.append(mg)
+                                l2.append(lg)
+                                p2.append(pg)
+                                a2.append(ag)
+                                need = ng if need is None else need | ng
+                        else:
+                            seq = []
+                            for i in range_constexpr(max(len(qk), len(pv))):
+                                if const_expr(i < len(qk)):
+                                    seq.append(qk[i])
+                                if const_expr(i < len(pv)):
+                                    seq.append(pv[i])
+                            run_steps(seq)
+                            for g in range_constexpr(G):
+                                mg, lg, ag, pg, ng = softmax(s_n[g], valid, m[g], l[g])
+                                m2.append(mg)
+                                l2.append(lg)
+                                p2.append(pg)
+                                a2.append(ag)
+                                need = ng if need is None else need | ng
                         flat = [x for g in range_constexpr(G) for x in o[g]]
 
                         def rescale():

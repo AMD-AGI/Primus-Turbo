@@ -42,6 +42,7 @@ row into the bf16 dKV.
 """
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -91,6 +92,7 @@ _LDS_CAP = 320 * 1024
 # reads run ~2.5x faster once the buffer spans less than ~2 GB.
 _INTERM_BYTES = 1536 << 20
 _GATHER_SEG = 256  # CSR entries per gather program
+_BAND_INTERM_BYTES = 4 << 30  # chunk cap with band_pool
 # global_prefetch_b8 cache policy: SCOPE_DEV (fill L2, not the WGP cache), non-speculative.
 _PF_L2 = (2 << 3) | 1
 _ROW_XMASK0 = 0x160  # DPP row_xmask:0
@@ -504,7 +506,8 @@ def _w1_block_k(num_heads):
 
 @functools.lru_cache(maxsize=64)
 def build_sparse_mla_bwd_gfx1250_w1(
-    num_heads, topk, scale, block_k=None, prefetch=8, pin=None, ahead=256, ct_resident=None, batch=4
+    num_heads, topk, scale, block_k=None, prefetch=8, pin=None, ahead=256, ct_resident=None, batch=4,
+    ablate="",
 ):
     """One wave per SIMD (4 waves), 32 heads per wave; the kv tiles arrive by TDM gather.
 
@@ -653,8 +656,9 @@ def build_sparse_mla_bwd_gfx1250_w1(
         for c in range_constexpr(QCH):
             idx = tid + c * BLOCK
             r, col = idx // CPR, idx % CPR
-            lds_store(buf_load(rsrc_q, r * (DQK * 2) + col * 16, v4i), q_lds + r * ROW + col * 16)
-            lds_store(buf_load(rsrc_do, r * (DV * 2) + col * 16, v4i), do_lds + r * ROW + col * 16)
+            if const_expr("stg" not in ablate):
+                lds_store(buf_load(rsrc_q, r * (DQK * 2) + col * 16, v4i), q_lds + r * ROW + col * 16)
+                lds_store(buf_load(rsrc_do, r * (DV * 2) + col * 16, v4i), do_lds + r * ROW + col * 16)
         gpu.barrier()
 
         # ---- delta = rowsum(O * dO): thread (h_d, p_d) sums part p_d of head h_d.
@@ -740,7 +744,8 @@ def build_sparse_mla_bwd_gfx1250_w1(
                             dp[g][kk] = wmma_bf16(cur["ad"][g], fr[-1], dp[g][kk])
 
                     steps.append((ld, mma))
-            run(steps)
+            if const_expr("sdp" not in ablate):
+                run(steps)
             # ---- P, dS: lane = slot t*BN + kt*16 + l16, element i = head hp*32 + g*16 + hi*8 + i.
             for kk in range_constexpr(KTW):
                 kt = kt0 + kk
@@ -776,7 +781,8 @@ def build_sparse_mla_bwd_gfx1250_w1(
                         for g in range_constexpr(G):
                             new[g][j] = wmma_bf16(fr[-1], cur["b"][g], new[g][j])
 
-                    steps.append((ld, mma))
+                    if const_expr("dq" not in ablate):
+                        steps.append((ld, mma))
             if const_expr(NBUF == 1):
                 run(steps)
                 steps = []
@@ -794,8 +800,9 @@ def build_sparse_mla_bwd_gfx1250_w1(
                     def keep(fr, kt=kt, hc=hc):
                         cur[("bs", kt, hc)], cur[("bp", kt, hc)] = fr
 
-                    steps.append((ld, keep))
-            for j in range_constexpr(DTW):
+                    if const_expr("ct" not in ablate):
+                        steps.append((ld, keep))
+            for j in range_constexpr(DTW if "ct" not in ablate else 0):
                 dt = wave * DTW + j
                 for hc in range_constexpr(HC):
 
@@ -825,7 +832,7 @@ def build_sparse_mla_bwd_gfx1250_w1(
                                         v = lds_load(
                                             stg + (r * RPS + lane // LPR) * SROW + (lane % LPR) * 16, v4i
                                         )
-                                        buf_store(v, rsrc_im, (row0 + r * RPS) * (DV * 2) + col, aux=CPOL_NT)
+                                        buf_store(v, rsrc_im, fx.Int32(0x7FFFFFF0) if const_expr("st" in ablate) else (row0 + r * RPS) * (DV * 2) + col, aux=CPOL_NT)
 
                     steps.append((ld, mma))
             run(steps)
@@ -838,7 +845,8 @@ def build_sparse_mla_bwd_gfx1250_w1(
             _rocdl.s_wait_tensorcnt(0)
             _lds_barrier()
             if const_expr(NBUF == 2):
-                issue(ti + 1, (ti + 1) % 2)
+                if const_expr("tdm" not in ablate):
+                    issue(ti + 1, (ti + 1) % 2)
                 buf = ti % 2
             else:
                 buf = fx.Int32(0)
@@ -1674,11 +1682,17 @@ def sparse_mla_bwd_gfx1250(
     interm_bytes=_INTERM_BYTES,
     use_w1=True,
     use_swa=True,
+    band_pool=None,
 ):
     """``(dq, dkv, dsink)``; dkv is shaped like ``kv`` and dsink is ``None`` without a sink.
 
     Tokens are processed in chunks whose bf16 ``[tokens, topk, 512]`` intermediate fits in
-    ``interm_bytes`` (no chunking when ``None``)."""
+    ``interm_bytes`` (no chunking when ``None``).
+
+    ``band_pool = (window, n_raw, pool)`` asserts the map is a window + pool map (V4 CSA with
+    B == 1: slots ``[0, window)`` are the sliding window ``t - window + 1 + s``, the rest pool
+    rows ``n_raw + p`` picked at most once per token, or -1). The dKV reduction then needs no
+    CSR inverse (no sort): see ``sparse_mla_dkv_band_gather``."""
     # Deferred: primus_turbo.triton imports primus_turbo.pytorch, which imports this module.
     from primus_turbo.triton.attention.sparse_mla_dkv_gather import dkv_gather_acc
     from primus_turbo.triton.attention.sparse_mla_dsink import sparse_mla_dsink
@@ -1694,6 +1708,10 @@ def sparse_mla_bwd_gfx1250(
     kv2 = kv.reshape(kv.shape[0], DQK)
     assert kv2.is_contiguous()
     num_kv = kv2.shape[0]
+    if band_pool is not None and interm_bytes == _INTERM_BYTES:
+        # The band gather does not slow down on a large intermediate (no CSR scan of it), and
+        # one launch beats two chunks (one fewer w1 prologue / tail, gather not competing).
+        interm_bytes = _BAND_INTERM_BYTES
     dq = torch.empty_like(q)
     delta = torch.empty(T_, H, dtype=torch.float32, device=q.device)
     dsink = None
@@ -1751,21 +1769,37 @@ def sparse_mla_bwd_gfx1250(
             run = build_sparse_mla_bwd_gfx1250_w1(H, topk, float(scale), ahead=cus)
             # Tiles up to each token's last valid slot (slots past it are all -1).
             bn = _w1_block_k(H)
-            slot = torch.arange(1, topk + 1, dtype=torch.int32, device=q.device)
-            ntile = ((topk_indices >= 0) * slot).amax(1).add_(bn - 1).div_(bn, rounding_mode="floor").int()
+            from primus_turbo.triton.attention.sparse_mla_dkv_band_gather import walked_tiles
+
+            ntile = walked_tiles(topk_indices, bn)
         else:
             run = build_sparse_mla_bwd_gfx1250(H, topk, float(scale))
         main = torch.cuda.current_stream(q.device) if stream is None else stream
         side = _side_stream(q.device)
+        band = band_pool is not None and topk > band_pool[0] - 1 and band_pool[1] + band_pool[2] == num_kv
+        if band:
+            from primus_turbo.triton.attention.sparse_mla_dkv_band_gather import (
+                band_pool_positions,
+                dkv_band_gather_acc,
+            )
+
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                pos = band_pool_positions(topk_indices, *band_pool)
         # The main kernel holds every CU, so side-stream work is not free: when the chunk keys fit
         # int16, one sort for all chunks costs about half of the per-chunk sorts.
-        joint = 1 < n_chunks and n_chunks * num_kv < torch.iinfo(torch.int16).max
+        joint = not band and 1 < n_chunks and n_chunks * num_kv < torch.iinfo(torch.int16).max
         if joint:
             side.wait_stream(main)
             with torch.cuda.stream(side):
                 keys, inv_ptr_all, inv_data = _inverted_topk_chunks(topk_indices, num_kv, chunk)
         freed = [None] * len(interms)
-        for c, t0 in enumerate(range(0, T_, chunk)):
+        starts = list(range(0, T_, chunk))
+        if band and os.environ.get("PRIMUS_SMLA_CHUNK_REV", "1") == "1":
+            # Causal map: the late tokens walk the most tiles. Their chunk first, so the
+            # light chunk's main kernel hides the heavy chunk's gather.
+            starts = starts[::-1]
+        for c, t0 in enumerate(starts):
             t1 = min(t0 + chunk, T_)
             b = c % len(interms)
             if freed[b] is not None:
@@ -1776,7 +1810,9 @@ def sparse_mla_bwd_gfx1250(
             run(*args, *((ntile[t0:t1],) if w1 else ()), stream=main)
             side.wait_stream(main)
             with torch.cuda.stream(side):
-                if joint:
+                if band:
+                    dkv_band_gather_acc(im, pos, dkv_acc, t0, t1, *band_pool, d=DV)
+                elif joint:
                     dkv_gather_acc(
                         im,
                         keys,
