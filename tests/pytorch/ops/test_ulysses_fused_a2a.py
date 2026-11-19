@@ -9,10 +9,12 @@
 Reference: fp32 ``F.linear`` -> Turbo's ``AttentionCPA2AHelper`` packing -> ``all_to_all_single``
 -> unpacking, i.e. the ``flash_attn_usp_func`` sequence order.
 
-The pytest entry launches this file under torchrun for every world size the node has GPUs for:
+The pytest entry launches the ``--quick`` suite under torchrun for every world size the node has
+GPUs for. The full suite compiles thousands of shape-specialized kernels, which on a cold FlyDSL
+cache takes longer than the CI timeout, so it is run by hand:
 
-    pytest tests/pytorch/ops/test_ulysses_fused_a2a.py --dist-only
-    torchrun --nproc_per_node 8 tests/pytorch/ops/test_ulysses_fused_a2a.py
+    pytest tests/pytorch/ops/test_ulysses_fused_a2a.py --dist-only            # quick, all world sizes
+    torchrun --nproc_per_node 8 tests/pytorch/ops/test_ulysses_fused_a2a.py   # full
 """
 
 import argparse
@@ -322,7 +324,14 @@ def test_ulysses_fused_a2a(world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size} GPUs")
     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    cmd = [sys.executable, "-m", "torch.distributed.run", f"--nproc_per_node={world_size}", __file__]
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        f"--nproc_per_node={world_size}",
+        __file__,
+        "--quick",
+    ]
     result = subprocess.run(cmd, cwd=repo_root, env={**os.environ, "PYTHONPATH": repo_root}, timeout=1800)
     assert result.returncode == 0
 

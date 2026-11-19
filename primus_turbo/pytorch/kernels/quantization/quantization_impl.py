@@ -1160,7 +1160,8 @@ def dequantize_mxfp4_impl(
     block_size: int,
     scale_inv: torch.Tensor,
 ) -> torch.Tensor:
-    assert x.is_contiguous(), "The x tensor must be contiguous."
+    # The kernel takes no row pitch; the FlyDSL MXFP4 quant's row-wise data has one.
+    x = x.contiguous()
     assert x.dim() in (2, 3), "The x must be a 2D or 3D tensor."
     assert scale_inv.dim() == x.dim(), "The scale_inv rank must match x."
     assert scale_inv.is_contiguous(), "The scale_inv tensor must be contiguous."

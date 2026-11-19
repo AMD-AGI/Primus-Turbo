@@ -100,6 +100,9 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_mxfp8_gfx1250.py",
     # The same across every visible GPU (EP2+).
     "tests/pytorch/ops/test_mega_mxfp8_gfx1250_ep.py",
+    # Host-only: a subprocess imports every primus_turbo.flydsl module and holds each launch
+    # declared at module level to the no-mutable-global rule. The rest of that file stays skipped here.
+    "tests/pytorch/ops/test_flydsl_autotune.py::test_no_module_level_launch_reads_a_mutable_global",
 )
 
 

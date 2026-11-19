@@ -83,7 +83,11 @@ nothing extra, so it rides along unconditionally.
 Host-side launches go through a small per-configuration call-state cache
 (``_CALL_STATE_CACHE``, keyed on device/shape/dtype — never on tensor ``id()``, see
 Rule 11) that re-dispatches a previously bound FlyDSL launcher directly instead
-of re-binding the signature on every call.
+of re-binding the signature on every call.  That shortcut depends on private
+``JitFunction`` members that flydsl 0.5.0 removed, so on releases without them
+every configuration records "no reusable state" once and falls back to an
+ordinary ``compiled(**kwargs)`` dispatch: identical results, without the
+host-side saving.
 
 Campaign round Q6 (host/Python issue cost): the ruler brackets the whole
 Python call, so every per-call Python-side op not strictly needed on the hot
@@ -1005,21 +1009,48 @@ def _compiled_fold(
 _CALL_STATE_CACHE = {}
 
 
+def _flydsl_call_state(compiled, kwargs):
+    """FlyDSL's cached ``CallState`` for ``kwargs``, or None if unreachable.
+
+    This reaches into two private ``JitFunction`` members, so it is written to
+    decline rather than raise on a FlyDSL that does not have them.  flydsl
+    0.5.0 keys its JIT cache on the traced IR and removed both
+    ``_build_full_cache_key`` and ``_call_state_cache`` (0.3.4.x has them); an
+    unguarded call would turn the first invocation of every entry point in this
+    module into an ``AttributeError``.  Returning None instead routes the
+    caller onto the plain ``compiled(**kwargs)`` path it already has for
+    kernels whose state cannot be memoized -- same results, only the host-side
+    re-binding saving from round Q6 is lost.  ``_sig`` is probed the same way
+    for the same reason, even though 0.5.0 still has it.
+    """
+    build_key = getattr(compiled, "_build_full_cache_key", None)
+    state_cache = getattr(compiled, "_call_state_cache", None)
+    signature = getattr(compiled, "_sig", None)
+    if build_key is None or state_cache is None or signature is None:
+        return None
+    bound = signature.bind(**kwargs)
+    bound.apply_defaults()
+    cache_key = build_key(bound.arguments, owner_cls=None, bound_self=None)
+    return state_cache.get(cache_key)
+
+
 def _launch(compiled, key, kwargs_fn, args):
     """`kwargs_fn` is a zero-arg callable building the kwargs dict, not the
     dict itself (Q6: the hot `state(args)` path below never reads kwargs at
     all -- only the two cold paths do -- so building a ~15-key dict on every
     call just to discard it on every steady-state call was pure waste; see
-    module docstring)."""
+    module docstring).
+
+    A ``False`` entry in ``_CALL_STATE_CACHE`` means "this configuration has no
+    reusable call state" -- either FlyDSL did not cache one, or this FlyDSL
+    release does not expose the cache at all (see ``_flydsl_call_state``).  It
+    is cached like any other answer so the probe stays off the hot path.
+    """
     state = _CALL_STATE_CACHE.get(key)
     if state is None:
         kwargs = kwargs_fn()
         compiled(**kwargs)
-        signature = compiled._sig
-        bound = signature.bind(**kwargs)
-        bound.apply_defaults()
-        cache_key = compiled._build_full_cache_key(bound.arguments, owner_cls=None, bound_self=None)
-        state = compiled._call_state_cache.get(cache_key)
+        state = _flydsl_call_state(compiled, kwargs)
         _CALL_STATE_CACHE[key] = state if state is not None else False
         return
     if state is False:

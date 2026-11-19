@@ -524,6 +524,7 @@ def build_jax_extension():
             ffi.include_dir(),
             pybind11.get_include(),
         ],
+        libraries=["hipblaslt"],
         **extra_flags,
     )
 
@@ -558,7 +559,19 @@ if __name__ == "__main__":
     # (rocdl.WMMA, rocdl.make_tdm_atom, rocdl.tdm_ops, rocdl.ds_load_tr16_b128) are all
     # present in it, and the gfx1250 bf16 grouped-GEMM entry points compile under it
     # (0.2.4 was also checked for correct results on gfx1250). Installed on every arch.
-    install_requires.append("flydsl==0.3.4.1")
+    #
+    # A RANGE, not a pin, because an exact pin silently downgrades a co-installed
+    # consumer's flydsl: aiter >= v0.1.29.post1 requires flydsl >= 0.5.0, and when
+    # Primus-Turbo is installed after it, `flydsl==0.3.4.1` drags flydsl back down and
+    # leaves that already-built aiter unimportable ("Unsupported `flydsl` version:
+    # expected >=`0.5.0`, got `0.3.4.1`") -- a runtime failure far from its cause.
+    # 0.4.* is excluded because the kernels here were never ported to or validated on
+    # that line (0.2.4 -> 0.3.4.1 was #544; aiter itself skipped 0.4.2 -> 0.5.0).
+    # NOTE: the gfx1250 attention kernels carry their own, tighter requirement in
+    # primus_turbo/flydsl/attention/gfx1250/flydsl_version.py and will decline (and
+    # let the dispatcher fall back) on a flydsl this range admits but that one does
+    # not. Widen FLYDSL_REQUIREMENT there only after re-validating on gfx1250 hardware.
+    install_requires.append("flydsl>=0.3.4.1,!=0.4.*,<0.6")
 
     # TODO(ruibin): Triton 3.7.0 does not support gfx1250, so we skip its
     # installation when building for gfx1250.

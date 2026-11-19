@@ -50,8 +50,8 @@ notes; the kernel backend behind each cell is in
 | | FP8 rowwise | ✅ | ✅ | ✅ | |
 | | FP8 blockwise | ✅ | ✅ | ✅ | |
 | | MXFP8 | — | ✅ | ✅ | gfx1250: E4M3, BF16 inputs and output, weight dims multiples of 16 |
-| `gemm_fp4` | MXFP4 | — | ✅ | — | |
-| `mlp_fp4` | MXFP4 | — | ✅ | — | Dense GLU MLP with fused activation |
+| `gemm_fp4` | MXFP4 | — | ✅ | — | See [MXFP4 training](./features/mxfp4.md) |
+| `mlp_fp4` | MXFP4 | — | ✅ | — | Dense GLU MLP with fused activation. See [MXFP4 training](./features/mxfp4.md) |
 
 ### 2.2 Grouped GEMM (MoE experts)
 
@@ -64,9 +64,9 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | | FP8 rowwise | ✅ | ✅ | ✅ | |
 | | FP8 blockwise | ✅ | ✅ | ✅ | |
 | | MXFP8 | — | ✅ | ✅ | gfx1250: FlyDSL for E4M3, BF16 inputs and output and weight dims multiples of 32; any other call on Triton |
-| `grouped_gemm_fp4` | MXFP4 | — | ✅ | ✅ | |
+| `grouped_gemm_fp4` | MXFP4 | — | ✅ | ✅ | See [MXFP4 training](./features/mxfp4.md) |
 | `grouped_mlp_fp8` | FP8 tensorwise / MXFP8 | — | ✅ | ✅ | Expert MLP with SwiGLU / GeGLU fused into the grouped GEMM; gfx1250: MXFP8 only (E4M3, BF16 inputs and output, weight dims multiples of 32, intermediate width of 128) |
-| `grouped_mlp_fp4` | MXFP4 | — | ✅ | — | Same, MXFP4 |
+| `grouped_mlp_fp4` | MXFP4 | — | ✅ | — | Same, MXFP4. See [MXFP4 training](./features/mxfp4.md) |
 
 ### 2.3 Attention
 
@@ -96,9 +96,13 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | `rmsnorm` | BF16 / FP16 / FP32 | ✅ | ✅ | ✅ | Optional zero-centered gamma |
 | `rmsnorm_residual` | BF16 / FP16 / FP32 | ✅ | ✅ | ✅ | Fused residual add |
 | `rmsnorm_residual_fp4` | BF16 → MXFP4 | — | ✅ | — | Fused residual add + MXFP4 quantization |
+| `adaln_modulate` | BF16 | — | ✅ | — | DiT adaLN: cat of two token segments + LayerNorm + `(1 + scale)` / `shift` modulation; C % 512, sequence lengths % 128. Eager PyTorch off gfx950 |
+| `gated_residual_adaln` | BF16 | — | ✅ | — | DiT gated residual `x + g * a` + adaLN, both streams of an MMDiT block in one call; C % 1536, sequence lengths % 32. Eager PyTorch off gfx950 |
 | `swiglu_with_probs`, `geglu_with_probs` | BF16 / FP16 | ✅ | ✅ | ✅ | GLU scaled by routing probability, optional row mask and clamp |
+| `linear_gelu` | BF16 | — | ✅ | — | Linear + bias + tanh GELU, optionally written after a prefix; bias gradient fused into the GELU backward. Unfused GELU off gfx950 and for untiled shapes |
 | `fused_qkv_rope` | BF16 | ✅ | ✅ | — | RoPE on packed QKV |
 | `fused_qkv_rmsnorm_rope` | BF16 | — | ✅ | — | QK RMSNorm + RoPE on packed QKV |
+| `dit_qk_norm_rope` | BF16 / FP16 / FP32 | — | ✅ | — | DiT q / k RMSNorm + RoPE from the QKV GEMM output (`sbhd` / `bshd`, one or two streams, interleaved or half-split RoPE, the QKV bias added in the op and its gradient fused; `v_out="none"` returns v as a strided view of the QKV output instead of a copy, over both streams when they come in one buffer with `txt_seq_len`) |
 | `cross_entropy` | BF16 / FP32 | ✅ | ✅ | ✅ | Label smoothing, ignore index, in-place logits. See [Cross Entropy](./cross_entropy.md) |
 
 ### 2.6 Quantization and low-precision training support
@@ -114,7 +118,7 @@ These are fwd-only utilities; the `_with_trans` variants also emit the transpose
 | `grouped_quantize_fp8` / `_with_trans`, `grouped_dequantize_fp8` | MXFP8 | — | ✅ | ✅ | Per-expert; on gfx1250 `_with_trans` fuses the MoE gather. See [MoE gather quantization](./moe_gather_quantization.md) |
 | `quantize_fp4`, `quantize_fp4_with_trans`, `dequantize_fp4` | MXFP4 | — | ✅ | ✅ | |
 | `grouped_quantize_fp4` / `_with_trans`, `grouped_dequantize_fp4` | MXFP4 | — | ✅ | ✅ | Fuses MoE gather. See [MoE gather quantization](./moe_gather_quantization.md) |
-| `weight_deosc_update`, `weight_deosc_close` | MXFP4 | ✅ | ✅ | — | Suppresses low-precision weight oscillation during training |
+| `weight_deosc_update`, `weight_deosc_close` | MXFP4 | ✅ | ✅ | — | Suppresses low-precision weight oscillation during training. See [MXFP4 training](./features/mxfp4.md#weight-de-oscillation) |
 | `weight_deosc_qdq` | MXFP4 | — | ✅ | — | Fused MXFP4 QDQ + tracking |
 
 ### 2.7 Communication and overlap
@@ -177,4 +181,7 @@ registration order, with the arch / format limits from each backend's `can_handl
 | MegaMoE (`fused_mega_moe*`) | FLYDSL |
 | `rmsnorm*`, `swiglu_with_probs`, `geglu_with_probs`, `cross_entropy`, router | TRITON (`rmsnorm_residual_fp4`: FLYDSL) |
 | `fused_qkv_rope`, `fused_qkv_rmsnorm_rope` | FLYDSL |
+| `dit_qk_norm_rope` | TRITON (forward; backward off gfx950 and outside the FlyDSL envelope), FLYDSL (backward, gfx950: BF16, D 128, interleaved RoPE) |
+| `linear_gelu` | FLYDSL GELU (gfx950, tiled shapes; unfused otherwise), TRITON GELU backward |
+| `adaln_modulate`, `gated_residual_adaln` | FLYDSL (gfx950), eager PyTorch otherwise |
 | Quantization | TURBO (HIP), TRITON (blockwise), FLYDSL (MXFP8 / MXFP4) |
