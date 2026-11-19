@@ -102,7 +102,7 @@ def quant_flat(x: torch.Tensor, dtype: torch.dtype, parts=None, block: int = 819
 def _quant_dual_kernel(
     X, Q, QT, P, n_part, SINV, offs_ptr, POFFS, C, stride_x, stride_q, stride_qt, G, n_t,
     NP: tl.constexpr, FP8_MAX: tl.constexpr, GP: tl.constexpr, ALIGN: tl.constexpr, MIN_T: tl.constexpr,
-    BT: tl.constexpr, BC: tl.constexpr, CB: tl.constexpr,
+    BT: tl.constexpr, BC: tl.constexpr, CB: tl.constexpr, EMAJ: tl.constexpr = 0,
 ):
     """grid (n_t, cdiv(C, BC*CB)); token-block axis fastest so neighbouring programs share rows."""
     pid_t = tl.program_id(0)
@@ -126,6 +126,8 @@ def _quant_dual_kernel(
     gid = tl.sum((pend_v <= d0).to(tl.int32))
     sel = idx == gid
     shift = tl.sum(tl.where(sel, lo - pstart, 0))
+    ps_g = tl.sum(tl.where(sel, pstart, 0))
+    pl_g = tl.sum(tl.where(sel, plen, 0))
     g_hi = tl.sum(tl.where(sel, hi, 0))
     d = d0 + tl.arange(0, BT)
     src = d + shift
@@ -146,11 +148,16 @@ def _quant_dual_kernel(
         ut = tl.reshape(u8, (BT // 4, 4, BC))
         wt = tl.trans(tl.sum(ut << (tl.arange(0, 4) * 8)[None, :, None], axis=1))
         dw = d0 // 4 + tl.arange(0, BT // 4)
-        tl.store(QW + rc[:, None].to(tl.int64) * (stride_qt // 4) + dw[None, :], wt)
+        if EMAJ:
+            # expert-major: expert g's block [C, plen_g] starts at pstart_g * C (contiguous per expert)
+            eb = (ps_g.to(tl.int64) * C + (d0 - ps_g)) // 4
+            tl.store(QW + eb + rc[:, None].to(tl.int64) * (pl_g // 4) + tl.arange(0, BT // 4)[None, :], wt)
+        else:
+            tl.store(QW + rc[:, None].to(tl.int64) * (stride_qt // 4) + dw[None, :], wt)
 
 
 def quant_dual(x: torch.Tensor, dtype: torch.dtype, group_offs: torch.Tensor, parts=None,
-               bt: int = ALIGN, bc: int = 64, cb: int = 4, nw: int = 4):
+               bt: int = ALIGN, bc: int = 64, cb: int = 4, nw: int = 4, emaj: bool = False):
     """bf16 x [M, C] -> (q [M, C], scale_inv [1], qT [C, P] padded token-contiguous, poffs int32 [G+1]).
     Same outputs as grouped_gemm_fp8_vk_gfx1250.quantize_fp8_tensorwise_dual. C % (bc*cb) == 0."""
     assert x.dim() == 2 and x.is_contiguous()
@@ -162,13 +169,14 @@ def quant_dual(x: torch.Tensor, dtype: torch.dtype, group_offs: torch.Tensor, pa
         parts = amax_partials(x)
     p, n_part = parts
     q = torch.empty((M, C), device=x.device, dtype=dtype)
-    qT = torch.empty((C, P), device=x.device, dtype=dtype)
+    # emaj: flat [P * C] buffer, expert g's [C, plen_g] block at poffs[g] * C (rows of one expert contiguous)
+    qT = torch.empty((C * P,) if emaj else (C, P), device=x.device, dtype=dtype)
     poffs = torch.empty(G + 1, device=x.device, dtype=torch.int32)
     sinv = torch.empty(1, device=x.device, dtype=torch.float32)
     n_t = min(triton.cdiv(P, bt), M // bt + G * MIN_T + 1)
     _quant_dual_kernel[(n_t, C // (bc * cb))](
-        x, q, qT, p, n_part, sinv, group_offs, poffs, C, x.stride(0), q.stride(0), qT.stride(0), G, n_t,
+        x, q, qT, p, n_part, sinv, group_offs, poffs, C, x.stride(0), q.stride(0), P if emaj else qT.stride(0), G, n_t,
         NP=p.numel(), FP8_MAX=torch.finfo(dtype).max, GP=triton.next_power_of_2(G + 1), ALIGN=ALIGN, MIN_T=MIN_T,
-        BT=bt, BC=bc, CB=cb, num_warps=nw,
+        BT=bt, BC=bc, CB=cb, EMAJ=int(emaj), num_warps=nw,
     )
     return q, sinv, qT, poffs
