@@ -1,0 +1,293 @@
+###############################################################################
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+"""Batch-invariant attention for RL: rollout (paged KV cache) and training (varlen) run one kernel
+family with one reduction order, so a token's forward output is bitwise the same whether it was
+computed in a rollout prefill, a rollout decode step, or the training forward, and whatever else
+shares its batch.
+
+* ``rl_paged_attention_func``: rollout, vLLM-layout paged KV cache, forward only.
+* ``rl_flash_attn_varlen_func`` / ``rl_flash_attn_func``: training, THD / BSHD, forward + backward.
+
+All three are causal (bottom-right aligned) by default, take an optional sliding window
+(``window_left``), per-head attention sinks (``sinks``), and an optional visibility mask built by
+``create_block_mask``. Bits depend on the reduction order (``set_reduce_order``), which must be the
+same in rollout and training; launch parameters never change them.
+
+Visibility masks
+----------------
+Each query token sees one contiguous, inclusive range [lo, hi] of keys of its own sequence, given
+in global key indices: keys are numbered across the batch in sequence order, so sequence s owns
+keys cu_seqlens_k[s] .. cu_seqlens_k[s + 1] - 1 (for a paged cache, cu_seqlens_k is the exclusive
+cumulative sum of seq_lens). With i the global index of a query token in self-attention:
+
+======================================  =============================  ===========
+Mask                                    lo                             hi
+======================================  =============================  ===========
+Causal                                  start of i's sequence          i
+Bidirectional span (e.g. an image)      span start                     span end
+Sliding window of W keys                max(seq start, i - W + 1)      i
+No keys (output 0, LSE +inf)            hi + 1                         any
+======================================  =============================  ===========
+
+Keys outside [lo, hi] are exact no-ops, and tiles are walked in increasing key position whatever the
+mask, so a token's output depends only on its own interval. The backward prunes its walks to the
+intervals.
+"""
+
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, Union
+
+import torch
+
+from primus_turbo.pytorch.kernels.attention import rl_attention_impl
+from primus_turbo.pytorch.kernels.attention.rl_attention_triton_impl import (
+    RLAttentionReduceOrder,
+    get_reduce_order,
+    set_reduce_order,
+)
+
+__all__ = [
+    "RLAttentionReduceOrder",
+    "RLBlockMask",
+    "create_block_mask",
+    "get_reduce_order",
+    "rl_flash_attn_func",
+    "rl_flash_attn_varlen_func",
+    "rl_paged_attention_func",
+    "set_backend",
+    "set_reduce_order",
+]
+
+set_backend = rl_attention_impl.set_backend
+
+
+@dataclass(frozen=True)
+class RLBlockMask:
+    """Per query token visible key range [lo, hi], inclusive, in global key indices."""
+
+    lo: torch.Tensor  # [num_tokens] int32
+    hi: torch.Tensor  # [num_tokens] int32
+    _cache: dict = field(default_factory=dict, init=False, repr=False, compare=False)
+
+    @property
+    def num_tokens(self) -> int:
+        return self.lo.numel()
+
+    def with_window(self, window_left: int) -> "RLBlockMask":
+        """Narrow each row to [max(lo, hi - window_left), hi]. Cached, so every layer of a step
+        reuses one narrowed mask."""
+        if window_left is None or window_left < 0:
+            return self
+        key = ("window", window_left)
+        if key not in self._cache:
+            self._cache[key] = RLBlockMask(
+                torch.maximum(self.lo, self.hi - window_left).contiguous(), self.hi
+            )
+        return self._cache[key]
+
+    def key_starts(self, seq_lens: torch.Tensor) -> torch.Tensor:
+        """cu_seqlens_k of a paged cache: the exclusive cumulative sum of seq_lens. Cached per
+        seq_lens tensor and version, so every layer of a step reuses one."""
+        cached = self._cache.get("starts")
+        if cached is None or cached[0] is not seq_lens or cached[1] != seq_lens._version:
+            starts = torch.nn.functional.pad(torch.cumsum(seq_lens, 0, dtype=torch.int32), (1, 0))
+            cached = self._cache["starts"] = (seq_lens, seq_lens._version, starts)
+        return cached[2]
+
+    def validate(self, cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor) -> None:
+        """Check every non-empty interval lies inside its token's own keys. Syncs with the device."""
+        q_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).long()
+        first = torch.repeat_interleave(cu_seqlens_k[:-1].long(), q_lens)
+        last = torch.repeat_interleave(cu_seqlens_k[1:].long(), q_lens) - 1
+        bad = (self.lo <= self.hi) & ((self.lo < first) | (self.hi > last))
+        if bool(bad.any()):
+            idx = int(bad.nonzero()[0])
+            raise ValueError(
+                f"visibility of token {idx} is [{int(self.lo[idx])}, {int(self.hi[idx])}], outside its "
+                f"sequence's keys [{int(first[idx])}, {int(last[idx])}]"
+            )
+
+
+def create_block_mask(
+    bounds: torch.Tensor, hi: Optional[torch.Tensor] = None, *, window_left: int = -1
+) -> RLBlockMask:
+    """Build a visibility mask from a [2, num_tokens] tensor of (lo, hi), or from lo and hi.
+
+    Unlike ``torch.nn.attention.flex_attention.create_block_mask`` this takes the bounds directly,
+    not a mask_mod function. ``window_left`` >= 0 narrows each row to [max(lo, hi - window_left), hi].
+    """
+    if hi is None:
+        if bounds.ndim != 2 or bounds.shape[0] != 2:
+            raise ValueError(
+                f"expected a [2, num_tokens] tensor of (lo, hi), got shape {tuple(bounds.shape)}"
+            )
+        lo, hi = bounds[0], bounds[1]
+    else:
+        lo = bounds
+    if lo.shape != hi.shape or lo.ndim != 1:
+        raise ValueError(
+            f"lo and hi must be 1D tensors of equal length, got {tuple(lo.shape)} and {tuple(hi.shape)}"
+        )
+    return RLBlockMask(lo.to(torch.int32).contiguous(), hi.to(torch.int32).contiguous()).with_window(
+        window_left
+    )
+
+
+def _prepare(num_tokens, num_q_heads, window_left, block_mask, sinks):
+    """Fold the window into the mask, and bring sinks to fp32."""
+    if block_mask is not None:
+        if block_mask.num_tokens != num_tokens:
+            raise ValueError(f"block_mask has {block_mask.num_tokens} rows for {num_tokens} query tokens")
+        block_mask = block_mask.with_window(window_left)
+        window_left = -1
+    if sinks is not None:
+        if sinks.numel() != num_q_heads:
+            raise ValueError(f"sinks must hold one logit per query head ({num_q_heads}), got {sinks.numel()}")
+        sinks = sinks.to(torch.float32).contiguous()
+    return window_left, block_mask, sinks
+
+
+def rl_paged_attention_func(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: Optional[float] = None,
+    window_left: int = -1,
+    block_mask: Optional[RLBlockMask] = None,
+    sinks: Optional[torch.Tensor] = None,
+    mode: str = "auto",
+) -> torch.Tensor:
+    """Rollout forward over a paged KV cache.
+
+    q [num_tokens, Hq, D]; k_cache, v_cache [num_blocks, block_size, Hkv, D]; block_table
+    [num_seqs, max_blocks] int32; seq_lens [num_seqs] int32 (keys per sequence, including this
+    step's queries); cu_seqlens_q [num_seqs + 1] int32. ``mode`` ("auto", "fused" or "split") only
+    changes the schedule. Returns out [num_tokens, Hq, Dv].
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    window_left, block_mask, sinks = _prepare(q.shape[0], q.shape[1], window_left, block_mask, sinks)
+    out, _ = rl_attention_impl.rl_attention_fwd_impl(
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        block_mask.key_starts(seq_lens) if block_mask is not None else None,
+        seq_lens,
+        block_table,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        float(softmax_scale),
+        window_left,
+        block_mask.lo if block_mask is not None else None,
+        block_mask.hi if block_mask is not None else None,
+        sinks,
+        False,
+        mode,
+    )
+    return out
+
+
+class RLFlashAttnVarlenFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, window_left, vis_lo,
+        vis_hi, sinks,
+    ):  # fmt: skip
+        sinks32 = sinks.to(torch.float32).contiguous() if sinks is not None else None
+        out, lse = rl_attention_impl.rl_attention_fwd_impl(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, None, None, max_seqlen_q, max_seqlen_k, softmax_scale,
+            window_left, vis_lo, vis_hi, sinks32, True, "fused",
+        )  # fmt: skip
+        ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, vis_lo, vis_hi, sinks32)
+        ctx.has_sinks = sinks is not None
+        ctx.sinks_dtype = sinks.dtype if sinks is not None else None
+        ctx.max_seqlen_q = max_seqlen_q
+        ctx.max_seqlen_k = max_seqlen_k
+        ctx.softmax_scale = softmax_scale
+        ctx.window_left = window_left
+        return out, lse
+
+    @staticmethod
+    def backward(ctx, dout, _dlse):
+        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, vis_lo, vis_hi, sinks = ctx.saved_tensors
+        dq, dk, dv, dsink = rl_attention_impl.rl_attention_bwd_impl(
+            dout.contiguous(), q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, ctx.max_seqlen_q,
+            ctx.max_seqlen_k, ctx.softmax_scale, ctx.window_left, vis_lo, vis_hi, sinks,
+        )  # fmt: skip
+        dsink = dsink.to(ctx.sinks_dtype) if ctx.has_sinks else None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, dsink
+
+
+def rl_flash_attn_varlen_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: Optional[float] = None,
+    window_left: int = -1,
+    block_mask: Optional[RLBlockMask] = None,
+    sinks: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Training forward + backward, THD layout: q [total_q, Hq, D], k, v [total_k, Hkv, D],
+    cu_seqlens_q / cu_seqlens_k [num_seqs + 1] int32. Returns out [total_q, Hq, Dv], plus the
+    natural-log LSE [total_q, Hq] fp32 with ``return_lse``."""
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    window_left, block_mask, _ = _prepare(q.shape[0], q.shape[1], window_left, block_mask, sinks)
+    out, lse = RLFlashAttnVarlenFunc.apply(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), int(max_seqlen_k), float(softmax_scale),
+        window_left, block_mask.lo if block_mask is not None else None,
+        block_mask.hi if block_mask is not None else None, sinks,
+    )  # fmt: skip
+    return (out, lse) if return_lse else out
+
+
+def rl_flash_attn_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    window_left: int = -1,
+    block_mask: Optional[RLBlockMask] = None,
+    sinks: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Training forward + backward, BSHD layout: q [B, Sq, Hq, D], k, v [B, Sk, Hkv, D]. A
+    ``block_mask`` has B * Sq rows in batch-major order, in global key indices (row b's keys start
+    at b * Sk)."""
+    batch, seqlen_q, num_q_heads, _ = q.shape
+    seqlen_k = k.shape[1]
+    cu_q = torch.arange(0, (batch + 1) * seqlen_q, seqlen_q, dtype=torch.int32, device=q.device)
+    cu_k = torch.arange(0, (batch + 1) * seqlen_k, seqlen_k, dtype=torch.int32, device=q.device)
+    res = rl_flash_attn_varlen_func(
+        q.reshape(batch * seqlen_q, num_q_heads, q.shape[-1]),
+        k.reshape(batch * seqlen_k, k.shape[2], k.shape[-1]),
+        v.reshape(batch * seqlen_k, v.shape[2], v.shape[-1]),
+        cu_q,
+        cu_k,
+        seqlen_q,
+        seqlen_k,
+        softmax_scale,
+        window_left,
+        block_mask,
+        sinks,
+        return_lse,
+    )
+    if return_lse:
+        out, lse = res
+        return out.view(batch, seqlen_q, num_q_heads, -1), lse.view(batch, seqlen_q, num_q_heads)
+    return res.view(batch, seqlen_q, num_q_heads, -1)
