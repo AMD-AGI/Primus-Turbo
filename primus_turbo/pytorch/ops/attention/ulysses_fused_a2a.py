@@ -76,8 +76,8 @@ class A2AGemmTuning:
             or the 256-row tiles make 2.5 waves of the CUs 32 pushers leave).
         num_push: push blocks, which run the last GEMM tiles once done (32; 16 with up to 3x CU wgrad
             tiles at n <= 4;
-            GEMM-bound without wgrad: 16, 8 from 8192 rows at n = 2; without wgrad, 128-row tiles at
-            n <= 4 with ``N * n >= 4096 * (n - 1)``: 16).
+            without wgrad past n = 4: 48; GEMM-bound without wgrad: 16, 8 from 8192 rows at n = 2;
+            without wgrad, 128-row tiles at n <= 4 with ``N * n >= 4096 * (n - 1)``: 16).
         push_split: sub-tiles a ``BM``-row m-tile is pushed in, so its rows land in pieces (8).
         wgrad_at: claim slot of the in-kernel wgrad tiles (backward QKV only; 0, or after every
             dgrad tile when the GEMM outweighs the exchange, ``N * n >= 4096 * min(n - 1, 3)``, or

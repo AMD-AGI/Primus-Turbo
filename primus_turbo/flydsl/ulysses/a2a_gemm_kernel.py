@@ -1114,7 +1114,12 @@ def ulysses_a2a_gemm(
     # n = 4 32K: 1536 -> 1350 us, 128K: 5870 -> 4455 us; with 16 pushers 1716 us).
     many_tiles = wgrad is None and 2 * ceildiv(M, 256) * ceildiv(N, BN) >= 5 * (num_cus - 32)
     if num_push is None:
-        if gemm_bound:
+        if wgrad is None and num_ranks > 4:
+            # seven peers: the exchange ends a third into the launch with 32 pushers, and more move its
+            # first rows earlier for the first wave of tiles (32K n = 8: GLM-4.7 723 -> 706 us; the
+            # GEMM-bound Llama3.1-70B shape 703 -> 671 us with 48, 16 pushers fall behind seven links)
+            num_push = 48
+        elif gemm_bound:
             num_push = 8 if M >= 8192 and num_ranks == 2 else 16
         elif wgrad is None and not many_tiles and num_ranks <= 4 and N * num_ranks >= 4096 * (num_ranks - 1):
             # 128-row tiles: up to three peers' links fill with 16 pushers, and the GEMM is large enough
