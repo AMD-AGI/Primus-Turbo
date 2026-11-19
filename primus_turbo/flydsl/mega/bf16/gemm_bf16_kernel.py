@@ -443,7 +443,10 @@ def gemm_bf16_nt_tile(
     a_row_idx=None,
     store_c_cls=StoreCBf16,
     k_seg=None,
+    tid=None,
 ):
+    """``tid`` (optional) stands in for ``fx.thread_idx.x`` in the lane / wave ids, e.g. an opaque copy
+    that keeps them from being hoisted out of a caller's branch."""
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
     assert K % BLOCK_K == 0, f"bf16 NT needs K % {BLOCK_K} == 0 (got K={K})"
     N_TILES_A = BLOCK_M // 128
@@ -454,8 +457,9 @@ def gemm_bf16_nt_tile(
     N_LDS_STEPS_B = LDS_BLOCK_N // 64
     N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
 
-    lane_id = fx.thread_idx.x % 64
-    wave_id = fx.thread_idx.x // 64
+    tid = fx.thread_idx.x if tid is None else tid
+    lane_id = tid % 64
+    wave_id = tid // 64
     wave_m = wave_id // 4
     wave_n = wave_id % 4
     # Two waves share a SIMD (``wave_id % 4``) and must share wave_n to read one B fragment.
