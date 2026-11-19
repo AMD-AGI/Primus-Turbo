@@ -424,6 +424,8 @@ Reference: https://arxiv.org/pdf/2509.25149
 
 > **Note:** MXFP4 GEMM requires **gfx950 or higher**.
 
+See [MXFP4 training](./features/mxfp4.md) for the grouped GEMM, the fused MLP ops, weight de-oscillation and the backends.
+
 Computation flow:
 
 `FP16/BF16 → Quantize (block=32, E8M0 scale, RHT/2D-block) → MXFP4 → GEMM(MXFP4 × MXFP4) → FP16/BF16`
