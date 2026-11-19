@@ -75,6 +75,17 @@ using CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1 = CKGroupedGemmTileConfig<
 using CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1_padding = CKGroupedGemmTileConfig<
     256, 128, 64, 32, 32, 16, 2, 2, 1, false, true
 >;
+// gfx942 BF16/FP16: 256x256x64 spills with CompV3; this fits in registers and runs 2 blocks per CU.
+using CKGroupedGemmTileCfg_128x128x64_16x16x16_2x2x1 = CKGroupedGemmTileConfig<
+    128, 128, 64, 16, 16, 16, 2, 2, 1, false, false
+>;
+using CKGroupedGemmTileCfg_128x128x64_16x16x16_2x2x1_padding = CKGroupedGemmTileConfig<
+    128, 128, 64, 16, 16, 16, 2, 2, 1, false, true
+>;
+// gfx942 BF16/FP16 forward (A, B row-major) with N % 256 == 0: about 7% faster than 128x128x64.
+using CKGroupedGemmTileCfg_128x256x32_32x32x16_2x2x1 = CKGroupedGemmTileConfig<
+    128, 256, 32, 32, 32, 16, 2, 2, 1, false, false
+>;
 // ***********************************************
 // ****** GFX942 Tile Config Specialization ******
 // FP8

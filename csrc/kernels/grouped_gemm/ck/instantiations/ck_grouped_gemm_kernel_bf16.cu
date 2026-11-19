@@ -14,5 +14,10 @@ APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER, ck_tile::bfloat16_t, ck_tile::bfloat16
 APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER, ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1)
 APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER, ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1_padding)
 #endif
+#ifdef PRIMUS_TURBO_GFX942
+APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER, ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, CKGroupedGemmTileCfg_128x128x64_16x16x16_2x2x1)
+APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER, ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, CKGroupedGemmTileCfg_128x128x64_16x16x16_2x2x1_padding)
+APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER, ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, CKGroupedGemmTileCfg_128x256x32_32x32x16_2x2x1)
+#endif
 // clang-format on
 } // namespace primus_turbo

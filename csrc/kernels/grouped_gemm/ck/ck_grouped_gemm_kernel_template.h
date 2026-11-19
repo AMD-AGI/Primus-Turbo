@@ -34,7 +34,12 @@ inline void _launch_ck_grouped_kernel(const ck_tile::stream_config& stream_cfg,
     constexpr int kBlockPerCu = 1;
     const dim3 blocks = Kernel::BlockSize();
     dim3       grids  = Kernel::MaxOccupancyGridSize(stream_cfg);
-    grids.x           = std::min(grids.x, num_cu);
+    // num_cu is a CU budget; MaxOccupancyGridSize already counts how many blocks fit per CU.
+    int device = 0, device_cus = 1;
+    PRIMUS_TURBO_CHECK_HIP(hipGetDevice(&device));
+    PRIMUS_TURBO_CHECK_HIP(hipDeviceGetAttribute(&device_cus, hipDeviceAttributeMultiprocessorCount, device));
+    const uint32_t blocks_per_cu = std::max<uint32_t>(1, grids.x / std::max(device_cus, 1));
+    grids.x           = std::min(grids.x, num_cu * blocks_per_cu);
     ck_tile::launch_kernel(
         stream_cfg, ck_tile::make_kernel<kBlockPerCu>(
                         Kernel{}, grids, blocks, 0,
@@ -413,6 +418,14 @@ APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER_EXTERN, ck_tile::half_t, ck_tile::half_
 APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER_EXTERN, ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, CKGroupedGemmTileCfg_256x256x64_32x32x16_2x2x1)
 APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER_EXTERN, ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1)
 APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER_EXTERN, ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1_padding)
+#endif
+#ifdef PRIMUS_TURBO_GFX942
+APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER_EXTERN, ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, CKGroupedGemmTileCfg_128x128x64_16x16x16_2x2x1)
+APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER_EXTERN, ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, CKGroupedGemmTileCfg_128x128x64_16x16x16_2x2x1_padding)
+APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER_EXTERN, ck_tile::half_t, ck_tile::half_t, ck_tile::half_t, CKGroupedGemmTileCfg_128x256x32_32x32x16_2x2x1)
+APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER_EXTERN, ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, CKGroupedGemmTileCfg_128x128x64_16x16x16_2x2x1)
+APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER_EXTERN, ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, CKGroupedGemmTileCfg_128x128x64_16x16x16_2x2x1_padding)
+APPLY_CK_GG_ALL_LAYOUT(DECL_CK_GG_RUNNER_EXTERN, ck_tile::bfloat16_t, ck_tile::bfloat16_t, ck_tile::bfloat16_t, CKGroupedGemmTileCfg_128x256x32_32x32x16_2x2x1)
 #endif
 
 // ***********************************************************************************
