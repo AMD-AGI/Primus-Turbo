@@ -15,15 +15,21 @@
 and the epoch bump of the last block out (see ``workspace.py`` for the protocol)."""
 
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl.expr import arith, const_expr
+from flydsl.expr import arith, const_expr, range_constexpr
 
 from primus_turbo.flydsl.deep_ep.common import _asm, ld_lds, st_lds
-from primus_turbo.flydsl.utils.buffer_ops import extract_base_index
+from primus_turbo.flydsl.utils.buffer_ops import (
+    buffer_load,
+    buffer_store,
+    extract_base_index,
+)
 from primus_turbo.flydsl.utils.prims import (
     _readfirstlane_i32,
     atomic_add,
     cast,
+    ceildiv,
     ld,
     read_clock,
     spin_timed_out,
@@ -36,6 +42,8 @@ NUM_WARPS = BLOCK_THREADS // WARP
 # 16 B per lane per copy step
 VEC_I32 = 4
 VEC_BF16 = 8
+# 16 B vectors whose loads are issued before their stores
+_BATCH = 8
 # sc0|sc1|nt: system-coherent, streaming; staging is read by peers, recv reuses a bank every 2 epochs
 SYS_NT = 19
 # s_memrealtime ticks at 100 MHz: 5 s
@@ -46,11 +54,46 @@ STATE_EPOCH = 0
 STATE_EXIT = 1
 STATE_CLAIM = 2
 STATE_TILE = 3
-NUM_STATE = 4
+# A2AGemm: own-row copy pieces claimed
+STATE_ASSIST = 4
+NUM_STATE = 5
 
 
 def i64_base(tensor):
     return fx.arith.ArithValue(arith.index_cast(fx.T.i64, extract_base_index(tensor)), signed=True)
+
+
+def opaque_tid(thread_index):
+    """``thread_index`` through an opaque move. Inside a claim loop over several unit kinds LICM
+    hoists every unit body's lane offsets out of their branches, and all of them live across the
+    loop and spill."""
+    return fx.arith.ArithValue(
+        _llvm.inline_asm(
+            fx.T.i32,
+            [fx.as_ir_value(cast(thread_index, fx.T.i32))],
+            "v_mov_b32 $0, $1",
+            "=v,v",
+            has_side_effects=True,
+        )
+    )
+
+
+def copy_rows(thread_index, num_vecs, vec_coords, src_res, dst_res, src_cm, dst_cm, batch=_BATCH):
+    """Copy ``num_vecs`` 16 B vectors, ``batch`` loads in flight per thread; ``vec_coords(v)`` gives
+    ``(src_word, dst_word, valid)``."""
+    per_iter = BLOCK_THREADS * batch
+    for it in range_constexpr(ceildiv(num_vecs, per_iter)):
+        coords = [
+            vec_coords(fx.Int32(it * per_iter + j * BLOCK_THREADS) + thread_index)
+            for j in range_constexpr(batch)
+            if it * per_iter + j * BLOCK_THREADS < num_vecs
+        ]
+        vals = [
+            buffer_load(src_res, src, vec_width=VEC_I32, dtype=fx.T.i32, mask=valid, cache_modifier=src_cm)
+            for src, _, valid in coords
+        ]
+        for val, (_, dst, valid) in zip(vals, coords):
+            buffer_store(val, dst_res, dst, mask=valid, cache_modifier=dst_cm)
 
 
 @ASTRewriter.transform
@@ -58,7 +101,7 @@ def spin_flag(flag_base, flag_idx, expected, rank, src, tag, report=True):
     """Spin until the i64 flag reaches ``expected``; on timeout trap (and printf unless ``report=False``).
 
     ``report=False`` skips the hostcall printf: inlined into a pull / K path it needs the registers the
-    surrounding loads hold."""
+    surrounding loads hold (same as ``spin_flags``)."""
     spin_start = read_clock()
     fx.rocdl.s_waitcnt(0)
     flag = ld(flag_base, flag_idx, scope="sys", dtype=fx.T.i64)
@@ -79,6 +122,38 @@ def spin_flag(flag_base, flag_idx, expected, rank, src, tag, report=True):
         flag = ld(flag_base, flag_idx, scope="sys", dtype=fx.T.i64)
 
 
+def _all_reached(flag_base, flag_idxs, expected):
+    ready = None
+    for idx in flag_idxs:
+        ok = ld(flag_base, idx, scope="sys", dtype=fx.T.i64) >= expected
+        ready = ok if ready is None else ready & ok
+    return ready
+
+
+@ASTRewriter.transform
+def spin_flags(flag_base, flag_idxs, expected, rank, src, tag, report=True):
+    """``spin_flag`` over several flags, polled together (one round trip per poll). ``report=False``
+    traps on timeout without the printf: inside a GEMM K loop its hostcall code needs the registers the
+    accumulators and prefetches hold, and what it evicts is reloaded after every wait."""
+    spin_start = read_clock()
+    fx.rocdl.s_waitcnt(0)
+    ready = _all_reached(flag_base, flag_idxs, expected)
+    while not ready:
+        fx.rocdl.s_sleep(fx.Int32(1))
+        if spin_timed_out(spin_start, SPIN_TIMEOUT):
+            if const_expr(report):
+                fx.printf(
+                    f"[fused_collective_gemm rank={rank} {tag}] flag wait timeout: "
+                    "src={} first flag_idx={} expected={}\n",
+                    src,
+                    flag_idxs[0],
+                    expected,
+                )
+            _asm("s_trap 2")
+        fx.rocdl.s_waitcnt(0)
+        ready = _all_reached(flag_base, flag_idxs, expected)
+
+
 @ASTRewriter.transform
 def claim_unit(thread_index, state_base, claim_slot, counter=STATE_CLAIM):
     """Next work unit for the whole block, from the call's shared counter ``state[counter]``."""
@@ -95,10 +170,10 @@ def claim_unit(thread_index, state_base, claim_slot, counter=STATE_CLAIM):
 
 
 @ASTRewriter.transform
-def exit_and_bump_epoch(thread_index, state_base, epoch, grid, order="acq_rel"):
-    """The last block out resets the counters and bumps the epoch; every block read it on entry.
-    ``order="relaxed"`` skips the L2 writeback / invalidate around the count; enough when every
-    claim of the block has returned before it exits and its flags carry their own release."""
+def exit_and_bump_epoch(thread_index, state_base, epoch, grid, order="acq_rel", extra_counters=()):
+    """The last block out resets the counters (and ``extra_counters``) and bumps the epoch; every block
+    read it on entry. ``order="relaxed"`` skips the L2 writeback / invalidate around the count; enough
+    when every claim of the block has returned before it exits and its flags carry their own release."""
     fx.gpu.barrier()
     if thread_index == fx.Int32(0):
         arrived = atomic_add(state_base, fx.Int32(STATE_EXIT), fx.Int64(1), scope="agent", order=order)
@@ -106,4 +181,6 @@ def exit_and_bump_epoch(thread_index, state_base, epoch, grid, order="acq_rel"):
             st(state_base, fx.Int32(STATE_EXIT), fx.Int64(0))
             st(state_base, fx.Int32(STATE_CLAIM), fx.Int64(0))
             st(state_base, fx.Int32(STATE_TILE), fx.Int64(0))
+            for counter in extra_counters:
+                st(state_base, fx.Int32(counter), fx.Int64(0))
             st(state_base, fx.Int32(STATE_EPOCH), epoch + fx.Int64(1))
