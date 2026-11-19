@@ -5,6 +5,8 @@
 ###############################################################################
 
 import pytest
+
+from primus_turbo.pytorch.core.utils import is_gfx1250
 import torch
 
 from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
@@ -228,6 +230,23 @@ def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, block_size, backend,
     )
 
 
+def _skip_mx_backend_on_gfx1250(backend, m, n, k):
+    """gfx1250: MX_BLOCKWISE runs only on the FlyDSL WMMA-scale kernel (gemm_gfx1250_kernel.py).
+
+    HIPBLASLT is refused there (its MXFP8 GEMM returns wrong results on gfx1250) and TURBO is
+    gfx950-only. The FlyDSL kernel pads N and K to its tile grid, so it needs only K % 32 == 0,
+    and M, N % 32 == 0 for the backward GEMMs that contract over them.
+    Returns True when the caller should skip its gfx950 FLYDSL shape checks.
+    """
+    if not is_gfx1250():
+        return False
+    if backend in (BackendType.HIPBLASLT, BackendType.TURBO):
+        pytest.skip(f"{backend.name} has no MX_BLOCKWISE GEMM on gfx1250")
+    if backend == BackendType.FLYDSL and (k % 32 or m % 32 or n % 32):
+        pytest.skip("FLYDSL gfx1250 MX GEMM needs k % 32 == 0 and m, n % 32 == 0 (backward)")
+    return backend == BackendType.FLYDSL
+
+
 @pytest.mark.parametrize("m, n, k", GEMM_MX_SHAPES)
 @pytest.mark.parametrize("layout", ["NT"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
@@ -242,6 +261,8 @@ def test_gemm_fp8_mx_blockwise(m, n, k, layout, format, dtype, backend, auto_tun
     if not mxfp8_supported:
         pytest.skip(reason)
 
+    gfx1250_flydsl = _skip_mx_backend_on_gfx1250(backend, m, n, k)
+
     if backend == BackendType.TURBO:
         if layout != "NT" or m % 16 != 0 or n % 16 != 0 or k % 128 != 0 or k < 384:
             pytest.skip("TURBO backend requires NT layout, m/n%16==0, k%128==0, k>=384")
@@ -249,7 +270,7 @@ def test_gemm_fp8_mx_blockwise(m, n, k, layout, format, dtype, backend, auto_tun
         if m % 128 != 0 or m < 384 or n % 128 != 0 or n < 384:
             pytest.skip("TURBO backward GEMMs require m,n%128==0 and m,n>=384")
 
-    if backend == BackendType.FLYDSL:
+    if backend == BackendType.FLYDSL and not gfx1250_flydsl:
         if layout != "NT" or k % 128 != 0 or k < 256:
             pytest.skip("FLYDSL backend requires NT layout, k%128==0, k>=256")
         # Backward GEMMs use m and n as their k dimension; they must also satisfy FLYDSL constraints
@@ -456,6 +477,8 @@ def test_gemm_fp8_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, 
     mxfp8_supported, reason = check_mxfp8_support()
     if not mxfp8_supported:
         pytest.skip(reason)
+
+    gfx1250_flydsl = _skip_mx_backend_on_gfx1250(backend, m, n, k)
 
     if backend == BackendType.TURBO:
         if layout != "NT" or m % 16 != 0 or n % 16 != 0 or k % 128 != 0 or k < 384:

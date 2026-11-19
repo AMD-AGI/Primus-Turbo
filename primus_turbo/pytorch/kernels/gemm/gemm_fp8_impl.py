@@ -11,6 +11,10 @@ import torch
 _torch_custom_op_wrapper = torch.library.custom_op
 
 from primus_turbo.flydsl.gemm.gemm_fp8_kernel import gemm_fp8_tensorwise_flydsl_kernel
+from primus_turbo.flydsl.gemm.gemm_gfx1250_kernel import (
+    default_config as _gfx1250_default_config,
+)
+from primus_turbo.flydsl.gemm.gemm_gfx1250_kernel import gemm_gfx1250
 from primus_turbo.flydsl.gemm.gemm_mxfp8_kernel import gemm_mxfp8_flydsl_kernel
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
@@ -103,6 +107,9 @@ class GEMMFP8HipBLASLtBackend(KernelBackend):
         supported = True
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             supported &= not is_gfx942()
+            # gfx1250: the hipBLASLt MXFP8 GEMM returns wrong results (SNR ~5 dB vs ~28 dB for
+            # FP8 tensorwise on the same inputs); the FlyDSL gfx1250 backend covers MX instead.
+            supported &= not is_gfx1250()
         # check ScalingGranularity
         supported &= granularity in GEMMFP8HipBLASLtBackend.SUPPORTED_GRANULARITIES
         # check dtype
@@ -393,6 +400,36 @@ class GEMMFP8TurboBackend(KernelBackend):
         )
 
 
+def _gemm_mxfp8_gfx1250(a, a_scale_inv, b, b_scale_inv, out_dtype):
+    """NT MXFP8 GEMM on gfx1250: ``a[M,K] @ b[N,K]^T`` with raw E8M0 scales [M,K//32]/[N,K//32].
+
+    The kernel needs N % tile_n == 0, K % tile_k == 0 and K // tile_k >= num_buffers; N and K are
+    zero-padded to that grid (zero data adds nothing whatever its scale) and the output sliced.
+    """
+    m, k = a.shape
+    n = b.shape[0]
+    sa = a_scale_inv.view(torch.uint8)
+    sb = b_scale_inv.view(torch.uint8)
+    (_, tile_n, tile_k), _, _, num_buffers, _ = _gfx1250_default_config("mxfp8", m, n)
+    n_pad = -(-n // tile_n) * tile_n - n
+    k_pad = max(-(-k // tile_k), num_buffers) * tile_k - k
+    if k_pad or n_pad:
+        a8, b8 = a.view(torch.uint8), b.view(torch.uint8)
+        if k_pad:
+            a8 = torch.nn.functional.pad(a8, (0, k_pad))
+            b8 = torch.nn.functional.pad(b8, (0, k_pad))
+            sa = torch.nn.functional.pad(sa, (0, k_pad // 32), value=127)
+            sb = torch.nn.functional.pad(sb, (0, k_pad // 32), value=127)
+        if n_pad:
+            b8 = torch.nn.functional.pad(b8, (0, 0, 0, n_pad))
+            sb = torch.nn.functional.pad(sb, (0, 0, 0, n_pad), value=127)
+        a, b = a8.view(a.dtype), b8.view(b.dtype)
+    res = gemm_gfx1250(
+        a.contiguous(), b.contiguous(), scale_a=sa.contiguous(), scale_b=sb.contiguous(), out_dtype=out_dtype
+    )
+    return res[:, :n].contiguous() if n_pad else res
+
+
 class GEMMFP8FlyDSLBackend(KernelBackend):
     """FlyDSL 8-wave fp8 dense GEMM backend (gfx950 only).
 
@@ -426,6 +463,21 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         if inplace_add_to_out:
             supported &= out is not None and out.dtype == out_dtype
             supported &= out_dtype in (torch.bfloat16, torch.float16)
+        if is_gfx1250():
+            # gfx1250: MX_BLOCKWISE through the WMMA-scale kernel (gemm_gfx1250_kernel.py), NT only,
+            # raw E8M0 2D scales [M,K//32]/[N,K//32]. N and K are padded to the tile grid.
+            if granularity != ScalingGranularity.MX_BLOCKWISE:
+                return False
+            supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
+            supported &= out_dtype in (torch.bfloat16, torch.float16)
+            supported &= (not trans_a) and trans_b
+            m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
+            supported &= k % 32 == 0
+            supported &= a_scale_inv.shape == (m, k // 32) and b_scale_inv.shape == (n, k // 32)
+            supported &= a_scale_inv.element_size() == 1 and b_scale_inv.element_size() == 1
+            if inplace_add_to_out:
+                supported &= out is not None and not trans_c
+            return supported
         # gfx950 (CDNA4) only: kernel uses mfma_f32_16x16x128_f8f6f4, absent on gfx942-.
         supported &= is_gfx950()
         supported &= granularity in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
@@ -462,6 +514,15 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         out: torch.Tensor | None = None,
         **kwargs,
     ):
+        if granularity == ScalingGranularity.MX_BLOCKWISE and is_gfx1250():
+            res = _gemm_mxfp8_gfx1250(a, a_scale_inv, b, b_scale_inv, out_dtype)
+            if trans_c:
+                res = res.t().contiguous()
+            if inplace_add_to_out:
+                # TODO: beta=1 epilogue in the kernel; correct but costs one extra pass for now.
+                out.add_(res)
+                return out
+            return res
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             res = gemm_mxfp8_flydsl_kernel(
                 a,
