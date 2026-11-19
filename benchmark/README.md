@@ -5,6 +5,19 @@ This document presents performance benchmarks for **Primus-Turbo**.
 
 **Work in Progress...**
 
+## RL attention
+
+The batch-invariant RL attention kernel ([RL attention](../docs/features/rl_attention.md)) on rollout
+decode / prefill (paged KV cache, against aiter `unified_attention`) and training forward and
+backward (varlen, against the default `flash_attn_varlen_func` backend), with the built-in causal
+mask, the same mask as visibility intervals, and an image-span mask. `--check` also verifies
+accuracy against the baseline and that rollout outputs equal a training forward bitwise.
+
+```bash
+python benchmark/ops/training/bench_rl_attention.py --check
+python benchmark/ops/training/bench_rl_attention.py --phase decode --model llama3-8b gpt-oss-120b --tp-size 8
+```
+
 ## DeepEP
 
 ### DeepEP vs all-to-all, DeepSeek-V3 shape
