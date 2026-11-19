@@ -508,6 +508,7 @@ def _w1_block_k(num_heads):
 def build_sparse_mla_bwd_gfx1250_w1(
     num_heads, topk, scale, block_k=None, prefetch=8, pin=None, ahead=256, ct_resident=None, batch=4,
     ablate="",
+    idx_pf=True,
 ):
     """One wave per SIMD (4 waves), 32 heads per wave; the kv tiles arrive by TDM gather.
 
@@ -551,7 +552,11 @@ def build_sparse_mla_bwd_gfx1250_w1(
     TILE_B = BN * ROW
     DS_B = BN * SP
     PPH = BLOCK // H  # delta partials per head
-    fixed = 2 * QO_B + 2 * DS_B + PPH * H * 4
+    # idx_pf: ring copies of each tile's row indices (written when its gather is issued) + a per-wave dump
+    # row; the P / dS mask reads them from LDS instead of a global load on the tile's critical path
+    # (ATT: that s_wait_loadcnt and the s_wait_kmcnt of the TDM index loads were ~26% of the stalls).
+    VLD_B = 3 * BN * 4 if idx_pf else 0
+    fixed = 2 * QO_B + 2 * DS_B + PPH * H * 4 + VLD_B
     NBUF = 2 if fixed + 2 * TILE_B <= _LDS_CAP else 1
     if fixed + NBUF * TILE_B > _LDS_CAP:
         raise ValueError("sparse-MLA backward tile does not fit in LDS")
@@ -626,6 +631,7 @@ def build_sparse_mla_bwd_gfx1250_w1(
         dl_lds = p_lds + DS_B
         kv_lds = dl_lds + PPH * H * 4
         stg = kv_lds + NBUF * TILE_B + wave * STG_B
+        vld0 = kv_lds + NBUF * TILE_B + (WAVES * STG_B if STAGE else 0)
 
         v4i = vec_type(4, fx.Int32)
         v4f = vec_type(4, fx.Float32)
@@ -637,15 +643,30 @@ def build_sparse_mla_bwd_gfx1250_w1(
         rsrc_idx = make_rsrc(tensor_addr(TOPK) + fx.Int64(tok) * (topk * 4), topk * 4)
         kv_addr = tensor_addr(KV)
 
-        def issue(t, buf):
+        def load_octs(t):
             # Past the last walked tile, re-fetch it into a buffer that is not read again.
             ct = fx.Int32((t < n_tile).select(t, last_t))
             base = ct * BN + wave * (OPW * RPO)
+            out = []
             for k in range_constexpr(OPW):
                 oct_ = _sbuf_load_v8i32(rsrc_idx, (base + k * RPO) * 4)
-                words = [oct_[i] for i in range_constexpr(8)]
+                out += [oct_[i] for i in range_constexpr(8)]
+            return out
+
+        def issue_octs(octs, buf):
+            for k in range_constexpr(OPW):
+                words = octs[k * 8 : (k + 1) * 8]
                 # An unused slot (-1) is out of range: the row lands as zeros (P is masked).
                 _tdm_gather(kv_lds + buf * TILE_B + (wave * OPW + k) * (RPO * ROW), kv_addr, words, RPO, NKV)
+                if const_expr(idx_pf):
+                    va = vld0 + (buf * BN + (wave * OPW + k) * RPO) * 4
+                    dump = vld0 + NBUF * BN * 4 + wave * (OPW * 32) + k * 32
+                    va = fx.Int32((lane == fx.Int32(0)).select(va, dump))
+                    lds_store(Vec.from_elements(words[0:4], fx.Int32), va)
+                    lds_store(Vec.from_elements(words[4:8], fx.Int32), va + 16)
+
+        def issue(t, buf):
+            issue_octs(load_octs(t), buf)
 
         issue(fx.Int32(0), fx.Int32(0))
 
@@ -749,7 +770,10 @@ def build_sparse_mla_bwd_gfx1250_w1(
             # ---- P, dS: lane = slot t*BN + kt*16 + l16, element i = head hp*32 + g*16 + hi*8 + i.
             for kk in range_constexpr(KTW):
                 kt = kt0 + kk
-                idx = fx.Int32(buf_load(rsrc_idx, (t * BN + kt * 16 + l16) * 4, T.i32))
+                if const_expr(idx_pf):
+                    idx = fx.Int32(lds_load(vld0 + (buf * BN + kt * 16 + l16) * 4, T.i32, align=4))
+                else:
+                    idx = fx.Int32(buf_load(rsrc_idx, (t * BN + kt * 16 + l16) * 4, T.i32))
                 ok = idx >= fx.Int32(0)
                 for g in range_constexpr(G):
                     sv = vmul_scalar(s[g][kk], c_log2)
@@ -838,21 +862,28 @@ def build_sparse_mla_bwd_gfx1250_w1(
             run(steps)
             return new
 
+        PF = idx_pf and NBUF == 2  # the next tile's index octets ride in the loop state
         init = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(G * DTQ)]
+        if const_expr(PF):
+            init = init + load_octs(fx.Int32(1))
         for t, st in range(fx.Index(0), fx.Index(n_tile), fx.Index(1), init=init):
             ti = fx.Int32(t)
             # Tile t landed, and every wave is done with tile t-1 (its kv buffer and dS / P).
             _rocdl.s_wait_tensorcnt(0)
             _lds_barrier()
+            nxt = []
             if const_expr(NBUF == 2):
-                if const_expr("tdm" not in ablate):
+                if const_expr(PF):
+                    issue_octs([st[G * DTQ + i] for i in range_constexpr(OPW * 8)], (ti + 1) % 2)
+                    nxt = load_octs(ti + 2)
+                elif const_expr("tdm" not in ablate):
                     issue(ti + 1, (ti + 1) % 2)
                 buf = ti % 2
             else:
                 buf = fx.Int32(0)
             dq = [[st[g * DTQ + j] for j in range_constexpr(DTQ)] for g in range_constexpr(G)]
             new = tile_compute(ti, buf, dq)
-            res = yield [new[g][j] for g in range_constexpr(G) for j in range_constexpr(DTQ)]
+            res = yield [new[g][j] for g in range_constexpr(G) for j in range_constexpr(DTQ)] + nxt
         # The over-issued gather must land before the workgroup's LDS is released.
         _rocdl.s_wait_tensorcnt(0)
         nxt = tok + fx.Int32(ahead)
@@ -863,8 +894,10 @@ def build_sparse_mla_bwd_gfx1250_w1(
         _l2_prefetch(tensor_addr(TOPK) + fx.Int64(nxt) * (topk * 4), topk * 4, tid, BLOCK)
         _l2_prefetch(tensor_addr(LSE) + fx.Int64(nxt) * (H * 4), H * 4, tid, BLOCK)
         # dQ (rope columns zeroed) goes out through the Q / dO area, free once every wave is past
-        # its last C^T, so the token's rows leave as one contiguous run.
-        gpu.barrier()
+        # its last C^T, so the token's rows leave as one contiguous run. LDS-only barriers: gpu.barrier()
+        # also drains every outstanding global store (the token's interm rows), which ATT showed as the
+        # top stall (s_wait_storecnt 0x0, ~7% of the kernel's stall cycles).
+        _lds_barrier()
         zero = Vec.filled(4, 0, fx.Int32)
         for g in range_constexpr(G):
             row = q_lds + (hp * 32 + g * 16 + l16) * QROW
@@ -872,7 +905,7 @@ def build_sparse_mla_bwd_gfx1250_w1(
                 lds_store(to_bf16(res[g * DTQ + j]), row + (dt0 + j) * 32 + hi * 16)
             for j in range_constexpr(RZ // DS):
                 lds_store(zero, row + DV * 2 + hi * (RZ * 16) + ds * (RZ // DS * 16) + j * 16)
-        gpu.barrier()
+        _lds_barrier()
         rsrc_dq = make_rsrc(tensor_addr(DQ) + tok_q, H * DQK * 2)
         for i in range_constexpr(H * QCPR // BLOCK):
             c = tid + i * BLOCK
