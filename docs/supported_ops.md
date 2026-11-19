@@ -96,7 +96,10 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | `rmsnorm` | BF16 / FP16 / FP32 | ✅ | ✅ | ✅ | Optional zero-centered gamma |
 | `rmsnorm_residual` | BF16 / FP16 / FP32 | ✅ | ✅ | ✅ | Fused residual add |
 | `rmsnorm_residual_fp4` | BF16 → MXFP4 | — | ✅ | — | Fused residual add + MXFP4 quantization |
+| `adaln_modulate` | BF16 | — | ✅ | — | DiT adaLN: cat of two token segments + LayerNorm + `(1 + scale)` / `shift` modulation; C % 512, sequence lengths % 128. Eager PyTorch off gfx950 |
+| `gated_residual_adaln` | BF16 | — | ✅ | — | DiT gated residual `x + g * a` + adaLN, both streams of an MMDiT block in one call; C % 1536, sequence lengths % 32. Eager PyTorch off gfx950 |
 | `swiglu_with_probs`, `geglu_with_probs` | BF16 / FP16 | ✅ | ✅ | ✅ | GLU scaled by routing probability, optional row mask and clamp |
+| `linear_gelu` | BF16 | — | ✅ | — | Linear + bias + tanh GELU, optionally written after a prefix; bias gradient fused into the GELU backward. Unfused GELU off gfx950 and for untiled shapes |
 | `fused_qkv_rope` | BF16 | ✅ | ✅ | — | RoPE on packed QKV |
 | `fused_qkv_rmsnorm_rope` | BF16 | — | ✅ | — | QK RMSNorm + RoPE on packed QKV |
 | `cross_entropy` | BF16 / FP32 | ✅ | ✅ | ✅ | Label smoothing, ignore index, in-place logits. See [Cross Entropy](./cross_entropy.md) |
@@ -177,4 +180,6 @@ registration order, with the arch / format limits from each backend's `can_handl
 | MegaMoE (`fused_mega_moe*`) | FLYDSL |
 | `rmsnorm*`, `swiglu_with_probs`, `geglu_with_probs`, `cross_entropy`, router | TRITON (`rmsnorm_residual_fp4`: FLYDSL) |
 | `fused_qkv_rope`, `fused_qkv_rmsnorm_rope` | FLYDSL |
+| `linear_gelu` | FLYDSL GELU (gfx950, tiled shapes; unfused otherwise), TRITON GELU backward |
+| `adaln_modulate`, `gated_residual_adaln` | FLYDSL (gfx950), eager PyTorch otherwise |
 | Quantization | TURBO (HIP), TRITON (blockwise), FLYDSL (MXFP8 / MXFP4) |
