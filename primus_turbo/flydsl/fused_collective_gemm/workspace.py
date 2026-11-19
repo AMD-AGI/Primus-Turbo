@@ -56,7 +56,8 @@ class CollectiveGemmWorkspace:
         self.num_bytes = FLAG_BYTES + 2 * self.bank_bytes
         self.symm_mem = SymmetricMemory(group, self.num_bytes, signal_pad_size=0)
         self.peer_ptrs = torch.tensor(self.symm_mem.buffer_ptrs, dtype=torch.int64, device="cuda")
-        # see common.STATE_*: [0] epoch, [1] exit counter, [2] / [3] unit / tile claim counters
+        # see common.STATE_*: [0] epoch, [1] exit counter, [2] / [3] unit / tile claim counters,
+        # [4] A2AGemm own-row pieces claimed
         self.state = torch.tensor([1] + [0] * (NUM_STATE - 1), dtype=torch.int64, device="cuda")
         torch.cuda.synchronize()
         dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
