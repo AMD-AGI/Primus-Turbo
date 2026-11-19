@@ -75,7 +75,7 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | `flash_attn_func` | BF16 / FP16 | ✅ | ✅ | ✅ | GQA / MQA, causal, sliding window, attention sink |
 | `flash_attn_varlen_func` | BF16 / FP16 | ✅ | ✅ | — | Packed variable-length sequences |
 | `flash_attn_fp8_func` | FP8 | ✅ | ✅ | — | |
-| `flash_attn_usp_func`, `flash_attn_varlen_usp_func`, `flash_attn_fp8_usp_func` | BF16 / FP8 | ✅ | ✅ | — | Context parallelism: ring + all-to-all (USP) |
+| `flash_attn_usp_func`, `flash_attn_varlen_usp_func`, `flash_attn_fp8_usp_func` | BF16 / FP8 | ✅ | ✅ | — | Context parallelism: ring + all-to-all (USP). See [USP](./features/usp.md) |
 | `sparse_mla_func` | BF16 | ✅ | ✅ | ✅ | DeepSeek sparse MLA |
 
 ### 2.4 MoE

@@ -74,7 +74,12 @@ print(o)
 print(o.shape)
 ```
 
-+ Attention with CP
+#### Attention with Context Parallel
+
+`flash_attn_usp_func` runs flash attention under context parallelism (Ulysses all-to-all, with
+an optional ring group). See [USP](./features/usp.md) for the varlen and FP8 ops, the options and
+the limitations.
+
 ```python
 import os
 import torch
@@ -84,7 +89,6 @@ from torch.distributed.device_mesh import init_device_mesh
 
 dtype = torch.bfloat16
 
-world_size = int(os.environ["WORLD_SIZE"])
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
 torch.cuda.set_device(local_rank)

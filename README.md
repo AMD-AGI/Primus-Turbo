@@ -7,7 +7,7 @@
 [What's Primus-Turbo?](#-whats-primus-turbo) | [What's New](#-whats-new) | [Quick Start](#-quick-start) | [Example](#-example) | [Performance](#-performance) | [Roadmap](#-roadmap) | [Primus Ecosystem](#-primus-ecosystem) | [Acknowledgements](#-acknowledgements) | [License](#-license)
 
 ## 🔍 What's Primus-Turbo?
-**Primus-Turbo** is a high-performance acceleration library dedicated to large-scale model training on AMD GPUs. Built and optimized for the AMD ROCm platform, it covers the full training stack — including core compute operators (GEMM, Attention, GroupedGEMM), communication primitives ([DeepEP](./docs/features/deep_ep.md)), fused MoE layers ([MegaMoE](./docs/features/mega_moe.md)), low-precision computation (FP8), and compute–communication overlap kernels.
+**Primus-Turbo** is a high-performance acceleration library dedicated to large-scale model training on AMD GPUs. Built and optimized for the AMD ROCm platform, it covers the full training stack — including core compute operators (GEMM, Attention, GroupedGEMM), communication primitives ([DeepEP](./docs/features/deep_ep.md)), fused MoE layers ([MegaMoE](./docs/features/mega_moe.md)), context-parallel attention ([USP](./docs/features/usp.md)), low-precision computation (FP8), and compute–communication overlap kernels.
 
 With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its guiding principles, Primus-Turbo is designed to fully unleash the potential of AMD GPUs for large-scale training workloads, offering a robust and complete acceleration foundation for next-generation AI systems.
 
@@ -22,7 +22,7 @@ Note: JAX support is under active development. Optim support is planned but not 
 |---|---|
 | GEMM | `gemm` (BF16/FP16), `gemm_fp8` (tensorwise / rowwise / blockwise / MXFP8), `gemm_fp4` (MXFP4), `mlp_fp4` |
 | Grouped GEMM | `grouped_gemm`, `grouped_gemm_fp8`, `grouped_gemm_fp4`, `grouped_mlp_fp8`, `grouped_mlp_fp4` |
-| Attention | `flash_attn_func`, `flash_attn_varlen_func`, `flash_attn_fp8_func`, `flash_attn_*_usp_func` (context parallel), `sparse_mla_func` |
+| Attention | `flash_attn_func`, `flash_attn_varlen_func`, `flash_attn_fp8_func`, [`flash_attn_*_usp_func`](./docs/features/usp.md) (context parallel), `sparse_mla_func` |
 | MoE | `fused_group_topk_routing_with_aux_score`, `moe_permute` / `moe_unpermute`, `moe_dispatch` / `moe_combine`, MegaMoE (BF16 / MXFP8) |
 | Norm / Act / RoPE / Loss | `rmsnorm`, `rmsnorm_residual`, `rmsnorm_residual_fp4`, `swiglu_with_probs`, `geglu_with_probs`, `fused_qkv_rope`, `fused_qkv_rmsnorm_rope`, `cross_entropy` |
 | Quantization | `quantize_fp8` / `quantize_fp4` (+ `_with_trans`, grouped, dequantize), `weight_deosc_*` |
