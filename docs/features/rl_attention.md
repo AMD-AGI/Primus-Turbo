@@ -1,0 +1,186 @@
+# RL attention (batch-invariant)
+
+On-policy RL needs the trainer to recompute exactly the log-probabilities the rollout engine
+sampled with. Ordinary attention kernels do not give that. The rollout runs paged decode and prefill
+with batch-dependent tiling and split-KV, the trainer runs a different, dense kernel, and the two
+round differently. RL attention is one Triton kernel family used on both sides. A token's forward
+output is **bitwise identical** whether it is computed in a rollout prefill, in a rollout decode
+step, or in the training forward, and whatever else shares its batch.
+
+Supported: bf16 / fp16, GQA / MQA, head dims up to 256, causal (bottom-right aligned), sliding
+window, per-head attention sinks (with their gradient), packed variable-length sequences, a
+vLLM-layout paged KV cache, and visibility masks. The backward is deterministic (no atomics).
+Tested on MI355X (gfx950). Kernels are derived from aiter's `unified_attention` and one-kernel
+backward (MIT).
+
+## Usage
+
+Through the normal attention interface:
+
+```python
+from primus_turbo.pytorch.ops.attention import flash_attn_varlen_func
+from primus_turbo.pytorch.ops.attention.rl_attention import create_block_mask
+
+# training: forward + backward
+out = flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                             causal=True, sink=sink, batch_invariant=True)
+
+# rollout: paged KV cache [num_blocks, block_size, Hkv, D], forward only
+out = flash_attn_varlen_func(q, k_cache, v_cache, cu_seqlens_q, None, max_seqlen_q, max_seqlen_k,
+                             causal=True, sink=sink, block_table=block_table, seqused_k=seq_lens)
+```
+
+`flash_attn_func` and `flash_attn_varlen_func` run RL attention when any of `batch_invariant=True`,
+`block_mask`, `kernel_options` or `block_table` is given, or when
+`PRIMUS_TURBO_ATTN_BATCH_INVARIANT=1` is set. The environment switch reaches a trainer that calls
+`flash_attn_*` from inside a framework. Without these, backend selection is unchanged.
+
+- `causal=True` with `window_size=(left, 0)` is causal attention with a sliding window.
+  `causal=False` is full attention over each sequence's keys.
+- `sink` is a per-head logit.
+- LSE comes back as `[B, Hq, Sq]` (dense) or `[Hq, total_q]` (varlen).
+- Unsupported arguments raise: dropout, bias, ALiBi, `return_attn_probs`, right windows, and LSE on
+  the paged path. `deterministic` has no effect, since the backward is always deterministic.
+
+The same kernel has dedicated entry points: `rl_paged_attention_func` (rollout),
+`rl_flash_attn_varlen_func` (THD) and `rl_flash_attn_func` (BSHD).
+
+## Visibility masks
+
+`create_block_mask(lo, hi)` gives each query token one contiguous, inclusive range of keys
+`[lo, hi]` of its own sequence. Unlike `torch.nn.attention.flex_attention.create_block_mask`, it
+takes the bounds directly, not a `mask_mod`. Bounds are **global key indices**: sequence `s` owns
+keys `cu_seqlens_k[s] .. cu_seqlens_k[s+1]-1`. For a paged cache, `cu_seqlens_k` is the exclusive
+cumulative sum of `seq_lens`; it is computed once per mask and reused by every layer. With `i` the
+global index of a query token:
+
+| Mask | lo | hi |
+|---|---|---|
+| Causal | start of i's sequence | i |
+| Bidirectional span (e.g. an image) | span start | span end |
+| Sliding window of W keys | max(seq start, i - W + 1) | i |
+| No keys (output 0) | hi + 1 | any |
+
+`create_block_mask(..., window_left=W)` narrows every row to `[max(lo, hi - W), hi]`. Keys
+outside a row's interval are exact no-ops. Tiles are always walked in increasing key position, so a
+mask never changes the order of additions. The backward skips work outside the intervals.
+`mask.validate(cu_seqlens_q, cu_seqlens_k)` checks that no interval reaches outside its sequence.
+
+## Kernel options
+
+`kernel_options` (a dict, as in FlexAttention) sets kernel parameters per call.
+`PRIMUS_TURBO_RL_ATTN_KERNEL_OPTIONS="KEY=VALUE,..."` sets process-wide defaults, and a call
+overrides them key by key. 0 or `auto` means the default.
+
+| Key | Changes bits | Meaning |
+|---|---|---|
+| `TILE_SIZE` | yes | KV tile per inner step (default 64, 32 for D > 128) |
+| `SEGMENT_SIZE` | yes | KV segment length, the split-KV unit (default 1024) |
+| `BACKEND` | yes | `TRITON` |
+| `MODE` | no | `auto`, `fused` (one pass) or `split` (split-KV + reduce) |
+| `BLOCK_M`, `num_warps`, `num_stages`, `waves_per_eu` | no | Schedule only |
+
+**Keys that change bits must be identical in the rollout and the training process**; setting the
+same environment variable in both is the simplest way. The others may differ per call and per
+process. `num_warps` is clamped to `BLOCK_M / 16` when `BLOCK_M > 16`, because warps that also
+split the columns of the score tile change the bits. The backward uses its own fixed configuration.
+
+## How the invariance is achieved
+
+A row's result depends only on the order of its floating-point reductions. The kernels fix that
+order per model and make everything else a pure scheduling choice:
+
+- **Fixed reduction order.** Keys are reduced in tiles of `TILE_SIZE`, in increasing absolute
+  position, inside fixed absolute segments of `SEGMENT_SIZE`. Segments are merged in order. Nothing
+  depends on the batch: upstream sizes segments from the batch.
+- **One code path for every mode.** The fused kernel walks the segments itself. The split kernel
+  computes one segment per program and a reduce kernel merges them in the same order. Both run the
+  same `@triton.jit` tile, merge, sink and epilogue helpers.
+- **Masking that cannot reorder.** The running max stays `-inf` until a row sees a key (upstream
+  resets it to 0, which made a fully masked leading tile round differently depending on block
+  grouping). Masks apply per element on the absolute tile grid. Sinks fold once after all keys.
+- **Paged = contiguous.** Contiguous K/V is read through the same kernels with page size 1, and key
+  loads are always masked by sequence length.
+
+## Testing methodology
+
+Tests live in `tests/pytorch/ops/test_rl_attention.py`, with an fp32 reference in
+`tests/pytorch/ref/rl_attention_ref.py`:
+
+```bash
+pytest tests/pytorch/ops/test_rl_attention.py
+```
+
+### Two kinds of checks
+
+- **Accuracy** compares against the fp32 PyTorch reference with `torch.testing.assert_close`:
+  atol / rtol 2e-2 for outputs, 5e-2 for gradients. This shows the kernel computes attention
+  correctly.
+- **Bitwise invariance** compares two kernel results with `torch.equal(a.view(torch.int16),
+  b.view(torch.int16))`. Every bit must match, with no tolerance; this is the RL guarantee itself. A
+  tolerance would hide exactly the 1-ulp differences that break on-policy RL.
+
+### Inputs chosen to expose differences
+
+- **Shapes that stress tile edges.** Most tests use sequence lengths `[1, 77, 300, 129]`. 1 behaves
+  like decode; the others end partway through a KV tile, so the masked last tile is always
+  exercised. Head shapes `(Hq, Hkv, D)` cover GQA ratios 1-8, a group size that is not a power of
+  two (6:2), and D = 64 / 128 / 256.
+- **Short segments.** A fixture sets `SEGMENT_SIZE=128` through
+  `PRIMUS_TURBO_RL_ATTN_KERNEL_OPTIONS`, as a deployment would, so split-KV and multi-segment fused
+  passes happen at test sizes.
+- **Adversarial paged caches.** K/V are scattered into a cache with shuffled physical blocks (page
+  sizes 1, 16, 64). Unused slots hold large garbage (about 100x), so a missing key mask shows up
+  immediately.
+- **Masks that mix every case.** Generated masks combine bidirectional image spans inside causal
+  sequences, random non-causal ranges, and empty rows, which must output exactly zero.
+- **Seeded data.** Inputs come from seeded CPU generators, so failures reproduce.
+
+### Bitwise invariance (the RL guarantees)
+
+Each test changes one thing a token's result must not depend on, and requires identical bits:
+
+| Guarantee | Test | What varies |
+|---|---|---|
+| Layout | `test_paged_split_fused_contiguous_bitwise`, `test_visibility_paged_split_fused_bitwise` | Paged cache (each page size) vs contiguous K/V; split-KV vs fused |
+| Launch | `test_launch_invariance` | 16 (`BLOCK_M`, `num_warps`) launches given through `kernel_options`, with and without masks |
+| Batch | `test_batch_invariance`, `test_visibility_batch_invariance` | A 200-token sequence alone vs packed among others (`[1, 5]`, `[333, 64, 17]`, six of 129), with masks and sinks |
+| Mask form | `test_causal_intervals_equal_builtin` | Causal / sliding window as `[lo, hi]` intervals vs the built-in masks |
+| Rollout vs training | `test_causal_rollout_matches_training`, `test_visibility_rollout_matches_training`, `test_flash_attn_varlen_func_paged_rollout_matches_training` | See below |
+| Options route | `test_env_options_and_per_call_override` | The same options through the environment vs per call (and a different `TILE_SIZE` must change the bits) |
+| Interface | `test_flash_attn_*_routes_to_rl_kernel`, `test_env_switch_routes_flash_attn` | `flash_attn_*` vs the `rl_*` entry points |
+
+The **rollout-vs-training** tests simulate an RL step end to end at the kernel level:
+
+1. **Training side:** one varlen forward over the whole sequence (prompt + response).
+2. **Rollout side:** the prompt is prefilled into a paged cache, either all at once or in 37-token
+   chunks (chunked prefill). The response is then decoded one token per step. Every step is batched
+   with another sequence that is also decoding, so tile and program assignment differ from training.
+   Each step runs in both `fused` and `split` mode.
+3. **Check:** every rollout token's output equals the training output at the same position, bit for
+   bit.
+
+They run with causal masks (each window and page size), with a bidirectional image span in the
+prompt plus sinks, and with both sides going through `flash_attn_varlen_func`.
+
+### Backward
+
+The backward never has to match inference. It must be correct and deterministic:
+
+- dq / dk / dv / dsink match the fp32 reference's autograd, for causal, windowed, masked and sink
+  cases.
+- Two runs give bitwise-identical gradients.
+- Short intervals scattered over long sequences check that the pruned walks skip only work that
+  does not matter.
+
+### Error handling
+
+Unknown or malformed kernel options, unsupported arguments, a paged `block_table` without
+`seqused_k`, and masks reaching outside their sequence all raise `ValueError`.
+
+### Not covered
+
+These tests check invariance at the kernel level. End-to-end on-policy matching also needs every
+other op in the model (GEMMs, norms, and tensor-parallel all-reduces) to be batch invariant and
+identical between the engine and the trainer, and the engine must call this kernel with the same
+bit-changing options.
