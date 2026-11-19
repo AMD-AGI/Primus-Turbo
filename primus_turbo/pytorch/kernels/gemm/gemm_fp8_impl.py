@@ -400,11 +400,15 @@ class GEMMFP8TurboBackend(KernelBackend):
         )
 
 
-def _gemm_mxfp8_gfx1250(a, a_scale_inv, b, b_scale_inv, out_dtype):
+def _gemm_mxfp8_gfx1250(a, a_scale_inv, b, b_scale_inv, out_dtype, out=None):
     """NT MXFP8 GEMM on gfx1250: ``a[M,K] @ b[N,K]^T`` with raw E8M0 scales [M,K//32]/[N,K//32].
 
     The kernel needs N % tile_n == 0, K % tile_k == 0 and K // tile_k >= num_buffers; N and K are
     zero-padded to that grid (zero data adds nothing whatever its scale) and the output sliced.
+
+    With ``out`` given the kernel's beta=1 epilogue accumulates into it (``out += a @ b^T``,
+    fp32 add, one rounding) -- the wgrad-into-main_grad path. ``out`` must be a row-major
+    bf16 / f16 ``(M, N)`` tensor and N must already sit on the tile grid (no output slice).
     """
     m, k = a.shape
     n = b.shape[0]
@@ -424,10 +428,27 @@ def _gemm_mxfp8_gfx1250(a, a_scale_inv, b, b_scale_inv, out_dtype):
             b8 = torch.nn.functional.pad(b8, (0, 0, 0, n_pad))
             sb = torch.nn.functional.pad(sb, (0, 0, 0, n_pad), value=127)
         a, b = a8.view(a.dtype), b8.view(b.dtype)
+    if out is not None:
+        assert not n_pad, "the accumulating MXFP8 GEMM needs N on the tile grid"
+        return gemm_gfx1250(
+            a.contiguous(),
+            b.contiguous(),
+            out,
+            scale_a=sa.contiguous(),
+            scale_b=sb.contiguous(),
+            out_dtype=out.dtype,
+            accumulate=True,
+        )
     res = gemm_gfx1250(
         a.contiguous(), b.contiguous(), scale_a=sa.contiguous(), scale_b=sb.contiguous(), out_dtype=out_dtype
     )
     return res[:, :n].contiguous() if n_pad else res
+
+
+def _gfx1250_mx_n_padded(m: int, n: int) -> bool:
+    """Whether the gfx1250 MXFP8 GEMM has to pad N (and so cannot write ``out`` in place)."""
+    (_, tile_n, _), _, _, _, _ = _gfx1250_default_config("mxfp8", m, n)
+    return n % tile_n != 0
 
 
 class GEMMFP8FlyDSLBackend(KernelBackend):
@@ -468,6 +489,9 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
             # raw E8M0 2D scales [M,K//32]/[N,K//32]. N and K are padded to the tile grid.
             if granularity != ScalingGranularity.MX_BLOCKWISE:
                 return False
+            # `out` may be the fp32 main_grad here: the bf16 / f16 case accumulates in the
+            # kernel epilogue, fp32 takes a separate add (see execute()).
+            supported = True
             supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
             supported &= out_dtype in (torch.bfloat16, torch.float16)
             supported &= (not trans_a) and trans_b
@@ -477,6 +501,7 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
             supported &= a_scale_inv.element_size() == 1 and b_scale_inv.element_size() == 1
             if inplace_add_to_out:
                 supported &= out is not None and not trans_c
+                supported &= out is not None and out.dtype in (torch.bfloat16, torch.float16, torch.float32)
             return supported
         # gfx950 (CDNA4) only: kernel uses mfma_f32_16x16x128_f8f6f4, absent on gfx942-.
         supported &= is_gfx950()
@@ -515,11 +540,20 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         **kwargs,
     ):
         if granularity == ScalingGranularity.MX_BLOCKWISE and is_gfx1250():
+            if (
+                inplace_add_to_out
+                and not trans_c
+                and out.dtype in (torch.bfloat16, torch.float16)
+                and out.is_contiguous()
+                and not _gfx1250_mx_n_padded(a.shape[0], b.shape[0])
+            ):
+                # beta=1 epilogue: wgrad lands in `out` (main_grad) without a separate add pass.
+                return _gemm_mxfp8_gfx1250(a, a_scale_inv, b, b_scale_inv, out_dtype, out=out)
             res = _gemm_mxfp8_gfx1250(a, a_scale_inv, b, b_scale_inv, out_dtype)
             if trans_c:
                 res = res.t().contiguous()
             if inplace_add_to_out:
-                # TODO: beta=1 epilogue in the kernel; correct but costs one extra pass for now.
+                # N off the tile grid (padded output) or an fp32 / strided `out`: separate add.
                 out.add_(res)
                 return out
             return res
@@ -692,3 +726,33 @@ def gemm_fp8_accum_impl_meta(
         m, n = n, m
     assert tuple(out.shape) == (m, n), f"out shape {tuple(out.shape)} must equal {(m, n)}"
     return None
+
+
+
+# ---------------------------------------------------------------------------
+# Eager fast path. ``torch.library.custom_op`` costs tens of microseconds of host time per
+# call (dispatcher redispatch + autograd/ADInplaceOrView keys + output checks), paid three
+# times per FP8 linear fwd+bwd; on gfx1250 that made small MXFP8 GEMMs host-bound. Outside
+# torch.compile the ops are called from inside autograd.Functions with plain tensors, so
+# calling the registered CUDA implementation directly is equivalent. Under compile (or with
+# PRIMUS_TURBO_CUSTOM_OP_EAGER=0) the registered custom op is used as before.
+# ---------------------------------------------------------------------------
+def _eager_custom_op_bypass(op):
+    import os
+
+    fn = getattr(op, "_backend_fns", {}).get("cuda")
+    if fn is None or os.environ.get("PRIMUS_TURBO_CUSTOM_OP_EAGER", "1") == "0":
+        return op
+
+    def call(*args, **kwargs):
+        if torch.compiler.is_compiling():
+            return op(*args, **kwargs)
+        return fn(*args, **kwargs)
+
+    call.custom_op = op
+    call.register_fake = op.register_fake
+    return call
+
+
+gemm_fp8_impl = _eager_custom_op_bypass(gemm_fp8_impl)
+gemm_fp8_accum_impl = _eager_custom_op_bypass(gemm_fp8_accum_impl)

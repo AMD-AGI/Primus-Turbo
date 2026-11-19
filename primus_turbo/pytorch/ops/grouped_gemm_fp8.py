@@ -873,6 +873,117 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         "('SourcelessBuilder.create cannot wrap FakeTensor'). "
     ),
 )
+
+def _gfx1250_tw_fast_path(a, b, a_t, b_t, trans_b, out_dtype, num_cu) -> bool:
+    """gfx1250 tensorwise expert GEMMs on FlyDSL WMMA kernels (PRIMUS_TURBO_GFX1250_FP8_MOE=0 opts out)."""
+    import os
+
+    from primus_turbo.pytorch.core.utils import is_gfx1250
+
+    if os.environ.get("PRIMUS_TURBO_GFX1250_FP8_MOE", "1") == "0" or not is_gfx1250():
+        return False
+    if isinstance(a, QuantizedTensor) or isinstance(b, QuantizedTensor) or a_t is not None or b_t is not None:
+        return False
+    if not (trans_b and num_cu is None and out_dtype == torch.bfloat16 and a.dtype == torch.bfloat16):
+        return False
+    if a.dim() != 2 or b.dim() != 3 or b.dtype != torch.bfloat16:
+        return False
+    G, N, K = b.shape
+    return a.shape[1] == K and K % 256 == 0 and N % 256 == 0 and a.is_contiguous()
+
+
+_PATH_LOGGED = set()
+
+
+def _log_gfx1250_path_once(fast, config):
+    import os
+
+    key = (bool(fast), str(config.granularity))
+    if key in _PATH_LOGGED:
+        return
+    _PATH_LOGGED.add(key)
+    print(
+        f"[primus_turbo grouped_gemm_fp8] path={'gfx1250-flydsl' if fast else 'default'} "
+        f"granularity={config.granularity.name} "
+        f"PRIMUS_TURBO_GFX1250_FP8_MOE={os.environ.get('PRIMUS_TURBO_GFX1250_FP8_MOE')} "
+        f"PRIMUS_TURBO_GFX1250_GG_TUNE={os.environ.get('PRIMUS_TURBO_GFX1250_GG_TUNE')}",
+        flush=True,
+    )
+    d = os.environ.get("PRIMUS_TURBO_PATHLOG_DIR")
+    if d:
+        with open(os.path.join(d, f"path_{os.getpid()}.txt"), "a") as f:
+            f.write(f"fast={bool(fast)} gran={config.granularity.name} "
+                    f"MOE={os.environ.get('PRIMUS_TURBO_GFX1250_FP8_MOE')} TUNE={os.environ.get('PRIMUS_TURBO_GFX1250_GG_TUNE')}\n")
+
+
+class FP8GroupedGemmTensorGfx1250Func(torch.autograd.Function):
+    """Tensorwise FP8 grouped GEMM (trans_b=True) for gfx1250.
+
+    fwd   : FlyDSL M-grouped NT WMMA kernel.
+    dgrad : Turbo Triton persistent kernel (NN, gfx1250 tile config).
+    wgrad : FlyDSL variable-K WMMA kernel on token-contiguous operands that the quantize pass emits
+            directly (``quantize_fp8_tensorwise_dual``: one read of the bf16 input writes the row-major
+            fp8 operand and the per-expert padded transposed copy), accumulating into main_grad.
+    """
+
+    @staticmethod
+    def forward(ctx, a, b, group_lens, group_offs, out_dtype, config, num_cu, fuse_bgrad_accum_pattern=None):
+        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_nt_flydsl_gfx1250 import flygg_fp8_nt
+        from primus_turbo.pytorch.kernels.quantization.quantization_impl import quantize_fp8_tensorwise_pad_impl
+        from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_vk_gfx1250 import quantize_fp8_tensorwise_dual
+        from primus_turbo.triton.grouped_gemm.grouped_gemm_helper import grouped_gemm_output_tail_kernel
+
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+        a_dtype = _get_fp8_dtype(config.format, True)
+        a_q, a_sinv, a_t, poffs = quantize_fp8_tensorwise_dual(a, a_dtype, group_offs)
+        b_q, b_sinv = quantize_fp8_tensorwise_pad_impl(b, _get_fp8_dtype(config.format, True), pad_n=True)
+        offs32 = group_offs.to(torch.int32)
+        out = flygg_fp8_nt(a_q, b_q, a_sinv, b_sinv, offs32)
+        out = grouped_gemm_output_tail_kernel(out, group_offs)
+        ctx.save_for_backward(a_t, b_q, a_sinv, b_sinv, group_lens, group_offs)
+        ctx.config, ctx.out_dtype, ctx.num_cu = config, out_dtype, num_cu
+        ctx.K = a.shape[1]
+        ctx.fuse_bgrad_accum = fuse_bgrad_accum
+        ctx.main_grad = main_grad
+        ctx.b_dtype = b.dtype
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_vk_gfx1250 import (
+            quantize_fp8_tensorwise_dual,
+            variable_k_padded,
+        )
+
+        grad_out = _ensure_contiguous_grad_out(grad_out)
+        a_t, b_q, a_sinv, b_sinv, group_lens, group_offs = ctx.saved_tensors
+        g_dtype = _get_fp8_dtype(ctx.config.format, False)
+        go_q, go_sinv, go_t, poffs = quantize_fp8_tensorwise_dual(grad_out, g_dtype, group_offs)
+        grad_a = grouped_gemm_fp8_impl(
+            go_q,
+            b_q,
+            go_sinv,
+            b_sinv,
+            group_lens,
+            group_offs,
+            trans_a=False,
+            trans_b=False,
+            out_dtype=ctx.out_dtype,
+            granularity=ctx.config.granularity.value,
+            num_cu=ctx.num_cu,
+            default_backend=BackendType.TRITON.value,
+            n_real=(ctx.K if ctx.K != b_q.shape[-1] else None),
+        )
+        G, N = b_q.shape[0], grad_out.shape[1]
+        if ctx.fuse_bgrad_accum:
+            variable_k_padded(go_t, a_t, go_sinv, a_sinv, poffs, group_offs, N, ctx.K, ctx.main_grad, 1.0)
+            grad_b = _get_dummy_wgrad(ctx.main_grad.shape, ctx.out_dtype)
+        else:
+            grad_b = torch.empty((G, N, ctx.K), device=grad_out.device, dtype=ctx.b_dtype)
+            variable_k_padded(go_t, a_t, go_sinv, a_sinv, poffs, group_offs, N, ctx.K, grad_b, 0.0)
+        return grad_a, grad_b, None, None, None, None, None, None
+
+
 def grouped_gemm_fp8(
     a: Union[torch.Tensor, QuantizedTensor, QuantizedTensorPair],
     b: Union[torch.Tensor, QuantizedTensor, QuantizedTensorPair],
@@ -924,6 +1035,14 @@ def grouped_gemm_fp8(
     if out_dtype is None:
         out_dtype = torch.promote_types(a_data.dtype, b_data.dtype)
 
+    _fast = config.granularity == ScalingGranularity.TENSORWISE and _gfx1250_tw_fast_path(
+        a_data, b_data, a_data_t, b_data_t, trans_b, out_dtype, num_cu
+    )
+    _log_gfx1250_path_once(_fast, config)
+    if _fast:
+        return FP8GroupedGemmTensorGfx1250Func.apply(
+            a_data, b_data, group_lens, group_offs, out_dtype, config, num_cu, fuse_bgrad_accum_pattern
+        )
     if config.granularity == ScalingGranularity.TENSORWISE:
         # TENSORWISE has a single scalar scale (no col-wise trans cache needed);
         # the inner ``data_t`` is ignored if provided.

@@ -38,12 +38,13 @@ Environment variable: PRIMUS_TURBO_GROUPED_GEMM_BACKEND=TRITON activates these k
 from __future__ import annotations
 
 import functools
+import os
 
 import torch
 import triton
 import triton.language as tl
 
-from primus_turbo.pytorch.core.utils import get_num_cus, is_gfx950
+from primus_turbo.pytorch.core.utils import get_num_cus, is_gfx950, is_gfx1250
 from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
     NUM_XCDS,
     _chiplet_transform_chunked,
@@ -117,6 +118,21 @@ def offline_select_gg_fp8(M_total, G, N, K, s_ak, s_bk):
 # ═══════════════════════════════════════════════════════════════════════════════
 # Cached config selection (avoids per-call origami / LDS overhead)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+# gfx1250 tile configs for the tensorwise persistent kernel, (BLOCK_M, BLOCK_N, BLOCK_K, num_stages, num_warps),
+# swept at the DSv4 MoE expert shapes (32 x 768 rows, N/K in {2048, 4096}). The generic table above is the
+# MI300X one (256x256x128, 2 stages, 8 warps): on gfx1250 4 warps + a third stage or BLOCK_K=256 win.
+_GFX1250_FWD_CFG = {
+    "nt": (256, 256, 256, 2, 4),  # forward: B is K-contiguous
+    "nn": (256, 256, 256, 2, 4),  # dgrad: B is N-contiguous
+}
+
+
+def _gfx1250_fwd_cfg(stride_bk):
+    if not is_gfx1250() or os.environ.get("PRIMUS_TURBO_GFX1250_GG_TUNE", "1") == "0":
+        return None
+    return _GFX1250_FWD_CFG["nt" if stride_bk == 1 else "nn"]
 
 
 @functools.lru_cache(maxsize=256)
@@ -634,6 +650,13 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
             stride_bk,
         )
     )
+    num_warps_val = 8
+    gfx1250_cfg = _gfx1250_fwd_cfg(stride_bk)
+    if gfx1250_cfg is not None:
+        blk_m, blk_n, blk_k, num_stages_val, num_warps_val = gfx1250_cfg
+        group_m = 4
+        tiles = (M_total // blk_m + G) * ((N + blk_n - 1) // blk_n)
+        num_sms = min(get_num_cus(), tiles)
     even_k = K % blk_k == 0
 
     # Precompute per-group tile cumulative sums on the device (single-program kernel,
@@ -679,7 +702,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
         MAX_G_NEXT_POW2=max_g_next_pow2,
-        num_warps=8,
+        num_warps=num_warps_val,
         num_stages=num_stages_val,
         waves_per_eu=0,
         matrix_instr_nonkdim=16,

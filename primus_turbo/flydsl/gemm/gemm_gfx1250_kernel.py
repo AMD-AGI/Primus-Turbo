@@ -174,12 +174,17 @@ def launch_gemm_gfx1250(
     kind_id: Constexpr[int],
     out_is_f16: Constexpr[int],
     group_m: Constexpr[int] = 8,
+    accumulate: Constexpr[int] = 0,
 ):
     """NT GEMM: ``C[M, N] = A[M, K] @ B[N, K]^T`` on gfx1250.
 
     ``K`` must be a multiple of ``tile_k`` and ``N`` of ``tile_n``; ``M`` is
     unrestricted (the TDM descriptors clamp the ragged tile, zero-filling on the
     load and dropping on the store).
+
+    ``accumulate`` selects a beta=1 epilogue, ``C += A @ B^T`` (8-bit operand
+    paths only): the existing C tile is TDM-loaded into the LDS staging buffer,
+    added to the fp32 accumulator and rounded to the output dtype once.
     """
     kind, a_cls, b_cls, elem_bytes, WMMA_K, is_mx = _KIND_BY_ID[kind_id]
     WMMA_M = WMMA_N = 16
@@ -195,6 +200,7 @@ def launch_gemm_gfx1250(
 
     k_iters = tile_k // WMMA_K
     out_cls = fx.Float16 if out_is_f16 else fx.BFloat16
+    assert not (accumulate and is_16bit), "the beta=1 epilogue is wired for the 8-bit paths only"
 
     # `num_buffers` stages, each an A tile then a B tile, K-major. The 16 B of
     # row padding is load-bearing: unpadded, a row is an exact multiple of the
@@ -218,6 +224,7 @@ def launch_gemm_gfx1250(
 
     kernel_name = (
         f"pt_gemm_gfx1250_{kind}_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}_nb{num_buffers}_g{group_m}"
+        + ("_acc" if accumulate else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -528,11 +535,18 @@ def launch_gemm_gfx1250(
                                 fx.gemm(mma_atom, c_frags[idx], bf[ni], af, c_frags[idx])
 
             def epilogue(sC):
+                c_base = fx.Int32(fx.ptrtoint(base_ptr))
                 for mi in range_constexpr(m_reps):
                     row = wmb + mi * WMMA_M + lane16
                     for ni in range_constexpr(n_reps):
                         col = wnb + ni * WMMA_N + kgrp * (WMMA_N // 2)
-                        h = c_frags[mi * n_reps + ni].load().to(out_cls)
+                        acc = c_frags[mi * n_reps + ni].load()
+                        if const_expr(accumulate):
+                            # beta=1: the old C tile already sits in the staging buffer;
+                            # this lane's 8 outputs are one 16 B LDS word.
+                            old = fx.Vector(lds_b128(c_base, (row * C_ROW + col) * 2))
+                            acc = acc + old.bitcast(out_cls).to(fx.Float32)
+                        h = acc.to(out_cls)
                         fx.ptr_store(
                             h.bitcast(fx.Int8),
                             base_ptr + (row * C_ROW + col) * 2,
@@ -565,9 +579,6 @@ def launch_gemm_gfx1250(
         # ---- epilogue: registers -> LDS -> global (TDM, OOB-clamped) ----
         fx.barrier()
         sC = _view(base_ptr, out_cls, (tile_m, C_ROW), (C_ROW, 1))
-        epilogue(sC)
-        fx.barrier()
-
         gtC = _gview(
             gC_base,
             fx.Int64(blk_m) * ldc64 + fx.Int64(blk_n),
@@ -575,6 +586,15 @@ def launch_gemm_gfx1250(
             (C_ROW, 1),
         )
         atomC = fx.rocdl.make_tdm_atom(gtC, [m_oob, tile_n], strides=[ldc64, None], num_warps=num_waves)
+        if const_expr(accumulate):
+            # Stage the existing C tile (OOB rows / pad columns zero-filled), then
+            # publish it to every wave before the read-modify-write below.
+            fx.copy(atomC, gtC, sC)
+            tdm_ops.tensor_wait(0)
+            fx.barrier()
+        epilogue(sC)
+        fx.barrier()
+
         fx.copy(atomC, sC, gtC)
         tdm_ops.tensor_wait(0)
 
@@ -656,8 +676,13 @@ def gemm_gfx1250(
     num_buffers: int | None = None,
     group_m: int | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
+    accumulate: bool = False,
 ) -> torch.Tensor:
     """``C = A @ B^T`` on gfx1250. NT layout, all operands row-major.
+
+    With ``accumulate=True`` the kernel computes ``out += A @ B^T`` in its
+    epilogue (beta=1; fp32 add, one rounding to ``out.dtype``). ``out`` is
+    then required, 8-bit operand kinds only.
 
     ``a`` is ``(M, K)``, ``b`` is ``(N, K)``, the result is ``(M, N)``.
 
@@ -717,6 +742,15 @@ def gemm_gfx1250(
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"out_dtype must be bf16 or f16, got {out_dtype}")
 
+    if accumulate:
+        if out is None:
+            raise ValueError("accumulate=True needs `out`")
+        if _KINDS[kind][2] != 1:
+            raise ValueError("accumulate=True is only wired for the 8-bit operand kinds")
+        if out.dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError(f"accumulate=True needs a bf16 / f16 `out`, got {out.dtype}")
+        if tuple(out.shape) != (M, N) or out.stride(1) != 1:
+            raise ValueError(f"accumulate=True needs a row-major ({M}, {N}) `out`, got {tuple(out.shape)}")
     if out is None:
         out = torch.empty((M, N), dtype=out_dtype, device=a.device)
     dummy = a if not is_mx else scale_a
@@ -744,13 +778,14 @@ def gemm_gfx1250(
         _KIND_ID[kind],
         out_is_f16,
         group_m,
+        1 if accumulate else 0,
     )
     # Calling the @flyc.jit function directly re-binds the signature and
     # rebuilds the cache key on every launch -- ~69 us of host time, which on
     # this GPU dominates any GEMM below roughly 4096^3. `flyc.compile` hoists
     # all of that to the first call and leaves a ~5 us dispatch. Everything
     # baked in as a constexpr has to be part of the key.
-    key = (kind, tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers, group_m, out_is_f16)
+    key = (kind, tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers, group_m, out_is_f16, bool(accumulate))
     compiled = _COMPILED.get(key)
     if compiled is None:
         # flyc.compile() also runs this first call.

@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -24,6 +25,11 @@ from primus_turbo.pytorch.core.low_precision import (
     check_mxfp8_support,
 )
 from primus_turbo.pytorch.core.utils import is_gfx1250
+from primus_turbo.triton.quantization.quant_mxfp8_dual import (
+    quant_mxfp8_dual_triton,
+    quant_mxfp8_dual_triton_config,
+    quant_mxfp8_dual_triton_supported,
+)
 from primus_turbo.triton.quantization.quant_blockwise import (
     dequant_fp8_blockwise_for_weight_kernel,
     dequant_fp8_blockwise_kernel,
@@ -32,6 +38,10 @@ from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_kernel,
     quant_fp8_blockwise_segment_m_row_col_kernel,
 )
+
+
+# PRIMUS_TURBO_MXFP8_QUANT_TRITON=0 sends the gfx1250 MXFP8 dual cast back to the HIP kernel.
+_MXFP8_DUAL_TRITON = os.environ.get("PRIMUS_TURBO_MXFP8_QUANT_TRITON", "1") != "0"
 
 
 def ceil_div(a, b):
@@ -558,6 +568,33 @@ def quantize_mxfp8_impl(
             if x.ndim == 3:
                 return quant_mxfp8_raw_batched(x, out_dtype, row_2d=row_2d, col_2d=col_2d)
             return quant_mxfp8_raw(x, out_dtype, row_2d=row_2d, col_2d=col_2d)
+        # gfx1250: Triton dual-cast (one tile read, both directions + E8M0 scales); the HIP
+        # kernel below is a wave64 design that reaches ~25% of the HBM floor on this GPU.
+        if (
+            is_gfx1250()
+            and _MXFP8_DUAL_TRITON
+            and not scaling_recipe.shuffle_scale
+            and not scaling_recipe.shuffle_out
+            and not scaling_recipe_for_trans.shuffle_scale
+            and not scaling_recipe_for_trans.shuffle_out
+            and x.dim() == 2
+            and (
+                cfg := quant_mxfp8_dual_triton_config(
+                    x.shape[0], x.shape[1], scaling_recipe.use_2d_block, scaling_recipe_for_trans.use_2d_block
+                )
+            )
+            is not None
+            and quant_mxfp8_dual_triton_supported(x, out_dtype, bm=cfg[0], bn=cfg[1])
+        ):
+            return quant_mxfp8_dual_triton(
+                x,
+                out_dtype,
+                row_2d=scaling_recipe.use_2d_block,
+                col_2d=scaling_recipe_for_trans.use_2d_block,
+                bm=cfg[0],
+                bn=cfg[1],
+                num_warps=cfg[2],
+            )
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp8_dual(
             x,
             out_dtype,
