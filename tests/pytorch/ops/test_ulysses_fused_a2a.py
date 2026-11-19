@@ -238,7 +238,7 @@ def check_scenarios(group, failures, hq=32, hkv=8, d=128, b=2, s_local=300, hidd
 def _poison_banks(group):
     """Fill both recv banks of every workspace with bf16 NaN: a kernel that reads a recv row before
     its producer wrote it this epoch (or a padding row into a live output) shows up as NaN."""
-    from primus_turbo.flydsl.ulysses.workspace import _WORKSPACES, FLAG_BYTES
+    from primus_turbo.flydsl.fused_collective_gemm.workspace import _WORKSPACES, FLAG_BYTES
 
     torch.cuda.synchronize()
     dist.barrier(group=group)

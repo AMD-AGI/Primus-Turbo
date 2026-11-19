@@ -22,12 +22,12 @@ sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "benchmark", "ops", "training"))
 from bench_ulysses_overlap import MODELS, timeit
 
-from primus_turbo.flydsl.ulysses.gemm_a2a_kernel import gemm_a2a_bank_bytes, ulysses_gemm_a2a
-from primus_turbo.flydsl.ulysses.workspace import (
+from primus_turbo.flydsl.fused_collective_gemm.workspace import (
     REGION_O_GEMM_A2A,
     REGION_QKV_GEMM_A2A,
     get_ulysses_workspace,
 )
+from primus_turbo.flydsl.ulysses.gemm_a2a_kernel import gemm_a2a_bank_bytes, ulysses_gemm_a2a
 
 
 def q(x, qs=(0.1, 0.5, 0.9)):

@@ -55,11 +55,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.deep_ep.common import _asm, _uniform_i64, ld_lds, st_lds
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
-from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
-    _make_shared_storage,
-    gemm_bf16_tile,
-)
-from primus_turbo.flydsl.ulysses.common import (
+from primus_turbo.flydsl.fused_collective_gemm.common import (
     BLOCK_THREADS,
     SPIN_TIMEOUT,
     STATE_CLAIM,
@@ -73,6 +69,15 @@ from primus_turbo.flydsl.ulysses.common import (
     opaque_base,
     opaque_tid,
 )
+from primus_turbo.flydsl.fused_collective_gemm.workspace import (
+    FLAG_BYTES,
+    FLAG_REGION_BYTES,
+    FLAGS_PER_REGION,
+)
+from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
+    _make_shared_storage,
+    gemm_bf16_tile,
+)
 from primus_turbo.flydsl.ulysses.kv_wgrad_kernel import (
     KV_WGRAD_LDS_CHUNK_STRIDE,
     kv_wgrad_splits,
@@ -83,11 +88,6 @@ from primus_turbo.flydsl.ulysses.kv_wgrad_kernel import (
     q_wgrad_tile,
     q_wgrad_tiles,
     split_k_counters,
-)
-from primus_turbo.flydsl.ulysses.workspace import (
-    FLAG_BYTES,
-    FLAG_REGION_BYTES,
-    FLAGS_PER_REGION,
 )
 from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_load,

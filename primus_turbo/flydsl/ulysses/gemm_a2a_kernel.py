@@ -33,14 +33,7 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr
 
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
-    grouped_gemm_bf16_variable_k_tile,
-)
-from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
-    _make_shared_storage,
-    gemm_bf16_tile,
-)
-from primus_turbo.flydsl.ulysses.common import (
+from primus_turbo.flydsl.fused_collective_gemm.common import (
     BLOCK_THREADS,
     NUM_WARPS,
     SYS_NT,
@@ -52,10 +45,17 @@ from primus_turbo.flydsl.ulysses.common import (
     i64_base,
     spin_flag,
 )
-from primus_turbo.flydsl.ulysses.workspace import (
+from primus_turbo.flydsl.fused_collective_gemm.workspace import (
     FLAG_BYTES,
     FLAG_REGION_BYTES,
     FLAGS_PER_REGION,
+)
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
+    grouped_gemm_bf16_variable_k_tile,
+)
+from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
+    _make_shared_storage,
+    gemm_bf16_tile,
 )
 from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_load,

@@ -25,9 +25,9 @@ from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.deep_ep.common import _asm
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
+from primus_turbo.flydsl.fused_collective_gemm.common import SPIN_TIMEOUT, SYS_NT, i64_base
 from primus_turbo.flydsl.gemm.gemm_bf16_kernel import _make_shared_storage
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import grouped_gemm_bf16_variable_k_tile
-from primus_turbo.flydsl.ulysses.common import SPIN_TIMEOUT, SYS_NT, i64_base
 from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_load,
     buffer_store,

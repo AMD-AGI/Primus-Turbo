@@ -193,7 +193,7 @@ tag 的格式（`g_<model>_cp<n>_s<seq>_u<mode>`）是 `summarize_gqa.py` 解析
 
 ## 相关代码
 
-- kernel：`primus_turbo/flydsl/ulysses/a2a_gemm_kernel.py`（A2AGemm：`_tile_loop`、`_gemm_tile`、`_claimed_tile`、`_arrival_k_seg`、`_all_landed`、`_push_loop`、`_wgrad_tile`、`_wgrad_k_hook`），`gemm_a2a_kernel.py`（GemmA2A），`common.py`，`workspace.py`；GEMM tile 来自 `primus_turbo/flydsl/mega/bf16/gemm_bf16_kernel.py`（`gemm_bf16_tile`），wgrad 用 `grouped_gemm_bf16_variable_k_tile`。
+- kernel：`primus_turbo/flydsl/ulysses/a2a_gemm_kernel.py`（A2AGemm：`_tile_loop`、`_gemm_tile`、`_claimed_tile`、`_arrival_k_seg`、`_all_landed`、`_push_loop`、`_wgrad_tile`、`_wgrad_k_hook`），`gemm_a2a_kernel.py`（GemmA2A），`primus_turbo/flydsl/fused_collective_gemm/common.py`，`primus_turbo/flydsl/fused_collective_gemm/workspace.py`；GEMM tile 来自 `primus_turbo/flydsl/mega/bf16/gemm_bf16_kernel.py`（`gemm_bf16_tile`），wgrad 用 `grouped_gemm_bf16_variable_k_tile`。
 - launch 启发式：`a2a_gemm_kernel.py::ulysses_a2a_gemm`（`gemm_bound`、`wgrad_last`、`num_push`、BM、stagger），`primus_turbo/pytorch/ops/attention/ulysses_fused_a2a.py`（`_qkv_gemm_a2a_forward`、`_qkv_backward`、`_o_gemm_forward`、`_o_gemm_dgrad`，以及 `GemmA2ATuning` / `A2AGemmTuning`）。
 
 ## 硬性约束

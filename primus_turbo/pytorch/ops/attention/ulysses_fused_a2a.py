@@ -19,6 +19,13 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from primus_turbo.flydsl.fused_collective_gemm.workspace import (
+    REGION_O_A2A_GEMM,
+    REGION_O_GEMM_A2A,
+    REGION_QKV_A2A_GEMM,
+    REGION_QKV_GEMM_A2A,
+    get_ulysses_workspace,
+)
 from primus_turbo.flydsl.ulysses.a2a_gemm_kernel import (
     a2a_gemm_bank_bytes,
     ulysses_a2a_gemm,
@@ -26,13 +33,6 @@ from primus_turbo.flydsl.ulysses.a2a_gemm_kernel import (
 from primus_turbo.flydsl.ulysses.gemm_a2a_kernel import (
     gemm_a2a_bank_bytes,
     ulysses_gemm_a2a,
-)
-from primus_turbo.flydsl.ulysses.workspace import (
-    REGION_O_A2A_GEMM,
-    REGION_O_GEMM_A2A,
-    REGION_QKV_A2A_GEMM,
-    REGION_QKV_GEMM_A2A,
-    get_ulysses_workspace,
 )
 
 __all__ = ["ulysses_qkv_gemm_a2a", "ulysses_a2a_o_gemm", "GemmA2ATuning", "A2AGemmTuning"]

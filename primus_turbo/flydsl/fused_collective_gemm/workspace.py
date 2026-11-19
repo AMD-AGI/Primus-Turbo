@@ -11,7 +11,7 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""Symmetric workspace shared by the Ulysses GemmA2A / A2AGemm kernels of one group.
+"""Symmetric workspace shared by the fused collective + GEMM kernels of one group.
 
 Heap layout (identical on every rank):
 

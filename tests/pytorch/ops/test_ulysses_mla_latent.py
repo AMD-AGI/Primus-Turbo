@@ -70,7 +70,7 @@ def reference(lq, lkv, wq, wkv, heads):
 def _poison_banks(group):
     """Fill both banks of every workspace with bf16 NaN: a GEMM tile that reads a gathered row before
     its producer wrote it this epoch (or a padding row into a live output) shows up as NaN."""
-    from primus_turbo.flydsl.ulysses.workspace import _WORKSPACES, FLAG_BYTES
+    from primus_turbo.flydsl.fused_collective_gemm.workspace import _WORKSPACES, FLAG_BYTES
 
     torch.cuda.synchronize()
     dist.barrier(group=group)

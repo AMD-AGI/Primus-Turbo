@@ -46,12 +46,7 @@ from flydsl.expr import arith, const_expr, range_constexpr
 
 from primus_turbo.flydsl.deep_ep.common import ld_lds, st_lds
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
-from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
-    _make_shared_storage,
-    gemm_bf16_tile,
-)
-from primus_turbo.flydsl.ulysses.a2a_gemm_kernel import _copy_rows
-from primus_turbo.flydsl.ulysses.common import (
+from primus_turbo.flydsl.fused_collective_gemm.common import (
     BLOCK_THREADS,
     NUM_XCDS,
     STATE_ASSIST,
@@ -67,11 +62,16 @@ from primus_turbo.flydsl.ulysses.common import (
     opaque_tid,
     spin_flags,
 )
-from primus_turbo.flydsl.ulysses.workspace import (
+from primus_turbo.flydsl.fused_collective_gemm.workspace import (
     FLAG_BYTES,
     FLAG_REGION_BYTES,
     FLAGS_PER_REGION,
 )
+from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
+    _make_shared_storage,
+    gemm_bf16_tile,
+)
+from primus_turbo.flydsl.ulysses.a2a_gemm_kernel import _copy_rows
 from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_load,
     buffer_store,

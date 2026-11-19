@@ -11,7 +11,7 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""Device helpers shared by the Ulysses fused kernels: flag waits, block-wide unit claims and the
+"""Device helpers shared by the fused collective + GEMM kernels: flag waits, block-wide unit claims and the
 epoch bump of the last block out (see ``workspace.py`` for the protocol)."""
 
 import flydsl.expr as fx

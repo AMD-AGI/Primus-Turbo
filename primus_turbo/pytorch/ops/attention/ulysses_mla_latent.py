@@ -134,13 +134,13 @@ def _dgrad_fused(
     """``d_q_latent`` / ``d_kv_latent`` (sbhd) through the GemmRS: the latent-gradient GEMMs with the
     reduce-scatter of their partials fused in; ``kv_wgrad=(lc, d_w_kv)`` / ``q_wgrad=(lq, d_w_q)`` add
     the weight gradients."""
+    from primus_turbo.flydsl.fused_collective_gemm.workspace import (
+        REGION_MLA_GEMM_RS,
+        get_ulysses_workspace,
+    )
     from primus_turbo.flydsl.ulysses.gemm_rs_kernel import (
         gemm_rs_bank_bytes,
         ulysses_mla_gemm_rs,
-    )
-    from primus_turbo.flydsl.ulysses.workspace import (
-        REGION_MLA_GEMM_RS,
-        get_ulysses_workspace,
     )
 
     n, rank = group.size(), group.rank()
@@ -183,13 +183,13 @@ def _fused_supported(qkv_format, heads, cq, ckv, dn, dr, dv):
 
 
 def _forward_fused(q_latent, kv_latent, w_q_b, w_kv_b, group, heads, dn, dr, dv, save):
+    from primus_turbo.flydsl.fused_collective_gemm.workspace import (
+        REGION_MLA_AG_GEMM,
+        get_ulysses_workspace,
+    )
     from primus_turbo.flydsl.ulysses.ag_gemm_kernel import (
         ag_gemm_bank_bytes,
         ulysses_mla_ag_gemm,
-    )
-    from primus_turbo.flydsl.ulysses.workspace import (
-        REGION_MLA_AG_GEMM,
-        get_ulysses_workspace,
     )
 
     n, rank = group.size(), group.rank()
