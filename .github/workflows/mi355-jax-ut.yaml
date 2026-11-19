@@ -1,6 +1,11 @@
 name: MI355 JAX unittest (trial)
 
 on:
+  push:
+    branches:
+      - ci/mi355-probe
+    paths:
+      - .github/workflows/mi355-jax-ut.yaml
   workflow_dispatch:
     inputs:
       tests:
