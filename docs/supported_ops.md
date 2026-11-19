@@ -85,9 +85,9 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | `fused_group_topk_routing_with_aux_score` | – | ✅ | ✅ | ✅ | Group top-k router with aux-loss scores |
 | `tokens_per_expert_to_mask` | – | ✅ | ✅ | ✅ | Index helper, fwd only |
 | `moe_permute`, `moe_unpermute` | BF16 / FP8 tensorwise | ✅ | ✅ | ✅ | |
-| `moe_dispatch`, `moe_combine` | – | ✅ | ✅ | — | Expert-parallel token dispatch / combine (intra- and inter-node) |
-| **MegaMoE**<br>`fused_mega_moe` (+ `_stage1` / `_stage2`) | BF16 | — | ✅ | ✅ | Dispatch + FC1 and FC2 + combine fused, intra-node EP. See [MegaMoE](./mega_moe.md) |
-| **MegaMoE**<br>`fused_mega_moe_fp8_stage1` / `_stage2` | MXFP8 | — | ✅ | — | Staged API only |
+| `moe_dispatch`, `moe_combine` | – | ✅ | ✅ | ✅ | Expert-parallel token dispatch / combine (intra- and inter-node; gfx1250 within one host) |
+| **MegaMoE**<br>`fused_mega_moe` (+ `_stage1` / `_stage2`) | BF16 | — | ✅ | ✅ | Dispatch + FC1 and FC2 + combine fused, intra-node EP. See [MegaMoE](./features/mega_moe.md) |
+| **MegaMoE**<br>`fused_mega_moe_fp8_stage1` / `_stage2` | MXFP8 | — | ✅ | — | Staged API only. See [MegaMoE](./features/mega_moe.md) |
 
 ### 2.5 Normalization, activation, position embedding, loss
 
@@ -96,7 +96,10 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | `rmsnorm` | BF16 / FP16 / FP32 | ✅ | ✅ | ✅ | Optional zero-centered gamma |
 | `rmsnorm_residual` | BF16 / FP16 / FP32 | ✅ | ✅ | ✅ | Fused residual add |
 | `rmsnorm_residual_fp4` | BF16 → MXFP4 | — | ✅ | — | Fused residual add + MXFP4 quantization |
+| `adaln_modulate` | BF16 | — | ✅ | — | DiT adaLN: cat of two token segments + LayerNorm + `(1 + scale)` / `shift` modulation; C % 512, sequence lengths % 128. Eager PyTorch off gfx950 |
+| `gated_residual_adaln` | BF16 | — | ✅ | — | DiT gated residual `x + g * a` + adaLN, both streams of an MMDiT block in one call; C % 1536, sequence lengths % 32. Eager PyTorch off gfx950 |
 | `swiglu_with_probs`, `geglu_with_probs` | BF16 / FP16 | ✅ | ✅ | ✅ | GLU scaled by routing probability, optional row mask and clamp |
+| `linear_gelu` | BF16 | — | ✅ | — | Linear + bias + tanh GELU, optionally written after a prefix; bias gradient fused into the GELU backward. Unfused GELU off gfx950 and for untiled shapes |
 | `fused_qkv_rope` | BF16 | ✅ | ✅ | — | RoPE on packed QKV |
 | `fused_qkv_rmsnorm_rope` | BF16 | — | ✅ | — | QK RMSNorm + RoPE on packed QKV |
 | `dit_qk_norm_rope` | BF16 / FP16 / FP32 | — | ✅ | — | DiT q / k RMSNorm + RoPE from the QKV GEMM output (`sbhd` / `bshd`, one or two streams, interleaved or half-split RoPE, the QKV bias added in the op and its gradient fused; `v_out="none"` returns v as a strided view of the QKV output instead of a copy, over both streams when they come in one buffer with `txt_seq_len`) |
@@ -124,7 +127,7 @@ These are fwd-only utilities; the `_with_trans` variants also emit the transpose
 |---|:-:|:-:|:-:|---|
 | `turbo.ops.fused_all_gather_matmul`, `turbo.ops.fused_all_gather_scaled_matmul`, `turbo.ops.fused_matmul_reduce_scatter` | ✅ | ✅ | — | Async tensor parallelism; fwd only, the training integration supplies the backward |
 | `primus_turbo.pytorch.dist.FP8AllToAll` | ✅ | ✅ | — | All-to-all on FP8 payloads, with backward |
-| `primus_turbo.pytorch.deep_ep.Buffer` | ✅ | ✅ | — | Intra-node and inter-node EP buffers (needs rocSHMEM). See [DeepEP guide](../primus_turbo/pytorch/deep_ep/README.md) |
+| `primus_turbo.pytorch.deep_ep.Buffer` | ✅ | ✅ | ✅ | Intra-node EP buffers, and inter-node on gfx942 / gfx950 (needs rocSHMEM); gfx1250 covers one host. See [DeepEP](./features/deep_ep.md) |
 
 ## 3. Supported modules (PyTorch)
 
@@ -179,4 +182,6 @@ registration order, with the arch / format limits from each backend's `can_handl
 | `rmsnorm*`, `swiglu_with_probs`, `geglu_with_probs`, `cross_entropy`, router | TRITON (`rmsnorm_residual_fp4`: FLYDSL) |
 | `fused_qkv_rope`, `fused_qkv_rmsnorm_rope` | FLYDSL |
 | `dit_qk_norm_rope` | TRITON (forward; backward off gfx950 and outside the FlyDSL envelope), FLYDSL (backward, gfx950: BF16, D 128, interleaved RoPE) |
+| `linear_gelu` | FLYDSL GELU (gfx950, tiled shapes; unfused otherwise), TRITON GELU backward |
+| `adaln_modulate`, `gated_residual_adaln` | FLYDSL (gfx950), eager PyTorch otherwise |
 | Quantization | TURBO (HIP), TRITON (blockwise), FLYDSL (MXFP8 / MXFP4) |

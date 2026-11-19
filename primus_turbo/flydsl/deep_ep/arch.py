@@ -17,8 +17,8 @@
 device), read once at import time: a process builds for one architecture, and FlyDSL keys its
 compile cache on the target.
 
-``default_intranode_backend`` picks the intranode backend of an architecture: ``cpp`` on
-``CPP_DEEPEP_ARCHS``, ``flydsl_v2`` on ``FLYDSL_DEEPEP_ARCHS``; any other is not supported: it logs an
+``default_intranode_backend`` picks the intranode version of an architecture: ``v1`` on
+``CPP_DEEPEP_ARCHS``, ``v2`` on ``FLYDSL_DEEPEP_ARCHS``; any other is not supported: it logs an
 error pointing to the all-to-all (RCCL) token dispatcher and raises.
 """
 
@@ -39,13 +39,13 @@ def rocm_arch(arch: Optional[str] = None) -> str:
 
 
 def default_intranode_backend(arch: Optional[str] = None) -> str:
-    """The intranode backend of ``arch``, else of this GPU: ``cpp`` on gfx942 / gfx950, ``flydsl_v2`` on
+    """The intranode version of ``arch``, else of this GPU: ``v1`` on gfx942 / gfx950, ``v2`` on
     gfx1250; other architectures raise."""
     arch = rocm_arch(arch)
     if arch in CPP_DEEPEP_ARCHS:
-        intranode_backend = "cpp"
+        intranode_backend = "v1"
     elif arch in FLYDSL_DEEPEP_ARCHS:
-        intranode_backend = "flydsl_v2"
+        intranode_backend = "v2"
     else:
         msg = (
             f"DeepEP intranode is not supported on {arch} "

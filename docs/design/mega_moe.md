@@ -8,10 +8,10 @@
 `grouped_gemm_combine` — each folding EP intra-node communication and a grouped GEMM into one
 FlyDSL kernel so the cross-rank traffic is hidden behind compute.
 
-The design target is intra-node expert parallelism (`gfx950` / MI355X-class devices) where every
-rank owns a slice of the experts and tokens are routed directly into a peer rank's memory.
-
-> **Status:** MegaMoE is under active development. The BF16 path is the primary, validated path.
+The design target is intra-node expert parallelism, where every rank owns a slice of the experts and
+tokens are routed directly into a peer rank's memory. It runs on MI355X (`gfx950`) in BF16 and
+MXFP8, and on MI455X (`gfx1250`) in BF16 with its own kernels (see
+[gfx1250 (MI455X)](#gfx1250-mi455x)). Usage, support and limitations: [MegaMoE](../features/mega_moe.md).
 
 ### Key points
 
@@ -20,12 +20,12 @@ rank owns a slice of the experts and tokens are routed directly into a peer rank
   dispatch and combine swapping roles.
 - **Comm-compute overlap** — communication overlaps GEMM compute, reaching 76%+ of the ideal
   roofline, 90%+ in some cases.
-- **Activation recompute** — forward saves only the original `x`; backward recomputes the
-  dispatched `x`.
+- **Activation recompute (BF16)** — forward saves only the original `x`; backward re-dispatches it.
 - **Buffers sized to the routing** — one host sync per layer reads back how many rows were
   dispatched to this rank, and every per-layer buffer is sized to them (not CUDA Graph capturable).
-- **Python API** — a single autograd op `fused_mega_moe` that takes external routing
-  (`topk_idx` / `topk_weights`).
+- **Python API** — the autograd op `fused_mega_moe`, and the staged pair `fused_mega_moe_stage1` /
+  `fused_mega_moe_stage2` (MXFP8: `fused_mega_moe_fp8_stage1` / `_stage2`), split at the FC1
+  output so each owns one weight; all take external routing (`topk_idx` / `topk_weights`).
 
 ## Core Design
 
@@ -49,7 +49,11 @@ the original `x` and recomputes the dispatched `x` in backward, reducing forward
 
 The key point: this recompute is not a standalone dispatch — it reuses `dispatch_grouped_gemm`, so
 the dispatch communication stays hidden behind the grouped GEMM compute. Activation memory is saved
-without adding any visible communication overhead in backward.
+without adding any visible communication overhead in backward. On gfx1250 the re-dispatch for dW1
+runs as peer copies on a side stream during the L1 dgrad (see [gfx1250 (MI455X)](#gfx1250-mi455x)).
+
+This is the BF16 path. The MXFP8 dW1 contracts over the column-wise MXFP8 copy of the dispatched
+`x` that the forward already produces, so it keeps that copy instead of re-dispatching.
 
 ### 3. Buffers sized to the dispatched rows
 
@@ -105,7 +109,8 @@ sum; their gradients are two-phase pool reductions in a fixed order. In MXFP8 th
 fp8 SwiGLU kernels (the backward emits the per-32-row column sums its gradient is made of), and the
 fc2 bias is added after the reduce, on the token's own rank, from the EP-gathered bias.
 
-BF16 takes a hidden / intermediate that leaves a 64- or 128-column tail of the 256-wide GEMM tile
+BF16 on gfx950 takes a hidden / intermediate that is a multiple of 64 (the K depth of a tile), at
+least 128 (two k-tiles), and leaves a 64- or 128-column tail of the 256-wide GEMM tile, or none
 (GPT-OSS's 2880). The MXFP8 kernels need hidden % 1024 == 0 and intermediate % 256 == 0; other
 shapes run zero-padded up to that grid (2880 runs as 3072), which is exact, and aligned shapes are
 untouched.
@@ -118,11 +123,43 @@ serve (a `main_grad` that is not a contiguous bf16 tensor of the weight's shape,
 that is not a whole number of the wgrad's output tiles) keep the ordinary gradient. This follows
 Megatron DDP's contract, which clears `grad_added_to_main_grad` once per step; Megatron-FSDP
 clears it before every backward and may overwrite or swap `main_grad`, so do not pass the pattern
-under FSDP.
+under FSDP. On gfx950 the pattern is accepted and has no effect: the weights keep the ordinary
+gradient.
+
+## gfx1250 (MI455X)
+
+The gfx950 kernels do not lower on gfx1250 (their direct-to-LDS loads have no gfx1250 form), so
+MI455X runs its own BF16 kernels behind the same ops and contracts: `fused_mega_moe` and the staged
+pair, the activation spec, the expert biases and the dispatched-row sizing all behave as above. The
+six GEMM stages of one step:
+
+| Stage | Kernel | What it does |
+| --- | --- | --- |
+| L1 forward | dispatch + GEMM, NT | dispatch `x`, FC1 (gate-up) GEMM |
+| L2 forward | GEMM + combine, NT | FC2 (down) GEMM, combine, top-k reduce |
+| L2 dgrad | dispatch + GEMM, NN | dispatch `dy`, FC2 dgrad |
+| dW2 | variable-K GEMM | reads the dispatched `dy` in place, no communication of its own |
+| L1 dgrad | GEMM + combine, NN | FC1 dgrad, combine, top-k reduce with the routing-weight gradient |
+| dW1 | variable-K GEMM | reads `x` re-dispatched during the L1 dgrad |
+
+- **Weights as stored:** the forward GEMMs read `w1` / `w2` in NT and the dgrads in NN, so no
+  weight is transposed.
+- **dW2:** the dispatched `dy` stays in the symmetric buffer until the next dispatch, and the
+  variable-K GEMM reads it in pool order through the pool's row table instead of gathering it.
+- **dW1:** `x` is needed again at every rank. Peer copies on a side stream push it into a second
+  receive buffer while the L1 dgrad + combine runs, instead of a dispatch exposed after it; the
+  variable-K GEMM then reads it through the same row table.
+- **Shapes:** NT weights, hidden and intermediate multiples of 64 and at least 128 (the tiles take K
+  in k-tiles of 128, or 64 when 128 does not divide it, at least two).
+- **`main_grad`:** with `fuse_wgrad_accum_pattern="megatron"` the variable-K GEMMs add into the
+  bf16 `main_grad` directly, for weights whose output shape is a whole number of their output tiles.
+
+Validated at EP1 / EP2 / EP4 ([#582](https://github.com/AMD-AGI/Primus-Turbo/pull/582)).
+Performance: [MI455X](#mi455x-gfx1250).
 
 ## Performance
 
-### Test Configuration
+### MI355X (gfx950) test configuration
 
 - **Device:** MI355X (`gfx950`), 8 ranks intra-node (EP8)
 - **Model:** DeepSeek-V3
@@ -163,19 +200,65 @@ python benchmark/ops/training/bench_mega_moe.py --mode dispatch_grouped_gemm --m
 python benchmark/ops/training/bench_mega_moe.py --mode grouped_gemm_combine --models DeepSeek-V3 --num-processes 8
 ```
 
+End-to-end results on MI355X (MXFP8, DeepSeek-V3 proxy, [#566](https://github.com/AMD-AGI/Primus-Turbo/pull/566)):
+[MegaMoE § End-to-end impact](../features/mega_moe.md#end-to-end-impact).
+
+### MI455X (gfx1250)
+
+From [#582](https://github.com/AMD-AGI/Primus-Turbo/pull/582), 4 × MI455X (EP4), Primus-Turbo
+`68821ec6`, BF16.
+
+One MoE layer: hidden 7168, intermediate 2048, 32 experts per rank, top-8. The baseline is
+Megatron's all-to-all token dispatcher with Primus-Turbo's `moe_permute` / `moe_unpermute` and
+grouped GEMM. The outputs and gradients of the two paths agree to an SNR of 47 dB or more.
+
+| Tokens per rank, routing | Baseline fwd+bwd | MegaMoE fwd+bwd | Speedup, fwd+bwd / fwd |
+| --- | --- | --- | --- |
+| 4096, random | 9.42 ms | 6.69 ms | 1.41× / 1.70× |
+| 8192, random | 16.62 ms | 11.78 ms | 1.41× / 1.66× |
+| 8192, skewed | 38.81 ms | 27.85 ms | 1.39× / 1.60× |
+
+End to end: DeepSeek-V3 proxy with 4 MoE layers, 128 experts, top-8, sequence 4096, MBS 2, GBS 64,
+mock data, against Primus's default MoE path.
+
+| Routing | TFLOP/s/GPU, baseline / MegaMoE | Change | Peak memory, baseline / MegaMoE |
+| --- | --- | --- | --- |
+| Even (Primus's default) | 1218.2 / 1338.8 | +9.9% | 170.9 / 155.0 GB |
+| Uniform | 1170.0 / 1292.2 | +10.4% | 179.7 / 155.3 GB |
+| Real routing (50 steps) | 986.7 / 1285.3 | +30.3% | 179.6 / 155.4 GB |
+
+Per-stage view (gemm_only / comm_only / fused / roofline for each of the six GEMM stages, then the
+whole step through `fused_mega_moe`):
+
+```bash
+python benchmark/ops/training/bench_mega_moe_gfx1250.py --num-processes 4
+```
+
 ## Implementation Map
 
 | Component | File |
 | --- | --- |
-| Autograd op | `primus_turbo/pytorch/ops/moe/fused_mega_moe.py` |
-| Forward / backward custom ops | `primus_turbo/pytorch/kernels/fused_mega_moe/` |
-| Dispatch + grouped GEMM kernel | `primus_turbo/flydsl/mega/dispatch_grouped_gemm_bf16_kernel.py` |
-| Grouped GEMM + combine kernel | `primus_turbo/flydsl/mega/grouped_gemm_combine_bf16_kernel.py` |
-| Dispatch prologue (routing tables) | `primus_turbo/flydsl/mega/dispatch_prologue_kernel.py` |
-| SwiGLU fwd/bwd | `primus_turbo/flydsl/utils/swiglu_kernel.py` |
-| SwiGLU + MXFP8 quant fwd/bwd | `primus_turbo/flydsl/mega/fp8/swiglu_mxfp8_kernel.py` |
+| Autograd ops, BF16 | `primus_turbo/pytorch/ops/moe/fused_mega_moe.py` |
+| Autograd ops, MXFP8 | `primus_turbo/pytorch/ops/moe/fused_mega_moe_fp8.py` |
+| Forward / backward custom ops and stage compositions | `primus_turbo/pytorch/kernels/fused_mega_moe/` |
+| gfx1250 stage compositions, shape check | `primus_turbo/pytorch/kernels/fused_mega_moe/fused_mega_moe_gfx1250_impl.py` |
+| MXFP8 weight prep and its per-step cache | `primus_turbo/pytorch/kernels/fused_mega_moe/mega_moe_fp8_weights.py` |
+| Expert-bias gradients | `primus_turbo/pytorch/kernels/fused_mega_moe/mega_moe_bias_impl.py` |
+| Symmetric memory (HIP IPC) | `primus_turbo/pytorch/core/symm_mem.py` |
+| gfx950 BF16: dispatch + grouped GEMM, grouped GEMM + combine | `primus_turbo/flydsl/mega/bf16/dispatch_grouped_gemm_bf16_kernel.py`, `grouped_gemm_combine_bf16_kernel.py` |
+| gfx950 BF16: dispatch prologue (routing tables) | `primus_turbo/flydsl/mega/bf16/dispatch_prologue_kernel.py` |
+| gfx950 BF16: cross-rank tiles (dispatch / combine / reduce) | `primus_turbo/flydsl/mega/bf16/ep_intranode.py` |
+| gfx950 BF16: symmetric buffer, barrier | `primus_turbo/flydsl/mega/bf16/symm_buffer.py`, `barrier.py` |
+| gfx950 SwiGLU fwd / bwd | `primus_turbo/flydsl/utils/swiglu_kernel.py` |
+| gfx950 MXFP8: dispatch + grouped GEMM, grouped GEMM + combine | `primus_turbo/flydsl/mega/fp8/dispatch_grouped_gemm_mxfp8_kernel.py`, `grouped_gemm_combine_fp8_kernel.py` |
+| gfx950 MXFP8: dispatch prologue, combine CU autotune | `primus_turbo/flydsl/mega/fp8/dispatch_prologue.py`, `combine_autotune.py` |
+| gfx950 MXFP8: SwiGLU + MXFP8 quant fwd / bwd | `primus_turbo/flydsl/mega/fp8/swiglu_mxfp8_kernel.py` |
+| gfx950 MXFP8: symmetric buffer, barrier | `primus_turbo/flydsl/mega/fp8/symm_buffer.py`, `barrier.py` |
+| gfx1250: dispatch + GEMM, GEMM + combine | `primus_turbo/flydsl/mega/gfx1250/bf16/dispatch_gemm_kernel.py`, `gemm_combine_kernel.py` |
+| gfx1250: variable-K wgrad, `x` re-dispatch | `primus_turbo/flydsl/mega/gfx1250/bf16/variable_k.py`, `x_redispatch_kernel.py` |
+| gfx1250: dispatch prologue, cross-rank tiles, SwiGLU | `primus_turbo/flydsl/mega/gfx1250/dispatch_prologue_kernel.py`, `ep_intranode.py`, `swiglu_kernel.py` |
+| gfx1250: symmetric buffer, barrier | `primus_turbo/flydsl/mega/gfx1250/symm_buffer.py`, `barrier.py` |
 | Activation spec (`GLUActivation`) | `primus_turbo/flydsl/utils/glu_activation.py` |
-| Cross-rank tiles (dispatch/combine/reduce) | `primus_turbo/flydsl/mega/ep_intranode.py` |
 
 ## Acknowledgements
 
@@ -184,5 +267,8 @@ python benchmark/ops/training/bench_mega_moe.py --mode grouped_gemm_combine --mo
   synchronization, fusing intra-node EP communication into the GEMM kernel) references
   Triton-distributed's overlapping-kernel approach.
 - [**DeepGEMM**](https://github.com/deepseek-ai/DeepGEMM) (DeepSeek, MIT License) — MegaMoE's
-  cross-rank barrier and symmetric-buffer layout follow DeepGEMM's design; see the file headers of
-  `primus_turbo/flydsl/mega/barrier.py` and `primus_turbo/flydsl/mega/symm_buffer.py` for details.
+  cross-rank barrier and symmetric-buffer layout follow DeepGEMM's design (`barrier.py` and
+  `symm_buffer.py` under `primus_turbo/flydsl/mega/bf16/`, `fp8/` and `gfx1250/`).
+- [**FlyDSL**](https://github.com/ROCm/FlyDSL) (Apache License 2.0) — the barrier and
+  symmetric-buffer files above are adapted from FlyDSL and stay under the Apache License 2.0 (see
+  their file headers and `LICENSE-APACHE`).

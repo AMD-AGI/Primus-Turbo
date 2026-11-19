@@ -56,7 +56,7 @@ Variables owned by other projects (FlyDSL, Triton, NVSHMEM, the launcher's `RANK
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM` | `bool` | `False` | A non-zero integer runs the EP dispatch/combine kernels on the caller's current stream instead of the Buffer's comm stream. Parsed as C++ does (`is_ep_force_current_stream` in deep_ep/configs.h, which caches it once per process): unset is off, and an empty or non-integer value is an error (ValueError here, std::stoi throws in C++). The FlyDSL intranode backend (`FlyDSLIntranodeRuntime`) reads it when it is constructed. `DeepEPTokenDispatcher` writes "1" with `set_env()` when a dispatcher asks for `deepep_use_comm_stream=False`. |
+| `PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM` | `bool` | `False` | A non-zero integer runs the EP dispatch/combine kernels on the caller's current stream instead of the Buffer's comm stream. Parsed as C++ does (`is_ep_force_current_stream` in deep_ep/configs.h, which caches it once per process): unset is off, and an empty or non-integer value is an error (ValueError here, std::stoi throws in C++). On gfx1250 the intranode runtime reads it when it is constructed. `DeepEPTokenDispatcher` writes "1" with `set_env()` when a dispatcher asks for `deepep_use_comm_stream=False`. |
 | `PRIMUS_TURBO_JAX_DEEPEP_MODE` | `str \| None` | unset | JAX DeepEP launch mode: "inproc" (the default when unset) or "per_process"; case and "-"/"_" are normalized by `LaunchMode.from_str`. `auto_detect_mode` and `setup(mode=...)` write it with `set_env()`, `reset_runtime()` clears it, and the mode locks at the first DeepEP call. |
 
 ### Mega MoE (FlyDSL FP8 combine)
@@ -77,7 +77,7 @@ These getters mirror the C++ parsing so Python can report the effective value; C
 |---|---|---|---|
 | `PRIMUS_TURBO_DEEPEP_CPU_TIMEOUT` | `int` | `300` | DeepEP host-side timeout in seconds (deep_ep/configs.h). Unset, empty or a non-integer reads as 300. |
 | `PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE` | `bool` | `False` | A non-zero integer makes the intranode dispatch/combine channels publish their tails with a full system-scope release/acquire instead of the cheap per-warp fence (gfx1250 always does). C++ caches it separately in the dispatch and combine launchers, each at its first call. |
-| `PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD` | `str` | `off` | The flydsl_v2 guards for TDM operations lost while KFD evicts a queue. "off" (default): neither guard; "redo": move a row again when one pass takes more than 0.5 ms; "all": also compare 32 words of every TDM load with its source and reload stale data. |
+| `PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD` | `str` | `off` | The guards of DeepEP V2 (MI455X) for TDM operations lost while KFD evicts a queue. "off" (default): neither guard; "redo": move a row again when one pass takes more than 0.5 ms; "all": also compare 32 words of every TDM load with its source and reload stale data. |
 
 ODC (on-demand-comm) rocSHMEM GDA device-kernel knobs, consumed by csrc/kernels/odc_rocshmem/odc_rocshmem_gda.cu for the multi-node reduce-scatter / all-gather device kernels.
 
