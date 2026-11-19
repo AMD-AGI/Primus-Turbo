@@ -1,0 +1,59 @@
+name: MI355 JAX unittest (trial)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tests:
+        description: "pytest targets and options to run instead of the full test steps; empty runs all of them"
+        required: false
+        default: ""
+
+jobs:
+  unittest-jax-gfx950:
+    runs-on: turbo-jax-ut-mi355-v2608 # GitHub runner inside rocm/jax-training:maxtext-v26.8 on SaFE (Crusoe MI355X)
+    timeout-minutes: 180
+    env:
+      XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+    steps:
+      - name: Clean stale submodule checkout
+        run: rm -rf "${GITHUB_WORKSPACE}/3rdparty" "${GITHUB_WORKSPACE}/.git/modules"
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+      - name: Print rocminfo
+        run: rocminfo | grep -E "Marketing Name|gfx9" | sort | uniq -c || true
+      - name: Install and build
+        run: |
+          unset AITER_ASM_DIR
+          pip3 install -r requirements.txt
+          GPU_ARCHS="gfx950" PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e ".[jax]" -v
+      - name: Run selected tests
+        if: ${{ inputs.tests }}
+        env:
+          TESTS: ${{ inputs.tests }}
+        # TESTS holds pytest targets and options; eval keeps quoted -k expressions intact.
+        run: eval "pytest -v ${TESTS} --log-cli-level=INFO"
+      - name: Run single-GPU tests (parallel)
+        if: ${{ !inputs.tests }}
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 60
+          max_attempts: 2
+          command: pytest -v tests/jax -n 8 --log-cli-level=INFO
+      # Keep in-process multi-GPU tests and distributed/per-process tests in
+      # separate pytest invocations (see unittest-jax-gfx942 in ci.yaml).
+      - name: Run in-process multi-GPU tests
+        if: ${{ !inputs.tests && (success() || failure()) }}
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 30
+          max_attempts: 2
+          command: pytest -v tests/jax --dist-only --ignore=tests/jax/lax/test_mp_dispatch_combine.py --log-cli-level=INFO
+      - name: Run distributed tests
+        if: ${{ !inputs.tests && (success() || failure()) }}
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 30
+          max_attempts: 2
+          command: pytest -v tests/jax/lax/test_mp_dispatch_combine.py --log-cli-level=INFO
