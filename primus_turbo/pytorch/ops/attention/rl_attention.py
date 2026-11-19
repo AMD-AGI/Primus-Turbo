@@ -394,3 +394,104 @@ def rl_flash_attn_func(
         out, lse = res
         return out.view(batch, seqlen_q, num_q_heads, -1), lse.view(batch, seqlen_q, num_q_heads)
     return res.view(batch, seqlen_q, num_q_heads, -1)
+
+
+# ----------------------------------------------------------------------------- flash_attn_* routing
+#
+# flash_attn_func / flash_attn_varlen_func run this kernel when the caller asks for batch
+# invariance (batch_invariant=True or PRIMUS_TURBO_ATTN_BATCH_INVARIANT=1), or passes an argument
+# only this kernel implements (block_mask, kernel_options, a paged block_table). Their other
+# backends are untouched.
+
+
+def use_rl_attention(batch_invariant=False, block_mask=None, kernel_options=None, block_table=None) -> bool:
+    return (
+        bool(batch_invariant)
+        or block_mask is not None
+        or kernel_options is not None
+        or block_table is not None
+        or envs.PRIMUS_TURBO_ATTN_BATCH_INVARIANT
+    )
+
+
+def _flash_args(dropout_p, causal, window_size, bias, alibi_slopes, return_attn_probs, block_mask):
+    """Map flash_attn_* arguments onto this kernel: returns (window_left, full), where ``full``
+    asks for non-causal attention over each sequence's keys."""
+    if dropout_p != 0.0 or bias is not None or alibi_slopes is not None or return_attn_probs:
+        raise ValueError("batch-invariant attention does not implement dropout, bias, alibi or attn probs")
+    left, right = window_size if window_size is not None else (-1, -1)
+    if block_mask is not None:
+        if (left, right) != (-1, -1):
+            raise ValueError("pass the window through block_mask (create_block_mask(..., window_left=W))")
+        return -1, False
+    if causal:
+        if right not in (-1, 0):
+            raise ValueError(f"batch-invariant attention supports window_size (left, 0), got {window_size}")
+        return left, False
+    if (left, right) != (-1, -1):
+        raise ValueError("batch-invariant attention supports sliding windows only with causal=True")
+    return -1, True
+
+
+def _full_mask(cu_seqlens_q, cu_seqlens_k):
+    q_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).long()
+    lo = torch.repeat_interleave(cu_seqlens_k[:-1], q_lens)
+    hi = torch.repeat_interleave(cu_seqlens_k[1:] - 1, q_lens)
+    return create_block_mask(lo, hi)
+
+
+def flash_attn_rl_varlen(
+    q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, causal,
+    window_size, bias, alibi_slopes, return_lse, return_attn_probs, sink, block_mask, kernel_options,
+    block_table, seqused_k,
+):  # fmt: skip
+    """flash_attn_varlen_func on this kernel. With ``block_table``, k / v are a paged cache
+    [num_blocks, block_size, Hkv, D] and ``seqused_k`` [num_seqs] gives each sequence's key count
+    (forward only). LSE is returned as [Hq, total_q], like the other varlen backends."""
+    window_left, full = _flash_args(
+        dropout_p, causal, window_size, bias, alibi_slopes, return_attn_probs, block_mask
+    )
+    if block_table is not None:
+        if seqused_k is None:
+            raise ValueError("a paged block_table needs seqused_k (keys per sequence)")
+        if return_lse:
+            raise ValueError("return_lse is not supported with a paged block_table")
+        if full:
+            starts = torch.nn.functional.pad(torch.cumsum(seqused_k, 0, dtype=torch.int32), (1, 0))
+            block_mask = _full_mask(cu_seqlens_q, starts)
+        return rl_paged_attention_func(
+            q, k, v, cu_seqlens_q, seqused_k, block_table, max_seqlen_q, max_seqlen_k, softmax_scale,
+            window_left, block_mask, sink, kernel_options,
+        )  # fmt: skip
+    if full:
+        block_mask = _full_mask(cu_seqlens_q, cu_seqlens_k)
+    res = rl_flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, window_left,
+        block_mask, sink, return_lse, kernel_options,
+    )  # fmt: skip
+    if return_lse:
+        out, lse = res
+        return out, lse.t()
+    return res
+
+
+def flash_attn_rl_dense(
+    q, k, v, dropout_p, softmax_scale, causal, window_size, bias, alibi_slopes, return_lse,
+    return_attn_probs, sink, block_mask, kernel_options,
+):  # fmt: skip
+    """flash_attn_func on this kernel: q, k, v [B, S, H, D]; LSE is returned as [B, Hq, Sq]."""
+    window_left, full = _flash_args(
+        dropout_p, causal, window_size, bias, alibi_slopes, return_attn_probs, block_mask
+    )
+    if full:
+        batch, seqlen_q, seqlen_k = q.shape[0], q.shape[1], k.shape[1]
+        cu_q = torch.arange(0, (batch + 1) * seqlen_q, seqlen_q, dtype=torch.int32, device=q.device)
+        cu_k = torch.arange(0, (batch + 1) * seqlen_k, seqlen_k, dtype=torch.int32, device=q.device)
+        block_mask = _full_mask(cu_q, cu_k)
+    res = rl_flash_attn_func(
+        q, k, v, softmax_scale, window_left, block_mask, sink, return_lse, kernel_options
+    )  # fmt: skip
+    if return_lse:
+        out, lse = res
+        return out, lse.permute(0, 2, 1)
+    return res

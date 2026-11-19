@@ -14,6 +14,7 @@ import torch
 
 from primus_turbo.common import envs
 from primus_turbo.pytorch.kernels.attention import rl_attention_impl
+from primus_turbo.pytorch.ops.attention import flash_attn_func, flash_attn_varlen_func
 from primus_turbo.pytorch.ops.attention.rl_attention import (
     _resolve_options,
     create_block_mask,
@@ -509,3 +510,108 @@ def test_env_options_and_per_call_override():
             rl_flash_attn_varlen_func(q, k, v, cu, cu, 300, 300)
     finally:
         _set_env_options(saved)
+
+
+# ----------------------------------------------------------------------------- flash_attn_* interface
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("window", [-1, 37])
+def test_flash_attn_varlen_func_routes_to_rl_kernel(dtype, window, small_segments):
+    """flash_attn_varlen_func(batch_invariant=True) is the RL kernel: same bits as
+    rl_flash_attn_varlen_func, LSE in the varlen layout [Hq, total_q], and gradients flow."""
+    hq, hkv, d = 8, 2, 64
+    q, k, v, cu = _varlen(LENS, hq, hkv, d, dtype, seed=15)
+    want, want_lse = rl_flash_attn_varlen_func(q, k, v, cu, cu, 300, 300, window_left=window, return_lse=True)
+    qq = q.clone().requires_grad_()
+    got, lse = flash_attn_varlen_func(
+        qq,
+        k,
+        v,
+        cu,
+        cu,
+        300,
+        300,
+        causal=True,
+        window_size=(window, 0),
+        return_lse=True,
+        batch_invariant=True,
+    )
+    assert _bits_equal(got, want)
+    assert lse.shape == (hq, q.shape[0]) and torch.equal(lse, want_lse.t())
+    got.float().sum().backward()
+    assert qq.grad is not None and torch.isfinite(qq.grad).all()
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("block_size", [16, 64])
+def test_flash_attn_varlen_func_paged_rollout_matches_training(dtype, block_size, small_segments):
+    """Both sides through the normal interface: paged decode with block_table / seqused_k
+    (rollout) and a varlen forward (training) give the same bits, with a mask and sinks."""
+    hq, hkv, d = 8, 2, 64
+    prompt, total = 100, 120
+    q, k, v, cu = _varlen([total], hq, hkv, d, dtype, seed=16)
+    sinks = _sinks(hq, 16)
+    lo = torch.zeros(total, dtype=torch.int32, device=DEVICE)
+    hi = torch.arange(total, dtype=torch.int32, device=DEVICE)
+    hi[20:60] = 59
+    training = flash_attn_varlen_func(
+        q, k, v, cu, cu, total, total, sink=sinks, block_mask=create_block_mask(lo, hi)
+    )
+    k_cache, v_cache, block_table, _ = _paged(k, v, cu, block_size)
+    for t0, t1 in [(0, prompt)] + [(t, t + 1) for t in range(prompt, total)]:
+        out = flash_attn_varlen_func(
+            q[t0:t1], k_cache, v_cache, _cu([t1 - t0]), None, t1 - t0, t1, sink=sinks,
+            block_mask=create_block_mask(lo[t0:t1], hi[t0:t1]), block_table=block_table,
+            seqused_k=torch.tensor([t1], dtype=torch.int32, device=DEVICE),
+        )  # fmt: skip
+        assert _bits_equal(out, training[t0:t1]), f"tokens [{t0}, {t1})"
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_flash_attn_func_routes_to_rl_kernel(dtype):
+    hq, hkv, d = 8, 2, 64
+    q, k, v, cu = _varlen([96, 96], hq, hkv, d, dtype, seed=17)
+    shape = lambda t, h: t.view(2, 96, h, d)  # noqa: E731
+    want, want_lse = rl_flash_attn_func(shape(q, hq), shape(k, hkv), shape(v, hkv), return_lse=True)
+    got, lse = flash_attn_func(
+        shape(q, hq), shape(k, hkv), shape(v, hkv), causal=True, return_lse=True, batch_invariant=True
+    )
+    assert _bits_equal(got, want)
+    assert lse.shape == (2, hq, 96) and torch.equal(lse, want_lse.permute(0, 2, 1))
+    assert _bits_equal(got.reshape(-1, hq, d), rl_flash_attn_varlen_func(q, k, v, cu, cu, 96, 96))
+
+
+def test_env_switch_routes_flash_attn():
+    hq, hkv, d = 8, 2, 64
+    q, k, v, cu = _varlen(LENS, hq, hkv, d, torch.bfloat16, seed=18)
+    want = rl_flash_attn_varlen_func(q, k, v, cu, cu, 300, 300)
+    saved = envs.PRIMUS_TURBO_ATTN_BATCH_INVARIANT
+    try:
+        envs.set_env("PRIMUS_TURBO_ATTN_BATCH_INVARIANT", "1")
+        got = flash_attn_varlen_func(q, k, v, cu, cu, 300, 300, causal=True)
+    finally:
+        envs.set_env("PRIMUS_TURBO_ATTN_BATCH_INVARIANT", "1" if saved else None)
+    assert _bits_equal(got, want)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_flash_attn_non_causal(dtype):
+    """causal=False is full attention over each sequence's keys, expressed as intervals."""
+    hq, hkv, d = 8, 2, 64
+    q, k, v, cu = _varlen(LENS, hq, hkv, d, dtype, seed=19)
+    starts = torch.repeat_interleave(cu[:-1], cu[1:] - cu[:-1])
+    ends = torch.repeat_interleave(cu[1:] - 1, cu[1:] - cu[:-1])
+    ref = rl_attention_ref(q, k, v, cu, cu, d**-0.5, starts, ends)
+    out = flash_attn_varlen_func(q, k, v, cu, cu, 300, 300, causal=False, batch_invariant=True)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+def test_flash_attn_rejects_unsupported():
+    q, k, v, cu = _varlen([64], 8, 2, 64, torch.bfloat16)
+    with pytest.raises(ValueError, match="dropout"):
+        flash_attn_varlen_func(q, k, v, cu, cu, 64, 64, dropout_p=0.1, causal=True, batch_invariant=True)
+    with pytest.raises(ValueError, match="window"):
+        flash_attn_varlen_func(q, k, v, cu, cu, 64, 64, causal=True, window_size=(8, 8), batch_invariant=True)
+    with pytest.raises(ValueError, match="seqused_k"):
+        flash_attn_varlen_func(q, k, v, cu, None, 64, 64, causal=True, block_table=cu[None, :1])
