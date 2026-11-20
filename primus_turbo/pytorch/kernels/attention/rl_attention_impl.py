@@ -9,10 +9,11 @@
 RL needs the rollout forward and the training forward to produce the same bits, so both must run
 the same backend with the same reduction order. That rules out what other ops do here: no
 per-shape auto-tuning across backends and no silent fallback. The backend is the ``BACKEND``
-kernel option (TRITON by default), and a backend that cannot take a call raises.
+kernel option (TRITON by default, or FLYDSL on gfx950), and a backend that cannot take a call
+raises. The two backends give different bits, so rollout and training must use the same one.
 
 Each backend provides ``can_handle(**kwargs)``, ``fwd(**kwargs)`` and ``bwd(**kwargs)``; a new one
-(e.g. FLYDSL) is added to ``_BACKENDS``. The forward receives the resolved kernel options as
+is an entry of ``_BACKENDS``. The forward receives the resolved kernel options as
 keyword arguments (``tile_size``, ``segment_size``, ``block_m``, ``num_warps``, ``num_stages``,
 ``waves_per_eu``, ``mode``; 0 / "auto" = backend default).
 """
@@ -38,7 +39,28 @@ class RLAttentionTritonBackend:
     bwd = staticmethod(rl_attention_bwd_triton)
 
 
-_BACKENDS = {BackendType.TRITON: RLAttentionTritonBackend}
+class RLAttentionFlydslBackend:
+    """gfx950 FlyDSL forward (bf16, D 64 / 128) with the Triton backward. Imported on first use, so
+    the Triton backend works without FlyDSL installed."""
+
+    @staticmethod
+    def can_handle(**kwargs) -> bool:
+        from primus_turbo.pytorch.kernels.attention import rl_attention_flydsl_impl
+
+        return rl_attention_flydsl_impl.can_handle(**kwargs)
+
+    @staticmethod
+    def fwd(**kwargs):
+        from primus_turbo.pytorch.kernels.attention import rl_attention_flydsl_impl
+
+        return rl_attention_flydsl_impl.rl_attention_fwd_flydsl(**kwargs)
+
+    @staticmethod
+    def bwd(**kwargs):
+        return rl_attention_bwd_triton(**kwargs)
+
+
+_BACKENDS = {BackendType.TRITON: RLAttentionTritonBackend, BackendType.FLYDSL: RLAttentionFlydslBackend}
 BACKEND_NAMES = tuple(b.name for b in _BACKENDS)
 
 
