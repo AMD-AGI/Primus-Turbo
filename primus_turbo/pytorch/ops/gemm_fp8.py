@@ -9,6 +9,8 @@ from typing import Optional, Union
 
 import torch
 
+from primus_turbo.pytorch.core import fp8blk_weight_cache
+
 from primus_turbo.pytorch.core.backend import (
     BackendType,
 )
@@ -465,13 +467,19 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             from primus_turbo.triton.quantization.quant_g90 import e8m0_of, quant_dual_t_e8m0
 
             a_row, _, a_re, a_t, a_te = quant_dual_t_e8m0(a.contiguous(), a_dtype)
-            b_row, b_row_scale = quantize_fp8(
-                b, b_dtype, config.granularity, block_size=config.block_size,
-                scaling_recipe=ScalingRecipe(use_2d_block=True),
-            )
-            b_e = e8m0_of(b_row_scale)
+            # PRIMUS_TURBO_FP8_WCACHE: W, W^T and E8M0 scales written by the optimizer step.
+            wc = fp8blk_weight_cache.lookup(b, b_dtype)
+            if wc is not None:
+                b_row, b_e, b_t, b_te = wc.w, wc.e8m0, wc.wt, wc.e8m0_t
+            else:
+                b_row, b_row_scale = quantize_fp8(
+                    b, b_dtype, config.granularity, block_size=config.block_size,
+                    scaling_recipe=ScalingRecipe(use_2d_block=True),
+                )
+                b_e = e8m0_of(b_row_scale)
+                b_t, b_te = None, None
             out = g90_block.gemm_nt(a_row, b_row, a_re, b_e, out_dtype)
-            ctx.save_for_backward(a_t, a_te, b_row, b_e)
+            ctx.save_for_backward(a_t, a_te, b_row, b_e, b_t, b_te)
             ctx.g90 = True
             ctx.trans_a, ctx.trans_b, ctx.out_dtype, ctx.config = trans_a, trans_b, out_dtype, config
             return out
@@ -499,9 +507,12 @@ class FP8GemmBlockFunction(torch.autograd.Function):
 
         # --- B side: 2D-block weight, reused unchanged in fwd + bwd. ---
         b_scaling_recipe = ScalingRecipe(use_2d_block=True)
+        wc = None if isinstance(b, QuantizedTensor) else fp8blk_weight_cache.lookup(b, b_dtype)
         if isinstance(b, QuantizedTensor):
             check_quantized_tensor(b, config, scaling_recipe=b_scaling_recipe)
             b_row, b_row_scale = b.qdata, b.scale_inv
+        elif wc is not None:  # PRIMUS_TURBO_FP8_WCACHE: quantized by the optimizer step
+            b_row, b_row_scale = wc.w, wc.scale_inv
         else:
             b_row, b_row_scale = quantize_fp8(
                 b, b_dtype, config.granularity, block_size=config.block_size, scaling_recipe=b_scaling_recipe
@@ -535,11 +546,13 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             from primus_turbo.flydsl.gemm import g90_block
             from primus_turbo.triton.quantization.quant_g90 import quant_dual_t_e8m0
 
-            a_t, a_te, b_row, b_e = ctx.saved_tensors
+            a_t, a_te, b_row, b_e, b_t, b_te = ctx.saved_tensors
             g_dtype = _get_fp8_dtype(ctx.config.format, False)
             g_row, _, g_re, g_t, g_te = quant_dual_t_e8m0(grad_out.contiguous(), g_dtype)
+            if b_t is None:  # no optimizer-written W^T: transpose the FP8 copy (128x128 blocks are transpose-invariant)
+                b_t, b_te = b_row.t().contiguous(), b_e.t().contiguous()
             # dgrad: dX = dY . W  ->  NT with the FP8 copy of W^T (block scales transposed)
-            grad_a = g90_block.gemm_nt(g_row, b_row.t().contiguous(), g_re, b_e.t().contiguous(), ctx.out_dtype)
+            grad_a = g90_block.gemm_nt(g_row, b_t, g_re, b_te, ctx.out_dtype)
             # wgrad: dW[N,K] = dY^T . X  ->  NT on the token-major copies
             grad_b = g90_block.gemm_nt(g_t, a_t, g_te, a_te, ctx.out_dtype)
             return grad_a, grad_b, None, None, None, None, None, None
