@@ -84,7 +84,7 @@ from primus_turbo.flydsl.utils.prims import LOG2E
 # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
 # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
 # kernel, or a warm cache keeps serving the old one.
-CODEGEN_REV = ("rl", 14)
+CODEGEN_REV = ("rl", 15)
 
 # Sentinel bound of an empty 32-row group (no visible key): above any key position.
 VIS_EMPTY = 1 << 30
@@ -1693,29 +1693,49 @@ class DualwaveKernelContext:
         # The program's base goes into the descriptor in 64 bits: 32-bit byte offsets from the
         # workspace start wrap past 4 GiB (long-context decode at large batch).
         prog_bytes = fx.Int64(prog) * fx.Int64(traits.BLOCK_SIZE * stride * 4)
-        rsrc = buffer_ops.create_buffer_resource(self.Partial, max_size=True, base_byte_offset=prog_bytes)
+        # Bounded to the program's slot, so a masked (redirected) access is dropped.
+        rsrc = buffer_ops.create_buffer_resource(
+            self.Partial, num_records_bytes=traits.BLOCK_SIZE * stride * 4, base_byte_offset=prog_bytes
+        )
         return rsrc, fx.Int32(self.tid * fx.Index(stride))
+
+    def _row_is_real(self):
+        """Only rows of a real token store and load partials: packed decode fills a few rows of a
+        block (one token x the query group), and the rest would multiply the workspace traffic."""
+        return as_mlir_value(ArithValue(self.q_row < self.seqlen_q_v))
 
     def store_partial(self, m_row, l_seg, v_o, seg):
         rsrc, base = self._partial_rsrc_and_base(seg)
-        buffer_ops.buffer_store(as_mlir_value(fx.Float32(m_row)), rsrc, as_mlir_value(base))
-        buffer_ops.buffer_store(as_mlir_value(fx.Float32(l_seg)), rsrc, as_mlir_value(base + fx.Int32(1)))
+        real = self._row_is_real()
+        buffer_ops.buffer_store(as_mlir_value(fx.Float32(m_row)), rsrc, as_mlir_value(base), mask=real)
+        buffer_ops.buffer_store(
+            as_mlir_value(fx.Float32(l_seg)), rsrc, as_mlir_value(base + fx.Int32(1)), mask=real
+        )
         for dc in range_constexpr(self.traits.D_CHUNKS):
             for q4 in range_constexpr(4):
                 part = Vec(v_o[dc]).shuffle(Vec(v_o[dc]), [q4 * 4 + i for i in range(4)])
                 off = base + fx.Int32(2 + dc * 16 + q4 * 4)
-                buffer_ops.buffer_store(as_mlir_value(part), rsrc, as_mlir_value(off))
+                buffer_ops.buffer_store(as_mlir_value(part), rsrc, as_mlir_value(off), mask=real)
 
     def load_partial_chunk(self, seg, dc):
         """Reference, row sum and accumulator chunk ``dc`` (an index Value) of segment ``seg``."""
         rsrc, base = self._partial_rsrc_and_base(seg)
-        m_row = fx.Float32(buffer_ops.buffer_load(rsrc, as_mlir_value(base), vec_width=1, dtype=fx.Float32))
+        real = self._row_is_real()
+        m_row = fx.Float32(
+            buffer_ops.buffer_load(rsrc, as_mlir_value(base), vec_width=1, dtype=fx.Float32, mask=real)
+        )
         l_seg = fx.Float32(
-            buffer_ops.buffer_load(rsrc, as_mlir_value(base + fx.Int32(1)), vec_width=1, dtype=fx.Float32)
+            buffer_ops.buffer_load(
+                rsrc, as_mlir_value(base + fx.Int32(1)), vec_width=1, dtype=fx.Float32, mask=real
+            )
         )
         off = base + fx.Int32(2) + fx.Int32(fx.Index(dc) * fx.Index(16))
         parts = [
-            Vec(buffer_ops.buffer_load(rsrc, as_mlir_value(off + fx.Int32(q4 * 4)), vec_width=4, dtype=fx.Float32))
+            Vec(
+                buffer_ops.buffer_load(
+                    rsrc, as_mlir_value(off + fx.Int32(q4 * 4)), vec_width=4, dtype=fx.Float32, mask=real
+                )
+            )
             for q4 in range_constexpr(4)
         ]
         lo = parts[0].shuffle(parts[1], list(range(8)))

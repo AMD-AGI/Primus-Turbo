@@ -303,14 +303,15 @@ def build_rl_flash_attn_module(
             if const_expr(traits.SPLIT_MODE == 2):
                 _merge_body()
                 return
-            if const_expr(traits.SPLIT_MODE == 1 and traits.SPLIT_SEGS > 1):
-                ctx.store_empty_partials()
             ctx.load_k_split(0, 0)
             _s_waitcnt(0)
             _sched_barrier(0)
             _s_barrier()
 
             q_all_bf16 = ctx.load_all()
+            if const_expr(traits.SPLIT_MODE == 1 and traits.SPLIT_SEGS > 1):
+                # After load_all: the stores are masked to real rows, set up there.
+                ctx.store_empty_partials()
             q_all_scaled_bf16 = ctx.scale_all(q_all_bf16)
 
             def _load_k_head(buf_id):
