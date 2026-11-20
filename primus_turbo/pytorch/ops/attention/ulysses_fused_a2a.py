@@ -10,7 +10,7 @@
 with the local heads over the full sequence; ``ulysses_a2a_o_gemm`` replaces
 ``pack -> all-to-all -> unpack -> linear_proj + residual``. Attention between them is the plain
 ``flash_attn_func``. Sequence order matches ``flash_attn_usp_func``: rank r holds the r-th contiguous
-chunk of the sequence.
+chunk of the sequence. The kernels are ``fused_collective_gemm``'s GemmA2A and A2AGemm.
 """
 
 from dataclasses import asdict, dataclass
@@ -19,23 +19,26 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from primus_turbo.flydsl.ulysses.a2a_gemm_kernel import (
+from primus_turbo.flydsl.fused_collective_gemm.a2a_gemm_kernel import (
+    a2a_gemm,
     a2a_gemm_bank_bytes,
-    ulysses_a2a_gemm,
 )
-from primus_turbo.flydsl.ulysses.gemm_a2a_kernel import (
+from primus_turbo.flydsl.fused_collective_gemm.gemm_a2a_kernel import (
+    gemm_a2a,
     gemm_a2a_bank_bytes,
-    ulysses_gemm_a2a,
 )
-from primus_turbo.flydsl.ulysses.workspace import (
-    REGION_O_A2A_GEMM,
-    REGION_O_GEMM_A2A,
-    REGION_QKV_A2A_GEMM,
-    REGION_QKV_GEMM_A2A,
-    get_ulysses_workspace,
+from primus_turbo.flydsl.fused_collective_gemm.workspace import (
+    get_collective_gemm_workspace,
 )
 
 __all__ = ["ulysses_qkv_gemm_a2a", "ulysses_a2a_o_gemm", "GemmA2ATuning", "A2AGemmTuning"]
+
+# Flag regions of the group's fused collective GEMM workspace, one per call site: a forward and a
+# backward launch can be in flight together. Other ops on the same workspace take other regions.
+REGION_QKV_GEMM_A2A = 0
+REGION_O_GEMM_A2A = 1
+REGION_O_A2A_GEMM = 2
+REGION_QKV_A2A_GEMM = 3
 
 _QKV_FORMATS = ("sbhd", "bshd")
 _WEIGHT_LAYOUTS = ("interleaved", "concat")
@@ -46,9 +49,13 @@ class GemmA2ATuning:
     """Launch knobs of a GemmA2A (forward QKV, backward o_proj); ``None`` keeps the default.
 
     Attributes:
-        BM: GEMM tile rows (128); smaller tiles finish, and get pulled, earlier.
+        BM: GEMM tile rows (forward QKV: 256 from 3 waves of 256-row tiles on, else 128; backward
+            o_proj: 256). Smaller tiles finish, and get pulled, earlier, but 256-row tiles run ~15 %
+            faster: they pay once the GEMM outweighs the first wave and the last-wave tail.
         num_lead: GEMM blocks dispatched ahead of the pull blocks (CU count, one wave).
-        num_pull_cu: pull blocks queued after the lead wave (16; forward QKV 24).
+        num_pull_cu: pull blocks queued after the lead wave (16; forward QKV 24; backward o_proj at
+            n = 2: 8). With one peer, 12+ pull blocks keep the link saturated with remote reads that
+            slow the concurrent GEMM tiles; at n >= 4 the reads spread over the peers and 8 fall behind.
         num_tail_pull: pull blocks queued after all GEMM blocks, for the last wave (16; forward QKV 8).
         wgrad_at: GEMM tile after which the in-kernel wgrad tiles are dispatched (backward o_proj
             only; ``num_lead + gemm_tiles // 8``, or last when there are more wgrad tiles than CUs).
@@ -66,11 +73,16 @@ class A2AGemmTuning:
     """Launch knobs of an A2AGemm (forward o_proj, backward QKV); ``None`` keeps the shape heuristic.
 
     Attributes:
-        BM: GEMM tile rows, 128 or 256 (256 when every tile fits on the CUs or wgrad tiles are many).
-        num_push: push blocks, which run the last GEMM tiles once done (32; 16 with few wgrad tiles).
+        BM: GEMM tile rows, 128 or 256 (256 when every tile fits on the CUs, there are more than 2x
+            CU wgrad tiles or, without wgrad, the GEMM outweighs the exchange, ``N * n >= 8192 * (n - 1)``,
+            or the 256-row tiles make 2.5 waves of the CUs 32 pushers leave).
+        num_push: push blocks, which run the last GEMM tiles once done (32; 16 with up to 3x CU wgrad
+            tiles at n <= 4; without wgrad past n = 4: 48; GEMM-bound without wgrad: 16, 8 from 8192
+            rows at n = 2; without wgrad, 128-row tiles at n <= 4 with ``N * n >= 4096 * (n - 1)``: 16).
         push_split: sub-tiles a ``BM``-row m-tile is pushed in, so its rows land in pieces (8).
         wgrad_at: claim slot of the in-kernel wgrad tiles (backward QKV only; 0, or after every
-            dgrad tile when there are more than 2x CU wgrad tiles).
+            dgrad tile when the GEMM outweighs the exchange, ``N * n >= 4096 * min(n - 1, 3)``, or
+            there are more than 2x CU wgrad tiles; with ``M > K`` a wave of dgrad tiles follows them).
     """
 
     BM: Optional[int] = None
@@ -137,9 +149,14 @@ def _qkv_gemm_a2a_forward(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout
     seq = s_local * n
     shape = (seq, b) if qkv_format == "sbhd" else (b, seq)
     q, k, v = (torch.empty(seq * b, h // n, d, dtype=x.dtype, device=x.device) for h in (hq, hkv, hkv))
-    workspace = get_ulysses_workspace(group, gemm_a2a_bank_bytes(M, N, 256))
+    workspace = get_collective_gemm_workspace(group, gemm_a2a_bank_bytes(M, N, 256))
     G, nq, nk, nv = _qkv_rank_block(hq, hkv, d, n, weight_layout)
-    ulysses_gemm_a2a(
+    # 256-row tiles run ~15 % faster but double the first wave the pulls wait behind and the last-wave
+    # tail: they pay from ~3 waves on (GLM-4.7 CP8 3.5 waves 638 -> 557 us; MiniMax-M2.5 CP8 2 waves
+    # 253 -> 274 us, Qwen3-30B 2.5 waves 428 -> 446 us)
+    num_cus = torch.cuda.get_device_properties(x.device).multi_processor_count
+    BM = 256 if -(-M // 256) * -(-N // 256) >= 3 * num_cus else 128
+    gemm_a2a(
         a,
         w,
         (q, k, v),
@@ -153,7 +170,7 @@ def _qkv_gemm_a2a_forward(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout
         seq_local=s_local,
         qkv_format=qkv_format,
         flag_region=REGION_QKV_GEMM_A2A,
-        **_launch_kwargs(tuning, num_pull_cu=24, num_tail_pull=8),
+        **_launch_kwargs(tuning, BM=BM, num_pull_cu=24, num_tail_pull=8),
     )
     return tuple(t.view(*shape, *t.shape[1:]) for t in (q, k, v))
 
@@ -179,9 +196,9 @@ def _qkv_backward(ctx, dq, dk, dv):
     x2d = x.reshape(M, hidden).contiguous() if need_dw else None
     dqkv = torch.empty(M, K, dtype=x.dtype, device=x.device) if need_dw and not fused_wgrad else None
     dw_rank_major = torch.empty(K, hidden, dtype=x.dtype, device=x.device) if fused_wgrad else None
-    workspace = get_ulysses_workspace(group, a2a_gemm_bank_bytes(M, K))
+    workspace = get_collective_gemm_workspace(group, a2a_gemm_bank_bytes(M, K))
     G = _qkv_rank_block(hq, hkv, d, n, weight_layout)[0]
-    ulysses_a2a_gemm(
+    a2a_gemm(
         parts,
         w,
         None,
@@ -282,8 +299,8 @@ def _o_gemm_forward(o, w_o, residual, group, qkv_format, save_o, tuning=None):
         residual = residual.reshape(M, N).contiguous()
     y = torch.empty(M, N, dtype=o.dtype, device=o.device)
     o_gathered = torch.empty(M, K, dtype=o.dtype, device=o.device) if save_o else None
-    workspace = get_ulysses_workspace(group, a2a_gemm_bank_bytes(M, K))
-    ulysses_a2a_gemm(
+    workspace = get_collective_gemm_workspace(group, a2a_gemm_bank_bytes(M, K))
+    a2a_gemm(
         o.reshape(seq * b, K_r).contiguous(),
         w_o.contiguous(),
         residual,
@@ -305,8 +322,8 @@ def _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format, wgrad=None
     M, K = dy2d.shape[0], w_o.shape[1]
     seq = s_local * n
     do = torch.empty(seq * b, heads, d, dtype=dy2d.dtype, device=dy2d.device)
-    workspace = get_ulysses_workspace(group, gemm_a2a_bank_bytes(M, K, 256))
-    ulysses_gemm_a2a(
+    workspace = get_collective_gemm_workspace(group, gemm_a2a_bank_bytes(M, K, 256))
+    gemm_a2a(
         dy2d,
         w_o.contiguous(),
         (do, do, do),
@@ -321,7 +338,7 @@ def _o_gemm_dgrad(dy2d, w_o, group, heads, d, s_local, b, qkv_format, wgrad=None
         qkv_format=qkv_format,
         flag_region=REGION_O_GEMM_A2A,
         wgrad=None if wgrad is None else (dy2d, *wgrad),
-        **_launch_kwargs(tuning),
+        **_launch_kwargs(tuning, BM=256, num_pull_cu=8 if n == 2 else 16),
     )
     shape = (seq, b) if qkv_format == "sbhd" else (b, seq)
     return do.view(*shape, heads, d)
