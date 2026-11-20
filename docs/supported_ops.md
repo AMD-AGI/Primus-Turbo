@@ -77,6 +77,7 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | `flash_attn_fp8_func` | FP8 | ✅ | ✅ | — | |
 | `flash_attn_usp_func`, `flash_attn_varlen_usp_func`, `flash_attn_fp8_usp_func` | BF16 / FP8 | ✅ | ✅ | — | Context parallelism: ring + all-to-all (USP) |
 | `sparse_mla_func` | BF16 | ✅ | ✅ | ✅ | DeepSeek sparse MLA |
+| `rl_paged_attention_func`, `rl_flash_attn_varlen_func`, `rl_flash_attn_func` (or `flash_attn_*` with `batch_invariant=True`) | BF16 / FP16 | — | ✅ | — | Batch-invariant attention for RL: rollout (paged) and training forwards match bitwise; visibility masks, sinks; TRITON or FLYDSL backend. See [RL attention](./features/rl_attention.md) |
 
 ### 2.4 MoE
 

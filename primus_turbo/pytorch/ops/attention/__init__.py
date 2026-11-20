@@ -14,4 +14,10 @@ from .flash_attn_usp_interface import (
     flash_attn_usp_func,
     flash_attn_varlen_usp_func,
 )
+from .rl_attention import (
+    RLBlockMask,
+    rl_flash_attn_func,
+    rl_flash_attn_varlen_func,
+    rl_paged_attention_func,
+)
 from .sparse_mla_interface import sparse_mla_func
