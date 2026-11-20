@@ -1212,7 +1212,7 @@ def _grouped_fp8_rowwise_variable_k_gemm_kernel(
         acc *= lhs_scale[:, None] * rhs_scale[None, :]
         rm_s = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        rn_s = tl.max_contiguous(tl.multiple_of(rn_s % OUT_N, BLOCK_SIZE_N), BLOCK_SIZE_N)
+        rn_s = tl.max_contiguous(tl.multiple_of(rn_s, BLOCK_SIZE_N), BLOCK_SIZE_N)
         c_mask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
         # Cast group_idx to int64 to prevent overflow in C group offset
         C_ = C + group_idx.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
@@ -1817,7 +1817,7 @@ def _grouped_blockwise_fp8_variable_k_gemm_kernel(
         # ── Store output ──
         rm_s = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        rn_s = tl.max_contiguous(tl.multiple_of(rn_s % OUT_N, BLOCK_SIZE_N), BLOCK_SIZE_N)
+        rn_s = tl.max_contiguous(tl.multiple_of(rn_s, BLOCK_SIZE_N), BLOCK_SIZE_N)
         c_mask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
         C_ = C + group_idx.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
         if BETA_IS_ONE:
