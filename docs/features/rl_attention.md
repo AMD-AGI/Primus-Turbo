@@ -122,7 +122,7 @@ per-shape auto-tuning across backends.
 | Masks, window, sinks, varlen, GQA | yes | yes |
 | Split-KV for decode | yes (`SEGMENT_SIZE`) | yes (`SEGMENT_SIZE`, see [the segment cost](#known-issue-cost-of-segments-on-flydsl)) |
 | Backward | Triton, deterministic | the same Triton backward |
-| Options used | all | `SEGMENT_SIZE` (a multiple of 64), `BLOCK_M` (64 / 128); `TILE_SIZE` must be 0 or 64; `MODE` and the warp / stage / wave options are ignored |
+| Options used | all but `SPLIT_SEGS` / `PACK` | `SEGMENT_SIZE` (a multiple of 64), `BLOCK_M` (64 / 128), `MODE`, `waves_per_eu`, `SPLIT_SEGS`, `PACK`; `TILE_SIZE` must be 0 or 64; `num_warps` / `num_stages` are ignored |
 
 **FLYDSL** (`primus_turbo/flydsl/attention/rl_attention_fwd.py`, helpers in
 `primus_turbo/flydsl/utils/rl_attn_helper.py`) is a fork of the dual-wave, software-pipelined gfx950
@@ -155,8 +155,8 @@ rescale fires, and with a sliding window even on random inputs). The fork change
   runs one program per segment and merges the partial states in a second launch with the same
   arithmetic and the same normalize / store code, so the bits equal the training forward's. Rows
   whose keys fit in one segment are unchanged (merging into an empty state is exact).
-- Visibility metadata (key starts, intervals, per-32-row bounds) is cached per step on the identity
-  and version of its input tensors.
+- Visibility metadata (key starts, intervals, per-32-row bounds) is computed per call in one Triton
+  launch (`rl_metadata_kernel`); there is no cache keyed on activation tensors.
 
 Speed on MI355X (bf16, TP 1, `benchmark/ops/training/bench_rl_attention.py`; "turbo" is the default,
 not batch-invariant `flash_attn_varlen_func` backend; SEGMENT_SIZE 1024, so every case below except
@@ -164,15 +164,15 @@ the 4k decodes of short contexts runs the segmented FLYDSL build):
 
 | Case | aiter / turbo | TRITON | FLYDSL |
 |---|---|---|---|
-| Training fwd, Llama-3-8B 8 x 4096 | 1.04 ms | 2.57 ms | 1.43 ms |
-| Training fwd + bwd, same | 6.04 ms | 11.06 ms | 9.96 ms |
-| Training fwd, Qwen3-32B 2 x 16384 | 7.14 ms | 17.10 ms | 10.69 ms |
-| Prefill 2048 on 16k, Llama-3-8B | 572 us | 1963 us | 862 us |
+| Training fwd, Llama-3-8B 8 x 4096 | 1.01 ms | 1.65 ms | 1.42 ms |
+| Training fwd + bwd, same | 6.01 ms | 10.20 ms | 9.96 ms |
+| Training fwd, Qwen3-32B 2 x 16384 | 6.88 ms | 12.13 ms | 10.16 ms |
+| Prefill 2048 on 16k, Llama-3-8B | 555 us | 791 us | 867 us |
 | Decode 1 x 4k, Llama-3-8B | 67 us | 74 us | 60 us |
 | Decode 64 x 4k, Llama-3-8B | 173 us | 175 us | 240 us |
 | Decode 1 x 32k, Llama-3-8B | 67 us | 76 us | 125 us |
 | Decode 8 x 32k, Llama-3-8B | 178 us | 195 us | 370 us |
-| Decode 8 x 4k, GPT-OSS-120B (window 128, sinks) | | 77 us | 34 us |
+| Decode 8 x 4k, GPT-OSS-120B (window 128, sinks) | | 46 us | 47 us |
 
 ### Known issue: cost of segments on FLYDSL
 

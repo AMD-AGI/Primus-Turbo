@@ -51,7 +51,7 @@ def _num_cus(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def _block_m(queries_per_kv: int, mode: str, max_seqlen_q: int, forced: int = 0) -> int:
+def _block_m(queries_per_kv: int, mode: str, max_seqlen_q: int, forced: int = 0, head_size: int = 128) -> int:
     """Rows per program, a multiple of the GQA group so a block never splits a token."""
     group = triton.next_power_of_2(queries_per_kv)
     if forced:
@@ -60,7 +60,7 @@ def _block_m(queries_per_kv: int, mode: str, max_seqlen_q: int, forced: int = 0)
         return max(forced, group)
     if mode == "split" or max_seqlen_q <= 16:
         return max(16, group)
-    if max_seqlen_q < 1024:
+    if max_seqlen_q < 1024 or head_size >= 128:
         return max(128, group)
     return max(256, group)
 
@@ -74,9 +74,10 @@ def _launch(
     num_warps: int = 0,
     num_stages: int = 0,
     waves_per_eu: int = 0,
+    head_size: int = 128,
 ) -> _Launch:
     """Defaults tuned on MI355X (D=128, GQA 4, bf16), decode first; nonzero arguments override."""
-    block_m = _block_m(queries_per_kv, mode, max_seqlen_q, block_m)
+    block_m = _block_m(queries_per_kv, mode, max_seqlen_q, block_m, head_size)
     if block_m <= 16 and mode == "split" and split_programs > 512:
         launch = _Launch(block_m, num_warps=2, num_stages=1, waves_per_eu=2)
     elif block_m <= 16 and mode == "split":
@@ -163,7 +164,7 @@ def rl_attention_fwd_triton(
     num_segments = triton.cdiv(max(int(max_seqlen_k), 1), segment_size)
     if mode == "auto" and 0 <= window_left and window_left + int(max_seqlen_q) <= segment_size:
         mode = "fused"  # the window reads at most two segments; split programs would find no keys
-    probe = _launch(queries_per_kv, "fused", int(max_seqlen_q), block_m=block_m)
+    probe = _launch(queries_per_kv, "fused", int(max_seqlen_q), block_m=block_m, head_size=head_size)
     probe_blocks = num_tokens // (probe.block_m // queries_per_kv) + num_seqs
     mode = _choose_mode(mode, probe_blocks, num_kv_heads, num_segments, int(max_seqlen_q), q.device)
     launch = _launch(
@@ -175,6 +176,7 @@ def rl_attention_fwd_triton(
         num_warps=num_warps,
         num_stages=num_stages,
         waves_per_eu=waves_per_eu,
+        head_size=head_size,
     )
     block_q = launch.block_m // queries_per_kv
     num_q_blocks = num_tokens // block_q + num_seqs
