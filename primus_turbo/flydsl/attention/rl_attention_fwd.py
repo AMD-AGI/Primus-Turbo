@@ -68,6 +68,8 @@ def build_rl_flash_attn_module(
     has_vis=False,
     page_size=0,
     gqa_pack=False,
+    segment_tiles=0,
+    split_mode=0,
 ):
     """Build a DUALWAVE_SWP flash_attn launcher for D=64/128 bf16/f16 on gfx950.
 
@@ -112,7 +114,13 @@ def build_rl_flash_attn_module(
         has_vis=has_vis,
         page_size=page_size,
         gqa_pack=gqa_pack,
+        segment_tiles=segment_tiles,
+        split_mode=split_mode,
     )
+    assert split_mode == 0 or (segment_tiles and has_vis and gqa_pack), (
+        "split / merge modes are for packed decode with segments and visibility intervals"
+    )
+    assert not (segment_tiles and use_score_bound), "segments need the exact per-tile rescale trigger"
     assert not gqa_pack or (has_vis and traits.Q_HEADS_PER_WG == 1 and 32 % traits.GQA_GROUP_SIZE == 0), (
         "GQA packing needs visibility intervals, no gqa_merge, and a group size dividing 32"
     )
@@ -143,6 +151,7 @@ def build_rl_flash_attn_module(
         VisLo: fx.Tensor,
         VisHi: fx.Tensor,
         VisGroup: fx.Tensor,
+        Partial: fx.Tensor,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
@@ -173,6 +182,7 @@ def build_rl_flash_attn_module(
             VisLo=VisLo,
             VisHi=VisHi,
             VisGroup=VisGroup,
+            Partial=Partial,
         )
         ctx._setup(SharedStorage)
 
@@ -230,7 +240,32 @@ def build_rl_flash_attn_module(
         split_t_end = ctx.split_t_end
         v_o_zero = ctx.c_zero_v16f32
 
+        def _finish(m_row, l_row, v_o):
+            """Normalize O and store it with its LSE (l_row is the scalar row sum)."""
+            # finalize_o_scale folds the learned sink into the denominator when HAS_SINK
+            # (else it is the plain 1/l path) and returns the (max, denom) to record as LSE.
+            o_scale, m_lse, l_lse = ctx.finalize_o_scale(m_row, l_row)
+            ctx.scale_o(v_o, o_scale)
+            _s_barrier()
+            # Store LSE before O so sink+LSE temps are not live across the O-store register peak.
+            if const_expr(traits.EMIT_LSE):
+                ctx.store_lse(m_lse, l_lse, ctx.q_row)
+            ctx.store_final_o(v_o, ctx.q_row)
+
+        def _merge_body():
+            """MERGE: fold the SPLIT programs' partials in segment order, then finish."""
+            ctx.setup_rows()
+            seg_keys = traits.SEGMENT_TILES * traits.BLOCK_N
+            num_segments = (ctx.seq_len_kv_v + fx.Index(seg_keys - 1)) // fx.Index(seg_keys)
+            for seg, carried in range(fx.Index(0), num_segments, fx.Index(1), init=ctx.empty_outer()):
+                m_seg, l_seg, a_seg = ctx.load_partial(seg)
+                merged_out = yield ctx.merge_segment(list(carried), m_seg, l_seg, a_seg)
+            _finish(merged_out[0], merged_out[1], list(merged_out[2:]))
+
         def _main_body():
+            if const_expr(traits.SPLIT_MODE == 2):
+                _merge_body()
+                return
             ctx.load_k_split(0, 0)
             _s_waitcnt(0)
             _sched_barrier(0)
@@ -244,7 +279,8 @@ def build_rl_flash_attn_module(
                     return ctx.lds_load_k(buf_id, ks_range=(0, K_HEAD))
                 return ctx.lds_load_k(buf_id)
 
-            def _qk(v_k, buf_id, tile_idx=None, live=None):
+            def _qk(v_k, buf_id, tile_idx=None, live=None, seg_tile=None):
+                ctx.next_qk_tile = seg_tile
                 """QK for one KV tile. `tile_idx`/`live` skip a wave-uniform dead 32-col half."""
                 if const_expr(tile_idx is None and live is None):
                     if const_expr(not split_k_reads):
@@ -423,6 +459,9 @@ def build_rl_flash_attn_module(
             split_rebase = ctx.use_score_bound
             if const_expr(split_rebase):
                 init_args.append(ctx.no_rescale())
+            n_carry = len(init_args)
+            outer = ctx.empty_outer() if const_expr(traits.SEGMENT_TILES > 0) else []
+            init_args += outer
 
             for j, loop_args in range(
                 loop_lb,
@@ -438,6 +477,7 @@ def build_rl_flash_attn_module(
                 ctx.set_seed_vec(loop_args[4 + traits.D_CHUNKS])
                 if const_expr(split_rebase):
                     pending = (ctx.bound_over_ref, loop_args[5 + traits.D_CHUNKS])
+                outer = [loop_args[n_carry + i] for i in range_constexpr(len(outer))]
                 j_idx = j
 
                 # Cluster 0: prefetch V buf1, read resident K for MMA0, and use carried page ids.
@@ -458,7 +498,7 @@ def build_rl_flash_attn_module(
                 v_p_0 = ctx.exp2(v_p_0, 16, 16)
                 v_p_0, l_row = ctx.cast_p_and_sum(l_row, v_p_0)
                 _sched_barrier(0)
-                v_s_1 = _qk(v_k, 1)
+                v_s_1 = _qk(v_k, 1, seg_tile=j_idx - 2)
                 _sched_barrier_pairs(traits, 6, 3, 1, traits.SCHED_EXP_MASK)
                 _sched_barrier_pairs(traits, 10, 5, 1)
                 _qk_cluster_sync()
@@ -501,6 +541,7 @@ def build_rl_flash_attn_module(
                 for pvs in range_constexpr(1, 4):
                     v_o = _pv_step(pvs, v_p_0, v_v, v_o, 0)
                 if const_expr(not split_rebase):
+                    m_row, l_row, v_o, outer = ctx.segment_boundary(j_idx - 2, m_row, l_row, v_o, outer)
                     m_row, l_row, v_s_1, v_o = ctx.rebase_if_needed(m_row, l_row, v_s_1, v_o)
                 v_p_1 = ctx.exp2(v_s_1, 0, 16)
 
@@ -527,7 +568,7 @@ def build_rl_flash_attn_module(
                 v_p_1 = ctx.exp2(v_p_1, 16, 16)
                 v_p_1, l_row = ctx.cast_p_and_sum(l_row, v_p_1)
                 _sched_barrier(0)
-                v_s_0 = _qk(v_k, 0)
+                v_s_0 = _qk(v_k, 0, seg_tile=j_idx - 1)
                 _sched_barrier_pairs(traits, 6, 3, 3, traits.SCHED_EXP_MASK)
                 _sched_barrier_pairs(traits, 10, 5, 3)
                 _qk_cluster_sync()
@@ -568,6 +609,7 @@ def build_rl_flash_attn_module(
                 for pvs in range_constexpr(1, 4):
                     v_o = _pv_step(pvs, v_p_1, v_v, v_o, 1)
                 if const_expr(not split_rebase):
+                    m_row, l_row, v_o, outer = ctx.segment_boundary(j_idx - 1, m_row, l_row, v_o, outer)
                     m_row, l_row, v_s_0, v_o = ctx.rebase_if_needed(m_row, l_row, v_s_0, v_o)
                 v_p_0 = ctx.exp2(v_s_0, 0, 16)
                 _sched_barrier_pairs(traits, 6, 5, 4)
@@ -579,6 +621,7 @@ def build_rl_flash_attn_module(
                 yield_args = [m_row, l_row] + v_o + [v_p_0[0], v_p_0[1], ctx.score_acc_seed()]
                 if const_expr(split_rebase):
                     yield_args.append(pending[1])
+                yield_args += outer
                 loop_results = yield yield_args
 
             # Epilogue drains the final in-flight tiles, continuing from the loop's maximum.
@@ -591,6 +634,7 @@ def build_rl_flash_attn_module(
             ctx.set_seed_vec(loop_results[4 + traits.D_CHUNKS])
             if const_expr(split_rebase):
                 v_o = ctx.rebase_acc(v_o, (ctx.bound_over_ref, loop_results[5 + traits.D_CHUNKS]))
+            outer = [loop_results[n_carry + i] for i in range_constexpr(len(outer))]
 
             max_m3 = split_t_end - 3
             max_m2 = split_t_end - 2
@@ -614,7 +658,7 @@ def build_rl_flash_attn_module(
                 # S1 (compute): finish the carried P, then MMA0 -> scores of max_m2.
                 v_p_0 = ctx.exp2(v_p_0, 16, 16)
                 v_p_0, l_row = ctx.cast_p_and_sum(l_row, v_p_0)
-                v_s_1 = _qk(v_k, 1)
+                v_s_1 = _qk(v_k, 1, seg_tile=max_m2)
                 _sched_barrier_pairs(traits, 6, 3, 5, traits.SCHED_EXP_MASK)
                 _sched_barrier_pairs(traits, 10, 5, 5)
                 _dualwave_sync_barrier()
@@ -638,6 +682,7 @@ def build_rl_flash_attn_module(
                 # v_p_0 here belongs to tile max_m3, the band's first tile.
                 _live_lo_m3, _ = ctx.chunk_live(max_m3)
                 v_o = _pv_lo_live(v_p_0, v_packs_s2, v_o, 0, _live_lo_m3)
+                m_row, l_row, v_o, outer = ctx.segment_boundary(max_m2, m_row, l_row, v_o, outer)
                 m_row, l_row, v_s_1, v_o = ctx.rebase_if_needed(m_row, l_row, v_s_1, v_o)
                 v_p_1 = ctx.exp2(v_s_1, 0, 16)
                 _sched_barrier_pairs(traits, 10, 5, 6)
@@ -660,7 +705,7 @@ def build_rl_flash_attn_module(
                 # S5 (compute): fold rescale, finish P of max_m2, MMA0 -> scores of max_m1.
                 v_p_1 = ctx.exp2(v_p_1, 16, 16)
                 v_p_1, l_row = ctx.cast_p_and_sum(l_row, v_p_1)
-                v_s_0 = _qk(v_k, 0, tile_idx=max_m1)
+                v_s_0 = _qk(v_k, 0, tile_idx=max_m1, seg_tile=max_m1)
                 _sched_barrier_pairs(traits, 6, 3, 7, traits.SCHED_EXP_MASK)
                 _sched_barrier_pairs(traits, 10, 5, 7)
                 _dualwave_sync_barrier()
@@ -681,6 +726,7 @@ def build_rl_flash_attn_module(
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
                 v_o = _pv(v_p_1, v_packs_s6, v_o, 1)
+                m_row, l_row, v_o, outer = ctx.segment_boundary(max_m1, m_row, l_row, v_o, outer)
                 m_row, l_row, v_s_0, v_o = ctx.rebase_if_needed(m_row, l_row, v_s_0, v_o)
                 v_p_0 = ctx.exp2(v_s_0, 0, 16)
                 _sched_barrier_pairs(traits, 9, 6, 8)
@@ -725,7 +771,7 @@ def build_rl_flash_attn_module(
                 # Epilogue C1 (compute): finish v_p_0 softmax, then MMA0 -> v_s_1 (like C1).
                 v_p_0 = ctx.exp2(v_p_0, 16, 16)
                 v_p_0, l_row = ctx.cast_p_and_sum(l_row, v_p_0)
-                v_s_1 = _qk(v_k, 1)
+                v_s_1 = _qk(v_k, 1, seg_tile=max_m3)
                 _sched_barrier_pairs(traits, 6, 3, 5, traits.SCHED_EXP_MASK)
                 _sched_barrier_pairs(traits, 10, 5, 5)
                 _dualwave_sync_barrier()
@@ -751,6 +797,7 @@ def build_rl_flash_attn_module(
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
                 v_o = _pv(v_p_0, v_packs_e3, v_o, 0)
+                m_row, l_row, v_o, outer = ctx.segment_boundary(max_m3, m_row, l_row, v_o, outer)
                 m_row, l_row, v_s_1, v_o = ctx.rebase_if_needed(m_row, l_row, v_s_1, v_o)
                 v_p_1 = ctx.exp2(v_s_1, 0, 16)
                 _sched_barrier_pairs(traits, 10, 5, 6)
@@ -774,7 +821,7 @@ def build_rl_flash_attn_module(
                 # Epilogue C5 finishes the v_p_1 softmax, then computes MMA0.
                 v_p_1 = ctx.exp2(v_p_1, 16, 16)
                 v_p_1, l_row = ctx.cast_p_and_sum(l_row, v_p_1)
-                v_s_0 = _qk(v_k, 0, live=(None, _live_hi_m2))
+                v_s_0 = _qk(v_k, 0, live=(None, _live_hi_m2), seg_tile=max_m2)
                 _sched_barrier_pairs(traits, 6, 3, 7, traits.SCHED_EXP_MASK)
                 _sched_barrier_pairs(traits, 10, 5, 7)
                 _dualwave_sync_barrier()
@@ -797,6 +844,7 @@ def build_rl_flash_attn_module(
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
                 v_o = _pv(v_p_1, v_packs_e7, v_o, 1)
+                m_row, l_row, v_o, outer = ctx.segment_boundary(max_m2, m_row, l_row, v_o, outer)
                 m_row, l_row, v_s_0, v_o = ctx.rebase_if_needed(m_row, l_row, v_s_0, v_o)
                 v_p_0 = ctx.exp2(v_s_0, 0, 16)
                 _sched_barrier_pairs(traits, 10, 5, 8)
@@ -819,7 +867,7 @@ def build_rl_flash_attn_module(
                 # Epilogue C9 finishes v_p_0, then computes the last-tile MMA0.
                 v_p_0 = ctx.exp2(v_p_0, 16, 16)
                 v_p_0, l_row = ctx.cast_p_and_sum(l_row, v_p_0)
-                v_s_1 = _qk(v_k, 1, live=(_live_lo_m1, _live_hi_m1))
+                v_s_1 = _qk(v_k, 1, live=(_live_lo_m1, _live_hi_m1), seg_tile=max_m1)
                 _sched_barrier_pairs(traits, 6, 3, 9, traits.SCHED_EXP_MASK)
                 _sched_barrier_pairs(traits, 10, 5, 9)
                 _dualwave_sync_barrier()
@@ -841,6 +889,7 @@ def build_rl_flash_attn_module(
                 # Epilogue C11: final rescale and complete the last tile's softmax in-place.
                 # v_p_0 belongs to max_m2, whose HI half is dead for row group 0.
                 v_o = _pv_hi_live(v_p_0, v_packs_e11, v_o, 0, _live_hi_m2)
+                m_row, l_row, v_o, outer = ctx.segment_boundary(max_m1, m_row, l_row, v_o, outer)
                 m_row, l_row, v_s_1, v_o = ctx.rebase_if_needed(m_row, l_row, v_s_1, v_o)
                 v_p_1 = ctx.exp2(v_s_1, 0, 16)
                 _sched_barrier_pairs(traits, 9, 6, 10)
@@ -866,16 +915,15 @@ def build_rl_flash_attn_module(
             # finalize_o_scale folds the learned sink into the denominator when HAS_SINK
             # (else it is the plain 1/l path, byte-identical) and returns the (max, denom)
             # to record as LSE.
-            l_row = ctx.finish_row_sum(l_row)
-            o_scale, m_lse, l_lse = ctx.finalize_o_scale(m_row, l_row)
-            ctx.scale_o(v_o, o_scale)
-
-            _s_barrier()
-
-            # Store LSE before O so sink+LSE temps are not live across the O-store register peak.
-            if const_expr(traits.EMIT_LSE):
-                ctx.store_lse(m_lse, l_lse, ctx.q_row)
-            ctx.store_final_o(v_o, ctx.q_row)
+            if const_expr(traits.SEGMENT_TILES > 0):
+                merged = ctx.merge_segment(outer, m_row, ctx.finish_row_sum(l_row), v_o)
+                m_row, l_row, v_o = merged[0], merged[1], list(merged[2:])
+            else:
+                l_row = ctx.finish_row_sum(l_row)
+            if const_expr(traits.SPLIT_MODE == 1):
+                ctx.store_partial(m_row, l_row, v_o)
+            else:
+                _finish(m_row, l_row, v_o)
 
         if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN and not traits.HAS_VIS):
             ctx.zero_o_block_if_needed()
@@ -906,6 +954,7 @@ def build_rl_flash_attn_module(
         VisLo: fx.Tensor,
         VisHi: fx.Tensor,
         VisGroup: fx.Tensor,
+        Partial: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
@@ -921,6 +970,15 @@ def build_rl_flash_attn_module(
         sl_idx = fx.Index(seq_len)
         rows = sl_idx * fx.Index(traits.GQA_GROUP_SIZE) if const_expr(traits.GQA_PACK) else sl_idx
         num_q_blocks = (rows + traits.BLOCK_M - 1) // traits.BLOCK_M
+        if const_expr(traits.SPLIT_MODE == 1):
+            seg_keys = traits.SEGMENT_TILES * traits.BLOCK_N
+            grid_x = fx.Index(traits.NUM_HEADS_KV) * (
+                (fx.Index(seq_len_kv) + fx.Index(seg_keys - 1)) // fx.Index(seg_keys)
+            )
+        elif const_expr(traits.GQA_PACK):
+            grid_x = traits.NUM_HEADS_KV
+        else:
+            grid_x = traits.NUM_HEADS_Q // traits.Q_HEADS_PER_WG
         grid_z = bs_idx
 
         passthrough_entries = (
@@ -946,6 +1004,7 @@ def build_rl_flash_attn_module(
             VisLo,
             VisHi,
             VisGroup,
+            Partial,
             seq_len,
             seq_len_kv,
             stride_q_n,
@@ -959,9 +1018,7 @@ def build_rl_flash_attn_module(
             },
         ).launch(
             grid=(
-                traits.NUM_HEADS_KV
-                if const_expr(traits.GQA_PACK)
-                else traits.NUM_HEADS_Q // traits.Q_HEADS_PER_WG,
+                grid_x,
                 num_q_blocks,
                 grid_z,
             ),
@@ -1005,6 +1062,7 @@ def build_rl_flash_attn_module(
         vis_lo,
         vis_hi,
         vis_group,
+        partial,
     ):
         # cu_seqlens_*/block_table/sink are unused kernel-signature placeholders for dense
         # launches / has_sink=False; the kernel only reads them under const_expr(traits.VARLEN
@@ -1023,6 +1081,7 @@ def build_rl_flash_attn_module(
             O if vis_lo is None else vis_lo,
             O if vis_hi is None else vis_hi,
             O if vis_group is None else vis_group,
+            O if partial is None else partial,
             batch_size,
             seq_len,
             seq_len if seq_len_kv is None else seq_len_kv,
@@ -1054,6 +1113,7 @@ def build_rl_flash_attn_module(
         vis_lo=None,
         vis_hi=None,
         vis_group=None,
+        partial=None,
         stream=None,
     ):
         args = _fill_defaults(
@@ -1077,10 +1137,11 @@ def build_rl_flash_attn_module(
             vis_lo,
             vis_hi,
             vis_group,
+            partial,
         )
-        # The scalar shape/mode args (JIT cache key) follow the 13 tensors; has_sink / has_vis
+        # The scalar shape/mode args (JIT cache key) follow the 14 tensors; has_sink / has_vis
         # are baked into the module (separate builds), so their tensors stay out of the key.
-        key = args[13:] + (stream is None,)
+        key = args[14:] + (stream is None,)
         fn = _compiled.get(key)
         if fn is None:
             if len(_compiled) >= _COMPILED_MAX:
@@ -1112,6 +1173,7 @@ def build_rl_flash_attn_module(
         vis_lo=None,
         vis_hi=None,
         vis_group=None,
+        partial=None,
         stream=None,
     ):
         args = _fill_defaults(
@@ -1135,6 +1197,7 @@ def build_rl_flash_attn_module(
             vis_lo,
             vis_hi,
             vis_group,
+            partial,
         )
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
             return flyc.compile(launch_flash_attn_dualwave_swp, *args, fx.Stream(stream))

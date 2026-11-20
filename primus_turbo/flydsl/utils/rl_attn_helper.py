@@ -43,6 +43,21 @@ head's query group, row r = token r // G, head kv_head * G + r % G, so each K/V 
 per KV head instead of once per query head. A row's arithmetic does not depend on which rows share
 its tile, so packed and unpacked launches give the same bits. Causal and windowed attention reach
 this mode as intervals, so every mask and tile-range decision comes from the row bounds.
+
+SEGMENT_TILES > 0 splits the keys into fixed absolute segments of that many tiles. A row's state
+(reference, row sum, accumulator) restarts empty at every segment start and is merged, in segment
+order, into an outer state carried beside it; the tile that opens a segment computes its scores
+without the old reference shift, as a program that starts at that segment does. So a split-KV
+launch (one program per segment, merged in the same order with the same arithmetic) gives the same
+bits as one program walking every segment. Merging into an empty outer state is exact, so a row
+whose keys lie in one segment is unchanged.
+
+SPLIT (with SEGMENT_TILES, HAS_VIS and GQA_PACK, for decode) runs the same walk with every row's
+interval clipped to one segment (grid x = KV heads x segments) and stores the row's (reference, row
+sum, accumulator) to a workspace instead of the output. MERGE loads those partials, merges them in
+segment order with ``merge_segment``, and finishes through the same normalize / store code as a
+full walk. The merge uses exact IEEE arithmetic (no fast-math), so the two kernels cannot fuse or
+reorder it differently.
 """
 
 import math as host_math
@@ -65,7 +80,7 @@ from primus_turbo.flydsl.utils.prims import LOG2E
 # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
 # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
 # kernel, or a warm cache keeps serving the old one.
-CODEGEN_REV = ("rl", 7)
+CODEGEN_REV = ("rl", 9)
 
 # Sentinel bound of an empty 32-row group (no visible key): above any key position.
 VIS_EMPTY = 1 << 30
@@ -447,6 +462,8 @@ class DualwaveSwpTraits:
             self.HAS_VIS,
             self.PAGE_SIZE,
             self.GQA_PACK,
+            self.SEGMENT_TILES,
+            self.SPLIT_MODE,
         )
 
 
@@ -471,6 +488,8 @@ def _make_dualwave_swp_traits(
     has_vis=False,
     page_size=0,
     gqa_pack=False,
+    segment_tiles=0,
+    split_mode=0,
 ):
     """Build gfx950 DUALWAVE_SWP compile-time layout traits."""
     rows_per_wave = 32
@@ -557,6 +576,8 @@ def _make_dualwave_swp_traits(
         HAS_VIS=bool(has_vis),
         PAGE_SIZE=int(page_size),
         GQA_PACK=bool(gqa_pack),
+        SEGMENT_TILES=int(segment_tiles),
+        SPLIT_MODE=int(split_mode),
         VARLEN=varlen,
         CROSS_SEQLEN=cross_seqlen,
         SBHD=bool(sbhd),
@@ -625,8 +646,10 @@ class DualwaveKernelContext:
         VisLo=None,
         VisHi=None,
         VisGroup=None,
+        Partial=None,
     ):
         self.traits = traits
+        self.Partial = Partial
         self.VisLo = VisLo
         self.VisHi = VisHi
         self.VisGroup = VisGroup
@@ -636,8 +659,11 @@ class DualwaveKernelContext:
         # Without the bound floor, a row whose prologue tile is wholly masked keeps the floor as its
         # reference; only a left window can still hand such a row live keys in a later tile.
         self.seed_floored = (
-            not self.use_score_bound and traits.CAUSAL and (traits.WINDOW_LEFT >= 0 or traits.HAS_VIS)
+            not self.use_score_bound
+            and traits.CAUSAL
+            and (traits.WINDOW_LEFT >= 0 or traits.HAS_VIS or traits.SEGMENT_TILES > 0)
         )
+        self.next_qk_tile = None
         self.bound_over_ref = None
         self._qk_seed = None
         self.q_norm_sq = None
@@ -948,6 +974,20 @@ class DualwaveKernelContext:
             lambda b, w, d: self._dma_base(b, w, d, _v_buf_base, traits.SMEM_V_LINE_STRIDE), self.NUM_DMA_V
         )
 
+    def _segment_keys(self):
+        """[first, last] key of this SPLIT program's segment, sequence-relative."""
+        seg_keys = self.traits.SEGMENT_TILES * self.traits.BLOCK_N
+        first = fx.Int32(self.group_id) * fx.Int32(seg_keys)
+        return first, first + fx.Int32(seg_keys - 1)
+
+    def _clip_to_segment(self, lo, hi):
+        if const_expr(self.traits.SPLIT_MODE != 1):
+            return lo, hi
+        first, last = self._segment_keys()
+        lo = fx.Int32(ArithValue(lo < first).select(first, lo))
+        hi = fx.Int32(ArithValue(hi > last).select(last, hi))
+        return lo, hi
+
     def _rows_per_token(self):
         return self.traits.GQA_GROUP_SIZE if const_expr(self.traits.GQA_PACK) else 1
 
@@ -965,12 +1005,18 @@ class DualwaveKernelContext:
         base = fx.Int32(self.kv_tok_base)
         big = fx.Int32(VIS_EMPTY)
         neg = fx.Int32(-1)
-        return (
+        bounds = [
             fx.Int32(valid.select(fx.Int32(vals[0]) - base, big)),
             fx.Int32(valid.select(fx.Int32(vals[1]) - base, big)),
             fx.Int32(valid.select(fx.Int32(vals[2]) - base, neg)),
             fx.Int32(valid.select(fx.Int32(vals[3]) - base, neg)),
-        )
+        ]
+        if const_expr(self.traits.SPLIT_MODE == 1):
+            # Clipping every row to the segment clips the group's bounds the same way.
+            bounds[0], bounds[3] = self._clip_to_segment(bounds[0], bounds[3])
+            bounds[1] = self._clip_to_segment(bounds[1], neg)[0]
+            bounds[2] = self._clip_to_segment(big, bounds[2])[1]
+        return tuple(bounds)
 
     def _setup_vis_range(self):
         """Tile range of the workgroup: from its rows' smallest lo to their largest hi, laid out
@@ -1017,8 +1063,9 @@ class DualwaveKernelContext:
         hi = fx.Int32(buffer_ops.buffer_load(hi_rsrc, as_mlir_value(tok), vec_width=1, dtype=fx.Int32))
         valid = ArithValue(self.q_row < self.seqlen_q_v)
         base = fx.Int32(self.kv_tok_base)
-        self.vis_lo_row = fx.Int32(valid.select(lo - base, fx.Int32(1)))
-        self.vis_hi_row = fx.Int32(valid.select(hi - base, fx.Int32(0)))
+        self.vis_lo_row, self.vis_hi_row = self._clip_to_segment(
+            fx.Int32(valid.select(lo - base, fx.Int32(1))), fx.Int32(valid.select(hi - base, fx.Int32(0)))
+        )
 
     def _dma_base(self, buf_id, w_rep, d, buf_base_fn, line_stride):
         traits = self.traits
@@ -1046,6 +1093,11 @@ class DualwaveKernelContext:
     # Pipeline helpers
 
     def load_all(self):
+        self.setup_rows()
+        return self._load_q()
+
+    def setup_rows(self):
+        """This lane's query row (token), query head and, with HAS_VIS, its interval."""
         traits = self.traits
         self.q_row_in_block = self.wave_q_offset + self.lane_mod_32
         self.q_start_pos_i32 = fx.Int32(self.q_start + self.wave_row_group_uni * traits.ROWS_PER_WAVE)
@@ -1060,6 +1112,8 @@ class DualwaveKernelContext:
         if const_expr(traits.HAS_VIS):
             self._load_vis_rows()
 
+    def _load_q(self):
+        traits = self.traits
         q_raw_packs = []
         for ks in range_constexpr(traits.K_STEPS_QK):
             if const_expr(traits.GQA_PACK):
@@ -1179,6 +1233,13 @@ class DualwaveKernelContext:
         which is where the stock kernel seeded the accumulator."""
         if v_s is None:
             seed = self.score_acc_seed()
+            if const_expr(self.traits.SEGMENT_TILES > 0 and self.next_qk_tile is not None):
+                # A segment's first tile is scored as by a program starting there: no shift.
+                seed = arith.select(
+                    as_mlir_value(self.segment_start(self.next_qk_tile)),
+                    as_mlir_value(self.c_zero_v16f32),
+                    as_mlir_value(seed),
+                )
             if const_expr(ks_hi < self.traits.K_STEPS_QK):
                 self._qk_seed = seed
             return (self.c_zero_v16f32, self.c_zero_v16f32), seed
@@ -1528,6 +1589,90 @@ class DualwaveKernelContext:
         if const_expr(pending is None):
             return res[0], res[1], (res[2], res[3]), v_o_out
         return res[0], res[1], (res[2], res[3]), v_o_out, (fired, res[5 + nd])
+
+    def segment_start(self, tile_idx):
+        return ArithValue(fx.Index(tile_idx) % fx.Index(self.traits.SEGMENT_TILES) == fx.Index(0))
+
+    def empty_row_sum(self):
+        return self.c_zero_v4f32 if const_expr(self.traits.DUALWAVE_SWP_MFMA_ROWSUM) else self.c_zero_f
+
+    def empty_outer(self):
+        """The outer (reference, row sum, accumulator) state before any segment is merged."""
+        return [self.c_neg_floor, self.c_zero_f] + [self.c_zero_v16f32] * self.traits.D_CHUNKS
+
+    def merge_segment(self, outer, m_row, l_seg, v_o):
+        """Outer state after merging one finished segment (reference m_row, scalar row sum l_seg,
+        accumulator v_o): M' = max(M, m), L' = L 2^(M - M') + l 2^(m - M'), likewise A. Plain IEEE
+        operations, so every kernel that merges computes the same bits."""
+        big_m, big_l, big_a = outer[0], outer[1], outer[2:]
+        m_new = _fmax(big_m, m_row, None)
+        a = fx.Float32(rocdl.exp2(T.f32, _fsub(big_m, m_new, None)))
+        b = fx.Float32(rocdl.exp2(T.f32, _fsub(m_row, m_new, None)))
+        l_new = _fadd(_fmul(big_l, a, None), _fmul(l_seg, b, None), None)
+        a_vec = Vec.from_elements([as_mlir_value(a)], fx.Float32).broadcast_to(16)
+        b_vec = Vec.from_elements([as_mlir_value(b)], fx.Float32).broadcast_to(16)
+        acc = [
+            _fadd(_fmul(Vec(big_a[dc]), a_vec, None), _fmul(Vec(v_o[dc]), b_vec, None), None)
+            for dc in range_constexpr(self.traits.D_CHUNKS)
+        ]
+        return [m_new, l_new] + acc
+
+    def segment_boundary(self, tile_idx, m_row, l_row, v_o, outer):
+        """Before the rebase of tile ``tile_idx``: if it opens a segment, merge the finished segment
+        into ``outer`` and restart the row state empty."""
+        if const_expr(self.traits.SEGMENT_TILES == 0):
+            return m_row, l_row, v_o, outer
+        nd = self.traits.D_CHUNKS
+
+        def _then():
+            merged = self.merge_segment(outer, m_row, self.finish_row_sum(l_row), v_o)
+            return [self.c_neg_floor, self.empty_row_sum()] + [self.c_zero_v16f32] * nd + merged
+
+        res = _if_wave(self.segment_start(tile_idx), [m_row, l_row] + list(v_o) + list(outer), _then)
+        self.set_ref(res[0])
+        return res[0], res[1], list(res[2 : 2 + nd]), list(res[2 + nd :])
+
+    def _partial_rsrc_and_base(self, seg):
+        """Workspace descriptor and this lane's first element for segment ``seg``: per program
+        (segment, sequence, query block, KV head) and thread, [reference, row sum, accumulator]."""
+        traits = self.traits
+        stride = 2 + 16 * traits.D_CHUNKS
+        rsrc = buffer_ops.create_buffer_resource(self.Partial, max_size=True)
+        num_seqs = fx.Index(gpu.grid_dim.z)
+        num_q_blocks = fx.Index(gpu.grid_dim.y)
+        prog = ((fx.Index(seg) * num_seqs + self.batch_idx) * num_q_blocks + self.q_block_idx) * fx.Index(
+            traits.NUM_HEADS_KV
+        ) + self.h_kv_idx
+        return rsrc, fx.Int32((prog * fx.Index(traits.BLOCK_SIZE) + self.tid) * fx.Index(stride))
+
+    def store_partial(self, m_row, l_seg, v_o):
+        rsrc, base = self._partial_rsrc_and_base(self.group_id)
+        buffer_ops.buffer_store(as_mlir_value(fx.Float32(m_row)), rsrc, as_mlir_value(base))
+        buffer_ops.buffer_store(as_mlir_value(fx.Float32(l_seg)), rsrc, as_mlir_value(base + fx.Int32(1)))
+        for dc in range_constexpr(self.traits.D_CHUNKS):
+            for q4 in range_constexpr(4):
+                part = Vec(v_o[dc]).shuffle(Vec(v_o[dc]), [q4 * 4 + i for i in range(4)])
+                off = base + fx.Int32(2 + dc * 16 + q4 * 4)
+                buffer_ops.buffer_store(as_mlir_value(part), rsrc, as_mlir_value(off))
+
+    def load_partial(self, seg):
+        rsrc, base = self._partial_rsrc_and_base(seg)
+        m_row = fx.Float32(buffer_ops.buffer_load(rsrc, as_mlir_value(base), vec_width=1, dtype=fx.Float32))
+        l_seg = fx.Float32(
+            buffer_ops.buffer_load(rsrc, as_mlir_value(base + fx.Int32(1)), vec_width=1, dtype=fx.Float32)
+        )
+        v_o = []
+        for dc in range_constexpr(self.traits.D_CHUNKS):
+            parts = []
+            for q4 in range_constexpr(4):
+                off = base + fx.Int32(2 + dc * 16 + q4 * 4)
+                parts.append(
+                    Vec(buffer_ops.buffer_load(rsrc, as_mlir_value(off), vec_width=4, dtype=fx.Float32))
+                )
+            lo = parts[0].shuffle(parts[1], list(range(8)))
+            hi = parts[2].shuffle(parts[3], list(range(8)))
+            v_o.append(Vec(lo).shuffle(Vec(hi), list(range(16))).ir_value())
+        return m_row, l_seg, v_o
 
     def no_rescale(self):
         """The neutral accumulator rescale a site hands on when the reference did not move."""
