@@ -3,15 +3,16 @@
 On-policy RL needs the trainer to recompute exactly the log-probabilities the rollout engine
 sampled with. Ordinary attention kernels do not give that. The rollout runs paged decode and prefill
 with batch-dependent tiling and split-KV, the trainer runs a different, dense kernel, and the two
-round differently. RL attention is one Triton kernel family used on both sides. A token's forward
-output is **bitwise identical** whether it is computed in a rollout prefill, in a rollout decode
-step, or in the training forward, and whatever else shares its batch.
+round differently. RL attention runs one kernel family on both sides, Triton or (on gfx950) FlyDSL.
+A token's forward output is **bitwise identical** whether it is computed in a rollout prefill, in a
+rollout decode step, or in the training forward, and whatever else shares its batch.
 
 Supported: bf16 / fp16, GQA / MQA, head dims up to 256, causal (bottom-right aligned), sliding
 window, per-head attention sinks (with their gradient), packed variable-length sequences, a
 vLLM-layout paged KV cache, and visibility masks. The backward is deterministic (no atomics).
-Tested on MI355X (gfx950). Kernels are derived from aiter's `unified_attention` and one-kernel
-backward (MIT).
+Tested on MI355X (gfx950). The Triton kernels are derived from aiter's `unified_attention` and
+one-kernel backward (MIT); the FlyDSL forward is forked from Turbo's gfx950 dual-wave flash-attention
+forward (see [Backends](#backends)).
 
 ## Usage
 
@@ -76,7 +77,7 @@ overrides them key by key. 0 or `auto` means the default.
 |---|---|---|
 | `TILE_SIZE` | yes | KV tile per inner step (default 64, 32 for D > 128) |
 | `SEGMENT_SIZE` | yes | KV segment length, the split-KV unit (default 1024) |
-| `BACKEND` | yes | `TRITON` |
+| `BACKEND` | yes | `TRITON` (default) or `FLYDSL` (gfx950), see [Backends](#backends) |
 | `MODE` | no | `auto`, `fused` (one pass) or `split` (split-KV + reduce) |
 | `BLOCK_M`, `num_warps`, `num_stages`, `waves_per_eu` | no | Schedule only |
 
@@ -85,7 +86,66 @@ same environment variable in both is the simplest way. The others may differ per
 process. `num_warps` is clamped to `BLOCK_M / 16` when `BLOCK_M > 16`, because warps that also
 split the columns of the score tile change the bits. The backward uses its own fixed configuration.
 
-## How the invariance is achieved
+## Backends
+
+The two backends implement the same contract but give different bits, so **rollout and training must
+use the same `BACKEND`**. A backend that cannot take a call raises; there is no silent fallback and no
+per-shape auto-tuning across backends.
+
+| | TRITON | FLYDSL |
+|---|---|---|
+| Hardware | any ROCm GPU Triton supports | gfx950 (MI350 / MI355) |
+| dtypes, head size | bf16 / fp16, D <= 256 | bf16, D = 64 or 128, `softmax_scale` = 1/sqrt(D) |
+| Paged cache | any page size | pages that are multiples of 64 |
+| Masks, window, sinks, varlen, GQA | yes | yes |
+| Split-KV for decode | yes (`SEGMENT_SIZE`) | not yet |
+| Backward | Triton, deterministic | the same Triton backward |
+| Options used | all | `BLOCK_M` (64 / 128); `TILE_SIZE` must be 0 or 64; `SEGMENT_SIZE`, `MODE` and the warp / stage / wave options are ignored |
+
+**FLYDSL** (`primus_turbo/flydsl/attention/rl_attention_fwd.py`, helpers in
+`primus_turbo/flydsl/utils/rl_attn_helper.py`) is a fork of the dual-wave, software-pipelined gfx950
+forward. The stock kernel is batch invariant across batch composition, but not across prefill,
+chunked prefill and decode: its lazy rescale moves the reference of every row in a wave when any row
+outruns its own, so a row's bits depend on which rows share its wave (measured on MI355X once the
+rescale fires, and with a sliding window even on random inputs). The fork changes:
+
+- **Per-row rescale.** The rebase stays a wave-uniform branch, but rows that did not outrun their own
+  reference take an exact identity (shift 0, rescale 1). The D <= 64 score bound, computed over the
+  whole packed K, is off.
+- **fp32 score scaling.** Q stays unscaled in bf16 and each score is
+  `fma(q.k, log2(e) * softmax_scale, -reference)` in fp32. The stock kernel rounds the pre-scaled Q
+  to bf16, which moves logits in the hundreds by whole units: max error vs fp32 was 0.15-1.2 on such
+  inputs, against 0.015 now (the Triton kernel's level). **This is the main reason the RL forward is
+  slower than the stock FlyDSL forward**: +8% (D=128) and +21% (D=64) on causal training shapes,
+  about 0 with a sliding window.
+- **Visibility intervals.** A workgroup walks its rows' tile range with the windowed pipeline; tiles
+  every row of a wave sees entirely skip the mask. Causal and window attention are converted to
+  intervals for everything but plain causal self-attention, and the two paths give the same bits.
+- **Paged cache.** Each 64-key tile lies in one page: one block-table lookup per tile, with a buffer
+  descriptor sized to the keys below the sequence length, so unused cache slots are never read.
+- **Packed decode rows.** With at most 16 query tokens per sequence, a workgroup's rows are
+  (token, head) pairs of one query group, so each K/V tile is read once per KV head.
+- Visibility metadata (key starts, intervals, per-32-row bounds) is cached per step on the identity
+  and version of its input tensors.
+
+Speed on MI355X (bf16, TP 1, `benchmark/ops/training/bench_rl_attention.py`; "turbo" is the default,
+not batch-invariant `flash_attn_varlen_func` backend):
+
+| Case | turbo | TRITON | FLYDSL |
+|---|---|---|---|
+| Training fwd, Llama-3-8B 8 x 4096 | 1.02 ms | 2.57 ms | 1.08 ms |
+| Training fwd + bwd, same | 6.12 ms | 11.12 ms | 9.62 ms |
+| Training fwd with an interval mask, same | | 3.21 ms | 1.13 ms |
+| Prefill 2048 on 16k, Llama-3-8B (aiter 550 us) | | 1958 us | 564 us |
+| Decode 64 x 4k, Llama-3-8B (aiter 181 us) | | 171 us | 227 us |
+| Decode 1 x 32k, Llama-3-8B (aiter 69 us) | | 77 us | 1010 us |
+| Decode 8 x 4k, GPT-OSS-120B (window 128, sinks) | | 78 us | 14 us |
+
+FLYDSL is the faster backend for training and long prefill. Without split-KV its decode is slow when
+there are few sequences and long contexts (too few workgroups); split-KV is the next step, and it
+needs the training forward to merge the same fixed segments in-kernel to keep the bits equal.
+
+## How the invariance is achieved (TRITON)
 
 A row's result depends only on the order of its floating-point reductions. The kernels fix that
 order per model and make everything else a pure scheduling choice:
@@ -104,11 +164,12 @@ order per model and make everything else a pure scheduling choice:
 
 ## Testing methodology
 
-Tests live in `tests/pytorch/ops/test_rl_attention.py`, with an fp32 reference in
-`tests/pytorch/ref/rl_attention_ref.py`:
+Tests live in `tests/pytorch/ops/test_rl_attention.py` (Triton backend) and
+`tests/pytorch/ops/test_rl_attention_flydsl.py` (FlyDSL backend, gfx950; every comparison stays within
+the backend), with an fp32 reference in `tests/pytorch/ref/rl_attention_ref.py`:
 
 ```bash
-pytest tests/pytorch/ops/test_rl_attention.py
+pytest tests/pytorch/ops/test_rl_attention.py tests/pytorch/ops/test_rl_attention_flydsl.py
 ```
 
 ### Two kinds of checks
