@@ -25,6 +25,12 @@ The second change is accuracy: Q stays unscaled in bf16, QK accumulates from zer
 becomes fma(q.k, log2(e) * softmax_scale, -reference) in fp32 (``_finish_scores``). The stock
 kernel rounds log2(e) * softmax_scale * Q to bf16 before the MFMA instead, which moves logits in
 the hundreds by whole units. The extra fma per score is the cost.
+
+HAS_VIS adds visibility intervals: query row t sees keys [lo[t], hi[t]] of its own sequence (global
+key indices, converted here by subtracting the sequence's first key). A workgroup walks the tiles
+from its rows' smallest lo to their largest hi with the windowed pipeline; a tile that every row of
+a wave sees entirely skips the mask, others mask per element. Per-32-row-group bounds (min lo,
+max lo, min hi, max hi, sequence-relative after the subtraction) come precomputed in VisGroup.
 """
 
 import math as host_math
@@ -47,7 +53,10 @@ from primus_turbo.flydsl.utils.prims import LOG2E
 # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
 # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
 # kernel, or a warm cache keeps serving the old one.
-CODEGEN_REV = ("rl", 2)
+CODEGEN_REV = ("rl", 3)
+
+# Sentinel bound of an empty 32-row group (no visible key): above any key position.
+VIS_EMPTY = 1 << 30
 
 # Room a later key has above a tile's row max before it forces another rebase.
 REF_MARGIN = 96.0
@@ -423,6 +432,7 @@ class DualwaveSwpTraits:
             self.CROSS_SEQLEN,
             self.SBHD,
             self.HAS_SINK,
+            self.HAS_VIS,
         )
 
 
@@ -444,6 +454,7 @@ def _make_dualwave_swp_traits(
     gqa_merge=None,
     sbhd=False,
     has_sink=False,
+    has_vis=False,
 ):
     """Build gfx950 DUALWAVE_SWP compile-time layout traits."""
     rows_per_wave = 32
@@ -527,6 +538,7 @@ def _make_dualwave_swp_traits(
         DUALWAVE_SWP_ENABLE_STAGGER=bool(dualwave_swp_enable_stagger),
         EMIT_LSE=bool(emit_lse),
         WINDOW_LEFT=int(window_left),
+        HAS_VIS=bool(has_vis),
         VARLEN=varlen,
         CROSS_SEQLEN=cross_seqlen,
         SBHD=bool(sbhd),
@@ -592,14 +604,22 @@ class DualwaveKernelContext:
         block_table_stride=None,
         SINK=None,
         ScoreBound=None,
+        VisLo=None,
+        VisHi=None,
+        VisGroup=None,
     ):
         self.traits = traits
+        self.VisLo = VisLo
+        self.VisHi = VisHi
+        self.VisGroup = VisGroup
         self.SINK = SINK
         self.ScoreBound = ScoreBound
         self.use_score_bound = ScoreBound is not None and traits.HEAD_DIM <= SCORE_BOUND_HEAD_DIM_MAX
         # Without the bound floor, a row whose prologue tile is wholly masked keeps the floor as its
         # reference; only a left window can still hand such a row live keys in a later tile.
-        self.seed_floored = not self.use_score_bound and traits.CAUSAL and traits.WINDOW_LEFT >= 0
+        self.seed_floored = (
+            not self.use_score_bound and traits.CAUSAL and (traits.WINDOW_LEFT >= 0 or traits.HAS_VIS)
+        )
         self.bound_over_ref = None
         self._qk_seed = None
         self.q_norm_sq = None
@@ -827,7 +847,9 @@ class DualwaveKernelContext:
             self.causal_end_raw_i32 = None
             self.max_num_tiles = self.num_kv_tiles
 
-        if const_expr(traits.CAUSAL and traits.WINDOW_LEFT >= 0):
+        if const_expr(traits.HAS_VIS):
+            self._setup_vis_range()
+        elif const_expr(traits.CAUSAL and traits.WINDOW_LEFT >= 0):
             # Keep an odd KV span: two-tile drain admits N in {3,5,7,...}; even-rounding
             # added a fourth tile that the window mask then threw away.
             self.max_num_tiles = fx.Index(
@@ -891,6 +913,70 @@ class DualwaveKernelContext:
             lambda b, w, d: self._dma_base(b, w, d, _v_buf_base, traits.SMEM_V_LINE_STRIDE), self.NUM_DMA_V
         )
 
+    def _load_vis_group(self, rsrc, row0):
+        """(min lo, max lo, min hi, max hi) of the 32-row group starting at block row ``row0``,
+        sequence-relative; an out-of-range group gives bounds no key satisfies."""
+        tok = fx.Int32(self.q_tok_base + row0)
+        vals = Vec(
+            buffer_ops.buffer_load(rsrc, as_mlir_value(tok * fx.Int32(4)), vec_width=4, dtype=fx.Int32)
+        )
+        valid = ArithValue(row0 < self.seqlen_q_v)
+        base = fx.Int32(self.kv_tok_base)
+        big = fx.Int32(VIS_EMPTY)
+        neg = fx.Int32(-1)
+        return (
+            fx.Int32(valid.select(fx.Int32(vals[0]) - base, big)),
+            fx.Int32(valid.select(fx.Int32(vals[1]) - base, big)),
+            fx.Int32(valid.select(fx.Int32(vals[2]) - base, neg)),
+            fx.Int32(valid.select(fx.Int32(vals[3]) - base, neg)),
+        )
+
+    def _setup_vis_range(self):
+        """Tile range of the workgroup: from its rows' smallest lo to their largest hi, laid out
+        like the left-window range (odd span of at least 3 tiles for the two-tile drain)."""
+        traits = self.traits
+        rsrc = buffer_ops.create_buffer_resource(self.VisGroup, max_size=True)
+        blk_lo = fx.Int32(VIS_EMPTY)
+        blk_hi = fx.Int32(-1)
+        for g in range_constexpr(traits.WAVE_ROW_GROUPS):
+            mn_lo, _, _, mx_hi = self._load_vis_group(rsrc, self.q_start + fx.Index(g * traits.ROWS_PER_WAVE))
+            blk_lo = fx.Int32(ArithValue(mn_lo < blk_lo).select(mn_lo, blk_lo))
+            blk_hi = fx.Int32(ArithValue(mx_hi > blk_hi).select(mx_hi, blk_hi))
+        wave_row0 = self.q_start + self.wave_row_group_uni * traits.ROWS_PER_WAVE
+        (self.vis_w_min_lo, self.vis_w_max_lo, self.vis_w_min_hi, self.vis_w_max_hi) = self._load_vis_group(
+            rsrc, wave_row0
+        )
+        empty = ArithValue(blk_hi < blk_lo)
+        blk_lo = fx.Int32(empty.select(fx.Int32(0), blk_lo))
+        blk_hi = fx.Int32(empty.select(fx.Int32(0), blk_hi))
+        first = fx.Index(blk_lo) // fx.Index(traits.BLOCK_N)
+        end = fx.Index(blk_hi) // fx.Index(traits.BLOCK_N) + fx.Index(1)
+        end = fx.Index(ArithValue(end < self.num_kv_tiles).select(end, self.num_kv_tiles))
+        end = fx.Index(ArithValue(end > first).select(end, first + fx.Index(1)))
+        self.max_num_tiles = fx.Index(ArithValue(end < fx.Index(3)).select(fx.Index(3), end))
+        max_lo = fx.Index(
+            ArithValue(self.max_num_tiles > fx.Index(3)).select(self.max_num_tiles - fx.Index(3), fx.Index(0))
+        )
+        first = fx.Index(ArithValue(first < max_lo).select(first, max_lo))
+        span = self.max_num_tiles - first
+        span_odd = span - (span // fx.Index(2)) * fx.Index(2)
+        grow = fx.Index(1) - span_odd
+        down = fx.Index(ArithValue(first > fx.Index(0)).select(grow, fx.Index(0)))
+        self.split_t0 = first - down
+        self.split_t_end = self.max_num_tiles + (grow - down)
+
+    def _load_vis_rows(self):
+        """This lane's row interval [lo, hi], sequence-relative; rows past the end see nothing."""
+        lo_rsrc = buffer_ops.create_buffer_resource(self.VisLo, max_size=True)
+        hi_rsrc = buffer_ops.create_buffer_resource(self.VisHi, max_size=True)
+        tok = fx.Int32(self.q_tok_base + self.q_row)
+        lo = fx.Int32(buffer_ops.buffer_load(lo_rsrc, as_mlir_value(tok), vec_width=1, dtype=fx.Int32))
+        hi = fx.Int32(buffer_ops.buffer_load(hi_rsrc, as_mlir_value(tok), vec_width=1, dtype=fx.Int32))
+        valid = ArithValue(self.q_row < self.seqlen_q_v)
+        base = fx.Int32(self.kv_tok_base)
+        self.vis_lo_row = fx.Int32(valid.select(lo - base, fx.Int32(1)))
+        self.vis_hi_row = fx.Int32(valid.select(hi - base, fx.Int32(0)))
+
     def _dma_base(self, buf_id, w_rep, d, buf_base_fn, line_stride):
         traits = self.traits
         wave_id_uni = self.wave_id_uni + fx.Index(w_rep * self.traits.NUM_WAVES)
@@ -922,6 +1008,8 @@ class DualwaveKernelContext:
         self.q_start_pos_i32 = fx.Int32(self.q_start + self.wave_row_group_uni * traits.ROWS_PER_WAVE)
         self.q_row = self.q_start + self.q_row_in_block
         self.q_row_i32 = fx.Int32(self.q_row)
+        if const_expr(traits.HAS_VIS):
+            self._load_vis_rows()
 
         q_raw_packs = []
         for ks in range_constexpr(traits.K_STEPS_QK):
@@ -1068,6 +1156,14 @@ class DualwaveKernelContext:
     def chunk_live(self, tile_idx):
         traits = self.traits
         kv0 = fx.Int32(self.tile_start(tile_idx))
+        if const_expr(traits.HAS_VIS):
+            live_lo = ArithValue(fx.Int32(kv0 + fx.Int32(31)) >= self.vis_w_min_lo) & (
+                kv0 <= self.vis_w_max_hi
+            )
+            live_hi = ArithValue(fx.Int32(kv0 + fx.Int32(63)) >= self.vis_w_min_lo) & (
+                fx.Int32(kv0 + fx.Int32(32)) <= self.vis_w_max_hi
+            )
+            return live_lo, live_hi
         q_lo = fx.Int32(self.q_start_pos_i32 + self.delta_i32)
         q_hi = fx.Int32(q_lo + fx.Int32(traits.ROWS_PER_WAVE - 1))
         live_hi = ArithValue(fx.Int32(kv0 + fx.Int32(32)) <= q_hi)
@@ -1412,11 +1508,25 @@ class DualwaveKernelContext:
             [Vec(s_hi)[r] for r in range_constexpr(16)],
         )
 
+    def _vis_mask_inplace(self, v_s, tile_idx):
+        """Keep a score only if its key lies in the row's [lo, hi]."""
+        s_lo, s_hi = v_s
+        col_base = fx.Int32(tile_idx * self.traits.BLOCK_N) + fx.Int32(self.lane_div_32) * fx.Int32(4)
+        for r in range_constexpr(16):
+            col_lo = col_base + fx.Int32((r // 4) * 8 + (r % 4))
+            col_hi = col_lo + fx.Int32(32)
+            for lst, col in ((s_lo, col_lo), (s_hi, col_hi)):
+                keep = ArithValue(col >= self.vis_lo_row) & (col <= self.vis_hi_row)
+                lst[r] = keep.select(lst[r], self.c_neg_inf)
+
     def _causal_mask_inplace(self, v_s, tile_idx, q_row_i32=None, *, do_causal=True, do_window=True):
         # Python bools: each instantiation emits only the requested edge.
         if q_row_i32 is None:
             q_row_i32 = self.q_row_i32
         traits = self.traits
+        if const_expr(traits.HAS_VIS):
+            self._vis_mask_inplace(v_s, tile_idx)
+            return
         s_lo, s_hi = v_s
         kv_tile_start = tile_idx * traits.BLOCK_N
         kv_start_i32 = fx.Int32(kv_tile_start)
@@ -1458,6 +1568,16 @@ class DualwaveKernelContext:
         @flyc.jit
         def _causal_mask_prologue_if_needed(v_s, tile_idx, kv_end_pos, q_start_pos_i32, q_row_i32):
             s_lo, s_hi = v_s
+            if const_expr(traits.HAS_VIS):
+                # Mask unless every row of the wave sees the whole tile.
+                _need_vis = ArithValue(fx.Int32(kv_start_pos_w) < self.vis_w_max_lo) | (
+                    fx.Int32(fx.Int32(kv_end_pos) - fx.Int32(1)) > self.vis_w_min_hi
+                )
+                if _need_vis:
+                    lo_list, hi_list = self.v_s_vec_to_lists((s_lo, s_hi))
+                    self._vis_mask_inplace((lo_list, hi_list), tile_idx)
+                    s_lo, s_hi = _score_lists_to_vecs((lo_list, hi_list))
+                return s_lo, s_hi
             _need = q_start_pos_i32 + self.delta_i32 < fx.Int32(kv_end_pos)
             if const_expr(traits.WINDOW_LEFT >= 0):
                 # Window and causal edges never share a tile; apply each mask only when needed.
@@ -1668,6 +1788,11 @@ class DualwaveKernelContext:
                 if lane < fx.Index(32):
                     log2_l = fx.Float32(fmath.log2(as_mlir_value(fx.Float32(l_row)), fastmath=fm_fast))
                     lse = _fmul(_fadd(m_row, log2_l, fm_fast), fx.Float32(_ln2), fm_fast)
+                    if const_expr(traits.HAS_VIS and not traits.HAS_SINK):
+                        # A row that sees no key: +inf, so a backward recomputing exp(s - lse) gets 0.
+                        lse = ArithValue(fx.Float32(l_row) > fx.Float32(0.0)).select(
+                            lse, fx.Float32(float("inf"))
+                        )
                     elem_idx = (q_tok_base + q_row) * fx.Index(traits.NUM_HEADS_Q) + q_head_idx
                     _lse_f32_ir = as_mlir_value(fx.Float32(lse))
                     buffer_ops.buffer_store(_lse_f32_ir, lse_rsrc, as_mlir_value(fx.Int32(elem_idx)))

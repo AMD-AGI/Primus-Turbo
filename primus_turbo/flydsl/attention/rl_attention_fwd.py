@@ -65,6 +65,7 @@ def build_rl_flash_attn_module(
     sbhd=False,
     has_sink=False,
     use_score_bound=False,
+    has_vis=False,
 ):
     """Build a DUALWAVE_SWP flash_attn launcher for D=64/128 bf16/f16 on gfx950.
 
@@ -104,6 +105,10 @@ def build_rl_flash_attn_module(
         gqa_merge=gqa_merge,
         sbhd=sbhd,
         has_sink=has_sink,
+        has_vis=has_vis,
+    )
+    assert not has_vis or (varlen and causal and window_left < 0), (
+        "visibility needs varlen, causal, window folded in"
     )
     _dualwave_swp_cache_tag = traits.cache_tag
 
@@ -125,6 +130,9 @@ def build_rl_flash_attn_module(
         BlockTable: fx.Tensor,
         SINK: fx.Tensor,
         ScoreBound: fx.Tensor,
+        VisLo: fx.Tensor,
+        VisHi: fx.Tensor,
+        VisGroup: fx.Tensor,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
@@ -152,6 +160,9 @@ def build_rl_flash_attn_module(
             # The D <= 64 Cauchy-Schwarz bound is computed over the whole packed K, and it floors
             # rows whose prologue tile is masked, so it is batch-dependent: off unless asked for.
             ScoreBound=ScoreBound if use_score_bound else None,
+            VisLo=VisLo,
+            VisHi=VisHi,
+            VisGroup=VisGroup,
         )
         ctx._setup(SharedStorage)
 
@@ -176,7 +187,7 @@ def build_rl_flash_attn_module(
         fold_pv_barriers = fold_mem_barriers and late_dma
         vm_drain_sync = 0 if fold_pv_barriers else ctx.VM_DRAIN_KV
         # Two-tile drain admits odd KV spans (windowed); three-tile drain needs even N.
-        short_drain = traits.CAUSAL and traits.WINDOW_LEFT >= 0
+        short_drain = traits.CAUSAL and (traits.WINDOW_LEFT >= 0 or traits.HAS_VIS)
 
         def _mem_cluster_sync():
             if const_expr(fold_mem_barriers):
@@ -462,7 +473,9 @@ def build_rl_flash_attn_module(
                 if const_expr(not split_rebase):
                     v_o = _pv_step(0, v_p_0, v_v, v_o, 0)
                 # Cross-seqlen can put a diagonal tile in v_s_1; so can SWA's lower window edge.
-                if const_expr(traits.CAUSAL and (traits.CROSS_SEQLEN or traits.WINDOW_LEFT >= 0)):
+                if const_expr(
+                    traits.CAUSAL and (traits.CROSS_SEQLEN or traits.WINDOW_LEFT >= 0 or traits.HAS_VIS)
+                ):
                     v_s_1 = ctx.causal_mask_prologue_if_needed(
                         v_s_1,
                         j_idx - 2,
@@ -515,7 +528,9 @@ def build_rl_flash_attn_module(
                     ctx.load_k_tile(j_idx + 1, 0)
                 v_v = _load_v_head(1)
                 # Dense causal: Cluster 6 is before the diagonal band; mask only on SWA / cross-seqlen.
-                if const_expr(traits.CAUSAL and (traits.CROSS_SEQLEN or traits.WINDOW_LEFT >= 0)):
+                if const_expr(
+                    traits.CAUSAL and (traits.CROSS_SEQLEN or traits.WINDOW_LEFT >= 0 or traits.HAS_VIS)
+                ):
                     v_s_0 = ctx.causal_mask_prologue_if_needed(
                         v_s_0,
                         j_idx - 1,
@@ -878,6 +893,9 @@ def build_rl_flash_attn_module(
         BlockTable: fx.Tensor,
         SINK: fx.Tensor,
         ScoreBound: fx.Tensor,
+        VisLo: fx.Tensor,
+        VisHi: fx.Tensor,
+        VisGroup: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
@@ -914,6 +932,9 @@ def build_rl_flash_attn_module(
             BlockTable,
             SINK,
             ScoreBound,
+            VisLo,
+            VisHi,
+            VisGroup,
             seq_len,
             seq_len_kv,
             stride_q_n,
@@ -964,10 +985,13 @@ def build_rl_flash_attn_module(
         block_table_stride,
         sink,
         score_bound,
+        vis_lo,
+        vis_hi,
+        vis_group,
     ):
         # cu_seqlens_*/block_table/sink are unused kernel-signature placeholders for dense
         # launches / has_sink=False; the kernel only reads them under const_expr(traits.VARLEN
-        # / HAS_SINK). O fills those slots. Returns the ordered 16-tuple the JIT entry expects.
+        # / HAS_SINK / HAS_VIS). O fills those slots. Returns the ordered tuple the JIT entry expects.
         return (
             Q,
             K,
@@ -979,6 +1003,9 @@ def build_rl_flash_attn_module(
             O if block_table is None else block_table,
             O if sink is None else sink,
             O if score_bound is None else score_bound,
+            O if vis_lo is None else vis_lo,
+            O if vis_hi is None else vis_hi,
+            O if vis_group is None else vis_group,
             batch_size,
             seq_len,
             seq_len if seq_len_kv is None else seq_len_kv,
@@ -1007,6 +1034,9 @@ def build_rl_flash_attn_module(
         block_table_stride=None,
         sink=None,
         score_bound=None,
+        vis_lo=None,
+        vis_hi=None,
+        vis_group=None,
         stream=None,
     ):
         args = _fill_defaults(
@@ -1027,11 +1057,13 @@ def build_rl_flash_attn_module(
             block_table_stride,
             sink,
             score_bound,
+            vis_lo,
+            vis_hi,
+            vis_group,
         )
-        # SINK now sits at index 8; the scalar shape/mode args (JIT cache key) start at 9.
-        # has_sink is baked into the module (separate build), so the SINK tensor stays out
-        # of the key.
-        key = args[10:] + (stream is None,)
+        # The scalar shape/mode args (JIT cache key) follow the 13 tensors; has_sink / has_vis
+        # are baked into the module (separate builds), so their tensors stay out of the key.
+        key = args[13:] + (stream is None,)
         fn = _compiled.get(key)
         if fn is None:
             if len(_compiled) >= _COMPILED_MAX:
@@ -1060,6 +1092,9 @@ def build_rl_flash_attn_module(
         block_table_stride=None,
         sink=None,
         score_bound=None,
+        vis_lo=None,
+        vis_hi=None,
+        vis_group=None,
         stream=None,
     ):
         args = _fill_defaults(
@@ -1080,6 +1115,9 @@ def build_rl_flash_attn_module(
             block_table_stride,
             sink,
             score_bound,
+            vis_lo,
+            vis_hi,
+            vis_group,
         )
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
             return flyc.compile(launch_flash_attn_dualwave_swp, *args, fx.Stream(stream))
