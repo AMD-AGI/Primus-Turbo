@@ -30,19 +30,16 @@ pre-scaling Q in bf16, which keeps large logits accurate (max error vs fp32 0.01
 """
 
 import functools
-from collections import OrderedDict
 from typing import Optional, Tuple
 
 import torch
+import triton
 
 from primus_turbo.pytorch.core.utils import is_gfx950
 from primus_turbo.pytorch.kernels.attention.rl_attention_triton_impl import (
     rl_attention_bwd_triton,
 )
-from primus_turbo.triton.attention.rl_attention_vis import (
-    causal_intervals_kernel,
-    vis_group_bounds_kernel,
-)
+from primus_turbo.triton.attention.rl_attention_vis import rl_metadata_kernel
 
 TILE = 64
 PACK_MAX_Q = 16
@@ -99,52 +96,38 @@ def _module(
     )
 
 
-class _StepCache:
-    """Visibility metadata keyed on the identity and version of the tensors it is derived from, so
-    every layer of a step reuses one computation. Entries hold those tensors, so their ids cannot be
-    reused while cached. Bypassed during CUDA-graph capture (the graph must recompute it) and for
-    inference tensors, which carry no version counter."""
-
-    def __init__(self, size=16):
-        self._size = size
-        self._entries = OrderedDict()
-
-    def get(self, tensors, extra, build):
-        if torch.cuda.is_current_stream_capturing():
-            return build()
-        try:
-            key = tuple((id(t), t._version) for t in tensors) + extra
-        except RuntimeError:
-            return build()
-        hit = self._entries.get(key)
-        if hit is not None:
-            self._entries.move_to_end(key)
-            return hit[1]
-        value = build()
-        self._entries[key] = (tensors, value)
-        if len(self._entries) > self._size:
-            self._entries.popitem(last=False)
-        return value
-
-
-_cache = _StepCache()
-
-
-def _causal_intervals(cu_seqlens_q, key_starts, num_tokens, window_left):
-    lo = torch.empty(num_tokens, dtype=torch.int32, device=cu_seqlens_q.device)
-    hi = torch.empty_like(lo)
-    causal_intervals_kernel[(num_tokens,)](
-        cu_seqlens_q, key_starts, lo, hi, cu_seqlens_q.numel() - 1, WINDOW_LEFT=window_left
+def _metadata(
+    cu_seqlens_q, cu_seqlens_k, seq_lens, num_tokens, vis_lo, vis_hi, window_left, tokens_per_group
+):
+    """Key starts, intervals and group bounds in one launch: (cu_seqlens_k, lo, hi, group)."""
+    device = cu_seqlens_q.device
+    num_seqs = cu_seqlens_q.numel() - 1
+    keys_are_lens = cu_seqlens_k is None
+    starts = torch.empty(num_seqs + 1, dtype=torch.int32, device=device) if keys_are_lens else cu_seqlens_k
+    has_mask = vis_lo is not None
+    if not has_mask:
+        vis_lo = torch.empty(num_tokens, dtype=torch.int32, device=device)
+        vis_hi = torch.empty_like(vis_lo)
+    group = torch.empty((num_tokens, 4), dtype=torch.int32, device=device)
+    grid = max(num_tokens, num_seqs + 1 if keys_are_lens else 0)
+    rl_metadata_kernel[(grid,)](
+        cu_seqlens_q,
+        seq_lens if keys_are_lens else cu_seqlens_k,
+        vis_lo,
+        vis_hi,
+        starts,
+        vis_lo,
+        vis_hi,
+        group,
+        num_seqs,
+        num_tokens,
+        KEYS_ARE_LENS=keys_are_lens,
+        HAS_MASK=has_mask,
+        WINDOW_LEFT=window_left,
+        TOKENS=tokens_per_group,
+        SEQ_BLOCK=triton.next_power_of_2(num_seqs + 1),
     )
-    return lo, hi
-
-
-def _group_bounds(cu_seqlens_q, lo, hi, tokens_per_group):
-    out = torch.empty((lo.numel(), 4), dtype=torch.int32, device=lo.device)
-    vis_group_bounds_kernel[(lo.numel(),)](
-        cu_seqlens_q, lo, hi, out, cu_seqlens_q.numel() - 1, TOKENS=tokens_per_group
-    )
-    return out
+    return starts, vis_lo, vis_hi, group
 
 
 def rl_attention_fwd_flydsl(
@@ -184,20 +167,7 @@ def rl_attention_fwd_flydsl(
     if num_tokens == 0:
         return out, lse
     num_seqs = cu_seqlens_q.numel() - 1
-    if paged and cu_seqlens_k is None:
-        cu_seqlens_k = _cache.get(
-            (seq_lens,),
-            ("starts",),
-            lambda: torch.nn.functional.pad(torch.cumsum(seq_lens, 0, dtype=torch.int32), (1, 0)),
-        )
-
     builtin = vis_lo is None and window_left < 0 and not paged and cu_seqlens_q is cu_seqlens_k
-    if not builtin and vis_lo is None:
-        vis_lo, vis_hi = _cache.get(
-            (cu_seqlens_q, cu_seqlens_k),
-            ("intervals", num_tokens, window_left),
-            lambda: _causal_intervals(cu_seqlens_q, cu_seqlens_k, num_tokens, window_left),
-        )
     group = num_q_heads // num_kv_heads
     pack = not builtin and int(max_seqlen_q) <= PACK_MAX_Q and ROWS_PER_WAVE % group == 0
     if block_m not in (0, 64, 128):
@@ -224,15 +194,11 @@ def rl_attention_fwd_flydsl(
     kw = {}
     if not builtin:
         tokens_per_group = ROWS_PER_WAVE // group if pack else ROWS_PER_WAVE
-        kw.update(
-            vis_lo=vis_lo,
-            vis_hi=vis_hi,
-            vis_group=_cache.get(
-                (cu_seqlens_q, vis_lo, vis_hi),
-                ("groups", tokens_per_group),
-                lambda: _group_bounds(cu_seqlens_q, vis_lo, vis_hi, tokens_per_group),
-            ),
-        )
+        cu_seqlens_k, vis_lo, vis_hi, vis_group = _metadata(
+            cu_seqlens_q, cu_seqlens_k, seq_lens if paged else None, num_tokens, vis_lo, vis_hi, window_left,
+            tokens_per_group,
+        )  # fmt: skip
+        kw.update(vis_lo=vis_lo, vis_hi=vis_hi, vis_group=vis_group)
     if paged:
         kw.update(block_table=block_table, block_table_stride=block_table.stride(0))
     if return_lse:
