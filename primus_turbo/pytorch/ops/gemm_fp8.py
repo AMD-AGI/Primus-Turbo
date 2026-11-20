@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import os
 from typing import Optional, Union
 
 import torch
@@ -443,6 +444,38 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         a_dtype = _get_fp8_dtype(config.format, True)
         b_dtype = _get_fp8_dtype(config.format, True)
 
+        # gfx1250 g90 FlyDSL path (PRIMUS_TURBO_FP8_BLOCK_KERNEL=g90): all three passes as NT GEMMs,
+        # 1x128 quant + token-major transposed copy in one pass, E8M0 scale bytes straight from the quant.
+        ctx.g90 = False
+        from primus_turbo.flydsl.gemm import g90_block
+
+        if (
+            g90_block.enabled()
+            and not isinstance(a, QuantizedTensor)
+            and not isinstance(b, QuantizedTensor)
+            and a.dim() == 2
+            and trans_b
+            and a.shape[0] % 512 == 0
+            and a.shape[1] % 512 == 0
+            and b.shape[0] % 512 == 0
+            and a_dtype == torch.float8_e4m3fn
+            and _get_fp8_dtype(config.format, False) == torch.float8_e4m3fn
+            and os.environ.get("PRIMUS_TURBO_FP8_BLOCK_UE8M0", "0") == "1"  # weight scales must be powers of two
+        ):
+            from primus_turbo.triton.quantization.quant_g90 import e8m0_of, quant_dual_t_e8m0
+
+            a_row, _, a_re, a_t, a_te = quant_dual_t_e8m0(a.contiguous(), a_dtype)
+            b_row, b_row_scale = quantize_fp8(
+                b, b_dtype, config.granularity, block_size=config.block_size,
+                scaling_recipe=ScalingRecipe(use_2d_block=True),
+            )
+            b_e = e8m0_of(b_row_scale)
+            out = g90_block.gemm_nt(a_row, b_row, a_re, b_e, out_dtype)
+            ctx.save_for_backward(a_t, a_te, b_row, b_e)
+            ctx.g90 = True
+            ctx.trans_a, ctx.trans_b, ctx.out_dtype, ctx.config = trans_a, trans_b, out_dtype, config
+            return out
+
         if isinstance(a, QuantizedTensor):
             check_quantized_tensor(a, config, axis=-1)
             a_row, a_row_scale = a.qdata, a.scale_inv
@@ -498,6 +531,19 @@ class FP8GemmBlockFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
+        if ctx.g90:
+            from primus_turbo.flydsl.gemm import g90_block
+            from primus_turbo.triton.quantization.quant_g90 import quant_dual_t_e8m0
+
+            a_t, a_te, b_row, b_e = ctx.saved_tensors
+            g_dtype = _get_fp8_dtype(ctx.config.format, False)
+            g_row, _, g_re, g_t, g_te = quant_dual_t_e8m0(grad_out.contiguous(), g_dtype)
+            # dgrad: dX = dY . W  ->  NT with the FP8 copy of W^T (block scales transposed)
+            grad_a = g90_block.gemm_nt(g_row, b_row.t().contiguous(), g_re, b_e.t().contiguous(), ctx.out_dtype)
+            # wgrad: dW[N,K] = dY^T . X  ->  NT on the token-major copies
+            grad_b = g90_block.gemm_nt(g_t, a_t, g_te, a_te, ctx.out_dtype)
+            return grad_a, grad_b, None, None, None, None, None, None
+
         a_col, a_col_scale, b_col, b_col_scale = ctx.saved_tensors
 
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
