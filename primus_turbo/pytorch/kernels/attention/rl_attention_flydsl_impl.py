@@ -200,7 +200,7 @@ def rl_attention_fwd_flydsl(
     elif mode == "split":
         split = True
     else:
-        split = num_seqs * num_kv_heads * num_q_blocks < _num_cus(q.device.index or 0)
+        split = num_seqs * num_kv_heads * num_q_blocks < 2 * _num_cus(q.device.index or 0)
 
     def build(split_mode, segs=1):
         return _module(
