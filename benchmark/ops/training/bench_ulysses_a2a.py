@@ -60,6 +60,10 @@ MODEL_PARAMS_TABLE = {
     # i.e. expert compute without EP dispatch/combine, routing or grouped-GEMM overhead.
     "qwen3-30b-a3b": dict(hidden=2048, hq=32, hkv=4, d=128, ffn=8 * 768, glu=True, causal=True),
     "qwen3-235b-a22b": dict(hidden=4096, hq=64, hkv=4, d=128, ffn=8 * 1536, glu=True, causal=True),
+    "qwen3-4b": dict(hidden=2560, hq=32, hkv=8, d=128, ffn=9728, glu=True, causal=True),
+    "qwen3-8b": dict(hidden=4096, hq=32, hkv=8, d=128, ffn=12288, glu=True, causal=True),
+    "qwen3-14b": dict(hidden=5120, hq=40, hkv=8, d=128, ffn=17408, glu=True, causal=True),
+    "qwen3-32b": dict(hidden=5120, hq=64, hkv=8, d=128, ffn=25600, glu=True, causal=True),
     "mixtral-8x7b": dict(hidden=4096, hq=32, hkv=8, d=128, ffn=2 * 14336, glu=True, causal=True),
     "glm-4.7": dict(hidden=5120, hq=96, hkv=8, d=128, ffn=8 * 1536, glu=True, causal=True),
 }
