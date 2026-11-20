@@ -66,6 +66,7 @@ def build_rl_flash_attn_module(
     has_sink=False,
     use_score_bound=False,
     has_vis=False,
+    page_size=0,
 ):
     """Build a DUALWAVE_SWP flash_attn launcher for D=64/128 bf16/f16 on gfx950.
 
@@ -106,7 +107,9 @@ def build_rl_flash_attn_module(
         sbhd=sbhd,
         has_sink=has_sink,
         has_vis=has_vis,
+        page_size=page_size,
     )
+    assert page_size % 64 == 0 and (page_size == 0 or varlen), "pages must be multiples of the 64-key tile"
     assert not has_vis or (varlen and causal and window_left < 0), (
         "visibility needs varlen, causal, window folded in"
     )

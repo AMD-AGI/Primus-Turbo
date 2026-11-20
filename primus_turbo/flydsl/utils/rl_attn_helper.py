@@ -31,6 +31,12 @@ key indices, converted here by subtracting the sequence's first key). A workgrou
 from its rows' smallest lo to their largest hi with the windowed pipeline; a tile that every row of
 a wave sees entirely skips the mask, others mask per element. Per-32-row-group bounds (min lo,
 max lo, min hi, max hi, sequence-relative after the subtraction) come precomputed in VisGroup.
+
+PAGE_SIZE > 0 (a multiple of the 64-key tile) reads K/V from a paged cache
+[num_blocks, PAGE_SIZE, Hkv, D] through BlockTable [num_seqs, max_blocks]: each tile lies in one
+page, so a tile load is one block-table lookup and a buffer descriptor based at that page row,
+sized to the tile's keys below the sequence length (slots past it read 0, never cache garbage).
+CuSeqKv is then the exclusive cumulative sum of the per-sequence key counts.
 """
 
 import math as host_math
@@ -53,7 +59,7 @@ from primus_turbo.flydsl.utils.prims import LOG2E
 # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
 # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
 # kernel, or a warm cache keeps serving the old one.
-CODEGEN_REV = ("rl", 3)
+CODEGEN_REV = ("rl", 4)
 
 # Sentinel bound of an empty 32-row group (no visible key): above any key position.
 VIS_EMPTY = 1 << 30
@@ -433,6 +439,7 @@ class DualwaveSwpTraits:
             self.SBHD,
             self.HAS_SINK,
             self.HAS_VIS,
+            self.PAGE_SIZE,
         )
 
 
@@ -455,6 +462,7 @@ def _make_dualwave_swp_traits(
     sbhd=False,
     has_sink=False,
     has_vis=False,
+    page_size=0,
 ):
     """Build gfx950 DUALWAVE_SWP compile-time layout traits."""
     rows_per_wave = 32
@@ -539,6 +547,7 @@ def _make_dualwave_swp_traits(
         EMIT_LSE=bool(emit_lse),
         WINDOW_LEFT=int(window_left),
         HAS_VIS=bool(has_vis),
+        PAGE_SIZE=int(page_size),
         VARLEN=varlen,
         CROSS_SEQLEN=cross_seqlen,
         SBHD=bool(sbhd),
@@ -631,6 +640,7 @@ class DualwaveKernelContext:
         self.CuSeqQ = CuSeqQ
         self.CuSeqKv = CuSeqKv
         self.BlockTable = BlockTable
+        self.bt_rsrc = None
         self.seq_len = seq_len
         self.seq_len_kv = seq_len_kv
         self.stride_q_n = stride_q_n
@@ -795,6 +805,8 @@ class DualwaveKernelContext:
         self.k_div, self.v_div = _batch_views(
             self.seqlen_kv_v, self.stride_kv_n_v, traits.NUM_HEADS_KV, self.kv_tok_base, k_tensor, v_tensor
         )
+        if const_expr(traits.PAGE_SIZE > 0):
+            self.bt_rsrc = buffer_ops.create_buffer_resource(self.BlockTable, max_size=True)
         # EMIT_LSE aliases the DebugCounts tensor slot as the fp32 LSE output
         # ([total_q, NUM_HEADS_Q] layout).
         if const_expr(traits.EMIT_LSE):
@@ -1634,9 +1646,36 @@ class DualwaveKernelContext:
 
         return _seq_pad_mask_if_needed(v_s, tile_idx)
 
+    def _paged_tile_div(self, tensor, tile_start):
+        """View of one KV tile of a paged cache: based at its page row, sized to the tile's keys
+        that lie below the sequence length."""
+        traits = self.traits
+        page = traits.PAGE_SIZE
+        entry = fx.Int32(self.batch_idx * fx.Index(self.block_table_stride) + tile_start // fx.Index(page))
+        blk = fx.Int32(
+            buffer_ops.buffer_load(
+                self.bt_rsrc, as_mlir_value(entry), vec_width=1, dtype=fx.Int32, is_scalar=True
+            )
+        )
+        row = fx.Int64(blk) * fx.Int64(page) + fx.Int64(fx.Int32(tile_start % fx.Index(page)))
+        row_bytes = self.stride_kv_n_v * fx.Index(traits.BF16_BYTES)
+        keys = fx.Int32(self.seqlen_kv_v) - fx.Int32(tile_start)
+        keys = fx.Int32(ArithValue(keys < fx.Int32(0)).select(fx.Int32(0), keys))
+        keys = fx.Int32(ArithValue(keys > fx.Int32(traits.BLOCK_N)).select(fx.Int32(traits.BLOCK_N), keys))
+        base_iter = fx.get_iter(tensor)
+        base_i64 = fx.Int64(fx.ptrtoint(base_iter))
+        shifted = fx.inttoptr(base_iter.type, base_i64 + row * fx.Int64(row_bytes))
+        buf_ptr = fx.rocdl.make_buffer_ptr(shifted, num_records_bytes=fx.Int64(fx.Index(keys) * row_bytes))
+        layout = fx.make_layout(fx.Int32(fx.Index(traits.BLOCK_N) * self.stride_kv_n_v), fx.Int32(1))
+        return fx.logical_divide(fx.make_view(buf_ptr, layout), fx.make_layout(1, 1))
+
     def _load_kv(self, tile_start, buf_id, dma_m0, div, num_dma):
         src_base = self.kv_gmem_elem_offset
-        soffset = tile_start * self.stride_kv_n_v
+        if const_expr(self.traits.PAGE_SIZE > 0):
+            div = self._paged_tile_div(div, tile_start)
+            soffset = 0
+        else:
+            soffset = tile_start * self.stride_kv_n_v
         # w_rep: each wave fills DMA_WAVE_REPS LDS lines (1 for 8-wave, 2 for 4-wave).
         for wr in range_constexpr(self.dma_wave_reps):
             eff_wave = self.wave_id + fx.Index(wr * self.traits.NUM_WAVES)
@@ -1654,13 +1693,15 @@ class DualwaveKernelContext:
                 fx.copy(self.dma_atom, src, dst, soffset=fx.Int32(soffset))
 
     def load_k_tile(self, tile_idx, buf_id):
-        self._load_kv(self.tile_start(tile_idx), buf_id, self.k_dma_m0, self.k_div, self.NUM_DMA_K)
+        k = self.K if const_expr(self.traits.PAGE_SIZE > 0) else self.k_div
+        self._load_kv(self.tile_start(tile_idx), buf_id, self.k_dma_m0, k, self.NUM_DMA_K)
 
     def load_k_split(self, offset_tiles, buf_id):
         self.load_k_tile(self.split_tile(offset_tiles), buf_id)
 
     def load_v_tile(self, tile_idx, buf_id):
-        self._load_kv(self.tile_start(tile_idx), buf_id, self.v_dma_m0, self.v_div, self.NUM_DMA_V)
+        v = self.V if const_expr(self.traits.PAGE_SIZE > 0) else self.v_div
+        self._load_kv(self.tile_start(tile_idx), buf_id, self.v_dma_m0, v, self.NUM_DMA_V)
 
     def load_v_split(self, offset_tiles, buf_id):
         self.load_v_tile(self.split_tile(offset_tiles), buf_id)
