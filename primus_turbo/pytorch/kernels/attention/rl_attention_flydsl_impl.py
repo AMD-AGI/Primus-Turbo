@@ -204,9 +204,9 @@ def rl_attention_fwd_flydsl(
         raise ValueError(f"the FlyDSL RL forward supports BLOCK_M 64 or 128, got {block_m}")
     segment = segment_size or DEFAULT_SEGMENT
     segment_tiles = segment // TILE if int(max_seqlen_k) > segment else 0
-    if segment_tiles and head_size == 128 and not pack:
+    if segment_tiles and head_size == 128:
         # The outer segment state is register heavy at D=128: one wave per SIMD and 64-row blocks
-        # are the fastest measured configuration.
+        # are the fastest measured configuration, for packed decode as for prefill / training.
         block_m, wpe = block_m or 64, 1
     else:
         block_m, wpe = block_m or (128 if head_size == 128 else 64), 2
