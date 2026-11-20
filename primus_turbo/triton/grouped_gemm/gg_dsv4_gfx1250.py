@@ -13,15 +13,18 @@ Both tables live on the device -> CUDA-graph capturable; no host sync.
 Kernels
   gg_dsv4_tile       (a) non-persistent: grid = (P/256) * (N/256); dead tiles (t >= n_mt*NT) return through a
                          scalar branch before any TDM is issued.
-  gg_dsv4_persistent (b)+(c) persistent grid G (256): tile t = vpid + i*G (vpid = XCD-contiguous pid remap),
-                         order M-major inside groups of 4 N tiles.  Epilogue: next tile's scale slot 0 + K-tile 0
-                         are issued first, then C is staged (bf16) in the drained data stage 1 (A half -> a_buf[1],
-                         B half -> b_buf[1]) and TDM-stored while that prefetch is in flight.
-                     (c) SPLIT > 1: if the last round is at most G/SPLIT tiles, each tail tile is split along K into
-                         SPLIT pieces; pieces add fp32 partials with L2 atomics into ws[j] and bump cnt[j] once per
-                         warp (acq_rel).  The warp that sees the final ticket makes its CTA the last arriver; it
-                         atomic-exchanges ws[j] with 0 (reads the sum and re-arms the workspace), resets cnt[j]
-                         and writes bf16 C.  Nobody waits on anybody: no spin loop exists.
+  gg_dsv4_persistent (b) persistent grid G (256): tile t = vpid + i*G (vpid = XCD-contiguous pid remap), order
+                         M-major inside groups of 4 N tiles.  Epilogue: the next tile's whole prologue (3 scale
+                         slots + K-tiles 0/1) is issued first, then bf16 C goes out with buffer stores straight from
+                         the WMMA registers (no wait).  C is NOT staged in the drained stage: the partitioned A/B
+                         stage layouts cannot be reinterpreted (MemDescReinterpretOp), 36 KB LDS is left and the WMMA
+                         accumulator cannot be register-sliced.  K steps all inside scf.for (_gg_mainloop_loops): the
+                         warp-pipeline pass only accepts flat stage borders at a function's top level.
+  gg_dsv4_tail       (c) launched after (b) PHASE=0 when the last round has at most G/SPLIT tiles: each tail tile
+                         is split along K into SPLIT pieces (one per CTA, flat static schedule); pieces add fp32
+                         partials with buffer atomics into ws[j] and take one acq_rel ticket per warp on cnt[j]; the
+                         CTA whose warp sees the final ticket exchanges ws[j] with 0 (reads the sum, re-arms the
+                         workspace), resets cnt[j] and stores bf16 C.  No spin loop anywhere.
 """
 import os
 
