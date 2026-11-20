@@ -171,15 +171,17 @@ the 4k decodes of short contexts runs the segmented FLYDSL build):
 
 | Case | aiter / turbo | TRITON | FLYDSL |
 |---|---|---|---|
-| Training fwd, Llama-3-8B 8 x 4096 | 1.01 ms | 1.65 ms | 1.42 ms |
-| Training fwd + bwd, same | 6.01 ms | 10.20 ms | 9.96 ms |
-| Training fwd, Qwen3-32B 2 x 16384 | 6.88 ms | 12.13 ms | 10.16 ms |
-| Prefill 2048 on 16k, Llama-3-8B | 555 us | 791 us | 867 us |
-| Decode 1 x 4k, Llama-3-8B | 68 us | 74 us | 57 us |
-| Decode 64 x 4k, Llama-3-8B | 173 us | 175 us | 240 us |
-| Decode 1 x 32k, Llama-3-8B | 66 us | 75 us | 77 us |
-| Decode 8 x 32k, Llama-3-8B | 178 us | 195 us | 297 us |
-| Decode 8 x 4k, GPT-OSS-120B (window 128, sinks) | | 46 us | 47 us |
+| Training fwd, Llama-3-8B 8 x 4096 | 1.03 ms | 1.67 ms | 1.48 ms |
+| Training fwd + bwd, same | 6.06 ms | 10.19 ms | 9.98 ms |
+| Training fwd, Qwen3-32B 2 x 16384 | 6.97 ms | 12.28 ms | 10.64 ms |
+| Prefill 2048 on 16k, Llama-3-8B | 550 us | 793 us | 815 us |
+| Decode 1 x 4k, Llama-3-8B | 69 us | 73 us | 60 us |
+| Decode 64 x 4k, Llama-3-8B | 180 us | 175 us | 228 us |
+| Decode 1 x 32k, Llama-3-8B | 69 us | 74 us | 65 us |
+| Decode 8 x 32k, Llama-3-8B | 186 us | 195 us | 252 us |
+| Decode 1 x 512k, Llama-3-8B | 335 us | 468 us | 543 us |
+| Decode 32 x 512k, Llama-3-8B | 10735 us | 10568 us | 11684 us |
+| Decode 8 x 4k, GPT-OSS-120B (window 128, sinks) | | 43 us | 51 us |
 
 ### Known issue: cost of segments on FLYDSL
 
