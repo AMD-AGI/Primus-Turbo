@@ -159,7 +159,7 @@ def rl_attention_fwd_flydsl(
     """Same contract as rl_attention_fwd_triton. Schedule options (none changes the bits):
     ``block_m`` (64 / 128), ``waves_per_eu`` (1 / 2), ``mode`` ("fused" never splits the keys across
     programs, "split" splits packed decode whenever there are several segments), ``split_segs``
-    (segments per split program, default 1) and ``pack`` ("on" / "off" forces (token, head) rows); 0 / "auto"
+    (segments per split program; 0 picks up to 8 while at least 4 programs per CU remain) and ``pack`` ("on" / "off" forces (token, head) rows); 0 / "auto"
     keeps the measured defaults. ``num_warps`` and ``num_stages`` belong to the Triton kernel."""
     paged = block_table is not None
     num_tokens, num_q_heads, head_size = q.shape
@@ -229,7 +229,14 @@ def rl_attention_fwd_flydsl(
     )
     if split:
         num_segments = (int(max_seqlen_k) + segment - 1) // segment
-        split_segs = min(split_segs or 1, num_segments)
+        if not split_segs:
+            # Walking several segments per program pays only with many programs: keep at least
+            # 4 per CU, up to 8 segments each.
+            programs = num_seqs * num_kv_heads * num_q_blocks * num_segments
+            split_segs = 1
+            while split_segs < 8 and programs // (2 * split_segs) >= 4 * _num_cus(q.device.index or 0):
+                split_segs *= 2
+        split_segs = min(split_segs, num_segments)
         slots = -(-num_segments // split_segs) * split_segs + 1  # + the trash slot of multi-segment programs
         per_thread = 2 + 16 * (head_size // 32)
         # One row per program (2 * block_m threads); 2D so no dimension passes the launcher's int32.
