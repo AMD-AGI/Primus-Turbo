@@ -161,6 +161,8 @@ def rl_attention_fwd_triton(
     if mode not in ("auto", "fused", "split"):
         raise ValueError(f"MODE must be auto, fused or split, got {mode!r}")
     num_segments = triton.cdiv(max(int(max_seqlen_k), 1), segment_size)
+    if mode == "auto" and 0 <= window_left and window_left + int(max_seqlen_q) <= segment_size:
+        mode = "fused"  # the window reads at most two segments; split programs would find no keys
     probe = _launch(queries_per_kv, "fused", int(max_seqlen_q), block_m=block_m)
     probe_blocks = num_tokens // (probe.block_m // queries_per_kv) + num_seqs
     mode = _choose_mode(mode, probe_blocks, num_kv_heads, num_segments, int(max_seqlen_q), q.device)

@@ -194,7 +194,8 @@ def rl_attention_fwd_flydsl(
     else:
         block_m, wpe = block_m or (128 if head_size == 128 else 64), waves_per_eu or 2
     num_q_blocks = (int(max_seqlen_q) * (group if pack else 1) + block_m - 1) // block_m
-    if mode == "fused" or not pack or not segment_tiles:
+    window_fits = 0 <= window_left and window_left + int(max_seqlen_q) <= segment
+    if mode == "fused" or not pack or not segment_tiles or (mode == "auto" and window_fits):
         split = False
     elif mode == "split":
         split = True
