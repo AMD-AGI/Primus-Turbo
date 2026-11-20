@@ -54,9 +54,13 @@ STATE_EPOCH = 0
 STATE_EXIT = 1
 STATE_CLAIM = 2
 STATE_TILE = 3
-# A2AGemm: own-row copy pieces claimed
+# A2AGemm / AgGemm: own-row copy pieces claimed; AgGemm: done
 STATE_ASSIST = 4
-NUM_STATE = 5
+STATE_ASSIST_DONE = 5
+# AgGemm: tile claim counter of each XCD (MI355X: 8 XCDs, block i runs on XCD i % 8)
+NUM_XCDS = 8
+STATE_XCD_TILE = 6
+NUM_STATE = STATE_XCD_TILE + NUM_XCDS
 
 
 def i64_base(tensor):
@@ -74,6 +78,15 @@ def opaque_tid(thread_index):
             "v_mov_b32 $0, $1",
             "=v,v",
             has_side_effects=True,
+        )
+    )
+
+
+def opaque_base(tensor):
+    """``i64_base(tensor)`` through an opaque move, for the same reason as ``opaque_tid``."""
+    return fx.arith.ArithValue(
+        _llvm.inline_asm(
+            fx.T.i64, [fx.as_ir_value(i64_base(tensor))], "s_mov_b64 $0, $1", "=s,s", has_side_effects=True
         )
     )
 
