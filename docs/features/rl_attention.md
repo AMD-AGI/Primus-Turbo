@@ -162,6 +162,11 @@ rescale fires, and with a sliding window even on random inputs). The fork change
   runs one program per segment and merges the partial states in a second launch with the same
   arithmetic and the same normalize / store code, so the bits equal the training forward's. Rows
   whose keys fit in one segment are unchanged (merging into an empty state is exact).
+- **Packed decode loads.** Paged K / V of packed decode builds are loaded non-temporally (`sc0 nt`,
+  as Triton's `.cg`; decode reads each key once) and programs launch sequence-major, so the
+  workgroups in flight read different sequences instead of the KV heads of the same rows. Measured
+  with loads-only / compute-only probe builds, decode is bound by the K / V loads, and these two cut
+  it 10-28% (64 x 4k 226 -> 172 us).
 - Visibility metadata (key starts, intervals, per-32-row bounds) is computed per call in one Triton
   launch (`rl_metadata_kernel`); there is no cache keyed on activation tensors.
 
