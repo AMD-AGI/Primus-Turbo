@@ -37,6 +37,12 @@ PAGE_SIZE > 0 (a multiple of the 64-key tile) reads K/V from a paged cache
 page, so a tile load is one block-table lookup and a buffer descriptor based at that page row,
 sized to the tile's keys below the sequence length (slots past it read 0, never cache garbage).
 CuSeqKv is then the exclusive cumulative sum of the per-sequence key counts.
+
+GQA_PACK (decode mode, with HAS_VIS): the rows of a workgroup are (token, head) pairs of one KV
+head's query group, row r = token r // G, head kv_head * G + r % G, so each K/V tile is read once
+per KV head instead of once per query head. A row's arithmetic does not depend on which rows share
+its tile, so packed and unpacked launches give the same bits. Causal and windowed attention reach
+this mode as intervals, so every mask and tile-range decision comes from the row bounds.
 """
 
 import math as host_math
@@ -59,7 +65,7 @@ from primus_turbo.flydsl.utils.prims import LOG2E
 # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
 # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
 # kernel, or a warm cache keeps serving the old one.
-CODEGEN_REV = ("rl", 4)
+CODEGEN_REV = ("rl", 7)
 
 # Sentinel bound of an empty 32-row group (no visible key): above any key position.
 VIS_EMPTY = 1 << 30
@@ -440,6 +446,7 @@ class DualwaveSwpTraits:
             self.HAS_SINK,
             self.HAS_VIS,
             self.PAGE_SIZE,
+            self.GQA_PACK,
         )
 
 
@@ -463,6 +470,7 @@ def _make_dualwave_swp_traits(
     has_sink=False,
     has_vis=False,
     page_size=0,
+    gqa_pack=False,
 ):
     """Build gfx950 DUALWAVE_SWP compile-time layout traits."""
     rows_per_wave = 32
@@ -548,6 +556,7 @@ def _make_dualwave_swp_traits(
         WINDOW_LEFT=int(window_left),
         HAS_VIS=bool(has_vis),
         PAGE_SIZE=int(page_size),
+        GQA_PACK=bool(gqa_pack),
         VARLEN=varlen,
         CROSS_SEQLEN=cross_seqlen,
         SBHD=bool(sbhd),
@@ -704,7 +713,12 @@ class DualwaveKernelContext:
             # Dispatch order is the list-schedule order and causal work grows with q_block
             # (a window flattens but never inverts that), so walk q_block descending
             # (longest-processing-time-first). From seq_len, not grid_dim.y, to stay uniform.
-            _nq = (self.seq_len_v + fx.Index(traits.BLOCK_M - 1)) // fx.Index(traits.BLOCK_M)
+            _rows = (
+                self.seq_len_v * fx.Index(traits.GQA_GROUP_SIZE)
+                if const_expr(traits.GQA_PACK)
+                else self.seq_len_v
+            )
+            _nq = (_rows + fx.Index(traits.BLOCK_M - 1)) // fx.Index(traits.BLOCK_M)
             self.q_block_idx = _nq - fx.Index(1) - fx.Index(gpu.block_idx.y)
         else:
             self.q_block_idx = fx.Index(gpu.block_idx.y)
@@ -736,7 +750,10 @@ class DualwaveKernelContext:
 
         self.h_kv_idx = self.h_idx % traits.NUM_HEADS_KV
         self.group_id = self.h_idx // traits.NUM_HEADS_KV
-        if const_expr(traits.Q_HEADS_PER_WG > 1):
+        if const_expr(traits.GQA_PACK):
+            # The grid runs over KV heads; each lane's query head is set with its row in load_all.
+            self.q_head_idx = self.h_kv_idx * traits.GQA_GROUP_SIZE
+        elif const_expr(traits.Q_HEADS_PER_WG > 1):
             self.q_head_idx = (
                 self.h_kv_idx * traits.GQA_GROUP_SIZE
                 + self.group_id * traits.Q_HEADS_PER_WG
@@ -776,7 +793,10 @@ class DualwaveKernelContext:
         o_tensor = self.O
 
         self.delta_i32 = fx.Int32(self.seqlen_kv_i32 - fx.Int32(self.seqlen_q_v))
-        self.q_gmem_elem_offset = self.q_start * self.stride_q_n_v + self.q_head_idx * traits.HEAD_DIM
+        if const_expr(traits.GQA_PACK):
+            self.q_gmem_elem_offset = fx.Index(0)
+        else:
+            self.q_gmem_elem_offset = self.q_start * self.stride_q_n_v + self.q_head_idx * traits.HEAD_DIM
         self.kv_gmem_elem_offset = self.kv_head_idx * traits.HEAD_DIM
 
         self.elem_ir = self.elem_dtype.ir_type
@@ -894,7 +914,10 @@ class DualwaveKernelContext:
             self.split_t0 = 0
             self.split_t_end = self.max_num_tiles
 
-        if const_expr(traits.VARLEN):
+        if const_expr(traits.VARLEN and traits.HAS_VIS):
+            # Rows that see nothing still write zeros, so a block is active while it has rows.
+            self.active = ArithValue(self.q_start // fx.Index(self._rows_per_token()) < self.seqlen_q_v)
+        elif const_expr(traits.VARLEN):
             if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN):
                 self.active = ArithValue(self.q_start < self.seqlen_q_v) & (
                     self.causal_end_raw_i32 > fx.Int32(0)
@@ -925,14 +948,20 @@ class DualwaveKernelContext:
             lambda b, w, d: self._dma_base(b, w, d, _v_buf_base, traits.SMEM_V_LINE_STRIDE), self.NUM_DMA_V
         )
 
+    def _rows_per_token(self):
+        return self.traits.GQA_GROUP_SIZE if const_expr(self.traits.GQA_PACK) else 1
+
     def _load_vis_group(self, rsrc, row0):
-        """(min lo, max lo, min hi, max hi) of the 32-row group starting at block row ``row0``,
-        sequence-relative; an out-of-range group gives bounds no key satisfies."""
-        tok = fx.Int32(self.q_tok_base + row0)
+        """(min lo, max lo, min hi, max hi) of the 32-row group starting at row ``row0``,
+        sequence-relative; an out-of-range group gives bounds no key satisfies. The entry sits at
+        the group's first token."""
+        tok0 = row0 // fx.Index(self._rows_per_token())
+        # Index a real entry even for an out-of-range group: the descriptor is not bounded.
+        tok = fx.Int32(ArithValue(tok0 < self.seqlen_q_v).select(self.q_tok_base + tok0, self.q_tok_base))
         vals = Vec(
             buffer_ops.buffer_load(rsrc, as_mlir_value(tok * fx.Int32(4)), vec_width=4, dtype=fx.Int32)
         )
-        valid = ArithValue(row0 < self.seqlen_q_v)
+        valid = ArithValue(tok0 < self.seqlen_q_v)
         base = fx.Int32(self.kv_tok_base)
         big = fx.Int32(VIS_EMPTY)
         neg = fx.Int32(-1)
@@ -981,7 +1010,9 @@ class DualwaveKernelContext:
         """This lane's row interval [lo, hi], sequence-relative; rows past the end see nothing."""
         lo_rsrc = buffer_ops.create_buffer_resource(self.VisLo, max_size=True)
         hi_rsrc = buffer_ops.create_buffer_resource(self.VisHi, max_size=True)
-        tok = fx.Int32(self.q_tok_base + self.q_row)
+        tok = fx.Int32(
+            ArithValue(self.q_row < self.seqlen_q_v).select(self.q_tok_base + self.q_row, self.q_tok_base)
+        )
         lo = fx.Int32(buffer_ops.buffer_load(lo_rsrc, as_mlir_value(tok), vec_width=1, dtype=fx.Int32))
         hi = fx.Int32(buffer_ops.buffer_load(hi_rsrc, as_mlir_value(tok), vec_width=1, dtype=fx.Int32))
         valid = ArithValue(self.q_row < self.seqlen_q_v)
@@ -1018,16 +1049,25 @@ class DualwaveKernelContext:
         traits = self.traits
         self.q_row_in_block = self.wave_q_offset + self.lane_mod_32
         self.q_start_pos_i32 = fx.Int32(self.q_start + self.wave_row_group_uni * traits.ROWS_PER_WAVE)
-        self.q_row = self.q_start + self.q_row_in_block
+        if const_expr(traits.GQA_PACK):
+            g = fx.Index(traits.GQA_GROUP_SIZE)
+            self.q_row = (self.q_start + self.q_row_in_block) // g
+            self.q_head_lane = self.h_kv_idx * g + self.q_row_in_block % g
+        else:
+            self.q_row = self.q_start + self.q_row_in_block
+            self.q_head_lane = self.q_head_idx
         self.q_row_i32 = fx.Int32(self.q_row)
         if const_expr(traits.HAS_VIS):
             self._load_vis_rows()
 
         q_raw_packs = []
         for ks in range_constexpr(traits.K_STEPS_QK):
+            if const_expr(traits.GQA_PACK):
+                q_row_off = self.q_row * self.stride_q_n_v + self.q_head_lane * traits.HEAD_DIM
+            else:
+                q_row_off = self.q_row_in_block * self.stride_q_n_v
             elem_index = self.q_gmem_elem_offset + (
-                self.q_row_in_block * self.stride_q_n_v
-                + (ks * self.traits.K_STEP_QK + self.lane_div_32 * self.traits.MFMA_LANE_K)
+                q_row_off + (ks * self.traits.K_STEP_QK + self.lane_div_32 * self.traits.MFMA_LANE_K)
             )
             q_i32_pack = fly.copy_atom_call_ssa(
                 [self.q_load_i32x4_type],
@@ -1346,7 +1386,7 @@ class DualwaveKernelContext:
             max_size=False,
             num_records_bytes=as_mlir_value(fx.Index(traits.NUM_HEADS_Q) * fx.Index(4)),
         )
-        return fx.Float32(buffer_ops.buffer_load(_sink_rsrc, self.q_head_idx, vec_width=1, dtype=fx.Float32))
+        return fx.Float32(buffer_ops.buffer_load(_sink_rsrc, self.q_head_lane, vec_width=1, dtype=fx.Float32))
 
     def finalize_o_scale(self, m_row, l_row):
         """Return (o_scale, m_out, l_out): the normalizing scale applied to the unnormalized O
@@ -1651,7 +1691,10 @@ class DualwaveKernelContext:
         that lie below the sequence length."""
         traits = self.traits
         page = traits.PAGE_SIZE
-        entry = fx.Int32(self.batch_idx * fx.Index(self.block_table_stride) + tile_start // fx.Index(page))
+        keys = fx.Int32(self.seqlen_kv_v) - fx.Int32(tile_start)
+        # A tile past the sequence reads no key; point it at the row's first entry, which exists.
+        page_idx = fx.Index(ArithValue(keys > fx.Int32(0)).select(tile_start // fx.Index(page), fx.Index(0)))
+        entry = fx.Int32(self.batch_idx * fx.Index(self.block_table_stride) + page_idx)
         blk = fx.Int32(
             buffer_ops.buffer_load(
                 self.bt_rsrc, as_mlir_value(entry), vec_width=1, dtype=fx.Int32, is_scalar=True
@@ -1659,7 +1702,6 @@ class DualwaveKernelContext:
         )
         row = fx.Int64(blk) * fx.Int64(page) + fx.Int64(fx.Int32(tile_start % fx.Index(page)))
         row_bytes = self.stride_kv_n_v * fx.Index(traits.BF16_BYTES)
-        keys = fx.Int32(self.seqlen_kv_v) - fx.Int32(tile_start)
         keys = fx.Int32(ArithValue(keys < fx.Int32(0)).select(fx.Int32(0), keys))
         keys = fx.Int32(ArithValue(keys > fx.Int32(traits.BLOCK_N)).select(fx.Int32(traits.BLOCK_N), keys))
         base_iter = fx.get_iter(tensor)
@@ -1770,7 +1812,8 @@ class DualwaveKernelContext:
         return packs
 
     def _final_o_base(self, q_row):
-        return q_row * self.stride_q_n_v + self.q_head_idx * self.traits.HEAD_DIM + self.lane_div_32 * 8
+        head = self.q_head_lane if const_expr(self.traits.GQA_PACK) else self.q_head_idx
+        return q_row * self.stride_q_n_v + head * self.traits.HEAD_DIM + self.lane_div_32 * 8
 
     def _final_o_global(self, o_base, dc, g):
         return o_base + (dc * self.traits.D_CHUNK + 2 * g * 8)
@@ -1817,7 +1860,7 @@ class DualwaveKernelContext:
         traits = self.traits
         lse_rsrc = self.lse_rsrc
         q_tok_base = self.q_tok_base
-        q_head_idx = self.q_head_idx
+        q_head_idx = self.q_head_lane if const_expr(traits.GQA_PACK) else self.q_head_idx
         seqlen_q_v = self.seqlen_q_v
         lane = self.lane
         fm_fast = self.fm_fast

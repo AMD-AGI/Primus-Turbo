@@ -67,6 +67,7 @@ def build_rl_flash_attn_module(
     use_score_bound=False,
     has_vis=False,
     page_size=0,
+    gqa_pack=False,
 ):
     """Build a DUALWAVE_SWP flash_attn launcher for D=64/128 bf16/f16 on gfx950.
 
@@ -88,6 +89,8 @@ def build_rl_flash_attn_module(
         num_kv_heads = num_heads
     assert num_heads % num_kv_heads == 0
 
+    if gqa_pack:
+        gqa_merge = False  # the packed rows already share each K/V tile across the query group
     traits = _make_dualwave_swp_traits(
         num_heads,
         num_kv_heads,
@@ -108,6 +111,10 @@ def build_rl_flash_attn_module(
         has_sink=has_sink,
         has_vis=has_vis,
         page_size=page_size,
+        gqa_pack=gqa_pack,
+    )
+    assert not gqa_pack or (has_vis and traits.Q_HEADS_PER_WG == 1 and 32 % traits.GQA_GROUP_SIZE == 0), (
+        "GQA packing needs visibility intervals, no gqa_merge, and a group size dividing 32"
     )
     assert page_size % 64 == 0 and (page_size == 0 or varlen), "pages must be multiples of the 64-key tile"
     assert not has_vis or (varlen and causal and window_left < 0), (
@@ -870,7 +877,7 @@ def build_rl_flash_attn_module(
                 ctx.store_lse(m_lse, l_lse, ctx.q_row)
             ctx.store_final_o(v_o, ctx.q_row)
 
-        if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN):
+        if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN and not traits.HAS_VIS):
             ctx.zero_o_block_if_needed()
 
         if active is None:
@@ -912,7 +919,8 @@ def build_rl_flash_attn_module(
         _ = _dualwave_swp_cache_tag
         bs_idx = fx.Index(batch_size)
         sl_idx = fx.Index(seq_len)
-        num_q_blocks = (sl_idx + traits.BLOCK_M - 1) // traits.BLOCK_M
+        rows = sl_idx * fx.Index(traits.GQA_GROUP_SIZE) if const_expr(traits.GQA_PACK) else sl_idx
+        num_q_blocks = (rows + traits.BLOCK_M - 1) // traits.BLOCK_M
         grid_z = bs_idx
 
         passthrough_entries = (
@@ -950,7 +958,13 @@ def build_rl_flash_attn_module(
                 "llvm.passthrough": passthrough_entries,
             },
         ).launch(
-            grid=(traits.NUM_HEADS_Q // traits.Q_HEADS_PER_WG, num_q_blocks, grid_z),
+            grid=(
+                traits.NUM_HEADS_KV
+                if const_expr(traits.GQA_PACK)
+                else traits.NUM_HEADS_Q // traits.Q_HEADS_PER_WG,
+                num_q_blocks,
+                grid_z,
+            ),
             block=(traits.BLOCK_SIZE, 1, 1),
             stream=stream,
         )
