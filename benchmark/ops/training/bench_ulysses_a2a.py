@@ -61,6 +61,7 @@ MODEL_PARAMS_TABLE = {
     "qwen3-30b-a3b": dict(hidden=2048, hq=32, hkv=4, d=128, ffn=8 * 768, glu=True, causal=True),
     "qwen3-235b-a22b": dict(hidden=4096, hq=64, hkv=4, d=128, ffn=8 * 1536, glu=True, causal=True),
     "mixtral-8x7b": dict(hidden=4096, hq=32, hkv=8, d=128, ffn=2 * 14336, glu=True, causal=True),
+    "glm-4.7": dict(hidden=5120, hq=96, hkv=8, d=128, ffn=8 * 1536, glu=True, causal=True),
 }
 
 STAGES = (
@@ -205,9 +206,10 @@ class _PostA2A(torch.autograd.Function):
 
 
 class UlyssesLayer:
-    def __init__(self, cfg, seq, mbs, group, use_mlp, fused=False, dtype=torch.bfloat16):
+    def __init__(self, cfg, seq, mbs, group, use_mlp, fused=False, dtype=torch.bfloat16, window=-1):
         n = group.size()
         self.cfg, self.mbs, self.group, self.use_mlp, self.fused = cfg, mbs, group, use_mlp, fused
+        self.window_size = (window, 0) if window >= 0 else (-1, -1)
         self.s_local = seq // n
         hidden, hq, hkv, d = cfg["hidden"], cfg["hq"], cfg["hkv"], cfg["d"]
 
@@ -240,7 +242,7 @@ class UlyssesLayer:
             q, k, v = mark("qkv_gemm", None, q, k, v)
             q, k, v = _PreA2A.apply(q, k, v, self.helper, self.group)
             q, k, v = mark(None, "attn", q, k, v)
-        o = flash_attn_func(q, k, v, causal=cfg["causal"])
+        o = flash_attn_func(q, k, v, causal=cfg["causal"], window_size=self.window_size)
         if self.fused:
             o = mark("attn", "o_gemm", o)
             y = ulysses_a2a_o_gemm(o, self.w_o, x, self.group, "bshd")
@@ -292,13 +294,13 @@ def _all_reduce(values, op):
     return t.tolist()
 
 
-def run_config(model, seq, mbs, group, use_mlp, warmup, iters, fused=False):
+def run_config(model, seq, mbs, group, use_mlp, warmup, iters, fused=False, window=-1):
     cfg = MODEL_PARAMS_TABLE[model]
     n = group.size()
     for what, size in (("seq", seq), ("q heads", cfg["hq"]), ("kv heads", cfg["hkv"])):
         assert size % n == 0, f"{what}={size} must be divisible by the Ulysses degree {n}"
 
-    layer = UlyssesLayer(cfg, seq, mbs, group, use_mlp, fused)
+    layer = UlyssesLayer(cfg, seq, mbs, group, use_mlp, fused, window=window)
     x0 = torch.randn(mbs, seq // n, cfg["hidden"], device="cuda", dtype=torch.bfloat16)
     dy = torch.randn_like(x0)
 
@@ -501,6 +503,9 @@ def main():
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--report-csv-path", type=str, default=None)
     parser.add_argument("--fused", action="store_true", help="also time the fused GemmA2A / A2AGemm layer")
+    parser.add_argument(
+        "--window", type=int, default=-1, help="sliding window: attention window_size=(WINDOW, 0); -1 = full causal"
+    )
     args = parser.parse_args()
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -509,17 +514,20 @@ def main():
     group = dist.group.WORLD
     rank, n = dist.get_rank(), dist.get_world_size()
     torch.manual_seed(42 + rank)
+    if rank == 0 and args.window >= 0:
+        print(f"attention window_size=({args.window}, 0)")
 
     results = []
     for model in args.model:
         for seq in args.seq:
             stages, stages_max, totals, iso, crit = run_config(
-                model, seq, args.mbs, group, not args.no_mlp, args.warmup, args.iters
+                model, seq, args.mbs, group, not args.no_mlp, args.warmup, args.iters, window=args.window
             )
             if args.fused:
                 fused_stages, fused_max, fused_totals, _, fused_crit = run_config(
-                    model, seq, args.mbs, group, not args.no_mlp, args.warmup, args.iters, fused=True
-                )
+                    model, seq, args.mbs, group, not args.no_mlp, args.warmup, args.iters, fused=True,
+                    window=args.window,
+                )  # fmt: skip
             if rank == 0:
                 row = report(model, seq, args.mbs, n, not args.no_mlp, stages, stages_max, totals, iso)
                 if args.fused:
