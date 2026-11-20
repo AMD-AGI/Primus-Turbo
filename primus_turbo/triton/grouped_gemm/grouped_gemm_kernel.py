@@ -812,85 +812,90 @@ def _process_variable_k_tile(
     # -- Group boundaries --
     m_start = tl.load(group_offs_ptr + group_idx)
     M_g = (tl.load(group_offs_ptr + group_idx + 1) - m_start).to(tl.int32)
-
-    # -- Output indices --
-    rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % OUT_M
-    rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % OUT_N
-    rk = tl.arange(0, BLOCK_SIZE_K)
-    rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
-
-    # -- Base pointers (LHS^T[rm, rk] = LHS[m_start + rk, rm]) --
-    LHS_BASE = LHS + m_start * stride_lhs_m + rm[:, None] * stride_lhs_n + rk[None, :] * stride_lhs_m
-    RHS_BASE = RHS + m_start * stride_rhs_m + rk[:, None] * stride_rhs_m + rn[None, :] * stride_rhs_n
-
-    # -- K-loop over M_g (variable per group, always masked) --
-    loop_k = tl.cdiv(M_g, BLOCK_SIZE_K)
-    acc_dtype = tl.float32
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
-
-    for k in range(loop_k):
-        k_start = k * BLOCK_SIZE_K
-        mask_k = (k_start + tl.arange(0, BLOCK_SIZE_K)) < M_g
-
-        if stride_lhs_n == 1:
-            a = tl.load(
-                tl.multiple_of(LHS_BASE, (16, 1)),
-                mask=mask_k[None, :],
-                other=0.0,
-                cache_modifier=CACHE_MODIFIER_A,
-            )
-        else:
-            a = tl.load(
-                tl.multiple_of(LHS_BASE, (1, 16)),
-                mask=mask_k[None, :],
-                other=0.0,
-                cache_modifier=CACHE_MODIFIER_A,
-            )
-        if stride_rhs_n == 1:
-            b = tl.load(
-                tl.multiple_of(RHS_BASE, (1, 16)),
-                mask=mask_k[:, None],
-                other=0.0,
-                cache_modifier=CACHE_MODIFIER_B,
-            )
-        else:
-            b = tl.load(
-                tl.multiple_of(RHS_BASE, (16, 1)),
-                mask=mask_k[:, None],
-                other=0.0,
-                cache_modifier=CACHE_MODIFIER_B,
-            )
-
-        if IS_FP8:
-            acc += tl.dot(a, b, input_precision="ieee")
-        else:
-            acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
-
-        LHS_BASE += BLOCK_SIZE_K * stride_lhs_m
-        RHS_BASE += BLOCK_SIZE_K * stride_rhs_m
-
-    # -- Apply scaling and store --
-    if IS_FP8:
-        acc *= scale
-    rm_s = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    rn_s = tl.max_contiguous(tl.multiple_of(rn_s % OUT_N, BLOCK_SIZE_N), BLOCK_SIZE_N)
-    c_mask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
-    C_ = (
-        C
-        + (group_idx - C_FIRST_GROUP).to(tl.int64) * stride_cg
-        + rm_s[:, None] * stride_cm
-        + rn_s[None, :] * stride_cn
-    )
     if BETA_IS_ONE:
-        # Read the previous value of this tile and fold it into the FP32
-        # accumulator before the cast. Costs one extra HBM read per output tile,
-        # which is nearly free in the bandwidth-bound regime since the tile is
-        # written anyway, and it removes the standalone accumulation kernel the
-        # caller would otherwise have to launch over the whole output.
-        acc += tl.load(C_, mask=c_mask, other=0.0).to(acc_dtype)
-    c = acc.to(C.type.element_ty)
-    tl.store(C_, c, c_mask)
+        # A group without rows adds nothing to its output: neither read nor write it.
+        has_rows = M_g > 0
+    else:
+        has_rows = True
+    if has_rows:
+        # -- Output indices --
+        rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % OUT_M
+        rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % OUT_N
+        rk = tl.arange(0, BLOCK_SIZE_K)
+        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+
+        # -- Base pointers (LHS^T[rm, rk] = LHS[m_start + rk, rm]) --
+        LHS_BASE = LHS + m_start * stride_lhs_m + rm[:, None] * stride_lhs_n + rk[None, :] * stride_lhs_m
+        RHS_BASE = RHS + m_start * stride_rhs_m + rk[:, None] * stride_rhs_m + rn[None, :] * stride_rhs_n
+
+        # -- K-loop over M_g (variable per group, always masked) --
+        loop_k = tl.cdiv(M_g, BLOCK_SIZE_K)
+        acc_dtype = tl.float32
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+
+        for k in range(loop_k):
+            k_start = k * BLOCK_SIZE_K
+            mask_k = (k_start + tl.arange(0, BLOCK_SIZE_K)) < M_g
+
+            if stride_lhs_n == 1:
+                a = tl.load(
+                    tl.multiple_of(LHS_BASE, (16, 1)),
+                    mask=mask_k[None, :],
+                    other=0.0,
+                    cache_modifier=CACHE_MODIFIER_A,
+                )
+            else:
+                a = tl.load(
+                    tl.multiple_of(LHS_BASE, (1, 16)),
+                    mask=mask_k[None, :],
+                    other=0.0,
+                    cache_modifier=CACHE_MODIFIER_A,
+                )
+            if stride_rhs_n == 1:
+                b = tl.load(
+                    tl.multiple_of(RHS_BASE, (1, 16)),
+                    mask=mask_k[:, None],
+                    other=0.0,
+                    cache_modifier=CACHE_MODIFIER_B,
+                )
+            else:
+                b = tl.load(
+                    tl.multiple_of(RHS_BASE, (16, 1)),
+                    mask=mask_k[:, None],
+                    other=0.0,
+                    cache_modifier=CACHE_MODIFIER_B,
+                )
+
+            if IS_FP8:
+                acc += tl.dot(a, b, input_precision="ieee")
+            else:
+                acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
+
+            LHS_BASE += BLOCK_SIZE_K * stride_lhs_m
+            RHS_BASE += BLOCK_SIZE_K * stride_rhs_m
+
+        # -- Apply scaling and store --
+        if IS_FP8:
+            acc *= scale
+        rm_s = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        rn_s = tl.max_contiguous(tl.multiple_of(rn_s % OUT_N, BLOCK_SIZE_N), BLOCK_SIZE_N)
+        c_mask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
+        C_ = (
+            C
+            + (group_idx - C_FIRST_GROUP).to(tl.int64) * stride_cg
+            + rm_s[:, None] * stride_cm
+            + rn_s[None, :] * stride_cn
+        )
+        if BETA_IS_ONE:
+            # Read the previous value of this tile and fold it into the FP32
+            # accumulator before the cast. Costs one extra HBM read per output tile,
+            # which is nearly free in the bandwidth-bound regime since the tile is
+            # written anyway, and it removes the standalone accumulation kernel the
+            # caller would otherwise have to launch over the whole output.
+            acc += tl.load(C_, mask=c_mask, other=0.0).to(acc_dtype)
+        c = acc.to(C.type.element_ty)
+        tl.store(C_, c, c_mask)
 
 
 @triton.jit
@@ -1302,7 +1307,8 @@ def grouped_gemm_variable_k_triton_kernel(
             ``out += lhs^T @ rhs``); no other value is supported. ``beta=1.0``
             requires ``out`` and folds the accumulation into the GEMM epilogue,
             removing the separate elementwise add the caller would otherwise run
-            over the whole output.
+            over the whole output. Groups without rows are left as they are: their
+            output is neither read nor written.
         out: Optional pre-allocated output buffer of shape ``(G, OUT_M, OUT_N)``.
             When given, the kernel writes (or accumulates, see ``beta``) into it
             instead of allocating, and its dtype decides the output dtype. Strides

@@ -252,6 +252,45 @@ def _check_fused_grad_accum(dtype, trans_b, num_zero):
     torch.testing.assert_close(b_fused.main_grad, expected, **get_tolerances(dtype))
 
 
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("work_steal", [False, True])
+def test_grouped_gemm_variable_k_beta1_skips_empty_groups(out_dtype, work_steal):
+    """With beta=1 a group without rows adds nothing, so its output must be neither read nor
+    written: the slice keeps every bit, -0.0 included (reading it and adding the zero
+    accumulator would store +0.0). ``group_offs`` starts past row 0, so a group's rows are
+    found from the offsets alone.
+    """
+    from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
+        grouped_gemm_variable_k_triton_kernel,
+    )
+
+    device = "cuda"
+    torch.manual_seed(0)
+    # Enough tiles for work stealing, which fails to compile on small shapes (#670).
+    N, K = 1024, 1024
+    group_lens = torch.tensor([0, 384, 0, 0, 128, 512, 0, 0], device=device)
+    group_offs = torch.zeros(group_lens.numel() + 1, dtype=torch.int64, device=device)
+    group_offs[1:] = group_lens.cumsum(0)
+    group_offs += 64
+    rows = int(group_offs[-1])
+    lhs = torch.randn(rows, N, dtype=torch.bfloat16, device=device)
+    rhs = torch.randn(rows, K, dtype=torch.bfloat16, device=device)
+    out = torch.randn(group_lens.numel(), N, K, dtype=out_dtype, device=device)
+    empty = group_lens == 0
+    out[empty] = -0.0
+    previous = out.clone()
+
+    grouped_gemm_variable_k_triton_kernel(lhs, rhs, group_offs, beta=1.0, out=out, work_steal=work_steal)
+    torch.cuda.synchronize()
+
+    bits = torch.int16 if out_dtype == torch.bfloat16 else torch.int32
+    assert torch.equal(out[empty].view(bits), previous[empty].view(bits)), "an empty group's output changed"
+    for g in torch.nonzero(~empty).flatten().tolist():
+        start, end = int(group_offs[g]), int(group_offs[g + 1])
+        expected = previous[g].float() + lhs[start:end].float().T @ rhs[start:end].float()
+        torch.testing.assert_close(out[g].float(), expected, **get_tolerances(torch.bfloat16))
+
+
 @pytest.mark.parametrize("B", [8])
 @pytest.mark.parametrize("M", [2048])
 @pytest.mark.parametrize("N_K", [(4096, 4096)])
