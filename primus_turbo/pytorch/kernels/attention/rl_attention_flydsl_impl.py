@@ -43,7 +43,7 @@ from primus_turbo.triton.attention.rl_attention_vis import rl_metadata_kernel
 
 TILE = 64
 PACK_MAX_Q = 16
-ROWS_PER_WAVE = 32
+DEFAULT_WAVE_ROWS = 16
 DEFAULT_SEGMENT = 1024
 
 
@@ -69,7 +69,7 @@ def _num_cus(device_index):
 @functools.lru_cache(maxsize=64)
 def _module(
     num_q_heads, num_kv_heads, head_size, cross, vis, page_size, pack, sink, emit_lse, block_m, waves_per_eu,
-    segment_tiles, split_mode, split_segs=1,
+    segment_tiles, split_mode, split_segs=1, wave_rows=32,
 ):  # fmt: skip
     from primus_turbo.flydsl.attention.rl_attention_fwd import build_rl_flash_attn_module
 
@@ -93,6 +93,7 @@ def _module(
         segment_tiles=segment_tiles,
         split_mode=split_mode,
         split_segs=split_segs,
+        rows_per_wave=wave_rows,
     )
 
 
@@ -155,6 +156,7 @@ def rl_attention_fwd_flydsl(
     waves_per_eu: int = 0,
     split_segs: int = 0,
     pack: str = "auto",
+    wave_rows: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Same contract as rl_attention_fwd_triton. Schedule options (none changes the bits):
     ``block_m`` (64 / 128), ``waves_per_eu`` (1 / 2), ``mode`` ("fused" never splits the keys across
@@ -173,20 +175,28 @@ def rl_attention_fwd_flydsl(
         return out, lse
     num_seqs = cu_seqlens_q.numel() - 1
     group = num_q_heads // num_kv_heads
-    if pack == "on" and ROWS_PER_WAVE % group:
-        raise ValueError(f"PACK=on needs a GQA group size dividing {ROWS_PER_WAVE}, got {group}")
+    rows = wave_rows or DEFAULT_WAVE_ROWS
+    if rows not in (16, 32):
+        raise ValueError(f"WAVE_ROWS must be 16 or 32, got {wave_rows}")
+    if pack == "on" and rows % group:
+        raise ValueError(f"PACK=on needs a GQA group size dividing {rows}, got {group}")
     builtin = (
         vis_lo is None and window_left < 0 and not paged and cu_seqlens_q is cu_seqlens_k and pack != "on"
     )
     if pack == "auto":
-        pack = not builtin and int(max_seqlen_q) <= PACK_MAX_Q and ROWS_PER_WAVE % group == 0
+        pack = not builtin and int(max_seqlen_q) <= PACK_MAX_Q and rows % group == 0
     else:
         pack = pack == "on"
-    if block_m not in (0, 64, 128):
-        raise ValueError(f"the FlyDSL RL forward supports BLOCK_M 64 or 128, got {block_m}")
+    if block_m not in (0, 64, 128) and not (rows == 16 and block_m == 32):
+        raise ValueError(f"the FlyDSL RL forward supports BLOCK_M 64 or 128 (and 32 with WAVE_ROWS=16), got {block_m}")
     segment = segment_size or DEFAULT_SEGMENT
     segment_tiles = segment // TILE if int(max_seqlen_k) > segment else 0
-    if segment_tiles and head_size == 128:
+    if rows == 16:
+        # Two waves of 16 rows for packed decode; otherwise as many waves as 64 rows give.
+        packed_rows = int(max_seqlen_q) * group
+        block_m = block_m or (32 if pack and packed_rows <= 32 else 64)
+        wpe = waves_per_eu or 2
+    elif segment_tiles and head_size == 128:
         # The outer segment state is register heavy at D=128: one wave per SIMD and 64-row blocks
         # are the fastest measured configuration, for packed decode as for prefill / training.
         block_m, wpe = block_m or 64, waves_per_eu or 1
@@ -204,12 +214,12 @@ def rl_attention_fwd_flydsl(
     def build(split_mode, segs=1):
         return _module(
             num_q_heads, num_kv_heads, head_size, not builtin, not builtin, k.shape[1] if paged else 0, pack,
-            sinks is not None, bool(return_lse), block_m, wpe, segment_tiles, split_mode, segs,
+            sinks is not None, bool(return_lse), block_m, wpe, segment_tiles, split_mode, segs, rows,
         )  # fmt: skip
 
     kw = {}
     if not builtin:
-        tokens_per_group = ROWS_PER_WAVE // group if pack else ROWS_PER_WAVE
+        tokens_per_group = rows // group if pack else rows
         cu_seqlens_k, vis_lo, vis_hi, vis_group = _metadata(
             cu_seqlens_q, cu_seqlens_k, seq_lens if paged else None, num_tokens, vis_lo, vis_hi, window_left,
             tokens_per_group,
@@ -238,10 +248,11 @@ def rl_attention_fwd_flydsl(
                 split_segs *= 2
         split_segs = min(split_segs, num_segments)
         slots = -(-num_segments // split_segs) * split_segs + 1  # + the trash slot of multi-segment programs
-        per_thread = 2 + 16 * (head_size // 32)
-        # One row per program (2 * block_m threads); 2D so no dimension passes the launcher's int32.
+        per_thread = 2 + head_size * rows // 64
+        threads = 64 * block_m // rows
+        # One row per program; 2D so no dimension passes the launcher's int32.
         workspace = torch.empty(
-            (slots * num_seqs * num_q_blocks * num_kv_heads, 2 * block_m * per_thread),
+            (slots * num_seqs * num_q_blocks * num_kv_heads, threads * per_thread),
             dtype=torch.float32,
             device=q.device,
         )

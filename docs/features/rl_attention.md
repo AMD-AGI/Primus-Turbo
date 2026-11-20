@@ -81,7 +81,14 @@ overrides them key by key. 0 or `auto` means the default.
 | `MODE` | no | `auto`, `fused` (one pass) or `split` (split-KV + reduce) |
 | `SPLIT_SEGS` | no | `FLYDSL`: segments per split-KV program (0: up to 8 while at least 4 programs per CU remain) |
 | `PACK` | no | `FLYDSL`: `auto`, `on` or `off`, rows as (token, head) of one query group |
+| `WAVE_ROWS` | no (*) | `FLYDSL`: rows per wave, 16 (default, 16x16x32 MFMAs) or 32 (32x32x16, opt-in) |
 | `BLOCK_M`, `num_warps`, `num_stages`, `waves_per_eu` | no | Schedule only |
+
+(*) `WAVE_ROWS` 16 and 32 gave identical bits on MI355X in every test (bf16 16x16x32 and 32x32x16 MFMA
+chains, including adversarial inputs, and the full test suite run with each); 32 is an opt-in whose bit
+equality rests on that measurement. 16 rows cut the FLYDSL decode geomean 6% (64 x 4k 241 -> 226 us,
+32 x 32k 819 -> 784 us) and cost 2-6% on the training forward (Llama-3-8B 8 x 4096: 1.43 -> 1.48 ms;
+forward + backward +0.4%).
 
 **Keys that change bits must be identical in the rollout and the training process**; setting the
 same environment variable in both is the simplest way. The others may differ per call and per

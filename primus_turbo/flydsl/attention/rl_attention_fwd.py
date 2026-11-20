@@ -80,6 +80,7 @@ def build_rl_flash_attn_module(
     segment_tiles=0,
     split_mode=0,
     split_segs=1,
+    rows_per_wave=32,
 ):
     """Build a DUALWAVE_SWP flash_attn launcher for D=64/128 bf16/f16 on gfx950.
 
@@ -127,14 +128,16 @@ def build_rl_flash_attn_module(
         segment_tiles=segment_tiles,
         split_mode=split_mode,
         split_segs=split_segs,
+        rows_per_wave=rows_per_wave,
     )
     assert split_mode == 0 or (segment_tiles and has_vis and gqa_pack), (
         "split / merge modes are for packed decode with segments and visibility intervals"
     )
     assert not (segment_tiles and use_score_bound), "segments need the exact per-tile rescale trigger"
-    assert not gqa_pack or (has_vis and traits.Q_HEADS_PER_WG == 1 and 32 % traits.GQA_GROUP_SIZE == 0), (
-        "GQA packing needs visibility intervals, no gqa_merge, and a group size dividing 32"
-    )
+    assert not gqa_pack or (
+        has_vis and traits.Q_HEADS_PER_WG == 1 and traits.ROWS_PER_WAVE % traits.GQA_GROUP_SIZE == 0
+    ), "GQA packing needs visibility intervals, no gqa_merge, and a group size dividing the rows per wave"
+    assert rows_per_wave == 32 or not use_score_bound, "the score bound is built for the 32-row layout"
     assert page_size % 64 == 0 and (page_size == 0 or varlen), "pages must be multiples of the 64-key tile"
     assert not has_vis or (varlen and causal and window_left < 0), (
         "visibility needs varlen, causal, window folded in"
@@ -249,7 +252,7 @@ def build_rl_flash_attn_module(
         else:
             l_row_init = ctx.c_zero_f
         split_t_end = ctx.split_t_end
-        v_o_zero = ctx.c_zero_v16f32
+        v_o_zero = ctx.c_zero_acc
 
         def _finish(m_row, l_row, v_o):
             """Normalize O and store it with its LSE (l_row is the scalar row sum)."""
@@ -365,8 +368,25 @@ def build_rl_flash_attn_module(
             # Skip P*V + V LDS reads on a wave-uniform dead 32-col half (P is 0 after the mask).
 
             def _pv_branch(v_o, live, body):
-                """Scalar-branch `body` over D_CHUNKS accs; flyc.jit cannot carry a Python list."""
-                if const_expr(traits.D_CHUNKS == 2):
+                """Scalar-branch `body` over the accs; flyc.jit cannot carry a Python list."""
+                if const_expr(len(v_o) == 8):
+
+                    @flyc.jit
+                    def _branch8(o0, o1, o2, o3, o4, o5, o6, o7, live):
+                        if live:
+                            _r = body([o0, o1, o2, o3, o4, o5, o6, o7])
+                            o0 = _r[0]
+                            o1 = _r[1]
+                            o2 = _r[2]
+                            o3 = _r[3]
+                            o4 = _r[4]
+                            o5 = _r[5]
+                            o6 = _r[6]
+                            o7 = _r[7]
+                        return o0, o1, o2, o3, o4, o5, o6, o7
+
+                    return list(_branch8(*v_o, live))
+                if const_expr(len(v_o) == 2):
 
                     @flyc.jit
                     def _branch2(o0, o1, live):
@@ -490,7 +510,7 @@ def build_rl_flash_attn_module(
             # The running maximum is what every rescale is measured against, so it rides the
             # back edge; restarting it each iteration silently loses row mass.
             init_args = [m_row_pro, l_row_init]
-            for _ in range_constexpr(traits.D_CHUNKS):
+            for _ in range_constexpr(traits.ACC_TILES):
                 init_args.append(v_o_zero)
             init_args.append(v_p_0[0])
             init_args.append(v_p_0[1])
@@ -519,11 +539,11 @@ def build_rl_flash_attn_module(
                 m_row = loop_args[0]
                 ctx.set_ref(m_row)
                 l_row = loop_args[1]
-                v_o = [loop_args[2 + i] for i in range_constexpr(traits.D_CHUNKS)]
-                v_p_0 = (loop_args[2 + traits.D_CHUNKS], loop_args[3 + traits.D_CHUNKS])
-                ctx.set_seed_vec(loop_args[4 + traits.D_CHUNKS])
+                v_o = [loop_args[2 + i] for i in range_constexpr(traits.ACC_TILES)]
+                v_p_0 = (loop_args[2 + traits.ACC_TILES], loop_args[3 + traits.ACC_TILES])
+                ctx.set_seed_vec(loop_args[4 + traits.ACC_TILES])
                 if const_expr(split_rebase):
-                    pending = (ctx.bound_over_ref, loop_args[5 + traits.D_CHUNKS])
+                    pending = (ctx.bound_over_ref, loop_args[5 + traits.ACC_TILES])
                 outer = [loop_args[n_carry + i] for i in range_constexpr(len(outer))]
                 j_idx = j
 
@@ -676,11 +696,11 @@ def build_rl_flash_attn_module(
             # the epilogue seeds against the loop's result, not the last body value
             ctx.set_ref(m_row)
             l_row = loop_results[1]
-            v_o = [loop_results[2 + i] for i in range_constexpr(traits.D_CHUNKS)]
-            v_p_0 = (loop_results[2 + traits.D_CHUNKS], loop_results[3 + traits.D_CHUNKS])
-            ctx.set_seed_vec(loop_results[4 + traits.D_CHUNKS])
+            v_o = [loop_results[2 + i] for i in range_constexpr(traits.ACC_TILES)]
+            v_p_0 = (loop_results[2 + traits.ACC_TILES], loop_results[3 + traits.ACC_TILES])
+            ctx.set_seed_vec(loop_results[4 + traits.ACC_TILES])
             if const_expr(split_rebase):
-                v_o = ctx.rebase_acc(v_o, (ctx.bound_over_ref, loop_results[5 + traits.D_CHUNKS]))
+                v_o = ctx.rebase_acc(v_o, (ctx.bound_over_ref, loop_results[5 + traits.ACC_TILES]))
             outer = [loop_results[n_carry + i] for i in range_constexpr(len(outer))]
 
             max_m3 = split_t_end - 3
@@ -1027,7 +1047,7 @@ def build_rl_flash_attn_module(
                 (fx.Index(seq_len_kv) + fx.Index(group_keys - 1)) // fx.Index(group_keys)
             )
         elif const_expr(traits.SPLIT_MODE == 2):
-            grid_x = traits.NUM_HEADS_KV * traits.D_CHUNKS * 2
+            grid_x = traits.NUM_HEADS_KV * (traits.ACC_FLOATS // 8)
         elif const_expr(traits.GQA_PACK):
             grid_x = traits.NUM_HEADS_KV
         else:

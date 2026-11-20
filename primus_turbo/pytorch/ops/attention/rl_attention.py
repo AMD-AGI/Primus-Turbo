@@ -31,11 +31,15 @@ BACKEND         yes          "TRITON" or "FLYDSL" (gfx950)
 MODE            no           "auto", "fused" (one pass) or "split" (split-KV + reduce)
 SPLIT_SEGS      no           FLYDSL: segments per split-KV program (0 = auto)
 PACK            no           FLYDSL: "auto", "on" or "off" — (token, head) rows of one query group
+WAVE_ROWS       no (*)       FLYDSL: rows per wave, 16 (16x16x32 MFMAs) or 32 (32x32x16)
 BLOCK_M         no           query rows per program (a multiple of the GQA group)
 num_warps       no           clamped to BLOCK_M / 16 when BLOCK_M > 16 to keep the bits
 num_stages      no           software pipelining depth
 waves_per_eu    no           occupancy hint
 ==============  ===========  ===================================================================
+
+(*) WAVE_ROWS 16 (default) and 32 gave identical bits on MI355X in every test (16x16x32 and
+32x32x16 bf16 MFMA chains sum alike); 32 is an opt-in whose bit equality rests on that measurement.
 
 Keys that change bits must be the same in the rollout and the training process (set them in the
 environment of both, or pass the same dict); the others may differ per call. The backward always
@@ -88,6 +92,7 @@ _INT_OPTIONS = (
     "num_stages",
     "waves_per_eu",
     "SPLIT_SEGS",
+    "WAVE_ROWS",
 )
 KERNEL_OPTIONS = _INT_OPTIONS + ("MODE", "PACK", "BACKEND")
 
@@ -101,6 +106,7 @@ class _Options:
     num_stages: int = 0
     waves_per_eu: int = 0
     split_segs: int = 0
+    wave_rows: int = 0
     mode: str = "auto"
     pack: str = "auto"
     backend: str = "TRITON"
@@ -117,6 +123,7 @@ class _Options:
             self.waves_per_eu,
             self.split_segs,
             self.pack,
+            self.wave_rows,
             self.backend,
         )
 
@@ -177,6 +184,7 @@ def _resolve_options(kernel_options: Optional[dict]) -> _Options:
         num_stages=merged.get("num_stages", 0),
         waves_per_eu=merged.get("waves_per_eu", 0),
         split_segs=merged.get("SPLIT_SEGS", 0),
+        wave_rows=merged.get("WAVE_ROWS", 0),
         mode=merged.get("MODE", "auto"),
         pack=merged.get("PACK", "auto"),
         backend=merged.get("BACKEND", "TRITON"),

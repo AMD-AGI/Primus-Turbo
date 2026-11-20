@@ -277,6 +277,8 @@ def test_rejects_unsupported():
 def _knob_sets(decode):
     """Schedule-only kernel options; none may change the bits."""
     sets = [{"BLOCK_M": bm, "waves_per_eu": w} for bm in (64, 128) for w in (1, 2)]
+    # The 32-row layout (32x32x16 MFMAs) against the 16-row default, and 16-row blocks of 32.
+    sets += [{"WAVE_ROWS": 32}, {"WAVE_ROWS": 32, "BLOCK_M": 128}, {"WAVE_ROWS": 16, "BLOCK_M": 32}]
     if decode:
         sets += [{"MODE": "fused"}, {"MODE": "fused", "PACK": "off"}]
         sets += [{"MODE": "split", "SPLIT_SEGS": k, "BLOCK_M": bm} for k in (1, 2, 4) for bm in (64, 128)]

@@ -24,7 +24,7 @@ import torch
 
 __all__ = ["SCHEDULE_OPTIONS", "TuneResult", "format_options", "search_space", "tune"]
 
-SCHEDULE_OPTIONS = ("MODE", "BLOCK_M", "num_warps", "num_stages", "waves_per_eu", "SPLIT_SEGS", "PACK")
+SCHEDULE_OPTIONS = ("MODE", "BLOCK_M", "num_warps", "num_stages", "waves_per_eu", "SPLIT_SEGS", "PACK", "WAVE_ROWS")
 _DEFAULTS = (0, "auto")
 
 
@@ -33,7 +33,12 @@ def search_space(backend: str, max_seqlen_q: int) -> Dict[str, list]:
     the default (0 / "auto") first."""
     decode = max_seqlen_q <= 16
     if backend.upper() == "FLYDSL":
-        space = {"MODE": ["auto", "fused", "split"], "BLOCK_M": [0, 64, 128], "waves_per_eu": [0, 1, 2]}
+        space = {
+            "WAVE_ROWS": [0, 16, 32],
+            "MODE": ["auto", "fused", "split"],
+            "BLOCK_M": [0, 32, 64, 128],
+            "waves_per_eu": [0, 1, 2],
+        }
         if decode:
             space.update(PACK=["auto", "off"], SPLIT_SEGS=[0, 1, 2, 4, 8, 16])
         return space

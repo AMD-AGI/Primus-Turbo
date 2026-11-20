@@ -136,6 +136,7 @@ def rl_attention_fwd_triton(
     waves_per_eu: int = 0,
     split_segs: int = 0,
     pack: str = "auto",
+    wave_rows: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward over a paged cache (``block_table`` and ``seq_lens``) or contiguous K/V
     (``cu_seqlens_k``). With visibility, ``cu_seqlens_k`` gives each sequence's first global key
