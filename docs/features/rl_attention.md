@@ -79,12 +79,34 @@ overrides them key by key. 0 or `auto` means the default.
 | `SEGMENT_SIZE` | yes | KV segment length, the split-KV unit (default 1024) |
 | `BACKEND` | yes | `TRITON` (default) or `FLYDSL` (gfx950), see [Backends](#backends) |
 | `MODE` | no | `auto`, `fused` (one pass) or `split` (split-KV + reduce) |
+| `SPLIT_SEGS` | no | `FLYDSL`: segments per split-KV program (0 picks about 2 programs per CU) |
+| `PACK` | no | `FLYDSL`: `auto`, `on` or `off`, rows as (token, head) of one query group |
 | `BLOCK_M`, `num_warps`, `num_stages`, `waves_per_eu` | no | Schedule only |
 
 **Keys that change bits must be identical in the rollout and the training process**; setting the
 same environment variable in both is the simplest way. The others may differ per call and per
 process. `num_warps` is clamped to `BLOCK_M / 16` when `BLOCK_M > 16`, because warps that also
 split the columns of the score tile change the bits. The backward uses its own fixed configuration.
+
+### Tuning the schedule
+
+The defaults are measured on MI355X for common model shapes. For other shapes, tune the schedule
+keys offline for the settings you run:
+
+```bash
+python benchmark/ops/training/tune_rl_attention.py --phase decode prefill train \
+    --model llama3-8b --backend TRITON FLYDSL [--case BATCH,CTX[,Q_LEN] ...] [--tp-size N] -o tuned.json
+```
+
+For each setting and backend it searches `MODE`, `BLOCK_M`, `num_warps`, `num_stages`,
+`waves_per_eu`, `SPLIT_SEGS` and `PACK` (coordinate descent; `--exhaustive` times the full grid),
+keeps only candidates whose output is **bitwise equal to the default schedule's**, and prints the
+fastest as a `kernel_options` string. It needs a 3% gain (`--min-gain`) to leave a default.
+`TILE_SIZE` and `SEGMENT_SIZE` change bits, so they are not searched; pass the values your training
+process uses with `--tile-size` / `--segment-size`. Training settings tune the forward only.
+The search is also available in Python as
+`primus_turbo.pytorch.ops.attention.rl_attention_tune.tune(run, search_space(backend, max_seqlen_q))`,
+where `run(options)` makes the call.
 
 ## Backends
 
@@ -259,6 +281,7 @@ Each test changes one thing a token's result must not depend on, and requires id
 |---|---|---|
 | Layout | `test_paged_split_fused_contiguous_bitwise`, `test_visibility_paged_split_fused_bitwise` | Paged cache (each page size) vs contiguous K/V; split-KV vs fused |
 | Launch | `test_launch_invariance` | 16 (`BLOCK_M`, `num_warps`) launches given through `kernel_options`, with and without masks |
+| Schedule (FLYDSL) | `test_schedule_knobs_do_not_change_bits` | `BLOCK_M`, `waves_per_eu`, `MODE`, `SPLIT_SEGS`, `PACK` on training, decode and a 37-token chunk |
 | Batch | `test_batch_invariance`, `test_visibility_batch_invariance` | A 200-token sequence alone vs packed among others (`[1, 5]`, `[333, 64, 17]`, six of 129), with masks and sinks |
 | Mask form | `test_causal_intervals_equal_builtin` | Causal / sliding window as `[lo, hi]` intervals vs the built-in masks |
 | Rollout vs training | `test_causal_rollout_matches_training`, `test_visibility_rollout_matches_training`, `test_flash_attn_varlen_func_paged_rollout_matches_training` | See below |
