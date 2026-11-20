@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def swiglu_with_mask_fwd_kernel(
     # pointers
     x_ptr,
@@ -16,7 +16,7 @@ def swiglu_with_mask_fwd_kernel(
     row_mask_ptr,
     out_ptr,
     # sizes
-    num_tokens: tl.constexpr,
+    num_tokens,
     # strides
     stride_x_token,
     stride_probs_token,
@@ -65,7 +65,7 @@ def swiglu_with_mask_fwd_kernel(
         tl.store(out_ptr + row_idx * stride_out_token + col_off, out.to(data_type), mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def swiglu_with_mask_bwd_kernel(
     # pointers
     grad_out_ptr,
@@ -75,7 +75,7 @@ def swiglu_with_mask_bwd_kernel(
     grad_x_ptr,
     grad_probs_ptr,
     # sizes
-    num_tokens: tl.constexpr,
+    num_tokens,
     # strides
     stride_grad_out_token,
     stride_x_token,
@@ -157,14 +157,14 @@ def swiglu_with_mask_bwd_kernel(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def swiglu_fwd_kernel(
     # pointers
     x_ptr,
     probs_ptr,
     out_ptr,
     # sizes
-    num_tokens: tl.constexpr,
+    num_tokens,
     # strides
     stride_x_token: tl.constexpr,
     stride_probs_token: tl.constexpr,
@@ -209,7 +209,7 @@ def swiglu_fwd_kernel(
     tl.store(out_ptr + row_idx * stride_out_token + col_off, out.to(data_type), mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def swiglu_bwd_kernel(
     # pointers
     grad_out_ptr,
@@ -218,7 +218,7 @@ def swiglu_bwd_kernel(
     grad_x_ptr,
     grad_probs_ptr,
     # sizes
-    num_tokens: tl.constexpr,
+    num_tokens,
     # strides
     stride_grad_out_token: tl.constexpr,
     stride_x_token: tl.constexpr,
