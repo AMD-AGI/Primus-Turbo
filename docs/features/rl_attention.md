@@ -98,9 +98,9 @@ per-shape auto-tuning across backends.
 | dtypes, head size | bf16 / fp16, D <= 256 | bf16, D = 64 or 128, `softmax_scale` = 1/sqrt(D) |
 | Paged cache | any page size | pages that are multiples of 64 |
 | Masks, window, sinks, varlen, GQA | yes | yes |
-| Split-KV for decode | yes (`SEGMENT_SIZE`) | not yet |
+| Split-KV for decode | yes (`SEGMENT_SIZE`) | yes (`SEGMENT_SIZE`, see [the segment cost](#known-issue-cost-of-segments-on-flydsl)) |
 | Backward | Triton, deterministic | the same Triton backward |
-| Options used | all | `BLOCK_M` (64 / 128); `TILE_SIZE` must be 0 or 64; `SEGMENT_SIZE`, `MODE` and the warp / stage / wave options are ignored |
+| Options used | all | `SEGMENT_SIZE` (a multiple of 64), `BLOCK_M` (64 / 128); `TILE_SIZE` must be 0 or 64; `MODE` and the warp / stage / wave options are ignored |
 
 **FLYDSL** (`primus_turbo/flydsl/attention/rl_attention_fwd.py`, helpers in
 `primus_turbo/flydsl/utils/rl_attn_helper.py`) is a fork of the dual-wave, software-pipelined gfx950
@@ -125,25 +125,61 @@ rescale fires, and with a sliding window even on random inputs). The fork change
   descriptor sized to the keys below the sequence length, so unused cache slots are never read.
 - **Packed decode rows.** With at most 16 query tokens per sequence, a workgroup's rows are
   (token, head) pairs of one query group, so each K/V tile is read once per KV head.
+- **Fixed segments and split-KV.** When a sequence has more keys than `SEGMENT_SIZE`, each row's
+  state restarts at every fixed absolute segment and is merged, in order and with exact IEEE
+  arithmetic, into an outer state carried beside it. Decode with too few workgroups for the GPU then
+  runs one program per segment and merges the partial states in a second launch with the same
+  arithmetic and the same normalize / store code, so the bits equal the training forward's. Rows
+  whose keys fit in one segment are unchanged (merging into an empty state is exact).
 - Visibility metadata (key starts, intervals, per-32-row bounds) is cached per step on the identity
   and version of its input tensors.
 
 Speed on MI355X (bf16, TP 1, `benchmark/ops/training/bench_rl_attention.py`; "turbo" is the default,
-not batch-invariant `flash_attn_varlen_func` backend):
+not batch-invariant `flash_attn_varlen_func` backend; SEGMENT_SIZE 1024, so every case below except
+the 4k decodes of short contexts runs the segmented FLYDSL build):
 
-| Case | turbo | TRITON | FLYDSL |
+| Case | aiter / turbo | TRITON | FLYDSL |
 |---|---|---|---|
-| Training fwd, Llama-3-8B 8 x 4096 | 1.02 ms | 2.57 ms | 1.08 ms |
-| Training fwd + bwd, same | 6.12 ms | 11.12 ms | 9.62 ms |
-| Training fwd with an interval mask, same | | 3.21 ms | 1.13 ms |
-| Prefill 2048 on 16k, Llama-3-8B (aiter 550 us) | | 1958 us | 564 us |
-| Decode 64 x 4k, Llama-3-8B (aiter 181 us) | | 171 us | 227 us |
-| Decode 1 x 32k, Llama-3-8B (aiter 69 us) | | 77 us | 1010 us |
-| Decode 8 x 4k, GPT-OSS-120B (window 128, sinks) | | 78 us | 14 us |
+| Training fwd, Llama-3-8B 8 x 4096 | 1.04 ms | 2.57 ms | 1.43 ms |
+| Training fwd + bwd, same | 6.04 ms | 11.06 ms | 9.96 ms |
+| Training fwd, Qwen3-32B 2 x 16384 | 7.14 ms | 17.10 ms | 10.69 ms |
+| Prefill 2048 on 16k, Llama-3-8B | 572 us | 1963 us | 862 us |
+| Decode 1 x 4k, Llama-3-8B | 67 us | 74 us | 60 us |
+| Decode 64 x 4k, Llama-3-8B | 173 us | 175 us | 240 us |
+| Decode 1 x 32k, Llama-3-8B | 67 us | 76 us | 125 us |
+| Decode 8 x 32k, Llama-3-8B | 178 us | 195 us | 370 us |
+| Decode 8 x 4k, GPT-OSS-120B (window 128, sinks) | | 77 us | 34 us |
 
-FLYDSL is the faster backend for training and long prefill. Without split-KV its decode is slow when
-there are few sequences and long contexts (too few workgroups); split-KV is the next step, and it
-needs the training forward to merge the same fixed segments in-kernel to keep the bits equal.
+### Known issue: cost of segments on FLYDSL
+
+Split-KV decode has to give the same bits as the training forward, so the training and prefill
+kernel must compute the same per-segment partial states and merge them in the same order, rather
+than run one online softmax across the whole sequence (the two round differently). It therefore
+carries a second, outer softmax state per row, about 64 more registers per lane at D=128 (32 at
+D=64), in a kernel tuned to just fit its register budget. Measured on MI355X, for launches with a
+sequence longer than `SEGMENT_SIZE` (shorter ones run the unsegmented build, with the same bits):
+
+| | Without segments | With segments |
+|---|---|---|
+| Training fwd, D=128, 8 x 4096 | 1.08 ms | 1.43 ms (+32%; at 2 waves / SIMD and 128-row blocks it was +68%) |
+| Training fwd, D=64, 8 x 4096 | 1.24 ms | 1.38 ms (+11%) |
+| Prefill 2048 on 16k, D=128 | 562 us | 862 us (+53%) |
+| Packed decode 64 x 4k, D=128 | 229 us | 240 us (+5%) |
+
+The segment length does not matter (16 or 32 tiles cost the same); the cost is the extra live state.
+Because the backward (Triton) is about 8x the forward, the training forward cost is about +4% of
+attention forward + backward. Possible fixes, not yet tried:
+
+- **Outer state in LDS.** It is only touched at segment boundaries (every 16 tiles), so it could live
+  in shared memory instead of registers: about 64 KB per 256-thread workgroup on top of the 34 KB the
+  kernel uses, which likely limits a CU to one workgroup, so the gain is uncertain.
+- **Outer state in AGPRs.** Pin it to the accumulation registers, which the pipeline uses less, so it
+  does not compete with the score and P registers.
+- **Larger `SEGMENT_SIZE`.** Fewer launches pay at all (e.g. 4096: training on sequences up to 4k is
+  unaffected), at the price of less decode parallelism for long contexts.
+- **Segment-parallel prefill.** For long chunked prefills, run the split programs plus the merge, as
+  decode does, instead of the single walk; costs the partial-state traffic but uses all CUs.
+- **Block-table prefetch** for the paged path (+14% on D=128 prefill, independent of segments).
 
 ## How the invariance is achieved (TRITON)
 
