@@ -84,7 +84,7 @@ from primus_turbo.flydsl.utils.prims import LOG2E
 # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
 # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
 # kernel, or a warm cache keeps serving the old one.
-CODEGEN_REV = ("rl", 15)
+CODEGEN_REV = ("rl", 16)
 
 # Sentinel bound of an empty 32-row group (no visible key): above any key position.
 VIS_EMPTY = 1 << 30
@@ -1610,7 +1610,7 @@ class DualwaveKernelContext:
         """The outer (reference, row sum, accumulator) state before any segment is merged."""
         return [self.c_neg_floor, self.c_zero_f] + [self.c_zero_v16f32] * self.traits.D_CHUNKS
 
-    def merge_segment(self, outer, m_row, l_seg, v_o):
+    def merge_segment(self, outer, m_row, l_seg, v_o, width=16):
         """Outer state after merging one finished segment (reference m_row, scalar row sum l_seg,
         accumulator v_o): M' = max(M, m), L' = L 2^(M - M') + l 2^(m - M'), likewise A. Plain IEEE
         operations, so every kernel that merges computes the same bits."""
@@ -1619,8 +1619,8 @@ class DualwaveKernelContext:
         a = fx.Float32(rocdl.exp2(T.f32, _fsub(big_m, m_new, None)))
         b = fx.Float32(rocdl.exp2(T.f32, _fsub(m_row, m_new, None)))
         l_new = _fadd(_fmul(big_l, a, None), _fmul(l_seg, b, None), None)
-        a_vec = Vec.from_elements([as_mlir_value(a)], fx.Float32).broadcast_to(16)
-        b_vec = Vec.from_elements([as_mlir_value(b)], fx.Float32).broadcast_to(16)
+        a_vec = Vec.from_elements([as_mlir_value(a)], fx.Float32).broadcast_to(width)
+        b_vec = Vec.from_elements([as_mlir_value(b)], fx.Float32).broadcast_to(width)
         acc = [
             _fadd(_fmul(Vec(big_a[dc]), a_vec, None), _fmul(Vec(v_o[dc]), b_vec, None), None)
             for dc in range_constexpr(len(v_o))
@@ -1716,6 +1716,30 @@ class DualwaveKernelContext:
                 part = Vec(v_o[dc]).shuffle(Vec(v_o[dc]), [q4 * 4 + i for i in range(4)])
                 off = base + fx.Int32(2 + dc * 16 + q4 * 4)
                 buffer_ops.buffer_store(as_mlir_value(part), rsrc, as_mlir_value(off), mask=real)
+
+    def load_partial_piece(self, seg, piece):
+        """Reference, row sum and accumulator floats [8 piece, 8 piece + 8) (``piece`` an index
+        Value) of segment ``seg``."""
+        rsrc, base = self._partial_rsrc_and_base(seg)
+        real = self._row_is_real()
+        m_row = fx.Float32(
+            buffer_ops.buffer_load(rsrc, as_mlir_value(base), vec_width=1, dtype=fx.Float32, mask=real)
+        )
+        l_seg = fx.Float32(
+            buffer_ops.buffer_load(
+                rsrc, as_mlir_value(base + fx.Int32(1)), vec_width=1, dtype=fx.Float32, mask=real
+            )
+        )
+        off = base + fx.Int32(2) + fx.Int32(fx.Index(piece) * fx.Index(8))
+        parts = [
+            Vec(
+                buffer_ops.buffer_load(
+                    rsrc, as_mlir_value(off + fx.Int32(q * 4)), vec_width=4, dtype=fx.Float32, mask=real
+                )
+            )
+            for q in range_constexpr(2)
+        ]
+        return m_row, l_seg, parts[0].shuffle(parts[1], list(range(8))).ir_value()
 
     def load_partial_chunk(self, seg, dc):
         """Reference, row sum and accumulator chunk ``dc`` (an index Value) of segment ``seg``."""
@@ -2084,6 +2108,20 @@ class DualwaveKernelContext:
         self._store_o_128(
             self._final_o_base(q_row),
             lambda dc, g: _packed_o_128_vec(self.traits, v_o, dc, g, self.lane_div_32, self.elem_dtype),
+        )
+
+    def store_final_o_piece(self, v_piece, q_row, piece):
+        """store_final_o for accumulator floats [8 piece, 8 piece + 8) (``piece`` an index Value):
+        one 128-bit store, packed as store group 0 of a chunk holding the piece."""
+        dc = fx.Index(piece) // fx.Index(2)
+        g = fx.Index(piece) % fx.Index(2)
+        chunk = Vec(v_piece).shuffle(Vec(v_piece), list(range(8)) * 2).ir_value()
+        _buffer_store_128(
+            _packed_o_128_vec(self.traits, [chunk], 0, 0, self.lane_div_32, self.elem_dtype),
+            self._final_o_base(q_row) + dc * self.traits.D_CHUNK + g * fx.Index(16),
+            _o_store_reg_128=self.o_store_reg_128,
+            _store_atom_128=self.store_atom_128,
+            o_div=self.o_div,
         )
 
     def store_final_o_chunk(self, v_chunk, q_row, dc):

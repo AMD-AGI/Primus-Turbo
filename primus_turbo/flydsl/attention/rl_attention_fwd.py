@@ -51,8 +51,8 @@ from primus_turbo.flydsl.utils.rl_attn_helper import (
     dtype_to_elem_type,
 )
 
-# Segments whose partials a merge program loads at once (16 + 2 floats each per lane).
-MERGE_DEPTH = 8
+# Segments whose partials a merge program loads at once (8 + 2 floats each per lane).
+MERGE_DEPTH = 16
 
 
 def build_rl_flash_attn_module(
@@ -265,39 +265,39 @@ def build_rl_flash_attn_module(
 
         def _merge_body():
             """MERGE: fold the SPLIT programs' partials in segment order, then finish. A program
-            merges one accumulator chunk (grid x = KV heads x D chunks): the merge is elementwise,
-            so a chunk is all it needs, and the registers that frees hold MERGE_DEPTH segments'
+            merges 8 accumulator floats (grid x = KV heads x 2 D chunks): the merge is elementwise,
+            so a piece is all it needs, and the registers that frees hold MERGE_DEPTH segments'
             loads in flight at once instead of one load-then-merge per segment."""
             ctx.setup_rows()
-            dc = ctx.group_id
+            piece = ctx.group_id
             seg_keys = traits.SEGMENT_TILES * traits.BLOCK_N
             num_segments = (ctx.seq_len_kv_v + fx.Index(seg_keys - 1)) // fx.Index(seg_keys)
             num_groups = (num_segments + fx.Index(MERGE_DEPTH - 1)) // fx.Index(MERGE_DEPTH)
             last = num_segments - fx.Index(1)
-            init = [ctx.c_neg_floor, ctx.c_zero_f, ctx.c_zero_v16f32]
+            init = [ctx.c_neg_floor, ctx.c_zero_f, Vec.filled(8, 0.0, fx.Float32)]
             for grp, carried in range(fx.Index(0), num_groups, fx.Index(1), init=init):
                 segs = [grp * fx.Index(MERGE_DEPTH) + fx.Index(k) for k in range_constexpr(MERGE_DEPTH)]
                 parts = [
-                    ctx.load_partial_chunk(fx.Index(ArithValue(seg < num_segments).select(seg, last)), dc)
+                    ctx.load_partial_piece(fx.Index(ArithValue(seg < num_segments).select(seg, last)), piece)
                     for seg in segs
                 ]
                 state = list(carried)
                 for k in range_constexpr(MERGE_DEPTH):
                     m_seg, l_seg, a_seg = parts[k]
-                    merged = ctx.merge_segment(state, m_seg, l_seg, [a_seg])
+                    merged = ctx.merge_segment(state, m_seg, l_seg, [a_seg], width=8)
                     # A segment past the end is dropped, not merged as empty: select is exact.
                     valid = as_mlir_value(ArithValue(segs[k] < num_segments))
                     state = [arith.select(valid, as_mlir_value(x), as_mlir_value(y)) for x, y in zip(merged, state)]
                 merged_out = yield state
             m_row, l_row, a_out = merged_out[0], merged_out[1], merged_out[2]
             o_scale, m_lse, l_lse = ctx.finalize_o_scale(m_row, l_row)
-            scale_vec = Vec.from_elements([o_scale], fx.Float32).broadcast_to(16)
+            scale_vec = Vec.from_elements([o_scale], fx.Float32).broadcast_to(8)
             a_out = _fmul(Vec(a_out), scale_vec, ctx.fm_fast)
             if const_expr(traits.EMIT_LSE):
-                # Chunk 0 stores the LSE; the others pass a row that store_lse skips.
-                q_lse = fx.Index(ArithValue(dc == fx.Index(0)).select(ctx.q_row, ctx.seqlen_q_v))
+                # Piece 0 stores the LSE; the others pass a row that store_lse skips.
+                q_lse = fx.Index(ArithValue(piece == fx.Index(0)).select(ctx.q_row, ctx.seqlen_q_v))
                 ctx.store_lse(m_lse, l_lse, q_lse)
-            ctx.store_final_o_chunk(a_out, ctx.q_row, dc)
+            ctx.store_final_o_piece(a_out, ctx.q_row, piece)
 
         def _main_body():
             if const_expr(traits.SPLIT_MODE == 2):
@@ -1027,7 +1027,7 @@ def build_rl_flash_attn_module(
                 (fx.Index(seq_len_kv) + fx.Index(group_keys - 1)) // fx.Index(group_keys)
             )
         elif const_expr(traits.SPLIT_MODE == 2):
-            grid_x = traits.NUM_HEADS_KV * traits.D_CHUNKS
+            grid_x = traits.NUM_HEADS_KV * traits.D_CHUNKS * 2
         elif const_expr(traits.GQA_PACK):
             grid_x = traits.NUM_HEADS_KV
         else:
