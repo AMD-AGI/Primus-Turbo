@@ -117,7 +117,9 @@ rescale fires, and with a sliding window even on random inputs). The fork change
   to bf16, which moves logits in the hundreds by whole units: max error vs fp32 was 0.15-1.2 on such
   inputs, against 0.015 now (the Triton kernel's level). **This is the main reason the RL forward is
   slower than the stock FlyDSL forward**: +8% (D=128) and +21% (D=64) on causal training shapes,
-  about 0 with a sliding window.
+  about 0 with a sliding window. It costs instructions, not occupancy: the compiled kernel uses 250
+  VGPRs instead of 230 at D=128 (170 instead of 150 at D=64), with no spills and the same 2 waves
+  per SIMD (see the register table below).
 - **Visibility intervals.** A workgroup walks its rows' tile range with the windowed pipeline; tiles
   every row of a wave sees entirely skip the mask. Causal and window attention are converted to
   intervals for everything but plain causal self-attention, and the two paths give the same bits.
@@ -167,12 +169,28 @@ sequence longer than `SEGMENT_SIZE` (shorter ones run the unsegmented build, wit
 | Packed decode 64 x 4k, D=128 | 229 us | 240 us (+5%) |
 
 The segment length does not matter (16 or 32 tiles cost the same); the cost is the extra live state.
+Register use from the compiler's ISA metadata (`FLYDSL_DUMP_IR=1 FLYDSL_DEBUG_DUMP_ASM=1`, then
+`.vgpr_count` / `.agpr_count` / `.vgpr_spill_count` in `15_final_isa.s`; on gfx950 VGPRs and AGPRs
+share a 512-entry pool per SIMD lane, so waves per SIMD = 512 / (VGPR + AGPR), capped by
+`waves_per_eu`):
+
+| Build | VGPR | AGPR | Spilled VGPRs (scratch) | LDS | Waves / SIMD |
+|---|---|---|---|---|---|
+| D=128 stock FlyDSL forward | 230 | 0 | 0 | 68 KB | 2 |
+| D=128 RL forward | 250 | 0 | 0 | 68 KB | 2 |
+| D=128 RL + segments, 2 waves, 128-row blocks | 256 (cap) | 0 | 46 (188 B) | 68 KB | 2 |
+| D=128 RL + segments, 1 wave, 64-row blocks (used) | 300 | 44 | 0 | 68 KB | 1 |
+| D=64 stock / RL / RL + segments | 150 / 170 / 200 | 0 | 0 | 34 KB | 2 |
+
+So at D=128 the segment cost is a register spill at 2 waves per SIMD (+68%) or, in the configuration
+used, half the occupancy without spills (+32%); at D=64 nothing spills and occupancy is unchanged.
 Because the backward (Triton) is about 8x the forward, the training forward cost is about +4% of
 attention forward + backward. Possible fixes, not yet tried:
 
 - **Outer state in LDS.** It is only touched at segment boundaries (every 16 tiles), so it could live
-  in shared memory instead of registers: about 64 KB per 256-thread workgroup on top of the 34 KB the
-  kernel uses, which likely limits a CU to one workgroup, so the gain is uncertain.
+  in shared memory instead of registers: about 64 KB per 256-thread workgroup on top of the 68 KB the
+  D=128 kernel uses, so a 160 KB CU would hold one workgroup; the gain over the current one wave per
+  SIMD is uncertain. Fewer rows per workgroup shrink it proportionally.
 - **Outer state in AGPRs.** Pin it to the accumulation registers, which the pipeline uses less, so it
   does not compete with the score and P registers.
 - **Larger `SEGMENT_SIZE`.** Fewer launches pay at all (e.g. 4096: training on sequences up to 4k is
