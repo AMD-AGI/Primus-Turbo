@@ -81,6 +81,8 @@ def build_rl_flash_attn_module(
     split_mode=0,
     split_segs=1,
     rows_per_wave=32,
+    seq_major=False,
+    kv_cache_aux=0,
 ):
     """Build a DUALWAVE_SWP flash_attn launcher for D=64/128 bf16/f16 on gfx950.
 
@@ -129,6 +131,8 @@ def build_rl_flash_attn_module(
         split_mode=split_mode,
         split_segs=split_segs,
         rows_per_wave=rows_per_wave,
+        seq_major=seq_major,
+        kv_cache_aux=kv_cache_aux,
     )
     assert split_mode == 0 or (segment_tiles and has_vis and gqa_pack), (
         "split / merge modes are for packed decode with segments and visibility intervals"
@@ -1090,11 +1094,7 @@ def build_rl_flash_attn_module(
                 "llvm.passthrough": passthrough_entries,
             },
         ).launch(
-            grid=(
-                grid_x,
-                num_q_blocks,
-                grid_z,
-            ),
+            grid=(grid_z, num_q_blocks, grid_x) if const_expr(traits.SEQ_MAJOR) else (grid_x, num_q_blocks, grid_z),
             block=(traits.BLOCK_SIZE, 1, 1),
             stream=stream,
         )

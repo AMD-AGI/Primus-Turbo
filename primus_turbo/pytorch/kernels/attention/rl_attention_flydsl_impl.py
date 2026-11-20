@@ -69,7 +69,7 @@ def _num_cus(device_index):
 @functools.lru_cache(maxsize=64)
 def _module(
     num_q_heads, num_kv_heads, head_size, cross, vis, page_size, pack, sink, emit_lse, block_m, waves_per_eu,
-    segment_tiles, split_mode, split_segs=1, wave_rows=32,
+    segment_tiles, split_mode, split_segs=1, wave_rows=32, seq_major=False, kv_cache_aux=0,
 ):  # fmt: skip
     from primus_turbo.flydsl.attention.rl_attention_fwd import build_rl_flash_attn_module
 
@@ -94,7 +94,15 @@ def _module(
         split_mode=split_mode,
         split_segs=split_segs,
         rows_per_wave=wave_rows,
+        seq_major=seq_major,
+        kv_cache_aux=kv_cache_aux,
     )
+
+
+# Packed decode builds: launch sequence-major, and load K / V with the non-temporal cache bits
+# (gfx950 sc0 | nt): decode streams each key once, and default-cached loads were ~15% slower.
+SEQ_MAJOR = True
+KV_CACHE_AUX = 3
 
 
 def _metadata(
@@ -215,6 +223,7 @@ def rl_attention_fwd_flydsl(
         return _module(
             num_q_heads, num_kv_heads, head_size, not builtin, not builtin, k.shape[1] if paged else 0, pack,
             sinks is not None, bool(return_lse), block_m, wpe, segment_tiles, split_mode, segs, rows,
+            SEQ_MAJOR and pack and split_mode != 2, KV_CACHE_AUX if pack else 0,
         )  # fmt: skip
 
     kw = {}

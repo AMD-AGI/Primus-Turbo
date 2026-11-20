@@ -84,7 +84,7 @@ from primus_turbo.flydsl.utils.prims import LOG2E
 # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
 # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
 # kernel, or a warm cache keeps serving the old one.
-CODEGEN_REV = ("rl", 17)
+CODEGEN_REV = ("rl", 19)
 
 # Sentinel bound of an empty 32-row group (no visible key): above any key position.
 VIS_EMPTY = 1 << 30
@@ -481,6 +481,8 @@ class DualwaveSwpTraits:
             self.SPLIT_MODE,
             self.SPLIT_SEGS,
             self.ROWS_PER_WAVE,
+            self.SEQ_MAJOR,
+            self.KV_CACHE_AUX,
         )
 
 
@@ -509,6 +511,8 @@ def _make_dualwave_swp_traits(
     split_mode=0,
     split_segs=1,
     rows_per_wave=32,
+    seq_major=False,
+    kv_cache_aux=0,
 ):
     """Build gfx950 DUALWAVE_SWP compile-time layout traits."""
     rows_per_wave = int(rows_per_wave)
@@ -605,6 +609,9 @@ def _make_dualwave_swp_traits(
         SEGMENT_TILES=int(segment_tiles),
         SPLIT_MODE=int(split_mode),
         SPLIT_SEGS=int(split_segs),
+        SEQ_MAJOR=bool(seq_major),
+        # Cache-policy bits of paged K / V loads (gfx950: 1 = sc0, 2 = nt); 0 keeps the copy atom.
+        KV_CACHE_AUX=int(kv_cache_aux),
         VARLEN=varlen,
         CROSS_SEQLEN=cross_seqlen,
         SBHD=bool(sbhd),
@@ -762,7 +769,10 @@ class DualwaveKernelContext:
         self.lds_kv_base_idx = fx.Index(fx.ptrtoint(lds.kv.ptr))
         self.lds_kv_base_ptr = buffer_ops.create_llvm_ptr(self.lds_kv_base_idx, address_space=3)
 
-        self.h_idx = fx.Index(gpu.block_idx.x)
+        # SEQ_MAJOR launches sequences fastest (grid x), so the workgroups in flight together read
+        # different sequences instead of the KV heads of one sequence's rows.
+        seq_major = traits.SEQ_MAJOR
+        self.h_idx = fx.Index(gpu.block_idx.z if seq_major else gpu.block_idx.x)
         if const_expr(traits.CAUSAL):
             # Dispatch order is the list-schedule order and causal work grows with q_block
             # (a window flattens but never inverts that), so walk q_block descending
@@ -776,7 +786,7 @@ class DualwaveKernelContext:
             self.q_block_idx = _nq - fx.Index(1) - fx.Index(gpu.block_idx.y)
         else:
             self.q_block_idx = fx.Index(gpu.block_idx.y)
-        self.batch_idx = fx.Index(gpu.block_idx.z)
+        self.batch_idx = fx.Index(gpu.block_idx.x if seq_major else gpu.block_idx.z)
         self.tid = fx.Index(gpu.thread_idx.x)
 
         self.wave_id = self.tid // traits.WARP_SIZE
@@ -1784,7 +1794,9 @@ class DualwaveKernelContext:
             fx.Index(seg) < first + fx.Index(self.traits.SPLIT_SEGS)
         )
         trash = (
-            fx.Index(gpu.grid_dim.x) // fx.Index(self.traits.NUM_HEADS_KV) * fx.Index(self.traits.SPLIT_SEGS)
+            fx.Index(gpu.grid_dim.z if self.traits.SEQ_MAJOR else gpu.grid_dim.x)
+            // fx.Index(self.traits.NUM_HEADS_KV)
+            * fx.Index(self.traits.SPLIT_SEGS)
         )
         target = fx.Index(in_range.select(fx.Index(seg), trash))
         self.store_partial(m_row, self.finish_row_sum(l_row), v_o, target)
@@ -1832,7 +1844,7 @@ class DualwaveKernelContext:
         (segment, sequence, query block, KV head) and thread, [reference, row sum, accumulator]."""
         traits = self.traits
         stride = 2 + traits.ACC_FLOATS
-        num_seqs = fx.Index(gpu.grid_dim.z)
+        num_seqs = fx.Index(gpu.grid_dim.x if traits.SEQ_MAJOR else gpu.grid_dim.z)
         num_q_blocks = fx.Index(gpu.grid_dim.y)
         prog = ((fx.Index(seg) * num_seqs + self.batch_idx) * num_q_blocks + self.q_block_idx) * fx.Index(
             traits.NUM_HEADS_KV
@@ -2116,8 +2128,47 @@ class DualwaveKernelContext:
         layout = fx.make_layout(fx.Int32(fx.Index(traits.BLOCK_N) * self.stride_kv_n_v), fx.Int32(1))
         return fx.logical_divide(fx.make_view(buf_ptr, layout), fx.make_layout(1, 1))
 
+    def _paged_tile_rsrc(self, tensor, tile_start):
+        """_paged_tile_div as a raw buffer descriptor."""
+        traits = self.traits
+        page = traits.PAGE_SIZE
+        keys = fx.Int32(self.seqlen_kv_v) - fx.Int32(tile_start)
+        page_idx = fx.Index(ArithValue(keys > fx.Int32(0)).select(tile_start // fx.Index(page), fx.Index(0)))
+        entry = fx.Int32(self.batch_idx * fx.Index(self.block_table_stride) + page_idx)
+        blk = fx.Int32(
+            buffer_ops.buffer_load(
+                self.bt_rsrc, as_mlir_value(entry), vec_width=1, dtype=fx.Int32, is_scalar=True
+            )
+        )
+        row = fx.Int64(blk) * fx.Int64(page) + fx.Int64(fx.Int32(tile_start % fx.Index(page)))
+        row_bytes = self.stride_kv_n_v * fx.Index(traits.BF16_BYTES)
+        keys = fx.Int32(ArithValue(keys < fx.Int32(0)).select(fx.Int32(0), keys))
+        keys = fx.Int32(ArithValue(keys > fx.Int32(traits.BLOCK_N)).select(fx.Int32(traits.BLOCK_N), keys))
+        base = fx.Int64(fx.ptrtoint(fx.get_iter(tensor))) + row * fx.Int64(row_bytes)
+        return buffer_ops.create_buffer_resource_from_addr(
+            as_mlir_value(base), num_records_bytes=as_mlir_value(fx.Int32(fx.Index(keys) * row_bytes))
+        )
+
     def _load_kv(self, tile_start, buf_id, dma_m0, div, num_dma):
         src_base = self.kv_gmem_elem_offset
+        if const_expr(self.traits.PAGE_SIZE > 0 and self.traits.KV_CACHE_AUX):
+            rsrc = self._paged_tile_rsrc(div, tile_start)
+            for wr in range_constexpr(self.dma_wave_reps):
+                eff_wave = self.wave_id + fx.Index(wr * self.traits.NUM_WAVES)
+                for d in range_constexpr(num_dma):
+                    n_in_tile = self.n_in_warp * self.traits.SMEM_N_RPT + eff_wave
+                    global_d = self.d_bucket * self.traits.VEC_KV + d * self.traits.D_128B_SIZE
+                    src_elem = src_base + n_in_tile * self.stride_kv_n_v + global_d
+                    rocdl.raw_ptr_buffer_load_lds(
+                        rsrc,
+                        buffer_ops.create_llvm_ptr(fx.Index(fx.Int32(dma_m0[buf_id][wr][d])), address_space=3),
+                        fx.Int32(self.traits.DMA_BYTES),
+                        fx.Int32(src_elem * fx.Index(self.traits.BF16_BYTES)),
+                        fx.Int32(0),
+                        fx.Int32(0),
+                        self.traits.KV_CACHE_AUX,
+                    )
+            return
         if const_expr(self.traits.PAGE_SIZE > 0):
             div = self._paged_tile_div(div, tile_start)
             soffset = 0
