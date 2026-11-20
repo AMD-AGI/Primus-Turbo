@@ -152,6 +152,45 @@ def test_causal_rollout_matches_training(heads, window, page):
 
 
 @pytest.mark.parametrize("heads", HEADS[:2])
+@pytest.mark.parametrize("window", [-1, 128])
+@pytest.mark.parametrize("with_sinks", [False, True])
+def test_long_rollout_matches_training(heads, window, with_sinks):
+    """Sequences longer than SEGMENT_SIZE: the training forward merges fixed 1024-key segments
+    in-kernel; the rollout prefills, then decodes through split-KV programs (few sequences), alone
+    and next to another long sequence. Every token must match."""
+    hq, hkv, d = heads
+    prompt, total = 2990, 3000
+    q, k, v, cu = _varlen([total], hq, hkv, d, BF16, seed=13)
+    sinks = _sinks(hq, 13) if with_sinks else None
+    training = _train(q, k, v, cu, total, window_left=window, sinks=sinks)
+    oq, ok, ov, _ = _varlen([4000], hq, hkv, d, BF16, seed=14)
+    k_cache, v_cache, block_table, _ = _paged(torch.cat([k, ok]), torch.cat([v, ov]), _cu([total, 4000]), 64)
+    for t0, t1 in [(0, prompt)] + [(t, t + 1) for t in range(prompt, total)]:
+        for with_other in (False, True):
+            other = 3000 + t0 - prompt
+            step_q = torch.cat([q[t0:t1], oq[other : other + 1]]) if with_other else q[t0:t1]
+            lens = [t1, other + 1] if with_other else [t1]
+            q_lens = [t1 - t0, 1] if with_other else [t1 - t0]
+            out = rl_paged_attention_func(
+                step_q, k_cache, v_cache, _cu(q_lens), torch.tensor(lens, dtype=torch.int32, device=DEVICE),
+                block_table[: len(lens)], t1 - t0, max(lens), window_left=window, sinks=sinks, kernel_options=FLY,
+            )  # fmt: skip
+            assert _bits_equal(out[: t1 - t0], training[t0:t1]), f"tokens [{t0}, {t1}) other={with_other}"
+
+
+@pytest.mark.parametrize("heads", HEADS[:2])
+def test_segments_leave_short_sequences_unchanged(heads):
+    """A batch with a long sequence runs the segmented build; a short sequence in it must keep the
+    bits it has alone (one segment, no merge)."""
+    hq, hkv, d = heads
+    q, k, v, cu = _varlen([700], hq, hkv, d, BF16, seed=15)
+    alone = _train(q, k, v, cu, 700)
+    oq, ok, ov, _ = _varlen([3000], hq, hkv, d, BF16, seed=16)
+    batched = _train(torch.cat([oq, q]), torch.cat([ok, k]), torch.cat([ov, v]), _cu([3000, 700]), 3000)
+    assert _bits_equal(batched[3000:], alone)
+
+
+@pytest.mark.parametrize("heads", HEADS[:2])
 @pytest.mark.parametrize("chunk", [None, 37])
 def test_masked_rollout_matches_training(heads, chunk):
     """A prompt with a bidirectional image span, prefilled whole or in 37-token chunks, then decode,
