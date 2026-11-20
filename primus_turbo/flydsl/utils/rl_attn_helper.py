@@ -20,6 +20,11 @@ others take an exact identity (shift 0, rescale 1, reference kept), which is wha
 the branch is not taken. A row's sequence of references, and so its bits, then depends only on its
 own scores and the absolute tile order, not on which rows share its wave, which differs between
 training, chunked prefill and decode.
+
+The second change is accuracy: Q stays unscaled in bf16, QK accumulates from zero, and each score
+becomes fma(q.k, log2(e) * softmax_scale, -reference) in fp32 (``_finish_scores``). The stock
+kernel rounds log2(e) * softmax_scale * Q to bf16 before the MFMA instead, which moves logits in
+the hundreds by whole units. The extra fma per score is the cost.
 """
 
 import math as host_math
@@ -42,7 +47,7 @@ from primus_turbo.flydsl.utils.prims import LOG2E
 # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
 # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
 # kernel, or a warm cache keeps serving the old one.
-CODEGEN_REV = ("rl", 1)
+CODEGEN_REV = ("rl", 2)
 
 # Room a later key has above a tile's row max before it forces another rebase.
 REF_MARGIN = 96.0
@@ -596,6 +601,7 @@ class DualwaveKernelContext:
         # reference; only a left window can still hand such a row live keys in a later tile.
         self.seed_floored = not self.use_score_bound and traits.CAUSAL and traits.WINDOW_LEFT >= 0
         self.bound_over_ref = None
+        self._qk_seed = None
         self.q_norm_sq = None
         self.Q = Q
         self.K = K
@@ -947,7 +953,6 @@ class DualwaveKernelContext:
     def scale_all(self, q_all_bf16):
         traits = self.traits
         fm_fast_attr = ir.Attribute.parse("#llvm.fastmath<fast>")
-        v64bf16_type = Vec.make_type(traits.K_STEPS_QK * traits.MFMA_LANE_K, self.elem_dtype)
         v64f32_type = Vec.make_type(traits.K_STEPS_QK * traits.MFMA_LANE_K, fx.Float32)
         q_all_f32_op = llvm.FPExtOp(v64f32_type, as_mlir_value(q_all_bf16))
         q_all_f32_op.operation.attributes["fastmathFlags"] = fm_fast_attr
@@ -965,10 +970,8 @@ class DualwaveKernelContext:
             sq = _fmul(Vec(q_all_scaled_f32), Vec(q_all_scaled_f32), self.fm_fast)
             acc = _reduce_vec_tree(sq, n_half, _fadd, self.fm_fast)
             self.q_norm_sq = _lane_pair_reduce(acc, _fadd, self.fm_fast)
-        q_all_scaled_bf16_op = llvm.FPTruncOp(v64bf16_type, q_all_scaled_f32)
-        q_all_scaled_bf16_op.operation.attributes["fastmathFlags"] = fm_fast_attr
-        q_all_scaled_bf16 = q_all_scaled_bf16_op.result
-        return Vec(q_all_scaled_bf16, (traits.K_STEPS_QK * traits.MFMA_LANE_K,), self.elem_dtype)
+        # The scale is applied to the fp32 scores (_finish_scores), so the MFMA sees Q as stored.
+        return Vec(q_all_bf16, (traits.K_STEPS_QK * traits.MFMA_LANE_K,), self.elem_dtype)
 
     def score_bound(self):
         """Cauchy-Schwarz upper bound on every logit this lane's q row can ever produce."""
@@ -1030,20 +1033,34 @@ class DualwaveKernelContext:
         self.ref_neg = _fsub(self.c_zero_f, self.seed_offset(ref), self.fm_fast)
         self.ref_seed_vec = None
 
+    def _start_scores(self, v_s, ks_lo, ks_hi):
+        """Accumulator to start a tile's QK from, and the reference shift to finish it with. A QK
+        split into k-step ranges (head, then tail) finishes with the shift current at its head,
+        which is where the stock kernel seeded the accumulator."""
+        if v_s is None:
+            seed = self.score_acc_seed()
+            if const_expr(ks_hi < self.traits.K_STEPS_QK):
+                self._qk_seed = seed
+            return (self.c_zero_v16f32, self.c_zero_v16f32), seed
+        return v_s, self._qk_seed
+
+    def _finish_scores(self, acc, seed):
+        """fp32 score = q.k * log2(e) * softmax_scale - reference, with one rounding."""
+        scale = Vec.from_elements([as_mlir_value(self.c_sm_scale_log2e)], fx.Float32).broadcast_to(16)
+        return fmath.fma(Vec(acc), scale, Vec(as_mlir_value(seed))).ir_value()
+
     def qk(self, v_k, q_all_scaled_bf16, v_s=None, ks_range=None):
         k_lo, k_hi = v_k
         ks_lo, ks_hi = (0, self.traits.K_STEPS_QK) if ks_range is None else ks_range
-        if v_s is None:
-            v_s_lo = self.score_acc_seed()
-            v_s_hi = v_s_lo
-        else:
-            v_s_lo, v_s_hi = v_s
+        (v_s_lo, v_s_hi), seed = self._start_scores(v_s, ks_lo, ks_hi)
         for ks in range_constexpr(ks_lo, ks_hi):
             _q_vec = Vec(q_all_scaled_bf16)
             _base = ks * self.traits.MFMA_LANE_K
             q_pack = _q_vec.shuffle(_q_vec, [_base + i for i in range(self.traits.MFMA_LANE_K)]).ir_value()
             v_s_lo = _mfma_acc(k_lo[ks], q_pack, v_s_lo, self.mma_atom, self.mfma_acc_vec_type)
             v_s_hi = _mfma_acc(k_hi[ks], q_pack, v_s_hi, self.mma_atom, self.mfma_acc_vec_type)
+        if const_expr(ks_hi == self.traits.K_STEPS_QK):
+            v_s_lo, v_s_hi = self._finish_scores(v_s_lo, seed), self._finish_scores(v_s_hi, seed)
         return (v_s_lo, v_s_hi)
 
     # Skip a 32-col QK half that is wholly -inf for this wave (window/causal edge).
@@ -1066,10 +1083,7 @@ class DualwaveKernelContext:
         k_lo, k_hi = v_k
         traits = self.traits
         ks_lo, ks_hi = (0, traits.K_STEPS_QK) if ks_range is None else ks_range
-        if v_s is None:
-            s_lo_in = s_hi_in = self.score_acc_seed()
-        else:
-            s_lo_in, s_hi_in = v_s
+        (s_lo_in, s_hi_in), seed = self._start_scores(v_s, ks_lo, ks_hi)
 
         def _chain(k_part, acc):
             for ks in range_constexpr(ks_lo, ks_hi):
@@ -1098,6 +1112,9 @@ class DualwaveKernelContext:
             return v_s_hi
 
         v_s_hi = _qk_hi(s_hi_in, live_hi)
+        if const_expr(ks_hi == traits.K_STEPS_QK):
+            # A skipped (dead) half finishes from zero and is masked to -inf afterwards anyway.
+            v_s_lo, v_s_hi = self._finish_scores(v_s_lo, seed), self._finish_scores(v_s_hi, seed)
         return (v_s_lo, v_s_hi)
 
     def pv_step_k(self, step, v_p, v_v, v_o):
