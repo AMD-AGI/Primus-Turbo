@@ -84,7 +84,7 @@ from primus_turbo.flydsl.utils.prims import LOG2E
 # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
 # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
 # kernel, or a warm cache keeps serving the old one.
-CODEGEN_REV = ("rl", 12)
+CODEGEN_REV = ("rl", 13)
 
 # Sentinel bound of an empty 32-row group (no visible key): above any key position.
 VIS_EMPTY = 1 << 30
@@ -1623,7 +1623,7 @@ class DualwaveKernelContext:
         b_vec = Vec.from_elements([as_mlir_value(b)], fx.Float32).broadcast_to(16)
         acc = [
             _fadd(_fmul(Vec(big_a[dc]), a_vec, None), _fmul(Vec(v_o[dc]), b_vec, None), None)
-            for dc in range_constexpr(self.traits.D_CHUNKS)
+            for dc in range_constexpr(len(v_o))
         ]
         return [m_new, l_new] + acc
 
@@ -1702,6 +1702,22 @@ class DualwaveKernelContext:
                 part = Vec(v_o[dc]).shuffle(Vec(v_o[dc]), [q4 * 4 + i for i in range(4)])
                 off = base + fx.Int32(2 + dc * 16 + q4 * 4)
                 buffer_ops.buffer_store(as_mlir_value(part), rsrc, as_mlir_value(off))
+
+    def load_partial_chunk(self, seg, dc):
+        """Reference, row sum and accumulator chunk ``dc`` (an index Value) of segment ``seg``."""
+        rsrc, base = self._partial_rsrc_and_base(seg)
+        m_row = fx.Float32(buffer_ops.buffer_load(rsrc, as_mlir_value(base), vec_width=1, dtype=fx.Float32))
+        l_seg = fx.Float32(
+            buffer_ops.buffer_load(rsrc, as_mlir_value(base + fx.Int32(1)), vec_width=1, dtype=fx.Float32)
+        )
+        off = base + fx.Int32(2) + fx.Int32(fx.Index(dc) * fx.Index(16))
+        parts = [
+            Vec(buffer_ops.buffer_load(rsrc, as_mlir_value(off + fx.Int32(q4 * 4)), vec_width=4, dtype=fx.Float32))
+            for q4 in range_constexpr(4)
+        ]
+        lo = parts[0].shuffle(parts[1], list(range(8)))
+        hi = parts[2].shuffle(parts[3], list(range(8)))
+        return m_row, l_seg, Vec(lo).shuffle(Vec(hi), list(range(16))).ir_value()
 
     def load_partial(self, seg):
         rsrc, base = self._partial_rsrc_and_base(seg)
@@ -2046,6 +2062,18 @@ class DualwaveKernelContext:
             self._final_o_base(q_row),
             lambda dc, g: _packed_o_128_vec(self.traits, v_o, dc, g, self.lane_div_32, self.elem_dtype),
         )
+
+    def store_final_o_chunk(self, v_chunk, q_row, dc):
+        """store_final_o for accumulator chunk ``dc`` (an index Value) only."""
+        o_base = self._final_o_base(q_row)
+        for g in range_constexpr(2):
+            _buffer_store_128(
+                _packed_o_128_vec(self.traits, [v_chunk], 0, g, self.lane_div_32, self.elem_dtype),
+                self._final_o_global(o_base, dc, g),
+                _o_store_reg_128=self.o_store_reg_128,
+                _store_atom_128=self.store_atom_128,
+                o_div=self.o_div,
+            )
 
     def store_lse(self, m_row, l_row, q_row):
         """LSE: m_row/l_row live in the log2 domain, hence LSE_natural =
