@@ -168,10 +168,10 @@ the 4k decodes of short contexts runs the segmented FLYDSL build):
 | Training fwd + bwd, same | 6.01 ms | 10.20 ms | 9.96 ms |
 | Training fwd, Qwen3-32B 2 x 16384 | 6.88 ms | 12.13 ms | 10.16 ms |
 | Prefill 2048 on 16k, Llama-3-8B | 555 us | 791 us | 867 us |
-| Decode 1 x 4k, Llama-3-8B | 67 us | 74 us | 60 us |
+| Decode 1 x 4k, Llama-3-8B | 68 us | 74 us | 57 us |
 | Decode 64 x 4k, Llama-3-8B | 173 us | 175 us | 240 us |
-| Decode 1 x 32k, Llama-3-8B | 67 us | 76 us | 125 us |
-| Decode 8 x 32k, Llama-3-8B | 178 us | 195 us | 370 us |
+| Decode 1 x 32k, Llama-3-8B | 66 us | 75 us | 77 us |
+| Decode 8 x 32k, Llama-3-8B | 178 us | 195 us | 297 us |
 | Decode 8 x 4k, GPT-OSS-120B (window 128, sinks) | | 46 us | 47 us |
 
 ### Known issue: cost of segments on FLYDSL
