@@ -85,7 +85,7 @@ def launch_vk_fp8_gfx1250(
     PITCH = STAGE_A + STAGE_B
     C_ROW = tile_n + 8
     ARENA = max(num_buffers * PITCH, tile_m * C_ROW * 2)
-    assert ARENA <= 160 * 1024, f"LDS arena {ARENA} B exceeds 160 KiB"
+    assert ARENA <= 320 * 1024, f"LDS arena {ARENA} B exceeds 320 KiB"
     n_ops = 2
 
     kernel_name = f"moe_vk_fp8_gfx1250_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}_nb{num_buffers}_a{a_id}{b_id}_b{beta_one}"

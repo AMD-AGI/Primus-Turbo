@@ -75,7 +75,7 @@ def launch_gg_fp8_nt_gfx1250(
     PITCH = STAGE_A + STAGE_B
     C_ROW = tile_n + 8
     ARENA = max(num_buffers * PITCH, tile_m * C_ROW * 2)
-    assert ARENA <= 160 * 1024, f"LDS arena {ARENA} B exceeds 160 KiB"
+    assert ARENA <= 320 * 1024, f"LDS arena {ARENA} B exceeds 320 KiB"
     n_ops = 2
     G = n_groups
 
