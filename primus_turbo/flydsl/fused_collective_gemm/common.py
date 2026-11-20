@@ -46,8 +46,10 @@ VEC_BF16 = 8
 _BATCH = 8
 # sc0|sc1|nt: system-coherent, streaming; staging is read by peers, recv reuses a bank every 2 epochs
 SYS_NT = 19
-# s_memrealtime ticks at 100 MHz: 5 s
-SPIN_TIMEOUT = 500_000_000
+# s_memrealtime ticks at 100 MHz: 20 s. A first launch waits for peers that are still compiling
+# their own variant of the kernel. Kept below 2**31 ticks: a wider constant changes the code of every
+# flag wait (GLM-4.7 n = 4 backward QKV A2AGemm +2 %).
+SPIN_TIMEOUT = 2_000_000_000
 
 # state: [epoch, exit counter, unit claim counter, tile claim counter]
 STATE_EPOCH = 0
