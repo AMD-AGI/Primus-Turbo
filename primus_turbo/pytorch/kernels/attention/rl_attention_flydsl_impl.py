@@ -27,6 +27,7 @@ pre-scaling Q in bf16, which keeps large logits accurate (max error vs fp32 0.01
 """
 
 import functools
+from collections import OrderedDict
 from typing import Optional, Tuple
 
 import torch
@@ -80,6 +81,37 @@ def _module(num_q_heads, num_kv_heads, head_size, cross, vis, page_size, pack, s
         gqa_pack=pack,
         has_sink=sink,
     )
+
+
+class _StepCache:
+    """Visibility metadata keyed on the identity and version of the tensors it is derived from, so
+    every layer of a step reuses one computation. Entries hold those tensors, so their ids cannot be
+    reused while cached. Bypassed during CUDA-graph capture (the graph must recompute it) and for
+    inference tensors, which carry no version counter."""
+
+    def __init__(self, size=16):
+        self._size = size
+        self._entries = OrderedDict()
+
+    def get(self, tensors, extra, build):
+        if torch.cuda.is_current_stream_capturing():
+            return build()
+        try:
+            key = tuple((id(t), t._version) for t in tensors) + extra
+        except RuntimeError:
+            return build()
+        hit = self._entries.get(key)
+        if hit is not None:
+            self._entries.move_to_end(key)
+            return hit[1]
+        value = build()
+        self._entries[key] = (tensors, value)
+        if len(self._entries) > self._size:
+            self._entries.popitem(last=False)
+        return value
+
+
+_cache = _StepCache()
 
 
 def _causal_intervals(cu_seqlens_q, key_starts, num_tokens, window_left):
@@ -137,11 +169,19 @@ def rl_attention_fwd_flydsl(
         return out, lse
     num_seqs = cu_seqlens_q.numel() - 1
     if paged and cu_seqlens_k is None:
-        cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(seq_lens, 0, dtype=torch.int32), (1, 0))
+        cu_seqlens_k = _cache.get(
+            (seq_lens,),
+            ("starts",),
+            lambda: torch.nn.functional.pad(torch.cumsum(seq_lens, 0, dtype=torch.int32), (1, 0)),
+        )
 
     builtin = vis_lo is None and window_left < 0 and not paged and cu_seqlens_q is cu_seqlens_k
     if not builtin and vis_lo is None:
-        vis_lo, vis_hi = _causal_intervals(cu_seqlens_q, cu_seqlens_k, num_tokens, window_left)
+        vis_lo, vis_hi = _cache.get(
+            (cu_seqlens_q, cu_seqlens_k),
+            ("intervals", num_tokens, window_left),
+            lambda: _causal_intervals(cu_seqlens_q, cu_seqlens_k, num_tokens, window_left),
+        )
     group = num_q_heads // num_kv_heads
     pack = not builtin and int(max_seqlen_q) <= PACK_MAX_Q and ROWS_PER_WAVE % group == 0
     if block_m not in (0, 64, 128):
@@ -166,7 +206,11 @@ def rl_attention_fwd_flydsl(
         kw.update(
             vis_lo=vis_lo,
             vis_hi=vis_hi,
-            vis_group=_group_bounds(cu_seqlens_q, vis_lo, vis_hi, tokens_per_group),
+            vis_group=_cache.get(
+                (cu_seqlens_q, vis_lo, vis_hi),
+                ("groups", tokens_per_group),
+                lambda: _group_bounds(cu_seqlens_q, vis_lo, vis_hi, tokens_per_group),
+            ),
         )
     if paged:
         kw.update(block_table=block_table, block_table_stride=block_table.stride(0))
