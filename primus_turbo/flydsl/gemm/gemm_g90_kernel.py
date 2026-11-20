@@ -186,9 +186,11 @@ def launch_gemm_g90(
     C_ROW = tile_n + 8
     # split-K: grid.x = tiles * split_k; split z covers K-tiles [z*KT/split_k, (z+1)*KT/split_k)
     # and writes fp32 partials to C + z * M * ldc (summed by the wrapper).
-    # accumulate: C (fp32) += A @ B^T -- the wgrad main_grad epilogue (beta = 1)
+    # accumulate: C += A @ B^T -- the wgrad main_grad epilogue (beta = 1). 1: fp32 C; 2: 16-bit C (bf16, or
+    # f16 with out_is_f16) read, added in fp32 and rounded once (Megatron main_grads_dtype=bf16).
     assert not (accumulate and split_k > 1)
-    OB = 4 if (split_k > 1 or accumulate) else 2
+    acc16 = accumulate == 2
+    OB = 4 if (split_k > 1 or accumulate == 1) else 2
     ARENA = max(NB * PITCH, tile_m * C_ROW * OB)
     assert ARENA <= 320 * 1024, f"LDS {ARENA} > 320 KiB"
     # tdm_mode 0: every wave fetches 1/num_waves of each operand (2 TDM ops per wave);
@@ -200,11 +202,11 @@ def launch_gemm_g90(
         n_ops = 1
     B_ROWS_PW = tile_n // (m_warp * n_warp)  # B rows fetched per wave (async path)
     B_ASYNC_PER_TILE = B_ROWS_PW * (tk_bytes // 16) // WAVE  # b128 async ops per wave per K-tile
-    out_cls = fx.Float32 if (split_k > 1 or accumulate) else (fx.Float16 if out_is_f16 else fx.BFloat16)
+    out_cls = fx.Float32 if (split_k > 1 or accumulate == 1) else (fx.Float16 if out_is_f16 else fx.BFloat16)
 
     kernel_name = f"g90_gemm_{kname}_t{tile_m}x{tile_n}_w{m_warp}x{n_warp}_nb{NB}_l{lead}_g{group_m}" + (f"_abl{abl}" if abl else "") + (
         f"_c{cluster_m}x{cluster_n}m{mc_mode}" if cluster_m * cluster_n > 1 else "") + (
-        f"_tm{tdm_mode}" if tdm_mode else "") + (f"_tk{tk_bytes}" if tk_bytes != 128 else "") + (f"_bp{b_path}" if b_path else "") + (f"_ws{ws_rows}" if ws_rows else "") + (f"_sk{split_k}" if split_k > 1 else "") + ("_brs" if b_rowscale else "") + ("_acc" if accumulate else "")
+        f"_tm{tdm_mode}" if tdm_mode else "") + (f"_tk{tk_bytes}" if tk_bytes != 128 else "") + (f"_bp{b_path}" if b_path else "") + (f"_ws{ws_rows}" if ws_rows else "") + (f"_sk{split_k}" if split_k > 1 else "") + ("_brs" if b_rowscale else "") + ("_acc" if accumulate == 1 else "") + ("_acc16" if acc16 else "")
     CM, CN = cluster_m, cluster_n
     CS = CM * CN
 
@@ -668,10 +670,14 @@ def launch_gemm_g90(
             for ni in range_constexpr(NR):
                 col = wnb + ni * WMMA_N + kgrp * (WMMA_N // 2)
                 accv = c_frags[mi * NR + ni].load()
-                if const_expr(accumulate):
+                if const_expr(accumulate == 1):
                     o0 = fx.Vector(lds_b128(c_base_i, (row * C_ROW + col) * 4))
                     o1 = fx.Vector(lds_b128(c_base_i, (row * C_ROW + col) * 4 + 16))
                     accv = accv + o0.shuffle(o1, list(range(8))).bitcast(fx.Float32)
+                elif const_expr(acc16):
+                    # 8 contiguous 16-bit old-C values = one b128; each lane rewrites exactly what it read
+                    o16 = fx.Vector(lds_b128(c_base_i, (row * C_ROW + col) * 2)).bitcast(out_cls)
+                    accv = accv + o16.to(fx.Float32)
                 h = accv.to(out_cls)
                 fx.ptr_store(h.bitcast(fx.Int8), base_ptr + (row * C_ROW + col) * OB)
         fx.barrier()
@@ -738,18 +744,21 @@ def gemm_g90(a, b, out=None, *, scale_a=None, scale_b=None, tile=(256, 256), m_w
     elif out is None:
         assert not accumulate, "accumulate needs out"
         out = torch.empty((M, N), dtype=out_dtype, device=a.device)
+    acc_mode = 0
     if accumulate:
-        assert out.dtype == torch.float32 and tuple(out.shape) == (M, N) and out.stride(1) == 1
+        assert out.dtype in (torch.float32, torch.bfloat16, torch.float16), out.dtype
+        assert tuple(out.shape) == (M, N) and out.stride(1) == 1 and out.stride(0) % 8 == 0
+        acc_mode = 1 if out.dtype == torch.float32 else 2
     out_is_f16 = 1 if out.dtype == torch.float16 else 0
     args = (
         _ptr(out), _ptr(a), _ptr(b), _ptr(sa8), _ptr(sb8), M,
         fx.Stream(torch.cuda.current_stream(device=a.device)),
         N, K, a.stride(0), b.stride(0), out.stride(-2),
         tm, tn, m_warp, n_warp, num_buffers, kind_id, lead, group_m, out_is_f16, abl, cm, cn, mc_mode, tdm_mode, tk_bytes, b_path, ws_rows, split_k, b_rowscale,
-        1 if accumulate else 0,
+        acc_mode,
     )
     key = (kind_id, tm, tn, m_warp, n_warp, num_buffers, lead, group_m, out_is_f16, abl, cm, cn, mc_mode,
-           tdm_mode, tk_bytes, b_path, ws_rows, split_k, b_rowscale, bool(accumulate))
+           tdm_mode, tk_bytes, b_path, ws_rows, split_k, b_rowscale, acc_mode)
     fn = _COMPILED.get(key)
     if fn is None:
         _COMPILED[key] = flyc.compile(launch_gemm_g90, *args)

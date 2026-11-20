@@ -18,14 +18,16 @@ Kernels: primus_turbo.triton.quantization.quant_blk_gfx1250 (routing, dispatch/S
 primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_{nt,vk}_flydsl_gfx1250 (WMMA-scale GEMMs).
 """
 
+import os
 import weakref
 from typing import Optional
 
 import torch
 
-from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad
+from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad, main_grad_first_write
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_nt_flydsl_gfx1250 import flygg_fp8blk_nt
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_vk_flydsl_gfx1250 import flyvkblk_fp8
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_vkp_flydsl_gfx1250 import expert_order_lpt, flyvkpblk_fp8
 from primus_turbo.triton.quantization.quant_blk_gfx1250 import (
     MX,
     build_routing_blk,
@@ -43,6 +45,22 @@ _ALIGN = 256
 _GEMM = dict(num_buffers=3)
 _VK = dict(num_buffers=2)
 _CACHES = weakref.WeakSet()
+# wgrad kernel: "vk" (one tile per workgroup) or "vkp" (persistent, experts longest-first, old-C prefetch for
+# beta = 1; needs the compact 1-byte-per-128-token col scales from the quant kernels). PRIMUS_TURBO_MOE_FP8BLK_WGRAD.
+_VKP_LDS_KWIN = 5120  # longest expert window the vkp LDS arena holds (scale planes grow with it)
+
+
+def _wgrad_kernel(T: int) -> str:
+    mode = os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_WGRAD", "vk").strip().lower()
+    assert mode in ("vk", "vkp"), f"PRIMUS_TURBO_MOE_FP8BLK_WGRAD={mode!r}"
+    if mode == "vkp" and _vkp_kwin(T) > _VKP_LDS_KWIN:
+        return "vk"
+    return mode
+
+
+def _vkp_kwin(T: int) -> int:
+    # an expert window holds each token at most once, padded to 256 rows (and >= 256)
+    return max(4096, -(-T // _ALIGN) * _ALIGN)
 
 
 class FP8BlockWeightCache:
@@ -90,14 +108,17 @@ class _FP8BlockMoE(torch.autograd.Function):
         if not (c1.valid and c2.valid):  # first use only (eager, before any capture)
             c1.refresh(); c2.refresh()
         rowmap, route_w, inv, poffs, preal = build_routing_blk(topk_idx, topk_w.float(), E, P, align=_ALIGN)
-        xq, xs, xT, xTs = quant_dual_blk(x, P, rowmap, preal=preal)
+        wk = _wgrad_kernel(T)
+        ct = wk == "vkp"  # col (token-direction) scales compact for the persistent wgrad
+        xq, xs, xT, xTs = quant_dual_blk(x, P, rowmap, preal=preal, compact_t=ct)
         l1 = flygg_fp8blk_nt(xq, c1.q, xs, c1.s, poffs, **_GEMM)
-        aq, as_, aT, aTs = swiglu_fwd_dual_blk(l1, route_w, activation, preal=preal)
+        aq, as_, aT, aTs = swiglu_fwd_dual_blk(l1, route_w, activation, preal=preal, compact_t=ct)
         l2 = flygg_fp8blk_nt(aq, c2.q, as_, c2.s, poffs, **_GEMM)
         y = combine_rows(l2, inv, T, K)
         ctx.save_for_backward(xT, xTs, aT, aTs, l1, route_w, rowmap, inv, poffs, preal)
         ctx.c1, ctx.c2, ctx.w1, ctx.w2 = c1, c2, w1, w2
         ctx.activation, ctx.accumulate, ctx.dims = activation, accumulate, (T, H, K, E, I, P)
+        ctx.wk = wk
         ctx.topk_dtype = topk_w.dtype
         return y
 
@@ -106,19 +127,31 @@ class _FP8BlockMoE(torch.autograd.Function):
         xT, xTs, aT, aTs, l1, route_w, rowmap, inv, poffs, preal = ctx.saved_tensors
         T, H, K, E, I, P = ctx.dims
         c1, c2, w1, w2 = ctx.c1, ctx.c2, ctx.w1, ctx.w2
-        dq, ds, dT, dTs = quant_dual_blk(dy.contiguous().to(torch.bfloat16), P, rowmap, preal=preal)
+        vkp = ctx.wk == "vkp"
+        dq, ds, dT, dTs = quant_dual_blk(dy.contiguous().to(torch.bfloat16), P, rowmap, preal=preal, compact_t=vkp)
         dact = flygg_fp8blk_nt(dq, c2.qT, ds, c2.sT, poffs, **_GEMM)
-        gq, gs, gT, gTs, dwr = swiglu_bwd_dual_blk(dact, l1, route_w, ctx.activation, preal=preal)
+        gq, gs, gT, gTs, dwr = swiglu_bwd_dual_blk(dact, l1, route_w, ctx.activation, preal=preal, compact_t=vkp)
+        # experts longest-first (one tiny argsort shared by both wgrads); PRIMUS_TURBO_MOE_FP8BLK_WGRAD_LPT=0: index order
+        lpt = os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_WGRAD_LPT", "1") == "1"
+        perm = expert_order_lpt(poffs) if (vkp and lpt) else None
+
+        def wgrad(lhs, rhs, lhs_s, rhs_s, n, k, out, beta):
+            if vkp:
+                flyvkpblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta=beta, perm=perm, kwin_max=_vkp_kwin(T))
+            else:
+                flyvkblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta=beta, **_VK)
+
         grads = []
         for w, lhs, lhs_s, rhs, rhs_s, n, k in ((w2, dT, dTs, aT, aTs, H, I), (w1, gT, gTs, xT, xTs, 2 * I, H)):
             mg = _setup_accum(w, ctx.accumulate)
             if mg is not None:
-                flyvkblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, mg, beta=1.0, **_VK)
+                # beta 0 on the step's first write into main_grad (framework skipped its clear), else accumulate
+                wgrad(lhs, rhs, lhs_s, rhs_s, n, k, mg, 0.0 if main_grad_first_write(w) else 1.0)
                 w.grad_added_to_main_grad = True
                 grads.append(_get_dummy_wgrad(w.shape, w.dtype))  # dummy, never read
             else:
                 g = torch.empty((E, n, k), device=w.device, dtype=torch.bfloat16)
-                flyvkblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, g, beta=0.0, **_VK)
+                wgrad(lhs, rhs, lhs_s, rhs_s, n, k, g, 0.0)
                 grads.append(g.to(w.dtype))
         dW2, dW1 = grads
         dxp = flygg_fp8blk_nt(gq, c1.qT, gs, c1.sT, poffs, **_GEMM)

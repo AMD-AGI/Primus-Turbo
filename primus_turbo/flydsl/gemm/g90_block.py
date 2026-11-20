@@ -40,6 +40,17 @@ def supported(M, N, K) -> bool:
     return M > 0 and N % 128 == 0 and K % 512 == 0
 
 
+def accum_supported(main_grad, N, K) -> bool:
+    """Whether gemm_nt can write/accumulate the [N, K] wgrad straight into ``main_grad``."""
+    return (
+        isinstance(main_grad, torch.Tensor)
+        and main_grad.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        and tuple(main_grad.shape) == (N, K)
+        and main_grad.is_contiguous()
+        and main_grad.data_ptr() % 16 == 0
+    )
+
+
 def gemm_nt(a, b, ea, eb, out_dtype=torch.bfloat16, out=None, accumulate=False):
     """C[M,N] = A[M,K] . B[N,K]^T with E8M0 scales ea [M,K/128] and eb [N/128,K/128] (block) or [N,K/128] (row)."""
     M, K = a.shape
