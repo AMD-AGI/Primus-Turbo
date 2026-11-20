@@ -79,7 +79,7 @@ overrides them key by key. 0 or `auto` means the default.
 | `SEGMENT_SIZE` | yes | KV segment length, the split-KV unit (default 1024) |
 | `BACKEND` | yes | `TRITON` (default) or `FLYDSL` (gfx950), see [Backends](#backends) |
 | `MODE` | no | `auto`, `fused` (one pass) or `split` (split-KV + reduce) |
-| `SPLIT_SEGS` | no | `FLYDSL`: segments per split-KV program (0 picks about 2 programs per CU) |
+| `SPLIT_SEGS` | no | `FLYDSL`: segments per split-KV program (default 1) |
 | `PACK` | no | `FLYDSL`: `auto`, `on` or `off`, rows as (token, head) of one query group |
 | `BLOCK_M`, `num_warps`, `num_stages`, `waves_per_eu` | no | Schedule only |
 

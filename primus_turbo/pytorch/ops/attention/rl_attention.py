@@ -29,7 +29,7 @@ TILE_SIZE       yes          KV tile per inner step (default 64, 32 for head siz
 SEGMENT_SIZE    yes          KV segment length, the split-KV unit (default 1024)
 BACKEND         yes          "TRITON" or "FLYDSL" (gfx950)
 MODE            no           "auto", "fused" (one pass) or "split" (split-KV + reduce)
-SPLIT_SEGS      no           FLYDSL: segments per split-KV program (0 = auto)
+SPLIT_SEGS      no           FLYDSL: segments per split-KV program (default 1)
 PACK            no           FLYDSL: "auto", "on" or "off" — (token, head) rows of one query group
 BLOCK_M         no           query rows per program (a multiple of the GQA group)
 num_warps       no           clamped to BLOCK_M / 16 when BLOCK_M > 16 to keep the bits

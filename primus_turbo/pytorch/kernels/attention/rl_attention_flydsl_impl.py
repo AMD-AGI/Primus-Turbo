@@ -160,7 +160,7 @@ def rl_attention_fwd_flydsl(
     """Same contract as rl_attention_fwd_triton. Schedule options (none changes the bits):
     ``block_m`` (64 / 128), ``waves_per_eu`` (1 / 2), ``mode`` ("fused" never splits the keys across
     programs, "split" splits packed decode whenever there are several segments), ``split_segs``
-    (segments per split program; 0 picks the fewest programs giving about 2 per CU) and ``pack`` ("on" / "off" forces (token, head) rows); 0 / "auto"
+    (segments per split program, default 1) and ``pack`` ("on" / "off" forces (token, head) rows); 0 / "auto"
     keeps the measured defaults. ``num_warps`` and ``num_stages`` belong to the Triton kernel."""
     paged = block_table is not None
     num_tokens, num_q_heads, head_size = q.shape
@@ -230,14 +230,7 @@ def rl_attention_fwd_flydsl(
     )
     if split:
         num_segments = (int(max_seqlen_k) + segment - 1) // segment
-        if not split_segs:
-            # The fewest programs that still give about 2 per CU.
-            base_programs = num_seqs * num_kv_heads * num_q_blocks
-            limit = 2 * _num_cus(q.device.index or 0)
-            split_segs = 1
-            while split_segs < 16 and base_programs * -(-num_segments // split_segs) > limit:
-                split_segs *= 2
-        split_segs = min(split_segs, num_segments)
+        split_segs = min(split_segs or 1, num_segments)
         slots = -(-num_segments // split_segs) * split_segs + 1  # + the trash slot of multi-segment programs
         per_thread = 2 + 16 * (head_size // 32)
         workspace = torch.empty(
