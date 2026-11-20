@@ -893,6 +893,8 @@ def _gfx1250_tw_fast_path(a, b, a_t, b_t, trans_b, out_dtype, num_cu) -> bool:
 
 
 _PATH_LOGGED = set()
+# PRIMUS_TURBO_GFX1250_QTW=0 sends the gfx1250 MoE operand quantization back to the previous kernels.
+_QTW_GFX1250 = __import__("os").environ.get("PRIMUS_TURBO_GFX1250_QTW", "1") != "0"
 
 
 def _log_gfx1250_path_once(fast, config):
@@ -935,8 +937,16 @@ class FP8GroupedGemmTensorGfx1250Func(torch.autograd.Function):
 
         fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
         a_dtype = _get_fp8_dtype(config.format, True)
-        a_q, a_sinv, a_t, poffs = quantize_fp8_tensorwise_dual(a, a_dtype, group_offs)
-        b_q, b_sinv = quantize_fp8_tensorwise_pad_impl(b, _get_fp8_dtype(config.format, True), pad_n=True)
+        if _QTW_GFX1250:
+            # gfx1250 tensorwise quant at the HBM floor: partial abs-max (no same-address atomics),
+            # consumers reduce the partials; weight cast is a flat streaming pass (N, K % 256 == 0 here).
+            from primus_turbo.triton.quantization.quant_tw_gfx1250 import quant_dual, quant_flat
+
+            a_q, a_sinv, a_t, poffs = quant_dual(a, a_dtype, group_offs)
+            b_q, b_sinv = quant_flat(b.contiguous(), _get_fp8_dtype(config.format, True))
+        else:
+            a_q, a_sinv, a_t, poffs = quantize_fp8_tensorwise_dual(a, a_dtype, group_offs)
+            b_q, b_sinv = quantize_fp8_tensorwise_pad_impl(b, _get_fp8_dtype(config.format, True), pad_n=True)
         offs32 = group_offs.to(torch.int32)
         out = flygg_fp8_nt(a_q, b_q, a_sinv, b_sinv, offs32)
         out = grouped_gemm_output_tail_kernel(out, group_offs)
@@ -958,7 +968,12 @@ class FP8GroupedGemmTensorGfx1250Func(torch.autograd.Function):
         grad_out = _ensure_contiguous_grad_out(grad_out)
         a_t, b_q, a_sinv, b_sinv, group_lens, group_offs = ctx.saved_tensors
         g_dtype = _get_fp8_dtype(ctx.config.format, False)
-        go_q, go_sinv, go_t, poffs = quantize_fp8_tensorwise_dual(grad_out, g_dtype, group_offs)
+        if _QTW_GFX1250:
+            from primus_turbo.triton.quantization.quant_tw_gfx1250 import quant_dual
+
+            go_q, go_sinv, go_t, poffs = quant_dual(grad_out, g_dtype, group_offs)
+        else:
+            go_q, go_sinv, go_t, poffs = quantize_fp8_tensorwise_dual(grad_out, g_dtype, group_offs)
         grad_a = grouped_gemm_fp8_impl(
             go_q,
             b_q,
