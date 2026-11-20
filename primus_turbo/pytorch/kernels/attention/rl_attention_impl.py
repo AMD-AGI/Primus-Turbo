@@ -97,6 +97,8 @@ def rl_attention_fwd_impl(
     num_warps: int,
     num_stages: int,
     waves_per_eu: int,
+    split_segs: int,
+    pack: str,
     backend: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """out [num_tokens, Hq, Dv] and the natural-log LSE [num_tokens, Hq] fp32 (shape [0] unless
@@ -124,6 +126,8 @@ def rl_attention_fwd_impl(
         num_warps=num_warps,
         num_stages=num_stages,
         waves_per_eu=waves_per_eu,
+        split_segs=split_segs,
+        pack=pack,
     )
     return _select(backend, **kwargs).fwd(**kwargs)
 
@@ -132,7 +136,7 @@ def rl_attention_fwd_impl(
 def _rl_attention_fwd_impl_meta(
     q, k, v, cu_seqlens_q, cu_seqlens_k, seq_lens, block_table, max_seqlen_q, max_seqlen_k,
     softmax_scale, window_left, vis_lo, vis_hi, sinks, return_lse, mode, tile_size, segment_size,
-    block_m, num_warps, num_stages, waves_per_eu, backend,
+    block_m, num_warps, num_stages, waves_per_eu, split_segs, pack, backend,
 ):  # fmt: skip
     num_tokens, num_q_heads, _ = q.shape
     lse_shape = (num_tokens, num_q_heads) if return_lse else (0,)

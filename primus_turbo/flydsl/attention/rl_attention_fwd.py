@@ -70,6 +70,7 @@ def build_rl_flash_attn_module(
     gqa_pack=False,
     segment_tiles=0,
     split_mode=0,
+    split_segs=1,
 ):
     """Build a DUALWAVE_SWP flash_attn launcher for D=64/128 bf16/f16 on gfx950.
 
@@ -116,6 +117,7 @@ def build_rl_flash_attn_module(
         gqa_pack=gqa_pack,
         segment_tiles=segment_tiles,
         split_mode=split_mode,
+        split_segs=split_segs,
     )
     assert split_mode == 0 or (segment_tiles and has_vis and gqa_pack), (
         "split / merge modes are for packed decode with segments and visibility intervals"
@@ -266,6 +268,8 @@ def build_rl_flash_attn_module(
             if const_expr(traits.SPLIT_MODE == 2):
                 _merge_body()
                 return
+            if const_expr(traits.SPLIT_MODE == 1 and traits.SPLIT_SEGS > 1):
+                ctx.store_empty_partials()
             ctx.load_k_split(0, 0)
             _s_waitcnt(0)
             _sched_barrier(0)
@@ -460,7 +464,14 @@ def build_rl_flash_attn_module(
             if const_expr(split_rebase):
                 init_args.append(ctx.no_rescale())
             n_carry = len(init_args)
-            outer = ctx.empty_outer() if const_expr(traits.SEGMENT_TILES > 0) else []
+            # SPLIT programs store each segment instead of merging, so they carry no outer state.
+            outer = (
+                ctx.empty_outer()
+                if const_expr(
+                    traits.SEGMENT_TILES > 0 and not (traits.SPLIT_MODE == 1 and traits.SPLIT_SEGS > 1)
+                )
+                else []
+            )
             init_args += outer
 
             for j, loop_args in range(
@@ -915,15 +926,18 @@ def build_rl_flash_attn_module(
             # finalize_o_scale folds the learned sink into the denominator when HAS_SINK
             # (else it is the plain 1/l path, byte-identical) and returns the (max, denom)
             # to record as LSE.
-            if const_expr(traits.SEGMENT_TILES > 0):
-                merged = ctx.merge_segment(outer, m_row, ctx.finish_row_sum(l_row), v_o)
-                m_row, l_row, v_o = merged[0], merged[1], list(merged[2:])
+            if const_expr(traits.SPLIT_MODE == 1 and traits.SPLIT_SEGS > 1):
+                ctx.store_last_split_segment(split_t_end - fx.Index(1), m_row, l_row, v_o)
             else:
-                l_row = ctx.finish_row_sum(l_row)
-            if const_expr(traits.SPLIT_MODE == 1):
-                ctx.store_partial(m_row, l_row, v_o)
-            else:
-                _finish(m_row, l_row, v_o)
+                if const_expr(traits.SEGMENT_TILES > 0):
+                    merged = ctx.merge_segment(outer, m_row, ctx.finish_row_sum(l_row), v_o)
+                    m_row, l_row, v_o = merged[0], merged[1], list(merged[2:])
+                else:
+                    l_row = ctx.finish_row_sum(l_row)
+                if const_expr(traits.SPLIT_MODE == 1):
+                    ctx.store_partial(m_row, l_row, v_o, ctx.group_id)
+                else:
+                    _finish(m_row, l_row, v_o)
 
         if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN and not traits.HAS_VIS):
             ctx.zero_o_block_if_needed()
@@ -972,8 +986,9 @@ def build_rl_flash_attn_module(
         num_q_blocks = (rows + traits.BLOCK_M - 1) // traits.BLOCK_M
         if const_expr(traits.SPLIT_MODE == 1):
             seg_keys = traits.SEGMENT_TILES * traits.BLOCK_N
+            group_keys = seg_keys * traits.SPLIT_SEGS
             grid_x = fx.Index(traits.NUM_HEADS_KV) * (
-                (fx.Index(seq_len_kv) + fx.Index(seg_keys - 1)) // fx.Index(seg_keys)
+                (fx.Index(seq_len_kv) + fx.Index(group_keys - 1)) // fx.Index(group_keys)
             )
         elif const_expr(traits.GQA_PACK):
             grid_x = traits.NUM_HEADS_KV

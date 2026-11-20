@@ -27,8 +27,10 @@ Key             Bits change  Meaning
 ==============  ===========  ===================================================================
 TILE_SIZE       yes          KV tile per inner step (default 64, 32 for head size > 128)
 SEGMENT_SIZE    yes          KV segment length, the split-KV unit (default 1024)
-BACKEND         yes          "TRITON" (FLYDSL to come)
+BACKEND         yes          "TRITON" or "FLYDSL" (gfx950)
 MODE            no           "auto", "fused" (one pass) or "split" (split-KV + reduce)
+SPLIT_SEGS      no           FLYDSL: segments per split-KV program (0 = auto)
+PACK            no           FLYDSL: "auto", "on" or "off" — (token, head) rows of one query group
 BLOCK_M         no           query rows per program (a multiple of the GQA group)
 num_warps       no           clamped to BLOCK_M / 16 when BLOCK_M > 16 to keep the bits
 num_stages      no           software pipelining depth
@@ -78,8 +80,16 @@ __all__ = [
     "rl_paged_attention_func",
 ]
 
-_INT_OPTIONS = ("TILE_SIZE", "SEGMENT_SIZE", "BLOCK_M", "num_warps", "num_stages", "waves_per_eu")
-KERNEL_OPTIONS = _INT_OPTIONS + ("MODE", "BACKEND")
+_INT_OPTIONS = (
+    "TILE_SIZE",
+    "SEGMENT_SIZE",
+    "BLOCK_M",
+    "num_warps",
+    "num_stages",
+    "waves_per_eu",
+    "SPLIT_SEGS",
+)
+KERNEL_OPTIONS = _INT_OPTIONS + ("MODE", "PACK", "BACKEND")
 
 
 @dataclass(frozen=True)
@@ -90,7 +100,9 @@ class _Options:
     num_warps: int = 0
     num_stages: int = 0
     waves_per_eu: int = 0
+    split_segs: int = 0
     mode: str = "auto"
+    pack: str = "auto"
     backend: str = "TRITON"
 
     def fwd_args(self) -> tuple:
@@ -103,6 +115,8 @@ class _Options:
             self.num_warps,
             self.num_stages,
             self.waves_per_eu,
+            self.split_segs,
+            self.pack,
             self.backend,
         )
 
@@ -123,6 +137,10 @@ def _merge_options(options: dict, source: str, into: dict) -> dict:
             value = str(value).lower()
             if value not in ("auto", "fused", "split"):
                 raise ValueError(f"{source} MODE must be auto, fused or split, got {value!r}")
+        elif key == "PACK":
+            value = str(value).lower()
+            if value not in ("auto", "on", "off"):
+                raise ValueError(f"{source} PACK must be auto, on or off, got {value!r}")
         else:
             value = str(value).upper()
             if value not in rl_attention_impl.BACKEND_NAMES:
@@ -158,7 +176,9 @@ def _resolve_options(kernel_options: Optional[dict]) -> _Options:
         num_warps=merged.get("num_warps", 0),
         num_stages=merged.get("num_stages", 0),
         waves_per_eu=merged.get("waves_per_eu", 0),
+        split_segs=merged.get("SPLIT_SEGS", 0),
         mode=merged.get("MODE", "auto"),
+        pack=merged.get("PACK", "auto"),
         backend=merged.get("BACKEND", "TRITON"),
     )
 

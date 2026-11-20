@@ -53,8 +53,12 @@ bits as one program walking every segment. Merging into an empty outer state is 
 whose keys lie in one segment is unchanged.
 
 SPLIT (with SEGMENT_TILES, HAS_VIS and GQA_PACK, for decode) runs the same walk with every row's
-interval clipped to one segment (grid x = KV heads x segments) and stores the row's (reference, row
-sum, accumulator) to a workspace instead of the output. MERGE loads those partials, merges them in
+interval clipped to SPLIT_SEGS consecutive segments (grid x = KV heads x segment groups) and stores
+the (reference, row sum, accumulator) of each of its segments to that segment's workspace slot
+instead of the output. With one segment per program it merges its walk into the outer state and
+stores that; with several it stores each finished segment and restarts the row state, every slot
+first written as an empty segment (the merge is not associative in floating point, so the partials
+must stay per segment). MERGE loads those partials, merges them in
 segment order with ``merge_segment``, and finishes through the same normalize / store code as a
 full walk. The merge uses exact IEEE arithmetic (no fast-math), so the two kernels cannot fuse or
 reorder it differently.
@@ -80,7 +84,7 @@ from primus_turbo.flydsl.utils.prims import LOG2E
 # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
 # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
 # kernel, or a warm cache keeps serving the old one.
-CODEGEN_REV = ("rl", 9)
+CODEGEN_REV = ("rl", 12)
 
 # Sentinel bound of an empty 32-row group (no visible key): above any key position.
 VIS_EMPTY = 1 << 30
@@ -464,6 +468,7 @@ class DualwaveSwpTraits:
             self.GQA_PACK,
             self.SEGMENT_TILES,
             self.SPLIT_MODE,
+            self.SPLIT_SEGS,
         )
 
 
@@ -490,6 +495,7 @@ def _make_dualwave_swp_traits(
     gqa_pack=False,
     segment_tiles=0,
     split_mode=0,
+    split_segs=1,
 ):
     """Build gfx950 DUALWAVE_SWP compile-time layout traits."""
     rows_per_wave = 32
@@ -578,6 +584,7 @@ def _make_dualwave_swp_traits(
         GQA_PACK=bool(gqa_pack),
         SEGMENT_TILES=int(segment_tiles),
         SPLIT_MODE=int(split_mode),
+        SPLIT_SEGS=int(split_segs),
         VARLEN=varlen,
         CROSS_SEQLEN=cross_seqlen,
         SBHD=bool(sbhd),
@@ -974,11 +981,14 @@ class DualwaveKernelContext:
             lambda b, w, d: self._dma_base(b, w, d, _v_buf_base, traits.SMEM_V_LINE_STRIDE), self.NUM_DMA_V
         )
 
+    def _first_split_segment(self):
+        return fx.Index(self.group_id) * fx.Index(self.traits.SPLIT_SEGS)
+
     def _segment_keys(self):
-        """[first, last] key of this SPLIT program's segment, sequence-relative."""
+        """[first, last] key of this SPLIT program's segments, sequence-relative."""
         seg_keys = self.traits.SEGMENT_TILES * self.traits.BLOCK_N
-        first = fx.Int32(self.group_id) * fx.Int32(seg_keys)
-        return first, first + fx.Int32(seg_keys - 1)
+        first = fx.Int32(self._first_split_segment()) * fx.Int32(seg_keys)
+        return first, first + fx.Int32(seg_keys * self.traits.SPLIT_SEGS - 1)
 
     def _clip_to_segment(self, lo, hi):
         if const_expr(self.traits.SPLIT_MODE != 1):
@@ -1617,12 +1627,50 @@ class DualwaveKernelContext:
         ]
         return [m_new, l_new] + acc
 
+    def _store_split_segment(self, seg, m_row, l_row, v_o):
+        """SPLIT: store the state of segment ``seg`` (an index Value) if it is one of this program's.
+        The workspace descriptor is unbounded, so a masked store would still land somewhere: an
+        out-of-range segment (walk tiles outside the program's range, always empty) goes to the
+        trash slot after the last real one instead."""
+        first = self._first_split_segment()
+        in_range = ArithValue(fx.Index(seg) >= first) & (
+            fx.Index(seg) < first + fx.Index(self.traits.SPLIT_SEGS)
+        )
+        trash = (
+            fx.Index(gpu.grid_dim.x) // fx.Index(self.traits.NUM_HEADS_KV) * fx.Index(self.traits.SPLIT_SEGS)
+        )
+        target = fx.Index(in_range.select(fx.Index(seg), trash))
+        self.store_partial(m_row, self.finish_row_sum(l_row), v_o, target)
+
+    def store_empty_partials(self):
+        """SPLIT: write every segment slot of this program as an empty segment first."""
+        zeros = [self.c_zero_v16f32] * self.traits.D_CHUNKS
+        for k in range_constexpr(self.traits.SPLIT_SEGS):
+            self.store_partial(
+                self.c_neg_floor, self.c_zero_f, zeros, self._first_split_segment() + fx.Index(k)
+            )
+
+    def store_last_split_segment(self, last_tile, m_row, l_row, v_o):
+        self._store_split_segment(
+            fx.Index(last_tile) // fx.Index(self.traits.SEGMENT_TILES), m_row, l_row, v_o
+        )
+
     def segment_boundary(self, tile_idx, m_row, l_row, v_o, outer):
         """Before the rebase of tile ``tile_idx``: if it opens a segment, merge the finished segment
-        into ``outer`` and restart the row state empty."""
+        into ``outer`` (SPLIT: store it to its slot) and restart the row state empty."""
         if const_expr(self.traits.SEGMENT_TILES == 0):
             return m_row, l_row, v_o, outer
         nd = self.traits.D_CHUNKS
+        if const_expr(self.traits.SPLIT_MODE == 1 and self.traits.SPLIT_SEGS > 1):
+
+            def _then_split():
+                finished = fx.Index(tile_idx) // fx.Index(self.traits.SEGMENT_TILES) - fx.Index(1)
+                self._store_split_segment(finished, m_row, l_row, v_o)
+                return [self.c_neg_floor, self.empty_row_sum()] + [self.c_zero_v16f32] * nd
+
+            res = _if_wave(self.segment_start(tile_idx), [m_row, l_row] + list(v_o), _then_split)
+            self.set_ref(res[0])
+            return res[0], res[1], list(res[2 : 2 + nd]), outer
 
         def _then():
             merged = self.merge_segment(outer, m_row, self.finish_row_sum(l_row), v_o)
@@ -1645,8 +1693,8 @@ class DualwaveKernelContext:
         ) + self.h_kv_idx
         return rsrc, fx.Int32((prog * fx.Index(traits.BLOCK_SIZE) + self.tid) * fx.Index(stride))
 
-    def store_partial(self, m_row, l_seg, v_o):
-        rsrc, base = self._partial_rsrc_and_base(self.group_id)
+    def store_partial(self, m_row, l_seg, v_o, seg):
+        rsrc, base = self._partial_rsrc_and_base(seg)
         buffer_ops.buffer_store(as_mlir_value(fx.Float32(m_row)), rsrc, as_mlir_value(base))
         buffer_ops.buffer_store(as_mlir_value(fx.Float32(l_seg)), rsrc, as_mlir_value(base + fx.Int32(1)))
         for dc in range_constexpr(self.traits.D_CHUNKS):

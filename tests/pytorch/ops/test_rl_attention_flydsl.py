@@ -269,3 +269,43 @@ def test_rejects_unsupported():
     k_cache, v_cache, block_table, seq_lens = _paged(k, v, cu, 16)
     with pytest.raises(ValueError, match="cannot handle"):
         rl_paged_attention_func(q, k_cache, v_cache, cu, seq_lens, block_table, 64, 64, kernel_options=FLY)
+
+
+# ----------------------------------------------------------------------------- schedule knobs
+
+
+def _knob_sets(decode):
+    """Schedule-only kernel options; none may change the bits."""
+    sets = [{"BLOCK_M": bm, "waves_per_eu": w} for bm in (64, 128) for w in (1, 2)]
+    if decode:
+        sets += [{"MODE": "fused"}, {"MODE": "fused", "PACK": "off"}]
+        sets += [{"MODE": "split", "SPLIT_SEGS": k, "BLOCK_M": bm} for k in (1, 2, 4) for bm in (64, 128)]
+        sets += [{"MODE": "split", "SPLIT_SEGS": 2, "waves_per_eu": 2}]
+    else:
+        sets += [{"PACK": "on"}, {"PACK": "on", "BLOCK_M": 128}]
+    return sets
+
+
+@pytest.mark.parametrize("heads", HEADS[:2])
+def test_schedule_knobs_do_not_change_bits(heads):
+    """Every schedule knob combination gives the training forward's bits for decode (3 segments,
+    next to another sequence), chunked prefill, and the training forward itself."""
+    hq, hkv, d = heads
+    total = 3000
+    q, k, v, cu = _varlen([total], hq, hkv, d, BF16, seed=17)
+    sinks = _sinks(hq, 17)
+    training = _train(q, k, v, cu, total, sinks=sinks)
+    for opts in _knob_sets(decode=False):
+        got = _train(q, k, v, cu, total, sinks=sinks, kernel_options={**FLY, **opts})
+        assert _bits_equal(got, training), f"training with {opts}"
+    oq, ok, ov, _ = _varlen([2600], hq, hkv, d, BF16, seed=18)
+    k_cache, v_cache, block_table, _ = _paged(torch.cat([k, ok]), torch.cat([v, ov]), _cu([total, 2600]), 64)
+    for t0, t1, decode in [(2999, 3000, True), (2963, 3000, False)]:
+        step_q = torch.cat([q[t0:t1], oq[2599:2600]])
+        seq_lens = torch.tensor([t1, 2600], dtype=torch.int32, device=DEVICE)
+        for opts in [{}] + _knob_sets(decode):
+            out = rl_paged_attention_func(
+                step_q, k_cache, v_cache, _cu([t1 - t0, 1]), seq_lens, block_table, t1 - t0, total,
+                sinks=sinks, kernel_options={**FLY, **opts},
+            )  # fmt: skip
+            assert _bits_equal(out[: t1 - t0], training[t0:t1]), f"tokens [{t0}, {t1}) with {opts}"
