@@ -24,6 +24,7 @@ prefill, that the rollout result equals a training forward of the same tokens bi
 
     python benchmark/ops/training/bench_rl_attention.py [--phase decode prefill train]
         [--model llama3-8b gpt-oss-120b] [--backend TRITON FLYDSL] [--tp-size N] [--check] [-o out.csv]
+        [--decode-batch 1 8 32 --decode-ctx 131072 262144 524288]
 """
 
 import argparse
@@ -177,10 +178,10 @@ def _rollout_case(phase, model, batch, ctx, q_len, shape, dtype, check, unified_
     return row
 
 
-def bench_rollout(phase, model, tp_size, dtype, check, backends):
+def bench_rollout(phase, model, tp_size, dtype, check, backends, decode_cases=DECODE_CASES):
     shape = heads(model, tp_size)
     unified_attention = _aiter_unified_attention()
-    cases = [(b, c, 1) for b, c in DECODE_CASES] if phase == "decode" else PREFILL_CASES
+    cases = [(b, c, 1) for b, c in decode_cases] if phase == "decode" else PREFILL_CASES
     return [
         _rollout_case(phase, model, batch, ctx, q_len, shape, dtype, check, unified_attention, backends)
         for batch, ctx, q_len in cases
@@ -260,10 +261,18 @@ def main(argv=None):
     parser.add_argument("--tp-size", type=int, default=1, help="shard attention heads over this many ranks")
     parser.add_argument("--dtype", default="bf16", choices=list(_DTYPES))
     parser.add_argument("--check", action="store_true", help="also check accuracy and rollout == train bits")
+    parser.add_argument("--decode-batch", nargs="+", type=int, help="decode batches (with --decode-ctx)")
+    parser.add_argument("--decode-ctx", nargs="+", type=int, help="decode contexts, e.g. 131072 262144 524288")
     parser.add_argument("-o", "--output", help="CSV path (default: rl_attention_<date>_<gpu>.csv)")
     args = parser.parse_args(argv)
 
     dtype = _DTYPES[args.dtype]
+    decode_cases = DECODE_CASES
+    if args.decode_batch or args.decode_ctx:
+        decode_cases = [
+            (b, c) for c in args.decode_ctx or sorted({c for _, c in DECODE_CASES})
+            for b in args.decode_batch or sorted({b for b, _ in DECODE_CASES})
+        ]  # fmt: skip
     gpu = torch.cuda.get_device_name(0)
     print(f"{gpu}, triton {triton.__version__}, {args.dtype}, tp {args.tp_size}")
     results = []
@@ -273,7 +282,7 @@ def main(argv=None):
             if phase == "train":
                 rows += bench_train(model, args.tp_size, dtype, args.check, args.backend)
             else:
-                rows += bench_rollout(phase, model, args.tp_size, dtype, args.check, args.backend)
+                rows += bench_rollout(phase, model, args.tp_size, dtype, args.check, args.backend, decode_cases)
         print(f"\n{phase}")
         print(tabulate(rows, headers="keys", tablefmt="github"))
         results += rows

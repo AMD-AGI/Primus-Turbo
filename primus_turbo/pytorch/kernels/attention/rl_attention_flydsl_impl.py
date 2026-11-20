@@ -45,7 +45,6 @@ TILE = 64
 PACK_MAX_Q = 16
 ROWS_PER_WAVE = 32
 DEFAULT_SEGMENT = 1024
-MAX_THREADS = 256  # threads of the largest workgroup the kernel builds (block_m 128)
 
 
 def can_handle(q, k, block_table=None, softmax_scale=None, tile_size=0, segment_size=0, **kwargs) -> bool:
@@ -233,8 +232,9 @@ def rl_attention_fwd_flydsl(
         split_segs = min(split_segs or 1, num_segments)
         slots = -(-num_segments // split_segs) * split_segs + 1  # + the trash slot of multi-segment programs
         per_thread = 2 + 16 * (head_size // 32)
+        # One row per program (2 * block_m threads); 2D so no dimension passes the launcher's int32.
         workspace = torch.empty(
-            slots * num_seqs * num_q_blocks * num_kv_heads * MAX_THREADS * per_thread,
+            (slots * num_seqs * num_q_blocks * num_kv_heads, 2 * block_m * per_thread),
             dtype=torch.float32,
             device=q.device,
         )

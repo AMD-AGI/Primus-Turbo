@@ -84,7 +84,7 @@ from primus_turbo.flydsl.utils.prims import LOG2E
 # and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
 # only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
 # kernel, or a warm cache keeps serving the old one.
-CODEGEN_REV = ("rl", 13)
+CODEGEN_REV = ("rl", 14)
 
 # Sentinel bound of an empty 32-row group (no visible key): above any key position.
 VIS_EMPTY = 1 << 30
@@ -1685,13 +1685,16 @@ class DualwaveKernelContext:
         (segment, sequence, query block, KV head) and thread, [reference, row sum, accumulator]."""
         traits = self.traits
         stride = 2 + 16 * traits.D_CHUNKS
-        rsrc = buffer_ops.create_buffer_resource(self.Partial, max_size=True)
         num_seqs = fx.Index(gpu.grid_dim.z)
         num_q_blocks = fx.Index(gpu.grid_dim.y)
         prog = ((fx.Index(seg) * num_seqs + self.batch_idx) * num_q_blocks + self.q_block_idx) * fx.Index(
             traits.NUM_HEADS_KV
         ) + self.h_kv_idx
-        return rsrc, fx.Int32((prog * fx.Index(traits.BLOCK_SIZE) + self.tid) * fx.Index(stride))
+        # The program's base goes into the descriptor in 64 bits: 32-bit byte offsets from the
+        # workspace start wrap past 4 GiB (long-context decode at large batch).
+        prog_bytes = fx.Int64(prog) * fx.Int64(traits.BLOCK_SIZE * stride * 4)
+        rsrc = buffer_ops.create_buffer_resource(self.Partial, max_size=True, base_byte_offset=prog_bytes)
+        return rsrc, fx.Int32(self.tid * fx.Index(stride))
 
     def store_partial(self, m_row, l_seg, v_o, seg):
         rsrc, base = self._partial_rsrc_and_base(seg)
