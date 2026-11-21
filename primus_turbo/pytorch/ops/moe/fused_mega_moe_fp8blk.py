@@ -81,6 +81,9 @@ class FP8BlockWeightCache:
         self.sT = torch.empty((E, K, N // MX), device=dev, dtype=torch.uint8)
         self.s_pk = self.sT_pk = None  # gg_dsv4 packed MX scales (only when PRIMUS_TURBO_MOE_GG_DSV4=1)
         self.valid = False
+        # Set by an optimizer that writes q / s / qT / sT itself with the bytes of refresh() after every
+        # update of ``weight`` (Primus PRIMUS_FP8BLK_ADAM_MEGAMOE=1); refresh_fp8blk_weights() then skips it.
+        self.adam_managed = False
         _CACHES.add(self)
 
     @torch.no_grad()
@@ -100,9 +103,26 @@ class FP8BlockWeightCache:
 
 @torch.no_grad()
 def refresh_fp8blk_weights():
-    """Re-quantize every live FP8-block expert weight. Call once after each optimizer step (outside graphs)."""
+    """Re-quantize every live FP8-block expert weight not written by the optimizer itself (``adam_managed``).
+    Call once after each optimizer step (outside graphs)."""
+    verify = os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_VERIFY", "0") == "1"
+    n_refreshed = n_verified = 0
     for c in list(_CACHES):
-        c.refresh()
+        if not (c.adam_managed and c.valid):
+            c.refresh()
+            n_refreshed += 1
+        elif verify:  # debug: the optimizer-written bytes must equal a fresh quant_w_128x128 (costs a sync)
+            ref = quant_w_128x128(c.weight.detach(), _FP8, transposed=True)
+            bad = [n for n, a, b in zip(("q", "s", "qT", "sT"), (c.q, c.s, c.qT, c.sT), ref)
+                   if not torch.equal(a.view(torch.uint8), b.view(torch.uint8))]
+            if bad:
+                raise RuntimeError(f"PRIMUS_TURBO_MOE_FP8BLK_VERIFY: optimizer-written {bad} differ from "
+                                   f"quant_w_128x128 of {tuple(c.weight.shape)}")
+            c.verified = getattr(c, "verified", 0) + 1
+            n_verified += 1
+    if verify:
+        print(f"[PRIMUS_TURBO_MOE_FP8BLK_VERIFY] caches={len(_CACHES)} refreshed={n_refreshed} "
+              f"adam-written verified byte-equal={n_verified}", flush=True)
 
 
 def _gg(a, a_s, c, transposed, poffs):
