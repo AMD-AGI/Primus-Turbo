@@ -44,8 +44,19 @@ Modes:
     collective in between would line up every rank at the phase boundary, and the phases are not balanced
     across ranks (rank r's q0 sees (r+1) chunks, its q1 2n-r).
 
-    The symmetric buffers are double buffered and reused call after call, which needs every rank of the
-    group to issue the same sequence of forward and backward calls (true of SPMD training).
+``mega``
+    the ``overlap`` schedule with MegaMoE-style communication kernels (``agkv_comm_kernel``) instead of
+    SDMA copies: one push kernel per exchange step stores the halves (gradient slots) over XGMI from a few
+    compute units into the peers' buffers and raises a flag per (destination, half); a one-block-per-XCD
+    wait kernel holds each call until its slots are in; in the backward one reduce kernel sums the
+    received slots and the own partial gradients (fp32, sender order) straight into dK / dV. A few dozen
+    blocks of stores move the data at about RCCL's speed and keep going beside the attention kernels; the
+    per-copy cost of the SDMA engines (~25 us a copy, a few copies in flight per engine) is gone, and so
+    are the local slot copies and the separate sums.
+
+Both ``overlap`` and ``mega`` reuse double-buffered symmetric buffers call after call, which needs every
+rank of the group to issue the same sequence of forward and backward calls (true of SPMD training), and
+count calls on the host, so they cannot be graph captured.
 
 The forward keeps the gathered K / V for the backward rather than gathering again.
 """
@@ -57,6 +68,7 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
+from primus_turbo.flydsl.attention import agkv_comm_kernel as _comm
 from primus_turbo.pytorch.core.pyhip_runtime_wrapper import (
     find_hip_runtime_library,
     get_hip_runtime_lib,
@@ -70,7 +82,11 @@ from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
 
 __all__ = ["AGKV_MODES", "attention_agkv"]
 
-AGKV_MODES = ("naive", "serial", "overlap")
+AGKV_MODES = ("naive", "serial", "overlap", "mega")
+
+# blocks of a mega push launch: 48 moved the n = 8 exchange at RCCL speed (16 / 24 / 32 were 55 / 23 / 18 %
+# slower) and slowed the concurrent attention no more than fewer blocks
+_PUSH_GRID = 48
 
 
 def _fwd(q, k, v, softmax_scale):
@@ -121,7 +137,7 @@ class _Layout:
 
 
 # --------------------------------------------------------------------------------------------------------
-# SDMA exchange
+# symmetric exchange buffers; SDMA copies (overlap)
 # --------------------------------------------------------------------------------------------------------
 
 # flag arrays in the signal pad, n int64 each, indexed by sender
@@ -151,16 +167,16 @@ def _stream_wait_value():
     return wait_value
 
 
-class _SDMAExchange:
-    """One rank's symmetric buffers, flags and copy streams for a process group.
+class _Exchange:
+    """One rank's symmetric buffers, flags and streams for a process group.
 
     Buffer, per bank (two, used alternately by consecutive calls of each direction):
         forward   K, V gathered buffers, (2n+1)c tokens each, in the ``_Layout`` order
         backward  K, V partial-gradient slots, [first: n senders | second: n senders] x c tokens each
 
     Each direction counts its calls (epochs, from 1) and uses bank ``epoch & 1``; a sender raises its flag
-    to the epoch with an 8-byte SDMA copy queued behind its data copies on the same stream, a receiver
-    waits until the flag reaches it. (``hipStreamWriteValue64`` is a kernel on ROCm; between the copies it
+    to the epoch once its data is in (``overlap``: an 8-byte SDMA copy queued behind its data copies on the
+    same stream; ``mega``: the push kernel), a receiver waits until the flag reaches it. (``hipStreamWriteValue64`` is a kernel on ROCm; between the copies it
     makes the stream switch engines and doubles the copy time at 7 peers.) A rank's call e cannot finish
     before every peer has sent its call-e data, which a peer does only after finishing call e - 1, so when a
     peer writes bank e & 1 for call e + 2 this rank is past call e: two banks need no acknowledgement.
@@ -184,6 +200,11 @@ class _SDMAExchange:
         self.flag_values = {
             d: torch.arange(1, _FLAG_TABLE + 1, dtype=torch.int64, device="cuda") for d in self.epoch
         }
+        self.heaps = torch.tensor(self.symm.buffer_ptrs, dtype=torch.int64, device="cuda")
+        self.flag_ptrs = torch.tensor(self.symm.signal_pad_ptrs, dtype=torch.int64, device="cuda")
+        # push group counters, see _GROUPS_*
+        self.counters = torch.zeros(6 * self.n, dtype=torch.int64, device="cuda")
+        self.comm_stream = torch.cuda.Stream(priority=-1)
 
     @classmethod
     def get(cls, group, nbytes):
@@ -268,12 +289,225 @@ def _exchange_sizes(lay, tok):
     return fwd, bwd
 
 
+# --------------------------------------------------------------------------------------------------------
+# mega: compute-unit pushes over XGMI (agkv_comm_kernel)
+# --------------------------------------------------------------------------------------------------------
+
+# push counter groups: forward [0, 2n), backward after q1 [2n, 4n), backward after q0 [4n, 6n)
+_GROUPS_FWD, _GROUPS_BWD1, _GROUPS_BWD0 = 0, 2, 4
+
+
+def _units_table(units, device):
+    t = torch.tensor(units, dtype=torch.int64, device=device)
+    return t, len(units)
+
+
+def _phase(pieces, items):
+    """Unit rows of ``items`` = ``(segment rows, ...)`` interleaved piece-major, so consecutive units
+    (taken by consecutive blocks) go to different links."""
+    rows = []
+    for piece in range(max(len(seg) for seg in items) if items else 0):
+        for seg in items:
+            if piece < len(seg):
+                rows.append(seg[piece])
+    return rows
+
+
+def _segment(sel, src_off, dst, dst_off, nbytes, group, group_size, flag):
+    step = _comm.UNIT_BYTES
+    return [
+        [sel, src_off + o, dst, dst_off + o, min(step, nbytes - o), group, group_size, flag]
+        for o in range(0, nbytes, step)
+    ]
+
+
+@functools.lru_cache(maxsize=64)
+def _mega_fwd_plan(n, r, c, tok, fwd_bytes, device):
+    """Forward copy units of rank ``r`` and the flags its two calls wait for.
+
+    Units copy K (source 0) / V (source 1) halves into every rank's forward bank (V region at
+    ``fwd_bytes // 2``): the first half to every rank's first-half slot ``r``, the second half to the
+    second-half slot ``r`` of the lower ranks and to the own tail. A (destination, half) is one group;
+    its flag is ``_FWD_FIRST`` / ``_FWD_SECOND`` of sender ``r``."""
+    half = c * tok
+    pieces = -(-half // _comm.UNIT_BYTES)
+    first_off = (n + r) * c * tok
+    second_off = r * c * tok
+    tail_off = 2 * n * c * tok
+
+    def segments(dst, h, dst_off):
+        group, flag = _GROUPS_FWD * n + 2 * dst + h, (_FWD_FIRST if h == 0 else _FWD_SECOND) * n + r
+        return [
+            _segment(t, h * half, dst, t * (fwd_bytes // 2) + dst_off, half, group, 2 * pieces, flag)
+            for t in range(2)
+        ]
+
+    own_first = segments(r, 0, first_off)
+    peers_first = [seg for p in list(range(r + 1, n)) + list(range(r)) for seg in segments(p, 0, first_off)]
+    seconds = [seg for p in range(r) for seg in segments(p, 1, second_off)] + segments(r, 1, tail_off)
+    rows = _phase(pieces, own_first) + _phase(pieces, peers_first) + _phase(pieces, seconds)
+    units, num_units = _units_table(rows, device)
+    q0_flags = [_FWD_FIRST * n + s for s in range(r + 1)]
+    q1_flags = [_FWD_FIRST * n + s for s in range(r + 1, n)] + [_FWD_SECOND * n + s for s in range(r, n)]
+    return units, num_units, tuple(q0_flags), tuple(q1_flags)
+
+
+@functools.lru_cache(maxsize=64)
+def _mega_bwd_plan(n, r, c, tok, bwd_bytes, device):
+    """Backward copy units of rank ``r``: after q1's backward, the gradient slots of the higher owners
+    (out of dK1 / dV1, sources 0 / 1), after q0's the first-half slots of the lower owners, each into
+    slot ``(half, r)`` of the owner's backward bank (V region at ``bwd_bytes // 2``). Also returns the
+    flags the owner's reduce waits for."""
+    seg = c * tok
+    pieces = -(-seg // _comm.UNIT_BYTES)
+
+    def segments(base, dst, h, src_row):
+        group, flag = base * n + 2 * dst + h, (_BWD_FIRST if h == 0 else _BWD_SECOND) * n + r
+        dst_off = (h * n + r) * seg
+        return [
+            _segment(t, src_row * tok, dst, t * (bwd_bytes // 2) + dst_off, seg, group, 2 * pieces, flag)
+            for t in range(2)
+        ]
+
+    # rows of dK1 (q1's keys): second-half slots r+1.., then first-half slots 0..n-1, then the own tail
+    after_q1 = [
+        sg
+        for s in range(r + 1, n)
+        for sg in segments(_GROUPS_BWD1, s, 1, (s - r - 1) * c)
+        + segments(_GROUPS_BWD1, s, 0, (n - r - 1 + s) * c)
+    ]
+    after_q0 = [sg for s in range(r) for sg in segments(_GROUPS_BWD0, s, 0, (n - r - 1 + s) * c)]
+    units1, num1 = _units_table(_phase(pieces, after_q1), device) if after_q1 else (None, 0)
+    units0, num0 = _units_table(_phase(pieces, after_q0), device) if after_q0 else (None, 0)
+    first_flags = tuple(_BWD_FIRST * n + s for s in range(n) if s != r)
+    second_flags = tuple(_BWD_SECOND * n + s for s in range(r))
+    return units1, num1, units0, num0, first_flags, second_flags
+
+
+def _mega_forward(q, k, v, lay, group, softmax_scale, save):
+    n, r, c = lay.n, lay.r, lay.c
+    tail_shape, dtype = k.shape[1:], k.dtype
+    tok = k[0].numel() * k.element_size()
+    fwd_bytes, bwd_bytes = _exchange_sizes(lay, tok)
+    ex = _Exchange.get(group, 2 * (fwd_bytes + bwd_bytes))
+    epoch = ex.begin("fwd")
+    bank_off = (epoch & 1) * fwd_bytes
+    units, num_units, q0_flags, q1_flags = _mega_fwd_plan(n, r, c, tok, fwd_bytes, k.device)
+    cur = torch.cuda.current_stream()
+    ex.comm_stream.wait_stream(cur)
+    _comm.push(
+        (k, v),
+        ex.heaps,
+        ex.flag_ptrs,
+        units,
+        num_units,
+        ex.counters,
+        bank_off,
+        epoch,
+        _PUSH_GRID,
+        ex.comm_stream,
+    )
+    k.record_stream(ex.comm_stream)
+    v.record_stream(ex.comm_stream)
+
+    kb, vb = (
+        ex.view(r, bank_off + i * fwd_bytes // 2, ((2 * n + 1) * c,) + tail_shape, dtype) for i in range(2)
+    )
+    _comm.wait(ex.flag_ptrs, r, q0_flags, epoch, cur)
+    out0, lse0 = _fwd(q[:c], kb[lay.keys0], vb[lay.keys0], softmax_scale)
+    _comm.wait(ex.flag_ptrs, r, q1_flags, epoch, cur)
+    saved = None
+    if save:
+        ex.save_stream.wait_stream(cur)
+        with torch.cuda.stream(ex.save_stream):
+            saved = [buf[lay.keys1].clone() for buf in (kb, vb)]
+    out1, lse1 = _fwd(q[c:], kb[lay.keys1], vb[lay.keys1], softmax_scale)
+    if save:
+        cur.wait_stream(ex.save_stream)
+        for t in saved:
+            t.record_stream(cur)
+    return out0, out1, lse0, lse1, saved
+
+
+def _mega_backward(dout, q, kb, vb, out0, out1, lse0, lse1, lay, group, scale, det, keys0, keys1):
+    n, r, c = lay.n, lay.r, lay.c
+    tail_shape, dtype = kb.shape[1:], kb.dtype
+    tok = kb[0].numel() * kb.element_size()
+    fwd_bytes, bwd_bytes = _exchange_sizes(lay, tok)
+    ex = _Exchange.get(group, 2 * (fwd_bytes + bwd_bytes))
+    epoch = ex.begin("bwd")
+    bank_off = 2 * fwd_bytes + (epoch & 1) * bwd_bytes
+    units1, num1, units0, num0, first_flags, second_flags = _mega_bwd_plan(n, r, c, tok, bwd_bytes, kb.device)
+    cur = torch.cuda.current_stream()
+
+    dq1, dk1, dv1 = _bwd(dout[c:], q[c:], kb[keys1], vb[keys1], out1, lse1, scale, det)
+    dk1, dv1 = dk1.contiguous(), dv1.contiguous()
+    if num1:
+        ex.comm_stream.wait_stream(cur)
+        _comm.push(
+            (dk1, dv1),
+            ex.heaps,
+            ex.flag_ptrs,
+            units1,
+            num1,
+            ex.counters,
+            bank_off,
+            epoch,
+            _PUSH_GRID,
+            ex.comm_stream,
+        )
+    dq0, dk0, dv0 = _bwd(dout[:c], q[:c], kb[keys0], vb[keys0], out0, lse0, scale, det)
+    # disjoint from the slots pushed after q1
+    lower = slice((n - r - 1) * c, n * c)
+    dk1[lower].add_(dk0)
+    dv1[lower].add_(dv0)
+    if num0:
+        ex.comm_stream.wait_stream(cur)
+        _comm.push(
+            (dk1, dv1),
+            ex.heaps,
+            ex.flag_ptrs,
+            units0,
+            num0,
+            ex.counters,
+            bank_off,
+            epoch,
+            _PUSH_GRID,
+            ex.comm_stream,
+        )
+    dk1.record_stream(ex.comm_stream)
+    dv1.record_stream(ex.comm_stream)
+
+    seg = c * tok // dk1.element_size()
+    dkv = torch.empty((2, 2 * c) + tail_shape, device=kb.device, dtype=dtype)
+    _comm.reduce(
+        ex.heaps,
+        ex.flag_ptrs,
+        dk1,
+        dv1,
+        dkv[0],
+        dkv[1],
+        r,
+        n,
+        seg,
+        (n - 1) * seg,
+        (2 * n - r - 1) * seg,
+        bank_off,
+        bwd_bytes // 4,
+        first_flags,
+        second_flags,
+        epoch,
+        cur,
+    )
+    return torch.cat((dq0, dq1)), dkv[0], dkv[1]
+
+
 def _sdma_forward(q, k, v, lay, group, softmax_scale, save):
     n, r, c = lay.n, lay.r, lay.c
     tail_shape, dtype = k.shape[1:], k.dtype
     tok = k[0].numel() * k.element_size()
     fwd_bytes, bwd_bytes = _exchange_sizes(lay, tok)
-    ex = _SDMAExchange.get(group, 2 * (fwd_bytes + bwd_bytes))
+    ex = _Exchange.get(group, 2 * (fwd_bytes + bwd_bytes))
     epoch = ex.begin("fwd")
     base = [(epoch & 1) * fwd_bytes + i * fwd_bytes // 2 for i in range(2)]
     bufs = [ex.view(r, base[i], ((2 * n + 1) * c,) + tail_shape, dtype) for i in range(2)]
@@ -321,7 +555,7 @@ def _sdma_backward(dout, q, kb, vb, out0, out1, lse0, lse1, lay, group, scale, d
     tail_shape, dtype = kb.shape[1:], kb.dtype
     tok = kb[0].numel() * kb.element_size()
     fwd_bytes, bwd_bytes = _exchange_sizes(lay, tok)
-    ex = _SDMAExchange.get(group, 2 * (fwd_bytes + bwd_bytes))
+    ex = _Exchange.get(group, 2 * (fwd_bytes + bwd_bytes))
     epoch = ex.begin("bwd")
     base = [2 * fwd_bytes + (epoch & 1) * bwd_bytes + i * bwd_bytes // 2 for i in range(2)]
     # [K / V, first / second half, sender, c tokens]
@@ -402,7 +636,8 @@ class _AGKVAttention(torch.autograd.Function):
             out1, lse1 = _fwd(q[c:], kb[keys1], vb[keys1], softmax_scale)
         else:
             save = any(ctx.needs_input_grad[:3])
-            out0, out1, lse0, lse1, saved = _sdma_forward(q, k, v, lay, group, softmax_scale, save)
+            exchange = _sdma_forward if mode == "overlap" else _mega_forward
+            out0, out1, lse0, lse1, saved = exchange(q, k, v, lay, group, softmax_scale, save)
             kb, vb = saved if saved is not None else (None, None)
             # saved holds keys1 = [(r+1)c, (2n+1)c) of the buffer
             off = keys1.start
@@ -423,8 +658,9 @@ class _AGKVAttention(torch.autograd.Function):
         dout = dout.contiguous()
         tail = kb.shape[1:]
 
-        if mode == "overlap":
-            dq, dk, dv = _sdma_backward(
+        if mode in ("overlap", "mega"):
+            exchange = _sdma_backward if mode == "overlap" else _mega_backward
+            dq, dk, dv = exchange(
                 dout, q, kb, vb, out0, out1, lse0, lse1, lay, group, scale, det, keys0, keys1
             )
             return dq, dk, dv, None, None, None, None
@@ -472,4 +708,5 @@ def attention_agkv(
     """
     assert mode in AGKV_MODES, f"mode must be one of {AGKV_MODES}, got {mode!r}"
     assert q.dim() == 4 and k.shape == v.shape and q.shape[:2] == k.shape[:2], "q / k / v must be sbhd"
+    assert mode != "mega" or k.dtype == torch.bfloat16, "mode 'mega' reduces gradients in bf16 only"
     return _AGKVAttention.apply(q, k, v, group, mode, softmax_scale, deterministic)

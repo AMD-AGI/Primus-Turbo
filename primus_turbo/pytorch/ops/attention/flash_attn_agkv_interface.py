@@ -29,8 +29,9 @@ def flash_attn_agkv_func(
     Megatron's ``get_batch_on_this_cp_rank``), and all heads. q [s_local, b, hq, d], k / v
     [s_local, b, hkv, d], sbhd, bf16, d in (64, 128), gfx950 FlyDSL kernels.
 
-    ``mode``: ``"overlap"`` (default) overlaps the K / V exchange with attention, ``"serial"`` uses the
-    same copy-free layout without overlap, ``"naive"`` is the plain gather / reorder / scatter baseline.
+    ``mode``: ``"overlap"`` (default) overlaps the K / V exchange (SDMA copies) with attention, ``"mega"``
+    does the same with compute-unit push / reduce kernels over XGMI, ``"serial"`` uses the same copy-free
+    layout without overlap, ``"naive"`` is the plain gather / reorder / scatter baseline.
     """
     return attention_agkv(
         q, k, v, cp_group, mode=mode, softmax_scale=softmax_scale, deterministic=deterministic

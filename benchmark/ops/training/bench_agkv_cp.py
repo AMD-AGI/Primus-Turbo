@@ -4,11 +4,12 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""All-gather-KV context-parallel attention: the three modes of ``flash_attn_agkv_func`` on one shape.
+"""All-gather-KV context-parallel attention: the modes of ``flash_attn_agkv_func`` on one shape.
 
 Modes (see ``usp/attention_agkv.py``): ``naive`` (RCCL gather, reorder copy, scatter copy, RCCL
 reduce-scatter, all serial), ``serial`` (RCCL, copy-free layout, no overlap), ``overlap`` (copy-free
-layout, exchange on the SDMA engines under the attention kernels). All timed the same way as
+layout, exchange on the SDMA engines under the attention kernels), ``mega`` (the same schedule with
+compute-unit push / reduce kernels). All timed the same way as
 ``bench_ulysses_overlap.py``: ranks aligned by a barrier, the launch queued behind a GPU sleep, median
 of iterations, max over ranks.
 
@@ -170,6 +171,14 @@ def report(name, seq, b, n, t):
             f"  {mode:<9}"
             + "".join(f"{t[f'{mode}_{c}']:>9.0f}" for c in cols)
             + f"{base_fb - fb:>10.0f}{base_blk - blk:>11.0f}{hidden:>7.0%}"
+        )
+    rccl, serial = t["ag"] + t["rs"], t["serial_fb"]
+    print(f"  fb: serial {serial:.0f} / attn {t['floor']:.0f} / rccl {rccl:.0f}")
+    for mode in AGKV_MODES[2:]:
+        fb = t[f"{mode}_fb"]
+        print(
+            f"  fb: {mode:<8} {fb:6.0f}   serial/{mode} {serial / fb:.3f}x   "
+            f"{mode} - max(attn, rccl) {fb - max(t['floor'], rccl):.0f}"
         )
 
 

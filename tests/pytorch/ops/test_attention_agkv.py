@@ -33,7 +33,7 @@ HEAD_CONFIGS = {
     "llama3_8b": (32, 8, 128),
     "d64": (16, 4, 64),
 }
-MODES = ("naive", "serial", "overlap")
+MODES = ("naive", "serial", "overlap", "mega")
 # relative L2 error against one FlyDSL call over the whole sequence; splitting the keys over two calls
 # changes the bf16 accumulation order, which at 32K puts dq of some ranks near 1e-2 in every mode
 TOL = {"out": 1e-2, "dq": 2e-2, "dk": 2e-2, "dv": 2e-2}
@@ -93,13 +93,13 @@ def run_case(seq, b, heads, mode, group, layers, verbose):
     return failures
 
 
-def run_suite(quick, verbose=False):
+def run_suite(quick, verbose=False, modes=MODES):
     group = dist.group.WORLD
     n, rank = group.size(), group.rank()
     seqs = [4096] if quick else [4096, 16384, 32768]
     batches = [1] if quick else [1, 2]
     failures = []
-    for seq, b, heads, mode in itertools.product(seqs, batches, HEAD_CONFIGS, MODES):
+    for seq, b, heads, mode in itertools.product(seqs, batches, HEAD_CONFIGS, modes):
         if seq % (2 * n * 128):
             continue
         failures += run_case(seq, b, heads, mode, group, layers=3, verbose=verbose)
@@ -115,10 +115,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--modes", nargs="+", default=list(MODES), choices=MODES)
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
     dist.init_process_group("nccl", timeout=timedelta(minutes=5))
-    ok = run_suite(args.quick, args.verbose)
+    ok = run_suite(args.quick, args.verbose, args.modes)
     dist.barrier()
     dist.destroy_process_group()
     sys.exit(0 if ok else 1)
