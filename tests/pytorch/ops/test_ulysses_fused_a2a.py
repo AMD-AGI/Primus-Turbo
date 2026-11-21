@@ -114,6 +114,16 @@ def _fp32_leaf(t):
     return t.detach().float().requires_grad_()
 
 
+def _rewrite_in_place(w, seed):
+    """New values written through another tensor over ``w``'s storage, as an optimizer updating its
+    parameter buffer does: ``w._version`` does not move, so no cache may key on it."""
+    version = w._version
+    alias = torch.empty(0, dtype=w.dtype, device=w.device)
+    alias.set_(w.untyped_storage(), w.storage_offset(), w.shape, w.stride())
+    alias.copy_(_randn(*w.shape, seed=seed, scale=0.02))
+    assert w._version == version
+
+
 def check_qkv(group, hq, hkv, d, b, s_local, hidden, qkv_format, weight_layout, repeats, failures):
     from primus_turbo.pytorch.ops.attention.ulysses_fused_a2a import ulysses_qkv_gemm_a2a
 
@@ -123,6 +133,8 @@ def check_qkv(group, hq, hkv, d, b, s_local, hidden, qkv_format, weight_layout, 
     for it in range(repeats):
         shape = (s_local, b, hidden) if qkv_format == "sbhd" else (b, s_local, hidden)
         x = _randn(*shape, seed=100 * it + rank).requires_grad_()
+        if it:
+            _rewrite_in_place(w_qkv, seed=1234 + it)
         w_qkv.grad = None
         outs = ulysses_qkv_gemm_a2a(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout)
         x_ref, w_ref = _fp32_leaf(x), _fp32_leaf(w_qkv)
