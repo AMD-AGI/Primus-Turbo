@@ -440,6 +440,50 @@ class FP8GemmRowFunction(torch.autograd.Function):
         )
 
 
+
+def _dsv4up_dual_bwd(ctx, g_row, b_t, pg, pbt, g_t, a_t, pgt, pat, b_row):
+    """dgrad dX = dY . W and wgrad dW = dY^T . X in one dsv4up launch (PRIMUS_TURBO_DSV4UP_DUAL). Same kernels'
+    per-tile code, same main_grad policy as the serial path. (None, None) -> caller runs the serial path."""
+    from primus_turbo.gluon.gemm import dsv4up_block
+    from primus_turbo.flydsl.gemm import g90_block
+
+    M_, N_ = g_row.shape
+    K_ = b_t.shape[0]
+    if dsv4up_block.split_k_of(M_, K_, N_) != 1:
+        return None, None
+    # tile counts: dgrad [M_, K_], wgrad [N_, K_]; the first GEMM's count must be a multiple of 8 (XCD mapping)
+    td, tw = (M_ // 256) * (K_ // 256), (N_ // 256) * (K_ // 256)
+    d_first = N_ >= M_  # longer-K GEMM first (dgrad K = N_, wgrad K = M_)
+    if (td if d_first else tw) % 8:
+        d_first = not d_first
+        if (td if d_first else tw) % 8:
+            return None, None
+    if (M_ if d_first else N_) > 8192:  # the second GEMM's K loop is unrolled (dsv4up_gemm.DUAL_MAX_K1)
+        return None, None
+    grad_a = torch.empty((M_, K_), dtype=ctx.out_dtype, device=g_row.device)
+    post = None
+    if ctx.fuse_bgrad_accum:
+        mg = ctx.main_grad
+        overwrite = main_grad_first_write(ctx.wparam)
+        if g90_block.accum_supported(mg, b_row.shape[0], a_t.shape[0]) and not (overwrite and mg.dtype != ctx.out_dtype):
+            wout, wacc = mg, not overwrite
+        else:
+            wout, wacc = torch.empty(tuple(mg.shape), dtype=ctx.out_dtype, device=mg.device), False
+            post = (mg, overwrite)
+        ctx.main_grad = ctx.wparam = None
+        grad_b = _get_dummy_wgrad(list(mg.shape), ctx.out_dtype)
+    else:
+        wout, wacc = torch.empty((b_row.shape[0], a_t.shape[0]), dtype=ctx.out_dtype, device=g_row.device), False
+        grad_b = wout
+    jd = (g_row, b_t, pg, pbt, grad_a, False)  # K = N_ (layer outputs)
+    jw = (g_t, a_t, pgt, pat, wout, wacc)  # K = M_ (tokens)
+    dsv4up_block.gemm_nt_dual(*((jd, jw) if d_first else (jw, jd)))
+    if post is not None:
+        mg, overwrite = post
+        mg.copy_(wout) if overwrite else mg.add_(wout)
+    return grad_a, grad_b
+
+
 class FP8GemmBlockFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -635,6 +679,12 @@ class FP8GemmBlockFunction(torch.autograd.Function):
 
             if b_t is None:  # no optimizer-written W^T: transpose the FP8 copy (128x128 blocks are transpose-invariant)
                 b_t, b_te = b_row.t().contiguous(), b_e.t().contiguous()
+            # PRIMUS_TURBO_DSV4UP_DUAL=1: dgrad and wgrad (both on dsv4up, no split-K) as ONE launch; each output is
+            # bit-identical to its own launch, the two fill the GPU together (e.g. the 64-tile wq_b dgrad).
+            if use_d and use_w and dsv4up_block.dual_enabled():
+                grad_a, grad_b = _dsv4up_dual_bwd(ctx, g_row, b_t, pg, pbt, g_t, a_t, pgt, pat, b_row)
+                if grad_a is not None:
+                    return grad_a, grad_b, None, None, None, None, None, None, None
             # dgrad: dX = dY . W  ->  NT with the FP8 copy of W^T (block scales transposed)
             if use_d:
                 grad_a = dsv4up_block.gemm_nt(g_row, b_t, pg, pbt, ctx.out_dtype)

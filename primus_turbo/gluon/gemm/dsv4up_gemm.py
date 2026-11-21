@@ -213,30 +213,37 @@ def _store_half(c_ptr, desc, shared, pid_m, pid_n, half: gl.constexpr, stride_cm
 
 
 @gluon.jit
-def dsv4up_gemm_kernel(a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M: gl.constexpr, N: gl.constexpr,
-                       K: gl.constexpr, stride_am: gl.constexpr, stride_bn: gl.constexpr, stride_cm: gl.constexpr,
-                       stride_scale_a: gl.constexpr, stride_scale_b: gl.constexpr, GRID_MN: gl.constexpr,
-                       SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B2: gl.constexpr, SHARED_SCALE_A: gl.constexpr,
-                       SHARED_SCALE_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr, LOAD_WMMA_LAYOUT: gl.constexpr,
-                       B2_LOAD_LAYOUT: gl.constexpr, OUTPUT_CGA_LAYOUT: gl.constexpr, BLOCK_M: gl.constexpr,
-                       BLOCK_N: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr, ACCUM: gl.constexpr,
-                       SPLIT_K: gl.constexpr = 1):
-    # Static-shape body of dsv4_gemm.py (gemmx/dsv4up, measured version): K-contiguous A/B (stride_ak = stride_bk
-    # = 1), row-major C (stride_cn = 1).  Host guarantees M, N % 256 == 0, K % 512 == 0, K >= 1024.
+def _xcd_pids(pid, M: gl.constexpr, N: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+              GRID_MN: gl.constexpr, NUM_XCDS_: gl.constexpr, GROUP_M: gl.constexpr):
+    # _get_xcd_swizzled_pids with the program id passed in (dual launch: pid local to its GEMM)
+    num_pid_m = gl.cdiv(M, BLOCK_M)
+    num_pid_n = gl.cdiv(N, BLOCK_N)
+    if NUM_XCDS_ != 1:
+        pid = _chiplet_transform(pid, GRID_MN, NUM_XCDS_)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + pid % num_pid_in_group % group_size_m
+    pid_n = pid % num_pid_in_group // group_size_m
+    return (pid_m, pid_n)
+
+
+@gluon.jit
+def _gemm_tile(pid_m, pid_n, a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M: gl.constexpr, N: gl.constexpr,
+               K: gl.constexpr, stride_am: gl.constexpr, stride_bn: gl.constexpr, stride_cm: gl.constexpr,
+               stride_scale_a: gl.constexpr, stride_scale_b: gl.constexpr, ACCUM: gl.constexpr,
+               SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B2: gl.constexpr, SHARED_SCALE_A: gl.constexpr,
+               SHARED_SCALE_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr, LOAD_WMMA_LAYOUT: gl.constexpr,
+               B2_LOAD_LAYOUT: gl.constexpr, OUTPUT_CGA_LAYOUT: gl.constexpr, BLOCK_M: gl.constexpr,
+               BLOCK_N: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr, UNROLL: gl.constexpr = False,
+               EPI2: gl.constexpr = False):
+    # One 256x256 output tile (pid_m, pid_n) of C[M,N] = A[M,K] . B[N,K]^T: static-shape body of dsv4_gemm.py
+    # (gemmx/dsv4up, measured version): K-contiguous A/B (stride_ak = stride_bk = 1), row-major C (stride_cn = 1).
+    # Host guarantees M, N % 256 == 0, K % 512 == 0, K >= 1024.
     stride_ak: gl.constexpr = 1
     stride_bk: gl.constexpr = 1
     stride_cn: gl.constexpr = 1
-    pid_m, pid_n = _get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, 4)
-    if SPLIT_K > 1:
-        # split-K (wgsmall): grid axis 1 = K slice z of length K (the per-slice K; the strides are the full
-        # operand's). Slice z reads A/B columns [z*K, (z+1)*K) and their packed scales (4 bytes per K column), and
-        # writes fp32 partial z to C + z*M*stride_cm; the host sums the partials in a fixed order.
-        pid_k = gl.program_id(axis=1)
-        a_ptr = a_ptr + pid_k * K
-        b_ptr = b_ptr + pid_k * K
-        a_scale_ptr = a_scale_ptr + pid_k * (K * 4)
-        b_scale_ptr = b_scale_ptr + pid_k * (K * 4)
-        c_ptr = c_ptr + pid_k * (M * stride_cm)
     dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, 16)
     dot_b: gl.constexpr = gl.DotOperandLayout(1, WMMA_LAYOUT, 16)
     dot_b_load: gl.constexpr = gl.DotOperandLayout(1, LOAD_WMMA_LAYOUT, 16)
@@ -270,24 +277,44 @@ def dsv4up_gemm_kernel(a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M: gl.cons
     acc1 = gl.zeros((BLOCK_M, BLOCK_N // 2), dtype=gl.float32, layout=WMMA_LAYOUT)
     iter_max: gl.constexpr = K // 256
     data_scale_waitcnt: gl.constexpr = 4
-    for _ in range(0, (iter_max - 4) // 6):
-        for inner in gl.static_range(6):
+    if UNROLL:  # fully unrolled K loop (dual launch: a 2nd runtime K loop in the other branch doubles the LDS)
+        for _ in gl.static_range((iter_max - 4) // 6):
+            for inner in gl.static_range(6):
+                a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = _consume_and_refill(
+                    a_buf, b_buf, as_buf, bs_buf, inner % 2, inner % 3, inner % 3, a_desc, b_desc, as_desc, bs_desc, acc0,
+                    acc1, dot_a, dot_b, B2_LOAD_LAYOUT, scale_a_layout, scale_a_layout, scale_b_layout, scale_b_load,
+                    BLOCK_M, BLOCK_N, CTA_N, True, data_scale_waitcnt)
+        for cleanup_pair in gl.static_range((iter_max - 4) % 6 // 2):
+            cleanup_tile = cleanup_pair * 2
+            s0 = cleanup_tile % 3
+            s1 = (cleanup_tile + 1) % 3
             a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = _consume_and_refill(
-                a_buf, b_buf, as_buf, bs_buf, inner % 2, inner % 3, inner % 3, a_desc, b_desc, as_desc, bs_desc, acc0,
-                acc1, dot_a, dot_b, B2_LOAD_LAYOUT, scale_a_layout, scale_a_layout, scale_b_layout, scale_b_load,
-                BLOCK_M, BLOCK_N, CTA_N, True, data_scale_waitcnt)
-    for cleanup_pair in range(0, (iter_max - 4) % 6 // 2):
-        cleanup_tile = cleanup_pair * 2
-        s0 = cleanup_tile % 3
-        s1 = (cleanup_tile + 1) % 3
-        a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = _consume_and_refill(
-            a_buf, b_buf, as_buf, bs_buf, 0, s0, s0, a_desc, b_desc, as_desc, bs_desc, acc0, acc1, dot_a, dot_b,
-            B2_LOAD_LAYOUT, scale_a_layout, scale_a_layout, scale_b_layout, scale_b_load, BLOCK_M, BLOCK_N, CTA_N, True,
-            data_scale_waitcnt)
-        a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = _consume_and_refill(
-            a_buf, b_buf, as_buf, bs_buf, 1, s1, s1, a_desc, b_desc, as_desc, bs_desc, acc0, acc1, dot_a, dot_b,
-            B2_LOAD_LAYOUT, scale_a_layout, scale_a_layout, scale_b_layout, scale_b_load, BLOCK_M, BLOCK_N, CTA_N, True,
-            data_scale_waitcnt)
+                a_buf, b_buf, as_buf, bs_buf, 0, s0, s0, a_desc, b_desc, as_desc, bs_desc, acc0, acc1, dot_a, dot_b,
+                B2_LOAD_LAYOUT, scale_a_layout, scale_a_layout, scale_b_layout, scale_b_load, BLOCK_M, BLOCK_N, CTA_N, True,
+                data_scale_waitcnt)
+            a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = _consume_and_refill(
+                a_buf, b_buf, as_buf, bs_buf, 1, s1, s1, a_desc, b_desc, as_desc, bs_desc, acc0, acc1, dot_a, dot_b,
+                B2_LOAD_LAYOUT, scale_a_layout, scale_a_layout, scale_b_layout, scale_b_load, BLOCK_M, BLOCK_N, CTA_N, True,
+                data_scale_waitcnt)
+    else:
+        for _ in range(0, (iter_max - 4) // 6):
+            for inner in gl.static_range(6):
+                a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = _consume_and_refill(
+                    a_buf, b_buf, as_buf, bs_buf, inner % 2, inner % 3, inner % 3, a_desc, b_desc, as_desc, bs_desc, acc0,
+                    acc1, dot_a, dot_b, B2_LOAD_LAYOUT, scale_a_layout, scale_a_layout, scale_b_layout, scale_b_load,
+                    BLOCK_M, BLOCK_N, CTA_N, True, data_scale_waitcnt)
+        for cleanup_pair in range(0, (iter_max - 4) % 6 // 2):
+            cleanup_tile = cleanup_pair * 2
+            s0 = cleanup_tile % 3
+            s1 = (cleanup_tile + 1) % 3
+            a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = _consume_and_refill(
+                a_buf, b_buf, as_buf, bs_buf, 0, s0, s0, a_desc, b_desc, as_desc, bs_desc, acc0, acc1, dot_a, dot_b,
+                B2_LOAD_LAYOUT, scale_a_layout, scale_a_layout, scale_b_layout, scale_b_load, BLOCK_M, BLOCK_N, CTA_N, True,
+                data_scale_waitcnt)
+            a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = _consume_and_refill(
+                a_buf, b_buf, as_buf, bs_buf, 1, s1, s1, a_desc, b_desc, as_desc, bs_desc, acc0, acc1, dot_a, dot_b,
+                B2_LOAD_LAYOUT, scale_a_layout, scale_a_layout, scale_b_layout, scale_b_load, BLOCK_M, BLOCK_N, CTA_N, True,
+                data_scale_waitcnt)
     residual = iter_max - 4
     s0 = residual % 3
     s1 = (residual + 1) % 3
@@ -321,10 +348,74 @@ def dsv4up_gemm_kernel(a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M: gl.cons
     desc = tdm.make_tensor_descriptor(base=c_ptr, shape=(M // cta_m, N // cta_n, cta_m, cta_n),
                                       strides=(cta_m * stride_cm, cta_n * stride_cn, stride_cm, stride_cn),
                                       block_shape=(CTA_M, CTA_N, cta_m, half_n), layout=shared_layout)
-    _store_half(c_ptr, desc, shared, pid_m, pid_n, 0, stride_cm, stride_cn, acc0, WMMA_LAYOUT, ACCUM)
-    tdm.async_wait(0)
-    _store_half(c_ptr, desc, shared, pid_m, pid_n, 1, stride_cm, stride_cn, acc1, WMMA_LAYOUT, ACCUM)
-    tdm.async_wait(0)
+    if EPI2:
+        # two LDS staging buffers (the operand ring is dead here, 2 x ~70 KB fit): half 1 is written to LDS while
+        # half 0's TDM store is in flight; one wait at the end. Same values, same rounding.
+        shared1 = gl.allocate_shared_memory(c_ptr.type.element_ty, [CTA_M, CTA_N, cta_m, half_n], shared_layout)
+        _store_half(c_ptr, desc, shared, pid_m, pid_n, 0, stride_cm, stride_cn, acc0, WMMA_LAYOUT, ACCUM)
+        _store_half(c_ptr, desc, shared1, pid_m, pid_n, 1, stride_cm, stride_cn, acc1, WMMA_LAYOUT, ACCUM)
+        tdm.async_wait(0)
+        shared1._keep_alive()
+    else:
+        _store_half(c_ptr, desc, shared, pid_m, pid_n, 0, stride_cm, stride_cn, acc0, WMMA_LAYOUT, ACCUM)
+        tdm.async_wait(0)
+        _store_half(c_ptr, desc, shared, pid_m, pid_n, 1, stride_cm, stride_cn, acc1, WMMA_LAYOUT, ACCUM)
+        tdm.async_wait(0)
+
+
+@gluon.jit
+def dsv4up_gemm_kernel(a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M: gl.constexpr, N: gl.constexpr,
+                       K: gl.constexpr, stride_am: gl.constexpr, stride_bn: gl.constexpr, stride_cm: gl.constexpr,
+                       stride_scale_a: gl.constexpr, stride_scale_b: gl.constexpr, GRID_MN: gl.constexpr,
+                       SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B2: gl.constexpr, SHARED_SCALE_A: gl.constexpr,
+                       SHARED_SCALE_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr, LOAD_WMMA_LAYOUT: gl.constexpr,
+                       B2_LOAD_LAYOUT: gl.constexpr, OUTPUT_CGA_LAYOUT: gl.constexpr, BLOCK_M: gl.constexpr,
+                       BLOCK_N: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr, ACCUM: gl.constexpr,
+                       SPLIT_K: gl.constexpr = 1, EPI2: gl.constexpr = False):
+    pid_m, pid_n = _get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, 4)
+    if SPLIT_K > 1:
+        # split-K (wgsmall): grid axis 1 = K slice z of length K (the per-slice K; the strides are the full
+        # operand's). Slice z reads A/B columns [z*K, (z+1)*K) and their packed scales (4 bytes per K column), and
+        # writes fp32 partial z to C + z*M*stride_cm; the host sums the partials in a fixed order.
+        pid_k = gl.program_id(axis=1)
+        a_ptr = a_ptr + pid_k * K
+        b_ptr = b_ptr + pid_k * K
+        a_scale_ptr = a_scale_ptr + pid_k * (K * 4)
+        b_scale_ptr = b_scale_ptr + pid_k * (K * 4)
+        c_ptr = c_ptr + pid_k * (M * stride_cm)
+    _gemm_tile(pid_m, pid_n, a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K, stride_am, stride_bn, stride_cm,
+               stride_scale_a, stride_scale_b, ACCUM, SHARED_LAYOUT_A, SHARED_LAYOUT_B2, SHARED_SCALE_A, SHARED_SCALE_B, WMMA_LAYOUT,
+                   LOAD_WMMA_LAYOUT, B2_LOAD_LAYOUT, OUTPUT_CGA_LAYOUT, BLOCK_M, BLOCK_N, CTA_M, CTA_N, False, EPI2)
+
+
+@gluon.jit
+def dsv4up_dual_kernel(a0, b0, c0, as0, bs0, a1, b1, c1, as1, bs1,
+                       M0: gl.constexpr, N0: gl.constexpr, K0: gl.constexpr, SAM0: gl.constexpr, SBN0: gl.constexpr,
+                       SCM0: gl.constexpr, SSA0: gl.constexpr, SSB0: gl.constexpr, GRID0: gl.constexpr,
+                       ACC0: gl.constexpr,
+                       M1: gl.constexpr, N1: gl.constexpr, K1: gl.constexpr, SAM1: gl.constexpr, SBN1: gl.constexpr,
+                       SCM1: gl.constexpr, SSA1: gl.constexpr, SSB1: gl.constexpr, GRID1: gl.constexpr,
+                       ACC1: gl.constexpr,
+                       SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B2: gl.constexpr, SHARED_SCALE_A: gl.constexpr,
+                       SHARED_SCALE_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr, LOAD_WMMA_LAYOUT: gl.constexpr,
+                       B2_LOAD_LAYOUT: gl.constexpr, OUTPUT_CGA_LAYOUT: gl.constexpr, BLOCK_M: gl.constexpr,
+                       BLOCK_N: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr, EPI2: gl.constexpr = False):
+    # Two independent GEMMs in one launch (e.g. a Linear's dgrad and wgrad): programs [0, GRID0) are GEMM 0's tiles
+    # (same tile order and per-tile code as dsv4up_gemm_kernel, so every output is bit-identical to its own launch),
+    # [GRID0, GRID0 + GRID1) GEMM 1's. GRID0 % 8 == 0 keeps each GEMM's XCD mapping. Put the longer-K GEMM first.
+    # GEMM 1's K loop is fully unrolled (same instructions): with a runtime K loop in both branches the LDS
+    # allocator keeps both branches' buffers live (582 KB > 320 KB); K1 is limited on the host.
+    pid = gl.program_id(axis=0)
+    if pid < GRID0:
+        pm, pn = _xcd_pids(pid, M0, N0, BLOCK_M, BLOCK_N, GRID0, 8, 4)
+        _gemm_tile(pm, pn, a0, b0, c0, as0, bs0, M0, N0, K0, SAM0, SBN0, SCM0, SSA0, SSB0, ACC0,
+                   SHARED_LAYOUT_A, SHARED_LAYOUT_B2, SHARED_SCALE_A, SHARED_SCALE_B, WMMA_LAYOUT,
+                   LOAD_WMMA_LAYOUT, B2_LOAD_LAYOUT, OUTPUT_CGA_LAYOUT, BLOCK_M, BLOCK_N, CTA_M, CTA_N, False, EPI2)
+    else:
+        pm, pn = _xcd_pids(pid - GRID0, M1, N1, BLOCK_M, BLOCK_N, GRID1, 8, 4)
+        _gemm_tile(pm, pn, a1, b1, c1, as1, bs1, M1, N1, K1, SAM1, SBN1, SCM1, SSA1, SSB1, ACC1,
+                   SHARED_LAYOUT_A, SHARED_LAYOUT_B2, SHARED_SCALE_A, SHARED_SCALE_B, WMMA_LAYOUT,
+                   LOAD_WMMA_LAYOUT, B2_LOAD_LAYOUT, OUTPUT_CGA_LAYOUT, BLOCK_M, BLOCK_N, CTA_M, CTA_N, True, EPI2)
 
 
 @triton.jit
@@ -399,8 +490,16 @@ def build_layouts():
 _PLANS = {}
 
 
+def _epi2() -> bool:
+    """PRIMUS_TURBO_DSV4UP_EPI2=1 (default off): double-buffered epilogue (bit-identical)."""
+    import os
+
+    return os.environ.get("PRIMUS_TURBO_DSV4UP_EPI2", "0") == "1"
+
+
 def _plan(M, N, K, sam, sbn, scm, cdt, accum, split_k=1):
-    key = (M, N, K, sam, sbn, scm, cdt, accum, split_k)
+    epi2 = _epi2()
+    key = (M, N, K, sam, sbn, scm, cdt, accum, split_k, epi2)
     p = _PLANS.get(key)
     if p is None:
         global _LAYOUTS
@@ -411,7 +510,8 @@ def _plan(M, N, K, sam, sbn, scm, cdt, accum, split_k=1):
         sk = dict(SPLIT_K=split_k) if split_k > 1 else {}
         p = ((grid_mn, split_k), dict(M=M, N=N, K=ks, stride_am=sam, stride_bn=sbn, stride_cm=scm,
                                       stride_scale_a=K // 32 * 128, stride_scale_b=K // 32 * 128, GRID_MN=grid_mn,
-                                      ACCUM=accum, num_warps=8, waves_per_eu=2, num_ctas=1, **sk, **_LAYOUTS))
+                                      ACCUM=accum, num_warps=8, waves_per_eu=2, num_ctas=1, **sk,
+                                      **(dict(EPI2=True) if epi2 else {}), **_LAYOUTS))
         _PLANS[key] = p
     return p
 
@@ -446,3 +546,51 @@ def dsv4up_gemm(a, b, a_packed, b_packed, out=None, out_dtype=torch.bfloat16, ac
     grid, kw = _plan(M, N, K, a.stride(0), b.stride(0), out.stride(0), out.dtype, bool(accumulate))
     dsv4up_gemm_kernel[grid](a, b, out, a_packed, b_packed, **kw)
     return out
+
+
+def _check_job(a, b, a_packed, b_packed, out):
+    M, K = a.shape
+    N = b.shape[0]
+    assert shape_supported(M, N, K), (M, N, K)
+    assert b.shape[1] == K and a.stride(1) == 1 and b.stride(1) == 1
+    assert a_packed.shape == (M // 128, K * 4) and b_packed.shape == (N // 128, K * 4)
+    assert a_packed.is_contiguous() and b_packed.is_contiguous()
+    assert tuple(out.shape) == (M, N) and out.stride(1) == 1
+    for t in (a, b, a_packed, b_packed, out):  # never hand the kernel a null / foreign address
+        assert t.is_cuda and t.data_ptr() != 0 and t.device == a.device, "dsv4up: bad operand"
+    return M, N, K
+
+
+_DUAL_PLANS = {}
+DUAL_MAX_K1 = 8192
+
+
+def dsv4up_dual(job0, job1):
+    """Two independent GEMMs in ONE launch; job = (a, b, a_packed, b_packed, out, accumulate) as in dsv4up_gemm
+    (``out`` given, split_k 1). Each output is bit-identical to its own dsv4up_gemm launch (same per-tile code and
+    tile order). GEMM 0's tiles get the lower program ids: pass the longer-K GEMM as job0."""
+    a0, b0, pa0, pb0, o0, acc0 = job0
+    a1, b1, pa1, pb1, o1, acc1 = job1
+    M0, N0, K0 = _check_job(a0, b0, pa0, pb0, o0)
+    M1, N1, K1 = _check_job(a1, b1, pa1, pb1, o1)
+    epi2 = _epi2()
+    key = (M0, N0, K0, a0.stride(0), b0.stride(0), o0.stride(0), o0.dtype, bool(acc0),
+           M1, N1, K1, a1.stride(0), b1.stride(0), o1.stride(0), o1.dtype, bool(acc1), epi2)
+    p = _DUAL_PLANS.get(key)
+    if p is None:
+        global _LAYOUTS
+        if _LAYOUTS is None:
+            _LAYOUTS = build_layouts()
+        g0, g1 = (M0 // TILE) * (N0 // TILE), (M1 // TILE) * (N1 // TILE)
+        assert g0 % 8 == 0, "dsv4up_dual: GEMM 0 tile count must be a multiple of 8 (XCD mapping)"
+        assert K1 <= DUAL_MAX_K1, "dsv4up_dual: GEMM 1's K loop is unrolled; K1 <= DUAL_MAX_K1"
+        p = ((g0 + g1,), dict(M0=M0, N0=N0, K0=K0, SAM0=a0.stride(0), SBN0=b0.stride(0), SCM0=o0.stride(0),
+                              SSA0=K0 // 32 * 128, SSB0=K0 // 32 * 128, GRID0=g0, ACC0=bool(acc0),
+                              M1=M1, N1=N1, K1=K1, SAM1=a1.stride(0), SBN1=b1.stride(0), SCM1=o1.stride(0),
+                              SSA1=K1 // 32 * 128, SSB1=K1 // 32 * 128, GRID1=g1, ACC1=bool(acc1),
+                              num_warps=8, waves_per_eu=2, num_ctas=1, **(dict(EPI2=True) if epi2 else {}),
+                              **_LAYOUTS))
+        _DUAL_PLANS[key] = p
+    grid, kw = p
+    dsv4up_dual_kernel[grid](a0, b0, o0, pa0, pb0, a1, b1, o1, pa1, pb1, **kw)
+    return o0, o1
