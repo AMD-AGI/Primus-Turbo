@@ -19,7 +19,6 @@ gradients only fill the rank's head rows (zero elsewhere); the data/context-para
 all-reduce sums them into the full gradient.
 """
 
-import weakref
 from typing import Optional, Tuple
 
 import torch
@@ -60,49 +59,21 @@ def _rank_rows(w, n, rank):
     return w.view(n, w.shape[0] // n, w.shape[1])[rank]
 
 
-def _weight_cached(cache, weights, params, build):
-    """``build()`` cached per weight tensor and version. The entry holds weak references: a weight
-    freed and another allocated at its address (same pointer, version 0) must not hit."""
-    key = (*(w.data_ptr() for w in weights), *params)
-    versions = tuple(w._version for w in weights)
-    cached = cache.get(key)
-    if cached is not None and cached[1] == versions and all(r() is w for r, w in zip(cached[0], weights)):
-        return cached[2]
-    value = build()
-    cache[key] = (tuple(weakref.ref(w) for w in weights), versions, value)
-    return value
-
-
-_SPLIT_KV_WEIGHTS = {}
+# The rearranged weights below are rebuilt on every call rather than cached: an optimizer can update a
+# weight without bumping ``w._version`` (e.g. Megatron's distributed optimizer writes the parameters
+# through their bucket buffer), and a CUDA graph replays only what it captured.
 
 
 def _split_kv_rows(w_kv_b, n, rank, heads, dn, dv):
-    """The rank's ``kv_b`` rows as ``[k_nope of every local head; v of every local head]``, rebuilt
-    only when the weight changes."""
-
-    def build():
-        w = _rank_rows(w_kv_b.detach(), n, rank).view(heads, dn + dv, -1)
-        return torch.cat((w[:, :dn].reshape(heads * dn, -1), w[:, dn:].reshape(heads * dv, -1)))
-
-    return _weight_cached(_SPLIT_KV_WEIGHTS, (w_kv_b,), (n, rank, heads, dn, dv), build)
-
-
-_DGRAD_WEIGHTS = {}
+    """The rank's ``kv_b`` rows as ``[k_nope of every local head; v of every local head]``."""
+    w = _rank_rows(w_kv_b.detach(), n, rank).view(heads, dn + dv, -1)
+    return torch.cat((w[:, :dn].reshape(heads * dn, -1), w[:, dn:].reshape(heads * dv, -1)))
 
 
 def _dgrad_weights(w_q_b, w_kv_b, n, rank, heads, dn, dr, dv):
-    """The GemmRS operands (``gemm_rs_kernel``), rebuilt only when a weight changes: the rank's ``q_b``
-    rows transposed, ``B'`` transposed (every head's ``Wk_nope`` and the identity block summing the
-    heads' ``k_pe`` gradients) and the ``v`` rows transposed."""
-    return _weight_cached(
-        _DGRAD_WEIGHTS,
-        (w_q_b, w_kv_b),
-        (n, rank, heads, dn, dr, dv),
-        lambda: _build_dgrad_weights(w_q_b, w_kv_b, n, rank, heads, dn, dr, dv),
-    )
-
-
-def _build_dgrad_weights(w_q_b, w_kv_b, n, rank, heads, dn, dr, dv):
+    """The GemmRS operands (``gemm_rs_kernel``): the rank's ``q_b`` rows transposed, ``B'`` transposed
+    (every head's ``Wk_nope`` and the identity block summing the heads' ``k_pe`` gradients) and the
+    ``v`` rows transposed."""
     w = _rank_rows(w_kv_b.detach(), n, rank).view(heads, dn + dv, -1)
     ckv = w.shape[-1]
     wq_t = _rank_rows(w_q_b.detach(), n, rank).t().contiguous()
