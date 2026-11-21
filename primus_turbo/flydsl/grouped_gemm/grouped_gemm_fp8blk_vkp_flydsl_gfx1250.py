@@ -24,6 +24,8 @@ from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import Constexpr
 from flydsl.expr.typing import T as _T
 
+from .grouped_gemm_fp8blk_nt_flydsl_gfx1250 import _store_c_lines
+
 WAVE = 32
 _A_ID = {0: fx.Float8E4M3FN, 1: fx.Float8E5M2}
 
@@ -70,9 +72,15 @@ def launch_vkpblk_fp8_gfx1250(
     kwin_max: Constexpr[int] = 4096,
     lpt: Constexpr[int] = 0,
     prefetch_c: Constexpr[int] = 0,
+    nbuf: Constexpr[int] = 2,
 ):
     a_cls, b_cls = _A_ID[a_id], _A_ID[b_id]
-    num_buffers = 2
+    # nbuf 3 (moegemm, beta 0 only): 3-stage ring with 2 k-tiles in flight instead of 1, C stored straight from
+    # the accumulators (global_store, not waited on) so the 135 KB C staging leaves LDS to the third stage
+    assert nbuf in (2, 3)
+    NB3 = nbuf == 3
+    assert not (NB3 and beta_one), "nbuf 3 is the beta 0 (overwrite) path"
+    num_buffers = nbuf
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
     MX_BLOCK = 32
@@ -95,12 +103,16 @@ def launch_vkpblk_fp8_gfx1250(
     PL_A = tile_m * SPB
     PL_B = tile_n * SPB
     PSET = PL_A + PL_B
-    PL_OFF = C_OFF + tile_m * C_ROW * 2
-    ARENA = PL_OFF + 2 * PSET
+    PL_OFF = C_OFF if NB3 else C_OFF + tile_m * C_ROW * 2
+    SCR_OFF = PL_OFF + 2 * PSET  # nb3: wave-private C line scratch
+    SCR_BANDS = 2  # 16-row bands per LDS round trip of the C line stores
+    SCR_W = SCR_BANDS * 16 * (2 * (tile_n // n_warp) + 16)
+    ARENA = PL_OFF + 2 * PSET + (num_waves * SCR_W if NB3 else 0)
     assert ARENA <= 320 * 1024, f"LDS arena {ARENA} B exceeds 320 KiB"
 
     kernel_name = (f"moe_vkpblk_fp8_gfx1250_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}_a{a_id}{b_id}"
-                   f"_b{beta_one}_w{kwin_max}" + ("_lpt" if lpt else "") + ("_pfc" if (prefetch_c and beta_one) else ""))
+                   f"_b{beta_one}_w{kwin_max}" + ("_lpt" if lpt else "") + ("_pfc" if (prefetch_c and beta_one) else "")
+                   + ("_nb3" if NB3 else ""))
     PFC = bool(prefetch_c and beta_one)
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -275,80 +287,127 @@ def launch_vkpblk_fp8_gfx1250(
                          (tile_m, C_ROW), (C_ROW, 1))
             return gtC, fx.rocdl.make_tdm_atom(gtC, [None, tile_n], strides=[c_ld, None], num_warps=num_waves)
 
-        # prologue: tile 0's planes (set 0) and first k-tile, then one TDM op standing in for the C store that
-        # later tiles keep in flight (keeps the wait counts uniform)
-        g0, bm0, bn0, kb0, ktn0 = tile_params(bid)
-        issue_planes(0, bm0, bn0, kb0, ktn0)
-        oa, ob = offs_of(bm0, bn0, kb0, 0)
-        issue(0, oa, ob)
-        gt0, at0 = c_view(g0, bm0, bn0)
-        fx.copy(at0, gt0, sC)
+        if const_expr(NB3):
+            # One TDM stream per workgroup: k-tiles of tile it, then (planes of tile it+1, its k-tiles), ...; the
+            # k-tile two ahead is issued at every step into the stage computed one step earlier (freed by the
+            # barrier). Ops newer than k-tile kt when it is waited for: k-tile kt+1 (2 ops), plus the next tile's
+            # planes (2 ops) when kt+1 is the next tile's k-tile 0 -> wait 2, or 4 at the tile's last k-step.
+            # Needs every window >= 2 k-tiles (the pool pads each expert to >= 256 rows), so the next tile's
+            # planes are issued (step kt_n-2) only after every wave finished the tile that last read that set.
+            g0, bm0, bn0, kb0, ktn0 = tile_params(bid)
+            issue_planes(0, bm0, bn0, kb0, ktn0)
+            for j0 in range_constexpr(2):
+                oa, ob = offs_of(bm0, bn0, kb0, j0)
+                issue(j0, oa, ob)
+            gC8 = _cast(fx.Int8, gC_base)
+            for it in range(my_cnt):
+                t = bid + it * i32_nwg
+                g, blk_m, blk_n, kb, kt_n = tile_params(t)
+                t_nx = (t + i32_nwg < total).select(t + i32_nwg, last_t)
+                _, nbm, nbn, nkb, nktn = tile_params(t_nx)
+                pset = it % 2
+                for cf in c_frags:
+                    cf.fill(0.0)
+                gk = gk_reg.load()[0]
+                for kt in range(kt_n):
+                    if kt == kt_n - 1:
+                        tdm_ops.tensor_wait(4)
+                    else:
+                        tdm_ops.tensor_wait(2)
+                    fx.barrier()
+                    f = kt + 2
+                    if f < kt_n:
+                        oa0, ob0 = offs_of(blk_m, blk_n, kb, f)
+                        issue((gk + f) % num_buffers, oa0, ob0)
+                    else:
+                        if f == kt_n:
+                            issue_planes(1 - pset, nbm, nbn, nkb, nktn)
+                            oa1, ob1 = offs_of(nbm, nbn, nkb, 0)
+                            issue((gk + f) % num_buffers, oa1, ob1)
+                        else:
+                            oa2, ob2 = offs_of(nbm, nbn, nkb, 1)
+                            issue((gk + f) % num_buffers, oa2, ob2)
+                    compute((gk + kt) % num_buffers, kt, pset)
+                gk_reg.store(gk_reg.load() + kt_n)
+                # epilogue: bf16 C from the accumulators via the wave's LDS line scratch (whole-line stores)
+                _store_c_lines(base_ptr, SCR_OFF + wave * SCR_W, lane, c_frags, m_reps, n_reps, warp_n, gC8,
+                               blk_m + wmb, blk_n + wnb, c_ld, out_cls, lds_b128,
+                               cbase64=fx.Int64(g) * fx.Int64(i32_m) * c_ld, bands=SCR_BANDS)
+        else:
+            # prologue: tile 0's planes (set 0) and first k-tile, then one TDM op standing in for the C store that
+            # later tiles keep in flight (keeps the wait counts uniform)
+            g0, bm0, bn0, kb0, ktn0 = tile_params(bid)
+            issue_planes(0, bm0, bn0, kb0, ktn0)
+            oa, ob = offs_of(bm0, bn0, kb0, 0)
+            issue(0, oa, ob)
+            gt0, at0 = c_view(g0, bm0, bn0)
+            fx.copy(at0, gt0, sC)
 
-        for it in range(my_cnt):
-            t = bid + it * i32_nwg
-            g, blk_m, blk_n, kb, kt_n = tile_params(t)
-            t_nx = (t + i32_nwg < total).select(t + i32_nwg, last_t)
-            _, nbm, nbn, nkb, nktn = tile_params(t_nx)
-            pset = it % 2
-            for cf in c_frags:
-                cf.fill(0.0)
-            gk = gk_reg.load()[0]
-            gtC, atomC = c_view(g, blk_m, blk_n)
-            for kt in range(kt_n):
-                if kt == 0:
-                    tdm_ops.tensor_wait(1)  # the previous tile's C store may still be in flight
-                else:
-                    if const_expr(PFC):
-                        if kt == 2:
-                            tdm_ops.tensor_wait(1)  # the old-C prefetch (newest op, issued at kt 1) may stay in flight
+            for it in range(my_cnt):
+                t = bid + it * i32_nwg
+                g, blk_m, blk_n, kb, kt_n = tile_params(t)
+                t_nx = (t + i32_nwg < total).select(t + i32_nwg, last_t)
+                _, nbm, nbn, nkb, nktn = tile_params(t_nx)
+                pset = it % 2
+                for cf in c_frags:
+                    cf.fill(0.0)
+                gk = gk_reg.load()[0]
+                gtC, atomC = c_view(g, blk_m, blk_n)
+                for kt in range(kt_n):
+                    if kt == 0:
+                        tdm_ops.tensor_wait(1)  # the previous tile's C store may still be in flight
+                    else:
+                        if const_expr(PFC):
+                            if kt == 2:
+                                tdm_ops.tensor_wait(1)  # the old-C prefetch (newest op, issued at kt 1) may stay in flight
+                            else:
+                                tdm_ops.tensor_wait(0)
                         else:
                             tdm_ops.tensor_wait(0)
+                    fx.barrier()
+                    f = kt + 1
+                    if f < kt_n:
+                        oa0, ob0 = offs_of(blk_m, blk_n, kb, f)
+                        issue((gk + f) % num_buffers, oa0, ob0)
                     else:
-                        tdm_ops.tensor_wait(0)
+                        # next tile: its scale planes (other set), then its first k-tile
+                        issue_planes(1 - pset, nbm, nbn, nkb, nktn)
+                        oa1, ob1 = offs_of(nbm, nbn, nkb, 0)
+                        issue((gk + f) % num_buffers, oa1, ob1)
+                    if const_expr(PFC):
+                        # beta = 1: this tile's old C -> sC, behind k-tile 2. The wait(0) at kt 1 retired the previous
+                        # tile's C store (older than every op since), so sC is free. Needs kt_n >= 3: the epilogue's
+                        # wait(4) (planes + stage of the next tile issued later) then also covers this load.
+                        if kt == 1:
+                            if kt_n >= 3:
+                                fx.copy(atomC, gtC, sC)
+                    compute((gk + kt) % num_buffers, kt, pset)
+                gk_reg.store(gk_reg.load() + kt_n)
+                # epilogue: the previous C store must be done before sC is rewritten (4 newer ops: planes + stage)
+                tdm_ops.tensor_wait(4)
                 fx.barrier()
-                f = kt + 1
-                if f < kt_n:
-                    oa0, ob0 = offs_of(blk_m, blk_n, kb, f)
-                    issue((gk + f) % num_buffers, oa0, ob0)
-                else:
-                    # next tile: its scale planes (other set), then its first k-tile
-                    issue_planes(1 - pset, nbm, nbn, nkb, nktn)
-                    oa1, ob1 = offs_of(nbm, nbn, nkb, 0)
-                    issue((gk + f) % num_buffers, oa1, ob1)
-                if const_expr(PFC):
-                    # beta = 1: this tile's old C -> sC, behind k-tile 2. The wait(0) at kt 1 retired the previous
-                    # tile's C store (older than every op since), so sC is free. Needs kt_n >= 3: the epilogue's
-                    # wait(4) (planes + stage of the next tile issued later) then also covers this load.
-                    if kt == 1:
-                        if kt_n >= 3:
+                if const_expr(beta_one):
+                    if const_expr(PFC):
+                        if kt_n < 3:  # short window: no prefetch slot, load old C here (exposed)
                             fx.copy(atomC, gtC, sC)
-                compute((gk + kt) % num_buffers, kt, pset)
-            gk_reg.store(gk_reg.load() + kt_n)
-            # epilogue: the previous C store must be done before sC is rewritten (4 newer ops: planes + stage)
-            tdm_ops.tensor_wait(4)
-            fx.barrier()
-            if const_expr(beta_one):
-                if const_expr(PFC):
-                    if kt_n < 3:  # short window: no prefetch slot, load old C here (exposed)
+                            tdm_ops.tensor_wait(0)
+                            fx.barrier()
+                    else:
                         fx.copy(atomC, gtC, sC)
                         tdm_ops.tensor_wait(0)
                         fx.barrier()
-                else:
-                    fx.copy(atomC, gtC, sC)
-                    tdm_ops.tensor_wait(0)
-                    fx.barrier()
-            cbase = fx.Int32(fx.ptrtoint(fx.add_offset(base_ptr, C_OFF)))
-            for mi in range_constexpr(m_reps):
-                row = wmb + mi * WMMA_M + lane16
-                for ni in range_constexpr(n_reps):
-                    col = wnb + ni * WMMA_N + kgrp * (WMMA_N // 2)
-                    v = c_frags[mi * n_reps + ni].load()
-                    if const_expr(beta_one):
-                        old = fx.Vector(lds_b128(cbase, (row * C_ROW + col) * 2)).bitcast(out_cls).to(fx.Float32)
-                        v = v + old
-                    fx.ptr_store(v.to(out_cls).bitcast(fx.Int8), fx.add_offset(base_ptr, C_OFF) + (row * C_ROW + col) * 2)
-            fx.barrier()
-            fx.copy(atomC, sC, gtC)
+                cbase = fx.Int32(fx.ptrtoint(fx.add_offset(base_ptr, C_OFF)))
+                for mi in range_constexpr(m_reps):
+                    row = wmb + mi * WMMA_M + lane16
+                    for ni in range_constexpr(n_reps):
+                        col = wnb + ni * WMMA_N + kgrp * (WMMA_N // 2)
+                        v = c_frags[mi * n_reps + ni].load()
+                        if const_expr(beta_one):
+                            old = fx.Vector(lds_b128(cbase, (row * C_ROW + col) * 2)).bitcast(out_cls).to(fx.Float32)
+                            v = v + old
+                        fx.ptr_store(v.to(out_cls).bitcast(fx.Int8), fx.add_offset(base_ptr, C_OFF) + (row * C_ROW + col) * 2)
+                fx.barrier()
+                fx.copy(atomC, sC, gtC)
         tdm_ops.tensor_wait(0)
 
     kernel_vkpblk(arg_c, arg_a, arg_b, arg_offs, arg_perm, arg_sa, arg_sb, i32_m, i32_n, i32_g, i32_lda, i32_ldb,
@@ -371,12 +430,14 @@ def expert_order_lpt(poffs_i32):
 
 
 def flyvkpblk_fp8(lhsP, rhsP, lhs_s, rhs_s, poffs_i32, OUT_M, OUT_N, out, beta=1.0, tile=(256, 256, 128),
-                  m_warp=2, n_warp=4, group_m=4, kwin_max=4096, nwg=None, perm=None, prefetch_c=True):
+                  m_warp=2, n_warp=4, group_m=4, kwin_max=4096, nwg=None, perm=None, prefetch_c=True, nbuf=2):
     """out [G, OUT_M, OUT_N] bf16 (+)= per-expert lhsP[:, seg] @ rhsP[:, seg]^T; lhs_s/rhs_s compact E8M0
     [rows, P/128] uint8. beta 1 accumulates into out, 0 overwrites it.
     perm: int32 [G] expert visiting order (``expert_order_lpt``) or None (expert index order). Every output tile is
     computed by one workgroup with the same k sequence whatever the order, so the result is bit-identical.
-    prefetch_c (beta 1): load each tile's old C behind its k-tile 2 instead of in the epilogue."""
+    prefetch_c (beta 1): load each tile's old C behind its k-tile 2 instead of in the epilogue.
+    nbuf: 3 = 3-stage ring + direct C stores (beta 0 only; beta 1 calls fall back to 2). Needs every expert
+    window >= 2 k-tiles (256 rows), as the MegaMoE pool guarantees. Bit-identical to nbuf 2 (same k order)."""
     assert out.dtype == torch.bfloat16 and out.is_contiguous()
     assert lhs_s.dtype == torch.uint8 and lhs_s.shape[1] * 128 == lhsP.shape[1]
     G = poffs_i32.numel() - 1
@@ -394,10 +455,11 @@ def flyvkpblk_fp8(lhsP, rhsP, lhs_s, rhs_s, poffs_i32, OUT_M, OUT_N, out, beta=1
     if lpt:
         assert perm.dtype == torch.int32 and perm.numel() == G and perm.is_contiguous()
     pfc = 1 if (prefetch_c and bo) else 0
+    nbuf = 2 if bo else nbuf
     args = (_ptr(out), _ptr(lhsP), _ptr(rhsP), _ptr(poffs_i32), _ptr(perm if lpt else poffs_i32), _ptr(lhs_s),
             _ptr(rhs_s), OUT_M, fx.Stream(torch.cuda.current_stream(device=lhsP.device)), OUT_N, G, lhsP.stride(0),
-            rhsP.stride(0), nwg, tm, tn, tk, m_warp, n_warp, a_id, b_id, bo, group_m, kwin_max, lpt, pfc)
-    key = (tm, tn, tk, m_warp, n_warp, a_id, b_id, bo, group_m, kwin_max, lpt, pfc)
+            rhsP.stride(0), nwg, tm, tn, tk, m_warp, n_warp, a_id, b_id, bo, group_m, kwin_max, lpt, pfc, nbuf)
+    key = (tm, tn, tk, m_warp, n_warp, a_id, b_id, bo, group_m, kwin_max, lpt, pfc, nbuf)
     c = _COMPILED.get(key)
     if c is None:
         _COMPILED[key] = flyc.compile(launch_vkpblk_fp8_gfx1250, *args)
