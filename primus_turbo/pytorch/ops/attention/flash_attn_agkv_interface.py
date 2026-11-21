@@ -30,7 +30,8 @@ def flash_attn_agkv_func(
     [s_local, b, hkv, d], sbhd, bf16, d in (64, 128), gfx950 FlyDSL kernels.
 
     ``mode``: ``"overlap"`` (default) overlaps the K / V exchange (SDMA copies) with attention, ``"mega"``
-    does the same with compute-unit push / reduce kernels over XGMI, ``"serial"`` uses the same copy-free
+    exchanges with compute-unit push / reduce kernels over XGMI and attends to the local keys while the
+    remote ones arrive (needs ``FLUX_ATTN_FLYDSL=1``), ``"serial"`` uses the same copy-free
     layout without overlap, ``"naive"`` is the plain gather / reorder / scatter baseline.
     """
     return attention_agkv(

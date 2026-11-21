@@ -12,6 +12,8 @@ the output and gradients with the matching rows of the reference.
 
     pytest tests/pytorch/ops/test_attention_agkv.py --dist-only             # quick, all world sizes
     torchrun --nproc_per_node 8 tests/pytorch/ops/test_attention_agkv.py    # full
+
+Mode mega needs the flux FlyDSL attention and is skipped unless FLUX_ATTN_FLYDSL=1.
 """
 
 import argparse
@@ -25,6 +27,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from primus_turbo.common.flux import enabled as flux_enabled
 from primus_turbo.pytorch.core.utils import is_gfx950
 
 # name: (hq, hkv, d)
@@ -93,10 +96,10 @@ def run_case(seq, b, heads, mode, group, layers, verbose):
     return failures
 
 
-def run_suite(quick, verbose=False, modes=MODES):
+def run_suite(quick, verbose=False, modes=MODES, seqs=None):
     group = dist.group.WORLD
     n, rank = group.size(), group.rank()
-    seqs = [4096] if quick else [4096, 16384, 32768]
+    seqs = seqs or ([4096] if quick else [4096, 16384, 32768])
     batches = [1] if quick else [1, 2]
     failures = []
     for seq, b, heads, mode in itertools.product(seqs, batches, HEAD_CONFIGS, modes):
@@ -116,10 +119,14 @@ def main():
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--modes", nargs="+", default=list(MODES), choices=MODES)
+    parser.add_argument("--seqs", nargs="+", type=int)
     args = parser.parse_args()
+    if "mega" in args.modes and not flux_enabled("FLUX_ATTN_FLYDSL"):
+        args.modes.remove("mega")
+        print("mode mega skipped: it needs FLUX_ATTN_FLYDSL=1", flush=True)
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
     dist.init_process_group("nccl", timeout=timedelta(minutes=5))
-    ok = run_suite(args.quick, args.verbose, args.modes)
+    ok = run_suite(args.quick, args.verbose, args.modes, args.seqs)
     dist.barrier()
     dist.destroy_process_group()
     sys.exit(0 if ok else 1)
@@ -142,8 +149,13 @@ def test_attention_agkv(world_size):
         __file__,
         "--quick",
     ]
-    result = subprocess.run(cmd, cwd=repo_root, env={**os.environ, "PYTHONPATH": repo_root}, timeout=1800)
-    assert result.returncode == 0
+    env = {**os.environ, "PYTHONPATH": repo_root}
+    # mode mega runs on the flux FlyDSL attention, the other modes on the attention the environment selects
+    for modes, flux in ((MODES[:-1], env.get("FLUX_ATTN_FLYDSL", "0")), (("mega",), "1")):
+        result = subprocess.run(
+            cmd + ["--modes", *modes], cwd=repo_root, env={**env, "FLUX_ATTN_FLYDSL": flux}, timeout=1800
+        )
+        assert result.returncode == 0
 
 
 if __name__ == "__main__":

@@ -8,8 +8,8 @@
 
 Modes (see ``usp/attention_agkv.py``): ``naive`` (RCCL gather, reorder copy, scatter copy, RCCL
 reduce-scatter, all serial), ``serial`` (RCCL, copy-free layout, no overlap), ``overlap`` (copy-free
-layout, exchange on the SDMA engines under the attention kernels), ``mega`` (the same schedule with
-compute-unit push / reduce kernels). All timed the same way as
+layout, exchange on the SDMA engines under the attention kernels), ``mega`` (compute-unit push / reduce
+kernels, local keys attended while the remote ones arrive; run with ``FLUX_ATTN_FLYDSL=1``). All timed the same way as
 ``bench_ulysses_overlap.py``: ranks aligned by a barrier, the launch queued behind a GPU sleep, median
 of iterations, max over ranks.
 
@@ -35,6 +35,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from primus_turbo.common.flux import enabled as flux_enabled
 from primus_turbo.pytorch.ops import flash_attn_agkv_func
 from primus_turbo.pytorch.ops.attention.usp.attention_agkv import (
     AGKV_MODES,
@@ -71,7 +72,7 @@ def timeit(fn, group, warmup=5, iters=30):
     return t.item()
 
 
-def bench_shape(cfg, seq, b, group, warmup, iters):
+def bench_shape(cfg, seq, b, group, warmup, iters, modes):
     n = group.size()
     hidden, hq, hkv, d = cfg["hidden"], cfg["hq"], cfg["hkv"], cfg["d"]
     s_local = seq // n
@@ -146,12 +147,12 @@ def bench_shape(cfg, seq, b, group, warmup, iters):
         t[f"{mode}_fb"] = T(lambda: torch.autograd.grad(op(), (ql, kl, vl), dout))
         t[f"{mode}_block"] = T(lambda: block(mode))
 
-    for mode in AGKV_MODES:
+    for mode in modes:
         bench_mode(mode)
     return t
 
 
-def report(name, seq, b, n, t):
+def report(name, seq, b, n, t, modes):
     print(f"\n== {name} seq={seq} cp={n} mbs={b}  (us, max over ranks)")
     print(
         f"  parts: ag {t['ag']:.0f}  rs {t['rs']:.0f}  attn fwd {t['attn_fwd']:.0f}  attn bwd {t['attn_bwd']:.0f}"
@@ -164,7 +165,7 @@ def report(name, seq, b, n, t):
         + f"{'saved fb':>10}{'saved blk':>11}{'hidden':>8}"
     )
     base_fb, base_blk = t["naive_fb"], t["naive_block"]
-    for mode in AGKV_MODES:
+    for mode in modes:
         fb, blk = t[f"{mode}_fb"], t[f"{mode}_block"]
         hidden = (base_fb - fb) / max(base_fb - t["floor"], 1e-9)
         print(
@@ -174,7 +175,7 @@ def report(name, seq, b, n, t):
         )
     rccl, serial = t["ag"] + t["rs"], t["serial_fb"]
     print(f"  fb: serial {serial:.0f} / attn {t['floor']:.0f} / rccl {rccl:.0f}")
-    for mode in AGKV_MODES[2:]:
+    for mode in modes[2:]:
         fb = t[f"{mode}_fb"]
         print(
             f"  fb: {mode:<8} {fb:6.0f}   serial/{mode} {serial / fb:.3f}x   "
@@ -191,16 +192,20 @@ def main():
     parser.add_argument("--mbs", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=30)
+    parser.add_argument("--modes", nargs="+", default=list(AGKV_MODES[2:]), choices=AGKV_MODES[2:])
     args = parser.parse_args()
+    if "mega" in args.modes and not flux_enabled("FLUX_ATTN_FLYDSL"):
+        parser.error("mode mega needs FLUX_ATTN_FLYDSL=1 (run every mode under it to compare like with like)")
+    modes = list(AGKV_MODES[:2]) + args.modes
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
     dist.init_process_group("nccl")
     group = dist.group.WORLD
     n, rank = group.size(), group.rank()
     for name in args.model:
         for seq in args.seq:
-            t = bench_shape(MODELS[name], seq, args.mbs, group, args.warmup, args.iters)
+            t = bench_shape(MODELS[name], seq, args.mbs, group, args.warmup, args.iters, modes)
             if rank == 0:
-                report(name, seq, args.mbs, n, t)
+                report(name, seq, args.mbs, n, t, modes)
             torch.cuda.empty_cache()
     dist.barrier()
     dist.destroy_process_group()

@@ -13,7 +13,7 @@
 
 """Communication kernels of the all-gather-KV attention's ``mega`` mode (FlyDSL, single node).
 
-The attention kernels stay the stock FlyDSL ones; these move K / V and their gradients between ranks
+The attention kernels stay the FlyDSL ones; these move K / V and their gradients between ranks
 with compute-unit stores over XGMI into the peers' symmetric buffers, MegaMoE style:
 
 ``push``
@@ -23,15 +23,22 @@ with compute-unit stores over XGMI into the peers' symmetric buffers, MegaMoE st
 ``wait``
     holds the stream until a set of this rank's flags reach ``epoch``. One block per XCD, each ending
     with a system-scope acquire, so no XCD's L2 keeps lines of a bank a peer rewrote.
+``reduce``
+    sums the received partial dK / dV slots and the own ones (fp32, sender order) into the final dK / dV.
+``merge``
+    combines two partial attention outputs over disjoint keys by their lse, in one pass.
 """
 
 import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import flydsl.expr.math as fmath
+from flydsl._mlir.dialects import vector as _vector
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr
 
+from primus_turbo.flydsl.deep_ep.common import _asm
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
 from primus_turbo.flydsl.fused_collective_gemm.common import (
     BLOCK_THREADS,
@@ -40,14 +47,13 @@ from primus_turbo.flydsl.fused_collective_gemm.common import (
     VEC_I32,
     copy_rows,
     i64_base,
-    spin_flags,
 )
 from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
 )
-from primus_turbo.flydsl.utils.prims import atomic_add, cast, ld, memory_fence, st
+from primus_turbo.flydsl.utils.prims import atomic_add, cast, ld, memory_fence, read_clock, spin_timed_out, st
 
 # i64 fields of a copy unit
 UNIT_FIELDS = 8
@@ -55,6 +61,38 @@ U_SRC, U_SRC_OFF, U_DST, U_DST_OFF, U_BYTES, U_GROUP, U_GROUP_SIZE, U_FLAG = ran
 # bytes a unit moves at most: one pass of 16 B vectors, ``PUSH_BATCH`` loads in flight per thread
 PUSH_BATCH = 8
 UNIT_BYTES = BLOCK_THREADS * PUSH_BATCH * 16
+
+
+# realtime ticks (100 MHz) a flag wait allows before it traps: a peer's first call of a shape JIT compiles
+# its attention kernels for tens of seconds, which the 20 s of the collective GEMM waits do not cover
+WAIT_TIMEOUT = 300 * 100_000_000
+
+
+def _reached(flag_base, flag_idxs, expected):
+    ready = None
+    for idx in flag_idxs:
+        ok = ld(flag_base, idx, scope="sys", dtype=fx.T.i64) >= expected
+        ready = ok if ready is None else ready & ok
+    return ready
+
+
+@ASTRewriter.transform
+def _spin(flag_base, flag_idxs, expected, rank, tag):
+    """Spin until every flag of ``flag_idxs`` reaches ``expected``; trap after ``WAIT_TIMEOUT``."""
+    spin_start = read_clock()
+    fx.rocdl.s_waitcnt(0)
+    ready = _reached(flag_base, flag_idxs, expected)
+    while not ready:
+        fx.rocdl.s_sleep(fx.Int32(1))
+        if spin_timed_out(spin_start, WAIT_TIMEOUT):
+            fx.printf(
+                f"[agkv rank={rank} {tag}] flag wait timeout: first flag_idx={{}} expected={{}}\n",
+                flag_idxs[0],
+                expected,
+            )
+            _asm("s_trap 2")
+        fx.rocdl.s_waitcnt(0)
+        ready = _reached(flag_base, flag_idxs, expected)
 
 
 def _unit_field(units, unit, field, wide=False):
@@ -218,9 +256,7 @@ def _reduce_loop(thread_index, block_index, segs, flags_base, epoch, rank, piece
             if seg == fx.Int32(i):
                 if const_expr(len(flag_idxs) > 0):
                     if thread_index == fx.Int32(0):
-                        spin_flags(
-                            flags_base, [fx.Int32(f) for f in flag_idxs], epoch, rank, -1, "agkv_reduce"
-                        )
+                        _spin(flags_base, [fx.Int32(f) for f in flag_idxs], epoch, rank, "agkv_reduce")
                     fx.rocdl.s_waitcnt(0)
                     fx.gpu.barrier()
                     memory_fence(order="acquire", scope="sys")
@@ -390,7 +426,7 @@ def reduce(
 @ASTRewriter.transform
 def _wait_flags(thread_index, base, flag_idxs, epoch, rank):
     if thread_index == fx.Int32(0):
-        spin_flags(base, flag_idxs, epoch, rank, -1, "agkv_wait")
+        _spin(base, flag_idxs, epoch, rank, "agkv_wait")
 
 
 @functools.lru_cache(maxsize=256)
@@ -428,3 +464,80 @@ def wait(flags, rank, flag_idxs, epoch, stream):
     mask = sum(1 << i for i in set(flag_idxs))
     if mask:
         run_launcher(_launch_wait, flags, epoch, rank, mask, stream)
+
+
+def _merge_vectors(thread_index, block_index, oa, la, ob, lb, out, lse, sq, b, hq, d):
+    """One 8-element vector of ``out`` = softmax-weighted sum of ``oa`` / ``ob`` (fp32), and the row's
+    merged lse from its first vector; vectors past the end fall outside the buffer ranges."""
+    f32, f32_vec, bf16_vec = fx.T.f32, fx.T.vec(8, fx.T.f32), fx.T.vec(8, fx.T.bf16)
+    vpr = d // 8
+    rows = sq * b * hq
+    o_res = [create_buffer_resource_from_addr(t, num_records_bytes=rows * d * 2) for t in (oa, ob, out)]
+    l_res = [create_buffer_resource_from_addr(t, num_records_bytes=rows * 4) for t in (la, lb, lse)]
+    vec = block_index * fx.Int32(BLOCK_THREADS) + thread_index
+    row = vec // fx.Int32(vpr)
+    # o rows are (token, batch, head), lse rows (batch, token, head)
+    token, batch, head = row // fx.Int32(b * hq), (row // fx.Int32(hq)) % fx.Int32(b), row % fx.Int32(hq)
+    li = (batch * fx.Int32(sq) + token) * fx.Int32(hq) + head
+    a, z = (buffer_load(res, li, vec_width=1, dtype=f32) for res in l_res[:2])
+    m = fx.arith.maximumf(a, z)
+    ea, ez = fmath.exp(fx.arith.subf(a, m)), fmath.exp(fx.arith.subf(z, m))
+    total = fx.arith.addf(ea, ez)
+    wa, wz = fx.arith.divf(ea, total), fx.arith.divf(ez, total)
+    va, vz = (
+        fx.arith.extf(f32_vec, buffer_load(res, vec * fx.Int32(8), vec_width=8, dtype=fx.T.bf16))
+        for res in o_res[:2]
+    )
+    acc = fx.arith.addf(
+        fx.arith.mulf(va, _vector.broadcast(f32_vec, wa)), fx.arith.mulf(vz, _vector.broadcast(f32_vec, wz))
+    )
+    buffer_store(fx.arith.trunc_f(bf16_vec, acc), o_res[2], vec * fx.Int32(8))
+    merged = fx.arith.addf(m, fmath.log(total))
+    buffer_store(merged, l_res[2], li, mask=(vec % fx.Int32(vpr)) == fx.Int32(0))
+
+
+@functools.lru_cache(maxsize=64)
+def _make_merge_kernel(sq, b, hq, d):
+    @flyc.kernel(name="agkv_merge_kernel", known_block_size=[BLOCK_THREADS, 1, 1])
+    def kernel(OA: fx.Tensor, LA: fx.Tensor, OB: fx.Tensor, LB: fx.Tensor, OUT: fx.Tensor, LSE: fx.Tensor):
+        block_index, _b, _c = fx.block_idx
+        _merge_vectors(
+            cast(fx.thread_idx.x, fx.T.i32),
+            cast(block_index, fx.T.i32),
+            *(i64_base(t) for t in (OA, LA, OB, LB, OUT, LSE)),
+            sq,
+            b,
+            hq,
+            d,
+        )
+
+    return kernel
+
+
+@flyc.jit
+def _launch_merge(
+    OA,
+    LA,
+    OB,
+    LB,
+    OUT,
+    LSE,
+    sq: fx.Constexpr[int],
+    b: fx.Constexpr[int],
+    hq: fx.Constexpr[int],
+    d: fx.Constexpr[int],
+    stream: fx.Stream,
+):
+    grid = -(-sq * b * hq * d // (8 * BLOCK_THREADS))
+    _make_merge_kernel(sq, b, hq, d)(OA, LA, OB, LB, OUT, LSE).launch(
+        grid=(grid, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream
+    )
+
+
+def merge(out, lse, oa, la, ob, lb, stream):
+    """``out`` / ``lse`` = the merge of two attentions of the same queries over disjoint keys.
+
+    ``o*`` / ``out``: contiguous bf16 ``[sq, b, hq, d]``; ``l*`` / ``lse``: fp32 natural-log ``[b * sq, hq]``."""
+    sq, b, hq, d = out.shape
+    assert d % 8 == 0 and all(t.is_contiguous() for t in (out, lse, oa, la, ob, lb))
+    run_launcher(_launch_merge, oa, la, ob, lb, out, lse, sq, b, hq, d, stream)

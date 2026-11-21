@@ -45,14 +45,28 @@ Modes:
     across ranks (rank r's q0 sees (r+1) chunks, its q1 2n-r).
 
 ``mega``
-    the ``overlap`` schedule with MegaMoE-style communication kernels (``agkv_comm_kernel``) instead of
-    SDMA copies: one push kernel per exchange step stores the halves (gradient slots) over XGMI from a few
-    compute units into the peers' buffers and raises a flag per (destination, half); a one-block-per-XCD
-    wait kernel holds each call until its slots are in; in the backward one reduce kernel sums the
-    received slots and the own partial gradients (fp32, sender order) straight into dK / dV. A few dozen
-    blocks of stores move the data at about RCCL's speed and keep going beside the attention kernels; the
-    per-copy cost of the SDMA engines (~25 us a copy, a few copies in flight per engine) is gone, and so
-    are the local slot copies and the separate sums.
+    MegaMoE-style communication kernels (``agkv_comm_kernel``) instead of SDMA copies, and a forward that
+    starts attending before any remote key is in. One push kernel per exchange step stores the halves
+    (gradient slots) over XGMI from a few compute units into the peers' buffers and raises a flag per
+    (destination, half); a one-block-per-XCD wait kernel holds a call until its slots are in. A few dozen
+    blocks of stores move the data at about RCCL's speed beside the attention kernels, without the
+    per-copy cost of the SDMA engines (~25 us a copy, a few copies in flight per engine).
+
+    Receiver p keeps the remote halves as
+
+        [ second halves of p+1..n-1 | first halves of p+1..n-1 | first halves of 0..p-1 ]
+
+    so q0's remote keys (the first halves of the lower ranks) are its tail and q1's are all of it. Each q
+    chunk runs its bottom-right causal call against its own keys first (q0: its own chunk, q1: both own
+    chunks), then, once the remote slots it reads are in, one non-causal call against them; a merge
+    kernel combines the two partial outputs by their LSE. Every rank sends all first halves before any
+    second half. The forward saves [ remote | own ] for the backward, which is the two causal calls of
+    ``overlap`` on it: q1's backward runs first and the gradient slots of the higher ranks go out during
+    q0's backward, then one reduce kernel sums the received slots and the own partial gradients (fp32,
+    sender order) straight into dK / dV.
+
+    The non-causal calls use the flux FlyDSL attention (``FLUX_ATTN_FLYDSL=1``); the stock non-causal
+    forward gives wrong outputs for these calls (SBHD, GQA, Sq != Skv).
 
 Both ``overlap`` and ``mega`` reuse double-buffered symmetric buffers call after call, which needs every
 rank of the group to issue the same sequence of forward and backward calls (true of SPMD training), and
@@ -68,6 +82,7 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
+from primus_turbo.common.flux import enabled as flux_enabled
 from primus_turbo.flydsl.attention import agkv_comm_kernel as _comm
 from primus_turbo.pytorch.core.pyhip_runtime_wrapper import (
     find_hip_runtime_library,
@@ -75,6 +90,8 @@ from primus_turbo.pytorch.core.pyhip_runtime_wrapper import (
     hipMemcpyKindEnum,
 )
 from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
+from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import _fwd_module as _flydsl_fwd_module
+from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import _score_bound as _flydsl_score_bound
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
     flash_attn_sbhd_flydsl_backward_impl,
     flash_attn_sbhd_flydsl_forward_impl,
@@ -321,62 +338,98 @@ def _segment(sel, src_off, dst, dst_off, nbytes, group, group_size, flag):
     ]
 
 
+def _fwd_full(q, k, v):
+    """Non-causal forward: the stock FlyDSL kernel built without the causal mask."""
+    Sq, B, Hq, D = q.shape
+    Skv, _, Hkv, _ = k.shape
+    mod = _flydsl_fwd_module(Hq, Hkv, D, False, Sq != Skv, True, -1, sbhd=True)
+    out = torch.empty_like(q)
+    lse = torch.empty((B * Sq, Hq), device=q.device, dtype=torch.float32)
+    mod(
+        q,
+        k,
+        v,
+        out,
+        B,
+        Sq,
+        seq_len_kv=Skv,
+        stride_q_n=B * Hq * D,
+        stride_kv_n=B * Hkv * D,
+        sink=None,
+        score_bound=_flydsl_score_bound(k, D),
+        stream=torch.cuda.current_stream(),
+        debug_counts=lse,
+    )
+    return out, lse
+
+
+def _remote_layout(n, p):
+    """Token offsets (in chunks) of the remote slots in receiver ``p``'s buffer, laid out
+
+        [ second halves of senders p+1..n-1 | first halves of p+1..n-1 | first halves of 0..p-1 ]
+
+    so q1's remote keys are the whole buffer and q0's (first halves of the lower ranks) its suffix."""
+    first = {s: (n - 1 - p) + (s - p - 1) if s > p else 2 * (n - 1 - p) + s for s in range(n) if s != p}
+    second = {s: s - p - 1 for s in range(p + 1, n)}
+    return first, second
+
+
 @functools.lru_cache(maxsize=64)
 def _mega_fwd_plan(n, r, c, tok, fwd_bytes, device):
-    """Forward copy units of rank ``r`` and the flags its two calls wait for.
+    """Forward copy units of rank ``r`` and the flags its two remote calls wait for.
 
-    Units copy K (source 0) / V (source 1) halves into every rank's forward bank (V region at
-    ``fwd_bytes // 2``): the first half to every rank's first-half slot ``r``, the second half to the
-    second-half slot ``r`` of the lower ranks and to the own tail. A (destination, half) is one group;
-    its flag is ``_FWD_FIRST`` / ``_FWD_SECOND`` of sender ``r``."""
+    Units copy K (source 0) / V (source 1) halves into the peers' forward banks (V region at
+    ``fwd_bytes // 2``) at their ``_remote_layout`` slots: the first half to every peer, the second half
+    to the lower ones. A (destination, half) is one group; its flag is ``_FWD_FIRST`` / ``_FWD_SECOND``
+    of sender ``r``. Every rank's remote q0 call needs only first halves, so they all go first, each
+    destination served alike (every rank is through its local calls at the same time)."""
     half = c * tok
     pieces = -(-half // _comm.UNIT_BYTES)
-    first_off = (n + r) * c * tok
-    second_off = r * c * tok
-    tail_off = 2 * n * c * tok
 
-    def segments(dst, h, dst_off):
+    def segments(dst, h):
+        first, second = _remote_layout(n, dst)
+        dst_off = (first if h == 0 else second)[r] * half
         group, flag = _GROUPS_FWD * n + 2 * dst + h, (_FWD_FIRST if h == 0 else _FWD_SECOND) * n + r
         return [
             _segment(t, h * half, dst, t * (fwd_bytes // 2) + dst_off, half, group, 2 * pieces, flag)
             for t in range(2)
         ]
 
-    own_first = segments(r, 0, first_off)
-    peers_first = [seg for p in list(range(r + 1, n)) + list(range(r)) for seg in segments(p, 0, first_off)]
-    seconds = [seg for p in range(r) for seg in segments(p, 1, second_off)] + segments(r, 1, tail_off)
-    rows = _phase(pieces, own_first) + _phase(pieces, peers_first) + _phase(pieces, seconds)
-    units, num_units = _units_table(rows, device)
-    q0_flags = [_FWD_FIRST * n + s for s in range(r + 1)]
-    q1_flags = [_FWD_FIRST * n + s for s in range(r + 1, n)] + [_FWD_SECOND * n + s for s in range(r, n)]
-    return units, num_units, tuple(q0_flags), tuple(q1_flags)
+    peers = list(range(r + 1, n)) + list(range(r))
+    firsts = [sg for p in peers for sg in segments(p, 0)]
+    seconds = [sg for p in peers if p < r for sg in segments(p, 1)]
+    rows = _phase(pieces, firsts) + _phase(pieces, seconds)
+    units, num_units = _units_table(rows, device) if rows else (None, 0)
+    q0_flags = tuple(_FWD_FIRST * n + s for s in range(r))
+    q1_flags = tuple(_FWD_FIRST * n + s for s in range(r + 1, n)) + tuple(
+        _FWD_SECOND * n + s for s in range(r + 1, n)
+    )
+    return units, num_units, q0_flags, q1_flags
 
 
 @functools.lru_cache(maxsize=64)
 def _mega_bwd_plan(n, r, c, tok, bwd_bytes, device):
-    """Backward copy units of rank ``r``: after q1's backward, the gradient slots of the higher owners
-    (out of dK1 / dV1, sources 0 / 1), after q0's the first-half slots of the lower owners, each into
-    slot ``(half, r)`` of the owner's backward bank (V region at ``bwd_bytes // 2``). Also returns the
-    flags the owner's reduce waits for."""
+    """Backward copy units of rank ``r``: out of the remote-key gradients (``_remote_layout`` rows of
+    dK / dV, sources 0 / 1), after q1's remote backward the slots of the higher owners, after q0's the
+    first-half slots of the lower owners, each into slot ``(half, r)`` of the owner's backward bank
+    (V region at ``bwd_bytes // 2``). Also returns the flags the owner's reduce waits for."""
     seg = c * tok
     pieces = -(-seg // _comm.UNIT_BYTES)
+    first, second = _remote_layout(n, r)
 
-    def segments(base, dst, h, src_row):
+    def segments(base, dst, h):
         group, flag = base * n + 2 * dst + h, (_BWD_FIRST if h == 0 else _BWD_SECOND) * n + r
+        src_off = (first if h == 0 else second)[dst] * seg
         dst_off = (h * n + r) * seg
         return [
-            _segment(t, src_row * tok, dst, t * (bwd_bytes // 2) + dst_off, seg, group, 2 * pieces, flag)
+            _segment(t, src_off, dst, t * (bwd_bytes // 2) + dst_off, seg, group, 2 * pieces, flag)
             for t in range(2)
         ]
 
-    # rows of dK1 (q1's keys): second-half slots r+1.., then first-half slots 0..n-1, then the own tail
     after_q1 = [
-        sg
-        for s in range(r + 1, n)
-        for sg in segments(_GROUPS_BWD1, s, 1, (s - r - 1) * c)
-        + segments(_GROUPS_BWD1, s, 0, (n - r - 1 + s) * c)
+        sg for s in range(r + 1, n) for sg in segments(_GROUPS_BWD1, s, 1) + segments(_GROUPS_BWD1, s, 0)
     ]
-    after_q0 = [sg for s in range(r) for sg in segments(_GROUPS_BWD0, s, 0, (n - r - 1 + s) * c)]
+    after_q0 = [sg for s in range(r) for sg in segments(_GROUPS_BWD0, s, 0)]
     units1, num1 = _units_table(_phase(pieces, after_q1), device) if after_q1 else (None, 0)
     units0, num0 = _units_table(_phase(pieces, after_q0), device) if after_q0 else (None, 0)
     first_flags = tuple(_BWD_FIRST * n + s for s in range(n) if s != r)
@@ -384,19 +437,12 @@ def _mega_bwd_plan(n, r, c, tok, bwd_bytes, device):
     return units1, num1, units0, num0, first_flags, second_flags
 
 
-def _mega_forward(q, k, v, lay, group, softmax_scale, save):
-    n, r, c = lay.n, lay.r, lay.c
-    tail_shape, dtype = k.shape[1:], k.dtype
-    tok = k[0].numel() * k.element_size()
-    fwd_bytes, bwd_bytes = _exchange_sizes(lay, tok)
-    ex = _Exchange.get(group, 2 * (fwd_bytes + bwd_bytes))
-    epoch = ex.begin("fwd")
-    bank_off = (epoch & 1) * fwd_bytes
-    units, num_units, q0_flags, q1_flags = _mega_fwd_plan(n, r, c, tok, fwd_bytes, k.device)
-    cur = torch.cuda.current_stream()
-    ex.comm_stream.wait_stream(cur)
+def _mega_push(ex, srcs, units, num_units, bank_off, epoch):
+    if not num_units:
+        return
+    ex.comm_stream.wait_stream(torch.cuda.current_stream())
     _comm.push(
-        (k, v),
+        srcs,
         ex.heaps,
         ex.flag_ptrs,
         units,
@@ -407,29 +453,60 @@ def _mega_forward(q, k, v, lay, group, softmax_scale, save):
         _PUSH_GRID,
         ex.comm_stream,
     )
-    k.record_stream(ex.comm_stream)
-    v.record_stream(ex.comm_stream)
+    for t in srcs:
+        t.record_stream(ex.comm_stream)
 
-    kb, vb = (
-        ex.view(r, bank_off + i * fwd_bytes // 2, ((2 * n + 1) * c,) + tail_shape, dtype) for i in range(2)
-    )
-    _comm.wait(ex.flag_ptrs, r, q0_flags, epoch, cur)
-    out0, lse0 = _fwd(q[:c], kb[lay.keys0], vb[lay.keys0], softmax_scale)
+
+def _mega_forward(q, k, v, lay, group, softmax_scale, save):
+    """Returns ``out``, the lse of q0 / q1 and, for the backward, K / V laid out
+
+        [ remote slots (``_remote_layout``) | own first half | own second half ]
+
+    where q1's keys are the whole buffer and q0's the first halves of the lower ranks plus its own: both
+    end with their own chunk, so the backward runs two bottom-right causal calls as ``serial`` does."""
+    n, r, c = lay.n, lay.r, lay.c
+    tail_shape, dtype = k.shape[1:], k.dtype
+    tok = k[0].numel() * k.element_size()
+    fwd_bytes, bwd_bytes = _exchange_sizes(lay, tok)
+    ex = _Exchange.get(group, 2 * (fwd_bytes + bwd_bytes))
+    epoch = ex.begin("fwd")
+    bank_off = (epoch & 1) * fwd_bytes
+    units, num_units, q0_flags, q1_flags = _mega_fwd_plan(n, r, c, tok, fwd_bytes, k.device)
+    cur = torch.cuda.current_stream()
+    _mega_push(ex, (k, v), units, num_units, bank_off, epoch)
+
+    # local keys first, under the exchange: q0 sees its own chunk, q1 both own chunks; every remote key
+    # is visible to every query, so the remote calls are non-causal and merge in by lse
+    o0, l0 = _fwd(q[:c], k[:c], v[:c], softmax_scale)
+    o1, l1 = _fwd(q[c:], k, v, softmax_scale)
+    rem, low = (2 * n - 2 - r) * c, r * c
+    kr, vr = (ex.view(r, bank_off + i * fwd_bytes // 2, (rem,) + tail_shape, dtype) for i in range(2))
+    out = torch.empty_like(q)
+    if r > 0:
+        _comm.wait(ex.flag_ptrs, r, q0_flags, epoch, cur)
+        ro, rl = _fwd_full(q[:c], kr[rem - low :], vr[rem - low :])
+        lse0 = torch.empty_like(l0)
+        _comm.merge(out[:c], lse0, o0, l0, ro, rl, cur)
+    else:
+        out[:c].copy_(o0)
+        lse0 = l0
     _comm.wait(ex.flag_ptrs, r, q1_flags, epoch, cur)
     saved = None
     if save:
         ex.save_stream.wait_stream(cur)
         with torch.cuda.stream(ex.save_stream):
-            saved = [buf[lay.keys1].clone() for buf in (kb, vb)]
-    out1, lse1 = _fwd(q[c:], kb[lay.keys1], vb[lay.keys1], softmax_scale)
+            saved = [torch.cat((buf, t)) for buf, t in ((kr, k), (vr, v))]
+    ro, rl = _fwd_full(q[c:], kr, vr)
+    lse1 = torch.empty_like(l1)
+    _comm.merge(out[c:], lse1, o1, l1, ro, rl, cur)
     if save:
         cur.wait_stream(ex.save_stream)
         for t in saved:
             t.record_stream(cur)
-    return out0, out1, lse0, lse1, saved
+    return out, lse0, lse1, saved
 
 
-def _mega_backward(dout, q, kb, vb, out0, out1, lse0, lse1, lay, group, scale, det, keys0, keys1):
+def _mega_backward(dout, q, kb, vb, out, lse0, lse1, lay, group, scale, det):
     n, r, c = lay.n, lay.r, lay.c
     tail_shape, dtype = kb.shape[1:], kb.dtype
     tok = kb[0].numel() * kb.element_size()
@@ -438,47 +515,19 @@ def _mega_backward(dout, q, kb, vb, out0, out1, lse0, lse1, lay, group, scale, d
     epoch = ex.begin("bwd")
     bank_off = 2 * fwd_bytes + (epoch & 1) * bwd_bytes
     units1, num1, units0, num0, first_flags, second_flags = _mega_bwd_plan(n, r, c, tok, bwd_bytes, kb.device)
-    cur = torch.cuda.current_stream()
+    rem, low = (2 * n - 2 - r) * c, r * c
+    keys0 = slice(rem - low, rem + c)
 
-    dq1, dk1, dv1 = _bwd(dout[c:], q[c:], kb[keys1], vb[keys1], out1, lse1, scale, det)
+    dq1, dk1, dv1 = _bwd(dout[c:], q[c:], kb, vb, out[c:], lse1, scale, det)
     dk1, dv1 = dk1.contiguous(), dv1.contiguous()
-    if num1:
-        ex.comm_stream.wait_stream(cur)
-        _comm.push(
-            (dk1, dv1),
-            ex.heaps,
-            ex.flag_ptrs,
-            units1,
-            num1,
-            ex.counters,
-            bank_off,
-            epoch,
-            _PUSH_GRID,
-            ex.comm_stream,
-        )
-    dq0, dk0, dv0 = _bwd(dout[:c], q[:c], kb[keys0], vb[keys0], out0, lse0, scale, det)
+    _mega_push(ex, (dk1, dv1), units1, num1, bank_off, epoch)
+    dq0, dk0, dv0 = _bwd(dout[:c], q[:c], kb[keys0], vb[keys0], out[:c], lse0, scale, det)
     # disjoint from the slots pushed after q1
-    lower = slice((n - r - 1) * c, n * c)
-    dk1[lower].add_(dk0)
-    dv1[lower].add_(dv0)
-    if num0:
-        ex.comm_stream.wait_stream(cur)
-        _comm.push(
-            (dk1, dv1),
-            ex.heaps,
-            ex.flag_ptrs,
-            units0,
-            num0,
-            ex.counters,
-            bank_off,
-            epoch,
-            _PUSH_GRID,
-            ex.comm_stream,
-        )
-    dk1.record_stream(ex.comm_stream)
-    dv1.record_stream(ex.comm_stream)
+    dk1[keys0].add_(dk0)
+    dv1[keys0].add_(dv0)
+    _mega_push(ex, (dk1, dv1), units0, num0, bank_off, epoch)
 
-    seg = c * tok // dk1.element_size()
+    seg = c * tok // kb.element_size()
     dkv = torch.empty((2, 2 * c) + tail_shape, device=kb.device, dtype=dtype)
     _comm.reduce(
         ex.heaps,
@@ -490,14 +539,14 @@ def _mega_backward(dout, q, kb, vb, out0, out1, lse0, lse1, lay, group, scale, d
         r,
         n,
         seg,
-        (n - 1) * seg,
-        (2 * n - r - 1) * seg,
+        (2 * n - 2 - r) * seg,
+        (2 * n - 1 - r) * seg,
         bank_off,
         bwd_bytes // 4,
         first_flags,
         second_flags,
         epoch,
-        cur,
+        torch.cuda.current_stream(),
     )
     return torch.cat((dq0, dq1)), dkv[0], dkv[1]
 
@@ -612,6 +661,15 @@ class _AGKVAttention(torch.autograd.Function):
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         tail = k.shape[1:]
         keys0, keys1 = lay.keys0, lay.keys1
+        ctx.group, ctx.mode, ctx.lay = group, mode, lay
+        ctx.softmax_scale, ctx.deterministic = softmax_scale, deterministic
+        if mode == "mega":
+            out, lse0, lse1, saved = _mega_forward(
+                q, k, v, lay, group, softmax_scale, any(ctx.needs_input_grad[:3])
+            )
+            kb, vb = saved if saved is not None else (None, None)
+            ctx.save_for_backward(q, kb, vb, out, lse0, lse1)
+            return out
         if mode == "naive":
             kg = torch.empty((2 * n * c,) + tail, device=k.device, dtype=k.dtype)
             vg = torch.empty_like(kg)
@@ -636,31 +694,33 @@ class _AGKVAttention(torch.autograd.Function):
             out1, lse1 = _fwd(q[c:], kb[keys1], vb[keys1], softmax_scale)
         else:
             save = any(ctx.needs_input_grad[:3])
-            exchange = _sdma_forward if mode == "overlap" else _mega_forward
-            out0, out1, lse0, lse1, saved = exchange(q, k, v, lay, group, softmax_scale, save)
+            out0, out1, lse0, lse1, saved = _sdma_forward(q, k, v, lay, group, softmax_scale, save)
             kb, vb = saved if saved is not None else (None, None)
             # saved holds keys1 = [(r+1)c, (2n+1)c) of the buffer
             off = keys1.start
             keys0, keys1 = slice(keys0.start - off, keys0.stop - off), slice(0, lay.len1)
         out = torch.cat((out0, out1))
         ctx.save_for_backward(q, kb, vb, out0, out1, lse0, lse1)
-        ctx.group, ctx.mode, ctx.lay, ctx.keys = group, mode, lay, (keys0, keys1)
-        ctx.softmax_scale, ctx.deterministic = softmax_scale, deterministic
+        ctx.keys = (keys0, keys1)
         return out
 
     @staticmethod
     def backward(ctx, dout):
-        q, kb, vb, out0, out1, lse0, lse1 = ctx.saved_tensors
         group, mode, lay = ctx.group, ctx.mode, ctx.lay
-        keys0, keys1 = ctx.keys
-        n, r, c = lay.n, lay.r, lay.c
         scale, det = ctx.softmax_scale, ctx.deterministic
         dout = dout.contiguous()
+        if mode == "mega":
+            q, kb, vb, out, lse0, lse1 = ctx.saved_tensors
+            dq, dk, dv = _mega_backward(dout, q, kb, vb, out, lse0, lse1, lay, group, scale, det)
+            return dq, dk, dv, None, None, None, None
+
+        q, kb, vb, out0, out1, lse0, lse1 = ctx.saved_tensors
+        keys0, keys1 = ctx.keys
+        n, r, c = lay.n, lay.r, lay.c
         tail = kb.shape[1:]
 
-        if mode in ("overlap", "mega"):
-            exchange = _sdma_backward if mode == "overlap" else _mega_backward
-            dq, dk, dv = exchange(
+        if mode == "overlap":
+            dq, dk, dv = _sdma_backward(
                 dout, q, kb, vb, out0, out1, lse0, lse1, lay, group, scale, det, keys0, keys1
             )
             return dq, dk, dv, None, None, None, None
@@ -708,5 +768,10 @@ def attention_agkv(
     """
     assert mode in AGKV_MODES, f"mode must be one of {AGKV_MODES}, got {mode!r}"
     assert q.dim() == 4 and k.shape == v.shape and q.shape[:2] == k.shape[:2], "q / k / v must be sbhd"
-    assert mode != "mega" or k.dtype == torch.bfloat16, "mode 'mega' reduces gradients in bf16 only"
+    if mode == "mega":
+        assert k.dtype == torch.bfloat16, "mode 'mega' reduces gradients in bf16 only"
+        # only the flux build of the FlyDSL forward runs the non-causal (bidirectional) mask correctly
+        assert flux_enabled("FLUX_ATTN_FLYDSL"), (
+            "mode 'mega' needs the flux FlyDSL attention (FLUX_ATTN_FLYDSL=1)"
+        )
     return _AGKVAttention.apply(q, k, v, group, mode, softmax_scale, deterministic)
