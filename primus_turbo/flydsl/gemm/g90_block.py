@@ -40,6 +40,23 @@ def supported(M, N, K) -> bool:
     return M > 0 and N % 128 == 0 and K % 512 == 0
 
 
+def dgrad_split_k(M, N, K) -> int:
+    """Split-K factor for a dgrad NT GEMM C[M,N] = A[M,K] . B[N,K]^T (1 = off).
+
+    PRIMUS_TURBO_WQB_SPLITK=<s> (default 1): split the K loop of deep-K / narrow-N dgrads into ``s``
+    fp32 partials summed in a fixed order (deterministic). Target is the DSv4 wq_b dgrad
+    dX[4096,1024] = dY[4096,32768] . W (K/N = 32): K-serial (~0.55 us per 128-K tile, 133 us at s=1 on
+    128x128 tiles). Applied only when K >= 16 * N, K % (512 * s) == 0 and K / s >= 1024, so the other
+    dense dgrads (K/N <= 2 in DSv4) are untouched."""
+    try:
+        s = int(os.environ.get("PRIMUS_TURBO_WQB_SPLITK", "1") or "1")
+    except ValueError:
+        return 1
+    if s <= 1 or K < 16 * N or K % (512 * s) or K // s < 1024:
+        return 1
+    return s
+
+
 def accum_supported(main_grad, N, K) -> bool:
     """Whether gemm_nt can write/accumulate the [N, K] wgrad straight into ``main_grad``."""
     return (
@@ -51,8 +68,10 @@ def accum_supported(main_grad, N, K) -> bool:
     )
 
 
-def gemm_nt(a, b, ea, eb, out_dtype=torch.bfloat16, out=None, accumulate=False):
-    """C[M,N] = A[M,K] . B[N,K]^T with E8M0 scales ea [M,K/128] and eb [N/128,K/128] (block) or [N,K/128] (row)."""
+def gemm_nt(a, b, ea, eb, out_dtype=torch.bfloat16, out=None, accumulate=False, split_k=1):
+    """C[M,N] = A[M,K] . B[N,K]^T with E8M0 scales ea [M,K/128] and eb [N/128,K/128] (block) or [N,K/128] (row).
+
+    ``split_k`` > 1: fp32 partials per K slice, summed by gemm_g90 (not with ``accumulate``)."""
     M, K = a.shape
     N = b.shape[0]
     rowb = tuple(eb.shape) == (N, K // 128)
@@ -63,4 +82,7 @@ def gemm_nt(a, b, ea, eb, out_dtype=torch.bfloat16, out=None, accumulate=False):
         kw.update(tile=(128, 128), lead=4)
         if not rowb:
             kw["wscale"] = True
+    if split_k > 1:
+        assert not accumulate, "split_k and accumulate are exclusive"
+        kw["split_k"] = split_k
     return gemm_g90(a, b, out=out, scale_a=ea, scale_b=eb, out_dtype=out_dtype, accumulate=accumulate, **kw)

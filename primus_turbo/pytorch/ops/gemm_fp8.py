@@ -559,7 +559,9 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             if b_t is None:  # no optimizer-written W^T: transpose the FP8 copy (128x128 blocks are transpose-invariant)
                 b_t, b_te = b_row.t().contiguous(), b_e.t().contiguous()
             # dgrad: dX = dY . W  ->  NT with the FP8 copy of W^T (block scales transposed)
-            grad_a = g90_block.gemm_nt(g_row, b_t, g_re, b_te, ctx.out_dtype)
+            # PRIMUS_TURBO_WQB_SPLITK=<s>: split-K for the deep-K wq_b dgrad (default off; see g90_block.dgrad_split_k)
+            sk = g90_block.dgrad_split_k(g_row.shape[0], b_t.shape[0], g_row.shape[1])
+            grad_a = g90_block.gemm_nt(g_row, b_t, g_re, b_te, ctx.out_dtype, split_k=sk)
             # wgrad: dW[N,K] = dY^T . X  ->  NT on the token-major copies
             if ctx.fuse_bgrad_accum:
                 mg = ctx.main_grad
