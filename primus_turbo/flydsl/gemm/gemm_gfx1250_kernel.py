@@ -218,7 +218,7 @@ def launch_gemm_gfx1250(
     PITCH = STAGE_A + STAGE_B + STAGE_SA + STAGE_SB
     # The epilogue restages C through the same arena, so it has to fit both.
     ARENA = max(num_buffers * PITCH, tile_m * (tile_n + 8) * 2)
-    assert ARENA <= 160 * 1024, f"LDS arena {ARENA} B exceeds the 160 KiB gfx1250 budget"
+    assert ARENA <= 320 * 1024, f"LDS arena {ARENA} B exceeds the 320 KiB gfx1250 budget"
 
     n_ops = 4 if is_mx else 2  # TDM ops issued per stage
 
