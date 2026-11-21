@@ -55,6 +55,60 @@ def _fuseq_kw():
             "num_warps": int(os.environ.get("PRIMUS_TURBO_FUSEQ_NW", "2"))}
 
 
+class DyPrequantSlot:
+    """dY pre-quantization hand-off for the g90 / dsv4up block path (Primus PRIMUS_GLUE_WQB_DYQ).
+
+    The producer of this GEMM's output gradient (e.g. the V4 q norm/rope backward) can emit dY already quantized in
+    exactly the bytes ``quant_dual_t_e8m0_v2`` would write, in the scale layouts this GEMM's backward passes use
+    (``row_layout`` for dgrad, ``t_layout`` for wgrad). It then returns an unwritten bf16 carrier as the gradient
+    and ``fill``s the slot; ``backward`` takes the FP8 copies instead of quantizing grad_out, after checking that
+    grad_out IS the carrier (same storage), so a gradient that was modified on its way is never silently replaced.
+    """
+
+    __slots__ = ("M", "N", "row_layout", "t_layout", "fp8_dtype", "carrier_ptr", "carrier_numel", "data")
+
+    def __init__(self, M, N, row_layout, t_layout, fp8_dtype):
+        self.M, self.N = int(M), int(N)
+        self.row_layout, self.t_layout, self.fp8_dtype = row_layout, t_layout, fp8_dtype
+        self.carrier_ptr, self.carrier_numel, self.data = None, 0, None
+
+    def fill(self, carrier: torch.Tensor, data) -> None:
+        self.carrier_ptr = carrier.untyped_storage().data_ptr()
+        self.carrier_numel = carrier.numel()
+        self.data = data
+
+    def take(self, grad_out: torch.Tensor):
+        data, self.data = self.data, None
+        if data is None:
+            return None
+        if not (
+            grad_out.untyped_storage().data_ptr() == self.carrier_ptr
+            and grad_out.storage_offset() == 0
+            and grad_out.numel() == self.carrier_numel == self.M * self.N
+            and grad_out.is_contiguous()
+        ):
+            raise RuntimeError(
+                "gemm_fp8 dY prequant: the slot was filled but grad_out is not the producer's carrier "
+                "(the gradient was modified between the producer and this GEMM); refusing to use stale FP8 dY"
+            )
+        return data
+
+
+_dyq_state = {"request": False, "last": None}
+
+
+def request_dy_prequant() -> None:
+    """The next g90 / dsv4up block FP8GemmBlockFunction forward creates a DyPrequantSlot (see take_dy_prequant_slot)."""
+    _dyq_state["request"], _dyq_state["last"] = True, None
+
+
+def take_dy_prequant_slot():
+    """-> the slot created since request_dy_prequant() (or None); clears the request."""
+    slot = _dyq_state["last"]
+    _dyq_state["request"], _dyq_state["last"] = False, None
+    return slot
+
+
 def _deter_use_nt_layout_gemm_in_bwd(trans_a: bool, trans_b: bool):
     if is_gfx942():
         return False
@@ -536,6 +590,15 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             else:
                 out = g90_block.gemm_nt(a_row, b_row, a_re, b_e, out_dtype)
             ctx.save_for_backward(a_t, a_te, b_row, b_e, b_t, b_te)
+            ctx.dyq_slot = None
+            if _dyq_state["request"]:
+                _dyq_state["request"] = False
+                if fq is not None:  # the slot carries quant_dual_t_e8m0_v2 bytes in this GEMM's backward layouts
+                    pd, pw = (bool(plan[1]), bool(plan[2])) if plan is not None else (False, False)
+                    ctx.dyq_slot = DyPrequantSlot(
+                        a.shape[0], b.shape[0], "packed" if pd else "g90", "packed" if pw else "g90",
+                        _get_fp8_dtype(config.format, False))
+                    _dyq_state["last"] = ctx.dyq_slot
             ctx.g90 = True
             ctx.trans_a, ctx.trans_b, ctx.out_dtype, ctx.config = trans_a, trans_b, out_dtype, config
             return out
@@ -605,7 +668,11 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             a_t, a_te, b_row, b_e, b_t, b_te = ctx.saved_tensors
             g_dtype = _get_fp8_dtype(ctx.config.format, False)
             fq = _fuseq_kw()
-            if fq is not None:
+            slot, ctx.dyq_slot = getattr(ctx, "dyq_slot", None), None
+            pre = slot.take(grad_out) if slot is not None else None
+            if pre is not None:  # dY quantized by its producer (DyPrequantSlot): same bytes, no quant pass here
+                g_row, g_re, g_t, g_te = pre
+            elif fq is not None:
                 from primus_turbo.triton.quantization.quant_g90 import quant_dual_t_e8m0_v2
 
                 pd, pw = ctx.dsv[0][1:] if ctx.dsv is not None else (False, False)
@@ -622,7 +689,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                 (_, use_d, use_w), pbt, pat = ctx.dsv
                 ctx.dsv = None
                 M_, N_ = g_row.shape
-                if fq is not None:  # PRIMUS_TURBO_FUSEQ=1: dY scales already in the dsv4up layout
+                if fq is not None or pre is not None:  # FUSEQ / prequant: dY scales already in the dsv4up layout
                     pg, pgt = (g_re if use_d else None), (g_te if use_w else None)
                 else:
                     pg, pgt = dsv4up_block.pack_scales([(g_re, 1, M_, N_) if use_d else None,
