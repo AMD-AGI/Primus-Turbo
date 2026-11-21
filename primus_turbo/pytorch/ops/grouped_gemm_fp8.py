@@ -8,6 +8,8 @@ from typing import Optional, Union
 
 import torch
 
+from primus_turbo.pytorch.core import fp8blk_weight_cache
+
 from primus_turbo.pytorch.core.backend import (
     BackendType,
 )
@@ -137,9 +139,12 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         # --- B side: 2D-block weight, reused unchanged in fwd + bwd. If the caller
         # pre-quantized it as a QuantizedTensor, reuse its buffers directly. ---
         b_scaling_recipe = ScalingRecipe(use_2d_block=True)
+        wc = None if isinstance(b, QuantizedTensor) else fp8blk_weight_cache.lookup(b, b_dtype)
         if isinstance(b, QuantizedTensor):
             check_quantized_tensor(b, config, scaling_recipe=b_scaling_recipe)
             b_fp8, b_scale = b.qdata, b.scale_inv
+        elif wc is not None:  # PRIMUS_TURBO_FP8_WCACHE: quantized by the optimizer step
+            b_fp8, b_scale = wc.w, wc.scale_inv
         else:
             b_fp8, b_scale = quant_fp8_blockwise_for_weight_impl(b, b_dtype, block_size=config.block_size)
 
