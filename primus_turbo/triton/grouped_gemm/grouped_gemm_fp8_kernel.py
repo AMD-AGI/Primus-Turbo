@@ -771,6 +771,12 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        out,  # output segments 1..3 and their first groups: unused with a single segment
+        out,
+        out,
+        G,
+        G,
+        G,
         stride_lhs_n=lhs.stride(1),
         stride_rhs_n=rhs.stride(1),
         BLOCK_SIZE_M=blk_m,
