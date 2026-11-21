@@ -103,18 +103,10 @@ def _rank_major_concat_rows(hq, hkv, d, n, device):
     return torch.cat((q, k + hq * d, v + (hq + hkv) * d), dim=1).reshape(-1)
 
 
-_PERMUTED_WEIGHTS = {}
-
-
 def _rank_major_weight(w, hq, hkv, d, n):
-    """``w[perm]`` for a concat-layout weight, rebuilt only when the weight changes."""
-    key = (w.data_ptr(), hq, hkv, d, n)
-    cached = _PERMUTED_WEIGHTS.get(key)
-    if cached is not None and cached[0] == w._version:
-        return cached[1]
-    permuted = w.detach().index_select(0, _rank_major_concat_rows(hq, hkv, d, n, w.device))
-    _PERMUTED_WEIGHTS[key] = (w._version, permuted)
-    return permuted
+    """``w[perm]`` for a concat-layout weight. Rebuilt on every call: an optimizer can update ``w``
+    without bumping ``w._version``, and a CUDA graph replays only what it captured."""
+    return w.detach().index_select(0, _rank_major_concat_rows(hq, hkv, d, n, w.device))
 
 
 def _qkv_rank_block(hq, hkv, d, n, weight_layout):

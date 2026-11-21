@@ -41,6 +41,16 @@ def _randn(*shape, seed, scale=1.0):
     return torch.randn(*shape, device="cuda", generator=gen).mul_(scale).bfloat16()
 
 
+def _rewrite_in_place(w, seed):
+    """New values written through another tensor over ``w``'s storage, as an optimizer updating its
+    parameter buffer does: ``w._version`` does not move, so no cache may key on it."""
+    version = w._version
+    alias = torch.empty(0, dtype=w.dtype, device=w.device)
+    alias.set_(w.untyped_storage(), w.storage_offset(), w.shape, w.stride())
+    alias.copy_(_randn(*w.shape, seed=seed, scale=0.02))
+    assert w._version == version
+
+
 def _close(name, out, ref, failures, tag, scale=None):
     from tests.pytorch.test_utils import get_tolerances
 
@@ -115,6 +125,9 @@ def check(group, dims, b, s_local, qkv_format, fused, repeats, failures, poison=
         ]
 
         lq, lkv = lqs[rank].clone().requires_grad_(), lkvs[rank].clone().requires_grad_()
+        if it:
+            _rewrite_in_place(wq, seed=11 + 100 * it)
+            _rewrite_in_place(wkv, seed=12 + 100 * it)
         wq.grad = wkv.grad = None
         if poison:
             _poison_banks(group)
