@@ -113,3 +113,16 @@ def gemm_nt(a, b, a_packed, b_packed, out_dtype=None, out=None, accumulate=False
 
     sk = split_k_of(a.shape[0], b.shape[0], a.shape[1])
     return dsv4up_gemm(a, b, a_packed, b_packed, out=out, out_dtype=out_dtype, accumulate=accumulate, split_k=sk)
+
+
+def dual_enabled() -> bool:
+    """PRIMUS_TURBO_DSV4UP_DUAL=1 (default off): a Linear's dgrad and wgrad run as one dsv4up launch (bit-identical
+    outputs; the two GEMMs fill the GPU together)."""
+    return os.environ.get("PRIMUS_TURBO_DSV4UP_DUAL", "0") == "1"
+
+
+def gemm_nt_dual(job0, job1):
+    """job = (a, b, a_packed, b_packed, out, accumulate); see dsv4up_gemm.dsv4up_dual."""
+    from primus_turbo.gluon.gemm.dsv4up_gemm import dsv4up_dual
+
+    return dsv4up_dual(job0, job1)

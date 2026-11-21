@@ -47,7 +47,8 @@ def _cdiv(a: int, b: int) -> int:
 class Fp8BlockWeightCache:
     """FP8 W / W^T / scales of one weight Parameter, refreshed by the optimizer each step."""
 
-    def __init__(self, param: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn):
+    def __init__(self, param: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn, w=None, scale_inv=None,
+                 e8m0=None):
         assert param.dim() in (2, 3), f"block FP8 weight cache needs a 2D/3D weight, got {tuple(param.shape)}"
         lead = tuple(param.shape[:-2])
         n, k = param.shape[-2:]
@@ -56,10 +57,11 @@ class Fp8BlockWeightCache:
         self.shape = tuple(param.shape)
         self.dtype = dtype
         self.data_ptr = param.data_ptr()
-        self.w = torch.empty(lead + (n, k), dtype=dtype, device=dev)
+        # w / scale_inv / e8m0 may be given as (contiguous) views of a joint buffer, see attach_joint
+        self.w = torch.empty(lead + (n, k), dtype=dtype, device=dev) if w is None else w
         self.wt = torch.empty(lead + (k, n), dtype=dtype, device=dev)
-        self.scale_inv = torch.empty(lead + (tn, tk), dtype=torch.float32, device=dev)
-        self.e8m0 = torch.empty(lead + (tn, tk), dtype=torch.uint8, device=dev)
+        self.scale_inv = torch.empty(lead + (tn, tk), dtype=torch.float32, device=dev) if scale_inv is None else scale_inv
+        self.e8m0 = torch.empty(lead + (tn, tk), dtype=torch.uint8, device=dev) if e8m0 is None else e8m0
         self.e8m0_t = torch.empty(lead + (tk, tn), dtype=torch.uint8, device=dev)
         self.ready = False
         self.hits = 0
@@ -80,6 +82,62 @@ def attach(param: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn) -> Fp8
         cache = Fp8BlockWeightCache(param, dtype)
         param._primus_fp8blk_cache = cache
     return cache
+
+
+class JointFp8BlockWeightCache:
+    """Caches of several 2D weights [N_i, K] (same K, N_i % 128 == 0) whose W / scale_inv / E8M0 are row slices of
+    one joint [sum N_i, K] buffer, in the given order. The optimizer fills each slice through the per-weight cache
+    (contiguous views), so the joint W and its scales are ready with no per-step copy (used by the concat-N GEMM,
+    e.g. DSv4 wq_a || wkv)."""
+
+    def __init__(self, params, dtype):
+        k = params[0].shape[1]
+        ns = [int(p.shape[0]) for p in params]
+        ntot = sum(ns)
+        dev = params[0].device
+        self.key = tuple((p.data_ptr(), tuple(p.shape)) for p in params)
+        self.dtype = dtype
+        self.w = torch.empty((ntot, k), dtype=dtype, device=dev)
+        self.scale_inv = torch.empty((ntot // BLOCK, _cdiv(k, BLOCK)), dtype=torch.float32, device=dev)
+        self.e8m0 = torch.empty((ntot // BLOCK, _cdiv(k, BLOCK)), dtype=torch.uint8, device=dev)
+        self.caches = []
+        off = 0
+        for p, n in zip(params, ns):
+            c = Fp8BlockWeightCache(p, dtype, w=self.w[off:off + n], scale_inv=self.scale_inv[off // BLOCK:(off + n) // BLOCK],
+                                    e8m0=self.e8m0[off // BLOCK:(off + n) // BLOCK])
+            p._primus_fp8blk_cache = c
+            self.caches.append(c)
+            off += n
+
+    def ready(self, params, dtype) -> bool:
+        """All per-weight caches are ready and still the joint views (none was re-created by ``attach``)."""
+        if dtype != self.dtype:
+            return False
+        for p, c in zip(params, self.caches):
+            if getattr(p, "_primus_fp8blk_cache", None) is not c or not c.matches(p, dtype):
+                return False
+        return True
+
+
+def attach_joint(params, dtype: torch.dtype = torch.float8_e4m3fn) -> Optional[JointFp8BlockWeightCache]:
+    """Create (once, before the optimizer's first ``attach``) joint caches for ``params``; None if not possible
+    (cache disabled, shapes, or a weight already has its own cache). Tags the weights like ``lookup``."""
+    if not enabled() or len(params) < 2:
+        return None
+    jc = getattr(params[0], "_primus_fp8blk_joint", None)
+    key = tuple((p.data_ptr(), tuple(p.shape)) for p in params)
+    if jc is not None:
+        return jc if jc.key == key else None
+    k = params[0].shape[-1]
+    if any(p.dim() != 2 or p.shape[1] != k or p.shape[0] % BLOCK or k % BLOCK for p in params):
+        return None
+    if any(getattr(p, "_primus_fp8blk_cache", None) is not None for p in params):
+        return None
+    jc = JointFp8BlockWeightCache(params, dtype)
+    for p in params:
+        p._primus_fp8blk_wanted = True
+        p._primus_fp8blk_joint = jc
+    return jc
 
 
 def wants_cache(param: torch.Tensor) -> bool:
