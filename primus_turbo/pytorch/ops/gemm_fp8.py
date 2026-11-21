@@ -485,7 +485,31 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                 )
                 b_e = e8m0_of(b_row_scale)
                 b_t, b_te = None, None
-            out = g90_block.gemm_nt(a_row, b_row, a_re, b_e, out_dtype)
+            # PRIMUS_TURBO_FP8_BLOCK_KERNEL=dsv4up: Gluon kernel per pass where the shape allows (else g90).
+            # Scale packing for every dsv4up pass that only needs forward-time scales is one launch here.
+            from primus_turbo.gluon.gemm import dsv4up_block
+
+            ctx.dsv = None
+            if dsv4up_block.enabled():
+                M_, K_ = a_row.shape
+                N_ = b_row.shape[0]
+                # an explicit PRIMUS_TURBO_WQB_SPLITK request keeps that dgrad on the g90 split-K kernel
+                plan = (dsv4up_block.use(M_, N_, K_, "fwd"),
+                        g90_block.dgrad_split_k(M_, K_, N_) == 1 and dsv4up_block.use(M_, K_, N_, "dgrad"),
+                        dsv4up_block.use(N_, K_, M_, "wgrad"))
+                pa, pb, pbt, pat = dsv4up_block.pack_scales([
+                    (a_re, 1, M_, K_) if plan[0] else None,
+                    (b_e, 128, N_, K_) if plan[0] else None,
+                    (b_e.t(), 128, K_, N_) if plan[1] else None,  # transposed view, no copy
+                    (a_te, 1, K_, M_) if plan[2] else None,
+                ])
+                ctx.dsv = (plan, pbt, pat)
+                if plan[0]:
+                    out = dsv4up_block.gemm_nt(a_row, b_row, pa, pb, out_dtype)
+                else:
+                    out = g90_block.gemm_nt(a_row, b_row, a_re, b_e, out_dtype)
+            else:
+                out = g90_block.gemm_nt(a_row, b_row, a_re, b_e, out_dtype)
             ctx.save_for_backward(a_t, a_te, b_row, b_e, b_t, b_te)
             ctx.g90 = True
             ctx.trans_a, ctx.trans_b, ctx.out_dtype, ctx.config = trans_a, trans_b, out_dtype, config
@@ -556,12 +580,31 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             a_t, a_te, b_row, b_e, b_t, b_te = ctx.saved_tensors
             g_dtype = _get_fp8_dtype(ctx.config.format, False)
             g_row, _, g_re, g_t, g_te = quant_dual_t_e8m0(grad_out.contiguous(), g_dtype)
+            # PRIMUS_TURBO_FP8_BLOCK_KERNEL=dsv4up: per-pass plan made in forward; one packing launch for dY scales
+            use_d = use_w = False
+            if ctx.dsv is not None:
+                from primus_turbo.gluon.gemm import dsv4up_block
+
+                (_, use_d, use_w), pbt, pat = ctx.dsv
+                ctx.dsv = None
+                M_, N_ = g_row.shape
+                pg, pgt = dsv4up_block.pack_scales([(g_re, 1, M_, N_) if use_d else None,
+                                                    (g_te, 1, N_, M_) if use_w else None])
+
+            def wgemm(out_dtype, out=None, accumulate=False):
+                if use_w:
+                    return dsv4up_block.gemm_nt(g_t, a_t, pgt, pat, out_dtype, out=out, accumulate=accumulate)
+                return g90_block.gemm_nt(g_t, a_t, g_te, a_te, out_dtype, out=out, accumulate=accumulate)
+
             if b_t is None:  # no optimizer-written W^T: transpose the FP8 copy (128x128 blocks are transpose-invariant)
                 b_t, b_te = b_row.t().contiguous(), b_e.t().contiguous()
             # dgrad: dX = dY . W  ->  NT with the FP8 copy of W^T (block scales transposed)
-            # PRIMUS_TURBO_WQB_SPLITK=<s>: split-K for the deep-K wq_b dgrad (default off; see g90_block.dgrad_split_k)
-            sk = g90_block.dgrad_split_k(g_row.shape[0], b_t.shape[0], g_row.shape[1])
-            grad_a = g90_block.gemm_nt(g_row, b_t, g_re, b_te, ctx.out_dtype, split_k=sk)
+            if use_d:
+                grad_a = dsv4up_block.gemm_nt(g_row, b_t, pg, pbt, ctx.out_dtype)
+            else:
+                # PRIMUS_TURBO_WQB_SPLITK=<s>: split-K for the deep-K wq_b dgrad (default off; see g90_block.dgrad_split_k)
+                sk = g90_block.dgrad_split_k(g_row.shape[0], b_t.shape[0], g_row.shape[1])
+                grad_a = g90_block.gemm_nt(g_row, b_t, g_re, b_te, ctx.out_dtype, split_k=sk)
             # wgrad: dW[N,K] = dY^T . X  ->  NT on the token-major copies
             if ctx.fuse_bgrad_accum:
                 mg = ctx.main_grad
@@ -571,14 +614,14 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                 ):
                     # beta 0: plain epilogue straight into main_grad (= the unfused GEMM's output bits);
                     # beta 1: old main_grad + acc in fp32, rounded once into main_grad's dtype
-                    g90_block.gemm_nt(g_t, a_t, g_te, a_te, mg.dtype, out=mg, accumulate=not overwrite)
+                    wgemm(mg.dtype, out=mg, accumulate=not overwrite)
                 else:
-                    gb = g90_block.gemm_nt(g_t, a_t, g_te, a_te, ctx.out_dtype)
+                    gb = wgemm(ctx.out_dtype)
                     mg.copy_(gb) if overwrite else mg.add_(gb)
                 ctx.main_grad = ctx.wparam = None
                 grad_b = _get_dummy_wgrad(list(mg.shape), ctx.out_dtype)
             else:
-                grad_b = g90_block.gemm_nt(g_t, a_t, g_te, a_te, ctx.out_dtype)
+                grad_b = wgemm(ctx.out_dtype)
             return grad_a, grad_b, None, None, None, None, None, None, None
 
         a_col, a_col_scale, b_col, b_col_scale = ctx.saved_tensors
