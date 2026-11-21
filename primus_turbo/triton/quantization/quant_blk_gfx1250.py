@@ -11,11 +11,22 @@ block-128 exponent repeated 4x (written as one int32), so the GEMM applies them 
 
   e = ceil(log2(amax / 448)), q = x * 2^-e (exact power-of-two scaling, one RNE rounding to E4M3),
   byte = e + 127; an all-zero block gets e = 0.
+The exponent comes from the amax bits (no division; quant_epi_gfx1250), bit-identical to the former
+``amax / FP8_MAX`` form. ``scale_layout`` = "x4" (default, flygg MX planes [R, K/32]) or "packed" (dsv4up
+pack_scale BK256 layout [R/128, K/32*128]); same bytes, different order.
 """
 
 import torch
 import triton
 import triton.language as tl
+
+from primus_turbo.triton.quantization.quant_epi_gfx1250 import (
+    SL_PACKED,
+    pow2_neg_fly,
+    scale_layout_id,
+    store_scale,
+    ue8m0_exp_fly,
+)
 
 FP8_MAX = 448.0
 MX = 32
@@ -23,18 +34,26 @@ MX = 32
 
 @triton.jit
 def _ue8m0_exp(amax, FP8_MAX: tl.constexpr):
-    """smallest e with amax <= FP8_MAX * 2^e (exact on the fp32 bit pattern), 0 for amax == 0."""
-    r = amax / FP8_MAX
-    bits = r.to(tl.int32, bitcast=True)
-    e = ((bits >> 23) & 0xFF) - 127
-    mant = bits & 0x7FFFFF
-    e = tl.where(mant != 0, e + 1, e)  # round the exponent up unless r is an exact power of two
-    e = tl.where(amax > 0, e, 0)
-    return tl.minimum(tl.maximum(e, -126), 126)
+    """smallest e with amax <= FP8_MAX * 2^e, 0 for amax == 0, from the amax bits (no division)."""
+    if FP8_MAX == 448.0:
+        e = ue8m0_exp_fly(amax, 8)
+    else:
+        tl.static_assert(FP8_MAX == 57344.0)
+        e = ue8m0_exp_fly(amax, 15)
+    return e
+
+
+def _scale_alloc(R: int, K: int, sl: int, dev):
+    """E8M0 bytes of a 1x128-tiled [R, K] operand in layout sl (same byte count for both)."""
+    if sl == SL_PACKED:
+        assert R % 128 == 0
+        return torch.empty((R // 128, K // MX * 128), device=dev, dtype=torch.uint8)
+    return torch.empty((R, K // MX), device=dev, dtype=torch.uint8)
 
 
 @triton.jit
-def _act_1x128_kernel(X, Q, S, M, K, stride_x, stride_q, R: tl.constexpr, FP8_MAX: tl.constexpr):
+def _act_1x128_kernel(X, Q, S, M, K, stride_x, stride_q, R: tl.constexpr, FP8_MAX: tl.constexpr,
+                      SL: tl.constexpr = 0):
     """grid (cdiv(M, R), K // 128): R rows x one 128-wide tile; scales [M, K/32] uint8 viewed as int32 [M, K/128]."""
     pid_m = tl.program_id(0)
     kb = tl.program_id(1)
@@ -44,21 +63,21 @@ def _act_1x128_kernel(X, Q, S, M, K, stride_x, stride_q, R: tl.constexpr, FP8_MA
     x = tl.load(X + rows[:, None].to(tl.int64) * stride_x + cols[None, :], mask=rm[:, None], other=0.0).to(tl.float32)
     amax = tl.max(tl.abs(x), axis=1)
     e = _ue8m0_exp(amax, FP8_MAX)
-    inv = ((127 - e) << 23).to(tl.float32, bitcast=True)  # 2^-e
-    q = (x * inv[:, None]).to(Q.dtype.element_ty)
+    q = (x * pow2_neg_fly(e)[:, None]).to(Q.dtype.element_ty)  # 2^-e
     tl.store(Q + rows[:, None].to(tl.int64) * stride_q + cols[None, :], q, mask=rm[:, None])
-    b = (e + 127) & 0xFF
-    tl.store(S.to(tl.pointer_type(tl.int32)) + rows.to(tl.int64) * (K // 128) + kb, b * 0x01010101, mask=rm)
+    store_scale(S, rows, kb, e, M, K // 128, SL, mask=rm)
 
 
-def quant_act_1x128(x: torch.Tensor, dtype=torch.float8_e4m3fn, rows_per_prog: int = 16):
+def quant_act_1x128(x: torch.Tensor, dtype=torch.float8_e4m3fn, rows_per_prog: int = 16, scale_layout="x4"):
     """x [M, K] bf16 (K % 128 == 0) -> (q [M, K] fp8, s [M, K/32] uint8 E8M0 repeated per 128)."""
     assert x.dim() == 2 and x.shape[1] % 128 == 0 and x.stride(1) == 1
     M, K = x.shape
+    sl = scale_layout_id(scale_layout)
     q = torch.empty((M, K), device=x.device, dtype=dtype)
-    s = torch.empty((M, K // MX), device=x.device, dtype=torch.uint8)
+    s = _scale_alloc(M, K, sl, x.device)
     _act_1x128_kernel[(triton.cdiv(M, rows_per_prog), K // 128)](
-        x, q, s, M, K, x.stride(0), q.stride(0), R=rows_per_prog, FP8_MAX=torch.finfo(dtype).max, num_warps=4
+        x, q, s, M, K, x.stride(0), q.stride(0), R=rows_per_prog, FP8_MAX=torch.finfo(dtype).max, SL=sl,
+        num_warps=4
     )
     return q, s
 
@@ -74,8 +93,7 @@ def _w_128x128_kernel(W, Q, S, QT, ST, N, K, FP8_MAX: tl.constexpr, TRANS: tl.co
     w = tl.load(W + base + (nb * 128 + r)[:, None].to(tl.int64) * K + kb * 128 + r[None, :]).to(tl.float32)
     amax = tl.max(tl.max(tl.abs(w), axis=1), axis=0)
     e = _ue8m0_exp(amax, FP8_MAX)
-    inv = ((127 - e) << 23).to(tl.float32, bitcast=True)
-    q = (w * inv).to(Q.dtype.element_ty)
+    q = (w * pow2_neg_fly(e)).to(Q.dtype.element_ty)
     tl.store(Q + base + (nb * 128 + r)[:, None].to(tl.int64) * K + kb * 128 + r[None, :], q)
     word = ((e + 127) & 0xFF) * 0x01010101
     sv = tl.zeros((128,), dtype=tl.int32) + word
@@ -118,7 +136,7 @@ def dequant(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
 @triton.jit
 def _dual_1x128_128x1_kernel(X, ROWMAP, Q, S, QT, ST, P, C, stride_x, PREAL, HAS_MAP: tl.constexpr, BT: tl.constexpr,
                              BC: tl.constexpr, FP8_MAX: tl.constexpr, HAS_PREAL: tl.constexpr, TMODE: tl.constexpr = 1,
-                             CT: tl.constexpr = 0):
+                             CT: tl.constexpr = 0, SL: tl.constexpr = 0):
     """grid (P // BT, C // BC), BT == BC == 128: one 128 pool rows x 128 channels tile quantized both ways.
     rows: pool row p reads X[ROWMAP[p]] (HAS_MAP; a negative entry is a padding row -> zeros) or X[p].
       Q  [P, C]  fp8, S  [P, C/32] (1x128 tiles, exponent x4 as int32 per 128 channels)
@@ -139,38 +157,48 @@ def _dual_1x128_128x1_kernel(X, ROWMAP, Q, S, QT, ST, P, C, stride_x, PREAL, HAS
         src = p
         valid = p < P
     x = tl.load(X + src[:, None].to(tl.int64) * stride_x + c[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
-    _quant_tile_dual(x, p, c, pt, pc, P, C, Q, S, QT, ST, FP8_MAX, TMODE, CT)
+    _quant_tile_dual(x, p, c, pc, c, pt, P, C, Q, S, QT, ST, FP8_MAX, TMODE, CT, SL)
+
+
+def _dual_alloc(P: int, C: int, dtype, sl: int, compact_t: bool, dev):
+    q = torch.empty((P, C), device=dev, dtype=dtype)
+    s = _scale_alloc(P, C, sl, dev)
+    qT = torch.empty((C, P), device=dev, dtype=dtype)
+    sT = torch.empty((C, P // 128), device=dev, dtype=torch.uint8) if compact_t else _scale_alloc(C, P, sl, dev)
+    return q, s, qT, sT
 
 
 def quant_dual_blk(x: torch.Tensor, P: int, rowmap: torch.Tensor = None, dtype=torch.float8_e4m3fn, nw: int = 8,
-                   preal: torch.Tensor = None, tmode: int = 1, compact_t: bool = False):
+                   preal: torch.Tensor = None, tmode: int = 1, compact_t: bool = False, scale_layout="x4"):
     """x [rows, C] bf16 -> pool-ordered (q [P, C], s [P, C/32], qT [C, P], sT [C, P/32]); P % 128 == 0.
-    ``rowmap`` int32 [P]: source row of each pool row (negative = padding, quantized as zeros)."""
+    ``rowmap`` int32 [P]: source row of each pool row (negative = padding, quantized as zeros): the dispatch
+    (permute) gather is fused, no permuted bf16 copy is written.
+    ``scale_layout="packed"``: s [P/128, C/32*128] and sT [C/128, P/32*128] in the dsv4up packed layout."""
     C = x.shape[1]
     assert P % 128 == 0 and C % 128 == 0 and x.stride(1) == 1
-    dev = x.device
-    q = torch.empty((P, C), device=dev, dtype=dtype)
-    s = torch.empty((P, C // MX), device=dev, dtype=torch.uint8)
-    qT = torch.empty((C, P), device=dev, dtype=dtype)
-    sT = torch.empty((C, P // (128 if compact_t else MX)), device=dev, dtype=torch.uint8)
+    sl = scale_layout_id(scale_layout)
+    q, s, qT, sT = _dual_alloc(P, C, dtype, sl, compact_t, x.device)
     _dual_1x128_128x1_kernel[(P // 128, C // 128)](
         x, rowmap if rowmap is not None else x, q, s, qT, sT, P, C, x.stride(0), preal if preal is not None else x,
         HAS_MAP=int(rowmap is not None), BT=128, BC=128, FP8_MAX=torch.finfo(dtype).max,
-        HAS_PREAL=int(preal is not None), TMODE=tmode, CT=int(compact_t), num_warps=nw)
+        HAS_PREAL=int(preal is not None), TMODE=tmode, CT=int(compact_t), SL=sl, num_warps=nw)
     return q, s, qT, sT
 
 
 @triton.jit
-def _quant_tile_dual(v, p, c, pt, pc, P, C, Q, S, QT, ST, FP8_MAX: tl.constexpr, TMODE: tl.constexpr = 1,
-                     CT: tl.constexpr = 0):
-    """quantize one [128 pool rows, 128 cols] fp32 tile both ways (see _dual_1x128_128x1_kernel)."""
+def _quant_tile_dual(v, p, cq, pcq, c, pt, P, C, Q, S, QT, ST, FP8_MAX: tl.constexpr, TMODE: tl.constexpr = 1,
+                     CT: tl.constexpr = 0, SL: tl.constexpr = 0):
+    """quantize one [128 pool rows, 128 cols] fp32 tile both ways (see _dual_1x128_128x1_kernel).
+    cq / pcq: columns / 128-block of the tile in the row-major copy Q [P, C] (and S);
+    c: the same channels as rows of the transposed copy QT [C, P] (and ST). They differ only for the
+    [gate128|up128]-interleaved fc1 layout, where Q follows the interleaved W1 K order and QT stays canonical."""
     av = tl.abs(v)
     er = _ue8m0_exp(tl.max(av, axis=1), FP8_MAX)
-    qr = (v * (((127 - er) << 23).to(tl.float32, bitcast=True))[:, None]).to(Q.dtype.element_ty)
-    tl.store(Q + p[:, None].to(tl.int64) * C + c[None, :], qr)
-    tl.store(S.to(tl.pointer_type(tl.int32)) + p.to(tl.int64) * (C // 128) + pc, ((er + 127) & 0xFF) * 0x01010101)
+    qr = (v * pow2_neg_fly(er)[:, None]).to(Q.dtype.element_ty)
+    tl.store(Q + p[:, None].to(tl.int64) * C + cq[None, :], qr)
+    store_scale(S, p, pcq, er, P, C // 128, SL)
     ec = _ue8m0_exp(tl.max(av, axis=0), FP8_MAX)
-    qc = (v * (((127 - ec) << 23).to(tl.float32, bitcast=True))[None, :]).to(QT.dtype.element_ty)
+    qc = (v * pow2_neg_fly(ec)[None, :]).to(QT.dtype.element_ty)
     if TMODE == 0:
         tl.store(QT + c[:, None].to(tl.int64) * P + p[None, :], tl.trans(qc))
     elif TMODE == 1:
@@ -184,15 +212,17 @@ def _quant_tile_dual(v, p, c, pt, pc, P, C, Q, S, QT, ST, FP8_MAX: tl.constexpr,
     if CT:  # compact: one byte per 128 pool rows, ST [C, P/128] (the persistent wgrad repeats it in-kernel)
         tl.store(ST + c.to(tl.int64) * (P // 128) + pt, ((ec + 127) & 0xFF).to(tl.uint8))
     else:
-        tl.store(ST.to(tl.pointer_type(tl.int32)) + c.to(tl.int64) * (P // 128) + pt, ((ec + 127) & 0xFF) * 0x01010101)
+        store_scale(ST, c, pt, ec, C, P // 128, SL)
 
 
 @triton.jit
 def _swiglu_fwd_dual_kernel(L1, W, Q, S, QT, ST, P, I, PREAL, ALPHA: tl.constexpr, OFF: tl.constexpr,
                             GLO: tl.constexpr, GHI: tl.constexpr, UCL: tl.constexpr, FP8_MAX: tl.constexpr,
-                            HAS_PREAL: tl.constexpr, CT: tl.constexpr = 0):
+                            HAS_PREAL: tl.constexpr, CT: tl.constexpr = 0, SL: tl.constexpr = 0,
+                            ILV: tl.constexpr = 0):
     """act_w[p, c] = w[p] * g * sigmoid(alpha g) * (u + off), g/u the clamped gate/up halves of l1 [P, 2I];
-    quantized 1x128 (fc2 A operand) and 128x1 transposed (dW2 B operand). grid (P // 128, I // 128)."""
+    quantized 1x128 (fc2 A operand) and 128x1 transposed (dW2 B operand). grid (P // 128, I // 128).
+    ILV: l1 columns interleaved per 128 ([gate blk j | up blk j] at 256 j), the fc1-epilogue W1 order."""
     pt = tl.program_id(0)
     pc = tl.program_id(1)
     if HAS_PREAL:
@@ -201,41 +231,56 @@ def _swiglu_fwd_dual_kernel(L1, W, Q, S, QT, ST, P, I, PREAL, ALPHA: tl.constexp
     p = pt * 128 + tl.arange(0, 128)
     c = pc * 128 + tl.arange(0, 128)
     rowp = L1 + p[:, None].to(tl.int64) * (2 * I)
-    g = tl.load(rowp + c[None, :]).to(tl.float32)
-    u = tl.load(rowp + I + c[None, :]).to(tl.float32)
+    if ILV:
+        gc = pc * 256 + tl.arange(0, 128)
+        uc = gc + 128
+    else:
+        gc = c
+        uc = I + c
+    g = tl.load(rowp + gc[None, :]).to(tl.float32)
+    u = tl.load(rowp + uc[None, :]).to(tl.float32)
     w = tl.load(W + p)
+    act = swiglu_act_w(g, u, w, ALPHA, OFF, GLO, GHI, UCL)
+    _quant_tile_dual(act, p, c, pc, c, pt, P, I, Q, S, QT, ST, FP8_MAX, 1, CT, SL)
+
+
+@triton.jit
+def swiglu_act_w(g, u, w, ALPHA: tl.constexpr, OFF: tl.constexpr, GLO: tl.constexpr, GHI: tl.constexpr,
+                 UCL: tl.constexpr):
+    """clamped SwiGLU x routing weight on fp32 tiles g, u [BR, BC] (bf16-exact values), w [BR]; the one
+    expression shared by the standalone kernel and the fc1 GEMM epilogue (keeps them bit-identical)."""
     g = tl.minimum(tl.maximum(g, GLO), GHI)
     u = tl.minimum(tl.maximum(u, -UCL), UCL)
-    act = g * tl.sigmoid(ALPHA * g) * (u + OFF) * w[:, None]
-    _quant_tile_dual(act, p, c, pt, pc, P, I, Q, S, QT, ST, FP8_MAX, 1, CT)
+    return g * tl.sigmoid(ALPHA * g) * (u + OFF) * w[:, None]
 
 
 def swiglu_fwd_dual_blk(l1: torch.Tensor, w: torch.Tensor, activation=None, dtype=torch.float8_e4m3fn, preal=None,
-                        compact_t: bool = False):
+                        compact_t: bool = False, scale_layout="x4", interleaved: bool = False):
     """l1 [P, 2I] bf16 (pool order), w [P] fp32 routing weight per pool row (0 on padding rows) ->
-    (q [P, I], s [P, I/32], qT [I, P], sT [I, P/32]) of the weighted activation."""
+    (q [P, I], s [P, I/32], qT [I, P], sT [I, P/32]) of the weighted activation.
+    ``interleaved``: l1 columns in the [gate128|up128] order of an interleaved W1 (see interleave_w1)."""
     from primus_turbo.flydsl.utils.glu_activation import activation_constexpr
     alpha, off, glo, ghi, ucl = activation_constexpr(activation)
     P, I2 = l1.shape
     I = I2 // 2
-    dev = l1.device
-    q = torch.empty((P, I), device=dev, dtype=dtype)
-    s = torch.empty((P, I // MX), device=dev, dtype=torch.uint8)
-    qT = torch.empty((I, P), device=dev, dtype=dtype)
-    sT = torch.empty((I, P // (128 if compact_t else MX)), device=dev, dtype=torch.uint8)
+    sl = scale_layout_id(scale_layout)
+    q, s, qT, sT = _dual_alloc(P, I, dtype, sl, compact_t, l1.device)
     _swiglu_fwd_dual_kernel[(P // 128, I // 128)](l1, w, q, s, qT, sT, P, I, preal if preal is not None else w,
                                                   ALPHA=alpha, OFF=off, GLO=glo, GHI=ghi, UCL=ucl,
                                                   FP8_MAX=torch.finfo(dtype).max, HAS_PREAL=int(preal is not None),
-                                                  CT=int(compact_t), num_warps=8)
+                                                  CT=int(compact_t), SL=sl, ILV=int(interleaved), num_warps=8)
     return q, s, qT, sT
 
 
 @triton.jit
 def _swiglu_bwd_dual_kernel(DA, L1, W, Q, S, QT, ST, GW, P, I, PREAL, ALPHA: tl.constexpr, OFF: tl.constexpr,
                             GLO: tl.constexpr, GHI: tl.constexpr, UCL: tl.constexpr, FP8_MAX: tl.constexpr,
-                            HAS_PREAL: tl.constexpr, CT: tl.constexpr = 0):
+                            HAS_PREAL: tl.constexpr, CT: tl.constexpr = 0, SL: tl.constexpr = 0,
+                            ILV: tl.constexpr = 0):
     """d act_w [P, I] -> grad_l1 [P, 2I] (gate | up), quantized 1x128 (L1 dgrad A) and 128x1 transposed (dW1 A),
-    plus per-(row, 128-col block) partials of d w = sum_c d act_w * act. grid (P // 128, I // 128)."""
+    plus per-(row, 128-col block) partials of d w = sum_c d act_w * act. grid (P // 128, I // 128).
+    ILV: l1 is read and the row-major grad_l1 copy is written in the interleaved [gate128|up128] order (the K order
+    of the interleaved W1^T); the transposed copy keeps canonical rows (gate c, up I + c) so dW1 stays canonical."""
     pt = tl.program_id(0)
     pc = tl.program_id(1)
     if HAS_PREAL:
@@ -244,8 +289,18 @@ def _swiglu_bwd_dual_kernel(DA, L1, W, Q, S, QT, ST, GW, P, I, PREAL, ALPHA: tl.
     p = pt * 128 + tl.arange(0, 128)
     c = pc * 128 + tl.arange(0, 128)
     rowp = L1 + p[:, None].to(tl.int64) * (2 * I)
-    g0 = tl.load(rowp + c[None, :]).to(tl.float32)
-    u0 = tl.load(rowp + I + c[None, :]).to(tl.float32)
+    if ILV:
+        gc = pc * 256 + tl.arange(0, 128)
+        uc = gc + 128
+        gb = 2 * pc
+        ub = 2 * pc + 1
+    else:
+        gc = c
+        uc = I + c
+        gb = pc
+        ub = pc + I // 128
+    g0 = tl.load(rowp + gc[None, :]).to(tl.float32)
+    u0 = tl.load(rowp + uc[None, :]).to(tl.float32)
     d = tl.load(DA + p[:, None].to(tl.int64) * I + c[None, :]).to(tl.float32)
     w = tl.load(W + p)
     g = tl.minimum(tl.maximum(g0, GLO), GHI)
@@ -260,28 +315,46 @@ def _swiglu_bwd_dual_kernel(DA, L1, W, Q, S, QT, ST, GW, P, I, PREAL, ALPHA: tl.
     uin = (u0 >= -UCL) & (u0 <= UCL)
     d_up = tl.where(uin, dw * silu, 0.0)
     d_gate = tl.where(gin, dw * up * (sg + ALPHA * g * sg * (1.0 - sg)), 0.0)
-    _quant_tile_dual(d_gate, p, c, pt, pc, P, 2 * I, Q, S, QT, ST, FP8_MAX, 1, CT)
-    _quant_tile_dual(d_up, p, c + I, pt, pc + I // 128, P, 2 * I, Q, S, QT, ST, FP8_MAX, 1, CT)
+    _quant_tile_dual(d_gate, p, gc, gb, c, pt, P, 2 * I, Q, S, QT, ST, FP8_MAX, 1, CT, SL)
+    _quant_tile_dual(d_up, p, uc, ub, c + I, pt, P, 2 * I, Q, S, QT, ST, FP8_MAX, 1, CT, SL)
 
 
 def swiglu_bwd_dual_blk(d_act: torch.Tensor, l1: torch.Tensor, w: torch.Tensor, activation=None,
-                        dtype=torch.float8_e4m3fn, preal=None, compact_t: bool = False):
-    """-> (q [P, 2I], s [P, 2I/32], qT [2I, P], sT [2I, P/32]) of grad_l1, and d w [P] (fp32)."""
+                        dtype=torch.float8_e4m3fn, preal=None, compact_t: bool = False, scale_layout="x4",
+                        interleaved: bool = False):
+    """-> (q [P, 2I], s [P, 2I/32], qT [2I, P], sT [2I, P/32]) of grad_l1, and d w [P] (fp32).
+    ``interleaved``: l1 and q in the [gate128|up128] column order; qT/sT rows stay canonical."""
     from primus_turbo.flydsl.utils.glu_activation import activation_constexpr
     alpha, off, glo, ghi, ucl = activation_constexpr(activation)
     P, I = d_act.shape
     dev = d_act.device
-    q = torch.empty((P, 2 * I), device=dev, dtype=dtype)
-    s = torch.empty((P, 2 * I // MX), device=dev, dtype=torch.uint8)
-    qT = torch.empty((2 * I, P), device=dev, dtype=dtype)
-    sT = torch.empty((2 * I, P // (128 if compact_t else MX)), device=dev, dtype=torch.uint8)
+    sl = scale_layout_id(scale_layout)
+    q, s, qT, sT = _dual_alloc(P, 2 * I, dtype, sl, compact_t, dev)
     # rows past the real pool keep zero partials (their d w is never read)
     gw = torch.zeros((P, I // 128), device=dev, dtype=torch.float32)
     _swiglu_bwd_dual_kernel[(P // 128, I // 128)](d_act, l1, w, q, s, qT, sT, gw, P, I,
                                                   preal if preal is not None else w, ALPHA=alpha, OFF=off, GLO=glo,
                                                   GHI=ghi, UCL=ucl, FP8_MAX=torch.finfo(dtype).max,
-                                                  HAS_PREAL=int(preal is not None), CT=int(compact_t), num_warps=8)
+                                                  HAS_PREAL=int(preal is not None), CT=int(compact_t), SL=sl,
+                                                  ILV=int(interleaved), num_warps=8)
     return q, s, qT, sT, gw.sum(1)
+
+
+def interleave_perm(n2: int, dev=None) -> torch.Tensor:
+    """row order of the [gate128|up128]-interleaved W1 [2I, H]: new row 256 j + i <- gate row 128 j + i,
+    new row 256 j + 128 + i <- up row I + 128 j + i."""
+    I = n2 // 2
+    assert I % 128 == 0
+    j = torch.arange(I // 128, device=dev).view(-1, 1, 1)
+    h = torch.arange(2, device=dev).view(1, -1, 1)
+    i = torch.arange(128, device=dev).view(1, 1, -1)
+    return (h * I + j * 128 + i).reshape(-1)
+
+
+def interleave_w1(w1: torch.Tensor) -> torch.Tensor:
+    """[..., 2I, H] (gate rows then up rows) -> interleaved rows (128-row blocks, so 128x128 weight-quant blocks map
+    1:1: quantizing the interleaved weight == interleaving the quantized blocks and their scales)."""
+    return w1.index_select(-2, interleave_perm(w1.shape[-2], w1.device))
 
 
 @triton.jit
