@@ -62,10 +62,10 @@ Modes:
     kernel combines the two partial outputs by their LSE. Every rank sends all first halves before any
     second half. The forward saves [ remote | own ] for the backward: q1 against the remote keys
     (non-causal) first, whose gradient slots for the higher ranks are then final and go out; q0 (causal),
-    after which the slots of the lower ranks go out; last q1 against its own two chunks (causal), under
-    both pushes. One reduce kernel then sums the received slots and the own partial gradients (fp32,
-    sender order) straight into dK / dV. Where that last call would be too small to fill the GPU, q1 runs
-    as one causal call and only q0's backward hides the pushes.
+    after which the slots of the lower ranks go out, the push adding q0's part on the way; last q1 against
+    its own two chunks (causal), under both pushes. One reduce kernel then sums the received slots and the
+    own partial gradients of all calls (fp32, sender order) straight into dK / dV. Where that last call
+    would be too small to fill the GPU, q1 runs as one causal call and only q0's backward hides the pushes.
 
     The non-causal calls use the flux FlyDSL attention (``FLUX_ATTN_FLYDSL=1``); the stock non-causal
     forward gives wrong outputs for these calls (SBHD, GQA, Sq != Skv).
@@ -479,7 +479,7 @@ def _mega_bwd_plan(n, r, c, tok, bwd_bytes, device):
     return units1, num1, units0, num0, first_flags, second_flags
 
 
-def _mega_push(ex, srcs, units, num_units, bank_off, epoch):
+def _mega_push(ex, srcs, units, num_units, bank_off, epoch, addends=None, add_delta=0):
     if not num_units:
         return
     ex.comm_stream.wait_stream(torch.cuda.current_stream())
@@ -494,9 +494,23 @@ def _mega_push(ex, srcs, units, num_units, bank_off, epoch):
         epoch,
         _push_grid(ex.n),
         ex.comm_stream,
+        addends,
+        add_delta,
     )
-    for t in srcs:
+    for t in tuple(srcs) + tuple(addends or ()):
         t.record_stream(ex.comm_stream)
+
+
+def _side_copy(ex, dst, src):
+    """``dst.copy_(src)`` on the side stream, under the work queued after it; ``_join_side`` ends it."""
+    ex.save_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(ex.save_stream):
+        dst.copy_(src)
+    src.record_stream(ex.save_stream)
+
+
+def _join_side(ex):
+    torch.cuda.current_stream().wait_stream(ex.save_stream)
 
 
 def _mega_forward(q, k, v, lay, group, softmax_scale, save):
@@ -530,21 +544,22 @@ def _mega_forward(q, k, v, lay, group, softmax_scale, save):
         lse0 = torch.empty_like(l0)
         _comm.merge(out[:c], lse0, o0, l0, ro, rl, cur)
     else:
-        out[:c].copy_(o0)
+        _side_copy(ex, out[:c], o0)
         lse0 = l0
     _comm.wait(ex.flag_ptrs, r, q1_flags, epoch, cur)
     saved = None
     if save:
+        # a copy kernel beside q1's remote call: the SDMA engines copy within a GPU at ~60 GB/s, which
+        # at 16K costs more than the kernel's share of the compute units
         ex.save_stream.wait_stream(cur)
         with torch.cuda.stream(ex.save_stream):
             saved = [torch.cat((buf, t)) for buf, t in ((kr, k), (vr, v))]
+        for t in saved:
+            t.record_stream(cur)
     ro, rl = _fwd_full(q[c:], kr, vr)
     lse1 = torch.empty_like(l1)
     _comm.merge(out[c:], lse1, o1, l1, ro, rl, cur)
-    if save:
-        cur.wait_stream(ex.save_stream)
-        for t in saved:
-            t.record_stream(cur)
+    _join_side(ex)
     return out, lse0, lse1, saved
 
 
@@ -562,6 +577,10 @@ def _mega_backward(dout, q, kb, vb, out, lse0, lse1, lay, group, scale, det):
 
     seg = c * tok // kb.element_size()
     own_first, own_tail = (2 * n - 2 - r) * seg, (2 * n - 1 - r) * seg
+    # q0's keys start at row rem - low of q1's: the pushes after q0 add q0's gradient rows of the lower
+    # ranks' slots on the fly, the reduce q0's own-chunk rows (from row low), so no add runs between calls
+    add_delta = (rem - low) * tok
+    dq = torch.empty_like(q)
     if 2 * c * kb.shape[1] * kb.shape[2] >= _BWD_SPLIT_MIN_KEY_HEADS:
         # q1 against the remote keys first: its gradient rows then hold the final slots of the higher ranks
         # and go out under q0 and q1's own causal part; the slots of the lower ranks go out after q0, under
@@ -570,23 +589,21 @@ def _mega_backward(dout, q, kb, vb, out, lse0, lse1, lay, group, scale, det):
         dq1, dk1, dv1 = _bwd_full(dout[c:], q[c:], kb[:rem], vb[:rem], out[c:], lse1, scale, det)
         _mega_push(ex, (dk1, dv1), units1, num1, bank_off, epoch)
         dq0, dk0, dv0 = _bwd(dout[:c], q[:c], kb[keys0], vb[keys0], out[:c], lse0, scale, det)
-        dk1[rem - low :].add_(dk0[:low])
-        dv1[rem - low :].add_(dv0[:low])
-        _mega_push(ex, (dk1, dv1), units0, num0, bank_off, epoch)
+        dk0, dv0 = dk0.contiguous(), dv0.contiguous()
+        _mega_push(ex, (dk1, dv1), units0, num0, bank_off, epoch, (dk0, dv0), add_delta)
+        _side_copy(ex, dq[:c], dq0)
         dqb, dko, dvo = _bwd(dout[c:], q[c:], kb[own], vb[own], out[c:], lse1, scale, det)
-        dko[:c].add_(dk0[low:])
-        dvo[:c].add_(dv0[low:])
-        dq1.add_(dqb)
+        torch.add(dq1, dqb, out=dq[c:])
         own_k, own_v, own_first, own_tail = dko, dvo, 0, seg
     else:
         dq1, dk1, dv1 = _bwd(dout[c:], q[c:], kb, vb, out[c:], lse1, scale, det)
         dk1, dv1 = dk1.contiguous(), dv1.contiguous()
         _mega_push(ex, (dk1, dv1), units1, num1, bank_off, epoch)
+        _side_copy(ex, dq[c:], dq1)
         dq0, dk0, dv0 = _bwd(dout[:c], q[:c], kb[keys0], vb[keys0], out[:c], lse0, scale, det)
-        # disjoint from the slots pushed after q1
-        dk1[keys0].add_(dk0)
-        dv1[keys0].add_(dv0)
-        _mega_push(ex, (dk1, dv1), units0, num0, bank_off, epoch)
+        dk0, dv0 = dk0.contiguous(), dv0.contiguous()
+        _mega_push(ex, (dk1, dv1), units0, num0, bank_off, epoch, (dk0, dv0), add_delta)
+        dq[:c].copy_(dq0)
         own_k, own_v = dk1, dv1
 
     dkv = torch.empty((2, 2 * c) + tail_shape, device=kb.device, dtype=dtype)
@@ -608,8 +625,10 @@ def _mega_backward(dout, q, kb, vb, out, lse0, lse1, lay, group, scale, det):
         second_flags,
         epoch,
         torch.cuda.current_stream(),
+        extra=(dk0, dv0, r * seg),
     )
-    return torch.cat((dq0, dq1)), dkv[0], dkv[1]
+    _join_side(ex)
+    return dq, dkv[0], dkv[1]
 
 
 def _sdma_forward(q, k, v, lay, group, softmax_scale, save):

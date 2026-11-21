@@ -19,12 +19,14 @@ with compute-unit stores over XGMI into the peers' symmetric buffers, MegaMoE st
 ``push``
     walks a table of copy units ``(source, source offset, destination rank, destination offset, bytes,
     group, group size, flag)``; a unit's stores are system scope and retired before the block counts the
-    unit into its group, and the group's last unit raises the destination's flag to ``epoch``.
+    unit into its group, and the group's last unit raises the destination's flag to ``epoch``. A launch
+    can store the sum of each source and a second tensor instead (two partial gradients of one slot).
 ``wait``
     holds the stream until a set of this rank's flags reach ``epoch``. One block per XCD, each ending
     with a system-scope acquire, so no XCD's L2 keeps lines of a bank a peer rewrote.
 ``reduce``
-    sums the received partial dK / dV slots and the own ones (fp32, sender order) into the final dK / dV.
+    sums the received partial dK / dV slots and the own ones (fp32, sender order; up to two own terms
+    for the first half) into the final dK / dV.
 ``merge``
     combines two partial attention outputs over disjoint keys by their lse, in one pass.
 """
@@ -100,19 +102,56 @@ def _unit_field(units, unit, field, wide=False):
     return value if wide else cast(value, fx.T.i32)
 
 
-def _copy_unit(thread_index, unit, srcs, heaps, units, bank_off):
-    """Issue the stores of ``unit`` (not waited)."""
+def _sum_rows(thread_index, nvec, a_res, b_res, dst_res):
+    """``dst = a + b`` over ``nvec`` 8-element bf16 vectors (fp32 add), ``PUSH_BATCH`` per thread in flight."""
+    f32_vec, bf16_vec = fx.T.vec(8, fx.T.f32), fx.T.vec(8, fx.T.bf16)
+    num_vecs = UNIT_BYTES // 16
+    per_iter = BLOCK_THREADS * PUSH_BATCH
+    for it in range_constexpr(-(-num_vecs // per_iter)):
+        vecs = [
+            fx.Int32(it * per_iter + j * BLOCK_THREADS) + thread_index
+            for j in range_constexpr(PUSH_BATCH)
+            if it * per_iter + j * BLOCK_THREADS < num_vecs
+        ]
+        pairs = [
+            tuple(
+                buffer_load(res, v * fx.Int32(8), vec_width=8, dtype=fx.T.bf16, mask=v < nvec)
+                for res in (a_res, b_res)
+            )
+            for v in vecs
+        ]
+        for v, (x, y) in zip(vecs, pairs):
+            total = fx.arith.addf(fx.arith.extf(f32_vec, x), fx.arith.extf(f32_vec, y))
+            buffer_store(
+                fx.arith.trunc_f(bf16_vec, total),
+                dst_res,
+                v * fx.Int32(8),
+                mask=v < nvec,
+                cache_modifier=SYS_NT,
+            )
+
+
+def _copy_unit(thread_index, unit, srcs, heaps, units, bank_off, addends, add_delta):
+    """Issue the stores of ``unit`` (not waited). With ``addends``, store source + addend instead: the
+    addend of source ``i`` is ``addends[i]``, read ``add_delta`` bytes before the unit's source offset."""
     sel = _unit_field(units, unit, U_SRC)
     src_base = srcs[0]
     for i in range(1, len(srcs)):
         src_base = arith.select(sel == fx.Int32(i), srcs[i], src_base)
     nbytes = _unit_field(units, unit, U_BYTES)
     dst_heap = ld(heaps, _unit_field(units, unit, U_DST), dtype=fx.T.i64)
-    src_addr = src_base + _unit_field(units, unit, U_SRC_OFF, wide=True)
+    src_off = _unit_field(units, unit, U_SRC_OFF, wide=True)
     dst_addr = dst_heap + bank_off + _unit_field(units, unit, U_DST_OFF, wide=True)
-    src_res = create_buffer_resource_from_addr(src_addr, num_records_bytes=nbytes)
+    src_res = create_buffer_resource_from_addr(src_base + src_off, num_records_bytes=nbytes)
     dst_res = create_buffer_resource_from_addr(dst_addr, num_records_bytes=nbytes)
     nvec = nbytes // fx.Int32(16)
+    if addends is not None:
+        add_base = addends[0]
+        for i in range(1, len(addends)):
+            add_base = arith.select(sel == fx.Int32(i), addends[i], add_base)
+        add_res = create_buffer_resource_from_addr(add_base + src_off - add_delta, num_records_bytes=nbytes)
+        _sum_rows(thread_index, nvec, src_res, add_res, dst_res)
+        return
 
     def coords(v):
         word = v * fx.Int32(VEC_I32)
@@ -123,11 +162,23 @@ def _copy_unit(thread_index, unit, srcs, heaps, units, bank_off):
 
 @ASTRewriter.transform
 def _push_loop(
-    thread_index, block_index, srcs, heaps, flags, units, counters, bank_off, epoch, num_units, grid
+    thread_index,
+    block_index,
+    srcs,
+    heaps,
+    flags,
+    units,
+    counters,
+    bank_off,
+    epoch,
+    num_units,
+    grid,
+    addends,
+    add_delta,
 ):
     unit = block_index
     while unit < fx.Int32(num_units):
-        _copy_unit(thread_index, unit, srcs, heaps, units, bank_off)
+        _copy_unit(thread_index, unit, srcs, heaps, units, bank_off, addends, add_delta)
         fx.rocdl.s_waitcnt(0)
         fx.gpu.barrier()
         if thread_index == fx.Int32(0):
@@ -142,7 +193,7 @@ def _push_loop(
 
 
 @functools.lru_cache(maxsize=64)
-def _make_push_kernel(num_srcs, num_units, grid):
+def _make_push_kernel(num_srcs, num_units, grid, summed):
     @flyc.kernel(name="agkv_push_kernel", known_block_size=[BLOCK_THREADS, 1, 1])
     def kernel(
         SRC0: fx.Tensor,
@@ -155,10 +206,12 @@ def _make_push_kernel(num_srcs, num_units, grid):
         COUNTERS: fx.Tensor,
         bank_off: fx.Int64,
         epoch: fx.Int64,
+        add_delta: fx.Int64,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
-        srcs = [i64_base(t) for t in (SRC0, SRC1, SRC2, SRC3)[:num_srcs]]
+        bases = [i64_base(t) for t in (SRC0, SRC1, SRC2, SRC3)]
+        srcs, addends = (bases[:2], bases[2:]) if summed else (bases[:num_srcs], None)
         _push_loop(
             cast(thread_index, fx.T.i32),
             cast(block_index, fx.T.i32),
@@ -171,6 +224,8 @@ def _make_push_kernel(num_srcs, num_units, grid):
             cast(epoch, fx.T.i64),
             num_units,
             grid,
+            addends,
+            cast(add_delta, fx.T.i64),
         )
 
     return kernel
@@ -188,25 +243,35 @@ def _launch_push(
     COUNTERS,
     bank_off: int,
     epoch: int,
+    add_delta: int,
     num_srcs: fx.Constexpr[int],
     num_units: fx.Constexpr[int],
     grid: fx.Constexpr[int],
+    summed: fx.Constexpr[int],
     stream: fx.Stream,
 ):
-    kernel = _make_push_kernel(num_srcs, num_units, grid)
-    kernel(SRC0, SRC1, SRC2, SRC3, HEAPS, FLAGS, UNITS, COUNTERS, bank_off, epoch).launch(
+    kernel = _make_push_kernel(num_srcs, num_units, grid, summed)
+    kernel(SRC0, SRC1, SRC2, SRC3, HEAPS, FLAGS, UNITS, COUNTERS, bank_off, epoch, add_delta).launch(
         grid=(grid, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream
     )
 
 
-def push(srcs, heaps, flags, units, num_units, counters, bank_off, epoch, grid, stream):
+def push(
+    srcs, heaps, flags, units, num_units, counters, bank_off, epoch, grid, stream, addends=None, add_delta=0
+):
     """Run the copy units of ``units`` (``[num_units, UNIT_FIELDS]`` int64) with ``grid`` blocks.
 
     ``srcs``: up to 4 contiguous tensors a unit's source selects; ``heaps`` / ``flags``: int64 tensors
     of every rank's symmetric buffer and flag array addresses; ``counters``: int64 group counters,
-    zero between launches; ``bank_off``: byte offset added to every destination offset."""
+    zero between launches; ``bank_off``: byte offset added to every destination offset.
+    ``addends``: one bf16 tensor per source (two sources at most); a unit then stores its source plus the
+    addend's bytes ``add_delta`` before the unit's source offset, summed in fp32."""
     assert 1 <= len(srcs) <= 4 and all(t.is_contiguous() for t in srcs)
-    padded = list(srcs) + [srcs[0]] * (4 - len(srcs))
+    if addends is not None:
+        assert len(srcs) == len(addends) <= 2 and all(t.is_contiguous() for t in addends)
+        padded = list(srcs) + [srcs[0]] * (2 - len(srcs)) + list(addends) + [addends[0]] * (2 - len(addends))
+    else:
+        padded = list(srcs) + [srcs[0]] * (4 - len(srcs))
     run_launcher(
         _launch_push,
         *padded,
@@ -216,9 +281,11 @@ def push(srcs, heaps, flags, units, num_units, counters, bank_off, epoch, grid, 
         counters,
         bank_off,
         epoch,
+        add_delta,
         len(srcs),
         num_units,
         min(grid, num_units),
+        int(addends is not None),
         stream,
     )
 
@@ -264,11 +331,13 @@ def _reduce_loop(thread_index, block_index, segs, flags_base, epoch, rank, piece
         unit = unit + fx.Int32(grid)
 
 
-def _reduce_segs(bank, tensors, n, r, seg_elems, local_first, local_tail, bank_v, first_flags, second_flags):
+def _reduce_segs(
+    bank, tensors, n, r, seg_elems, local_first, local_tail, extra_first, bank_v, first_flags, second_flags
+):
     """``(sources, output address, flags)`` of the four output segments (K / V x half)."""
     segs = []
-    for t, (local, out) in enumerate(tensors):
-        local_base, out_base = i64_base(local), i64_base(out)
+    for t, (local, extra, out) in enumerate(tensors):
+        local_base, extra_base, out_base = i64_base(local), i64_base(extra), i64_base(out)
         region = bank + fx.Int64(t * bank_v * 2)
         for h in range(2):
             srcs = []
@@ -276,6 +345,8 @@ def _reduce_segs(bank, tensors, n, r, seg_elems, local_first, local_tail, bank_v
                 if s == r:
                     own = local_first if h == 0 else local_tail
                     srcs.append((local_base + fx.Int64(own * 2), 0))
+                    if h == 0 and extra_first >= 0:
+                        srcs.append((extra_base + fx.Int64(extra_first * 2), 0))
                 else:
                     srcs.append((region + fx.Int64((h * n + s) * seg_elems * 2), SYS_NT))
             segs.append(
@@ -286,7 +357,7 @@ def _reduce_segs(bank, tensors, n, r, seg_elems, local_first, local_tail, bank_v
 
 @functools.lru_cache(maxsize=64)
 def _make_reduce_kernel(
-    rank, num_ranks, seg_elems, local_first, local_tail, bank_v, first_flags, second_flags, grid
+    rank, num_ranks, seg_elems, local_first, local_tail, extra_first, bank_v, first_flags, second_flags, grid
 ):
     n, r = num_ranks, rank
     pieces = -(-seg_elems // REDUCE_ELEMS)
@@ -297,6 +368,8 @@ def _make_reduce_kernel(
         FLAGS: fx.Tensor,
         DK: fx.Tensor,
         DV: fx.Tensor,
+        XK: fx.Tensor,
+        XV: fx.Tensor,
         OUT_K: fx.Tensor,
         OUT_V: fx.Tensor,
         bank_off: fx.Int64,
@@ -308,12 +381,13 @@ def _make_reduce_kernel(
         flags_base = ld(i64_base(FLAGS), fx.Int32(r), dtype=fx.T.i64)
         segs = _reduce_segs(
             bank,
-            ((DK, OUT_K), (DV, OUT_V)),
+            ((DK, XK, OUT_K), (DV, XV, OUT_V)),
             n,
             r,
             seg_elems,
             local_first,
             local_tail,
+            extra_first,
             bank_v,
             first_flags,
             second_flags,
@@ -339,6 +413,8 @@ def _launch_reduce(
     FLAGS,
     DK,
     DV,
+    XK,
+    XV,
     OUT_K,
     OUT_V,
     bank_off: int,
@@ -348,6 +424,7 @@ def _launch_reduce(
     seg_elems: fx.Constexpr[int],
     local_first: fx.Constexpr[int],
     local_tail: fx.Constexpr[int],
+    extra_first: fx.Constexpr[int],
     bank_v: fx.Constexpr[int],
     first_flags: fx.Constexpr[int],
     second_flags: fx.Constexpr[int],
@@ -361,12 +438,13 @@ def _launch_reduce(
         seg_elems,
         local_first,
         local_tail,
+        extra_first,
         bank_v,
         unpack(first_flags),
         unpack(second_flags),
         grid,
     )
-    kernel(HEAPS, FLAGS, DK, DV, OUT_K, OUT_V, bank_off, epoch).launch(
+    kernel(HEAPS, FLAGS, DK, DV, XK, XV, OUT_K, OUT_V, bank_off, epoch).launch(
         grid=(grid, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream
     )
 
@@ -389,6 +467,7 @@ def reduce(
     second_flags,
     epoch,
     stream,
+    extra=None,
 ):
     """Sum this rank's dK / dV, ``out_k`` / ``out_v`` = ``[first half | second half]`` of
     ``seg_elems`` bf16 elements each.
@@ -397,15 +476,19 @@ def reduce(
     the K / V region of the bank at ``bank_off``; the V region starts ``bank_v`` elements in), with the
     own term read from ``dk`` / ``dv`` at element ``local_first``; half 1 sums the second-half slots of
     senders ``0..rank``, the own term at ``local_tail``. A half waits for its flags (``first_flags`` /
-    ``second_flags``, indices into this rank's flag array) first."""
+    ``second_flags``, indices into this rank's flag array) first. ``extra = (xk, xv, first)`` adds a
+    second own term to half 0, read from ``xk`` / ``xv`` at element ``first``."""
     pieces = -(-seg_elems // REDUCE_ELEMS)
     mask = lambda idxs: sum(1 << i for i in set(idxs))  # noqa: E731
+    xk, xv, extra_first = extra if extra is not None else (dk, dv, -1)
     run_launcher(
         _launch_reduce,
         heaps,
         flags,
         dk,
         dv,
+        xk,
+        xv,
         out_k,
         out_v,
         bank_off,
@@ -415,6 +498,7 @@ def reduce(
         seg_elems,
         local_first,
         local_tail,
+        extra_first,
         bank_v,
         mask(first_flags),
         mask(second_flags),
