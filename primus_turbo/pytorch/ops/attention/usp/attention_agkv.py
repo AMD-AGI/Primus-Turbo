@@ -60,10 +60,12 @@ Modes:
     chunk runs its bottom-right causal call against its own keys first (q0: its own chunk, q1: both own
     chunks), then, once the remote slots it reads are in, one non-causal call against them; a merge
     kernel combines the two partial outputs by their LSE. Every rank sends all first halves before any
-    second half. The forward saves [ remote | own ] for the backward, which is the two causal calls of
-    ``overlap`` on it: q1's backward runs first and the gradient slots of the higher ranks go out during
-    q0's backward, then one reduce kernel sums the received slots and the own partial gradients (fp32,
-    sender order) straight into dK / dV.
+    second half. The forward saves [ remote | own ] for the backward: q1 against the remote keys
+    (non-causal) first, whose gradient slots for the higher ranks are then final and go out; q0 (causal),
+    after which the slots of the lower ranks go out; last q1 against its own two chunks (causal), under
+    both pushes. One reduce kernel then sums the received slots and the own partial gradients (fp32,
+    sender order) straight into dK / dV. Where that last call would be too small to fill the GPU, q1 runs
+    as one causal call and only q0's backward hides the pushes.
 
     The non-causal calls use the flux FlyDSL attention (``FLUX_ATTN_FLYDSL=1``); the stock non-causal
     forward gives wrong outputs for these calls (SBHD, GQA, Sq != Skv).
@@ -77,6 +79,7 @@ The forward keeps the gathered K / V for the backward rather than gathering agai
 
 import ctypes
 import functools
+import math
 from typing import Optional
 
 import torch
@@ -84,6 +87,7 @@ import torch.distributed as dist
 
 from primus_turbo.common.flux import enabled as flux_enabled
 from primus_turbo.flydsl.attention import agkv_comm_kernel as _comm
+from primus_turbo.flydsl.attention.flash_attn_bwd import flydsl_varlen_backward as _flydsl_bwd
 from primus_turbo.pytorch.core.pyhip_runtime_wrapper import (
     find_hip_runtime_library,
     get_hip_runtime_lib,
@@ -101,9 +105,21 @@ __all__ = ["AGKV_MODES", "attention_agkv"]
 
 AGKV_MODES = ("naive", "serial", "overlap", "mega")
 
-# blocks of a mega push launch: 48 moved the n = 8 exchange at RCCL speed (16 / 24 / 32 were 55 / 23 / 18 %
-# slower) and slowed the concurrent attention no more than fewer blocks
-_PUSH_GRID = 48
+# blocks of a mega push launch, per peer link: fewer leave the link idle, more slow the concurrent attention
+# (n = 2: 8 / 16 / 32 / 48 blocks gave 66.1 / 66.3 / 67.0 / 67.4 ms for one 64K llama3-8b fwd + bwd); 48
+# moved the n = 8 exchange at RCCL speed, 16 / 24 / 32 were 55 / 23 / 18 % slower
+_PUSH_BLOCKS_PER_PEER = 8
+_PUSH_GRID_MAX = 48
+
+
+# mega splits q1's backward into the remote keys (non-causal) and its own two chunks (causal, last, under
+# the gradient pushes) when that last call has at least this many (key, kv head) pairs: fewer leave the GPU
+# under-occupied (2c = 2048 keys x 4 heads: +120 us on a 16K n = 8 fwd + bwd; x 8 heads: -35 us)
+_BWD_SPLIT_MIN_KEY_HEADS = 16384
+
+
+def _push_grid(n):
+    return min(_PUSH_BLOCKS_PER_PEER * (n - 1), _PUSH_GRID_MAX)
 
 
 def _fwd(q, k, v, softmax_scale):
@@ -339,7 +355,7 @@ def _segment(sel, src_off, dst, dst_off, nbytes, group, group_size, flag):
 
 
 def _fwd_full(q, k, v):
-    """Non-causal forward: the stock FlyDSL kernel built without the causal mask."""
+    """Non-causal forward: the flux FlyDSL kernel built without the causal mask."""
     Sq, B, Hq, D = q.shape
     Skv, _, Hkv, _ = k.shape
     mod = _flydsl_fwd_module(Hq, Hkv, D, False, Sq != Skv, True, -1, sbhd=True)
@@ -361,6 +377,32 @@ def _fwd_full(q, k, v):
         debug_counts=lse,
     )
     return out, lse
+
+
+def _bwd_full(dout, q, k, v, out, lse, softmax_scale, deterministic):
+    """Non-causal backward of queries ``q`` against keys ``k`` alone, ``out`` / ``lse`` over all their keys."""
+    Sq, B, Hq, D = q.shape
+    Skv, _, Hkv, _ = k.shape
+    scale = 1.0 / math.sqrt(D) if softmax_scale is None else softmax_scale
+    lse_bhs = lse.view(B, Sq, Hq).permute(0, 2, 1)
+    return _flydsl_bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        lse_bhs,
+        B,
+        Sq,
+        Skv,
+        Hq,
+        Hkv,
+        D,
+        scale,
+        sbhd=True,
+        deterministic=deterministic,
+        causal=False,
+    )[:3]
 
 
 def _remote_layout(n, p):
@@ -450,7 +492,7 @@ def _mega_push(ex, srcs, units, num_units, bank_off, epoch):
         ex.counters,
         bank_off,
         epoch,
-        _PUSH_GRID,
+        _push_grid(ex.n),
         ex.comm_stream,
     )
     for t in srcs:
@@ -518,29 +560,48 @@ def _mega_backward(dout, q, kb, vb, out, lse0, lse1, lay, group, scale, det):
     rem, low = (2 * n - 2 - r) * c, r * c
     keys0 = slice(rem - low, rem + c)
 
-    dq1, dk1, dv1 = _bwd(dout[c:], q[c:], kb, vb, out[c:], lse1, scale, det)
-    dk1, dv1 = dk1.contiguous(), dv1.contiguous()
-    _mega_push(ex, (dk1, dv1), units1, num1, bank_off, epoch)
-    dq0, dk0, dv0 = _bwd(dout[:c], q[:c], kb[keys0], vb[keys0], out[:c], lse0, scale, det)
-    # disjoint from the slots pushed after q1
-    dk1[keys0].add_(dk0)
-    dv1[keys0].add_(dv0)
-    _mega_push(ex, (dk1, dv1), units0, num0, bank_off, epoch)
-
     seg = c * tok // kb.element_size()
+    own_first, own_tail = (2 * n - 2 - r) * seg, (2 * n - 1 - r) * seg
+    if 2 * c * kb.shape[1] * kb.shape[2] >= _BWD_SPLIT_MIN_KEY_HEADS:
+        # q1 against the remote keys first: its gradient rows then hold the final slots of the higher ranks
+        # and go out under q0 and q1's own causal part; the slots of the lower ranks go out after q0, under
+        # q1's own part
+        own = slice(rem, rem + 2 * c)
+        dq1, dk1, dv1 = _bwd_full(dout[c:], q[c:], kb[:rem], vb[:rem], out[c:], lse1, scale, det)
+        _mega_push(ex, (dk1, dv1), units1, num1, bank_off, epoch)
+        dq0, dk0, dv0 = _bwd(dout[:c], q[:c], kb[keys0], vb[keys0], out[:c], lse0, scale, det)
+        dk1[rem - low :].add_(dk0[:low])
+        dv1[rem - low :].add_(dv0[:low])
+        _mega_push(ex, (dk1, dv1), units0, num0, bank_off, epoch)
+        dqb, dko, dvo = _bwd(dout[c:], q[c:], kb[own], vb[own], out[c:], lse1, scale, det)
+        dko[:c].add_(dk0[low:])
+        dvo[:c].add_(dv0[low:])
+        dq1.add_(dqb)
+        own_k, own_v, own_first, own_tail = dko, dvo, 0, seg
+    else:
+        dq1, dk1, dv1 = _bwd(dout[c:], q[c:], kb, vb, out[c:], lse1, scale, det)
+        dk1, dv1 = dk1.contiguous(), dv1.contiguous()
+        _mega_push(ex, (dk1, dv1), units1, num1, bank_off, epoch)
+        dq0, dk0, dv0 = _bwd(dout[:c], q[:c], kb[keys0], vb[keys0], out[:c], lse0, scale, det)
+        # disjoint from the slots pushed after q1
+        dk1[keys0].add_(dk0)
+        dv1[keys0].add_(dv0)
+        _mega_push(ex, (dk1, dv1), units0, num0, bank_off, epoch)
+        own_k, own_v = dk1, dv1
+
     dkv = torch.empty((2, 2 * c) + tail_shape, device=kb.device, dtype=dtype)
     _comm.reduce(
         ex.heaps,
         ex.flag_ptrs,
-        dk1,
-        dv1,
+        own_k,
+        own_v,
         dkv[0],
         dkv[1],
         r,
         n,
         seg,
-        (2 * n - 2 - r) * seg,
-        (2 * n - 1 - r) * seg,
+        own_first,
+        own_tail,
         bank_off,
         bwd_bytes // 4,
         first_flags,
