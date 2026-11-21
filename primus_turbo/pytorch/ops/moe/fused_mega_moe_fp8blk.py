@@ -42,6 +42,11 @@ __all__ = ["FP8BlockWeightCache", "fused_mega_moe_fp8blk", "refresh_fp8blk_weigh
 
 _FP8 = torch.float8_e4m3fn
 _ALIGN = 256
+# PRIMUS_TURBO_MOE_GG_DSV4=1: grouped fwd/dgrad GEMMs on the Gluon DSv4 kernel (gg_dsv4_gfx1250: upstream
+# warp-pipeline mainloop, persistent grid + split-K tail; needs Triton main with gluon cdna5) instead of
+# flygg_fp8blk_nt.  Default off (not recommended: tile 159.2 us vs flygg 162.1 us, gate failed).
+# GG_DSV4_MODE=tile|persistent|split selects the variant (default tile; persistent/split measured slower).
+_GG_DSV4 = os.environ.get("PRIMUS_TURBO_MOE_GG_DSV4", "0") == "1"
 _GEMM = dict(num_buffers=3)
 _VK = dict(num_buffers=2)
 _CACHES = weakref.WeakSet()
@@ -74,12 +79,22 @@ class FP8BlockWeightCache:
         self.s = torch.empty((E, N, K // MX), device=dev, dtype=torch.uint8)
         self.qT = torch.empty((E, K, N), device=dev, dtype=_FP8)
         self.sT = torch.empty((E, K, N // MX), device=dev, dtype=torch.uint8)
+        self.s_pk = self.sT_pk = None  # gg_dsv4 packed MX scales (only when PRIMUS_TURBO_MOE_GG_DSV4=1)
         self.valid = False
         _CACHES.add(self)
 
     @torch.no_grad()
     def refresh(self):
         quant_w_128x128(self.weight.detach(), _FP8, transposed=True, out=(self.q, self.s, self.qT, self.sT))
+        if _GG_DSV4:
+            from primus_turbo.triton.grouped_gemm.gg_dsv4_gfx1250 import pack_rows
+
+            E, N, K = self.q.shape
+            if self.s_pk is None:
+                self.s_pk = torch.empty((E * N // 128, K * 4), device=self.q.device, dtype=torch.uint8)
+                self.sT_pk = torch.empty((E * K // 128, N * 4), device=self.q.device, dtype=torch.uint8)
+            self.s_pk.copy_(pack_rows(self.s.view(E * N, K // MX)))
+            self.sT_pk.copy_(pack_rows(self.sT.view(E * K, N // MX)))
         self.valid = True
 
 
@@ -88,6 +103,19 @@ def refresh_fp8blk_weights():
     """Re-quantize every live FP8-block expert weight. Call once after each optimizer step (outside graphs)."""
     for c in list(_CACHES):
         c.refresh()
+
+
+def _gg(a, a_s, c, transposed, poffs):
+    """Grouped NT GEMM over the expert pool: a [P, K] fp8 x expert weights (c.q, or c.qT for the dgrads)."""
+    w, ws = (c.qT, c.sT) if transposed else (c.q, c.s)
+    if not _GG_DSV4:
+        return flygg_fp8blk_nt(a, w, a_s, ws, poffs, **_GEMM)
+    from primus_turbo.triton.grouped_gemm.gg_dsv4_gfx1250 import gg_dsv4, pack_rows, tile_table
+
+    E, N, K = w.shape
+    P = a.shape[0]
+    mte, nmt = tile_table(poffs, P)  # device-only (searchsorted), capturable
+    return gg_dsv4(a, w.view(E * N, K), pack_rows(a_s), c.sT_pk if transposed else c.s_pk, mte, nmt, N)
 
 
 def _setup_accum(w: torch.Tensor, accumulate: bool):
@@ -111,9 +139,9 @@ class _FP8BlockMoE(torch.autograd.Function):
         wk = _wgrad_kernel(T)
         ct = wk == "vkp"  # col (token-direction) scales compact for the persistent wgrad
         xq, xs, xT, xTs = quant_dual_blk(x, P, rowmap, preal=preal, compact_t=ct)
-        l1 = flygg_fp8blk_nt(xq, c1.q, xs, c1.s, poffs, **_GEMM)
+        l1 = _gg(xq, xs, c1, False, poffs)
         aq, as_, aT, aTs = swiglu_fwd_dual_blk(l1, route_w, activation, preal=preal, compact_t=ct)
-        l2 = flygg_fp8blk_nt(aq, c2.q, as_, c2.s, poffs, **_GEMM)
+        l2 = _gg(aq, as_, c2, False, poffs)
         y = combine_rows(l2, inv, T, K)
         ctx.save_for_backward(xT, xTs, aT, aTs, l1, route_w, rowmap, inv, poffs, preal)
         ctx.c1, ctx.c2, ctx.w1, ctx.w2 = c1, c2, w1, w2
@@ -129,7 +157,7 @@ class _FP8BlockMoE(torch.autograd.Function):
         c1, c2, w1, w2 = ctx.c1, ctx.c2, ctx.w1, ctx.w2
         vkp = ctx.wk == "vkp"
         dq, ds, dT, dTs = quant_dual_blk(dy.contiguous().to(torch.bfloat16), P, rowmap, preal=preal, compact_t=vkp)
-        dact = flygg_fp8blk_nt(dq, c2.qT, ds, c2.sT, poffs, **_GEMM)
+        dact = _gg(dq, ds, c2, True, poffs)
         gq, gs, gT, gTs, dwr = swiglu_bwd_dual_blk(dact, l1, route_w, ctx.activation, preal=preal, compact_t=vkp)
         # experts longest-first (one tiny argsort shared by both wgrads); PRIMUS_TURBO_MOE_FP8BLK_WGRAD_LPT=0: index order
         lpt = os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_WGRAD_LPT", "1") == "1"
@@ -154,7 +182,7 @@ class _FP8BlockMoE(torch.autograd.Function):
                 wgrad(lhs, rhs, lhs_s, rhs_s, n, k, g, 0.0)
                 grads.append(g.to(w.dtype))
         dW2, dW1 = grads
-        dxp = flygg_fp8blk_nt(gq, c1.qT, gs, c1.sT, poffs, **_GEMM)
+        dxp = _gg(gq, gs, c1, True, poffs)
         dx = combine_rows(dxp, inv, T, K)
         dtw = dwr[inv.long()].view(T, K).to(ctx.topk_dtype)
         return dx, None, dtw, dW1, dW2, None, None, None, None
