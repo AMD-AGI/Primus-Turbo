@@ -572,12 +572,12 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
 
     """
 
-    # A real measured boundary on gfx950 (clean through G=65, wrong at G=80 and G=96),
-    # but only a convention on gfx1250, which was measured correct up to G=160. The cap
-    # is kept at 64 on both anyway: raising it for one arch would make the supported
-    # expert count arch-dependent for no measured shape, and no MoE configuration in
-    # the benchmark table exceeds G=32.
+    # Most groups one call takes, per architecture. gfx950: a real measured boundary
+    # (clean through G=65, wrong at G=80 and G=96). gfx1250: measured correct up to
+    # G=160; MiniMax-M3 on one GPU has 128 local experts, so the gfx1250 cap is the
+    # measured one rather than gfx950's.
     MAX_G = 64
+    MAX_G_GFX1250 = 160
 
     @staticmethod
     def can_handle(
@@ -606,7 +606,11 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
         supported &= a.dim() == 2 and b.dim() == 2 and a.shape[0] == b.shape[0]
         supported &= a.dtype in (torch.bfloat16, torch.float16) and b.dtype == a.dtype
         supported &= trans_a and not trans_b
-        supported &= group_lens.numel() <= GroupedGEMMVariableKFlyDSLBackend.MAX_G
+        supported &= group_lens.numel() <= (
+            GroupedGEMMVariableKFlyDSLBackend.MAX_G_GFX1250
+            if gfx1250
+            else GroupedGEMMVariableKFlyDSLBackend.MAX_G
+        )
         if supported and gfx1250:
             from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
                 grouped_gemm_bf16_variable_k_supported,
