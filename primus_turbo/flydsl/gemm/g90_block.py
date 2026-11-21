@@ -25,7 +25,8 @@ _CFG_128_ROWB = dict(tile=(128, 128), lead=4, tdm_mode=2)
 
 
 def enabled() -> bool:
-    return os.environ.get("PRIMUS_TURBO_FP8_BLOCK_KERNEL", "") == "g90"
+    # dsv4up rides on the g90 path (gluon/gemm/dsv4up_block.py swaps the GEMM per supported pass)
+    return os.environ.get("PRIMUS_TURBO_FP8_BLOCK_KERNEL", "") in ("g90", "dsv4up")
 
 
 def _cfg(M, N, K, rowb):
