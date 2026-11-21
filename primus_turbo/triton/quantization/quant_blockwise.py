@@ -9,10 +9,19 @@ import triton.language as tl
 
 
 @triton.jit
-def compute_scale_and_quant(x_tile, x_tile_abs, axis, FP8_MAX):
+def pow2_floor(s):
+    """UE8M0 scale: round a positive normal fp32 scale down to a power of two (exact, by
+    masking the mantissa), so |x| * scale stays <= FP8_MAX and 1/scale is exact."""
+    return (s.to(tl.int32, bitcast=True) & 0x7F800000).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def compute_scale_and_quant(x_tile, x_tile_abs, axis, FP8_MAX, POW2_SCALE: tl.constexpr = False):
     x_tile_max = tl.max(x_tile_abs, axis=axis, keep_dims=True)
     x_tile_max = tl.maximum(x_tile_max, 1e-4)
     x_scales_tile = FP8_MAX / x_tile_max
+    if POW2_SCALE:
+        x_scales_tile = pow2_floor(x_scales_tile)
     x_fp8_tile = x_tile * x_scales_tile
     x_fp8_tile = tl.clamp(x_fp8_tile, min=-FP8_MAX, max=FP8_MAX)
     return x_fp8_tile, x_scales_tile
@@ -29,6 +38,7 @@ def quant_fp8_blockwise_kernel(
     BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
     AXIS: tl.constexpr,
+    POW2_SCALE: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -41,7 +51,7 @@ def quant_fp8_blockwise_kernel(
     x_tile = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
     x_tile_abs = tl.abs(x_tile)
 
-    x_fp8_tile, x_scales_tile = compute_scale_and_quant(x_tile, x_tile_abs, AXIS, FP8_MAX)
+    x_fp8_tile, x_scales_tile = compute_scale_and_quant(x_tile, x_tile_abs, AXIS, FP8_MAX, POW2_SCALE)
 
     # Store output
     x_fp8_ptrs = x_fp8_ptr + offs_m[:, None] * N + offs_n[None, :]
@@ -73,6 +83,7 @@ def quant_fp8_blockwise_dual_kernel(
     N,
     BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    POW2_SCALE: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -84,8 +95,8 @@ def quant_fp8_blockwise_dual_kernel(
     x_tile = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
     x_tile_abs = tl.abs(x_tile)
 
-    x_fp8_row_tile, x_scales_row_tile = compute_scale_and_quant(x_tile, x_tile_abs, 1, FP8_MAX)
-    x_fp8_col_tile, x_scales_col_tile = compute_scale_and_quant(x_tile, x_tile_abs, 0, FP8_MAX)
+    x_fp8_row_tile, x_scales_row_tile = compute_scale_and_quant(x_tile, x_tile_abs, 1, FP8_MAX, POW2_SCALE)
+    x_fp8_col_tile, x_scales_col_tile = compute_scale_and_quant(x_tile, x_tile_abs, 0, FP8_MAX, POW2_SCALE)
 
     x_fp8_row_ptrs = x_fp8_row_ptr + offs_m[:, None] * N + offs_n[None, :]
     tl.store(x_fp8_row_ptrs, x_fp8_row_tile.to(x_fp8_row_ptr.dtype.element_ty), mask=mask)
@@ -124,6 +135,7 @@ def quant_fp8_blockwise_for_weight_kernel(
     N,
     BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    POW2_SCALE: tl.constexpr = False,
 ):
     bid = tl.program_id(axis=0)
     pid_m = tl.program_id(axis=1)
@@ -144,6 +156,8 @@ def quant_fp8_blockwise_for_weight_kernel(
     w_tile_max = tl.max(w_tile_abs)  # [1]
     w_tile_max = tl.maximum(w_tile_max, 1e-4)
     w_scales = FP8_MAX / w_tile_max
+    if POW2_SCALE:
+        w_scales = pow2_floor(w_scales)
     w_fp8_tile = w_tile * w_scales
     w_fp8_tile = tl.clamp(w_fp8_tile, min=-FP8_MAX, max=FP8_MAX)
 
@@ -248,6 +262,7 @@ def quant_fp8_blockwise_segment_m_row_col_kernel(
     num_groups,
     BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    POW2_SCALE: tl.constexpr = False,
 ):
     """Fused row + segment-padded col quant for grouped GEMM (dgrad + variable-K wgrad).
 
@@ -288,10 +303,14 @@ def quant_fp8_blockwise_segment_m_row_col_kernel(
 
     col_max = tl.maximum(tl.max(x_abs, axis=0, keep_dims=True), 1e-4)
     col_scale = FP8_MAX / col_max
+    if POW2_SCALE:
+        col_scale = pow2_floor(col_scale)
     x_fp8_col = tl.clamp(x * col_scale, min=-FP8_MAX, max=FP8_MAX).to(x_fp8_col_padded_ptr.dtype.element_ty)
 
     row_max = tl.maximum(tl.max(x_abs, axis=1, keep_dims=True), 1e-4)
     row_scale = FP8_MAX / row_max
+    if POW2_SCALE:
+        row_scale = pow2_floor(row_scale)
     x_fp8_row = tl.clamp(x * row_scale, min=-FP8_MAX, max=FP8_MAX).to(x_fp8_row_ptr.dtype.element_ty)
 
     out_mask_pad = (offs_m_out[:, None] < M_padded) & (offs_n[None, :] < N)
