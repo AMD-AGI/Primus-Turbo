@@ -47,6 +47,8 @@ from primus_turbo.pytorch.ops.attention.usp.attention_agkv import (
 MODELS = {
     "llama3.1-8b": dict(hidden=4096, hq=32, hkv=8, d=128),
     "llama3.1-70b": dict(hidden=8192, hq=64, hkv=8, d=128),
+    "muse-glimmer-30b": dict(hidden=6656, hq=32, hkv=2, d=128),
+    "muse-spark-open": dict(hidden=8192, hq=128, hkv=16, d=64),
     "qwen3-4b": dict(hidden=2560, hq=32, hkv=8, d=128),
     "qwen3-8b": dict(hidden=4096, hq=32, hkv=8, d=128),
     "qwen3-30b-a3b": dict(hidden=2048, hq=32, hkv=4, d=128),
