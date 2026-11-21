@@ -19,7 +19,8 @@ an fp32 (or 16-bit) main_grad.  Requires Triton main (gluon cdna5 / tdm); import
 """
 
 import torch
-import triton  # noqa: F401
+import triton
+import triton.language as tl
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
 from triton.experimental.gluon.language.amd.cdna5 import PartitionedSharedLayout, tdm
@@ -218,13 +219,24 @@ def dsv4up_gemm_kernel(a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M: gl.cons
                        SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B2: gl.constexpr, SHARED_SCALE_A: gl.constexpr,
                        SHARED_SCALE_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr, LOAD_WMMA_LAYOUT: gl.constexpr,
                        B2_LOAD_LAYOUT: gl.constexpr, OUTPUT_CGA_LAYOUT: gl.constexpr, BLOCK_M: gl.constexpr,
-                       BLOCK_N: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr, ACCUM: gl.constexpr):
+                       BLOCK_N: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr, ACCUM: gl.constexpr,
+                       SPLIT_K: gl.constexpr = 1):
     # Static-shape body of dsv4_gemm.py (gemmx/dsv4up, measured version): K-contiguous A/B (stride_ak = stride_bk
     # = 1), row-major C (stride_cn = 1).  Host guarantees M, N % 256 == 0, K % 512 == 0, K >= 1024.
     stride_ak: gl.constexpr = 1
     stride_bk: gl.constexpr = 1
     stride_cn: gl.constexpr = 1
     pid_m, pid_n = _get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, 4)
+    if SPLIT_K > 1:
+        # split-K (wgsmall): grid axis 1 = K slice z of length K (the per-slice K; the strides are the full
+        # operand's). Slice z reads A/B columns [z*K, (z+1)*K) and their packed scales (4 bytes per K column), and
+        # writes fp32 partial z to C + z*M*stride_cm; the host sums the partials in a fixed order.
+        pid_k = gl.program_id(axis=1)
+        a_ptr = a_ptr + pid_k * K
+        b_ptr = b_ptr + pid_k * K
+        a_scale_ptr = a_scale_ptr + pid_k * (K * 4)
+        b_scale_ptr = b_scale_ptr + pid_k * (K * 4)
+        c_ptr = c_ptr + pid_k * (M * stride_cm)
     dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, 16)
     dot_b: gl.constexpr = gl.DotOperandLayout(1, WMMA_LAYOUT, 16)
     dot_b_load: gl.constexpr = gl.DotOperandLayout(1, LOAD_WMMA_LAYOUT, 16)
@@ -315,6 +327,19 @@ def dsv4up_gemm_kernel(a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M: gl.cons
     tdm.async_wait(0)
 
 
+@triton.jit
+def _splitk_reduce_kernel(p_ptr, c_ptr, MN, S: tl.constexpr, ACCUM: tl.constexpr, BLOCK: tl.constexpr):
+    # C = [old C +] sum_z partial[z] (z = 0..S-1 in order, fp32), one rounding into C's dtype
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < MN
+    acc = tl.load(p_ptr + offs, mask=mask, other=0.0)
+    for z in tl.static_range(1, S):
+        acc += tl.load(p_ptr + z * MN + offs, mask=mask, other=0.0)
+    if ACCUM:
+        acc = tl.load(c_ptr + offs, mask=mask, other=0.0).to(tl.float32) + acc
+    tl.store(c_ptr + offs, acc.to(c_ptr.dtype.element_ty), mask=mask)
+
+
 # ----------------------------------------------------------------------------------------------- host side
 def shape_supported(M, N, K):
     """cluster = 1 constraints: 256x256 CTA tile, BK256 with an even trip count >= 4."""
@@ -374,30 +399,46 @@ def build_layouts():
 _PLANS = {}
 
 
-def _plan(M, N, K, sam, sbn, scm, cdt, accum):
-    key = (M, N, K, sam, sbn, scm, cdt, accum)
+def _plan(M, N, K, sam, sbn, scm, cdt, accum, split_k=1):
+    key = (M, N, K, sam, sbn, scm, cdt, accum, split_k)
     p = _PLANS.get(key)
     if p is None:
         global _LAYOUTS
         if _LAYOUTS is None:
             _LAYOUTS = build_layouts()
         grid_mn = (M // TILE) * (N // TILE)
-        p = ((grid_mn, 1), dict(M=M, N=N, K=K, stride_am=sam, stride_bn=sbn, stride_cm=scm,
-                                stride_scale_a=K // 32 * 128, stride_scale_b=K // 32 * 128, GRID_MN=grid_mn,
-                                ACCUM=accum, num_warps=8, waves_per_eu=2, num_ctas=1, **_LAYOUTS))
+        ks = K // split_k  # per-slice K (the kernel's K); the packed-scale row stride stays the full K's
+        sk = dict(SPLIT_K=split_k) if split_k > 1 else {}
+        p = ((grid_mn, split_k), dict(M=M, N=N, K=ks, stride_am=sam, stride_bn=sbn, stride_cm=scm,
+                                      stride_scale_a=K // 32 * 128, stride_scale_b=K // 32 * 128, GRID_MN=grid_mn,
+                                      ACCUM=accum, num_warps=8, waves_per_eu=2, num_ctas=1, **sk, **_LAYOUTS))
         _PLANS[key] = p
     return p
 
 
-def dsv4up_gemm(a, b, a_packed, b_packed, out=None, out_dtype=torch.bfloat16, accumulate=False):
+def dsv4up_gemm(a, b, a_packed, b_packed, out=None, out_dtype=torch.bfloat16, accumulate=False, split_k=1):
     """C[M,N] = A[M,K] . B[N,K]^T; a/b fp8 e4m3 K-contiguous; *_packed from dsv4up_pack (contiguous
-    [rows/128, K*4] uint8). accumulate=True: out += A.B^T (fp32 add, one rounding into out's dtype)."""
+    [rows/128, K*4] uint8). accumulate=True: out += A.B^T (fp32 add, one rounding into out's dtype).
+    split_k > 1: split_k K slices (each a supported K) as fp32 partials in one launch, summed in slice order, then
+    rounded once into the output (with accumulate: old C + sum, one rounding). Not bit-identical to split_k = 1."""
     M, K = a.shape
     N = b.shape[0]
     assert shape_supported(M, N, K), (M, N, K)
     assert b.shape[1] == K and a.stride(1) == 1 and b.stride(1) == 1
     assert a_packed.shape == (M // 128, K * 4) and b_packed.shape == (N // 128, K * 4)
     assert a_packed.is_contiguous() and b_packed.is_contiguous()
+    if split_k > 1:
+        assert K % split_k == 0 and shape_supported(M, N, K // split_k), (M, N, K, split_k)
+        part = torch.empty((split_k, M, N), dtype=torch.float32, device=a.device)
+        grid, kw = _plan(M, N, K, a.stride(0), b.stride(0), N, torch.float32, False, split_k)
+        dsv4up_gemm_kernel[grid](a, b, part, a_packed, b_packed, **kw)
+        if out is None:
+            out = torch.empty((M, N), dtype=out_dtype, device=a.device)
+        assert out.is_contiguous()
+        BLK = 4096
+        _splitk_reduce_kernel[(triton.cdiv(M * N, BLK),)](part, out, M * N, S=split_k, ACCUM=bool(accumulate),
+                                                           BLOCK=BLK, num_warps=8)
+        return out
     if out is None:
         assert not accumulate
         out = torch.empty((M, N), dtype=out_dtype, device=a.device)

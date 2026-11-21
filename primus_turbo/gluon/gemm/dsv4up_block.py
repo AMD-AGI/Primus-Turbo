@@ -82,6 +82,26 @@ def use(M, N, K, tag) -> bool:
     return True
 
 
+_SPLITK = {}
+
+
+def split_k_of(M, N, K) -> int:
+    """PRIMUS_TURBO_DSV4UP_SPLITK="MxNxK:s,..." (GEMM dims of the call, default ""): split those dsv4up GEMMs into s
+    K slices (fp32 partials, fixed-order sum; numerics differ from s = 1 by fp32 summation order only)."""
+    spec = os.environ.get("PRIMUS_TURBO_DSV4UP_SPLITK", "")
+    if spec not in _SPLITK:
+        m = {}
+        for item in filter(None, (t.strip() for t in spec.split(","))):
+            shp, _, sk = item.partition(":")
+            m[tuple(map(int, shp.split("x")))] = int(sk or "1")
+        _SPLITK[spec] = m
+    sk = _SPLITK[spec].get((M, N, K), 1)
+    if sk > 1 and (K % sk or not shape_supported(M, N, K // sk)):
+        _warn_once(("splitk", M, N, K, sk), f"split_k {sk} not valid for {M}x{N}x{K} (K/s must be >= 1024, % 512)")
+        return 1
+    return sk
+
+
 def pack_scales(jobs):
     from primus_turbo.gluon.gemm.dsv4up_pack import pack_scales as _pack
 
@@ -91,4 +111,5 @@ def pack_scales(jobs):
 def gemm_nt(a, b, a_packed, b_packed, out_dtype=None, out=None, accumulate=False):
     from primus_turbo.gluon.gemm.dsv4up_gemm import dsv4up_gemm
 
-    return dsv4up_gemm(a, b, a_packed, b_packed, out=out, out_dtype=out_dtype, accumulate=accumulate)
+    sk = split_k_of(a.shape[0], b.shape[0], a.shape[1])
+    return dsv4up_gemm(a, b, a_packed, b_packed, out=out, out_dtype=out_dtype, accumulate=accumulate, split_k=sk)
