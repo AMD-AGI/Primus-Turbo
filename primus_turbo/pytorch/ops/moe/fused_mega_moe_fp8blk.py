@@ -27,7 +27,11 @@ import torch
 from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad, main_grad_first_write
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_nt_flydsl_gfx1250 import flygg_fp8blk_nt
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_vk_flydsl_gfx1250 import flyvkblk_fp8
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_vkp_flydsl_gfx1250 import expert_order_lpt, flyvkpblk_fp8
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_vkp_flydsl_gfx1250 import (
+    expert_order_lpt,
+    flyvkpblk_fp8,
+    vkpblk_sumsq_numel,
+)
 from primus_turbo.triton.quantization.quant_blk_gfx1250 import (
     MX,
     build_routing_blk,
@@ -158,6 +162,22 @@ def _gg(a, a_s, c, transposed, poffs):
     return gg_dsv4(a, w.view(E * N, K), pack_rows(a_s), c.sT_pk if transposed else c.s_pk, mte, nmt, N)
 
 
+def _wgrad_sumsq_buf(w: torch.Tensor, mg: torch.Tensor):
+    """PRIMUS_TURBO_MOE_WGRAD_SUMSQ=1: persistent fp32 partial buffer the vkp wgrad fills with the sum of squares of
+    ``w.main_grad`` (its final bf16 values) in its epilogue; exposed as ``w._primus_main_grad_sumsq`` (a tensor whose
+    sum is sum(main_grad^2)) and flagged ``w._primus_main_grad_sumsq_fresh`` for the grad-norm pass, which then skips
+    re-reading this weight's grad. None when off. The epilogue is on the nbuf 2 path: with
+    PRIMUS_TURBO_MOE_FP8BLK_VKP_NB=3 the beta 0 wgrads of the fold run nbuf 2 (bit-identical C)."""
+    if os.environ.get("PRIMUS_TURBO_MOE_WGRAD_SUMSQ", "0") != "1":
+        return None
+    buf = getattr(w, "_primus_main_grad_sumsq", None)
+    n = vkpblk_sumsq_numel(mg)
+    if buf is None or buf.numel() != n or buf.device != mg.device:
+        buf = torch.zeros(n, dtype=torch.float32, device=mg.device)
+        w._primus_main_grad_sumsq = buf
+    return buf
+
+
 def _setup_accum(w: torch.Tensor, accumulate: bool):
     mg = getattr(w, "main_grad", None) if accumulate else None
     if mg is not None and mg.dtype == torch.bfloat16 and mg.shape == w.shape and mg.is_contiguous():
@@ -203,10 +223,10 @@ class _FP8BlockMoE(torch.autograd.Function):
         lpt = os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_WGRAD_LPT", "1") == "1"
         perm = expert_order_lpt(poffs) if (vkp and lpt) else None
 
-        def wgrad(lhs, rhs, lhs_s, rhs_s, n, k, out, beta):
+        def wgrad(lhs, rhs, lhs_s, rhs_s, n, k, out, beta, sq=None):
             if vkp:
                 flyvkpblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta=beta, perm=perm, kwin_max=_vkp_kwin(T),
-                              nbuf=_VKP_NB)
+                              nbuf=_VKP_NB, sumsq_out=sq)
             else:
                 flyvkblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta=beta, **_VK)
 
@@ -215,7 +235,11 @@ class _FP8BlockMoE(torch.autograd.Function):
             mg = _setup_accum(w, ctx.accumulate)
             if mg is not None:
                 # beta 0 on the step's first write into main_grad (framework skipped its clear), else accumulate
-                wgrad(lhs, rhs, lhs_s, rhs_s, n, k, mg, 0.0 if main_grad_first_write(w) else 1.0)
+                # every call writes all of main_grad, so with the fold the last call of the step leaves the sum of
+                # squares of the final grad (multi-microbatch accumulation included)
+                sq = _wgrad_sumsq_buf(w, mg) if vkp else None
+                wgrad(lhs, rhs, lhs_s, rhs_s, n, k, mg, 0.0 if main_grad_first_write(w) else 1.0, sq)
+                w._primus_main_grad_sumsq_fresh = sq is not None
                 w.grad_added_to_main_grad = True
                 grads.append(_get_dummy_wgrad(w.shape, w.dtype))  # dummy, never read
             else:

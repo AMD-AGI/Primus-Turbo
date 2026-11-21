@@ -24,6 +24,8 @@ from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import Constexpr
 from flydsl.expr.typing import T as _T
 
+from primus_turbo.flydsl.utils import buffer_ops as _bops
+
 from .grouped_gemm_fp8blk_nt_flydsl_gfx1250 import _store_c_lines
 
 WAVE = 32
@@ -53,6 +55,7 @@ def launch_vkpblk_fp8_gfx1250(
     arg_perm: fx.Pointer,
     arg_sa: fx.Pointer,
     arg_sb: fx.Pointer,
+    arg_sq: fx.Pointer,
     i32_m: fx.Int32,
     stream: fx.Stream,
     i32_n: fx.Int32,
@@ -73,13 +76,18 @@ def launch_vkpblk_fp8_gfx1250(
     lpt: Constexpr[int] = 0,
     prefetch_c: Constexpr[int] = 0,
     nbuf: Constexpr[int] = 2,
+    sumsq: Constexpr[int] = 0,
 ):
+    """sumsq (nbuf 2 path only): every thread also sums the squares of the bf16 values it stores (the final C, after
+    the beta = 1 add) over all of its tiles, and writes that fp32 partial to arg_sq[bid * block + tid] (fixed order,
+    no atomics)."""
     a_cls, b_cls = _A_ID[a_id], _A_ID[b_id]
     # nbuf 3 (moegemm, beta 0 only): 3-stage ring with 2 k-tiles in flight instead of 1, C stored straight from
     # the accumulators (global_store, not waited on) so the 135 KB C staging leaves LDS to the third stage
     assert nbuf in (2, 3)
     NB3 = nbuf == 3
     assert not (NB3 and beta_one), "nbuf 3 is the beta 0 (overwrite) path"
+    assert not (NB3 and sumsq), "the sumsq epilogue is on the nbuf 2 path (the host falls back to nbuf 2)"
     num_buffers = nbuf
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
@@ -112,7 +120,7 @@ def launch_vkpblk_fp8_gfx1250(
 
     kernel_name = (f"moe_vkpblk_fp8_gfx1250_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}_a{a_id}{b_id}"
                    f"_b{beta_one}_w{kwin_max}" + ("_lpt" if lpt else "") + ("_pfc" if (prefetch_c and beta_one) else "")
-                   + ("_nb3" if NB3 else ""))
+                   + ("_nb3" if NB3 else "") + ("_sq" if sumsq else ""))
     PFC = bool(prefetch_c and beta_one)
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -124,6 +132,7 @@ def launch_vkpblk_fp8_gfx1250(
         arg_perm: fx.Pointer,
         arg_sa: fx.Pointer,
         arg_sb: fx.Pointer,
+        arg_sq: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         i32_g: fx.Int32,
@@ -237,6 +246,9 @@ def launch_vkpblk_fp8_gfx1250(
         c_frags = [fx.make_rmem_tensor(WMMA_N // 2, fx.Float32) for _ in range_constexpr(n_acc)]
         gk_reg = fx.make_rmem_tensor(1, fx.Int32)
         gk_reg.fill(0)
+        if const_expr(sumsq):
+            sq_reg = fx.make_rmem_tensor(WMMA_N // 2, fx.Float32)
+            sq_reg.fill(0.0)
         lds_base = fx.Int32(fx.ptrtoint(base_ptr))
 
         def _operand(base, plane_off, row, ks):
@@ -405,13 +417,24 @@ def launch_vkpblk_fp8_gfx1250(
                         if const_expr(beta_one):
                             old = fx.Vector(lds_b128(cbase, (row * C_ROW + col) * 2)).bitcast(out_cls).to(fx.Float32)
                             v = v + old
-                        fx.ptr_store(v.to(out_cls).bitcast(fx.Int8), fx.add_offset(base_ptr, C_OFF) + (row * C_ROW + col) * 2)
+                        h = v.to(out_cls)
+                        if const_expr(sumsq):
+                            hf = h.to(fx.Float32)
+                            sq_reg.store(sq_reg.load() + hf * hf)
+                        fx.ptr_store(h.bitcast(fx.Int8), fx.add_offset(base_ptr, C_OFF) + (row * C_ROW + col) * 2)
                 fx.barrier()
                 fx.copy(atomC, sC, gtC)
         tdm_ops.tensor_wait(0)
+        if const_expr(sumsq):
+            sv = sq_reg.load()
+            tot = sv[0]
+            for i_ in range_constexpr(1, WMMA_N // 2):
+                tot = tot + sv[i_]
+            sq_rsrc = rocdl.get_buffer_rsrc(rocdl.make_buffer_ptr(_cast(fx.Float32, arg_sq, 4)))
+            _bops.buffer_store(tot, sq_rsrc, bid * block + tid)
 
-    kernel_vkpblk(arg_c, arg_a, arg_b, arg_offs, arg_perm, arg_sa, arg_sb, i32_m, i32_n, i32_g, i32_lda, i32_ldb,
-                  i32_nwg).launch(grid=(i32_nwg, 1, 1), block=(block, 1, 1), stream=stream)
+    kernel_vkpblk(arg_c, arg_a, arg_b, arg_offs, arg_perm, arg_sa, arg_sb, arg_sq, i32_m, i32_n, i32_g, i32_lda,
+                  i32_ldb, i32_nwg).launch(grid=(i32_nwg, 1, 1), block=(block, 1, 1), stream=stream)
 
 
 launch_vkpblk_fp8_gfx1250.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": True}
@@ -429,15 +452,28 @@ def expert_order_lpt(poffs_i32):
     return torch.argsort(poffs_i32[1:] - poffs_i32[:-1], descending=True, stable=True).to(torch.int32)
 
 
+def vkpblk_sumsq_numel(out, tile=(256, 256, 128), m_warp=2, n_warp=4, nwg=None):
+    """fp32 elements of the ``sumsq_out`` partial buffer flyvkpblk_fp8 fills (one per thread of every workgroup)."""
+    if nwg is None:
+        nwg = torch.cuda.get_device_properties(out.device).multi_processor_count
+    G, M, N = out.shape
+    return min(nwg, (M // tile[0]) * (N // tile[1]) * G) * m_warp * n_warp * 32
+
+
 def flyvkpblk_fp8(lhsP, rhsP, lhs_s, rhs_s, poffs_i32, OUT_M, OUT_N, out, beta=1.0, tile=(256, 256, 128),
-                  m_warp=2, n_warp=4, group_m=4, kwin_max=4096, nwg=None, perm=None, prefetch_c=True, nbuf=2):
+                  m_warp=2, n_warp=4, group_m=4, kwin_max=4096, nwg=None, perm=None, prefetch_c=True, nbuf=2,
+                  sumsq_out=None):
     """out [G, OUT_M, OUT_N] bf16 (+)= per-expert lhsP[:, seg] @ rhsP[:, seg]^T; lhs_s/rhs_s compact E8M0
     [rows, P/128] uint8. beta 1 accumulates into out, 0 overwrites it.
     perm: int32 [G] expert visiting order (``expert_order_lpt``) or None (expert index order). Every output tile is
     computed by one workgroup with the same k sequence whatever the order, so the result is bit-identical.
     prefetch_c (beta 1): load each tile's old C behind its k-tile 2 instead of in the epilogue.
     nbuf: 3 = 3-stage ring + direct C stores (beta 0 only; beta 1 calls fall back to 2). Needs every expert
-    window >= 2 k-tiles (256 rows), as the MegaMoE pool guarantees. Bit-identical to nbuf 2 (same k order)."""
+    window >= 2 k-tiles (256 rows), as the MegaMoE pool guarantees. Bit-identical to nbuf 2 (same k order).
+    sumsq_out: fp32 [vkpblk_sumsq_numel(out)] or None. When given, the kernel also writes per-thread partial sums of
+    squares of the bf16 values of ``out`` it stores (all of ``out``: sumsq_out.sum() == out.float().square().sum()
+    up to fp32 summation order); every element is overwritten, so no clearing is needed. The sumsq epilogue lives on
+    the nbuf 2 path: with sumsq_out an nbuf 3 request runs nbuf 2 (bit-identical C)."""
     assert out.dtype == torch.bfloat16 and out.is_contiguous()
     assert lhs_s.dtype == torch.uint8 and lhs_s.shape[1] * 128 == lhsP.shape[1]
     G = poffs_i32.numel() - 1
@@ -455,11 +491,17 @@ def flyvkpblk_fp8(lhsP, rhsP, lhs_s, rhs_s, poffs_i32, OUT_M, OUT_N, out, beta=1
     if lpt:
         assert perm.dtype == torch.int32 and perm.numel() == G and perm.is_contiguous()
     pfc = 1 if (prefetch_c and bo) else 0
-    nbuf = 2 if bo else nbuf
+    sq = 0
+    if sumsq_out is not None:
+        assert sumsq_out.dtype == torch.float32 and sumsq_out.is_contiguous()
+        assert sumsq_out.numel() >= nwg * m_warp * n_warp * 32, (sumsq_out.numel(), nwg)
+        sq = 1
+    nbuf = 2 if (bo or sq) else nbuf
     args = (_ptr(out), _ptr(lhsP), _ptr(rhsP), _ptr(poffs_i32), _ptr(perm if lpt else poffs_i32), _ptr(lhs_s),
-            _ptr(rhs_s), OUT_M, fx.Stream(torch.cuda.current_stream(device=lhsP.device)), OUT_N, G, lhsP.stride(0),
-            rhsP.stride(0), nwg, tm, tn, tk, m_warp, n_warp, a_id, b_id, bo, group_m, kwin_max, lpt, pfc, nbuf)
-    key = (tm, tn, tk, m_warp, n_warp, a_id, b_id, bo, group_m, kwin_max, lpt, pfc, nbuf)
+            _ptr(rhs_s), _ptr(sumsq_out if sq else out), OUT_M, fx.Stream(torch.cuda.current_stream(device=lhsP.device)),
+            OUT_N, G, lhsP.stride(0), rhsP.stride(0), nwg, tm, tn, tk, m_warp, n_warp, a_id, b_id, bo, group_m, kwin_max,
+            lpt, pfc, nbuf, sq)
+    key = (tm, tn, tk, m_warp, n_warp, a_id, b_id, bo, group_m, kwin_max, lpt, pfc, nbuf, sq)
     c = _COMPILED.get(key)
     if c is None:
         _COMPILED[key] = flyc.compile(launch_vkpblk_fp8_gfx1250, *args)
