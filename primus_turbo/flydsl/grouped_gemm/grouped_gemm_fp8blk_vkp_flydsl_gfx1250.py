@@ -48,6 +48,7 @@ def launch_vkpblk_fp8_gfx1250(
     arg_a: fx.Pointer,
     arg_b: fx.Pointer,
     arg_offs: fx.Pointer,
+    arg_perm: fx.Pointer,
     arg_sa: fx.Pointer,
     arg_sb: fx.Pointer,
     i32_m: fx.Int32,
@@ -67,6 +68,8 @@ def launch_vkpblk_fp8_gfx1250(
     beta_one: Constexpr[int],
     group_m: Constexpr[int] = 4,
     kwin_max: Constexpr[int] = 4096,
+    lpt: Constexpr[int] = 0,
+    prefetch_c: Constexpr[int] = 0,
 ):
     a_cls, b_cls = _A_ID[a_id], _A_ID[b_id]
     num_buffers = 2
@@ -97,7 +100,8 @@ def launch_vkpblk_fp8_gfx1250(
     assert ARENA <= 320 * 1024, f"LDS arena {ARENA} B exceeds 320 KiB"
 
     kernel_name = (f"moe_vkpblk_fp8_gfx1250_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}_a{a_id}{b_id}"
-                   f"_b{beta_one}_w{kwin_max}")
+                   f"_b{beta_one}_w{kwin_max}" + ("_lpt" if lpt else "") + ("_pfc" if (prefetch_c and beta_one) else ""))
+    PFC = bool(prefetch_c and beta_one)
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
     def kernel_vkpblk(
@@ -105,6 +109,7 @@ def launch_vkpblk_fp8_gfx1250(
         arg_a: fx.Pointer,
         arg_b: fx.Pointer,
         arg_offs: fx.Pointer,
+        arg_perm: fx.Pointer,
         arg_sa: fx.Pointer,
         arg_sb: fx.Pointer,
         i32_m: fx.Int32,
@@ -126,13 +131,18 @@ def launch_vkpblk_fp8_gfx1250(
 
         i32_ptr = fx.PointerType.get(elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4)
         offs = fx.recast_iter(i32_ptr, arg_offs)
+        perm = fx.recast_iter(i32_ptr, arg_perm)
         lda64 = fx.Int64(i32_lda)
         ldb64 = fx.Int64(i32_ldb)
         ska = i32_lda // 128
         skb = i32_ldb // 128
 
         def tile_params(t):
+            # lpt: tile slot t // tpg -> expert perm[slot] (experts sorted by window length, longest first), so the
+            # round-robin t = bid + it * nwg hands out the longest experts' tiles first and the short ones fill the tail
             g = t // tpg
+            if const_expr(lpt):
+                g = rocdl.readfirstlane(_T.i32, perm[g])
             pid = t % tpg
             per_group = group_m * n_tiles_n
             first_m = (pid // per_group) * group_m
@@ -283,11 +293,18 @@ def launch_vkpblk_fp8_gfx1250(
             for cf in c_frags:
                 cf.fill(0.0)
             gk = gk_reg.load()[0]
+            gtC, atomC = c_view(g, blk_m, blk_n)
             for kt in range(kt_n):
                 if kt == 0:
                     tdm_ops.tensor_wait(1)  # the previous tile's C store may still be in flight
                 else:
-                    tdm_ops.tensor_wait(0)
+                    if const_expr(PFC):
+                        if kt == 2:
+                            tdm_ops.tensor_wait(1)  # the old-C prefetch (newest op, issued at kt 1) may stay in flight
+                        else:
+                            tdm_ops.tensor_wait(0)
+                    else:
+                        tdm_ops.tensor_wait(0)
                 fx.barrier()
                 f = kt + 1
                 if f < kt_n:
@@ -298,16 +315,28 @@ def launch_vkpblk_fp8_gfx1250(
                     issue_planes(1 - pset, nbm, nbn, nkb, nktn)
                     oa1, ob1 = offs_of(nbm, nbn, nkb, 0)
                     issue((gk + f) % num_buffers, oa1, ob1)
+                if const_expr(PFC):
+                    # beta = 1: this tile's old C -> sC, behind k-tile 2. The wait(0) at kt 1 retired the previous
+                    # tile's C store (older than every op since), so sC is free. Needs kt_n >= 3: the epilogue's
+                    # wait(4) (planes + stage of the next tile issued later) then also covers this load.
+                    if kt == 1:
+                        if kt_n >= 3:
+                            fx.copy(atomC, gtC, sC)
                 compute((gk + kt) % num_buffers, kt, pset)
             gk_reg.store(gk_reg.load() + kt_n)
             # epilogue: the previous C store must be done before sC is rewritten (4 newer ops: planes + stage)
-            gtC, atomC = c_view(g, blk_m, blk_n)
             tdm_ops.tensor_wait(4)
             fx.barrier()
             if const_expr(beta_one):
-                fx.copy(atomC, gtC, sC)
-                tdm_ops.tensor_wait(0)
-                fx.barrier()
+                if const_expr(PFC):
+                    if kt_n < 3:  # short window: no prefetch slot, load old C here (exposed)
+                        fx.copy(atomC, gtC, sC)
+                        tdm_ops.tensor_wait(0)
+                        fx.barrier()
+                else:
+                    fx.copy(atomC, gtC, sC)
+                    tdm_ops.tensor_wait(0)
+                    fx.barrier()
             cbase = fx.Int32(fx.ptrtoint(fx.add_offset(base_ptr, C_OFF)))
             for mi in range_constexpr(m_reps):
                 row = wmb + mi * WMMA_M + lane16
@@ -322,7 +351,7 @@ def launch_vkpblk_fp8_gfx1250(
             fx.copy(atomC, sC, gtC)
         tdm_ops.tensor_wait(0)
 
-    kernel_vkpblk(arg_c, arg_a, arg_b, arg_offs, arg_sa, arg_sb, i32_m, i32_n, i32_g, i32_lda, i32_ldb,
+    kernel_vkpblk(arg_c, arg_a, arg_b, arg_offs, arg_perm, arg_sa, arg_sb, i32_m, i32_n, i32_g, i32_lda, i32_ldb,
                   i32_nwg).launch(grid=(i32_nwg, 1, 1), block=(block, 1, 1), stream=stream)
 
 
@@ -335,10 +364,19 @@ def _ptr(t):
     return flyc.from_c_void_p(fx.Int8, t.data_ptr(), assumed_align=16)
 
 
+def expert_order_lpt(poffs_i32):
+    """int32 [G]: experts by window length (poffs[g+1] - poffs[g]) descending, ties by index (stable). No host
+    sync (graph-capturable)."""
+    return torch.argsort(poffs_i32[1:] - poffs_i32[:-1], descending=True, stable=True).to(torch.int32)
+
+
 def flyvkpblk_fp8(lhsP, rhsP, lhs_s, rhs_s, poffs_i32, OUT_M, OUT_N, out, beta=1.0, tile=(256, 256, 128),
-                  m_warp=2, n_warp=4, group_m=4, kwin_max=4096, nwg=None):
+                  m_warp=2, n_warp=4, group_m=4, kwin_max=4096, nwg=None, perm=None, prefetch_c=True):
     """out [G, OUT_M, OUT_N] bf16 (+)= per-expert lhsP[:, seg] @ rhsP[:, seg]^T; lhs_s/rhs_s compact E8M0
-    [rows, P/128] uint8. beta 1 accumulates into out, 0 overwrites it."""
+    [rows, P/128] uint8. beta 1 accumulates into out, 0 overwrites it.
+    perm: int32 [G] expert visiting order (``expert_order_lpt``) or None (expert index order). Every output tile is
+    computed by one workgroup with the same k sequence whatever the order, so the result is bit-identical.
+    prefetch_c (beta 1): load each tile's old C behind its k-tile 2 instead of in the epilogue."""
     assert out.dtype == torch.bfloat16 and out.is_contiguous()
     assert lhs_s.dtype == torch.uint8 and lhs_s.shape[1] * 128 == lhsP.shape[1]
     G = poffs_i32.numel() - 1
@@ -350,11 +388,16 @@ def flyvkpblk_fp8(lhsP, rhsP, lhs_s, rhs_s, poffs_i32, OUT_M, OUT_N, out, beta=1
     nwg = min(nwg, total)
     a_id = 0 if lhsP.dtype == torch.float8_e4m3fn else 1
     b_id = 0 if rhsP.dtype == torch.float8_e4m3fn else 1
+    assert beta in (0.0, 1.0)
     bo = 1 if beta == 1.0 else 0
-    args = (_ptr(out), _ptr(lhsP), _ptr(rhsP), _ptr(poffs_i32), _ptr(lhs_s), _ptr(rhs_s), OUT_M,
-            fx.Stream(torch.cuda.current_stream(device=lhsP.device)), OUT_N, G, lhsP.stride(0), rhsP.stride(0), nwg,
-            tm, tn, tk, m_warp, n_warp, a_id, b_id, bo, group_m, kwin_max)
-    key = (tm, tn, tk, m_warp, n_warp, a_id, b_id, bo, group_m, kwin_max)
+    lpt = 0 if perm is None else 1
+    if lpt:
+        assert perm.dtype == torch.int32 and perm.numel() == G and perm.is_contiguous()
+    pfc = 1 if (prefetch_c and bo) else 0
+    args = (_ptr(out), _ptr(lhsP), _ptr(rhsP), _ptr(poffs_i32), _ptr(perm if lpt else poffs_i32), _ptr(lhs_s),
+            _ptr(rhs_s), OUT_M, fx.Stream(torch.cuda.current_stream(device=lhsP.device)), OUT_N, G, lhsP.stride(0),
+            rhsP.stride(0), nwg, tm, tn, tk, m_warp, n_warp, a_id, b_id, bo, group_m, kwin_max, lpt, pfc)
+    key = (tm, tn, tk, m_warp, n_warp, a_id, b_id, bo, group_m, kwin_max, lpt, pfc)
     c = _COMPILED.get(key)
     if c is None:
         _COMPILED[key] = flyc.compile(launch_vkpblk_fp8_gfx1250, *args)

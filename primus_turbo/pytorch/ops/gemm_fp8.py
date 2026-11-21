@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import os
 from typing import Optional, Union
 
 import torch
@@ -36,6 +37,7 @@ from primus_turbo.pytorch.ops.utils import (
     _get_dummy_wgrad,
     _get_fp8_dtype,
     _setup_fused_grad_accum,
+    main_grad_first_write,
 )
 
 __all__ = ["gemm_fp8"]
@@ -438,10 +440,48 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         trans_b: bool,
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
+        fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
         assert trans_a == False, "trans_a has to be False"
         a_dtype = _get_fp8_dtype(config.format, True)
         b_dtype = _get_fp8_dtype(config.format, True)
+        # Fused wgrad accumulation (g90 path: the kernel's beta=1 epilogue reads/writes main_grad, or beta=0 on the
+        # step's first write; other paths: GEMM then one add / copy into main_grad). The weight object is kept for
+        # the first-write policy, which is asked in backward (actual write order).
+        ctx.fuse_bgrad_accum, ctx.main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+        ctx.wparam = b if ctx.fuse_bgrad_accum else None
+
+        # gfx1250 g90 FlyDSL path (PRIMUS_TURBO_FP8_BLOCK_KERNEL=g90): all three passes as NT GEMMs,
+        # 1x128 quant + token-major transposed copy in one pass, E8M0 scale bytes straight from the quant.
+        ctx.g90 = False
+        from primus_turbo.flydsl.gemm import g90_block
+
+        if (
+            g90_block.enabled()
+            and not isinstance(a, QuantizedTensor)
+            and not isinstance(b, QuantizedTensor)
+            and a.dim() == 2
+            and trans_b
+            and a.shape[0] % 512 == 0
+            and a.shape[1] % 512 == 0
+            and b.shape[0] % 512 == 0
+            and a_dtype == torch.float8_e4m3fn
+            and _get_fp8_dtype(config.format, False) == torch.float8_e4m3fn
+            and os.environ.get("PRIMUS_TURBO_FP8_BLOCK_UE8M0", "0") == "1"  # weight scales must be powers of two
+        ):
+            from primus_turbo.triton.quantization.quant_g90 import e8m0_of, quant_dual_t_e8m0
+
+            a_row, _, a_re, a_t, a_te = quant_dual_t_e8m0(a.contiguous(), a_dtype)
+            b_row, b_row_scale = quantize_fp8(
+                b, b_dtype, config.granularity, block_size=config.block_size,
+                scaling_recipe=ScalingRecipe(use_2d_block=True),
+            )
+            b_e = e8m0_of(b_row_scale)
+            out = g90_block.gemm_nt(a_row, b_row, a_re, b_e, out_dtype)
+            ctx.save_for_backward(a_t, a_te, b_row, b_e)
+            ctx.g90 = True
+            ctx.trans_a, ctx.trans_b, ctx.out_dtype, ctx.config = trans_a, trans_b, out_dtype, config
+            return out
 
         if isinstance(a, QuantizedTensor):
             check_quantized_tensor(a, config, axis=-1)
@@ -498,6 +538,34 @@ class FP8GemmBlockFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
+        if ctx.g90:
+            from primus_turbo.flydsl.gemm import g90_block
+            from primus_turbo.triton.quantization.quant_g90 import quant_dual_t_e8m0
+
+            a_t, a_te, b_row, b_e = ctx.saved_tensors
+            g_dtype = _get_fp8_dtype(ctx.config.format, False)
+            g_row, _, g_re, g_t, g_te = quant_dual_t_e8m0(grad_out.contiguous(), g_dtype)
+            # dgrad: dX = dY . W  ->  NT with the FP8 copy of W^T (block scales transposed)
+            grad_a = g90_block.gemm_nt(g_row, b_row.t().contiguous(), g_re, b_e.t().contiguous(), ctx.out_dtype)
+            # wgrad: dW[N,K] = dY^T . X  ->  NT on the token-major copies
+            if ctx.fuse_bgrad_accum:
+                mg = ctx.main_grad
+                overwrite = main_grad_first_write(ctx.wparam)
+                if g90_block.accum_supported(mg, b_row.shape[0], a_t.shape[0]) and not (
+                    overwrite and mg.dtype != ctx.out_dtype
+                ):
+                    # beta 0: plain epilogue straight into main_grad (= the unfused GEMM's output bits);
+                    # beta 1: old main_grad + acc in fp32, rounded once into main_grad's dtype
+                    g90_block.gemm_nt(g_t, a_t, g_te, a_te, mg.dtype, out=mg, accumulate=not overwrite)
+                else:
+                    gb = g90_block.gemm_nt(g_t, a_t, g_te, a_te, ctx.out_dtype)
+                    mg.copy_(gb) if overwrite else mg.add_(gb)
+                ctx.main_grad = ctx.wparam = None
+                grad_b = _get_dummy_wgrad(list(mg.shape), ctx.out_dtype)
+            else:
+                grad_b = g90_block.gemm_nt(g_t, a_t, g_te, a_te, ctx.out_dtype)
+            return grad_a, grad_b, None, None, None, None, None, None, None
+
         a_col, a_col_scale, b_col, b_col_scale = ctx.saved_tensors
 
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
@@ -540,6 +608,12 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             granularity=ctx.config.granularity.value,
             default_backend=BackendType.TRITON.value,
         )
+        if ctx.fuse_bgrad_accum:
+            # no BLOCKWISE Triton kernel has a beta=1 epilogue: one add (or copy on the step's first write)
+            mg = ctx.main_grad
+            mg.copy_(grad_b) if main_grad_first_write(ctx.wparam) else mg.add_(grad_b)
+            ctx.main_grad = ctx.wparam = None
+            grad_b = _get_dummy_wgrad(list(mg.shape), ctx.out_dtype)
 
         return (
             grad_a,  # a
@@ -550,6 +624,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             None,  # trans_b
             None,  # out_dtype
             None,  # config
+            None,  # fuse_bgrad_accum_pattern
         )
 
 
@@ -809,6 +884,10 @@ def gemm_fp8(
             a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config, fuse_bgrad_accum_pattern
         )
 
+    if config.granularity == ScalingGranularity.BLOCKWISE:
+        return FP8GemmBlockFunction.apply(
+            a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config, fuse_bgrad_accum_pattern
+        )
     # The remaining granularities silently ignore the flag rather than fusing, which
     # would leave main_grad unwritten and the weight without a gradient.
     assert fuse_bgrad_accum_pattern is None, (
