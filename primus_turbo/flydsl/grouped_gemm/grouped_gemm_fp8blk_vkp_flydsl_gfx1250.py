@@ -77,8 +77,16 @@ def launch_vkpblk_fp8_gfx1250(
     prefetch_c: Constexpr[int] = 0,
     nbuf: Constexpr[int] = 2,
     sumsq: Constexpr[int] = 0,
+    xdl_nostall: Constexpr[int] = 0,
+    sched2: Constexpr[int] = 0,
 ):
-    """sumsq (nbuf 2 path only): every thread also sums the squares of the bf16 values it stores (the final C, after
+    """sched2 (moegemm2, nbuf 2 path; bit-identical: same k order, same WMMAs, same epilogue): (a) tile parameters
+    (perm / group offsets) by scalar buffer loads instead of vector global loads + readfirstlane (ATT: ~1300 cycles of
+    s_wait_loadcnt per tile); (b) the E8M0 scale words of k-step kt+1 are read from the LDS planes at the end of k-step
+    kt (one batch, live across the next barrier; ATT: the compiler serialized each word with s_wait_dscnt 0), the byte
+    -> 4x repeat is one v_perm_b32; (c) the M-side operand fragments are read sched2 groups ahead of their WMMAs, pinned
+    with sched_barrier (ATT: one s_wait_dscnt 0 per 16-row group).
+    sumsq (nbuf 2 path only): every thread also sums the squares of the bf16 values it stores (the final C, after
     the beta = 1 add) over all of its tiles, and writes that fp32 partial to arg_sq[bid * block + tid] (fixed order,
     no atomics)."""
     a_cls, b_cls = _A_ID[a_id], _A_ID[b_id]
@@ -87,7 +95,6 @@ def launch_vkpblk_fp8_gfx1250(
     assert nbuf in (2, 3)
     NB3 = nbuf == 3
     assert not (NB3 and beta_one), "nbuf 3 is the beta 0 (overwrite) path"
-    assert not (NB3 and sumsq), "the sumsq epilogue is on the nbuf 2 path (the host falls back to nbuf 2)"
     num_buffers = nbuf
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
@@ -120,7 +127,7 @@ def launch_vkpblk_fp8_gfx1250(
 
     kernel_name = (f"moe_vkpblk_fp8_gfx1250_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}_a{a_id}{b_id}"
                    f"_b{beta_one}_w{kwin_max}" + ("_lpt" if lpt else "") + ("_pfc" if (prefetch_c and beta_one) else "")
-                   + ("_nb3" if NB3 else "") + ("_sq" if sumsq else ""))
+                   + ("_nb3" if NB3 else "") + ("_sq" if sumsq else "") + ("_xn" if xdl_nostall else "") + (f"_s{sched2}" if sched2 else ""))
     PFC = bool(prefetch_c and beta_one)
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -140,6 +147,8 @@ def launch_vkpblk_fp8_gfx1250(
         i32_ldb: fx.Int32,
         i32_nwg: fx.Int32,
     ):
+        if const_expr(xdl_nostall):
+            rocdl.disable_xdl_arb_stall()
         tid = fx.Int32(fx.thread_idx.x)
         bid_x, _, _ = fx.block_idx
         bid = fx.Int32(bid_x)
@@ -158,10 +167,31 @@ def launch_vkpblk_fp8_gfx1250(
         ska = i32_lda // 128
         skb = i32_ldb // 128
 
+        if const_expr(sched2):
+            offs_rsrc = rocdl.get_buffer_rsrc(rocdl.make_buffer_ptr(fx.recast_iter(i32_ptr, arg_offs)))
+            perm_rsrc = rocdl.get_buffer_rsrc(rocdl.make_buffer_ptr(fx.recast_iter(i32_ptr, arg_perm)))
+
+            def _sld(rsrc, i):
+                return fx.Int32(_bops.buffer_load(rsrc, i, vec_width=1, is_scalar=True))
+
         def tile_params(t):
             # lpt: tile slot t // tpg -> expert perm[slot] (experts sorted by window length, longest first), so the
             # round-robin t = bid + it * nwg hands out the longest experts' tiles first and the short ones fill the tail
             g = t // tpg
+            if const_expr(sched2):
+                if const_expr(lpt):
+                    g = _sld(perm_rsrc, g)
+                pid = t % tpg
+                per_group = group_m * n_tiles_n
+                first_m = (pid // per_group) * group_m
+                rem = n_tiles_m - first_m
+                gsize = (rem < group_m).select(rem, fx.Int32(group_m))
+                in_g = pid % per_group
+                pm = first_m + in_g % gsize
+                pn = in_g // gsize
+                kb = _sld(offs_rsrc, g)
+                ke = _sld(offs_rsrc, g + fx.Int32(1))
+                return g, pm * tile_m, pn * tile_n, kb, (ke - kb) // tile_k
             if const_expr(lpt):
                 g = rocdl.readfirstlane(_T.i32, perm[g])
             pid = t % tpg
@@ -286,6 +316,38 @@ def launch_vkpblk_fp8_gfx1250(
                     idx = mi * n_reps + ni
                     fx.gemm(mma_atom, c_frags[idx], bf[ni], af, c_frags[idx], scale_a=sbv[ni], scale_b=sav)
 
+        NSW = n_reps + m_reps
+        if const_expr(sched2):
+            sw_regs = [fx.make_rmem_tensor(1, fx.Int32) for _ in range_constexpr(NSW)]
+
+        def load_words(kt, pset):
+            """sched2: the raw scale words of k-step kt (B rows of the wave, then A rows) -> sw_regs"""
+            poff = PL_OFF + pset * PSET
+            koff = (kt // 4) * 4
+            for ni in range_constexpr(n_reps):
+                sw_regs[ni].store(lds_b32(lds_base, poff + PL_A + (wnb + ni * WMMA_N + lane16) * SPB + koff))
+            for mi in range_constexpr(m_reps):
+                sw_regs[n_reps + mi].store(lds_b32(lds_base, poff + (wmb + mi * WMMA_M + lane16) * SPB + koff))
+
+        def compute2(s, kt, pset, kt_n):
+            base = fx.Int32(fx.ptrtoint(_stage(s)))
+            sel = (kt % 4) * 0x01010101  # v_perm_b32: every result byte = byte kt%4 of the word
+            sw = [r.load()[0] for r in sw_regs]
+            sv = [fx.Int32(rocdl.perm_b32(w, w, sel)) for w in sw]
+            sbv, sav_all = sv[:n_reps], sv[n_reps:]
+            bf = [_operand(base, STAGE_A, wnb + ni * WMMA_N + lane16, 0) for ni in range_constexpr(n_reps)]
+            afs = [None] * m_reps
+            for mi in range_constexpr(min(sched2, m_reps)):
+                afs[mi] = _operand(base, 0, wmb + mi * WMMA_M + lane16, 0)
+            for mi in range_constexpr(m_reps):
+                if const_expr(mi + sched2 < m_reps):
+                    afs[mi + sched2] = _operand(base, 0, wmb + (mi + sched2) * WMMA_M + lane16, 0)
+                rocdl.sched_barrier(0)
+                for ni in range_constexpr(n_reps):
+                    idx = mi * n_reps + ni
+                    fx.gemm(mma_atom, c_frags[idx], bf[ni], afs[mi], c_frags[idx], scale_a=sbv[ni], scale_b=sav_all[mi])
+                rocdl.sched_barrier(0)
+
         def offs_of(blk_m, blk_n, kb, kt):
             k = fx.Int64(kb) + fx.Int64(kt) * tile_k
             return fx.Int64(blk_m) * lda64 + k, fx.Int64(blk_n) * ldb64 + k
@@ -327,6 +389,9 @@ def launch_vkpblk_fp8_gfx1250(
                     else:
                         tdm_ops.tensor_wait(2)
                     fx.barrier()
+                    if const_expr(sched2):
+                        if kt == 0:
+                            load_words(0, pset)
                     f = kt + 2
                     if f < kt_n:
                         oa0, ob0 = offs_of(blk_m, blk_n, kb, f)
@@ -339,12 +404,18 @@ def launch_vkpblk_fp8_gfx1250(
                         else:
                             oa2, ob2 = offs_of(nbm, nbn, nkb, 1)
                             issue((gk + f) % num_buffers, oa2, ob2)
-                    compute((gk + kt) % num_buffers, kt, pset)
+                    if const_expr(sched2):
+                        compute2((gk + kt) % num_buffers, kt, pset, kt_n)
+                        if kt + 1 < kt_n:
+                            load_words(kt + 1, pset)
+                    else:
+                        compute((gk + kt) % num_buffers, kt, pset)
                 gk_reg.store(gk_reg.load() + kt_n)
                 # epilogue: bf16 C from the accumulators via the wave's LDS line scratch (whole-line stores)
                 _store_c_lines(base_ptr, SCR_OFF + wave * SCR_W, lane, c_frags, m_reps, n_reps, warp_n, gC8,
                                blk_m + wmb, blk_n + wnb, c_ld, out_cls, lds_b128,
-                               cbase64=fx.Int64(g) * fx.Int64(i32_m) * c_ld, bands=SCR_BANDS)
+                               cbase64=fx.Int64(g) * fx.Int64(i32_m) * c_ld, bands=SCR_BANDS,
+                               sq_reg=sq_reg if sumsq else None)
         else:
             # prologue: tile 0's planes (set 0) and first k-tile, then one TDM op standing in for the C store that
             # later tiles keep in flight (keeps the wait counts uniform)
@@ -377,6 +448,9 @@ def launch_vkpblk_fp8_gfx1250(
                         else:
                             tdm_ops.tensor_wait(0)
                     fx.barrier()
+                    if const_expr(sched2):
+                        if kt == 0:
+                            load_words(0, pset)
                     f = kt + 1
                     if f < kt_n:
                         oa0, ob0 = offs_of(blk_m, blk_n, kb, f)
@@ -393,7 +467,13 @@ def launch_vkpblk_fp8_gfx1250(
                         if kt == 1:
                             if kt_n >= 3:
                                 fx.copy(atomC, gtC, sC)
-                    compute((gk + kt) % num_buffers, kt, pset)
+                    if const_expr(sched2):
+                        compute2((gk + kt) % num_buffers, kt, pset, kt_n)
+                        # next k-step's scale words (same tile only: the next tile's planes are still in flight)
+                        if kt + 1 < kt_n:
+                            load_words(kt + 1, pset)
+                    else:
+                        compute((gk + kt) % num_buffers, kt, pset)
                 gk_reg.store(gk_reg.load() + kt_n)
                 # epilogue: the previous C store must be done before sC is rewritten (4 newer ops: planes + stage)
                 tdm_ops.tensor_wait(4)
@@ -462,7 +542,7 @@ def vkpblk_sumsq_numel(out, tile=(256, 256, 128), m_warp=2, n_warp=4, nwg=None):
 
 def flyvkpblk_fp8(lhsP, rhsP, lhs_s, rhs_s, poffs_i32, OUT_M, OUT_N, out, beta=1.0, tile=(256, 256, 128),
                   m_warp=2, n_warp=4, group_m=4, kwin_max=4096, nwg=None, perm=None, prefetch_c=True, nbuf=2,
-                  sumsq_out=None):
+                  sumsq_out=None, xdl_nostall=0, sched2=0):
     """out [G, OUT_M, OUT_N] bf16 (+)= per-expert lhsP[:, seg] @ rhsP[:, seg]^T; lhs_s/rhs_s compact E8M0
     [rows, P/128] uint8. beta 1 accumulates into out, 0 overwrites it.
     perm: int32 [G] expert visiting order (``expert_order_lpt``) or None (expert index order). Every output tile is
@@ -472,8 +552,8 @@ def flyvkpblk_fp8(lhsP, rhsP, lhs_s, rhs_s, poffs_i32, OUT_M, OUT_N, out, beta=1
     window >= 2 k-tiles (256 rows), as the MegaMoE pool guarantees. Bit-identical to nbuf 2 (same k order).
     sumsq_out: fp32 [vkpblk_sumsq_numel(out)] or None. When given, the kernel also writes per-thread partial sums of
     squares of the bf16 values of ``out`` it stores (all of ``out``: sumsq_out.sum() == out.float().square().sum()
-    up to fp32 summation order); every element is overwritten, so no clearing is needed. The sumsq epilogue lives on
-    the nbuf 2 path: with sumsq_out an nbuf 3 request runs nbuf 2 (bit-identical C)."""
+    up to fp32 summation order); every element is overwritten, so no clearing is needed. nbuf 2 and 3 sum the same
+    values in the same per-thread order (bit-identical partials)."""
     assert out.dtype == torch.bfloat16 and out.is_contiguous()
     assert lhs_s.dtype == torch.uint8 and lhs_s.shape[1] * 128 == lhsP.shape[1]
     G = poffs_i32.numel() - 1
@@ -496,12 +576,12 @@ def flyvkpblk_fp8(lhsP, rhsP, lhs_s, rhs_s, poffs_i32, OUT_M, OUT_N, out, beta=1
         assert sumsq_out.dtype == torch.float32 and sumsq_out.is_contiguous()
         assert sumsq_out.numel() >= nwg * m_warp * n_warp * 32, (sumsq_out.numel(), nwg)
         sq = 1
-    nbuf = 2 if (bo or sq) else nbuf
+    nbuf = 2 if bo else nbuf  # moegemm2: the nbuf 3 path has the sumsq epilogue (same per-thread order)
     args = (_ptr(out), _ptr(lhsP), _ptr(rhsP), _ptr(poffs_i32), _ptr(perm if lpt else poffs_i32), _ptr(lhs_s),
             _ptr(rhs_s), _ptr(sumsq_out if sq else out), OUT_M, fx.Stream(torch.cuda.current_stream(device=lhsP.device)),
             OUT_N, G, lhsP.stride(0), rhsP.stride(0), nwg, tm, tn, tk, m_warp, n_warp, a_id, b_id, bo, group_m, kwin_max,
-            lpt, pfc, nbuf, sq)
-    key = (tm, tn, tk, m_warp, n_warp, a_id, b_id, bo, group_m, kwin_max, lpt, pfc, nbuf, sq)
+            lpt, pfc, nbuf, sq, int(xdl_nostall), int(sched2))
+    key = (tm, tn, tk, m_warp, n_warp, a_id, b_id, bo, group_m, kwin_max, lpt, pfc, nbuf, sq, int(xdl_nostall), int(sched2))
     c = _COMPILED.get(key)
     if c is None:
         _COMPILED[key] = flyc.compile(launch_vkpblk_fp8_gfx1250, *args)

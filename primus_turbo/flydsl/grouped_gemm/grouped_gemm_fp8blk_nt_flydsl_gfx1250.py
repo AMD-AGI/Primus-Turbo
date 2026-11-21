@@ -23,6 +23,8 @@ from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import Constexpr
 from flydsl.expr.typing import T as _T
 
+from primus_turbo.flydsl.utils import buffer_ops as _bops
+
 WAVE = 32
 _A_ID = {0: fx.Float8E4M3FN, 1: fx.Float8E5M2}
 
@@ -42,14 +44,15 @@ def _make_lds_load(bits):
 
 
 def _store_c_lines(base_ptr, scr_off, lane, c_frags, m_reps, n_reps, warp_n, gC8, row0, col0, ldc64, out_cls,
-                   lds_b128, cbase64=None, bands=1):
+                   lds_b128, cbase64=None, bands=1, sq_reg=None):
     """Store a wave's (m_reps*16) x warp_n accumulator block as bf16 with whole-line global stores.
     The WMMA C layout gives each lane 8 consecutive columns of one row, so a direct global_store_b128 of a fragment
     touches 16 rows x 32 B (16 cache lines per instruction); measured ~4-5 TB/s, +30-60 us per flygg call. Here each
     16-row band goes through a wave-private LDS scratch (16 x (2*warp_n + 16) B at scr_off) and is read back
     row-contiguous, so one global_store_b128 covers 32/LPR rows x 2*warp_n B (whole lines). LDS ops of one wave
     execute in order, so no barrier is needed. row0/col0: first output row/column of the wave block (elements).
-    bands: 16-row bands staged per LDS round trip (scratch = bands x 16 x (2*warp_n + 16) B per wave)."""
+    bands: 16-row bands staged per LDS round trip (scratch = bands x 16 x (2*warp_n + 16) B per wave).
+    sq_reg: optional fp32 rmem vector (8): += the squares of the bf16 values, fragments in (mi, ni) order."""
     RB = 2 * warp_n + 16
     LPR = (2 * warp_n) // 16  # lanes per output row
     assert 32 % LPR == 0
@@ -64,6 +67,9 @@ def _store_c_lines(base_ptr, scr_off, lane, c_frags, m_reps, n_reps, warp_n, gC8
             mi = mb * bands + bi
             for ni in range_constexpr(n_reps):
                 h = c_frags[mi * n_reps + ni].load().to(out_cls)
+                if sq_reg is not None:
+                    hf = h.to(fx.Float32)
+                    sq_reg.store(sq_reg.load() + hf * hf)
                 fx.ptr_store(h.bitcast(fx.Int8),
                              base_ptr + (scr_off + (bi * 16 + lane16) * RB + (ni * 16 + kgrp * 8) * 2))
         vs = []
@@ -105,7 +111,10 @@ def launch_gg_fp8blk_nt_gfx1250(
     dstore: Constexpr[int] = 0,
     lds_pad: Constexpr[int] = 16,
     bblk: Constexpr[int] = 0,
+    xdl_nostall: Constexpr[int] = 0,
 ):
+    """xdl_nostall (moegemm2): set SCHED_MODE.DISABLE_XDL_ARB_STALL at kernel start (no WMMA multicycle
+    arbitration stall between back-to-back matrix ops; scheduling only, bit-identical)."""
     a_cls, b_cls = _A_ID[a_id], _A_ID[b_id]
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
@@ -142,7 +151,7 @@ def launch_gg_fp8blk_nt_gfx1250(
     n_ops = 2
     G = n_groups
 
-    kernel_name = f"moe_gg_fp8blk_nt_gfx1250_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}_nb{num_buffers}_a{a_id}{b_id}_g{G}" + ("_ds" if dstore else "") + (f"_p{lds_pad}" if lds_pad != 16 else "") + ("_bb" if bblk else "")
+    kernel_name = f"moe_gg_fp8blk_nt_gfx1250_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}_nb{num_buffers}_a{a_id}{b_id}_g{G}" + ("_ds" if dstore else "") + (f"_p{lds_pad}" if lds_pad != 16 else "") + ("_bb" if bblk else "") + ("_xn" if xdl_nostall else "")
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
     def kernel_gg(
@@ -156,6 +165,8 @@ def launch_gg_fp8blk_nt_gfx1250(
         i32_n: fx.Int32,
         i32_k: fx.Int32,
     ):
+        if const_expr(xdl_nostall):
+            rocdl.disable_xdl_arb_stall()
         tid = fx.Int32(fx.thread_idx.x)
         bid_x, _, _ = fx.block_idx
         n_tiles_n = (i32_n + (tile_n - 1)) // tile_n
@@ -609,6 +620,237 @@ def launch_ggq_fp8blk_nt_gfx1250(
 
 launch_ggq_fp8blk_nt_gfx1250.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": True}
 
+
+@flyc.jit
+def launch_ggk_fp8blk_nt_gfx1250(
+    arg_c: fx.Pointer,
+    arg_a: fx.Pointer,
+    arg_b: fx.Pointer,
+    arg_offs: fx.Pointer,
+    arg_sa: fx.Pointer,
+    arg_sb: fx.Pointer,
+    i32_nwg: fx.Int32,
+    stream: fx.Stream,
+    i32_n: fx.Int32,
+    i32_k: fx.Int32,
+    n_groups: Constexpr[int],
+    tile_m: Constexpr[int],
+    tile_n: Constexpr[int],
+    tile_k: Constexpr[int],
+    m_warp: Constexpr[int],
+    n_warp: Constexpr[int],
+    a_id: Constexpr[int],
+    b_id: Constexpr[int],
+):
+    """Persistent flygg with k256 k-tiles (moegemm2). Same operands, WMMAs, per-tile k order and bf16 rounding as
+    kernel_gg (bit-identical); removes the per-tile prologue / epilogue that ATT showed in the one-tile-per-workgroup
+    kernel (first k-tile wait ~1.4 us + C store wait ~1 us per tile, ~6 tiles per CU):
+    * grid = #CUs, workgroup bid walks the live output tiles t = bid, bid + nwg, ... (live = offs[G] / tile_m m-tiles;
+      group offsets are tile_m multiples, read once into SGPRs by scalar buffer loads);
+    * one TDM stream per workgroup through a 2-stage ring of tile_k-deep k-tiles (2 TDM ops per k-tile, wait 0 per
+      step as in kernel_gg); the next tile's k-tile 0 is issued at the current tile's last k-step;
+    * no scale planes in LDS: each k-step's E8M0 words (4x-repeated bytes = the WMMA scale operand) come straight
+      from global memory with vector loads issued one k-step ahead (carried in registers, also across tiles);
+    * C leaves through the wave-private LDS line scratch with whole-line global stores (_store_c_lines), which are not
+      tensorcnt ops, so the next tile's TDM waits never wait for them.
+    Needs aligned group offsets, K % tile_k == 0, N % tile_n == 0, sb constant over 16-row groups of N (128x128-block
+    weight scales) -- the B word of fragment row 16*i stands for its 16 rows."""
+    a_cls, b_cls = _A_ID[a_id], _A_ID[b_id]
+    WMMA_M = WMMA_N = 16
+    WMMA_K = 128
+    MX_BLOCK = 32
+    NB = 2
+    k_iters = tile_k // WMMA_K
+    num_waves = m_warp * n_warp
+    block = num_waves * WAVE
+    assert tile_m % (m_warp * WMMA_M) == 0 and tile_n % (n_warp * WMMA_N) == 0
+    assert tile_k % WMMA_K == 0 and tile_m % num_waves == 0 and tile_n % num_waves == 0
+    out_cls = fx.BFloat16
+    LDS_PAD = 16
+    A_ROW = tile_k + LDS_PAD
+    B_ROW = tile_k + LDS_PAD
+    STAGE_A = tile_m * A_ROW
+    STAGE_B = tile_n * B_ROW
+    PITCH = STAGE_A + STAGE_B
+    SCR_OFF = NB * PITCH
+    SCR_W = 16 * (2 * (tile_n // n_warp) + 16)
+    ARENA = SCR_OFF + num_waves * SCR_W
+    assert ARENA <= 320 * 1024, f"LDS arena {ARENA} B exceeds 320 KiB"
+    G = n_groups
+    kernel_name = (f"moe_ggk_fp8blk_nt_gfx1250_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}_a{a_id}{b_id}_g{G}")
+
+    @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
+    def kernel_ggk(
+        arg_c: fx.Pointer,
+        arg_a: fx.Pointer,
+        arg_b: fx.Pointer,
+        arg_offs: fx.Pointer,
+        arg_sa: fx.Pointer,
+        arg_sb: fx.Pointer,
+        i32_nwg: fx.Int32,
+        i32_n: fx.Int32,
+        i32_k: fx.Int32,
+    ):
+        tid = fx.Int32(fx.thread_idx.x)
+        bid_x, _, _ = fx.block_idx
+        bid = fx.Int32(bid_x)
+        n_tiles_n = i32_n // tile_n
+        i32_ptr = fx.PointerType.get(elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4)
+        offs_rsrc = rocdl.get_buffer_rsrc(rocdl.make_buffer_ptr(fx.recast_iter(i32_ptr, arg_offs)))
+        sa_rsrc = rocdl.get_buffer_rsrc(rocdl.make_buffer_ptr(fx.recast_iter(i32_ptr, arg_sa)))
+        sb_rsrc = rocdl.get_buffer_rsrc(rocdl.make_buffer_ptr(fx.recast_iter(i32_ptr, arg_sb)))
+        zero = bid * fx.Int32(0)
+        one = zero + fx.Int32(1)
+        offv = [fx.Int32(_bops.buffer_load(offs_rsrc, zero + fx.Int32(i), vec_width=1, is_scalar=True))
+                for i in range_constexpr(G + 1)]
+        live_rows = offv[G]
+        total = (live_rows // tile_m) * n_tiles_n
+        my_cnt = (total - bid + i32_nwg - 1) // i32_nwg
+        my_cnt = (my_cnt > zero).select(my_cnt, zero)
+        last_t = bid + (my_cnt - 1) * i32_nwg
+        KT = i32_k // tile_k
+        lda64 = fx.Int64(i32_k)
+        ldc64 = fx.Int64(i32_n)
+        sk = i32_k // MX_BLOCK  # scale bytes per row (4x-repeated E8M0 per 128-block)
+        skw = sk // 4  # scale words per row
+
+        def tile_params(t):
+            """tile t -> (expert, first pool row, first n column); group offsets are tile_m aligned"""
+            m_row = (t // n_tiles_n) * tile_m
+            g = zero
+            for i in range_constexpr(G):
+                g = g + (offv[i + 1] <= m_row).select(one, zero)
+            g = (g < fx.Int32(G)).select(g, fx.Int32(G - 1))
+            return g, m_row, (t % n_tiles_n) * tile_n
+
+        arena = fx.SharedAllocator(static=False)
+        arena.allocate(ARENA)
+        base_ptr = arena.base_ptr
+
+        def _stage(s):
+            return fx.add_offset(base_ptr, s * PITCH)
+
+        def _view(ptr, cls, shape, stride, align=16):
+            return fx.Tensor(
+                fx.make_view(
+                    fx.recast_iter(fx.PointerType.get(cls.ir_type, ptr.address_space, align), ptr),
+                    fx.make_layout(shape, stride),
+                )
+            )
+
+        def _gview(base, off, shape, stride):
+            return fx.Tensor(fx.make_view(fx.add_offset(base, off), fx.make_layout(shape, stride)))
+
+        def _cast(cls, p, align=16):
+            return fx.recast_iter(fx.PointerType.get(cls.ir_type, p.address_space, align), p)
+
+        gA = _gview(_cast(a_cls, arg_a), fx.Int64(0), (tile_m, tile_k), (i32_k, 1))
+        gB = _gview(_cast(b_cls, arg_b), fx.Int64(0), (tile_n, tile_k), (i32_k, 1))
+        atomA = fx.rocdl.make_tdm_atom(gA, [None, None], strides=[lda64, None], num_warps=num_waves,
+                                       pad_interval=tile_k, pad_amount=LDS_PAD)
+        atomB = fx.rocdl.make_tdm_atom(gB, [None, None], strides=[lda64, None], num_warps=num_waves,
+                                       pad_interval=tile_k, pad_amount=LDS_PAD)
+
+        def sA_of(s):
+            return _view(_stage(s), a_cls, (tile_m, tile_k), (A_ROW, 1))
+
+        def sB_of(s):
+            return _view(fx.add_offset(_stage(s), STAGE_A), b_cls, (tile_n, tile_k), (B_ROW, 1))
+
+        def issue(s, g, m_row, blk_n, kt):
+            k = fx.Int64(kt) * tile_k
+            fx.copy(atomA, gA, sA_of(s), imm_offset=fx.Int64(m_row) * lda64 + k)
+            fx.copy(atomB, gB, sB_of(s), imm_offset=(fx.Int64(g) * fx.Int64(i32_n) + fx.Int64(blk_n)) * lda64 + k)
+
+        mma_atom = fx.make_mma_atom(fx.rocdl.WMMAScale(WMMA_M, WMMA_N, WMMA_K, b_cls, a_cls, fx.Float32,
+                                                       block_size=MX_BLOCK))
+        warp_m = tile_m // m_warp
+        warp_n = tile_n // n_warp
+        m_reps = warp_m // WMMA_M
+        n_reps = warp_n // WMMA_N
+        lds_b128 = _make_lds_load(128)
+        wave = rocdl.readfirstlane(_T.i32, tid // WAVE)
+        lane = tid % WAVE
+        lane16 = lane % 16
+        kgrp = lane // 16
+        wmb = (wave // n_warp) * warp_m
+        wnb = (wave % n_warp) * warp_n
+        n_acc = m_reps * n_reps
+        c_frags = [fx.make_rmem_tensor(WMMA_N // 2, fx.Float32) for _ in range_constexpr(n_acc)]
+        gk_reg = fx.make_rmem_tensor(1, fx.Int32)
+        gk_reg.fill(0)
+        # scale words of the next k-step (k_iters words per fragment row), carried across steps and tiles
+        sa_regs = [fx.make_rmem_tensor(k_iters, fx.Int32) for _ in range_constexpr(m_reps)]
+        sb_regs = [fx.make_rmem_tensor(k_iters, fx.Int32) for _ in range_constexpr(n_reps)]
+
+        def load_scales(g, m_row, blk_n, kt):
+            kw0 = kt * k_iters
+            for mi in range_constexpr(m_reps):
+                sa_regs[mi].store(fx.Vector(_bops.buffer_load(
+                    sa_rsrc, (m_row + wmb + mi * WMMA_M + lane16) * skw + kw0, vec_width=k_iters, dtype=fx.Int32)))
+            for ni in range_constexpr(n_reps):
+                sb_regs[ni].store(fx.Vector(_bops.buffer_load(
+                    sb_rsrc, (g * i32_n + blk_n + wnb + ni * WMMA_N) * skw + kw0, vec_width=k_iters, dtype=fx.Int32)))
+
+        def _operand(base, plane_off, row, row_bytes, ks):
+            b0 = plane_off + row * row_bytes + ks * WMMA_K + kgrp * 16
+            v = [fx.Vector(lds_b128(base, b0 + 32 * j)) for j in range_constexpr(4)]
+            v01 = v[0].shuffle(v[1], list(range(8)))
+            v23 = v[2].shuffle(v[3], list(range(8)))
+            reg = fx.make_rmem_tensor(16, fx.Int32)
+            reg.store(v01.shuffle(v23, list(range(16))))
+            return reg
+
+        def compute(s, sav_w, sbv_w):
+            base = fx.Int32(fx.ptrtoint(_stage(s)))
+            for ks in range_constexpr(k_iters):
+                bf = [_operand(base, STAGE_A, wnb + ni * WMMA_N + lane16, B_ROW, ks) for ni in range_constexpr(n_reps)]
+                for mi in range_constexpr(m_reps):
+                    af = _operand(base, 0, wmb + mi * WMMA_M + lane16, A_ROW, ks)
+                    for ni in range_constexpr(n_reps):
+                        idx = mi * n_reps + ni
+                        fx.gemm(mma_atom, c_frags[idx], bf[ni], af, c_frags[idx], scale_a=sbv_w[ni][ks],
+                                scale_b=sav_w[mi][ks])
+
+        gC8 = _cast(fx.Int8, _cast(out_cls, arg_c))
+        t0 = (my_cnt > zero).select(bid, zero)
+        g0, mr0, bn0 = tile_params(t0)
+        issue(0, g0, mr0, bn0, zero)
+        load_scales(g0, mr0, bn0, zero)
+        for it in range(my_cnt):
+            t = bid + it * i32_nwg
+            g, m_row, blk_n = tile_params(t)
+            t_nx = (t + i32_nwg < total).select(t + i32_nwg, last_t)
+            ng, nm_row, nblk_n = tile_params(t_nx)
+            for cf in c_frags:
+                cf.fill(0.0)
+            gk = gk_reg.load()[0]
+            for kt in range(KT):
+                tdm_ops.tensor_wait(0)
+                fx.barrier()
+                # next k-step: k-tile kt+1 of this tile, or k-tile 0 of the next one (branch-free)
+                nxt_last = kt + 1 >= KT
+                sg = nxt_last.select(ng, g)
+                sm = nxt_last.select(nm_row, m_row)
+                sn = nxt_last.select(nblk_n, blk_n)
+                skt = nxt_last.select(zero, kt + 1)
+                issue((gk + kt + 1) % NB, sg, sm, sn, skt)
+                sav_w = [r.load() for r in sa_regs]
+                sbv_w = [r.load() for r in sb_regs]
+                load_scales(sg, sm, sn, skt)
+                compute((gk + kt) % NB, sav_w, sbv_w)
+            gk_reg.store(gk_reg.load() + KT)
+            _store_c_lines(base_ptr, SCR_OFF + wave * SCR_W, lane, c_frags, m_reps, n_reps, warp_n, gC8,
+                           m_row + wmb, blk_n + wnb, ldc64, out_cls, lds_b128)
+        tdm_ops.tensor_wait(0)
+
+    kernel_ggk(arg_c, arg_a, arg_b, arg_offs, arg_sa, arg_sb, i32_nwg, i32_n, i32_k).launch(
+        grid=(i32_nwg, 1, 1), block=(block, 1, 1), stream=stream
+    )
+
+
+launch_ggk_fp8blk_nt_gfx1250.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": True}
+
 _COMPILED: dict = {}
 
 
@@ -617,7 +859,7 @@ def _ptr(t):
 
 
 def flygg_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, tile=(256, 256, 128), m_warp=2, n_warp=2, num_buffers=3,
-                    aligned=False, dstore=0, persistent=0, lds_pad=16, bblk=0):
+                    aligned=False, dstore=0, persistent=0, lds_pad=16, bblk=0, xdl_nostall=0):
     """a [M, K] fp8, b [G, N, K] fp8 contiguous, sa [M, K/32] / sb [G, N, K/32] uint8 E8M0 (block-128 exponents
     repeated 4x), offs_i32 [G+1] int32. Returns out [M, N] bf16 (rows past offs[G] are not written).
     aligned: the caller guarantees every offs_i32 entry is a multiple of tile[0] (not checked: that would sync), so
@@ -639,6 +881,21 @@ def flygg_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, tile=(256, 256, 128), m_wa
     a_id = 0 if a.dtype == torch.float8_e4m3fn else 1
     b_id = 0 if b.dtype == torch.float8_e4m3fn else 1
     assert not dstore or aligned, "dstore needs whole tiles (aligned group offsets)"
+    if persistent == 2:
+        # moegemm2: persistent k256 (launch_ggk); scales read straight from sa / sb, C through _store_c_lines
+        assert aligned and tk % 128 == 0 and K % tk == 0 and N % tn == 0
+        assert sa.shape == (M, K // 32) and sb.shape == (G, N, K // 32)
+        nwg = torch.cuda.get_device_properties(a.device).multi_processor_count
+        nwg = max(1, min(nwg, (M // tm) * (N // tn)))
+        args = (_ptr(out), _ptr(a), _ptr(b), _ptr(offs_i32), _ptr(sa), _ptr(sb), nwg,
+                fx.Stream(torch.cuda.current_stream(device=a.device)), N, K, G, tm, tn, tk, m_warp, n_warp, a_id, b_id)
+        key = ("k", G, tm, tn, tk, m_warp, n_warp, a_id, b_id, nwg)
+        c = _COMPILED.get(key)
+        if c is None:
+            _COMPILED[key] = flyc.compile(launch_ggk_fp8blk_nt_gfx1250, *args)
+        else:
+            c(*args)
+        return out
     if persistent:
         assert aligned and tk == 128 and K // tk >= 2 and K <= 4096 and tn % 128 == 0
         nwg = torch.cuda.get_device_properties(a.device).multi_processor_count
@@ -656,8 +913,8 @@ def flygg_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, tile=(256, 256, 128), m_wa
     mtiles = M // tm if aligned else M // tm + G
     args = (_ptr(out), _ptr(a), _ptr(b), _ptr(offs_i32), _ptr(sa), _ptr(sb), mtiles,
             fx.Stream(torch.cuda.current_stream(device=a.device)), N, K, G, tm, tn, tk, m_warp, n_warp,
-            num_buffers, a_id, b_id, K, int(dstore), lds_pad, int(bblk))
-    key = (G, tm, tn, tk, m_warp, n_warp, num_buffers, a_id, b_id, K, int(dstore), lds_pad, int(bblk))
+            num_buffers, a_id, b_id, K, int(dstore), lds_pad, int(bblk), int(xdl_nostall))
+    key = (G, tm, tn, tk, m_warp, n_warp, num_buffers, a_id, b_id, K, int(dstore), lds_pad, int(bblk), int(xdl_nostall))
     c = _COMPILED.get(key)
     if c is None:
         _COMPILED[key] = flyc.compile(launch_gg_fp8blk_nt_gfx1250, *args)

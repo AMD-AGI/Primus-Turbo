@@ -57,19 +57,24 @@ _GEMM = dict(num_buffers=3)
 #   aligned: same kernel, grid bound M/256 (pool offsets are 256-aligned) -> no G x N/256 dead workgroups;
 #   k256: aligned + 256x256x256 k-tiles in a 2-stage ring (half the k-step barriers/waits per FLOP, same bytes in
 #         flight) + B scale plane of one row per 16-row fragment (128x128-block weight scales) so it fits LDS;
-#   persistent: flygg ggq (grid = #CUs, cross-tile TDM stream, C via LDS line scratch) -- measured slower.
+#   persistent: flygg ggq (grid = #CUs, cross-tile TDM stream, C via LDS line scratch) -- measured slower;
+#   k256p (moegemm2): persistent k256 (launch_ggk: grid = #CUs, one TDM stream across tiles, scale words straight from
+#         global memory one k-step ahead, C through the LDS line scratch with non-TDM stores).
 _GG_MODE = os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_GG", "tile").strip().lower()
-assert _GG_MODE in ("tile", "aligned", "k256", "persistent"), f"PRIMUS_TURBO_MOE_FP8BLK_GG={_GG_MODE!r}"
+assert _GG_MODE in ("tile", "aligned", "k256", "persistent", "k256p"), f"PRIMUS_TURBO_MOE_FP8BLK_GG={_GG_MODE!r}"
 if _GG_MODE != "tile":
     assert _ALIGN % 256 == 0
-    _GEMM.update(aligned=True, persistent=int(_GG_MODE == "persistent"))
-if _GG_MODE == "k256":
+    _GEMM.update(aligned=True, persistent={"persistent": 1, "k256p": 2}.get(_GG_MODE, 0))
+if _GG_MODE in ("k256", "k256p"):
     _GEMM.update(tile=(256, 256, 256), num_buffers=2, bblk=1)
 _VK = dict(num_buffers=2)
 # PRIMUS_TURBO_MOE_FP8BLK_VKP_NB=3: vkp wgrad with a 3-stage ring (2 k-tiles in flight) for beta 0 (bit-identical;
 # measured neutral to slightly slower: the direct C stores cost what the deeper ring saves). Default 2.
 _VKP_NB = int(os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_VKP_NB", "2"))
 assert _VKP_NB in (2, 3)
+# moegemm2. PRIMUS_TURBO_MOE_FP8BLK_VKP_SCHED2=1: vkp wgrad with scalar-loaded tile parameters, batched + carried E8M0
+# scale words and A fragments read ahead of their WMMAs (bit-identical C and sumsq partials). Default 0.
+_VKP_SCHED2 = int(os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_VKP_SCHED2", "0"))
 _CACHES = weakref.WeakSet()
 # wgrad kernel: "vk" (one tile per workgroup) or "vkp" (persistent, experts longest-first, old-C prefetch for
 # beta = 1; needs the compact 1-byte-per-128-token col scales from the quant kernels). PRIMUS_TURBO_MOE_FP8BLK_WGRAD.
@@ -152,7 +157,7 @@ def _gg(a, a_s, c, transposed, poffs):
     if not _GG_DSV4:
         kw = _GEMM
         if kw.get("tile", (0, 0, 128))[2] == 256 and a.shape[1] % 256:  # k256 needs K % 256 == 0
-            kw = dict(kw, tile=(256, 256, 128), num_buffers=3)
+            kw = dict(kw, tile=(256, 256, 128), num_buffers=3, persistent=0)
         return flygg_fp8blk_nt(a, w, a_s, ws, poffs, **kw)
     from primus_turbo.triton.grouped_gemm.gg_dsv4_gfx1250 import gg_dsv4, pack_rows, tile_table
 
@@ -226,7 +231,7 @@ class _FP8BlockMoE(torch.autograd.Function):
         def wgrad(lhs, rhs, lhs_s, rhs_s, n, k, out, beta, sq=None):
             if vkp:
                 flyvkpblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta=beta, perm=perm, kwin_max=_vkp_kwin(T),
-                              nbuf=_VKP_NB, sumsq_out=sq)
+                              nbuf=_VKP_NB, sumsq_out=sq, sched2=_VKP_SCHED2)
             else:
                 flyvkblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta=beta, **_VK)
 
