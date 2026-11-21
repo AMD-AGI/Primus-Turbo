@@ -666,9 +666,9 @@ def _ws(device, N, split, grid):
 def gg_dsv4(a, b, as_packed, bs_packed, mte, nmt, N, out=None, mode=None, grid=256, split=None):
     """a [P, K] fp8, b [E*N, K] or [E, N, K] fp8, as_packed [P/128, K*4], bs_packed [E*N/128, K*4] uint8,
     mte int16 [P/256], nmt int32 [1].  Returns out [P, N] bf16 (rows of dead tiles are not written).
-    mode: 'tile' (a), 'persistent' (b, split=1) or 'split' (b+c); default env GG_DSV4_MODE or 'split'."""
+    mode: 'tile' (a), 'persistent' (b, split=1) or 'split' (b+c); default env GG_DSV4_MODE or 'tile'."""
     global _LAYOUTS
-    mode = mode or os.environ.get("GG_DSV4_MODE", "split")
+    mode = mode or os.environ.get("GG_DSV4_MODE", "tile")  # tile 159 us < persistent/split ~217-222 us (GPU A/B)
     P, K = a.shape
     b2 = b.reshape(-1, K)
     assert P % 256 == 0 and N % 256 == 0 and K % 512 == 0 and K >= 1024 and b2.shape[0] % N == 0
@@ -685,7 +685,7 @@ def gg_dsv4(a, b, as_packed, bs_packed, mte, nmt, N, out=None, mode=None, grid=2
                              num_ctas=1, **L)
         return out
     sp = 1 if mode == "persistent" else (split or default_split(K))
-    assert grid % NUM_XCDS == 0 and (K // sp) % 512 == 0 and K // sp >= 1024
+    assert grid % 8 == 0 and (K // sp) % 512 == 0 and K // sp >= 1024
     ws, cnt = _ws(a.device, N, sp, grid) if sp > 1 else (out, nmt)  # dummies when SPLIT == 1
     wsi = ws.view(torch.int32) if sp > 1 else nmt
     # whole tiles, then (split) the tail pieces: two launches on one stream (capturable), no host sync
