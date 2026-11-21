@@ -45,6 +45,16 @@ from primus_turbo.pytorch.ops.utils import (
 __all__ = ["gemm_fp8"]
 
 
+def _fuseq_kw():
+    """PRIMUS_TURBO_FUSEQ=1 (default off): g90 / dsv4up block path quantizes activations and dY with
+    quant_dual_t_e8m0_v2 (scales written in the consumer GEMM's layout, no activation pack_scales launch).
+    PRIMUS_TURBO_FUSEQ_TMODE / _NW pick the kernel variant. Returns its kwargs, or None when off."""
+    if os.environ.get("PRIMUS_TURBO_FUSEQ", "0") != "1":
+        return None
+    return {"tmode": int(os.environ.get("PRIMUS_TURBO_FUSEQ_TMODE", "0")),
+            "num_warps": int(os.environ.get("PRIMUS_TURBO_FUSEQ_NW", "2"))}
+
+
 def _deter_use_nt_layout_gemm_in_bwd(trans_a: bool, trans_b: bool):
     if is_gfx942():
         return False
@@ -471,9 +481,29 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             and _get_fp8_dtype(config.format, False) == torch.float8_e4m3fn
             and os.environ.get("PRIMUS_TURBO_FP8_BLOCK_UE8M0", "0") == "1"  # weight scales must be powers of two
         ):
+            from primus_turbo.gluon.gemm import dsv4up_block
             from primus_turbo.triton.quantization.quant_g90 import e8m0_of, quant_dual_t_e8m0
 
-            a_row, _, a_re, a_t, a_te = quant_dual_t_e8m0(a.contiguous(), a_dtype)
+            a = a.contiguous()
+            fq = _fuseq_kw()
+            plan = None
+            if dsv4up_block.enabled():
+                M_, K_ = a.shape
+                N_ = b.shape[0]
+                # an explicit PRIMUS_TURBO_WQB_SPLITK request keeps that dgrad on the g90 split-K kernel
+                plan = (dsv4up_block.use(M_, N_, K_, "fwd"),
+                        g90_block.dgrad_split_k(M_, K_, N_) == 1 and dsv4up_block.use(M_, K_, N_, "dgrad"),
+                        dsv4up_block.use(N_, K_, M_, "wgrad"))
+            if fq is not None:
+                # PRIMUS_TURBO_FUSEQ=1: the quant writes each activation scale in its consumer's layout (dsv4up
+                # packed for the dsv4up fwd / wgrad passes, g90 bytes otherwise): no activation pack_scales job.
+                from primus_turbo.triton.quantization.quant_g90 import quant_dual_t_e8m0_v2
+
+                a_row, _, a_re, a_t, a_te = quant_dual_t_e8m0_v2(
+                    a, a_dtype, row_layout="packed" if plan and plan[0] else "g90",
+                    t_layout="packed" if plan and plan[2] else "g90", **fq)
+            else:
+                a_row, _, a_re, a_t, a_te = quant_dual_t_e8m0(a, a_dtype)
             # PRIMUS_TURBO_FP8_WCACHE: W, W^T and E8M0 scales written by the optimizer step.
             wc = fp8blk_weight_cache.lookup(b, b_dtype)
             if wc is not None:
@@ -487,22 +517,17 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                 b_t, b_te = None, None
             # PRIMUS_TURBO_FP8_BLOCK_KERNEL=dsv4up: Gluon kernel per pass where the shape allows (else g90).
             # Scale packing for every dsv4up pass that only needs forward-time scales is one launch here.
-            from primus_turbo.gluon.gemm import dsv4up_block
-
             ctx.dsv = None
-            if dsv4up_block.enabled():
-                M_, K_ = a_row.shape
-                N_ = b_row.shape[0]
-                # an explicit PRIMUS_TURBO_WQB_SPLITK request keeps that dgrad on the g90 split-K kernel
-                plan = (dsv4up_block.use(M_, N_, K_, "fwd"),
-                        g90_block.dgrad_split_k(M_, K_, N_) == 1 and dsv4up_block.use(M_, K_, N_, "dgrad"),
-                        dsv4up_block.use(N_, K_, M_, "wgrad"))
+            if plan is not None:
                 pa, pb, pbt, pat = dsv4up_block.pack_scales([
-                    (a_re, 1, M_, K_) if plan[0] else None,
+                    (a_re, 1, M_, K_) if plan[0] and fq is None else None,
                     (b_e, 128, N_, K_) if plan[0] else None,
                     (b_e.t(), 128, K_, N_) if plan[1] else None,  # transposed view, no copy
-                    (a_te, 1, K_, M_) if plan[2] else None,
+                    (a_te, 1, K_, M_) if plan[2] and fq is None else None,
                 ])
+                if fq is not None:  # already packed by the quant
+                    pa = a_re if plan[0] else None
+                    pat = a_te if plan[2] else None
                 ctx.dsv = (plan, pbt, pat)
                 if plan[0]:
                     out = dsv4up_block.gemm_nt(a_row, b_row, pa, pb, out_dtype)
@@ -579,7 +604,16 @@ class FP8GemmBlockFunction(torch.autograd.Function):
 
             a_t, a_te, b_row, b_e, b_t, b_te = ctx.saved_tensors
             g_dtype = _get_fp8_dtype(ctx.config.format, False)
-            g_row, _, g_re, g_t, g_te = quant_dual_t_e8m0(grad_out.contiguous(), g_dtype)
+            fq = _fuseq_kw()
+            if fq is not None:
+                from primus_turbo.triton.quantization.quant_g90 import quant_dual_t_e8m0_v2
+
+                pd, pw = ctx.dsv[0][1:] if ctx.dsv is not None else (False, False)
+                g_row, _, g_re, g_t, g_te = quant_dual_t_e8m0_v2(
+                    grad_out.contiguous(), g_dtype, row_layout="packed" if pd else "g90",
+                    t_layout="packed" if pw else "g90", **fq)
+            else:
+                g_row, _, g_re, g_t, g_te = quant_dual_t_e8m0(grad_out.contiguous(), g_dtype)
             # PRIMUS_TURBO_FP8_BLOCK_KERNEL=dsv4up: per-pass plan made in forward; one packing launch for dY scales
             use_d = use_w = False
             if ctx.dsv is not None:
@@ -588,8 +622,11 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                 (_, use_d, use_w), pbt, pat = ctx.dsv
                 ctx.dsv = None
                 M_, N_ = g_row.shape
-                pg, pgt = dsv4up_block.pack_scales([(g_re, 1, M_, N_) if use_d else None,
-                                                    (g_te, 1, N_, M_) if use_w else None])
+                if fq is not None:  # PRIMUS_TURBO_FUSEQ=1: dY scales already in the dsv4up layout
+                    pg, pgt = (g_re if use_d else None), (g_te if use_w else None)
+                else:
+                    pg, pgt = dsv4up_block.pack_scales([(g_re, 1, M_, N_) if use_d else None,
+                                                        (g_te, 1, N_, M_) if use_w else None])
 
             def wgemm(out_dtype, out=None, accumulate=False):
                 if use_w:
