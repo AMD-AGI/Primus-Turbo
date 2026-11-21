@@ -113,6 +113,81 @@ def quant_dual_t_e8m0(x: torch.Tensor, dtype=torch.float8_e4m3fn, with_row=True,
     return qr, sr, er, qt, et
 
 
+@triton.jit
+def _quant_dual_t2_kernel(
+    x_ptr, qr_ptr, sr_ptr, er_ptr, qt_ptr, et_ptr,
+    M, N, stride_x,
+    FP8_MAX: tl.constexpr, WITH_ROW: tl.constexpr, WITH_T: tl.constexpr, WITH_SR: tl.constexpr,
+    MAX_EXP: tl.constexpr, SLR: tl.constexpr, SLT: tl.constexpr, TMODE: tl.constexpr,
+):
+    """fuseq variant of _quant_dual_t_kernel for M % 128 == N % 128 == 0 (no masks): same bytes, plus
+    * separate scale layouts for the row (SLR) and transposed (SLT) E8M0 bytes, so each consumer gets its GEMM's
+      layout (dsv4up packed or g90 byte) straight from the quant -- no dsv4up pack_scales launch;
+    * the fp32 scale_inv is optional (WITH_SR; the g90 / dsv4up GEMMs never read it);
+    * TMODE 1: four consecutive tokens of a channel packed into one int32 before the transpose (4-byte stores).
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * 128 + tl.arange(0, 128)
+    offs_n = pid_n * 128 + tl.arange(0, 128)
+    x = tl.load(x_ptr + offs_m[:, None].to(tl.int64) * stride_x + offs_n[None, :]).to(tl.float32)
+    ax = tl.abs(x)
+    nb_n = N // 128
+    nb_m = M // 128
+    if WITH_ROW:
+        e = ue8m0_exp_g90(tl.max(ax, axis=1), MAX_EXP)  # [128] per row
+        q = tl.clamp(x * pow2_neg(e)[:, None], -FP8_MAX, FP8_MAX)
+        tl.store(qr_ptr + offs_m[:, None].to(tl.int64) * N + offs_n[None, :], q.to(qr_ptr.dtype.element_ty))
+        if WITH_SR:
+            tl.store(sr_ptr + offs_m * nb_n + pid_n, pow2_pos(e))
+        store_scale(er_ptr, offs_m, pid_n, e, M, nb_n, SLR)
+    if WITH_T:
+        e = ue8m0_exp_g90(tl.max(ax, axis=0), MAX_EXP)  # [128] per column
+        q = tl.clamp(x * pow2_neg(e)[None, :], -FP8_MAX, FP8_MAX).to(qt_ptr.dtype.element_ty)
+        if TMODE == 1:
+            u = tl.reshape(q.to(tl.uint8, bitcast=True).to(tl.int32), (32, 4, 128))
+            w = tl.sum(u << (tl.arange(0, 4) * 8)[None, :, None], axis=1)  # [32, 128]: tokens 4a..4a+3
+            pw = pid_m * 32 + tl.arange(0, 32)
+            tl.store(qt_ptr.to(tl.pointer_type(tl.int32)) + offs_n[:, None].to(tl.int64) * (M // 4) + pw[None, :],
+                     tl.trans(w))
+        else:
+            tl.store(qt_ptr + offs_n[:, None].to(tl.int64) * M + offs_m[None, :], tl.trans(q))
+        store_scale(et_ptr, offs_n, pid_m, e, N, nb_m, SLT)
+
+
+def _scale_buf(R, K, sl, dev):
+    if sl == SL_PACKED:
+        return torch.empty((R // 128, K // 32 * 128), dtype=torch.uint8, device=dev)
+    return torch.empty((R, K // 128), dtype=torch.uint8, device=dev)
+
+
+def quant_dual_t_e8m0_v2(x: torch.Tensor, dtype=torch.float8_e4m3fn, with_row=True, with_t=True,
+                         row_layout="g90", t_layout="g90", with_sr=False, tmode=0, num_warps=2):
+    """Like quant_dual_t_e8m0 (same FP8 bytes and E8M0 codes) for M % 128 == N % 128 == 0, with per-output scale
+    layouts: ``row_layout`` / ``t_layout`` in {"g90" (byte), "packed" (dsv4up)}. scale_inv is None unless
+    ``with_sr``. Returns (q_row, scale_inv_row, e8m0_row, q_t, e8m0_t)."""
+    assert x.dim() == 2 and x.stride(1) == 1
+    M, N = x.shape
+    assert M % 128 == 0 and N % 128 == 0
+    slr, slt = scale_layout_id(row_layout), scale_layout_id(t_layout)
+    assert slr in (SL_BYTE, SL_PACKED) and slt in (SL_BYTE, SL_PACKED)
+    dev = x.device
+    qr = torch.empty((M, N), dtype=dtype, device=dev) if with_row else None
+    sr = torch.empty((M, N // 128), dtype=torch.float32, device=dev) if (with_row and with_sr) else None
+    er = _scale_buf(M, N, slr, dev) if with_row else None
+    qt = torch.empty((N, M), dtype=dtype, device=dev) if with_t else None
+    et = _scale_buf(N, M, slt, dev) if with_t else None
+    fmax = float(torch.finfo(dtype).max)
+    d = x
+    _quant_dual_t2_kernel[(M // 128, N // 128)](
+        x, qr if with_row else d, sr if sr is not None else d, er if with_row else d,
+        qt if with_t else d, et if with_t else d, M, N, x.stride(0),
+        FP8_MAX=fmax, WITH_ROW=with_row, WITH_T=with_t, WITH_SR=sr is not None, MAX_EXP=fp8_max_exp(fmax),
+        SLR=slr, SLT=slt, TMODE=tmode, num_warps=num_warps,
+    )
+    return qr, sr, er, qt, et
+
+
 def e8m0_of(scale_inv: torch.Tensor) -> torch.Tensor:
     """fp32 power-of-two scale_inv -> E8M0 exponent bytes (same shape)."""
     return ((scale_inv.contiguous().view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
