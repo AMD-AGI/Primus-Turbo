@@ -89,8 +89,21 @@ def _vkp_kwin(T: int) -> int:
     return max(4096, -(-T // _ALIGN) * _ALIGN)
 
 
+def _materialize(w: torch.Tensor):
+    """Run the weight's materialize hook, if an optimizer registered one: an optimizer that keeps only the FP32
+    master (and this cache) current between steps, without the BF16 weight (Primus PRIMUS_FP8BLK_ADAM_SKIP_BF16=1),
+    rebuilds the BF16 weight before anything reads it."""
+    hook = getattr(w, FP8BlockWeightCache.MATERIALIZE_HOOK, None)
+    if hook is not None:
+        hook()
+
+
 class FP8BlockWeightCache:
     """Fixed buffers holding one expert weight [E, N, K] in 128x128-block FP8 (+ the transposed copy)."""
+
+    # Name of the optional zero-argument hook on ``weight`` that brings a lazily updated BF16 weight up to date;
+    # refresh() and the VERIFY check call it before reading the weight.
+    MATERIALIZE_HOOK = "_fp8blk_materialize"
 
     def __init__(self, w: torch.Tensor):
         E, N, K = w.shape
@@ -109,6 +122,7 @@ class FP8BlockWeightCache:
 
     @torch.no_grad()
     def refresh(self):
+        _materialize(self.weight)
         quant_w_128x128(self.weight.detach(), _FP8, transposed=True, out=(self.q, self.s, self.qT, self.sT))
         if _GG_DSV4:
             from primus_turbo.triton.grouped_gemm.gg_dsv4_gfx1250 import pack_rows
@@ -133,6 +147,7 @@ def refresh_fp8blk_weights():
             c.refresh()
             n_refreshed += 1
         elif verify:  # debug: the optimizer-written bytes must equal a fresh quant_w_128x128 (costs a sync)
+            _materialize(c.weight)
             ref = quant_w_128x128(c.weight.detach(), _FP8, transposed=True)
             bad = [n for n, a, b in zip(("q", "s", "qT", "sT"), (c.q, c.s, c.qT, c.sT), ref)
                    if not torch.equal(a.view(torch.uint8), b.view(torch.uint8))]
