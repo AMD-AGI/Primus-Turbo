@@ -61,6 +61,7 @@ def quantize_fp8(
     scaling_recipe: Optional[ScalingRecipe] = None,
     pad_align_last: int = 0,
     pad_align_penultimate: int = 0,
+    scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     FP8 Quantize
@@ -77,7 +78,19 @@ def quantize_fp8(
         ``pad_align_last`` / ``pad_align_penultimate`` are opt-in (default 0, off), TENSORWISE
         fp8 only: when >0 the cast zero-pads the last (K) / penultimate (weight N) dim to a
         multiple of 128. The scale is computed pre-pad, so it stays pad-invariant.
+
+        ``scale`` (TENSORWISE only, default None): a one-element float32 tensor on ``x``'s
+        device to cast with, instead of measuring ``x``'s amax; the returned ``scale_inv`` is
+        its reciprocal. For callers that keep scales across steps (delayed scaling).
     """
+    if scale is not None:
+        if granularity != ScalingGranularity.TENSORWISE:
+            raise ValueError(f"scale is only supported for TENSORWISE quantization, got {granularity}")
+        if scale.numel() != 1 or scale.dtype != torch.float32 or scale.device != x.device:
+            raise ValueError(
+                "scale must be a one-element float32 tensor on the input's device, got "
+                f"shape={tuple(scale.shape)}, dtype={scale.dtype}, device={scale.device}"
+            )
     if granularity == ScalingGranularity.TENSORWISE:
         # (k_align=1, pad_n=False) matches the legacy cast byte-for-byte; only padded callers widen K/N.
         return quantize_fp8_tensorwise_pad_impl(
@@ -85,6 +98,7 @@ def quantize_fp8(
             out_dtype,
             pad_n=(pad_align_penultimate > 0),
             k_align=(pad_align_last or 1),
+            scale=scale,
         )
 
     elif granularity == ScalingGranularity.ROWWISE:

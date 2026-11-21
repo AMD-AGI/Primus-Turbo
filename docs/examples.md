@@ -315,6 +315,8 @@ print(c)
 print(c.shape) # [128, 256]
 ```
 
+Under `torch.compile`, a `TENSORWISE` `gemm_fp8` on plain tensors is traced into the graph, forward and backward. The other granularities, pre-quantized `QuantizedTensor` inputs and `fuse_bgrad_accum_pattern` run outside it, as a graph break.
+
 The same `gemm_fp8` entry point also supports `BLOCKWISE` granularity. Just swap the
 `Float8QuantConfig` and keep the rest of the call site unchanged:
 
