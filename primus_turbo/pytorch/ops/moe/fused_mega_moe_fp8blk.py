@@ -25,6 +25,7 @@ from typing import Optional
 import torch
 
 from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad, main_grad_first_write
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_mx_flydsl_gfx1250 import mxgg_fp8blk_nt
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_nt_flydsl_gfx1250 import flygg_fp8blk_nt
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_vk_flydsl_gfx1250 import flyvkblk_fp8
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_vkp_flydsl_gfx1250 import (
@@ -61,12 +62,18 @@ _GEMM = dict(num_buffers=3)
 #   k256p (moegemm2): persistent k256 (launch_ggk: grid = #CUs, one TDM stream across tiles, scale words straight from
 #         global memory one k-step ahead, C through the LDS line scratch with non-TDM stores).
 _GG_MODE = os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_GG", "tile").strip().lower()
-assert _GG_MODE in ("tile", "aligned", "k256", "persistent", "k256p"), f"PRIMUS_TURBO_MOE_FP8BLK_GG={_GG_MODE!r}"
+#   mx (mxgemm): mxgg -- 4-stage ring of 128-deep k-tiles, fragments of the next k-step read during the current one
+#         (grouped_gemm_fp8blk_mx_flydsl_gfx1250.py); falls back to k256 when a shape constraint fails.
+assert _GG_MODE in ("tile", "aligned", "k256", "persistent", "k256p", "mx"), f"PRIMUS_TURBO_MOE_FP8BLK_GG={_GG_MODE!r}"
 if _GG_MODE != "tile":
     assert _ALIGN % 256 == 0
     _GEMM.update(aligned=True, persistent={"persistent": 1, "k256p": 2}.get(_GG_MODE, 0))
-if _GG_MODE in ("k256", "k256p"):
+if _GG_MODE in ("k256", "k256p", "mx"):
     _GEMM.update(tile=(256, 256, 256), num_buffers=2, bblk=1)
+# mxgemm. PRIMUS_TURBO_MOE_FP8BLK_GG_BPF=1 (with GG=k256): fragment software pipeline inside each 256-deep k-tile (B
+# fragments of the next 128-k step double-buffered, A one row group ahead). Bit-identical. Default 0.
+if _GG_MODE == "k256" and os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_GG_BPF", "0") == "1":
+    _GEMM.update(bpf=1)
 _VK = dict(num_buffers=2)
 # PRIMUS_TURBO_MOE_FP8BLK_VKP_NB=3: vkp wgrad with a 3-stage ring (2 k-tiles in flight) for beta 0 (bit-identical;
 # measured neutral to slightly slower: the direct C stores cost what the deeper ring saves). Default 2.
@@ -169,6 +176,10 @@ def refresh_fp8blk_weights():
 def _gg(a, a_s, c, transposed, poffs):
     """Grouped NT GEMM over the expert pool: a [P, K] fp8 x expert weights (c.q, or c.qT for the dgrads)."""
     w, ws = (c.qT, c.sT) if transposed else (c.q, c.s)
+    if _GG_MODE == "mx" and not _GG_DSV4:
+        P, K = a.shape
+        if K % 128 == 0 and K >= 384 and w.shape[1] % 256 == 0 and P % 256 == 0:
+            return mxgg_fp8blk_nt(a, w, a_s, ws, poffs)
     if not _GG_DSV4:
         kw = _GEMM
         if kw.get("tile", (0, 0, 128))[2] == 256 and a.shape[1] % 256:  # k256 needs K % 256 == 0
