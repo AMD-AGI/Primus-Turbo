@@ -2,7 +2,7 @@
 
 Please include a brief summary of the changes, relevant motivation and context.
 
-Fixes # (issue)
+Fixes # (issue), or Part of # (one step of a tracking issue)
 
 ## Type of change
 
