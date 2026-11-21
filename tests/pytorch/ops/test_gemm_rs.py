@@ -13,10 +13,11 @@ bf16 as the kernel stages it, summed over the ranks in fp32; this rank's rows of
 gradients, as the MLA op runs them: ``gq^T @ lq`` (one operand) and ``[gk_nope | gv]^T @ lc`` (a pair
 of views) in fp32. Outputs start as NaN, so an element the kernel does not write fails.
 
-The pytest entry launches this file under torchrun for every world size the node has GPUs for:
+The pytest entry launches the ``--quick`` suite under torchrun for every world size the node has
+GPUs for. The full suite takes longer than the CI timeout on a cold FlyDSL cache, so it is run by hand:
 
-    pytest tests/pytorch/ops/test_gemm_rs.py
-    torchrun --nproc_per_node 8 tests/pytorch/ops/test_gemm_rs.py [--quick]
+    pytest tests/pytorch/ops/test_gemm_rs.py --dist-only            # quick, all world sizes
+    torchrun --nproc_per_node 8 tests/pytorch/ops/test_gemm_rs.py   # full
 """
 
 import argparse
@@ -290,7 +291,14 @@ def test_gemm_rs(world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size} GPUs")
     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    cmd = [sys.executable, "-m", "torch.distributed.run", f"--nproc_per_node={world_size}", __file__]
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        f"--nproc_per_node={world_size}",
+        __file__,
+        "--quick",
+    ]
     result = subprocess.run(cmd, cwd=repo_root, env={**os.environ, "PYTHONPATH": repo_root}, timeout=1800)
     assert result.returncode == 0
 
