@@ -48,7 +48,24 @@ _ALIGN = 256
 # GG_DSV4_MODE=tile|persistent|split selects the variant (default tile; persistent/split measured slower).
 _GG_DSV4 = os.environ.get("PRIMUS_TURBO_MOE_GG_DSV4", "0") == "1"
 _GEMM = dict(num_buffers=3)
+# moegemm track. PRIMUS_TURBO_MOE_FP8BLK_GG: grouped fwd/dgrad GEMM schedule (all bit-identical):
+#   tile (default): flygg 256x256x128, 3-stage ring, one tile per workgroup, grid bound M/256 + G m-tiles;
+#   aligned: same kernel, grid bound M/256 (pool offsets are 256-aligned) -> no G x N/256 dead workgroups;
+#   k256: aligned + 256x256x256 k-tiles in a 2-stage ring (half the k-step barriers/waits per FLOP, same bytes in
+#         flight) + B scale plane of one row per 16-row fragment (128x128-block weight scales) so it fits LDS;
+#   persistent: flygg ggq (grid = #CUs, cross-tile TDM stream, C via LDS line scratch) -- measured slower.
+_GG_MODE = os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_GG", "tile").strip().lower()
+assert _GG_MODE in ("tile", "aligned", "k256", "persistent"), f"PRIMUS_TURBO_MOE_FP8BLK_GG={_GG_MODE!r}"
+if _GG_MODE != "tile":
+    assert _ALIGN % 256 == 0
+    _GEMM.update(aligned=True, persistent=int(_GG_MODE == "persistent"))
+if _GG_MODE == "k256":
+    _GEMM.update(tile=(256, 256, 256), num_buffers=2, bblk=1)
 _VK = dict(num_buffers=2)
+# PRIMUS_TURBO_MOE_FP8BLK_VKP_NB=3: vkp wgrad with a 3-stage ring (2 k-tiles in flight) for beta 0 (bit-identical;
+# measured neutral to slightly slower: the direct C stores cost what the deeper ring saves). Default 2.
+_VKP_NB = int(os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_VKP_NB", "2"))
+assert _VKP_NB in (2, 3)
 _CACHES = weakref.WeakSet()
 # wgrad kernel: "vk" (one tile per workgroup) or "vkp" (persistent, experts longest-first, old-C prefetch for
 # beta = 1; needs the compact 1-byte-per-128-token col scales from the quant kernels). PRIMUS_TURBO_MOE_FP8BLK_WGRAD.
@@ -109,7 +126,10 @@ def _gg(a, a_s, c, transposed, poffs):
     """Grouped NT GEMM over the expert pool: a [P, K] fp8 x expert weights (c.q, or c.qT for the dgrads)."""
     w, ws = (c.qT, c.sT) if transposed else (c.q, c.s)
     if not _GG_DSV4:
-        return flygg_fp8blk_nt(a, w, a_s, ws, poffs, **_GEMM)
+        kw = _GEMM
+        if kw.get("tile", (0, 0, 128))[2] == 256 and a.shape[1] % 256:  # k256 needs K % 256 == 0
+            kw = dict(kw, tile=(256, 256, 128), num_buffers=3)
+        return flygg_fp8blk_nt(a, w, a_s, ws, poffs, **kw)
     from primus_turbo.triton.grouped_gemm.gg_dsv4_gfx1250 import gg_dsv4, pack_rows, tile_table
 
     E, N, K = w.shape
@@ -165,7 +185,8 @@ class _FP8BlockMoE(torch.autograd.Function):
 
         def wgrad(lhs, rhs, lhs_s, rhs_s, n, k, out, beta):
             if vkp:
-                flyvkpblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta=beta, perm=perm, kwin_max=_vkp_kwin(T))
+                flyvkpblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta=beta, perm=perm, kwin_max=_vkp_kwin(T),
+                              nbuf=_VKP_NB)
             else:
                 flyvkblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta=beta, **_VK)
 
