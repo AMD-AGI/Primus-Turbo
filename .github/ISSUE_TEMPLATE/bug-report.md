@@ -2,7 +2,7 @@
 name: Bug report
 about: Report a reproducible issue to help us identify and fix it faster
 title: "[Bug] "
-labels: bug
+labels: bug, needs-triage
 assignees: ""
 ---
 
@@ -22,7 +22,7 @@ assignees: ""
 ## Environment
 <!-- Please fill in as much as you can (the more the better):
 - OS / distro: e.g. Ubuntu 22.04
-- GPU model: e.g. MI300X / MI355X
+- GPU model: e.g. MI300X / MI355X / MI455X
 - ROCm version: e.g. ROCm-7.0
 - Python version: e.g. 3.10.13
 - Image/container (if any): image:tag or digest (sha256:...)

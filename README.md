@@ -230,7 +230,12 @@ See [Examples](./docs/examples.md) for usage examples.
 See [Benchmarks](./benchmark/README.md) for detailed performance results and comparisons.
 
 ## 📍 Roadmap
-[Roadmap: Primus-Turbo Roadmap H1 2026](https://github.com/AMD-AGI/Primus-Turbo/issues/211)
+- **Current roadmap**: the open [roadmap issue](https://github.com/AMD-AGI/Primus-Turbo/issues?q=is%3Aissue%20is%3Aopen%20label%3Aroadmap), updated at every release.
+- **Work in progress**: the open [tracking issues](https://github.com/AMD-AGI/Primus-Turbo/issues?q=is%3Aissue%20is%3Aopen%20label%3Atracking), one per effort that takes several PRs.
+- **Past roadmaps**: [H1 2026](https://github.com/AMD-AGI/Primus-Turbo/issues/211), [H2 2025](https://github.com/AMD-AGI/Primus-Turbo/issues/101).
+- **Training-side plan**: the [Primus roadmap](https://github.com/AMD-AGI/Primus/issues?q=is%3Aissue%20is%3Aopen%20label%3Aroadmap).
+
+How roadmap, tracking and feature issues are used: [Roadmap and Issues](./CONTRIBUTING.md#-roadmap-and-issues).
 
 ---
 
