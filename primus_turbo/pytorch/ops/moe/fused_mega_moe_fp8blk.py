@@ -36,6 +36,8 @@ from primus_turbo.triton.quantization.quant_blk_gfx1250 import (
     MX,
     build_routing_blk,
     combine_rows,
+    expert_order_lpt_fused,
+    route_dw_partials,
     quant_dual_blk,
     quant_w_128x128,
     swiglu_bwd_dual_blk,
@@ -74,6 +76,9 @@ _VKP_NB = int(os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_VKP_NB", "2"))
 assert _VKP_NB in (2, 3)
 # moegemm2. PRIMUS_TURBO_MOE_FP8BLK_VKP_SCHED2=1: vkp wgrad with scalar-loaded tile parameters, batched + carried E8M0
 # scale words and A fragments read ahead of their WMMAs (bit-identical C and sumsq partials). Default 0.
+# fuse track. PRIMUS_FUSE_MOE_BWD=1: d topk_weights in one launch from the unsummed SwiGLU-bwd partials (no zero fill,
+# sum, index and casts) and the LPT expert order in one launch (bit-identical order); default off.
+_FUSE_BWD = os.environ.get("PRIMUS_FUSE_MOE_BWD", "0") == "1"
 _VKP_SCHED2 = int(os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_VKP_SCHED2", "0"))
 _CACHES = weakref.WeakSet()
 # wgrad kernel: "vk" (one tile per workgroup) or "vkp" (persistent, experts longest-first, old-C prefetch for
@@ -238,10 +243,11 @@ class _FP8BlockMoE(torch.autograd.Function):
         vkp = ctx.wk == "vkp"
         dq, ds, dT, dTs = quant_dual_blk(dy.contiguous().to(torch.bfloat16), P, rowmap, preal=preal, compact_t=vkp)
         dact = _gg(dq, ds, c2, True, poffs)
-        gq, gs, gT, gTs, dwr = swiglu_bwd_dual_blk(dact, l1, route_w, ctx.activation, preal=preal, compact_t=vkp)
+        gq, gs, gT, gTs, dwr = swiglu_bwd_dual_blk(dact, l1, route_w, ctx.activation, preal=preal, compact_t=vkp,
+                                                   raw_dw=_FUSE_BWD)
         # experts longest-first (one tiny argsort shared by both wgrads); PRIMUS_TURBO_MOE_FP8BLK_WGRAD_LPT=0: index order
         lpt = os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_WGRAD_LPT", "1") == "1"
-        perm = expert_order_lpt(poffs) if (vkp and lpt) else None
+        perm = (expert_order_lpt_fused if _FUSE_BWD else expert_order_lpt)(poffs) if (vkp and lpt) else None
 
         def wgrad(lhs, rhs, lhs_s, rhs_s, n, k, out, beta, sq=None):
             if vkp:
@@ -269,7 +275,10 @@ class _FP8BlockMoE(torch.autograd.Function):
         dW2, dW1 = grads
         dxp = _gg(gq, gs, c1, True, poffs)
         dx = combine_rows(dxp, inv, T, K)
-        dtw = dwr[inv.long()].view(T, K).to(ctx.topk_dtype)
+        if _FUSE_BWD:
+            dtw = route_dw_partials(dwr, inv, ctx.topk_dtype).view(T, K)
+        else:
+            dtw = dwr[inv.long()].view(T, K).to(ctx.topk_dtype)
         return dx, None, dtw, dW1, dW2, None, None, None, None
 
 
