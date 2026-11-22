@@ -145,7 +145,19 @@ def wants_cache(param: torch.Tensor) -> bool:
     return bool(getattr(param, "_primus_fp8blk_wanted", False))
 
 
+def materialize(b: torch.Tensor) -> None:
+    """Run ``b``'s materialize hook, if an optimizer registered one (Primus PRIMUS_OPTB_DENSE_SKIP_BF16=1 keeps only
+    the FP32 master and this cache current, not the BF16 weight): call before anything reads the BF16 weight."""
+    hook = getattr(b, MATERIALIZE_HOOK, None)
+    if hook is not None:
+        hook()
+
+
+MATERIALIZE_HOOK = "_fp8blk_materialize"  # same attribute name as the MegaMoE FP8BlockWeightCache hook
+
+
 def _check(b: torch.Tensor, cache: Fp8BlockWeightCache) -> None:
+    materialize(b)
     from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
         quant_fp8_blockwise_for_weight_impl,
     )
@@ -175,6 +187,7 @@ def lookup(b: torch.Tensor, dtype: torch.dtype) -> Optional[Fp8BlockWeightCache]
         return None
     cache = getattr(b, "_primus_fp8blk_cache", None)
     if cache is None or not cache.matches(b, dtype):
+        materialize(b)  # miss: the caller quantizes the BF16 weight (no-op unless its store was skipped)
         return None
     if _verify():
         _check(b, cache)

@@ -124,6 +124,7 @@ def _weights_fp8(weights, b_dtype):
 
     qs, es = [], []
     for w in weights:  # same quant as FP8GemmBlockFunction's no-cache path, per weight
+        fp8blk_weight_cache.materialize(w)  # BF16 reader (no-op unless the optimizer skipped its store)
         q, s = quantize_fp8(w, b_dtype, ScalingGranularity.BLOCKWISE, block_size=128,
                             scaling_recipe=ScalingRecipe(use_2d_block=True))
         qs.append(q)
