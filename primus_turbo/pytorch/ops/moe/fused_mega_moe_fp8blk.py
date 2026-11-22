@@ -51,7 +51,8 @@ from primus_turbo.triton.quantization.quant_blk_gfx1250 import (
     swiglu_fwd_dual_blk,
 )
 
-__all__ = ["FP8BlockWeightCache", "fused_mega_moe_fp8blk", "refresh_fp8blk_weights"]
+__all__ = ["FP8BlockWeightCache", "early_routing_tables", "even_routing_tables", "fused_mega_moe_fp8blk",
+           "refresh_fp8blk_weights", "routing_pool_rows"]
 
 _FP8 = torch.float8_e4m3fn
 _ALIGN = 256
@@ -242,9 +243,52 @@ def _setup_accum(w: torch.Tensor, accumulate: bool):
     return None
 
 
+def routing_pool_rows(T: int, K: int, E: int) -> int:
+    """Rows of the fixed-size expert pool (T*K routes + ``_ALIGN`` rows of padding per expert)."""
+    return T * K + E * _ALIGN
+
+
+_EVEN_TABLES = {}
+
+
+def even_routing_tables(T: int, K: int, E: int, device):
+    """route3 (PRIMUS_ROUTE3_TABLES=1): pool tables of force-load-balancing "even" routing, where route r = t*K + k
+    goes to expert r % E whatever the router picked. rowmap / inv / poffs, the LPT expert order and the list of
+    padding rows then depend on (T, K, E) only: built once, eagerly, by the same kernels (build_routing_blk on the
+    slot pattern, expert_order_lpt_fused) and shared by every layer and step (all consumers only read them).
+    Only route_w depends on the routing weights; the caller writes it (route_w[inv[r]] = w[r], 0 on padding rows).
+    Returns (rowmap, inv, poffs, perm, padrows int32, P), or None during a graph capture before the first build."""
+    key = (int(T), int(K), int(E), str(device))
+    t = _EVEN_TABLES.get(key)
+    if t is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        P = routing_pool_rows(T, K, E)
+        slots = (torch.arange(T * K, device=device, dtype=torch.int64) % E).view(T, K)
+        rowmap, _, inv, poffs, _ = build_routing_blk(slots, torch.zeros((T, K), device=device), E, P, align=_ALIGN)
+        perm = expert_order_lpt_fused(poffs)
+        padrows = torch.nonzero(rowmap < 0).flatten().to(torch.int32).contiguous()
+        torch.cuda.current_stream().synchronize()
+        t = (rowmap, inv, poffs, perm, padrows, P)
+        _EVEN_TABLES[key] = t
+    return t
+
+
+def early_routing_tables(topk_idx: torch.Tensor, topk_w: torch.Tensor, E: int):
+    """route3 EARLY: the pool tables of ``_FP8BlockMoE.forward`` (same kernels, same inputs -> same bytes), built by the
+    caller wherever it likes (e.g. before a stream join); pass the result as ``routing=``. LPT order: None (the
+    backward builds it as before)."""
+    T, K = topk_idx.shape
+    P = routing_pool_rows(T, K, E)
+    rowmap, rw, inv, poffs, _ = build_routing_blk(topk_idx.to(torch.int64).contiguous(), topk_w.float(), E, P,
+                                                  align=_ALIGN)
+    return (rowmap, rw, inv, poffs, None)
+
+
 class _FP8BlockMoE(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, topk_idx, topk_w, w1, w2, c1, c2, activation, accumulate, add=None):
+    def forward(ctx, x, topk_idx, topk_w, w1, w2, c1, c2, activation, accumulate, add=None, routing=None,
+                add_join=None):
         T, H = x.shape
         K = topk_idx.shape[1]
         E, I2, _ = w1.shape
@@ -252,13 +296,25 @@ class _FP8BlockMoE(torch.autograd.Function):
         P = T * K + E * _ALIGN
         if not (c1.valid and c2.valid):  # first use only (eager, before any capture)
             c1.refresh(); c2.refresh()
-        rowmap, route_w, inv, poffs, preal = build_routing_blk(topk_idx, topk_w.float(), E, P, align=_ALIGN)
+        ctx.perm_r = None
+        if routing is not None:
+            # route3: precomputed pool tables (even_routing_tables + the caller's route_w), same bytes as below
+            rowmap, route_w, inv, poffs, ctx.perm_r = routing
+            assert rowmap.numel() == P and route_w.numel() == P and inv.numel() == T * K and poffs.numel() == E + 1
+            preal = poffs[E:]
+        else:
+            rowmap, route_w, inv, poffs, preal = build_routing_blk(topk_idx, topk_w.float(), E, P, align=_ALIGN)
         wk = _wgrad_kernel(T)
         ct = wk in ("vkp", "vkq")  # col (token-direction) scales compact for the persistent wgrads
         xq, xs, xT, xTs = quant_dual_blk(x, P, rowmap, preal=preal, compact_t=ct)
+        if add_join is not None and getattr(add_join, "after_dispatch", False):
+            add_join()  # route3 LATE_JOIN=dq: join after the dispatch quant, before fc1
+            add_join = None
         l1 = _gg(xq, xs, c1, False, poffs)
         aq, as_, aT, aTs = swiglu_fwd_dual_blk(l1, route_w, activation, preal=preal, compact_t=ct)
         l2 = _gg(aq, as_, c2, False, poffs)
+        if add_join is not None:  # route3 LATE_JOIN: the stream join of ``add``'s producer, right before its reader
+            add_join()
         y = combine_rows(l2, inv, T, K, add=add)
         ctx.has_add = add is not None
         ctx.save_for_backward(xT, xTs, aT, aTs, l1, route_w, rowmap, inv, poffs, preal)
@@ -284,6 +340,11 @@ class _FP8BlockMoE(torch.autograd.Function):
         jobs = ((w2, dT, dTs, aT, aTs, H, I), (w1, gT, gTs, xT, xTs, 2 * I, H))
         mgs = [_setup_accum(w, ctx.accumulate) for w, *_ in jobs]
         deferred = _overlap.enabled("MOE_WGRAD") and all(mg is not None for mg in mgs)
+        if ctx.perm_r is not None and not deferred:
+            # route3: the static LPT order of the precomputed tables (same int32 order), serial path only. On the
+            # deferred side stream the LPT launch stays: without it the persistent vkq wgrad is issued before the
+            # fc1 dgrad and takes every CU first (in-step the dgrad went 155 -> 296 us, MoE bwd +20..+37 us/layer).
+            order_lpt = lambda _poffs, _p=ctx.perm_r: _p  # noqa: E731
         if deferred:
             # PRIMUS_OVERLAP_MOE_WGRAD=1: the LPT order and both expert wgrads (they only feed the optimizer) run on
             # the side stream next to the fc1 dgrad / combine / router backward; same kernels and inputs -> same bits
@@ -349,7 +410,7 @@ class _FP8BlockMoE(torch.autograd.Function):
                 dtw = route_dw_partials(dwr, inv, ctx.topk_dtype).view(T, K)
             else:
                 dtw = dwr[inv.long()].view(T, K).to(ctx.topk_dtype)
-        return dx, None, dtw, dW1, dW2, None, None, None, None, (dy if ctx.has_add else None)
+        return dx, None, dtw, dW1, dW2, None, None, None, None, (dy if ctx.has_add else None), None, None
 
 
 def fused_mega_moe_fp8blk(
@@ -363,6 +424,8 @@ def fused_mega_moe_fp8blk(
     activation=None,
     accumulate_wgrad: bool = False,
     add: Optional[torch.Tensor] = None,
+    routing=None,
+    add_join=None,
 ) -> torch.Tensor:
     """y [T, H] = sum_k topk_w[t, k] * w2[e] act(w1[e] x[t]) with e = topk_idx[t, k], all GEMMs FP8 128-block.
 
@@ -371,11 +434,15 @@ def fused_mega_moe_fp8blk(
     ``accumulate_wgrad``: add dW straight into ``w.main_grad`` (bf16, Megatron DDP) and set
     ``grad_added_to_main_grad``; the returned weight gradient is then a dummy.
     ``add`` [T, H] bf16 (e.g. the shared expert output): returned y is ``y + add`` with the add fused into the
-    combine kernel (bit-identical to the separate bf16 add; its gradient is dy)."""
+    combine kernel (bit-identical to the separate bf16 add; its gradient is dy).
+    ``routing`` (route3): precomputed pool tables ``(rowmap, route_w, inv, poffs, lpt_perm)`` in build_routing_blk's
+    format for these ``topk_idx`` / ``topk_weights`` (see ``even_routing_tables``); skips the three table kernels.
+    ``add_join`` (route3): callable run right before the combine (e.g. the stream join of the branch that produces
+    ``add``), so everything before the combine can run beside that branch."""
     assert x.dim() == 2 and x.dtype == torch.bfloat16
     assert w1.shape[0] == w2.shape[0] and w1.shape[2] == x.shape[1] and w2.shape[1] == x.shape[1]
     assert w1.shape[1] % 256 == 0 and x.shape[1] % 256 == 0 and w2.shape[2] * 2 == w1.shape[1]
     if add is not None:
         add = add.reshape(x.shape).contiguous()
     return _FP8BlockMoE.apply(x.contiguous(), topk_idx.to(torch.int64).contiguous(), topk_weights, w1, w2, cache1,
-                              cache2, activation, accumulate_wgrad, add)
+                              cache2, activation, accumulate_wgrad, add, routing, add_join)
