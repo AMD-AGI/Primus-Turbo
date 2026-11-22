@@ -24,6 +24,7 @@ from typing import Optional
 
 import torch
 
+from primus_turbo.pytorch.core import overlap as _overlap
 from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad, main_grad_first_write
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_mx_flydsl_gfx1250 import mxgg_fp8blk_nt, mxgk_fp8blk_nt, mxgp_fp8blk_nt
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_nt_flydsl_gfx1250 import flygg_fp8blk_nt
@@ -268,7 +269,33 @@ class _FP8BlockMoE(torch.autograd.Function):
                                                    raw_dw=_FUSE_BWD)
         # experts longest-first (one tiny argsort shared by both wgrads); PRIMUS_TURBO_MOE_FP8BLK_WGRAD_LPT=0: index order
         lpt = os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_WGRAD_LPT", "1") == "1"
-        perm = (expert_order_lpt_fused if _FUSE_BWD else expert_order_lpt)(poffs) if (vkp and lpt) else None
+        order_lpt = expert_order_lpt_fused if _FUSE_BWD else expert_order_lpt
+        jobs = ((w2, dT, dTs, aT, aTs, H, I), (w1, gT, gTs, xT, xTs, 2 * I, H))
+        mgs = [_setup_accum(w, ctx.accumulate) for w, *_ in jobs]
+        deferred = _overlap.enabled("MOE_WGRAD") and all(mg is not None for mg in mgs)
+        if deferred:
+            # PRIMUS_OVERLAP_MOE_WGRAD=1: the LPT order and both expert wgrads (they only feed the optimizer) run on
+            # the side stream next to the fc1 dgrad / combine / router backward; same kernels and inputs -> same bits
+            # (main_grad and the sumsq partials are per weight; nothing reads them before the join).
+            betas = [0.0 if main_grad_first_write(w) else 1.0 for w, *_ in jobs]
+            sqs = [_wgrad_sumsq_buf(w, mg) if vkp else None for (w, *_), mg in zip(jobs, mgs)]
+
+            def side_wgrads():
+                perm_s = order_lpt(poffs) if (vkp and lpt) else None
+                for (w, lhs, lhs_s, rhs, rhs_s, n, k), mg, beta, sq in zip(jobs, mgs, betas, sqs):
+                    if vkp:
+                        flyvkpblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, mg, beta=beta, perm=perm_s,
+                                      kwin_max=_vkp_kwin(T), nbuf=_VKP_NB, sumsq_out=sq, sched2=_VKP_SCHED2)
+                    else:
+                        flyvkblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, mg, beta=beta, **_VK)
+                return perm_s
+
+            _overlap.defer(side_wgrads, dT, dTs, aT, aTs, gT, gTs, xT, xTs, poffs, *mgs, *sqs)
+            for (w, *_), sq in zip(jobs, sqs):
+                w._primus_main_grad_sumsq_fresh = sq is not None
+                w.grad_added_to_main_grad = True
+            jobs = ()  # nothing left for the serial loop below
+        perm = order_lpt(poffs) if (vkp and lpt and not deferred) else None
 
         def wgrad(lhs, rhs, lhs_s, rhs_s, n, k, out, beta, sq=None):
             if vkp:
@@ -278,8 +305,7 @@ class _FP8BlockMoE(torch.autograd.Function):
                 flyvkblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta=beta, **_VK)
 
         grads = []
-        for w, lhs, lhs_s, rhs, rhs_s, n, k in ((w2, dT, dTs, aT, aTs, H, I), (w1, gT, gTs, xT, xTs, 2 * I, H)):
-            mg = _setup_accum(w, ctx.accumulate)
+        for (w, lhs, lhs_s, rhs, rhs_s, n, k), mg in zip(jobs, mgs):
             if mg is not None:
                 # beta 0 on the step's first write into main_grad (framework skipped its clear), else accumulate
                 # every call writes all of main_grad, so with the fold the last call of the step leaves the sum of
@@ -293,7 +319,7 @@ class _FP8BlockMoE(torch.autograd.Function):
                 g = torch.empty((E, n, k), device=w.device, dtype=torch.bfloat16)
                 wgrad(lhs, rhs, lhs_s, rhs_s, n, k, g, 0.0)
                 grads.append(g.to(w.dtype))
-        dW2, dW1 = grads
+        dW2, dW1 = grads if not deferred else (_get_dummy_wgrad(w.shape, w.dtype) for w in (w2, w1))
         dxp = _gg(gq, gs, c1, True, poffs)
         dx = combine_rows(dxp, inv, T, K)
         if _FUSE_BWD:

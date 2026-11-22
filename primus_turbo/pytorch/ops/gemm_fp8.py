@@ -10,6 +10,7 @@ from typing import Optional, Union
 import torch
 
 from primus_turbo.pytorch.core import fp8blk_weight_cache
+from primus_turbo.pytorch.core import overlap as _overlap
 
 from primus_turbo.pytorch.core.backend import (
     BackendType,
@@ -752,15 +753,8 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                 grad_a, grad_b = _dsv4up_dual_bwd(ctx, g_row, b_t, pg, pbt, g_t, a_t, pgt, pat, b_row)
                 if grad_a is not None:
                     return grad_a, grad_b, None, None, None, None, None, None, None
-            # dgrad: dX = dY . W  ->  NT with the FP8 copy of W^T (block scales transposed)
-            if use_d:
-                grad_a = dsv4up_block.gemm_nt(g_row, b_t, pg, pbt, ctx.out_dtype)
-            else:
-                # PRIMUS_TURBO_WQB_SPLITK=<s>: split-K for the deep-K wq_b dgrad (default off; see g90_block.dgrad_split_k)
-                sk = g90_block.dgrad_split_k(g_row.shape[0], b_t.shape[0], g_row.shape[1])
-                grad_a = g90_block.gemm_nt(g_row, b_t, g_re, b_te, ctx.out_dtype, split_k=sk)
-            # wgrad: dW[N,K] = dY^T . X  ->  NT on the token-major copies
-            if ctx.fuse_bgrad_accum:
+            def fused_wgrad():
+                # wgrad: dW[N,K] = dY^T . X  ->  NT on the token-major copies, straight into main_grad
                 mg = ctx.main_grad
                 overwrite = main_grad_first_write(ctx.wparam)
                 if g90_block.accum_supported(mg, b_row.shape[0], a_t.shape[0]) and not (
@@ -768,11 +762,33 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                 ):
                     # beta 0: plain epilogue straight into main_grad (= the unfused GEMM's output bits);
                     # beta 1: old main_grad + acc in fp32, rounded once into main_grad's dtype
-                    wgemm(mg.dtype, out=mg, accumulate=not overwrite)
+                    run = lambda: wgemm(mg.dtype, out=mg, accumulate=not overwrite)  # noqa: E731
                 else:
-                    gb = wgemm(ctx.out_dtype)
-                    mg.copy_(gb) if overwrite else mg.add_(gb)
+                    def run():
+                        gb = wgemm(ctx.out_dtype)
+                        mg.copy_(gb) if overwrite else mg.add_(gb)
                 ctx.main_grad = ctx.wparam = None
+                return mg, run
+
+            # PRIMUS_OVERLAP_WGRAD=1: the fused wgrad goes to the side stream first (it only feeds the optimizer), so
+            # it runs next to the dgrad chain; same kernel, same inputs -> same main_grad bits.
+            deferred = None
+            if ctx.fuse_bgrad_accum and _overlap.enabled("WGRAD"):
+                deferred, run = fused_wgrad()
+                _overlap.defer(run, deferred, g_t, a_t, g_te, a_te,
+                               pgt if use_w else None, pat if use_w else None)
+            # dgrad: dX = dY . W  ->  NT with the FP8 copy of W^T (block scales transposed)
+            if use_d:
+                grad_a = dsv4up_block.gemm_nt(g_row, b_t, pg, pbt, ctx.out_dtype)
+            else:
+                # PRIMUS_TURBO_WQB_SPLITK=<s>: split-K for the deep-K wq_b dgrad (default off; see g90_block.dgrad_split_k)
+                sk = g90_block.dgrad_split_k(g_row.shape[0], b_t.shape[0], g_row.shape[1])
+                grad_a = g90_block.gemm_nt(g_row, b_t, g_re, b_te, ctx.out_dtype, split_k=sk)
+            if deferred is not None:
+                grad_b = _get_dummy_wgrad(list(deferred.shape), ctx.out_dtype)
+            elif ctx.fuse_bgrad_accum:
+                mg, run = fused_wgrad()
+                run()
                 grad_b = _get_dummy_wgrad(list(mg.shape), ctx.out_dtype)
             else:
                 grad_b = wgemm(ctx.out_dtype)
