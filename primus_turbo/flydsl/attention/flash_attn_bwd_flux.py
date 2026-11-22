@@ -1453,6 +1453,11 @@ def build_flash_attn_bwd_dkdv_module(
     # four-wave form the right pick is the registers per SIMD it leaves free, which is
     # what lets the dQ reduce co-reside (see `_dq_partial_ws` / `_fused_pipelined`).
     flat_wg=256,
+    # epilogue: replaces the dK/dV workspace store of the launch that runs the LAST q split
+    # (qsp_lo = q_split - 1, n_qsp = 1, or q_split = 1); called at trace time as
+    # epilogue(dv_values, dk_values, info), each values a list of (f32x4, kv element index),
+    # info the work-group's coordinates and tensors (see the store below). None = stock store.
+    epilogue=None,
 ):
     """Build the dK/dV KV-outer backward launcher (clean mirror of the forward).
 
@@ -4393,13 +4398,41 @@ def build_flash_attn_bwd_dkdv_module(
                         g_idx = global_idx_kv(kv_row_of(nt, h), d_col)
                         buffer_ops.buffer_store(o_pack, rsrc, g_idx * fx.Index(2), offset_is_bytes=True)
 
+        def _values(accs, scale):
+            vals = []
+            for h in range_constexpr(KV_HALVES):
+                for dt in range_constexpr(DT):
+                    for nt in range_constexpr(NT):
+                        v = Vec(accs[(h * DT + dt) * NT + nt])
+                        if const_expr(scale):
+                            v = v * dk_fold_v4
+                        vals.append((v, global_idx_kv(kv_row_of(nt, h), fx.Index(dt * D_TILE) + kg * fx.Index(4))))
+            return vals
+
         if const_expr(MFMA_TIE):
             # An inline-asm MFMA is invisible to GCNHazardRecognizer, so nothing else inserts these waits.
             rocdl.sched_barrier(0)
             rocdl.s_nop(15)
             rocdl.s_nop(15)
-        _store(dv_accs, dv_rsrc, False)
-        _store(dk_accs, dk_rsrc, True)
+        if const_expr(epilogue is not None and N_QSP == 1 and QSP_LO == Q_SPLIT - 1):
+            epilogue(
+                _values(dv_accs, False),
+                _values(dk_accs, True),
+                dict(
+                    tid=tid,
+                    kv_start=kv_start,
+                    batch_idx=batch_idx,
+                    seq_len_k=seq_len_k_v,
+                    dk_ws=DK,
+                    dv_ws=DV,
+                    params=CuSeqKv,
+                    token_stride=RD_STRIDE_KV,
+                    q_split=Q_SPLIT,
+                ),
+            )
+        else:
+            _store(dv_accs, dv_rsrc, False)
+            _store(dk_accs, dk_rsrc, True)
 
     @flyc.jit
     def launch_flash_attn_bwd_dkdv(
