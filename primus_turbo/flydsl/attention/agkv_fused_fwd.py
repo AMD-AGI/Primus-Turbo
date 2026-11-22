@@ -61,7 +61,7 @@ from primus_turbo.flydsl.attention.agkv_comm_kernel import (
     _unit_field,
 )
 from primus_turbo.flydsl.attention.flash_attn_fwd_stock import emit_dualwave_swp_body
-from primus_turbo.flydsl.deep_ep.common import _asm
+from primus_turbo.flydsl.deep_ep.common import _asm, ld_lds, st_lds
 from primus_turbo.flydsl.fused_collective_gemm.common import BLOCK_THREADS, VEC_I32, copy_rows, i64_base
 from primus_turbo.flydsl.utils.attn_helper_stock import (
     DualwaveKernelContext,
@@ -69,7 +69,16 @@ from primus_turbo.flydsl.utils.attn_helper_stock import (
     dtype_to_elem_type,
 )
 from primus_turbo.flydsl.utils.buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_addr
-from primus_turbo.flydsl.utils.prims import atomic_add, cast, ld, memory_fence, read_clock, spin_timed_out, st
+from primus_turbo.flydsl.utils.prims import (
+    _readfirstlane_i32,
+    atomic_add,
+    cast,
+    ld,
+    memory_fence,
+    read_clock,
+    spin_timed_out,
+    st,
+)
 
 # i64 fields of a save unit, at the push unit's positions (fields 5 / 6 unused, flag -1: none)
 S_SRC, S_SRC_OFF, S_DST, S_DST_OFF, S_BYTES = range(5)
@@ -209,11 +218,22 @@ def _save_unit(thread_index, unit, srcs, dsts, units, block_threads):
         return word, word, v < nvec
 
     for k in range(BLOCK_THREADS // block_threads):
-        copy_rows(thread_index + fx.Int32(k * block_threads), UNIT_BYTES // 16, coords, src_res, dst_res, 0, 0, PUSH_BATCH)
+        copy_rows(
+            thread_index + fx.Int32(k * block_threads),
+            UNIT_BYTES // 16,
+            coords,
+            src_res,
+            dst_res,
+            0,
+            0,
+            PUSH_BATCH,
+        )
 
 
 @ASTRewriter.transform
-def _save_loop(thread_index, block_index, srcs, dsts, units, flag_base, epoch, num_units, grid, block_threads):
+def _save_loop(
+    thread_index, block_index, srcs, dsts, units, flag_base, epoch, num_units, grid, block_threads
+):
     unit = block_index
     while unit < fx.Int32(num_units):
         flag = _unit_field(units, unit, S_FLAG)
@@ -251,12 +271,32 @@ def _comm_role(
             memory_fence(order="acquire", scope="sys")
         if const_expr(not _DBG_NOPUSH):
             _push_loop(
-                thread_index, block_index, srcs, heaps, flags, units, counters, bank_off, epoch, num_units, grid, None, 0,
+                thread_index,
+                block_index,
+                srcs,
+                heaps,
+                flags,
+                units,
+                counters,
+                bank_off,
+                epoch,
+                num_units,
+                grid,
+                None,
+                0,
                 block_threads,
             )
         if const_expr(num_save_units > 0 and not _DBG_NOPUSH):
             _save_loop(
-                thread_index, block_index, save_srcs, save_dsts, save_units, flag_base, epoch, num_save_units, grid,
+                thread_index,
+                block_index,
+                save_srcs,
+                save_dsts,
+                save_units,
+                flag_base,
+                epoch,
+                num_save_units,
+                grid,
                 block_threads,
             )
 
@@ -285,7 +325,12 @@ def _finish(thread_index, nparts, counters, item_id, lds_base, combine):
             memory_fence(order="release", scope="agent")
             done = atomic_add(counters, item_id, fx.Int32(1), scope="agent")
             last = done == nparts - fx.Int32(1)
-            st(lds_base, fx.Int32(0), fx.Int32(ArithValue(last).select(fx.Int32(1), fx.Int32(0))), space="lds")
+            st(
+                lds_base,
+                fx.Int32(0),
+                fx.Int32(ArithValue(last).select(fx.Int32(1), fx.Int32(0))),
+                space="lds",
+            )
             if last:
                 st(counters, item_id, fx.Int32(0))
         fx.gpu.barrier()
@@ -299,19 +344,23 @@ class _AgkvFwdContext(DualwaveKernelContext):
     chunk's first tile after its flag, and its output in a workspace slot unless it is its segment's only
     part."""
 
-    def __init__(self, traits, geo, Q, KL, VL, O, LSE, KB, VB, WS, WSL, items, flag_base, epoch, *args):
+    def __init__(
+        self, traits, geo, Q, KL, VL, O, LSE, KB, VB, WS, WSL, items, flag_base, epoch, *args, zid=None
+    ):
         super().__init__(traits, Q, KL, VL, O, LSE, Q, Q, Q, *args)
         self.geo = geo
         self.KB, self.VB, self.WS, self.WSL = KB, VB, WS, WSL
         self.items = items
         self.flag_base, self.epoch = flag_base, epoch
+        # item x batch + batch index of a claimed work item (persistent launch); else the grid's z - 1
+        self.zid = zid
 
     def _item_field(self, field):
         value = ld(self.items, self.item * fx.Int32(ITEM_FIELDS) + fx.Int32(field), dtype=fx.T.i64)
         return fx.Index(cast(value, fx.T.i32))
 
     def _grid_batch_index(self):
-        z = fx.Int32(fx.Index(gpu.block_idx.z)) - fx.Int32(1)
+        z = self.zid if self.zid is not None else fx.Int32(fx.Index(gpu.block_idx.z)) - fx.Int32(1)
         self.item = z // fx.Int32(self.geo.batch)
         self.seg = self._item_field(I_SEG)
         self.remote = ArithValue(self._item_field(I_REMOTE) != fx.Index(0))
@@ -345,10 +394,12 @@ class _AgkvFwdContext(DualwaveKernelContext):
     def _div(tensor, base_i64, nrec_bytes, nelem):
         shifted = fx.inttoptr(fx.get_iter(tensor).type, base_i64)
         buf_ptr = fx.rocdl.make_buffer_ptr(shifted, num_records_bytes=fx.Int64(nrec_bytes))
-        return fx.logical_divide(fx.make_view(buf_ptr, fx.make_layout(fx.Int32(nelem), fx.Int32(1))), fx.make_layout(1, 1))
+        return fx.logical_divide(
+            fx.make_view(buf_ptr, fx.make_layout(fx.Int32(nelem), fx.Int32(1))), fx.make_layout(1, 1)
+        )
 
-    def _setup(self, shared_storage):
-        super()._setup(shared_storage)
+    def _setup(self, shared_storage, block_ids=None, lds=None):
+        super()._setup(shared_storage, block_ids, lds)
         traits, g = self.traits, self.geo
         bf16 = fx.Index(traits.BF16_BYTES)
         hqd = traits.NUM_HEADS_Q * traits.HEAD_DIM
@@ -365,14 +416,20 @@ class _AgkvFwdContext(DualwaveKernelContext):
         self.q_div = self._div(self.Q, fx.Int64(i64_base(self.Q)) + q_off_b, q_per * bf16, q_per)
         self.slot_g = fx.Index(self.is_q1.select(self.slot, self.slot + fx.Index(g.p1)))
         ws_off = (self.slot_g * fx.Index(g.c * g.batch) + self.batch_idx) * fx.Index(hqd) * bf16
-        o_base = self.final.select(fx.Int64(i64_base(self.O)) + q_off_b, fx.Int64(i64_base(self.WS)) + fx.Int64(ws_off))
+        o_base = self.final.select(
+            fx.Int64(i64_base(self.O)) + q_off_b, fx.Int64(i64_base(self.WS)) + fx.Int64(ws_off)
+        )
         self.o_div = self._div(self.O, fx.Int64(o_base), q_per * bf16, q_per)
-        wsl = fx.Int64(i64_base(self.WSL)) + fx.Int64(self.slot_g * fx.Index(g.batch * g.c * traits.NUM_HEADS_Q * 4))
+        wsl = fx.Int64(i64_base(self.WSL)) + fx.Int64(
+            self.slot_g * fx.Index(g.batch * g.c * traits.NUM_HEADS_Q * 4)
+        )
         lse_base = fx.Int64(self.final.select(fx.Int64(i64_base(self.DebugCounts)), wsl))
         self.lse_rsrc = create_buffer_resource_from_addr(lse_base, num_records_bytes=0xFFFFFFFF)
 
         tok_b = self.stride_kv_n_v * bf16
-        kv_off = fx.Int64(self.src_tok * tok_b + self.batch_idx * fx.Index(traits.NUM_HEADS_KV * traits.HEAD_DIM) * bf16)
+        kv_off = fx.Int64(
+            self.src_tok * tok_b + self.batch_idx * fx.Index(traits.NUM_HEADS_KV * traits.HEAD_DIM) * bf16
+        )
         nrec = self.seqlen_kv_v * tok_b
         nelem = self.seqlen_kv_v * self.stride_kv_n_v
         self.k_div, self.v_div = (
@@ -434,7 +491,8 @@ class _AgkvFwdContext(DualwaveKernelContext):
             valid = [fx.Int32(s) < nparts for s in range(g.p1)]
             lses = [
                 ArithValue(valid[s]).select(
-                    buffer_load(l_res, li + fx.Int32(s * slot_lse), vec_width=1, dtype=f32, mask=valid[s]), neg_inf
+                    buffer_load(l_res, li + fx.Int32(s * slot_lse), vec_width=1, dtype=f32, mask=valid[s]),
+                    neg_inf,
                 )
                 for s in range(g.p1)
             ]
@@ -449,11 +507,15 @@ class _AgkvFwdContext(DualwaveKernelContext):
             for s in range(g.p1):
                 o = fx.arith.extf(
                     f32_vec,
-                    buffer_load(o_res, oi + fx.Int32(s * slot_elems), vec_width=8, dtype=fx.T.bf16, mask=valid[s]),
+                    buffer_load(
+                        o_res, oi + fx.Int32(s * slot_elems), vec_width=8, dtype=fx.T.bf16, mask=valid[s]
+                    ),
                 )
                 term = fx.arith.mulf(o, _vector.broadcast(f32_vec, fx.arith.divf(weights[s], total)))
                 acc = term if acc is None else fx.arith.addf(acc, term)
-            out_i = ((q_row0 + qr) * fx.Int32(b_n) + b) * fx.Int32(hqd) + head * fx.Int32(d) + d8 * fx.Int32(8)
+            out_i = (
+                ((q_row0 + qr) * fx.Int32(b_n) + b) * fx.Int32(hqd) + head * fx.Int32(d) + d8 * fx.Int32(8)
+            )
             buffer_store(fx.arith.trunc_f(bf16_vec, acc), out_res, out_i)
             lse_i = ((seg_lse * fx.Int32(b_n) + b) * fx.Int32(c) + qr) * fx.Int32(hq) + head
             buffer_store(fx.arith.addf(m, fmath.log(total)), lse_res, lse_i, mask=d8 == fx.Int32(0))
@@ -470,6 +532,11 @@ MAX_SLOTS = int(os.environ.get("AGKV_FUSED_MAX_SLOTS", "8"))
 TRACE_BUF = None
 _TRACE_DUMMY = {}
 _XCD_EPOCHS = {}
+# one persistent launch: blocks claim push / attention / save work instead of one block per grid slot
+PERSISTENT = os.environ.get("AGKV_FUSED_PERSISTENT", "1") == "1"
+PERSISTENT_BLOCKS = int(os.environ.get("AGKV_FUSED_BLOCKS", "0"))
+_STATES = {}
+_SAVE_ROWS = {}
 
 
 def _hwreg(reg):
@@ -515,7 +582,19 @@ def _traits(num_heads, num_kv_heads, head_dim, block_m, merge):
 
 @functools.lru_cache(maxsize=32)
 def _build(
-    num_heads, num_kv_heads, head_dim, n, r, c, batch, num_units, num_save_units, push_blocks, block_m, merge, group
+    num_heads,
+    num_kv_heads,
+    head_dim,
+    n,
+    r,
+    c,
+    batch,
+    num_units,
+    num_save_units,
+    push_blocks,
+    block_m,
+    merge,
+    group,
 ):
     traits = _traits(num_heads, num_kv_heads, head_dim, block_m, merge)
     assert BLOCK_THREADS % traits.BLOCK_SIZE == 0, "the push / save units are sized for 512-thread blocks"
@@ -527,8 +606,19 @@ def _build(
     grid = min(push_blocks, grid_x * grid_y, max(num_units, 1))
     lds_dtype = dtype_to_elem_type(traits.DTYPE_STR)
     cache_tag = traits.cache_tag + (
-        n, r, c, batch, num_units, num_save_units, grid, group,
-        _DBG_NOWAIT, _DBG_NOFENCE, _DBG_NOPUSH, _DBG_NOATTN, _DBG_TRACE,
+        n,
+        r,
+        c,
+        batch,
+        num_units,
+        num_save_units,
+        grid,
+        group,
+        _DBG_NOWAIT,
+        _DBG_NOFENCE,
+        _DBG_NOPUSH,
+        _DBG_NOATTN,
+        _DBG_TRACE,
     )
 
     @fx.struct
@@ -568,7 +658,8 @@ def _build(
         thread_index = cast(fx.thread_idx.x, fx.T.i32)
         if const_expr(_DBG_TRACE):
             lin = fx.Int32(
-                (z * fx.Index(grid_y) + fx.Index(gpu.block_idx.y)) * fx.Index(grid_x) + fx.Index(gpu.block_idx.x)
+                (z * fx.Index(grid_y) + fx.Index(gpu.block_idx.y)) * fx.Index(grid_x)
+                + fx.Index(gpu.block_idx.x)
             )
             t_start = read_clock()
             hw = fx.arith.extsi(fx.T.i64, _hwreg(4))
@@ -634,7 +725,10 @@ def _build(
                 item_id,
                 ctx.lds_kv_base_idx,
                 lambda: ctx.combine(
-                    thread_index, fx.Int64(i64_base(WS)), fx.Int64(i64_base(WSL)), fx.Int64(i64_base(O)),
+                    thread_index,
+                    fx.Int64(i64_base(WS)),
+                    fx.Int64(i64_base(WSL)),
+                    fx.Int64(i64_base(O)),
                     fx.Int64(i64_base(LSE)),
                 ),
             )
@@ -737,6 +831,355 @@ def _build(
     return launch, [None]
 
 
+# persistent launch state (int64, zero between launches): schedule claims, blocks out
+ST_CLAIM, ST_EXIT = 0, 1
+STATE_LEN = 2
+
+
+@ASTRewriter.transform
+def _claim(thread_index, state, slot):
+    """The block's next schedule position."""
+    if thread_index == fx.Int32(0):
+        claimed = atomic_add(state, fx.Int32(ST_CLAIM), fx.Int64(1), scope="agent")
+        st_lds(slot, 0, cast(claimed, fx.T.i32))
+    # s_barrier does not wait for LDS traffic: drain the store, then the reads
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    unit = _readfirstlane_i32(ld_lds(slot, 0))
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    return unit
+
+
+@ASTRewriter.transform
+def _exit(thread_index, state, grid):
+    """The last block out resets the state: every block's claims returned before it counted itself."""
+    fx.gpu.barrier()
+    if thread_index == fx.Int32(0):
+        arrived = atomic_add(state, fx.Int32(ST_EXIT), fx.Int64(1), scope="agent")
+        if arrived == fx.Int64(grid - 1):
+            st(state, fx.Int32(ST_EXIT), fx.Int64(0))
+            st(state, fx.Int32(ST_CLAIM), fx.Int64(0))
+
+
+@ASTRewriter.transform
+def _pushers(
+    thread_index, block, push_blocks, srcs, heaps, flags, units, counters, bank_off, epoch, num_units, bt
+):
+    if block < fx.Int32(push_blocks):
+        _push_loop(
+            thread_index,
+            block,
+            srcs,
+            heaps,
+            flags,
+            units,
+            counters,
+            bank_off,
+            epoch,
+            num_units,
+            push_blocks,
+            None,
+            0,
+            bt,
+        )
+
+
+@ASTRewriter.transform
+def _save_one(thread_index, unit, srcs, dsts, units, flag_base, epoch, xcds, block_threads):
+    """Save unit ``unit``, behind its chunk's flag when it reads the bank."""
+    flag = _unit_field(units, unit, S_FLAG)
+    if flag >= fx.Int32(0):
+        if thread_index == fx.Int32(0):
+            _spin_flag(flag_base, flag, epoch)
+        fx.gpu.barrier()
+    _xcd_acquire(flag >= fx.Int32(0), xcds, epoch)
+    _save_unit(thread_index, unit, srcs, dsts, units, block_threads)
+
+
+@ASTRewriter.transform
+def _work_loop(thread_index, state, slot, sched, num_sched, attend, save):
+    """Claim schedule entries until none are left: ``e >= 0`` attention work item ``e``, else save unit
+    ``-1 - e``."""
+    unit = _claim(thread_index, state, slot)
+    while unit < fx.Int32(num_sched):
+        entry = _readfirstlane_i32(cast(ld(sched, unit, dtype=fx.T.i64), fx.T.i32))
+        if entry >= fx.Int32(0):
+            attend(entry)
+        else:
+            save(fx.Int32(-1) - entry)
+        # the next item's LDS writes wait for this one's last reads
+        fx.gpu.barrier()
+        unit = _claim(thread_index, state, slot)
+
+
+@functools.lru_cache(maxsize=32)
+def _build_persistent(
+    num_heads,
+    num_kv_heads,
+    head_dim,
+    n,
+    r,
+    c,
+    batch,
+    num_units,
+    num_save_units,
+    push_blocks,
+    block_m,
+    merge,
+    group,
+    num_sched,
+    grid,
+):
+    traits = _traits(num_heads, num_kv_heads, head_dim, block_m, merge)
+    assert BLOCK_THREADS % traits.BLOCK_SIZE == 0, "the push / save units are sized for 512-thread blocks"
+    assert traits.BLOCK_M * traits.Q_HEADS_PER_WG * (head_dim // 8) % traits.BLOCK_SIZE == 0
+    plan = Plan(n, r, c, group)
+    geo = _Geometry(n, r, c, batch, plan)
+    grid_x, grid_y = num_heads // traits.Q_HEADS_PER_WG, c // traits.BLOCK_M
+    push_blocks = min(push_blocks, grid, max(num_units, 1)) if num_units else 0
+    lds_dtype = dtype_to_elem_type(traits.DTYPE_STR)
+    cache_tag = traits.cache_tag + (
+        "persistent",
+        n,
+        r,
+        c,
+        batch,
+        num_units,
+        num_save_units,
+        push_blocks,
+        group,
+        num_sched,
+        grid,
+        _DBG_NOWAIT,
+        _DBG_NOFENCE,
+    )
+
+    @fx.struct
+    class SharedStorage:
+        kv: fx.Array[lds_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
+        claim: fx.Array[fx.Int32, 4, 16]
+
+    @flyc.kernel(name="agkv_fused_fwd_persistent_kernel", known_block_size=[traits.BLOCK_SIZE, 1, 1])
+    def kernel(
+        Q: fx.Tensor,
+        KL: fx.Tensor,
+        VL: fx.Tensor,
+        KB: fx.Tensor,
+        VB: fx.Tensor,
+        O: fx.Tensor,  # noqa: E741
+        LSE: fx.Tensor,
+        SK: fx.Tensor,
+        SV: fx.Tensor,
+        HEAPS: fx.Tensor,
+        FLAGS: fx.Tensor,
+        UNITS: fx.Tensor,
+        COUNTERS: fx.Tensor,
+        SAVE_UNITS: fx.Tensor,
+        ITEMS: fx.Tensor,
+        SCHED: fx.Tensor,
+        STATE: fx.Tensor,
+        WS: fx.Tensor,
+        WSL: fx.Tensor,
+        DONE: fx.Tensor,
+        XCDS: fx.Tensor,
+        stride_q_n: fx.Int32,
+        stride_kv_n: fx.Int32,
+        bank_off: fx.Int64,
+        epoch: fx.Int64,
+    ):
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        claim_slot = fx.Int32(fx.ptrtoint(lds.claim.ptr))
+        flag_base = ld(i64_base(FLAGS), fx.Int32(r), dtype=fx.T.i64)
+        epoch_v = cast(epoch, fx.T.i64)
+        thread_index = cast(fx.thread_idx.x, fx.T.i32)
+        block = cast(fx.block_idx.x, fx.T.i32)
+        state = i64_base(STATE)
+
+        # the lowest block ids (dispatched first) push this rank's halves, then join the workers
+        _pushers(
+            thread_index,
+            block,
+            push_blocks,
+            [i64_base(KL), i64_base(VL)],
+            i64_base(HEAPS),
+            i64_base(FLAGS),
+            i64_base(UNITS),
+            i64_base(COUNTERS),
+            cast(bank_off, fx.T.i64),
+            epoch_v,
+            num_units,
+            traits.BLOCK_SIZE,
+        )
+
+        def attend(entry):
+            per = fx.Int32(grid_x * grid_y)
+            zid, rest = entry // per, entry % per
+            y, x = rest // fx.Int32(grid_x), rest % fx.Int32(grid_x)
+            ctx = _AgkvFwdContext(
+                traits,
+                geo,
+                Q,
+                KL,
+                VL,
+                O,
+                LSE,
+                KB,
+                VB,
+                WS,
+                WSL,
+                i64_base(ITEMS),
+                flag_base,
+                epoch_v,
+                c,
+                c,
+                stride_q_n,
+                stride_kv_n,
+                head_dim,
+                0,
+                zid=zid,
+            )
+            ctx._setup(None, block_ids=(x, y), lds=lds)
+            if const_expr(not _DBG_NOFENCE):
+                _xcd_acquire(ctx.remote, i64_base(XCDS), epoch_v)
+            emit_dualwave_swp_body(ctx, traits)
+            item_id = (
+                (fx.Int32(ctx.seg) * fx.Int32(batch) + fx.Int32(ctx.batch_idx)) * fx.Int32(grid_y) + y
+            ) * fx.Int32(grid_x) + x
+            _finish(
+                thread_index,
+                fx.Int32(ctx.nparts),
+                i64_base(DONE),
+                item_id,
+                ctx.lds_kv_base_idx,
+                lambda: ctx.combine(
+                    thread_index,
+                    fx.Int64(i64_base(WS)),
+                    fx.Int64(i64_base(WSL)),
+                    fx.Int64(i64_base(O)),
+                    fx.Int64(i64_base(LSE)),
+                ),
+            )
+
+        def save(unit):
+            _save_one(
+                thread_index,
+                unit,
+                [i64_base(t) for t in (KB, VB, KL, VL)],
+                [i64_base(SK), i64_base(SV)],
+                i64_base(SAVE_UNITS),
+                flag_base,
+                epoch_v,
+                i64_base(XCDS),
+                traits.BLOCK_SIZE,
+            )
+
+        _work_loop(thread_index, state, claim_slot, i64_base(SCHED), num_sched, attend, save)
+        _exit(thread_index, state, grid)
+
+    @flyc.jit
+    def launch(
+        Q: fx.Tensor,
+        KL: fx.Tensor,
+        VL: fx.Tensor,
+        KB: fx.Tensor,
+        VB: fx.Tensor,
+        O: fx.Tensor,  # noqa: E741
+        LSE: fx.Tensor,
+        SK: fx.Tensor,
+        SV: fx.Tensor,
+        HEAPS: fx.Tensor,
+        FLAGS: fx.Tensor,
+        UNITS: fx.Tensor,
+        COUNTERS: fx.Tensor,
+        SAVE_UNITS: fx.Tensor,
+        ITEMS: fx.Tensor,
+        SCHED: fx.Tensor,
+        STATE: fx.Tensor,
+        WS: fx.Tensor,
+        WSL: fx.Tensor,
+        DONE: fx.Tensor,
+        XCDS: fx.Tensor,
+        stride_q_n: fx.Int32,
+        stride_kv_n: fx.Int32,
+        bank_off: fx.Int64,
+        epoch: fx.Int64,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        _ = cache_tag
+        kernel(
+            Q,
+            KL,
+            VL,
+            KB,
+            VB,
+            O,
+            LSE,
+            SK,
+            SV,
+            HEAPS,
+            FLAGS,
+            UNITS,
+            COUNTERS,
+            SAVE_UNITS,
+            ITEMS,
+            SCHED,
+            STATE,
+            WS,
+            WSL,
+            DONE,
+            XCDS,
+            stride_q_n,
+            stride_kv_n,
+            bank_off,
+            epoch,
+            value_attrs={
+                "rocdl.waves_per_eu": traits.WAVES_PER_EU,
+                "rocdl.flat_work_group_size": f"{traits.BLOCK_SIZE},{traits.BLOCK_SIZE}",
+                "llvm.passthrough": [
+                    ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
+                    ["no-nans-fp-math", "true"],
+                    ["unsafe-fp-math", "true"],
+                ],
+            },
+        ).launch(grid=(grid, 1, 1), block=(traits.BLOCK_SIZE, 1, 1), stream=stream)
+
+    return launch, [None]
+
+
+def _resident_blocks(traits, device):
+    """Work-groups of this kernel one GPU holds at once (waves per EU and LDS bound)."""
+    props = torch.cuda.get_device_properties(device)
+    waves = traits.WAVES_PER_EU * 4 * 64 // traits.BLOCK_SIZE
+    lds = 160 * 1024 // (traits.LDS_KV_TOTAL_SIZE * 2 + 256)
+    return props.multi_processor_count * max(1, min(waves, lds))
+
+
+@functools.lru_cache(maxsize=64)
+def _schedule(plan, batch, grid_x, grid_y, c, tok, save_rows, device):
+    """Claim order of the persistent launch: the work items in ``plan`` order (each over batch, q block,
+    head group), the own-chunk save units after the own parts and each remote chunk's save units after
+    the first q1 group holding it (its flag is up by then). Attention entries are ``>= 0``, save unit
+    ``u`` is ``-1 - u``."""
+    per_item = batch * grid_y * grid_x
+    own = [u for u, row in enumerate(save_rows) if row[S_FLAG] < 0]
+    by_chunk = {}
+    for u, row in enumerate(save_rows):
+        if row[S_FLAG] >= 0:
+            by_chunk.setdefault(row[S_SRC_OFF] // (c * tok), []).append(u)
+    sched = []
+    for i, item in enumerate(plan.items):
+        sched += range(i * per_item, (i + 1) * per_item)
+        if i == 1:
+            sched += [-1 - u for u in own]
+        if item[I_SEG] == 0 and item[I_REMOTE]:
+            for k in range(item[I_CHUNK], item[I_CHUNK] + item[I_NTILES] * _BLOCK_N // c):
+                sched += [-1 - u for u in by_chunk.pop(k, [])]
+    for units in by_chunk.values():
+        sched += [-1 - u for u in units]
+    return torch.tensor(sched, dtype=torch.int64, device=device), len(sched)
+
+
 @functools.lru_cache(maxsize=64)
 def _launch_plan(num_heads, num_kv_heads, head_dim, n, r, c, batch, device):
     """(group, plan, item table, done counters) of a shape; the counters return to zero after every launch."""
@@ -752,8 +1195,28 @@ def _launch_plan(num_heads, num_kv_heads, head_dim, n, r, c, batch, device):
 
 
 def forward(
-    q, k, v, kb, vb, out, lse, sk, sv, heaps, flags, units, num_units, counters, save_units, num_save_units, n, r,
-    bank_off, epoch, push_blocks, stream,
+    q,
+    k,
+    v,
+    kb,
+    vb,
+    out,
+    lse,
+    sk,
+    sv,
+    heaps,
+    flags,
+    units,
+    num_units,
+    counters,
+    save_units,
+    num_save_units,
+    n,
+    r,
+    bank_off,
+    epoch,
+    push_blocks,
+    stream,
 ):
     """Launch the fused forward of rank ``r`` of ``n``.
 
@@ -769,22 +1232,110 @@ def forward(
     assert plan.slots * c * B * Hq * D * 2 < 1 << 31, "workspace offsets are 32-bit"
     ws = torch.empty((plan.slots, c, B, Hq, D), dtype=q.dtype, device=q.device)
     wsl = torch.empty((plan.slots, B * c, Hq), dtype=torch.float32, device=q.device)
-    launch, compiled = _build(
-        Hq, Hkv, D, n, r, c, B, num_units, num_save_units, push_blocks, block_m, merge, group
-    )
     # epoch of each XCD's last acquire: epochs count the calls of one exchange, so one array per exchange
     xcds = _XCD_EPOCHS.get(flags.data_ptr())
     if xcds is None:
         xcds = _XCD_EPOCHS[flags.data_ptr()] = torch.zeros(16, dtype=torch.int64, device=q.device)
+    if PERSISTENT:
+        traits = _traits(Hq, Hkv, D, block_m, merge)
+        grid_x, grid_y = Hq // traits.Q_HEADS_PER_WG, c // traits.BLOCK_M
+        tok = k[0].numel() * k.element_size()
+        key = (save_units.data_ptr(), num_save_units)
+        save_rows = _SAVE_ROWS.get(key)
+        if save_rows is None:
+            # the save tables are cached by the caller: read each back once
+            rows = save_units[:num_save_units].tolist() if num_save_units else []
+            save_rows = _SAVE_ROWS[key] = tuple(map(tuple, rows))
+        sched, num_sched = _schedule(plan, B, grid_x, grid_y, c, tok, save_rows, q.device)
+        grid = PERSISTENT_BLOCKS or _resident_blocks(traits, q.device)
+        state = _STATES.get(flags.data_ptr())
+        if state is None:
+            state = _STATES[flags.data_ptr()] = torch.zeros(STATE_LEN, dtype=torch.int64, device=q.device)
+        launch, compiled = _build_persistent(
+            Hq,
+            Hkv,
+            D,
+            n,
+            r,
+            c,
+            B,
+            num_units,
+            num_save_units,
+            push_blocks,
+            block_m,
+            merge,
+            group,
+            num_sched,
+            grid,
+        )
+        args = (
+            q,
+            k,
+            v,
+            kb,
+            vb,
+            out,
+            lse,
+            sk,
+            sv,
+            heaps,
+            flags,
+            units,
+            counters,
+            save_units,
+            items,
+            sched,
+            state,
+            ws,
+            wsl,
+            done,
+            xcds,
+            B * Hq * D,
+            B * Hkv * D,
+            bank_off,
+            epoch,
+            stream,
+        )
+        if compiled[0] is None:
+            with CompilationContext.compile_hints(_COMPILE_HINTS):
+                compiled[0] = flyc.compile(launch, *args)
+        else:
+            compiled[0](*args)
+        return
+    launch, compiled = _build(
+        Hq, Hkv, D, n, r, c, B, num_units, num_save_units, push_blocks, block_m, merge, group
+    )
     trace = TRACE_BUF
     if trace is None:
         trace = _TRACE_DUMMY.get(q.device)
         if trace is None:
             trace = _TRACE_DUMMY[q.device] = torch.zeros(4, dtype=torch.int64, device=q.device)
     args = (
-        q, k, v, kb, vb, out, lse, sk, sv, heaps, flags, units, counters, save_units, items, ws, wsl, done, xcds,
+        q,
+        k,
+        v,
+        kb,
+        vb,
+        out,
+        lse,
+        sk,
+        sv,
+        heaps,
+        flags,
+        units,
+        counters,
+        save_units,
+        items,
+        ws,
+        wsl,
+        done,
+        xcds,
         trace,
-        B * Hq * D, B * Hkv * D, bank_off, epoch, stream,
+        B * Hq * D,
+        B * Hkv * D,
+        bank_off,
+        epoch,
+        stream,
     )
     if compiled[0] is None:
         # compiling runs the launch once
