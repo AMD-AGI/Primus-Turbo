@@ -14,7 +14,7 @@
 """The all-gather-KV attention forward as one kernel: K / V exchange and both causal calls (gfx950).
 
 One launch on one stream does what ``mega`` spreads over push, wait, attention and merge kernels on three
-streams. Grid ``(Hq / Q_HEADS_PER_WG, c / BLOCK_M, 1 + 2B)``:
+streams. Grid ``(Hq / Q_HEADS_PER_WG, c / BLOCK_M, 1 + items x B)``:
 
 ``z = 0``
     the first ``push_blocks`` blocks (lowest block ids, so dispatched before any attention block) store
@@ -22,21 +22,22 @@ streams. Grid ``(Hq / Q_HEADS_PER_WG, c / BLOCK_M, 1 + 2B)``:
     units and flags), then copy what the backward needs, ``[ remote | own first | own second ]``, into
     ordinary memory: the own chunks at once, each remote chunk once its flag is up. The other blocks of
     the slice exit.
-``z = 1 .. B``
-    q1 (chunk 2n-1-r) of batch ``z - 1``: keys ``[ remote (rem) | own first | own second ]``.
-``z = B + 1 .. 2B``
-    q0 (chunk r): keys ``[ first halves of 0..r-1 (low) | own first ]``.
+``z = 1 + item x B + b``
+    one part of the keys of q1 (chunk 2n-1-r) or q0 (chunk r) of batch ``b`` (``Plan``): the own part
+    (q1: own first + own second chunk, q0: own chunk; causal), or a group of remote chunks of the forward
+    bank (visible to every query, so unmasked). Items run own parts first, then the remote groups in the
+    order their chunks arrive (first halves, then second halves).
 
-An attention block is the DUALWAVE_SWP flash-attention body with its key tiles reordered: own tiles first
-(they need no wait, and the diagonal ones are the only masked ones), then the remote tiles from the last
-to the first, so a chunk is entered at its last tile. Before loading the K tile a chunk is entered at,
-every wave polls that chunk's flag (sender, half) until it reaches ``epoch``. Every remote key is visible
-to every query, so the online softmax over the reordered tiles is the causal attention over all keys and
-the block stores the final ``out`` / ``lse``; nothing merges afterwards.
+An attention block is the DUALWAVE_SWP flash-attention body over its part's key tiles. Before the first K
+tile of each remote chunk every wave polls that chunk's flag (sender, half) until it reaches ``epoch``.
+A segment of one part stores the final ``out`` / ``lse``; otherwise each part stores its normalized
+output and lse in a workspace slot, counts itself done, and the last part of a (segment, batch, q block,
+head group) merges the slots by their lse into ``out`` / ``lse``.
 
-The banks are ordinary (cached) memory. Every block runs a system-scope acquire before its first read, so
-no XCD's L2 keeps lines of a bank a peer rewrote for this call: after that a line is only cached by a read
-that observed its chunk's flag.
+The banks are ordinary (cached) memory. Before an XCD first reads a bank in a call, one of its blocks runs a
+system-scope acquire (the first remote part there, ``_xcd_acquire``; the comm blocks their own), so no L2
+keeps lines of a bank a peer rewrote for this call: after that a line is only cached by a read that
+observed its chunk's flag.
 """
 
 import functools
@@ -44,10 +45,12 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import flydsl.expr.math as fmath
 import torch
+from flydsl._mlir.dialects import vector as _vector
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import const_expr, gpu
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.utils.arith import ArithValue
 
 from primus_turbo.flydsl.attention.agkv_comm_kernel import (
@@ -65,8 +68,8 @@ from primus_turbo.flydsl.utils.attn_helper_stock import (
     _make_dualwave_swp_traits,
     dtype_to_elem_type,
 )
-from primus_turbo.flydsl.utils.buffer_ops import create_buffer_resource_from_addr
-from primus_turbo.flydsl.utils.prims import cast, ld, memory_fence, read_clock, spin_timed_out, st
+from primus_turbo.flydsl.utils.buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_addr
+from primus_turbo.flydsl.utils.prims import atomic_add, cast, ld, memory_fence, read_clock, spin_timed_out, st
 
 # i64 fields of a save unit, at the push unit's positions (fields 5 / 6 unused, flag -1: none)
 S_SRC, S_SRC_OFF, S_DST, S_DST_OFF, S_BYTES = range(5)
@@ -75,6 +78,14 @@ S_FLAG = 7
 SAVE_SRC_BANK_K, SAVE_SRC_BANK_V, SAVE_SRC_K, SAVE_SRC_V = range(4)
 # this rank's flag array, ``agkv_comm`` order: [first halves | second halves], indexed by sender
 _FLAG_FIRST, _FLAG_SECOND = 0, 1
+
+# i64 fields of a work item: segment (0: q1, 1: q0), remote, first key token in its source (the bank or
+# the local K / V), key tiles (remote), workspace slot, parts of its segment, first bank chunk (remote)
+I_SEG, I_REMOTE, I_SRC_TOK, I_NTILES, I_SLOT, I_NPARTS, I_CHUNK = range(7)
+ITEM_FIELDS = 8
+# delta of a remote part: every query sees every key
+_NO_MASK_DELTA = 1 << 24
+_BLOCK_N = 64
 
 
 def supported(num_heads, num_kv_heads, head_dim, c):
@@ -95,10 +106,63 @@ def bank_chunk_flag(n, r, k):
     return _FLAG_FIRST * n + k - 2 * n1
 
 
+def _groups(lo, hi, size):
+    """Chunks ``[lo, hi)`` in groups of ``size``, aligned to ``hi``, last group first."""
+    out, end = [], hi
+    while end > lo:
+        out.append((max(lo, end - size), end))
+        end = max(lo, end - size)
+    return out
+
+
+class Plan:
+    """Work items of rank ``r``: each segment's own part, then its remote chunks in groups of ``group``.
+
+    q0's remote chunks (first halves of the lower ranks) are the bank's last ``r``, a suffix of q1's first
+    half chunks; both are grouped from the bank's end, so a q0 group covers the chunks of the q1 group it
+    runs beside."""
+
+    def __init__(self, n, r, c, group):
+        self.n, self.r, self.c, self.group = n, r, c, group
+        rem_chunks, n1 = 2 * n - 2 - r, n - 1 - r
+        first, second = _groups(n1, rem_chunks, group), _groups(0, n1, group)
+        low = _groups(rem_chunks - r, rem_chunks, group)
+        self.p1, self.p0 = 1 + len(first) + len(second), 1 + len(low)
+        tiles = c // _BLOCK_N
+        items = [(0, 0, 0, 0, 0, self.p1, -1), (1, 0, 0, 0, 0, self.p0, -1)]
+        slots = [1, 1]
+
+        def remote(seg, lo, hi):
+            items.append((seg, 1, lo * c, (hi - lo) * tiles, slots[seg], (self.p1, self.p0)[seg], lo))
+            slots[seg] += 1
+
+        for i, (lo, hi) in enumerate(first):
+            remote(0, lo, hi)
+            if i < len(low):
+                remote(1, *low[i])
+        for lo, hi in second:
+            remote(0, lo, hi)
+        self.items = tuple(items)
+        # workspace slots: q1's, then q0's (none when its own part is all of it)
+        self.slots0 = self.p0 if self.p0 > 1 else 0
+        self.slots = self.p1 + self.slots0
+
+
+def choose_group(n, r, c, blocks_per_item, max_blocks, max_slots):
+    """Fewest remote chunks per part that keeps the launch within ``max_blocks`` attention blocks and the
+    workspace within ``max_slots`` slots."""
+    rem_chunks = 2 * n - 2 - r
+    for group in range(1, rem_chunks + 1):
+        plan = Plan(n, r, c, group)
+        if len(plan.items) * blocks_per_item <= max_blocks and plan.slots <= max_slots:
+            return group
+    return rem_chunks
+
+
 class _Geometry:
-    def __init__(self, n, r, c, batch):
+    def __init__(self, n, r, c, batch, plan):
         self.n, self.r, self.c, self.batch = n, r, c, batch
-        self.rem, self.low = (2 * n - 2 - r) * c, r * c
+        self.p1, self.p0 = plan.p1, plan.p0
 
 
 @ASTRewriter.transform
@@ -197,36 +261,79 @@ def _comm_role(
             )
 
 
-class _AgkvFwdContext(DualwaveKernelContext):
-    """DualwaveKernelContext of one (segment, batch) of the fused forward: own key tiles first, then the
-    remote ones last to first, each remote chunk entered after its flag."""
+@ASTRewriter.transform
+def _xcd_acquire(need, xcd_epochs, epoch):
+    """System-scope acquire unless a block on this XCD already ran one in this call.
 
-    def __init__(self, traits, geo, Q, KL, VL, O, LSE, KB, VB, flag_base, epoch, *args):
+    It only has to drop the L2 lines a bank kept from earlier calls: in this call a bank line is cached
+    only by a read that observed its chunk's flag."""
+    if need:
+        xcc = fx.Int32(_hwreg(20) & fx.Int32(0xF))
+        if ld(xcd_epochs, xcc, scope="sys", dtype=fx.T.i64) != epoch:
+            memory_fence(order="acquire", scope="sys")
+            st(xcd_epochs, xcc, epoch, scope="sys")
+
+
+@ASTRewriter.transform
+def _finish(thread_index, nparts, counters, item_id, lds_base, combine):
+    """Count this part done; the last part of its item runs ``combine``."""
+    if nparts > fx.Int32(1):
+        fx.rocdl.s_waitcnt(0)
+        fx.gpu.barrier()
+        if thread_index == fx.Int32(0):
+            # the slot stores (retired by every thread) leave this XCD's L2 before the count
+            memory_fence(order="release", scope="agent")
+            done = atomic_add(counters, item_id, fx.Int32(1), scope="agent")
+            last = done == nparts - fx.Int32(1)
+            st(lds_base, fx.Int32(0), fx.Int32(ArithValue(last).select(fx.Int32(1), fx.Int32(0))), space="lds")
+            if last:
+                st(counters, item_id, fx.Int32(0))
+        fx.gpu.barrier()
+        if ld(lds_base, fx.Int32(0), space="lds") != fx.Int32(0):
+            memory_fence(order="acquire", scope="agent")
+            combine()
+
+
+class _AgkvFwdContext(DualwaveKernelContext):
+    """DualwaveKernelContext of one work item (``Plan``) of one batch: its key tiles in order, a remote
+    chunk's first tile after its flag, and its output in a workspace slot unless it is its segment's only
+    part."""
+
+    def __init__(self, traits, geo, Q, KL, VL, O, LSE, KB, VB, WS, WSL, items, flag_base, epoch, *args):
         super().__init__(traits, Q, KL, VL, O, LSE, Q, Q, Q, *args)
         self.geo = geo
-        self.KB, self.VB = KB, VB
+        self.KB, self.VB, self.WS, self.WSL = KB, VB, WS, WSL
+        self.items = items
         self.flag_base, self.epoch = flag_base, epoch
 
+    def _item_field(self, field):
+        value = ld(self.items, self.item * fx.Int32(ITEM_FIELDS) + fx.Int32(field), dtype=fx.T.i64)
+        return fx.Index(cast(value, fx.T.i32))
+
     def _grid_batch_index(self):
-        z = fx.Index(gpu.block_idx.z) - fx.Index(1)
-        # segment 0 = q1 (more work, dispatched first), 1 = q0
-        self.segment = z // fx.Index(self.geo.batch)
-        return z % fx.Index(self.geo.batch)
+        z = fx.Int32(fx.Index(gpu.block_idx.z)) - fx.Int32(1)
+        self.item = z // fx.Int32(self.geo.batch)
+        self.seg = self._item_field(I_SEG)
+        self.remote = ArithValue(self._item_field(I_REMOTE) != fx.Index(0))
+        self.src_tok = self._item_field(I_SRC_TOK)
+        self.ntiles = self._item_field(I_NTILES)
+        self.slot = self._item_field(I_SLOT)
+        self.nparts = self._item_field(I_NPARTS)
+        self.chunk0 = self._item_field(I_CHUNK)
+        return fx.Index(z % fx.Int32(self.geo.batch))
+
+    def _sel(self, a, b):
+        return fx.Index(self.is_q1.select(fx.Index(a), fx.Index(b)))
 
     def _dense_geometry(self):
         g = self.geo
-        is_q1 = ArithValue(self.segment == fx.Index(0))
-
-        def sel(a, b):
-            return fx.Index(is_q1.select(fx.Index(a), fx.Index(b)))
-
-        self.rem_tok = sel(g.rem, g.low)
-        self.rem_tiles = self.rem_tok // fx.Index(self.traits.BLOCK_N)
-        self.q_row0 = sel(g.c, 0)
-        self.bank_tok0 = sel(0, g.rem - g.low)
-        kv_len = self.rem_tok + sel(2 * g.c, g.c)
-        # lse rows: [q0 | q1] x batch x c
-        self.q_tok_base = (sel(1, 0) * fx.Index(g.batch) + self.batch_idx) * fx.Index(g.c)
+        self.is_q1 = ArithValue(self.seg == fx.Index(0))
+        self.final = ArithValue(self.nparts == fx.Index(1))
+        self.own_len = self._sel(2 * g.c, g.c)
+        kv_len = fx.Index(self.remote.select(self.ntiles * fx.Index(_BLOCK_N), self.own_len))
+        # lse rows: final [q0 | q1] x batch x c, a slot batch x c
+        final_base = (self._sel(1, 0) * fx.Index(g.batch) + self.batch_idx) * fx.Index(g.c)
+        self.q_tok_base = fx.Index(self.final.select(final_base, self.batch_idx * fx.Index(g.c)))
         self.kv_tok_base = fx.Index(0)
         self.q_tok_end = self.q_tok_base + fx.Index(g.c)
         self.kv_tok_end = kv_len
@@ -244,56 +351,46 @@ class _AgkvFwdContext(DualwaveKernelContext):
         super()._setup(shared_storage)
         traits, g = self.traits, self.geo
         bf16 = fx.Index(traits.BF16_BYTES)
-        self.own_tiles = self.split_t_end - self.rem_tiles
+        hqd = traits.NUM_HEADS_Q * traits.HEAD_DIM
+        # the own part is causal from its own chunk on (delta c for q1, 0 for q0), a remote part unmasked
+        self.delta_i32 = fx.Int32(
+            self.remote.select(fx.Int32(_NO_MASK_DELTA), fx.Int32(self.own_len - fx.Index(g.c)))
+        )
+        self.split_t_end = fx.Index(self.remote.select(self.ntiles, self.split_t_end))
+        self.causal_end_raw_i32 = fx.Int32(self.q_start + traits.BLOCK_M) + self.delta_i32
+        self.active = ArithValue(self.causal_end_raw_i32 > fx.Int32(0))
 
         q_per = self.seqlen_q_v * self.stride_q_n_v
-        q_off = (self.q_row0 * fx.Index(g.batch) + self.batch_idx) * fx.Index(traits.NUM_HEADS_Q * traits.HEAD_DIM)
-        q_off_b = fx.Int64(q_off * bf16)
+        q_off_b = fx.Int64((self._sel(g.c, 0) * fx.Index(g.batch) + self.batch_idx) * fx.Index(hqd) * bf16)
         self.q_div = self._div(self.Q, fx.Int64(i64_base(self.Q)) + q_off_b, q_per * bf16, q_per)
-        self.o_div = self._div(self.O, fx.Int64(i64_base(self.O)) + q_off_b, q_per * bf16, q_per)
+        self.slot_g = fx.Index(self.is_q1.select(self.slot, self.slot + fx.Index(g.p1)))
+        ws_off = (self.slot_g * fx.Index(g.c * g.batch) + self.batch_idx) * fx.Index(hqd) * bf16
+        o_base = self.final.select(fx.Int64(i64_base(self.O)) + q_off_b, fx.Int64(i64_base(self.WS)) + fx.Int64(ws_off))
+        self.o_div = self._div(self.O, fx.Int64(o_base), q_per * bf16, q_per)
+        wsl = fx.Int64(i64_base(self.WSL)) + fx.Int64(self.slot_g * fx.Index(g.batch * g.c * traits.NUM_HEADS_Q * 4))
+        lse_base = fx.Int64(self.final.select(fx.Int64(i64_base(self.DebugCounts)), wsl))
+        self.lse_rsrc = create_buffer_resource_from_addr(lse_base, num_records_bytes=0xFFFFFFFF)
 
         tok_b = self.stride_kv_n_v * bf16
-        batch_b = self.batch_idx * fx.Index(traits.NUM_HEADS_KV * traits.HEAD_DIM) * bf16
-        rem_off = fx.Int64(self.bank_tok0 * tok_b + batch_b)
-        self.kv_srcs = tuple(
-            (fx.Int64(i64_base(bank)) + rem_off, fx.Int64(i64_base(local)) + fx.Int64(batch_b))
+        kv_off = fx.Int64(self.src_tok * tok_b + self.batch_idx * fx.Index(traits.NUM_HEADS_KV * traits.HEAD_DIM) * bf16)
+        nrec = self.seqlen_kv_v * tok_b
+        nelem = self.seqlen_kv_v * self.stride_kv_n_v
+        self.k_div, self.v_div = (
+            self._div(
+                self.K,
+                fx.Int64(self.remote.select(fx.Int64(i64_base(bank)), fx.Int64(i64_base(local)))) + kv_off,
+                nrec,
+                nelem,
+            )
             for bank, local in ((self.KB, self.K), (self.VB, self.V))
         )
-        self.rem_nrec = fx.Int64(self.rem_tok * tok_b)
-        self.own_nrec = fx.Int64((self.seqlen_kv_v - self.rem_tok) * tok_b)
-        self.kv_nelem = self.seqlen_kv_v * self.stride_kv_n_v
-
-    def tile_start(self, tile_idx):
-        t = fx.Index(tile_idx)
-        own = ArithValue(t < self.own_tiles)
-        phys = fx.Index(own.select(self.rem_tiles + t, self.rem_tiles + self.own_tiles - fx.Index(1) - t))
-        return phys * fx.Index(self.traits.BLOCK_N)
-
-    def causal_mask_prologue_if_needed(self, v_s, tile_idx=None, kv_end_pos=None, *args, kv_end_tile=None, **kw):
-        # logical tile t + 1 is not the physical successor of t once the order turns into the remote keys
-        if tile_idx is None:
-            tile_idx = fx.Index(0)
-        if kv_end_pos is None:
-            kv_end_pos = self.tile_start(tile_idx) + fx.Index(self.traits.BLOCK_N)
-        return super().causal_mask_prologue_if_needed(v_s, tile_idx, kv_end_pos, *args, **kw)
-
-    def _source(self, tile_idx, which):
-        tok = self.tile_start(tile_idx)
-        remote = ArithValue(tok < self.rem_tok)
-        rem_base, own_base = self.kv_srcs[which]
-        base = fx.Int64(remote.select(rem_base, own_base))
-        nrec = fx.Int64(remote.select(self.rem_nrec, self.own_nrec))
-        rel = fx.Index(remote.select(tok, tok - self.rem_tok))
-        return self._div(self.K, base, nrec, self.kv_nelem), rel
 
     def _wait_chunk(self, tile_idx):
-        """Poll the flag of the remote chunk tile ``tile_idx`` enters (its last tile), if it enters one."""
+        """Poll the flag of the remote chunk whose first tile is ``tile_idx``, if it is one."""
         g = self.geo
-        block_n = self.traits.BLOCK_N
-        tok = self.tile_start(tile_idx)
-        last = ArithValue((tok // fx.Index(block_n) + fx.Index(1)) % fx.Index(g.c // block_n) == fx.Index(0))
-        need = ArithValue(tok < self.rem_tok) & last
-        k = (tok + self.bank_tok0) // fx.Index(g.c)
+        tok = fx.Index(tile_idx) * fx.Index(_BLOCK_N)
+        need = self.remote & ArithValue(tok % fx.Index(g.c) == fx.Index(0))
+        k = self.chunk0 + tok // fx.Index(g.c)
         n1 = g.n - 1 - g.r
         second = fx.Index(_FLAG_SECOND * g.n + g.r + 1) + k
         first_hi = fx.Index(_FLAG_FIRST * g.n + g.r + 1 - n1) + k
@@ -305,12 +402,61 @@ class _AgkvFwdContext(DualwaveKernelContext):
     def load_k_tile(self, tile_idx, buf_id):
         if const_expr(not _DBG_NOWAIT):
             self._wait_chunk(tile_idx)
-        div, rel = self._source(tile_idx, 0)
-        self._load_kv(rel, buf_id, self.k_dma_m0, div, self.NUM_DMA_K)
+        super().load_k_tile(tile_idx, buf_id)
 
-    def load_v_tile(self, tile_idx, buf_id):
-        div, rel = self._source(tile_idx, 1)
-        self._load_kv(rel, buf_id, self.v_dma_m0, div, self.NUM_DMA_V)
+    def combine(self, thread_index, ws, wsl, out, lse):
+        """``out`` / ``lse`` of this block's rows and heads from its segment's slots, weighted by their lse."""
+        traits, g = self.traits, self.geo
+        f32, f32_vec, bf16_vec = fx.T.f32, fx.T.vec(8, fx.T.f32), fx.T.vec(8, fx.T.bf16)
+        hq, d, b_n, c = traits.NUM_HEADS_Q, traits.HEAD_DIM, g.batch, g.c
+        hqd, qh, vpr = hq * d, traits.Q_HEADS_PER_WG, d // 8
+        slot_elems, slot_lse = c * b_n * hqd, b_n * c * hq
+        nparts = fx.Int32(self.nparts)
+        slot0 = fx.Int64(self._sel(0, g.p1))
+        o_res = create_buffer_resource_from_addr(
+            ws + slot0 * fx.Int64(slot_elems * 2), num_records_bytes=nparts * fx.Int32(slot_elems * 2)
+        )
+        l_res = create_buffer_resource_from_addr(
+            wsl + slot0 * fx.Int64(slot_lse * 4), num_records_bytes=nparts * fx.Int32(slot_lse * 4)
+        )
+        out_res = create_buffer_resource_from_addr(out, num_records_bytes=2 * c * b_n * hqd * 2)
+        lse_res = create_buffer_resource_from_addr(lse, num_records_bytes=2 * b_n * c * hq * 4)
+        q_row0, seg_lse = fx.Int32(self._sel(c, 0)), fx.Int32(self._sel(1, 0))
+        head0 = fx.Int32(self.h_kv_idx * traits.GQA_GROUP_SIZE + self.group_id * qh)
+        q_start, b = fx.Int32(self.q_start), fx.Int32(self.batch_idx)
+        neg_inf = fx.Float32(float("-inf"))
+        for k in range_constexpr(traits.BLOCK_M * qh * vpr // traits.BLOCK_SIZE):
+            v = thread_index + fx.Int32(k * traits.BLOCK_SIZE)
+            row, j, d8 = v // fx.Int32(qh * vpr), (v // fx.Int32(vpr)) % fx.Int32(qh), v % fx.Int32(vpr)
+            head, qr = head0 + j, q_start + row
+            oi = (qr * fx.Int32(b_n) + b) * fx.Int32(hqd) + head * fx.Int32(d) + d8 * fx.Int32(8)
+            li = (b * fx.Int32(c) + qr) * fx.Int32(hq) + head
+            valid = [fx.Int32(s) < nparts for s in range(g.p1)]
+            lses = [
+                ArithValue(valid[s]).select(
+                    buffer_load(l_res, li + fx.Int32(s * slot_lse), vec_width=1, dtype=f32, mask=valid[s]), neg_inf
+                )
+                for s in range(g.p1)
+            ]
+            m = lses[0]
+            for x in lses[1:]:
+                m = fx.arith.maximumf(m, x)
+            weights = [fmath.exp(fx.arith.subf(x, m)) for x in lses]
+            total = weights[0]
+            for w in weights[1:]:
+                total = fx.arith.addf(total, w)
+            acc = None
+            for s in range(g.p1):
+                o = fx.arith.extf(
+                    f32_vec,
+                    buffer_load(o_res, oi + fx.Int32(s * slot_elems), vec_width=8, dtype=fx.T.bf16, mask=valid[s]),
+                )
+                term = fx.arith.mulf(o, _vector.broadcast(f32_vec, fx.arith.divf(weights[s], total)))
+                acc = term if acc is None else fx.arith.addf(acc, term)
+            out_i = ((q_row0 + qr) * fx.Int32(b_n) + b) * fx.Int32(hqd) + head * fx.Int32(d) + d8 * fx.Int32(8)
+            buffer_store(fx.arith.trunc_f(bf16_vec, acc), out_res, out_i)
+            lse_i = ((seg_lse * fx.Int32(b_n) + b) * fx.Int32(c) + qr) * fx.Int32(hq) + head
+            buffer_store(fx.arith.addf(m, fmath.log(total)), lse_res, lse_i, mask=d8 == fx.Int32(0))
 
 
 _DBG_NOWAIT = os.environ.get("AGKV_FUSED_DBG_NOWAIT") == "1"
@@ -318,8 +464,12 @@ _DBG_NOFENCE = os.environ.get("AGKV_FUSED_DBG_NOFENCE") == "1"
 _DBG_NOPUSH = os.environ.get("AGKV_FUSED_DBG_NOPUSH") == "1"
 _DBG_NOATTN = os.environ.get("AGKV_FUSED_DBG_NOATTN") == "1"
 _DBG_TRACE = os.environ.get("AGKV_FUSED_DBG_TRACE") == "1"
+_DBG_TILE = os.environ.get("AGKV_FUSED_TILE", "128")
+MAX_BLOCKS = int(os.environ.get("AGKV_FUSED_MAX_BLOCKS", "2048"))
+MAX_SLOTS = int(os.environ.get("AGKV_FUSED_MAX_SLOTS", "8"))
 TRACE_BUF = None
 _TRACE_DUMMY = {}
+_XCD_EPOCHS = {}
 
 
 def _hwreg(reg):
@@ -328,6 +478,7 @@ def _hwreg(reg):
     return fx.arith.ArithValue(
         llvm.inline_asm(fx.T.i32, [], f"s_getreg_b32 $0, hwreg({reg})", "=s", has_side_effects=True)
     )
+
 
 _COMPILE_HINTS = {
     "fast_fp_math": True,
@@ -340,9 +491,13 @@ _COMPILE_HINTS = {
 }
 
 
-@functools.lru_cache(maxsize=32)
-def _build(num_heads, num_kv_heads, head_dim, n, r, c, batch, num_units, num_save_units, push_blocks, block_m, merge):
-    traits = _make_dualwave_swp_traits(
+def _tile(c):
+    """(BLOCK_M, GQA merge) of the attention blocks."""
+    return {"128": (128, None), "64": (64, None), "128nm": (128, False)}[_DBG_TILE]
+
+
+def _traits(num_heads, num_kv_heads, head_dim, block_m, merge):
+    return _make_dualwave_swp_traits(
         num_heads,
         num_kv_heads,
         head_dim,
@@ -356,12 +511,25 @@ def _build(num_heads, num_kv_heads, head_dim, n, r, c, batch, num_units, num_sav
         gqa_merge=merge,
         sbhd=True,
     )
+
+
+@functools.lru_cache(maxsize=32)
+def _build(
+    num_heads, num_kv_heads, head_dim, n, r, c, batch, num_units, num_save_units, push_blocks, block_m, merge, group
+):
+    traits = _traits(num_heads, num_kv_heads, head_dim, block_m, merge)
     assert BLOCK_THREADS % traits.BLOCK_SIZE == 0, "the push / save units are sized for 512-thread blocks"
-    geo = _Geometry(n, r, c, batch)
+    assert traits.BLOCK_M * traits.Q_HEADS_PER_WG * (head_dim // 8) % traits.BLOCK_SIZE == 0
+    plan = Plan(n, r, c, group)
+    geo = _Geometry(n, r, c, batch, plan)
+    num_items = len(plan.items)
     grid_x, grid_y = num_heads // traits.Q_HEADS_PER_WG, c // traits.BLOCK_M
     grid = min(push_blocks, grid_x * grid_y, max(num_units, 1))
     lds_dtype = dtype_to_elem_type(traits.DTYPE_STR)
-    cache_tag = traits.cache_tag + (n, r, c, batch, num_units, num_save_units, grid, _DBG_NOWAIT, _DBG_NOFENCE, _DBG_NOPUSH, _DBG_NOATTN, _DBG_TRACE)
+    cache_tag = traits.cache_tag + (
+        n, r, c, batch, num_units, num_save_units, grid, group,
+        _DBG_NOWAIT, _DBG_NOFENCE, _DBG_NOPUSH, _DBG_NOATTN, _DBG_TRACE,
+    )
 
     @fx.struct
     class SharedStorage:
@@ -383,6 +551,11 @@ def _build(num_heads, num_kv_heads, head_dim, n, r, c, batch, num_units, num_sav
         UNITS: fx.Tensor,
         COUNTERS: fx.Tensor,
         SAVE_UNITS: fx.Tensor,
+        ITEMS: fx.Tensor,
+        WS: fx.Tensor,
+        WSL: fx.Tensor,
+        DONE: fx.Tensor,
+        XCDS: fx.Tensor,
         TRACE: fx.Tensor,
         stride_q_n: fx.Int32,
         stride_kv_n: fx.Int32,
@@ -392,6 +565,7 @@ def _build(num_heads, num_kv_heads, head_dim, n, r, c, batch, num_units, num_sav
         z = fx.Index(gpu.block_idx.z)
         flag_base = ld(i64_base(FLAGS), fx.Int32(r), dtype=fx.T.i64)
         epoch_v = cast(epoch, fx.T.i64)
+        thread_index = cast(fx.thread_idx.x, fx.T.i32)
         if const_expr(_DBG_TRACE):
             lin = fx.Int32(
                 (z * fx.Index(grid_y) + fx.Index(gpu.block_idx.y)) * fx.Index(grid_x) + fx.Index(gpu.block_idx.x)
@@ -403,7 +577,7 @@ def _build(num_heads, num_kv_heads, head_dim, n, r, c, batch, num_units, num_sav
         def _comm():
             block = fx.Index(gpu.block_idx.y) * fx.Index(grid_x) + fx.Index(gpu.block_idx.x)
             _comm_role(
-                cast(fx.thread_idx.x, fx.T.i32),
+                thread_index,
                 fx.Int32(block),
                 [i64_base(KL), i64_base(VL)],
                 i64_base(HEAPS),
@@ -423,8 +597,6 @@ def _build(num_heads, num_kv_heads, head_dim, n, r, c, batch, num_units, num_sav
             )
 
         def _attention():
-            if const_expr(not _DBG_NOFENCE):
-                memory_fence(order="acquire", scope="sys")
             ctx = _AgkvFwdContext(
                 traits,
                 geo,
@@ -435,17 +607,37 @@ def _build(num_heads, num_kv_heads, head_dim, n, r, c, batch, num_units, num_sav
                 LSE,
                 KB,
                 VB,
+                WS,
+                WSL,
+                i64_base(ITEMS),
                 flag_base,
                 epoch_v,
                 c,
-                geo.rem + 2 * c,
+                c,
                 stride_q_n,
                 stride_kv_n,
                 head_dim,
                 0,
             )
             ctx._setup(SharedStorage)
+            if const_expr(not _DBG_NOFENCE):
+                _xcd_acquire(ctx.remote, i64_base(XCDS), epoch_v)
             emit_dualwave_swp_body(ctx, traits)
+            item_id = (
+                (fx.Int32(ctx.seg) * fx.Int32(batch) + fx.Int32(ctx.batch_idx)) * fx.Int32(grid_y)
+                + fx.Int32(fx.Index(gpu.block_idx.y))
+            ) * fx.Int32(grid_x) + fx.Int32(fx.Index(gpu.block_idx.x))
+            _finish(
+                thread_index,
+                fx.Int32(ctx.nparts),
+                i64_base(DONE),
+                item_id,
+                ctx.lds_kv_base_idx,
+                lambda: ctx.combine(
+                    thread_index, fx.Int64(i64_base(WS)), fx.Int64(i64_base(WSL)), fx.Int64(i64_base(O)),
+                    fx.Int64(i64_base(LSE)),
+                ),
+            )
 
         @flyc.jit
         def _comm_if():
@@ -468,7 +660,7 @@ def _build(num_heads, num_kv_heads, head_dim, n, r, c, batch, num_units, num_sav
 
             @flyc.jit
             def _trace_if():
-                if cast(fx.thread_idx.x, fx.T.i32) == fx.Int32(0):
+                if thread_index == fx.Int32(0):
                     tb = i64_base(TRACE)
                     st(tb, lin * fx.Int32(4), t_start)
                     st(tb, lin * fx.Int32(4) + fx.Int32(1), t_end)
@@ -493,6 +685,11 @@ def _build(num_heads, num_kv_heads, head_dim, n, r, c, batch, num_units, num_sav
         UNITS: fx.Tensor,
         COUNTERS: fx.Tensor,
         SAVE_UNITS: fx.Tensor,
+        ITEMS: fx.Tensor,
+        WS: fx.Tensor,
+        WSL: fx.Tensor,
+        DONE: fx.Tensor,
+        XCDS: fx.Tensor,
         TRACE: fx.Tensor,
         stride_q_n: fx.Int32,
         stride_kv_n: fx.Int32,
@@ -516,6 +713,11 @@ def _build(num_heads, num_kv_heads, head_dim, n, r, c, batch, num_units, num_sav
             UNITS,
             COUNTERS,
             SAVE_UNITS,
+            ITEMS,
+            WS,
+            WSL,
+            DONE,
+            XCDS,
             TRACE,
             stride_q_n,
             stride_kv_n,
@@ -530,17 +732,23 @@ def _build(num_heads, num_kv_heads, head_dim, n, r, c, batch, num_units, num_sav
                     ["unsafe-fp-math", "true"],
                 ],
             },
-        ).launch(grid=(grid_x, grid_y, 1 + 2 * batch), block=(traits.BLOCK_SIZE, 1, 1), stream=stream)
+        ).launch(grid=(grid_x, grid_y, 1 + num_items * batch), block=(traits.BLOCK_SIZE, 1, 1), stream=stream)
 
     return launch, [None]
 
 
-_DBG_TILE = os.environ.get("AGKV_FUSED_TILE", "128")
-
-
-def _tile(c):
-    """(BLOCK_M, GQA merge) of the attention blocks."""
-    return {"128": (128, None), "64": (64, None), "128nm": (128, False)}[_DBG_TILE]
+@functools.lru_cache(maxsize=64)
+def _launch_plan(num_heads, num_kv_heads, head_dim, n, r, c, batch, device):
+    """(group, plan, item table, done counters) of a shape; the counters return to zero after every launch."""
+    block_m, merge = _tile(c)
+    traits = _traits(num_heads, num_kv_heads, head_dim, block_m, merge)
+    grid_x, grid_y = num_heads // traits.Q_HEADS_PER_WG, c // traits.BLOCK_M
+    group = choose_group(n, r, c, grid_x * grid_y * batch, MAX_BLOCKS, MAX_SLOTS)
+    plan = Plan(n, r, c, group)
+    rows = [list(item) + [0] * (ITEM_FIELDS - len(item)) for item in plan.items]
+    items = torch.tensor(rows, dtype=torch.int64, device=device)
+    done = torch.zeros(2 * batch * grid_y * grid_x, dtype=torch.int32, device=device)
+    return group, plan, items, done
 
 
 def forward(
@@ -557,14 +765,25 @@ def forward(
     Hkv = k.shape[2]
     c = S // 2
     block_m, merge = _tile(c)
-    launch, compiled = _build(Hq, Hkv, D, n, r, c, B, num_units, num_save_units, push_blocks, block_m, merge)
+    group, plan, items, done = _launch_plan(Hq, Hkv, D, n, r, c, B, q.device)
+    assert plan.slots * c * B * Hq * D * 2 < 1 << 31, "workspace offsets are 32-bit"
+    ws = torch.empty((plan.slots, c, B, Hq, D), dtype=q.dtype, device=q.device)
+    wsl = torch.empty((plan.slots, B * c, Hq), dtype=torch.float32, device=q.device)
+    launch, compiled = _build(
+        Hq, Hkv, D, n, r, c, B, num_units, num_save_units, push_blocks, block_m, merge, group
+    )
+    # epoch of each XCD's last acquire: epochs count the calls of one exchange, so one array per exchange
+    xcds = _XCD_EPOCHS.get(flags.data_ptr())
+    if xcds is None:
+        xcds = _XCD_EPOCHS[flags.data_ptr()] = torch.zeros(16, dtype=torch.int64, device=q.device)
     trace = TRACE_BUF
     if trace is None:
         trace = _TRACE_DUMMY.get(q.device)
         if trace is None:
             trace = _TRACE_DUMMY[q.device] = torch.zeros(4, dtype=torch.int64, device=q.device)
     args = (
-        q, k, v, kb, vb, out, lse, sk, sv, heaps, flags, units, counters, save_units, trace,
+        q, k, v, kb, vb, out, lse, sk, sv, heaps, flags, units, counters, save_units, items, ws, wsl, done, xcds,
+        trace,
         B * Hq * D, B * Hkv * D, bank_off, epoch, stream,
     )
     if compiled[0] is None:
