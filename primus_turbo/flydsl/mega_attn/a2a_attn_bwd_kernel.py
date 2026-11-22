@@ -366,7 +366,8 @@ def _finish_item(thread_index, band, claim_slot, count_base, band_base, peers_ba
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
     if thread_index == fx.Int32(0):
-        old = atomic_add(count_base, band, fx.Int64(1), scope="agent", order="acq_rel")
+        # release only: an agent-scope acquire invalidates the XCD's L2 under the other resident items
+        old = atomic_add(count_base, band, fx.Int64(1), scope="agent", order="release")
         st_lds(claim_slot, 1, arith.select(old == fx.Int64(ipb - 1), fx.Int32(1), fx.Int32(0)))
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
@@ -520,17 +521,23 @@ def _work_loop(
     band_base = my_base + fx.Int64(REGION_BWD_BAND * FLAG_REGION_BYTES)
     recv_flags = my_base + fx.Int64(REGION_BWD_RECV * FLAG_REGION_BYTES)
     trace_at = c["trace_item_at"]
+    # dO / delta rows from here on were acquired by this block: later items above it skip the wait and
+    # its fence (an agent-scope acquire invalidates the XCD's L2 under the other resident items)
+    acquired = fx.Int32(c["S"])
     unit = claim_unit(opaque_tid(thread_index), state_base, claim_slot, counter=STATE_TILE)
     while unit < fx.Int32(num_claims):
+        k = unit // fx.Int32(ipb)
+        band = arith.select(k < fx.Int32(early), fx.Int32(nb - 1) - k, k - fx.Int32(early))
+        kv_lo = band * fx.Int32(BAND)
+        need = (unit < fx.Int32(ni)) & (kv_lo < acquired)
         if unit < fx.Int32(ni):
-            k = unit // fx.Int32(ipb)
-            band = arith.select(k < fx.Int32(early), fx.Int32(nb - 1) - k, k - fx.Int32(early))
             sub = unit % fx.Int32(ipb)
             if const_expr(trace_base is not None):
                 if thread_index == fx.Int32(0):
                     st(trace_base, fx.Int32(trace_at) + unit * fx.Int32(3), read_clock())
             if const_expr(comm):
-                _wait_suffix(opaque_tid(thread_index), ready_base, band * fx.Int32(BAND), epoch, **c)
+                if need:
+                    _wait_suffix(opaque_tid(thread_index), ready_base, kv_lo, epoch, **c)
             if const_expr(trace_base is not None):
                 if thread_index == fx.Int32(0):
                     st(trace_base, fx.Int32(trace_at) + unit * fx.Int32(3) + fx.Int32(1), read_clock())
@@ -570,6 +577,7 @@ def _work_loop(
                 if const_expr(trace_base is not None):
                     if thread_index == fx.Int32(0):
                         st(trace_base, fx.Int32(c["trace_gather_at"]) + gg, read_clock())
+        acquired = arith.select(need, kv_lo, acquired)
         unit = claim_unit(opaque_tid(thread_index), state_base, claim_slot, counter=STATE_TILE)
 
 
