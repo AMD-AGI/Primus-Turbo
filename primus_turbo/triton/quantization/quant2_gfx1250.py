@@ -139,6 +139,58 @@ def _q2_tile(src, tm, tn, rv_r, rv_c, QR, ER, QT, ET, M, N, FP8_MAX: gl.constexp
 
 
 @gluon.jit
+def _q2_tile8(src, tm, tn, rv_r, rv_c, QR, ER, QT, ET, M, N, FP8_MAX: gl.constexpr, MAX_EXP: gl.constexpr,
+             CONV: gl.constexpr, SLR: gl.constexpr, SLT: gl.constexpr, CTT: gl.constexpr, ZM: gl.constexpr,
+             NW: gl.constexpr):
+    """One [128 rows (tile tm of M), 128 cols (tile tn of N)] bf16 tile in LDS `src`: QR [M, N] + ER (block tn),
+    QT [N, M] + ET (block tm). ZM: zero the rows whose rv_* flag is False (gathered padding rows)."""
+    gl.static_assert(NW == 8)
+    LR: gl.constexpr = gl.DistributedLinearLayout(  # lane = half a row
+        reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]],
+        lane_bases=[[0, 64], [1, 0], [2, 0], [4, 0], [8, 0]], warp_bases=[[16, 0], [32, 0], [64, 0]], block_bases=[],
+        shape=[128, 128])
+    LC: gl.constexpr = gl.DistributedLinearLayout(  # lane = half a column (lane bits 0-2 contiguous: tr16)
+        reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
+        lane_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [64, 0]], warp_bases=[[0, 16], [0, 32], [0, 64]], block_bases=[],
+        shape=[128, 128])
+    # coalesced store layouts (16 contiguous bytes per lane, 8 lanes per 128-byte row) with the same warp -> rows /
+    # columns map as LR / LC, so the regrouping stays inside each warp
+    LSR: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [4, 0], [8, 0]],
+        lane_bases=[[0, 16], [0, 32], [0, 64], [1, 0], [2, 0]], warp_bases=[[16, 0], [32, 0], [64, 0]], block_bases=[],
+        shape=[128, 128])
+    LSC: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 4], [0, 8]],
+        lane_bases=[[16, 0], [32, 0], [64, 0], [0, 1], [0, 2]], warp_bases=[[0, 16], [0, 32], [0, 64]], block_bases=[],
+        shape=[128, 128])
+    # ---- row pass (1x128 along N)
+    x = src.load(LR).to(gl.float32)
+    if ZM:
+        x = gl.where(rv_r[:, None], x, 0.0)
+    q, e = _quant(x, 1, FP8_MAX, MAX_EXP, CONV, QR.dtype.element_ty)
+    q = gl.convert_layout(q, LSR)
+    m_s = tm * 128 + gl.arange(0, 128, layout=gl.SliceLayout(1, LSR))
+    n_s = tn * 128 + gl.arange(0, 128, layout=gl.SliceLayout(0, LSR))
+    gl.store(QR + m_s[:, None].to(gl.int64) * N + n_s[None, :], q)
+    m_r = tm * 128 + gl.arange(0, 128, layout=gl.SliceLayout(1, LR))
+    _store_scale(ER, m_r, tn, e, N // 128, SLR)
+    # ---- column pass (128x1 along M), stored transposed
+    xc = src.load(LC).to(gl.float32)
+    if ZM:
+        xc = gl.where(rv_c[:, None], xc, 0.0)
+    qc, ec = _quant(xc, 0, FP8_MAX, MAX_EXP, CONV, QT.dtype.element_ty)
+    qc = gl.convert_layout(qc, LSC)
+    m_s2 = tm * 128 + gl.arange(0, 128, layout=gl.SliceLayout(1, LSC))
+    n_s2 = tn * 128 + gl.arange(0, 128, layout=gl.SliceLayout(0, LSC))
+    gl.store(QT + n_s2[None, :].to(gl.int64) * M + m_s2[:, None], qc)
+    n_c = tn * 128 + gl.arange(0, 128, layout=gl.SliceLayout(0, LC))
+    if CTT:
+        gl.store(ET + n_c.to(gl.int64) * (M // 128) + tm, ((ec + 127) & 0xFF).to(gl.uint8))
+    else:
+        _store_scale(ET, n_c, tm, ec, M // 128, SLT)
+
+
+@gluon.jit
 def _q2_dense_kernel(X, QR, ER, QT, ET, M, N, stride_x, FP8_MAX: gl.constexpr, MAX_EXP: gl.constexpr,
                      CONV: gl.constexpr, SLR: gl.constexpr, SLT: gl.constexpr, NW: gl.constexpr,
                      NPROG: gl.constexpr, NS: gl.constexpr):
@@ -159,8 +211,12 @@ def _q2_dense_kernel(X, QR, ER, QT, ET, M, N, stride_x, FP8_MAX: gl.constexpr, M
         tdm.async_wait(NS - 2)  # this tile's load (the oldest outstanding) is complete for this wave ...
         gl.barrier()  # ... and for all waves; the slot re-filled below was released by the previous iteration's barrier
         tdm.async_load(xd, [(tl_ % nbm) * 128, (tl_ // nbm) * 128], bufs.index((it + NS - 1) % NS))
-        _q2_tile(bufs.index(it % NS), t % nbm, t // nbm, 0, 0, QR, ER, QT, ET, M, N, FP8_MAX, MAX_EXP, CONV, SLR,
-                 SLT, 0, 0, NW)
+        if NW == 8:
+            _q2_tile8(bufs.index(it % NS), t % nbm, t // nbm, 0, 0, QR, ER, QT, ET, M, N, FP8_MAX, MAX_EXP, CONV,
+                      SLR, SLT, 0, 0, NW)
+        else:
+            _q2_tile(bufs.index(it % NS), t % nbm, t // nbm, 0, 0, QR, ER, QT, ET, M, N, FP8_MAX, MAX_EXP, CONV, SLR,
+                     SLT, 0, 0, NW)
         gl.barrier()
     tdm.async_wait(0)
 
@@ -212,8 +268,13 @@ def _q2_gather_kernel(X, ROWMAP, Q, S, QT, ST, T, P, C, stride_x, PREAL, FP8_MAX
         gl.barrier()
         tdm.async_gather(tdm.update_tensor_descriptor(xd, add_offsets=[0, (tl_ // npt) * 128]), rn.to(gl.int16),
                          bufs.index((it + NS - 1) % NS))
-        _q2_tile(bufs.index(it % NS), pt, t // npt, rv_r, rv_c, Q, S, QT, ST, P, C, FP8_MAX, MAX_EXP, 1, SL, SL,
-                 CT, ZM, NW)
+        if NW == 8:
+            gl.static_assert(ZM == 0)
+            _q2_tile8(bufs.index(it % NS), pt, t // npt, 0, 0, Q, S, QT, ST, P, C, FP8_MAX, MAX_EXP, 1, SL, SL,
+                      CT, 0, NW)
+        else:
+            _q2_tile(bufs.index(it % NS), pt, t // npt, rv_r, rv_c, Q, S, QT, ST, P, C, FP8_MAX, MAX_EXP, 1, SL, SL,
+                     CT, ZM, NW)
         gl.barrier()
     tdm.async_wait(0)
 
@@ -231,6 +292,10 @@ def _mark(kind, *key):
 
 
 LAST = None  # last compiled kernel (tests)
+# PRIMUS_QUANT2_NW (default 4): warps per tile of the bf16 core (q2_dense / q2_gather / q2_dense_pack). 8 = one lane per
+# half row / half column (122 VGPR, 7 KB .text; byte-identical).
+_NW = int(os.environ.get("PRIMUS_QUANT2_NW", "4"))
+assert _NW in (4, 8)
 _NCU = {}
 
 
@@ -254,10 +319,11 @@ def _scale_buf(R, K, sl, dev):
     return torch.empty((R, K // 128), dtype=torch.uint8, device=dev)
 
 
-def q2_dense(x, dtype=torch.float8_e4m3fn, row_layout="g90", t_layout="g90", out=None, nw=4, ns=2, wpc=3,
+def q2_dense(x, dtype=torch.float8_e4m3fn, row_layout="g90", t_layout="g90", out=None, nw=None, ns=2, wpc=3,
              nprog=None):
     """Same outputs as quant_g90.quant_dual_t_e8m0_v2(x, dtype, row_layout=, t_layout=) (with_row, with_t, no sr):
     returns (q_row, None, e8m0_row, q_t, e8m0_t)."""
+    nw = nw or _NW
     assert x.dim() == 2 and x.stride(1) == 1 and x.dtype == torch.bfloat16
     M, N = x.shape
     assert M % 128 == 0 and N % 128 == 0
@@ -275,7 +341,7 @@ def q2_dense(x, dtype=torch.float8_e4m3fn, row_layout="g90", t_layout="g90", out
     fmax = float(torch.finfo(dtype).max)
     for t in (x, qr, er, qt, et):
         assert t.data_ptr() != 0
-    _mark("dense", M, N, slr, slt, str(dtype))
+    _mark("dense", M, N, slr, slt, str(dtype), nw)
     global LAST
     LAST = _q2_dense_kernel[(nprog,)](x, qr, er, qt, et, M, N, x.stride(0), FP8_MAX=fmax,
                                       MAX_EXP=_fp8_max_exp(fmax), CONV=0, SLR=slr, SLT=slt, NW=nw, NPROG=nprog,
@@ -283,10 +349,11 @@ def q2_dense(x, dtype=torch.float8_e4m3fn, row_layout="g90", t_layout="g90", out
     return qr, None, er, qt, et
 
 
-def q2_gather(x, P, rowmap, preal, dtype=torch.float8_e4m3fn, compact_t=False, scale_layout="x4", out=None, nw=4,
+def q2_gather(x, P, rowmap, preal, dtype=torch.float8_e4m3fn, compact_t=False, scale_layout="x4", out=None, nw=None,
               ns=2, wpc=3, nprog=None, zm=0):
     """Same outputs as quant_blk_gfx1250.quant_dual_blk(x, P, rowmap, preal=preal, compact_t=, scale_layout=)
     (live pool tiles only; tiles at or past preal are not written, like the int kernel)."""
+    nw = nw or _NW
     C = x.shape[1]
     T = x.shape[0]
     assert x.dim() == 2 and x.stride(1) == 1 and x.dtype == torch.bfloat16 and P % 128 == 0 and C % 128 == 0
@@ -309,7 +376,7 @@ def q2_gather(x, P, rowmap, preal, dtype=torch.float8_e4m3fn, compact_t=False, s
     fmax = float(torch.finfo(dtype).max)
     for t in (x, rowmap, preal, q, s, qT, sT):
         assert t.data_ptr() != 0
-    _mark("gather", T, C, P, sl, int(compact_t), str(dtype))
+    _mark("gather", T, C, P, sl, int(compact_t), str(dtype), nw)
     global LAST
     LAST = _q2_gather_kernel[(nprog,)](x, rowmap, q, s, qT, sT, T, P, C, x.stride(0), preal, FP8_MAX=fmax,
                                        MAX_EXP=_fp8_max_exp(fmax), SL=sl, CT=int(compact_t), ZM=zm, NW=nw,
@@ -438,3 +505,101 @@ def swb_q2(d_act, l1, w, q, s, qT, sT, gw, preal, alpha, off, glo, ghi, ucl, npr
     LAST = _swb_q2_kernel[(nprog,)](d_act, l1, w, q, s, qT, sT, gw, P, I, preal, ALPHA=alpha, OFF=off, GLO=glo,
                                     GHI=ghi, UCL=ucl, NPROG=nprog, NW=8, num_warps=8)
 
+
+# ----------------------------------------------------------------------------------------------------------------
+# PRIMUS_QUANT2_T2P: quant_g90.quant_dual_pack (MB_PACKQ: activation dual quant + up to two dsv4up weight-scale pack
+# jobs in one launch) on the quant2 dense core; the pack jobs run after each program's tiles.
+@gluon.jit
+def _q2_pack_job(src, dst, s0, s1, KB, RPS, j, n_kcb, NW: gl.constexpr):
+    """quant_g90._mb_pack_job (dsv4up_pack._pack_job, BKC = 8): 128-row block c, 8 K-chunks -> packed int32 words."""
+    LP: gl.constexpr = gl.BlockedLayout([1, 1], [1, 32], [NW // 4, 4], [1, 0])
+    c = j // n_kcb
+    kc = (j % n_kcb) * 8 + gl.arange(0, 8, layout=gl.SliceLayout(1, LP))
+    t = gl.arange(0, 128, layout=gl.SliceLayout(0, LP))
+    row = c * 128 + (t % 4) * 32 + t // 4
+    srow = row // RPS
+    kmask = kc < KB
+    v = gl.load(src + srow[None, :].to(gl.int64) * s0 + kc[:, None].to(gl.int64) * s1, mask=kmask[:, None],
+                other=127)
+    w = v.to(gl.int32) * 0x01010101
+    dst32 = dst.to(gl.pointer_type(gl.int32)) + c.to(gl.int64) * KB * 128
+    gl.store(dst32 + kc[:, None].to(gl.int64) * 128 + t[None, :], w, mask=kmask[:, None])
+
+
+@gluon.jit
+def _q2_dense_pack_kernel(X, QR, ER, QT, ET, M, N, stride_x, s0p, d0p, a0, b0, k0, r0, n0, c0, s1p, d1p, a1, b1, k1,
+                          r1, n1, c1, FP8_MAX: gl.constexpr, MAX_EXP: gl.constexpr, SLR: gl.constexpr,
+                          SLT: gl.constexpr, NW: gl.constexpr, NPROG: gl.constexpr, NS: gl.constexpr):
+    """_q2_dense_kernel (G90) + the pack jobs j = pid, pid + NPROG, ... of two job slots (n0 + n1 jobs) after the
+    tiles. Same bytes as quant_g90._quant_dual_t2p_kernel."""
+    SH: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[128, 8]], [128, 128], [1, 0])
+    pid = gl.program_id(0)
+    nbm = M // 128
+    ntiles = nbm * (N // 128)
+    bufs = gl.allocate_shared_memory(gl.bfloat16, [NS, 128, 128], SH)
+    xd = tdm.make_tensor_descriptor(base=X, shape=(M, N), strides=(stride_x, 1), block_shape=(128, 128), layout=SH)
+    n_my = (ntiles - pid + NPROG - 1) // NPROG
+    for s in gl.static_range(NS - 1):
+        t = gl.minimum(pid + s * NPROG, ntiles - 1)
+        tdm.async_load(xd, [(t % nbm) * 128, (t // nbm) * 128], bufs.index(s))
+    for it in range(0, n_my):
+        t = pid + it * NPROG
+        tl_ = gl.minimum(t + (NS - 1) * NPROG, ntiles - 1)
+        tdm.async_wait(NS - 2)
+        gl.barrier()
+        tdm.async_load(xd, [(tl_ % nbm) * 128, (tl_ // nbm) * 128], bufs.index((it + NS - 1) % NS))
+        if NW == 8:
+            _q2_tile8(bufs.index(it % NS), t % nbm, t // nbm, 0, 0, QR, ER, QT, ET, M, N, FP8_MAX, MAX_EXP, 0, SLR,
+                      SLT, 0, 0, NW)
+        else:
+            _q2_tile(bufs.index(it % NS), t % nbm, t // nbm, 0, 0, QR, ER, QT, ET, M, N, FP8_MAX, MAX_EXP, 0, SLR,
+                     SLT, 0, 0, NW)
+        gl.barrier()
+    tdm.async_wait(0)
+    for j in range(pid, n0 + n1, NPROG):
+        if j < n0:
+            _q2_pack_job(s0p, d0p, a0, b0, k0, r0, j, c0, NW)
+        else:
+            _q2_pack_job(s1p, d1p, a1, b1, k1, r1, j - n0, c1, NW)
+
+
+def q2_dense_pack(x, dtype, row_layout, t_layout, wjobs, ns=2, wpc=3, nw=None):
+    """quant_g90.quant_dual_pack's contract: ((q_row, None, e8m0_row, q_t, e8m0_t), packed list aligned with wjobs)."""
+    nw = nw or _NW
+    assert x.dim() == 2 and x.stride(1) == 1 and x.dtype == torch.bfloat16 and len(wjobs) <= 2
+    M, N = x.shape
+    assert M % 128 == 0 and N % 128 == 0
+    slr = 2 if row_layout in ("packed", "dsv4", 2) else 1
+    slt = 2 if t_layout in ("packed", "dsv4", 2) else 1
+    dev = x.device
+    qr = torch.empty((M, N), dtype=dtype, device=dev)
+    er = _scale_buf(M, N, slr, dev)
+    qt = torch.empty((N, M), dtype=dtype, device=dev)
+    et = _scale_buf(N, M, slt, dev)
+    outs, args, njobs = [], [], []
+    for jb in wjobs:
+        if jb is None:
+            outs.append(None)
+            continue
+        src, rps, R, K = jb
+        assert src.dtype == torch.uint8 and src.dim() == 2 and R % 128 == 0 and K % 128 == 0
+        KB = K // 128
+        assert tuple(src.shape) == ((R // rps), KB) and src.data_ptr() != 0
+        dst = torch.empty((R // 128, K * 4), dtype=torch.uint8, device=dev)
+        outs.append(dst)
+        n_kcb = triton.cdiv(KB, 8)
+        njobs.append((R // 128) * n_kcb)
+        args += [src, dst, src.stride(0), src.stride(1), KB, rps, njobs[-1], n_kcb]
+    while len(njobs) < 2:
+        args += [er, er, 0, 0, 0, 1, 0, 1]  # unused slot (no jobs)
+        njobs.append(0)
+    nprog = min(_ncu(dev) * wpc, (M // 128) * (N // 128))
+    fmax = float(torch.finfo(dtype).max)
+    for t in (x, qr, er, qt, et):
+        assert t.data_ptr() != 0
+    _mark("dense_pack", M, N, slr, slt, str(dtype), tuple(njobs), nw)
+    global LAST
+    LAST = _q2_dense_pack_kernel[(nprog,)](x, qr, er, qt, et, M, N, x.stride(0), *args, FP8_MAX=fmax,
+                                           MAX_EXP=_fp8_max_exp(fmax), SLR=slr, SLT=slt, NW=nw, NPROG=nprog, NS=ns,
+                                           num_warps=nw)
+    return (qr, None, er, qt, et), outs
