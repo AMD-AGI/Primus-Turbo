@@ -62,7 +62,6 @@ from primus_turbo.flydsl.ulysses.common import (
     exit_and_bump_epoch,
     i64_base,
     opaque_tid,
-    spin_flag,
     spin_flags,
 )
 from primus_turbo.flydsl.ulysses.workspace import (
@@ -93,8 +92,11 @@ REGION_FWD_STAGE = 0
 REGION_FWD_READY = 1
 REGION_FWD_O = 2
 
-# rows of one stage / pull unit
+# rows of one pull unit
 BM = 128
+# stage pieces per pull unit: many small pieces in flight finish the first m-tiles early, so the pulls
+# start while the later ones are still staged
+STAGE_SPLIT = 4
 # 16 B vectors per thread in flight in the gather copy
 _GATHER_BATCH = 8
 
@@ -127,14 +129,15 @@ def _global_row(t, src, cs, n):
 
 
 @ASTRewriter.transform
-def _stage_unit(thread_index, m_tile, dst, in_res, stage_res, **c):
-    """Rows ``[m_tile * BM, +BM)`` of ``dst``'s heads of this rank's tensors into ``dst``'s column block of
-    the staging bank, retired on return."""
+def _stage_unit(thread_index, m_sub, dst, in_res, stage_res, **c):
+    """Rows ``[m_sub * rows, +rows)`` (``rows = BM // STAGE_SPLIT``) of ``dst``'s heads of this rank's tensors
+    into ``dst``'s column block of the staging bank, retired on return."""
     M, n, d = c["M"], c["num_ranks"], c["head_dim"]
     heads, offs = c["heads"], c["head_offs"]
     row_vecs_out = n * c["N_r"] // VEC_BF16
     blk_vecs = c["N_r"] // VEC_BF16
-    t0 = m_tile * fx.Int32(BM)
+    rows = BM // STAGE_SPLIT
+    t0 = m_sub * fx.Int32(rows)
     for x in range_constexpr(len(heads)):
         h_vecs = heads[x] * d // VEC_BF16
         row_vecs_in = n * h_vecs
@@ -148,9 +151,9 @@ def _stage_unit(thread_index, m_tile, dst, in_res, stage_res, **c):
             dst_word = (
                 t * fx.Int32(row_vecs_out) + dst * fx.Int32(blk_vecs) + fx.Int32(off) + col
             ) * fx.Int32(VEC_I32)
-            return src_word, dst_word, (r < fx.Int32(BM)) & (t < fx.Int32(M))
+            return src_word, dst_word, (r < fx.Int32(rows)) & (t < fx.Int32(M))
 
-        _copy_rows(thread_index, BM * h_vecs, coords, in_res[x], stage_res, 0, SYS_NT)
+        _copy_rows(thread_index, rows * h_vecs, coords, in_res[x], stage_res, 0, SYS_NT)
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
 
@@ -164,9 +167,9 @@ def _pull_unit(thread_index, src, m_tile, src_heap, bank_offset, out_res, epoch,
     blk_vecs = c["N_r"] // VEC_BF16
     if thread_index == fx.Int32(0):
         flag_base = src_heap + fx.Int64(c["stage_region"] * FLAG_REGION_BYTES)
-        spin_flag(
-            flag_base, m_tile * fx.Int32(n) + fx.Int32(rank), epoch, rank, src, "a2a_attn pull", report=False
-        )
+        flag0 = m_tile * fx.Int32(STAGE_SPLIT * n) + fx.Int32(rank)
+        flag_idxs = [flag0 + fx.Int32(i * n) for i in range(STAGE_SPLIT)]
+        spin_flags(flag_base, flag_idxs, epoch, rank, src, "a2a_attn pull", report=False)
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
     stage_res = create_buffer_resource_from_addr(src_heap + bank_offset, num_records_bytes=c["stage_bytes"])
@@ -196,21 +199,21 @@ def _stage_role(thread_index, state_base, claim_slot, my_base, bank_offset, in_r
     stage_res = create_buffer_resource_from_addr(my_base + bank_offset, num_records_bytes=c["stage_bytes"])
     stage_flags = my_base + fx.Int64(c["stage_region"] * FLAG_REGION_BYTES)
     more_stage = fx.Int32(1)
-    num_pieces = m_tiles * n
+    num_pieces = m_tiles * STAGE_SPLIT * n
     while more_stage == fx.Int32(1):
         piece = claim_unit(opaque_tid(thread_index), state_base, claim_slot, STATE_ASSIST)
         if piece < fx.Int32(num_pieces):
-            m_tile = piece // fx.Int32(n)
+            m_sub = piece // fx.Int32(n)
             # the pullers of m-tile i start with src = dst - i: stage the other ranks' blocks first
             dst = (fx.Int32(rank + 1) + piece % fx.Int32(n)) % fx.Int32(n)
-            _stage_unit(thread_index, m_tile, dst, in_res, stage_res, **c)
+            _stage_unit(thread_index, m_sub, dst, in_res, stage_res, **c)
             if thread_index == fx.Int32(0):
                 # the staging stores are system scope (SYS_NT) and retired above
-                st(stage_flags, m_tile * fx.Int32(n) + dst, epoch, scope="sys", order="relaxed")
+                st(stage_flags, m_sub * fx.Int32(n) + dst, epoch, scope="sys", order="relaxed")
                 if const_expr(trace_base is not None):
                     st(
                         trace_base,
-                        fx.Int32(c.get("trace_stage_at", 0)) + m_tile * fx.Int32(n) + dst,
+                        fx.Int32(c.get("trace_stage_at", 0)) + m_sub * fx.Int32(n) + dst,
                         read_clock(),
                     )
         more_stage = arith.select(piece < fx.Int32(num_pieces), fx.Int32(1), fx.Int32(0))
@@ -420,14 +423,14 @@ TRACE_MAX_BLOCKS = 1024
 def trace_layout(M, num_ranks, hq_r, hkv_r, head_dim):
     """Offsets of the debug timeline (s_memrealtime, 100 MHz): pull unit ends ``[m_tiles * n]``, then
     ``[claim, ready, end]`` per attention item, the gather unit ends ``[m_tiles_o * n]``, the stage piece ends
-    ``[m_tiles * n]`` and the block start times ``[TRACE_MAX_BLOCKS]``; and the total length."""
+    ``[m_tiles * STAGE_SPLIT * n]`` and the block start times ``[TRACE_MAX_BLOCKS]``; and the total length."""
     traits = make_traits(hq_r, hkv_r, head_dim)
     bm = traits.BLOCK_M
     hg = hq_r // traits.Q_HEADS_PER_WG
     attn_at = M // BM * num_ranks
     gather_at = attn_at + 3 * (M * num_ranks // bm) * hg
     stage_at = gather_at + M // bm * num_ranks
-    start_at = stage_at + M // BM * num_ranks
+    start_at = stage_at + M // BM * STAGE_SPLIT * num_ranks
     return attn_at, gather_at, stage_at, start_at, start_at + TRACE_MAX_BLOCKS
 
 
@@ -470,7 +473,7 @@ def _make_kernel(
     hg = hq_r // traits.Q_HEADS_PER_WG
     nqb = S // bm
     m_tiles_o = M // bm
-    assert m_tiles * n <= FLAGS_PER_REGION and m_tiles_o * n * hg <= FLAGS_PER_REGION
+    assert m_tiles * STAGE_SPLIT * n <= FLAGS_PER_REGION and m_tiles_o * n * hg <= FLAGS_PER_REGION
     assert (bm * hq_r * d // VEC_BF16) % (BLOCK_THREADS * _GATHER_BATCH) == 0, (
         "gather unit must be whole copy steps"
     )

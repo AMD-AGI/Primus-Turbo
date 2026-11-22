@@ -27,7 +27,7 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr
 
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
-from primus_turbo.flydsl.mega_attn.a2a_attn_kernel import BM, _pull_role, _stage_role
+from primus_turbo.flydsl.mega_attn.a2a_attn_kernel import BM, STAGE_SPLIT, _pull_role, _stage_role
 from primus_turbo.flydsl.ulysses.a2a_gemm_kernel import _copy_rows
 from primus_turbo.flydsl.ulysses.common import (
     BLOCK_THREADS,
@@ -168,7 +168,7 @@ def _make_kernel(direction, M, rank, num_ranks, h0, h1, h2, head_dim, seq_chunk,
     assert bank_used <= bank_bytes and bank_used < 2**31 and S * max(heads) * d * 2 < 2**31, (
         "i32 byte offsets overflow"
     )
-    assert m_tiles * n <= FLAGS_PER_REGION
+    assert m_tiles * STAGE_SPLIT * n <= FLAGS_PER_REGION
     head_offs = tuple(sum(heads[:x]) for x in range(len(heads)))
     c = dict(
         M=M,
