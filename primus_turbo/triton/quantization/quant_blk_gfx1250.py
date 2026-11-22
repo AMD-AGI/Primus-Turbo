@@ -360,22 +360,31 @@ def interleave_w1(w1: torch.Tensor) -> torch.Tensor:
 
 
 @triton.jit
-def _combine_kernel(Y, INV, OUT, H, K: tl.constexpr, BH: tl.constexpr):
-    """out[t] = sum_k Y[INV[t*K + k]] (bf16 rows, fp32 sum). grid (T, H // BH)."""
+def _combine_kernel(Y, INV, OUT, H, K: tl.constexpr, BH: tl.constexpr, ADD=None, HAS_ADD: tl.constexpr = 0):
+    """out[t] = sum_k Y[INV[t*K + k]] (bf16 rows, fp32 sum). grid (T, H // BH).
+    HAS_ADD: out[t] = bf16(fp32(bf16(sum)) + fp32(ADD[t])), i.e. exactly ``combine + ADD`` as two bf16 ops (the
+    routed + shared expert add of the MoE layer, fuse track)."""
     t = tl.program_id(0)
     h = tl.program_id(1) * BH + tl.arange(0, BH)
     acc = tl.zeros((BH,), dtype=tl.float32)
     for k in tl.static_range(K):
         r = tl.load(INV + t * K + k).to(tl.int64)
         acc += tl.load(Y + r * H + h).to(tl.float32)
-    tl.store(OUT + t.to(tl.int64) * H + h, acc.to(OUT.dtype.element_ty))
+    o = acc.to(OUT.dtype.element_ty)
+    if HAS_ADD:
+        o = (o.to(tl.float32) + tl.load(ADD + t.to(tl.int64) * H + h).to(tl.float32)).to(OUT.dtype.element_ty)
+    tl.store(OUT + t.to(tl.int64) * H + h, o)
 
 
-def combine_rows(y: torch.Tensor, inv: torch.Tensor, T: int, K: int, bh: int = 1024):
-    """y [P, H] pool rows (routing weight already applied), inv int32 [T*K] pool row of route (t, k) -> [T, H]."""
+def combine_rows(y: torch.Tensor, inv: torch.Tensor, T: int, K: int, bh: int = 1024, add: torch.Tensor = None):
+    """y [P, H] pool rows (routing weight already applied), inv int32 [T*K] pool row of route (t, k) -> [T, H].
+    ``add`` [T, H] (same dtype, contiguous): fused ``+ add`` (bit-identical to a separate torch add)."""
     H = y.shape[1]
     out = torch.empty((T, H), device=y.device, dtype=y.dtype)
-    _combine_kernel[(T, H // bh)](y, inv, out, H, K=K, BH=bh, num_warps=4)
+    if add is not None:
+        assert add.shape == (T, H) and add.dtype == y.dtype and add.is_contiguous() and add.data_ptr() != 0
+    _combine_kernel[(T, H // bh)](y, inv, out, H, K=K, BH=bh, ADD=add if add is not None else y,
+                                  HAS_ADD=int(add is not None), num_warps=4)
     return out
 
 

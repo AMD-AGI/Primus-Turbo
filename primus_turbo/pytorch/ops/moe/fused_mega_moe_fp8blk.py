@@ -212,7 +212,7 @@ def _setup_accum(w: torch.Tensor, accumulate: bool):
 
 class _FP8BlockMoE(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, topk_idx, topk_w, w1, w2, c1, c2, activation, accumulate):
+    def forward(ctx, x, topk_idx, topk_w, w1, w2, c1, c2, activation, accumulate, add=None):
         T, H = x.shape
         K = topk_idx.shape[1]
         E, I2, _ = w1.shape
@@ -227,7 +227,8 @@ class _FP8BlockMoE(torch.autograd.Function):
         l1 = _gg(xq, xs, c1, False, poffs)
         aq, as_, aT, aTs = swiglu_fwd_dual_blk(l1, route_w, activation, preal=preal, compact_t=ct)
         l2 = _gg(aq, as_, c2, False, poffs)
-        y = combine_rows(l2, inv, T, K)
+        y = combine_rows(l2, inv, T, K, add=add)
+        ctx.has_add = add is not None
         ctx.save_for_backward(xT, xTs, aT, aTs, l1, route_w, rowmap, inv, poffs, preal)
         ctx.c1, ctx.c2, ctx.w1, ctx.w2 = c1, c2, w1, w2
         ctx.activation, ctx.accumulate, ctx.dims = activation, accumulate, (T, H, K, E, I, P)
@@ -279,7 +280,7 @@ class _FP8BlockMoE(torch.autograd.Function):
             dtw = route_dw_partials(dwr, inv, ctx.topk_dtype).view(T, K)
         else:
             dtw = dwr[inv.long()].view(T, K).to(ctx.topk_dtype)
-        return dx, None, dtw, dW1, dW2, None, None, None, None
+        return dx, None, dtw, dW1, dW2, None, None, None, None, (dy if ctx.has_add else None)
 
 
 def fused_mega_moe_fp8blk(
@@ -292,15 +293,20 @@ def fused_mega_moe_fp8blk(
     cache2: FP8BlockWeightCache,
     activation=None,
     accumulate_wgrad: bool = False,
+    add: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """y [T, H] = sum_k topk_w[t, k] * w2[e] act(w1[e] x[t]) with e = topk_idx[t, k], all GEMMs FP8 128-block.
 
     x [T, H] bf16, w1 [E, 2I, H], w2 [E, H, I] (H, I multiples of 256). ``cache1``/``cache2`` hold the quantized
     weights (``FP8BlockWeightCache(w)``, refreshed by ``refresh_fp8blk_weights()`` after each optimizer step).
     ``accumulate_wgrad``: add dW straight into ``w.main_grad`` (bf16, Megatron DDP) and set
-    ``grad_added_to_main_grad``; the returned weight gradient is then a dummy."""
+    ``grad_added_to_main_grad``; the returned weight gradient is then a dummy.
+    ``add`` [T, H] bf16 (e.g. the shared expert output): returned y is ``y + add`` with the add fused into the
+    combine kernel (bit-identical to the separate bf16 add; its gradient is dy)."""
     assert x.dim() == 2 and x.dtype == torch.bfloat16
     assert w1.shape[0] == w2.shape[0] and w1.shape[2] == x.shape[1] and w2.shape[1] == x.shape[1]
     assert w1.shape[1] % 256 == 0 and x.shape[1] % 256 == 0 and w2.shape[2] * 2 == w1.shape[1]
+    if add is not None:
+        add = add.reshape(x.shape).contiguous()
     return _FP8BlockMoE.apply(x.contiguous(), topk_idx.to(torch.int64).contiguous(), topk_weights, w1, w2, cache1,
-                              cache2, activation, accumulate_wgrad)
+                              cache2, activation, accumulate_wgrad, add)
