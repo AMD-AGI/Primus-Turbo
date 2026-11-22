@@ -34,6 +34,8 @@ FP8_MAX = 448.0
 MX = 32
 # fuse-moe: Gluon TDM-streamed SwiGLU backward (quant_blk_gluon_gfx1250; needs Triton main with gluon cdna5)
 _SWB_TDM = os.environ.get("PRIMUS_FUSE_MOE_SWB_TDM", "0") == "1"
+# quant2: MegaMoE dispatch gather + dual quant on the Gluon quant2 core (quant2_gfx1250.q2_gather; byte-identical)
+_Q2_DQ = os.environ.get("PRIMUS_QUANT2_DQ", "0") == "1"
 
 
 @triton.jit
@@ -181,6 +183,13 @@ def quant_dual_blk(x: torch.Tensor, P: int, rowmap: torch.Tensor = None, dtype=t
     C = x.shape[1]
     assert P % 128 == 0 and C % 128 == 0 and x.stride(1) == 1
     sl = scale_layout_id(scale_layout)
+    if (_Q2_DQ and rowmap is not None and preal is not None and sl in (0, 2) and x.dtype == torch.bfloat16
+            and x.shape[0] < 32768 and rowmap.dtype == torch.int32 and preal.dtype == torch.int32
+            and rowmap.is_contiguous() and preal.is_contiguous() and (x.stride(0) * 2) % 16 == 0
+            and x.data_ptr() % 16 == 0):
+        from primus_turbo.triton.quantization.quant2_gfx1250 import q2_gather
+
+        return q2_gather(x, P, rowmap, preal, dtype=dtype, compact_t=compact_t, scale_layout=sl)
     q, s, qT, sT = _dual_alloc(P, C, dtype, sl, compact_t, x.device)
     _dual_1x128_128x1_kernel[(P // 128, C // 128)](
         x, rowmap if rowmap is not None else x, q, s, qT, sT, P, C, x.stride(0), preal if preal is not None else x,

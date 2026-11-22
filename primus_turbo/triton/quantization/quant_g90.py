@@ -309,6 +309,24 @@ def _mb_qdual_spec():
 _MB_QDUAL = _mb_qdual_spec()
 
 
+def _q2_t2_spec():
+    """PRIMUS_QUANT2_T2 (quant2, default off): comma list of keys <site><N> | <N> | '*' (MB_QDUAL keys) whose
+    quant_dual_t_e8m0_v2 call (row + transposed, no scale_inv, bf16 input) runs the Gluon quant2 core
+    (quant2_gfx1250.q2_dense: TDM tiles, lane-per-row / lane-per-column amax, byte-identical)."""
+    return frozenset(k.strip() for k in os.environ.get("PRIMUS_QUANT2_T2", "").split(",") if k.strip())
+
+
+_Q2_T2 = _q2_t2_spec()
+
+
+def _q2_t2_use(x, site, N, with_row, with_t, with_sr) -> bool:
+    if not _Q2_T2 or not (with_row and with_t) or with_sr or x.dtype != torch.bfloat16:
+        return False
+    if not ({f"{site}{N}", str(N), "*"} & _Q2_T2):
+        return False
+    return x.stride(1) == 1 and (x.stride(0) * 2) % 16 == 0 and x.data_ptr() % 16 == 0
+
+
 def _scale_buf(R, K, sl, dev):
     if sl == SL_PACKED:
         return torch.empty((R // 128, K // 32 * 128), dtype=torch.uint8, device=dev)
@@ -325,6 +343,10 @@ def quant_dual_t_e8m0_v2(x: torch.Tensor, dtype=torch.float8_e4m3fn, with_row=Tr
     assert M % 128 == 0 and N % 128 == 0
     slr, slt = scale_layout_id(row_layout), scale_layout_id(t_layout)
     assert slr in (SL_BYTE, SL_PACKED) and slt in (SL_BYTE, SL_PACKED)
+    if _q2_t2_use(x, site, N, with_row, with_t, with_sr):
+        from primus_turbo.triton.quantization.quant2_gfx1250 import q2_dense
+
+        return q2_dense(x, dtype, row_layout=slr, t_layout=slt)
     dev = x.device
     qr = torch.empty((M, N), dtype=dtype, device=dev) if with_row else None
     sr = torch.empty((M, N // 128), dtype=torch.float32, device=dev) if (with_row and with_sr) else None
