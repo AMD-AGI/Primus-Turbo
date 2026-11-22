@@ -284,7 +284,7 @@ def q2_dense(x, dtype=torch.float8_e4m3fn, row_layout="g90", t_layout="g90", out
 
 
 def q2_gather(x, P, rowmap, preal, dtype=torch.float8_e4m3fn, compact_t=False, scale_layout="x4", out=None, nw=4,
-              ns=2, wpc=3, nprog=None, zm=1):
+              ns=2, wpc=3, nprog=None, zm=0):
     """Same outputs as quant_blk_gfx1250.quant_dual_blk(x, P, rowmap, preal=preal, compact_t=, scale_layout=)
     (live pool tiles only; tiles at or past preal are not written, like the int kernel)."""
     C = x.shape[1]
