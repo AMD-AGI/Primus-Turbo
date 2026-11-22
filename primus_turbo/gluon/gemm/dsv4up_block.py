@@ -126,3 +126,17 @@ def gemm_nt_dual(job0, job1):
     from primus_turbo.gluon.gemm.dsv4up_gemm import dsv4up_dual
 
     return dsv4up_dual(job0, job1)
+
+
+def split_epi_enabled() -> bool:
+    """PRIMUS_TURBO_CONCAT_SPLIT_EPI=1 (default off, fuseattn): the concat-N op runs its forward and its two-weight
+    wgrad as ONE dsv4up launch with the split-output epilogue (one GEMM over the joint N / M, each tile stored into
+    its own output) instead of the dual kernel; outputs bit-identical."""
+    return os.environ.get("PRIMUS_TURBO_CONCAT_SPLIT_EPI", "0") == "1"
+
+
+def gemm_nt_split(a, b, a_packed, b_packed, out0, out1, axis, accumulate=False):
+    """See dsv4up_gemm.dsv4up_gemm_split."""
+    from primus_turbo.gluon.gemm.dsv4up_gemm import dsv4up_gemm_split
+
+    return dsv4up_gemm_split(a, b, a_packed, b_packed, out0, out1, axis, accumulate=accumulate)
