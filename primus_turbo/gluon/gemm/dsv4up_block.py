@@ -108,10 +108,50 @@ def pack_scales(jobs):
     return _pack(jobs)
 
 
+_SMALL = {}
+
+
+def small_tile_of(M, N, K, accumulate) -> str:
+    """PRIMUS_TURBO_DSV4UP_SMALLTILE="MxNxK[a]:tile,..." (default "" = off): run those dsv4up GEMMs (GEMM dims of the
+    call; the "a" suffix selects the beta-1 accumulate call, e.g. a wgrad with the same dims as a dgrad) on the dsv4s
+    smaller-output-tile kernel (tiles in dsv4s_gemm.TILES, e.g. 256x128s3). Bit-identical to dsv4up: same per-output
+    K order and the same WMMA instruction per 128-wide K chunk; only the output tiling changes (more CUs busy)."""
+    spec = os.environ.get("PRIMUS_TURBO_DSV4UP_SMALLTILE", "")
+    if not spec:
+        return ""
+    if spec not in _SMALL:
+        from primus_turbo.gluon.gemm.dsv4s_gemm import TILES
+
+        m = {}
+        for item in filter(None, (t.strip() for t in spec.split(","))):
+            shp, _, tile = item.partition(":")
+            acc = shp.endswith("a")
+            dims = tuple(map(int, shp.rstrip("a").split("x")))
+            if tile not in TILES:
+                _warn_once(("smalltile", item), f"PRIMUS_TURBO_DSV4UP_SMALLTILE: unknown tile {tile!r} in {item!r}")
+                continue
+            m[dims + (acc,)] = tile
+        _SMALL[spec] = m
+    tile = _SMALL[spec].get((M, N, K, bool(accumulate)), "")
+    if tile:
+        from primus_turbo.gluon.gemm.dsv4s_gemm import shape_supported as _ss
+
+        if not _ss(M, N, K, tile):
+            _warn_once(("smalltile", M, N, K, tile), f"dsv4s tile {tile} does not support {M}x{N}x{K} -> dsv4up")
+            return ""
+    return tile
+
+
 def gemm_nt(a, b, a_packed, b_packed, out_dtype=None, out=None, accumulate=False):
     from primus_turbo.gluon.gemm.dsv4up_gemm import dsv4up_gemm
 
     sk = split_k_of(a.shape[0], b.shape[0], a.shape[1])
+    if sk == 1:
+        tile = small_tile_of(a.shape[0], b.shape[0], a.shape[1], accumulate)
+        if tile:
+            from primus_turbo.gluon.gemm.dsv4s_gemm import dsv4s_gemm
+
+            return dsv4s_gemm(a, b, a_packed, b_packed, out=out, out_dtype=out_dtype, accumulate=accumulate, tile=tile)
     return dsv4up_gemm(a, b, a_packed, b_packed, out=out, out_dtype=out_dtype, accumulate=accumulate, split_k=sk)
 
 
@@ -136,7 +176,17 @@ def split_epi_enabled() -> bool:
 
 
 def gemm_nt_split(a, b, a_packed, b_packed, out0, out1, axis, accumulate=False):
-    """See dsv4up_gemm.dsv4up_gemm_split."""
+    """See dsv4up_gemm.dsv4up_gemm_split. PRIMUS_TURBO_DSV4UP_SMALLTILE entries also apply (dsv4s split epilogue) when
+    the split point is a multiple of the tile edge."""
     from primus_turbo.gluon.gemm.dsv4up_gemm import dsv4up_gemm_split
+
+    tile = small_tile_of(a.shape[0], b.shape[0], a.shape[1], accumulate)
+    if tile:
+        from primus_turbo.gluon.gemm.dsv4s_gemm import TILES, dsv4s_gemm_split
+
+        bm, bn, _, _ = TILES[tile]
+        s0 = out0.shape[1] if axis == "n" else out0.shape[0]
+        if s0 % (bn if axis == "n" else bm) == 0:
+            return dsv4s_gemm_split(a, b, a_packed, b_packed, out0, out1, axis, accumulate=accumulate, tile=tile)
 
     return dsv4up_gemm_split(a, b, a_packed, b_packed, out0, out1, axis, accumulate=accumulate)
