@@ -24,32 +24,51 @@ Two mechanisms, both bit-identical to the serial step (same kernels, same inputs
 each microbatch's backward (before grad-norm / optimizer / the next microbatch), so inside a captured CUDA graph the
 forks and joins are edges of the same capture.
 
-Switches (default off; read once at import):
+Switches (default off; read once at import; all off when torch.distributed world size > 1):
   PRIMUS_OVERLAP_WGRAD=1       dense block-FP8 Linear wgrads (dsv4up / g90, fused main_grad) on the side stream
   PRIMUS_OVERLAP_MOE_WGRAD=1   MegaMoE fp8_block expert wgrads (vkp / vk) on the side stream
   PRIMUS_OVERLAP_SHARED=1      (Primus) MoE shared expert forward (and so its backward) on the branch stream
   PRIMUS_OVERLAP_INDEXER=1     (Primus) CSA indexer (forward only) on the "indexer" side stream
-  PRIMUS_OVERLAP_COMPRESSOR=1  (Primus) HCA compressor (pool) forward (and so its backward) on a side stream
+  PRIMUS_OVERLAP_COMPRESSOR=1  (Primus) HCA compressor (pool) forward (and so its backward) on a side stream;
+                               =2 also the CSA layers' compressor
 """
 
 import os
 
 import torch
 
-__all__ = ["enabled", "side_stream", "defer", "join", "pending", "branch", "ForkGrad"]
+__all__ = ["enabled", "level", "side_stream", "defer", "join", "pending", "branch", "ForkGrad"]
 
-_FLAGS = {
-    k: os.environ.get(f"PRIMUS_OVERLAP_{k}", "0") == "1"
-    for k in ("WGRAD", "MOE_WGRAD", "SHARED", "INDEXER", "COMPRESSOR")
-}
+def _level(v: str) -> int:
+    try:
+        return int(v)
+    except ValueError:
+        return 0
+
+
+_SWITCHES = ("WGRAD", "MOE_WGRAD", "SHARED", "INDEXER", "COMPRESSOR")
+_FLAGS = {k: _level(os.environ.get(f"PRIMUS_OVERLAP_{k}", "0")) for k in _SWITCHES}
 _side = {}
 _used = {}  # (device index, name) -> side stream with un-joined work
 _keep = []  # tensors read/written by un-joined deferred work
 
 
+def _single_process() -> bool:
+    """Only measured on one GPU: with any process group (DP / TP / EP / PP > 1) the step stays serial, so no grad
+    reduction launched from a backward hook can race a side-stream wgrad."""
+    import torch.distributed as dist
+
+    return not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1)
+
+
+def level(name: str) -> int:
+    """Value of ``PRIMUS_OVERLAP_<name>`` (read once at import; tests may set ``_FLAGS``); 0 when world size > 1."""
+    v = int(_FLAGS.get(name, 0))
+    return v if (v > 0 and _single_process()) else 0
+
+
 def enabled(name: str) -> bool:
-    """Switch ``PRIMUS_OVERLAP_<name>`` (read once at import; tests may set ``_FLAGS``)."""
-    return _FLAGS.get(name, False)
+    return level(name) > 0
 
 
 def side_stream(name: str = "wgrad", device=None) -> torch.cuda.Stream:
