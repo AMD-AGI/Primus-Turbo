@@ -51,8 +51,8 @@ from primus_turbo.triton.quantization.quant_blk_gfx1250 import (
     swiglu_fwd_dual_blk,
 )
 
-__all__ = ["FP8BlockWeightCache", "even_routing_tables", "fused_mega_moe_fp8blk", "refresh_fp8blk_weights",
-           "routing_pool_rows"]
+__all__ = ["FP8BlockWeightCache", "early_routing_tables", "even_routing_tables", "fused_mega_moe_fp8blk",
+           "refresh_fp8blk_weights", "routing_pool_rows"]
 
 _FP8 = torch.float8_e4m3fn
 _ALIGN = 256
@@ -274,6 +274,17 @@ def even_routing_tables(T: int, K: int, E: int, device):
     return t
 
 
+def early_routing_tables(topk_idx: torch.Tensor, topk_w: torch.Tensor, E: int):
+    """route3 EARLY: the pool tables of ``_FP8BlockMoE.forward`` (same kernels, same inputs -> same bytes), built by the
+    caller wherever it likes (e.g. before a stream join); pass the result as ``routing=``. LPT order: None (the
+    backward builds it as before)."""
+    T, K = topk_idx.shape
+    P = routing_pool_rows(T, K, E)
+    rowmap, rw, inv, poffs, _ = build_routing_blk(topk_idx.to(torch.int64).contiguous(), topk_w.float(), E, P,
+                                                  align=_ALIGN)
+    return (rowmap, rw, inv, poffs, None)
+
+
 class _FP8BlockMoE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, topk_idx, topk_w, w1, w2, c1, c2, activation, accumulate, add=None, routing=None,
@@ -296,6 +307,9 @@ class _FP8BlockMoE(torch.autograd.Function):
         wk = _wgrad_kernel(T)
         ct = wk in ("vkp", "vkq")  # col (token-direction) scales compact for the persistent wgrads
         xq, xs, xT, xTs = quant_dual_blk(x, P, rowmap, preal=preal, compact_t=ct)
+        if add_join is not None and getattr(add_join, "after_dispatch", False):
+            add_join()  # route3 LATE_JOIN=dq: join after the dispatch quant, before fc1
+            add_join = None
         l1 = _gg(xq, xs, c1, False, poffs)
         aq, as_, aT, aTs = swiglu_fwd_dual_blk(l1, route_w, activation, preal=preal, compact_t=ct)
         l2 = _gg(aq, as_, c2, False, poffs)
@@ -323,11 +337,14 @@ class _FP8BlockMoE(torch.autograd.Function):
         # experts longest-first (one tiny argsort shared by both wgrads); PRIMUS_TURBO_MOE_FP8BLK_WGRAD_LPT=0: index order
         lpt = os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_WGRAD_LPT", "1") == "1"
         order_lpt = expert_order_lpt_fused if _FUSE_BWD else expert_order_lpt
-        if ctx.perm_r is not None:  # route3: the static LPT order of the precomputed tables (same int32 order)
-            order_lpt = lambda _poffs, _p=ctx.perm_r: _p  # noqa: E731
         jobs = ((w2, dT, dTs, aT, aTs, H, I), (w1, gT, gTs, xT, xTs, 2 * I, H))
         mgs = [_setup_accum(w, ctx.accumulate) for w, *_ in jobs]
         deferred = _overlap.enabled("MOE_WGRAD") and all(mg is not None for mg in mgs)
+        if ctx.perm_r is not None and not deferred:
+            # route3: the static LPT order of the precomputed tables (same int32 order), serial path only. On the
+            # deferred side stream the LPT launch stays: without it the persistent vkq wgrad is issued before the
+            # fc1 dgrad and takes every CU first (in-step the dgrad went 155 -> 296 us, MoE bwd +20..+37 us/layer).
+            order_lpt = lambda _poffs, _p=ctx.perm_r: _p  # noqa: E731
         if deferred:
             # PRIMUS_OVERLAP_MOE_WGRAD=1: the LPT order and both expert wgrads (they only feed the optimizer) run on
             # the side stream next to the fc1 dgrad / combine / router backward; same kernels and inputs -> same bits
