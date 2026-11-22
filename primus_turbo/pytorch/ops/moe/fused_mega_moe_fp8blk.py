@@ -290,7 +290,10 @@ class _FP8BlockMoE(torch.autograd.Function):
             def side_wgrads():
                 perm_s = order_lpt(poffs) if (vkp and lpt) else None
                 for (w, lhs, lhs_s, rhs, rhs_s, n, k), mg, beta, sq in zip(jobs, mgs, betas, sqs):
-                    if vkp:
+                    if ctx.wk == "vkq":
+                        flyvkqblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, mg, beta=beta, perm=perm_s,
+                                      kwin_max=_vkp_kwin(T), sumsq_out=sq, nbuf=_VKQ_NB if _ALIGN % 256 == 0 else 2)
+                    elif vkp:
                         flyvkpblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, mg, beta=beta, perm=perm_s,
                                       kwin_max=_vkp_kwin(T), nbuf=_VKP_NB, sumsq_out=sq, sched2=_VKP_SCHED2)
                     else:
