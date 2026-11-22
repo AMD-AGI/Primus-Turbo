@@ -3,8 +3,9 @@
 #
 # See LICENSE for license information.
 ###############################################################################
-"""quant2 (PRIMUS_QUANT2_T2 / PRIMUS_QUANT2_DQ, default off): Gluon (Triton main, gluon cdna5) dual FP8 activation
-quant core for gfx1250, byte-identical to quant_g90._quant_dual_t2_kernel and quant_blk_gfx1250._dual_1x128_128x1_kernel.
+"""quant2 (PRIMUS_QUANT2_T2 / _DQ / _SWB, default off): Gluon (Triton main, gluon cdna5) dual FP8 activation
+quant core for gfx1250, byte-identical to quant_g90._quant_dual_t2_kernel, quant_blk_gfx1250._dual_1x128_128x1_kernel and
+quant_blk_gluon_gfx1250._swb_tdm_kernel.
 
 Per 128x128 bf16 tile (persistent programs, NS-stage TDM prefetch ring in LDS, rows padded by 16 B):
   * row pass: one lane per row (ds_load_b128), in-lane 1x128 amax, quantize, regroup in-warp to 16 B x 8 lanes per
@@ -314,3 +315,126 @@ def q2_gather(x, P, rowmap, preal, dtype=torch.float8_e4m3fn, compact_t=False, s
                                        MAX_EXP=_fp8_max_exp(fmax), SL=sl, CT=int(compact_t), ZM=zm, NW=nw,
                                        NPROG=nprog, NS=ns, num_warps=nw)
     return q, s, qT, sT
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# fp32-input variant (values computed in registers, e.g. the MegaMoE SwiGLU backward): the producer stores its fp32
+# tile column-major into LDS (4 consecutive rows per thread -> ds_store_b128), then a column pass (lane = half a
+# column, ds_load_b128) and a row pass (lane = half a row, ds_load_b32) quantize it, 8 warps, FLY convention.
+@gluon.jit
+def _q2f_tile(cbuf, p0, kbq, cq0, ct0, pt, P, CQ, Q, S, QT, ST, MAX_EXP: gl.constexpr, NW: gl.constexpr):
+    """cbuf: [128 rows, 128 cols] fp32 in LDS (column-major). Rows are pool rows p0 + i; row-major copy Q [P, CQ]
+    columns cq0 + j with x4 scale block kbq; transposed copy QT [*, P] rows ct0 + j with compact ST [*, P/128]."""
+    gl.static_assert(NW == 8)
+    # lane = half a row: lane bit 0 -> column bit 2 so the two halves' b32 reads hit different LDS banks
+    LR8: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[[0, 1], [0, 2], [0, 8], [0, 16], [0, 32], [0, 64]],
+        lane_bases=[[0, 4], [1, 0], [2, 0], [4, 0], [8, 0]], warp_bases=[[16, 0], [32, 0], [64, 0]], block_bases=[],
+        shape=[128, 128])
+    LC8: gl.constexpr = gl.BlockedLayout([64, 1], [2, 16], [1, 8], [0, 1])  # lane = half a column
+    LSR8: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [4, 0], [8, 0]],
+        lane_bases=[[0, 16], [0, 32], [0, 64], [1, 0], [2, 0]], warp_bases=[[16, 0], [32, 0], [64, 0]], block_bases=[],
+        shape=[128, 128])
+    LSC8: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 4], [0, 8]],
+        lane_bases=[[16, 0], [32, 0], [64, 0], [0, 1], [0, 2]], warp_bases=[[0, 16], [0, 32], [0, 64]], block_bases=[],
+        shape=[128, 128])
+    # ---- column pass (128x1 along the pool rows) -> QT rows, compact ST
+    xc = cbuf.load(LC8)
+    ec = _e_fly(gl.max(gl.abs(xc), axis=0), MAX_EXP)
+    qc = gl.convert_layout((xc * _p2neg_fly(ec)[None, :]).to(QT.dtype.element_ty), LSC8)
+    r_s = p0 + gl.arange(0, 128, layout=gl.SliceLayout(1, LSC8))
+    c_s = ct0 + gl.arange(0, 128, layout=gl.SliceLayout(0, LSC8))
+    gl.store(QT + c_s[None, :].to(gl.int64) * P + r_s[:, None], qc)
+    c_c = ct0 + gl.arange(0, 128, layout=gl.SliceLayout(0, LC8))
+    gl.store(ST + c_c.to(gl.int64) * (P // 128) + pt, ((ec + 127) & 0xFF).to(gl.uint8))
+    # ---- row pass (1x128 along the channels) -> Q, x4 S
+    xr = cbuf.load(LR8)
+    er = _e_fly(gl.max(gl.abs(xr), axis=1), MAX_EXP)
+    qr = gl.convert_layout((xr * _p2neg_fly(er)[:, None]).to(Q.dtype.element_ty), LSR8)
+    r_s2 = p0 + gl.arange(0, 128, layout=gl.SliceLayout(1, LSR8))
+    c_s2 = cq0 + gl.arange(0, 128, layout=gl.SliceLayout(0, LSR8))
+    gl.store(Q + r_s2[:, None].to(gl.int64) * CQ + c_s2[None, :], qr)
+    r_r = p0 + gl.arange(0, 128, layout=gl.SliceLayout(1, LR8))
+    gl.store(S.to(gl.pointer_type(gl.int32)) + r_r.to(gl.int64) * (CQ // 128) + kbq, ((er + 127) & 0xFF) * 0x01010101)
+
+
+@gluon.jit
+def _sigmoid(x):
+    return 1 / (1 + gl.exp(-x))  # tl.sigmoid's expression (as quant_blk_gluon_gfx1250._sigmoid)
+
+
+@gluon.jit
+def _swb_q2_kernel(DA, L1, W, Q, S, QT, ST, GW, P, I, PREAL, ALPHA: gl.constexpr, OFF: gl.constexpr,
+                   GLO: gl.constexpr, GHI: gl.constexpr, UCL: gl.constexpr, NPROG: gl.constexpr, NW: gl.constexpr):
+    """quant_blk_gluon_gfx1250._swb_tdm_kernel (same loads, math, gw sums in the same layout) with the two dual
+    quants on the quant2 fp32 core (column-major LDS tile, lane-per-half-row / half-column amax)."""
+    L: gl.constexpr = gl.BlockedLayout(size_per_thread=[4, 16], threads_per_warp=[32, 1], warps_per_cta=[1, NW],
+                                       order=[1, 0])
+    SH: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[128, 8]], [128, 128], [1, 0])
+    SC: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[128, 4]], [128, 128], [0, 1])  # column-major fp32
+    pid = gl.program_id(0)
+    nct = I // 128
+    ntiles = (gl.load(PREAL) // 128) * nct
+    gbuf = gl.allocate_shared_memory(gl.bfloat16, [2, 128, 128], SH)
+    ubuf = gl.allocate_shared_memory(gl.bfloat16, [2, 128, 128], SH)
+    dbuf = gl.allocate_shared_memory(gl.bfloat16, [2, 128, 128], SH)
+    cbuf = gl.allocate_shared_memory(gl.float32, [128, 128], SC)
+    l1d = tdm.make_tensor_descriptor(base=L1, shape=(P, 2 * I), strides=(2 * I, 1), block_shape=(128, 128), layout=SH)
+    dad = tdm.make_tensor_descriptor(base=DA, shape=(P, I), strides=(I, 1), block_shape=(128, 128), layout=SH)
+    n_my = (ntiles - pid + NPROG - 1) // NPROG
+    t0 = gl.minimum(pid, ntiles - 1)
+    tdm.async_load(l1d, [(t0 // nct) * 128, (t0 % nct) * 128], gbuf.index(0))
+    tdm.async_load(l1d, [(t0 // nct) * 128, I + (t0 % nct) * 128], ubuf.index(0))
+    tdm.async_load(dad, [(t0 // nct) * 128, (t0 % nct) * 128], dbuf.index(0))
+    for it in range(0, n_my):
+        slot = it % 2
+        t = pid + it * NPROG
+        tn = gl.minimum(t + NPROG, ntiles - 1)  # the last iteration re-loads a valid tile (never read)
+        tdm.async_wait(0)
+        gl.barrier()
+        tdm.async_load(l1d, [(tn // nct) * 128, (tn % nct) * 128], gbuf.index(1 - slot))
+        tdm.async_load(l1d, [(tn // nct) * 128, I + (tn % nct) * 128], ubuf.index(1 - slot))
+        tdm.async_load(dad, [(tn // nct) * 128, (tn % nct) * 128], dbuf.index(1 - slot))
+        pt = t // nct
+        pc = t % nct
+        p = pt * 128 + gl.arange(0, 128, layout=gl.SliceLayout(1, L))
+        g0 = gbuf.index(slot).load(L).to(gl.float32)
+        u0 = ubuf.index(slot).load(L).to(gl.float32)
+        d = dbuf.index(slot).load(L).to(gl.float32)
+        w = gl.load(W + p)
+        g = gl.minimum(gl.maximum(g0, GLO), GHI)
+        u = gl.minimum(gl.maximum(u0, -UCL), UCL)
+        sg = _sigmoid(ALPHA * g)
+        silu = g * sg
+        up = u + OFF
+        gl.store(GW + p.to(gl.int64) * (I // 128) + pc, gl.sum(d * silu * up, axis=1))
+        dw = d * w[:, None]
+        gin = (g0 >= GLO) & (g0 <= GHI)
+        uin = (u0 >= -UCL) & (u0 <= UCL)
+        d_up = gl.where(uin, dw * silu, 0.0)
+        d_gate = gl.where(gin, dw * up * (sg + ALPHA * g * sg * (1.0 - sg)), 0.0)
+        cbuf.store(d_gate)
+        gl.barrier()
+        _q2f_tile(cbuf, pt * 128, pc, pc * 128, pc * 128, pt, P, 2 * I, Q, S, QT, ST, 8, NW)
+        gl.barrier()
+        cbuf.store(d_up)
+        gl.barrier()
+        _q2f_tile(cbuf, pt * 128, pc + I // 128, I + pc * 128, I + pc * 128, pt, P, 2 * I, Q, S, QT, ST, 8, NW)
+        gl.barrier()  # every wave is done with this stage and cbuf before the next iteration overwrites them
+    tdm.async_wait(0)
+
+
+def swb_q2(d_act, l1, w, q, s, qT, sT, gw, preal, alpha, off, glo, ghi, ucl, nprog=None):
+    """quant_blk_gluon_gfx1250.swiglu_bwd_dual_tdm's contract (outputs allocated by swiglu_bwd_dual_blk)."""
+    P, I = d_act.shape
+    assert l1.shape == (P, 2 * I) and P % 128 == 0 and I % 128 == 0
+    for t in (d_act, l1, w, q, s, qT, sT, gw, preal):
+        assert t.is_cuda and t.is_contiguous() and t.data_ptr() != 0
+    nprog = nprog or _ncu(d_act.device)
+    _mark("swb", P, I)
+    global LAST
+    LAST = _swb_q2_kernel[(nprog,)](d_act, l1, w, q, s, qT, sT, gw, P, I, preal, ALPHA=alpha, OFF=off, GLO=glo,
+                                    GHI=ghi, UCL=ucl, NPROG=nprog, NW=8, num_warps=8)
+

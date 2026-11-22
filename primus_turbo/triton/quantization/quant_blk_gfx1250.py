@@ -36,6 +36,8 @@ MX = 32
 _SWB_TDM = os.environ.get("PRIMUS_FUSE_MOE_SWB_TDM", "0") == "1"
 # quant2: MegaMoE dispatch gather + dual quant on the Gluon quant2 core (quant2_gfx1250.q2_gather; byte-identical)
 _Q2_DQ = os.environ.get("PRIMUS_QUANT2_DQ", "0") == "1"
+# quant2: the SWB_TDM kernel's two dual quants on the quant2 fp32 core (quant2_gfx1250.swb_q2; byte-identical)
+_Q2_SWB = os.environ.get("PRIMUS_QUANT2_SWB", "0") == "1"
 
 
 @triton.jit
@@ -350,7 +352,10 @@ def swiglu_bwd_dual_blk(d_act: torch.Tensor, l1: torch.Tensor, w: torch.Tensor, 
     if (_SWB_TDM and preal is not None and compact_t and sl == 0 and not interleaved and dtype == torch.float8_e4m3fn
             and d_act.dtype == torch.bfloat16 and l1.dtype == torch.bfloat16 and w.dtype == torch.float32):
         # fuse-moe (PRIMUS_FUSE_MOE_SWB_TDM=1): Gluon TDM-streamed version, byte-identical outputs
-        from primus_turbo.triton.quantization.quant_blk_gluon_gfx1250 import swiglu_bwd_dual_tdm
+        if _Q2_SWB and preal.dtype == torch.int32:
+            from primus_turbo.triton.quantization.quant2_gfx1250 import swb_q2 as swiglu_bwd_dual_tdm
+        else:
+            from primus_turbo.triton.quantization.quant_blk_gluon_gfx1250 import swiglu_bwd_dual_tdm
 
         swiglu_bwd_dual_tdm(d_act.contiguous(), l1.contiguous(), w.contiguous(), q, s, qT, sT, gw, preal,
                             alpha, off, glo, ghi, ucl)
