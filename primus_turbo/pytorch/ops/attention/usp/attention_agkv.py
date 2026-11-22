@@ -105,11 +105,16 @@ __all__ = ["AGKV_MODES", "attention_agkv"]
 
 AGKV_MODES = ("naive", "serial", "overlap", "mega")
 
-# blocks of a mega push launch, per peer link: fewer leave the link idle, more slow the concurrent attention
-# (n = 2: 8 / 16 / 32 / 48 blocks gave 66.1 / 66.3 / 67.0 / 67.4 ms for one 64K llama3-8b fwd + bwd); 48
-# moved the n = 8 exchange at RCCL speed, 16 / 24 / 32 were 55 / 23 / 18 % slower
-_PUSH_BLOCKS_PER_PEER = 8
-_PUSH_GRID_MAX = 48
+# blocks of a mega push launch: (per peer link, at least, at most in all), always a multiple of the n - 1
+# links, which keeps every block on one link (units alternate between destinations) so no link has fewer
+# blocks than another: at n = 8, 28 blocks ran the forward 30-50 us faster than 24 or 32 at 16K. Fewer
+# blocks leave the links idle, more slow the attention beside them. The forward needs the keys early (28 /
+# 24 / 8 blocks at n = 8 / 4 / 2; at n = 8, 0.5-3 % off fwd + bwd against 48); the backward's pushes run
+# under attention and only need to finish before it does (21 / 9 / 8). The push after q0 without a split
+# q1 has no attention beside it.
+_FWD_PUSH_BLOCKS = (8, 1, 28)
+_BWD_PUSH_BLOCKS = (3, 8, 1 << 30)
+_EXPOSED_PUSH_BLOCKS = (8, 48, 1 << 30)
 
 
 # mega splits q1's backward into the remote keys (non-causal) and its own two chunks (causal, last, under
@@ -118,8 +123,9 @@ _PUSH_GRID_MAX = 48
 _BWD_SPLIT_MIN_KEY_HEADS = 16384
 
 
-def _push_grid(n):
-    return min(_PUSH_BLOCKS_PER_PEER * (n - 1), _PUSH_GRID_MAX)
+def _push_grid(n, blocks):
+    per_peer, least, most = blocks
+    return (n - 1) * max(min(per_peer, most // (n - 1)), -(-least // (n - 1)), 1)
 
 
 def _fwd(q, k, v, softmax_scale):
@@ -479,7 +485,7 @@ def _mega_bwd_plan(n, r, c, tok, bwd_bytes, device):
     return units1, num1, units0, num0, first_flags, second_flags
 
 
-def _mega_push(ex, srcs, units, num_units, bank_off, epoch, addends=None, add_delta=0):
+def _mega_push(ex, srcs, units, num_units, bank_off, epoch, grid, addends=None, add_delta=0):
     if not num_units:
         return
     ex.comm_stream.wait_stream(torch.cuda.current_stream())
@@ -492,7 +498,7 @@ def _mega_push(ex, srcs, units, num_units, bank_off, epoch, addends=None, add_de
         ex.counters,
         bank_off,
         epoch,
-        _push_grid(ex.n),
+        grid,
         ex.comm_stream,
         addends,
         add_delta,
@@ -529,7 +535,7 @@ def _mega_forward(q, k, v, lay, group, softmax_scale, save):
     bank_off = (epoch & 1) * fwd_bytes
     units, num_units, q0_flags, q1_flags = _mega_fwd_plan(n, r, c, tok, fwd_bytes, k.device)
     cur = torch.cuda.current_stream()
-    _mega_push(ex, (k, v), units, num_units, bank_off, epoch)
+    _mega_push(ex, (k, v), units, num_units, bank_off, epoch, _push_grid(n, _FWD_PUSH_BLOCKS))
 
     # local keys first, under the exchange: q0 sees its own chunk, q1 both own chunks; every remote key
     # is visible to every query, so the remote calls are non-causal and merge in by lse
@@ -580,6 +586,7 @@ def _mega_backward(dout, q, kb, vb, out, lse0, lse1, lay, group, scale, det):
     # q0's keys start at row rem - low of q1's: the pushes after q0 add q0's gradient rows of the lower
     # ranks' slots on the fly, the reduce q0's own-chunk rows (from row low), so no add runs between calls
     add_delta = (rem - low) * tok
+    grid, exposed = _push_grid(n, _BWD_PUSH_BLOCKS), _push_grid(n, _EXPOSED_PUSH_BLOCKS)
     dq = torch.empty_like(q)
     if 2 * c * kb.shape[1] * kb.shape[2] >= _BWD_SPLIT_MIN_KEY_HEADS:
         # q1 against the remote keys first: its gradient rows then hold the final slots of the higher ranks
@@ -587,10 +594,10 @@ def _mega_backward(dout, q, kb, vb, out, lse0, lse1, lay, group, scale, det):
         # q1's own part
         own = slice(rem, rem + 2 * c)
         dq1, dk1, dv1 = _bwd_full(dout[c:], q[c:], kb[:rem], vb[:rem], out[c:], lse1, scale, det)
-        _mega_push(ex, (dk1, dv1), units1, num1, bank_off, epoch)
+        _mega_push(ex, (dk1, dv1), units1, num1, bank_off, epoch, grid)
         dq0, dk0, dv0 = _bwd(dout[:c], q[:c], kb[keys0], vb[keys0], out[:c], lse0, scale, det)
         dk0, dv0 = dk0.contiguous(), dv0.contiguous()
-        _mega_push(ex, (dk1, dv1), units0, num0, bank_off, epoch, (dk0, dv0), add_delta)
+        _mega_push(ex, (dk1, dv1), units0, num0, bank_off, epoch, grid, (dk0, dv0), add_delta)
         _side_copy(ex, dq[:c], dq0)
         dqb, dko, dvo = _bwd(dout[c:], q[c:], kb[own], vb[own], out[c:], lse1, scale, det)
         torch.add(dq1, dqb, out=dq[c:])
@@ -598,11 +605,12 @@ def _mega_backward(dout, q, kb, vb, out, lse0, lse1, lay, group, scale, det):
     else:
         dq1, dk1, dv1 = _bwd(dout[c:], q[c:], kb, vb, out[c:], lse1, scale, det)
         dk1, dv1 = dk1.contiguous(), dv1.contiguous()
-        _mega_push(ex, (dk1, dv1), units1, num1, bank_off, epoch)
+        _mega_push(ex, (dk1, dv1), units1, num1, bank_off, epoch, grid)
         _side_copy(ex, dq[c:], dq1)
         dq0, dk0, dv0 = _bwd(dout[:c], q[:c], kb[keys0], vb[keys0], out[:c], lse0, scale, det)
         dk0, dv0 = dk0.contiguous(), dv0.contiguous()
-        _mega_push(ex, (dk1, dv1), units0, num0, bank_off, epoch, (dk0, dv0), add_delta)
+        # no attention is left to run beside this push
+        _mega_push(ex, (dk1, dv1), units0, num0, bank_off, epoch, exposed, (dk0, dv0), add_delta)
         dq[:c].copy_(dq0)
         own_k, own_v = dk1, dv1
 
