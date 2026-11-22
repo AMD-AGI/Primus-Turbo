@@ -41,7 +41,34 @@ from primus_turbo.pytorch.ops.utils import (
     main_grad_first_write,
 )
 
-__all__ = ["gemm_fp8_block_concat_n", "gemm_fp8_block_concat_n_supported"]
+__all__ = ["gemm_fp8_block_concat_n", "gemm_fp8_block_concat_n_supported", "request_dx_accum"]
+
+# fuse2 (PRIMUS_FUSE2_ATT_GADD): an object with ``take(M, K, dtype) -> Tensor | None`` and a ``fused`` attribute,
+# handed to the next concat-N forward. Its backward then writes dX into the returned tensor as
+# bf16(dX) + tensor (dsv4up accumulate=2: torch's bf16 add) and records it in ``fused``.
+_DX_ACCUM = [None]
+
+
+def request_dx_accum(slot) -> None:
+    _DX_ACCUM[0] = slot
+
+
+def _dgrad(g_row, b_t, pg, pbt, out_dtype, slot):
+    from primus_turbo.gluon.gemm import dsv4up_block
+
+    if slot is not None:
+        M, K = g_row.shape[0], b_t.shape[0]
+        acc = slot.take(M, K, out_dtype)
+        if (acc is not None and dsv4up_block.split_k_of(M, K, g_row.shape[1]) == 1
+                and not dsv4up_block.small_tile_of(M, K, g_row.shape[1], True)):
+            from primus_turbo.gluon.gemm.dsv4up_gemm import dsv4up_gemm
+
+            dsv4up_gemm(g_row, b_t, pg, pbt, out=acc, accumulate=2)
+            slot.fused = acc
+            return acc
+        if acc is not None:  # cannot fuse: give the buffer back untouched, autograd adds as usual
+            slot.untake(acc)
+    return dsv4up_block.gemm_nt(g_row, b_t, pg, pbt, out_dtype)
 
 
 def _fuseq_kw():
@@ -243,6 +270,7 @@ class FP8GemmBlockConcatNFunction(torch.autograd.Function):
             for j in jobs:
                 dsv4up_block.gemm_nt(j[0], j[1], j[2], j[3], x.dtype, out=j[4])
         ctx.wts = wts
+        ctx.dx_slot, _DX_ACCUM[0] = _DX_ACCUM[0], None
         ctx.save_for_backward(a_t, pat, pbt, w_j)
         ctx.config, ctx.out_dtype, ctx.K = config, x.dtype, K
         return tuple(outs)
@@ -284,12 +312,12 @@ class FP8GemmBlockConcatNFunction(torch.autograd.Function):
                 grad_x = torch.empty((M, ctx.K), dtype=ctx.out_dtype, device=g.device)
                 dsv4up_block.gemm_nt_dual((g_t, a_t, pgt, pat, jmg, not ows[0]), (g_row, b_t, pg, pbt, grad_x, False))
             elif jmg is not None:
-                grad_x = dsv4up_block.gemm_nt(g_row, b_t, pg, pbt, ctx.out_dtype)
+                grad_x = _dgrad(g_row, b_t, pg, pbt, ctx.out_dtype, ctx.dx_slot)
                 dsv4up_block.gemm_nt(g_t, a_t, pgt, pat, jmg.dtype, out=jmg, accumulate=not ows[0])
             else:
                 # main_grads not adjacent (DSv4: wq_b's lies between wkv's and wq_a's): one wgrad per weight on its
                 # row slice of dY^T, the two in ONE dsv4up dual launch (same bits as separate launches)
-                grad_x = dsv4up_block.gemm_nt(g_row, b_t, pg, pbt, ctx.out_dtype)
+                grad_x = _dgrad(g_row, b_t, pg, pbt, ctx.out_dtype, ctx.dx_slot)
                 off, jobs, posts = 0, [], []
                 for mg, n, ow in zip(mgs, ctx.ns, ows):
                     gt_i, pgt_i = g_t[off:off + n], pgt[off // 128:(off + n) // 128]
@@ -317,7 +345,7 @@ class FP8GemmBlockConcatNFunction(torch.autograd.Function):
             for i, mg in enumerate(mgs):
                 grads[i] = _get_dummy_wgrad(list(mg.shape), ctx.out_dtype)
         else:
-            grad_x = dsv4up_block.gemm_nt(g_row, b_t, pg, pbt, ctx.out_dtype)
+            grad_x = _dgrad(g_row, b_t, pg, pbt, ctx.out_dtype, ctx.dx_slot)
             gw = dsv4up_block.gemm_nt(g_t, a_t, pgt, pat, ctx.out_dtype)
             off = 0
             for i, ((f, mg), n, w) in enumerate(zip(ctx.fused, ctx.ns, ctx.wparams)):
@@ -328,7 +356,7 @@ class FP8GemmBlockConcatNFunction(torch.autograd.Function):
                 else:
                     grads[i] = gw[off:off + n]
                 off += n
-        ctx.wts = ctx.wparams = ctx.fused = None
+        ctx.wts = ctx.wparams = ctx.fused = ctx.dx_slot = None
         return (grad_x, None, None, *grads)
 
 
