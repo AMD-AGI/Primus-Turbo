@@ -29,10 +29,12 @@ where a chunk's destinations are the addresses of ITS first row (batch 0).
 """
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl._mlir.dialects import llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
@@ -44,6 +46,7 @@ from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
+    create_llvm_ptr,
 )
 from primus_turbo.flydsl.utils.prims import cast, ld, st
 
@@ -93,8 +96,9 @@ def epilogue(c, rem, add_lo, add_hi, tok, batch_bytes):
 
     def emit(dv_values, dk_values, info):
         assert info["token_stride"] * 2 == tok
-        f32x4, bf16x4 = fx.T.vec(4, fx.T.f32), fx.T.vec(4, fx.T.bf16)
+        bf16x4 = fx.T.vec(4, fx.T.bf16)
         params = i64_base(info["params"])
+        tid, head = cast(info["tid"], fx.T.i32), cast(info["kv_head_idx"], fx.T.i32)
         kv_start = cast(info["kv_start"], fx.T.i32)
         b_off = cast(cast(info["batch_idx"], fx.T.i32) * fx.Int32(batch_bytes), fx.T.i64)
         chunk = kv_start // fx.Int32(c)
@@ -115,14 +119,55 @@ def epilogue(c, rem, add_lo, add_hi, tok, batch_bytes):
                 - cast(chunk, fx.T.i64) * fx.Int64(c * tok)
             )
             dst_res = create_buffer_resource_from_addr(dst, num_records_bytes=(chunk + fx.Int32(1)) * fx.Int32(c * tok))
-            values = [(_raw(v), cast(idx, fx.T.i32)) for v, idx in values]
-            loads = [[buffer_load(res, idx, vec_width=4, dtype=fx.T.bf16) for res in terms] for _, idx in values]
-            for (acc, idx), parts in zip(values, loads):
-                for part in parts:
-                    acc = fx.arith.addf(acc, fx.arith.extf(f32x4, part))
-                buffer_store(fx.arith.trunc_f(bf16x4, acc), dst_res, idx, cache_modifier=SYS_NT)
+            fragments = [
+                (fx.arith.trunc_f(bf16x4, _raw(v)), cast(row, fx.T.i32) - kv_start, cast(col, fx.T.i32))
+                for v, _, row, col in values
+            ]
+            _stage_and_store(fragments, terms, dst_res, kv_start, head, tid, info)
 
     return emit
+
+
+# s_waitcnt lgkmcnt(0), vmcnt and expcnt left alone
+_WAIT_LGKM = 0xC07F
+_STORE_CM = int(os.environ.get("AGKV_BWD_DBG_CM", SYS_NT))
+
+
+def _lds_ptr(elem, lds_off):
+    return create_llvm_ptr(elem * fx.Int32(2) + fx.Int32(lds_off), address_space=3)
+
+
+def _stage_and_store(fragments, terms, dst_res, kv_start, head, tid, info):
+    """Store one work-group's [BLOCK_KV, D] tile, held as bf16 4-element fragments ``(value, tile row,
+    column)``, plus the same rows of ``terms`` (bf16 buffers laid out as the destination), summed in fp32,
+    as whole rows: through the LDS the main loop is done with, then 16 B per lane, a wave's access four
+    contiguous 256 B rows. Fragment accesses would move 32 B pieces, which the remote fabric stores at a
+    fraction of the rate and which hold the attention's own loads behind them; the term rows are loaded
+    before the LDS round trip and arrive under it."""
+    bkv, hd, threads, lds_off = info["block_kv"], info["head_dim"], info["block_size"], info["lds_off"]
+    row_elems = hd + 8  # padded: the fragment writes of 16 rows at one column fall in distinct banks
+    vecs_per_row = hd // 8
+    assert bkv * row_elems * 2 <= info["lds_bytes"] and bkv * vecs_per_row % threads == 0
+    f32x8, bf16x8 = fx.T.vec(8, fx.T.f32), fx.T.vec(8, fx.T.bf16)
+    coords = []
+    for i in range(bkv * vecs_per_row // threads):
+        vec = tid + fx.Int32(i * threads)
+        row, part = vec // fx.Int32(vecs_per_row), vec % fx.Int32(vecs_per_row)
+        idx = (kv_start + row) * fx.Int32(info["token_stride"]) + head * fx.Int32(hd) + part * fx.Int32(8)
+        coords.append((row * fx.Int32(row_elems) + part * fx.Int32(8), idx))
+    # the main loop's LDS reads and DMA writes retire before the LDS is reused
+    fx.rocdl.s_waitcnt(0)
+    loads = [[buffer_load(res, idx, vec_width=8, dtype=fx.T.bf16) for res in terms] for _, idx in coords]
+    fx.gpu.barrier()
+    for value, row, col in fragments:
+        llvm.StoreOp(_raw(value), _lds_ptr(row * fx.Int32(row_elems) + col, lds_off))
+    fx.rocdl.s_waitcnt(_WAIT_LGKM)
+    fx.gpu.barrier()
+    for (elem, idx), parts in zip(coords, loads):
+        acc = fx.arith.extf(f32x8, llvm.LoadOp(bf16x8, _lds_ptr(elem, lds_off)).result)
+        for part in parts:
+            acc = fx.arith.addf(acc, fx.arith.extf(f32x8, part))
+        buffer_store(fx.arith.trunc_f(bf16x8, acc), dst_res, idx, cache_modifier=_STORE_CM)
 
 
 def block_kv(Skv, D):

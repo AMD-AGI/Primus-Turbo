@@ -1455,8 +1455,9 @@ def build_flash_attn_bwd_dkdv_module(
     flat_wg=256,
     # epilogue: replaces the dK/dV workspace store of the launch that runs the LAST q split
     # (qsp_lo = q_split - 1, n_qsp = 1, or q_split = 1); called at trace time as
-    # epilogue(dv_values, dk_values, info), each values a list of (f32x4, kv element index),
-    # info the work-group's coordinates and tensors (see the store below). None = stock store.
+    # epilogue(dv_values, dk_values, info), each values a list of (f32x4, kv element index,
+    # kv row, column), info the work-group's coordinates, tensors and the LDS view it may reuse
+    # (see the store below). None = stock store.
     epilogue=None,
 ):
     """Build the dK/dV KV-outer backward launcher (clean mirror of the forward).
@@ -4406,7 +4407,8 @@ def build_flash_attn_bwd_dkdv_module(
                         v = Vec(accs[(h * DT + dt) * NT + nt])
                         if const_expr(scale):
                             v = v * dk_fold_v4
-                        vals.append((v, global_idx_kv(kv_row_of(nt, h), fx.Index(dt * D_TILE) + kg * fx.Index(4))))
+                        row, col = kv_row_of(nt, h), fx.Index(dt * D_TILE) + kg * fx.Index(4)
+                        vals.append((v, global_idx_kv(row, col), row, col))
             return vals
 
         if const_expr(MFMA_TIE):
@@ -4421,7 +4423,13 @@ def build_flash_attn_bwd_dkdv_module(
                 dict(
                     tid=tid,
                     kv_start=kv_start,
+                    kv_head_idx=kv_head_idx,
                     batch_idx=batch_idx,
+                    block_kv=BLOCK_KV,
+                    head_dim=HEAD_DIM,
+                    block_size=BLOCK_SIZE,
+                    lds_off=lds_off,
+                    lds_bytes=LDS_VIEW_ELEMS * 2,
                     seq_len_k=seq_len_k_v,
                     dk_ws=DK,
                     dv_ws=DV,
