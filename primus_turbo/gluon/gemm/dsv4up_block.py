@@ -142,9 +142,58 @@ def small_tile_of(M, N, K, accumulate) -> str:
     return tile
 
 
+_SPLITK_DENSE = {}
+
+
+def splitk_dense_of(M, N, K, accumulate):
+    """PRIMUS_SPLITK_DENSE="MxNxK[a]:tile:S[:i][:p],..." (splitk line, default "" = off): run those dsv4up GEMMs
+    (GEMM dims of the call; "a" = the beta-1 accumulate call) on dsv4s tile `tile` with S K slices (fp32 partials)
+    and ONE fixed-order fp32 reduce: deterministic, no atomics, numerics differ from S = 1 by the fp32 summation
+    order only. "i": interleaved slices (slice z takes BK blocks z, z+S, ...); "p": pairwise reduce (S = 4).
+    tile "up": the dsv4up 256x256 kernel's split-K partials (as PRIMUS_TURBO_DSV4UP_SPLITK) with this reduce.
+    Example: PRIMUS_SPLITK_DENSE=4096x1024x32768:256x128s3:2 (wq_b dgrad)."""
+    spec = os.environ.get("PRIMUS_SPLITK_DENSE", "")
+    if not spec:
+        return None
+    if spec not in _SPLITK_DENSE:
+        from primus_turbo.gluon.gemm.dsv4s_gemm import TILES
+
+        m = {}
+        for item in filter(None, (t.strip() for t in spec.split(","))):
+            f = item.split(":")
+            acc = f[0].endswith("a")
+            dims = tuple(map(int, f[0].rstrip("a").split("x")))
+            if len(f) < 3 or (f[1] not in TILES and f[1] != "up"):
+                _warn_once(("splitk_dense", item), f"PRIMUS_SPLITK_DENSE: bad entry {item!r}")
+                continue
+            m[dims + (acc,)] = (f[1], int(f[2]), "i" in f[3:], 1 if "p" in f[3:] else 0)
+        _SPLITK_DENSE[spec] = m
+    cfg = _SPLITK_DENSE[spec].get((M, N, K, bool(accumulate)))
+    if cfg is not None:
+        from primus_turbo.gluon.gemm.dsv4s_gemm import splitk_supported
+
+        tile, s, _, order = cfg
+        if not splitk_supported(M, N, K, tile, s) or (order == 1 and s != 4):
+            _warn_once(("splitk_dense", M, N, K, cfg), f"PRIMUS_SPLITK_DENSE {cfg} not valid for {M}x{N}x{K}")
+            return None
+        mark = os.environ.get("PRIMUS_SPLITK_MARK", "")
+        if mark and ("mark", M, N, K, cfg) not in _SPLITK_DENSE:  # one line per GEMM shape: proof the path ran
+            _SPLITK_DENSE[("mark", M, N, K, cfg)] = True
+            with open(mark, "a") as fh:
+                fh.write(f"splitk dense {M}x{N}x{K} acc={int(bool(accumulate))} cfg={cfg}\n")
+    return cfg
+
+
 def gemm_nt(a, b, a_packed, b_packed, out_dtype=None, out=None, accumulate=False):
     from primus_turbo.gluon.gemm.dsv4up_gemm import dsv4up_gemm
 
+    skd = splitk_dense_of(a.shape[0], b.shape[0], a.shape[1], accumulate)
+    if skd is not None and (out is None or out.is_contiguous()):
+        from primus_turbo.gluon.gemm.dsv4s_gemm import dsv4s_gemm_splitk
+
+        tile, s, inter, order = skd
+        return dsv4s_gemm_splitk(a, b, a_packed, b_packed, out=out, out_dtype=out_dtype,
+                                 accumulate=accumulate, tile=tile, split_k=s, kinter=inter, order=order)
     sk = split_k_of(a.shape[0], b.shape[0], a.shape[1])
     if sk == 1:
         tile = small_tile_of(a.shape[0], b.shape[0], a.shape[1], accumulate)

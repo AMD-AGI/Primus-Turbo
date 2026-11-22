@@ -13,6 +13,8 @@ slots), cluster = 1 (cluster arrive/wait dropped), packed dsv4up scales instead 
 """
 
 import torch
+import triton
+import triton.language as tl
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
 from triton.experimental.gluon.language.amd.cdna5 import tdm
@@ -49,14 +51,16 @@ def _pids(M: gl.constexpr, N: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.c
 
 
 @gluon.jit
-def _refill(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, slot: gl.constexpr, BK: gl.constexpr):
+def _refill(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, slot: gl.constexpr, BK: gl.constexpr,
+            KSTEP: gl.constexpr = 1):
+    # KSTEP > 1 (splitk interleaved slices): the next K step of this slice is KSTEP BK-blocks further
     tdm.async_load(a_desc, dest=a_buf.index(slot), warp_used_hint=0b00001111)
     tdm.async_load(b_desc, dest=b_buf.index(slot), warp_used_hint=0b00001111)
     tdm.async_load_fused([(as_desc, as_buf.index(slot), 0b00000011), (bs_desc, bs_buf.index(slot), 0b00001100)])
-    a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, BK])
-    b_desc = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, BK])
-    as_desc = tdm.update_tensor_descriptor(as_desc, add_offsets=[0, BK * 4])  # packed: 4 B per K column
-    bs_desc = tdm.update_tensor_descriptor(bs_desc, add_offsets=[0, BK * 4])
+    a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, BK * KSTEP])
+    b_desc = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, BK * KSTEP])
+    as_desc = tdm.update_tensor_descriptor(as_desc, add_offsets=[0, BK * 4 * KSTEP])  # packed: 4 B per K column
+    bs_desc = tdm.update_tensor_descriptor(bs_desc, add_offsets=[0, BK * 4 * KSTEP])
     return a_desc, b_desc, as_desc, bs_desc
 
 
@@ -82,7 +86,7 @@ def _chunk_load(a_buf, b_buf, as_buf, bs_buf, slot: gl.constexpr, k: gl.constexp
 @gluon.jit
 def _step(a_buf, b_buf, as_buf, bs_buf, slot: gl.constexpr, a_desc, b_desc, as_desc, bs_desc, acc,
           dot_a: gl.constexpr, dot_b: gl.constexpr, sa: gl.constexpr, sb: gl.constexpr, BLOCK_M: gl.constexpr,
-          BLOCK_N: gl.constexpr, BK: gl.constexpr, NS: gl.constexpr):
+          BLOCK_N: gl.constexpr, BK: gl.constexpr, NS: gl.constexpr, KSTEP: gl.constexpr = 1):
     # upstream _mxfp8_tiled_bk512_five, 1 CTA: consume slot (its K chunks in order), then refill it NS steps ahead
     tdm.async_wait(3 * (NS - 1))
     if BK == 512:
@@ -115,7 +119,7 @@ def _step(a_buf, b_buf, as_buf, bs_buf, slot: gl.constexpr, a_desc, b_desc, as_d
             acc = gl.amd.cdna5.wmma_scaled(a1, as1, 'e4m3', b1, bs1, 'e4m3', acc)
     with gl.amd.warp_pipeline_stage('s_stage4_refill'):
         a_desc, b_desc, as_desc, bs_desc = _refill(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, slot,
-                                                   BK)
+                                                   BK, KSTEP)
     return a_desc, b_desc, as_desc, bs_desc, acc
 
 
@@ -159,9 +163,22 @@ def dsv4s_gemm_kernel(a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M: gl.const
                       SHARED_BS: gl.constexpr, WMMA: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
                       BK: gl.constexpr, NS: gl.constexpr, ACCUM: gl.constexpr, GROUP_M: gl.constexpr = 4,
                       c1_ptr=None, stride_c1m: gl.constexpr = 0, SPLIT_AXIS: gl.constexpr = 0,
-                      SPLIT0: gl.constexpr = 0):
+                      SPLIT0: gl.constexpr = 0, SPLIT_K: gl.constexpr = 1, KINTER: gl.constexpr = False):
     # C[M,N] (+)= A[M,K] . B[N,K]^T; K-contiguous A/B, row-major C; M % BLOCK_M, N % BLOCK_N, K % BK == 0, K >= 3*BK
     pid_m, pid_n = _pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, GROUP_M)
+    KSTEP: gl.constexpr = SPLIT_K if KINTER else 1
+    if SPLIT_K > 1:
+        # splitk line: grid axis 1 = K slice z; K is the per-slice K (strides are the full operand's). Contiguous
+        # slices: z reads K columns [z*K, (z+1)*K); KINTER: z reads the BK blocks z, z+S, z+2S, ... Slice z writes
+        # its fp32 partial to C + z*M*stride_cm (a fixed-order reduce follows; no atomics).
+        pid_k = gl.program_id(axis=1)
+        k0 = pid_k * BK if KINTER else pid_k * K
+        a_ptr = a_ptr + k0
+        b_ptr = b_ptr + k0
+        a_scale_ptr = a_scale_ptr + k0 * 4
+        b_scale_ptr = b_scale_ptr + k0 * 4
+        c_ptr = c_ptr + pid_k * (M * stride_cm)
+    KD: gl.constexpr = K * SPLIT_K if KINTER else K  # descriptor K extent (from the slice base)
     dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA, 16)
     dot_b: gl.constexpr = gl.DotOperandLayout(1, WMMA, 16)
     sa: gl.constexpr = gl.amd.cdna5.get_wmma_scale_layout(dot_a, [BLOCK_M, 4])
@@ -171,19 +188,19 @@ def dsv4s_gemm_kernel(a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M: gl.const
     b_buf = gl.allocate_shared_memory(b_ptr.type.element_ty, [NS, BLOCK_N, BK], SHARED_B)
     as_buf = gl.allocate_shared_memory(a_scale_ptr.type.element_ty, [NS, BLOCK_M // 128, SK], SHARED_AS)
     bs_buf = gl.allocate_shared_memory(b_scale_ptr.type.element_ty, [NS, BLOCK_N // 128, SK], SHARED_BS)
-    a_desc = tdm.make_tensor_descriptor(base=a_ptr + pid_m * BLOCK_M * stride_am, shape=(M, K), strides=(stride_am, 1),
+    a_desc = tdm.make_tensor_descriptor(base=a_ptr + pid_m * BLOCK_M * stride_am, shape=(M, KD), strides=(stride_am, 1),
                                         block_shape=(BLOCK_M, BK), layout=SHARED_A)
-    b_desc = tdm.make_tensor_descriptor(base=b_ptr + pid_n * BLOCK_N * stride_bn, shape=(N, K), strides=(stride_bn, 1),
+    b_desc = tdm.make_tensor_descriptor(base=b_ptr + pid_n * BLOCK_N * stride_bn, shape=(N, KD), strides=(stride_bn, 1),
                                         block_shape=(BLOCK_N, BK), layout=SHARED_B)
     as_desc = tdm.make_tensor_descriptor(base=a_scale_ptr + pid_m * (BLOCK_M // 128) * stride_scale_a,
-                                         shape=(M // 128, K // 32 * 128), strides=(stride_scale_a, 1),
+                                         shape=(M // 128, KD // 32 * 128), strides=(stride_scale_a, 1),
                                          block_shape=(BLOCK_M // 128, SK), layout=SHARED_AS)
     bs_desc = tdm.make_tensor_descriptor(base=b_scale_ptr + pid_n * (BLOCK_N // 128) * stride_scale_b,
-                                         shape=(N // 128, K // 32 * 128), strides=(stride_scale_b, 1),
+                                         shape=(N // 128, KD // 32 * 128), strides=(stride_scale_b, 1),
                                          block_shape=(BLOCK_N // 128, SK), layout=SHARED_BS)
     for s0 in gl.static_range(NS):
         a_desc, b_desc, as_desc, bs_desc = _refill(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, s0,
-                                                   BK)
+                                                   BK, KSTEP)
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA)
     iter_max: gl.constexpr = K // BK
     n_main: gl.constexpr = iter_max - NS
@@ -192,10 +209,10 @@ def dsv4s_gemm_kernel(a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M: gl.const
         for inner in gl.static_range(6):
             a_desc, b_desc, as_desc, bs_desc, acc = _step(a_buf, b_buf, as_buf, bs_buf, inner % NS, a_desc, b_desc,
                                                           as_desc, bs_desc, acc, dot_a, dot_b, sa, sb, BLOCK_M,
-                                                          BLOCK_N, BK, NS)
+                                                          BLOCK_N, BK, NS, KSTEP)
     for r in gl.static_range(n_main % 6):
         a_desc, b_desc, as_desc, bs_desc, acc = _step(a_buf, b_buf, as_buf, bs_buf, r % NS, a_desc, b_desc, as_desc,
-                                                      bs_desc, acc, dot_a, dot_b, sa, sb, BLOCK_M, BLOCK_N, BK, NS)
+                                                      bs_desc, acc, dot_a, dot_b, sa, sb, BLOCK_M, BLOCK_N, BK, NS, KSTEP)
     for t in gl.static_range(NS):  # drain: the last NS K steps, no refill
         tdm.async_wait(3 * (NS - 1 - t))
         acc = _tail(a_buf, b_buf, as_buf, bs_buf, (n_main + t) % NS, acc, dot_a, dot_b, sa, sb, BLOCK_M, BLOCK_N, BK)
@@ -236,6 +253,29 @@ def dsv4s_gemm_kernel(a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M: gl.const
             _epi(c1_ptr, M1, N1, stride_c1m, r1, c1, acc, c_shared, c_layout, WMMA, BLOCK_M, BLOCK_N, ACCUM)
 
 
+@triton.jit
+def _splitk_reduce2_kernel(p_ptr, c_ptr, MN, S: tl.constexpr, ORDER: tl.constexpr, ACCUM: tl.constexpr,
+                           BLOCK: tl.constexpr):
+    # splitk line: C = [old C +] fixed-order fp32 sum of the S partials, one rounding into C's dtype.
+    # ORDER 0: sequential ((p0 + p1) + p2) + p3 ...; ORDER 1 (S = 4): pairwise (p0 + p1) + (p2 + p3).
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < MN
+    if ORDER == 1:
+        tl.static_assert(S == 4)
+        q0 = tl.load(p_ptr + offs, mask=mask, other=0.0)
+        q1 = tl.load(p_ptr + MN + offs, mask=mask, other=0.0)
+        q2 = tl.load(p_ptr + 2 * MN + offs, mask=mask, other=0.0)
+        q3 = tl.load(p_ptr + 3 * MN + offs, mask=mask, other=0.0)
+        acc = (q0 + q1) + (q2 + q3)
+    else:
+        acc = tl.load(p_ptr + offs, mask=mask, other=0.0)
+        for z in tl.static_range(1, S):
+            acc += tl.load(p_ptr + z * MN + offs, mask=mask, other=0.0)
+    if ACCUM:
+        acc = tl.load(c_ptr + offs, mask=mask, other=0.0).to(tl.float32) + acc
+    tl.store(c_ptr + offs, acc.to(c_ptr.dtype.element_ty), mask=mask)
+
+
 def shape_supported(M, N, K, tile="128x128"):
     bm, bn, bk, ns = TILES[tile]
     return M > 0 and N > 0 and M % bm == 0 and N % bn == 0 and K % bk == 0 and K >= (ns + 1) * bk and K % 512 == 0
@@ -272,19 +312,21 @@ def build_layouts(tile):
                 BLOCK_M=block_m, BLOCK_N=block_n, BK=block_k, NS=nslot)
 
 
-def _plan(M, N, K, sam, sbn, scm, cdt, accum, tile="128x128", group_m=4, split=None):
-    key = (M, N, K, sam, sbn, scm, cdt, accum, tile, group_m, split)
+def _plan(M, N, K, sam, sbn, scm, cdt, accum, tile="128x128", group_m=4, split=None, split_k=1, kinter=False):
+    key = (M, N, K, sam, sbn, scm, cdt, accum, tile, group_m, split, split_k, kinter)
     p = _PLANS.get(key)
     if p is None:
         if tile not in _LAYOUTS:
             _LAYOUTS[tile] = build_layouts(tile)
         bm, bn, _, _ = TILES[tile]
         grid_mn = (M // bm) * (N // bn)
-        p = ((grid_mn,), dict(M=M, N=N, K=K, stride_am=sam, stride_bn=sbn, stride_cm=scm,
-                              stride_scale_a=K // 32 * 128, stride_scale_b=K // 32 * 128, GRID_MN=grid_mn,
-                              ACCUM=accum, GROUP_M=group_m, num_warps=8, waves_per_eu=2, num_ctas=1,
-                              **(dict(stride_c1m=split[0], SPLIT_AXIS=split[1], SPLIT0=split[2]) if split else {}),
-                              **_LAYOUTS[tile]))
+        # split_k > 1: K below is the per-slice K; the packed-scale row stride stays the full K's
+        sk = dict(SPLIT_K=split_k, KINTER=bool(kinter)) if split_k > 1 else {}
+        p = ((grid_mn, split_k) if split_k > 1 else (grid_mn,), dict(M=M, N=N, K=K // split_k, stride_am=sam, stride_bn=sbn, stride_cm=scm,
+                                      stride_scale_a=K // 32 * 128, stride_scale_b=K // 32 * 128, GRID_MN=grid_mn,
+                                      ACCUM=accum, GROUP_M=group_m, num_warps=8, waves_per_eu=2, num_ctas=1,
+                                      **(dict(stride_c1m=split[0], SPLIT_AXIS=split[1], SPLIT0=split[2])
+                                         if split else {}), **sk, **_LAYOUTS[tile]))
         _PLANS[key] = p
     return p
 
@@ -306,6 +348,53 @@ def dsv4s_gemm(a, b, a_packed, b_packed, out=None, out_dtype=torch.bfloat16, acc
         assert t.is_cuda and t.data_ptr() != 0 and t.device == a.device
     grid, kw = _plan(M, N, K, a.stride(0), b.stride(0), out.stride(0), out.dtype, bool(accumulate), tile, group_m)
     dsv4s_gemm_kernel[grid](a, b, out, a_packed, b_packed, **kw)
+    return out
+
+
+def splitk_supported(M, N, K, tile, split_k):
+    if tile == "up":  # dsv4up 256x256 kernel's own split-K partials (grid axis 1), reduced here
+        from primus_turbo.gluon.gemm.dsv4up_gemm import shape_supported as _up_ok
+
+        return split_k > 1 and K % split_k == 0 and _up_ok(M, N, K // split_k)
+    bm, bn, bk, ns = TILES[tile]
+    return (split_k > 1 and K % (split_k * bk) == 0 and shape_supported(M, N, K // split_k, tile)
+            and (K // split_k) % 512 == 0)
+
+
+def dsv4s_gemm_splitk(a, b, a_packed, b_packed, out=None, out_dtype=torch.bfloat16, accumulate=False,
+                      tile="256x128s3", split_k=2, kinter=False, order=0, group_m=4):
+    """splitk line (PRIMUS_SPLITK_DENSE): dsv4s with split_k K slices as fp32 partials in one launch (grid axis 1),
+    then ONE fixed-order fp32 reduce (order 0 sequential, 1 pairwise for 4 slices) and one rounding into out
+    (accumulate: old C + sum). Deterministic (no atomics), not bit-identical to split_k = 1 (fp32 summation order).
+    kinter: slice z takes the BK blocks z, z + S, ... instead of a contiguous K range."""
+    M, K = a.shape
+    N = b.shape[0]
+    assert splitk_supported(M, N, K, tile, split_k), (M, N, K, tile, split_k)
+    assert b.shape[1] == K and a.stride(1) == 1 and b.stride(1) == 1
+    assert a_packed.shape == (M // 128, K * 4) and b_packed.shape == (N // 128, K * 4)
+    assert a_packed.is_contiguous() and b_packed.is_contiguous()
+    assert order in (0, 1) and (order == 0 or split_k == 4)
+    if out is None:
+        assert not accumulate
+        out = torch.empty((M, N), dtype=out_dtype or torch.bfloat16, device=a.device)
+    assert tuple(out.shape) == (M, N) and out.is_contiguous()
+    part = torch.empty((split_k, M, N), dtype=torch.float32, device=a.device)
+    for t in (a, b, a_packed, b_packed, out, part):
+        assert t.is_cuda and t.data_ptr() != 0 and t.device == a.device
+    if tile == "up":
+        from primus_turbo.gluon.gemm.dsv4up_gemm import _plan as _up_plan
+        from primus_turbo.gluon.gemm.dsv4up_gemm import dsv4up_gemm_kernel
+
+        assert not kinter
+        grid, kw = _up_plan(M, N, K, a.stride(0), b.stride(0), N, torch.float32, False, split_k)
+        dsv4up_gemm_kernel[grid](a, b, part, a_packed, b_packed, **kw)
+    else:
+        grid, kw = _plan(M, N, K, a.stride(0), b.stride(0), N, torch.float32, False, tile, group_m, None, split_k,
+                         kinter)
+        dsv4s_gemm_kernel[grid](a, b, part, a_packed, b_packed, **kw)
+    BLK = 4096
+    _splitk_reduce2_kernel[(triton.cdiv(M * N, BLK),)](part, out, M * N, S=split_k, ORDER=order,
+                                                        ACCUM=bool(accumulate), BLOCK=BLK, num_warps=8)
     return out
 
 

@@ -80,6 +80,26 @@ def _pool_fill_kernel(Pos, Off, Ent, t0, t1, T, TOPK, BLOCK: tl.constexpr):
 
 
 @triton.jit
+def _pool_fill_scan_kernel(Pos, Cnt, Off, Ent, t0, t1, T, TOPK, P, BLOCK: tl.constexpr, PB: tl.constexpr):
+    # _pool_fill_kernel with the exclusive scan of Cnt done in place (exact integer sums): writes
+    # Off[p + 1] (and Off[0]), so the separate zeros + cumsum + copies are not needed.
+    p = tl.program_id(0)
+    i = tl.arange(0, PB)
+    base = tl.sum(tl.load(Cnt + i, mask=i < p, other=0), axis=0)
+    tl.store(Off + p + 1, base + tl.load(Cnt + p))
+    if p == 0:
+        tl.store(Off, 0)
+    for tb in range(t0, t1, BLOCK):
+        t = tb + tl.arange(0, BLOCK)
+        sl = tl.load(Pos + p.to(tl.int64) * T + t, mask=t < t1, other=-1).to(tl.int32)
+        ok = sl >= 0
+        oki = ok.to(tl.int32)
+        pre = tl.cumsum(oki, axis=0) - oki
+        tl.store(Ent + base + pre, (t - t0) * TOPK + sl, mask=ok)
+        base += tl.sum(oki, axis=0)
+
+
+@triton.jit
 def _pool_gather_kernel(Interm, Ent, Off, Side, NSEG, SEG: tl.constexpr, DB: tl.constexpr):
     # Partial of pool row p over its entries [s * SEG, (s + 1) * SEG), columns block c -> side[p, s].
     p = tl.program_id(0)
@@ -132,9 +152,12 @@ def band_pool_positions(topk_indices, window, n_raw, pool):
     return pos
 
 
-def dkv_band_gather_acc(interm, pos, acc, t0, t1, window, n_raw, pool, d=512, seg_t=256, db=128, nw=8):
+def dkv_band_gather_acc(
+    interm, pos, acc, t0, t1, window, n_raw, pool, d=512, seg_t=256, db=128, nw=8, fused_scan=False
+):
     """``acc[:, :d] +=`` the dKV of tokens ``[t0, t1)`` from their ``[t1 - t0, topk, d]`` bf16
-    intermediate, for a window + pool map (see the module docstring)."""
+    intermediate, for a window + pool map (see the module docstring). ``fused_scan``: the per-pool-row
+    offsets are scanned inside the fill kernel (same values; two kernels instead of six)."""
     n = t1 - t0
     if n <= 0:
         return
@@ -147,10 +170,16 @@ def dkv_band_gather_acc(interm, pos, acc, t0, t1, window, n_raw, pool, d=512, se
     if pool and topk > window:
         cnt = torch.empty(pool, dtype=torch.int32, device=acc.device)
         _pool_count_kernel[(pool,)](pos, cnt, t0, t1, T, BLOCK=1024, num_warps=4)
-        off = torch.zeros(pool + 1, dtype=torch.int32, device=acc.device)
-        off[1:] = torch.cumsum(cnt, 0)
         ent = torch.empty(n * (topk - window), dtype=torch.int32, device=acc.device)
-        _pool_fill_kernel[(pool,)](pos, off, ent, t0, t1, T, topk, BLOCK=1024, num_warps=4)
+        if fused_scan:
+            off = torch.empty(pool + 1, dtype=torch.int32, device=acc.device)
+            _pool_fill_scan_kernel[(pool,)](
+                pos, cnt, off, ent, t0, t1, T, topk, pool, BLOCK=1024, PB=triton.next_power_of_2(pool), num_warps=4
+            )
+        else:
+            off = torch.zeros(pool + 1, dtype=torch.int32, device=acc.device)
+            off[1:] = torch.cumsum(cnt, 0)
+            _pool_fill_kernel[(pool,)](pos, off, ent, t0, t1, T, topk, BLOCK=1024, num_warps=4)
         nseg = triton.cdiv(n, seg_t)
         side = torch.empty(pool, nseg, d, dtype=torch.float32, device=acc.device)
         _pool_gather_kernel[(pool, nseg, d // db)](interm, ent, off, side, nseg, SEG=seg_t, DB=db, num_warps=nw)
