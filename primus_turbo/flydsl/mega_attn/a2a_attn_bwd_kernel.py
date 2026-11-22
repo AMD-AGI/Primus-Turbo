@@ -13,7 +13,8 @@ forward, q / k / v / O / LSE of its own heads over the whole sequence. One launc
   block per destination rank, raising one flag per (row piece, destination);
 * pull blocks (the first ``num_pull``) claim pull units ``(m_tile, src)``, copy ``src``'s rows of this
   rank's column block into dO ``[S, hq_r, d]`` (sequence order), fold the identity delta
-  ``-rowsum(O * dO)`` of those rows on the way, raise a local ready flag per unit and count it; then
+  ``-rowsum(O * dO)`` of those rows on the way, write the rows' scaled, transposed LSE (the stock
+  backward's ``_prescale_lse``), raise a local ready flag per unit and count it; then
   they join the workers. Stage and pull order: the rows of the first ``num_prefix`` bands from the
   bottom up (the diagonal q blocks the first wave of items starts on), then the rest from the top down;
 * every block runs as a persistent worker over the FlyDSL backward's work items ``(band, split, kv head)``
@@ -24,8 +25,8 @@ forward, q / k / v / O / LSE of its own heads over the whole sequence. One launc
   done. Claim order: the top ``num_early`` bands from the top down, then band 0 up (longest first);
 * after every item is claimed: dQ push units, one per 256-row q block ``j`` in sequence order, wait for
   bands ``0..j`` (every band that adds into those rows of the atomic dQ image), un-permute and scale the
-  rows and push them to their owners; then gather units ``(m-tile, src)`` copy ``src``'s column blocks of
-  the recv rows into dq / dk / dv ``[M, n * h_r, d]``.
+  rows, push them to their owners and zero them in the image for the next call; then gather units
+  ``(m-tile, src)`` copy ``src``'s column blocks of the recv rows into dq / dk / dv ``[M, n * h_r, d]``.
 
 Pull units are claimed by running blocks before those turn worker, every item is claimed before any dQ
 push or gather unit, and an item's own waits are only on pull units, so no wait can deadlock whatever the
@@ -220,8 +221,10 @@ def _stage_role(thread_index, state_base, claim_slot, my_base, bank_offset, in_r
 
 
 @ASTRewriter.transform
-def _pull_unit(thread_index, src, m_tile, src_heap, bank_offset, do_res, o_res, delta_res, epoch, **c):
-    """``src``'s staged dO rows ``[m_tile * BM, +BM)`` of this rank's column block into dO, with their delta."""
+def _pull_unit(thread_index, src, m_tile, src_heap, bank_offset, do_res, o_res, delta_res, prep, epoch, **c):
+    """``src``'s staged dO rows ``[m_tile * BM, +BM)`` of this rank's column block into dO, with their delta;
+    ``prep`` = (lse, scaled LSE) resources: those rows of the latter, as the stock ``_prescale_lse``
+    rounds them (the Q prescale stays a launch: HBM-bound, it would slow the pull the items wait on)."""
     n, d, rank, cs, hq_r, S = c["num_ranks"], c["head_dim"], c["rank"], c["seq_chunk"], c["hq_r"], c["S"]
     lanes = d // VEC_BF16
     h_vecs = hq_r * lanes
@@ -259,12 +262,19 @@ def _pull_unit(thread_index, src, m_tile, src_heap, bank_offset, do_res, o_res, 
             row = g0 + vs[j] // fx.Int32(h_vecs)
             head = vs[j] % fx.Int32(h_vecs) // fx.Int32(lanes)
             buffer_store(fx.Float32(neg), delta_res, head * fx.Int32(S) + row, mask=first_lane)
+    lse_res, lsef_res = prep
+    for it in range_constexpr(BM * c["hq_r"] // THREADS):
+        x = fx.Int32(it * THREADS) + thread_index
+        r = g0 + x % fx.Int32(BM)
+        h = x // fx.Int32(BM)
+        v = buffer_load(lse_res, r * fx.Int32(c["hq_r"]) + h, vec_width=1, dtype=fx.Float32)
+        buffer_store(fx.Float32(v) * fx.Float32(-_bwd._LOG2E), lsef_res, h * fx.Int32(S) + r)
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
 
 
 @ASTRewriter.transform
-def _pull_role(thread_index, state_base, claim_slot, peers_base, my_base, bank_offset, do_res, o_res, delta_res, epoch, trace_base, **c):
+def _pull_role(thread_index, state_base, claim_slot, peers_base, my_base, bank_offset, do_res, o_res, delta_res, prep, epoch, trace_base, **c):
     """Pull units ``(m_tile, src)``, one 128-row block of the sequence each, the first ``prefix_tiles``
     from the bottom up and then the rest from the top down, until none are left."""
     n, m_tiles, cs, pre = c["num_ranks"], c["m_tiles"], c["seq_chunk"], c["prefix_tiles"]
@@ -278,7 +288,7 @@ def _pull_role(thread_index, state_base, claim_slot, peers_base, my_base, bank_o
             src, t = _owner_row(g * fx.Int32(BM), cs, n)
             m_tile = t // fx.Int32(BM)
             src_heap = ld(peers_base, src, dtype=fx.T.i64)
-            _pull_unit(opaque_tid(thread_index), src, m_tile, src_heap, bank_offset, do_res, o_res, delta_res, epoch, **c)
+            _pull_unit(opaque_tid(thread_index), src, m_tile, src_heap, bank_offset, do_res, o_res, delta_res, prep, epoch, **c)
             if thread_index == fx.Int32(0):
                 st(ready_base, m_tile * fx.Int32(n) + src, epoch, scope="agent", order="release")
                 atomic_add(state_base, fx.Int32(STATE_PULLED), fx.Int64(1))
@@ -463,6 +473,11 @@ def _push_dq(thread_index, j, band_base, peers_base, recv_offset, img_res, epoch
             )
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
+    # the unit's image rows are one contiguous span: zero it for the next call's atomics
+    span = BAND * hq_r * d
+    zero = Vec.filled(VEC_BF16, 0.0, _BF16).ir_value()
+    for it in range_constexpr(span // VEC_BF16 // THREADS):
+        buffer_store(zero, img_res, j * fx.Int32(span) + (fx.Int32(it * THREADS) + thread_index) * fx.Int32(VEC_BF16))
     if thread_index == fx.Int32(0):
         for h in range_constexpr(BAND // BM):
             owner, t0 = _owner_row(j * fx.Int32(BAND) + fx.Int32(h * BM), cs, n)
@@ -674,7 +689,7 @@ def _make_kernel(
     assert stage_bytes + sum(recv_x_bytes) <= bank_bytes
     assert q_split * S * hkv_r * d * 2 < 2**31 and S * hq_r * d * 2 < 2**31, "i32 byte offsets overflow"
     assert m_tiles * STAGE_SPLIT * n <= FLAGS_PER_REGION and 2 * g_tiles * n <= FLAGS_PER_REGION
-    assert nb <= BAND_DONE_AT
+    assert nb <= BAND_DONE_AT and BM * hq_r % THREADS == 0
     assert (BM * hq_r * d // VEC_BF16) % (THREADS * _BATCH) == 0 and (BM * hkv_r * d // VEC_BF16) % (THREADS * _BATCH) == 0
     grid = max(num_blocks, num_pull)
     trace_item_at, trace_dq_at, trace_gather_at, trace_stage_at, trace_start_at, trace_dqw_at, _ = trace_layout(
@@ -742,6 +757,7 @@ def _make_kernel(
         DO: fx.Tensor,
         LSE: fx.Tensor,
         DELTA: fx.Tensor,
+        LSE_IN: fx.Tensor,
         WSK: fx.Tensor,
         WSV: fx.Tensor,
         IMG: fx.Tensor,
@@ -802,6 +818,10 @@ def _make_kernel(
                     create_buffer_resource(DO, num_records_bytes=S * hq_r * d * 2),
                     create_buffer_resource(O, num_records_bytes=S * hq_r * d * 2),
                     create_buffer_resource(DELTA, num_records_bytes=S * hq_r * 4),
+                    [
+                        create_buffer_resource(LSE_IN, num_records_bytes=S * hq_r * 4),
+                        create_buffer_resource(LSE, num_records_bytes=S * hq_r * 4),
+                    ],
                     epoch,
                     trace_base,
                     **c,
@@ -848,6 +868,7 @@ def _launch(
     DO,
     LSE,
     DELTA,
+    LSE_IN,
     WSK,
     WSV,
     IMG,
@@ -895,16 +916,20 @@ def _launch(
     with ir.InsertionPoint(CompilationContext.get_current().gpu_module_body):
         allocator.finalize()
     kernel(
-        DO_IN, Q, K, V, O, DO, LSE, DELTA, WSK, WSV, IMG, DQ, DK, DV, PEER_PTRS, STATE, COUNT, TRACE, value_attrs=value_attrs
+        DO_IN, Q, K, V, O, DO, LSE, DELTA, LSE_IN, WSK, WSV, IMG, DQ, DK, DV, PEER_PTRS, STATE, COUNT, TRACE,
+        value_attrs=value_attrs,
     ).launch(grid=(grid, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
 
 _BUFS: dict = {}
+# buffer keys whose dQ image an attn_only call (no dQ push) left non-zero
+_IMG_DIRTY: set = set()
 
 
 def _buffers(S, hq_r, hkv_r, d, q_split, device):
-    """dO and delta of this rank's heads, the dK / dV slots, the dQ image and the band item counts (zero
-    between calls: a band's last item resets its count); reused across calls."""
+    """dO and delta of this rank's heads, the dK / dV slots, the dQ image (zero between calls: its dQ push
+    units zero it), the band item counts (zero between calls: a band's last item resets its count) and
+    the scaled LSE; reused across calls."""
     key = (S, hq_r, hkv_r, d, q_split, device)
     bufs = _BUFS.get(key)
     if bufs is None:
@@ -914,9 +939,11 @@ def _buffers(S, hq_r, hkv_r, d, q_split, device):
             torch.empty(hq_r, S, device=device, dtype=torch.float32),
             torch.empty(q_split, S, hkv_r, d, device=device, dtype=torch.bfloat16),
             torch.empty(q_split, S, hkv_r, d, device=device, dtype=torch.bfloat16),
-            torch.empty(S * hq_r * d, device=device, dtype=torch.bfloat16),
+            torch.zeros(S * hq_r * d, device=device, dtype=torch.bfloat16),
             torch.zeros(S // BAND, device=device, dtype=torch.int64),
+            torch.empty(hq_r * S, device=device, dtype=torch.float32),
         )
+        _IMG_DIRTY.clear()
         _BUFS[key] = bufs
     return bufs
 
@@ -947,8 +974,8 @@ def ulysses_a2a_attn_bwd(
     ``[M, n * hkv_r, d]`` for this rank's tokens. The bank must hold ``a2a_attn_bwd_bank_bytes``.
 
     ``mode`` (measurement only): ``"attn_only"`` runs the backward items on the dO / delta of the previous
-    call (no exchange, no waits, no folds, pushes or gathers); ``"comm_only"`` runs every step but the
-    items' attention body."""
+    call (no exchange, no waits, no folds, pushes or gathers; LSE prescaled and the dQ image zeroed by
+    separate launches); ``"comm_only"`` runs every step but the items' attention body."""
     n = workspace.num_ranks
     M, H, d = dout.shape[0], dout.shape[-2], dout.shape[-1]
     S, hq_r, hkv_r = M * n, H // n, k.shape[-2]
@@ -959,10 +986,18 @@ def ulysses_a2a_attn_bwd(
     if num_blocks is None:
         num_blocks = torch.cuda.get_device_properties(dout.device).multi_processor_count
     stream = torch.cuda.current_stream()
+    key = (S, hq_r, hkv_r, d, q_split, dout.device)
+    do_h, delta, ws_dk, ws_dv, img, counts, lsef = _buffers(*key)
     qf = _bwd._prescale_q(q, 1.0 / math.sqrt(d))
-    lsef = _bwd._prescale_lse(lse.view(1, S, hq_r).permute(0, 2, 1), stream).reshape(-1)
-    do_h, delta, ws_dk, ws_dv, img, counts = _buffers(S, hq_r, hkv_r, d, q_split, dout.device)
-    img.zero_()
+    if mode == "attn_only":
+        # no pull units to write it
+        lsef = _bwd._prescale_lse(lse.view(1, S, hq_r).permute(0, 2, 1), stream).reshape(-1)
+    if mode == "attn_only" or key in _IMG_DIRTY:
+        img.zero_()
+    if mode == "attn_only":
+        _IMG_DIRTY.add(key)
+    else:
+        _IMG_DIRTY.discard(key)
     with CompilationContext.compile_hints(_plan(S, hq_r, hkv_r, d)[1].embed["hints"]):
         run_launcher(
             _launch,
@@ -974,6 +1009,7 @@ def ulysses_a2a_attn_bwd(
             do_h,
             lsef,
             delta,
+            lse,
             ws_dk,
             ws_dv,
             img,
