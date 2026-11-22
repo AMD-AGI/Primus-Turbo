@@ -10,10 +10,11 @@ Reference: all-gather every rank's ``a``, multiply by this rank's column block o
 out at their source rank's sequence offset, split into the q / k / v head pieces; the in-kernel wgrad
 against ``a^T @ wb``.
 
-The pytest entry launches this file under torchrun for every world size the node has GPUs for:
+The pytest entry launches the ``--quick`` suite under torchrun for every world size the node has
+GPUs for. The full suite takes longer than the CI timeout on a cold FlyDSL cache, so it is run by hand:
 
-    pytest tests/pytorch/ops/test_gemm_a2a.py
-    torchrun --nproc_per_node 8 tests/pytorch/ops/test_gemm_a2a.py [--quick]
+    pytest tests/pytorch/ops/test_gemm_a2a.py --dist-only            # quick, all world sizes
+    torchrun --nproc_per_node 8 tests/pytorch/ops/test_gemm_a2a.py   # full
 """
 
 import argparse
@@ -269,12 +270,21 @@ def main():
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and is_gfx950()), reason="the fused collective GEMM kernels need gfx950"
 )
+# A cold FlyDSL cache takes minutes per world size to compile its kernels; allow the subprocess timeout.
+@pytest.mark.timeout(1800)
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 def test_gemm_a2a(world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size} GPUs")
     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    cmd = [sys.executable, "-m", "torch.distributed.run", f"--nproc_per_node={world_size}", __file__]
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        f"--nproc_per_node={world_size}",
+        __file__,
+        "--quick",
+    ]
     result = subprocess.run(cmd, cwd=repo_root, env={**os.environ, "PYTHONPATH": repo_root}, timeout=1800)
     assert result.returncode == 0
 
