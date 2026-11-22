@@ -1790,7 +1790,10 @@ def sparse_mla_bwd_gfx1250(
     ``PRIMUS_SMLA_BWD_V2=1`` (default 0; the same outputs bit for bit): the w1 kernel without its
     end-of-token L2 prefetch and with Q / dO / O staged by TDM gather; the band path builds the
     pool-row positions after w1 (not under it) and scans the per-pool-row counts inside the fill
-    kernel (no cumsum / copies). CSA shape (T 4096, H 64, topk 640): 855 -> ~770 us per call."""
+    kernel (no cumsum / copies). CSA shape (T 4096, H 64, topk 640): 855 -> ~770 us per call.
+
+    ``PRIMUS_CSABWD_PP=1`` (with V2, H = 64; default 0; same outputs bit for bit): the w1 kernel's work split over
+    eight waves, score waves (S / dP, softmax, dQ^T) next to C^T waves one tile behind (``bwd_pp``)."""
     # Deferred: primus_turbo.triton imports primus_turbo.pytorch, which imports this module.
     from primus_turbo.triton.attention.sparse_mla_dkv_gather import dkv_gather_acc
     from primus_turbo.triton.attention.sparse_mla_dsink import sparse_mla_dsink
@@ -1867,6 +1870,12 @@ def sparse_mla_bwd_gfx1250(
         if w1:
             v2kw = {"l2_prefetch": False, "qdo_tdm": H <= _w1_block_k(H)} if v2 else {}
             run = build_sparse_mla_bwd_gfx1250_w1(H, topk, float(scale), ahead=cus, **v2kw)
+            if v2 and H == 64 and os.environ.get("PRIMUS_CSABWD_PP", "0") == "1":
+                # Warp-specialized w1 (score waves || C^T waves one tile behind; the C^T waves prefetch the
+                # next CU-round token's inputs into L2 during their idle first step): same results bit for bit.
+                from .bwd_pp import build_sparse_mla_bwd_gfx1250_pp
+
+                run = build_sparse_mla_bwd_gfx1250_pp(H, topk, float(scale), l2pf=cus)
             # Tiles up to each token's last valid slot (slots past it are all -1).
             bn = _w1_block_k(H)
             from primus_turbo.triton.attention.sparse_mla_dkv_band_gather import walked_tiles
