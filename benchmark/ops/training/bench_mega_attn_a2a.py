@@ -164,9 +164,11 @@ def bench(model, seq, chunks, num_pulls, warmup, iters, reps, trace_dir, modes=F
         if trace_dir:
             total = trace_layout(M, n, hq_r, hkv_r, d)[-1]
             trace = torch.zeros(total, device=dev, dtype=torch.int64)
-            # the traced build compiles on its first call: time the second
-            for _ in range(2):
-                _barrier()
+            # the traced build compiles on its first call; then back-to-back calls like the timed loop
+            # (no host launch skew between the ranks): the buffer keeps the last one
+            for i in range(5):
+                if i < 2:
+                    _barrier()
                 ulysses_a2a_attn_fwd(
                     q_in,
                     k_in,
