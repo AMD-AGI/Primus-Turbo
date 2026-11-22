@@ -207,6 +207,8 @@ def _store_half(c_ptr, desc, shared, pid_m, pid_n, half: gl.constexpr, stride_cm
         gl.barrier()
         old = shared.load(layout=out.type.layout)
         gl.barrier()
+        if ACCUM == 2:  # fuse2: round the product to C's dtype first (= torch's bf16 add of two bf16 tensors)
+            out = out.to(c_ptr.type.element_ty).to(gl.float32)
         out = out + old.to(gl.float32)
     shared.store(out.to(c_ptr.type.element_ty))
     tdm.async_store(desc, [pid_m, pid_n, 0, half * half_n], shared)
@@ -598,7 +600,10 @@ def dsv4up_gemm(a, b, a_packed, b_packed, out=None, out_dtype=torch.bfloat16, ac
     assert b.shape[1] == K and a.stride(1) == 1 and b.stride(1) == 1
     assert a_packed.shape == (M // 128, K * 4) and b_packed.shape == (N // 128, K * 4)
     assert a_packed.is_contiguous() and b_packed.is_contiguous()
+    # accumulate == 2 (fuse2 dX fan-in): C = bf16(product) + old C in fp32, one rounding -- torch's bf16 add
+    acc_mode = 2 if (not isinstance(accumulate, bool) and accumulate == 2) else bool(accumulate)
     if split_k > 1:
+        assert acc_mode != 2, "dsv4up: accumulate=2 needs split_k == 1"
         assert K % split_k == 0 and shape_supported(M, N, K // split_k), (M, N, K, split_k)
         part = torch.empty((split_k, M, N), dtype=torch.float32, device=a.device)
         grid, kw = _plan(M, N, K, a.stride(0), b.stride(0), N, torch.float32, False, split_k)
@@ -614,7 +619,7 @@ def dsv4up_gemm(a, b, a_packed, b_packed, out=None, out_dtype=torch.bfloat16, ac
         assert not accumulate
         out = torch.empty((M, N), dtype=out_dtype, device=a.device)
     assert tuple(out.shape) == (M, N) and out.stride(1) == 1
-    grid, kw = _plan(M, N, K, a.stride(0), b.stride(0), out.stride(0), out.dtype, bool(accumulate))
+    grid, kw = _plan(M, N, K, a.stride(0), b.stride(0), out.stride(0), out.dtype, acc_mode)
     dsv4up_gemm_kernel[grid](a, b, out, a_packed, b_packed, **kw)
     return out
 
