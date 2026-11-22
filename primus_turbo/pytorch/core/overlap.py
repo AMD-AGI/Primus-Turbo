@@ -29,6 +29,7 @@ Switches (default off; read once at import):
   PRIMUS_OVERLAP_MOE_WGRAD=1   MegaMoE fp8_block expert wgrads (vkp / vk) on the side stream
   PRIMUS_OVERLAP_SHARED=1      (Primus) MoE shared expert forward (and so its backward) on the branch stream
   PRIMUS_OVERLAP_INDEXER=1     (Primus) CSA indexer (forward only) on the "indexer" side stream
+  PRIMUS_OVERLAP_COMPRESSOR=1  (Primus) HCA compressor (pool) forward (and so its backward) on a side stream
 """
 
 import os
@@ -37,7 +38,10 @@ import torch
 
 __all__ = ["enabled", "side_stream", "defer", "join", "pending", "branch", "ForkGrad"]
 
-_FLAGS = {k: os.environ.get(f"PRIMUS_OVERLAP_{k}", "0") == "1" for k in ("WGRAD", "MOE_WGRAD", "SHARED", "INDEXER")}
+_FLAGS = {
+    k: os.environ.get(f"PRIMUS_OVERLAP_{k}", "0") == "1"
+    for k in ("WGRAD", "MOE_WGRAD", "SHARED", "INDEXER", "COMPRESSOR")
+}
 _side = {}
 _used = {}  # (device index, name) -> side stream with un-joined work
 _keep = []  # tensors read/written by un-joined deferred work
