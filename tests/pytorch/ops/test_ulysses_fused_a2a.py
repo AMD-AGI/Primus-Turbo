@@ -345,6 +345,8 @@ def main():
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and is_gfx950()), reason="the Ulysses FlyDSL kernels need gfx950"
 )
+# A cold FlyDSL cache takes minutes per world size to compile its kernels; allow the subprocess timeout.
+@pytest.mark.timeout(1800)
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 def test_ulysses_fused_a2a(world_size):
     if torch.cuda.device_count() < world_size:
