@@ -25,7 +25,7 @@ from typing import Optional
 import torch
 
 from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad, main_grad_first_write
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_mx_flydsl_gfx1250 import mxgg_fp8blk_nt, mxgk_fp8blk_nt
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_mx_flydsl_gfx1250 import mxgg_fp8blk_nt, mxgk_fp8blk_nt, mxgp_fp8blk_nt
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_nt_flydsl_gfx1250 import flygg_fp8blk_nt
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_vk_flydsl_gfx1250 import flyvkblk_fp8
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_vkp_flydsl_gfx1250 import (
@@ -68,11 +68,14 @@ _GG_MODE = os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_GG", "tile").strip().lower()
 #         (grouped_gemm_fp8blk_mx_flydsl_gfx1250.py); falls back to k256 when a shape constraint fails.
 #   mxk (mxgemm): mxgk -- k256's TDM traffic (2 x 256-deep stages, whole-K scale planes) + a fragment pipeline that
 #         crosses k-tiles (early barrier in each k-tile's second half); falls back to k256.
-assert _GG_MODE in ("tile", "aligned", "k256", "persistent", "k256p", "mx", "mxk"), f"PRIMUS_TURBO_MOE_FP8BLK_GG={_GG_MODE!r}"
+#   mxp (mxgemm phase 2): mxgp -- persistent mxgk (grid = #CUs, live tiles bounded on the device from the group offsets:
+#         no dead workgroups, EP>1 worst-case pools OK; next tile's k-tiles / planes issued during the current tile's
+#         last k-tiles; C via line-scratch VMEM stores). Needs K % 512 == 0, else mxgk / k256. Bit-identical.
+assert _GG_MODE in ("tile", "aligned", "k256", "persistent", "k256p", "mx", "mxk", "mxp"), f"PRIMUS_TURBO_MOE_FP8BLK_GG={_GG_MODE!r}"
 if _GG_MODE != "tile":
     assert _ALIGN % 256 == 0
     _GEMM.update(aligned=True, persistent={"persistent": 1, "k256p": 2}.get(_GG_MODE, 0))
-if _GG_MODE in ("k256", "k256p", "mx", "mxk"):
+if _GG_MODE in ("k256", "k256p", "mx", "mxk", "mxp"):
     _GEMM.update(tile=(256, 256, 256), num_buffers=2, bblk=1)
 # mxgemm. PRIMUS_TURBO_MOE_FP8BLK_GG_BPF=1 (with GG=k256): fragment software pipeline inside each 256-deep k-tile (B
 # fragments of the next 128-k step double-buffered, A one row group ahead). Bit-identical. Default 0.
@@ -183,12 +186,14 @@ def refresh_fp8blk_weights():
 def _gg(a, a_s, c, transposed, poffs):
     """Grouped NT GEMM over the expert pool: a [P, K] fp8 x expert weights (c.q, or c.qT for the dgrads)."""
     w, ws = (c.qT, c.sT) if transposed else (c.q, c.s)
-    if _GG_MODE in ("mx", "mxk") and not _GG_DSV4:
+    if _GG_MODE in ("mx", "mxk", "mxp") and not _GG_DSV4:
         P, K = a.shape
         if _GG_MODE == "mx" and K % 128 == 0 and K >= 384 and w.shape[1] % 256 == 0 and P % 256 == 0:
             return mxgg_fp8blk_nt(a, w, a_s, ws, poffs)
-        if _GG_MODE == "mxk" and K >= 512 and (K & (K - 1)) == 0 and w.shape[1] % 256 == 0 and P % 256 == 0:
-            return mxgk_fp8blk_nt(a, w, a_s, ws, poffs)
+        if _GG_MODE == "mxp" and K % 512 == 0 and (K & (K - 1)) == 0 and w.shape[1] % 256 == 0 and P % 256 == 0:
+            return mxgp_fp8blk_nt(a, w, a_s, ws, poffs)
+        if _GG_MODE in ("mxk", "mxp") and K >= 512 and (K & (K - 1)) == 0 and w.shape[1] % 256 == 0 and P % 256 == 0:
+            return mxgk_fp8blk_nt(a, w, a_s, ws, poffs, sched=1)
     if not _GG_DSV4:
         kw = _GEMM
         if kw.get("tile", (0, 0, 128))[2] == 256 and a.shape[1] % 256:  # k256 needs K % 256 == 0
