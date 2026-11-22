@@ -29,7 +29,6 @@ where a chunk's destinations are the addresses of ITS first row (batch 0).
 """
 
 import functools
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -130,7 +129,6 @@ def epilogue(c, rem, add_lo, add_hi, tok, batch_bytes):
 
 # s_waitcnt lgkmcnt(0), vmcnt and expcnt left alone
 _WAIT_LGKM = 0xC07F
-_STORE_CM = int(os.environ.get("AGKV_BWD_DBG_CM", SYS_NT))
 
 
 def _lds_ptr(elem, lds_off):
@@ -167,7 +165,7 @@ def _stage_and_store(fragments, terms, dst_res, kv_start, head, tid, info):
         acc = fx.arith.extf(f32x8, llvm.LoadOp(bf16x8, _lds_ptr(elem, lds_off)).result)
         for part in parts:
             acc = fx.arith.addf(acc, fx.arith.extf(f32x8, part))
-        buffer_store(fx.arith.trunc_f(bf16x8, acc), dst_res, idx, cache_modifier=_STORE_CM)
+        buffer_store(fx.arith.trunc_f(bf16x8, acc), dst_res, idx, cache_modifier=SYS_NT)
 
 
 def block_kv(Skv, D):
