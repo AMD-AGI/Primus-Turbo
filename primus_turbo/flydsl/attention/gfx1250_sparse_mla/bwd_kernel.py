@@ -510,6 +510,8 @@ def build_sparse_mla_bwd_gfx1250_w1(
     ablate="",
     idx_pf=True,
     st_group=8,
+    l2_prefetch=True,
+    qdo_tdm=False,
 ):
     """One wave per SIMD (4 waves), 32 heads per wave; the kv tiles arrive by TDM gather.
 
@@ -525,7 +527,15 @@ def build_sparse_mla_bwd_gfx1250_w1(
 
     ``batch``: LDS operands load in batches of that many steps (see ``_run_steps``); 4 beats
     3 / 5 / 6 within noise at the fewest VGPRs, 8 spills. 0 restores the ``prefetch`` / ``pin``
-    stream."""
+    stream.
+
+    ``l2_prefetch=False``: no end-of-token L2 prefetch of the next token's inputs. The prefetch is
+    exposed latency at the end of every token (the workgroup ends only after it): 588 -> 527 us at
+    the CSA shape (L2 flushed), same results.
+
+    ``qdo_tdm``: Q / dO / O rows arrive by TDM gather (the SWA kernel's 8-row form; O lands in kv
+    buffer 1, which tile 1's gather overwrites only after delta) instead of buffer_load + ds_store
+    through VGPRs: -15..-24 us, same results."""
     H = num_heads
     WAVES = 4
     HP = H // 32  # 32-head pairs
@@ -573,6 +583,9 @@ def build_sparse_mla_bwd_gfx1250_w1(
     ]
     GW = fits[0] if fits else 0
     STAGE = GW > 0
+    QDO_TDM = bool(qdo_tdm)
+    if QDO_TDM and (NBUF != 2 or H * ROW > TILE_B or (H // 8) % WAVES):
+        raise ValueError("qdo_tdm needs two kv buffers that hold H rows")
     SROW = GW * 32 + 16
     STG_B = _stage_b(GW)
     LPR = max(GW * 2, 1)  # lanes per staged row (16 B each)
@@ -675,24 +688,38 @@ def build_sparse_mla_bwd_gfx1250_w1(
         def issue(t, buf):
             issue_octs(load_octs(t), buf)
 
+        if const_expr(QDO_TDM):
+            n_rows_all = fx.Int32(fx.grid_dim.x) * H
+            for k in range_constexpr(H // RPO // WAVES):
+                op = wave * (H // RPO // WAVES) + k
+                words = [tok * H + op * RPO + e for e in range(RPO)]
+                _tdm_gather(q_lds + op * (RPO * ROW), tensor_addr(Q), words, RPO, n_rows_all)
+                _tdm_gather(do_lds + op * (RPO * ROW), tensor_addr(DO), words, RPO, n_rows_all, row_len=DV)
+                _tdm_gather(kv_lds + TILE_B + op * (RPO * ROW), tensor_addr(O), words, RPO, n_rows_all, row_len=DV)
         issue_octs(load_octs(None, static_tile=0), fx.Int32(0))
 
         # ---- stage Q and dO (all heads) in LDS; O rows for delta go out alongside.
         h_d = tid // PPH
         p_d = tid % PPH
-        o_regs = [buf_load(rsrc_o, h_d * (DV * 2) + (p_d * CPP + j) * 16, v4i) for j in range_constexpr(CPP)]
+        if const_expr(not QDO_TDM):
+            o_regs = [buf_load(rsrc_o, h_d * (DV * 2) + (p_d * CPP + j) * 16, v4i) for j in range_constexpr(CPP)]
         for c in range_constexpr(QCH):
             idx = tid + c * BLOCK
             r, col = idx // CPR, idx % CPR
-            if const_expr("stg" not in ablate):
+            if const_expr("stg" not in ablate and not QDO_TDM):
                 lds_store(buf_load(rsrc_q, r * (DQK * 2) + col * 16, v4i), q_lds + r * ROW + col * 16)
                 lds_store(buf_load(rsrc_do, r * (DV * 2) + col * 16, v4i), do_lds + r * ROW + col * 16)
+        if const_expr(QDO_TDM):
+            _rocdl.s_wait_tensorcnt(0)
         gpu.barrier()
 
         # ---- delta = rowsum(O * dO): thread (h_d, p_d) sums part p_d of head h_d.
         acc = fx.Float32(0.0)
         for j in range_constexpr(CPP):
-            ov = Vec(o_regs[j]).bitcast(fx.BFloat16)
+            if const_expr(QDO_TDM):
+                ov = Vec(lds_load(kv_lds + TILE_B + h_d * ROW + (p_d * CPP + j) * 16, v4i)).bitcast(fx.BFloat16)
+            else:
+                ov = Vec(o_regs[j]).bitcast(fx.BFloat16)
             dv = Vec(lds_load(do_lds + h_d * ROW + (p_d * CPP + j) * 16, v4i)).bitcast(fx.BFloat16)
             for e in range_constexpr(8):
                 acc = fadd(acc, fmul(fx.Float32(ov[e]), fx.Float32(dv[e])))
@@ -901,13 +928,14 @@ def build_sparse_mla_bwd_gfx1250_w1(
             res = yield [new[g][j] for g in range_constexpr(G) for j in range_constexpr(DTQ)] + nxt
         # The over-issued gather must land before the workgroup's LDS is released.
         _rocdl.s_wait_tensorcnt(0)
-        nxt = tok + fx.Int32(ahead)
-        nxt = fx.Int32((nxt < fx.Int32(fx.grid_dim.x)).select(nxt, tok))
-        _l2_prefetch(tensor_addr(Q) + fx.Int64(nxt) * (H * DQK * 2), H * DQK * 2, tid, BLOCK)
-        _l2_prefetch(tensor_addr(DO) + fx.Int64(nxt) * (H * DV * 2), H * DV * 2, tid, BLOCK)
-        _l2_prefetch(tensor_addr(O) + fx.Int64(nxt) * (H * DV * 2), H * DV * 2, tid, BLOCK)
-        _l2_prefetch(tensor_addr(TOPK) + fx.Int64(nxt) * (topk * 4), topk * 4, tid, BLOCK)
-        _l2_prefetch(tensor_addr(LSE) + fx.Int64(nxt) * (H * 4), H * 4, tid, BLOCK)
+        if const_expr(l2_prefetch):
+            nxt = tok + fx.Int32(ahead)
+            nxt = fx.Int32((nxt < fx.Int32(fx.grid_dim.x)).select(nxt, tok))
+            _l2_prefetch(tensor_addr(Q) + fx.Int64(nxt) * (H * DQK * 2), H * DQK * 2, tid, BLOCK)
+            _l2_prefetch(tensor_addr(DO) + fx.Int64(nxt) * (H * DV * 2), H * DV * 2, tid, BLOCK)
+            _l2_prefetch(tensor_addr(O) + fx.Int64(nxt) * (H * DV * 2), H * DV * 2, tid, BLOCK)
+            _l2_prefetch(tensor_addr(TOPK) + fx.Int64(nxt) * (topk * 4), topk * 4, tid, BLOCK)
+            _l2_prefetch(tensor_addr(LSE) + fx.Int64(nxt) * (H * 4), H * 4, tid, BLOCK)
         # dQ (rope columns zeroed) goes out through the Q / dO area, free once every wave is past
         # its last C^T, so the token's rows leave as one contiguous run. LDS-only barriers: gpu.barrier()
         # also drains every outstanding global store (the token's interm rows), which ATT showed as the
@@ -1757,7 +1785,12 @@ def sparse_mla_bwd_gfx1250(
     ``band_pool = (window, n_raw, pool)`` asserts the map is a window + pool map (V4 CSA with
     B == 1: slots ``[0, window)`` are the sliding window ``t - window + 1 + s``, the rest pool
     rows ``n_raw + p`` picked at most once per token, or -1). The dKV reduction then needs no
-    CSR inverse (no sort): see ``sparse_mla_dkv_band_gather``."""
+    CSR inverse (no sort): see ``sparse_mla_dkv_band_gather``.
+
+    ``PRIMUS_SMLA_BWD_V2=1`` (default 0; the same outputs bit for bit): the w1 kernel without its
+    end-of-token L2 prefetch and with Q / dO / O staged by TDM gather; the band path builds the
+    pool-row positions after w1 (not under it) and scans the per-pool-row counts inside the fill
+    kernel (no cumsum / copies). CSA shape (T 4096, H 64, topk 640): 855 -> ~770 us per call."""
     # Deferred: primus_turbo.triton imports primus_turbo.pytorch, which imports this module.
     from primus_turbo.triton.attention.sparse_mla_dkv_gather import dkv_gather_acc
     from primus_turbo.triton.attention.sparse_mla_dsink import sparse_mla_dsink
@@ -1828,10 +1861,12 @@ def sparse_mla_bwd_gfx1250(
         torch.empty(chunk, topk, DV, dtype=torch.bfloat16, device=q.device) for _ in range(min(n_chunks, 2))
     ]
     dkv_acc = torch.zeros(num_kv, DQK, dtype=torch.float32, device=q.device)
+    v2 = os.environ.get("PRIMUS_SMLA_BWD_V2", "0") == "1"
     if T_ > 0:
         w1 = use_w1 and H % 32 == 0 and topk % _w1_block_k(H) == 0
         if w1:
-            run = build_sparse_mla_bwd_gfx1250_w1(H, topk, float(scale), ahead=cus)
+            v2kw = {"l2_prefetch": False, "qdo_tdm": H <= _w1_block_k(H)} if v2 else {}
+            run = build_sparse_mla_bwd_gfx1250_w1(H, topk, float(scale), ahead=cus, **v2kw)
             # Tiles up to each token's last valid slot (slots past it are all -1).
             bn = _w1_block_k(H)
             from primus_turbo.triton.attention.sparse_mla_dkv_band_gather import walked_tiles
@@ -1848,9 +1883,11 @@ def sparse_mla_bwd_gfx1250(
                 dkv_band_gather_acc,
             )
 
-            side.wait_stream(main)
-            with torch.cuda.stream(side):
-                pos = band_pool_positions(topk_indices, *band_pool)
+            pos = None
+            if not v2:
+                side.wait_stream(main)
+                with torch.cuda.stream(side):
+                    pos = band_pool_positions(topk_indices, *band_pool)
         # The main kernel holds every CU, so side-stream work is not free: when the chunk keys fit
         # int16, one sort for all chunks costs about half of the per-chunk sorts.
         joint = not band and 1 < n_chunks and n_chunks * num_kv < torch.iinfo(torch.int16).max
@@ -1876,7 +1913,10 @@ def sparse_mla_bwd_gfx1250(
             side.wait_stream(main)
             with torch.cuda.stream(side):
                 if band:
-                    dkv_band_gather_acc(im, pos, dkv_acc, t0, t1, *band_pool, d=DV)
+                    if pos is None:
+                        # v2: after w1 (under w1 it slows w1 more than it costs here)
+                        pos = band_pool_positions(topk_indices, *band_pool)
+                    dkv_band_gather_acc(im, pos, dkv_acc, t0, t1, *band_pool, d=DV, fused_scan=v2)
                 elif joint:
                     dkv_gather_acc(
                         im,
