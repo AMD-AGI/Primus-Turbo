@@ -34,6 +34,10 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_vkp_flydsl_gfx1250 imp
     flyvkpblk_fp8,
     vkpblk_sumsq_numel,
 )
+from primus_turbo.triton.quantization.persist_moe import (
+    combine_dw_enabled as _combine_dw_enabled,
+    combine_rows_route_dw as _combine_rows_route_dw,
+)
 from primus_turbo.triton.quantization.quant_blk_gfx1250 import (
     MX,
     build_routing_blk,
@@ -321,11 +325,16 @@ class _FP8BlockMoE(torch.autograd.Function):
                 grads.append(g.to(w.dtype))
         dW2, dW1 = grads if not deferred else (_get_dummy_wgrad(w.shape, w.dtype) for w in (w2, w1))
         dxp = _gg(gq, gs, c1, True, poffs)
-        dx = combine_rows(dxp, inv, T, K)
-        if _FUSE_BWD:
-            dtw = route_dw_partials(dwr, inv, ctx.topk_dtype).view(T, K)
+        if _FUSE_BWD and _combine_dw_enabled():
+            # persist track: combine + d topk-weights (independent kernels) as one launch, same bits
+            dx, dtw = _combine_rows_route_dw(dxp, inv, T, K, dwr, ctx.topk_dtype)
+            dtw = dtw.view(T, K)
         else:
-            dtw = dwr[inv.long()].view(T, K).to(ctx.topk_dtype)
+            dx = combine_rows(dxp, inv, T, K)
+            if _FUSE_BWD:
+                dtw = route_dw_partials(dwr, inv, ctx.topk_dtype).view(T, K)
+            else:
+                dtw = dwr[inv.long()].view(T, K).to(ctx.topk_dtype)
         return dx, None, dtw, dW1, dW2, None, None, None, None, (dy if ctx.has_add else None)
 
 
