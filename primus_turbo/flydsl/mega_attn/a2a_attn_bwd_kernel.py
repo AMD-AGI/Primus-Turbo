@@ -73,6 +73,8 @@ from primus_turbo.flydsl.utils.buffer_ops import (
 from primus_turbo.flydsl.utils.prims import (
     _readfirstlane_i32,
     atomic_add,
+    _i64,
+    cast,
     ld,
     memory_fence,
     read_clock,
@@ -99,6 +101,10 @@ BAND = 256
 _BATCH = 8
 
 _BF16 = fx.BFloat16
+
+# LDS stash of the work loop's 64-bit bases (see _stashed)
+_S_PEERS, _S_MY, _S_EPOCH, _S_COUNT, _S_WSK, _S_WSV, _S_IMG, _S_DQ, _S_STATE, _S_TRACE = 0, 1, 2, 3, 4, 5, 6, 7, 10, 11
+_STASH_LEN = 12
 
 
 def _ceildiv(a, b):
@@ -487,26 +493,41 @@ def _gather_unit(thread_index, g, src, flag_base, recv_addr, out_res, epoch, **c
     fx.gpu.barrier()
 
 
+def _stashed(stash, i):
+    """Stash entry ``i``, read where it is used: a base or descriptor held across the stock body raises
+    its SGPR pressure, and the spills land in its main loop. An LDS load is not hoisted past the body."""
+    v = fx.arith.ArithValue(ld(stash, fx.Int32(i), scope="workgroup", space=3, dtype=fx.T.i64), signed=True)
+    lo = _readfirstlane_i32(cast(v, fx.T.i32))
+    hi = _readfirstlane_i32(cast(v >> fx.Int64(32), fx.T.i32))
+    return (_i64(hi) << fx.Int64(32)) | (_i64(lo) & fx.Int64(0xFFFFFFFF))
+
+
+def _region(stash, region):
+    return _stashed(stash, _S_MY) + fx.Int64(region * FLAG_REGION_BYTES)
+
+
+def _recv_offset(epoch, c):
+    """This epoch's recv rows in the heap (behind the flags and the dO staging rows of its bank)."""
+    return fx.Int64(FLAG_BYTES + c["stage_bytes"]) + (epoch & fx.Int64(1)) * fx.Int64(c["bank_bytes"])
+
+
+def _ws_res(stash, i, c):
+    return create_buffer_resource_from_addr(
+        _stashed(stash, i), num_records_bytes=c["q_split"] * c["S"] * c["hkv_r"] * c["head_dim"] * 2
+    )
+
+
 @ASTRewriter.transform
-def _work_loop(
-    thread_index,
-    state_base,
-    claim_slot,
-    my_base,
-    peers_base,
-    recv_offset,
-    wsk_res,
-    wsv_res,
-    img_res,
-    out_res,
-    count_base,
-    epoch,
-    run_item,
-    trace_base,
-    **c,
-):
+def _trace(stash, at, thread_index):
+    tb = _stashed(stash, _S_TRACE)
+    if thread_index == fx.Int32(0):
+        st(tb, at, read_clock())
+
+
+@ASTRewriter.transform
+def _work_loop(thread_index, claim_slot, stash, run_item, **c):
     """Claim items (``num_early`` top bands, then the rest from band 0 up), then dQ push units in sequence
-    order, then gather units ``(m-tile, src)``."""
+    order, then gather units ``(m-tile, src)``. Every base comes from ``stash`` at its use."""
     nb, ipb, ni, early, qs, n = (
         c["num_bands"],
         c["items_per_band"],
@@ -517,68 +538,94 @@ def _work_loop(
     )
     attn, comm = c["mode"] != "comm_only", c["mode"] != "attn_only"
     num_claims = ni + ((nb + c["g_tiles"] * n) if comm else 0)
-    ready_base = my_base + fx.Int64(REGION_BWD_READY * FLAG_REGION_BYTES)
-    band_base = my_base + fx.Int64(REGION_BWD_BAND * FLAG_REGION_BYTES)
-    recv_flags = my_base + fx.Int64(REGION_BWD_RECV * FLAG_REGION_BYTES)
-    trace_at = c["trace_item_at"]
+    trace, trace_at = c["trace"], c["trace_item_at"]
     # dO / delta rows from here on were acquired by this block: later items above it skip the wait and
     # its fence (an agent-scope acquire invalidates the XCD's L2 under the other resident items)
     acquired = fx.Int32(c["S"])
-    unit = claim_unit(opaque_tid(thread_index), state_base, claim_slot, counter=STATE_TILE)
-    while unit < fx.Int32(num_claims):
+    # items, then (a second loop: what the dQ push / gather code holds stays off the body's registers)
+    # the comm units; claims are ordered, so the unit that ends the first loop starts the second
+    unit = claim_unit(opaque_tid(thread_index), _stashed(stash, _S_STATE), claim_slot, counter=STATE_TILE)
+    while unit < fx.Int32(ni):
         k = unit // fx.Int32(ipb)
         band = arith.select(k < fx.Int32(early), fx.Int32(nb - 1) - k, k - fx.Int32(early))
         kv_lo = band * fx.Int32(BAND)
-        need = (unit < fx.Int32(ni)) & (kv_lo < acquired)
-        if unit < fx.Int32(ni):
-            sub = unit % fx.Int32(ipb)
-            if const_expr(trace_base is not None):
-                if thread_index == fx.Int32(0):
-                    st(trace_base, fx.Int32(trace_at) + unit * fx.Int32(3), read_clock())
-            if const_expr(comm):
-                if need:
-                    _wait_suffix(opaque_tid(thread_index), ready_base, kv_lo, epoch, **c)
-            if const_expr(trace_base is not None):
-                if thread_index == fx.Int32(0):
-                    st(trace_base, fx.Int32(trace_at) + unit * fx.Int32(3) + fx.Int32(1), read_clock())
-            if const_expr(attn):
-                run_item(band, sub % fx.Int32(qs), sub // fx.Int32(qs))
-            if const_expr(comm):
-                _finish_item(
+        need = kv_lo < acquired
+        sub = unit % fx.Int32(ipb)
+        if const_expr(trace):
+            _trace(stash, fx.Int32(trace_at) + unit * fx.Int32(3), thread_index)
+        if const_expr(comm):
+            if need:
+                _wait_suffix(
                     opaque_tid(thread_index),
-                    band,
-                    claim_slot,
-                    count_base,
-                    band_base,
-                    peers_base,
-                    recv_offset,
-                    wsk_res,
-                    wsv_res,
+                    _region(stash, REGION_BWD_READY),
+                    kv_lo,
+                    _stashed(stash, _S_EPOCH),
+                    **c,
+                )
+        if const_expr(trace):
+            _trace(stash, fx.Int32(trace_at) + unit * fx.Int32(3) + fx.Int32(1), thread_index)
+        if const_expr(attn):
+            run_item(band, sub % fx.Int32(qs), sub // fx.Int32(qs))
+        if const_expr(comm):
+            epoch = _stashed(stash, _S_EPOCH)
+            _finish_item(
+                opaque_tid(thread_index),
+                band,
+                claim_slot,
+                _stashed(stash, _S_COUNT),
+                _region(stash, REGION_BWD_BAND),
+                _stashed(stash, _S_PEERS),
+                _recv_offset(epoch, c),
+                _ws_res(stash, _S_WSK, c),
+                _ws_res(stash, _S_WSV, c),
+                epoch,
+                **c,
+            )
+        if const_expr(trace):
+            _trace(stash, fx.Int32(trace_at) + unit * fx.Int32(3) + fx.Int32(2), thread_index)
+        # the next unit's LDS writes wait for this one's last reads
+        fx.gpu.barrier()
+        acquired = arith.select(need, kv_lo, acquired)
+        unit = claim_unit(opaque_tid(thread_index), _stashed(stash, _S_STATE), claim_slot, counter=STATE_TILE)
+    if const_expr(comm):
+        while unit < fx.Int32(num_claims):
+            jj = unit - fx.Int32(ni)
+            epoch = _stashed(stash, _S_EPOCH)
+            if jj < fx.Int32(nb):
+                _push_dq(
+                    opaque_tid(thread_index),
+                    jj,
+                    _region(stash, REGION_BWD_BAND),
+                    _stashed(stash, _S_PEERS),
+                    _recv_offset(epoch, c),
+                    create_buffer_resource_from_addr(
+                        _stashed(stash, _S_IMG), num_records_bytes=c["S"] * c["hq_r"] * c["head_dim"] * 2
+                    ),
                     epoch,
                     **c,
                 )
-            if const_expr(trace_base is not None):
-                if thread_index == fx.Int32(0):
-                    st(trace_base, fx.Int32(trace_at) + unit * fx.Int32(3) + fx.Int32(2), read_clock())
-            # the next unit's LDS writes wait for this one's last reads
-            fx.gpu.barrier()
-        else:
-            jj = unit - fx.Int32(ni)
-            if jj < fx.Int32(nb):
-                _push_dq(opaque_tid(thread_index), jj, band_base, peers_base, recv_offset, img_res, epoch, **c)
-                if const_expr(trace_base is not None):
-                    if thread_index == fx.Int32(0):
-                        st(trace_base, fx.Int32(c["trace_dq_at"]) + jj, read_clock())
+                if const_expr(trace):
+                    _trace(stash, fx.Int32(c["trace_dq_at"]) + jj, thread_index)
             else:
                 gg = jj - fx.Int32(nb)
                 g = gg // fx.Int32(n)
                 src = gg % fx.Int32(n)
-                _gather_unit(opaque_tid(thread_index), g, src, recv_flags, my_base + recv_offset, out_res, epoch, **c)
-                if const_expr(trace_base is not None):
-                    if thread_index == fx.Int32(0):
-                        st(trace_base, fx.Int32(c["trace_gather_at"]) + gg, read_clock())
-        acquired = arith.select(need, kv_lo, acquired)
-        unit = claim_unit(opaque_tid(thread_index), state_base, claim_slot, counter=STATE_TILE)
+                _gather_unit(
+                    opaque_tid(thread_index),
+                    g,
+                    src,
+                    _region(stash, REGION_BWD_RECV),
+                    _stashed(stash, _S_MY) + _recv_offset(epoch, c),
+                    [
+                        create_buffer_resource_from_addr(_stashed(stash, _S_DQ + x), num_records_bytes=c["recv_x_bytes"][x])
+                        for x in range_constexpr(3)
+                    ],
+                    epoch,
+                    **c,
+                )
+                if const_expr(trace):
+                    _trace(stash, fx.Int32(c["trace_gather_at"]) + gg, thread_index)
+            unit = claim_unit(opaque_tid(thread_index), _stashed(stash, _S_STATE), claim_slot, counter=STATE_TILE)
 
 
 TRACE_MAX_BLOCKS = 1024
@@ -630,6 +677,7 @@ def _make_kernel(M, rank, num_ranks, hq_r, hkv_r, head_dim, seq_chunk, num_pull,
     @fx.struct
     class SharedStorage:
         claim: fx.Array[fx.Int32, 4, 16]
+        stash: fx.Array[fx.Int32, 2 * _STASH_LEN, 16]
 
     c = dict(
         M=M,
@@ -655,6 +703,8 @@ def _make_kernel(M, rank, num_ranks, hq_r, hkv_r, head_dim, seq_chunk, num_pull,
         num_early=min(num_early, nb),
         dq_scale=dkdv_l.dq_scale,
         mode=mode,
+        trace=trace,
+        bank_bytes=bank_bytes,
         trace_item_at=trace_item_at,
         trace_dq_at=trace_dq_at,
         trace_gather_at=trace_gather_at,
@@ -695,6 +745,25 @@ def _make_kernel(M, rank, num_ranks, hq_r, hkv_r, head_dim, seq_chunk, num_pull,
         epoch = ld(state_base, fx.Int32(0), dtype=fx.T.i64)
         bank_offset = fx.Int64(FLAG_BYTES) + (epoch & fx.Int64(1)) * fx.Int64(bank_bytes)
         my_base = ld(peers_base, fx.Int32(rank), dtype=fx.T.i64)
+        stash = fx.Int32(fx.ptrtoint(lds.stash.ptr))
+        if thread_index == fx.Int32(0):
+            for i, v in (
+                (_S_PEERS, peers_base),
+                (_S_MY, my_base),
+                (_S_EPOCH, epoch),
+                (_S_COUNT, i64_base(COUNT)),
+                (_S_WSK, i64_base(WSK)),
+                (_S_WSV, i64_base(WSV)),
+                (_S_IMG, i64_base(IMG)),
+                (_S_DQ, i64_base(DQ)),
+                (_S_DQ + 1, i64_base(DK)),
+                (_S_DQ + 2, i64_base(DV)),
+                (_S_STATE, state_base),
+                (_S_TRACE, trace_base if trace else fx.Int64(0)),
+            ):
+                st(stash, fx.Int32(i), v, scope="workgroup", space=3)
+        fx.rocdl.s_waitcnt(0)
+        fx.gpu.barrier()
 
         if const_expr(mode != "attn_only"):
             in_res = create_buffer_resource(DO_IN, num_records_bytes=stage_bytes)
@@ -735,28 +804,11 @@ def _make_kernel(M, rank, num_ranks, hq_r, hkv_r, head_dim, seq_chunk, num_pull,
                 ids=(fx.Index(band), fx.Index(kvh), fx.Index(split), fx.Index(0)),
             )
 
-        _work_loop(
-            thread_index,
-            state_base,
-            claim_slot,
-            my_base,
-            peers_base,
-            bank_offset + fx.Int64(stage_bytes),
-            create_buffer_resource(WSK, num_records_bytes=q_split * S * hkv_r * d * 2),
-            create_buffer_resource(WSV, num_records_bytes=q_split * S * hkv_r * d * 2),
-            create_buffer_resource(IMG, num_records_bytes=S * hq_r * d * 2),
-            [
-                create_buffer_resource(t, num_records_bytes=nbytes)
-                for t, nbytes in zip((DQ, DK, DV), recv_x_bytes)
-            ],
-            i64_base(COUNT),
-            epoch,
-            run_item,
-            trace_base,
-            **c,
-        )
+        _work_loop(thread_index, claim_slot, stash, run_item, **c)
 
-        exit_and_bump_epoch(thread_index, state_base, epoch, grid, extra_counters=(STATE_ASSIST,))
+        exit_and_bump_epoch(
+            thread_index, _stashed(stash, _S_STATE), _stashed(stash, _S_EPOCH), grid, extra_counters=(STATE_ASSIST,)
+        )
 
     return kernel, grid, emb["value_attrs"], emb["allocator"]
 
