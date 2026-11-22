@@ -68,7 +68,14 @@ def rocm_sdk_devel_library_home():
     if is_package_installed("rocm_sdk_devel"):
         from rocm_sdk._devel import get_devel_root
 
-        return get_devel_root()
+        try:
+            return get_devel_root()
+        except PermissionError:
+            # get_devel_root() also links per-ISA device files into the expanded tree, which needs
+            # write access to the environment; a read-only one still has what the build needs.
+            import _rocm_sdk_devel
+
+            return os.path.dirname(_rocm_sdk_devel.__file__)
 
     else:
         return None
