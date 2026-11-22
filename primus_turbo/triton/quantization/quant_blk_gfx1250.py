@@ -16,6 +16,8 @@ The exponent comes from the amax bits (no division; quant_epi_gfx1250), bit-iden
 pack_scale BK256 layout [R/128, K/32*128]); same bytes, different order.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -30,6 +32,8 @@ from primus_turbo.triton.quantization.quant_epi_gfx1250 import (
 
 FP8_MAX = 448.0
 MX = 32
+# fuse-moe: Gluon TDM-streamed SwiGLU backward (quant_blk_gluon_gfx1250; needs Triton main with gluon cdna5)
+_SWB_TDM = os.environ.get("PRIMUS_FUSE_MOE_SWB_TDM", "0") == "1"
 
 
 @triton.jit
@@ -321,7 +325,7 @@ def _swiglu_bwd_dual_kernel(DA, L1, W, Q, S, QT, ST, GW, P, I, PREAL, ALPHA: tl.
 
 def swiglu_bwd_dual_blk(d_act: torch.Tensor, l1: torch.Tensor, w: torch.Tensor, activation=None,
                         dtype=torch.float8_e4m3fn, preal=None, compact_t: bool = False, scale_layout="x4",
-                        interleaved: bool = False):
+                        interleaved: bool = False, raw_dw: bool = False):
     """-> (q [P, 2I], s [P, 2I/32], qT [2I, P], sT [2I, P/32]) of grad_l1, and d w [P] (fp32).
     ``interleaved``: l1 and q in the [gate128|up128] column order; qT/sT rows stay canonical."""
     from primus_turbo.flydsl.utils.glu_activation import activation_constexpr
@@ -331,13 +335,23 @@ def swiglu_bwd_dual_blk(d_act: torch.Tensor, l1: torch.Tensor, w: torch.Tensor, 
     sl = scale_layout_id(scale_layout)
     q, s, qT, sT = _dual_alloc(P, 2 * I, dtype, sl, compact_t, dev)
     # rows past the real pool keep zero partials (their d w is never read)
-    gw = torch.zeros((P, I // 128), device=dev, dtype=torch.float32)
+    # raw_dw (fuse track, PRIMUS_FUSE_MOE_BWD): return the per-(row, 128-col block) partials [P, I/128] unsummed and
+    # unzeroed (rows past the real pool hold garbage; route_dw_partials reads only routed rows)
+    gw = (torch.empty if raw_dw else torch.zeros)((P, I // 128), device=dev, dtype=torch.float32)
+    if (_SWB_TDM and preal is not None and compact_t and sl == 0 and not interleaved and dtype == torch.float8_e4m3fn
+            and d_act.dtype == torch.bfloat16 and l1.dtype == torch.bfloat16 and w.dtype == torch.float32):
+        # fuse-moe (PRIMUS_FUSE_MOE_SWB_TDM=1): Gluon TDM-streamed version, byte-identical outputs
+        from primus_turbo.triton.quantization.quant_blk_gluon_gfx1250 import swiglu_bwd_dual_tdm
+
+        swiglu_bwd_dual_tdm(d_act.contiguous(), l1.contiguous(), w.contiguous(), q, s, qT, sT, gw, preal,
+                            alpha, off, glo, ghi, ucl)
+        return q, s, qT, sT, (gw if raw_dw else gw.sum(1))
     _swiglu_bwd_dual_kernel[(P // 128, I // 128)](d_act, l1, w, q, s, qT, sT, gw, P, I,
                                                   preal if preal is not None else w, ALPHA=alpha, OFF=off, GLO=glo,
                                                   GHI=ghi, UCL=ucl, FP8_MAX=torch.finfo(dtype).max,
                                                   HAS_PREAL=int(preal is not None), CT=int(compact_t), SL=sl,
                                                   ILV=int(interleaved), num_warps=8)
-    return q, s, qT, sT, gw.sum(1)
+    return q, s, qT, sT, (gw if raw_dw else gw.sum(1))
 
 
 def interleave_perm(n2: int, dev=None) -> torch.Tensor:
@@ -358,22 +372,31 @@ def interleave_w1(w1: torch.Tensor) -> torch.Tensor:
 
 
 @triton.jit
-def _combine_kernel(Y, INV, OUT, H, K: tl.constexpr, BH: tl.constexpr):
-    """out[t] = sum_k Y[INV[t*K + k]] (bf16 rows, fp32 sum). grid (T, H // BH)."""
+def _combine_kernel(Y, INV, OUT, H, K: tl.constexpr, BH: tl.constexpr, ADD=None, HAS_ADD: tl.constexpr = 0):
+    """out[t] = sum_k Y[INV[t*K + k]] (bf16 rows, fp32 sum). grid (T, H // BH).
+    HAS_ADD: out[t] = bf16(fp32(bf16(sum)) + fp32(ADD[t])), i.e. exactly ``combine + ADD`` as two bf16 ops (the
+    routed + shared expert add of the MoE layer, fuse track)."""
     t = tl.program_id(0)
     h = tl.program_id(1) * BH + tl.arange(0, BH)
     acc = tl.zeros((BH,), dtype=tl.float32)
     for k in tl.static_range(K):
         r = tl.load(INV + t * K + k).to(tl.int64)
         acc += tl.load(Y + r * H + h).to(tl.float32)
-    tl.store(OUT + t.to(tl.int64) * H + h, acc.to(OUT.dtype.element_ty))
+    o = acc.to(OUT.dtype.element_ty)
+    if HAS_ADD:
+        o = (o.to(tl.float32) + tl.load(ADD + t.to(tl.int64) * H + h).to(tl.float32)).to(OUT.dtype.element_ty)
+    tl.store(OUT + t.to(tl.int64) * H + h, o)
 
 
-def combine_rows(y: torch.Tensor, inv: torch.Tensor, T: int, K: int, bh: int = 1024):
-    """y [P, H] pool rows (routing weight already applied), inv int32 [T*K] pool row of route (t, k) -> [T, H]."""
+def combine_rows(y: torch.Tensor, inv: torch.Tensor, T: int, K: int, bh: int = 1024, add: torch.Tensor = None):
+    """y [P, H] pool rows (routing weight already applied), inv int32 [T*K] pool row of route (t, k) -> [T, H].
+    ``add`` [T, H] (same dtype, contiguous): fused ``+ add`` (bit-identical to a separate torch add)."""
     H = y.shape[1]
     out = torch.empty((T, H), device=y.device, dtype=y.dtype)
-    _combine_kernel[(T, H // bh)](y, inv, out, H, K=K, BH=bh, num_warps=4)
+    if add is not None:
+        assert add.shape == (T, H) and add.dtype == y.dtype and add.is_contiguous() and add.data_ptr() != 0
+    _combine_kernel[(T, H // bh)](y, inv, out, H, K=K, BH=bh, ADD=add if add is not None else y,
+                                  HAS_ADD=int(add is not None), num_warps=4)
     return out
 
 
@@ -446,3 +469,61 @@ def build_routing_blk(topk_idx: torch.Tensor, topk_w: torch.Tensor, num_experts:
     _route_scatter_kernel[(nch,)](idx, topk_w.contiguous(), base, rowmap, rw, inv, R, E=E, K=K, BLOCK=block,
                                   num_warps=4)
     return rowmap, rw, inv, poffs, poffs[E:]
+
+
+@triton.jit
+def _gw4(GW, p, m, NC: tl.constexpr, j: tl.constexpr):
+    x0 = tl.load(GW + p * NC + 4 * j, mask=m, other=0.0)
+    x1 = tl.load(GW + p * NC + 4 * j + 1, mask=m, other=0.0)
+    x2 = tl.load(GW + p * NC + 4 * j + 2, mask=m, other=0.0)
+    x3 = tl.load(GW + p * NC + 4 * j + 3, mask=m, other=0.0)
+    return (x0 + x1) + (x2 + x3)
+
+
+@triton.jit
+def _route_dw_kernel(GW, INV, OUT, R, NC: tl.constexpr, BLOCK: tl.constexpr):
+    """OUT[r] = sum_c GW[INV[r], c]: d topk_weight of route r from the SwiGLU-bwd partials. NC 16 / 8: the pairwise
+    tree torch's gw.sum(1) uses for those widths (bit-identical, checked); other widths sequential."""
+    r = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = r < R
+    p = tl.load(INV + r, mask=m, other=0).to(tl.int64)
+    if NC == 16:
+        acc = (_gw4(GW, p, m, NC, 0) + _gw4(GW, p, m, NC, 1)) + (_gw4(GW, p, m, NC, 2) + _gw4(GW, p, m, NC, 3))
+    elif NC == 8:
+        acc = _gw4(GW, p, m, NC, 0) + _gw4(GW, p, m, NC, 1)
+    else:
+        acc = tl.zeros((BLOCK,), dtype=tl.float32)
+        for c in tl.static_range(NC):
+            acc += tl.load(GW + p * NC + c, mask=m, other=0.0)
+    tl.store(OUT + r, acc.to(OUT.dtype.element_ty), mask=m)
+
+
+def route_dw_partials(gw: torch.Tensor, inv: torch.Tensor, out_dtype=torch.float32) -> torch.Tensor:
+    """gw [P, NC] fp32 partials of d w per pool row (swiglu_bwd_dual_blk raw_dw), inv int32 [R] pool row of each
+    route -> d topk_weights [R] in one launch (replaces zeros + sum(1) + inv.long() + index + cast; bit-identical to
+    ``gw.sum(1)[inv.long()]`` for NC 16 and 8)."""
+    R = inv.numel()
+    NC = gw.shape[1]
+    out = torch.empty(R, device=gw.device, dtype=out_dtype)
+    _route_dw_kernel[(triton.cdiv(R, 1024),)](gw, inv, out, R, NC=NC, BLOCK=1024, num_warps=4)
+    return out
+
+
+@triton.jit
+def _lpt_order_kernel(POFFS, PERM, G, GP: tl.constexpr):
+    """one program: PERM = experts by window length descending, ties by index (= stable argsort, descending)."""
+    g = tl.arange(0, GP)
+    v = g < G
+    ln = tl.where(v, tl.load(POFFS + 1 + g, mask=v, other=0) - tl.load(POFFS + g, mask=v, other=0), -1)
+    before = (ln[None, :] > ln[:, None]) | ((ln[None, :] == ln[:, None]) & (g[None, :] < g[:, None]))
+    rank = tl.sum(before.to(tl.int32), axis=1)
+    tl.store(PERM + rank, g.to(tl.int32), mask=v)
+
+
+def expert_order_lpt_fused(poffs_i32: torch.Tensor) -> torch.Tensor:
+    """Same int32 [G] order as grouped_gemm_fp8blk_vkp's ``expert_order_lpt`` (stable descending argsort of the
+    window lengths) in one launch instead of seven."""
+    G = poffs_i32.numel() - 1
+    perm = torch.empty(G, device=poffs_i32.device, dtype=torch.int32)
+    _lpt_order_kernel[(1,)](poffs_i32, perm, G, GP=triton.next_power_of_2(G), num_warps=4)
+    return perm

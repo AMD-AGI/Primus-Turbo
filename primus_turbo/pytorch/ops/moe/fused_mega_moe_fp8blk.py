@@ -26,7 +26,7 @@ import torch
 
 from primus_turbo.pytorch.core import overlap as _overlap
 from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad, main_grad_first_write
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_mx_flydsl_gfx1250 import mxgg_fp8blk_nt, mxgk_fp8blk_nt
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_mx_flydsl_gfx1250 import mxgg_fp8blk_nt, mxgk_fp8blk_nt, mxgp_fp8blk_nt
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_nt_flydsl_gfx1250 import flygg_fp8blk_nt
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_vk_flydsl_gfx1250 import flyvkblk_fp8
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_vkp_flydsl_gfx1250 import (
@@ -38,6 +38,8 @@ from primus_turbo.triton.quantization.quant_blk_gfx1250 import (
     MX,
     build_routing_blk,
     combine_rows,
+    expert_order_lpt_fused,
+    route_dw_partials,
     quant_dual_blk,
     quant_w_128x128,
     swiglu_bwd_dual_blk,
@@ -67,11 +69,14 @@ _GG_MODE = os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_GG", "tile").strip().lower()
 #         (grouped_gemm_fp8blk_mx_flydsl_gfx1250.py); falls back to k256 when a shape constraint fails.
 #   mxk (mxgemm): mxgk -- k256's TDM traffic (2 x 256-deep stages, whole-K scale planes) + a fragment pipeline that
 #         crosses k-tiles (early barrier in each k-tile's second half); falls back to k256.
-assert _GG_MODE in ("tile", "aligned", "k256", "persistent", "k256p", "mx", "mxk"), f"PRIMUS_TURBO_MOE_FP8BLK_GG={_GG_MODE!r}"
+#   mxp (mxgemm phase 2): mxgp -- persistent mxgk (grid = #CUs, live tiles bounded on the device from the group offsets:
+#         no dead workgroups, EP>1 worst-case pools OK; next tile's k-tiles / planes issued during the current tile's
+#         last k-tiles; C via line-scratch VMEM stores). Needs K % 512 == 0, else mxgk / k256. Bit-identical.
+assert _GG_MODE in ("tile", "aligned", "k256", "persistent", "k256p", "mx", "mxk", "mxp"), f"PRIMUS_TURBO_MOE_FP8BLK_GG={_GG_MODE!r}"
 if _GG_MODE != "tile":
     assert _ALIGN % 256 == 0
     _GEMM.update(aligned=True, persistent={"persistent": 1, "k256p": 2}.get(_GG_MODE, 0))
-if _GG_MODE in ("k256", "k256p", "mx", "mxk"):
+if _GG_MODE in ("k256", "k256p", "mx", "mxk", "mxp"):
     _GEMM.update(tile=(256, 256, 256), num_buffers=2, bblk=1)
 # mxgemm. PRIMUS_TURBO_MOE_FP8BLK_GG_BPF=1 (with GG=k256): fragment software pipeline inside each 256-deep k-tile (B
 # fragments of the next 128-k step double-buffered, A one row group ahead). Bit-identical. Default 0.
@@ -84,6 +89,9 @@ _VKP_NB = int(os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_VKP_NB", "2"))
 assert _VKP_NB in (2, 3)
 # moegemm2. PRIMUS_TURBO_MOE_FP8BLK_VKP_SCHED2=1: vkp wgrad with scalar-loaded tile parameters, batched + carried E8M0
 # scale words and A fragments read ahead of their WMMAs (bit-identical C and sumsq partials). Default 0.
+# fuse track. PRIMUS_FUSE_MOE_BWD=1: d topk_weights in one launch from the unsummed SwiGLU-bwd partials (no zero fill,
+# sum, index and casts) and the LPT expert order in one launch (bit-identical order); default off.
+_FUSE_BWD = os.environ.get("PRIMUS_FUSE_MOE_BWD", "0") == "1"
 _VKP_SCHED2 = int(os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_VKP_SCHED2", "0"))
 _CACHES = weakref.WeakSet()
 # wgrad kernel: "vk" (one tile per workgroup) or "vkp" (persistent, experts longest-first, old-C prefetch for
@@ -179,12 +187,14 @@ def refresh_fp8blk_weights():
 def _gg(a, a_s, c, transposed, poffs):
     """Grouped NT GEMM over the expert pool: a [P, K] fp8 x expert weights (c.q, or c.qT for the dgrads)."""
     w, ws = (c.qT, c.sT) if transposed else (c.q, c.s)
-    if _GG_MODE in ("mx", "mxk") and not _GG_DSV4:
+    if _GG_MODE in ("mx", "mxk", "mxp") and not _GG_DSV4:
         P, K = a.shape
         if _GG_MODE == "mx" and K % 128 == 0 and K >= 384 and w.shape[1] % 256 == 0 and P % 256 == 0:
             return mxgg_fp8blk_nt(a, w, a_s, ws, poffs)
-        if _GG_MODE == "mxk" and K >= 512 and (K & (K - 1)) == 0 and w.shape[1] % 256 == 0 and P % 256 == 0:
-            return mxgk_fp8blk_nt(a, w, a_s, ws, poffs)
+        if _GG_MODE == "mxp" and K % 512 == 0 and (K & (K - 1)) == 0 and w.shape[1] % 256 == 0 and P % 256 == 0:
+            return mxgp_fp8blk_nt(a, w, a_s, ws, poffs)
+        if _GG_MODE in ("mxk", "mxp") and K >= 512 and (K & (K - 1)) == 0 and w.shape[1] % 256 == 0 and P % 256 == 0:
+            return mxgk_fp8blk_nt(a, w, a_s, ws, poffs, sched=1)
     if not _GG_DSV4:
         kw = _GEMM
         if kw.get("tile", (0, 0, 128))[2] == 256 and a.shape[1] % 256:  # k256 needs K % 256 == 0
@@ -223,7 +233,7 @@ def _setup_accum(w: torch.Tensor, accumulate: bool):
 
 class _FP8BlockMoE(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, topk_idx, topk_w, w1, w2, c1, c2, activation, accumulate):
+    def forward(ctx, x, topk_idx, topk_w, w1, w2, c1, c2, activation, accumulate, add=None):
         T, H = x.shape
         K = topk_idx.shape[1]
         E, I2, _ = w1.shape
@@ -238,7 +248,8 @@ class _FP8BlockMoE(torch.autograd.Function):
         l1 = _gg(xq, xs, c1, False, poffs)
         aq, as_, aT, aTs = swiglu_fwd_dual_blk(l1, route_w, activation, preal=preal, compact_t=ct)
         l2 = _gg(aq, as_, c2, False, poffs)
-        y = combine_rows(l2, inv, T, K)
+        y = combine_rows(l2, inv, T, K, add=add)
+        ctx.has_add = add is not None
         ctx.save_for_backward(xT, xTs, aT, aTs, l1, route_w, rowmap, inv, poffs, preal)
         ctx.c1, ctx.c2, ctx.w1, ctx.w2 = c1, c2, w1, w2
         ctx.activation, ctx.accumulate, ctx.dims = activation, accumulate, (T, H, K, E, I, P)
@@ -254,12 +265,15 @@ class _FP8BlockMoE(torch.autograd.Function):
         vkp = ctx.wk == "vkp"
         dq, ds, dT, dTs = quant_dual_blk(dy.contiguous().to(torch.bfloat16), P, rowmap, preal=preal, compact_t=vkp)
         dact = _gg(dq, ds, c2, True, poffs)
-        gq, gs, gT, gTs, dwr = swiglu_bwd_dual_blk(dact, l1, route_w, ctx.activation, preal=preal, compact_t=vkp)
+        gq, gs, gT, gTs, dwr = swiglu_bwd_dual_blk(dact, l1, route_w, ctx.activation, preal=preal, compact_t=vkp,
+                                                   raw_dw=_FUSE_BWD)
         # experts longest-first (one tiny argsort shared by both wgrads); PRIMUS_TURBO_MOE_FP8BLK_WGRAD_LPT=0: index order
         lpt = os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_WGRAD_LPT", "1") == "1"
+        order_lpt = expert_order_lpt_fused if _FUSE_BWD else expert_order_lpt
         jobs = ((w2, dT, dTs, aT, aTs, H, I), (w1, gT, gTs, xT, xTs, 2 * I, H))
         mgs = [_setup_accum(w, ctx.accumulate) for w, *_ in jobs]
-        if _overlap.enabled("MOE_WGRAD") and all(mg is not None for mg in mgs):
+        deferred = _overlap.enabled("MOE_WGRAD") and all(mg is not None for mg in mgs)
+        if deferred:
             # PRIMUS_OVERLAP_MOE_WGRAD=1: the LPT order and both expert wgrads (they only feed the optimizer) run on
             # the side stream next to the fc1 dgrad / combine / router backward; same kernels and inputs -> same bits
             # (main_grad and the sumsq partials are per weight; nothing reads them before the join).
@@ -267,7 +281,7 @@ class _FP8BlockMoE(torch.autograd.Function):
             sqs = [_wgrad_sumsq_buf(w, mg) if vkp else None for (w, *_), mg in zip(jobs, mgs)]
 
             def side_wgrads():
-                perm_s = expert_order_lpt(poffs) if (vkp and lpt) else None
+                perm_s = order_lpt(poffs) if (vkp and lpt) else None
                 for (w, lhs, lhs_s, rhs, rhs_s, n, k), mg, beta, sq in zip(jobs, mgs, betas, sqs):
                     if vkp:
                         flyvkpblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, mg, beta=beta, perm=perm_s,
@@ -280,12 +294,8 @@ class _FP8BlockMoE(torch.autograd.Function):
             for (w, *_), sq in zip(jobs, sqs):
                 w._primus_main_grad_sumsq_fresh = sq is not None
                 w.grad_added_to_main_grad = True
-            dW2, dW1 = (_get_dummy_wgrad(w.shape, w.dtype) for w, *_ in jobs)
-            dxp = _gg(gq, gs, c1, True, poffs)
-            dx = combine_rows(dxp, inv, T, K)
-            dtw = dwr[inv.long()].view(T, K).to(ctx.topk_dtype)
-            return dx, None, dtw, dW1, dW2, None, None, None, None
-        perm = expert_order_lpt(poffs) if (vkp and lpt) else None
+            jobs = ()  # nothing left for the serial loop below
+        perm = order_lpt(poffs) if (vkp and lpt and not deferred) else None
 
         def wgrad(lhs, rhs, lhs_s, rhs_s, n, k, out, beta, sq=None):
             if vkp:
@@ -309,11 +319,14 @@ class _FP8BlockMoE(torch.autograd.Function):
                 g = torch.empty((E, n, k), device=w.device, dtype=torch.bfloat16)
                 wgrad(lhs, rhs, lhs_s, rhs_s, n, k, g, 0.0)
                 grads.append(g.to(w.dtype))
-        dW2, dW1 = grads
+        dW2, dW1 = grads if not deferred else (_get_dummy_wgrad(w.shape, w.dtype) for w in (w2, w1))
         dxp = _gg(gq, gs, c1, True, poffs)
         dx = combine_rows(dxp, inv, T, K)
-        dtw = dwr[inv.long()].view(T, K).to(ctx.topk_dtype)
-        return dx, None, dtw, dW1, dW2, None, None, None, None
+        if _FUSE_BWD:
+            dtw = route_dw_partials(dwr, inv, ctx.topk_dtype).view(T, K)
+        else:
+            dtw = dwr[inv.long()].view(T, K).to(ctx.topk_dtype)
+        return dx, None, dtw, dW1, dW2, None, None, None, None, (dy if ctx.has_add else None)
 
 
 def fused_mega_moe_fp8blk(
@@ -326,15 +339,20 @@ def fused_mega_moe_fp8blk(
     cache2: FP8BlockWeightCache,
     activation=None,
     accumulate_wgrad: bool = False,
+    add: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """y [T, H] = sum_k topk_w[t, k] * w2[e] act(w1[e] x[t]) with e = topk_idx[t, k], all GEMMs FP8 128-block.
 
     x [T, H] bf16, w1 [E, 2I, H], w2 [E, H, I] (H, I multiples of 256). ``cache1``/``cache2`` hold the quantized
     weights (``FP8BlockWeightCache(w)``, refreshed by ``refresh_fp8blk_weights()`` after each optimizer step).
     ``accumulate_wgrad``: add dW straight into ``w.main_grad`` (bf16, Megatron DDP) and set
-    ``grad_added_to_main_grad``; the returned weight gradient is then a dummy."""
+    ``grad_added_to_main_grad``; the returned weight gradient is then a dummy.
+    ``add`` [T, H] bf16 (e.g. the shared expert output): returned y is ``y + add`` with the add fused into the
+    combine kernel (bit-identical to the separate bf16 add; its gradient is dy)."""
     assert x.dim() == 2 and x.dtype == torch.bfloat16
     assert w1.shape[0] == w2.shape[0] and w1.shape[2] == x.shape[1] and w2.shape[1] == x.shape[1]
     assert w1.shape[1] % 256 == 0 and x.shape[1] % 256 == 0 and w2.shape[2] * 2 == w1.shape[1]
+    if add is not None:
+        add = add.reshape(x.shape).contiguous()
     return _FP8BlockMoE.apply(x.contiguous(), topk_idx.to(torch.int64).contiguous(), topk_weights, w1, w2, cache1,
-                              cache2, activation, accumulate_wgrad)
+                              cache2, activation, accumulate_wgrad, add)
