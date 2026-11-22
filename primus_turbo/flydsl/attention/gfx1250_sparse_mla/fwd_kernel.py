@@ -270,6 +270,9 @@ def build_sparse_mla_fwd_gfx1250(
     ablate="",
     vld_lds=True,
     sm_overlap=False,
+    wpe=1,
+    batch=None,
+    expert=True,
 ):
     """Launcher for fixed (H, topk, scale, sink); see ``sparse_mla_fwd_gfx1250``.
 
@@ -278,6 +281,9 @@ def build_sparse_mla_fwd_gfx1250(
     workgroup over tokens; otherwise one token per workgroup, which after its last tile
     prefetches into L2 (``l2_prefetch``) the q rows and indices of the token that takes over its
     slot next. Only at one workgroup per CU: with two, the sibling already hides the prologue.
+    ``wpe`` (attnfwd probe): waves per SIMD; > 1 runs ``wpe`` times the workgroups per CU (needs
+    <= 1024 / wpe VGPRs and the LDS share). ``batch`` overrides ``BATCH``. ``expert=False`` compiles
+    without expert scheduling.
     """
     H = num_heads
     d_hpw, d_waves, d_bk = _default_config(H, topk)
@@ -303,7 +309,8 @@ def build_sparse_mla_fwd_gfx1250(
     # Slot validity of each ring tile (i32 row indices, written when its gather is issued) plus a
     # per-wave dump row for the lanes that do not store.
     VLD_B = (NBUF * BN + WAVES * 8) * 4 if vld_lds else 0
-    STAGE = (LDS_B + VLD_B + WAVES * STG_B) * (4 // WAVES) <= _LDS_MAX
+    STAGE = (LDS_B + VLD_B + WAVES * STG_B) * (4 // WAVES) * wpe <= _LDS_MAX and "xg" not in ablate
+    BAT = BATCH if batch is None else batch
     RPO = 16 if idx16 else 8  # rows per TDM op
     if (BN // RPO) % WAVES:
         raise ValueError(f"kv tile {BN} does not split into TDM ops over {WAVES} waves")
@@ -371,6 +378,8 @@ def build_sparse_mla_fwd_gfx1250(
                 hit = _highest_lane_p1(fx.Int32(live.select(mx, fx.Int32(-1))) >= fx.Int32(0))
                 n_tile = fx.Int32((hit > fx.Int32(0)).select(fx.Int32(c0) + hit, n_tile))
             n_tile = uniform(n_tile)
+            if const_expr("xs" in ablate):  # probe: no index scan, one tile per token
+                n_tile = fx.Int32(1)
 
         # The TDM tile stream runs across tokens: tile g is tile g % NT of local token g // NT,
         # so the next token's first tiles land while the current one finishes.
@@ -403,7 +412,8 @@ def build_sparse_mla_fwd_gfx1250(
         # The prologue gathers go out before the Q loads so the two overlap.
         pro = [load_rows(fx.Int32(s)) for s in range_constexpr(NBUF)]
         for s in range_constexpr(NBUF - 1):
-            issue(fx.Int32(s), pro[s])
+            if const_expr("xp" not in ablate):  # probe: no prologue gathers
+                issue(fx.Int32(s), pro[s])
 
         # ---- Q fragments (B operand of S^T = K Q^T): lane holds head h_lane[g].
         def load_q(j):
@@ -422,7 +432,10 @@ def build_sparse_mla_fwd_gfx1250(
                     )
             return out
 
-        q_first = load_q(fx.Int32(0))
+        if const_expr("xq" in ablate):  # probe: no q load
+            q_first = [Vec.filled(16, 0.0, fx.BFloat16) for _ in range_constexpr(G * KS)]
+        else:
+            q_first = load_q(fx.Int32(0))
 
         k_lane = l16 * ROW + hi * 16
         v_lane = (hi * 8 + l8) * ROW + (l16 // 8) * 16
@@ -481,7 +494,7 @@ def build_sparse_mla_fwd_gfx1250(
             return steps
 
         def run_steps(steps):
-            _run_steps(steps, BATCH)
+            _run_steps(steps, BAT)
 
         def softmax(s, valid, m_run, l_run):
             if const_expr("sm" in ablate):
@@ -585,13 +598,13 @@ def build_sparse_mla_fwd_gfx1250(
                             # QK of tile t+1 first, then P*V of tile t with the softmax of tile t+1
                             # emitted inside its WMMA batches: the scheduler hides the VALU / TRANS
                             # work under the matrix pipe instead of running it after both.
-                            _run_steps(qk, BATCH)
+                            _run_steps(qk, BAT)
                             res = {}
 
                             def sm_piece(g):
                                 res[g] = softmax(s_n[g], valid, m[g], l[g])
 
-                            _run_steps_with(pv, BATCH, [lambda g=g: sm_piece(g) for g in range_constexpr(G)])
+                            _run_steps_with(pv, BAT, [lambda g=g: sm_piece(g) for g in range_constexpr(G)])
                             for g in range_constexpr(G):
                                 mg, lg, ag, pg, ng = res[g]
                                 m2.append(mg)
@@ -639,7 +652,7 @@ def build_sparse_mla_fwd_gfx1250(
 
             m, l, o, p = unpack_state(st)  # noqa: E741
             nxt = None
-            if const_expr(not persist and l2_prefetch and WAVES == 4):
+            if const_expr(not persist and l2_prefetch and (WAVES == 4 or "l2" in ablate) and wpe == 1):
                 # Tokens launch last first and NPROG workgroups fill the GPU: token tok - NPROG
                 # takes over this slot next. Warm L2 with its q rows and indices.
                 nx = tok - NPROG
@@ -654,9 +667,10 @@ def build_sparse_mla_fwd_gfx1250(
                 nxt = load_q(ji + 1) + load_rows(g0 + NT + NBUF - 1)
             run_steps(pv_steps(lds0 + ((g0 + n_tile - fx.Int32(1)) % NBUF) * TILE_B, p, o))
 
-            rsrc_o = make_rsrc(tensor_addr(O) + fx.Int64(tok) * (H * DV * 2), H * DV * 2)
-            rsrc_lse = make_rsrc(tensor_addr(LSE) + fx.Int64(tok) * (H * 4), H * 4)
-            for g in range_constexpr(G):
+            # xn, probe: o / lse stores issued but dropped (0-record descriptors)
+            rsrc_o = make_rsrc(tensor_addr(O) + fx.Int64(tok) * (H * DV * 2), H * DV * 2 if "xn" not in ablate else 0)
+            rsrc_lse = make_rsrc(tensor_addr(LSE) + fx.Int64(tok) * (H * 4), H * 4 if "xn" not in ablate else 0)
+            for g in range_constexpr(G if "xo" not in ablate else 0):  # xo, probe: no o / lse
                 l_tot = fadd(l[g], swap_halves(l[g]))
                 if const_expr(has_sink):
                     rsrc_sink = make_rsrc(tensor_addr(SINK), H * 4)
@@ -713,7 +727,7 @@ def build_sparse_mla_fwd_gfx1250(
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         sparse_mla_fwd_gfx1250_kernel(
-            Q, KV, TOPK, SINK, O, LSE, NKV, n_tok, n_prog, value_attrs={"rocdl.waves_per_eu": 1}
+            Q, KV, TOPK, SINK, O, LSE, NKV, n_tok, n_prog, value_attrs={"rocdl.waves_per_eu": wpe}
         ).launch(grid=(fx.Index(n_grid), H // HB, 1), block=(BLOCK, 1, 1), stream=stream)
 
     compiled = {}
@@ -722,7 +736,7 @@ def build_sparse_mla_fwd_gfx1250(
         n_tok = int(q.shape[0])
         # One wave per SIMD: 4 // WAVES workgroups per CU (persistent: each loops over its tokens;
         # otherwise the L2 prefetch distance).
-        n_prog = min(n_tok, _num_cus(q.device) * (4 // WAVES))
+        n_prog = min(n_tok, _num_cus(q.device) * (4 // WAVES) * wpe)
         n_grid = n_prog if persist else n_tok
         args = (
             q,
@@ -738,7 +752,7 @@ def build_sparse_mla_fwd_gfx1250(
         )
         fn = compiled.get("fn")
         if fn is None:
-            fn = flyc.compile[COMPILE_HINTS](launch_sparse_mla_fwd_gfx1250, *args, fx.Stream(stream))
+            fn = flyc.compile[COMPILE_HINTS if expert else {}](launch_sparse_mla_fwd_gfx1250, *args, fx.Stream(stream))
             compiled["fn"] = fn
         return fn(*args, stream)
 
@@ -752,7 +766,8 @@ _LDS_MAX = 320 * 1024
 
 @functools.lru_cache(maxsize=64)
 def build_sparse_mla_fwd_gfx1250_swa(
-    num_heads, scale, has_sink, block_t=16, block_k=None, pool_p=0, pool_cr=0, prefetch=PREFETCH, batch=6
+    num_heads, scale, has_sink, block_t=16, block_k=None, pool_p=0, pool_cr=0, prefetch=PREFETCH, batch=6,
+    ablate="",
 ):
     """Launcher for the cr0 / cr128 bands; see ``sparse_mla_fwd_gfx1250``.
 
@@ -801,7 +816,7 @@ def build_sparse_mla_fwd_gfx1250_swa(
     # Per-wave 16-head o staging after window + pool, so o leaves as whole 512-byte row halves
     # (per-head 32-byte pieces from the fragments run the store ~1.6x slower); without room,
     # direct fragment stores.
-    STAGE = (WR + NPP + 16 * WAVES) * ROW <= _LDS_MAX
+    STAGE = (WR + NPP + 16 * WAVES) * ROW <= _LDS_MAX and "xg" not in ablate
     c_log2 = float(scale) * LOG2E
 
     @flyc.kernel(name="sparse_mla_fwd_gfx1250_swa_kernel", known_block_size=[BLOCK, 1, 1])
@@ -860,7 +875,12 @@ def build_sparse_mla_fwd_gfx1250_swa(
                     )
             return out
 
-        q_first = load_q(tl)
+        def load_q_ab(j):
+            if const_expr("xq" in ablate):  # probe: no q load
+                return [Vec.filled(16, 0.0, fx.BFloat16) for _ in range_constexpr(G * KS)]
+            return load_q(j)
+
+        q_first = load_q_ab(tl)
         _rocdl.s_wait_tensorcnt(0)
         gpu.barrier()
 
@@ -1041,11 +1061,12 @@ def build_sparse_mla_fwd_gfx1250_swa(
                 m, l, o, p = unpack_state([res[i] for i in range_constexpr(NS)])  # noqa: E741
 
             # This token's q is dead: the lane's next token loads under the last P*V.
-            nxt = load_q(ji + TL)
+            nxt = load_q_ab(ji + TL)
             run_steps(pv_steps(tile_base(fx.Int32(NTT - 1), vbw, lds0 + v_lane), PC, p, o))
 
-            rsrc_o = make_rsrc(tensor_addr(O) + fx.Int64(tok) * (H * DV * 2), H * DV * 2)
-            rsrc_lse = make_rsrc(tensor_addr(LSE) + fx.Int64(tok) * (H * 4), H * 4)
+            # xn, probe: o / lse stores issued but dropped (0-record descriptors)
+            rsrc_o = make_rsrc(tensor_addr(O) + fx.Int64(tok) * (H * DV * 2), H * DV * 2 if "xn" not in ablate else 0)
+            rsrc_lse = make_rsrc(tensor_addr(LSE) + fx.Int64(tok) * (H * 4), H * 4 if "xn" not in ablate else 0)
             for g in range_constexpr(G):
                 l_tot = fadd(l[g], swap_halves(l[g]))
                 if const_expr(has_sink):
