@@ -8,9 +8,9 @@
 
 ``ulysses_mega_attn`` replaces ``all-to-all -> flash_attn -> all-to-all`` between the projections: it
 takes this rank's tokens with every head and returns the attention output for those tokens with every
-head. The forward is one kernel (pull q / k / v, attention, push O). The backward pulls dO with an
-in-kernel all-to-all, runs the FlyDSL SBHD backward on this rank's heads and pushes dq / dk / dv back
-to the token owners with a second one.
+head. The forward is one kernel (pull q / k / v, attention, push O), and so is the backward (pull dO,
+the FlyDSL SBHD backward on this rank's heads, push dq / dk / dv to the token owners). A shape the fused
+backward does not cover runs it as an in-kernel all-to-all, the FlyDSL backward and a second all-to-all.
 
 Sequence split: with ``seq_chunk`` cs, global chunk ``c`` (cs tokens) lives on rank ``c % n``;
 ``seq_chunk=0`` is the contiguous split (rank r holds the r-th chunk of ``S / n`` tokens). A striped
@@ -20,6 +20,11 @@ split balances causal attention across ranks and lets the attention start before
 import torch
 import torch.distributed as dist
 
+from primus_turbo.flydsl.mega_attn.a2a_attn_bwd_kernel import _plan as _bwd_plan
+from primus_turbo.flydsl.mega_attn.a2a_attn_bwd_kernel import (
+    a2a_attn_bwd_bank_bytes,
+    ulysses_a2a_attn_bwd,
+)
 from primus_turbo.flydsl.mega_attn.a2a_attn_kernel import (
     a2a_attn_fwd_bank_bytes,
     ulysses_a2a_attn_fwd,
@@ -40,8 +45,21 @@ __all__ = ["ulysses_mega_attn"]
 def _bank_bytes(M, n, hq_r, hkv_r, d):
     return max(
         a2a_attn_fwd_bank_bytes(M, n, hq_r, hkv_r, d),
+        a2a_attn_bwd_bank_bytes(M, n, hq_r, hkv_r, d),
         a2a_bank_bytes(M, n, (hq_r, hkv_r, hkv_r), d),
     )
+
+
+def _fused_bwd_ok(S, hq_r, hkv_r, d, cs):
+    """Whether the one-kernel backward runs this shape: the stock plan must be the a16 dQ image with
+    256-row bands (dense causal, ``S`` a multiple of the q-split tile)."""
+    if cs % 128 or S % 256:
+        return False
+    try:
+        _bwd_plan(S, hq_r, hkv_r, d)
+    except AssertionError:
+        return False
+    return True
 
 
 class UlyssesMegaAttnFunction(torch.autograd.Function):
@@ -75,6 +93,12 @@ class UlyssesMegaAttnFunction(torch.autograd.Function):
         hkv_r = k_h.shape[1]
         M = S // n
         ws = get_ulysses_workspace(group, _bank_bytes(M, n, hq_r, hkv_r, d), name="mega_attn")
+        dq = q_h.new_empty(M, n * hq_r, d)
+        dk = q_h.new_empty(M, n * hkv_r, d)
+        dv = q_h.new_empty(M, n * hkv_r, d)
+        if _fused_bwd_ok(S, hq_r, hkv_r, d, cs or M):
+            ulysses_a2a_attn_bwd(dout.contiguous(), q_h, k_h, v_h, o_h, lse, dq, dk, dv, ws, seq_chunk=cs)
+            return dq, dk, dv, None, None, None
         do_h = torch.empty_like(o_h)
         ulysses_a2a_seq_to_heads([dout.contiguous()], [do_h], ws, seq_chunk=cs)
         dq_h, dk_h, dv_h = flash_attn_sbhd_flydsl_backward_impl(
@@ -86,9 +110,6 @@ class UlyssesMegaAttnFunction(torch.autograd.Function):
             lse.view(1, S, hq_r).permute(0, 2, 1),
             causal=True,
         )
-        dq = q_h.new_empty(M, n * hq_r, d)
-        dk = q_h.new_empty(M, n * hkv_r, d)
-        dv = q_h.new_empty(M, n * hkv_r, d)
         ulysses_a2a_heads_to_seq(
             [dq_h.view(S, hq_r, d), dk_h.view(S, hkv_r, d), dv_h.view(S, hkv_r, d)],
             [dq, dk, dv],
