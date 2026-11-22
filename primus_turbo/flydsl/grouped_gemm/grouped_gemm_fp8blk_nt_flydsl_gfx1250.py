@@ -112,9 +112,19 @@ def launch_gg_fp8blk_nt_gfx1250(
     lds_pad: Constexpr[int] = 16,
     bblk: Constexpr[int] = 0,
     xdl_nostall: Constexpr[int] = 0,
+    bpf: Constexpr[int] = 0,
+    hwsched: Constexpr[int] = 0,
 ):
     """xdl_nostall (moegemm2): set SCHED_MODE.DISABLE_XDL_ARB_STALL at kernel start (no WMMA multicycle
-    arbitration stall between back-to-back matrix ops; scheduling only, bit-identical)."""
+    arbitration stall between back-to-back matrix ops; scheduling only, bit-identical).
+    bpf (mxgemm): fragment software pipeline inside a k-tile (needs tile_k >= 256 and m_reps == n_reps). The B
+    fragments of 128-k step ks+1 are read one per row group during step ks (double-buffered B, +128 VGPR), the A
+    fragment of row group mi+1 during mi, each group pinned with sched_barrier. Same WMMAs, operands and k order:
+    bit-identical. (probe mxgemm E0c: flygg LDS pattern 15.3 -> 11.1 cycles/WMMA with B double-buffered.)
+    hwsched (mxgemm): compiled WITHOUT amdgpu-expert-scheduling-mode (hardware dependency interlocks, as hipcc and
+    Triton with TRITON_HIP_USE_EXPERT_SCHEDULING=0). In expert mode the compiler guards every LDS load that reuses a
+    register an in-flight WMMA reads with s_wait_alu depctr_va_vdst(0), draining the WMMA pipe once per row group.
+    Only the name differs in the IR (cache key); the wrapper flips the llvm option for that compile. Bit-identical."""
     a_cls, b_cls = _A_ID[a_id], _A_ID[b_id]
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
@@ -151,7 +161,9 @@ def launch_gg_fp8blk_nt_gfx1250(
     n_ops = 2
     G = n_groups
 
-    kernel_name = f"moe_gg_fp8blk_nt_gfx1250_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}_nb{num_buffers}_a{a_id}{b_id}_g{G}" + ("_ds" if dstore else "") + (f"_p{lds_pad}" if lds_pad != 16 else "") + ("_bb" if bblk else "") + ("_xn" if xdl_nostall else "")
+    kernel_name = f"moe_gg_fp8blk_nt_gfx1250_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}_nb{num_buffers}_a{a_id}{b_id}_g{G}" + ("_ds" if dstore else "") + (f"_p{lds_pad}" if lds_pad != 16 else "") + ("_bb" if bblk else "") + ("_xn" if xdl_nostall else "") + ("_bpf" if bpf else "") + ("_hw" if hwsched else "")
+    if bpf:
+        assert k_iters >= 2 and tile_m // m_warp == tile_n // n_warp, "bpf: tile_k >= 256, square wave tile"
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
     def kernel_gg(
@@ -304,7 +316,44 @@ def launch_gg_fp8blk_nt_gfx1250(
 
         sc_base = fx.Int32(fx.ptrtoint(fx.add_offset(base_ptr, SC_OFF)))
 
+        def _sbw(kc, ni):
+            if const_expr(bblk):
+                return lds_b32(sc_base, PLANE_SA + (wnb // WMMA_N + ni) * SP + kc)[0]
+            return lds_b32(sc_base, PLANE_SA + (wnb + ni * WMMA_N + lane16) * SP + kc)[0]
+
+        def compute_bpf(s, kt):
+            base = fx.Int32(fx.ptrtoint(_stage(s)))
+            bcur = [_operand(base, STAGE_A, wnb + ni * WMMA_N + lane16, B_ROW, 0) for ni in range_constexpr(n_reps)]
+            sbv = [_sbw(kt * k_iters * 4, ni) for ni in range_constexpr(n_reps)]
+            for ks in range_constexpr(k_iters):
+                kc = (kt * k_iters + ks) * 4
+                if const_expr(ks + 1 < k_iters):
+                    sbn = [_sbw(kc + 4, ni) for ni in range_constexpr(n_reps)]  # next step's B scale words, early
+                afs = [None] * m_reps
+                savs = [None] * m_reps
+                afs[0] = _operand(base, 0, wmb + lane16, A_ROW, ks)
+                savs[0] = lds_b32(sc_base, (wmb + lane16) * SP + kc)[0]
+                bnx = [None] * n_reps
+                for mi in range_constexpr(m_reps):
+                    if const_expr(mi + 1 < m_reps):
+                        afs[mi + 1] = _operand(base, 0, wmb + (mi + 1) * WMMA_M + lane16, A_ROW, ks)
+                        savs[mi + 1] = lds_b32(sc_base, (wmb + (mi + 1) * WMMA_M + lane16) * SP + kc)[0]
+                    if const_expr(ks + 1 < k_iters):
+                        bnx[mi] = _operand(base, STAGE_A, wnb + mi * WMMA_N + lane16, B_ROW, ks + 1)
+                    rocdl.sched_barrier(0)
+                    for ni in range_constexpr(n_reps):
+                        idx = mi * n_reps + ni
+                        fx.gemm(mma_atom, c_frags[idx], bcur[ni], afs[mi], c_frags[idx], scale_a=sbv[ni],
+                                scale_b=savs[mi])
+                    rocdl.sched_barrier(0)
+                bcur = bnx
+                if const_expr(ks + 1 < k_iters):
+                    sbv = sbn
+
         def compute(s, kt):
+            if const_expr(bpf):
+                compute_bpf(s, kt)
+                return
             base = fx.Int32(fx.ptrtoint(_stage(s)))
             for ks in range_constexpr(k_iters):
                 kc = (kt * k_iters + ks) * 4  # byte column of this 128-wide k-step in the scale planes
@@ -859,7 +908,7 @@ def _ptr(t):
 
 
 def flygg_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, tile=(256, 256, 128), m_warp=2, n_warp=2, num_buffers=3,
-                    aligned=False, dstore=0, persistent=0, lds_pad=16, bblk=0, xdl_nostall=0):
+                    aligned=False, dstore=0, persistent=0, lds_pad=16, bblk=0, xdl_nostall=0, bpf=0, hwsched=0):
     """a [M, K] fp8, b [G, N, K] fp8 contiguous, sa [M, K/32] / sb [G, N, K/32] uint8 E8M0 (block-128 exponents
     repeated 4x), offs_i32 [G+1] int32. Returns out [M, N] bf16 (rows past offs[G] are not written).
     aligned: the caller guarantees every offs_i32 entry is a multiple of tile[0] (not checked: that would sync), so
@@ -869,6 +918,8 @@ def flygg_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, tile=(256, 256, 128), m_wa
     sb constant over each 16-row group of N (true for 128x128-block weight scales).
     lds_pad: LDS row pad of the operand stages (8 lets num_buffers=4 fit with bblk). bblk: B scale plane with one
     row per 16-row fragment (needs sb constant over 16-row groups of N, true for 128x128-block weight scales).
+    bpf (mxgemm): in-k-tile fragment pipeline of kernel_gg (tile_k >= 256 only; ignored otherwise).
+    hwsched (mxgemm): kernel_gg built without expert scheduling mode (hardware interlocks).
     All are bit-identical to the default path."""
     assert sa.dtype == torch.uint8 and sb.dtype == torch.uint8 and sa.is_contiguous() and sb.is_contiguous()
     M, K = a.shape
@@ -913,11 +964,25 @@ def flygg_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, tile=(256, 256, 128), m_wa
     mtiles = M // tm if aligned else M // tm + G
     args = (_ptr(out), _ptr(a), _ptr(b), _ptr(offs_i32), _ptr(sa), _ptr(sb), mtiles,
             fx.Stream(torch.cuda.current_stream(device=a.device)), N, K, G, tm, tn, tk, m_warp, n_warp,
-            num_buffers, a_id, b_id, K, int(dstore), lds_pad, int(bblk), int(xdl_nostall))
-    key = (G, tm, tn, tk, m_warp, n_warp, num_buffers, a_id, b_id, K, int(dstore), lds_pad, int(bblk), int(xdl_nostall))
+            num_buffers, a_id, b_id, K, int(dstore), lds_pad, int(bblk), int(xdl_nostall), int(bpf and tk >= 256),
+            int(hwsched))
+    key = (G, tm, tn, tk, m_warp, n_warp, num_buffers, a_id, b_id, K, int(dstore), lds_pad, int(bblk), int(xdl_nostall),
+           int(bpf and tk >= 256), int(hwsched))
     c = _COMPILED.get(key)
     if c is None:
-        _COMPILED[key] = flyc.compile(launch_gg_fp8blk_nt_gfx1250, *args)
+        _COMPILED[key] = _compile_sched(launch_gg_fp8blk_nt_gfx1250, hwsched, args)
     else:
         c(*args)
     return out
+
+
+def _compile_sched(launch, hwsched, args):
+    """flyc.compile with amdgpu-expert-scheduling-mode off for hwsched variants (the kernel name carries _hw)."""
+    hints = launch.compile_hints
+    old = hints.get("llvm_options")
+    if hwsched:
+        hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": False}
+    try:
+        return flyc.compile(launch, *args)
+    finally:
+        hints["llvm_options"] = old
