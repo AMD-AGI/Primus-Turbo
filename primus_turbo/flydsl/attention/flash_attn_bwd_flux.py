@@ -1496,6 +1496,10 @@ def build_flash_attn_bwd_dkdv_module(
     assert q_split >= 1
     N_QSP = Q_SPLIT if n_qsp is None else n_qsp
     QSP_LO = qsp_lo
+    EPILOGUE = epilogue if epilogue is not None and N_QSP == 1 and QSP_LO == Q_SPLIT - 1 else None
+    # epilogue.aux_blocks (multiple of the XCD count): extra work-groups dispatched FIRST that run
+    # epilogue.aux(is_aux, info) and then walk an empty (out-of-range) kv tile.
+    AUX = getattr(EPILOGUE, "aux_blocks", 0)
     BAT_LO = int(bat_lo)
     assert 1 <= N_QSP <= Q_SPLIT and 0 <= QSP_LO <= Q_SPLIT - N_QSP
     assert BAT_LO == 0 or (batch_size is not None and 0 < BAT_LO < batch_size)
@@ -2004,6 +2008,12 @@ def build_flash_attn_bwd_dkdv_module(
         lds = SmemPtr(base_ptr, lds_off, elem_type, shape=(LDS_VIEW_ELEMS,)).get()
 
         block_id = fx.Index(gpu.block_idx.x)
+        grid_x_v = fx.Index(gpu.grid_dim.x)
+        if const_expr(AUX):
+            aux_id = block_id
+            is_aux = block_id < fx.Index(AUX)
+            block_id = fx.Index(ArithValue(is_aux).select(fx.Index(0), block_id - fx.Index(AUX)))
+            grid_x_v = grid_x_v - fx.Index(AUX)
         tid = fx.Index(gpu.thread_idx.x)
         wave_id = tid // WARP_SIZE
         lane = tid % WARP_SIZE
@@ -2026,7 +2036,7 @@ def build_flash_attn_bwd_dkdv_module(
         # same locality via xcd_remap_pid when it doesn't, else falls back to the plain decode.
         num_kv_tiles = (seq_len_k_v + BLOCK_KV - 1) // BLOCK_KV
         if const_expr(NUM_HEADS_KV % NUM_XCD != 0 and WIN_XCD):
-            _lin = fx.Index(xcd_remap_pid(block_id, fx.Index(gpu.grid_dim.x), NUM_XCD))
+            _lin = fx.Index(xcd_remap_pid(block_id, grid_x_v, NUM_XCD))
             split_idx = fx.Index(QSP_LO)
             kv_tile_idx = _lin % num_kv_tiles
             _u = _lin // num_kv_tiles
@@ -2063,6 +2073,8 @@ def build_flash_attn_bwd_dkdv_module(
             batch_idx = _rest // num_kv_tiles
         if const_expr(BAT_LO):
             batch_idx = batch_idx + fx.Index(BAT_LO)
+        if const_expr(AUX):
+            kv_tile_idx = fx.Index(ArithValue(is_aux).select(num_kv_tiles, kv_tile_idx))
         # SHADOW seq_len_q_v/k_v to the per-segment length so downstream base/SRD/loop-bounds follow the segment (byte-identical when uniform; grid tiles were fixed from max above).
         if const_expr(varlen):
             _seg = batch_idx
@@ -2148,6 +2160,8 @@ def build_flash_attn_bwd_dkdv_module(
         else:
             kv_band_idx = kv_tile_idx
         kv_start = kv_band_idx * BLOCK_KV
+        if const_expr(AUX):
+            EPILOGUE.aux(is_aux, dict(tid=tid, aux_id=aux_id, params=CuSeqKv, block_size=BLOCK_SIZE))
         # This wave owns ROWS_PER_WAVE_KV kv rows, split into NT 16-wide N-tiles.
         # In the 16x16 layout the owned kv row for a lane is nt*16 + lane16.
         kv_row_wave = kv_start + wave_id * ROWS_PER_WAVE_KV
@@ -4416,8 +4430,8 @@ def build_flash_attn_bwd_dkdv_module(
             rocdl.sched_barrier(0)
             rocdl.s_nop(15)
             rocdl.s_nop(15)
-        if const_expr(epilogue is not None and N_QSP == 1 and QSP_LO == Q_SPLIT - 1):
-            epilogue(
+        if const_expr(EPILOGUE is not None):
+            EPILOGUE(
                 _values(dv_accs, False),
                 _values(dk_accs, True),
                 dict(
@@ -4471,6 +4485,8 @@ def build_flash_attn_bwd_dkdv_module(
         sl_idx = fx.Index(seq_len_k)
         num_kv_tiles = (sl_idx + BLOCK_KV - 1) // BLOCK_KV
         grid_x = bs_idx * num_kv_tiles * NUM_HEADS_KV * N_QSP
+        if const_expr(AUX):
+            grid_x = grid_x + fx.Index(AUX)
 
         passthrough_entries = (
             [

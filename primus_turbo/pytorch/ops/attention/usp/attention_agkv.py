@@ -196,6 +196,10 @@ class _Layout:
 # Off: its scattered remote stores stall the attention's own memory pipeline and cost more than mega's
 # push kernel, which runs beside the attention on other CUs.
 _FUSED_BWD = os.environ.get("AGKV_FUSED_BWD") == "1"
+# push blocks of q1's last dK / dV launch that send the staged remote-key gradients (a multiple of the
+# XCD count); 0: the attention work-groups store them to the owners themselves. Off: at l8 cp8 16 push
+# blocks lose 50-120 us to the direct stores (they hold whole CUs and still push too slowly).
+_FUSED_BWD_PUSH_BLOCKS = int(os.environ.get("AGKV_FUSED_BWD_PUSH", "0"))
 
 # flag arrays in the signal pad, n int64 each, indexed by sender
 _FWD_FIRST, _FWD_SECOND, _BWD_FIRST, _BWD_SECOND = range(4)
@@ -755,30 +759,39 @@ def _fused_backward(dout, q, kb, vb, out, lse0, lse1, lay, group, scale, det):
     own = torch.empty((2, 2 * c) + tail_shape, device=kb.device, dtype=dtype)
     first, second = _remote_layout(n, r)
     owner = {k: (s, 0) for s, k in first.items()} | {k: (s, 1) for s, k in second.items()}
+    nrem = rem // c
+    aux = _FUSED_BWD_PUSH_BLOCKS if nrem else 0
     table = [epoch, dk0.data_ptr(), dv0.data_ptr()]
-    dbg_local = os.environ.get("AGKV_BWD_DBG_LOCAL") == "1"
-    if dbg_local:
-        scratch = torch.empty((2, rem) + tail_shape, device=kb.device, dtype=dtype)
-        dummy = torch.zeros(rem // c, dtype=torch.int64, device=kb.device)
-    for k in range(rem // c):
-        o, h = owner[k]
-        slot = ex.symm.buffer_ptrs[o] + bank_off + (h * n + r) * c * tok
-        flag = ex.symm.signal_pad_ptrs[o] + ((_BWD_FIRST if h == 0 else _BWD_SECOND) * n + r) * 8
-        if dbg_local:
-            slot, flag = scratch[0, k * c].data_ptr(), dummy[k:].data_ptr()
-            table += [slot, scratch[1, k * c].data_ptr(), flag]
-            continue
-        table += [slot, slot + bwd_bytes // 2, flag]
+    if aux:
+        stage = torch.empty((2, rem) + tail_shape, device=kb.device, dtype=dtype)
+        owners = tuple(owner[k] + ((_BWD_FIRST, _BWD_SECOND)[owner[k][1]],) for k in range(nrem))
+        units, num_units = _fused_bwd.push_units(owners, r, n, c * tok, bwd_bytes, kb.device)
+        counters = ex.__dict__.get("fused_bwd_counters")
+        if counters is None:
+            counters = ex.fused_bwd_counters = torch.zeros(2, 2 * n, dtype=torch.int64, device=kb.device)
+        table += [counters[0].data_ptr(), counters[1].data_ptr(), units.data_ptr(), ex.heaps.data_ptr()]
+        table += [ex.flag_ptrs.data_ptr(), bank_off, stage[0].data_ptr(), stage[1].data_ptr()]
+        for k in range(nrem):
+            table += [stage[0, k * c].data_ptr(), stage[1, k * c].data_ptr(), 0]
+    else:
+        table += [0] * (_fused_bwd.P_CHUNKS - len(table))
+        for k in range(nrem):
+            o, h = owner[k]
+            slot = ex.symm.buffer_ptrs[o] + bank_off + (h * n + r) * c * tok
+            flag = ex.symm.signal_pad_ptrs[o] + ((_BWD_FIRST if h == 0 else _BWD_SECOND) * n + r) * 8
+            table += [slot, slot + bwd_bytes // 2, flag]
     for j in range(2):
         table += [own[0, j * c].data_ptr(), own[1, j * c].data_ptr(), 0]
     params = _fused_bwd.params_table(table, kb.device)
-    epi = _fused_bwd.epilogue(c, rem, rem - low, rem + c, tok, Hkv * D * 2)
-    _fused_bwd.q1_backward(dout[c:], q[c:], kb, vb, out[c:], lse1, scale, det, epi, params, rem // c, dq[c:])
+    if aux:
+        expected = c // _fused_bwd.block_kv(skv, D) * Hkv * B
+        epi = _fused_bwd.epilogue(c, rem, rem - low, rem + c, tok, Hkv * D * 2, aux, num_units, expected, r)
+    else:
+        epi = _fused_bwd.epilogue(c, rem, rem - low, rem + c, tok, Hkv * D * 2)
+    signalled = 0 if aux else nrem
+    _fused_bwd.q1_backward(dout[c:], q[c:], kb, vb, out[c:], lse1, scale, det, epi, params, signalled, dq[c:])
 
     dkv = torch.empty((2, 2 * c) + tail_shape, device=kb.device, dtype=dtype)
-    if dbg_local:
-        _join_side(ex)
-        return dq, own[0], own[1]
     _comm.reduce(
         ex.heaps,
         ex.flag_ptrs,
@@ -916,7 +929,9 @@ class _AGKVAttention(torch.autograd.Function):
         ctx.softmax_scale, ctx.deterministic = softmax_scale, deterministic
         if mode in ("mega", "fused"):
             forward = _mega_forward if mode == "mega" else _fused_forward
-            out, lse0, lse1, saved = forward(q, k, v, lay, group, softmax_scale, any(ctx.needs_input_grad[:3]))
+            out, lse0, lse1, saved = forward(
+                q, k, v, lay, group, softmax_scale, any(ctx.needs_input_grad[:3])
+            )
             kb, vb = saved if saved is not None else (None, None)
             ctx.save_for_backward(q, kb, vb, out, lse0, lse1)
             return out
