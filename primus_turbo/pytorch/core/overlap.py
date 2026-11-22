@@ -117,12 +117,37 @@ class branch:
         return False
 
     def done(self, *outs):
-        """Main stream waits for the branch; the outputs (allocated on the branch stream) are marked as used there."""
+        """Main stream waits for the branch; the outputs (allocated on the branch stream) are marked as used by the
+        main stream, and differentiable ones pass through ``_BranchOutput`` (a no-kernel view created on the branch
+        stream) so that their incoming gradient is marked as used by the branch stream in the backward."""
+        res = []
+        with torch.cuda.stream(self.side):
+            for t in outs:
+                if isinstance(t, torch.Tensor) and t.requires_grad and torch.is_grad_enabled():
+                    t = _BranchOutput.apply(t)
+                res.append(t)
         self.main.wait_stream(self.side)
-        for t in outs:
+        for t in res:
             if isinstance(t, torch.Tensor):
                 t.record_stream(self.main)
-        return outs[0] if len(outs) == 1 else outs
+        return res[0] if len(res) == 1 else tuple(res)
+
+
+class _BranchOutput(torch.autograd.Function):
+    """Identity (a view, no kernel) on a branch output, created on the branch stream, so autograd runs its backward
+    on the branch stream before the rest of the branch's backward. It records the incoming gradient (allocated by the
+    main stream) as used by the branch stream: the caching allocator then cannot hand that block to the main stream
+    while branch kernels still read it (eager mode reuses freed blocks immediately)."""
+
+    @staticmethod
+    def forward(ctx, x):
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        if g is not None and g.is_cuda:
+            g.record_stream(torch.cuda.current_stream(g.device))
+        return g
 
 
 class ForkGrad(torch.autograd.Function):
@@ -137,11 +162,14 @@ class ForkGrad(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grads):
+        cur = torch.cuda.current_stream()
         acc = None
         for i in ctx.order:
             g = grads[i]
             if g is None:
                 continue
+            if g.is_cuda:  # a branch's gradient was allocated on the branch stream: mark it used here too
+                g.record_stream(cur)
             acc = g if acc is None else acc + g
         return acc, None, None
 
