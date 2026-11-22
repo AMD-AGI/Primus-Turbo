@@ -18,8 +18,9 @@ Every rank holds its ``M`` tokens with all heads (q / k / v ``[M, n * h_r, d]``,
   flags of every unit holding rows of its causal KV prefix, runs the dual-wave tile, and pushes the O
   tile into the recv bank of the rank owning those tokens, raising that rank's flag
   ``(m-tile, src, head group)``;
-* once every attention item is claimed, the workers claim gather tiles: an m-tile waits for the flags
-  of every source and head group, then its recv rows are copied into ``out`` ``[M, n * hq_r, d]``.
+* once every attention item is claimed, the workers claim gather units ``(m-tile, src)``: a unit waits
+  for the flags of ``src``'s head groups, then copies ``src``'s column block of the m-tile's recv rows
+  into ``out`` ``[M, n * hq_r, d]``.
 
 Every pull unit is claimed by a running block before that block turns worker, and every attention
 item is claimed by a running worker before any worker waits on a gather flag, so with the pull blocks
@@ -310,28 +311,33 @@ def _push_o(thread_index, qb, h, peers_base, recv_offset, o_res, epoch, **c):
 
 
 @ASTRewriter.transform
-def _gather_tile(thread_index, g, flag_base, recv_addr, out_res, epoch, **c):
-    """Recv rows of m-tile ``g`` into ``out`` once every source and head group has pushed them."""
-    bm, K_o = c["block_m"], c["K_o"]
-    slots = c["num_ranks"] * c["head_groups"]
+def _gather_unit(thread_index, g, src, flag_base, recv_addr, out_res, epoch, **c):
+    """``src``'s column block of the recv rows of m-tile ``g`` into ``out`` once every head group of
+    ``src`` has pushed it."""
+    bm, K_o, hg = c["block_m"], c["K_o"], c["head_groups"]
+    blk_vecs = c["hq_r"] * c["head_dim"] // VEC_BF16
     if thread_index == fx.Int32(0):
-        flag_idxs = [g * fx.Int32(slots) + fx.Int32(i) for i in range(slots)]
-        spin_flags(flag_base, flag_idxs, epoch, c["rank"], -1, "a2a_attn gather")
+        flag0 = g * fx.Int32(c["num_ranks"] * hg) + src * fx.Int32(hg)
+        flag_idxs = [flag0 + fx.Int32(i) for i in range(hg)]
+        spin_flags(flag_base, flag_idxs, epoch, c["rank"], src, "a2a_attn gather")
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
     # recv rows are rewritten by peers every 2 epochs: drop what this CU / XCD still caches of them
     memory_fence(order="acquire", scope="sys")
     recv_res = create_buffer_resource_from_addr(recv_addr, num_records_bytes=c["recv_bytes"])
-    num_vecs = bm * K_o // VEC_BF16
+    num_vecs = bm * blk_vecs
     per_iter = BLOCK_THREADS * _GATHER_BATCH
-    base_word = g * fx.Int32(num_vecs * VEC_I32)
-    # a tile is hundreds of copy steps: a loop rather than _copy_rows' unrolled ones
+    row0 = g * fx.Int32(bm)
+    col0 = src * fx.Int32(blk_vecs)
+
+    def word(v):
+        r = v // fx.Int32(blk_vecs)
+        return ((row0 + r) * fx.Int32(K_o // VEC_BF16) + col0 + v % fx.Int32(blk_vecs)) * fx.Int32(VEC_I32)
+
+    # a unit is many copy steps: a loop rather than _copy_rows' unrolled ones
     for it in range(num_vecs // per_iter):
         v0 = fx.Int32(it * per_iter) + thread_index
-        words = [
-            base_word + (v0 + fx.Int32(j * BLOCK_THREADS)) * fx.Int32(VEC_I32)
-            for j in range_constexpr(_GATHER_BATCH)
-        ]
+        words = [word(v0 + fx.Int32(j * BLOCK_THREADS)) for j in range_constexpr(_GATHER_BATCH)]
         vals = [
             buffer_load(recv_res, w, vec_width=VEC_I32, dtype=fx.T.i32, cache_modifier=SYS_NT) for w in words
         ]
@@ -357,13 +363,14 @@ def _attn_loop(
     **c,
 ):
     """Claim ``(head group, q block)`` items (``num_ascending`` q blocks in sequence order, then the rest
-    longest first), wait for each item's KV prefix, run its tile and push its O; then the gather tiles
-    (the m-tiles of the ascending q blocks first, the rest from the end)."""
+    longest first), wait for each item's KV prefix, run its tile and push its O; then the gather units
+    ``(m-tile, src)`` (the m-tiles of the ascending q blocks first, the rest from the end)."""
     nqb, hg, asc, bm, bn = c["num_q_blocks"], c["head_groups"], c["num_ascending"], c["block_m"], c["block_n"]
     m_tiles_o, o_asc = c["m_tiles_o"], c["o_ascending"]
     num_units = nqb * hg
     attn, comm = c["mode"] != "comm_only", c["mode"] != "attn_only"
-    num_claims = num_units + (m_tiles_o if comm else 0)
+    n = c["num_ranks"]
+    num_claims = num_units + (m_tiles_o * n if comm else 0)
     ready_base = my_base + fx.Int64(REGION_FWD_READY * FLAG_REGION_BYTES)
     o_flags = my_base + fx.Int64(REGION_FWD_O * FLAG_REGION_BYTES)
     trace_at = c["trace_attn_at"]
@@ -397,11 +404,13 @@ def _attn_loop(
                     st(trace_base, fx.Int32(trace_at) + unit * fx.Int32(3) + fx.Int32(2), read_clock())
         else:
             j = unit - fx.Int32(num_units)
-            g = arith.select(j < fx.Int32(o_asc), j, fx.Int32(m_tiles_o - 1 + o_asc) - j)
-            _gather_tile(thread_index, g, o_flags, my_base + recv_offset, out_res, epoch, **c)
+            k = j // fx.Int32(n)
+            src = j % fx.Int32(n)
+            g = arith.select(k < fx.Int32(o_asc), k, fx.Int32(m_tiles_o - 1 + o_asc) - k)
+            _gather_unit(thread_index, g, src, o_flags, my_base + recv_offset, out_res, epoch, **c)
             if const_expr(trace_base is not None):
                 if thread_index == fx.Int32(0):
-                    st(trace_base, fx.Int32(c["trace_gather_at"]) + g, read_clock())
+                    st(trace_base, fx.Int32(c["trace_gather_at"]) + g * fx.Int32(n) + src, read_clock())
         unit = claim_unit(thread_index, state_base, claim_slot, counter=STATE_TILE)
 
 
@@ -410,14 +419,14 @@ TRACE_MAX_BLOCKS = 1024
 
 def trace_layout(M, num_ranks, hq_r, hkv_r, head_dim):
     """Offsets of the debug timeline (s_memrealtime, 100 MHz): pull unit ends ``[m_tiles * n]``, then
-    ``[claim, ready, end]`` per attention item, the gather tile ends, the stage piece ends
+    ``[claim, ready, end]`` per attention item, the gather unit ends ``[m_tiles_o * n]``, the stage piece ends
     ``[m_tiles * n]`` and the block start times ``[TRACE_MAX_BLOCKS]``; and the total length."""
     traits = make_traits(hq_r, hkv_r, head_dim)
     bm = traits.BLOCK_M
     hg = hq_r // traits.Q_HEADS_PER_WG
     attn_at = M // BM * num_ranks
     gather_at = attn_at + 3 * (M * num_ranks // bm) * hg
-    stage_at = gather_at + M // bm
+    stage_at = gather_at + M // bm * num_ranks
     start_at = stage_at + M // BM * num_ranks
     return attn_at, gather_at, stage_at, start_at, start_at + TRACE_MAX_BLOCKS
 
@@ -462,8 +471,8 @@ def _make_kernel(
     nqb = S // bm
     m_tiles_o = M // bm
     assert m_tiles * n <= FLAGS_PER_REGION and m_tiles_o * n * hg <= FLAGS_PER_REGION
-    assert (bm * K_o // VEC_BF16) % (BLOCK_THREADS * _GATHER_BATCH) == 0, (
-        "gather tile must be whole copy steps"
+    assert (bm * hq_r * d // VEC_BF16) % (BLOCK_THREADS * _GATHER_BATCH) == 0, (
+        "gather unit must be whole copy steps"
     )
     num_ascending = min(num_ascending, nqb)
     grid = max(num_blocks, num_pull)
