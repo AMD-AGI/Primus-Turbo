@@ -1833,9 +1833,12 @@ def build_flash_attn_bwd_dkdv_module(
         seq_len_k,
         total_kv,
         ids=None,
+        q_ready=None,
     ):
         """One work-group's band. ``ids`` = ``(kv_tile, kv_head, split, batch)`` index values replace the
-        decode of the work-group id: a persistent caller runs one band per work item."""
+        decode of the work-group id: a persistent caller runs one band per work item. ``q_ready(q_start)``
+        (PF_QB only) runs before each q-block's first dO / delta fetch: a caller still producing dO
+        waits there for those rows."""
         elem_dtype = dtype_to_elem_type(dtype_str)
         elem_type = elem_dtype.ir_type
         q_ptr = _extract_aligned_pointer(Q)
@@ -4021,6 +4024,10 @@ def build_flash_attn_bwd_dkdv_module(
             _bases = _dma_bases(q_start, poff) if const_expr(ENABLE_DMA and not Q_PREF) else None
             _ldv = None
             _g3_prev = inner[2 * H_ACCS] if const_expr(G3_QCARRY) else None
+            if const_expr(q_ready is not None):
+                # the next q-block's fetch rides this one's last head-step; checked here, where
+                # the fewest registers are live
+                q_ready(q_start + fx.Index(_step) if nq is None else nq)
             if const_expr(PF_QB):
                 _pfb = 2 * H_ACCS + (1 if G3_QCARRY else 0)
                 _qdo = list(inner[_pfb : _pfb + 2 * NUM_DMA_Q])
@@ -4129,6 +4136,8 @@ def build_flash_attn_bwd_dkdv_module(
                 _pf0 = fx.Index(
                     ArithValue(_q_loop_start < _masked_upper).select(_q_loop_start, _desc_q(fx.Index(0)))
                 )
+            if const_expr(q_ready is not None):
+                q_ready(_pf0)
             _carry = _carry + _qdo_issue(_pf0, 0) + _stage_ld_issue(_pf0)
         loop_results = _carry
 
@@ -4390,6 +4399,7 @@ def build_flash_attn_bwd_dkdv_module(
         block_kv=BLOCK_KV,
         block_q=BLOCK_Q,
         q_split=Q_SPLIT,
+        q_ready=PF_QB,
     )
     return _launch
 
