@@ -16,6 +16,8 @@ The exponent comes from the amax bits (no division; quant_epi_gfx1250), bit-iden
 pack_scale BK256 layout [R/128, K/32*128]); same bytes, different order.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -30,6 +32,8 @@ from primus_turbo.triton.quantization.quant_epi_gfx1250 import (
 
 FP8_MAX = 448.0
 MX = 32
+# fuse-moe: Gluon TDM-streamed SwiGLU backward (quant_blk_gluon_gfx1250; needs Triton main with gluon cdna5)
+_SWB_TDM = os.environ.get("PRIMUS_FUSE_MOE_SWB_TDM", "0") == "1"
 
 
 @triton.jit
@@ -334,6 +338,14 @@ def swiglu_bwd_dual_blk(d_act: torch.Tensor, l1: torch.Tensor, w: torch.Tensor, 
     # raw_dw (fuse track, PRIMUS_FUSE_MOE_BWD): return the per-(row, 128-col block) partials [P, I/128] unsummed and
     # unzeroed (rows past the real pool hold garbage; route_dw_partials reads only routed rows)
     gw = (torch.empty if raw_dw else torch.zeros)((P, I // 128), device=dev, dtype=torch.float32)
+    if (_SWB_TDM and preal is not None and compact_t and sl == 0 and not interleaved and dtype == torch.float8_e4m3fn
+            and d_act.dtype == torch.bfloat16 and l1.dtype == torch.bfloat16 and w.dtype == torch.float32):
+        # fuse-moe (PRIMUS_FUSE_MOE_SWB_TDM=1): Gluon TDM-streamed version, byte-identical outputs
+        from primus_turbo.triton.quantization.quant_blk_gluon_gfx1250 import swiglu_bwd_dual_tdm
+
+        swiglu_bwd_dual_tdm(d_act.contiguous(), l1.contiguous(), w.contiguous(), q, s, qT, sT, gw, preal,
+                            alpha, off, glo, ghi, ucl)
+        return q, s, qT, sT, (gw if raw_dw else gw.sum(1))
     _swiglu_bwd_dual_kernel[(P // 128, I // 128)](d_act, l1, w, q, s, qT, sT, gw, P, I,
                                                   preal if preal is not None else w, ALPHA=alpha, OFF=off, GLO=glo,
                                                   GHI=ghi, UCL=ucl, FP8_MAX=torch.finfo(dtype).max,
