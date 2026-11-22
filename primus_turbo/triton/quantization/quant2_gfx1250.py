@@ -438,3 +438,96 @@ def swb_q2(d_act, l1, w, q, s, qT, sT, gw, preal, alpha, off, glo, ghi, ucl, npr
     LAST = _swb_q2_kernel[(nprog,)](d_act, l1, w, q, s, qT, sT, gw, P, I, preal, ALPHA=alpha, OFF=off, GLO=glo,
                                     GHI=ghi, UCL=ucl, NPROG=nprog, NW=8, num_warps=8)
 
+
+# ----------------------------------------------------------------------------------------------------------------
+# PRIMUS_QUANT2_T2P: quant_g90.quant_dual_pack (MB_PACKQ: activation dual quant + up to two dsv4up weight-scale pack
+# jobs in one launch) on the quant2 dense core; the pack jobs run after each program's tiles.
+@gluon.jit
+def _q2_pack_job(src, dst, s0, s1, KB, RPS, j, n_kcb, NW: gl.constexpr):
+    """quant_g90._mb_pack_job (dsv4up_pack._pack_job, BKC = 8): 128-row block c, 8 K-chunks -> packed int32 words."""
+    LP: gl.constexpr = gl.BlockedLayout([1, 1], [1, 32], [1, NW], [1, 0])
+    c = j // n_kcb
+    kc = (j % n_kcb) * 8 + gl.arange(0, 8, layout=gl.SliceLayout(1, LP))
+    t = gl.arange(0, 128, layout=gl.SliceLayout(0, LP))
+    row = c * 128 + (t % 4) * 32 + t // 4
+    srow = row // RPS
+    kmask = kc < KB
+    v = gl.load(src + srow[None, :].to(gl.int64) * s0 + kc[:, None].to(gl.int64) * s1, mask=kmask[:, None],
+                other=127)
+    w = v.to(gl.int32) * 0x01010101
+    dst32 = dst.to(gl.pointer_type(gl.int32)) + c.to(gl.int64) * KB * 128
+    gl.store(dst32 + kc[:, None].to(gl.int64) * 128 + t[None, :], w, mask=kmask[:, None])
+
+
+@gluon.jit
+def _q2_dense_pack_kernel(X, QR, ER, QT, ET, M, N, stride_x, s0p, d0p, a0, b0, k0, r0, n0, c0, s1p, d1p, a1, b1, k1,
+                          r1, n1, c1, FP8_MAX: gl.constexpr, MAX_EXP: gl.constexpr, SLR: gl.constexpr,
+                          SLT: gl.constexpr, NW: gl.constexpr, NPROG: gl.constexpr, NS: gl.constexpr):
+    """_q2_dense_kernel (G90) + the pack jobs j = pid, pid + NPROG, ... of two job slots (n0 + n1 jobs) after the
+    tiles. Same bytes as quant_g90._quant_dual_t2p_kernel."""
+    SH: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[128, 8]], [128, 128], [1, 0])
+    pid = gl.program_id(0)
+    nbm = M // 128
+    ntiles = nbm * (N // 128)
+    bufs = gl.allocate_shared_memory(gl.bfloat16, [NS, 128, 128], SH)
+    xd = tdm.make_tensor_descriptor(base=X, shape=(M, N), strides=(stride_x, 1), block_shape=(128, 128), layout=SH)
+    n_my = (ntiles - pid + NPROG - 1) // NPROG
+    for s in gl.static_range(NS - 1):
+        t = gl.minimum(pid + s * NPROG, ntiles - 1)
+        tdm.async_load(xd, [(t % nbm) * 128, (t // nbm) * 128], bufs.index(s))
+    for it in range(0, n_my):
+        t = pid + it * NPROG
+        tl_ = gl.minimum(t + (NS - 1) * NPROG, ntiles - 1)
+        tdm.async_wait(NS - 2)
+        gl.barrier()
+        tdm.async_load(xd, [(tl_ % nbm) * 128, (tl_ // nbm) * 128], bufs.index((it + NS - 1) % NS))
+        _q2_tile(bufs.index(it % NS), t % nbm, t // nbm, 0, 0, QR, ER, QT, ET, M, N, FP8_MAX, MAX_EXP, 0, SLR,
+                 SLT, 0, 0, NW)
+        gl.barrier()
+    tdm.async_wait(0)
+    for j in range(pid, n0 + n1, NPROG):
+        if j < n0:
+            _q2_pack_job(s0p, d0p, a0, b0, k0, r0, j, c0, NW)
+        else:
+            _q2_pack_job(s1p, d1p, a1, b1, k1, r1, j - n0, c1, NW)
+
+
+def q2_dense_pack(x, dtype, row_layout, t_layout, wjobs, ns=2, wpc=3):
+    """quant_g90.quant_dual_pack's contract: ((q_row, None, e8m0_row, q_t, e8m0_t), packed list aligned with wjobs)."""
+    assert x.dim() == 2 and x.stride(1) == 1 and x.dtype == torch.bfloat16 and len(wjobs) <= 2
+    M, N = x.shape
+    assert M % 128 == 0 and N % 128 == 0
+    slr = 2 if row_layout in ("packed", "dsv4", 2) else 1
+    slt = 2 if t_layout in ("packed", "dsv4", 2) else 1
+    dev = x.device
+    qr = torch.empty((M, N), dtype=dtype, device=dev)
+    er = _scale_buf(M, N, slr, dev)
+    qt = torch.empty((N, M), dtype=dtype, device=dev)
+    et = _scale_buf(N, M, slt, dev)
+    outs, args, njobs = [], [], []
+    for jb in wjobs:
+        if jb is None:
+            outs.append(None)
+            continue
+        src, rps, R, K = jb
+        assert src.dtype == torch.uint8 and src.dim() == 2 and R % 128 == 0 and K % 128 == 0
+        KB = K // 128
+        assert tuple(src.shape) == ((R // rps), KB) and src.data_ptr() != 0
+        dst = torch.empty((R // 128, K * 4), dtype=torch.uint8, device=dev)
+        outs.append(dst)
+        n_kcb = triton.cdiv(KB, 8)
+        njobs.append((R // 128) * n_kcb)
+        args += [src, dst, src.stride(0), src.stride(1), KB, rps, njobs[-1], n_kcb]
+    while len(njobs) < 2:
+        args += [er, er, 0, 0, 0, 1, 0, 1]  # unused slot (no jobs)
+        njobs.append(0)
+    nprog = min(_ncu(dev) * wpc, (M // 128) * (N // 128))
+    fmax = float(torch.finfo(dtype).max)
+    for t in (x, qr, er, qt, et):
+        assert t.data_ptr() != 0
+    _mark("dense_pack", M, N, slr, slt, str(dtype), tuple(njobs))
+    global LAST
+    LAST = _q2_dense_pack_kernel[(nprog,)](x, qr, er, qt, et, M, N, x.stride(0), *args, FP8_MAX=fmax,
+                                           MAX_EXP=_fp8_max_exp(fmax), SLR=slr, SLT=slt, NW=4, NPROG=nprog, NS=ns,
+                                           num_warps=4)
+    return (qr, None, er, qt, et), outs

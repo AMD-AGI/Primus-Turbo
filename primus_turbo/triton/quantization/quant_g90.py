@@ -259,6 +259,11 @@ def quant_dual_pack(x, dtype, row_layout, t_layout, wjobs, site=None, num_warps=
     assert x.dim() == 2 and x.stride(1) == 1 and len(wjobs) <= 2
     M, N = x.shape
     assert M % 128 == 0 and N % 128 == 0
+    if _Q2_T2P and ({f"{site}{N}", str(N), "*"} & _Q2_T2P) and x.dtype == torch.bfloat16 and (
+            x.stride(0) * 2) % 16 == 0 and x.data_ptr() % 16 == 0:
+        from primus_turbo.triton.quantization.quant2_gfx1250 import q2_dense_pack
+
+        return q2_dense_pack(x, dtype, row_layout, t_layout, wjobs)
     v = _MB_QDUAL.get(f"{site}{N}", _MB_QDUAL.get(str(N), _MB_QDUAL.get("*"))) if (_MB_QDUAL and site) else None
     if v is not None and v.startswith("t2w"):
         num_warps = int(v[3:])
@@ -317,6 +322,9 @@ def _q2_t2_spec():
 
 
 _Q2_T2 = _q2_t2_spec()
+# PRIMUS_QUANT2_T2P (quant2, default off): same keys for quant_dual_pack (MB_PACKQ quant + weight-scale packs) on the
+# quant2 core (quant2_gfx1250.q2_dense_pack; byte-identical)
+_Q2_T2P = frozenset(k.strip() for k in os.environ.get("PRIMUS_QUANT2_T2P", "").split(",") if k.strip())
 
 
 def _q2_t2_use(x, site, N, with_row, with_t, with_sr) -> bool:
