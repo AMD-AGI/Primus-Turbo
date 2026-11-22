@@ -233,7 +233,11 @@ class FP8GemmBlockConcatNFunction(torch.autograd.Function):
             jobs.append((a_row, w_j[off:off + n], pa, pb[off // 128:(off + n) // 128], o, False))
             off += n
         tiles = [(M // 256) * (n // 256) for n in ctx.ns]
-        if len(jobs) == 2 and (tiles[0] % 8 == 0 or tiles[1] % 8 == 0) and K <= 8192:
+        if len(jobs) == 2 and dsv4up_block.split_epi_enabled() and ctx.ns[0] % 256 == 0 and N % 256 == 0:
+            # PRIMUS_TURBO_CONCAT_SPLIT_EPI=1: ONE GEMM over the joint N, each 256-column tile stored into its own
+            # output (split-output epilogue); same per-tile main loop -> the separate GEMMs' bits.
+            dsv4up_block.gemm_nt_split(a_row, w_j, pa, pb, outs[0], outs[1], "n")
+        elif len(jobs) == 2 and (tiles[0] % 8 == 0 or tiles[1] % 8 == 0) and K <= 8192:
             dsv4up_block.gemm_nt_dual(*(jobs if tiles[0] % 8 == 0 else jobs[::-1]))
         else:
             for j in jobs:
@@ -297,7 +301,13 @@ class FP8GemmBlockConcatNFunction(torch.autograd.Function):
                         posts.append((mg, tmp, ow))
                     off += n
                 tiles = [(n // 256) * (ctx.K // 256) for n in ctx.ns]
-                if len(jobs) == 2 and M <= 8192 and (tiles[0] % 8 == 0 or tiles[1] % 8 == 0):
+                if (len(jobs) == 2 and not posts and dsv4up_block.split_epi_enabled() and jobs[0][5] == jobs[1][5]
+                        and jobs[0][4].dtype == jobs[1][4].dtype and ctx.ns[0] % 256 == 0 and N % 256 == 0):
+                    # PRIMUS_TURBO_CONCAT_SPLIT_EPI=1: ONE wgrad GEMM over the joint dY^T rows, each 256-row tile
+                    # stored into its weight's main_grad (split-output epilogue); bits = the per-weight GEMMs'.
+                    dsv4up_block.gemm_nt_split(g_t, a_t, pgt, pat, jobs[0][4], jobs[1][4], "m",
+                                               accumulate=jobs[0][5])
+                elif len(jobs) == 2 and M <= 8192 and (tiles[0] % 8 == 0 or tiles[1] % 8 == 0):
                     dsv4up_block.gemm_nt_dual(*(jobs if tiles[0] % 8 == 0 else jobs[::-1]))
                 else:
                     for j in jobs:

@@ -213,6 +213,51 @@ def _store_half(c_ptr, desc, shared, pid_m, pid_n, half: gl.constexpr, stride_cm
 
 
 @gluon.jit
+def _store_split(c_ptr, c1_ptr, shared, shared_layout: gl.constexpr, pid_m, pid_n, M: gl.constexpr, N: gl.constexpr,
+                 stride_cm: gl.constexpr, stride_c1m: gl.constexpr, SPLIT_AXIS: gl.constexpr, SPLIT0: gl.constexpr,
+                 acc0, acc1, WMMA_LAYOUT: gl.constexpr, ACCUM: gl.constexpr, CTA_M: gl.constexpr,
+                 CTA_N: gl.constexpr):
+    # Same two half-tile stores as the default epilogue, through the descriptor of the output owning the tile.
+    cta_m: gl.constexpr = 256
+    cta_n: gl.constexpr = 256
+    half_n: gl.constexpr = 128
+    if SPLIT_AXIS == 1:
+        M0: gl.constexpr = SPLIT0
+        N0: gl.constexpr = N
+        M1: gl.constexpr = M - SPLIT0
+        N1: gl.constexpr = N
+        first = pid_m * cta_m < SPLIT0
+    else:
+        M0: gl.constexpr = M
+        N0: gl.constexpr = SPLIT0
+        M1: gl.constexpr = M
+        N1: gl.constexpr = N - SPLIT0
+        first = pid_n * cta_n < SPLIT0
+    if first:
+        desc0 = tdm.make_tensor_descriptor(base=c_ptr, shape=(M0 // cta_m, N0 // cta_n, cta_m, cta_n),
+                                           strides=(cta_m * stride_cm, cta_n, stride_cm, 1),
+                                           block_shape=(CTA_M, CTA_N, cta_m, half_n), layout=shared_layout)
+        _store_half(c_ptr, desc0, shared, pid_m, pid_n, 0, stride_cm, 1, acc0, WMMA_LAYOUT, ACCUM)
+        tdm.async_wait(0)
+        _store_half(c_ptr, desc0, shared, pid_m, pid_n, 1, stride_cm, 1, acc1, WMMA_LAYOUT, ACCUM)
+        tdm.async_wait(0)
+    else:
+        if SPLIT_AXIS == 1:
+            pm1 = pid_m - SPLIT0 // cta_m
+            pn1 = pid_n
+        else:
+            pm1 = pid_m
+            pn1 = pid_n - SPLIT0 // cta_n
+        desc1 = tdm.make_tensor_descriptor(base=c1_ptr, shape=(M1 // cta_m, N1 // cta_n, cta_m, cta_n),
+                                           strides=(cta_m * stride_c1m, cta_n, stride_c1m, 1),
+                                           block_shape=(CTA_M, CTA_N, cta_m, half_n), layout=shared_layout)
+        _store_half(c1_ptr, desc1, shared, pm1, pn1, 0, stride_c1m, 1, acc0, WMMA_LAYOUT, ACCUM)
+        tdm.async_wait(0)
+        _store_half(c1_ptr, desc1, shared, pm1, pn1, 1, stride_c1m, 1, acc1, WMMA_LAYOUT, ACCUM)
+        tdm.async_wait(0)
+
+
+@gluon.jit
 def _xcd_pids(pid, M: gl.constexpr, N: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
               GRID_MN: gl.constexpr, NUM_XCDS_: gl.constexpr, GROUP_M: gl.constexpr):
     # _get_xcd_swizzled_pids with the program id passed in (dual launch: pid local to its GEMM)
@@ -237,7 +282,8 @@ def _gemm_tile(pid_m, pid_n, a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M: g
                SHARED_SCALE_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr, LOAD_WMMA_LAYOUT: gl.constexpr,
                B2_LOAD_LAYOUT: gl.constexpr, OUTPUT_CGA_LAYOUT: gl.constexpr, BLOCK_M: gl.constexpr,
                BLOCK_N: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr, UNROLL: gl.constexpr = False,
-               EPI2: gl.constexpr = False):
+               EPI2: gl.constexpr = False, c1_ptr=None, stride_c1m: gl.constexpr = 0, SPLIT_AXIS: gl.constexpr = 0,
+               SPLIT0: gl.constexpr = 0):
     # One 256x256 output tile (pid_m, pid_n) of C[M,N] = A[M,K] . B[N,K]^T: static-shape body of dsv4_gemm.py
     # (gemmx/dsv4up, measured version): K-contiguous A/B (stride_ak = stride_bk = 1), row-major C (stride_cn = 1).
     # Host guarantees M, N % 256 == 0, K % 512 == 0, K >= 1024.
@@ -345,22 +391,30 @@ def _gemm_tile(pid_m, pid_n, a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M: g
     shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[half_n, 8]], [CTA_M, CTA_N, cta_m, half_n],
                                                                           [3, 2, 1, 0], OUTPUT_CGA_LAYOUT)
     shared = gl.allocate_shared_memory(c_ptr.type.element_ty, [CTA_M, CTA_N, cta_m, half_n], shared_layout)
-    desc = tdm.make_tensor_descriptor(base=c_ptr, shape=(M // cta_m, N // cta_n, cta_m, cta_n),
-                                      strides=(cta_m * stride_cm, cta_n * stride_cn, stride_cm, stride_cn),
-                                      block_shape=(CTA_M, CTA_N, cta_m, half_n), layout=shared_layout)
-    if EPI2:
-        # two LDS staging buffers (the operand ring is dead here, 2 x ~70 KB fit): half 1 is written to LDS while
-        # half 0's TDM store is in flight; one wait at the end. Same values, same rounding.
-        shared1 = gl.allocate_shared_memory(c_ptr.type.element_ty, [CTA_M, CTA_N, cta_m, half_n], shared_layout)
-        _store_half(c_ptr, desc, shared, pid_m, pid_n, 0, stride_cm, stride_cn, acc0, WMMA_LAYOUT, ACCUM)
-        _store_half(c_ptr, desc, shared1, pid_m, pid_n, 1, stride_cm, stride_cn, acc1, WMMA_LAYOUT, ACCUM)
-        tdm.async_wait(0)
-        shared1._keep_alive()
+    if SPLIT_AXIS != 0:
+        # Split-output epilogue hook (fuseattn, PRIMUS_TURBO_CONCAT_SPLIT_EPI): C is the concatenation of two
+        # row-major outputs along M (SPLIT_AXIS 1) or N (SPLIT_AXIS 2): rows / cols [0, SPLIT0) go to c_ptr
+        # (stride_cm), the rest to c1_ptr (stride_c1m). SPLIT0 % 256 == 0, so a 256x256 tile lies in exactly one
+        # output; only the store descriptor and the tile coordinate change, the accumulators are untouched.
+        _store_split(c_ptr, c1_ptr, shared, shared_layout, pid_m, pid_n, M, N, stride_cm, stride_c1m, SPLIT_AXIS,
+                     SPLIT0, acc0, acc1, WMMA_LAYOUT, ACCUM, CTA_M, CTA_N)
     else:
-        _store_half(c_ptr, desc, shared, pid_m, pid_n, 0, stride_cm, stride_cn, acc0, WMMA_LAYOUT, ACCUM)
-        tdm.async_wait(0)
-        _store_half(c_ptr, desc, shared, pid_m, pid_n, 1, stride_cm, stride_cn, acc1, WMMA_LAYOUT, ACCUM)
-        tdm.async_wait(0)
+        desc = tdm.make_tensor_descriptor(base=c_ptr, shape=(M // cta_m, N // cta_n, cta_m, cta_n),
+                                          strides=(cta_m * stride_cm, cta_n * stride_cn, stride_cm, stride_cn),
+                                          block_shape=(CTA_M, CTA_N, cta_m, half_n), layout=shared_layout)
+        if EPI2:
+            # two LDS staging buffers (the operand ring is dead here, 2 x ~70 KB fit): half 1 is written to LDS while
+            # half 0's TDM store is in flight; one wait at the end. Same values, same rounding.
+            shared1 = gl.allocate_shared_memory(c_ptr.type.element_ty, [CTA_M, CTA_N, cta_m, half_n], shared_layout)
+            _store_half(c_ptr, desc, shared, pid_m, pid_n, 0, stride_cm, stride_cn, acc0, WMMA_LAYOUT, ACCUM)
+            _store_half(c_ptr, desc, shared1, pid_m, pid_n, 1, stride_cm, stride_cn, acc1, WMMA_LAYOUT, ACCUM)
+            tdm.async_wait(0)
+            shared1._keep_alive()
+        else:
+            _store_half(c_ptr, desc, shared, pid_m, pid_n, 0, stride_cm, stride_cn, acc0, WMMA_LAYOUT, ACCUM)
+            tdm.async_wait(0)
+            _store_half(c_ptr, desc, shared, pid_m, pid_n, 1, stride_cm, stride_cn, acc1, WMMA_LAYOUT, ACCUM)
+            tdm.async_wait(0)
 
 
 @gluon.jit
@@ -386,6 +440,23 @@ def dsv4up_gemm_kernel(a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M: gl.cons
     _gemm_tile(pid_m, pid_n, a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K, stride_am, stride_bn, stride_cm,
                stride_scale_a, stride_scale_b, ACCUM, SHARED_LAYOUT_A, SHARED_LAYOUT_B2, SHARED_SCALE_A, SHARED_SCALE_B, WMMA_LAYOUT,
                    LOAD_WMMA_LAYOUT, B2_LOAD_LAYOUT, OUTPUT_CGA_LAYOUT, BLOCK_M, BLOCK_N, CTA_M, CTA_N, False, EPI2)
+
+
+@gluon.jit
+def dsv4up_split_kernel(a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, c1_ptr, M: gl.constexpr, N: gl.constexpr,
+                        K: gl.constexpr, stride_am: gl.constexpr, stride_bn: gl.constexpr, stride_cm: gl.constexpr,
+                        stride_c1m: gl.constexpr, stride_scale_a: gl.constexpr, stride_scale_b: gl.constexpr,
+                        GRID_MN: gl.constexpr, SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B2: gl.constexpr,
+                        SHARED_SCALE_A: gl.constexpr, SHARED_SCALE_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr,
+                        LOAD_WMMA_LAYOUT: gl.constexpr, B2_LOAD_LAYOUT: gl.constexpr, OUTPUT_CGA_LAYOUT: gl.constexpr,
+                        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr,
+                        ACCUM: gl.constexpr, SPLIT_AXIS: gl.constexpr, SPLIT0: gl.constexpr):
+    # dsv4up_gemm_kernel (same tile order and main loop) whose C is split into two outputs, see _store_split.
+    pid_m, pid_n = _get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, 4)
+    _gemm_tile(pid_m, pid_n, a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K, stride_am, stride_bn, stride_cm,
+               stride_scale_a, stride_scale_b, ACCUM, SHARED_LAYOUT_A, SHARED_LAYOUT_B2, SHARED_SCALE_A, SHARED_SCALE_B,
+               WMMA_LAYOUT, LOAD_WMMA_LAYOUT, B2_LOAD_LAYOUT, OUTPUT_CGA_LAYOUT, BLOCK_M, BLOCK_N, CTA_M, CTA_N, False,
+               False, c1_ptr, stride_c1m, SPLIT_AXIS, SPLIT0)
 
 
 @gluon.jit
@@ -594,3 +665,47 @@ def dsv4up_dual(job0, job1):
     grid, kw = p
     dsv4up_dual_kernel[grid](a0, b0, o0, pa0, pb0, a1, b1, o1, pa1, pb1, **kw)
     return o0, o1
+
+
+_SPLIT_PLANS = {}
+
+
+def dsv4up_gemm_split(a, b, a_packed, b_packed, out0, out1, axis, accumulate=False):
+    """One dsv4up GEMM C[M,N] = A[M,K] . B[N,K]^T whose C is two separate row-major outputs (fuseattn split-output
+    epilogue): axis "n" -> out0 [M, N0], out1 [M, N - N0] (columns); axis "m" -> out0 [M0, N], out1 [M - M0, N]
+    (rows). The split point (N0 / M0) is a multiple of 256, so every 256x256 tile is stored whole into one output; the
+    tiles' accumulators are exactly dsv4up_gemm's (same main loop), so each output has the bits of the GEMM restricted
+    to its rows / columns. accumulate: beta 1 into both outputs (same dtype)."""
+    M, K = a.shape
+    N = b.shape[0]
+    assert shape_supported(M, N, K), (M, N, K)
+    assert b.shape[1] == K and a.stride(1) == 1 and b.stride(1) == 1
+    assert a_packed.shape == (M // 128, K * 4) and b_packed.shape == (N // 128, K * 4)
+    assert a_packed.is_contiguous() and b_packed.is_contiguous()
+    assert out0.dtype == out1.dtype and out0.stride(1) == 1 and out1.stride(1) == 1
+    if axis == "n":
+        s0 = out0.shape[1]
+        assert out0.shape[0] == M and out1.shape[0] == M and s0 + out1.shape[1] == N, (out0.shape, out1.shape, M, N)
+        ax = 2
+    else:
+        s0 = out0.shape[0]
+        assert out0.shape[1] == N and out1.shape[1] == N and s0 + out1.shape[0] == M, (out0.shape, out1.shape, M, N)
+        ax = 1
+    assert 0 < s0 and s0 % TILE == 0, s0
+    for t in (a, b, a_packed, b_packed, out0, out1):  # never hand the kernel a null / foreign address
+        assert t.is_cuda and t.data_ptr() != 0 and t.device == a.device, "dsv4up split: bad operand"
+    key = (M, N, K, a.stride(0), b.stride(0), out0.stride(0), out1.stride(0), out0.dtype, bool(accumulate), ax, s0)
+    p = _SPLIT_PLANS.get(key)
+    if p is None:
+        global _LAYOUTS
+        if _LAYOUTS is None:
+            _LAYOUTS = build_layouts()
+        grid_mn = (M // TILE) * (N // TILE)
+        p = ((grid_mn,), dict(M=M, N=N, K=K, stride_am=a.stride(0), stride_bn=b.stride(0), stride_cm=out0.stride(0),
+                              stride_c1m=out1.stride(0), stride_scale_a=K // 32 * 128, stride_scale_b=K // 32 * 128,
+                              GRID_MN=grid_mn, ACCUM=bool(accumulate), SPLIT_AXIS=ax, SPLIT0=s0, num_warps=8,
+                              waves_per_eu=2, num_ctas=1, **_LAYOUTS))
+        _SPLIT_PLANS[key] = p
+    grid, kw = p
+    dsv4up_split_kernel[grid](a, b, out0, a_packed, b_packed, out1, **kw)
+    return out0, out1
