@@ -125,8 +125,9 @@ def _global_row(t, src, cs, n):
 
 
 @ASTRewriter.transform
-def _stage_unit(thread_index, m_tile, in_res, stage_res, **c):
-    """Rows ``[m_tile * BM, +BM)`` of this rank's q / k / v into its staging bank, retired on return."""
+def _stage_unit(thread_index, m_tile, dst, in_res, stage_res, **c):
+    """Rows ``[m_tile * BM, +BM)`` of ``dst``'s heads of this rank's tensors into ``dst``'s column block of
+    the staging bank, retired on return."""
     M, n, d = c["M"], c["num_ranks"], c["head_dim"]
     heads, offs = c["heads"], c["head_offs"]
     row_vecs_out = n * c["N_r"] // VEC_BF16
@@ -138,15 +139,16 @@ def _stage_unit(thread_index, m_tile, in_res, stage_res, **c):
         off = offs[x] * d // VEC_BF16
 
         def coords(v, h_vecs=h_vecs, row_vecs_in=row_vecs_in, off=off):
-            r = v // fx.Int32(row_vecs_in)
-            col = v % fx.Int32(row_vecs_in)
+            r = v // fx.Int32(h_vecs)
+            col = v % fx.Int32(h_vecs)
             t = t0 + r
-            src_word = (t * fx.Int32(row_vecs_in) + col) * fx.Int32(VEC_I32)
-            dst_col = col // fx.Int32(h_vecs) * fx.Int32(blk_vecs) + fx.Int32(off) + col % fx.Int32(h_vecs)
-            dst_word = (t * fx.Int32(row_vecs_out) + dst_col) * fx.Int32(VEC_I32)
+            src_word = (t * fx.Int32(row_vecs_in) + dst * fx.Int32(h_vecs) + col) * fx.Int32(VEC_I32)
+            dst_word = (
+                t * fx.Int32(row_vecs_out) + dst * fx.Int32(blk_vecs) + fx.Int32(off) + col
+            ) * fx.Int32(VEC_I32)
             return src_word, dst_word, (r < fx.Int32(BM)) & (t < fx.Int32(M))
 
-        _copy_rows(thread_index, BM * row_vecs_in, coords, in_res[x], stage_res, 0, SYS_NT)
+        _copy_rows(thread_index, BM * h_vecs, coords, in_res[x], stage_res, 0, SYS_NT)
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
 
@@ -160,7 +162,9 @@ def _pull_unit(thread_index, src, m_tile, src_heap, bank_offset, out_res, epoch,
     blk_vecs = c["N_r"] // VEC_BF16
     if thread_index == fx.Int32(0):
         flag_base = src_heap + fx.Int64(c["stage_region"] * FLAG_REGION_BYTES)
-        spin_flag(flag_base, m_tile, epoch, rank, src, "a2a_attn pull", report=False)
+        spin_flag(
+            flag_base, m_tile * fx.Int32(n) + fx.Int32(rank), epoch, rank, src, "a2a_attn pull", report=False
+        )
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
     stage_res = create_buffer_resource_from_addr(src_heap + bank_offset, num_records_bytes=c["stage_bytes"])
@@ -197,20 +201,25 @@ def _pull_role(
     trace_base,
     **c,
 ):
-    """Stage units until none are left, then pull units ``(m_tile, src = rank + i)`` m-major."""
+    """Stage pieces ``(m_tile, dst)`` until none are left, then pull units ``(m_tile, src = rank + i)``
+    m-major."""
     n, rank, m_tiles = c["num_ranks"], c["rank"], c["m_tiles"]
     stage_res = create_buffer_resource_from_addr(my_base + bank_offset, num_records_bytes=c["stage_bytes"])
     stage_flags = my_base + fx.Int64(c["stage_region"] * FLAG_REGION_BYTES)
     ready_base = my_base + fx.Int64(c["ready_region"] * FLAG_REGION_BYTES)
     more_stage = fx.Int32(1)
+    num_pieces = m_tiles * n
     while more_stage == fx.Int32(1):
         piece = claim_unit(opaque_tid(thread_index), state_base, claim_slot, STATE_ASSIST)
-        if piece < fx.Int32(m_tiles):
-            _stage_unit(thread_index, piece, in_res, stage_res, **c)
+        if piece < fx.Int32(num_pieces):
+            m_tile = piece // fx.Int32(n)
+            # the pullers of m-tile i start with src = dst - i: stage the other ranks' blocks first
+            dst = (fx.Int32(rank + 1) + piece % fx.Int32(n)) % fx.Int32(n)
+            _stage_unit(thread_index, m_tile, dst, in_res, stage_res, **c)
             if thread_index == fx.Int32(0):
                 # the staging stores are system scope (SYS_NT) and retired above
-                st(stage_flags, piece, epoch, scope="sys", order="relaxed")
-        more_stage = arith.select(piece < fx.Int32(m_tiles), fx.Int32(1), fx.Int32(0))
+                st(stage_flags, m_tile * fx.Int32(n) + dst, epoch, scope="sys", order="relaxed")
+        more_stage = arith.select(piece < fx.Int32(num_pieces), fx.Int32(1), fx.Int32(0))
     num_units = m_tiles * n
     more_pull = fx.Int32(1)
     while more_pull == fx.Int32(1):
@@ -342,7 +351,8 @@ def _attn_loop(
     nqb, hg, asc, bm, bn = c["num_q_blocks"], c["head_groups"], c["num_ascending"], c["block_m"], c["block_n"]
     m_tiles_o, o_asc = c["m_tiles_o"], c["o_ascending"]
     num_units = nqb * hg
-    num_claims = num_units + m_tiles_o
+    attn, comm = c["mode"] != "comm_only", c["mode"] != "attn_only"
+    num_claims = num_units + (m_tiles_o if comm else 0)
     ready_base = my_base + fx.Int64(REGION_FWD_READY * FLAG_REGION_BYTES)
     o_flags = my_base + fx.Int64(REGION_FWD_O * FLAG_REGION_BYTES)
     trace_at = c["trace_attn_at"]
@@ -361,13 +371,16 @@ def _attn_loop(
                 ((qb + fx.Int32(1)) * fx.Int32(bm) + fx.Int32(2 * bn - 1)) // fx.Int32(2 * bn) * fx.Int32(2)
             )
             kv_tiles = arith.select(kv_tiles < fx.Int32(4), fx.Int32(4), kv_tiles)
-            _wait_prefix(thread_index, ready_base, kv_tiles * fx.Int32(bn), epoch, **c)
+            if const_expr(comm):
+                _wait_prefix(thread_index, ready_base, kv_tiles * fx.Int32(bn), epoch, **c)
             if const_expr(trace_base is not None):
                 if thread_index == fx.Int32(0):
                     st(trace_base, fx.Int32(trace_at) + unit * fx.Int32(3) + fx.Int32(1), read_clock())
             # _setup walks causal q blocks descending from the grid y index
-            run_tile((h, fx.Int32(nqb - 1) - qb, fx.Int32(0)))
-            _push_o(thread_index, qb, h, peers_base, recv_offset, o_res, epoch, **c)
+            if const_expr(attn):
+                run_tile((h, fx.Int32(nqb - 1) - qb, fx.Int32(0)))
+            if const_expr(comm):
+                _push_o(thread_index, qb, h, peers_base, recv_offset, o_res, epoch, **c)
             if const_expr(trace_base is not None):
                 if thread_index == fx.Int32(0):
                     st(trace_base, fx.Int32(trace_at) + unit * fx.Int32(3) + fx.Int32(2), read_clock())
@@ -406,6 +419,7 @@ def _make_kernel(
     num_ascending,
     bank_bytes,
     trace,
+    mode,
 ):
     n, d = num_ranks, head_dim
     traits = make_traits(hq_r, hkv_r, d)
@@ -470,6 +484,7 @@ def _make_kernel(
         num_ascending=num_ascending,
         m_tiles_o=m_tiles_o,
         o_ascending=min(num_ascending // n, m_tiles_o),
+        mode=mode,
         trace_attn_at=trace_attn_at,
         trace_gather_at=trace_gather_at,
     )
@@ -500,7 +515,7 @@ def _make_kernel(
         bank_offset = fx.Int64(FLAG_BYTES) + (epoch & fx.Int64(1)) * fx.Int64(bank_bytes)
         my_base = ld(peers_base, fx.Int32(rank), dtype=fx.T.i64)
 
-        if block_index < fx.Int32(num_pull):
+        if const_expr(mode != "attn_only") and block_index < fx.Int32(num_pull):
             in_res = [
                 create_buffer_resource(t, num_records_bytes=M * n * h * d * 2)
                 for t, h in ((Q_IN, hq_r), (K_IN, hkv_r), (V_IN, hkv_r))
@@ -601,6 +616,7 @@ def _launch(
     num_ascending: fx.Constexpr[int],
     bank_bytes: fx.Constexpr[int],
     trace: fx.Constexpr[bool],
+    mode: fx.Constexpr[str],
     stream: fx.Stream,
 ):
     kernel, grid, value_attrs = _make_kernel(
@@ -616,6 +632,7 @@ def _launch(
         num_ascending,
         bank_bytes,
         trace,
+        mode,
     )
     kernel(Q_IN, K_IN, V_IN, Q, K, V, O, LSE, OUT, PEER_PTRS, STATE, TRACE, value_attrs=value_attrs).launch(
         grid=(grid, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream
@@ -639,11 +656,16 @@ def ulysses_a2a_attn_fwd(
     num_blocks=None,
     num_ascending=None,
     trace=None,
+    mode="full",
 ):
     """``q_in`` / ``k_in`` / ``v_in`` ``[M, n * h_r, d]``: this rank's tokens with every head (batch 1).
     Writes ``q`` / ``k`` / ``v`` ``[S, h_r, d]`` (this rank's heads over the sequence, sequence order),
     the causal attention output ``o`` (like ``q``) with its natural-log LSE ``[S, hq_r]`` fp32, and ``out``
-    ``[M, n * hq_r, d]``: the output for this rank's tokens. The bank must hold ``a2a_attn_fwd_bank_bytes``."""
+    ``[M, n * hq_r, d]``: the output for this rank's tokens. The bank must hold ``a2a_attn_fwd_bank_bytes``.
+
+    ``mode`` (measurement only): ``"attn_only"`` runs the attention items on the q / k / v already in place
+    (no exchange, no waits, no O push or gather); ``"comm_only"`` runs every exchange step and wait but
+    no attention tile."""
     n = workspace.num_ranks
     M, H, d = q_in.shape[0], q_in.shape[-2], q_in.shape[-1]
     hq_r, hkv_r = H // n, k_in.shape[-2] // n
@@ -677,5 +699,6 @@ def ulysses_a2a_attn_fwd(
             num_ascending,
             workspace.bank_bytes,
             trace is not None,
+            mode,
             torch.cuda.current_stream(),
         )

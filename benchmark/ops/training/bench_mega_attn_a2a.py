@@ -86,7 +86,7 @@ def time_us(fn, warmup, iters, reps):
     return t.item()
 
 
-def bench(model, seq, chunks, num_pulls, warmup, iters, reps, trace_dir):
+def bench(model, seq, chunks, num_pulls, warmup, iters, reps, trace_dir, modes=False):
     group = dist.group.WORLD
     n, rank = group.size(), group.rank()
     cfg = MODELS[model]
@@ -141,18 +141,26 @@ def bench(model, seq, chunks, num_pulls, warmup, iters, reps, trace_dir):
     o = torch.empty_like(q)
     lse = torch.empty(seq, hq_r, device=dev, dtype=torch.float32)
     out = torch.empty_like(q_in)
+    overlap = {}
     for cs in chunks:
         if cs and (M % cs or cs % 128):
             continue
         for npull in num_pulls:
-            results[f"fused cs={cs} p={npull}"] = time_us(
-                lambda cs=cs, npull=npull: ulysses_a2a_attn_fwd(
-                    q_in, k_in, v_in, q, k, v, o, lse, out, ws, seq_chunk=cs, num_pull=npull
-                ),
-                warmup,
-                iters,
-                reps,
-            )
+            for mode in ("full", "attn_only", "comm_only") if modes else ("full",):
+                key = f"fused cs={cs} p={npull}" + ("" if mode == "full" else f" {mode}")
+                results[key] = time_us(
+                    lambda cs=cs, npull=npull, mode=mode: ulysses_a2a_attn_fwd(
+                        q_in, k_in, v_in, q, k, v, o, lse, out, ws, seq_chunk=cs, num_pull=npull, mode=mode
+                    ),
+                    warmup,
+                    iters,
+                    reps,
+                )
+            if modes:
+                full = results[f"fused cs={cs} p={npull}"]
+                t_attn = results[f"fused cs={cs} p={npull} attn_only"]
+                t_comm = results[f"fused cs={cs} p={npull} comm_only"]
+                overlap[(cs, npull)] = (full, t_attn, t_comm)
         if trace_dir:
             total = trace_layout(M, n, hq_r, hkv_r, d)[2]
             trace = torch.zeros(total, device=dev, dtype=torch.int64)
@@ -178,8 +186,17 @@ def bench(model, seq, chunks, num_pulls, warmup, iters, reps, trace_dir):
             if name in ("attn", "a2a"):
                 continue
             print(
-                f"  {name:22s} {t:9.1f} us   vs unfused {results['unfused'] / t:5.3f}x   "
+                f"  {name:32s} {t:9.1f} us   vs unfused {results['unfused'] / t:5.3f}x   "
                 f"over attn {t - results['attn']:8.1f} us",
+                flush=True,
+            )
+        for (cs, npull), (full, t_attn, t_comm) in overlap.items():
+            hidden = t_attn + t_comm - full
+            print(
+                f"  overlap cs={cs} p={npull}: fused-kernel attention {t_attn:.1f} us "
+                f"(+{t_attn - results['attn']:.1f} over standalone), in-kernel comm {t_comm:.1f} us "
+                f"(RCCL a2a {results['a2a']:.1f}), hidden {hidden:.1f} us = {100 * hidden / t_comm:.0f}% of comm, "
+                f"exposed {full - t_attn:.1f} us",
                 flush=True,
             )
     return results
@@ -285,6 +302,7 @@ def main():
     parser.add_argument("--reps", type=int, default=5)
     parser.add_argument("--trace-dir", type=str, default=None)
     parser.add_argument("--bwd", action="store_true")
+    parser.add_argument("--modes", action="store_true", help="also time attn_only / comm_only: overlap")
     args = parser.parse_args()
     dist.init_process_group("nccl", timeout=timedelta(minutes=5))
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))

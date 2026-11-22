@@ -174,11 +174,11 @@ def check_op(group, hq, hkv, d, s_local, seq_chunk, failures):
     per_group = []
     for r in range(n):
         hs_q, hs_kv = slice(r * hq_r, (r + 1) * hq_r), slice(r * hkv_r, (r + 1) * hkv_r)
-        q_r, k_r, v_r = (t[:, hs, None].contiguous() for t, hs in ((qg, hs_q), (kg, hs_kv), (vg, hs_kv)))
+        q_r, k_r, v_r = (t[:, None, hs].contiguous() for t, hs in ((qg, hs_q), (kg, hs_kv), (vg, hs_kv)))
         o_r, lse_r = flash_attn_sbhd_flydsl_forward_impl(q_r, k_r, v_r, causal=True, return_lse=True)
         per_group.append(
             flash_attn_sbhd_flydsl_backward_impl(
-                dog[:, hs_q, None].contiguous(),
+                dog[:, None, hs_q].contiguous(),
                 q_r,
                 k_r,
                 v_r,
