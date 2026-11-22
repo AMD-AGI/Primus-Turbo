@@ -250,7 +250,7 @@ def _pull_role(
 @ASTRewriter.transform
 def _wait_prefix(thread_index, ready_base, kv_end, epoch, **c):
     """Wait for the ready flag of every pull unit holding rows below ``kv_end``: each thread polls its
-    own share of the units, then the block rendezvous."""
+    own share of the units (relaxed), then the block rendezvous and acquires once."""
     n, cs, rank = c["num_ranks"], c["seq_chunk"], c["rank"]
     total = c["m_tiles"] * n
     idx = thread_index
@@ -258,13 +258,13 @@ def _wait_prefix(thread_index, ready_base, kv_end, epoch, **c):
     while idx < fx.Int32(total):
         g0 = _global_row(idx // fx.Int32(n) * fx.Int32(BM), idx % fx.Int32(n), cs, n)
         need = g0 < kv_end
-        flag = ld(ready_base, idx, scope="agent", order="acquire", dtype=fx.T.i64)
+        flag = ld(ready_base, idx, scope="agent", dtype=fx.T.i64)
         while need & (flag < epoch):
             fx.rocdl.s_sleep(fx.Int32(1))
             if spin_timed_out(spin_start, SPIN_TIMEOUT):
                 fx.printf(f"[a2a_attn rank={rank}] ready flag timeout: idx={{}} flag={{}}\n", idx, flag)
                 _asm("s_trap 2")
-            flag = ld(ready_base, idx, scope="agent", order="acquire", dtype=fx.T.i64)
+            flag = ld(ready_base, idx, scope="agent", dtype=fx.T.i64)
         idx = idx + fx.Int32(BLOCK_THREADS)
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
