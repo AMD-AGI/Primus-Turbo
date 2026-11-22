@@ -1993,7 +1993,7 @@ def _swahca_loop_kw(pool):
     (bit-identical, code-placement independent); 0 = the fully unrolled kernel."""
     if os.environ.get("PRIMUS_SWAHCA_LOOP", "0") != "1":
         return {}
-    return dict(sdp_u=1, psdp_u=4, dq_u=1) if pool else dict(sdp_u=2, dq_u=1)
+    return dict(sdp_u=2, psdp_u=4, dq_u=1) if pool else dict(sdp_u=4, dq_u=1)
 
 
 def _launch_glue_on():
