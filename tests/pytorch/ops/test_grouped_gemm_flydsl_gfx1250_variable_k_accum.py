@@ -241,7 +241,7 @@ def test_backend_takes_accumulating_calls(impl, monkeypatch):
 
 
 MUSE_WGRAD_OUTS = [(2 * FFN, LATENT), (LATENT, FFN)]  # fc1, fc2
-MUSE_WGRAD_KEYS = [(m, n, avg) for m, n in MUSE_WGRAD_OUTS for avg in (512, 1024, 2048)]
+MUSE_WGRAD_KEYS = [(m, n, avg) for m, n in MUSE_WGRAD_OUTS for avg in (512, 1024, 2048, 4096, 8192)]
 
 
 def test_muse_wgrad_keys_reach_accumulating_calls_only():
