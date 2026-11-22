@@ -126,11 +126,15 @@ def _ceildiv(a, b):
     return (a + b - 1) // b
 
 
-def _link_plan(num_ranks):
-    """``(num_pull, num_comm)``: on two ranks one link carries the whole exchange, and fewer pullers land
-    the first dO rows sooner while dedicated pushers keep it busy as bands finish; with more links the
-    exchange is short and every block is worth more on the items."""
-    return {2: (24, 8), 4: (32, 4)}.get(num_ranks, (32, 0))
+def _link_plan(num_ranks, S):
+    """``(num_pull, num_comm, local_first)``: on two ranks one link carries the whole exchange, and fewer
+    pullers land the first dO rows sooner while dedicated pushers keep it busy as bands finish; with more
+    links the exchange is short and every block is worth more on the items. Local first pays only while
+    the start is a large share of the call (two ranks, up to 16K: A/B -1.0 / -1.5%, +0.8..+2.8% above).
+    Four ranks keep pushers up to 32K (64K: A/B -1.5% without them)."""
+    if num_ranks == 2:
+        return 24, 8, S <= 16384
+    return 32, (4 if num_ranks == 4 and S <= 32768 else 0), False
 
 
 def _pull_rows(hq_r, pull_rows=None):
@@ -1143,7 +1147,7 @@ def ulysses_a2a_attn_bwd(
     num_prefix=-1,
     dq_rows=None,
     num_comm=None,
-    local_first=0,
+    local_first=None,
     pull_rows=None,
     trace=None,
     mode="full",
@@ -1155,7 +1159,8 @@ def ulysses_a2a_attn_bwd(
     ``num_pull``: pull blocks (default: by ``n``, see ``_link_plan``). ``dq_rows``: sequence rows of one
     dQ push unit (default: by bytes, see ``_dq_rows``). ``num_comm``: of the pull blocks, how many push dQ
     units as their bands finish instead of joining the items first (default: by ``n``).
-    ``local_first``: the first wave starts on this rank's own bands (needs ``seq_chunk % 256 == 0``).
+    ``local_first``: the first wave starts on this rank's own bands (needs ``seq_chunk % 256 == 0``;
+    default: by ``n`` and ``S``).
     ``pull_rows``: sequence rows of one pull unit (default: by bytes, see ``_pull_rows``).
 
     ``mode`` (measurement only): ``"attn_only"`` runs the backward items on the dO / delta of the previous
@@ -1170,9 +1175,10 @@ def ulysses_a2a_attn_bwd(
     q_split, _ = _plan(S, hq_r, hkv_r, d)
     dq_rows = _dq_rows(hq_r, dq_rows)
     pull_rows = _pull_rows(hq_r, pull_rows)
-    auto_pull, auto_comm = _link_plan(n)
+    auto_pull, auto_comm, auto_local = _link_plan(n, S)
     num_pull = auto_pull if num_pull is None else num_pull
     num_comm = auto_comm if num_comm is None else num_comm
+    local_first = auto_local if local_first is None else local_first
     if num_blocks is None:
         num_blocks = torch.cuda.get_device_properties(dout.device).multi_processor_count
     stream = torch.cuda.current_stream()
