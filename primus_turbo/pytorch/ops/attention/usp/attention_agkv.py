@@ -78,8 +78,8 @@ Modes:
     groups, chunks not a multiple of 128 tokens) run ``mega``'s forward. The backward is ``mega``'s; with
     ``AGKV_FUSED_BWD=1`` it is one persistent kernel too (``agkv_fused_bwd``): the dK / dV work-groups of
     q0 and q1 store the remote-key gradients (q splits and q0's part summed) straight into the owners'
-    slots and raise their flags, then the same kernel sums what this rank received; dQ is reduced after
-    it.
+    slots and raise their flags, reduce dQ head group by head group as each group's items finish, and
+    the same kernel sums what this rank received.
 
 ``overlap``, ``mega`` and ``fused`` reuse double-buffered symmetric buffers call after call, which needs every
 rank of the group to issue the same sequence of forward and backward calls (true of SPMD training), and
@@ -193,8 +193,7 @@ class _Layout:
 # symmetric exchange buffers; SDMA copies (overlap)
 # --------------------------------------------------------------------------------------------------------
 
-# fused mode's backward as one persistent kernel (``_fused_backward``). Off: at l8 cp8 64K it is still ~4%
-# slower than mega's.
+# fused mode's backward as one persistent kernel (``_fused_backward``) rather than mega's.
 _FUSED_BWD = os.environ.get("AGKV_FUSED_BWD") == "1"
 
 # flag arrays in the signal pad, n int64 each, indexed by sender
