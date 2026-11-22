@@ -40,7 +40,7 @@ from flydsl._mlir.dialects import vector as _vector
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr
 
-from primus_turbo.flydsl.deep_ep.common import _asm
+from primus_turbo.flydsl.deep_ep.common import _asm, _uniform_i64
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
 from primus_turbo.flydsl.fused_collective_gemm.common import (
     BLOCK_THREADS,
@@ -55,7 +55,16 @@ from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_store,
     create_buffer_resource_from_addr,
 )
-from primus_turbo.flydsl.utils.prims import atomic_add, cast, ld, memory_fence, read_clock, spin_timed_out, st
+from primus_turbo.flydsl.utils.prims import (
+    _readfirstlane_i32,
+    atomic_add,
+    cast,
+    ld,
+    memory_fence,
+    read_clock,
+    spin_timed_out,
+    st,
+)
 
 # i64 fields of a copy unit
 UNIT_FIELDS = 8
@@ -98,8 +107,10 @@ def _spin(flag_base, flag_idxs, expected, rank, tag):
 
 
 def _unit_field(units, unit, field, wide=False):
+    """Field ``field`` of the block-uniform ``unit``, in scalar registers: a vector load leaves it in VGPRs,
+    and every buffer descriptor built from it then pays a waterfall (and spills inside a persistent loop)."""
     value = ld(units, unit * fx.Int32(UNIT_FIELDS) + fx.Int32(field), dtype=fx.T.i64)
-    return value if wide else cast(value, fx.T.i32)
+    return _uniform_i64(value) if wide else _readfirstlane_i32(cast(value, fx.T.i32))
 
 
 def _sum_rows(thread_index, nvec, a_res, b_res, dst_res):
@@ -131,7 +142,9 @@ def _sum_rows(thread_index, nvec, a_res, b_res, dst_res):
             )
 
 
-def _copy_unit(thread_index, unit, srcs, heaps, units, bank_off, addends, add_delta, block_threads=BLOCK_THREADS):
+def _copy_unit(
+    thread_index, unit, srcs, heaps, units, bank_off, addends, add_delta, block_threads=BLOCK_THREADS
+):
     """Issue the stores of ``unit`` (not waited). With ``addends``, store source + addend instead: the
     addend of source ``i`` is ``addends[i]``, read ``add_delta`` bytes before the unit's source offset.
     A block of ``block_threads`` < ``BLOCK_THREADS`` copies the unit as that many threads would."""
@@ -140,7 +153,7 @@ def _copy_unit(thread_index, unit, srcs, heaps, units, bank_off, addends, add_de
     for i in range(1, len(srcs)):
         src_base = arith.select(sel == fx.Int32(i), srcs[i], src_base)
     nbytes = _unit_field(units, unit, U_BYTES)
-    dst_heap = ld(heaps, _unit_field(units, unit, U_DST), dtype=fx.T.i64)
+    dst_heap = _uniform_i64(ld(heaps, _unit_field(units, unit, U_DST), dtype=fx.T.i64))
     src_off = _unit_field(units, unit, U_SRC_OFF, wide=True)
     dst_addr = dst_heap + bank_off + _unit_field(units, unit, U_DST_OFF, wide=True)
     src_res = create_buffer_resource_from_addr(src_base + src_off, num_records_bytes=nbytes)
@@ -161,7 +174,14 @@ def _copy_unit(thread_index, unit, srcs, heaps, units, bank_off, addends, add_de
 
     for k in range_constexpr(BLOCK_THREADS // block_threads):
         copy_rows(
-            thread_index + fx.Int32(k * block_threads), UNIT_BYTES // 16, coords, src_res, dst_res, 0, SYS_NT, PUSH_BATCH
+            thread_index + fx.Int32(k * block_threads),
+            UNIT_BYTES // 16,
+            coords,
+            src_res,
+            dst_res,
+            0,
+            SYS_NT,
+            PUSH_BATCH,
         )
 
 

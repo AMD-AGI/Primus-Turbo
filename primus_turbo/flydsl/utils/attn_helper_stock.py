@@ -605,10 +605,11 @@ class DualwaveKernelContext:
         self.head_dim_runtime = head_dim_runtime
         self.block_table_stride = block_table_stride
 
-    def _setup(self, shared_storage, block_ids=None, lds=None):
-        """``block_ids`` (head group, q block) and ``lds`` default to the launch grid position and a fresh
-        ``shared_storage`` allocation; persistent callers pass the claimed work item and the LDS view they
-        already hold."""
+    def _setup(self, shared_storage, block_ids=None, lds=None, tid=None):
+        """``block_ids`` (head group, q block), ``lds`` and ``tid`` default to the launch grid position, a
+        fresh ``shared_storage`` allocation and ``thread_idx.x``; persistent callers pass the claimed work
+        item, the LDS view they already hold, and a thread index LICM cannot hoist out of their claim loop
+        (else the body's lane offsets stay live across every item)."""
         head_dim_runtime = self.head_dim_runtime
         traits = self.traits
         self.NUM_DMA_K = traits.SMEM_D_RPT
@@ -672,7 +673,7 @@ class DualwaveKernelContext:
         else:
             self.q_block_idx = fx.Index(block_ids[1])
         self.batch_idx = self._grid_batch_index()
-        self.tid = fx.Index(gpu.thread_idx.x)
+        self.tid = fx.Index(gpu.thread_idx.x if tid is None else tid)
 
         self.wave_id = self.tid // traits.WARP_SIZE
         self.lane = self.tid % traits.WARP_SIZE
