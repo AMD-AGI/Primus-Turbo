@@ -8,10 +8,10 @@
 
 Every rank holds its ``M`` tokens with all heads (q / k / v ``[M, n * h_r, d]``, batch 1). One launch:
 
-* every block (one per CU) first stages this rank's q / k / v rows into its symmetric bank as one
-  column block per destination rank (``[q heads | k heads | v heads]`` of that rank), raising one
-  flag per (m-tile, destination);
-* pull blocks (the first ``num_pull``) then claim pull units ``(m_tile, src)`` m-major, copy ``src``'s rows of this
+* every block but the pull blocks (all of them when the grid has no others) first stages this rank's q / k / v
+  rows into its symmetric bank as one column block per destination rank (``[q heads | k heads | v heads]`` of that
+  rank), raising one flag per (row piece, destination);
+* pull blocks (the first ``num_pull``) meanwhile claim pull units ``(m_tile, src)`` m-major, copy ``src``'s rows of this
   rank's column block into q / k / v over the full sequence (``[S, h_r, d]``, sequence order) and raise
   a local ready flag per unit, and then join the workers;
 * every block runs as a persistent attention worker that claims ``(head group, q block)`` items, waits for the ready
@@ -554,10 +554,12 @@ def _make_kernel(
                 create_buffer_resource(t, num_records_bytes=M * n * h * d * 2)
                 for t, h in ((Q_IN, hq_r), (K_IN, hkv_r), (V_IN, hkv_r))
             ]
-            # staging never waits, so every block can take part before its role
-            _stage_role(
-                thread_index, state_base, claim_slot, my_base, bank_offset, in_res, epoch, trace_base, **c
-            )
+            # staging never waits, so the stagers finish it whatever the pull blocks wait for; the pull blocks
+            # stay out of it to start on the first m-tiles while the later ones are staged
+            if block_index >= fx.Int32(0 if grid <= num_pull else num_pull):
+                _stage_role(
+                    thread_index, state_base, claim_slot, my_base, bank_offset, in_res, epoch, trace_base, **c
+                )
             if block_index < fx.Int32(num_pull):
                 out_res = [
                     create_buffer_resource(t, num_records_bytes=S * h * d * 2)
