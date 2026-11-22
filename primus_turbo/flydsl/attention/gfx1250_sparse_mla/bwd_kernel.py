@@ -1761,7 +1761,28 @@ def _inverted_topk_chunks(topk_indices, num_kv, chunk):
     return keys, inv_ptr, inv_data
 
 
+def _launch_glue_on():
+    return os.environ.get("PRIMUS_LAUNCH_SMLA_GLUE", "0") == "1"
+
+
+def _dsink(attn_sink, lse, delta):
+
+    """dsink fp32 [H], or None after writing it into the main_grad target set by the caller (PRIMUS_LAUNCH_DSINK)."""
+    from primus_turbo.triton.attention import sparse_mla_dsink as _sd
+
+    t = _sd.take_main_grad_target()
+    if t is not None:
+        if os.environ.get("PRIMUS_LAUNCH_DSINK", "1") == "2":
+            _sd.sparse_mla_dsink_mg2(attn_sink, lse, delta, t[0], t[1])
+        else:
+            _sd.sparse_mla_dsink_mg(attn_sink, lse, delta, t[0], t[1])
+        return None
+
+    return _sd.sparse_mla_dsink(attn_sink, lse, delta)
+
+
 def sparse_mla_bwd_gfx1250(
+
     q,
     kv,
     o,
@@ -1840,7 +1861,12 @@ def sparse_mla_bwd_gfx1250(
     ):
         part = torch.empty(n_part, _swa_rows(_SWA_BT), DV, dtype=torch.float32, device=q.device)
         kvt = ppart = None
-        if pool_p > 0:
+        if pool_p > 0 and os.environ.get("PRIMUS_LAUNCH_SMLA_KVT", "0") == "1":
+
+            from primus_turbo.triton.attention.sparse_mla_dkv_band_gather import kvt_pad
+
+            kvt = kvt_pad(kv2, T_, pool_p, npp, DV)  # PRIMUS_LAUNCH_SMLA_GLUE: zeros + strided copy in one launch
+        elif pool_p > 0:
             kvt = torch.zeros(DV, npp, dtype=kv.dtype, device=q.device)
             kvt[:, :pool_p] = kv2[T_:, :DV].t()
             ppart = torch.empty(n_part, npp, DV, dtype=torch.float32, device=q.device)
@@ -1850,7 +1876,7 @@ def sparse_mla_bwd_gfx1250(
         dkv = torch.empty(num_kv, DQK, dtype=kv.dtype, device=q.device)
         build_swa_dkv_reduce(H, block_t=_SWA_BT, pool_p=max(pool_p, 0))(part, dkv, ppart, stream=stream)
         if attn_sink is not None:
-            dsink = sparse_mla_dsink(attn_sink, lse, delta)
+            dsink = _dsink(attn_sink, lse, delta)
         return dq, dkv.view(kv_shape), dsink
     # One workgroup per token and per CU: chunks are whole multiples of the CU count.
     cus = _num_cus(q.device)
@@ -1863,10 +1889,18 @@ def sparse_mla_bwd_gfx1250(
     interms = [
         torch.empty(chunk, topk, DV, dtype=torch.bfloat16, device=q.device) for _ in range(min(n_chunks, 2))
     ]
-    dkv_acc = torch.zeros(num_kv, DQK, dtype=torch.float32, device=q.device)
     v2 = os.environ.get("PRIMUS_SMLA_BWD_V2", "0") == "1"
+    w1 = use_w1 and H % 32 == 0 and topk % _w1_block_k(H) == 0
+    band = band_pool is not None and topk > band_pool[0] - 1 and band_pool[1] + band_pool[2] == num_kv
+    # PRIMUS_LAUNCH_SMLA_GLUE: single-chunk band path writes the bf16 dKV directly (see dkv_band_gather_out)
+    lg = (
+        _launch_glue_on() and T_ > 0 and w1 and band and v2 and n_chunks == 1 and kv.dtype == torch.bfloat16
+        and band_pool[1] == T_ and band_pool[2] > 0 and topk > band_pool[0] and DQK > DV
+    )
+    dkv_acc = None if lg else torch.zeros(num_kv, DQK, dtype=torch.float32, device=q.device)
+    dkv_out = torch.empty(num_kv, DQK, dtype=kv.dtype, device=q.device) if lg else None
+    lg_pos = None
     if T_ > 0:
-        w1 = use_w1 and H % 32 == 0 and topk % _w1_block_k(H) == 0
         if w1:
             v2kw = {"l2_prefetch": False, "qdo_tdm": H <= _w1_block_k(H)} if v2 else {}
             run = build_sparse_mla_bwd_gfx1250_w1(H, topk, float(scale), ahead=cus, **v2kw)
@@ -1878,14 +1912,16 @@ def sparse_mla_bwd_gfx1250(
                 run = build_sparse_mla_bwd_gfx1250_pp(H, topk, float(scale), l2pf=cus)
             # Tiles up to each token's last valid slot (slots past it are all -1).
             bn = _w1_block_k(H)
-            from primus_turbo.triton.attention.sparse_mla_dkv_band_gather import walked_tiles
+            from primus_turbo.triton.attention.sparse_mla_dkv_band_gather import walked_tiles, walked_tiles_fill_pos
 
-            ntile = walked_tiles(topk_indices, bn)
+            if lg:  # the pool-position fill (-1) rides in the same launch
+                ntile, lg_pos = walked_tiles_fill_pos(topk_indices, bn, band_pool[2])
+            else:
+                ntile = walked_tiles(topk_indices, bn)
         else:
             run = build_sparse_mla_bwd_gfx1250(H, topk, float(scale))
         main = torch.cuda.current_stream(q.device) if stream is None else stream
         side = _side_stream(q.device)
-        band = band_pool is not None and topk > band_pool[0] - 1 and band_pool[1] + band_pool[2] == num_kv
         if band:
             from primus_turbo.triton.attention.sparse_mla_dkv_band_gather import (
                 band_pool_positions,
@@ -1921,7 +1957,15 @@ def sparse_mla_bwd_gfx1250(
             run(*args, *((ntile[t0:t1],) if w1 else ()), stream=main)
             side.wait_stream(main)
             with torch.cuda.stream(side):
-                if band:
+                if lg:
+                    from primus_turbo.triton.attention.sparse_mla_dkv_band_gather import (
+                        dkv_band_gather_out,
+                        pool_positions_into,
+                    )
+
+                    pos = pool_positions_into(lg_pos, topk_indices, *band_pool)
+                    dkv_band_gather_out(im, pos, dkv_out, *band_pool, d=DV)
+                elif band:
                     if pos is None:
                         # v2: after w1 (under w1 it slows w1 more than it costs here)
                         pos = band_pool_positions(topk_indices, *band_pool)
@@ -1947,5 +1991,7 @@ def sparse_mla_bwd_gfx1250(
                 freed[b].record(side)
         main.wait_stream(side)
     if attn_sink is not None:
-        dsink = sparse_mla_dsink(attn_sink, lse, delta)
+        dsink = _dsink(attn_sink, lse, delta)
+    if lg:
+        return dq, dkv_out.view(kv_shape), dsink
     return dq, dkv_acc.to(kv.dtype).view(kv_shape), dsink

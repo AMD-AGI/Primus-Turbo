@@ -210,6 +210,84 @@ def _quant_cat(parts, dtype):
     return qr, er, qt, et
 
 
+def _launch_qcat_on():
+    return os.environ.get("PRIMUS_LAUNCH_QCAT", "0") == "1"
+
+
+@triton.jit
+def _quant_cat2_cols_kernel(x0_ptr, x1_ptr, qr_ptr, er_ptr, qt_ptr, et_ptr, M, N, N0, stride_x0, stride_x1,
+                            s0, s1, d, R, NQ, NBN, NCB,
+                            FP8_MAX: tl.constexpr, MAX_EXP: tl.constexpr, SL: tl.constexpr,
+                            C0: tl.constexpr, C1: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr):
+    """PRIMUS_LAUNCH_QCAT (launch line): ``_quant_cat2_kernel`` (programs [0, NQ)) and ``_cat_cols2_kernel``
+    (programs [NQ, ...)) in one launch; each program runs the original body (same bytes)."""
+    pid = tl.program_id(0)
+    if pid < NQ:
+        pid_m = pid // NBN
+        pid_n = pid % NBN
+        offs_m = pid_m * 128 + tl.arange(0, 128)
+        offs_n = pid_n * 128 + tl.arange(0, 128)
+        if pid_n * 128 < N0:
+            x = tl.load(x0_ptr + offs_m[:, None].to(tl.int64) * stride_x0 + offs_n[None, :]).to(tl.float32)
+        else:
+            x = tl.load(x1_ptr + offs_m[:, None].to(tl.int64) * stride_x1 + (offs_n[None, :] - N0)).to(tl.float32)
+        ax = tl.abs(x)
+        nb_n = N // 128
+        nb_m = M // 128
+        e = ue8m0_exp_g90(tl.max(ax, axis=1), MAX_EXP)  # [128] per row
+        q = tl.clamp(x * pow2_neg(e)[:, None], -FP8_MAX, FP8_MAX)
+        tl.store(qr_ptr + offs_m[:, None].to(tl.int64) * N + offs_n[None, :], q.to(qr_ptr.dtype.element_ty))
+        store_scale(er_ptr, offs_m, pid_n, e, M, nb_n, SL)
+        e = ue8m0_exp_g90(tl.max(ax, axis=0), MAX_EXP)  # [128] per column
+        q = tl.clamp(x * pow2_neg(e)[None, :], -FP8_MAX, FP8_MAX).to(qt_ptr.dtype.element_ty)
+        tl.store(qt_ptr + offs_n[:, None].to(tl.int64) * M + offs_m[None, :], tl.trans(q))
+        store_scale(et_ptr, offs_n, pid_m, e, N, nb_m, SL)
+    else:
+        c = pid - NQ
+        rows = (c // NCB) * BR + tl.arange(0, BR)[:, None]
+        cols = (c % NCB) * BC + tl.arange(0, BC)[None, :]
+        m = (rows < R) & (cols < C0 + C1)
+        in0 = cols < C0
+        v0 = tl.load(s0 + rows * C0 + cols, mask=m & in0, other=0)
+        v1 = tl.load(s1 + rows * C1 + (cols - C0), mask=m & (cols >= C0), other=0)
+        tl.store(d + rows * (C0 + C1) + cols, tl.where(in0, v0, v1), mask=m)
+
+
+def _quant_cat_cols(parts, dtype, ts):
+    """(_quant_cat(parts, dtype), _cat_cols(ts)) in ONE launch, or None when either would not take its 2-part
+    Triton kernel."""
+    if len(parts) != 2 or len(ts) != 2 or any(not t.is_contiguous() or t.shape[1] % 4 for t in ts):
+        return None
+    x0, x1 = parts
+    M, N0 = x0.shape
+    N = N0 + x1.shape[1]
+    if not (M % 128 == 0 and N0 % 128 == 0 and N % 128 == 0 and x0.stride(1) == 1 and x1.stride(1) == 1):
+        return None
+    R = ts[0].shape[0]
+    if ts[1].shape[0] != R:
+        return None
+    c0, c1 = ts[0].shape[1] // 4, ts[1].shape[1] // 4
+    dev = x0.device
+    qr = torch.empty((M, N), dtype=dtype, device=dev)
+    er = torch.empty((M // 128, N // 32 * 128), dtype=torch.uint8, device=dev)
+    qt = torch.empty((N, M), dtype=dtype, device=dev)
+    et = torch.empty((N // 128, M // 32 * 128), dtype=torch.uint8, device=dev)
+    out = torch.empty((R, (c0 + c1) * 4), dtype=ts[0].dtype, device=ts[0].device)
+    for t in (x0, x1, qr, er, qt, et, *ts, out):
+        assert t.is_cuda and t.data_ptr() != 0
+    fmax = float(torch.finfo(dtype).max)
+    BR, BC = 32, 128
+    nbn = N // 128
+    nq = (M // 128) * nbn
+    ncb = triton.cdiv(c0 + c1, BC)
+    ncat = triton.cdiv(R, BR) * ncb
+    _quant_cat2_cols_kernel[(nq + ncat,)](
+        x0, x1, qr, er, qt, et, M, N, N0, x0.stride(0), x1.stride(0),
+        ts[0].view(torch.int32), ts[1].view(torch.int32), out.view(torch.int32), R, nq, nbn, ncb,
+        FP8_MAX=fmax, MAX_EXP=fp8_max_exp(fmax), SL=SL_PACKED, C0=c0, C1=c1, BR=BR, BC=BC, num_warps=2)
+    return (qr, er, qt, et), out
+
+
 def _joint_main_grad(params, main_grads):
     """[sum N, K] view over adjacent main_grads (same dtype, contiguous, in this order), else None."""
     mg0 = main_grads[0]
@@ -302,13 +380,20 @@ class FP8GemmBlockConcatNFunction(torch.autograd.Function):
             if go is None:
                 go = torch.zeros((M, n), dtype=ctx.out_dtype, device=a_t.device)
             parts.append(go.reshape(M, n) if go.stride(-1) == 1 else go.reshape(M, n).contiguous())
-        g_row, pg, g_t, pgt = _quant_cat(parts, g_dtype)  # one quant of [dY_0 | dY_1 ...], no bf16 cat
+        qc = _quant_cat_cols(parts, g_dtype, ctx.wts) if (_launch_qcat_on() and ctx.wts is not None) else None
+        if qc is not None:  # PRIMUS_LAUNCH_QCAT: dY quant + W^T column-cat in one launch (same bytes)
+            (g_row, pg, g_t, pgt), b_t = qc
+        else:
+            g_row, pg, g_t, pgt = _quant_cat(parts, g_dtype)  # one quant of [dY_0 | dY_1 ...], no bf16 cat
         g = parts[0]
         # dgrad: dX[M,K] = dY[M,N] . W_joint[N,K]  ->  NT with B = W_joint^T [K, N]
-        if ctx.wts is not None:  # one Triton column-cat of the per-weight W^T (torch's fp8 cat runs ~9 us)
+        if qc is not None:
+            pass
+        elif ctx.wts is not None:  # one Triton column-cat of the per-weight W^T (torch's fp8 cat runs ~9 us)
             b_t = _cat_cols(ctx.wts)
         else:
             b_t = w_j.t().contiguous()
+
         # wgrad: dW_i[N_i,K] = dY^T[rows of W_i] . X^T
         grads = [None] * len(ctx.ns)
         grad_x = None

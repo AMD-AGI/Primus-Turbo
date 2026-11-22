@@ -207,3 +207,129 @@ def walked_tiles(topk_indices, bn):
             topk_indices, out, T, topk, bn, BLOCK=triton.next_power_of_2(topk), ROWS=rows, num_warps=4
         )
     return out
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# PRIMUS_LAUNCH_SMLA_GLUE (launch line, default off). Single-chunk band backward (T tokens, kv rows [0, T) raw + T + p
+# pool): every dKV row has exactly one writer (window gather for raw rows, fixup for pool rows), so the gather writes
+# the final bf16 dKV itself -- no fp32 zeros, no fp32 -> bf16 cast. Values: 0.0 + x then RNE to bf16, as before.
+# The pos fill (-1) rides in the _ntile launch; the HCA kv^T pad (zeros + strided copy) is one kernel.
+@triton.jit
+def _ntile_fill_kernel(Idx, Out, n_tok, TOPK, BN, Pos, NPOS, NT, BLOCK: tl.constexpr, ROWS: tl.constexpr,
+                       FB: tl.constexpr):
+    pid = tl.program_id(0)
+    if pid < NT:
+        r = pid * ROWS + tl.arange(0, ROWS)
+        s = tl.arange(0, BLOCK)
+        m = (r < n_tok)[:, None] & (s < TOPK)[None, :]
+        v = tl.load(Idx + r.to(tl.int64)[:, None] * TOPK + s[None, :], mask=m, other=-1)
+        last = tl.max(tl.where(v >= 0, s[None, :] + 1, 0), axis=1)
+        tl.store(Out + r, (last + BN - 1) // BN, mask=r < n_tok)
+    else:
+        o = (pid - NT).to(tl.int64) * FB + tl.arange(0, FB)
+        tl.store(Pos + o, tl.full([FB], -1, tl.int16), mask=o < NPOS)
+
+
+def walked_tiles_fill_pos(topk_indices, bn, pool):
+    """(walked_tiles(topk_indices, bn), int16 [pool, T] filled with -1) from one launch."""
+    T, topk = topk_indices.shape
+    out = torch.empty(T, dtype=torch.int32, device=topk_indices.device)
+    pos = torch.empty((pool, T), dtype=torch.int16, device=topk_indices.device)
+    rows, fb = 8, 4096
+    nt = triton.cdiv(T, rows)
+    npos = pool * T
+    assert T > 0 and npos > 0 and topk_indices.is_contiguous()
+    _ntile_fill_kernel[(nt + triton.cdiv(npos, fb),)](
+        topk_indices, out, T, topk, bn, pos, npos, nt, BLOCK=triton.next_power_of_2(topk), ROWS=rows, FB=fb,
+        num_warps=4,
+    )
+    return out, pos
+
+
+def pool_positions_into(pos, topk_indices, window, n_raw, pool):
+    """band_pool_positions into a pre-filled (-1) ``pos``."""
+    T, topk = topk_indices.shape
+    if T and topk > window and pool:
+        _pool_pos_kernel[(T,)](
+            topk_indices, pos, 0, T, T, topk, window, n_raw, pool,
+            BLOCK=triton.next_power_of_2(topk - window), num_warps=4,
+        )
+    return pos
+
+
+@triton.jit
+def _window_gather_out_kernel(Interm, Out, t0, t1, W, TOPK, stride_out, WP: tl.constexpr, DB: tl.constexpr,
+                              D: tl.constexpr, RP: tl.constexpr):
+    j = t0 - W + 1 + tl.program_id(0)
+    c = tl.program_id(1)
+    if j >= 0:
+        offs_d = c * DB + tl.arange(0, DB)
+        t = j + tl.arange(0, WP)
+        m = (t >= t0) & (t < t1) & (t < j + W)
+        ent = (t - t0).to(tl.int64) * TOPK + (j - t + W - 1)
+        rows = tl.load(Interm + ent[:, None] * 512 + offs_d[None, :], mask=m[:, None], other=0.0)
+        acc = tl.sum(rows.to(tl.float32), axis=0)
+        acc = tl.where(acc == 0.0, 0.0, acc)  # 0.0 + acc (the zeroed fp32 accumulator)
+        o_ptr = Out + j.to(tl.int64) * stride_out
+        tl.store(o_ptr + offs_d, acc.to(Out.dtype.element_ty))
+        if c == 0:
+            z = tl.arange(0, RP)
+            tl.store(o_ptr + D + z, tl.zeros([RP], dtype=Out.dtype.element_ty))
+
+
+@triton.jit
+def _pool_fixup_out_kernel(Out, Side, n_raw, NSEG, stride_out, D: tl.constexpr, RP: tl.constexpr):
+    p = tl.program_id(0)
+    offs_d = tl.arange(0, D)
+    a = tl.load(Side + (p.to(tl.int64) * NSEG) * D + offs_d)
+    a = tl.where(a == 0.0, 0.0, a)  # 0.0 + side[0]
+    for s in range(1, NSEG):
+        a += tl.load(Side + (p.to(tl.int64) * NSEG + s) * D + offs_d)
+    o_ptr = Out + (n_raw + p).to(tl.int64) * stride_out
+    tl.store(o_ptr + offs_d, a.to(Out.dtype.element_ty))
+    z = tl.arange(0, RP)
+    tl.store(o_ptr + D + z, tl.zeros([RP], dtype=Out.dtype.element_ty))
+
+
+def dkv_band_gather_out(interm, pos, out, window, n_raw, pool, d=512, seg_t=256, db=128, nw=8):
+    """``out [n_raw + pool, d + rp]`` (bf16) = the final dKV of ALL tokens ``[0, T)`` (single chunk, T == n_raw):
+    the bytes of ``zeros fp32 -> dkv_band_gather_acc(fused_scan=True) -> .to(bf16)``."""
+    T = interm.shape[0]
+    topk = interm.shape[1]
+    rp = out.shape[1] - d
+    assert d == 512 and d % db == 0 and T == n_raw and pool > 0 and topk > window and out.shape[0] == n_raw + pool
+    assert rp > 0 and rp & (rp - 1) == 0 and out.stride(1) == 1
+    _window_gather_out_kernel[(T + window - 1, d // db)](
+        interm, out, 0, T, window, topk, out.stride(0), WP=triton.next_power_of_2(window), DB=db, D=d, RP=rp,
+        num_warps=nw
+    )
+    cnt = torch.empty(pool, dtype=torch.int32, device=out.device)
+    _pool_count_kernel[(pool,)](pos, cnt, 0, T, T, BLOCK=1024, num_warps=4)
+    ent = torch.empty(T * (topk - window), dtype=torch.int32, device=out.device)
+    off = torch.empty(pool + 1, dtype=torch.int32, device=out.device)
+    _pool_fill_scan_kernel[(pool,)](
+        pos, cnt, off, ent, 0, T, T, topk, pool, BLOCK=1024, PB=triton.next_power_of_2(pool), num_warps=4
+    )
+    nseg = triton.cdiv(T, seg_t)
+    side = torch.empty(pool, nseg, d, dtype=torch.float32, device=out.device)
+    _pool_gather_kernel[(pool, nseg, d // db)](interm, ent, off, side, nseg, SEG=seg_t, DB=db, num_warps=nw)
+    _pool_fixup_out_kernel[(pool,)](out, side, n_raw, nseg, out.stride(0), D=d, RP=rp, num_warps=4)
+
+
+@triton.jit
+def _kvt_pad_kernel(KV, Out, T, PP, NPP, stride_kv, BD: tl.constexpr, BP: tl.constexpr):
+    # Out[d, p] = KV[T + p, d] for p < PP else 0   (Out [DV, NPP] row-major)
+    d = tl.program_id(0) * BD + tl.arange(0, BD)
+    p = tl.program_id(1) * BP + tl.arange(0, BP)
+    v = tl.load(KV + (T + p).to(tl.int64)[None, :] * stride_kv + d[:, None], mask=(p < PP)[None, :], other=0.0)
+    tl.store(Out + d.to(tl.int64)[:, None] * NPP + p[None, :], v, mask=(p < NPP)[None, :])
+
+
+def kvt_pad(kv2, T, pool_p, npp, dv):
+    """``torch.zeros(dv, npp); [:, :pool_p] = kv2[T:, :dv].t()`` in one launch."""
+    out = torch.empty(dv, npp, dtype=kv2.dtype, device=kv2.device)
+    bd, bp = 64, 32
+    assert dv % bd == 0 and kv2.stride(1) == 1 and kv2.data_ptr() != 0
+    _kvt_pad_kernel[(dv // bd, triton.cdiv(npp, bp))](kv2, out, T, pool_p, npp, kv2.stride(0), BD=bd, BP=bp,
+                                                       num_warps=4)
+    return out
