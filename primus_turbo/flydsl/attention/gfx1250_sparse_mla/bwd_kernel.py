@@ -60,6 +60,7 @@ from .fwd_kernel import (
     DQK,
     DV,
     ROW,
+    _if_wave,
     _sbuf_load_v8i32,
     _tdm_gather,
 )
@@ -1017,6 +1018,10 @@ def build_sparse_mla_bwd_gfx1250_swa(
     batch=None,
     qgw=None,
     qsg=None,
+    sdp_u=0,
+    psdp_u=0,
+    dq_u=0,
+    pad=0,
 ):
     """cr0 backward (pure SWA, top-k = the 128-row window ``[t-127, t]`` in slot order).
 
@@ -1035,7 +1040,15 @@ def build_sparse_mla_bwd_gfx1250_swa(
     and pool slots in one pass.
 
     ``batch`` (see ``_run_steps``): 4 without a pool (cr0 -5..-6%); 0 (the ``prefetch`` / ``pin``
-    stream) with one, where batching is 18-36% slower at 4K."""
+    stream) with one, where batching is 18-36% slower at 4K.
+
+    ``sdp_u`` / ``psdp_u`` / ``dq_u`` > 0 (PRIMUS_SWAHCA_LOOP): the window S / dP, the pool S / dP
+    and the dQ pass run as runtime loops (``sdp_u`` / ``psdp_u`` latent steps, ``dq_u`` stage
+    groups of ``QGW`` d tiles per iteration) instead of fully unrolled, with the same step order
+    and the operand prefetch carried across iterations. Per element the WMMA accumulation order
+    is unchanged (bit-identical). The token loop's code shrinks, so its speed no longer depends on
+    where the code object lands (the unrolled loop has two code-placement modes ~15-22% apart).
+    ``pad`` leading ``s_nop`` (probe: shifts the code by 4 B each)."""
     H, HW, W, BT = num_heads, _SWA_HW, _SWA_W, block_t
     if H % HW:
         raise ValueError(f"SWA backward needs num_heads % {HW} == 0, got {H}")
@@ -1103,6 +1116,14 @@ def build_sparse_mla_bwd_gfx1250_swa(
     pin_every = pin if pin > 0 else 1 << 30
     # Row tiles whose shifted dS / P rows can fall outside the 128 slots (read as zeros).
     edge = [r * 16 - (BT - 1) < 0 or r * 16 + 15 >= W for r in range(NR)]
+    # Runtime loops (sdp_u / psdp_u / dq_u): whole batches per iteration, the pool K^T look-ahead
+    # within one iteration's pool steps.
+    GJ = dq_u * QGW  # d tiles per dQ iteration
+    for u_, n_, per_ in ((sdp_u, KS, KTW), (psdp_u, KS, KTWP if POOL else 1), (GJ, DTQ, PC + NPC)):
+        if u_ and (n_ % u_ or (batch and (u_ * per_) % batch)):
+            raise ValueError(f"loop unit {u_} must divide {n_} and give whole batches of {batch}")
+    if dq_u and ((POOL and min(pool_la * NPC, DTQ * NPC) > GJ * NPC) or not bf_hold):
+        raise ValueError("dq_u needs bf_hold and pool_la within one dQ iteration")
 
     @flyc.kernel(name="sparse_mla_bwd_gfx1250_swa_kernel", known_block_size=[BLOCK, 1, 1])
     def sparse_mla_bwd_gfx1250_swa_kernel(
@@ -1118,6 +1139,8 @@ def build_sparse_mla_bwd_gfx1250_swa(
         PPART: fx.Tensor,
         N_TOK: fx.Int32,
     ):
+        for _ in range_constexpr(pad):
+            _rocdl.s_nop(0)  # probe: shifts the code layout by 4 B per nop
         tid = fx.Int32(fx.thread_idx.x)
         wave = uniform(tid // WAVE)
         hp = wave % HP
@@ -1181,6 +1204,96 @@ def build_sparse_mla_bwd_gfx1250_swa(
         def run(steps):
             _run_steps(steps, prefetch, pin_every, batch)
 
+        def run_loop(n_it, mk, acc, ctx):
+            """``_run_steps`` over ``n_it`` runtime iterations of the step list ``mk(it, ctx)``
+            (``(ld, mma)`` with ``mma(fr, acc) -> acc``): the same step order as unrolled, the loads
+            of the next iteration's first steps issued in this one and carried (with ``ctx["kq"]``)
+            as loop state. The last iteration's look-ahead re-loads the last iteration's operands
+            (discarded). Returns the final ``acc``."""
+            nacc = len(acc)
+            first = mk(fx.Int32(0), ctx)
+            n_st = len(first)
+            ahead = batch if batch > 0 else min(prefetch, n_st)
+            q = [first[i][0]() for i in range_constexpr(ahead)]
+            shapes = [len(x) for x in q]
+            nk = len(ctx.get("kq", []))
+            init = list(acc) + [x for t in q for x in t] + list(ctx.get("kq", []))
+            for it, st in range(fx.Index(0), fx.Index(n_it), fx.Index(1), init=init, unroll=1):
+                i_ = fx.Int32(it)
+                a = [Vec(st[k]) for k in range_constexpr(nacc)]
+                pos = nacc
+                q = []
+                for n in shapes:
+                    q.append(tuple(Vec(st[pos + e]) for e in range_constexpr(n)))
+                    pos += n
+                if const_expr(nk > 0):
+                    ctx["kq"] = [Vec(st[pos + e]) for e in range_constexpr(nk)]
+                inx = fx.Int32((i_ + fx.Int32(1) < fx.Int32(n_it)).select(i_ + fx.Int32(1), fx.Int32(n_it - 1)))
+                cs = mk(i_, ctx)
+                steps = cs + mk(inx, ctx)
+                if const_expr(batch > 0):
+                    for b0 in range_constexpr(0, n_st, batch):
+                        nxt = [steps[k][0]() for k in range_constexpr(b0 + batch, b0 + 2 * batch)]
+                        fx.rocdl.sched_barrier(0)
+                        for j in range_constexpr(batch):
+                            a = cs[b0 + j][1](q[j], a)
+                        fx.rocdl.sched_barrier(0)
+                        q = nxt
+                else:
+                    for i in range_constexpr(n_st):
+                        q.append(steps[i + ahead][0]())
+                        a = cs[i][1](q.pop(0), a)
+                        if const_expr((i + 1) % pin_every == 0):
+                            fx.rocdl.sched_barrier(0)
+                res = yield list(a) + [x for t in q for x in t] + list(ctx.get("kq", []))
+            ctx["kq"] = None
+            return [Vec(res[k]) for k in range_constexpr(nacc)]
+
+        def sdp_mk(ns, nkt, k_frag):
+            # S / dP steps of one loop iteration (ns latent steps of nkt key tiles): acc holds
+            # s[g][kk] at g * nkt + kk and dp[g][kk] at (G + g) * nkt + kk.
+            def mk(it, ctx):
+                cur = {}
+                steps = []
+                ko = it * (ns * 64)
+                qb = [q_row[g] + ko for g in range_constexpr(G)]
+                db = [do_row[g] + ko for g in range_constexpr(G)]
+                for u in range_constexpr(ns):
+                    for kk in range_constexpr(nkt):
+
+                        def ld(u=u, kk=kk):
+                            bk = k_frag(it, ko, u, kk)
+                            if const_expr(kk == 0):
+                                aq = [_frag(qb[g] + u * 64) for g in range_constexpr(G)]
+                                ad = [_frag(db[g] + u * 64) for g in range_constexpr(G)]
+                                return (*aq, *ad, bk)
+                            return (bk,)
+
+                        def mma(fr, a, kk=kk):
+                            a = list(a)
+                            if const_expr(kk == 0):
+                                cur["aq"], cur["ad"] = fr[:G], fr[G : 2 * G]
+                            for g in range_constexpr(G):
+                                a[g * nkt + kk] = wmma_bf16(cur["aq"][g], fr[-1], a[g * nkt + kk])
+                                a[(G + g) * nkt + kk] = wmma_bf16(cur["ad"][g], fr[-1], a[(G + g) * nkt + kk])
+                            return a
+
+                        steps.append((ld, mma))
+                return steps
+
+            return mk
+
+        def sdp_loop(ns, nkt, k_frag):
+            a = run_loop(
+                KS // ns,
+                sdp_mk(ns, nkt, k_frag),
+                [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(2 * G * nkt)],
+                {},
+            )
+            s = [[a[g * nkt + kk] for kk in range_constexpr(nkt)] for g in range_constexpr(G)]
+            dp = [[a[(G + g) * nkt + kk] for kk in range_constexpr(nkt)] for g in range_constexpr(G)]
+            return s, dp
+
         def sdp(kbase, tok, lse2):
             # Window S / dP -> (P, dP) per (g, kk): lane = slot kt*16 + l16, element i = head row.
             kb_w = kbase + a_lane + kt0 * 16 * ROW
@@ -1188,7 +1301,7 @@ def build_sparse_mla_bwd_gfx1250_swa(
             dp = [[Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(KTW)] for _ in range_constexpr(G)]
             cur = {}
             steps = []
-            for ks in range_constexpr(KS):
+            for ks in range_constexpr(0 if sdp_u else KS):
                 for kk in range_constexpr(KTW):
 
                     def ld(ks=ks, kk=kk):
@@ -1207,7 +1320,12 @@ def build_sparse_mla_bwd_gfx1250_swa(
                             dp[g][kk] = wmma_bf16(cur["ad"][g], fr[-1], dp[g][kk])
 
                     steps.append((ld, mma))
-            run(steps)
+            if const_expr(sdp_u > 0):
+                s, dp = sdp_loop(
+                    sdp_u, KTW, lambda it, ko, u, kk: _frag(kb_w + ko + (kk * 16 * ROW + u * 64))
+                )
+            else:
+                run(steps)
             pv = []
             for kk in range_constexpr(KTW):
                 slot = (kt0 + kk) * 16 + l16
@@ -1343,7 +1461,7 @@ def build_sparse_mla_bwd_gfx1250_swa(
             dp = [[Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(KTWP)] for _ in range_constexpr(G)]
             cur = {}
             steps = []
-            for ks in range_constexpr(KS):
+            for ks in range_constexpr(0 if psdp_u else KS):
                 for kk in range_constexpr(KTWP):
 
                     def ld(ks=ks, kk=kk):
@@ -1362,7 +1480,17 @@ def build_sparse_mla_bwd_gfx1250_swa(
                             dp[g][kk] = wmma_bf16(cur["ad"][g], fr[-1], dp[g][kk])
 
                     steps.append((ld, mma))
-            run(steps)
+            if const_expr(psdp_u > 0):
+                # The latent offset rides in soffset (wave-uniform).
+                s, dp = sdp_loop(
+                    psdp_u,
+                    KTWP,
+                    lambda it, ko, u, kk: gfrag(
+                        rsrc_kvp, (kk * 16 + l16) * (DQK * 2) + u * 64 + hi * 16, kp0 * (16 * DQK * 2) + ko
+                    ),
+                )
+            else:
+                run(steps)
             pv = []
             for kk in range_constexpr(KTWP):
                 slot = (kp0 + kk) * 16 + l16
@@ -1415,6 +1543,87 @@ def build_sparse_mla_bwd_gfx1250_swa(
                 run(steps)
             return new
 
+        def dq_loop(kbase, rsrc_dq, bf, dq_off, NS, la):
+            # dq_pass's steps as a runtime loop over groups of GJ d tiles (whole stage groups).
+            NIT = DTQ // GJ
+            order_l = [(jl, pc) for jl in range_constexpr(GJ) for pc in range_constexpr(NS)]
+            pk_l = [(jl, pc - PC) for jl, pc in order_l if pc >= PC]
+            npk = len(pk_l)
+
+            def pkt(itg, jl, pcp):
+                o = (jl * 16 + l16) * (NPP * 2) + (pcp * 32 + hi * 8) * 2
+                return gfrag(rsrc_kvt, o, uniform((dt0 + itg * GJ) * (16 * NPP * 2)))
+
+            def mk(it, ctx):
+                jo = it * GJ
+                itn = fx.Int32((it + fx.Int32(1) < fx.Int32(NIT)).select(it + fx.Int32(1), fx.Int32(NIT - 1)))
+                kb = kbase + tr_lane + jo * 32
+                cur = {}
+                steps = []
+                for jl, pc in order_l:
+
+                    def ld(jl=jl, pc=pc):
+                        if const_expr(pc < PC):
+                            return (_frag_tr(kb + dt0 * 32 + (pc * 32 * ROW + jl * 32), ROW),)
+                        i = cur.get("pn", 0)
+                        cur["pn"] = i + 1
+                        t = i + la
+                        if const_expr(t < npk):
+                            ctx["kq"].append(pkt(it, *pk_l[t]))
+                        else:
+                            ctx["kq"].append(pkt(itn, *pk_l[t - npk]))
+                        return (ctx["kq"].pop(0),)
+
+                    def mma(fr, a, jl=jl, pc=pc):
+                        for g in range_constexpr(G):
+                            c = Vec.filled(8, 0.0, fx.Float32) if pc == 0 else cur[(jl, g)]
+                            cur[(jl, g)] = wmma_bf16(fr[0], bf[pc][g], c)
+                            if const_expr(pc == NS - 1 and QGW == 1):
+                                buf_store(
+                                    to_bf16(cur[(jl, g)]).bitcast(fx.Int32),
+                                    rsrc_dq,
+                                    dq_off[g] + jl * 32,
+                                    soff=dt0 * 32 + jo * 32,
+                                )
+                            elif const_expr(pc == NS - 1 and POOL):
+                                o = qstg + (g * 16 + l16) * QSROW + (jl % QGW) * 32 + hi * 16
+                                lds_store(to_bf16(cur[(jl, g)]), o)
+                            elif const_expr(pc == NS - 1):
+                                cur[("o", g, jl % QGW)] = to_bf16(cur[(jl, g)])
+                        if const_expr(QGW > 1 and pc == NS - 1 and jl % QGW == QGW - 1):
+                            col = (dt0 + jl - (QGW - 1)) * 32 + jo * 32
+                            for g in range_constexpr(G):
+                                if const_expr(POOL):
+                                    for r0 in range_constexpr(0, 16 // QRPS, QSG):
+                                        vs = [
+                                            lds_load(q_ld + (g * 16 + r * QRPS) * QSROW, v4i)
+                                            for r in range_constexpr(r0, min(r0 + QSG, 16 // QRPS))
+                                        ]
+                                        for k, r in enumerate(range_constexpr(r0, min(r0 + QSG, 16 // QRPS))):
+                                            soff = (hp * 32 + g * 16 + r * QRPS) * (DQK * 2) + col
+                                            buf_store(vs[k], rsrc_dq, q_st, soff=uniform(soff))
+                                else:
+                                    col_l = (dt0 + jl - (QGW - 1)) * 32 + (lane % QLPR) * 16
+                                    for jj in range_constexpr(QGW):
+                                        lds_store(cur[("o", g, jj)], qstg + l16 * QSROW + jj * 32 + hi * 16)
+                                    for r0 in range_constexpr(0, 16 // QRPS, QSG):
+                                        rr = list(range_constexpr(r0, min(r0 + QSG, 16 // QRPS)))
+                                        rows = [r * QRPS + lane // QLPR for r in rr]
+                                        vs = [lds_load(qstg + row * QSROW + (lane % QLPR) * 16, v4i) for row in rows]
+                                        for v, row in zip(vs, rows):
+                                            buf_store(
+                                                v, rsrc_dq, (hp * 32 + g * 16 + row) * (DQK * 2) + col_l, soff=jo * 32
+                                            )
+                        return a
+
+                    steps.append((ld, mma))
+                return steps
+
+            ctx = {}
+            if const_expr(POOL):
+                ctx["kq"] = [pkt(fx.Int32(0), *pk_l[i]) for i in range_constexpr(la)]
+            run_loop(NIT, mk, [], ctx)
+
         def dq_pass(kbase, tok):
             rsrc_dq = make_rsrc(tensor_addr(DQ) + fx.Int64(tok * H + h0) * (DQK * 2), HW * DQK * 2)
             NS = PC + NPC
@@ -1434,7 +1643,10 @@ def build_sparse_mla_bwd_gfx1250_swa(
             # Pool K^T comes from global memory: its loads run pool_la d tiles ahead.
             pk = [(j, pc - PC) for j, pc in order if pc >= PC]
             la = min(pool_la * NPC, len(pk))
-            kq = [pool_kt(*k) for k in pk[:la]]
+            if const_expr(dq_u > 0):
+                dq_loop(kbase, rsrc_dq, bf, dq_off, NS, la)
+                order = []
+            kq = [pool_kt(*k) for k in pk[: 0 if dq_u else la]]
             cur = {}
             steps = []
             for j, pc in order:
@@ -1495,12 +1707,17 @@ def build_sparse_mla_bwd_gfx1250_swa(
                                         buf_store(v, rsrc_dq, (hp * 32 + g * 16 + row) * (DQK * 2) + col_l)
 
                 steps.append((ld, mma))
-            run(steps)
+            if const_expr(dq_u == 0):
+                run(steps)
             zero = Vec.filled(4, 0, fx.Int32)
             for g in range_constexpr(G):
                 rz_off = dq_off[g] - hi * 16 + DV * 2 + hi * (RZ * 16) + ds * (RZ // DS * 16)
                 for j in range_constexpr(RZ // DS):
                     buf_store(zero, rsrc_dq, rz_off + j * 16)
+
+        def dq_late(ip):
+            dq_pass(kw_lds + ip * ROW, t0 + ip)
+            return []
 
         init = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(NACC + NPACC)]
         for i, st in range(fx.Index(0), fx.Index(n_i), fx.Index(1), init=init):
@@ -1508,6 +1725,10 @@ def build_sparse_mla_bwd_gfx1250_swa(
             tok = t0 + ii
             acc = [st[k] for k in range_constexpr(NACC)]
             pacc = [st[NACC + k] for k in range_constexpr(NPACC)]
+            if const_expr(dq_u > 0):
+                # The previous token's dQ (its loop ahead of this token's C^T: LLVM would sink the
+                # C^T WMMAs past a loop that followed them, keeping their operands live across it).
+                _if_wave(ii > fx.Int32(0), [], lambda: dq_late(ii - fx.Int32(1)), lambda: None)
             # Q / dO of this token (and on the first pass the kv window) landed.
             _rocdl.s_wait_tensorcnt(0)
             gpu.barrier()
@@ -1533,6 +1754,9 @@ def build_sparse_mla_bwd_gfx1250_swa(
                 lse2.append(lg)
 
             kbase = kw_lds + ii * ROW
+            # Pool S / dP first (with sdp_u, as a loop too: unrolled, LLVM sinks its WMMAs past the window
+            # loop and keeps their fragments live across it). Pinning them in place (inline-asm anchors)
+            # or running the window first changes how delta's fast-math sum is associated (not bit-identical).
             ppv = sdp_pool(tok, lse2) if POOL else []
             pv = sdp(kbase, tok, lse2)
             dlt = delta_pdp(tok, pv + ppv)
@@ -1554,7 +1778,8 @@ def build_sparse_mla_bwd_gfx1250_swa(
                 gpu.barrier()
             # Every wave is done with Q / dO: the next token's land under dQ.
             issue_qdo(tok + fx.Int32(1), ii + fx.Int32(1) < n_i)
-            dq_pass(kbase, tok)
+            if const_expr(dq_u == 0):
+                dq_pass(kbase, tok)
             res = yield acc + pacc
         _rocdl.s_wait_tensorcnt(0)
 
@@ -1575,6 +1800,8 @@ def build_sparse_mla_bwd_gfx1250_swa(
                 off = (r * 16 + l16) * (DV * 4) + ((wave * DTW + j) * 16 + hi * 8) * 4
                 buf_store(v.shuffle(v, [0, 1, 2, 3]), rsrc_pt, off)
                 buf_store(v.shuffle(v, [4, 5, 6, 7]), rsrc_pt, off + 16)
+        if const_expr(dq_u > 0):
+            dq_late(n_i - fx.Int32(1))
 
     @flyc.jit
     def launch_sparse_mla_bwd_gfx1250_swa(
@@ -1761,6 +1988,14 @@ def _inverted_topk_chunks(topk_indices, num_kv, chunk):
     return keys, inv_ptr, inv_data
 
 
+def _swahca_loop_kw(pool):
+    """PRIMUS_SWAHCA_LOOP=1: the SWA / HCA backward kernel with runtime S / dP and dQ loops
+    (bit-identical, code-placement independent); 0 = the fully unrolled kernel."""
+    if os.environ.get("PRIMUS_SWAHCA_LOOP", "0") != "1":
+        return {}
+    return dict(sdp_u=1, psdp_u=4, dq_u=1) if pool else dict(sdp_u=2, dq_u=1)
+
+
 def _launch_glue_on():
     return os.environ.get("PRIMUS_LAUNCH_SMLA_GLUE", "0") == "1"
 
@@ -1882,7 +2117,12 @@ def sparse_mla_bwd_gfx1250(
             # Pool partials are needed on both kvt paths (with KVT=1 a missing ppart made run_ alias it to `part`).
             ppart = torch.empty(n_part, npp, DV, dtype=torch.float32, device=q.device)
         build_sparse_mla_bwd_gfx1250_swa(
-            H, float(scale), block_t=_SWA_BT, pool_p=max(pool_p, 0), pool_cr=T_ // pool_p if pool_p > 0 else 0
+            H,
+            float(scale),
+            block_t=_SWA_BT,
+            pool_p=max(pool_p, 0),
+            pool_cr=T_ // pool_p if pool_p > 0 else 0,
+            **_swahca_loop_kw(pool_p > 0),
         )(q, kv2, o, do, lse, dq, delta, part, kvt, ppart, stream=stream)
         dkv = torch.empty(num_kv, DQK, dtype=kv.dtype, device=q.device)
         build_swa_dkv_reduce(H, block_t=_SWA_BT, pool_p=max(pool_p, 0))(part, dkv, ppart, stream=stream)
