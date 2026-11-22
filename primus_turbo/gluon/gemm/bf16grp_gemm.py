@@ -382,23 +382,26 @@ def bf16rot_kernel(a_ptr, b_ptr, c_ptr, M: gl.constexpr, N: gl.constexpr, K: gl.
 @gluon.jit
 def bf16rot2_kernel(a0_ptr, b0_ptr, c0_ptr, a1_ptr, b1_ptr, c1_ptr,
                     M0: gl.constexpr, N0: gl.constexpr, K0: gl.constexpr, SAM0: gl.constexpr, SBN0: gl.constexpr,
-                    SCM0: gl.constexpr, NT0: gl.constexpr, SHARED_A0: gl.constexpr, SHARED_B0: gl.constexpr,
-                    WMMA0: gl.constexpr, BM0: gl.constexpr, BN0: gl.constexpr, NS0: gl.constexpr, AT0: gl.constexpr,
-                    BT0: gl.constexpr,
+                    SCM0: gl.constexpr, SAG0: gl.constexpr, SBG0: gl.constexpr, SCG0: gl.constexpr,
+                    NT0: gl.constexpr, SHARED_A0: gl.constexpr, SHARED_B0: gl.constexpr, WMMA0: gl.constexpr,
+                    BM0: gl.constexpr, BN0: gl.constexpr, NS0: gl.constexpr, AT0: gl.constexpr, BT0: gl.constexpr,
+                    SUN0: gl.constexpr,
                     M1: gl.constexpr, N1: gl.constexpr, K1: gl.constexpr, SAM1: gl.constexpr, SBN1: gl.constexpr,
-                    SCM1: gl.constexpr, NT1: gl.constexpr, SHARED_A1: gl.constexpr, SHARED_B1: gl.constexpr,
-                    WMMA1: gl.constexpr, BM1: gl.constexpr, BN1: gl.constexpr, NS1: gl.constexpr, AT1: gl.constexpr,
-                    BT1: gl.constexpr,
-                    GROUP_M: gl.constexpr, SU_W: gl.constexpr, SU_N: gl.constexpr, KW: gl.constexpr = 8):
-    # two independent 2-D problems (own layouts / tiles) in one launch: programs [0, NT0) -> problem 0, rest -> 1;
-    # each operand is its own pointer argument (no cross-allocation offsets)
+                    SCM1: gl.constexpr, SAG1: gl.constexpr, SBG1: gl.constexpr, SCG1: gl.constexpr,
+                    NT1: gl.constexpr, SHARED_A1: gl.constexpr, SHARED_B1: gl.constexpr, WMMA1: gl.constexpr,
+                    BM1: gl.constexpr, BN1: gl.constexpr, NS1: gl.constexpr, AT1: gl.constexpr, BT1: gl.constexpr,
+                    SUN1: gl.constexpr,
+                    GROUP_M: gl.constexpr, SU_W: gl.constexpr, KW: gl.constexpr = 8):
+    # two independent (batched) problems, own layouts / tiles, in one launch: programs [0, NT0) -> problem 0, the rest
+    # -> problem 1; each operand is its own pointer argument (no cross-allocation offsets). SUN_i = 32: hipBLASLt
+    # untuned-SAV StaggerU K start; SUN_i = 1: plain ascending K (= bf16g2 / the tuned hipBLASLt solutions)
     pid = _chiplet(gl.program_id(axis=0), NT0 + NT1, 8)
     if pid < NT0:
-        _rot_tile(a0_ptr, b0_ptr, c0_ptr, pid, M0, N0, K0, SAM0, SBN0, SCM0, 0, 0, 0, SHARED_A0, SHARED_B0, WMMA0,
-                  BM0, BN0, NS0, GROUP_M, AT0, BT0, SU_W, SU_N, KW)
+        _rot_tile(a0_ptr, b0_ptr, c0_ptr, pid, M0, N0, K0, SAM0, SBN0, SCM0, SAG0, SBG0, SCG0, SHARED_A0, SHARED_B0,
+                  WMMA0, BM0, BN0, NS0, GROUP_M, AT0, BT0, SU_W, SUN0, KW)
     else:
-        _rot_tile(a1_ptr, b1_ptr, c1_ptr, pid - NT0, M1, N1, K1, SAM1, SBN1, SCM1, 0, 0, 0, SHARED_A1, SHARED_B1,
-                  WMMA1, BM1, BN1, NS1, GROUP_M, AT1, BT1, SU_W, SU_N, KW)
+        _rot_tile(a1_ptr, b1_ptr, c1_ptr, pid - NT0, M1, N1, K1, SAM1, SBN1, SCM1, SAG1, SBG1, SCG1, SHARED_A1,
+                  SHARED_B1, WMMA1, BM1, BN1, NS1, GROUP_M, AT1, BT1, SU_W, SUN1, KW)
 
 
 _RPLANS = {}
@@ -457,46 +460,52 @@ def bf16rot_mm(a, b, out, tile="256x256", group_m=4, tpad=8, su_w=256, su_n=32):
     return out
 
 
-def _rot_args(a, b, out, tile, tpad):
-    M, K = a.shape
-    N = b.shape[1]
-    assert b.shape[0] == K and out.shape == (M, N) and out.stride(1) == 1, (a.shape, b.shape, out.shape)
+def _rot_args(a, b, out, tile, tpad, sun):
+    if a.dim() == 2:
+        a, b, out = a.unsqueeze(0), b.unsqueeze(0), out.unsqueeze(0)
+    G, M, K = a.shape
+    N = b.shape[2]
+    assert b.shape == (G, K, N) and out.shape == (G, M, N) and out.stride(2) == 1, (a.shape, b.shape, out.shape)
     assert a.dtype == b.dtype == out.dtype == torch.bfloat16
-    if a.stride(1) == 1:
-        at, sam = False, a.stride(0)
+    if a.stride(2) == 1:
+        at, sam = False, a.stride(1)
     else:
-        assert a.stride(0) == 1, a.stride()
-        at, sam = True, a.stride(1)
-    if b.stride(0) == 1:
-        bt, sbn = False, b.stride(1)
+        assert a.stride(1) == 1, a.stride()
+        at, sam = True, a.stride(2)
+    if b.stride(1) == 1:
+        bt, sbn = False, b.stride(2)
     else:
-        assert b.stride(1) == 1, b.stride()
-        bt, sbn = True, b.stride(0)
+        assert b.stride(2) == 1, b.stride()
+        bt, sbn = True, b.stride(1)
     bm, bn, ns = TILES[tile]
     assert 256 % bn == 0 and K % int(BK.value) == 0 and K // int(BK.value) >= ns + 1, (K, tile)
     for t in (a, b, out):
         assert t.is_cuda and t.data_ptr() != 0
+    sag, sbg, scg = (a.stride(0), b.stride(0), out.stride(0)) if G > 1 else (0, 0, 0)
     lk = (tile, at, bt, tpad)
     if lk not in _RLAYOUTS:
         _RLAYOUTS[lk] = build_layouts(tile, at, bt, tpad)
     lay = _RLAYOUTS[lk]
-    nt = _cdiv(M, bm) * _cdiv(N, bn)
-    return dict(M=M, N=N, K=K, SAM=sam, SBN=sbn, SCM=out.stride(0), NT=nt, SHARED_A=lay["SHARED_A"],
-                SHARED_B=lay["SHARED_B"], WMMA=lay["WMMA"], BM=bm, BN=bn, NS=ns, AT=at, BT=bt)
+    nt = G * _cdiv(M, bm) * _cdiv(N, bn)
+    return dict(M=M, N=N, K=K, SAM=sam, SBN=sbn, SCM=out.stride(1), SAG=sag, SBG=sbg, SCG=scg, NT=nt,
+                SHARED_A=lay["SHARED_A"], SHARED_B=lay["SHARED_B"], WMMA=lay["WMMA"], BM=bm, BN=bn, NS=ns, AT=at,
+                BT=bt, SUN=sun)
 
 
-def bf16rot2_mm(p0, p1, group_m=4, su_w=256, su_n=32):
-    """Two independent 2-D GEMMs out_i = a_i @ b_i (bf16, hipBLASLt untuned-SAV K order, as bf16rot_mm) in ONE launch.
-    p_i = (a, b, out, tile, tpad). Problem 0's programs come first (put the longer-K problem first)."""
-    key = tuple((a.shape, a.stride(), b.shape, b.stride(), o.shape, o.stride(), t, tp) for a, b, o, t, tp in (p0, p1))
-    key = key + (group_m, su_w, su_n)
+def bf16rot2_mm(p0, p1, group_m=4, su_w=256):
+    """Two independent GEMMs out_i[g] = a_i[g] @ b_i[g] (torch.mm / bmm semantics, bf16) in ONE launch.
+    p_i = (a, b, out, tile, tpad[, su_n]); su_n 32 (default) = hipBLASLt untuned-SAV StaggerU K order (as bf16rot_mm),
+    su_n 1 = plain ascending K (as bf16g2_mm). Problem 0's programs come first (put the longer-K problem first)."""
+    ps = [tuple(p) + ((32,) if len(p) == 5 else ()) for p in (p0, p1)]
+    key = tuple((a.shape, a.stride(), b.shape, b.stride(), o.shape, o.stride(), t, tp, su) for a, b, o, t, tp, su in ps)
+    key = key + (group_m, su_w)
     kw = _RPLANS.get(key)
     if kw is None:
         kw = {}
-        for i, (a, b, o, t, tp) in enumerate((p0, p1)):
-            for k, v in _rot_args(a, b, o, t, tp).items():
+        for i, (a, b, o, t, tp, su) in enumerate(ps):
+            for k, v in _rot_args(a, b, o, t, tp, su).items():
                 kw[f"{k}{i}"] = v
-        kw.update(GROUP_M=group_m, SU_W=su_w, SU_N=su_n, KW=8, num_warps=8, waves_per_eu=2, num_ctas=1)
+        kw.update(GROUP_M=group_m, SU_W=su_w, KW=8, num_warps=8, waves_per_eu=2, num_ctas=1)
         _RPLANS[key] = kw
-    bf16rot2_kernel[(kw["NT0"] + kw["NT1"],)](p0[0], p0[1], p0[2], p1[0], p1[1], p1[2], **kw)
+    bf16rot2_kernel[(kw["NT0"] + kw["NT1"],)](ps[0][0], ps[0][1], ps[0][2], ps[1][0], ps[1][1], ps[1][2], **kw)
     return p0[2], p1[2]
