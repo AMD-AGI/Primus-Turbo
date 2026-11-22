@@ -216,8 +216,17 @@ class FP8GemmBlockConcatNFunction(torch.autograd.Function):
         M, K = x.shape
         N = sum(ctx.ns)
         fq = _fuseq_kw()
-        if fq is not None:
-            a_row, _, pa, a_t, pat = quant_dual_t_e8m0_v2(x, a_dtype, row_layout="packed", t_layout="packed", **fq)
+        from primus_turbo.triton.quantization import quant_g90 as _qg
+
+        if fq is not None and fq["tmode"] == 0 and _qg.mb_packq_enabled():
+            # membound PRIMUS_MB_PACKQ=1: weight-scale packing inside the activation quant launch (same bytes)
+            w_j, e_j, wts = _weights_fp8(weights, a_dtype)
+            (a_row, _, pa, a_t, pat), (pb, pbt) = _qg.quant_dual_pack(
+                x, a_dtype, "packed", "packed", [(e_j, 128, N, K), (e_j.t(), 128, K, N)], site="c",
+                num_warps=fq["num_warps"])
+        elif fq is not None:
+            a_row, _, pa, a_t, pat = quant_dual_t_e8m0_v2(x, a_dtype, row_layout="packed", t_layout="packed",
+                                                          site="c", **fq)
             w_j, e_j, wts = _weights_fp8(weights, a_dtype)
             pb, pbt = dsv4up_block.pack_scales([(e_j, 128, N, K), (e_j.t(), 128, K, N)])
         else:
