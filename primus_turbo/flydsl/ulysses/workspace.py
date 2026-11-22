@@ -84,9 +84,11 @@ class UlyssesWorkspace:
 _WORKSPACES: dict = {}
 
 
-def get_ulysses_workspace(group: dist.ProcessGroup, bank_bytes: int) -> UlyssesWorkspace:
-    """The group's workspace, regrown (collectively, outside graph capture) when a bank is too small."""
-    ws: Optional[UlyssesWorkspace] = _WORKSPACES.get(group.group_name)
+def get_ulysses_workspace(group: dist.ProcessGroup, bank_bytes: int, name: str = "") -> UlyssesWorkspace:
+    """The group's workspace, regrown (collectively, outside graph capture) when a bank is too small.
+    A ``name`` gives a separate heap with its own epoch, flag regions and banks."""
+    key = (group.group_name, name)
+    ws: Optional[UlyssesWorkspace] = _WORKSPACES.get(key)
     if ws is not None and ws.bank_bytes >= bank_bytes:
         return ws
     if torch.cuda.is_current_stream_capturing():
@@ -100,5 +102,5 @@ def get_ulysses_workspace(group: dist.ProcessGroup, bank_bytes: int) -> UlyssesW
     ws = UlyssesWorkspace(group, max(bank_bytes, 0 if old is None else 2 * old.bank_bytes))
     if old is not None:
         old.destroy()
-    _WORKSPACES[group.group_name] = ws
+    _WORKSPACES[key] = ws
     return ws

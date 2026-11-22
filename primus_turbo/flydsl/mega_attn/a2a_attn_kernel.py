@@ -1,0 +1,668 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+"""Ulysses all-to-all + causal attention + all-to-all in one kernel (single node, symmetric memory).
+
+Every rank holds its ``M`` tokens with all heads (q / k / v ``[M, n * h_r, d]``, batch 1). One launch:
+
+* pull blocks (the first ``num_pull``) first stage this rank's q / k / v rows into its symmetric bank as
+  one column block per destination rank (``[q heads | k heads | v heads]`` of that rank), raising one
+  flag per m-tile; then they claim pull units ``(m_tile, src)`` m-major, copy ``src``'s rows of this
+  rank's column block into q / k / v over the full sequence (``[S, h_r, d]``, sequence order) and raise
+  a local ready flag per unit;
+* one persistent attention worker per CU claims ``(head group, q block)`` items, waits for the ready
+  flags of every unit holding rows of its causal KV prefix, runs the dual-wave tile, and pushes the O
+  tile into the recv bank of the rank owning those tokens, raising that rank's flag
+  ``(m-tile, src, head group)``;
+* once every attention item is claimed, the workers claim gather tiles: an m-tile waits for the flags
+  of every source and head group, then its recv rows are copied into ``out`` ``[M, n * hq_r, d]``.
+
+Every attention item is claimed by a running worker before any worker waits on a gather flag, and
+pull blocks are dispatched before the workers, so no wait can deadlock whatever the grid size.
+
+Sequence split: with ``seq_chunk`` cs, chunk ``c`` of the global sequence lives on rank ``c % n`` (local
+token ``t`` of rank ``r`` is global ``((t // cs) * n + r) * cs + t % cs``); ``cs = M`` is the contiguous
+split. The pull units land m-major, i.e. in sequence order under a striped split, so the KV prefix of
+the early q blocks is complete while the exchange still runs: workers take ``num_ascending`` q blocks
+in sequence order, then the rest longest first.
+"""
+
+import functools
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+import torch
+from flydsl.compiler.ast_rewriter import ASTRewriter
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import arith, const_expr, range_constexpr
+
+from primus_turbo.flydsl.attention.flash_attn_fwd_stock import (
+    DUALWAVE_SWP_COMPILE_HINTS,
+    make_dualwave_swp_tile,
+)
+from primus_turbo.flydsl.deep_ep.common import _asm
+from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
+from primus_turbo.flydsl.ulysses.a2a_gemm_kernel import _copy_rows
+from primus_turbo.flydsl.ulysses.common import (
+    BLOCK_THREADS,
+    SPIN_TIMEOUT,
+    STATE_ASSIST,
+    STATE_CLAIM,
+    STATE_TILE,
+    SYS_NT,
+    VEC_BF16,
+    VEC_I32,
+    claim_unit,
+    exit_and_bump_epoch,
+    i64_base,
+    opaque_tid,
+    spin_flag,
+    spin_flags,
+)
+from primus_turbo.flydsl.ulysses.workspace import (
+    FLAG_BYTES,
+    FLAG_REGION_BYTES,
+    FLAGS_PER_REGION,
+)
+from primus_turbo.flydsl.utils.attn_helper_stock import (
+    DualwaveKernelContext,
+    _make_dualwave_swp_traits,
+    dtype_to_elem_type,
+)
+from primus_turbo.flydsl.utils.buffer_ops import (
+    buffer_load,
+    buffer_store,
+    create_buffer_resource,
+    create_buffer_resource_from_addr,
+)
+from primus_turbo.flydsl.utils.prims import (
+    ld,
+    memory_fence,
+    read_clock,
+    spin_timed_out,
+    st,
+)
+
+REGION_FWD_STAGE = 0
+REGION_FWD_READY = 1
+REGION_FWD_O = 2
+
+# rows of one stage / pull unit
+BM = 128
+# 16 B vectors per thread in flight in the gather copy
+_GATHER_BATCH = 8
+
+
+def make_traits(hq, hkv, d):
+    """The production SBHD causal forward configuration (``attention_flydsl_impl._fwd_module``)."""
+    return _make_dualwave_swp_traits(
+        hq,
+        hkv,
+        d,
+        causal=True,
+        dtype_str="bf16",
+        waves_per_eu=2,
+        dualwave_swp_enable_stagger=False,
+        emit_lse=True,
+        block_m=64 if d == 64 else 128,
+        sbhd=True,
+    )
+
+
+def a2a_attn_fwd_bank_bytes(M, num_ranks, hq_r, hkv_r, head_dim):
+    """Bank bytes: the q / k / v staging rows, then the O recv rows."""
+    stage = M * num_ranks * (hq_r + 2 * hkv_r) * head_dim * 2
+    return stage + M * num_ranks * hq_r * head_dim * 2
+
+
+def _global_row(t, src, cs, n):
+    """Sequence position of local token ``t`` of rank ``src``."""
+    return (t // fx.Int32(cs) * fx.Int32(n) + src) * fx.Int32(cs) + t % fx.Int32(cs)
+
+
+@ASTRewriter.transform
+def _stage_unit(thread_index, m_tile, in_res, stage_res, **c):
+    """Rows ``[m_tile * BM, +BM)`` of this rank's q / k / v into its staging bank, retired on return."""
+    M, n, d = c["M"], c["num_ranks"], c["head_dim"]
+    heads, offs = c["heads"], c["head_offs"]
+    row_vecs_out = n * c["N_r"] // VEC_BF16
+    blk_vecs = c["N_r"] // VEC_BF16
+    t0 = m_tile * fx.Int32(BM)
+    for x in range_constexpr(3):
+        h_vecs = heads[x] * d // VEC_BF16
+        row_vecs_in = n * h_vecs
+        off = offs[x] * d // VEC_BF16
+
+        def coords(v, h_vecs=h_vecs, row_vecs_in=row_vecs_in, off=off):
+            r = v // fx.Int32(row_vecs_in)
+            col = v % fx.Int32(row_vecs_in)
+            t = t0 + r
+            src_word = (t * fx.Int32(row_vecs_in) + col) * fx.Int32(VEC_I32)
+            dst_col = col // fx.Int32(h_vecs) * fx.Int32(blk_vecs) + fx.Int32(off) + col % fx.Int32(h_vecs)
+            dst_word = (t * fx.Int32(row_vecs_out) + dst_col) * fx.Int32(VEC_I32)
+            return src_word, dst_word, (r < fx.Int32(BM)) & (t < fx.Int32(M))
+
+        _copy_rows(thread_index, BM * row_vecs_in, coords, in_res[x], stage_res, 0, SYS_NT)
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+
+
+@ASTRewriter.transform
+def _pull_unit(thread_index, src, m_tile, src_heap, bank_offset, out_res, epoch, **c):
+    """``src``'s staged rows ``[m_tile * BM, +BM)`` of this rank's column block into q / k / v."""
+    M, n, d, rank, cs = c["M"], c["num_ranks"], c["head_dim"], c["rank"], c["seq_chunk"]
+    heads, offs = c["heads"], c["head_offs"]
+    row_vecs = n * c["N_r"] // VEC_BF16
+    blk_vecs = c["N_r"] // VEC_BF16
+    if thread_index == fx.Int32(0):
+        flag_base = src_heap + fx.Int64(REGION_FWD_STAGE * FLAG_REGION_BYTES)
+        spin_flag(flag_base, m_tile, epoch, rank, src, "a2a_attn pull", report=False)
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    stage_res = create_buffer_resource_from_addr(src_heap + bank_offset, num_records_bytes=c["stage_bytes"])
+    t0 = m_tile * fx.Int32(BM)
+    # a unit lies inside one sequence chunk (cs % BM == 0): its rows land contiguously
+    g0 = _global_row(t0, src, cs, n)
+    for x in range_constexpr(3):
+        h_vecs = heads[x] * d // VEC_BF16
+        off = rank * blk_vecs + offs[x] * d // VEC_BF16
+
+        def coords(v, h_vecs=h_vecs, off=off):
+            r = v // fx.Int32(h_vecs)
+            col = v % fx.Int32(h_vecs)
+            src_word = ((t0 + r) * fx.Int32(row_vecs) + fx.Int32(off) + col) * fx.Int32(VEC_I32)
+            dst_word = ((g0 + r) * fx.Int32(h_vecs) + col) * fx.Int32(VEC_I32)
+            return src_word, dst_word, (r < fx.Int32(BM)) & (t0 + r < fx.Int32(M))
+
+        _copy_rows(thread_index, BM * h_vecs, coords, stage_res, out_res[x], SYS_NT, 0)
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+
+
+@ASTRewriter.transform
+def _pull_role(
+    thread_index,
+    state_base,
+    claim_slot,
+    peers_base,
+    my_base,
+    bank_offset,
+    in_res,
+    out_res,
+    epoch,
+    trace_base,
+    **c,
+):
+    """Stage units until none are left, then pull units ``(m_tile, src = rank + i)`` m-major."""
+    n, rank, m_tiles = c["num_ranks"], c["rank"], c["m_tiles"]
+    stage_res = create_buffer_resource_from_addr(my_base + bank_offset, num_records_bytes=c["stage_bytes"])
+    stage_flags = my_base + fx.Int64(REGION_FWD_STAGE * FLAG_REGION_BYTES)
+    ready_base = my_base + fx.Int64(REGION_FWD_READY * FLAG_REGION_BYTES)
+    more_stage = fx.Int32(1)
+    while more_stage == fx.Int32(1):
+        piece = claim_unit(opaque_tid(thread_index), state_base, claim_slot, STATE_ASSIST)
+        if piece < fx.Int32(m_tiles):
+            _stage_unit(thread_index, piece, in_res, stage_res, **c)
+            if thread_index == fx.Int32(0):
+                # the staging stores are system scope (SYS_NT) and retired above
+                st(stage_flags, piece, epoch, scope="sys", order="relaxed")
+        more_stage = arith.select(piece < fx.Int32(m_tiles), fx.Int32(1), fx.Int32(0))
+    num_units = m_tiles * n
+    more_pull = fx.Int32(1)
+    while more_pull == fx.Int32(1):
+        unit = claim_unit(opaque_tid(thread_index), state_base, claim_slot, STATE_CLAIM)
+        if unit < fx.Int32(num_units):
+            m_tile = unit // fx.Int32(n)
+            src = (fx.Int32(rank) + unit % fx.Int32(n)) % fx.Int32(n)
+            src_heap = ld(peers_base, src, dtype=fx.T.i64)
+            _pull_unit(thread_index, src, m_tile, src_heap, bank_offset, out_res, epoch, **c)
+            if thread_index == fx.Int32(0):
+                st(ready_base, m_tile * fx.Int32(n) + src, epoch, scope="agent", order="release")
+                if const_expr(trace_base is not None):
+                    st(trace_base, m_tile * fx.Int32(n) + src, read_clock())
+        more_pull = arith.select(unit < fx.Int32(num_units), fx.Int32(1), fx.Int32(0))
+
+
+@ASTRewriter.transform
+def _wait_prefix(thread_index, ready_base, kv_end, epoch, **c):
+    """Wait for the ready flag of every pull unit holding rows below ``kv_end``: each thread polls its
+    own share of the units, then the block rendezvous."""
+    n, cs, rank = c["num_ranks"], c["seq_chunk"], c["rank"]
+    total = c["m_tiles"] * n
+    idx = thread_index
+    spin_start = read_clock()
+    while idx < fx.Int32(total):
+        g0 = _global_row(idx // fx.Int32(n) * fx.Int32(BM), idx % fx.Int32(n), cs, n)
+        need = g0 < kv_end
+        flag = ld(ready_base, idx, scope="agent", order="acquire", dtype=fx.T.i64)
+        while need & (flag < epoch):
+            fx.rocdl.s_sleep(fx.Int32(1))
+            if spin_timed_out(spin_start, SPIN_TIMEOUT):
+                fx.printf(f"[a2a_attn rank={rank}] ready flag timeout: idx={{}} flag={{}}\n", idx, flag)
+                _asm("s_trap 2")
+            flag = ld(ready_base, idx, scope="agent", order="acquire", dtype=fx.T.i64)
+        idx = idx + fx.Int32(BLOCK_THREADS)
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    memory_fence(order="acquire", scope="agent")
+
+
+@ASTRewriter.transform
+def _push_o(thread_index, qb, h, peers_base, recv_offset, o_res, epoch, **c):
+    """O rows of q block ``qb`` for work-item head group ``h`` into the owner's recv bank (this rank's
+    column block, head order), then the owner's flag ``(m-tile, rank, h)``."""
+    bm, cs, n, rank, hg = c["block_m"], c["seq_chunk"], c["num_ranks"], c["rank"], c["head_groups"]
+    d, hq_r, hkv_r, qpw, K_o = c["head_dim"], c["hq_r"], c["hkv_r"], c["heads_per_wg"], c["K_o"]
+    # O was just stored by this CU's waves: drop stale L1 lines before reading it back
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    memory_fence(order="acquire", scope="agent")
+    pos0 = qb * fx.Int32(bm)
+    chunk = pos0 // fx.Int32(cs)
+    owner = chunk % fx.Int32(n)
+    t0 = chunk // fx.Int32(n) * fx.Int32(cs) + pos0 % fx.Int32(cs)
+    owner_heap = ld(peers_base, owner, dtype=fx.T.i64)
+    recv_res = create_buffer_resource_from_addr(owner_heap + recv_offset, num_records_bytes=c["recv_bytes"])
+    vecs_per_row = qpw * d // VEC_BF16
+    # the q heads of work-item head group h (attn_helper: kv head h % hkv, sharer group h // hkv)
+    head0 = (h % fx.Int32(hkv_r)) * fx.Int32(hq_r // hkv_r) + h // fx.Int32(hkv_r) * fx.Int32(qpw)
+    src_col0 = head0 * fx.Int32(d // VEC_BF16)
+    dst_col0 = fx.Int32(rank * hq_r * d // VEC_BF16) + src_col0
+
+    def coords(v):
+        r = v // fx.Int32(vecs_per_row)
+        col = v % fx.Int32(vecs_per_row)
+        src_word = ((pos0 + r) * fx.Int32(hq_r * d // VEC_BF16) + src_col0 + col) * fx.Int32(VEC_I32)
+        dst_word = ((t0 + r) * fx.Int32(K_o // VEC_BF16) + dst_col0 + col) * fx.Int32(VEC_I32)
+        return src_word, dst_word, r < fx.Int32(bm)
+
+    _copy_rows(thread_index, bm * vecs_per_row, coords, o_res, recv_res, 0, SYS_NT)
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    if thread_index == fx.Int32(0):
+        flag_base = owner_heap + fx.Int64(REGION_FWD_O * FLAG_REGION_BYTES)
+        slot = t0 // fx.Int32(bm) * fx.Int32(n * hg) + fx.Int32(rank * hg) + h
+        st(flag_base, slot, epoch, scope="sys", order="release")
+
+
+@ASTRewriter.transform
+def _gather_tile(thread_index, g, flag_base, recv_addr, out_res, epoch, **c):
+    """Recv rows of m-tile ``g`` into ``out`` once every source and head group has pushed them."""
+    bm, K_o = c["block_m"], c["K_o"]
+    slots = c["num_ranks"] * c["head_groups"]
+    if thread_index == fx.Int32(0):
+        flag_idxs = [g * fx.Int32(slots) + fx.Int32(i) for i in range(slots)]
+        spin_flags(flag_base, flag_idxs, epoch, c["rank"], -1, "a2a_attn gather")
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    # recv rows are rewritten by peers every 2 epochs: drop what this CU / XCD still caches of them
+    memory_fence(order="acquire", scope="sys")
+    recv_res = create_buffer_resource_from_addr(recv_addr, num_records_bytes=c["recv_bytes"])
+    num_vecs = bm * K_o // VEC_BF16
+    per_iter = BLOCK_THREADS * _GATHER_BATCH
+    base_word = g * fx.Int32(num_vecs * VEC_I32)
+    # a tile is hundreds of copy steps: a loop rather than _copy_rows' unrolled ones
+    for it in range(num_vecs // per_iter):
+        v0 = fx.Int32(it * per_iter) + thread_index
+        words = [
+            base_word + (v0 + fx.Int32(j * BLOCK_THREADS)) * fx.Int32(VEC_I32)
+            for j in range_constexpr(_GATHER_BATCH)
+        ]
+        vals = [
+            buffer_load(recv_res, w, vec_width=VEC_I32, dtype=fx.T.i32, cache_modifier=SYS_NT) for w in words
+        ]
+        for w, val in zip(words, vals):
+            buffer_store(val, out_res, w)
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+
+
+@ASTRewriter.transform
+def _attn_loop(
+    thread_index,
+    state_base,
+    claim_slot,
+    my_base,
+    peers_base,
+    recv_offset,
+    o_res,
+    out_res,
+    epoch,
+    run_tile,
+    trace_base,
+    **c,
+):
+    """Claim ``(head group, q block)`` items (``num_ascending`` q blocks in sequence order, then the rest
+    longest first), wait for each item's KV prefix, run its tile and push its O; then the gather tiles
+    (the m-tiles of the ascending q blocks first, the rest from the end)."""
+    nqb, hg, asc, bm, bn = c["num_q_blocks"], c["head_groups"], c["num_ascending"], c["block_m"], c["block_n"]
+    m_tiles_o, o_asc = c["m_tiles_o"], c["o_ascending"]
+    num_units = nqb * hg
+    num_claims = num_units + m_tiles_o
+    ready_base = my_base + fx.Int64(REGION_FWD_READY * FLAG_REGION_BYTES)
+    o_flags = my_base + fx.Int64(REGION_FWD_O * FLAG_REGION_BYTES)
+    trace_at = c["trace_attn_at"]
+    unit = claim_unit(thread_index, state_base, claim_slot, counter=STATE_TILE)
+    while unit < fx.Int32(num_claims):
+        if unit < fx.Int32(num_units):
+            k = unit // fx.Int32(hg)
+            qb = arith.select(k < fx.Int32(asc), k, fx.Int32(nqb - 1 + asc) - k)
+            h = unit % fx.Int32(hg)
+            if const_expr(trace_base is not None):
+                if thread_index == fx.Int32(0):
+                    st(trace_base, fx.Int32(trace_at) + unit * fx.Int32(3), read_clock())
+            # the KV the tile reads, masked or not (attn_helper: max(4, even(ceil(q_end / BLOCK_N)))
+            # tiles); masked columns still multiply V, so those rows must be the landed ones
+            kv_tiles = (
+                ((qb + fx.Int32(1)) * fx.Int32(bm) + fx.Int32(2 * bn - 1)) // fx.Int32(2 * bn) * fx.Int32(2)
+            )
+            kv_tiles = arith.select(kv_tiles < fx.Int32(4), fx.Int32(4), kv_tiles)
+            _wait_prefix(thread_index, ready_base, kv_tiles * fx.Int32(bn), epoch, **c)
+            if const_expr(trace_base is not None):
+                if thread_index == fx.Int32(0):
+                    st(trace_base, fx.Int32(trace_at) + unit * fx.Int32(3) + fx.Int32(1), read_clock())
+            # _setup walks causal q blocks descending from the grid y index
+            run_tile((h, fx.Int32(nqb - 1) - qb, fx.Int32(0)))
+            _push_o(thread_index, qb, h, peers_base, recv_offset, o_res, epoch, **c)
+            if const_expr(trace_base is not None):
+                if thread_index == fx.Int32(0):
+                    st(trace_base, fx.Int32(trace_at) + unit * fx.Int32(3) + fx.Int32(2), read_clock())
+        else:
+            j = unit - fx.Int32(num_units)
+            g = arith.select(j < fx.Int32(o_asc), j, fx.Int32(m_tiles_o - 1 + o_asc) - j)
+            _gather_tile(thread_index, g, o_flags, my_base + recv_offset, out_res, epoch, **c)
+            if const_expr(trace_base is not None):
+                if thread_index == fx.Int32(0):
+                    st(trace_base, fx.Int32(c["trace_gather_at"]) + g, read_clock())
+        unit = claim_unit(thread_index, state_base, claim_slot, counter=STATE_TILE)
+
+
+def trace_layout(M, num_ranks, hq_r, hkv_r, head_dim):
+    """Offsets of the debug timeline (s_memrealtime, 100 MHz): pull unit ends ``[m_tiles * n]``, then
+    ``[claim, ready, end]`` per attention item, then the gather tile ends; and the total length."""
+    traits = make_traits(hq_r, hkv_r, head_dim)
+    bm = traits.BLOCK_M
+    hg = hq_r // traits.Q_HEADS_PER_WG
+    attn_at = M // BM * num_ranks
+    gather_at = attn_at + 3 * (M * num_ranks // bm) * hg
+    return attn_at, gather_at, gather_at + M // bm
+
+
+@functools.lru_cache(maxsize=32)
+def _make_kernel(
+    M, rank, num_ranks, hq_r, hkv_r, head_dim, seq_chunk, num_pull, num_attn, num_ascending, bank_bytes, trace
+):
+    n, d = num_ranks, head_dim
+    traits = make_traits(hq_r, hkv_r, d)
+    assert traits.BLOCK_SIZE == BLOCK_THREADS, (
+        f"the fused kernel runs {BLOCK_THREADS}-thread blocks; this head config builds {traits.BLOCK_SIZE} "
+        "(an even q-per-kv group is needed for the two-head CTA)"
+    )
+    attn_tile = make_dualwave_swp_tile(traits)
+    bm = traits.BLOCK_M
+    cs = seq_chunk if seq_chunk else M
+    assert M % cs == 0 and cs % BM == 0 and BM % bm == 0, f"need M % seq_chunk == 0 and seq_chunk % {BM} == 0"
+    S = M * n
+    m_tiles = M // BM
+    N_r = (hq_r + 2 * hkv_r) * d
+    stage_bytes = M * n * N_r * 2
+    K_o = n * hq_r * d
+    recv_bytes = M * K_o * 2
+    assert stage_bytes + recv_bytes <= bank_bytes
+    assert stage_bytes < 2**31 and recv_bytes < 2**31 and S * hq_r * d * 2 < 2**31, (
+        "i32 byte offsets overflow"
+    )
+    hg = hq_r // traits.Q_HEADS_PER_WG
+    nqb = S // bm
+    m_tiles_o = M // bm
+    assert m_tiles * n <= FLAGS_PER_REGION and m_tiles_o * n * hg <= FLAGS_PER_REGION
+    assert (bm * K_o // VEC_BF16) % (BLOCK_THREADS * _GATHER_BATCH) == 0, (
+        "gather tile must be whole copy steps"
+    )
+    num_ascending = min(num_ascending, nqb)
+    grid = num_pull + num_attn
+    trace_attn_at, trace_gather_at, _ = trace_layout(M, n, hq_r, hkv_r, d)
+
+    elem = dtype_to_elem_type(traits.DTYPE_STR)
+
+    @fx.struct
+    class SharedStorage:
+        kv: fx.Array[elem, traits.LDS_KV_TOTAL_SIZE, 16]
+        claim: fx.Array[fx.Int32, 4, 16]
+
+    c = dict(
+        M=M,
+        rank=rank,
+        num_ranks=n,
+        head_dim=d,
+        hq_r=hq_r,
+        hkv_r=hkv_r,
+        heads=(hq_r, hkv_r, hkv_r),
+        head_offs=(0, hq_r, hq_r + hkv_r),
+        N_r=N_r,
+        K_o=K_o,
+        seq_chunk=cs,
+        m_tiles=m_tiles,
+        stage_bytes=stage_bytes,
+        recv_bytes=recv_bytes,
+        block_m=bm,
+        block_n=traits.BLOCK_N,
+        head_groups=hg,
+        heads_per_wg=traits.Q_HEADS_PER_WG,
+        num_q_blocks=nqb,
+        num_ascending=num_ascending,
+        m_tiles_o=m_tiles_o,
+        o_ascending=min(num_ascending // n, m_tiles_o),
+        trace_attn_at=trace_attn_at,
+        trace_gather_at=trace_gather_at,
+    )
+
+    @flyc.kernel(name="ulysses_a2a_attn_fwd_kernel", known_block_size=[BLOCK_THREADS, 1, 1])
+    def kernel(
+        Q_IN: fx.Tensor,
+        K_IN: fx.Tensor,
+        V_IN: fx.Tensor,
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        O: fx.Tensor,  # noqa: E741
+        LSE: fx.Tensor,
+        OUT: fx.Tensor,
+        PEER_PTRS: fx.Tensor,
+        STATE: fx.Tensor,
+        TRACE: fx.Tensor,
+    ):
+        thread_index = fx.thread_idx.x
+        block_index, _b, _c = fx.block_idx
+        trace_base = i64_base(TRACE) if trace else None
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        claim_slot = fx.Int32(fx.ptrtoint(lds.claim.ptr))
+        state_base = i64_base(STATE)
+        peers_base = i64_base(PEER_PTRS)
+        epoch = ld(state_base, fx.Int32(0), dtype=fx.T.i64)
+        bank_offset = fx.Int64(FLAG_BYTES) + (epoch & fx.Int64(1)) * fx.Int64(bank_bytes)
+        my_base = ld(peers_base, fx.Int32(rank), dtype=fx.T.i64)
+
+        if block_index < fx.Int32(num_pull):
+            in_res = [
+                create_buffer_resource(t, num_records_bytes=M * n * h * d * 2)
+                for t, h in ((Q_IN, hq_r), (K_IN, hkv_r), (V_IN, hkv_r))
+            ]
+            out_res = [
+                create_buffer_resource(t, num_records_bytes=S * h * d * 2)
+                for t, h in ((Q, hq_r), (K, hkv_r), (V, hkv_r))
+            ]
+            _pull_role(
+                thread_index,
+                state_base,
+                claim_slot,
+                peers_base,
+                my_base,
+                bank_offset,
+                in_res,
+                out_res,
+                epoch,
+                trace_base,
+                **c,
+            )
+        else:
+
+            def run_tile(block_ids):
+                ctx = DualwaveKernelContext(
+                    traits,
+                    Q,
+                    K,
+                    V,
+                    O,
+                    LSE,
+                    O,
+                    O,
+                    O,
+                    fx.Int32(S),
+                    fx.Int32(S),
+                    fx.Int32(hq_r * d),
+                    fx.Int32(hkv_r * d),
+                    fx.Int32(d),
+                    fx.Int32(0),
+                    SINK=O,
+                    ScoreBound=None,
+                )
+                ctx._setup(None, block_ids=block_ids, lds=lds)
+                attn_tile(ctx)
+
+            _attn_loop(
+                thread_index,
+                state_base,
+                claim_slot,
+                my_base,
+                peers_base,
+                bank_offset + fx.Int64(stage_bytes),
+                create_buffer_resource(O, num_records_bytes=S * hq_r * d * 2),
+                create_buffer_resource(OUT, num_records_bytes=recv_bytes),
+                epoch,
+                run_tile,
+                trace_base,
+                **c,
+            )
+
+        exit_and_bump_epoch(thread_index, state_base, epoch, grid, extra_counters=(STATE_ASSIST,))
+
+    value_attrs = {
+        "rocdl.waves_per_eu": traits.WAVES_PER_EU,
+        "rocdl.flat_work_group_size": f"{BLOCK_THREADS},{BLOCK_THREADS}",
+        "llvm.passthrough": [
+            ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
+            ["no-nans-fp-math", "true"],
+            ["unsafe-fp-math", "true"],
+        ],
+    }
+    return kernel, grid, value_attrs
+
+
+@flyc.jit
+def _launch(
+    Q_IN,
+    K_IN,
+    V_IN,
+    Q,
+    K,
+    V,
+    O,  # noqa: E741
+    LSE,
+    OUT,
+    PEER_PTRS,
+    STATE,
+    TRACE,
+    M: fx.Constexpr[int],
+    rank: fx.Constexpr[int],
+    num_ranks: fx.Constexpr[int],
+    hq_r: fx.Constexpr[int],
+    hkv_r: fx.Constexpr[int],
+    head_dim: fx.Constexpr[int],
+    seq_chunk: fx.Constexpr[int],
+    num_pull: fx.Constexpr[int],
+    num_attn: fx.Constexpr[int],
+    num_ascending: fx.Constexpr[int],
+    bank_bytes: fx.Constexpr[int],
+    trace: fx.Constexpr[bool],
+    stream: fx.Stream,
+):
+    kernel, grid, value_attrs = _make_kernel(
+        M,
+        rank,
+        num_ranks,
+        hq_r,
+        hkv_r,
+        head_dim,
+        seq_chunk,
+        num_pull,
+        num_attn,
+        num_ascending,
+        bank_bytes,
+        trace,
+    )
+    kernel(Q_IN, K_IN, V_IN, Q, K, V, O, LSE, OUT, PEER_PTRS, STATE, TRACE, value_attrs=value_attrs).launch(
+        grid=(grid, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream
+    )
+
+
+def ulysses_a2a_attn_fwd(
+    q_in,
+    k_in,
+    v_in,
+    q,
+    k,
+    v,
+    o,
+    lse,
+    out,
+    workspace,
+    *,
+    seq_chunk=0,
+    num_pull=32,
+    num_attn=None,
+    num_ascending=None,
+    trace=None,
+):
+    """``q_in`` / ``k_in`` / ``v_in`` ``[M, n * h_r, d]``: this rank's tokens with every head (batch 1).
+    Writes ``q`` / ``k`` / ``v`` ``[S, h_r, d]`` (this rank's heads over the sequence, sequence order),
+    the causal attention output ``o`` (like ``q``) with its natural-log LSE ``[S, hq_r]`` fp32, and ``out``
+    ``[M, n * hq_r, d]``: the output for this rank's tokens. The bank must hold ``a2a_attn_fwd_bank_bytes``."""
+    n = workspace.num_ranks
+    M, H, d = q_in.shape[0], q_in.shape[-2], q_in.shape[-1]
+    hq_r, hkv_r = H // n, k_in.shape[-2] // n
+    tensors = (q_in, k_in, v_in, q, k, v, o, lse, out)
+    assert all(t.is_contiguous() for t in tensors)
+    assert q_in.dtype == torch.bfloat16 and H % n == 0 and k_in.shape[-2] % n == 0
+    assert (
+        q.shape[0] == M * n and q.shape[-2] == hq_r and k.shape[-2] == hkv_r and out.numel() == q_in.numel()
+    )
+    if num_attn is None:
+        num_attn = torch.cuda.get_device_properties(q_in.device).multi_processor_count
+    bm = make_traits(hq_r, hkv_r, d).BLOCK_M
+    if num_ascending is None:
+        num_ascending = M * n // bm // 2
+    with CompilationContext.compile_hints(DUALWAVE_SWP_COMPILE_HINTS):
+        run_launcher(
+            _launch,
+            *tensors,
+            workspace.peer_ptrs,
+            workspace.state,
+            workspace.state if trace is None else trace,
+            M,
+            workspace.rank,
+            n,
+            hq_r,
+            hkv_r,
+            d,
+            seq_chunk,
+            num_pull,
+            num_attn,
+            num_ascending,
+            workspace.bank_bytes,
+            trace is not None,
+            torch.cuda.current_stream(),
+        )
