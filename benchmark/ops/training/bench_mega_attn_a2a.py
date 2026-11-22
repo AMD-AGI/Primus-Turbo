@@ -162,12 +162,26 @@ def bench(model, seq, chunks, num_pulls, warmup, iters, reps, trace_dir, modes=F
                 t_comm = results[f"fused cs={cs} p={npull} comm_only"]
                 overlap[(cs, npull)] = (full, t_attn, t_comm)
         if trace_dir:
-            total = trace_layout(M, n, hq_r, hkv_r, d)[2]
+            total = trace_layout(M, n, hq_r, hkv_r, d)[-1]
             trace = torch.zeros(total, device=dev, dtype=torch.int64)
             # the traced build compiles on its first call: time the second
             for _ in range(2):
                 _barrier()
-                ulysses_a2a_attn_fwd(q_in, k_in, v_in, q, k, v, o, lse, out, ws, seq_chunk=cs, trace=trace)
+                ulysses_a2a_attn_fwd(
+                    q_in,
+                    k_in,
+                    v_in,
+                    q,
+                    k,
+                    v,
+                    o,
+                    lse,
+                    out,
+                    ws,
+                    seq_chunk=cs,
+                    num_pull=num_pulls[-1],
+                    trace=trace,
+                )
             torch.cuda.synchronize()
             os.makedirs(trace_dir, exist_ok=True)
             torch.save(
@@ -312,7 +326,15 @@ def main():
                 bench_bwd(model, seq, args.chunks, args.warmup, args.iters, args.reps)
             else:
                 bench(
-                    model, seq, args.chunks, args.num_pull, args.warmup, args.iters, args.reps, args.trace_dir
+                    model,
+                    seq,
+                    args.chunks,
+                    args.num_pull,
+                    args.warmup,
+                    args.iters,
+                    args.reps,
+                    args.trace_dir,
+                    args.modes,
                 )
     dist.destroy_process_group()
 

@@ -219,6 +219,12 @@ def _pull_role(
             if thread_index == fx.Int32(0):
                 # the staging stores are system scope (SYS_NT) and retired above
                 st(stage_flags, m_tile * fx.Int32(n) + dst, epoch, scope="sys", order="relaxed")
+                if const_expr(trace_base is not None):
+                    st(
+                        trace_base,
+                        fx.Int32(c.get("trace_stage_at", 0)) + m_tile * fx.Int32(n) + dst,
+                        read_clock(),
+                    )
         more_stage = arith.select(piece < fx.Int32(num_pieces), fx.Int32(1), fx.Int32(0))
     num_units = m_tiles * n
     more_pull = fx.Int32(1)
@@ -394,15 +400,21 @@ def _attn_loop(
         unit = claim_unit(thread_index, state_base, claim_slot, counter=STATE_TILE)
 
 
+TRACE_MAX_BLOCKS = 1024
+
+
 def trace_layout(M, num_ranks, hq_r, hkv_r, head_dim):
     """Offsets of the debug timeline (s_memrealtime, 100 MHz): pull unit ends ``[m_tiles * n]``, then
-    ``[claim, ready, end]`` per attention item, then the gather tile ends; and the total length."""
+    ``[claim, ready, end]`` per attention item, the gather tile ends, the stage piece ends
+    ``[m_tiles * n]`` and the block start times ``[TRACE_MAX_BLOCKS]``; and the total length."""
     traits = make_traits(hq_r, hkv_r, head_dim)
     bm = traits.BLOCK_M
     hg = hq_r // traits.Q_HEADS_PER_WG
     attn_at = M // BM * num_ranks
     gather_at = attn_at + 3 * (M * num_ranks // bm) * hg
-    return attn_at, gather_at, gather_at + M // bm
+    stage_at = gather_at + M // bm
+    start_at = stage_at + M // BM * num_ranks
+    return attn_at, gather_at, stage_at, start_at, start_at + TRACE_MAX_BLOCKS
 
 
 @functools.lru_cache(maxsize=32)
@@ -450,7 +462,8 @@ def _make_kernel(
     )
     num_ascending = min(num_ascending, nqb)
     grid = max(num_blocks, num_pull)
-    trace_attn_at, trace_gather_at, _ = trace_layout(M, n, hq_r, hkv_r, d)
+    trace_attn_at, trace_gather_at, trace_stage_at, trace_start_at, _ = trace_layout(M, n, hq_r, hkv_r, d)
+    assert not trace or grid <= TRACE_MAX_BLOCKS
 
     elem = dtype_to_elem_type(traits.DTYPE_STR)
 
@@ -487,6 +500,7 @@ def _make_kernel(
         mode=mode,
         trace_attn_at=trace_attn_at,
         trace_gather_at=trace_gather_at,
+        trace_stage_at=trace_stage_at,
     )
 
     @flyc.kernel(name="ulysses_a2a_attn_fwd_kernel", known_block_size=[BLOCK_THREADS, 1, 1])
@@ -507,6 +521,9 @@ def _make_kernel(
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
         trace_base = i64_base(TRACE) if trace else None
+        if const_expr(trace):
+            if thread_index == fx.Int32(0):
+                st(trace_base, fx.Int32(trace_start_at) + block_index, read_clock())
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         claim_slot = fx.Int32(fx.ptrtoint(lds.claim.ptr))
         state_base = i64_base(STATE)
