@@ -86,7 +86,7 @@ def time_us(fn, warmup, iters, reps):
     return t.item()
 
 
-def bench(model, seq, chunks, num_pulls, warmup, iters, reps, trace_dir, modes=False):
+def bench(model, seq, chunks, num_pulls, warmup, iters, reps, trace_dir, modes=False, trace_mode="full"):
     group = dist.group.WORLD
     n, rank = group.size(), group.rank()
     cfg = MODELS[model]
@@ -181,12 +181,13 @@ def bench(model, seq, chunks, num_pulls, warmup, iters, reps, trace_dir, modes=F
                     seq_chunk=cs,
                     num_pull=num_pulls[-1],
                     trace=trace,
+                    mode=trace_mode,
                 )
             torch.cuda.synchronize()
             os.makedirs(trace_dir, exist_ok=True)
             torch.save(
                 dict(trace=trace.cpu(), layout=trace_layout(M, n, hq_r, hkv_r, d), M=M, n=n, cs=cs),
-                os.path.join(trace_dir, f"{model}_s{seq}_n{n}_cs{cs}_r{rank}.pt"),
+                os.path.join(trace_dir, f"{model}_s{seq}_n{n}_cs{cs}_p{num_pulls[-1]}_{trace_mode}_r{rank}.pt"),
             )
 
     if rank == 0:
@@ -315,6 +316,7 @@ def main():
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--reps", type=int, default=5)
     parser.add_argument("--trace-dir", type=str, default=None)
+    parser.add_argument("--trace-mode", type=str, default="full", choices=["full", "attn_only", "comm_only"])
     parser.add_argument("--bwd", action="store_true")
     parser.add_argument("--modes", action="store_true", help="also time attn_only / comm_only: overlap")
     args = parser.parse_args()
@@ -335,6 +337,7 @@ def main():
                     args.reps,
                     args.trace_dir,
                     args.modes,
+                    args.trace_mode,
                 )
     dist.destroy_process_group()
 
