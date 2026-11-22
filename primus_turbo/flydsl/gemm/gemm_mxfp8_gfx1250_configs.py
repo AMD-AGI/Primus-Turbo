@@ -106,5 +106,9 @@ def pick_grouped_config(mode: int, N: int, K: int, bf16_out: bool = True) -> MXG
         return C(256, 256, 4, 1, 2, 4) if K >= 2048 else C(256, 256, 2, 2, 1, 4, persist=True)
     if mode != VARIABLE_K:
         raise ValueError(f"pick_grouped_config: mode {mode} is not GROUPED_M or VARIABLE_K")
+    if N == 4096 and bf16_out:
+        # Muse Spark's expert wgrads ([G, 8192, 4096] and [G, 4096, 4096]): the non-persistent kpair-1
+        # pipeline in 2 x 4 clusters is 1-3 % faster than the persistent 2 x 2 under every routing measured.
+        return C(256, 256, 4, 1, 2, 4)
     c = 1 if N <= 2048 and bf16_out else 2
     return C(256, 256, 2, 2, c, c, persist=True)
