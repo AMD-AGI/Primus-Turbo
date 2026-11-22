@@ -13,6 +13,10 @@ kernel (``primus_turbo.flydsl.mega_attn.a2a_attn_kernel``).
 * ``attn``: the attention alone on this rank's heads over the full sequence, and ``a2a``: the two
   all-to-alls alone (q/k/v and O bytes), ranks aligned first -- the lower bound is max(attn, a2a).
 
+With ``--bwd``, forward + backward: the unfused path with autograd all-to-alls, the attention alone,
+``ulysses_mega_attn``, and the pieces of its backward (dO all-to-all, attention backward, dq / dk / dv
+all-to-all) timed alone.
+
     torchrun --nproc_per_node 4 benchmark/ops/training/bench_mega_attn_a2a.py --model qwen3-30b-a3b --seq 32768
 """
 
@@ -29,8 +33,20 @@ from primus_turbo.flydsl.mega_attn.a2a_attn_kernel import (
     trace_layout,
     ulysses_a2a_attn_fwd,
 )
+from primus_turbo.flydsl.mega_attn.a2a_kernel import (
+    ulysses_a2a_heads_to_seq,
+    ulysses_a2a_seq_to_heads,
+)
 from primus_turbo.flydsl.ulysses.workspace import get_ulysses_workspace
+from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
+    flash_attn_sbhd_flydsl_backward_impl,
+    flash_attn_sbhd_flydsl_forward_impl,
+)
 from primus_turbo.pytorch.ops import flash_attn_func
+from primus_turbo.pytorch.ops.attention.ulysses_mega_attn import (
+    _bank_bytes,
+    ulysses_mega_attn,
+)
 from primus_turbo.pytorch.ops.attention.usp.attention_a2a_helper import (
     get_attention_cp_a2a_helper,
 )
@@ -70,7 +86,7 @@ def time_us(fn, warmup, iters, reps):
     return t.item()
 
 
-def bench(model, seq, chunks, warmup, iters, reps, trace_dir):
+def bench(model, seq, chunks, num_pulls, warmup, iters, reps, trace_dir):
     group = dist.group.WORLD
     n, rank = group.size(), group.rank()
     cfg = MODELS[model]
@@ -128,17 +144,22 @@ def bench(model, seq, chunks, warmup, iters, reps, trace_dir):
     for cs in chunks:
         if cs and (M % cs or cs % 128):
             continue
-        results[f"fused cs={cs}"] = time_us(
-            lambda cs=cs: ulysses_a2a_attn_fwd(q_in, k_in, v_in, q, k, v, o, lse, out, ws, seq_chunk=cs),
-            warmup,
-            iters,
-            reps,
-        )
+        for npull in num_pulls:
+            results[f"fused cs={cs} p={npull}"] = time_us(
+                lambda cs=cs, npull=npull: ulysses_a2a_attn_fwd(
+                    q_in, k_in, v_in, q, k, v, o, lse, out, ws, seq_chunk=cs, num_pull=npull
+                ),
+                warmup,
+                iters,
+                reps,
+            )
         if trace_dir:
             total = trace_layout(M, n, hq_r, hkv_r, d)[2]
             trace = torch.zeros(total, device=dev, dtype=torch.int64)
-            _barrier()
-            ulysses_a2a_attn_fwd(q_in, k_in, v_in, q, k, v, o, lse, out, ws, seq_chunk=cs, trace=trace)
+            # the traced build compiles on its first call: time the second
+            for _ in range(2):
+                _barrier()
+                ulysses_a2a_attn_fwd(q_in, k_in, v_in, q, k, v, o, lse, out, ws, seq_chunk=cs, trace=trace)
             torch.cuda.synchronize()
             os.makedirs(trace_dir, exist_ok=True)
             torch.save(
@@ -157,10 +178,99 @@ def bench(model, seq, chunks, warmup, iters, reps, trace_dir):
             if name in ("attn", "a2a"):
                 continue
             print(
-                f"  {name:16s} {t:9.1f} us   vs unfused {results['unfused'] / t:5.3f}x   "
+                f"  {name:22s} {t:9.1f} us   vs unfused {results['unfused'] / t:5.3f}x   "
                 f"over attn {t - results['attn']:8.1f} us",
                 flush=True,
             )
+    return results
+
+
+def bench_bwd(model, seq, chunks, warmup, iters, reps):
+    from torch.distributed.nn.functional import all_to_all_single
+
+    group = dist.group.WORLD
+    n, rank = group.size(), group.rank()
+    cfg = MODELS[model]
+    hq, hkv, d = cfg["hq"], cfg["hkv"], cfg["d"]
+    M, hq_r, hkv_r = seq // n, hq // n, hkv // n
+    dev = torch.device("cuda")
+    gen = torch.Generator(device=dev).manual_seed(rank)
+
+    def leaf(*shape):
+        return torch.randn(*shape, device=dev, dtype=torch.bfloat16, generator=gen).requires_grad_()
+
+    q_in, k_in, v_in = leaf(M, hq, d), leaf(M, hkv, d), leaf(M, hkv, d)
+    dout = torch.randn(M, hq, d, device=dev, dtype=torch.bfloat16, generator=gen)
+    results = {}
+    helper = get_attention_cp_a2a_helper(1, seq, hq, hkv, d, d, 1, n)
+
+    def unfused():
+        qkv = helper.combine_qkv_before_a2a(q_in[None], k_in[None], v_in[None])
+        recv = all_to_all_single(torch.empty_like(qkv), qkv, group=group)
+        q, k, v = helper.splits_qkv_after_a2a(recv)
+        o = flash_attn_func(q, k, v, causal=True)
+        o = helper.reshape_o_before_a2a(o)
+        recv_o = all_to_all_single(torch.empty_like(o), o, group=group)
+        helper.reshape_o_after_a2a(recv_o).view(M, hq, d).backward(dout)
+
+    results["unfused fwd+bwd"] = time_us(unfused, warmup, iters, reps)
+
+    qg, kg, vg = leaf(1, seq, hq_r, d), leaf(1, seq, hkv_r, d), leaf(1, seq, hkv_r, d)
+    dog = torch.randn(1, seq, hq_r, d, device=dev, dtype=torch.bfloat16, generator=gen)
+    results["attn fwd+bwd"] = time_us(
+        lambda: flash_attn_func(qg, kg, vg, causal=True).backward(dog), warmup, iters, reps
+    )
+
+    for cs in chunks:
+        if cs and (M % cs or cs % 128):
+            continue
+        results[f"mega cs={cs} fwd+bwd"] = time_us(
+            lambda cs=cs: ulysses_mega_attn(q_in, k_in, v_in, group, seq_chunk=cs).backward(dout),
+            warmup,
+            iters,
+            reps,
+        )
+
+    # the fused op's backward pieces alone
+    ws = get_ulysses_workspace(group, _bank_bytes(M, n, hq_r, hkv_r, d), name="mega_attn")
+    q_h = torch.randn(seq, hq_r, d, device=dev, dtype=torch.bfloat16, generator=gen)
+    k_h = torch.randn(seq, hkv_r, d, device=dev, dtype=torch.bfloat16, generator=gen)
+    v_h = torch.randn(seq, hkv_r, d, device=dev, dtype=torch.bfloat16, generator=gen)
+    o_h, lse = flash_attn_sbhd_flydsl_forward_impl(
+        q_h[:, None], k_h[:, None], v_h[:, None], causal=True, return_lse=True
+    )
+    do_h = torch.empty_like(q_h)
+    d_in = dout.detach().contiguous()
+    cs = chunks[-1]
+    results["  bwd: dO a2a"] = time_us(
+        lambda: ulysses_a2a_seq_to_heads([d_in], [do_h], ws, seq_chunk=cs), warmup, iters, reps
+    )
+    results["  bwd: attn bwd"] = time_us(
+        lambda: flash_attn_sbhd_flydsl_backward_impl(
+            do_h[:, None],
+            q_h[:, None],
+            k_h[:, None],
+            v_h[:, None],
+            o_h,
+            lse.view(1, seq, hq_r).permute(0, 2, 1),
+            causal=True,
+        ),
+        warmup,
+        iters,
+        reps,
+    )
+    outs = [torch.empty(M, n * h, d, device=dev, dtype=torch.bfloat16) for h in (hq_r, hkv_r, hkv_r)]
+    results["  bwd: dqkv a2a"] = time_us(
+        lambda: ulysses_a2a_heads_to_seq([q_h, k_h, v_h], outs, ws, seq_chunk=cs), warmup, iters, reps
+    )
+
+    if rank == 0:
+        print(
+            f"\n== {model} seq={seq} n={n} (hq/n={hq_r}, hkv/n={hkv_r}, d={d}) forward + backward", flush=True
+        )
+        for name, t in results.items():
+            extra = f"   vs unfused {results['unfused fwd+bwd'] / t:5.3f}x" if "fwd+bwd" in name else ""
+            print(f"  {name:24s} {t:9.1f} us{extra}", flush=True)
     return results
 
 
@@ -169,16 +279,23 @@ def main():
     parser.add_argument("--model", nargs="+", default=["qwen3-30b-a3b"], choices=sorted(MODELS))
     parser.add_argument("--seq", nargs="+", type=int, default=[32768])
     parser.add_argument("--chunks", nargs="+", type=int, default=[0, 256, 512, 1024, 2048])
+    parser.add_argument("--num-pull", nargs="+", type=int, default=[32])
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--reps", type=int, default=5)
     parser.add_argument("--trace-dir", type=str, default=None)
+    parser.add_argument("--bwd", action="store_true")
     args = parser.parse_args()
     dist.init_process_group("nccl", timeout=timedelta(minutes=5))
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     for model in args.model:
         for seq in args.seq:
-            bench(model, seq, args.chunks, args.warmup, args.iters, args.reps, args.trace_dir)
+            if args.bwd:
+                bench_bwd(model, seq, args.chunks, args.warmup, args.iters, args.reps)
+            else:
+                bench(
+                    model, seq, args.chunks, args.num_pull, args.warmup, args.iters, args.reps, args.trace_dir
+                )
     dist.destroy_process_group()
 
 
