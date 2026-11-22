@@ -592,14 +592,28 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                 plan = (dsv4up_block.use(M_, N_, K_, "fwd"),
                         g90_block.dgrad_split_k(M_, K_, N_) == 1 and dsv4up_block.use(M_, K_, N_, "dgrad"),
                         dsv4up_block.use(N_, K_, M_, "wgrad"))
-            if fq is not None:
+            # membound PRIMUS_MB_PACKQ=1: with a ready weight cache, the weight-scale packing of the dsv4up passes
+            # runs inside the activation quant launch (same bytes, one launch less per Linear forward).
+            from primus_turbo.triton.quantization import quant_g90 as _qg
+
+            mbpk = None
+            if fq is not None and plan is not None and fq["tmode"] == 0 and _qg.mb_packq_enabled():
+                wc = fp8blk_weight_cache.lookup(b, b_dtype)
+                if wc is not None:
+                    (a_row, _, a_re, a_t, a_te), mbpk = _qg.quant_dual_pack(
+                        a, a_dtype, "packed" if plan[0] else "g90", "packed" if plan[2] else "g90",
+                        [(wc.e8m0, 128, N_, K_) if plan[0] else None,
+                         (wc.e8m0.t(), 128, K_, N_) if plan[1] else None], site="f", num_warps=fq["num_warps"])
+            if mbpk is not None:
+                pass
+            elif fq is not None:
                 # PRIMUS_TURBO_FUSEQ=1: the quant writes each activation scale in its consumer's layout (dsv4up
                 # packed for the dsv4up fwd / wgrad passes, g90 bytes otherwise): no activation pack_scales job.
                 from primus_turbo.triton.quantization.quant_g90 import quant_dual_t_e8m0_v2
 
                 a_row, _, a_re, a_t, a_te = quant_dual_t_e8m0_v2(
                     a, a_dtype, row_layout="packed" if plan and plan[0] else "g90",
-                    t_layout="packed" if plan and plan[2] else "g90", **fq)
+                    t_layout="packed" if plan and plan[2] else "g90", site="f", **fq)
             else:
                 a_row, _, a_re, a_t, a_te = quant_dual_t_e8m0(a, a_dtype)
             # PRIMUS_TURBO_FP8_WCACHE: W, W^T and E8M0 scales written by the optimizer step.
@@ -617,12 +631,15 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             # Scale packing for every dsv4up pass that only needs forward-time scales is one launch here.
             ctx.dsv = None
             if plan is not None:
-                pa, pb, pbt, pat = dsv4up_block.pack_scales([
-                    (a_re, 1, M_, K_) if plan[0] and fq is None else None,
-                    (b_e, 128, N_, K_) if plan[0] else None,
-                    (b_e.t(), 128, K_, N_) if plan[1] else None,  # transposed view, no copy
-                    (a_te, 1, K_, M_) if plan[2] and fq is None else None,
-                ])
+                if mbpk is not None:  # weight scales packed by the quant launch (membound PRIMUS_MB_PACKQ)
+                    pa, pb, pbt, pat = None, mbpk[0], mbpk[1], None
+                else:
+                    pa, pb, pbt, pat = dsv4up_block.pack_scales([
+                        (a_re, 1, M_, K_) if plan[0] and fq is None else None,
+                        (b_e, 128, N_, K_) if plan[0] else None,
+                        (b_e.t(), 128, K_, N_) if plan[1] else None,  # transposed view, no copy
+                        (a_te, 1, K_, M_) if plan[2] and fq is None else None,
+                    ])
                 if fq is not None:  # already packed by the quant
                     pa = a_re if plan[0] else None
                     pat = a_te if plan[2] else None
@@ -722,7 +739,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                 pd, pw = ctx.dsv[0][1:] if ctx.dsv is not None else (False, False)
                 g_row, _, g_re, g_t, g_te = quant_dual_t_e8m0_v2(
                     grad_out.contiguous(), g_dtype, row_layout="packed" if pd else "g90",
-                    t_layout="packed" if pw else "g90", **fq)
+                    t_layout="packed" if pw else "g90", site="b", **fq)
             else:
                 g_row, _, g_re, g_t, g_te = quant_dual_t_e8m0(grad_out.contiguous(), g_dtype)
             # PRIMUS_TURBO_FP8_BLOCK_KERNEL=dsv4up: per-pass plan made in forward; one packing launch for dY scales
