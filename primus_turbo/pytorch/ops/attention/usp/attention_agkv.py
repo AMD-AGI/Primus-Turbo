@@ -70,7 +70,14 @@ Modes:
     The non-causal calls use the flux FlyDSL attention (``FLUX_ATTN_FLYDSL=1``); the stock non-causal
     forward gives wrong outputs for these calls (SBHD, GQA, Sq != Skv).
 
-Both ``overlap`` and ``mega`` reuse double-buffered symmetric buffers call after call, which needs every
+``fused``
+    the forward as one kernel on the current stream (``agkv_fused_fwd``): a few blocks push the halves as
+    ``mega`` does and then copy the backward's [ remote | own ] K / V out of the bank, while the attention
+    blocks of q0 and q1 walk their own keys first and then the remote chunks, each once its flag is up, and
+    store the final output and lse. The backward is ``mega``'s. Shapes the kernel does not take (head dim
+    other than 128, odd GQA groups, chunks not a multiple of 128 tokens) run ``mega``'s forward.
+
+``overlap``, ``mega`` and ``fused`` reuse double-buffered symmetric buffers call after call, which needs every
 rank of the group to issue the same sequence of forward and backward calls (true of SPMD training), and
 count calls on the host, so they cannot be graph captured.
 
@@ -87,6 +94,7 @@ import torch.distributed as dist
 
 from primus_turbo.common.flux import enabled as flux_enabled
 from primus_turbo.flydsl.attention import agkv_comm_kernel as _comm
+from primus_turbo.flydsl.attention import agkv_fused_fwd as _fused
 from primus_turbo.flydsl.attention.flash_attn_bwd import flydsl_varlen_backward as _flydsl_bwd
 from primus_turbo.pytorch.core.pyhip_runtime_wrapper import (
     find_hip_runtime_library,
@@ -103,7 +111,7 @@ from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
 
 __all__ = ["AGKV_MODES", "attention_agkv"]
 
-AGKV_MODES = ("naive", "serial", "overlap", "mega")
+AGKV_MODES = ("naive", "serial", "overlap", "mega", "fused")
 
 # blocks of a mega push launch: (per peer link, at least, at most in all), always a multiple of the n - 1
 # links, which keeps every block on one link (units alternate between destinations) so no link has fewer
@@ -569,6 +577,75 @@ def _mega_forward(q, k, v, lay, group, softmax_scale, save):
     return out, lse0, lse1, saved
 
 
+@functools.lru_cache(maxsize=64)
+def _fused_save_plan(n, r, c, tok, device):
+    """Save units of the fused forward: [ remote | own first | own second ] of K and V out of the bank and
+    the local tensors, the own chunks first, then the remote chunks first halves before second halves (the
+    order they arrive in), each behind its flag."""
+    rem = (2 * n - 2 - r) * c
+    rows = []
+    for t in range(2):
+        rows += _segment(_fused.SAVE_SRC_K + t, 0, t, rem * tok, 2 * c * tok, 0, 0, -1)
+    chunks = sorted(range(rem // c), key=lambda k: (_fused.bank_chunk_flag(n, r, k) >= n, k))
+    for k in chunks:
+        flag = _fused.bank_chunk_flag(n, r, k)
+        for t in range(2):
+            rows += _segment(_fused.SAVE_SRC_BANK_K + t, k * c * tok, t, k * c * tok, c * tok, 0, 0, flag)
+    return _units_table(rows, device)
+
+
+def _fused_forward(q, k, v, lay, group, softmax_scale, save):
+    """``_mega_forward``'s results from one kernel (see ``agkv_fused_fwd``)."""
+    n, r, c = lay.n, lay.r, lay.c
+    tail_shape, dtype = k.shape[1:], k.dtype
+    B, Hq, D = q.shape[1:]
+    if not _fused.supported(Hq, k.shape[2], D, c) or (
+        softmax_scale is not None and abs(softmax_scale - 1.0 / math.sqrt(D)) > 1e-6
+    ):
+        return _mega_forward(q, k, v, lay, group, softmax_scale, save)
+    tok = k[0].numel() * k.element_size()
+    fwd_bytes, bwd_bytes = _exchange_sizes(lay, tok)
+    ex = _Exchange.get(group, 2 * (fwd_bytes + bwd_bytes))
+    epoch = ex.begin("fwd")
+    bank_off = (epoch & 1) * fwd_bytes
+    units, num_units, _, _ = _mega_fwd_plan(n, r, c, tok, fwd_bytes, k.device)
+    rem = (2 * n - 2 - r) * c
+    kr, vr = (ex.view(r, bank_off + i * fwd_bytes // 2, (rem,) + tail_shape, dtype) for i in range(2))
+    out = torch.empty_like(q)
+    lse = torch.empty((2, B * c, Hq), device=q.device, dtype=torch.float32)
+    if save:
+        saved = [torch.empty((rem + 2 * c,) + tail_shape, device=k.device, dtype=dtype) for _ in range(2)]
+        save_units, num_save = _fused_save_plan(n, r, c, tok, k.device)
+    else:
+        saved, save_units, num_save = None, units, 0
+    sk, sv = saved if save else (k, v)
+    _fused.forward(
+        q,
+        k,
+        v,
+        kr,
+        vr,
+        out,
+        lse,
+        sk,
+        sv,
+        ex.heaps,
+        ex.flag_ptrs,
+        units,
+        num_units,
+        ex.counters,
+        save_units,
+        num_save,
+        n,
+        r,
+        bank_off,
+        epoch,
+        _push_grid(n, _FWD_PUSH_BLOCKS),
+        torch.cuda.current_stream(),
+    )
+    return out, lse[0], lse[1], saved
+
+
 def _mega_backward(dout, q, kb, vb, out, lse0, lse1, lay, group, scale, det):
     n, r, c = lay.n, lay.r, lay.c
     tail_shape, dtype = kb.shape[1:], kb.dtype
@@ -751,10 +828,9 @@ class _AGKVAttention(torch.autograd.Function):
         keys0, keys1 = lay.keys0, lay.keys1
         ctx.group, ctx.mode, ctx.lay = group, mode, lay
         ctx.softmax_scale, ctx.deterministic = softmax_scale, deterministic
-        if mode == "mega":
-            out, lse0, lse1, saved = _mega_forward(
-                q, k, v, lay, group, softmax_scale, any(ctx.needs_input_grad[:3])
-            )
+        if mode in ("mega", "fused"):
+            forward = _mega_forward if mode == "mega" else _fused_forward
+            out, lse0, lse1, saved = forward(q, k, v, lay, group, softmax_scale, any(ctx.needs_input_grad[:3]))
             kb, vb = saved if saved is not None else (None, None)
             ctx.save_for_backward(q, kb, vb, out, lse0, lse1)
             return out
@@ -797,7 +873,7 @@ class _AGKVAttention(torch.autograd.Function):
         group, mode, lay = ctx.group, ctx.mode, ctx.lay
         scale, det = ctx.softmax_scale, ctx.deterministic
         dout = dout.contiguous()
-        if mode == "mega":
+        if mode in ("mega", "fused"):
             q, kb, vb, out, lse0, lse1 = ctx.saved_tensors
             dq, dk, dv = _mega_backward(dout, q, kb, vb, out, lse0, lse1, lay, group, scale, det)
             return dq, dk, dv, None, None, None, None
@@ -856,10 +932,10 @@ def attention_agkv(
     """
     assert mode in AGKV_MODES, f"mode must be one of {AGKV_MODES}, got {mode!r}"
     assert q.dim() == 4 and k.shape == v.shape and q.shape[:2] == k.shape[:2], "q / k / v must be sbhd"
-    if mode == "mega":
-        assert k.dtype == torch.bfloat16, "mode 'mega' reduces gradients in bf16 only"
+    if mode in ("mega", "fused"):
+        assert k.dtype == torch.bfloat16, f"mode {mode!r} reduces gradients in bf16 only"
         # only the flux build of the FlyDSL forward runs the non-causal (bidirectional) mask correctly
         assert flux_enabled("FLUX_ATTN_FLYDSL"), (
-            "mode 'mega' needs the flux FlyDSL attention (FLUX_ATTN_FLYDSL=1)"
+            f"mode {mode!r} needs the flux FlyDSL attention (FLUX_ATTN_FLYDSL=1)"
         )
     return _AGKVAttention.apply(q, k, v, group, mode, softmax_scale, deterministic)

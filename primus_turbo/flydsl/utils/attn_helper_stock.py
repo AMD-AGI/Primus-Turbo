@@ -665,7 +665,7 @@ class DualwaveKernelContext:
             self.q_block_idx = _nq - fx.Index(1) - fx.Index(gpu.block_idx.y)
         else:
             self.q_block_idx = fx.Index(gpu.block_idx.y)
-        self.batch_idx = fx.Index(gpu.block_idx.z)
+        self.batch_idx = self._grid_batch_index()
         self.tid = fx.Index(gpu.thread_idx.x)
 
         self.wave_id = self.tid // traits.WARP_SIZE
@@ -719,13 +719,7 @@ class DualwaveKernelContext:
             self.seqlen_kv_v = self.kv_tok_end - self.kv_tok_base
             self.seqlen_kv_i32 = fx.Int32(self.seqlen_kv_v)
         else:
-            self.q_tok_base = self.batch_idx * self.seq_len_v
-            self.kv_tok_base = self.batch_idx * self.seq_len_kv_v
-            self.q_tok_end = (self.batch_idx + fx.Index(1)) * self.seq_len_v
-            self.kv_tok_end = (self.batch_idx + fx.Index(1)) * self.seq_len_kv_v
-            self.seqlen_q_v = self.seq_len_v
-            self.seqlen_kv_v = self.seq_len_kv_v
-            self.seqlen_kv_i32 = self.seq_len_kv
+            self._dense_geometry()
 
         q_tensor = self.Q
         k_tensor = self.K
@@ -877,6 +871,19 @@ class DualwaveKernelContext:
         self.v_dma_m0 = self.dma_m0_table(
             lambda b, w, d: self._dma_base(b, w, d, _v_buf_base, traits.SMEM_V_LINE_STRIDE), self.NUM_DMA_V
         )
+
+    def _grid_batch_index(self):
+        return fx.Index(gpu.block_idx.z)
+
+    def _dense_geometry(self):
+        """Token bases and lengths of this work group's (q, kv) pair in a dense launch."""
+        self.q_tok_base = self.batch_idx * self.seq_len_v
+        self.kv_tok_base = self.batch_idx * self.seq_len_kv_v
+        self.q_tok_end = (self.batch_idx + fx.Index(1)) * self.seq_len_v
+        self.kv_tok_end = (self.batch_idx + fx.Index(1)) * self.seq_len_kv_v
+        self.seqlen_q_v = self.seq_len_v
+        self.seqlen_kv_v = self.seq_len_kv_v
+        self.seqlen_kv_i32 = self.seq_len_kv
 
     def _dma_base(self, buf_id, w_rep, d, buf_base_fn, line_stride):
         traits = self.traits
@@ -1385,8 +1392,7 @@ class DualwaveKernelContext:
             q_row_i32 = self.q_row_i32
         traits = self.traits
         s_lo, s_hi = v_s
-        kv_tile_start = tile_idx * traits.BLOCK_N
-        kv_start_i32 = fx.Int32(kv_tile_start)
+        kv_start_i32 = fx.Int32(self.tile_start(tile_idx))
         # lane>=32 has a larger n offset in the K-permuted P layout.
         lane_off_i32 = fx.Int32(self.lane_div_32) * fx.Int32(4)
         rel_lo_i32 = fx.Int32(q_row_i32 + self.delta_i32 - kv_start_i32 - lane_off_i32)

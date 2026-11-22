@@ -131,9 +131,10 @@ def _sum_rows(thread_index, nvec, a_res, b_res, dst_res):
             )
 
 
-def _copy_unit(thread_index, unit, srcs, heaps, units, bank_off, addends, add_delta):
+def _copy_unit(thread_index, unit, srcs, heaps, units, bank_off, addends, add_delta, block_threads=BLOCK_THREADS):
     """Issue the stores of ``unit`` (not waited). With ``addends``, store source + addend instead: the
-    addend of source ``i`` is ``addends[i]``, read ``add_delta`` bytes before the unit's source offset."""
+    addend of source ``i`` is ``addends[i]``, read ``add_delta`` bytes before the unit's source offset.
+    A block of ``block_threads`` < ``BLOCK_THREADS`` copies the unit as that many threads would."""
     sel = _unit_field(units, unit, U_SRC)
     src_base = srcs[0]
     for i in range(1, len(srcs)):
@@ -146,6 +147,7 @@ def _copy_unit(thread_index, unit, srcs, heaps, units, bank_off, addends, add_de
     dst_res = create_buffer_resource_from_addr(dst_addr, num_records_bytes=nbytes)
     nvec = nbytes // fx.Int32(16)
     if addends is not None:
+        assert block_threads == BLOCK_THREADS
         add_base = addends[0]
         for i in range(1, len(addends)):
             add_base = arith.select(sel == fx.Int32(i), addends[i], add_base)
@@ -157,7 +159,10 @@ def _copy_unit(thread_index, unit, srcs, heaps, units, bank_off, addends, add_de
         word = v * fx.Int32(VEC_I32)
         return word, word, v < nvec
 
-    copy_rows(thread_index, UNIT_BYTES // 16, coords, src_res, dst_res, 0, SYS_NT, PUSH_BATCH)
+    for k in range_constexpr(BLOCK_THREADS // block_threads):
+        copy_rows(
+            thread_index + fx.Int32(k * block_threads), UNIT_BYTES // 16, coords, src_res, dst_res, 0, SYS_NT, PUSH_BATCH
+        )
 
 
 @ASTRewriter.transform
@@ -175,10 +180,11 @@ def _push_loop(
     grid,
     addends,
     add_delta,
+    block_threads=BLOCK_THREADS,
 ):
     unit = block_index
     while unit < fx.Int32(num_units):
-        _copy_unit(thread_index, unit, srcs, heaps, units, bank_off, addends, add_delta)
+        _copy_unit(thread_index, unit, srcs, heaps, units, bank_off, addends, add_delta, block_threads)
         fx.rocdl.s_waitcnt(0)
         fx.gpu.barrier()
         if thread_index == fx.Int32(0):

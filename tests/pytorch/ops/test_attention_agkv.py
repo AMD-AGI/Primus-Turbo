@@ -13,7 +13,7 @@ the output and gradients with the matching rows of the reference.
     pytest tests/pytorch/ops/test_attention_agkv.py --dist-only             # quick, all world sizes
     torchrun --nproc_per_node 8 tests/pytorch/ops/test_attention_agkv.py    # full
 
-Mode mega needs the flux FlyDSL attention and is skipped unless FLUX_ATTN_FLYDSL=1.
+Modes mega and fused need the flux FlyDSL attention and are skipped unless FLUX_ATTN_FLYDSL=1.
 """
 
 import argparse
@@ -36,7 +36,9 @@ HEAD_CONFIGS = {
     "llama3_8b": (32, 8, 128),
     "d64": (16, 4, 64),
 }
-MODES = ("naive", "serial", "overlap", "mega")
+MODES = ("naive", "serial", "overlap", "mega", "fused")
+# modes that run on the flux FlyDSL attention only
+FLUX_MODES = ("mega", "fused")
 # relative L2 error against one FlyDSL call over the whole sequence; splitting the keys over two calls
 # changes the bf16 accumulation order, which at 32K puts dq of some ranks near 1e-2 in every mode
 TOL = {"out": 1e-2, "dq": 2e-2, "dk": 2e-2, "dv": 2e-2}
@@ -121,9 +123,11 @@ def main():
     parser.add_argument("--modes", nargs="+", default=list(MODES), choices=MODES)
     parser.add_argument("--seqs", nargs="+", type=int)
     args = parser.parse_args()
-    if "mega" in args.modes and not flux_enabled("FLUX_ATTN_FLYDSL"):
-        args.modes.remove("mega")
-        print("mode mega skipped: it needs FLUX_ATTN_FLYDSL=1", flush=True)
+    if not flux_enabled("FLUX_ATTN_FLYDSL"):
+        for mode in FLUX_MODES:
+            if mode in args.modes:
+                args.modes.remove(mode)
+                print(f"mode {mode} skipped: it needs FLUX_ATTN_FLYDSL=1", flush=True)
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
     dist.init_process_group("nccl", timeout=timedelta(minutes=5))
     ok = run_suite(args.quick, args.verbose, args.modes, args.seqs)
@@ -150,8 +154,9 @@ def test_attention_agkv(world_size):
         "--quick",
     ]
     env = {**os.environ, "PYTHONPATH": repo_root}
-    # mode mega runs on the flux FlyDSL attention, the other modes on the attention the environment selects
-    for modes, flux in ((MODES[:-1], env.get("FLUX_ATTN_FLYDSL", "0")), (("mega",), "1")):
+    # modes mega / fused run on the flux FlyDSL attention, the others on the attention the environment selects
+    plain = tuple(m for m in MODES if m not in FLUX_MODES)
+    for modes, flux in ((plain, env.get("FLUX_ATTN_FLYDSL", "0")), (FLUX_MODES, "1")):
         result = subprocess.run(
             cmd + ["--modes", *modes], cwd=repo_root, env={**env, "FLUX_ATTN_FLYDSL": flux}, timeout=1800
         )
