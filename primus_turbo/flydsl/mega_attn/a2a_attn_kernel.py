@@ -310,7 +310,9 @@ def _push_o(thread_index, qb, h, peers_base, recv_offset, o_res, epoch, **c):
     if thread_index == fx.Int32(0):
         flag_base = owner_heap + fx.Int64(REGION_FWD_O * FLAG_REGION_BYTES)
         slot = t0 // fx.Int32(bm) * fx.Int32(n * hg) + fx.Int32(rank * hg) + h
-        st(flag_base, slot, epoch, scope="sys", order="release")
+        # the O stores are system scope (SYS_NT) and retired above; a release here would write back the
+        # XCD's whole L2 for every item
+        st(flag_base, slot, epoch, scope="sys", order="relaxed")
 
 
 @ASTRewriter.transform
