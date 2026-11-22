@@ -24,6 +24,7 @@ from typing import Optional
 
 import torch
 
+from primus_turbo.pytorch.core import overlap as _overlap
 from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad, main_grad_first_write
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_mx_flydsl_gfx1250 import mxgg_fp8blk_nt, mxgk_fp8blk_nt, mxgp_fp8blk_nt
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_nt_flydsl_gfx1250 import flygg_fp8blk_nt
@@ -33,6 +34,7 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_vkp_flydsl_gfx1250 imp
     flyvkpblk_fp8,
     vkpblk_sumsq_numel,
 )
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_vkq_flydsl_gfx1250 import flyvkqblk_fp8
 from primus_turbo.triton.quantization.quant_blk_gfx1250 import (
     MX,
     build_routing_blk,
@@ -95,13 +97,19 @@ _VKP_SCHED2 = int(os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_VKP_SCHED2", "0"))
 _CACHES = weakref.WeakSet()
 # wgrad kernel: "vk" (one tile per workgroup) or "vkp" (persistent, experts longest-first, old-C prefetch for
 # beta = 1; needs the compact 1-byte-per-128-token col scales from the quant kernels). PRIMUS_TURBO_MOE_FP8BLK_WGRAD.
-_VKP_LDS_KWIN = 5120  # longest expert window the vkp LDS arena holds (scale planes grow with it)
+# wgrad line: "vkq" = vkp's contract, tiles, LPT order and sumsq layout (main_grad and the sumsq partials
+# bit-identical to vkp, beta 0 and 1) with the scale planes on VMEM instead of in the TDM queue (~-13% per call).
+# PRIMUS_TURBO_MOE_FP8BLK_VKQ_NB=4 (beta 0 only; experimental, not faster): 4-stage ring with next-step fragment
+# prefetch and C through a per-wave line scratch. Same window limit as vkp.
+_VKP_LDS_KWIN = 5120  # longest expert window the vkp / vkq LDS arenas hold (scale planes grow with it)
+_VKQ_NB = int(os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_VKQ_NB", "2"))
+assert _VKQ_NB in (2, 3, 4)
 
 
 def _wgrad_kernel(T: int) -> str:
     mode = os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_WGRAD", "vk").strip().lower()
-    assert mode in ("vk", "vkp"), f"PRIMUS_TURBO_MOE_FP8BLK_WGRAD={mode!r}"
-    if mode == "vkp" and _vkp_kwin(T) > _VKP_LDS_KWIN:
+    assert mode in ("vk", "vkp", "vkq"), f"PRIMUS_TURBO_MOE_FP8BLK_WGRAD={mode!r}"
+    if mode in ("vkp", "vkq") and _vkp_kwin(T) > _VKP_LDS_KWIN:
         return "vk"
     return mode
 
@@ -242,7 +250,7 @@ class _FP8BlockMoE(torch.autograd.Function):
             c1.refresh(); c2.refresh()
         rowmap, route_w, inv, poffs, preal = build_routing_blk(topk_idx, topk_w.float(), E, P, align=_ALIGN)
         wk = _wgrad_kernel(T)
-        ct = wk == "vkp"  # col (token-direction) scales compact for the persistent wgrad
+        ct = wk in ("vkp", "vkq")  # col (token-direction) scales compact for the persistent wgrads
         xq, xs, xT, xTs = quant_dual_blk(x, P, rowmap, preal=preal, compact_t=ct)
         l1 = _gg(xq, xs, c1, False, poffs)
         aq, as_, aT, aTs = swiglu_fwd_dual_blk(l1, route_w, activation, preal=preal, compact_t=ct)
@@ -261,25 +269,57 @@ class _FP8BlockMoE(torch.autograd.Function):
         xT, xTs, aT, aTs, l1, route_w, rowmap, inv, poffs, preal = ctx.saved_tensors
         T, H, K, E, I, P = ctx.dims
         c1, c2, w1, w2 = ctx.c1, ctx.c2, ctx.w1, ctx.w2
-        vkp = ctx.wk == "vkp"
+        vkp = ctx.wk in ("vkp", "vkq")  # vkq: the vkp family (compact col scales, LPT, sumsq fold)
         dq, ds, dT, dTs = quant_dual_blk(dy.contiguous().to(torch.bfloat16), P, rowmap, preal=preal, compact_t=vkp)
         dact = _gg(dq, ds, c2, True, poffs)
         gq, gs, gT, gTs, dwr = swiglu_bwd_dual_blk(dact, l1, route_w, ctx.activation, preal=preal, compact_t=vkp,
                                                    raw_dw=_FUSE_BWD)
         # experts longest-first (one tiny argsort shared by both wgrads); PRIMUS_TURBO_MOE_FP8BLK_WGRAD_LPT=0: index order
         lpt = os.environ.get("PRIMUS_TURBO_MOE_FP8BLK_WGRAD_LPT", "1") == "1"
-        perm = (expert_order_lpt_fused if _FUSE_BWD else expert_order_lpt)(poffs) if (vkp and lpt) else None
+        order_lpt = expert_order_lpt_fused if _FUSE_BWD else expert_order_lpt
+        jobs = ((w2, dT, dTs, aT, aTs, H, I), (w1, gT, gTs, xT, xTs, 2 * I, H))
+        mgs = [_setup_accum(w, ctx.accumulate) for w, *_ in jobs]
+        deferred = _overlap.enabled("MOE_WGRAD") and all(mg is not None for mg in mgs)
+        if deferred:
+            # PRIMUS_OVERLAP_MOE_WGRAD=1: the LPT order and both expert wgrads (they only feed the optimizer) run on
+            # the side stream next to the fc1 dgrad / combine / router backward; same kernels and inputs -> same bits
+            # (main_grad and the sumsq partials are per weight; nothing reads them before the join).
+            betas = [0.0 if main_grad_first_write(w) else 1.0 for w, *_ in jobs]
+            sqs = [_wgrad_sumsq_buf(w, mg) if vkp else None for (w, *_), mg in zip(jobs, mgs)]
+
+            def side_wgrads():
+                perm_s = order_lpt(poffs) if (vkp and lpt) else None
+                for (w, lhs, lhs_s, rhs, rhs_s, n, k), mg, beta, sq in zip(jobs, mgs, betas, sqs):
+                    if ctx.wk == "vkq":
+                        flyvkqblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, mg, beta=beta, perm=perm_s,
+                                      kwin_max=_vkp_kwin(T), sumsq_out=sq, nbuf=_VKQ_NB if _ALIGN % 256 == 0 else 2)
+                    elif vkp:
+                        flyvkpblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, mg, beta=beta, perm=perm_s,
+                                      kwin_max=_vkp_kwin(T), nbuf=_VKP_NB, sumsq_out=sq, sched2=_VKP_SCHED2)
+                    else:
+                        flyvkblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, mg, beta=beta, **_VK)
+                return perm_s
+
+            _overlap.defer(side_wgrads, dT, dTs, aT, aTs, gT, gTs, xT, xTs, poffs, *mgs, *sqs)
+            for (w, *_), sq in zip(jobs, sqs):
+                w._primus_main_grad_sumsq_fresh = sq is not None
+                w.grad_added_to_main_grad = True
+            jobs = ()  # nothing left for the serial loop below
+        perm = order_lpt(poffs) if (vkp and lpt and not deferred) else None
 
         def wgrad(lhs, rhs, lhs_s, rhs_s, n, k, out, beta, sq=None):
-            if vkp:
+            if ctx.wk == "vkq":
+                # nbuf 4 needs every expert window a multiple of 256 tokens: the pool alignment (_ALIGN)
+                flyvkqblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta=beta, perm=perm, kwin_max=_vkp_kwin(T),
+                              sumsq_out=sq, nbuf=_VKQ_NB if _ALIGN % 256 == 0 else 2)
+            elif vkp:
                 flyvkpblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta=beta, perm=perm, kwin_max=_vkp_kwin(T),
                               nbuf=_VKP_NB, sumsq_out=sq, sched2=_VKP_SCHED2)
             else:
                 flyvkblk_fp8(lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta=beta, **_VK)
 
         grads = []
-        for w, lhs, lhs_s, rhs, rhs_s, n, k in ((w2, dT, dTs, aT, aTs, H, I), (w1, gT, gTs, xT, xTs, 2 * I, H)):
-            mg = _setup_accum(w, ctx.accumulate)
+        for (w, lhs, lhs_s, rhs, rhs_s, n, k), mg in zip(jobs, mgs):
             if mg is not None:
                 # beta 0 on the step's first write into main_grad (framework skipped its clear), else accumulate
                 # every call writes all of main_grad, so with the fold the last call of the step leaves the sum of
@@ -293,7 +333,7 @@ class _FP8BlockMoE(torch.autograd.Function):
                 g = torch.empty((E, n, k), device=w.device, dtype=torch.bfloat16)
                 wgrad(lhs, rhs, lhs_s, rhs_s, n, k, g, 0.0)
                 grads.append(g.to(w.dtype))
-        dW2, dW1 = grads
+        dW2, dW1 = grads if not deferred else (_get_dummy_wgrad(w.shape, w.dtype) for w in (w2, w1))
         dxp = _gg(gq, gs, c1, True, poffs)
         dx = combine_rows(dxp, inv, T, K)
         if _FUSE_BWD:

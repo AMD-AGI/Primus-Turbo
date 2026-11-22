@@ -28,6 +28,7 @@ import triton
 import triton.language as tl
 
 from primus_turbo.pytorch.core import fp8blk_weight_cache
+from primus_turbo.pytorch.core import overlap as _overlap
 from primus_turbo.triton.quantization.quant_epi_gfx1250 import (
     SL_PACKED,
     fp8_max_exp,
@@ -60,7 +61,8 @@ def _dgrad(g_row, b_t, pg, pbt, out_dtype, slot):
         M, K = g_row.shape[0], b_t.shape[0]
         acc = slot.take(M, K, out_dtype)
         if (acc is not None and dsv4up_block.split_k_of(M, K, g_row.shape[1]) == 1
-                and not dsv4up_block.small_tile_of(M, K, g_row.shape[1], True)):
+                and not dsv4up_block.small_tile_of(M, K, g_row.shape[1], True)
+                and not dsv4up_block.small_tile_of(M, K, g_row.shape[1], False)):
             from primus_turbo.gluon.gemm.dsv4up_gemm import dsv4up_gemm
 
             dsv4up_gemm(g_row, b_t, pg, pbt, out=acc, accumulate=2)
@@ -242,8 +244,17 @@ class FP8GemmBlockConcatNFunction(torch.autograd.Function):
         M, K = x.shape
         N = sum(ctx.ns)
         fq = _fuseq_kw()
-        if fq is not None:
-            a_row, _, pa, a_t, pat = quant_dual_t_e8m0_v2(x, a_dtype, row_layout="packed", t_layout="packed", **fq)
+        from primus_turbo.triton.quantization import quant_g90 as _qg
+
+        if fq is not None and fq["tmode"] == 0 and _qg.mb_packq_enabled():
+            # membound PRIMUS_MB_PACKQ=1: weight-scale packing inside the activation quant launch (same bytes)
+            w_j, e_j, wts = _weights_fp8(weights, a_dtype)
+            (a_row, _, pa, a_t, pat), (pb, pbt) = _qg.quant_dual_pack(
+                x, a_dtype, "packed", "packed", [(e_j, 128, N, K), (e_j.t(), 128, K, N)], site="c",
+                num_warps=fq["num_warps"])
+        elif fq is not None:
+            a_row, _, pa, a_t, pat = quant_dual_t_e8m0_v2(x, a_dtype, row_layout="packed", t_layout="packed",
+                                                          site="c", **fq)
             w_j, e_j, wts = _weights_fp8(weights, a_dtype)
             pb, pbt = dsv4up_block.pack_scales([(e_j, 128, N, K), (e_j.t(), 128, K, N)])
         else:
@@ -312,12 +323,20 @@ class FP8GemmBlockConcatNFunction(torch.autograd.Function):
                 grad_x = torch.empty((M, ctx.K), dtype=ctx.out_dtype, device=g.device)
                 dsv4up_block.gemm_nt_dual((g_t, a_t, pgt, pat, jmg, not ows[0]), (g_row, b_t, pg, pbt, grad_x, False))
             elif jmg is not None:
-                grad_x = _dgrad(g_row, b_t, pg, pbt, ctx.out_dtype, ctx.dx_slot)
-                dsv4up_block.gemm_nt(g_t, a_t, pgt, pat, jmg.dtype, out=jmg, accumulate=not ows[0])
+                jw = lambda: dsv4up_block.gemm_nt(g_t, a_t, pgt, pat, jmg.dtype, out=jmg,  # noqa: E731
+                                                  accumulate=not ows[0])
+                if _overlap.enabled("WGRAD"):  # PRIMUS_OVERLAP_WGRAD=1: joint wgrad on the side stream (same bits)
+                    _overlap.defer(jw, g_t, a_t, pgt, pat, jmg)
+                    grad_x = _dgrad(g_row, b_t, pg, pbt, ctx.out_dtype, ctx.dx_slot)
+                else:
+                    grad_x = _dgrad(g_row, b_t, pg, pbt, ctx.out_dtype, ctx.dx_slot)
+                    jw()
             else:
                 # main_grads not adjacent (DSv4: wq_b's lies between wkv's and wq_a's): one wgrad per weight on its
                 # row slice of dY^T, the two in ONE dsv4up dual launch (same bits as separate launches)
-                grad_x = _dgrad(g_row, b_t, pg, pbt, ctx.out_dtype, ctx.dx_slot)
+                ovl = _overlap.enabled("WGRAD")
+                if not ovl:
+                    grad_x = _dgrad(g_row, b_t, pg, pbt, ctx.out_dtype, ctx.dx_slot)
                 off, jobs, posts = 0, [], []
                 for mg, n, ow in zip(mgs, ctx.ns, ows):
                     gt_i, pgt_i = g_t[off:off + n], pgt[off // 128:(off + n) // 128]
@@ -329,19 +348,28 @@ class FP8GemmBlockConcatNFunction(torch.autograd.Function):
                         posts.append((mg, tmp, ow))
                     off += n
                 tiles = [(n // 256) * (ctx.K // 256) for n in ctx.ns]
-                if (len(jobs) == 2 and not posts and dsv4up_block.split_epi_enabled() and jobs[0][5] == jobs[1][5]
-                        and jobs[0][4].dtype == jobs[1][4].dtype and ctx.ns[0] % 256 == 0 and N % 256 == 0):
-                    # PRIMUS_TURBO_CONCAT_SPLIT_EPI=1: ONE wgrad GEMM over the joint dY^T rows, each 256-row tile
-                    # stored into its weight's main_grad (split-output epilogue); bits = the per-weight GEMMs'.
-                    dsv4up_block.gemm_nt_split(g_t, a_t, pgt, pat, jobs[0][4], jobs[1][4], "m",
-                                               accumulate=jobs[0][5])
-                elif len(jobs) == 2 and M <= 8192 and (tiles[0] % 8 == 0 or tiles[1] % 8 == 0):
-                    dsv4up_block.gemm_nt_dual(*(jobs if tiles[0] % 8 == 0 else jobs[::-1]))
+
+                def wgrads():
+                    if (len(jobs) == 2 and not posts and dsv4up_block.split_epi_enabled() and jobs[0][5] == jobs[1][5]
+                            and jobs[0][4].dtype == jobs[1][4].dtype and ctx.ns[0] % 256 == 0 and N % 256 == 0):
+                        # PRIMUS_TURBO_CONCAT_SPLIT_EPI=1: ONE wgrad GEMM over the joint dY^T rows, each 256-row tile
+                        # stored into its weight's main_grad (split-output epilogue); bits = the per-weight GEMMs'.
+                        dsv4up_block.gemm_nt_split(g_t, a_t, pgt, pat, jobs[0][4], jobs[1][4], "m",
+                                                   accumulate=jobs[0][5])
+                    elif len(jobs) == 2 and M <= 8192 and (tiles[0] % 8 == 0 or tiles[1] % 8 == 0):
+                        dsv4up_block.gemm_nt_dual(*(jobs if tiles[0] % 8 == 0 else jobs[::-1]))
+                    else:
+                        for j in jobs:
+                            dsv4up_block.gemm_nt(j[0], j[1], j[2], j[3], j[4].dtype, out=j[4], accumulate=j[5])
+                    for mg, tmp, ow in posts:
+                        mg.copy_(tmp) if ow else mg.add_(tmp)
+
+                if ovl:
+                    # PRIMUS_OVERLAP_WGRAD=1: the wgrads (main_grad only) on the side stream, then the dgrad here
+                    _overlap.defer(wgrads, g_t, a_t, pgt, pat, *[t for j in jobs for t in j[:5]])
+                    grad_x = _dgrad(g_row, b_t, pg, pbt, ctx.out_dtype, ctx.dx_slot)
                 else:
-                    for j in jobs:
-                        dsv4up_block.gemm_nt(j[0], j[1], j[2], j[3], j[4].dtype, out=j[4], accumulate=j[5])
-                for mg, tmp, ow in posts:
-                    mg.copy_(tmp) if ow else mg.add_(tmp)
+                    wgrads()
             for i, mg in enumerate(mgs):
                 grads[i] = _get_dummy_wgrad(list(mg.shape), ctx.out_dtype)
         else:
