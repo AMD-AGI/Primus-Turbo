@@ -64,6 +64,18 @@ _TABLE: dict = {
     (7168, 2048, 2048): C(256, 256, 2, 2, 4, 1),  # fc2 wgrad
 }
 
+# Muse Spark linears (N_out, K_in) at T = 4096 / 8192 tokens (micro-batch 1 / 2 at seq 4096): QKV (18432, 8192),
+# attention output (8192, 8192), fc1 / fc2 latent projections (4096, 8192) / (8192, 4096). Their fwd, dgrad and
+# wgrad all run fastest with the kpair-1 pipeline in 4 x 4 multicast clusters (the grid-fill rule's 2 x 2 is
+# 3-10 % slower), except QKV's dgrad and wgrad at 8192 tokens, where 2 x 4 clusters are 2-5 % faster still.
+_C44, _C24 = C(256, 256, 4, 1, 4, 4), C(256, 256, 4, 1, 2, 4)
+for _t in (4096, 8192):
+    for _n, _k in ((18432, 8192), (8192, 8192), (4096, 8192), (8192, 4096)):
+        for _mnk in ((_t, _n, _k), (_t, _k, _n), (_n, _k, _t)):
+            _TABLE.setdefault(_mnk, _C44)
+_TABLE[(8192, 8192, 18432)] = _C24  # QKV dgrad, 8192 tokens
+_TABLE[(18432, 8192, 8192)] = _C24  # QKV wgrad, 8192 tokens
+
 # beta = 1 into a bf16 out (a wgrad into main_grad), where the measured best is not ``pick_config``'s rule
 _TABLE_ACC: dict = {
     (24576, 1536, 8192): C(256, 256, 2, 2, 1, 4, persist=True),  # q_up wgrad
