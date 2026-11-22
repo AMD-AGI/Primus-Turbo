@@ -598,7 +598,9 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             from primus_turbo.triton.quantization import quant_g90 as _qg
 
             mbpk = None
-            if fq is not None and plan is not None and fq["tmode"] == 0 and _qg.mb_packq_enabled():
+            if (fq is not None and plan is not None and fq["tmode"] == 0 and _qg.mb_packq_enabled()
+                    and f"f{K_}" not in os.environ.get("PRIMUS_MB_PACKQ_SKIP", "").split(",")):
+                # PRIMUS_MB_PACKQ_SKIP: comma list of f<K> sites that keep the separate pack launch
                 wc = fp8blk_weight_cache.lookup(b, b_dtype)
                 if wc is not None:
                     (a_row, _, a_re, a_t, a_te), mbpk = _qg.quant_dual_pack(
