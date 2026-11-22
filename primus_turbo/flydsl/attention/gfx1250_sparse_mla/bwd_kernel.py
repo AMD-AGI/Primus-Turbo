@@ -1869,6 +1869,8 @@ def sparse_mla_bwd_gfx1250(
         elif pool_p > 0:
             kvt = torch.zeros(DV, npp, dtype=kv.dtype, device=q.device)
             kvt[:, :pool_p] = kv2[T_:, :DV].t()
+        if pool_p > 0:
+            # Pool partials are needed on both kvt paths (with KVT=1 a missing ppart made run_ alias it to `part`).
             ppart = torch.empty(n_part, npp, DV, dtype=torch.float32, device=q.device)
         build_sparse_mla_bwd_gfx1250_swa(
             H, float(scale), block_t=_SWA_BT, pool_p=max(pool_p, 0), pool_cr=T_ // pool_p if pool_p > 0 else 0
