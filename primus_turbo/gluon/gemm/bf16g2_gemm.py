@@ -354,7 +354,7 @@ def supported(a, b, out, tile="256x256"):
     try:
         if a.dim() != b.dim() or a.dim() not in (2, 3) or out.dim() != a.dim():
             return False
-        if not (a.dtype == b.dtype == out.dtype == torch.bfloat16):
+        if not (a.dtype == b.dtype == torch.bfloat16 and out.dtype in (torch.bfloat16, torch.float32)):
             return False
         K = a.shape[-1]
         _, _, ns = TILES[tile]
@@ -368,13 +368,14 @@ def bf16g2_mm(a, b, out, tile="256x256", group_m=4, persistent=False, nprog=None
               tpad=8):
     """out[g] = a[g] @ b[g] (torch.bmm / torch.mm semantics, 2-D or 3-D, bf16, fp32 accumulate, beta 0).
     a: [G,M,K] with K or M contiguous; b: [G,K,N] with K or N contiguous; out: [G,M,N] with N contiguous;
-    batch strides arbitrary. Returns out."""
+    batch strides arbitrary. out may be fp32 (bf16tune split-K partials: the fp32 accumulator stored unrounded).
+    Returns out."""
     if a.dim() == 2:
         a, b, out = a.unsqueeze(0), b.unsqueeze(0), out.unsqueeze(0)
     G, M, K = a.shape
     N = b.shape[2]
     assert b.shape == (G, K, N) and out.shape == (G, M, N), (a.shape, b.shape, out.shape)
-    assert a.dtype == b.dtype == out.dtype == torch.bfloat16
+    assert a.dtype == b.dtype == torch.bfloat16 and out.dtype in (torch.bfloat16, torch.float32)  # fp32 out: split-K
     if a.stride(2) == 1:
         at, sam = False, a.stride(1)
     else:
