@@ -563,6 +563,7 @@ PERSISTENT_BLOCKS = int(os.environ.get("AGKV_FUSED_BLOCKS", "0"))
 PERSISTENT_PUSHERS = int(os.environ.get("AGKV_FUSED_PUSHERS", "0"))
 _STATES = {}
 _SAVE_ROWS = {}
+_SCHEDS = {}
 
 
 def _hwreg(reg):
@@ -909,17 +910,31 @@ def _opaque_tid(thread_index):
     )
 
 
-# persistent launch state (int64, zero between launches): schedule claims, blocks out
-ST_CLAIM, ST_EXIT = 0, 1
-STATE_LEN = 2
+# persistent launch state (int64, zero between launches): blocks out, then the claims of each XCD's queue
+ST_EXIT, ST_CLAIM = 0, 1
+NUM_XCDS = 8
+STATE_LEN = ST_CLAIM + NUM_XCDS
+# the schedule opens with (offset, length) of each XCD's queue
+SCHED_HEAD = 2 * NUM_XCDS
 
 
 @ASTRewriter.transform
-def _claim(thread_index, state, slot):
-    """The block's next schedule position."""
+def _claim(thread_index, state, slot, sched, num_sched):
+    """The block's next schedule position: from its own XCD's queue, else the next XCD's with work left.
+
+    Entry ``e`` sits in the queue of XCD ``e % NUM_XCDS``, the XCD the grid launch dispatches it to, so
+    the q blocks of a head group share that XCD's L2 for their K/V as they do there."""
     if thread_index == fx.Int32(0):
-        claimed = atomic_add(state, fx.Int32(ST_CLAIM), fx.Int64(1), scope="agent")
-        st_lds(slot, 0, cast(claimed, fx.T.i32))
+        xcc = fx.Int32(_hwreg(20) & fx.Int32(0xF))
+        k = fx.Int32(0)
+        pos = fx.Int32(num_sched)
+        while k < fx.Int32(NUM_XCDS):
+            q = (xcc + k) % fx.Int32(NUM_XCDS)
+            claimed = cast(atomic_add(state, fx.Int32(ST_CLAIM) + q, fx.Int64(1), scope="agent"), fx.T.i32)
+            hit = claimed < cast(ld(sched, fx.Int32(2) * q + fx.Int32(1), dtype=fx.T.i64), fx.T.i32)
+            pos = hit.select(cast(ld(sched, fx.Int32(2) * q, dtype=fx.T.i64), fx.T.i32) + claimed, pos)
+            k = hit.select(fx.Int32(NUM_XCDS), k + fx.Int32(1))
+        st_lds(slot, 0, pos)
     # s_barrier does not wait for LDS traffic: drain the store, then the reads
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
@@ -936,8 +951,8 @@ def _exit(thread_index, state, grid):
     if thread_index == fx.Int32(0):
         arrived = atomic_add(state, fx.Int32(ST_EXIT), fx.Int64(1), scope="agent")
         if arrived == fx.Int64(grid - 1):
-            st(state, fx.Int32(ST_EXIT), fx.Int64(0))
-            st(state, fx.Int32(ST_CLAIM), fx.Int64(0))
+            for i in range_constexpr(STATE_LEN):
+                st(state, fx.Int32(i), fx.Int64(0))
 
 
 @ASTRewriter.transform
@@ -979,16 +994,16 @@ def _save_one(thread_index, unit, srcs, dsts, units, flag_base, epoch, xcds, blo
 def _work_loop(thread_index, state, slot, sched, num_sched, attend, save):
     """Claim schedule entries until none are left: ``e >= 0`` attention work item ``e``, else save unit
     ``-1 - e``."""
-    unit = _claim(thread_index, state, slot)
+    unit = _claim(thread_index, state, slot, sched, num_sched)
     while unit < fx.Int32(num_sched):
-        entry = _readfirstlane_i32(cast(ld(sched, unit, dtype=fx.T.i64), fx.T.i32))
+        entry = _readfirstlane_i32(cast(ld(sched, unit + fx.Int32(SCHED_HEAD), dtype=fx.T.i64), fx.T.i32))
         if entry >= fx.Int32(0):
             attend(entry)
         else:
             save(fx.Int32(-1) - entry)
         # the next item's LDS writes wait for this one's last reads
         fx.gpu.barrier()
-        unit = _claim(thread_index, state, slot)
+        unit = _claim(thread_index, state, slot, sched, num_sched)
 
 
 @functools.lru_cache(maxsize=32)
@@ -1260,8 +1275,8 @@ def _resident_blocks(traits, device):
 def _schedule(plan, batch, grid_x, grid_y, c, tok, save_rows, device):
     """Claim order of the persistent launch: the work items in ``plan`` order (each over batch, q block,
     head group), the own-chunk save units after the own parts and each remote chunk's save units after
-    the first q1 group holding it (its flag is up by then). Attention entries are ``>= 0``, save unit
-    ``u`` is ``-1 - u``."""
+    the first q1 group holding it (its flag is up by then), split into the XCD queues of ``_claim``.
+    Attention entries are ``>= 0``, save unit ``u`` is ``-1 - u``."""
     per_item = batch * grid_y * grid_x
     own = [u for u, row in enumerate(save_rows) if row[S_FLAG] < 0]
     by_chunk = {}
@@ -1278,7 +1293,14 @@ def _schedule(plan, batch, grid_x, grid_y, c, tok, save_rows, device):
                 sched += [-1 - u for u in by_chunk.pop(k, [])]
     for units in by_chunk.values():
         sched += [-1 - u for u in units]
-    return torch.tensor(sched, dtype=torch.int64, device=device), len(sched)
+    queues = [[] for _ in range(NUM_XCDS)]
+    for e in sched:
+        queues[(e if e >= 0 else -1 - e) % NUM_XCDS].append(e)
+    head, flat = [], []
+    for queue in queues:
+        head += [len(flat), len(queue)]
+        flat += queue
+    return torch.tensor(head + flat, dtype=torch.int64, device=device), len(flat)
 
 
 @functools.lru_cache(maxsize=64)
@@ -1347,8 +1369,11 @@ def forward(
             # the save tables are cached by the caller: read each back once
             rows = save_units[:num_save_units].tolist() if num_save_units else []
             save_rows = _SAVE_ROWS[key] = tuple(map(tuple, rows))
-        sched, num_sched = _schedule(plan, B, grid_x, grid_y, c, tok, save_rows, q.device)
         grid = PERSISTENT_BLOCKS or _resident_blocks(traits, q.device)
+        sched_key = (key, id(plan), B, grid_x, grid_y, c, tok, q.device)
+        if sched_key not in _SCHEDS:
+            _SCHEDS[sched_key] = _schedule(plan, B, grid_x, grid_y, c, tok, save_rows, q.device)
+        sched, num_sched = _SCHEDS[sched_key]
         push_blocks = PERSISTENT_PUSHERS or push_blocks
         if os.environ.get("AGKV_FUSED_SHOW") == "1" and r == 0:
             print(
