@@ -8,9 +8,10 @@
 
 Every rank holds its ``M`` tokens with all heads (q / k / v ``[M, n * h_r, d]``, batch 1). One launch:
 
-* pull blocks (the first ``num_pull`` of one block per CU) first stage this rank's q / k / v rows into its symmetric bank as
-  one column block per destination rank (``[q heads | k heads | v heads]`` of that rank), raising one
-  flag per m-tile; then they claim pull units ``(m_tile, src)`` m-major, copy ``src``'s rows of this
+* every block (one per CU) first stages this rank's q / k / v rows into its symmetric bank as one
+  column block per destination rank (``[q heads | k heads | v heads]`` of that rank), raising one
+  flag per (m-tile, destination);
+* pull blocks (the first ``num_pull``) then claim pull units ``(m_tile, src)`` m-major, copy ``src``'s rows of this
   rank's column block into q / k / v over the full sequence (``[S, h_r, d]``, sequence order) and raise
   a local ready flag per unit, and then join the workers;
 * every block runs as a persistent attention worker that claims ``(head group, q block)`` items, waits for the ready
@@ -188,25 +189,11 @@ def _pull_unit(thread_index, src, m_tile, src_heap, bank_offset, out_res, epoch,
 
 
 @ASTRewriter.transform
-def _pull_role(
-    thread_index,
-    state_base,
-    claim_slot,
-    peers_base,
-    my_base,
-    bank_offset,
-    in_res,
-    out_res,
-    epoch,
-    trace_base,
-    **c,
-):
-    """Stage pieces ``(m_tile, dst)`` until none are left, then pull units ``(m_tile, src = rank + i)``
-    m-major."""
+def _stage_role(thread_index, state_base, claim_slot, my_base, bank_offset, in_res, epoch, trace_base, **c):
+    """Stage pieces ``(m_tile, dst)`` m-major until none are left."""
     n, rank, m_tiles = c["num_ranks"], c["rank"], c["m_tiles"]
     stage_res = create_buffer_resource_from_addr(my_base + bank_offset, num_records_bytes=c["stage_bytes"])
     stage_flags = my_base + fx.Int64(c["stage_region"] * FLAG_REGION_BYTES)
-    ready_base = my_base + fx.Int64(c["ready_region"] * FLAG_REGION_BYTES)
     more_stage = fx.Int32(1)
     num_pieces = m_tiles * n
     while more_stage == fx.Int32(1):
@@ -226,6 +213,24 @@ def _pull_role(
                         read_clock(),
                     )
         more_stage = arith.select(piece < fx.Int32(num_pieces), fx.Int32(1), fx.Int32(0))
+
+
+@ASTRewriter.transform
+def _pull_role(
+    thread_index,
+    state_base,
+    claim_slot,
+    peers_base,
+    my_base,
+    bank_offset,
+    out_res,
+    epoch,
+    trace_base,
+    **c,
+):
+    """Pull units ``(m_tile, src = rank + i)`` m-major until none are left."""
+    n, rank, m_tiles = c["num_ranks"], c["rank"], c["m_tiles"]
+    ready_base = my_base + fx.Int64(c["ready_region"] * FLAG_REGION_BYTES)
     num_units = m_tiles * n
     more_pull = fx.Int32(1)
     while more_pull == fx.Int32(1):
@@ -532,28 +537,32 @@ def _make_kernel(
         bank_offset = fx.Int64(FLAG_BYTES) + (epoch & fx.Int64(1)) * fx.Int64(bank_bytes)
         my_base = ld(peers_base, fx.Int32(rank), dtype=fx.T.i64)
 
-        if const_expr(mode != "attn_only") and block_index < fx.Int32(num_pull):
+        if const_expr(mode != "attn_only"):
             in_res = [
                 create_buffer_resource(t, num_records_bytes=M * n * h * d * 2)
                 for t, h in ((Q_IN, hq_r), (K_IN, hkv_r), (V_IN, hkv_r))
             ]
-            out_res = [
-                create_buffer_resource(t, num_records_bytes=S * h * d * 2)
-                for t, h in ((Q, hq_r), (K, hkv_r), (V, hkv_r))
-            ]
-            _pull_role(
-                thread_index,
-                state_base,
-                claim_slot,
-                peers_base,
-                my_base,
-                bank_offset,
-                in_res,
-                out_res,
-                epoch,
-                trace_base,
-                **c,
+            # staging never waits, so every block can take part before its role
+            _stage_role(
+                thread_index, state_base, claim_slot, my_base, bank_offset, in_res, epoch, trace_base, **c
             )
+            if block_index < fx.Int32(num_pull):
+                out_res = [
+                    create_buffer_resource(t, num_records_bytes=S * h * d * 2)
+                    for t, h in ((Q, hq_r), (K, hkv_r), (V, hkv_r))
+                ]
+                _pull_role(
+                    thread_index,
+                    state_base,
+                    claim_slot,
+                    peers_base,
+                    my_base,
+                    bank_offset,
+                    out_res,
+                    epoch,
+                    trace_base,
+                    **c,
+                )
 
         def run_tile(block_ids):
             ctx = DualwaveKernelContext(

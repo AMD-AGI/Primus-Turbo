@@ -27,7 +27,7 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr
 
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
-from primus_turbo.flydsl.mega_attn.a2a_attn_kernel import BM, _pull_role
+from primus_turbo.flydsl.mega_attn.a2a_attn_kernel import BM, _pull_role, _stage_role
 from primus_turbo.flydsl.ulysses.a2a_gemm_kernel import _copy_rows
 from primus_turbo.flydsl.ulysses.common import (
     BLOCK_THREADS,
@@ -215,6 +215,7 @@ def _make_kernel(direction, M, rank, num_ranks, h0, h1, h2, head_dim, seq_chunk,
         in_res = [create_buffer_resource(t, num_records_bytes=S * h * d * 2) for t, h in zip(xs, heads)]
         out_res = [create_buffer_resource(t, num_records_bytes=S * h * d * 2) for t, h in zip(ys, heads)]
         if const_expr(direction == "seq_to_heads"):
+            _stage_role(thread_index, state_base, claim_slot, my_base, bank_offset, in_res, epoch, None, **c)
             _pull_role(
                 thread_index,
                 state_base,
@@ -222,7 +223,6 @@ def _make_kernel(direction, M, rank, num_ranks, h0, h1, h2, head_dim, seq_chunk,
                 peers_base,
                 my_base,
                 bank_offset,
-                in_res,
                 out_res,
                 epoch,
                 None,
