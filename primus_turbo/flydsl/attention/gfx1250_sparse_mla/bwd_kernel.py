@@ -1797,8 +1797,17 @@ def sparse_mla_bwd_gfx1250(
     use_w1=True,
     use_swa=True,
     band_pool=None,
+    dkv_stream=None,
+    dkv_keep=None,
 ):
     """``(dq, dkv, dsink)``; dkv is shaped like ``kv`` and dsink is ``None`` without a sink.
+
+    ``dkv_stream`` / ``dkv_keep`` (a stream and a list; PRIMUS_OVERLAP_CSA_BWD, default None = unchanged): on the
+    index-driven w1 path the dKV gathers and the final fp32 -> bf16 cast are issued on ``dkv_stream`` (instead of the
+    private side stream) and the current stream does NOT wait for them; ``dkv`` is then produced on ``dkv_stream``
+    and every tensor that stream still reads or writes is appended to ``dkv_keep``. The caller must make each dkv
+    consumer wait for ``dkv_stream`` and keep ``dkv_keep`` alive until the current stream has waited. Same kernels,
+    same inputs, same bits. ``dkv_keep`` stays empty when the call took another path (joined as before).
 
     Tokens are processed in chunks whose bf16 ``[tokens, topk, 512]`` intermediate fits in
     ``interm_bytes`` (no chunking when ``None``).
@@ -1924,6 +1933,9 @@ def sparse_mla_bwd_gfx1250(
             run = build_sparse_mla_bwd_gfx1250(H, topk, float(scale))
         main = torch.cuda.current_stream(q.device) if stream is None else stream
         side = _side_stream(q.device)
+        defer_dkv = dkv_stream is not None and dkv_keep is not None and band
+        if defer_dkv:
+            side = dkv_stream
         if band:
             from primus_turbo.triton.attention.sparse_mla_dkv_band_gather import (
                 band_pool_positions,
@@ -1991,6 +2003,14 @@ def sparse_mla_bwd_gfx1250(
                     dkv_gather_acc(im, keys, inv_ptr, inv_data, dkv_acc, d=DV, seg=_GATHER_SEG)
                 freed[b] = torch.cuda.Event()
                 freed[b].record(side)
+        if defer_dkv:
+            # PRIMUS_OVERLAP_CSA_BWD: no join here; the bf16 dKV is finished on the dKV stream too.
+            if attn_sink is not None:
+                dsink = _dsink(attn_sink, lse, delta)
+            with torch.cuda.stream(side):
+                dkv = dkv_out if lg else dkv_acc.to(kv.dtype)
+            dkv_keep.extend(t for t in (topk_indices, dkv_acc, dkv_out, pos, lg_pos, *interms) if t is not None)
+            return dq, dkv.view(kv_shape), dsink
         main.wait_stream(side)
     if attn_sink is not None:
         dsink = _dsink(attn_sink, lse, delta)
