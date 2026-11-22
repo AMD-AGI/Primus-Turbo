@@ -76,9 +76,10 @@ Modes:
     blocks of q0 and q1 walk their own keys first and then the remote chunks, each once its flag is up, and
     store the final output and lse. Shapes the kernel does not take (head dim other than 128, odd GQA
     groups, chunks not a multiple of 128 tokens) run ``mega``'s forward. The backward is ``mega``'s; with
-    ``AGKV_FUSED_BWD=1`` it runs q0, then q1 as one causal call against all its keys whose dK / dV kernel
-    stores the remote-key gradients (its q splits and q0's part summed) straight into the owners' slots
-    (``agkv_fused_bwd``), no push kernel; the owner's reduce is ``mega``'s.
+    ``AGKV_FUSED_BWD=1`` it is one persistent kernel too (``agkv_fused_bwd``): the dK / dV work-groups of
+    q0 and q1 store the remote-key gradients (q splits and q0's part summed) straight into the owners'
+    slots and raise their flags, then the same kernel sums what this rank received; dQ is reduced after
+    it.
 
 ``overlap``, ``mega`` and ``fused`` reuse double-buffered symmetric buffers call after call, which needs every
 rank of the group to issue the same sequence of forward and backward calls (true of SPMD training), and
@@ -192,14 +193,9 @@ class _Layout:
 # symmetric exchange buffers; SDMA copies (overlap)
 # --------------------------------------------------------------------------------------------------------
 
-# fused mode's backward: q1's dK / dV kernel stores the remote-key gradients itself (``_fused_backward``).
-# Off: its scattered remote stores stall the attention's own memory pipeline and cost more than mega's
-# push kernel, which runs beside the attention on other CUs.
+# fused mode's backward as one persistent kernel (``_fused_backward``). Off: at l8 cp8 64K it is still ~4%
+# slower than mega's.
 _FUSED_BWD = os.environ.get("AGKV_FUSED_BWD") == "1"
-# push blocks of q1's last dK / dV launch that send the staged remote-key gradients (a multiple of the
-# XCD count); 0: the attention work-groups store them to the owners themselves. Off: at l8 cp8 16 push
-# blocks lose 50-120 us to the direct stores (they hold whole CUs and still push too slowly).
-_FUSED_BWD_PUSH_BLOCKS = int(os.environ.get("AGKV_FUSED_BWD_PUSH", "0"))
 
 # flag arrays in the signal pad, n int64 each, indexed by sender
 _FWD_FIRST, _FWD_SECOND, _BWD_FIRST, _BWD_SECOND = range(4)
@@ -731,87 +727,58 @@ def _mega_backward(dout, q, kb, vb, out, lse0, lse1, lay, group, scale, det):
 
 
 def _fused_backward(dout, q, kb, vb, out, lse0, lse1, lay, group, scale, det):
-    """q0's backward, then q1's against all its keys, whose dK / dV kernel stores the remote-key gradients
-    (q-split sum and q0's rows added) into the owners' backward banks and raises their flags itself
-    (see ``agkv_fused_bwd``); the owner's reduce is ``mega``'s."""
+    """Both chunks' backward in one persistent kernel that stores the remote-key gradients (q-split sum
+    and q0's rows added) into the owners' backward banks, raises their flags itself and then sums the
+    gradients this rank received (see ``agkv_fused_bwd``)."""
     n, r, c = lay.n, lay.r, lay.c
     tail_shape, dtype = kb.shape[1:], kb.dtype
     B, Hkv, D = tail_shape
     scale = D**-0.5 if scale is None else scale
     tok = kb[0].numel() * kb.element_size()
-    rem, low = (2 * n - 2 - r) * c, r * c
-    skv = rem + 2 * c
-    if not _fused_bwd.supported(B, c, skv, q.shape[2], Hkv, D, scale, det, c, tok):
+    if not _fused_bwd.supported(B, c, n, r, q.shape[2], Hkv, D, scale, det):
         return _mega_backward(dout, q, kb, vb, out, lse0, lse1, lay, group, scale, det)
     fwd_bytes, bwd_bytes = _exchange_sizes(lay, tok)
     ex = _Exchange.get(group, 2 * (fwd_bytes + bwd_bytes))
     epoch = ex.begin("bwd")
     bank_off = 2 * fwd_bytes + (epoch & 1) * bwd_bytes
-    first_flags, second_flags = _mega_bwd_plan(n, r, c, tok, bwd_bytes, kb.device)[4:]
-    keys0 = slice(rem - low, rem + c)
-    seg = c * tok // kb.element_size()
-
-    dq = torch.empty_like(q)
-    dq0, dk0, dv0 = _bwd(dout[:c], q[:c], kb[keys0], vb[keys0], out[:c], lse0, scale, det)
-    dk0, dv0 = dk0.contiguous(), dv0.contiguous()
-    _side_copy(ex, dq[:c], dq0)
 
     own = torch.empty((2, 2 * c) + tail_shape, device=kb.device, dtype=dtype)
     first, second = _remote_layout(n, r)
     owner = {k: (s, 0) for s, k in first.items()} | {k: (s, 1) for s, k in second.items()}
-    nrem = rem // c
-    aux = _FUSED_BWD_PUSH_BLOCKS if nrem else 0
-    table = [epoch, dk0.data_ptr(), dv0.data_ptr()]
-    if aux:
-        stage = torch.empty((2, rem) + tail_shape, device=kb.device, dtype=dtype)
-        owners = tuple(owner[k] + ((_BWD_FIRST, _BWD_SECOND)[owner[k][1]],) for k in range(nrem))
-        units, num_units = _fused_bwd.push_units(owners, r, n, c * tok, bwd_bytes, kb.device)
-        counters = ex.__dict__.get("fused_bwd_counters")
-        if counters is None:
-            counters = ex.fused_bwd_counters = torch.zeros(2, 2 * n, dtype=torch.int64, device=kb.device)
-        table += [counters[0].data_ptr(), counters[1].data_ptr(), units.data_ptr(), ex.heaps.data_ptr()]
-        table += [ex.flag_ptrs.data_ptr(), bank_off, stage[0].data_ptr(), stage[1].data_ptr()]
-        for k in range(nrem):
-            table += [stage[0, k * c].data_ptr(), stage[1, k * c].data_ptr(), 0]
-    else:
-        table += [0] * (_fused_bwd.P_CHUNKS - len(table))
-        for k in range(nrem):
-            o, h = owner[k]
-            slot = ex.symm.buffer_ptrs[o] + bank_off + (h * n + r) * c * tok
-            flag = ex.symm.signal_pad_ptrs[o] + ((_BWD_FIRST if h == 0 else _BWD_SECOND) * n + r) * 8
-            table += [slot, slot + bwd_bytes // 2, flag]
+    table = [epoch]
+    for k in range(2 * n - 2 - r):
+        o, h = owner[k]
+        slot = ex.symm.buffer_ptrs[o] + bank_off + (h * n + r) * c * tok
+        flag = ex.symm.signal_pad_ptrs[o] + ((_BWD_FIRST if h == 0 else _BWD_SECOND) * n + r) * 8
+        table += [slot, slot + bwd_bytes // 2, flag]
     for j in range(2):
-        table += [own[0, j * c].data_ptr(), own[1, j * c].data_ptr(), 0]
-    params = _fused_bwd.params_table(table, kb.device)
-    if aux:
-        expected = c // _fused_bwd.block_kv(skv, D) * Hkv * B
-        epi = _fused_bwd.epilogue(c, rem, rem - low, rem + c, tok, Hkv * D * 2, aux, num_units, expected, r)
-    else:
-        epi = _fused_bwd.epilogue(c, rem, rem - low, rem + c, tok, Hkv * D * 2)
-    signalled = 0 if aux else nrem
-    _fused_bwd.q1_backward(dout[c:], q[c:], kb, vb, out[c:], lse1, scale, det, epi, params, signalled, dq[c:])
-
+        flag = ex.symm.signal_pad_ptrs[r] + ((_BWD_FIRST if j == 0 else _BWD_SECOND) * n + r) * 8
+        table += [own[0, j * c].data_ptr(), own[1, j * c].data_ptr(), flag]
     dkv = torch.empty((2, 2 * c) + tail_shape, device=kb.device, dtype=dtype)
-    _comm.reduce(
-        ex.heaps,
-        ex.flag_ptrs,
-        own[0],
-        own[1],
-        dkv[0],
-        dkv[1],
-        r,
+    table += [
+        ex.symm.buffer_ptrs[r] + bank_off,
+        ex.symm.signal_pad_ptrs[r],
+        dkv[0].data_ptr(),
+        dkv[1].data_ptr(),
+    ]
+    table += [own[0].data_ptr(), own[1].data_ptr()]
+    dq = torch.empty_like(q)
+    _fused_bwd.backward(
+        dout,
+        q,
+        kb,
+        vb,
+        out,
+        lse0,
+        lse1,
+        scale,
         n,
-        seg,
-        0,
-        seg,
-        bank_off,
-        bwd_bytes // 4,
-        first_flags,
-        second_flags,
-        epoch,
-        torch.cuda.current_stream(),
+        r,
+        table,
+        dq,
+        bwd_bytes // 2,
+        (_BWD_FIRST * n, _BWD_SECOND * n),
     )
-    _join_side(ex)
     return dq, dkv[0], dkv[1]
 
 

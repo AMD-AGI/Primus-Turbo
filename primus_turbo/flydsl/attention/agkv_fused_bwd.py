@@ -4,35 +4,37 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""q1's backward for the fused all-gather-KV attention, its dK / dV sent by the kernel itself.
+"""Both zigzag chunks' dK / dV for the fused all-gather-KV attention backward in one persistent kernel,
+the remote keys' gradients pushed to their owners from inside it.
 
-The flux dK / dV kernel runs q1 (the rank's second zigzag chunk, ``c`` rows) against all its keys
-``[remote | own first | own second]`` one q split per launch. The launch of the last split stores
-through ``epilogue``: per work-group (BLOCK_KV key rows of one kv head and batch) it sums its
-fp32 split with the earlier splits' bf16 partials and q0's gradient (``dk0`` / ``dv0``, key rows
-``[add_lo, add_hi)``), and stores the result
+Rank ``r`` holds q0 (its first chunk, ``c`` rows, keys ``keys0`` = the ``len0 = (r + 1) c`` rows from
+``rem - r c`` on) and q1 (its second chunk, every key ``[remote | own first | own second]``, ``skv``
+rows). Every resident work-group claims work items from per-XCD queues (see ``agkv_fused_fwd._claim``):
+one item is one work-group of the flux dK / dV kernel, ``(segment, kv tile, kv head, q split, batch)``,
+run through the flux body with that segment's tensors (one compiled body serves both: q0's plan is
+q1's). An item stores its split's dK / dV slot and counts itself on its group ``(band, kv head,
+batch)`` of the ``skv`` axis; the group's last item sums the group's slots (q1's splits, and q0's
+when the band lies in ``keys0``) and stores the rows
 
     remote key chunk k  ->  slot (half, rank) of the owner's backward bank (system-scope stores)
     own chunk           ->  the local own-gradient buffer [own first | own second]
 
-Direct (``aux_blocks`` = 0): a work-group does not wait for its stores; the launch's completion
-publishes them, and a one-block kernel queued behind it raises the owners' backward flags to the
-epoch (``signal``). Each work-group's remote write still holds its CU after its compute (one
-work-group per CU), so the traffic adds to the launch instead of hiding under it.
+then counts the group on its chunk; a chunk's last group raises its flag: a remote chunk's in the
+owner's backward flags (slot (half, rank)), an own chunk's in this rank's own slot of them. No item
+waits on another, so the claims cannot deadlock.
 
-Pushed (``aux_blocks`` > 0): remote rows go to a local staging buffer and each work-group counts
-itself into its key chunk; ``aux_blocks`` extra work-groups of the same launch, dispatched first,
-copy each chunk to its owner once it is complete (whole-row 16 B copies, chunk order) while the
-other CUs keep computing, and raise the owner's flag as the push kernel does. The owner's reduce
-kernel waits for the flags unchanged either way.
+The reduce-scatter sum of this rank's received gradients runs as reduce units after every item is
+claimed: unit (K / V, half, piece) waits for the flags of the half's senders (every rank for the
+first half, ranks ``0..r`` for the second; this rank's own slot is its own chunk), then sums their
+slots in sender order, the own term at the rank's place (``mega``'s reduce, number for number). dQ
+partials stay the flux kernel's, reduced after the launch.
 
-Per-call addresses ride a small int64 table in the dense path's unused cu_seqlens argument:
+Per-call addresses ride a small int64 table:
 
-    [epoch, dk0, dv0, ready counters, done counters, units, heaps, flag arrays, bank offset,
-     staging K, staging V, (dK destination, dV destination, flag address) per key chunk]
+    [epoch, (dK destination, dV destination, flag address) per key chunk,
+     backward bank, flag array, dK out, dV out, own dK, own dV]
 
-where a chunk's destinations are the addresses of ITS first row (batch 0). Push units are the comm
-kernel's (``UNIT_FIELDS`` int64 each), their group the key chunk.
+where a chunk's destinations are the addresses of ITS first row (batch 0, kv head 0).
 """
 
 import functools
@@ -40,372 +42,464 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm
+from flydsl._mlir import ir
 from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl.expr.utils.arith import ArithValue
-from flydsl.expr.utils.arith import _to_raw as _raw
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import range_constexpr
 
 from primus_turbo.flydsl.attention import flash_attn_bwd_flux as _flux
-from primus_turbo.flydsl.attention.agkv_comm_kernel import (
-    PUSH_BATCH,
-    U_BYTES,
-    U_DST,
-    U_DST_OFF,
-    U_FLAG,
-    U_SRC,
-    U_SRC_OFF,
-    UNIT_BYTES,
-    UNIT_FIELDS,
-    WAIT_TIMEOUT,
-    _unit_field,
+from primus_turbo.flydsl.attention.agkv_comm_kernel import _spin
+from primus_turbo.flydsl.attention.agkv_fused_fwd import (
+    NUM_XCDS,
+    SCHED_HEAD,
+    STATE_LEN,
+    _claim,
+    _opaque_tid,
+    _stash_bases,
+    _stashed,
 )
-from primus_turbo.flydsl.deep_ep.common import _asm
-from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
-from primus_turbo.flydsl.fused_collective_gemm.common import (
-    BLOCK_THREADS,
-    SYS_NT,
-    VEC_I32,
-    copy_rows,
-    i64_base,
-)
-from primus_turbo.flydsl.utils.buffer_ops import (
-    buffer_load,
-    buffer_store,
-    create_buffer_resource_from_addr,
-    create_llvm_ptr,
-)
-from primus_turbo.flydsl.utils.prims import atomic_add, cast, ld, read_clock, spin_timed_out, st
+from primus_turbo.flydsl.deep_ep.common import _uniform_i64, ld_lds, st_lds
+from primus_turbo.flydsl.fused_collective_gemm.common import SYS_NT, i64_base
+from primus_turbo.flydsl.utils.buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_addr
+from primus_turbo.flydsl.utils.prims import _readfirstlane_i32, atomic_add, cast, ld, memory_fence, st
 
-(
-    P_EPOCH,
-    P_ADD_K,
-    P_ADD_V,
-    P_READY,
-    P_DONE,
-    P_UNITS,
-    P_HEAPS,
-    P_FLAGS,
-    P_BANK,
-    P_STAGE_K,
-    P_STAGE_V,
-    P_CHUNKS,
-) = range(12)
+P_EPOCH, P_CHUNKS = 0, 1
 CHUNK_FIELDS = 3
-SIGNAL_THREADS = 64
+RS_BANK, RS_FLAGS, RS_OUT, RS_OWN = 0, 1, 2, 4
+# the reduce units' claim counter, after the attention queues' state
+ST_TAIL = STATE_LEN
+RS_ITERS = 4
 
 # host table copies in flight per (device, length) before the oldest is reused
 _RING = 8
 
-
-@ASTRewriter.transform
-def _raise_flags(tid, params, num_chunks):
-    if tid < fx.Int32(num_chunks):
-        flag = ld(params, fx.Int32(P_CHUNKS + 2) + tid * fx.Int32(CHUNK_FIELDS), dtype=fx.T.i64)
-        st(flag, fx.Int32(0), ld(params, fx.Int32(P_EPOCH), dtype=fx.T.i64), scope="sys", order="relaxed")
+_SEG = ("Q", "K", "V", "DO", "LSE", "DELTA", "DK", "DV", "WSQ")
+_STASH = tuple(f"{name}{i}" for i in range(2) for name in _SEG) + ("SCHED", "STATE", "COUNTS", "PARAMS")
 
 
-@functools.lru_cache(maxsize=64)
-def _make_signal_kernel(num_chunks):
-    @flyc.kernel(name="agkv_bwd_signal_kernel", known_block_size=[SIGNAL_THREADS, 1, 1])
-    def kernel(PARAMS: fx.Tensor):
-        _raise_flags(cast(fx.thread_idx.x, fx.T.i32), i64_base(PARAMS), num_chunks)
-
-    return kernel
-
-
-@flyc.jit
-def _launch_signal(PARAMS, num_chunks: fx.Constexpr[int], stream: fx.Stream):
-    _make_signal_kernel(num_chunks)(PARAMS).launch(
-        grid=(1, 1, 1), block=(SIGNAL_THREADS, 1, 1), stream=stream
+def plan(B, c, n, r, Hq, Hkv, D, scale):
+    """The shared flux body of both segments: ``(dkdv launcher, odo launcher, q_split, block_kv, dQ
+    interleave)``, or None when q1's flux plan is not one plain launch (a16, band groups, rings)."""
+    rem, len0 = (2 * n - 2 - r) * c, (r + 1) * c
+    skv = rem + 2 * c
+    p = _flux._dense_plan(B, c, skv, Hq, Hkv, D, scale, -1, True, False)
+    _, q_split, bkv, nb1, a16, _, ilv, ring, pair, span = p[:10]
+    if a16 or ring or pair or span or c % bkv or skv * B * Hkv * D * 2 >= 1 << 31:
+        return None
+    ilv = min(ilv, _flux._wsq_ilv(len0 // bkv, B, c, Hq * D))
+    dkdv_l, odo_l = _flux._get_bwd(
+        Hq, Hkv, D, scale, -1, q_split, bkv, batch_size=B, sbhd=True, square=False, wsq_ilv=ilv, causal=True
     )
-
-
-def signal(params, num_chunks, stream):
-    """Raise the flags of the table's first ``num_chunks`` key chunks to its epoch, once ``stream``'s work
-    so far is done."""
-    assert num_chunks <= SIGNAL_THREADS
-    if num_chunks:
-        run_launcher(_launch_signal, params, num_chunks, stream)
+    return dkdv_l, odo_l, q_split, bkv, ilv
 
 
 @ASTRewriter.transform
-def _when(cond, body):
-    if cond:
-        body()
-
-
-@ASTRewriter.transform
-def _count_ready(tid, remote, params, chunk):
-    """One more work-group of key chunk ``chunk`` has its rows in the staging buffer."""
-    if remote:
-        fx.rocdl.s_waitcnt(0)
-        fx.gpu.barrier()
+def _finish(tid, band, head, batch, slot, stash, c):
+    """Count the item on its group; the group's last item folds the group's slots and stores them."""
+    nb, hkv, qs, lo0, nb0 = c["nb"], c["hkv"], c["q_split"], c["lo0"], c["nb0"]
+    group = (batch * fx.Int32(hkv) + head) * fx.Int32(nb) + band
+    in0 = (band >= fx.Int32(lo0)) & (band < fx.Int32(lo0 + nb0))
+    expected = in0.select(fx.Int32(2 * qs), fx.Int32(qs))
+    # this item's slot stores retire before its count releases them
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    counts = _stashed(stash, _STASH.index("COUNTS"))
+    if tid == fx.Int32(0):
+        old = atomic_add(counts, group, fx.Int64(1), scope="agent", order="release")
+        st_lds(slot, 1, (old == cast(expected, fx.T.i64) - fx.Int64(1)).select(fx.Int32(1), fx.Int32(0)))
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    last = _readfirstlane_i32(ld_lds(slot, 1))
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    if last == fx.Int32(1):
+        memory_fence(order="acquire", scope="agent")
         if tid == fx.Int32(0):
-            atomic_add(ld(params, fx.Int32(P_READY), dtype=fx.T.i64), chunk, fx.Int64(1), scope="agent")
-
-
-def _copy_staged(tid, unit, srcs, heaps, units, bank_off, block_threads):
-    """Copy unit ``unit`` out of the staging buffer (read past the caches: other XCDs wrote it)."""
-    sel = _unit_field(units, unit, U_SRC)
-    src_base = ArithValue(sel == fx.Int32(1)).select(srcs[1], srcs[0])
-    nbytes = _unit_field(units, unit, U_BYTES)
-    dst_heap = ld(heaps, _unit_field(units, unit, U_DST), dtype=fx.T.i64)
-    src_res = create_buffer_resource_from_addr(
-        src_base + _unit_field(units, unit, U_SRC_OFF, wide=True), num_records_bytes=nbytes
-    )
-    dst_res = create_buffer_resource_from_addr(
-        dst_heap + bank_off + _unit_field(units, unit, U_DST_OFF, wide=True), num_records_bytes=nbytes
-    )
-    nvec = nbytes // fx.Int32(16)
-
-    def coords(v):
-        word = v * fx.Int32(VEC_I32)
-        return word, word, v < nvec
-
-    for k in range(BLOCK_THREADS // block_threads):
-        copy_rows(
-            tid + fx.Int32(k * block_threads),
-            UNIT_BYTES // 16,
-            coords,
-            src_res,
-            dst_res,
-            SYS_NT,
-            SYS_NT,
-            PUSH_BATCH,
-        )
+            st(counts, group, fx.Int64(0))
+        _fold(tid, band, head, batch, in0, stash, c)
 
 
 @ASTRewriter.transform
-def _wait_staged(ready, chunk, expected, rank):
-    spin_start = read_clock()
-    staged = ld(ready, chunk, scope="sys", dtype=fx.T.i64) >= fx.Int64(expected)
-    while not staged:
-        fx.rocdl.s_sleep(fx.Int32(1))
-        if spin_timed_out(spin_start, WAIT_TIMEOUT):
-            fx.printf(f"[agkv rank={rank} bwd push] chunk wait timeout: chunk={{}}\n", chunk)
-            _asm("s_trap 2")
-        staged = ld(ready, chunk, scope="sys", dtype=fx.T.i64) >= fx.Int64(expected)
-
-
-@ASTRewriter.transform
-def _count_pushed(done, ready, flags, units, chunk, first_unit, mine, chunk_units, epoch):
-    """``mine`` more units of ``chunk`` retired; the chunk's last resets its counters and raises its flag."""
-    if mine > fx.Int64(0):
-        count = atomic_add(done, chunk, mine, scope="agent")
-        if count + mine == fx.Int64(chunk_units):
-            st(done, chunk, fx.Int64(0), scope="agent")
-            st(ready, chunk, fx.Int64(0), scope="agent")
-            dst_flags = ld(flags, _unit_field(units, first_unit, U_DST), dtype=fx.T.i64)
-            st(dst_flags, _unit_field(units, first_unit, U_FLAG), epoch, scope="sys", order="relaxed")
-
-
-@ASTRewriter.transform
-def _push_staged(
-    is_aux, tid, aux_id, params, num_chunks, chunk_units, aux_blocks, expected, block_threads, rank
-):
-    """The push blocks, key chunk by key chunk: wait until the chunk has all ``expected`` work-groups
-    staged, issue this block's share of its units (every ``aux_blocks``-th) back to back, drain them
-    once, and count them; the chunk's last count resets its counters and raises the owner's flag."""
-    if is_aux:
-        units = ld(params, fx.Int32(P_UNITS), dtype=fx.T.i64)
-        ready = ld(params, fx.Int32(P_READY), dtype=fx.T.i64)
-        done = ld(params, fx.Int32(P_DONE), dtype=fx.T.i64)
-        heaps = ld(params, fx.Int32(P_HEAPS), dtype=fx.T.i64)
-        flags = ld(params, fx.Int32(P_FLAGS), dtype=fx.T.i64)
-        bank_off = ld(params, fx.Int32(P_BANK), dtype=fx.T.i64)
-        epoch = ld(params, fx.Int32(P_EPOCH), dtype=fx.T.i64)
-        srcs = [
-            ld(params, fx.Int32(P_STAGE_K), dtype=fx.T.i64),
-            ld(params, fx.Int32(P_STAGE_V), dtype=fx.T.i64),
+def _fold(tid, band, head, batch, in0, stash, c):
+    """The group's rows: q1's slots plus q0's (none outside ``keys0``: their descriptors are empty), fp32,
+    stored to the chunk's destination; then the chunk's count, whose last raises a remote owner's flag."""
+    bkv, d, tok, qs, skv, len0, lo0 = c["bkv"], c["d"], c["tok"], c["q_split"], c["skv"], c["len0"], c["lo0"]
+    block, cc, per_chunk, ng = c["block"], c["c"], c["per_chunk"], c["ngroups"]
+    vecs_per_row = d // 8
+    f32x8, bf16x8 = fx.T.vec(8, fx.T.f32), fx.T.vec(8, fx.T.bf16)
+    col0 = cast((batch * fx.Int32(c["hkv"]) + head) * fx.Int32(d * 2), fx.T.i64)
+    row0 = band * fx.Int32(bkv)
+    chunk = row0 // fx.Int32(cc)
+    params = _stashed(stash, _STASH.index("PARAMS"))
+    entry = fx.Int32(P_CHUNKS) + chunk * fx.Int32(CHUNK_FIELDS)
+    band_bytes = fx.Int64(bkv * tok)
+    rows0 = in0.select(fx.Int32(bkv * tok), fx.Int32(0))
+    off0 = cast(in0.select(band - fx.Int32(lo0), fx.Int32(0)), fx.T.i64) * band_bytes
+    for t in range_constexpr(2):
+        ws1 = _stashed(stash, _STASH.index(("DK1", "DV1")[t])) + col0 + cast(band, fx.T.i64) * band_bytes
+        ws0 = _stashed(stash, _STASH.index(("DK0", "DV0")[t])) + col0 + off0
+        terms = [
+            create_buffer_resource_from_addr(ws1 + fx.Int64(s * skv * tok), num_records_bytes=bkv * tok)
+            for s in range(qs)
+        ] + [
+            create_buffer_resource_from_addr(ws0 + fx.Int64(s * len0 * tok), num_records_bytes=rows0)
+            for s in range(qs)
         ]
-        mine = ArithValue(aux_id < fx.Int32(chunk_units)).select(
-            (fx.Int32(chunk_units - 1) - aux_id) // fx.Int32(aux_blocks) + fx.Int32(1), fx.Int32(0)
+        dst = (
+            _param(params, entry + fx.Int32(t))
+            + col0
+            + cast(row0 - chunk * fx.Int32(cc), fx.T.i64) * fx.Int64(tok)
         )
-        chunk = fx.Int32(0)
-        while chunk < fx.Int32(num_chunks):
-            first_unit = chunk * fx.Int32(chunk_units)
+        dst_res = create_buffer_resource_from_addr(dst, num_records_bytes=bkv * tok)
+        idxs = []
+        for i in range_constexpr(bkv * vecs_per_row // block):
+            vec = tid + fx.Int32(i * block)
+            idxs.append(
+                (vec // fx.Int32(vecs_per_row)) * fx.Int32(tok // 2)
+                + vec % fx.Int32(vecs_per_row) * fx.Int32(8)
+            )
+        loads = [[buffer_load(res, idx, vec_width=8, dtype=fx.T.bf16) for res in terms] for idx in idxs]
+        for idx, parts in zip(idxs, loads):
+            acc = fx.arith.extf(f32x8, parts[0])
+            for part in parts[1:]:
+                acc = fx.arith.addf(acc, fx.arith.extf(f32x8, part))
+            buffer_store(fx.arith.trunc_f(bf16x8, acc), dst_res, idx, cache_modifier=SYS_NT)
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    if tid == fx.Int32(0):
+        counts = _stashed(stash, _STASH.index("COUNTS"))
+        done = atomic_add(counts, fx.Int32(ng) + chunk, fx.Int64(1), scope="agent", order="release")
+        if done == fx.Int64(per_chunk - 1):
+            st(counts, fx.Int32(ng) + chunk, fx.Int64(0))
+            memory_fence(order="release", scope="sys")
+            flag = _param(params, entry + fx.Int32(2))
+            st(flag, fx.Int32(0), _param(params, fx.Int32(P_EPOCH)), scope="sys", order="relaxed")
+
+
+def _param(params, i):
+    return _uniform_i64(ld(params, i, dtype=fx.T.i64))
+
+
+@ASTRewriter.transform
+def _run_item(body, segs, lens, stash, tid, seg, tile, head, split, batch):
+    """One flux dK / dV work-group of segment ``seg`` (both segments inline the same body), its tensor
+    addresses read from the stash where the body uses them."""
+    ids = (fx.Index(tile), fx.Index(head), fx.Index(split), fx.Index(batch))
+    sq, len0, skv = lens
+    bases = [{name: _reader(stash, f"{name}{i}") for name in _SEG} for i in range(2)]
+    if seg == fx.Int32(0):
+        body(*segs[0], fx.Int32(sq), fx.Int32(len0), fx.Int32(0), ids=ids, tid=tid, bases=bases[0])
+    else:
+        body(*segs[1], fx.Int32(sq), fx.Int32(skv), fx.Int32(0), ids=ids, tid=tid, bases=bases[1])
+
+
+@ASTRewriter.transform
+def _rs_unit(tid, unit, stash, c):
+    """Reduce unit ``unit``: ``RS_ITERS`` vectors per thread of one (K / V, half) output segment."""
+    n, r, block, pieces, seg_bytes = c["n"], c["r"], c["block"], c["rs_pieces"], c["c"] * c["tok"]
+    f32x8, bf16x8 = fx.T.vec(8, fx.T.f32), fx.T.vec(8, fx.T.bf16)
+    params = _stashed(stash, _STASH.index("PARAMS"))
+    rs = fx.Int32(c["rs_off"])
+    seg = unit // fx.Int32(pieces)
+    elem0 = (unit % fx.Int32(pieces)) * fx.Int32(block * 8 * RS_ITERS)
+    epoch = _param(params, fx.Int32(P_EPOCH))
+    for i in range_constexpr(4):
+        t, h = i // 2, i % 2
+        senders = list(range(n) if h == 0 else range(r + 1))
+        if seg == fx.Int32(i):
             if tid == fx.Int32(0):
-                _wait_staged(ready, chunk, expected, rank)
-            fx.gpu.barrier()
-            j = aux_id
-            while j < fx.Int32(chunk_units):
-                _copy_staged(tid, first_unit + j, srcs, heaps, units, bank_off, block_threads)
-                j = j + fx.Int32(aux_blocks)
+                flags = _param(params, rs + fx.Int32(RS_FLAGS))
+                _spin(flags, [fx.Int32(c["flag_halves"][h] + s) for s in senders], epoch, r, "agkv_fused_bwd")
             fx.rocdl.s_waitcnt(0)
             fx.gpu.barrier()
-            if tid == fx.Int32(0):
-                _count_pushed(
-                    done, ready, flags, units, chunk, first_unit, cast(mine, fx.T.i64), chunk_units, epoch
-                )
-            chunk = chunk + fx.Int32(1)
-
-
-@functools.lru_cache(maxsize=64)
-def epilogue(c, rem, add_lo, add_hi, tok, batch_bytes, aux_blocks=0, num_units=0, expected=0, rank=0):
-    """The flux dK / dV epilogue of one rank's q1 (lengths in key rows, ``tok`` bytes per key row of all
-    batches, ``batch_bytes`` per batch). ``aux_blocks`` > 0: remote rows go to the staging buffer and
-    that many push blocks of the same launch send its ``num_units`` copy units, a chunk once its
-    ``expected`` work-groups are in."""
-    skv = rem + 2 * c
-
-    def store(dv_values, dk_values, info):
-        bf16x4 = fx.T.vec(4, fx.T.bf16)
-        params = i64_base(info["params"])
-        tid, head = cast(info["tid"], fx.T.i32), cast(info["kv_head_idx"], fx.T.i32)
-        kv_start = cast(info["kv_start"], fx.T.i32)
-        b_off = cast(cast(info["batch_idx"], fx.T.i32) * fx.Int32(batch_bytes), fx.T.i64)
-        chunk = kv_start // fx.Int32(c)
-        entry = fx.Int32(P_CHUNKS) + chunk * fx.Int32(CHUNK_FIELDS)
-        has_add = (kv_start >= fx.Int32(add_lo)) & (kv_start < fx.Int32(add_hi))
-        add_bytes = ArithValue(has_add).select(fx.Int32(add_hi * tok), fx.Int32(0))
-        for t, values, ws in ((1, dv_values, info["dv_ws"]), (0, dk_values, info["dk_ws"])):
-            ws_base = i64_base(ws) + b_off
-            terms = [
-                create_buffer_resource_from_addr(
-                    ws_base + fx.Int64(s * skv * tok), num_records_bytes=skv * tok
-                )
-                for s in range(info["q_split"] - 1)
+            memory_fence(order="acquire", scope="sys")
+            bank = _param(params, rs + fx.Int32(RS_BANK)) + fx.Int64(t * c["v_off"])
+            own = _param(params, rs + fx.Int32(RS_OWN + t)) + fx.Int64(h * seg_bytes)
+            srcs = [
+                (own, 0) if s == r else (bank + fx.Int64((h * n + s) * seg_bytes), SYS_NT) for s in senders
             ]
-            add_base = ld(params, fx.Int32(P_ADD_K + t), dtype=fx.T.i64) + b_off - fx.Int64(add_lo * tok)
-            terms.append(create_buffer_resource_from_addr(add_base, num_records_bytes=add_bytes))
-            dst = (
-                ld(params, entry + fx.Int32(t), dtype=fx.T.i64)
-                + b_off
-                - cast(chunk, fx.T.i64) * fx.Int64(c * tok)
-            )
-            dst_res = create_buffer_resource_from_addr(
-                dst, num_records_bytes=(chunk + fx.Int32(1)) * fx.Int32(c * tok)
-            )
-            fragments = [
-                (fx.arith.trunc_f(bf16x4, _raw(v)), cast(row, fx.T.i32) - kv_start, cast(col, fx.T.i32))
-                for v, _, row, col in values
+            res = [(create_buffer_resource_from_addr(a, num_records_bytes=seg_bytes), cm) for a, cm in srcs]
+            out = _param(params, rs + fx.Int32(RS_OUT + t)) + fx.Int64(h * seg_bytes)
+            out_res = create_buffer_resource_from_addr(out, num_records_bytes=seg_bytes)
+            idxs = [elem0 + (fx.Int32(it * block) + tid) * fx.Int32(8) for it in range(RS_ITERS)]
+            vals = [
+                [buffer_load(rs_, e, vec_width=8, dtype=fx.T.bf16, cache_modifier=cm) for rs_, cm in res]
+                for e in idxs
             ]
-            _stage_and_store(fragments, terms, dst_res, kv_start, head, tid, info)
-        if aux_blocks:
-            _count_ready(tid, kv_start < fx.Int32(rem), params, chunk)
+            for e, parts in zip(idxs, vals):
+                acc = fx.arith.extf(f32x8, parts[0])
+                for part in parts[1:]:
+                    acc = fx.arith.addf(acc, fx.arith.extf(f32x8, part))
+                buffer_store(fx.arith.trunc_f(bf16x8, acc), out_res, e)
 
-    def emit(dv_values, dk_values, info):
-        assert info["token_stride"] * 2 == tok
-        if aux_blocks:
-            # the push blocks walk the empty tile past the keys
-            _when(cast(info["kv_start"], fx.T.i32) < fx.Int32(skv), lambda: store(dv_values, dk_values, info))
-        else:
-            store(dv_values, dk_values, info)
 
-    def aux(is_aux, info):
-        _push_staged(
-            is_aux,
-            cast(info["tid"], fx.T.i32),
-            cast(info["aux_id"], fx.T.i32),
-            i64_base(info["params"]),
-            rem // c,
-            num_units // (rem // c),
-            aux_blocks,
-            expected,
-            info["block_size"],
-            rank,
+@ASTRewriter.transform
+def _claim_tail(tid, stash, slot):
+    if tid == fx.Int32(0):
+        state = _stashed(stash, _STASH.index("STATE"))
+        st_lds(slot, 2, cast(atomic_add(state, fx.Int32(ST_TAIL), fx.Int64(1), scope="agent"), fx.T.i32))
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    unit = _readfirstlane_i32(ld_lds(slot, 2))
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    return unit
+
+
+@ASTRewriter.transform
+def _rs_loop(thread_index, slot, stash, c):
+    """Reduce units, claimed once every attention item is: an item never waits, so every flag a unit
+    waits for comes up."""
+    num = 4 * c["rs_pieces"]
+    unit = _claim_tail(_opaque_tid(thread_index), stash, slot)
+    while unit < fx.Int32(num):
+        _rs_unit(_opaque_tid(thread_index), unit, stash, c)
+        unit = _claim_tail(_opaque_tid(thread_index), stash, slot)
+
+
+@ASTRewriter.transform
+def _exit_all(thread_index, state, grid):
+    """``_exit`` over the reduce units' counter too."""
+    fx.gpu.barrier()
+    if thread_index == fx.Int32(0):
+        arrived = atomic_add(state, fx.Int32(0), fx.Int64(1), scope="agent")
+        if arrived == fx.Int64(grid - 1):
+            for i in range_constexpr(ST_TAIL + 1):
+                st(state, fx.Int32(i), fx.Int64(0))
+
+
+def _reader(stash, name):
+    return lambda: _stashed(stash, _STASH.index(name))
+
+
+@ASTRewriter.transform
+def _work_loop(thread_index, slot, stash, num_sched, run_item, c):
+    """Claim items until none are left; entry ``((((seg * B + batch) * Hkv + head) * nb + tile) * q_split
+    + split``, ``tile`` local to its segment."""
+    nb, hkv, b, qs, lo0 = c["nb"], c["hkv"], c["batch"], c["q_split"], c["lo0"]
+    unit = _claim(
+        _opaque_tid(thread_index),
+        _stashed(stash, _STASH.index("STATE")),
+        slot,
+        _stashed(stash, _STASH.index("SCHED")),
+        num_sched,
+    )
+    while unit < fx.Int32(num_sched):
+        sched = _stashed(stash, _STASH.index("SCHED"))
+        e = _readfirstlane_i32(cast(ld(sched, unit + fx.Int32(SCHED_HEAD), dtype=fx.T.i64), fx.T.i32))
+        split = e % fx.Int32(qs)
+        rest = e // fx.Int32(qs)
+        tile = rest % fx.Int32(nb)
+        rest = rest // fx.Int32(nb)
+        head = rest % fx.Int32(hkv)
+        rest = rest // fx.Int32(hkv)
+        batch = rest % fx.Int32(b)
+        seg = rest // fx.Int32(b)
+        run_item(seg, tile, head, split, batch)
+        band = (seg == fx.Int32(0)).select(tile + fx.Int32(lo0), tile)
+        _finish(_opaque_tid(thread_index), band, head, batch, slot, stash, c)
+        # the next item's LDS writes wait for this one's last reads
+        fx.gpu.barrier()
+        unit = _claim(
+            _opaque_tid(thread_index),
+            _stashed(stash, _STASH.index("STATE")),
+            slot,
+            _stashed(stash, _STASH.index("SCHED")),
+            num_sched,
         )
 
-    if aux_blocks:
-        emit.aux_blocks = aux_blocks
-        emit.aux = aux
-    return emit
+
+@functools.lru_cache(maxsize=32)
+def _build(Hq, Hkv, D, scale, n, r, c, B, num_sched, grid, v_off, flag_halves):
+    dkdv_l, _, q_split, bkv, _ = plan(B, c, n, r, Hq, Hkv, D, scale)
+    emb = dkdv_l.embed
+    assert emb["q_split"] == q_split and emb["n_qsp"] == q_split and emb["block_kv"] == bkv
+    body, block = emb["body"], emb["block_size"]
+    rem, len0 = (2 * n - 2 - r) * c, (r + 1) * c
+    skv = rem + 2 * c
+    nb = skv // bkv
+    consts = dict(
+        nb=nb,
+        nb0=len0 // bkv,
+        lo0=(rem - r * c) // bkv,
+        hkv=Hkv,
+        batch=B,
+        q_split=q_split,
+        bkv=bkv,
+        d=D,
+        tok=B * Hkv * D * 2,
+        skv=skv,
+        len0=len0,
+        c=c,
+        block=block,
+        nrem=rem // c,
+        per_chunk=c // bkv * Hkv * B,
+        ngroups=nb * Hkv * B,
+        n=n,
+        r=r,
+        rs_off=P_CHUNKS + CHUNK_FIELDS * (2 * n - r),
+        rs_pieces=-(-(c * B * Hkv * D) // (block * 8 * RS_ITERS)),
+        v_off=v_off,
+        flag_halves=flag_halves,
+    )
+    assert bkv * (D // 8) % block == 0
+
+    @fx.struct
+    class SharedStorage:
+        claim: fx.Array[fx.Int32, 4, 16]
+        stash: fx.Array[fx.Int32, 2 * len(_STASH), 16]
+
+    @flyc.kernel(name="agkv_fused_bwd_kernel", known_block_size=[block, 1, 1])
+    def kernel(
+        Q0: fx.Tensor,
+        K0: fx.Tensor,
+        V0: fx.Tensor,
+        DO0: fx.Tensor,
+        LSE0: fx.Tensor,
+        DELTA0: fx.Tensor,
+        WSK0: fx.Tensor,
+        WSV0: fx.Tensor,
+        WSQ0: fx.Tensor,
+        Q1: fx.Tensor,
+        K1: fx.Tensor,
+        V1: fx.Tensor,
+        DO1: fx.Tensor,
+        LSE1: fx.Tensor,
+        DELTA1: fx.Tensor,
+        WSK1: fx.Tensor,
+        WSV1: fx.Tensor,
+        WSQ1: fx.Tensor,
+        PH: fx.Tensor,
+        SCHED: fx.Tensor,
+        STATE: fx.Tensor,
+        COUNTS: fx.Tensor,
+        PARAMS: fx.Tensor,
+    ):
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        slot = fx.Int32(fx.ptrtoint(lds.claim.ptr))
+        stash = fx.Int32(fx.ptrtoint(lds.stash.ptr))
+        thread_index = cast(fx.thread_idx.x, fx.T.i32)
+        segs = (
+            (Q0, K0, V0, DO0, LSE0, DELTA0, WSK0, WSV0, PH, PH, WSQ0),
+            (Q1, K1, V1, DO1, LSE1, DELTA1, WSK1, WSV1, PH, PH, WSQ1),
+        )
+        tensors = dict(SCHED=SCHED, STATE=STATE, COUNTS=COUNTS, PARAMS=PARAMS)
+        for i in range_constexpr(2):
+            for j in range_constexpr(len(_SEG)):
+                tensors[f"{_SEG[j]}{i}"] = segs[i][(0, 1, 2, 3, 4, 5, 6, 7, 10)[j]]
+        _stash_bases(thread_index, stash, [i64_base(tensors[name]) for name in _STASH])
+
+        def run_item(seg, tile, head, split, batch):
+            _run_item(
+                body, segs, (c, len0, skv), stash, _opaque_tid(thread_index), seg, tile, head, split, batch
+            )
+
+        _work_loop(thread_index, slot, stash, num_sched, run_item, consts)
+        _rs_loop(thread_index, slot, stash, consts)
+        _exit_all(thread_index, _stashed(stash, _STASH.index("STATE")), grid)
+
+    allocator, value_attrs = emb["allocator"], emb["value_attrs"]
+
+    @flyc.jit
+    def launch(
+        Q0: fx.Tensor,
+        K0: fx.Tensor,
+        V0: fx.Tensor,
+        DO0: fx.Tensor,
+        LSE0: fx.Tensor,
+        DELTA0: fx.Tensor,
+        WSK0: fx.Tensor,
+        WSV0: fx.Tensor,
+        WSQ0: fx.Tensor,
+        Q1: fx.Tensor,
+        K1: fx.Tensor,
+        V1: fx.Tensor,
+        DO1: fx.Tensor,
+        LSE1: fx.Tensor,
+        DELTA1: fx.Tensor,
+        WSK1: fx.Tensor,
+        WSV1: fx.Tensor,
+        WSQ1: fx.Tensor,
+        PH: fx.Tensor,
+        SCHED: fx.Tensor,
+        STATE: fx.Tensor,
+        COUNTS: fx.Tensor,
+        PARAMS: fx.Tensor,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        # the body's LDS lives in its builder's allocator
+        allocator.finalized = False
+        with ir.InsertionPoint(CompilationContext.get_current().gpu_module_body):
+            allocator.finalize()
+        kernel(
+            Q0,
+            K0,
+            V0,
+            DO0,
+            LSE0,
+            DELTA0,
+            WSK0,
+            WSV0,
+            WSQ0,
+            Q1,
+            K1,
+            V1,
+            DO1,
+            LSE1,
+            DELTA1,
+            WSK1,
+            WSV1,
+            WSQ1,
+            PH,
+            SCHED,
+            STATE,
+            COUNTS,
+            PARAMS,
+            value_attrs=value_attrs,
+        ).launch(grid=(grid, 1, 1), block=(block, 1, 1), stream=stream)
+
+    return launch, [None], emb["hints"], consts
 
 
-# s_waitcnt lgkmcnt(0), vmcnt and expcnt left alone
-_WAIT_LGKM = 0xC07F
-
-
-def _lds_ptr(elem, lds_off):
-    return create_llvm_ptr(elem * fx.Int32(2) + fx.Int32(lds_off), address_space=3)
-
-
-def _stage_and_store(fragments, terms, dst_res, kv_start, head, tid, info):
-    """Store one work-group's [BLOCK_KV, D] tile, held as bf16 4-element fragments ``(value, tile row,
-    column)``, plus the same rows of ``terms`` (bf16 buffers laid out as the destination), summed in fp32,
-    as whole rows: through the LDS the main loop is done with, then 16 B per lane, a wave's access four
-    contiguous 256 B rows. Fragment accesses would move 32 B pieces, which the remote fabric stores at a
-    fraction of the rate and which hold the attention's own loads behind them; the term rows are loaded
-    before the LDS round trip and arrive under it."""
-    bkv, hd, threads, lds_off = info["block_kv"], info["head_dim"], info["block_size"], info["lds_off"]
-    row_elems = hd + 8  # padded: the fragment writes of 16 rows at one column fall in distinct banks
-    vecs_per_row = hd // 8
-    assert bkv * row_elems * 2 <= info["lds_bytes"] and bkv * vecs_per_row % threads == 0
-    f32x8, bf16x8 = fx.T.vec(8, fx.T.f32), fx.T.vec(8, fx.T.bf16)
-    coords = []
-    for i in range(bkv * vecs_per_row // threads):
-        vec = tid + fx.Int32(i * threads)
-        row, part = vec // fx.Int32(vecs_per_row), vec % fx.Int32(vecs_per_row)
-        idx = (kv_start + row) * fx.Int32(info["token_stride"]) + head * fx.Int32(hd) + part * fx.Int32(8)
-        coords.append((row * fx.Int32(row_elems) + part * fx.Int32(8), idx))
-    # the main loop's LDS reads and DMA writes retire before the LDS is reused
-    fx.rocdl.s_waitcnt(0)
-    loads = [[buffer_load(res, idx, vec_width=8, dtype=fx.T.bf16) for res in terms] for _, idx in coords]
-    fx.gpu.barrier()
-    for value, row, col in fragments:
-        llvm.StoreOp(_raw(value), _lds_ptr(row * fx.Int32(row_elems) + col, lds_off))
-    fx.rocdl.s_waitcnt(_WAIT_LGKM)
-    fx.gpu.barrier()
-    for (elem, idx), parts in zip(coords, loads):
-        acc = fx.arith.extf(f32x8, llvm.LoadOp(bf16x8, _lds_ptr(elem, lds_off)).result)
-        for part in parts:
-            acc = fx.arith.addf(acc, fx.arith.extf(f32x8, part))
-        buffer_store(fx.arith.trunc_f(bf16x8, acc), dst_res, idx, cache_modifier=SYS_NT)
+def resident_blocks(dkdv_l, device):
+    """Work-groups of the persistent kernel one GPU holds at once (waves per EU and LDS bound)."""
+    emb = dkdv_l.embed
+    waves = emb["waves_per_eu"] * 4 * 64 // emb["block_size"]
+    lds = 160 * 1024 // (emb["lds_bytes"] + 256)
+    return torch.cuda.get_device_properties(device).multi_processor_count * max(1, min(waves, lds))
 
 
 @functools.lru_cache(maxsize=64)
-def push_units(owners, rank, num_ranks, seg_bytes, bwd_bytes, device):
-    """The push blocks' copy units, key chunk by key chunk: ``owners[k]`` = (owner rank, half, flag array)
-    of remote key chunk k, whose rows sit at ``k * seg_bytes`` of the staging buffers and go to slot
-    (half, rank) of the owner's backward bank (V region at ``bwd_bytes // 2``)."""
-    pieces = -(-seg_bytes // UNIT_BYTES)
-    rows = []
-    for k, (owner, half, array) in enumerate(owners):
-        slot = (half * num_ranks + rank) * seg_bytes
-        for p in range(pieces):
-            off = p * UNIT_BYTES
-            for t in range(2):
-                rows.append(
-                    [
-                        t,
-                        k * seg_bytes + off,
-                        owner,
-                        t * (bwd_bytes // 2) + slot + off,
-                        min(UNIT_BYTES, seg_bytes - off),
-                        k,
-                        2 * pieces,
-                        array * num_ranks + rank,
-                    ]
-                )
-    assert all(len(row) == UNIT_FIELDS for row in rows)
-    return torch.tensor(rows, dtype=torch.int64, device=device), len(rows)
-
-
-def block_kv(Skv, D):
-    return _flux._fuse_blockkv_for(Skv, D, -1)
-
-
-def _plan(B, Sq, Skv, Hq, Hkv, D, scale, deterministic, epi):
-    """The dense plan of q1's backward with ``epi``, or None when it cannot run one launch per split."""
-    plan = _flux._dense_plan(
-        B, Sq, Skv, Hq, Hkv, D, scale, -1, True, deterministic, causal=True, dkdv_override={"epilogue": epi}
-    )
-    _, q_split, bkv, _, a16, _, _, _, _, band_span, _, _, _, _ = plan
-    split_ok = q_split == 1 or (
-        (bkv % (q_split * _flux._BWD_BLOCK_Q) == 0 or _flux._qsp_absolute(D, bkv, q_split))
-        and _flux._qsp_cuttable(Sq, q_split)
-    )
-    if a16 or band_span or bkv != block_kv(Skv, D) or not split_ok:
-        return None
-    return plan
-
-
-def supported(B, Sq, Skv, Hq, Hkv, D, scale, deterministic, c, tok):
-    bkv = block_kv(Skv, D)
-    if c % bkv or Skv * tok >= 1 << 31:
-        return False
-    epi = epilogue(c, Skv - 2 * c, 0, c, tok, Hkv * D * 2)
-    return _plan(B, Sq, Skv, Hq, Hkv, D, scale, deterministic, epi) is not None
+def schedule(n, r, c, B, Hkv, q_split, bkv, device):
+    """Claim order: every item longest first (its visible q rows), an item of (batch, kv head) ``g`` in
+    the queue of XCD ``g`` (spread over ``NUM_XCDS // groups`` XCDs when there are fewer groups)."""
+    rem, len0 = (2 * n - 2 - r) * c, (r + 1) * c
+    skv = rem + 2 * c
+    nb = skv // bkv
+    items = []
+    for seg, (tiles, offset) in enumerate(((len0 // bkv, len0 - c), (nb, skv - c))):
+        for b in range(B):
+            for h in range(Hkv):
+                for tile in range(tiles):
+                    # q row i sees key k when k <= i + offset
+                    rows = min(c, max(0, c + offset - tile * bkv))
+                    for s in range(q_split):
+                        e = (((seg * B + b) * Hkv + h) * nb + tile) * q_split + s
+                        items.append((-rows, len(items), e, b * Hkv + h))
+    items.sort()
+    groups = B * Hkv
+    spread = max(1, NUM_XCDS // groups)
+    queues = [[] for _ in range(NUM_XCDS)]
+    seen = {}
+    for _, _, e, g in items:
+        k = seen.get(g, 0)
+        seen[g] = k + 1
+        queues[(g * spread + k % spread) % NUM_XCDS].append(e)
+    head, flat = [], []
+    for queue in queues:
+        head += [len(flat), len(queue)]
+        flat += queue
+    return torch.tensor(head + flat, dtype=torch.int64, device=device), len(flat)
 
 
 _RINGS = {}
@@ -434,91 +528,98 @@ def params_table(values, device):
     return dev
 
 
-def q1_backward(dout, q, k, v, out, lse, scale, deterministic, epi, params, num_remote, dq):
-    """dQ of ``q`` (the last ``Sq`` rows of a bottom-right causal call against ``k`` / ``v``) into ``dq``;
-    dK / dV go out through ``epi``, whose runtime table is ``params``, then the flags of its first
-    ``num_remote`` key chunks go up."""
-    Sq, B, Hq, D = q.shape
-    Skv, _, Hkv, _ = k.shape
-    plan = _plan(B, Sq, Skv, Hq, Hkv, D, scale, deterministic, epi)
-    assert plan is not None
-    _, q_split, bkv, n_bands, _, _, wsq_ilv, wsq_ring, wsq_pair, _, pipe, dkdv_l, odo_l, _ = plan
-    st = torch.cuda.current_stream()
-    qf = _flux._prescale_q(q, scale)
-    kf, vf, dof = k.reshape(-1), v.reshape(-1), dout.reshape(-1)
-    o16 = out.to(q.dtype).reshape(-1)
-    delta = torch.empty(B, Hq, Sq, device=q.device, dtype=torch.float32)
-    df = delta.reshape(-1)
-    odo_l(o16, dof, df, B, Sq, st)
-    ws_dk, ws_dv = (
-        torch.empty(max(q_split - 1, 1), Skv, B, Hkv, D, device=q.device, dtype=k.dtype).reshape(-1)
-        for _ in range(2)
-    )
-    lsef = _flux._prescale_lse(lse.view(B, Sq, Hq).permute(0, 2, 1), st).reshape(-1)
-    ws_dq, _ = _flux._dq_partial_ws(
-        wsq_ring * wsq_ilv or n_bands,
-        B,
-        Sq,
-        Hq * D,
-        q.device,
-        q.dtype,
-        _flux._WSQ_BAND_PAD if D == 128 else 0,
-        wsq_ilv,
-        carry=False,
-        pair=bool(wsq_pair),
-    )
-    side = _flux._SIDE_STREAM.get(q.device)
-    if side is None:
-        side = _flux._SIDE_STREAM[q.device] = torch.cuda.Stream(device=q.device)
-    ph = _flux._cu_placeholder(q.device)
+_STATES = {}
+_COUNTS = {}
 
-    def reduce(stream, qsp=(1, 0, None)):
+
+def backward(dout, q, k, v, out, lse0, lse1, scale, n, r, table, dq, v_off, flag_halves):
+    """dQ of both chunks into ``dq``; dK / dV out through ``table`` (see the module doc). ``k`` / ``v`` are
+    the saved ``[remote | own first | own second]`` keys of q1; ``v_off`` is the V region's byte offset
+    in a backward bank, ``flag_halves`` the flag array indices of sender 0 per half."""
+    S2, B, Hq, D = q.shape
+    c = S2 // 2
+    skv, _, Hkv, _ = k.shape
+    rem, len0 = (2 * n - 2 - r) * c, (r + 1) * c
+    keys0 = slice(rem - r * c, rem + c)
+    dkdv_l, odo_l, q_split, bkv, ilv = plan(B, c, n, r, Hq, Hkv, D, scale)
+    st_ = torch.cuda.current_stream()
+    dev = q.device
+    qf = _flux._prescale_q(q, scale)
+    half = c * B * Hq * D
+    deltas = [torch.empty(B, Hq, c, device=dev, dtype=torch.float32) for _ in range(2)]
+    for i in range(2):
+        rows = slice(i * c, (i + 1) * c)
+        odo_l(out[rows].reshape(-1), dout[rows].reshape(-1), deltas[i].reshape(-1), B, c, st_)
+    lses = [_flux._prescale_lse(lse.view(B, c, Hq).permute(0, 2, 1), st_).reshape(-1) for lse in (lse0, lse1)]
+    lens = (len0, skv)
+    ws_kv = [
+        [torch.empty(q_split, kv_len, B, Hkv, D, device=dev, dtype=k.dtype).reshape(-1) for _ in range(2)]
+        for kv_len in lens
+    ]
+    pad = _flux._WSQ_BAND_PAD if D == 128 else 0
+    ws_dq = [_flux._dq_partial_ws(kv_len // bkv, B, c, Hq * D, dev, q.dtype, pad, ilv)[0] for kv_len in lens]
+    ph = _flux._cu_placeholder(dev)
+    sched, num_sched = schedule(n, r, c, B, Hkv, q_split, bkv, dev)
+    grid = resident_blocks(dkdv_l, dev)
+    state = _STATES.get(dev)
+    if state is None:
+        state = _STATES[dev] = torch.zeros(ST_TAIL + 1, dtype=torch.int64, device=dev)
+    nb = skv // bkv
+    ckey = (dev, nb * Hkv * B + skv // c)
+    counts = _COUNTS.get(ckey)
+    if counts is None:
+        counts = _COUNTS[ckey] = torch.zeros(ckey[1], dtype=torch.int64, device=dev)
+    params = params_table(table, dev)
+    launch, compiled, hints, _ = _build(Hq, Hkv, D, scale, n, r, c, B, num_sched, grid, v_off, flag_halves)
+    args = (
+        qf[:half],
+        k[keys0].reshape(-1),
+        v[keys0].reshape(-1),
+        dout[:c].reshape(-1),
+        lses[0],
+        deltas[0].reshape(-1),
+        ws_kv[0][0],
+        ws_kv[0][1],
+        ws_dq[0][0, 0].reshape(-1),
+        qf[half:],
+        k.reshape(-1),
+        v.reshape(-1),
+        dout[c:].reshape(-1),
+        lses[1],
+        deltas[1].reshape(-1),
+        ws_kv[1][0],
+        ws_kv[1][1],
+        ws_dq[1][0, 0].reshape(-1),
+        ph,
+        sched,
+        state,
+        counts,
+        params,
+        st_,
+    )
+    if compiled[0] is None:
+        with CompilationContext.compile_hints(hints):
+            compiled[0] = flyc.compile(launch, *args)
+    else:
+        compiled[0](*args)
+    for i, kv_len in enumerate(lens):
         _flux._reduce_dq_partials(
-            ws_dq,
-            dq,
+            ws_dq[i],
+            dq[i * c : (i + 1) * c],
             bkv,
             Hq,
             D,
             dkdv_l.dq_scale,
-            stream,
-            qsp=qsp,
-            causal_offset=Skv - Sq,
+            st_,
+            causal_offset=kv_len - c,
             window_left=-1,
             causal=True,
-            n_bands=n_bands,
+            n_bands=kv_len // bkv,
             sbhd=True,
-            band_ring=wsq_ring,
-            band_pair=wsq_pair,
             ph=ph,
         )
-
-    for s in range(q_split):
-        body = dkdv_l if q_split == 1 else dkdv_l.chunk(s, 1)
-        body(
-            qf,
-            kf,
-            vf,
-            dof,
-            lsef,
-            df,
-            ws_dk,
-            ws_dv,
-            params,
-            params,
-            ws_dq[0, 0].reshape(-1),
-            B,
-            Sq,
-            Skv,
-            0,
-            st,
-        )
-        if pipe and s < q_split - 1:
-            side.wait_stream(st)
-            reduce(side, (q_split, s, 1))
-    signal(params, num_remote, st)
-    if pipe:
-        reduce(st, (q_split, q_split - 1, 1))
-        st.wait_stream(side)
-    else:
-        reduce(st)
     return dq
+
+
+def supported(B, c, n, r, Hq, Hkv, D, scale, deterministic):
+    return not deterministic and plan(B, c, n, r, Hq, Hkv, D, scale) is not None
