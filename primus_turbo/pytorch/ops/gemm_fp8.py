@@ -8,6 +8,9 @@ from typing import Optional, Union
 
 import torch
 
+import primus_turbo.common.envs as envs
+from primus_turbo.pytorch.core import fp8blk_weight_cache
+from primus_turbo.pytorch.core import overlap as _overlap
 from primus_turbo.pytorch.core.backend import (
     BackendType,
 )
@@ -36,9 +39,14 @@ from primus_turbo.pytorch.ops.utils import (
     _get_dummy_wgrad,
     _get_fp8_dtype,
     _setup_fused_grad_accum,
+    main_grad_first_write,
 )
 
 __all__ = ["gemm_fp8"]
+
+# Linear sites ("f<K>", K = the activation width) whose forward keeps a separate weight-scale pack launch
+# instead of packing inside the activation quant launch.
+_PACK_IN_QUANT_SKIP = frozenset({"f4096"})
 
 
 def _deter_use_nt_layout_gemm_in_bwd(trans_a: bool, trans_b: bool):
@@ -438,10 +446,117 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         trans_b: bool,
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
+        fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
         assert trans_a == False, "trans_a has to be False"
         a_dtype = _get_fp8_dtype(config.format, True)
         b_dtype = _get_fp8_dtype(config.format, True)
+        # Fused wgrad accumulation (g90 path: the kernel's beta=1 epilogue reads/writes main_grad, or beta=0 on the
+        # step's first write; other paths: GEMM then one add / copy into main_grad). The weight object is kept for
+        # the first-write policy, which is asked in backward (actual write order).
+        ctx.fuse_bgrad_accum, ctx.main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+        ctx.wparam = b if ctx.fuse_bgrad_accum else None
+
+        # gfx1250 dense path (PRIMUS_TURBO_FP8_BLOCK_KERNEL = dsv4up or g90): all three passes as NT GEMMs,
+        # 1x128 quant + token-major transposed copy in one pass, E8M0 scale bytes straight from the quant.
+        ctx.g90 = False
+        from primus_turbo.pytorch.kernels.gemm import gemm_fp8_flydsl_gfx1250_impl
+
+        if (
+            gemm_fp8_flydsl_gfx1250_impl.enabled()
+            and not isinstance(a, QuantizedTensor)
+            and not isinstance(b, QuantizedTensor)
+            and a.dim() == 2
+            and trans_b
+            and a.shape[0] % 512 == 0
+            and a.shape[1] % 512 == 0
+            and b.shape[0] % 512 == 0
+            and a_dtype == torch.float8_e4m3fn
+            and _get_fp8_dtype(config.format, False) == torch.float8_e4m3fn
+            and envs.PRIMUS_TURBO_FP8_BLOCK_UE8M0  # weight scales must be powers of two
+        ):
+            from primus_turbo.pytorch.kernels.gemm import gemm_fp8_gluon_gfx1250_impl
+            from primus_turbo.triton.quantization import quantization_fp8blk_dual_kernel as _qg
+
+            a = a.contiguous()
+            plan = None
+            if gemm_fp8_gluon_gfx1250_impl.enabled():
+                M_, K_ = a.shape
+                N_ = b.shape[0]
+                plan = (
+                    gemm_fp8_gluon_gfx1250_impl.use(M_, N_, K_, "fwd"),
+                    gemm_fp8_gluon_gfx1250_impl.use(M_, K_, N_, "dgrad"),
+                    gemm_fp8_gluon_gfx1250_impl.use(N_, K_, M_, "wgrad"),
+                )
+            # With a ready weight cache the weight-scale packing of the dsv4up passes runs inside the
+            # activation quant launch (same bytes, one launch less per Linear forward).
+            mbpk = None
+            if plan is not None and f"f{K_}" not in _PACK_IN_QUANT_SKIP:
+                wc = fp8blk_weight_cache.lookup(b, b_dtype)
+                if wc is not None:
+                    (a_row, _, a_re, a_t, a_te), mbpk = _qg.quant_dual_pack(
+                        a,
+                        a_dtype,
+                        "packed" if plan[0] else "g90",
+                        "packed" if plan[2] else "g90",
+                        [
+                            (wc.e8m0, 128, N_, K_) if plan[0] else None,
+                            (wc.e8m0.t(), 128, K_, N_) if plan[1] else None,
+                        ],
+                        site="f",
+                    )
+            if mbpk is None:
+                # The quant writes each activation scale in its consumer's layout (dsv4up packed for the dsv4up
+                # fwd / wgrad passes, g90 bytes otherwise): no activation pack_scales job.
+                a_row, _, a_re, a_t, a_te = _qg.quant_dual_t_e8m0_v2(
+                    a,
+                    a_dtype,
+                    row_layout="packed" if plan and plan[0] else "g90",
+                    t_layout="packed" if plan and plan[2] else "g90",
+                    site="f",
+                )
+            # W, W^T and E8M0 scales written by the optimizer step (FP8 weight cache), else quantized here.
+            wc = fp8blk_weight_cache.lookup(b, b_dtype)
+            if wc is not None:
+                b_row, b_e, b_t, b_te = wc.w, wc.e8m0, wc.wt, wc.e8m0_t
+            else:
+                b_row, b_row_scale = quantize_fp8(
+                    b,
+                    b_dtype,
+                    config.granularity,
+                    block_size=config.block_size,
+                    scaling_recipe=ScalingRecipe(use_2d_block=True),
+                )
+                b_e = _qg.e8m0_of(b_row_scale)
+                b_t, b_te = None, None
+            # dsv4up (Gluon) per pass where the shape allows, else g90. The weight scales of every dsv4up pass that
+            # only needs forward-time scales are packed in one launch here.
+            ctx.dsv = None
+            if plan is not None:
+                if mbpk is not None:  # weight scales packed by the quant launch
+                    pb, pbt = mbpk
+                else:
+                    _, pb, pbt, _ = gemm_fp8_gluon_gfx1250_impl.pack_scales(
+                        [
+                            None,
+                            (b_e, 128, N_, K_) if plan[0] else None,
+                            (b_e.t(), 128, K_, N_) if plan[1] else None,  # transposed view, no copy
+                            None,
+                        ]
+                    )
+                pa = a_re if plan[0] else None  # activation scales are already packed by the quant
+                pat = a_te if plan[2] else None
+                ctx.dsv = (plan, pbt, pat)
+                if plan[0]:
+                    out = gemm_fp8_gluon_gfx1250_impl.gemm_nt(a_row, b_row, pa, pb, out_dtype)
+                else:
+                    out = gemm_fp8_flydsl_gfx1250_impl.gemm_nt(a_row, b_row, a_re, b_e, out_dtype)
+            else:
+                out = gemm_fp8_flydsl_gfx1250_impl.gemm_nt(a_row, b_row, a_re, b_e, out_dtype)
+            ctx.save_for_backward(a_t, a_te, b_row, b_e, b_t, b_te)
+            ctx.g90 = True
+            ctx.trans_a, ctx.trans_b, ctx.out_dtype, ctx.config = trans_a, trans_b, out_dtype, config
+            return out
 
         if isinstance(a, QuantizedTensor):
             check_quantized_tensor(a, config, axis=-1)
@@ -466,9 +581,12 @@ class FP8GemmBlockFunction(torch.autograd.Function):
 
         # --- B side: 2D-block weight, reused unchanged in fwd + bwd. ---
         b_scaling_recipe = ScalingRecipe(use_2d_block=True)
+        wc = None if isinstance(b, QuantizedTensor) else fp8blk_weight_cache.lookup(b, b_dtype)
         if isinstance(b, QuantizedTensor):
             check_quantized_tensor(b, config, scaling_recipe=b_scaling_recipe)
             b_row, b_row_scale = b.qdata, b.scale_inv
+        elif wc is not None:  # quantized by the optimizer step (FP8 weight cache)
+            b_row, b_row_scale = wc.w, wc.scale_inv
         else:
             b_row, b_row_scale = quantize_fp8(
                 b, b_dtype, config.granularity, block_size=config.block_size, scaling_recipe=b_scaling_recipe
@@ -498,6 +616,85 @@ class FP8GemmBlockFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
+        if ctx.g90:
+            from primus_turbo.pytorch.kernels.gemm import gemm_fp8_flydsl_gfx1250_impl
+            from primus_turbo.triton.quantization.quantization_fp8blk_dual_kernel import quant_dual_t_e8m0_v2
+
+            a_t, a_te, b_row, b_e, b_t, b_te = ctx.saved_tensors
+            g_dtype = _get_fp8_dtype(ctx.config.format, False)
+            pd, pw = ctx.dsv[0][1:] if ctx.dsv is not None else (False, False)
+            g_row, _, g_re, g_t, g_te = quant_dual_t_e8m0_v2(
+                grad_out.contiguous(),
+                g_dtype,
+                row_layout="packed" if pd else "g90",
+                t_layout="packed" if pw else "g90",
+                site="b",
+            )
+            # Per-pass plan made in forward. The dY scales come out of the quant in the dsv4up layout.
+            use_d = use_w = False
+            if ctx.dsv is not None:
+                from primus_turbo.pytorch.kernels.gemm import gemm_fp8_gluon_gfx1250_impl
+
+                (_, use_d, use_w), pbt, pat = ctx.dsv
+                ctx.dsv = None
+                pg, pgt = (g_re if use_d else None), (g_te if use_w else None)
+
+            def wgemm(out_dtype, out=None, accumulate=False):
+                if use_w:
+                    return gemm_fp8_gluon_gfx1250_impl.gemm_nt(
+                        g_t, a_t, pgt, pat, out_dtype, out=out, accumulate=accumulate
+                    )
+                return gemm_fp8_flydsl_gfx1250_impl.gemm_nt(
+                    g_t, a_t, g_te, a_te, out_dtype, out=out, accumulate=accumulate
+                )
+
+            if (
+                b_t is None
+            ):  # no optimizer-written W^T: transpose the FP8 copy (128x128 blocks are transpose-invariant)
+                b_t, b_te = b_row.t().contiguous(), b_e.t().contiguous()
+
+            def fused_wgrad():
+                # wgrad: dW[N,K] = dY^T . X  ->  NT on the token-major copies, straight into main_grad
+                mg = ctx.main_grad
+                overwrite = main_grad_first_write(ctx.wparam)
+                if gemm_fp8_flydsl_gfx1250_impl.accum_supported(mg, b_row.shape[0], a_t.shape[0]) and not (
+                    overwrite and mg.dtype != ctx.out_dtype
+                ):
+                    # beta 0: plain epilogue straight into main_grad (= the unfused GEMM's output bits);
+                    # beta 1: old main_grad + acc in fp32, rounded once into main_grad's dtype
+                    run = lambda: wgemm(mg.dtype, out=mg, accumulate=not overwrite)  # noqa: E731
+                else:
+
+                    def run():
+                        gb = wgemm(ctx.out_dtype)
+                        mg.copy_(gb) if overwrite else mg.add_(gb)
+
+                ctx.main_grad = ctx.wparam = None
+                return mg, run
+
+            # With overlap on, the fused wgrad goes to the side stream first (it only feeds the optimizer), so
+            # it runs next to the dgrad chain; same kernel, same inputs -> same main_grad bits.
+            deferred = None
+            if ctx.fuse_bgrad_accum and _overlap.enabled("WGRAD"):
+                deferred, run = fused_wgrad()
+                _overlap.defer(
+                    run, deferred, g_t, a_t, g_te, a_te, pgt if use_w else None, pat if use_w else None
+                )
+            # dgrad: dX = dY . W  ->  NT with the FP8 copy of W^T (block scales transposed)
+            if use_d:
+                grad_a = gemm_fp8_gluon_gfx1250_impl.gemm_nt(g_row, b_t, pg, pbt, ctx.out_dtype)
+            else:
+                grad_a = gemm_fp8_flydsl_gfx1250_impl.gemm_nt(g_row, b_t, g_re, b_te, ctx.out_dtype)
+            if deferred is not None:
+                grad_b = _get_dummy_wgrad(list(deferred.shape), ctx.out_dtype)
+            elif ctx.fuse_bgrad_accum:
+                mg, run = fused_wgrad()
+                run()
+                grad_b = _get_dummy_wgrad(list(mg.shape), ctx.out_dtype)
+            else:
+                grad_b = wgemm(ctx.out_dtype)
+            return grad_a, grad_b, None, None, None, None, None, None, None
+
         a_col, a_col_scale, b_col, b_col_scale = ctx.saved_tensors
 
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
@@ -540,6 +737,12 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             granularity=ctx.config.granularity.value,
             default_backend=BackendType.TRITON.value,
         )
+        if ctx.fuse_bgrad_accum:
+            # no BLOCKWISE Triton kernel has a beta=1 epilogue: one add (or copy on the step's first write)
+            mg = ctx.main_grad
+            mg.copy_(grad_b) if main_grad_first_write(ctx.wparam) else mg.add_(grad_b)
+            ctx.main_grad = ctx.wparam = None
+            grad_b = _get_dummy_wgrad(list(mg.shape), ctx.out_dtype)
 
         return (
             grad_a,  # a
@@ -550,6 +753,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             None,  # trans_b
             None,  # out_dtype
             None,  # config
+            None,  # fuse_bgrad_accum_pattern
         )
 
 
@@ -809,6 +1013,10 @@ def gemm_fp8(
             a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config, fuse_bgrad_accum_pattern
         )
 
+    if config.granularity == ScalingGranularity.BLOCKWISE:
+        return FP8GemmBlockFunction.apply(
+            a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config, fuse_bgrad_accum_pattern
+        )
     # The remaining granularities silently ignore the flag rather than fusing, which
     # would leave main_grad unwritten and the weight without a gradient.
     assert fuse_bgrad_accum_pattern is None, (

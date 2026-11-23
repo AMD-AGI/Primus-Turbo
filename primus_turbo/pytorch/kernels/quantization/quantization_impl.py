@@ -4,11 +4,13 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import functools
 from typing import Optional, Tuple, Union
 
 import torch
 import triton
 
+import primus_turbo.common.envs as envs
 from primus_turbo.flydsl.quantization.mxfp8_quant_flydsl import (
     grouped_quant_mxfp8_raw,
     quant_mxfp8_raw,
@@ -90,6 +92,14 @@ def dequantize_fp8_rowwise_impl(x: torch.Tensor, out_dtype: torch.dtype, axis: i
     return torch.ops.primus_turbo_cpp_extension.dequantize_fp8_rowwise(x, scale_inv, axis, out_dtype)
 
 
+@functools.lru_cache(maxsize=None)
+def blockwise_ue8m0() -> bool:
+    """PRIMUS_TURBO_FP8_BLOCK_UE8M0=1: BLOCKWISE (128) quant rounds every scale to a power of two
+    (UE8M0, DeepSeek-V3/V4 recipe). Scales stay fp32 tensors holding 2^k values, so every blockwise
+    GEMM consumes them unchanged. The HIP quant fast paths do not implement it and are bypassed."""
+    return envs.PRIMUS_TURBO_FP8_BLOCK_UE8M0
+
+
 @torch.library.custom_op("primus_turbo::quant_fp8_blockwise_impl", mutates_args=())
 def quant_fp8_blockwise_impl(
     x: torch.Tensor,
@@ -133,6 +143,7 @@ def quant_fp8_blockwise_impl(
         block_size,
         torch.finfo(dtype).max,
         axis,
+        POW2_SCALE=blockwise_ue8m0(),
     )
     return x_fp8, x_scales
 
@@ -289,6 +300,7 @@ def quant_fp8_blockwise_dual_impl(
         N,
         block_size,
         torch.finfo(dtype).max,
+        POW2_SCALE=blockwise_ue8m0(),
     )
     return x_fp8_row, x_scales_row, x_fp8_col, x_scales_col
 
@@ -335,8 +347,10 @@ def quant_fp8_blockwise_for_weight_impl(
     # only when the C++ op is built and block_size == 128 (its only supported size),
     # else fall through to the Triton kernel. Benefits both the grouped and
     # non-grouped blockwise paths that quantize weights through here.
-    if block_size == 128 and hasattr(
-        torch.ops.primus_turbo_cpp_extension, "quantize_fp8_blockwise_for_weight"
+    if (
+        block_size == 128
+        and not blockwise_ue8m0()
+        and hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_fp8_blockwise_for_weight")
     ):
         return torch.ops.primus_turbo_cpp_extension.quantize_fp8_blockwise_for_weight(w, dtype, block_size)
 
@@ -361,6 +375,7 @@ def quant_fp8_blockwise_for_weight_impl(
         N,
         block_size,
         torch.finfo(dtype).max,
+        POW2_SCALE=blockwise_ue8m0(),
     )
 
     if ori_dims == 2:
@@ -433,6 +448,7 @@ def quant_fp8_blockwise_segment_m_row_col_impl(
     if (
         gemm_other_dim is not None
         and block_size == 128
+        and not blockwise_ue8m0()
         and hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_fp8_blockwise_segment_m_row_col")
     ):
         gemm_flops = x.size(0) * x.size(1) * gemm_other_dim
@@ -472,6 +488,7 @@ def quant_fp8_blockwise_segment_m_row_col_impl(
         num_groups,
         block_size,
         torch.finfo(dtype).max,
+        POW2_SCALE=blockwise_ue8m0(),
     )
     return (
         x_fp8_row,

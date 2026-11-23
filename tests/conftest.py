@@ -55,6 +55,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_kwargs_keys.py",
     # beta = 1 on the same kernel's variable-K wgrad, into an fp32 main_grad (Muse Spark expert shapes).
     "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_variable_k_accum.py",
+    # The gfx1250 Gluon gate (Triton >= 3.9) and the fallbacks it selects; host-only.
+    "tests/pytorch/ops/test_gluon_gate.py",
     # FlyDSL attention at the DeepSeek-V3 MLA head dims (primus_turbo/flydsl/attention/gfx1250_mla).
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla.py",
     # Its backward's launch plan: head chunks within the dS scratch budget, grids, bitwise equality across chunkings.
@@ -86,6 +88,14 @@ _GFX1250_ENABLED_TESTS = (
     # Host-only: a subprocess imports every primus_turbo.flydsl module and holds each launch
     # declared at module level to the no-mutable-global rule. The rest of that file stays skipped here.
     "tests/pytorch/ops/test_flydsl_autotune.py::test_no_module_level_launch_reads_a_mutable_global",
+    # FP8 / BF16 / quantization / attention gfx1250 kernel tests.
+    "tests/pytorch/ops/test_overlap_switch.py",
+    "tests/pytorch/ops/test_gemm_fp8_block_wgrad_gfx1250.py",
+    "tests/pytorch/ops/test_fp8_block_weight_cache_gfx1250.py",
+    "tests/pytorch/ops/test_gemm_bf16_gluon_gfx1250.py",
+    "tests/pytorch/ops/test_quant_dual_gfx1250.py",
+    "tests/pytorch/ops/test_gemm_fp8_block_gluon_gfx1250.py",
+    "tests/pytorch/ops/test_gemm_fp8_block_gfx1250.py",
 )
 
 
