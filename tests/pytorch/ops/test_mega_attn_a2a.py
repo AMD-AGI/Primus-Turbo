@@ -257,6 +257,8 @@ def run_suite(quick, checks, models):
         configs.append((32 if n <= 4 else 64, 4 if n <= 4 else 8, 128, 128, 128**-0.5))
         if not quick:
             configs.append((8 * n, n, 128, 128, 128**-0.5))
+            # two kv heads a rank (Llama3.1-8B at CP4)
+            configs.append((8 * n, 2 * n, 128, 128, 128**-0.5))
     if "mla" in models:
         # Kimi-K2 at CP8 (8 local heads); DeepSeek-V3's 16 local heads in the full suite
         configs.append((8 * n, 8 * n, 192, 128, MLA_SCALE))
