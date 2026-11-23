@@ -81,6 +81,11 @@ def _report(name, out, ref, failures, tag, bitwise):
     return same, diff
 
 
+def _snr(out, ref):
+    err = (out.float() - ref.float()).pow(2).sum()
+    return (10 * torch.log10(ref.float().pow(2).sum() / err.clamp_min(1e-30))).item()
+
+
 def check_forward(group, hq, hkv, d, d_v, scale, s_local, seq_chunk, repeats, failures):
     from primus_turbo.flydsl.mega_attn.a2a_attn_kernel import (
         a2a_attn_fwd_bank_bytes,
@@ -221,17 +226,24 @@ def check_op(group, hq, hkv, d, d_v, scale, s_local, seq_chunk, failures):
         torch.cuda.synchronize()
         t = f"{tag} it={it}"
         so, do = _report("out", out, o_all[:, 0][rows], failures, t, False)
-        _, dq = _report("dq", q.grad, dq_all[:, 0][rows], failures, t, False)
         _, dk = _report("dk", k.grad, dk_all[:, 0][rows], failures, t, False)
         _, dv = _report("dv", v.grad, dv_all[:, 0][rows], failures, t, False)
-        sq, dqg = _report("dq vs per-group", q.grad, dq_grp[rows], failures, t, False)
         sk, _ = _report("dk vs per-group", k.grad, dk_grp[rows], failures, t, True)
         sv, _ = _report("dv vs per-group", v.grad, dv_grp[rows], failures, t, True)
+        if d == d_v:
+            _, dq = _report("dq", q.grad, dq_all[:, 0][rows], failures, t, False)
+            dq_msg = f"dq {dq:.2e}"
+        else:
+            # the MLA backward's dQ is bf16 atomics into its dQ images: not run to run deterministic
+            snrs = [_snr(q.grad, ref[rows]) for ref in (dq_all[:, 0], dq_grp)]
+            for name, snr in zip(("dq", "dq vs per-group"), snrs):
+                if snr <= 40:
+                    failures.append(f"{t} {name}: snr {snr:.1f} dB")
+            dq_msg = f"dq snr {snrs[0]:.1f} dB (per-group {snrs[1]:.1f} dB)"
         if rank == 0:
             print(
-                f"{t} out bitwise={so} {do:.2e} | vs global: dq {dq:.2e} dk {dk:.2e} dv {dv:.2e}"
-                f" (max|dq| {dq_all.float().abs().max().item():.2e}) | vs per-group: dq bitwise={sq}"
-                f" {dqg:.2e}, dk/dv bitwise {sk}/{sv}",
+                f"{t} out bitwise={so} {do:.2e} | vs global: {dq_msg} dk {dk:.2e} dv {dv:.2e}"
+                f" | dk/dv bitwise vs per-group {sk}/{sv}",
                 flush=True,
             )
 
