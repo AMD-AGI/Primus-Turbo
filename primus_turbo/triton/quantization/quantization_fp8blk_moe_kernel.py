@@ -330,6 +330,13 @@ def swiglu_fwd_dual_blk(
     I = I2 // 2
     sl = scale_layout_id(scale_layout)
     q, s, qT, sT = _dual_alloc(P, I, dtype, sl, compact_t, l1.device)
+    if gluon_ok():
+        from primus_turbo.gluon.activation import swiglu_fp8blk_fwd_kernel as _swf
+
+        act = (alpha, off, glo, ghi, ucl)
+        if _swf.swf_gl_ok(l1, w, preal, act, P, I, compact_t, sl, dtype):
+            # persistent Gluon kernel, byte-identical to _swiglu_fwd_dual_kernel (default activation, compact sT)
+            return _swf.swf_gl(l1, w, preal, act, q, s, qT, sT)
     _swiglu_fwd_dual_kernel[(P // 128, I // 128)](
         l1,
         w,
@@ -445,6 +452,28 @@ def swiglu_bwd_dual_blk(
         and w.dtype == torch.float32
         and preal.dtype == torch.int32
     ):
+        from primus_turbo.gluon.activation import swiglu_fp8blk_bwd_kernel as _swb
+        from primus_turbo.gluon.activation.swiglu_fp8blk_fwd_kernel import VERIFIED_ACT
+
+        if P % 128 == 0 and I % 128 == 0 and (alpha, off, glo, ghi, ucl) in VERIFIED_ACT:
+            # persistent Gluon kernel, byte-identical to swb_q2 (q, s, qT, sT and the d w partials)
+            _swb.swb_gl(
+                d_act.contiguous(),
+                l1.contiguous(),
+                w.contiguous(),
+                q,
+                s,
+                qT,
+                sT,
+                gw,
+                preal,
+                alpha,
+                off,
+                glo,
+                ghi,
+                ucl,
+            )
+            return q, s, qT, sT, (gw if raw_dw else gw.sum(1))
         from primus_turbo.gluon.quantization.quantization_fp8blk_dual_kernel import swb_q2
 
         swb_q2(
