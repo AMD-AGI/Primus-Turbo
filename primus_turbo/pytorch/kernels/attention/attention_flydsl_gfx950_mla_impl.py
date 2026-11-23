@@ -71,8 +71,6 @@ def flydsl_gfx950_mla_unsupported_reason(
         return "causal only"
     if int(window_size[0]) >= 0 or int(window_size[1]) > 0:
         return f"no sliding window, got {tuple(window_size)}"
-    if softmax_scale is not None and abs(float(softmax_scale) - 1.0 / math.sqrt(D_QK)) > 1e-6:
-        return "the forward bakes softmax_scale = 1/sqrt(192)"
     if deterministic:
         return "dQ is accumulated with atomics; no deterministic path"
     B, Sq, Hq, _ = q.shape
@@ -90,13 +88,22 @@ def flydsl_gfx950_mla_unsupported_reason(
     return None
 
 
+def _baked_scale(softmax_scale):
+    """The forward's compile-time scale: None (1/sqrt(192), computed in the kernel) or the number."""
+    if softmax_scale is None or abs(float(softmax_scale) - 1.0 / math.sqrt(D_QK)) <= 1e-12:
+        return None
+    return float(softmax_scale)
+
+
 @_eager_custom_op("primus_turbo::flash_attn_flydsl_gfx950_mla_forward")
-def _forward_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    return _kernels().mla_fwd_sbhd(q, k, v, causal=True, return_lse=True)
+def _forward_op(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: Optional[float]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _kernels().mla_fwd_sbhd(q, k, v, causal=True, return_lse=True, softmax_scale=softmax_scale)
 
 
 @_forward_op.register_fake
-def _forward_op_fake(q, k, v):
+def _forward_op_fake(q, k, v, softmax_scale):
     Sq, B, Hq, _ = q.shape
     return q.new_empty((Sq, B, Hq, D_V)), q.new_empty((B * Sq, Hq), dtype=torch.float32)
 
@@ -119,10 +126,10 @@ def _backward_op_fake(dout, q, k, v, out, lse, softmax_scale):
     return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
 
-def flash_attn_flydsl_gfx950_mla_forward_impl(q, k, v):
+def flash_attn_flydsl_gfx950_mla_forward_impl(q, k, v, softmax_scale=None):
     """q/k [Sq,B,H,192], v [Sq,B,H,128] (sbhd). Returns O [Sq,B,H,128] and LSE [B*Sq,H] fp32."""
     q, k, v = (t.contiguous() for t in (q, k, v))
-    return _forward_op(q, k, v)
+    return _forward_op(q, k, v, _baked_scale(softmax_scale))
 
 
 def flash_attn_flydsl_gfx950_mla_backward_impl(dout, q, k, v, out, lse, softmax_scale=None):
@@ -132,12 +139,14 @@ def flash_attn_flydsl_gfx950_mla_backward_impl(dout, q, k, v, out, lse, softmax_
 
 
 @_eager_custom_op("primus_turbo::flash_attn_flydsl_gfx950_mla_bshd_forward")
-def _forward_bshd_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    return _kernels().mla_fwd_bshd(q, k, v, causal=True, return_lse=True)
+def _forward_bshd_op(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: Optional[float]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _kernels().mla_fwd_bshd(q, k, v, causal=True, return_lse=True, softmax_scale=softmax_scale)
 
 
 @_forward_bshd_op.register_fake
-def _forward_bshd_op_fake(q, k, v):
+def _forward_bshd_op_fake(q, k, v, softmax_scale):
     B, Sq, Hq, _ = q.shape
     return q.new_empty((B, Sq, Hq, D_V)), q.new_empty((B * Sq, Hq), dtype=torch.float32)
 
@@ -160,9 +169,9 @@ def _backward_bshd_op_fake(dout, q, k, v, out, lse, softmax_scale):
     return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
 
-def flash_attn_flydsl_gfx950_mla_forward_bshd_impl(q, k, v):
+def flash_attn_flydsl_gfx950_mla_forward_bshd_impl(q, k, v, softmax_scale=None):
     """q/k [B,Sq,H,192], v [B,Sq,H,128], contiguous. Returns O [B,Sq,H,128] and LSE [B*Sq,H] fp32."""
-    return _forward_bshd_op(q, k, v)
+    return _forward_bshd_op(q, k, v, _baked_scale(softmax_scale))
 
 
 def flash_attn_flydsl_gfx950_mla_backward_bshd_impl(dout, q, k, v, out, lse, softmax_scale=None):

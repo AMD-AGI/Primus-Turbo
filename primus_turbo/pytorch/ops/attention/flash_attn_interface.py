@@ -257,7 +257,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 ctx.mla_bshd = mla_bshd_native(q, k, v)
                 if ctx.mla_bshd:
                     # Contiguous bshd is read in place by the bshd kernels: no copy either way.
-                    out_b, lse = flash_attn_flydsl_gfx950_mla_forward_bshd_impl(q, k, v)
+                    out_b, lse = flash_attn_flydsl_gfx950_mla_forward_bshd_impl(q, k, v, softmax_scale)
                     B, Sq, Hq = q.shape[0], q.shape[1], q.shape[2]
                     if is_grad_enabled and _any_requires_grad(q, k, v, sink):
                         ctx.save_for_backward(q, k, v, out_b, lse)
@@ -266,7 +266,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 # sbhd storage makes this view contiguous as it stands; any other byte order is
                 # copied, once, and kept for the backward.
                 q_s, k_s, v_s = (t.contiguous() for t in (q_s, k_s, v_s))
-                out_s, lse = flash_attn_flydsl_gfx950_mla_forward_impl(q_s, k_s, v_s)
+                out_s, lse = flash_attn_flydsl_gfx950_mla_forward_impl(q_s, k_s, v_s, softmax_scale)
             else:
                 out_s, lse = flash_attn_sbhd_flydsl_forward_impl(
                     q_s,

@@ -27,6 +27,7 @@ import heapq
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.utils.arith import ArithValue
@@ -66,163 +67,37 @@ JOB_BATCH_LIMIT = 1 << 7
 JOB_FIXED_TILES = 8
 
 
-def build_flash_attn_dualwave_swp_module(
-    num_heads,
-    head_dim,
-    causal=True,
-    dtype_str="bf16",
-    num_kv_heads=None,
-    waves_per_eu=2,
-    daz=True,
-    dualwave_swp_setprio=True,
-    dualwave_swp_enable_stagger=True,
-    varlen=False,
-    cross_seqlen=False,
-    emit_lse=False,
-    window_left=-1,
-    block_m=None,
-    gqa_merge=None,
-    sbhd=False,
-    has_sink=False,
-    head_dim_v=None,
-    k_head=None,
-    qk_mfma16=None,
-    pv_mfma16=None,
-    rows_per_wave=32,
-    fold_barriers=None,
-    persistent=0,
-):
-    """Build a DUALWAVE_SWP flash_attn launcher for (D_QK, D_V) in {64/64, 128/128, 192/128}.
+def prefetch_k(ctx, job):
+    """First two K tiles of a packed persistent job (split_t0 is 0 there) into buf0 / buf1."""
+    h_idx, batch_idx = fx.Index(job & JOB_HEAD_MASK), fx.Index(job >> JOB_BATCH_SHIFT)
+    for t in range_constexpr(2):
+        ctx.prefetch_k_tile(h_idx, batch_idx, fx.Index(t), t)
 
-    Supports dense (SBHD) and varlen packed QKV (THD) layouts. has_sink folds a learned
-    per-q-head attention sink (SINK[Hq] fp32) into the online-softmax denominator.
-    ``k_head`` is the number of QK k-steps whose K packs are read before the first MFMA
-    group (default K_STEPS_QK - 2). ``qk_mfma16`` runs QK on 16x16x32 MFMAs (default: on
-    for D_QK 192 without a causal window); ``pv_mfma16`` runs P*V on them too (default: with
-    ``qk_mfma16``). ``rows_per_wave`` 64 halves the waves per q block (one per SIMD at
-    block_m 256). ``fold_barriers`` drops the memory-cluster rendezvous (default: above 4 waves).
-    ``persistent`` > 0 launches at most that many CTAs (one per CU), each running the jobs the
-    host schedule (``launcher.schedule``) gives it; dense layouts without a window only.
-    """
-    gpu_arch = get_hip_arch()
 
-    if not gpu_arch.startswith("gfx950"):
-        raise RuntimeError(
-            f"flash_attn_dualwave_swp requires gfx950+ (uses ds_read_tr16_b64), got {gpu_arch}"
-        )
-    head_dim_v = head_dim if head_dim_v is None else head_dim_v
-    if (head_dim, head_dim_v) not in ((64, 64), (128, 128), (192, 128)):
-        raise RuntimeError(
-            f"flash_attn_dualwave_swp supports D_QK/D_V 64/64, 128/128, 192/128, got {head_dim}/{head_dim_v}"
-        )
-    if dtype_str not in ("bf16", "f16"):
-        raise RuntimeError(f"flash_attn_dualwave_swp supports bf16/f16 only, got dtype={dtype_str}")
-
-    if num_kv_heads is None:
-        num_kv_heads = num_heads
-    assert num_heads % num_kv_heads == 0
-
-    traits = _make_dualwave_swp_traits(
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        causal=causal,
-        dtype_str=dtype_str,
-        waves_per_eu=waves_per_eu,
-        daz=daz,
-        dualwave_swp_setprio=dualwave_swp_setprio,
-        dualwave_swp_enable_stagger=dualwave_swp_enable_stagger,
-        varlen=varlen,
-        cross_seqlen=cross_seqlen,
-        emit_lse=emit_lse,
-        window_left=window_left,
-        block_m=block_m,
-        gqa_merge=gqa_merge,
-        sbhd=sbhd,
-        has_sink=has_sink,
-        head_dim_v=head_dim_v,
-        qk_mfma16=qk_mfma16,
-        pv_mfma16=pv_mfma16,
-        rows_per_wave=rows_per_wave,
+def job_coords(job):
+    """(head, q block, batch) of a packed persistent job."""
+    return (
+        fx.Index(job & JOB_HEAD_MASK),
+        fx.Index((job >> JOB_QBLOCK_SHIFT) & JOB_QBLOCK_MASK),
+        fx.Index(job >> JOB_BATCH_SHIFT),
     )
-    traits.FOLD_BARRIERS = traits.NUM_WAVES > 4 if fold_barriers is None else bool(fold_barriers)
-    traits.K_HEAD = max(1, traits.K_STEPS_QK - 2) if k_head is None else int(k_head)
-    assert 1 <= traits.K_HEAD <= traits.K_STEPS_QK
-    traits.PERSISTENT = int(persistent)
-    assert not traits.PERSISTENT or not (varlen or cross_seqlen or window_left >= 0)
-    # Persistent drains DMA part of the next job's Q through the O stage tiles (stage_q_dma);
-    # its geometry is the D_QK 192 paired-step split.
-    traits.Q_LDS_STAGE = bool(
-        traits.PERSISTENT and traits.O_LDS_STAGE and traits.QK_MFMA16 and traits.HEAD_DIM == 192
-    )
-    # Persistent dense causal with four q tiles a wave: q tile qt of wave w takes block rows
-    # 64 qt + 16 w, not 64 w + 16 qt. Every wave then holds the same share of the diagonal, and
-    # the drain's dead q tiles are the same static ones on every wave (`_qk_diag`).
-    traits.ROW_INTERLEAVE = bool(
-        traits.PERSISTENT
-        and traits.CAUSAL
-        and traits.Q_TILES == 4
-        and traits.QK_MFMA16
-        and traits.PV_MFMA16
-        and traits.Q_HEADS_PER_WG == 1
-        and traits.NUM_WAVES * 16 == traits.BLOCK_M // traits.Q_TILES == traits.BLOCK_N
-    )
-    if traits.ROW_INTERLEAVE:
-        traits.QT_ROW_STRIDE = traits.BLOCK_M // traits.Q_TILES
-        traits.WAVE_ROW_STRIDE = 16
-    _dualwave_swp_cache_tag = traits.cache_tag
 
-    _lds_elem_dtype = dtype_to_elem_type(traits.DTYPE_STR)
 
-    @fx.struct
-    class SharedStorage:
-        kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
-        if traits.O_LDS_STAGE:
-            o: fx.Array[_lds_elem_dtype, traits.LDS_O_STAGE_SIZE, 16]
+def prefetch_q(ctx, job, staged=False):
+    """Raw Q packs of a packed persistent job, for its `mla_tile(q_raw=...)`; `staged` leaves the
+    O-stage ones None for `read_q_stage`."""
+    if const_expr(staged):
+        return ctx.prefetch_q_staged(*job_coords(job))
+    return ctx.prefetch_q_raw(*job_coords(job))
 
-    @flyc.kernel(known_block_size=[traits.BLOCK_SIZE, 1, 1])
-    def flash_attn_dualwave_swp_gfx950_kernel(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        O: fx.Tensor,  # noqa: E741
-        DebugCounts: fx.Tensor,
-        CuSeqQ: fx.Tensor,
-        CuSeqKv: fx.Tensor,
-        BlockTable: fx.Tensor,
-        SINK: fx.Tensor,
-        ScoreBound: fx.Tensor,
-        Sched: fx.Tensor,
-        seq_len: fx.Int32,
-        seq_len_kv: fx.Int32,
-        stride_q_n: fx.Int32,
-        stride_kv_n: fx.Int32,
-        head_dim_runtime: fx.Int32,
-        block_table_stride: fx.Int32,
-        sched_stride: fx.Int32,
-    ):
-        ctx = DualwaveKernelContext(
-            traits,
-            Q,
-            K,
-            V,
-            O,
-            DebugCounts,
-            CuSeqQ,
-            CuSeqKv,
-            BlockTable,
-            seq_len,
-            seq_len_kv,
-            stride_q_n,
-            stride_kv_n,
-            head_dim_runtime,
-            block_table_stride,
-            SINK=SINK,
-            ScoreBound=ScoreBound,
-        )
-        ctx._setup(SharedStorage, bind_block=not traits.PERSISTENT)
 
-        active = None if traits.PERSISTENT else ctx.active
+def make_mla_tile(traits):
+    """The kernel body for the job ``ctx.bind_item`` bound: ``mla_tile(ctx, next_job, q_raw)`` after
+    ``ctx._setup``. Shared by the one-CTA-per-job launch, the persistent job loop and persistent
+    callers that claim their own jobs (``next_job=None``: no cross-job prefetch)."""
+
+    @ASTRewriter.transform
+    def mla_tile(ctx, next_job=None, q_raw=None):
         # A tile's LDS buffer is not overwritten until two barriers later, so its drain can sink
         # into the consuming compute cluster; stagger spends that same slack, hence the exclusion.
         sink_drains = not traits.DUALWAVE_SWP_ENABLE_STAGGER
@@ -284,25 +159,13 @@ def build_flash_attn_dualwave_swp_module(
         v_o_zero = ctx.c_zero_o if traits.PV_MFMA16 else ctx.c_zero_v16f32
 
         def _prefetch_k(job):
-            """First two K tiles of a packed persistent job (split_t0 is 0 there) into buf0 / buf1."""
-            h_idx, batch_idx = fx.Index(job & JOB_HEAD_MASK), fx.Index(job >> JOB_BATCH_SHIFT)
-            for t in range_constexpr(2):
-                ctx.prefetch_k_tile(h_idx, batch_idx, fx.Index(t), t)
+            prefetch_k(ctx, job)
 
         def _job_coords(job):
-            """(head, q block, batch) of a packed persistent job."""
-            return (
-                fx.Index(job & JOB_HEAD_MASK),
-                fx.Index((job >> JOB_QBLOCK_SHIFT) & JOB_QBLOCK_MASK),
-                fx.Index(job >> JOB_BATCH_SHIFT),
-            )
+            return job_coords(job)
 
         def _prefetch_q(job, staged=False):
-            """Raw Q packs of a packed persistent job, for its `_main_body(q_raw=...)`; `staged`
-            leaves the O-stage ones None for `read_q_stage`."""
-            if const_expr(staged):
-                return ctx.prefetch_q_staged(*_job_coords(job))
-            return ctx.prefetch_q_raw(*_job_coords(job))
+            return prefetch_q(ctx, job, staged)
 
         def _main_body(next_job=None, q_raw=None):
             """With `next_job` (persistent), this job's first two K tiles and its Q (`q_raw`) were
@@ -1165,6 +1028,231 @@ def build_flash_attn_dualwave_swp_module(
             ctx.store_final_o(v_o, ctx.q_row)
             return q_next
 
+        return _main_body(next_job=next_job, q_raw=q_raw)
+
+    return mla_tile
+
+
+def make_mla_traits(
+    num_heads,
+    head_dim,
+    causal=True,
+    dtype_str="bf16",
+    num_kv_heads=None,
+    waves_per_eu=2,
+    daz=True,
+    dualwave_swp_setprio=True,
+    dualwave_swp_enable_stagger=True,
+    varlen=False,
+    cross_seqlen=False,
+    emit_lse=False,
+    window_left=-1,
+    block_m=None,
+    gqa_merge=None,
+    sbhd=False,
+    has_sink=False,
+    head_dim_v=None,
+    k_head=None,
+    qk_mfma16=None,
+    pv_mfma16=None,
+    rows_per_wave=32,
+    fold_barriers=None,
+    persistent=0,
+    sm_scale=None,
+):
+    """The traits ``build_flash_attn_dualwave_swp_module`` compiles (same arguments), for callers
+    that embed its job body (``make_mla_tile``)."""
+    gpu_arch = get_hip_arch()
+
+    if not gpu_arch.startswith("gfx950"):
+        raise RuntimeError(
+            f"flash_attn_dualwave_swp requires gfx950+ (uses ds_read_tr16_b64), got {gpu_arch}"
+        )
+    head_dim_v = head_dim if head_dim_v is None else head_dim_v
+    if (head_dim, head_dim_v) not in ((64, 64), (128, 128), (192, 128)):
+        raise RuntimeError(
+            f"flash_attn_dualwave_swp supports D_QK/D_V 64/64, 128/128, 192/128, got {head_dim}/{head_dim_v}"
+        )
+    if dtype_str not in ("bf16", "f16"):
+        raise RuntimeError(f"flash_attn_dualwave_swp supports bf16/f16 only, got dtype={dtype_str}")
+
+    if num_kv_heads is None:
+        num_kv_heads = num_heads
+    assert num_heads % num_kv_heads == 0
+
+    traits = _make_dualwave_swp_traits(
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        causal=causal,
+        dtype_str=dtype_str,
+        waves_per_eu=waves_per_eu,
+        daz=daz,
+        dualwave_swp_setprio=dualwave_swp_setprio,
+        dualwave_swp_enable_stagger=dualwave_swp_enable_stagger,
+        varlen=varlen,
+        cross_seqlen=cross_seqlen,
+        emit_lse=emit_lse,
+        window_left=window_left,
+        block_m=block_m,
+        gqa_merge=gqa_merge,
+        sbhd=sbhd,
+        has_sink=has_sink,
+        head_dim_v=head_dim_v,
+        qk_mfma16=qk_mfma16,
+        pv_mfma16=pv_mfma16,
+        rows_per_wave=rows_per_wave,
+    )
+    traits.FOLD_BARRIERS = traits.NUM_WAVES > 4 if fold_barriers is None else bool(fold_barriers)
+    traits.K_HEAD = max(1, traits.K_STEPS_QK - 2) if k_head is None else int(k_head)
+    assert 1 <= traits.K_HEAD <= traits.K_STEPS_QK
+    traits.PERSISTENT = int(persistent)
+    assert not traits.PERSISTENT or not (varlen or cross_seqlen or window_left >= 0)
+    # Persistent drains DMA part of the next job's Q through the O stage tiles (stage_q_dma);
+    # its geometry is the D_QK 192 paired-step split.
+    traits.Q_LDS_STAGE = bool(
+        traits.PERSISTENT and traits.O_LDS_STAGE and traits.QK_MFMA16 and traits.HEAD_DIM == 192
+    )
+    # Persistent dense causal with four q tiles a wave: q tile qt of wave w takes block rows
+    # 64 qt + 16 w, not 64 w + 16 qt. Every wave then holds the same share of the diagonal, and
+    # the drain's dead q tiles are the same static ones on every wave (`_qk_diag`).
+    traits.ROW_INTERLEAVE = bool(
+        traits.PERSISTENT
+        and traits.CAUSAL
+        and traits.Q_TILES == 4
+        and traits.QK_MFMA16
+        and traits.PV_MFMA16
+        and traits.Q_HEADS_PER_WG == 1
+        and traits.NUM_WAVES * 16 == traits.BLOCK_M // traits.Q_TILES == traits.BLOCK_N
+    )
+    if traits.ROW_INTERLEAVE:
+        traits.QT_ROW_STRIDE = traits.BLOCK_M // traits.Q_TILES
+        traits.WAVE_ROW_STRIDE = 16
+    traits.SM_SCALE = None if sm_scale is None else float(sm_scale)
+    return traits
+
+
+def build_flash_attn_dualwave_swp_module(
+    num_heads,
+    head_dim,
+    causal=True,
+    dtype_str="bf16",
+    num_kv_heads=None,
+    waves_per_eu=2,
+    daz=True,
+    dualwave_swp_setprio=True,
+    dualwave_swp_enable_stagger=True,
+    varlen=False,
+    cross_seqlen=False,
+    emit_lse=False,
+    window_left=-1,
+    block_m=None,
+    gqa_merge=None,
+    sbhd=False,
+    has_sink=False,
+    head_dim_v=None,
+    k_head=None,
+    qk_mfma16=None,
+    pv_mfma16=None,
+    rows_per_wave=32,
+    fold_barriers=None,
+    persistent=0,
+    sm_scale=None,
+):
+    """Build a DUALWAVE_SWP flash_attn launcher for (D_QK, D_V) in {64/64, 128/128, 192/128}.
+
+    Supports dense (SBHD) and varlen packed QKV (THD) layouts. has_sink folds a learned
+    per-q-head attention sink (SINK[Hq] fp32) into the online-softmax denominator.
+    ``k_head`` is the number of QK k-steps whose K packs are read before the first MFMA
+    group (default K_STEPS_QK - 2). ``qk_mfma16`` runs QK on 16x16x32 MFMAs (default: on
+    for D_QK 192 without a causal window); ``pv_mfma16`` runs P*V on them too (default: with
+    ``qk_mfma16``). ``rows_per_wave`` 64 halves the waves per q block (one per SIMD at
+    block_m 256). ``fold_barriers`` drops the memory-cluster rendezvous (default: above 4 waves).
+    ``persistent`` > 0 launches at most that many CTAs (one per CU), each running the jobs the
+    host schedule (``launcher.schedule``) gives it; dense layouts without a window only.
+    """
+    traits = make_mla_traits(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        causal=causal,
+        dtype_str=dtype_str,
+        num_kv_heads=num_kv_heads,
+        waves_per_eu=waves_per_eu,
+        daz=daz,
+        dualwave_swp_setprio=dualwave_swp_setprio,
+        dualwave_swp_enable_stagger=dualwave_swp_enable_stagger,
+        varlen=varlen,
+        cross_seqlen=cross_seqlen,
+        emit_lse=emit_lse,
+        window_left=window_left,
+        block_m=block_m,
+        gqa_merge=gqa_merge,
+        sbhd=sbhd,
+        has_sink=has_sink,
+        head_dim_v=head_dim_v,
+        k_head=k_head,
+        qk_mfma16=qk_mfma16,
+        pv_mfma16=pv_mfma16,
+        rows_per_wave=rows_per_wave,
+        fold_barriers=fold_barriers,
+        persistent=persistent,
+        sm_scale=sm_scale,
+    )
+    _dualwave_swp_cache_tag = traits.cache_tag
+
+    mla_tile = make_mla_tile(traits)
+    _lds_elem_dtype = dtype_to_elem_type(traits.DTYPE_STR)
+
+    @fx.struct
+    class SharedStorage:
+        kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
+        if traits.O_LDS_STAGE:
+            o: fx.Array[_lds_elem_dtype, traits.LDS_O_STAGE_SIZE, 16]
+
+    @flyc.kernel(known_block_size=[traits.BLOCK_SIZE, 1, 1])
+    def flash_attn_dualwave_swp_gfx950_kernel(
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        O: fx.Tensor,  # noqa: E741
+        DebugCounts: fx.Tensor,
+        CuSeqQ: fx.Tensor,
+        CuSeqKv: fx.Tensor,
+        BlockTable: fx.Tensor,
+        SINK: fx.Tensor,
+        ScoreBound: fx.Tensor,
+        Sched: fx.Tensor,
+        seq_len: fx.Int32,
+        seq_len_kv: fx.Int32,
+        stride_q_n: fx.Int32,
+        stride_kv_n: fx.Int32,
+        head_dim_runtime: fx.Int32,
+        block_table_stride: fx.Int32,
+        sched_stride: fx.Int32,
+    ):
+        ctx = DualwaveKernelContext(
+            traits,
+            Q,
+            K,
+            V,
+            O,
+            DebugCounts,
+            CuSeqQ,
+            CuSeqKv,
+            BlockTable,
+            seq_len,
+            seq_len_kv,
+            stride_q_n,
+            stride_kv_n,
+            head_dim_runtime,
+            block_table_stride,
+            SINK=SINK,
+            ScoreBound=ScoreBound,
+        )
+        ctx._setup(SharedStorage, bind_block=not traits.PERSISTENT)
+
+        active = None if traits.PERSISTENT else ctx.active
+
         if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN):
             ctx.zero_o_block_if_needed()
 
@@ -1180,8 +1268,8 @@ def build_flash_attn_dualwave_swp_module(
 
             n_jobs = _sched_load(sched_row)
             job_first = _sched_load(sched_row + 1)
-            _prefetch_k(job_first)
-            q_first = _prefetch_q(job_first)
+            prefetch_k(ctx, job_first)
+            q_first = prefetch_q(ctx, job_first)
             # No O stores follow the first job's prefetch for the job-top wait to count past.
             _s_waitcnt(0)
             n_q = len(q_first)
@@ -1196,17 +1284,17 @@ def build_flash_attn_dualwave_swp_module(
                     fx.Index((job >> JOB_QBLOCK_SHIFT) & JOB_QBLOCK_MASK),
                     fx.Index(job >> JOB_BATCH_SHIFT),
                 )
-                q_next = _main_body(next_job=job_prefetch, q_raw=q_cur)
+                q_next = mla_tile(ctx, next_job=job_prefetch, q_raw=q_cur)
                 _ = yield [job_next] + q_next
             _s_waitcnt(0)
         elif active is None:
-            _main_body()
+            mla_tile(ctx)
         else:
 
             @flyc.jit
             def _run_body_if_active():
                 if active:
-                    _main_body()
+                    mla_tile(ctx)
 
             _run_body_if_active()
 

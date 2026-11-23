@@ -1408,9 +1408,22 @@ def _mla_case(qkv_format, batch, seqlen, num_head, dtype=torch.bfloat16):
 @pytest.mark.parametrize("qkv_format", ["sbhd", "bshd", "bhsd"])
 @pytest.mark.parametrize("backend", [None, BackendType.FLYDSL])
 def test_flydsl_gfx950_mla_attention(batch, seqlen, num_head, qkv_format, backend):
+    _check_mla_attention(batch, seqlen, num_head, qkv_format, backend, 192 ** (-0.5))
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()), reason="FlyDSL MLA attention is gfx950-only"
+)
+# DeepSeek-V3's YaRN scale (rotary factor 40, mscale_all_dim 1): baked into the forward.
+@pytest.mark.parametrize("qkv_format", ["sbhd", "bshd"])
+def test_flydsl_gfx950_mla_attention_softmax_scale(qkv_format):
+    mscale = 0.1 * math.log(40.0) + 1.0
+    _check_mla_attention(1, 4096, 16, qkv_format, BackendType.FLYDSL, mscale * mscale * 192 ** (-0.5))
+
+
+def _check_mla_attention(batch, seqlen, num_head, qkv_format, backend, scale):
     torch.manual_seed(42)
     q, k, v, dout = _mla_case(qkv_format, batch, seqlen, num_head)
-    scale = 192 ** (-0.5)
     # Unpinned, these shapes resolve to FlyDSL, not to aiter.
     assert (
         resolve_flash_attn_backend(
@@ -1456,7 +1469,6 @@ def test_flydsl_gfx950_mla_attention(batch, seqlen, num_head, qkv_format, backen
         {"seqlen": 1000},
         {"deterministic": True},
         {"window_size": (128, 0)},
-        {"softmax_scale": 0.1},
         {"dtype": torch.float16},
     ],
 )
