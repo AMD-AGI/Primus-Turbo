@@ -21,9 +21,9 @@ per-XCD queues (``_claim``, ``_schedule``) until none are left:
 
 attention work item ``(item, b, q block, head group)``
     one part of the keys of q1 (chunk 2n-1-r) or q0 (chunk r) of batch ``b`` (``Plan``): the own part
-    (q1: own first + own second chunk, q0: own chunk; causal), or a group of remote chunks of the forward
-    bank (visible to every query, so unmasked). Items run own parts first, then the remote groups in the
-    order their chunks arrive (first halves, then second halves).
+    (q1: own first + own second chunk, q0: own chunk; causal), or its remote chunks of one half in the
+    forward bank (visible to every query, so unmasked). Items run own parts first, then the remote parts in
+    the order their chunks arrive (first halves, then second halves).
 save unit
     copies part of what the backward needs, ``[ remote | own first | own second ]``, into ordinary memory:
     the own chunks early, a remote chunk after the attention items that read it, once its flag is up.
@@ -115,27 +115,19 @@ def bank_chunk_flag(n, r, k):
     return _FLAG_FIRST * n + k - 2 * n1
 
 
-def _groups(lo, hi, size):
-    """Chunks ``[lo, hi)`` in groups of ``size``, aligned to ``hi``, last group first."""
-    out, end = [], hi
-    while end > lo:
-        out.append((max(lo, end - size), end))
-        end = max(lo, end - size)
-    return out
-
-
 class Plan:
-    """Work items of rank ``r``: each segment's own part, then its remote chunks in groups of ``group``.
+    """Work items of rank ``r``: each segment's own part, then its remote chunks: q1's first halves, q0's
+    (the first halves of the lower ranks, the bank's last ``r`` chunks), q1's second halves.
 
-    q0's remote chunks (first halves of the lower ranks) are the bank's last ``r``, a suffix of q1's first
-    half chunks; both are grouped from the bank's end, so a q0 group covers the chunks of the q1 group it
-    runs beside."""
+    One part per half rather than smaller groups: every part costs a workspace slot written and read
+    again by the merge, which outweighs the finer split (Hq 64 at 16K: 8 slots took 682 us, 4 took 639)."""
 
-    def __init__(self, n, r, c, group):
-        self.n, self.r, self.c, self.group = n, r, c, group
+    def __init__(self, n, r, c):
+        self.n, self.r, self.c = n, r, c
         rem_chunks, n1 = 2 * n - 2 - r, n - 1 - r
-        first, second = _groups(n1, rem_chunks, group), _groups(0, n1, group)
-        low = _groups(rem_chunks - r, rem_chunks, group)
+        first = [(n1, rem_chunks)] if rem_chunks > n1 else []
+        second = [(0, n1)] if n1 else []
+        low = [(rem_chunks - r, rem_chunks)] if r else []
         self.p1, self.p0 = 1 + len(first) + len(second), 1 + len(low)
         tiles = c // _BLOCK_N
         items = [(0, 0, 0, 0, 0, self.p1, -1), (1, 0, 0, 0, 0, self.p0, -1)]
@@ -155,17 +147,6 @@ class Plan:
         # workspace slots: q1's, then q0's (none when its own part is all of it)
         self.slots0 = self.p0 if self.p0 > 1 else 0
         self.slots = self.p1 + self.slots0
-
-
-def choose_group(n, r, c, blocks_per_item, max_blocks, max_slots):
-    """Fewest remote chunks per part that keeps the launch within ``max_blocks`` attention blocks and the
-    workspace within ``max_slots`` slots."""
-    rem_chunks = 2 * n - 2 - r
-    for group in range(1, rem_chunks + 1):
-        plan = Plan(n, r, c, group)
-        if len(plan.items) * blocks_per_item <= max_blocks and plan.slots <= max_slots:
-            return group
-    return rem_chunks
 
 
 class _Geometry:
@@ -473,8 +454,6 @@ class _AgkvFwdContext(DualwaveKernelContext):
             buffer_store(fx.arith.addf(m, fmath.log(total)), lse_res, lse_i, mask=d8 == fx.Int32(0))
 
 
-MAX_BLOCKS = 2048
-MAX_SLOTS = 8
 _XCD_EPOCHS = {}
 _STATES = {}
 _SAVE_ROWS = {}
@@ -683,14 +662,13 @@ def _build(
     push_blocks,
     block_m,
     merge,
-    group,
     num_sched,
     grid,
 ):
     traits = _traits(num_heads, num_kv_heads, head_dim, block_m, merge)
     assert BLOCK_THREADS % traits.BLOCK_SIZE == 0, "the push / save units are sized for 512-thread blocks"
     assert traits.BLOCK_M * traits.Q_HEADS_PER_WG * (head_dim // 8) % traits.BLOCK_SIZE == 0
-    plan = Plan(n, r, c, group)
+    plan = Plan(n, r, c)
     geo = _Geometry(n, r, c, batch, plan)
     grid_x, grid_y = num_heads // traits.Q_HEADS_PER_WG, c // traits.BLOCK_M
     push_blocks = min(push_blocks, grid, max(num_units, 1)) if num_units else 0
@@ -704,7 +682,6 @@ def _build(
         num_units,
         num_save_units,
         push_blocks,
-        group,
         num_sched,
         grid,
     )
@@ -935,7 +912,7 @@ def _resident_blocks(traits, device):
 def _schedule(plan, batch, grid_x, grid_y, c, tok, save_rows, device):
     """Claim order of the persistent launch: the work items in ``plan`` order (each over batch, q block,
     head group), the own-chunk save units after the own parts and each remote chunk's save units after
-    the first q1 group holding it (its flag is up by then), split into the XCD queues of ``_claim``.
+    the q1 part holding it (its flag is up by then), split into the XCD queues of ``_claim``.
     Attention entries are ``>= 0``, save unit ``u`` is ``-1 - u``."""
     per_item = batch * grid_y * grid_x
     own = [u for u, row in enumerate(save_rows) if row[S_FLAG] < 0]
@@ -965,16 +942,15 @@ def _schedule(plan, batch, grid_x, grid_y, c, tok, save_rows, device):
 
 @functools.lru_cache(maxsize=64)
 def _launch_plan(num_heads, num_kv_heads, head_dim, n, r, c, batch, device):
-    """(group, plan, item table, done counters) of a shape; the counters return to zero after every launch."""
+    """(plan, item table, done counters) of a shape; the counters return to zero after every launch."""
     block_m, merge = _TILE
     traits = _traits(num_heads, num_kv_heads, head_dim, block_m, merge)
     grid_x, grid_y = num_heads // traits.Q_HEADS_PER_WG, c // traits.BLOCK_M
-    group = choose_group(n, r, c, grid_x * grid_y * batch, MAX_BLOCKS, MAX_SLOTS)
-    plan = Plan(n, r, c, group)
+    plan = Plan(n, r, c)
     rows = [list(item) + [0] * (ITEM_FIELDS - len(item)) for item in plan.items]
     items = torch.tensor(rows, dtype=torch.int64, device=device)
     done = torch.zeros(2 * batch * grid_y * grid_x, dtype=torch.int32, device=device)
-    return group, plan, items, done
+    return plan, items, done
 
 
 def forward(
@@ -1011,7 +987,7 @@ def forward(
     Hkv = k.shape[2]
     c = S // 2
     block_m, merge = _TILE
-    group, plan, items, done = _launch_plan(Hq, Hkv, D, n, r, c, B, q.device)
+    plan, items, done = _launch_plan(Hq, Hkv, D, n, r, c, B, q.device)
     assert plan.slots * c * B * Hq * D * 2 < 1 << 31, "workspace offsets are 32-bit"
     ws = torch.empty((plan.slots, c, B, Hq, D), dtype=q.dtype, device=q.device)
     wsl = torch.empty((plan.slots, B * c, Hq), dtype=torch.float32, device=q.device)
@@ -1049,7 +1025,6 @@ def forward(
         push_blocks,
         block_m,
         merge,
-        group,
         num_sched,
         grid,
     )
