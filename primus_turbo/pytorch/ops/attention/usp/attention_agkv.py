@@ -71,15 +71,15 @@ Modes:
     forward gives wrong outputs for these calls (SBHD, GQA, Sq != Skv).
 
 ``fused``
-    the forward as one kernel on the current stream (``agkv_fused_fwd``): a few blocks push the halves as
-    ``mega`` does and then copy the backward's [ remote | own ] K / V out of the bank, while the attention
-    blocks of q0 and q1 walk their own keys first and then the remote chunks, each once its flag is up, and
-    store the final output and lse. Shapes the kernel does not take (head dim other than 128, odd GQA
-    groups, chunks not a multiple of 128 tokens) run ``mega``'s forward. The backward is ``mega``'s; with
-    ``AGKV_FUSED_BWD=1`` it is one persistent kernel too (``agkv_fused_bwd``): the dK / dV work-groups of
-    q0 and q1 store the remote-key gradients (q splits and q0's part summed) straight into the owners'
-    slots and raise their flags, reduce dQ head group by head group as each group's items finish, and
-    the same kernel sums what this rank received.
+    the forward as one persistent kernel on the current stream (``agkv_fused_fwd``): a few blocks push the
+    halves as ``mega`` does, then every block claims attention work of q0 and q1 (their own keys first, then
+    the remote chunks, each once its flag is up; the final output and lse stored) and the copies of the
+    backward's [ remote | own ] K / V out of the bank. Shapes the kernel does not take (head dim other than
+    128, odd GQA groups, chunks not a multiple of 128 tokens) run ``mega``'s forward. The backward is
+    ``mega``'s; with ``PRIMUS_TURBO_AGKV_FUSED_BWD=1`` it is one persistent kernel too (``agkv_fused_bwd``):
+    the dK / dV work-groups of q0 and q1 store the remote-key gradients (q splits and q0's part summed)
+    straight into the owners' slots and raise their flags, dQ is reduced head group by head group as each
+    group's items finish, and the same kernel sums what this rank received.
 
 ``overlap``, ``mega`` and ``fused`` reuse double-buffered symmetric buffers call after call, which needs every
 rank of the group to issue the same sequence of forward and backward calls (true of SPMD training), and
@@ -91,12 +91,12 @@ The forward keeps the gathered K / V for the backward rather than gathering agai
 import ctypes
 import functools
 import math
-import os
 from typing import Optional
 
 import torch
 import torch.distributed as dist
 
+import primus_turbo.common.envs as envs
 from primus_turbo.common.flux import enabled as flux_enabled
 from primus_turbo.flydsl.attention import agkv_comm_kernel as _comm
 from primus_turbo.flydsl.attention import agkv_fused_bwd as _fused_bwd
@@ -193,8 +193,6 @@ class _Layout:
 # symmetric exchange buffers; SDMA copies (overlap)
 # --------------------------------------------------------------------------------------------------------
 
-# fused mode's backward as one persistent kernel (``_fused_backward``) rather than mega's.
-_FUSED_BWD = os.environ.get("AGKV_FUSED_BWD") == "1"
 
 # flag arrays in the signal pad, n int64 each, indexed by sender
 _FWD_FIRST, _FWD_SECOND, _BWD_FIRST, _BWD_SECOND = range(4)
@@ -942,7 +940,9 @@ class _AGKVAttention(torch.autograd.Function):
         dout = dout.contiguous()
         if mode in ("mega", "fused"):
             q, kb, vb, out, lse0, lse1 = ctx.saved_tensors
-            backward = _fused_backward if mode == "fused" and _FUSED_BWD else _mega_backward
+            backward = (
+                _fused_backward if mode == "fused" and envs.PRIMUS_TURBO_AGKV_FUSED_BWD else _mega_backward
+            )
             dq, dk, dv = backward(dout, q, kb, vb, out, lse0, lse1, lay, group, scale, det)
             return dq, dk, dv, None, None, None, None
 

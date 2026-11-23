@@ -156,10 +156,13 @@ def test_attention_agkv(world_size):
     env = {**os.environ, "PYTHONPATH": repo_root}
     # modes mega / fused run on the flux FlyDSL attention, the others on the attention the environment selects
     plain = tuple(m for m in MODES if m not in FLUX_MODES)
-    for modes, flux in ((plain, env.get("FLUX_ATTN_FLYDSL", "0")), (FLUX_MODES, "1")):
-        result = subprocess.run(
-            cmd + ["--modes", *modes], cwd=repo_root, env={**env, "FLUX_ATTN_FLYDSL": flux}, timeout=1800
-        )
+    runs = (
+        (plain, {"FLUX_ATTN_FLYDSL": env.get("FLUX_ATTN_FLYDSL", "0")}),
+        (FLUX_MODES, {"FLUX_ATTN_FLYDSL": "1"}),
+        (("fused",), {"FLUX_ATTN_FLYDSL": "1", "PRIMUS_TURBO_AGKV_FUSED_BWD": "1"}),
+    )
+    for modes, extra in runs:
+        result = subprocess.run(cmd + ["--modes", *modes], cwd=repo_root, env={**env, **extra}, timeout=1800)
         assert result.returncode == 0
 
 

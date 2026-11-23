@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_STRICT_DISPATCH: bool = False
     PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32: bool = True
     PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT: bool = False
+    PRIMUS_TURBO_AGKV_FUSED_BWD: bool = False
     PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM: bool = False
     PRIMUS_TURBO_JAX_DEEPEP_MODE: str | None = None
     PT_MEGA_FP8_COMBINE_AUTOTUNE: bool = True
@@ -275,6 +276,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT": lambda: (
         os.getenv("PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT", "0") == "1"
     ),
+    # "1" runs the backward of the all-gather-KV context-parallel attention's ``fused`` mode as one
+    # persistent kernel (``agkv_fused_bwd``: dK / dV, their reduce-scatter and dQ); otherwise it is
+    # ``mega``'s. Shapes that kernel does not take run ``mega``'s either way. Read at the first such
+    # backward.
+    "PRIMUS_TURBO_AGKV_FUSED_BWD": lambda: os.getenv("PRIMUS_TURBO_AGKV_FUSED_BWD", "0") == "1",
     # ================== Expert parallel ==================
     # A non-zero integer runs the EP dispatch/combine kernels on the caller's current stream
     # instead of the Buffer's comm stream. Parsed as C++ does (``is_ep_force_current_stream`` in

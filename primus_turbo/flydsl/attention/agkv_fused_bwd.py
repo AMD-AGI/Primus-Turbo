@@ -43,7 +43,6 @@ where a chunk's destinations are the addresses of ITS first row (batch 0, kv hea
 """
 
 import functools
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -51,7 +50,7 @@ import torch
 from flydsl._mlir import ir
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
@@ -94,8 +93,6 @@ DQ_UNROLL = 4
 DQ_LOOK = 2
 # work-groups in dQ units at once while items are left, per this many resident work-groups
 DQ_SHARE = 4
-_DBG_TRACE = os.environ.get("AGKV_FUSED_DBG_TRACE") == "1"
-_LAST_TRACE = []
 
 # host table copies in flight per (device, length) before the oldest is reused
 _RING = 8
@@ -381,11 +378,6 @@ def _try_dq(tid, slot, stash, c):
         _dq_unit(tid, pick, stash, c)
         fx.rocdl.s_waitcnt(0)
         fx.gpu.barrier()
-        if const_expr(_DBG_TRACE):
-            if tid == fx.Int32(0):
-                atomic_add(
-                    _stashed(stash, _STASH.index("COUNTS")), fx.Int32(c["trace"]), fx.Int64(1), scope="agent"
-                )
     if tid == fx.Int32(0):
         atomic_add(_stashed(stash, _STASH.index("COUNTS")), fx.Int32(hint_i + 1), fx.Int64(-1), scope="agent")
 
@@ -430,10 +422,6 @@ def _dq_loop(thread_index, slot, stash, c):
     while pick < fx.Int32(num):
         memory_fence(order="acquire", scope="agent")
         _dq_unit(_opaque_tid(thread_index), pick, stash, c)
-        if const_expr(_DBG_TRACE):
-            if thread_index == fx.Int32(0):
-                counts = _stashed(stash, _STASH.index("COUNTS"))
-                atomic_add(counts, fx.Int32(c["trace"] + 1), fx.Int64(1), scope="agent")
         pick = _claim_dq_tail(_opaque_tid(thread_index), slot, stash, c)
 
 
@@ -567,7 +555,6 @@ def _build(Hq, Hkv, D, scale, n, r, c, B, num_sched, grid, v_off, flag_halves):
     consts.update(hg_done=nb * Hkv * B + nchunks)
     consts.update(hg_claim=consts["hg_done"] + consts["nhg"])
     consts.update(hg_hint=consts["hg_claim"] + consts["nhg"], dq_cap=max(1, grid // DQ_SHARE))
-    consts.update(trace=consts["hg_hint"] + 2)
     assert bkv * (D // 8) % block == 0
     assert block % consts["dq_tpr"] == 0 and bkv % (DQ_PASSES * consts["dq_rpp"]) == 0
 
@@ -621,26 +608,9 @@ def _build(Hq, Hkv, D, scale, n, r, c, B, num_sched, grid, v_off, flag_halves):
                 body, segs, (c, len0, skv), stash, _opaque_tid(thread_index), seg, tile, head, split, batch
             )
 
-        stamps = []
-        if const_expr(_DBG_TRACE):
-            stamps.append(read_clock())
         _work_loop(thread_index, slot, stash, num_sched, run_item, consts)
-        if const_expr(_DBG_TRACE):
-            stamps.append(read_clock())
         _dq_loop(thread_index, slot, stash, consts)
-        if const_expr(_DBG_TRACE):
-            stamps.append(read_clock())
         _rs_loop(thread_index, slot, stash, consts)
-        if const_expr(_DBG_TRACE):
-            stamps.append(read_clock())
-            if thread_index == fx.Int32(0):
-                blk = fx.Int32(fx.Index(gpu.block_idx.x))
-                for i in range_constexpr(4):
-                    st(
-                        _stashed(stash, _STASH.index("COUNTS")),
-                        fx.Int32(consts["trace"] + 2) + blk * fx.Int32(4) + fx.Int32(i),
-                        stamps[i],
-                    )
         _exit_all(
             thread_index,
             _stashed(stash, _STASH.index("STATE")),
@@ -812,8 +782,7 @@ def backward(dout, q, k, v, out, lse0, lse1, scale, n, r, table, dq, v_off, flag
     if state is None:
         state = _STATES[dev] = torch.zeros(ST_TAIL + 1, dtype=torch.int64, device=dev)
     nb = skv // bkv
-    ncounts = nb * Hkv * B + skv // c + 4 * B * Hkv + 2
-    ckey = (dev, ncounts + (2 + 4 * grid if _DBG_TRACE else 0))
+    ckey = (dev, nb * Hkv * B + skv // c + 4 * B * Hkv + 2)
     counts = _COUNTS.get(ckey)
     if counts is None:
         counts = _COUNTS[ckey] = torch.zeros(ckey[1], dtype=torch.int64, device=dev)
@@ -845,9 +814,6 @@ def backward(dout, q, k, v, out, lse0, lse1, scale, n, r, table, dq, v_off, flag
         params,
         st_,
     )
-    if _DBG_TRACE:
-        counts[ncounts : ncounts + 2].zero_()
-        _LAST_TRACE[:] = [counts, ncounts, grid]
     if compiled[0] is None:
         with CompilationContext.compile_hints(hints):
             compiled[0] = flyc.compile(launch, *args)
