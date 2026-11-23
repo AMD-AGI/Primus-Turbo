@@ -90,6 +90,9 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_HB_GG_VERBOSE: bool = False
     PRIMUS_TURBO_DGATE_ACC_ATOMIC: bool = True
     PRIMUS_GLUON: bool = True
+    PRIMUS_TURBO_MOE_FP8BLK_GG: str = "mxp"
+    PRIMUS_TURBO_MOE_FP8BLK_WGRAD: str = "vkq"
+    PRIMUS_TURBO_MOE_FP8BLK_VERIFY: bool = False
     PRIMUS_TURBO_FP8_BLOCK_UE8M0: bool = False
     PRIMUS_TURBO_FP8_BLOCK_KERNEL: str = "dsv4up"
     PRIMUS_TURBO_FP8_WCACHE: bool = True
@@ -458,6 +461,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ``primus_turbo.pytorch.core.overlap.join()`` after each backward: an un-joined deferred wgrad
     # is silently wrong. Always off when torch.distributed has more than one rank.
     "PRIMUS_OVERLAP": lambda: os.getenv("PRIMUS_OVERLAP", "0") == "1",
+    # ================== fp8_block MegaMoE (gfx1250) ==================
+    # Grouped fwd / dgrad GEMM of the fp8_block MegaMoE operator: "mxp" (persistent, fragment
+    # pipeline), "k256" (K % 256 = 0 TDM kernel) or "tile". Each falls back to the next when its shape
+    # test fails (mxp -> k256 -> tile). Read when the operator is built.
+    "PRIMUS_TURBO_MOE_FP8BLK_GG": env_choice("PRIMUS_TURBO_MOE_FP8BLK_GG", "mxp", ("mxp", "k256", "tile")),
+    # Variable-K wgrad GEMM of the fp8_block MegaMoE operator: "vkq" (persistent, scale planes through
+    # async VMEM) or "vk" (the simple kernel). Read when the operator is built.
+    "PRIMUS_TURBO_MOE_FP8BLK_WGRAD": env_choice("PRIMUS_TURBO_MOE_FP8BLK_WGRAD", "vkq", ("vkq", "vk")),
+    # "1" checks every fp8_block MegaMoE GEMM against a reference and logs the result (slow; debugging).
+    "PRIMUS_TURBO_MOE_FP8BLK_VERIFY": lambda: os.getenv("PRIMUS_TURBO_MOE_FP8BLK_VERIFY", "0") == "1",
     # ================== Flux ==================
     # "0" makes the Flux dgate epilogue accumulate without atomics. Unset and any other value
     # keep the atomic path. Read once, when the MXFP4 quant kernel module is imported.
