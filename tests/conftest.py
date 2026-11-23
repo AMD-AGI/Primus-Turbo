@@ -94,8 +94,10 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_flydsl_autotune.py::test_no_module_level_launch_reads_a_mutable_global",
     # FP8 / BF16 / quantization / attention gfx1250 kernel tests.
     "tests/pytorch/ops/test_overlap_switch.py",
+    "tests/pytorch/ops/test_sparse_mla_dsink_gfx1250.py",
     "tests/pytorch/ops/test_moe_pool_glue_gfx1250.py",
     "tests/pytorch/ops/test_fused_mega_moe_fp8blk_gfx1250.py",
+    "tests/pytorch/ops/test_sparse_mla_gfx1250_kernels.py",
     "tests/pytorch/ops/test_gemm_fp8_block_wgrad_gfx1250.py",
     "tests/pytorch/ops/test_fp8_block_weight_cache_gfx1250.py",
     "tests/pytorch/ops/test_gemm_bf16_gluon_gfx1250.py",

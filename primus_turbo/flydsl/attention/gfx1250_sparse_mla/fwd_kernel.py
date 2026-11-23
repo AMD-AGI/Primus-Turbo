@@ -235,6 +235,26 @@ def _run_steps(steps, batch, prefetch=0, pin=0):
             fx.rocdl.sched_barrier(0)
 
 
+def _run_steps_with(steps, batch, extras):
+    """``_run_steps`` in batch mode, with ``extras[i]()`` (independent VALU work) emitted between
+    the WMMAs of batch i and its closing ``sched_barrier``, so it is scheduled among them."""
+    n = len(steps)
+    cur = [steps[i][0]() for i in range_constexpr(min(batch, n))]
+    bi = 0
+    for b0 in range_constexpr(0, n, batch):
+        nxt = [steps[i][0]() for i in range_constexpr(b0 + batch, min(b0 + 2 * batch, n))]
+        fx.rocdl.sched_barrier(0)
+        for j in range_constexpr(len(cur)):
+            steps[b0 + j][1](cur[j])
+        if const_expr(bi < len(extras)):
+            extras[bi]()
+        fx.rocdl.sched_barrier(0)
+        cur = nxt
+        bi += 1
+    for k in range_constexpr(bi, len(extras)):
+        extras[k]()
+
+
 @functools.lru_cache(maxsize=64)
 def build_sparse_mla_fwd_gfx1250(
     num_heads,
@@ -247,6 +267,7 @@ def build_sparse_mla_fwd_gfx1250(
     block_k=None,
     persist=None,
     l2_prefetch=True,
+    sm_next=False,
 ):
     """Launcher for fixed (H, topk, scale, sink); see ``sparse_mla_fwd_gfx1250``.
 
@@ -255,6 +276,8 @@ def build_sparse_mla_fwd_gfx1250(
     workgroup over tokens; otherwise one token per workgroup, which after its last tile
     prefetches into L2 (``l2_prefetch``) the q rows and indices of the token that takes over its
     slot next. Only at one workgroup per CU: with two, the sibling already hides the prologue.
+    ``sm_next``: one token per workgroup only; iteration t runs the QK WMMAs of tile
+    t+1 with the softmax of tile t emitted inside them, then P*V(t) (same arithmetic, byte-identical).
     """
     H = num_heads
     d_hpw, d_waves, d_bk = _default_config(H, topk)
@@ -277,7 +300,11 @@ def build_sparse_mla_fwd_gfx1250(
     LDS_B = NBUF * TILE_B
     # O goes out through a per-wave LDS stage of 16 head rows, when it fits at full occupancy.
     STG_B = 16 * ROW
-    STAGE = (LDS_B + WAVES * STG_B) * (4 // WAVES) <= _LDS_MAX
+    # Slot validity of each ring tile (i32 row indices, written when its gather is issued) plus a
+    # per-wave dump row for the lanes that do not store.
+    VLD_B = (NBUF * BN + WAVES * 8) * 4
+    STAGE = (LDS_B + VLD_B + WAVES * STG_B) * (4 // WAVES) <= _LDS_MAX
+    BAT = BATCH
     RPO = 16 if idx16 else 8  # rows per TDM op
     if (BN // RPO) % WAVES:
         raise ValueError(f"kv tile {BN} does not split into TDM ops over {WAVES} waves")
@@ -319,9 +346,10 @@ def build_sparse_mla_fwd_gfx1250(
             return bid + fx.Int32((j < n_loc).select(j, n_loc - fx.Int32(1))) * NPROG
 
         arena = fx.SharedAllocator(static=False)
-        arena.allocate(LDS_B + (WAVES * STG_B if STAGE else 0))
+        arena.allocate(LDS_B + VLD_B + (WAVES * STG_B if STAGE else 0))
         lds0 = fx.Int32(fx.Int64(fx.ptrtoint(arena.base_ptr)))
-        stg = lds0 + LDS_B + wave * STG_B
+        vld0 = lds0 + LDS_B
+        stg = lds0 + LDS_B + VLD_B + wave * STG_B
 
         rsrc_idx = make_rsrc(tensor_addr(TOPK), N_TOK * (topk * 4))
         kv_addr = tensor_addr(KV)
@@ -366,6 +394,11 @@ def build_sparse_mla_fwd_gfx1250(
                     words = rows
                 # An unused slot (-1) is out of range: the row lands as zeros, masked below.
                 _tdm_gather(buf_base + (wave * OPW + k) * (RPO * ROW), kv_addr, words, RPO, NKV)
+                # The tile's row indices, for the softmax mask (LDS instead of a global reload).
+                va = vld0 + ((t % NBUF) * BN + (wave * OPW + k) * RPO) * 4
+                va = fx.Int32((lane == fx.Int32(0)).select(va, vld0 + (NBUF * BN + wave * 8) * 4))
+                for h in range_constexpr(RPO // 4):
+                    lds_store(Vec.from_elements(rows[4 * h : 4 * h + 4], fx.Int32), va + h * 16)
 
         # The prologue gathers go out before the Q loads so the two overlap.
         pro = [load_rows(fx.Int32(s)) for s in range_constexpr(NBUF)]
@@ -394,6 +427,15 @@ def build_sparse_mla_fwd_gfx1250(
         k_lane = l16 * ROW + hi * 16
         v_lane = (hi * 8 + l8) * ROW + (l16 // 8) * 16
         v8e = vec_type(8, fx.BFloat16)
+
+        def valid_lds(g):
+            # Validity from the ring copy of stream tile g's indices (see issue).
+            out = []
+            for kt in range_constexpr(KT):
+                o = vld0 + ((g % NBUF) * BN + kt * 16 + hi * 8) * 4
+                iv = cat(Vec(lds_load(o, v4i)), Vec(lds_load(o + 16, v4i)))
+                out.append([iv[i] >= fx.Int32(0) for i in range_constexpr(8)])
+            return out
 
         def valid_of(tok, t):
             # Validity of the kv rows this lane's score elements cover: kt*16 + hi*8 + i.
@@ -439,7 +481,7 @@ def build_sparse_mla_fwd_gfx1250(
             return steps
 
         def run_steps(steps):
-            _run_steps(steps, BATCH)
+            _run_steps(steps, BAT)
 
         def softmax(s, valid, m_run, l_run):
             vals = []
@@ -488,6 +530,43 @@ def build_sparse_mla_fwd_gfx1250(
 
         NQ = G * KS  # q fragments carried across tokens
 
+        def finish(tok, m, l, o):  # noqa: E741
+            # o / lse of one token (sink folded in), staged through LDS when it fits.
+            rsrc_o = make_rsrc(tensor_addr(O) + fx.Int64(tok) * (H * DV * 2), H * DV * 2)
+            rsrc_lse = make_rsrc(tensor_addr(LSE) + fx.Int64(tok) * (H * 4), H * 4)
+            for g in range_constexpr(G):
+                l_tot = fadd(l[g], swap_halves(l[g]))
+                if const_expr(has_sink):
+                    rsrc_sink = make_rsrc(tensor_addr(SINK), H * 4)
+                    sink_log2 = fmul(fx.Float32(buf_load(rsrc_sink, h_lane[g] * 4, T.f32)), LOG2E)
+                    mf = fmax(m[g], sink_log2)
+                    af = exp2(fsub(m[g], mf))
+                    l_out = fadd(fmul(l_tot, af), exp2(fsub(sink_log2, mf)))
+                    o_scale = fmul(af, rcp(l_out))
+                else:
+                    mf = m[g]
+                    l_out = l_tot
+                    o_scale = fx.Float32((l_tot > fx.Float32(0.0)).select(rcp(l_tot), fx.Float32(0.0)))
+                if const_expr(STAGE):
+                    # Lane (head l16, half hi) holds d = dt * 16 + hi * 8 + [0, 8) of its head; the
+                    # read-back gives each store half a head row. LDS ops of a wave run in order,
+                    # so the next group's writes cannot pass this group's reads.
+                    for dt in range_constexpr(DT):
+                        o16 = to_bf16(vmul_scalar(o[g][dt], o_scale))
+                        lds_store(o16, stg + l16 * ROW + hi * 16 + dt * 32)
+                    o_off = (h_lane[g] - l16) * (DV * 2) + lane * 16
+                    for r in range_constexpr(DT):
+                        row = lds_load(stg + (r // 2) * ROW + (r % 2) * 512 + lane * 16, v4i)
+                        buf_store(row, rsrc_o, o_off + (r // 2) * (DV * 2) + (r % 2) * 512)
+                else:
+                    o_off = h_lane[g] * (DV * 2) + hi * 16
+                    for dt in range_constexpr(DT):
+                        o16 = to_bf16(vmul_scalar(o[g][dt], o_scale))
+                        buf_store(o16.bitcast(fx.Int32), rsrc_o, o_off + dt * 32)
+                lse = fmul(fadd(mf, log2(l_out)), LN2)
+                # Lanes 16..31 hold the same heads; push their store out of range.
+                buf_store(lse, rsrc_lse, fx.Int32((hi == 0).select(h_lane[g] * 4, fx.Int32(0x7FFFFFF0))))
+
         def token(ji, tsm):
             tok = tok_of(ji)
             g0 = ji * NT  # stream index of this token's tile 0
@@ -500,7 +579,7 @@ def build_sparse_mla_fwd_gfx1250(
             gpu.barrier()
             s0, steps0 = qk_steps(lds0 + (g0 % NBUF) * TILE_B, q_frag)
             run_steps(steps0)
-            v0 = valid_of(tok, fx.Int32(0))
+            v0 = valid_lds(g0)
             m, l, p = [], [], []  # noqa: E741
             for g in range_constexpr(G):
                 mg, lg, _, pg, _ = softmax(s0[g], v0, fx.Float32(_NEG_INF), fx.Float32(0.0))
@@ -525,9 +604,11 @@ def build_sparse_mla_fwd_gfx1250(
                         gpu.barrier()
                         issue(gt + NBUF - 1, [sm[NS + i] for i in range_constexpr(IW)])
                         nxt = load_rows(gt + NBUF)
-                        valid = valid_of(tok, ti + 1)
+                        valid = valid_lds(gt + 1)
                         s_n, qk = qk_steps(lds0 + ((gt + 1) % NBUF) * TILE_B, q_frag)
                         pv = pv_steps(lds0 + (gt % NBUF) * TILE_B, p, o)
+                        m2, l2, p2, a2 = [], [], [], []
+                        need = None
                         seq = []
                         for i in range_constexpr(max(len(qk), len(pv))):
                             if const_expr(i < len(qk)):
@@ -535,8 +616,6 @@ def build_sparse_mla_fwd_gfx1250(
                             if const_expr(i < len(pv)):
                                 seq.append(pv[i])
                         run_steps(seq)
-                        m2, l2, p2, a2 = [], [], [], []
-                        need = None
                         for g in range_constexpr(G):
                             mg, lg, ag, pg, ng = softmax(s_n[g], valid, m[g], l[g])
                             m2.append(mg)
@@ -584,45 +663,117 @@ def build_sparse_mla_fwd_gfx1250(
                 nxt = load_q(ji + 1) + load_rows(g0 + NT + NBUF - 1)
             run_steps(pv_steps(lds0 + ((g0 + n_tile - fx.Int32(1)) % NBUF) * TILE_B, p, o))
 
-            rsrc_o = make_rsrc(tensor_addr(O) + fx.Int64(tok) * (H * DV * 2), H * DV * 2)
-            rsrc_lse = make_rsrc(tensor_addr(LSE) + fx.Int64(tok) * (H * 4), H * 4)
-            for g in range_constexpr(G):
-                l_tot = fadd(l[g], swap_halves(l[g]))
-                if const_expr(has_sink):
-                    rsrc_sink = make_rsrc(tensor_addr(SINK), H * 4)
-                    sink_log2 = fmul(fx.Float32(buf_load(rsrc_sink, h_lane[g] * 4, T.f32)), LOG2E)
-                    mf = fmax(m[g], sink_log2)
-                    af = exp2(fsub(m[g], mf))
-                    l_out = fadd(fmul(l_tot, af), exp2(fsub(sink_log2, mf)))
-                    o_scale = fmul(af, rcp(l_out))
-                else:
-                    mf = m[g]
-                    l_out = l_tot
-                    o_scale = fx.Float32((l_tot > fx.Float32(0.0)).select(rcp(l_tot), fx.Float32(0.0)))
-                if const_expr(STAGE):
-                    # Lane (head l16, half hi) holds d = dt * 16 + hi * 8 + [0, 8) of its head; the
-                    # read-back gives each store half a head row. LDS ops of a wave run in order,
-                    # so the next group's writes cannot pass this group's reads.
-                    for dt in range_constexpr(DT):
-                        o16 = to_bf16(vmul_scalar(o[g][dt], o_scale))
-                        lds_store(o16, stg + l16 * ROW + hi * 16 + dt * 32)
-                    o_off = (h_lane[g] - l16) * (DV * 2) + lane * 16
-                    for r in range_constexpr(DT):
-                        row = lds_load(stg + (r // 2) * ROW + (r % 2) * 512 + lane * 16, v4i)
-                        buf_store(row, rsrc_o, o_off + (r // 2) * (DV * 2) + (r % 2) * 512)
-                else:
-                    o_off = h_lane[g] * (DV * 2) + hi * 16
-                    for dt in range_constexpr(DT):
-                        o16 = to_bf16(vmul_scalar(o[g][dt], o_scale))
-                        buf_store(o16.bitcast(fx.Int32), rsrc_o, o_off + dt * 32)
-                lse = fmul(fadd(mf, log2(l_out)), LN2)
-                # Lanes 16..31 hold the same heads; push their store out of range.
-                buf_store(lse, rsrc_lse, fx.Int32((hi == 0).select(h_lane[g] * 4, fx.Int32(0x7FFFFFF0))))
+            finish(tok, m, l, o)
             return nxt
+
+        def token_fa3(ji, tsm):
+            """FA3 order (``sm_next``, one token per workgroup): iteration t runs QK(t+1) with the softmax of tile t
+            emitted inside its WMMA batches, then rescales O and runs P*V(t). The loop carries the raw
+            scores of the next tile instead of its P (same arithmetic, same order as ``token``)."""
+            tok = tok_of(ji)
+            g0 = ji * NT
+            qf = [tsm[i] for i in range_constexpr(NQ)]
+            q_frag = [qf[g * KS : (g + 1) * KS] for g in range_constexpr(G)]
+            octs_in = [tsm[NQ + i] for i in range_constexpr(IW)]
+            NS3 = G * (2 + DT + KT)
+
+            def pack3(m, l, o, sc):  # noqa: E741
+                out = list(m) + list(l)
+                for g in range_constexpr(G):
+                    out += list(o[g])
+                for g in range_constexpr(G):
+                    out += list(sc[g])
+                return out
+
+            def unpack3(st):
+                m = [st[g] for g in range_constexpr(G)]
+                l = [st[G + g] for g in range_constexpr(G)]  # noqa: E741
+                o = [[st[2 * G + g * DT + dt] for dt in range_constexpr(DT)] for g in range_constexpr(G)]
+                sc = [
+                    [st[2 * G + G * DT + g * KT + kt] for kt in range_constexpr(KT)]
+                    for g in range_constexpr(G)
+                ]
+                return m, l, o, sc
+
+            def sm_rescale(sc, valid, m, l, o):  # noqa: E741
+                m2, l2, p2, a2 = [], [], [], []
+                need = None
+                for g in range_constexpr(G):
+                    mg, lg, ag, pg, ng = softmax(sc[g], valid, m[g], l[g])
+                    m2.append(mg)
+                    l2.append(lg)
+                    p2.append(pg)
+                    a2.append(ag)
+                    need = ng if need is None else need | ng
+                return m2, l2, p2, a2, need
+
+            def rescaled(o, a2, need):
+                flat = [x for g in range_constexpr(G) for x in o[g]]
+
+                def rescale():
+                    return [
+                        vmul_scalar(o[g][dt], a2[g]) for g in range_constexpr(G) for dt in range_constexpr(DT)
+                    ]
+
+                flat = [_like(r, x) for r, x in zip(_if_wave(need, flat, rescale, lambda: None), flat)]
+                return [flat[g * DT : (g + 1) * DT] for g in range_constexpr(G)]
+
+            _rocdl.s_wait_tensorcnt((NBUF - 2) * OPW)
+            gpu.barrier()
+            s0, steps0 = qk_steps(lds0 + (g0 % NBUF) * TILE_B, q_frag)
+            run_steps(steps0)
+            m = [fx.Float32(_NEG_INF) for _ in range_constexpr(G)]
+            l = [fx.Float32(0.0) for _ in range_constexpr(G)]  # noqa: E741
+            o = [[Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(DT)] for _ in range_constexpr(G)]
+            st = pack3(m, l, o, s0) + octs_in
+            if const_expr(NT > 1):
+                for t, sm in range(fx.Index(0), fx.Index(NT - 1), fx.Index(1), init=st):
+                    ti = fx.Int32(t)
+                    gt = g0 + ti
+
+                    def tile_step(sm=sm, ti=ti, gt=gt):
+                        m, l, o, sc = unpack3(sm)  # noqa: E741
+                        _rocdl.s_wait_tensorcnt((NBUF - 3) * OPW)
+                        gpu.barrier()
+                        issue(gt + NBUF - 1, [sm[NS3 + i] for i in range_constexpr(IW)])
+                        nxt = load_rows(gt + NBUF)
+                        valid = valid_lds(gt)
+                        s_n, qk = qk_steps(lds0 + ((gt + 1) % NBUF) * TILE_B, q_frag)
+                        res = {}
+
+                        def piece(g):
+                            res[g] = softmax(sc[g], valid, m[g], l[g])
+
+                        _run_steps_with(qk, BAT, [lambda g=g: piece(g) for g in range_constexpr(G)])
+                        m2, l2, p2, a2 = [], [], [], []
+                        need = None
+                        for g in range_constexpr(G):
+                            mg, lg, ag, pg, ng = res[g]
+                            m2.append(mg)
+                            l2.append(lg)
+                            p2.append(pg)
+                            a2.append(ag)
+                            need = ng if need is None else need | ng
+                        o = rescaled(o, a2, need)
+                        run_steps(pv_steps(lds0 + (gt % NBUF) * TILE_B, p2, o))
+                        return pack3(m2, l2, o, s_n) + nxt
+
+                    out = _if_wave(ti + fx.Int32(1) < n_tile, list(sm), tile_step, lambda: None)
+                    res_ = yield [_like(r, x) for r, x in zip(out, sm)]
+                st = [res_[i] for i in range_constexpr(NS3 + IW)]
+            m, l, o, sc = unpack3(st)  # noqa: E741
+            glast = g0 + n_tile - fx.Int32(1)
+            m, l, p, a2, need = sm_rescale(sc, valid_lds(glast), m, l, o)  # noqa: E741
+            o = rescaled(o, a2, need)
+            run_steps(pv_steps(lds0 + (glast % NBUF) * TILE_B, p, o))
+            finish(tok, m, l, o)
+            return None
 
         if const_expr(persist):
             for j, tsm in range(fx.Index(0), fx.Index(n_loc), fx.Index(1), init=q_first + pro[NBUF - 1]):
                 _ = yield token(fx.Int32(j), tsm)
+        elif const_expr(sm_next):
+            token_fa3(fx.Int32(0), q_first + pro[NBUF - 1])
         else:
             token(fx.Int32(0), q_first + pro[NBUF - 1])
         # The over-issued gathers must land before the workgroup's LDS is released.
@@ -682,7 +833,15 @@ _LDS_MAX = 320 * 1024
 
 @functools.lru_cache(maxsize=64)
 def build_sparse_mla_fwd_gfx1250_swa(
-    num_heads, scale, has_sink, block_t=16, block_k=None, pool_p=0, pool_cr=0, prefetch=PREFETCH, batch=6
+    num_heads,
+    scale,
+    has_sink,
+    block_t=16,
+    block_k=None,
+    pool_p=0,
+    pool_cr=0,
+    prefetch=PREFETCH,
+    batch=6,
 ):
     """Launcher for the cr0 / cr128 bands; see ``sparse_mla_fwd_gfx1250``.
 
@@ -917,6 +1076,41 @@ def build_sparse_mla_fwd_gfx1250_swa(
                 o[g] = [vmul_scalar(o[g][dt], ag) for dt in range_constexpr(DT)]
             return p
 
+        def finish_g(tok, g, m, l, o):  # noqa: E741
+            # o / lse of head group g of one token (sink folded in), staged through LDS when it fits.
+            rsrc_o = make_rsrc(tensor_addr(O) + fx.Int64(tok) * (H * DV * 2), H * DV * 2)
+            rsrc_lse = make_rsrc(tensor_addr(LSE) + fx.Int64(tok) * (H * 4), H * 4)
+            l_tot = fadd(l[g], swap_halves(l[g]))
+            if const_expr(has_sink):
+                rsrc_sink = make_rsrc(tensor_addr(SINK), H * 4)
+                sink_log2 = fmul(fx.Float32(buf_load(rsrc_sink, h_lane[g] * 4, T.f32)), LOG2E)
+                mf = fmax(m[g], sink_log2)
+                af = exp2(fsub(m[g], mf))
+                l_out = fadd(fmul(l_tot, af), exp2(fsub(sink_log2, mf)))
+                o_scale = fmul(af, rcp(l_out))
+            else:
+                mf = m[g]
+                l_out = l_tot
+                o_scale = fx.Float32((l_tot > fx.Float32(0.0)).select(rcp(l_tot), fx.Float32(0.0)))
+            if const_expr(STAGE):
+                # Lane (head l16, half hi) holds d = dt * 16 + hi * 8 + [0, 8) of its head; the
+                # read-back gives each store half a head row. LDS ops of a wave run in order,
+                # so the next group's writes cannot pass this group's reads.
+                for dt in range_constexpr(DT):
+                    o16 = to_bf16(vmul_scalar(o[g][dt], o_scale))
+                    lds_store(o16, stg + l16 * ROW + hi * 16 + dt * 32)
+                o_off = (h_lane[g] - l16) * (DV * 2) + lane * 16
+                for r in range_constexpr(DT):
+                    row = lds_load(stg + (r // 2) * ROW + (r % 2) * 512 + lane * 16, v4i)
+                    buf_store(row, rsrc_o, o_off + (r // 2) * (DV * 2) + (r % 2) * 512)
+            else:
+                o_off = h_lane[g] * (DV * 2) + hi * 16
+                for dt in range_constexpr(DT):
+                    o16 = to_bf16(vmul_scalar(o[g][dt], o_scale))
+                    buf_store(o16.bitcast(fx.Int32), rsrc_o, o_off + dt * 32)
+            lse = fmul(fadd(mf, log2(l_out)), LN2)
+            buf_store(lse, rsrc_lse, fx.Int32((hi == 0).select(h_lane[g] * 4, fx.Int32(0x7FFFFFF0))))
+
         def token(ji, qf):
             tok = tok_of(ji)
             # Window tiles start at the token's row offset; pool tiles (after them) are shared.
@@ -974,39 +1168,8 @@ def build_sparse_mla_fwd_gfx1250_swa(
             nxt = load_q(ji + TL)
             run_steps(pv_steps(tile_base(fx.Int32(NTT - 1), vbw, lds0 + v_lane), PC, p, o))
 
-            rsrc_o = make_rsrc(tensor_addr(O) + fx.Int64(tok) * (H * DV * 2), H * DV * 2)
-            rsrc_lse = make_rsrc(tensor_addr(LSE) + fx.Int64(tok) * (H * 4), H * 4)
             for g in range_constexpr(G):
-                l_tot = fadd(l[g], swap_halves(l[g]))
-                if const_expr(has_sink):
-                    rsrc_sink = make_rsrc(tensor_addr(SINK), H * 4)
-                    sink_log2 = fmul(fx.Float32(buf_load(rsrc_sink, h_lane[g] * 4, T.f32)), LOG2E)
-                    mf = fmax(m[g], sink_log2)
-                    af = exp2(fsub(m[g], mf))
-                    l_out = fadd(fmul(l_tot, af), exp2(fsub(sink_log2, mf)))
-                    o_scale = fmul(af, rcp(l_out))
-                else:
-                    mf = m[g]
-                    l_out = l_tot
-                    o_scale = fx.Float32((l_tot > fx.Float32(0.0)).select(rcp(l_tot), fx.Float32(0.0)))
-                if const_expr(STAGE):
-                    # Lane (head l16, half hi) holds d = dt * 16 + hi * 8 + [0, 8) of its head; the
-                    # read-back gives each store half a head row. LDS ops of a wave run in order,
-                    # so the next group's writes cannot pass this group's reads.
-                    for dt in range_constexpr(DT):
-                        o16 = to_bf16(vmul_scalar(o[g][dt], o_scale))
-                        lds_store(o16, stg + l16 * ROW + hi * 16 + dt * 32)
-                    o_off = (h_lane[g] - l16) * (DV * 2) + lane * 16
-                    for r in range_constexpr(DT):
-                        row = lds_load(stg + (r // 2) * ROW + (r % 2) * 512 + lane * 16, v4i)
-                        buf_store(row, rsrc_o, o_off + (r // 2) * (DV * 2) + (r % 2) * 512)
-                else:
-                    o_off = h_lane[g] * (DV * 2) + hi * 16
-                    for dt in range_constexpr(DT):
-                        o16 = to_bf16(vmul_scalar(o[g][dt], o_scale))
-                        buf_store(o16.bitcast(fx.Int32), rsrc_o, o_off + dt * 32)
-                lse = fmul(fadd(mf, log2(l_out)), LN2)
-                buf_store(lse, rsrc_lse, fx.Int32((hi == 0).select(h_lane[g] * 4, fx.Int32(0x7FFFFFF0))))
+                finish_g(tok, g, m, l, o)
             return nxt
 
         for j, tsm in range(fx.Index(tl), fx.Index(n_loc), fx.Index(TL), init=q_first):
@@ -1088,6 +1251,9 @@ def sparse_mla_fwd_gfx1250(
     # With 128 heads the pool forces 32-row tiles, which lose to the generic 64-row kernel
     # once the pool is long (T = 16K: +4%).
     pool_max = _SWA_POOL_MAX if H < 128 else _SWA_POOL_MAX // 2
+    # 64 heads: the top-k kernel runs the softmax of tile t inside the QK WMMAs of tile t+1
+    # (sm_next); byte-identical outputs. The band kernels are unchanged.
+    pipe = H == 64
     if use_swa and 0 <= pool_p <= pool_max and bt is not None:
         build_sparse_mla_fwd_gfx1250_swa(
             H,
@@ -1101,6 +1267,8 @@ def sparse_mla_fwd_gfx1250(
     hpw, waves, _ = _default_config(H, topk)
     # 16-bit indices halve the TDM op count; worth it where each wave issues several ops per tile.
     idx16 = kv.shape[0] <= 65536 and waves < 4
-    run = build_sparse_mla_fwd_gfx1250(H, topk, float(scale), attn_sink is not None, idx16=idx16)
+    run = build_sparse_mla_fwd_gfx1250(
+        H, topk, float(scale), attn_sink is not None, idx16=idx16, sm_next=pipe
+    )
     run(q, kv, topk_indices, attn_sink, o, lse, stream=stream)
     return o, lse
