@@ -19,6 +19,13 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+# Re: https://github.com/pytorch/pytorch/pull/203621
+# This handles compatibility for torch.jit.script across different PyTorch versions.
+try:
+    _script = torch.jit.script
+except AttributeError:
+    from torch.jit._script import script as _script
+
 
 class RingComm:
     def __init__(self, process_group: dist.ProcessGroup):
@@ -61,7 +68,7 @@ class RingComm:
         self._ops = []
 
 
-@torch.jit.script
+@_script
 def _update_out_and_lse(
     out: torch.Tensor,
     lse: torch.Tensor,

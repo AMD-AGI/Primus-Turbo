@@ -25,6 +25,14 @@ from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_varlen_backward_impl,
     attention_aiter_varlen_forward_impl,
 )
+from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx950_mla_impl import (
+    flash_attn_flydsl_gfx950_mla_backward_bshd_impl,
+    flash_attn_flydsl_gfx950_mla_backward_impl,
+    flash_attn_flydsl_gfx950_mla_forward_bshd_impl,
+    flash_attn_flydsl_gfx950_mla_forward_impl,
+    flydsl_gfx950_mla_unsupported_reason,
+    mla_bshd_native,
+)
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_impl import (
     flash_attn_flydsl_gfx1250_backward_impl,
     flash_attn_flydsl_gfx1250_forward_impl,
@@ -234,18 +242,42 @@ class FlashAttnFunc(torch.autograd.Function):
             # only sbhd bytes make the [s,b,h,d] view a relabel rather than a reinterpretation.
             # The dispatcher checked that before naming this backend, but apply() can be called
             # straight, and then reading bshd bytes as sbhd would just return the wrong answer.
-            assert _sbhd_layout(q, qkv_format), f"flydsl gfx950 attention is sbhd only, got {qkv_format}"
-            q_s, k_s, v_s = (t.permute(1, 0, 2, 3) for t in (q, k, v))
-            out_s, lse = flash_attn_sbhd_flydsl_forward_impl(
-                q_s,
-                k_s,
-                v_s,
-                softmax_scale=softmax_scale,
-                causal=causal,
-                window_size=window_size,
-                return_lse=True,
-                sink=sink,
+            ctx.flydsl_gfx950_mla = is_mla_head_dims(q, k, v)
+            assert ctx.flydsl_gfx950_mla or _sbhd_layout(q, qkv_format), (
+                f"flydsl gfx950 attention is sbhd only, got {qkv_format}"
             )
+            q_s, k_s, v_s = (t.permute(1, 0, 2, 3) for t in (q, k, v))
+            ctx.mla_bshd = False
+            if ctx.flydsl_gfx950_mla:
+                reason = flydsl_gfx950_mla_unsupported_reason(
+                    q, k, v, causal, window_size, softmax_scale, deterministic
+                )
+                if reason is not None or sink is not None or dropout_p != 0.0 or bias is not None:
+                    raise ValueError(f"gfx950 flydsl MLA attention: {reason or 'no sink, dropout or bias'}")
+                ctx.mla_bshd = mla_bshd_native(q, k, v)
+                if ctx.mla_bshd:
+                    # Contiguous bshd is read in place by the bshd kernels: no copy either way.
+                    out_b, lse = flash_attn_flydsl_gfx950_mla_forward_bshd_impl(q, k, v)
+                    B, Sq, Hq = q.shape[0], q.shape[1], q.shape[2]
+                    if is_grad_enabled and _any_requires_grad(q, k, v, sink):
+                        ctx.save_for_backward(q, k, v, out_b, lse)
+                        ctx.softmax_scale = softmax_scale
+                    return (out_b, lse.view(B, Sq, Hq).permute(0, 2, 1)) if return_lse else out_b
+                # sbhd storage makes this view contiguous as it stands; any other byte order is
+                # copied, once, and kept for the backward.
+                q_s, k_s, v_s = (t.contiguous() for t in (q_s, k_s, v_s))
+                out_s, lse = flash_attn_flydsl_gfx950_mla_forward_impl(q_s, k_s, v_s)
+            else:
+                out_s, lse = flash_attn_sbhd_flydsl_forward_impl(
+                    q_s,
+                    k_s,
+                    v_s,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                    window_size=window_size,
+                    return_lse=True,
+                    sink=sink,
+                )
             B, Sq, Hq = q.shape[0], q.shape[1], q.shape[2]
             if is_grad_enabled and _any_requires_grad(q, k, v, sink):
                 ctx.save_for_backward(q_s, k_s, v_s, out_s, lse)
@@ -386,6 +418,21 @@ class FlashAttnFunc(torch.autograd.Function):
                     causal=ctx.causal,
                     deterministic=ctx.deterministic,
                 )
+            return _flash_attn_grads(dq, dk, dv, None, None)
+
+        if ctx.backend == BackendType.FLYDSL and ctx.flydsl_gfx950_mla and ctx.mla_bshd:
+            q_b, k_b, v_b, out_b, lse = ctx.saved_tensors
+            dq, dk, dv = flash_attn_flydsl_gfx950_mla_backward_bshd_impl(
+                dout, q_b, k_b, v_b, out_b, lse, softmax_scale=ctx.softmax_scale
+            )
+            return _flash_attn_grads(dq, dk, dv, None, None)
+
+        if ctx.backend == BackendType.FLYDSL and ctx.flydsl_gfx950_mla:
+            q_s, k_s, v_s, out_s, lse = ctx.saved_tensors
+            dq, dk, dv = flash_attn_flydsl_gfx950_mla_backward_impl(
+                dout.permute(1, 0, 2, 3), q_s, k_s, v_s, out_s, lse, softmax_scale=ctx.softmax_scale
+            )
+            dq, dk, dv = (g.permute(1, 0, 2, 3) for g in (dq, dk, dv))
             return _flash_attn_grads(dq, dk, dv, None, None)
 
         if ctx.backend == BackendType.FLYDSL:
@@ -621,6 +668,7 @@ def flash_attn_func(
     backend = resolve_flash_attn_backend(
         varlen=False,
         user_backend=GlobalBackendManager.get_attn_backend(_ATTN_PRECISION),
+        deterministic=deterministic,
         q=q,
         k=k,
         v=v,
