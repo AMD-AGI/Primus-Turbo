@@ -607,6 +607,7 @@ class DualwaveSwpTraits:
             self.ROWS_PER_WAVE,
             getattr(self, "FOLD_BARRIERS", None),
             getattr(self, "PERSISTENT", 0),
+            getattr(self, "SM_SCALE", None),
         )
 
 
@@ -855,8 +856,10 @@ class DualwaveKernelContext:
         self.head_dim_runtime = head_dim_runtime
         self.block_table_stride = block_table_stride
 
-    def _setup(self, shared_storage, bind_block=True):
-        """Per-CTA state; ``bind_block`` also binds the CTA's own job (see `bind_item`)."""
+    def _setup(self, shared_storage, bind_block=True, lds=None):
+        """Per-CTA state; ``bind_block`` also binds the CTA's own job (see `bind_item`). ``lds``
+        defaults to a fresh ``shared_storage`` allocation; callers that share the CTA's LDS with
+        other roles pass the view they hold."""
         head_dim_runtime = self.head_dim_runtime
         traits = self.traits
         self.NUM_DMA_K = traits.SMEM_D_RPT_K
@@ -888,15 +891,18 @@ class DualwaveKernelContext:
         self.c_zero_l16 = Vec.filled(4 * self.QT, 0.0, fx.Float32)
         self.ref_neg = None
         self.ref_seed_vec = None
-        head_dim_f32 = fx.Float32(fx.Int32(head_dim_runtime))
-        c_log2e_f = fx.Float32(LOG2E)
-        self.c_sm_scale_log2e = fx.Float32(
-            arith.mulf(
-                as_mlir_value(fmath.rsqrt(head_dim_f32, fastmath=self.fm_fast)),
-                as_mlir_value(c_log2e_f),
-                fastmath=self.fm_fast,
+        if const_expr(getattr(traits, "SM_SCALE", None) is not None):
+            self.c_sm_scale_log2e = fx.Float32(float(traits.SM_SCALE) * LOG2E)
+        else:
+            head_dim_f32 = fx.Float32(fx.Int32(head_dim_runtime))
+            c_log2e_f = fx.Float32(LOG2E)
+            self.c_sm_scale_log2e = fx.Float32(
+                arith.mulf(
+                    as_mlir_value(fmath.rsqrt(head_dim_f32, fastmath=self.fm_fast)),
+                    as_mlir_value(c_log2e_f),
+                    fastmath=self.fm_fast,
+                )
             )
-        )
 
         seq_len = self.seq_len
         seq_len_kv = self.seq_len_kv
@@ -914,7 +920,8 @@ class DualwaveKernelContext:
             self.stride_o_n_v = self.stride_q_n_v // fx.Index(traits.HEAD_DIM) * fx.Index(traits.HEAD_DIM_V)
             self.stride_v_n_v = self.stride_kv_n_v // fx.Index(traits.HEAD_DIM) * fx.Index(traits.HEAD_DIM_V)
 
-        lds = fx.SharedAllocator().allocate(shared_storage).peek()
+        if lds is None:
+            lds = fx.SharedAllocator().allocate(shared_storage).peek()
         self.lds = lds
         self.lds_kv_base_idx = fx.Index(fx.ptrtoint(lds.kv.ptr))
         self.lds_kv_base_ptr = buffer_ops.create_llvm_ptr(self.lds_kv_base_idx, address_space=3)

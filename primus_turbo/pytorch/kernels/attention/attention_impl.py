@@ -331,12 +331,12 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
                 out, lse = flash_attn_flydsl_gfx1250_forward_impl(q, k, v, softmax_scale, causal)
             return (out, lse) if return_lse else out
         if is_mla_head_dims(q, k, v) and mla_bshd_native(q, k, v):
-            out, lse = flash_attn_flydsl_gfx950_mla_forward_bshd_impl(q, k, v)
+            out, lse = flash_attn_flydsl_gfx950_mla_forward_bshd_impl(q, k, v, softmax_scale)
             return (out, lse) if return_lse else out
         # Under autotune, off the op layer's path, so the sbhd view is taken here too.
         q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))
         if is_mla_head_dims(q, k, v):
-            out, lse = flash_attn_flydsl_gfx950_mla_forward_impl(q, k, v)
+            out, lse = flash_attn_flydsl_gfx950_mla_forward_impl(q, k, v, softmax_scale)
             return (out, lse) if return_lse else out
         return flash_attn_sbhd_flydsl_forward_impl(
             q,

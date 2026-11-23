@@ -33,6 +33,7 @@ def _fwd_module(
     rows_per_wave,
     persistent,
     sbhd=True,
+    sm_scale=None,
 ):
     return build_flash_attn_dualwave_swp_module(
         num_heads=hq,
@@ -55,6 +56,7 @@ def _fwd_module(
         # One wave per SIMD keeps the 8-wave barrier schedule: one rendezvous per KV tile.
         fold_barriers=True if rows_per_wave == 64 else None,
         persistent=persistent,
+        sm_scale=sm_scale,
     )
 
 
@@ -84,10 +86,12 @@ def mla_fwd_sbhd(
     rows_per_wave=64,
     persistent=True,
     sbhd=True,
+    softmax_scale=None,
 ):
     """q [Sq,B,Hq,Dqk], k [Skv,B,Hkv,Dqk], v [Skv,B,Hkv,Dv], contiguous bf16.
 
-    Returns O [Sq,B,Hq,Dv] (and LSE [B*Sq,Hq] fp32, natural log). Softmax scale is 1/sqrt(Dqk).
+    Returns O [Sq,B,Hq,Dv] (and LSE [B*Sq,Hq] fp32, natural log). ``softmax_scale`` None is
+    1/sqrt(Dqk), computed in the kernel; a number is baked in as a compile-time constant.
     ``rows_per_wave`` 64 runs a 256-row q block on one wave per SIMD (512 registers each).
     ``persistent`` launches one CTA per CU, each running a host-scheduled list of q blocks.
     ``sbhd=False`` takes and returns contiguous [B,S,H,D] tensors instead (see mla_fwd_bshd).
@@ -120,6 +124,7 @@ def mla_fwd_sbhd(
         rows_per_wave,
         _num_cus(device_index) if persistent else 0,
         bool(sbhd),
+        None if softmax_scale is None else float(softmax_scale),
     )
     out = q.new_empty((Sq, B, Hq, d_v) if sbhd else (B, Sq, Hq, d_v))
     lse = torch.empty((B * Sq, Hq) if return_lse else (0,), device=q.device, dtype=torch.float32)
