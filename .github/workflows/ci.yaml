@@ -196,7 +196,7 @@ jobs:
           command: >
             timeout -k 60s 130m
             bash -lc
-            "exec pytest -v tests/pytorch -n 8 --timeout=600 --timeout-method=thread --max-worker-restart=8 --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append"
+            "exec pytest -v tests/pytorch -n 8 --dist worksteal --timeout=600 --timeout-method=thread --max-worker-restart=8 --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append"
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
       - name: Run deterministic tests (parallel)
@@ -208,7 +208,7 @@ jobs:
           command: >
             timeout -k 60s 55m
             bash -lc
-            "exec pytest -v tests/pytorch -n 8 --deterministic-only --timeout=600 --timeout-method=thread --max-worker-restart=8 --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append"
+            "exec pytest -v tests/pytorch -n 8 --dist worksteal --deterministic-only --timeout=600 --timeout-method=thread --max-worker-restart=8 --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append"
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
       - name: Run distributed tests
@@ -343,8 +343,9 @@ jobs:
           max_attempts: 2
           command: >
             bash .github/scripts/safe_job.sh run
-            'timeout -k 60s 130m pytest -v tests/pytorch -n 8 --timeout=600 --timeout-method=thread
-            --max-worker-restart=8 --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append'
+            'timeout -k 60s 130m pytest -v tests/pytorch -n 8 --dist worksteal --timeout=600
+            --timeout-method=thread --max-worker-restart=8 --log-cli-level=INFO --cov=primus_turbo --cov-branch
+            --cov-append'
       - name: Run deterministic tests (parallel)
         uses: nick-fields/retry@v3
         env:
@@ -354,9 +355,9 @@ jobs:
           max_attempts: 2
           command: >
             bash .github/scripts/safe_job.sh run
-            'timeout -k 60s 55m pytest -v tests/pytorch -n 8 --deterministic-only --timeout=600
-            --timeout-method=thread --max-worker-restart=8 --log-cli-level=INFO --cov=primus_turbo
-            --cov-branch --cov-append'
+            'timeout -k 60s 55m pytest -v tests/pytorch -n 8 --dist worksteal --deterministic-only
+            --timeout=600 --timeout-method=thread --max-worker-restart=8 --log-cli-level=INFO
+            --cov=primus_turbo --cov-branch --cov-append'
       - name: Run distributed tests
         uses: nick-fields/retry@v3
         env:
@@ -461,7 +462,7 @@ jobs:
         with:
           timeout_minutes: 60
           max_attempts: 2
-          command: pytest -v tests/jax -n 8 --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append
+          command: pytest -v tests/jax -n 8 --dist worksteal --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
       # Keep in-process multi-GPU tests and distributed/per-process tests in
