@@ -16,6 +16,11 @@ MLA head dims (q / k 192, v 128) run the gfx950 MLA forward tile and, unfused, i
 Sequence split: with ``seq_chunk`` cs, global chunk ``c`` (cs tokens) lives on rank ``c % n``;
 ``seq_chunk=0`` is the contiguous split (rank r holds the r-th chunk of ``S / n`` tokens). A striped
 split balances causal attention across ranks and lets the attention start before the exchange ends.
+
+The kernels spin on flags the peer ranks' kernels set, so a peer must not be queued behind a kernel
+that waits on this rank: with ``GPU_MAX_HW_QUEUES=2`` RCCL collectives overlapped on a side stream
+(Megatron's grad reduce / param gather) deadlock against them until the spin watchdog traps. Run
+with ``GPU_MAX_HW_QUEUES`` unset (HIP's 4) or >= 4.
 """
 
 from typing import Optional
