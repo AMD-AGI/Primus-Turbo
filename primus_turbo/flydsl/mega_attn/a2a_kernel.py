@@ -62,16 +62,18 @@ MAX_TENSORS = 3
 
 
 def a2a_bank_bytes(M, num_ranks, heads, head_dim):
-    """Bank bytes of one exchange of ``heads`` (per-rank head counts of each tensor)."""
-    return M * num_ranks * sum(heads) * head_dim * 2
+    """Bank bytes of one exchange of ``heads`` (per-rank head counts of each tensor) of ``head_dim``
+    (one for all, or one per tensor)."""
+    dims = head_dim if isinstance(head_dim, (tuple, list)) else (head_dim,) * len(heads)
+    return M * num_ranks * sum(h * d for h, d in zip(heads, dims)) * 2
 
 
 @ASTRewriter.transform
 def _push_unit(thread_index, unit, peers_base, bank_offset, in_res, epoch, **c):
     """Rows ``[unit * BM, +BM)`` of the sequence into the owner's recv bank (this rank's column block),
     then the owner's flag ``(m-tile, rank)``."""
-    n, d, rank, cs = c["num_ranks"], c["head_dim"], c["rank"], c["seq_chunk"]
-    heads, offs = c["heads"], c["head_offs"]
+    n, rank, cs = c["num_ranks"], c["rank"], c["seq_chunk"]
+    widths, col_offs = c["widths"], c["col_offs"]
     row_vecs = n * c["N_r"] // VEC_BF16
     blk_vecs = c["N_r"] // VEC_BF16
     g0 = unit * fx.Int32(BM)
@@ -80,9 +82,9 @@ def _push_unit(thread_index, unit, peers_base, bank_offset, in_res, epoch, **c):
     t0 = chunk // fx.Int32(n) * fx.Int32(cs) + g0 % fx.Int32(cs)
     owner_heap = ld(peers_base, owner, dtype=fx.T.i64)
     recv_res = create_buffer_resource_from_addr(owner_heap + bank_offset, num_records_bytes=c["bank_used"])
-    for x in range_constexpr(len(heads)):
-        h_vecs = heads[x] * d // VEC_BF16
-        off = rank * blk_vecs + offs[x] * d // VEC_BF16
+    for x in range_constexpr(len(widths)):
+        h_vecs = widths[x] // VEC_BF16
+        off = rank * blk_vecs + col_offs[x] // VEC_BF16
 
         def coords(v, h_vecs=h_vecs, off=off):
             r = v // fx.Int32(h_vecs)
@@ -102,8 +104,8 @@ def _push_unit(thread_index, unit, peers_base, bank_offset, in_res, epoch, **c):
 @ASTRewriter.transform
 def _gather_unit(thread_index, m_tile, my_base, bank_offset, out_res, epoch, **c):
     """Recv rows ``[m_tile * BM, +BM)`` into the ``[M, n * h_r, d]`` outputs once every source pushed them."""
-    n, d = c["num_ranks"], c["head_dim"]
-    heads, offs = c["heads"], c["head_offs"]
+    n = c["num_ranks"]
+    widths, col_offs = c["widths"], c["col_offs"]
     row_vecs = n * c["N_r"] // VEC_BF16
     blk_vecs = c["N_r"] // VEC_BF16
     if thread_index == fx.Int32(0):
@@ -116,10 +118,10 @@ def _gather_unit(thread_index, m_tile, my_base, bank_offset, out_res, epoch, **c
     memory_fence(order="acquire", scope="sys")
     recv_res = create_buffer_resource_from_addr(my_base + bank_offset, num_records_bytes=c["bank_used"])
     t0 = m_tile * fx.Int32(BM)
-    for x in range_constexpr(len(heads)):
-        h_vecs = heads[x] * d // VEC_BF16
+    for x in range_constexpr(len(widths)):
+        h_vecs = widths[x] // VEC_BF16
         row_vecs_out = n * h_vecs
-        off = offs[x] * d // VEC_BF16
+        off = col_offs[x] // VEC_BF16
 
         def coords(v, h_vecs=h_vecs, row_vecs_out=row_vecs_out, off=off):
             r = v // fx.Int32(row_vecs_out)
@@ -155,28 +157,27 @@ def _push_gather(
 
 
 @functools.lru_cache(maxsize=64)
-def _make_kernel(direction, M, rank, num_ranks, h0, h1, h2, head_dim, seq_chunk, num_blocks, bank_bytes):
-    n, d = num_ranks, head_dim
-    heads = tuple(h for h in (h0, h1, h2) if h)
+def _make_kernel(direction, M, rank, num_ranks, w0, w1, w2, seq_chunk, num_blocks, bank_bytes):
+    """``w0`` / ``w1`` / ``w2``: the per-rank width (heads * head dim) of each tensor, 0 for none."""
+    n = num_ranks
+    widths = tuple(w for w in (w0, w1, w2) if w)
     cs = seq_chunk if seq_chunk else M
     assert M % cs == 0 and cs % BM == 0, f"need M % seq_chunk == 0 and seq_chunk % {BM} == 0"
-    assert 1 <= len(heads) <= MAX_TENSORS
+    assert 1 <= len(widths) <= MAX_TENSORS and all(w % VEC_BF16 == 0 for w in widths)
     S = M * n
     m_tiles = M // BM
-    N_r = sum(heads) * d
-    bank_used = a2a_bank_bytes(M, n, heads, d)
-    assert bank_used <= bank_bytes and bank_used < 2**31 and S * max(heads) * d * 2 < 2**31, (
+    N_r = sum(widths)
+    bank_used = M * n * N_r * 2
+    assert bank_used <= bank_bytes and bank_used < 2**31 and S * max(widths) * 2 < 2**31, (
         "i32 byte offsets overflow"
     )
     assert m_tiles * STAGE_SPLIT * n <= FLAGS_PER_REGION
-    head_offs = tuple(sum(heads[:x]) for x in range(len(heads)))
     c = dict(
         M=M,
         rank=rank,
         num_ranks=n,
-        head_dim=d,
-        heads=heads,
-        head_offs=head_offs,
+        widths=widths,
+        col_offs=tuple(sum(widths[:x]) for x in range(len(widths))),
         N_r=N_r,
         seq_chunk=cs,
         m_tiles=m_tiles,
@@ -209,11 +210,11 @@ def _make_kernel(direction, M, rank, num_ranks, h0, h1, h2, head_dim, seq_chunk,
         epoch = ld(state_base, fx.Int32(0), dtype=fx.T.i64)
         bank_offset = fx.Int64(FLAG_BYTES) + (epoch & fx.Int64(1)) * fx.Int64(bank_bytes)
         my_base = ld(peers_base, fx.Int32(rank), dtype=fx.T.i64)
-        xs = (X0, X1, X2)[: len(heads)]
-        ys = (Y0, Y1, Y2)[: len(heads)]
+        xs = (X0, X1, X2)[: len(widths)]
+        ys = (Y0, Y1, Y2)[: len(widths)]
         # [M, n * h, d] and [S, h, d] are the same bytes
-        in_res = [create_buffer_resource(t, num_records_bytes=S * h * d * 2) for t, h in zip(xs, heads)]
-        out_res = [create_buffer_resource(t, num_records_bytes=S * h * d * 2) for t, h in zip(ys, heads)]
+        in_res = [create_buffer_resource(t, num_records_bytes=S * w * 2) for t, w in zip(xs, widths)]
+        out_res = [create_buffer_resource(t, num_records_bytes=S * w * 2) for t, w in zip(ys, widths)]
         if const_expr(direction == "seq_to_heads"):
             _stage_role(thread_index, state_base, claim_slot, my_base, bank_offset, in_res, epoch, None, **c)
             _pull_role(
@@ -261,17 +262,16 @@ def _launch(
     M: fx.Constexpr[int],
     rank: fx.Constexpr[int],
     num_ranks: fx.Constexpr[int],
-    h0: fx.Constexpr[int],
-    h1: fx.Constexpr[int],
-    h2: fx.Constexpr[int],
-    head_dim: fx.Constexpr[int],
+    w0: fx.Constexpr[int],
+    w1: fx.Constexpr[int],
+    w2: fx.Constexpr[int],
     seq_chunk: fx.Constexpr[int],
     num_blocks: fx.Constexpr[int],
     bank_bytes: fx.Constexpr[int],
     stream: fx.Stream,
 ):
     kernel, value_attrs = _make_kernel(
-        direction, M, rank, num_ranks, h0, h1, h2, head_dim, seq_chunk, num_blocks, bank_bytes
+        direction, M, rank, num_ranks, w0, w1, w2, seq_chunk, num_blocks, bank_bytes
     )
     kernel(X0, X1, X2, Y0, Y1, Y2, PEER_PTRS, STATE, value_attrs=value_attrs).launch(
         grid=(num_blocks, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream
@@ -282,17 +282,18 @@ def _run(direction, xs, ys, workspace, seq_chunk, num_blocks):
     n = workspace.num_ranks
     assert 1 <= len(xs) == len(ys) <= MAX_TENSORS
     assert all(t.is_contiguous() and t.dtype == torch.bfloat16 for t in (*xs, *ys))
-    d = xs[0].shape[-1]
+    dims = tuple(x.shape[-1] for x in xs)
     if direction == "seq_to_heads":
         M = xs[0].shape[0]
         heads = tuple(x.shape[-2] // n for x in xs)
         assert all(x.shape[-2] % n == 0 and x.shape[0] == M for x in xs)
-        assert all(y.shape == (M * n, h, d) for y, h in zip(ys, heads))
+        assert all(y.shape == (M * n, h, d) for y, h, d in zip(ys, heads, dims))
     else:
         M = ys[0].shape[0]
         heads = tuple(x.shape[-2] for x in xs)
-        assert all(x.shape == (M * n, h, d) for x, h in zip(xs, heads))
-        assert all(y.shape == (M, n * h, d) for y, h in zip(ys, heads))
+        assert all(x.shape == (M * n, h, d) for x, h, d in zip(xs, heads, dims))
+        assert all(y.shape == (M, n * h, d) for y, h, d in zip(ys, heads, dims))
+    widths = tuple(h * d for h, d in zip(heads, dims))
     if num_blocks is None:
         num_blocks = torch.cuda.get_device_properties(xs[0].device).multi_processor_count
     pad = (xs[0],) * (MAX_TENSORS - len(xs))
@@ -308,9 +309,8 @@ def _run(direction, xs, ys, workspace, seq_chunk, num_blocks):
         M,
         workspace.rank,
         n,
-        *heads,
-        *((0,) * (MAX_TENSORS - len(heads))),
-        d,
+        *widths,
+        *((0,) * (MAX_TENSORS - len(widths))),
         seq_chunk,
         num_blocks,
         workspace.bank_bytes,
