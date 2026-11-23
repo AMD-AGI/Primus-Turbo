@@ -10,7 +10,9 @@ For weights that read the same input (DeepSeek-V4 wq_a || wkv), with the DSv4 re
 128x128 weight blocks, UE8M0 scales, ``PRIMUS_TURBO_FP8_BLOCK_KERNEL=dsv4up``):
   fwd    one 1x128 quant of X, one launch writing one CONTIGUOUS output per weight (split-output epilogue
          for two weights; bits = the separate GEMMs')
-  bwd    one 1x128 quant of [dY_0 | dY_1] read from the separate grads (no bf16 concat copy)
+  bwd    one 1x128 quant of [dY_0 | dY_1] read from the separate grads (no bf16 concat copy); with two
+         outputs the op that consumes both may run that quant in its own backward launch
+         (DyPrequantSlot: take_dy_prequant / dy_prequant_fill)
   dgrad  one GEMM with K = sum N_i                       (fp32 over all K, one rounding: NOT the bits of
                                                            separate dgrads + a bf16 add)
   wgrad  one GEMM into the joint main_grad if the weights' main_grads are adjacent in that order, else one GEMM
@@ -43,7 +45,13 @@ from primus_turbo.triton.quantization.quantization_fp8blk_utils import (
     ue8m0_exp_g90,
 )
 
-__all__ = ["gemm_fp8_block_concat_n", "gemm_fp8_block_concat_n_supported", "request_dx_accum"]
+__all__ = [
+    "gemm_fp8_block_concat_n",
+    "gemm_fp8_block_concat_n_supported",
+    "request_dx_accum",
+    "take_dy_prequant",
+    "dy_prequant_fill",
+]
 
 # Optional hand-off from the framework: an object with ``take(M, K, dtype) -> Tensor | None`` and a ``fused`` attribute,
 # handed to the next concat-N forward. Its backward then writes dX into the returned tensor as
@@ -373,6 +381,220 @@ def _quant_cat_cols(parts, dtype, ts):
     return (qr, er, qt, et), out
 
 
+@triton.jit
+def _quant_cat2_cols_red_kernel(
+    x0_ptr,
+    x1_ptr,
+    qr_ptr,
+    er_ptr,
+    qt_ptr,
+    et_ptr,
+    M,
+    N,
+    N0,
+    stride_x0,
+    stride_x1,
+    s0,
+    s1,
+    d,
+    R,
+    NQ,
+    NBN,
+    NCB,
+    NCAT,
+    dgp0,
+    dgo0,
+    dgp1,
+    dgo1,
+    PR,
+    FP8_MAX: tl.constexpr,
+    MAX_EXP: tl.constexpr,
+    SL: tl.constexpr,
+    C0: tl.constexpr,
+    C1: tl.constexpr,
+    BR: tl.constexpr,
+    BC: tl.constexpr,
+    H0R: tl.constexpr,
+    H1R: tl.constexpr,
+    RBH: tl.constexpr,
+    RBP: tl.constexpr,
+):
+    """``_quant_cat2_cols_kernel`` (programs [0, NQ + NCAT), same bodies) plus, in programs [NQ + NCAT, ...), a
+    fixed-order column sum of two fp32 partial sets [PR, H0R] / [PR, H1R] into dgo0 / dgo1 ([RBP, RBH] tiles summed
+    over PR in steps of RBP, then one tl.sum over the tile rows; 4 warps). The quant / cat parts only take maxima and
+    elementwise ops, so their bytes do not depend on the warp count."""
+    pid = tl.program_id(0)
+    if pid < NQ:
+        pid_m = pid // NBN
+        pid_n = pid % NBN
+        offs_m = pid_m * 128 + tl.arange(0, 128)
+        offs_n = pid_n * 128 + tl.arange(0, 128)
+        if pid_n * 128 < N0:
+            x = tl.load(x0_ptr + offs_m[:, None].to(tl.int64) * stride_x0 + offs_n[None, :]).to(tl.float32)
+        else:
+            x = tl.load(x1_ptr + offs_m[:, None].to(tl.int64) * stride_x1 + (offs_n[None, :] - N0)).to(
+                tl.float32
+            )
+        ax = tl.abs(x)
+        nb_n = N // 128
+        nb_m = M // 128
+        e = ue8m0_exp_g90(tl.max(ax, axis=1), MAX_EXP)  # [128] per row
+        q = tl.clamp(x * pow2_neg(e)[:, None], -FP8_MAX, FP8_MAX)
+        tl.store(qr_ptr + offs_m[:, None].to(tl.int64) * N + offs_n[None, :], q.to(qr_ptr.dtype.element_ty))
+        store_scale(er_ptr, offs_m, pid_n, e, M, nb_n, SL)
+        e = ue8m0_exp_g90(tl.max(ax, axis=0), MAX_EXP)  # [128] per column
+        q = tl.clamp(x * pow2_neg(e)[None, :], -FP8_MAX, FP8_MAX).to(qt_ptr.dtype.element_ty)
+        tl.store(qt_ptr + offs_n[:, None].to(tl.int64) * M + offs_m[None, :], tl.trans(q))
+        store_scale(et_ptr, offs_n, pid_m, e, N, nb_m, SL)
+    elif pid < NQ + NCAT:
+        c = pid - NQ
+        rows = (c // NCB) * BR + tl.arange(0, BR)[:, None]
+        cols = (c % NCB) * BC + tl.arange(0, BC)[None, :]
+        m = (rows < R) & (cols < C0 + C1)
+        in0 = cols < C0
+        v0 = tl.load(s0 + rows * C0 + cols, mask=m & in0, other=0)
+        v1 = tl.load(s1 + rows * C1 + (cols - C0), mask=m & (cols >= C0), other=0)
+        tl.store(d + rows * (C0 + C1) + cols, tl.where(in0, v0, v1), mask=m)
+    else:
+        r = pid - NQ - NCAT
+        NR0: tl.constexpr = H0R // RBH
+        if r < NR0:
+            rcols = r * RBH + tl.arange(0, RBH)
+            racc = tl.zeros((RBP, RBH), dtype=tl.float32)
+            for p0 in range(0, PR, RBP):
+                pr = p0 + tl.arange(0, RBP)
+                racc += tl.load(dgp0 + pr[:, None] * H0R + rcols[None, :], mask=(pr[:, None] < PR), other=0.0)
+            tl.store(dgo0 + rcols, tl.sum(racc, axis=0).to(dgo0.dtype.element_ty))
+        else:
+            rcols = (r - NR0) * RBH + tl.arange(0, RBH)
+            racc = tl.zeros((RBP, RBH), dtype=tl.float32)
+            for p0 in range(0, PR, RBP):
+                pr = p0 + tl.arange(0, RBP)
+                racc += tl.load(dgp1 + pr[:, None] * H1R + rcols[None, :], mask=(pr[:, None] < PR), other=0.0)
+            tl.store(dgo1 + rcols, tl.sum(racc, axis=0).to(dgo1.dtype.element_ty))
+
+
+class DyPrequantSlot:
+    """Hand-off between a two-output concat-N forward and the op that consumes both outputs (DeepSeek-V4: the
+    q / kv post-processing after wq_a || wkv). The consumer's backward produces the concat's output gradients; it
+    quantizes them right there (plus the W^T column cat and a reduction of its own) in ONE launch
+    (``dy_prequant_fill``), and the concat backward takes that result instead of running ``_quant_cat_cols``: one
+    launch fewer, same bytes. The concat backward checks that the gradients it receives are exactly the tensors that
+    were quantized (pointer, shape, strides) and quantizes them itself otherwise."""
+
+    __slots__ = ("g_dtype", "wts", "out_ptrs", "result", "keys")
+
+    def __init__(self, g_dtype, wts, out_ptrs):
+        self.g_dtype, self.wts, self.out_ptrs = g_dtype, wts, out_ptrs
+        self.result = self.keys = None
+
+
+# The slot of the latest two-output concat-N forward, consumed by ``take_dy_prequant``.
+_DY_PREQ = [None]
+
+
+def take_dy_prequant(a: torch.Tensor, b: torch.Tensor):
+    """``(slot, swapped)``: the slot of the latest concat-N forward if its two outputs are ``(a, b)`` (by data
+    pointer; ``swapped`` when they are ``(b, a)`` in its output order), else ``(None, False)``. Consumed once."""
+    slot, _DY_PREQ[0] = _DY_PREQ[0], None
+    if slot is not None:
+        if slot.out_ptrs == (a.data_ptr(), b.data_ptr()):
+            return slot, False
+        if slot.out_ptrs == (b.data_ptr(), a.data_ptr()):
+            return slot, True
+    return None, False
+
+
+def _part_key(t):
+    return (t.data_ptr(), tuple(t.shape), tuple(t.stride()))
+
+
+def dy_prequant_fill(slot, parts, red) -> bool:
+    """Quantize ``parts`` (the concat's output gradients in its output order, [M, N_i] each) like the concat
+    backward's ``_quant_cat_cols`` and, in the same launch, reduce ``red = (dgp0, dgo0, dgp1, dgo1, P)``: fp32
+    partials dgp_i [P, H_i] summed over P into dgo_i [H_i] (see ``_quant_cat2_cols_red_kernel`` for the order).
+    Returns False, with nothing launched, when the shapes do not fit; the caller then does its own reduction."""
+    ts = slot.wts
+    if (
+        len(parts) != 2
+        or ts is None
+        or len(ts) != 2
+        or any(not t.is_contiguous() or t.shape[1] % 4 for t in ts)
+    ):
+        return False
+    x0, x1 = parts
+    M, N0 = x0.shape
+    N = N0 + x1.shape[1]
+    if not (M % 128 == 0 and N0 % 128 == 0 and N % 128 == 0 and x0.stride(1) == 1 and x1.stride(1) == 1):
+        return False
+    R = ts[0].shape[0]
+    if ts[1].shape[0] != R:
+        return False
+    dgp0, dgo0, dgp1, dgo1, PR = red
+    H0R, H1R = dgp0.shape[1], dgp1.shape[1]
+    RBH, RBP = 64, 64
+    if H0R % RBH or H1R % RBH or not (dgo0.is_contiguous() and dgo1.is_contiguous()):
+        return False
+    dtype = slot.g_dtype
+    c0, c1 = ts[0].shape[1] // 4, ts[1].shape[1] // 4
+    dev = x0.device
+    qr = torch.empty((M, N), dtype=dtype, device=dev)
+    er = torch.empty((M // 128, N // 32 * 128), dtype=torch.uint8, device=dev)
+    qt = torch.empty((N, M), dtype=dtype, device=dev)
+    et = torch.empty((N // 128, M // 32 * 128), dtype=torch.uint8, device=dev)
+    out = torch.empty((R, (c0 + c1) * 4), dtype=ts[0].dtype, device=ts[0].device)
+    for t in (x0, x1, qr, er, qt, et, *ts, out, dgp0, dgo0, dgp1, dgo1):
+        assert t.is_cuda and t.data_ptr() != 0
+    fmax = float(torch.finfo(dtype).max)
+    BR, BC = 32, 128
+    nbn = N // 128
+    nq = (M // 128) * nbn
+    ncb = triton.cdiv(c0 + c1, BC)
+    ncat = triton.cdiv(R, BR) * ncb
+    nred = H0R // RBH + H1R // RBH
+    _quant_cat2_cols_red_kernel[(nq + ncat + nred,)](
+        x0,
+        x1,
+        qr,
+        er,
+        qt,
+        et,
+        M,
+        N,
+        N0,
+        x0.stride(0),
+        x1.stride(0),
+        ts[0].view(torch.int32),
+        ts[1].view(torch.int32),
+        out.view(torch.int32),
+        R,
+        nq,
+        nbn,
+        ncb,
+        ncat,
+        dgp0,
+        dgo0,
+        dgp1,
+        dgo1,
+        PR,
+        FP8_MAX=fmax,
+        MAX_EXP=fp8_max_exp(fmax),
+        SL=SL_PACKED,
+        C0=c0,
+        C1=c1,
+        BR=BR,
+        BC=BC,
+        H0R=H0R,
+        H1R=H1R,
+        RBH=RBH,
+        RBP=RBP,
+        num_warps=4,
+    )
+    slot.result = ((qr, er, qt, et), out)
+    slot.keys = tuple(_part_key(p) for p in parts)
+    return True
+
+
 def _joint_main_grad(params, main_grads):
     """[sum N, K] view over adjacent main_grads (same dtype, same storage, contiguous, in this order), else None.
     Address adjacency alone is not enough: two separate allocations can sit back to back, and a view over both would
@@ -442,6 +664,13 @@ class FP8GemmBlockConcatNFunction(torch.autograd.Function):
                 gemm_fp8_gluon_gfx1250_impl.gemm_nt(j[0], j[1], j[2], j[3], x.dtype, out=j[4])
         ctx.wts = wts
         ctx.dx_slot, _DX_ACCUM[0] = _DX_ACCUM[0], None
+        # The consumer of both outputs may quantize their gradients for the backward (see DyPrequantSlot).
+        ctx.preq = None
+        if wts is not None and len(outs) == 2:
+            ctx.preq = DyPrequantSlot(
+                _get_fp8_dtype(config.format, False), wts, (outs[0].data_ptr(), outs[1].data_ptr())
+            )
+        _DY_PREQ[0] = ctx.preq
         ctx.save_for_backward(a_t, pat, pbt, w_j)
         ctx.config, ctx.out_dtype, ctx.K = config, x.dtype, K
         return tuple(outs)
@@ -463,7 +692,11 @@ class FP8GemmBlockConcatNFunction(torch.autograd.Function):
             if go is None:
                 go = torch.zeros((M, n), dtype=ctx.out_dtype, device=a_t.device)
             parts.append(go.reshape(M, n) if go.stride(-1) == 1 else go.reshape(M, n).contiguous())
-        qc = _quant_cat_cols(parts, g_dtype, ctx.wts) if ctx.wts is not None else None
+        preq, ctx.preq = ctx.preq, None
+        if preq is not None and preq.result is not None and preq.keys == tuple(_part_key(p) for p in parts):
+            qc = preq.result  # quantized by the consumer's backward (same kernel bodies, same bytes)
+        else:
+            qc = _quant_cat_cols(parts, g_dtype, ctx.wts) if ctx.wts is not None else None
         if qc is not None:  # dY quant + W^T column-cat in one launch (same bytes)
             (g_row, pg, g_t, pgt), b_t = qc
         else:
@@ -566,7 +799,7 @@ class FP8GemmBlockConcatNFunction(torch.autograd.Function):
                 else:
                     grads[i] = gw[off : off + n]
                 off += n
-        ctx.wts = ctx.wparams = ctx.fused = ctx.dx_slot = None
+        ctx.wts = ctx.wparams = ctx.fused = ctx.dx_slot = ctx.preq = None
         return (grad_x, None, None, *grads)
 
 

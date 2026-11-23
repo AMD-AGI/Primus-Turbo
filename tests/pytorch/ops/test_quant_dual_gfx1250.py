@@ -122,3 +122,37 @@ def test_dual_pack_bits_equal_separate_quant_and_pack(monkeypatch, n_jobs):
         out, packed = fn()
         assert _same(ref, out)
         assert all(torch.equal(a, b) for a, b in zip(ref_packed, packed))
+
+
+# ----------------------------------------------------------------------------- one program per tile (NS = 1)
+
+
+@requires_gluon
+def test_q2_dense_plan_one_program_per_tile_for_small_grids():
+    from primus_turbo.gluon.quantization.quantization_fp8blk_dual_kernel import _dense_plan, _ncu
+
+    dev = torch.device("cuda")
+    ncu = _ncu(dev)
+    assert _dense_plan(32 * 32, dev, None, 3, None) == (1, 32 * 32)  # 4096 x 4096
+    assert _dense_plan(6 * ncu, dev, None, 3, None) == (1, 6 * ncu)
+    assert _dense_plan(6 * ncu + 1, dev, None, 3, None) == (2, min(3 * ncu, 6 * ncu + 1))
+    assert _dense_plan(64, dev, 2, 3, None) == (2, 64)  # an explicit NS keeps the ring
+    assert _dense_plan(64, dev, None, 3, 5) == (2, 5)  # an explicit program count keeps the ring
+
+
+@requires_gluon
+@pytest.mark.parametrize("rl, tl", LAYOUTS[:3])
+@pytest.mark.parametrize("m, n", [(4096, 1024), (4096, 2048), (4096, 4096), (4096, 512)])
+def test_q2_dense_one_program_per_tile_bits_equal_ring_and_triton(monkeypatch, rl, tl, m, n):
+    """DeepSeek-V4 activation shapes: the default launch (one program per tile, no ring) writes the bytes of the
+    2-slot ring launch and of the Triton kernel."""
+    from primus_turbo.gluon.quantization.quantization_fp8blk_dual_kernel import _ncu, q2_dense
+    from primus_turbo.triton.quantization import quantization_fp8blk_dual_kernel as qg
+
+    x = _make(m, n, 2, True)
+    monkeypatch.setattr(qg, "_q2_use", lambda x: False)
+    ref = qg.quant_dual_t_e8m0_v2(x, F8, row_layout=rl, t_layout=tl, num_warps=2)
+    one = q2_dense(x, F8, row_layout=rl, t_layout=tl)
+    ring = q2_dense(x, F8, row_layout=rl, t_layout=tl, ns=2, nprog=3 * _ncu(x.device))
+    assert _same(ref, one)
+    assert _same(ref, ring)
