@@ -117,15 +117,16 @@ def _all_reached(flag_base, flag_idxs, expected):
 
 
 @ASTRewriter.transform
-def spin_flags(flag_base, flag_idxs, expected, rank, src, tag, report=True):
+def spin_flags(flag_base, flag_idxs, expected, rank, src, tag, report=True, sleep=1):
     """``spin_flag`` over several flags, polled together (one round trip per poll). ``report=False``
     traps on timeout without the printf: inside a GEMM K loop its hostcall code needs the registers the
-    accumulators and prefetches hold, and what it evicts is reloaded after every wait."""
+    accumulators and prefetches hold, and what it evicts is reloaded after every wait. ``sleep``: the
+    s_sleep count between polls (64 clocks each)."""
     spin_start = read_clock()
     fx.rocdl.s_waitcnt(0)
     ready = _all_reached(flag_base, flag_idxs, expected)
     while not ready:
-        fx.rocdl.s_sleep(fx.Int32(1))
+        fx.rocdl.s_sleep(fx.Int32(sleep))
         if spin_timed_out(spin_start, SPIN_TIMEOUT):
             if const_expr(report):
                 fx.printf(

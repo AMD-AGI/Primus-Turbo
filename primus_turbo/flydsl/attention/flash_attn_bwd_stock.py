@@ -4400,6 +4400,10 @@ def build_flash_attn_bwd_dkdv_module(
         block_q=BLOCK_Q,
         q_split=Q_SPLIT,
         q_ready=PF_QB,
+        # the unmasked q walk: descending, rotated by band % qdesc_r (see _desc_q); with g3_qcarry a trip's
+        # last head emits its dQ in the next trip
+        qdesc_r=QDESC_R if QDESC else 0,
+        g3_qcarry=G3_QCARRY,
     )
     return _launch
 
