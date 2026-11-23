@@ -51,7 +51,7 @@ Variables owned by other projects (FlyDSL, Triton, NVSHMEM, the launcher's `RANK
 |---|---|---|---|
 | `PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32` | `bool` | `True` | Whether the attention V3 (CK) backward accumulates with FP32 atomics. Only "0" disables it; unset, "1" and any other value keep it on. Read at the first forward that does not pass `is_v3_atomic_fp32` explicitly. |
 | `PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT` | `bool` | `False` | "1" lets the FP4 variable-K grouped GEMM (wgrad) overwrite `out` with beta=0 instead of accumulating into it, when the caller allows it and no CUDA graph is being captured. |
-| `PRIMUS_TURBO_AGKV_FUSED_BWD` | `bool` | `False` | "1" runs the backward of the all-gather-KV context-parallel attention's `fused` mode as one persistent kernel (`agkv_fused_bwd`: dK / dV, their reduce-scatter and dQ); otherwise it is `mega`'s. Shapes that kernel does not take run `mega`'s either way. Read at the first such backward. |
+| `PRIMUS_TURBO_AGKV_FUSED_BWD` | `bool` | `True` | "1" (default) runs the backward of the all-gather-KV context-parallel attention's `fused` mode as one persistent kernel (`agkv_fused_bwd`: dK / dV, their reduce-scatter and dQ); "0" runs `mega`'s. Shapes that kernel does not take run `mega`'s either way. Read at the first such backward. |
 
 ### Expert parallel
 

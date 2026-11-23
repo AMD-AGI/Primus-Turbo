@@ -1,8 +1,8 @@
 # gfx950 / agkv_cp_attention_fused / flydsl tips
 
 Mode `fused` of the all-gather-KV context-parallel attention (`attention_agkv.py`): the forward is one persistent
-FlyDSL kernel with the K/V all-gather inside it (`agkv_fused_fwd`); with `PRIMUS_TURBO_AGKV_FUSED_BWD=1` the
-backward is one persistent kernel as well (`agkv_fused_bwd`: dK / dV, their reduce-scatter and dQ). 8 x MI355X
+FlyDSL kernel with the K/V all-gather inside it (`agkv_fused_fwd`), the backward one persistent kernel as well
+(`agkv_fused_bwd`: dK / dV, their reduce-scatter and dQ; `PRIMUS_TURBO_AGKV_FUSED_BWD=0` runs mega's). 8 x MI355X
 XGMI mesh, zigzag cp 8, mbs 1, `FLUX_ATTN_FLYDSL=1`.
 
 ### 2026-11-23 03:55 UTC final — STATE OF THE BRANCH (5d24cb67c)
