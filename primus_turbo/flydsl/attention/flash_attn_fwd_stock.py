@@ -363,9 +363,7 @@ def emit_dualwave_swp_body(ctx, traits):
             else:
                 v_s_1 = ctx.scores_for_softmax(v_s_1)
             if const_expr(split_rebase):
-                m_row, l_row, v_s_1, v_o, pending = ctx.rebase_if_needed(
-                    m_row, l_row, v_s_1, v_o, pending
-                )
+                m_row, l_row, v_s_1, v_o, pending = ctx.rebase_if_needed(m_row, l_row, v_s_1, v_o, pending)
                 v_o = _pv_step(0, v_p_0, v_v, v_o, 0)
             for pvs in range_constexpr(1, 4):
                 v_o = _pv_step(pvs, v_p_0, v_v, v_o, 0)
@@ -428,9 +426,7 @@ def emit_dualwave_swp_body(ctx, traits):
             if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                 _s_setprio(1)
             if const_expr(split_rebase):
-                m_row, l_row, v_s_0, v_o, pending = ctx.rebase_if_needed(
-                    m_row, l_row, v_s_0, v_o, pending
-                )
+                m_row, l_row, v_s_0, v_o, pending = ctx.rebase_if_needed(m_row, l_row, v_s_0, v_o, pending)
             v_o = _pv_step(0, v_p_1, v_v, v_o, 1)
             for pvs in range_constexpr(1, 4):
                 v_o = _pv_step(pvs, v_p_1, v_v, v_o, 1)

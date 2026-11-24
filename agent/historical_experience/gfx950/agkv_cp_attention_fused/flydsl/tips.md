@@ -58,3 +58,19 @@ XGMI mesh, zigzag cp 8, mbs 1, `FLUX_ATTN_FLYDSL=1`.
   Loss matches TE at iteration 1 and within bf16 noise at 10 / 20 (32K: 8.274-8.281, 5.977-5.997)
 - Takeaway: on this ROCm the RCCL streams (`TORCH_NCCL_HIGH_PRIORITY=1`) share the compute stream's hardware queue when queues are few; a rank whose RCCL kernel is queued ahead of its attention kernel waits for a peer whose attention kernel, queued ahead of its RCCL kernel, spins for it. Any kernel that waits on its peers' kernels needs the collectives on other queues; leaving CUs free does not help
 - Applicability: run agkv (fused or mega) with `GPU_MAX_HW_QUEUES>=8`; the Primus example config sets it in its `env:` block and `PrimusTurboAttention` warns below 8. Fused saves the gathered K / V for the backward: +6 GB (32K) / +21 GB (64K) per GPU over TE at 32 layers
+
+### 2026-11-24 03:00 UTC Primus end to end — 128K, qwen3-30b-a3b, where the gain comes from
+- Context: llama3.1-8B as above at 128K (12 iterations, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`); qwen3-30b-a3b (48 layers, Hq 32 / Hkv 4, d 128, 128 experts top 8) with cp 8, ep 8, DeepEP, GBS 8, 20 iterations (`qwen3_30B_A3B-BF16-cp8-agkv-pretrain.yaml`). TE is its CK backend (`NVTE_FUSED_ATTN_CK=1`, `NVTE_CK_USES_BWD_V3=1`: aiter's assembly v3 backward); every agkv mode except mega / fused runs the stock flux kernels
+- Signal (llama3.1-8B 128K, ms/iter): TE all_gather 21248, TE p2p 23473, mega 22002, fused 21770 (0.976x of TE all_gather); max alloc 129.7 / 194.8 / 206.7 GB for TE / mega / fused. Without expandable segments fused and mega fail in iteration 2 allocating the 64 GiB dQ partial workspace with ~70 GiB reserved but unallocated
+- Signal (qwen3-30b-a3b, ms/iter, x = speedup over TE all_gather):
+
+| seq | TE all_gather | naive | serial | overlap | mega | fused | max alloc TE / naive / fused |
+|---|---|---|---|---|---|---|---|
+| 16K | 2773 | 2651 (1.046x) | 2509 (1.105x) | 3706 (0.748x) | - | 2348 (1.181x) | 52.8 / 55.2 / 54.5 GB |
+| 32K | 4244 | 4074 (1.042x) | 4072 (1.042x) | 5349 (0.793x) | 4880 (0.870x) | 3790 (1.120x) | 64.1 / 71.0 / 69.7 GB |
+| 64K | 9278 | 9838 (0.943x) | 9752 (0.951x) | 11686 (0.794x) | 10707 (0.867x) | 9165 (1.012x) | 86.8 / 108.5 / 106.5 GB |
+
+  Loss equals TE at iteration 1 in every mode; largest per-iteration relative difference 4.1e-4 (16K), 1.4e-5 (32K), 6.1e-6 (64K)
+- Takeaway: fused / TE = (naive / TE) x (serial / naive) x (fused / serial). naive is TE's algorithm on flux kernels (plus saving the gathered K / V where TE gathers again in the backward): 1.046 / 1.042 / 0.943 at 16K / 32K / 64K. The fusion itself, fused / serial, is a steady 1.069 / 1.074 / 1.064 of the whole step. Past 32K the flux attention loses to TE's CK kernels by about what the fusion wins, so the end-to-end gain falls to 1 % at 64K and -2.4 % at llama 128K. The extra memory over TE is the saved K / V plus flux's dQ partial workspace, not the fusion: naive needs as much
+- Takeaway: mega and overlap (separate comm kernels or SDMA copies on side streams) are 13-25 % slower than TE next to DeepEP on qwen; on llama mega was within 3 % of fused. Cause not investigated
+- Applicability: at 64K and beyond the next gain is in the flux backward kernel (dQ partial traffic), not in the exchange; use fused, not mega / overlap, on MoE models; run 128K and longer with expandable segments
