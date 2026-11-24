@@ -146,13 +146,17 @@ def _ceildiv(a, b):
     return (a + b - 1) // b
 
 
-def _link_plan(num_ranks, S):
+def _link_plan(num_ranks, S, mla=False):
     """``(num_pull, num_comm, local_first, num_top)``: on two ranks one link carries the whole exchange,
     and fewer pullers land the first dO rows sooner while dedicated pushers keep it busy as bands finish;
     with more links the exchange is short and every block is worth more on the items. Local first pays
     only while the start is a large share of the call (two ranks, up to 16K: A/B -1.0 / -1.5%, +0.8..+2.8%
     above). Four ranks keep pushers up to 32K (64K: A/B -1.5% without them) and pull 8 top bands right
-    after the prefix (A/B 0.0..-2.0% up to 32K); eight ranks pull with 48 blocks (A/B -0.2..-1.3%)."""
+    after the prefix (A/B 0.0..-2.0% up to 32K); eight ranks pull with 48 blocks (A/B -0.2..-1.3%).
+    MLA moves 5-10x the GQA bytes per row of attention: on eight ranks 8 pullers, 4 of them pushers
+    (DeepSeek-V3 / Kimi-K2 heads, 32K / 64K: A/B -2.6..-7.4% against 48 / 0)."""
+    if mla and num_ranks == 8:
+        return 8, 4, False, 0
     if num_ranks == 2:
         return 24, 8, S <= 16384, 0
     if num_ranks == 4:
@@ -1512,7 +1516,7 @@ def ulysses_a2a_attn_bwd(
     q_split, n_img = plan[0], plan[1].embed.get("a16_imgs", 1)
     dq_rows = _dq_rows(hq_r, dq_rows, mla)
     pull_rows = _pull_rows(hq_r, pull_rows)
-    auto_pull, auto_comm, auto_local, auto_top = _link_plan(n, S)
+    auto_pull, auto_comm, auto_local, auto_top = _link_plan(n, S, mla)
     num_top = auto_top if num_top is None else num_top
     num_pull = auto_pull if num_pull is None else num_pull
     num_comm = auto_comm if num_comm is None else num_comm
