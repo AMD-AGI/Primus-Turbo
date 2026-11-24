@@ -908,6 +908,12 @@ def grouped_gemm_fp8(
     """
     if config is None:
         config = Float8QuantConfig()
+    if config.default_backend is not None:
+        raise ValueError(
+            "Float8QuantConfig.default_backend is read by the dense FP8 GEMMs only; "
+            "grouped_gemm_fp8 picks its backends per stage. Use a config without it, or "
+            "set_grouped_gemm_backend() / PRIMUS_TURBO_GROUPED_GEMM_BACKEND."
+        )
 
     if group_offs is None:
         group_offs = group_offs_from_lens(group_lens)
