@@ -49,7 +49,7 @@ notes; the kernel backend behind each cell is in
 | `gemm_fp8` | FP8 tensorwise | ✅ | ✅ | ✅ | E4M3 / E5M2 |
 | | FP8 rowwise | ✅ | ✅ | ✅ | |
 | | FP8 blockwise | ✅ | ✅ | ✅ | |
-| | MXFP8 | — | ✅ | — | |
+| | MXFP8 | — | ✅ | ✅ | gfx1250: FLYDSL only (NT, K % 32 == 0); other cases raise |
 | `gemm_fp4` | MXFP4 | — | ✅ | — | See [MXFP4 training](./features/mxfp4.md) |
 | `mlp_fp4` | MXFP4 | — | ✅ | — | Dense GLU MLP with fused activation. See [MXFP4 training](./features/mxfp4.md) |
 
@@ -165,7 +165,7 @@ registration order, with the arch / format limits from each backend's `can_handl
 | Op | Backends |
 |---|---|
 | `gemm` | HIPBLASLT, TRITON |
-| `gemm_fp8` | TURBO (MXFP8, gfx950), HIPBLASLT (tensorwise; MXFP8 not on gfx942), CK (tensorwise / rowwise / blockwise; not gfx1250), TRITON (tensorwise / rowwise / blockwise), FLYDSL (tensorwise / MXFP8; gfx950) |
+| `gemm_fp8` | TURBO (MXFP8, gfx950), HIPBLASLT (tensorwise; MXFP8 not on gfx942 / gfx1250), CK (tensorwise / rowwise / blockwise; not gfx1250), TRITON (tensorwise / rowwise / blockwise), FLYDSL (tensorwise / MXFP8 on gfx950; MXFP8 on gfx1250) |
 | `gemm_fp4` | AITER (gfx950, NT layout), HIPBLASLT (not gfx942), FLYDSL (gfx950) |
 | `mlp_fp4` | FLYDSL (fused GLU + MXFP4 quantization, forward and backward; required, gfx950), HIPBLASLT (remaining GEMMs, default) |
 | `grouped_gemm` | CK (not gfx1250), HIPBLASLT, TRITON, FLYDSL (gfx950, gfx1250) |
