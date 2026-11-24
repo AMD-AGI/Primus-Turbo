@@ -55,6 +55,12 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_kwargs_keys.py",
     # beta = 1 on the same kernel's variable-K wgrad, into an fp32 main_grad (Muse Spark expert shapes).
     "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_variable_k_accum.py",
+    # Dense FlyDSL GEMM for gfx1250 (bf16 / fp8 / mxfp8, WMMA + TDM): gemm_gfx1250_kernel.py.
+    "tests/pytorch/ops/test_gemm_gfx1250.py",
+    # MXFP8 dense GEMM through the backend registry; on gfx1250 it is served by the kernel above.
+    "tests/pytorch/ops/test_gemm_fp8.py::test_gemm_fp8_mx_blockwise",
+    # Dense MXFP8 fwd / dgrad / wgrad vs BF16 (SNR >= 20 dB, incl. K = 2880), and the hipBLASLt MX gate.
+    "tests/pytorch/ops/test_gemm_fp8_mx_dense_snr.py",
     # FlyDSL attention at the DeepSeek-V3 MLA head dims (primus_turbo/flydsl/attention/gfx1250_mla).
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla.py",
     # Its backward's launch plan: head chunks within the dS scratch budget, grids, bitwise equality across chunkings.

@@ -22,7 +22,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
     check_quantized_tensor,
 )
-from primus_turbo.pytorch.core.utils import is_gfx942
+from primus_turbo.pytorch.core.utils import is_gfx942, is_gfx1250
 from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
     gemm_fp8_accum_impl,
     gemm_fp8_impl,
@@ -680,7 +680,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
             False,
             granularity=ctx.config.granularity.value,
             default_backend=_stage_backend(
-                ctx.config, BackendType.HIPBLASLT if ctx.fuse_bgrad_accum else BackendType.FLYDSL
+                ctx.config,
+                # gfx1250: hipBLASLt never runs MXFP8 there, so the fused accumulate stays on FlyDSL.
+                (BackendType.HIPBLASLT if ctx.fuse_bgrad_accum and not is_gfx1250() else BackendType.FLYDSL),
             ),
             inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,
