@@ -214,3 +214,56 @@ def test_gemm_schedule_chain_fallback_shapes(fm_env, schedule, h, i):
     TDM pad interval K / 32 must be a power of two; compiling them used to abort the process)."""
     with pytest.raises(ValueError, match="power of two"):
         _chain(fm_env, schedule, h, i)
+
+
+def _skew_route(t, e, k, seed=0):
+    """Expert 0 gets no token, expert 1 gets every token (the longest window), the rest share the remaining slots."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    rest = torch.rand(t, e - 2, device="cuda", generator=g).argsort(dim=1)[:, : k - 1] + 2
+    idx = torch.cat([torch.ones(t, 1, device="cuda", dtype=rest.dtype), rest], dim=1)
+    tw = torch.softmax(torch.randn(t, k, device="cuda", generator=g), dim=1).float()
+    return idx, tw
+
+
+@pytest.mark.parametrize("routing", ["random", "skew"])
+@pytest.mark.parametrize(
+    "mode, sumsq",
+    [("grad", False), ("first_write", False), ("first_write", True), ("accumulate", True)],
+    ids=["beta0_grad", "beta0_main_grad", "beta0_main_grad_sumsq", "beta1_main_grad_sumsq"],
+)
+def test_vkw_wgrad_equals_vkq(monkeypatch, routing, mode, sumsq):
+    """Beta-0 wgrads run the 4-wave vkw kernel (every pool window is a multiple of 256 tokens): y, dx, d topk_w, dW1,
+    dW2 and the sum-of-squares partials are the bits of vkq. Beta-1 (accumulating) calls keep vkq."""
+    from primus_turbo.flydsl.grouped_gemm import grouped_gemm_fp8blk_vkq_kernel as VKQ
+    from primus_turbo.pytorch.ops import utils as ops_utils
+
+    t, h, i, e, k = 1024, 1024, 512, 8, 4
+    data = _inputs(t, h, i, e, k, seed=3, route=_skew_route(t, e, k) if routing == "skew" else None)
+    g = torch.Generator(device="cuda").manual_seed(11)
+    mg0 = (
+        (torch.randn(e, 2 * i, h, device="cuda", generator=g) * 0.01).bfloat16(),
+        (torch.randn(e, h, i, device="cuda", generator=g) * 0.01).bfloat16(),
+    )
+    monkeypatch.setenv("PRIMUS_TURBO_MOE_FP8BLK_WGRAD", "vkq")
+    if sumsq:
+        monkeypatch.setenv("PRIMUS_TURBO_MOE_WGRAD_SUMSQ", "1")
+    else:
+        monkeypatch.delenv("PRIMUS_TURBO_MOE_WGRAD_SUMSQ", raising=False)
+    accumulate = mode != "grad"
+    ops_utils.set_main_grad_first_write_policy((lambda p: True) if mode == "first_write" else None)
+    try:
+        res = {}
+        for vkw in (False, True):
+            monkeypatch.setattr(FM, "_VKW", vkw)
+            VKQ._COMPILED.clear()
+            res[vkw] = _run(FM, *data, accumulate=accumulate, main_grad0=mg0 if accumulate else None)
+            ran_vkw = any(key[0] == "vkw" for key in VKQ._COMPILED)
+            assert ran_vkw == (vkw and mode != "accumulate"), f"vkw kernel ran: {ran_vkw}"
+    finally:
+        ops_utils.set_main_grad_first_write_policy(None)
+    for name in ("y", "dx", "dtw", "dw1", "dw2"):
+        assert bit_diff_count(res[True][name], res[False][name]) == 0, name
+    if sumsq and accumulate:
+        for wa, wb in zip(res[False]["_w"], res[True]["_w"]):
+            assert wa._primus_main_grad_sumsq_fresh and wb._primus_main_grad_sumsq_fresh
+            assert bits_equal(wa._primus_main_grad_sumsq, wb._primus_main_grad_sumsq)

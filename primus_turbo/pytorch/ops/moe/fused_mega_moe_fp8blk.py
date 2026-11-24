@@ -78,6 +78,10 @@ _CACHES = weakref.WeakSet()
 # scale planes on VMEM; needs the compact 1-byte-per-128-token col scales from the quant kernels) or "vk" (one tile
 # per workgroup).
 _VKP_LDS_KWIN = 5120  # longest expert window the vkq LDS arena holds (scale planes grow with it)
+# Every expert window of the pool is a multiple of _ALIGN = 256 tokens, so the beta-0 vkq wgrads run as vkw
+# (4 waves of 128x128, 256-token k-tiles; main_grad and the sumsq partials bit-identical to vkq, 7-10% faster);
+# beta-1 (accumulating) calls keep vkq.
+_VKW = _ALIGN % 256 == 0
 # longest expert window the vk LDS arena holds (a power of two: the scale-plane TDM pad interval)
 _VK_LDS_KWIN = 8192
 
@@ -239,6 +243,7 @@ def _run_wgrad(wk, lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta, perm, window,
             perm=perm,
             kwin_max=_vkp_kwin(window),
             sumsq_out=sq,
+            vkw=_VKW,
         )
     else:
         bound = _vkp_kwin(window)  # an expert window holds each token at most once, padded to 256 rows
