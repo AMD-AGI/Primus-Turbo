@@ -188,7 +188,8 @@ def _q2_dense_kernel(
     NPROG: gl.constexpr,
     NS: gl.constexpr,
 ):
-    """persistent dense dual quant of X [M, N]: program pid walks tiles pid, pid + NPROG, ... (tokens fastest)."""
+    """persistent dense dual quant of X [M, N]: program pid walks tiles pid, pid + NPROG, ... (tokens fastest).
+    NS >= 2: an NS-slot TDM prefetch ring; NS == 1: one slot, no prefetch (meant for one program per tile)."""
     SH: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[128, 8]], [128, 128], [1, 0])
     pid = gl.program_id(0)
     nbm = M // 128
@@ -198,36 +199,64 @@ def _q2_dense_kernel(
         base=X, shape=(M, N), strides=(stride_x, 1), block_shape=(128, 128), layout=SH
     )
     n_my = (ntiles - pid + NPROG - 1) // NPROG
-    for s in gl.static_range(NS - 1):
-        t = gl.minimum(pid + s * NPROG, ntiles - 1)
-        tdm.async_load(xd, [(t % nbm) * 128, (t // nbm) * 128], bufs.index(s))
-    for it in range(0, n_my):
-        t = pid + it * NPROG
-        tl_ = gl.minimum(
-            t + (NS - 1) * NPROG, ntiles - 1
-        )  # tail iterations re-load a valid tile (never read)
-        tdm.async_wait(NS - 2)  # this tile's load (the oldest outstanding) is complete for this wave ...
-        gl.barrier()  # ... and for all waves; the slot re-filled below was released by the previous iteration's barrier
-        tdm.async_load(xd, [(tl_ % nbm) * 128, (tl_ // nbm) * 128], bufs.index((it + NS - 1) % NS))
-        _q2_tile8(
-            bufs.index(it % NS),
-            t % nbm,
-            t // nbm,
-            QR,
-            ER,
-            QT,
-            ET,
-            M,
-            N,
-            FP8_MAX,
-            MAX_EXP,
-            CONV,
-            SLR,
-            SLT,
-            0,
-            NW,
-        )
-        gl.barrier()
+    if NS == 1:
+        # No prefetch ring: load the tile, wait, quantize. One 35 KB slot lets up to six programs share a CU, which
+        # beats the ring when each program has only one or two tiles (same tile math, same bytes).
+        for it in range(0, n_my):
+            t = pid + it * NPROG
+            tdm.async_load(xd, [(t % nbm) * 128, (t // nbm) * 128], bufs.index(0))
+            tdm.async_wait(0)
+            gl.barrier()
+            _q2_tile8(
+                bufs.index(0),
+                t % nbm,
+                t // nbm,
+                QR,
+                ER,
+                QT,
+                ET,
+                M,
+                N,
+                FP8_MAX,
+                MAX_EXP,
+                CONV,
+                SLR,
+                SLT,
+                0,
+                NW,
+            )
+            gl.barrier()
+    else:
+        for s in gl.static_range(NS - 1):
+            t = gl.minimum(pid + s * NPROG, ntiles - 1)
+            tdm.async_load(xd, [(t % nbm) * 128, (t // nbm) * 128], bufs.index(s))
+        for it in range(0, n_my):
+            t = pid + it * NPROG
+            tl_ = gl.minimum(
+                t + (NS - 1) * NPROG, ntiles - 1
+            )  # tail iterations re-load a valid tile (never read)
+            tdm.async_wait(NS - 2)  # this tile's load (the oldest outstanding) is complete for this wave ...
+            gl.barrier()  # ... and for all waves; the slot re-filled below was released by the previous barrier
+            tdm.async_load(xd, [(tl_ % nbm) * 128, (tl_ // nbm) * 128], bufs.index((it + NS - 1) % NS))
+            _q2_tile8(
+                bufs.index(it % NS),
+                t % nbm,
+                t // nbm,
+                QR,
+                ER,
+                QT,
+                ET,
+                M,
+                N,
+                FP8_MAX,
+                MAX_EXP,
+                CONV,
+                SLR,
+                SLT,
+                0,
+                NW,
+            )
+            gl.barrier()
     tdm.async_wait(0)
 
 
@@ -344,12 +373,23 @@ def _dense_alloc(x, dtype, row_layout, t_layout):
     return M, N, slr, slt, qr, er, qt, et
 
 
-def q2_dense(x, dtype=torch.float8_e4m3fn, row_layout="g90", t_layout="g90", ns=2, wpc=3, nprog=None):
-    """Same outputs as quantization_fp8blk_dual_kernel.quant_dual_t_e8m0_v2(x, dtype, row_layout=, t_layout=) (with_row, with_t, no sr):
-    returns (q_row, None, e8m0_row, q_t, e8m0_t)."""
+def _dense_plan(ntiles, dev, ns, wpc, nprog):
+    """(NS, programs) of a dense launch. Unless the caller picks either: when every 128x128 tile can have its own
+    program at up to six programs per CU (NS = 1 needs ~51 KB of LDS), one program per tile without the prefetch
+    ring; otherwise a 2-slot ring on ``wpc`` programs per CU. Both give the same bytes. Measured on MI455X (after a
+    GEMM / after an L2 flush): 4096x1024 3.2 / 6.6 -> 2.7 / 5.2 us, 4096x4096 8.0 / 12.7 -> 5.4 / 8.6 us."""
+    if ns is None and nprog is None and ntiles <= 6 * _ncu(dev):
+        return 1, ntiles
+    return (2 if ns is None else ns), min(nprog or _ncu(dev) * wpc, ntiles)
+
+
+def q2_dense(x, dtype=torch.float8_e4m3fn, row_layout="g90", t_layout="g90", ns=None, wpc=3, nprog=None):
+    """Same outputs as quantization_fp8blk_dual_kernel.quant_dual_t_e8m0_v2(x, dtype, row_layout=, t_layout=)
+    (with_row, with_t, no sr): returns (q_row, None, e8m0_row, q_t, e8m0_t). ``ns`` / ``nprog`` pick the prefetch
+    depth / program count (default: see ``_dense_plan``)."""
     M, N, slr, slt, qr, er, qt, et = _dense_alloc(x, dtype, row_layout, t_layout)
     dev = x.device
-    nprog = min(nprog or _ncu(dev) * wpc, (M // 128) * (N // 128))
+    ns, nprog = _dense_plan((M // 128) * (N // 128), dev, ns, wpc, nprog)
     fmax = float(torch.finfo(dtype).max)
     for t in (x, qr, er, qt, et):
         assert t.data_ptr() != 0

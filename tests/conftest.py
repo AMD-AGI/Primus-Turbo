@@ -104,6 +104,7 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_gemm_bf16_gluon_gfx1250.py",
     "tests/pytorch/ops/test_quant_dual_gfx1250.py",
     "tests/pytorch/ops/test_gemm_fp8_block_gluon_gfx1250.py",
+    "tests/pytorch/ops/test_gemm_fp8_concat_dy_prequant_gfx1250.py",
     "tests/pytorch/ops/test_gemm_fp8_block_gfx1250.py",
 )
 
