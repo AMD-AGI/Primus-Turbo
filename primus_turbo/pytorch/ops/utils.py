@@ -64,6 +64,28 @@ def _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern: Optional[str]):
     return True, b.main_grad
 
 
+# ---------------------------------------------------------------------------
+# beta = 0 on the first write of a step (the framework's main_grad clear made redundant)
+#
+# A training framework that stops zeroing ``main_grad`` up front registers a policy: ``policy(param) -> bool`` answers
+# "is this the first write into param.main_grad since the last clear point?" and CONSUMES that state (it must return
+# True at most once per clear point, and the caller then fully overwrites main_grad). Without a policy every fused
+# wgrad accumulates (beta = 1), the historical contract. Primus: PRIMUS_WGRAD_BETA0=1 (wgrad_beta0_patches.py).
+# ---------------------------------------------------------------------------
+_main_grad_first_write_policy = None
+
+
+def set_main_grad_first_write_policy(fn) -> None:
+    global _main_grad_first_write_policy
+    _main_grad_first_write_policy = fn
+
+
+def main_grad_first_write(param) -> bool:
+    """True: the caller must OVERWRITE ``param.main_grad`` (beta = 0); False: accumulate (beta = 1)."""
+    fn = _main_grad_first_write_policy
+    return bool(fn(param)) if (fn is not None and param is not None) else False
+
+
 _dummy_wgrads = {}
 
 

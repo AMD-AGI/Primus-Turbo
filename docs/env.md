@@ -112,6 +112,29 @@ JAX hipBLASLt grouped GEMM (csrc/jax/grouped_gemm/hipblaslt_grouped_gemm.cpp).
 | `PRIMUS_TURBO_HB_GG_PICK_NN`<br>`PRIMUS_TURBO_HB_GG_PICK_NT`<br>`PRIMUS_TURBO_HB_GG_PICK_TN` | `int` | `0` | k: use the k-th supported heuristic candidate for the forward (NN), input-gradient (NT) or weight-gradient (TN) product instead of the first (kernel sweeps). C++ reads it at every call. |
 | `PRIMUS_TURBO_HB_GG_VERBOSE` | `bool` | `False` | Set (to any value): log the plans and tuning of the hipBLASLt grouped GEMM. |
 
+### gfx1250 Gluon kernels
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `PRIMUS_GLUON` | `bool` | `True` | "0" turns off every gfx1250 Gluon (cdna5) kernel and selects the non-Gluon fallbacks (dsv4up -&gt; g90 FlyDSL GEMM, bf16g2 / bf16grp -&gt; hipBLASLt, quant2 -&gt; Triton quant). Unset and any other value leave them on when the device is gfx1250 and Triton is 3.9 or newer (`primus_turbo.gluon.gate.gluon_ok`). |
+
+### Block-FP8 dense GEMM (gfx1250)
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `PRIMUS_TURBO_FP8_BLOCK_UE8M0` | `bool` | `False` | "1" makes the 128-block FP8 quantization round every scale to a power of two (UE8M0, the DeepSeek-V3 / V4 recipe). Scales stay fp32 tensors holding 2^k, so every blockwise GEMM consumes them unchanged. The dsv4up / g90 dense GEMMs and the FP8 weight cache require it. |
+| `PRIMUS_TURBO_FP8_BLOCK_KERNEL` | `str` | `dsv4up` | Dense block-FP8 GEMM kernel on gfx1250 (UE8M0 scales, 2-D inputs): "dsv4up" (Gluon, per pass where the shape allows, else g90), "g90" (FlyDSL), or "off" (the generic Triton blockwise kernels). "dsv4up" runs as "g90" when the Gluon kernels are off (`primus_turbo.gluon.gate`). |
+| `PRIMUS_TURBO_FP8_WCACHE` | `bool` | `True` | "0" ignores the per-step FP8 weight cache that the optimizer fills (W, W^T and UE8M0 scales); without a filled cache the GEMMs quantize the weight themselves either way. |
+| `PRIMUS_TURBO_FP8_WCACHE_VERIFY` | `bool` | `False` | "1" re-quantizes every weight-cache hit and raises on any byte difference (debugging; syncs). |
+| `PRIMUS_TURBO_DSV4UP_SMALLTILE` | `str` | `4096x1024x32768:256x128s3,4096x1536x4096:256x128s3,1536x4096x4096:256x128s3,1536x4096x4096a:256x128s3` | dsv4up GEMMs that run on the dsv4s smaller-output-tile kernel (bit-identical, more CUs busy): comma-separated "MxNxK[a]:tile", the GEMM dims of the call, "a" for the beta-1 accumulate call, tile from `gemm_fp8blk_smalltile_kernel.TILES`. The default is the DSv4-Flash table; set it to the empty string to turn the table off. |
+| `PRIMUS_MB_QDUAL` | `str` | `f1024:t2w8,f2048:t2w8,f4096:t2w8,f8192:t2w8,c4096:t2w8` | Per-site kernel variant of the Triton dual quantization (non-Gluon fallback), comma-separated "&lt;f\|c&gt;&lt;K&gt;:t2w&lt;warps&gt;". The default is the DSv4-Flash table; the empty string turns it off. |
+
+### Side-stream overlap (gfx1250 training step)
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `PRIMUS_OVERLAP` | `bool` | `False` | "1" lets the training framework run independent chains (deferred wgrads, shared expert, indexer, compressor) on side streams. Only for a framework that calls `primus_turbo.pytorch.core.overlap.join()` after each backward: an un-joined deferred wgrad is silently wrong. Always off when torch.distributed has more than one rank. |
+
 ### Flux
 
 | Variable | Type | Default | Description |

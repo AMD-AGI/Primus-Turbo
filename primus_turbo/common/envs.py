@@ -89,6 +89,14 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_HB_GG_PICK_TN: int = 0
     PRIMUS_TURBO_HB_GG_VERBOSE: bool = False
     PRIMUS_TURBO_DGATE_ACC_ATOMIC: bool = True
+    PRIMUS_GLUON: bool = True
+    PRIMUS_TURBO_FP8_BLOCK_UE8M0: bool = False
+    PRIMUS_TURBO_FP8_BLOCK_KERNEL: str = "dsv4up"
+    PRIMUS_TURBO_FP8_WCACHE: bool = True
+    PRIMUS_TURBO_FP8_WCACHE_VERIFY: bool = False
+    PRIMUS_TURBO_DSV4UP_SMALLTILE: str = "4096x1024x32768:256x128s3,4096x1536x4096:256x128s3,1536x4096x4096:256x128s3,1536x4096x4096a:256x128s3"
+    PRIMUS_MB_QDUAL: str = "f1024:t2w8,f2048:t2w8,f4096:t2w8,f8192:t2w8,c4096:t2w8"
+    PRIMUS_OVERLAP: bool = False
 
 
 def backend_spec(name: str) -> Callable[[], str | None]:
@@ -407,6 +415,49 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PRIMUS_TURBO_HB_GG_PICK_TN": env_clamped_int("PRIMUS_TURBO_HB_GG_PICK_TN", 0, -(2**31), 2**31 - 1),
     # Set (to any value): log the plans and tuning of the hipBLASLt grouped GEMM.
     "PRIMUS_TURBO_HB_GG_VERBOSE": lambda: os.getenv("PRIMUS_TURBO_HB_GG_VERBOSE") is not None,
+    # ================== gfx1250 Gluon kernels ==================
+    # "0" turns off every gfx1250 Gluon (cdna5) kernel and selects the non-Gluon fallbacks (dsv4up
+    # -> g90 FlyDSL GEMM, bf16g2 / bf16grp -> hipBLASLt, quant2 -> Triton quant). Unset and any
+    # other value leave them on when the device is gfx1250 and Triton is 3.9 or newer
+    # (``primus_turbo.gluon.gate.gluon_ok``).
+    "PRIMUS_GLUON": lambda: os.getenv("PRIMUS_GLUON", "1") != "0",
+    # ================== Block-FP8 dense GEMM (gfx1250) ==================
+    # "1" makes the 128-block FP8 quantization round every scale to a power of two (UE8M0, the
+    # DeepSeek-V3 / V4 recipe). Scales stay fp32 tensors holding 2^k, so every blockwise GEMM
+    # consumes them unchanged. The dsv4up / g90 dense GEMMs and the FP8 weight cache require it.
+    "PRIMUS_TURBO_FP8_BLOCK_UE8M0": lambda: (
+        os.getenv("PRIMUS_TURBO_FP8_BLOCK_UE8M0", "0").strip().lower() in ("1", "true")
+    ),
+    # Dense block-FP8 GEMM kernel on gfx1250 (UE8M0 scales, 2-D inputs): "dsv4up" (Gluon, per pass
+    # where the shape allows, else g90), "g90" (FlyDSL), or "off" (the generic Triton blockwise
+    # kernels). "dsv4up" runs as "g90" when the Gluon kernels are off (``primus_turbo.gluon.gate``).
+    "PRIMUS_TURBO_FP8_BLOCK_KERNEL": env_choice(
+        "PRIMUS_TURBO_FP8_BLOCK_KERNEL", "dsv4up", ("dsv4up", "g90", "off")
+    ),
+    # "0" ignores the per-step FP8 weight cache that the optimizer fills (W, W^T and UE8M0 scales);
+    # without a filled cache the GEMMs quantize the weight themselves either way.
+    "PRIMUS_TURBO_FP8_WCACHE": lambda: os.getenv("PRIMUS_TURBO_FP8_WCACHE", "1") != "0",
+    # "1" re-quantizes every weight-cache hit and raises on any byte difference (debugging; syncs).
+    "PRIMUS_TURBO_FP8_WCACHE_VERIFY": lambda: os.getenv("PRIMUS_TURBO_FP8_WCACHE_VERIFY", "0") == "1",
+    # dsv4up GEMMs that run on the dsv4s smaller-output-tile kernel (bit-identical, more CUs busy):
+    # comma-separated "MxNxK[a]:tile", the GEMM dims of the call, "a" for the beta-1 accumulate
+    # call, tile from ``gemm_fp8blk_smalltile_kernel.TILES``. The default is the DSv4-Flash table; set it to the
+    # empty string to turn the table off.
+    "PRIMUS_TURBO_DSV4UP_SMALLTILE": lambda: os.getenv(
+        "PRIMUS_TURBO_DSV4UP_SMALLTILE",
+        "4096x1024x32768:256x128s3,4096x1536x4096:256x128s3,1536x4096x4096:256x128s3,1536x4096x4096a:256x128s3",
+    ),
+    # Per-site kernel variant of the Triton dual quantization (non-Gluon fallback), comma-separated
+    # "<f|c><K>:t2w<warps>". The default is the DSv4-Flash table; the empty string turns it off.
+    "PRIMUS_MB_QDUAL": lambda: os.getenv(
+        "PRIMUS_MB_QDUAL", "f1024:t2w8,f2048:t2w8,f4096:t2w8,f8192:t2w8,c4096:t2w8"
+    ),
+    # ================== Side-stream overlap (gfx1250 training step) ==================
+    # "1" lets the training framework run independent chains (deferred wgrads, shared expert,
+    # indexer, compressor) on side streams. Only for a framework that calls
+    # ``primus_turbo.pytorch.core.overlap.join()`` after each backward: an un-joined deferred wgrad
+    # is silently wrong. Always off when torch.distributed has more than one rank.
+    "PRIMUS_OVERLAP": lambda: os.getenv("PRIMUS_OVERLAP", "0") == "1",
     # ================== Flux ==================
     # "0" makes the Flux dgate epilogue accumulate without atomics. Unset and any other value
     # keep the atomic path. Read once, when the MXFP4 quant kernel module is imported.
