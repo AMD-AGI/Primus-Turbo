@@ -96,6 +96,7 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_overlap_switch.py",
     "tests/pytorch/ops/test_sparse_mla_dsink_gfx1250.py",
     "tests/pytorch/ops/test_moe_pool_glue_gfx1250.py",
+    "tests/pytorch/ops/test_swiglu_gluon_gfx1250.py",
     "tests/pytorch/ops/test_fused_mega_moe_fp8blk_gfx1250.py",
     "tests/pytorch/ops/test_sparse_mla_gfx1250_kernels.py",
     "tests/pytorch/ops/test_gemm_fp8_block_wgrad_gfx1250.py",
