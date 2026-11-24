@@ -134,6 +134,8 @@ def build_rl_flash_attn_module(
         seq_major=seq_major,
         kv_cache_aux=kv_cache_aux,
     )
+    # The wrapper converts every call except plain causal training into visibility intervals before
+    # launching the kernel, so every packed decode has has_vis set.
     assert split_mode == 0 or (segment_tiles and has_vis and gqa_pack), (
         "split / merge modes are for packed decode with segments and visibility intervals"
     )
