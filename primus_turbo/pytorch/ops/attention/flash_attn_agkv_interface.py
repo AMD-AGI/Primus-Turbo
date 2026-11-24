@@ -31,7 +31,9 @@ def flash_attn_agkv_func(
 
     ``mode``: ``"overlap"`` (default) overlaps the K / V exchange (SDMA copies) with attention, ``"mega"``
     exchanges with compute-unit push / reduce kernels over XGMI and attends to the local keys while the
-    remote ones arrive (needs ``FLUX_ATTN_FLYDSL=1``), ``"serial"`` uses the same copy-free
+    remote ones arrive (needs ``FLUX_ATTN_FLYDSL=1``), ``"fused"`` runs the forward and the backward as
+    one persistent kernel each with the exchange inside it (needs ``FLUX_ATTN_FLYDSL=1``; run it with
+    ``GPU_MAX_HW_QUEUES>=8`` beside overlapped collectives), ``"serial"`` uses the same copy-free
     layout without overlap, ``"naive"`` is the plain gather / reorder / scatter baseline.
     """
     return attention_agkv(
