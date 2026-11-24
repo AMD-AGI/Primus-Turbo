@@ -173,9 +173,7 @@ class AttnFwdAiterBackend(KernelBackend):
                 causal, window_size_left, window_size_right
             )
 
-            out, softmax_lse, S_dmask, philox_seed, philox_offset = _get_aiter_attn_kernels()[
-                "triton_flash_attn_forward"
-            ](
+            fwd_result = _get_aiter_attn_kernels()["triton_flash_attn_forward"](
                 q,
                 k,
                 v,
@@ -192,6 +190,15 @@ class AttnFwdAiterBackend(KernelBackend):
                 max_seqlen_k,
                 sink=sink,
             )
+            # aiter >= v0.1.30 (ROCm/aiter#6502) appends rng_state to the returned tuple. It is only
+            # set by aiter's "dao_ai" implementation; the default one used here still reports the
+            # dropout state as philox_seed/philox_offset, which the Triton backward below consumes.
+            out, softmax_lse, S_dmask, philox_seed, philox_offset = fwd_result[:5]
+            if len(fwd_result) > 5 and fwd_result[5] is not None:
+                raise RuntimeError(
+                    "aiter's Triton flash-attention forward returned a 'dao_ai' rng_state; "
+                    "the sink attention path supports only aiter's default MHA implementation."
+                )
             rng_state = torch.tensor([philox_seed, philox_offset], dtype=torch.int64, device="cpu")
 
         return out, softmax_lse, S_dmask, rng_state
