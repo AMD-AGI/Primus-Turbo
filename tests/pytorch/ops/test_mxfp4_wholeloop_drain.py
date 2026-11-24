@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 """The MXFP4 whole-K-loop asm must retire its own LDS reads before it hands registers back (AIMA-354).
 
 The loop's last phase still prefetches the next k-block's operands, and its phase barrier waits only down to
