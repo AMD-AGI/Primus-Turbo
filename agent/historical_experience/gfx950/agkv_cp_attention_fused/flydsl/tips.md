@@ -74,3 +74,21 @@ XGMI mesh, zigzag cp 8, mbs 1, `FLUX_ATTN_FLYDSL=1`.
 - Takeaway: fused / TE = (naive / TE) x (serial / naive) x (fused / serial). naive is TE's algorithm on flux kernels (plus saving the gathered K / V where TE gathers again in the backward): 1.046 / 1.042 / 0.943 at 16K / 32K / 64K. The fusion itself, fused / serial, is a steady 1.069 / 1.074 / 1.064 of the whole step. Past 32K the flux attention loses to TE's CK kernels by about what the fusion wins, so the end-to-end gain falls to 1 % at 64K and -2.4 % at llama 128K. The extra memory over TE is the saved K / V plus flux's dQ partial workspace, not the fusion: naive needs as much
 - Takeaway: mega and overlap (separate comm kernels or SDMA copies on side streams) are 13-25 % slower than TE next to DeepEP on qwen; on llama mega was within 3 % of fused. Cause not investigated
 - Applicability: at 64K and beyond the next gain is in the flux backward kernel (dQ partial traffic), not in the exchange; use fused, not mega / overlap, on MoE models; run 128K and longer with expandable segments
+
+### 2026-11-24 12:45 UTC Primus end to end — cp 4 / cp 2
+- Context: as the cp 8 runs above, 8 GPUs, so dp 2 (cp 4) / dp 4 (cp 2), GBS 8; qwen3-30b-a3b ep 8. ms/iter, x = speedup over TE all_gather
+- Signal (qwen3-30b-a3b):
+
+| cp | seq | TE all_gather | serial | fused | fused / serial | max alloc TE / fused |
+|---|---|---|---|---|---|---|
+| 4 | 16K | 1759 | 1660 (1.059x) | 1528 (1.151x) | 1.086 | 64.1 / 66.2 GB |
+| 4 | 32K | 3280 | 3372 (0.973x) | 3097 (1.059x) | 1.089 | 86.8 / 95.4 GB |
+| 4 | 64K | 8493 | 8946 (0.949x) | 8405 (1.010x) | 1.064 | 132.0 / 167.3 GB |
+| 2 | 16K | 1304 | 1311 (0.994x) | 1189 (1.097x) | 1.103 | 86.8 / 89.8 GB |
+| 2 | 32K | 2910 | 3000 (0.970x) | 2730 (1.066x) | 1.099 | 132.0 / 148.1 GB |
+| 2 | 64K | 7960 | out of memory | out of memory | - | 222.5 / - GB |
+
+- Signal (llama3.1-8B, fused vs TE all_gather): cp 4 32K 2775 -> 2479 (1.120x), 64K 7052 -> 6808 (1.036x); cp 2 32K 2684 -> 2410 (1.114x), 64K TE 6859 and fused out of memory, also with expandable segments (211 GiB allocated, the 64.06 GiB dQ partial workspace does not fit in the 63.75 GiB left)
+- Signal (qwen cp 2 64K hang): fused and serial hung in iteration 1 rather than failing. With every GPU full, rank 2's first data-parallel reduce-scatter failed in RCCL (`Failed to CUDA calloc 6291456 bytes`, NCCL unhandled cuda error); Primus logged it on that rank only (the runner shows local rank 0) and the other ranks waited for it in their collectives
+- Takeaway: the fusion factor holds or grows at lower cp (1.06-1.10); serial / TE follows the per-rank length, the same at equal per-rank tokens (8K per rank: cp 8 64K 0.951, cp 4 32K 0.973, cp 2 16K 0.994), so the flux kernels lose to TE's CK kernels as the per-rank sequence grows whatever the cp. Memory, not speed, ends the range: the flux dQ partial workspace (64 GiB at 32K query rows x 64K keys, the same at cp 8 128K) is uncapped for these non-square calls
+- Applicability: per-rank 32K query rows (cp 2 64K, cp 8 128K) is the limit on 288 GB; capping the non-square dQ workspace (bands in rounds under a budget, as the square path does) is what extends it. Debug a silent multi-rank hang with `LOCAL_RANKS="--local-ranks-filter 0,...,7"` and `PYTHONFAULTHANDLER=1`
