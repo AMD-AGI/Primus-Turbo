@@ -266,7 +266,7 @@ def bench_bwd(model, seq, chunks, warmup, iters, reps):
         )
 
     # the fused op's backward pieces alone
-    ws = get_ulysses_workspace(group, _bank_bytes(M, n, hq_r, hkv_r, d), name="mega_attn")
+    ws = get_ulysses_workspace(group, _bank_bytes(M, n, hq_r, hkv_r, d, d), name="mega_attn")
     q_h = torch.randn(seq, hq_r, d, device=dev, dtype=torch.bfloat16, generator=gen)
     k_h = torch.randn(seq, hkv_r, d, device=dev, dtype=torch.bfloat16, generator=gen)
     v_h = torch.randn(seq, hkv_r, d, device=dev, dtype=torch.bfloat16, generator=gen)

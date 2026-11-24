@@ -31,6 +31,11 @@ forward, q / k / v / O / LSE of its own heads over the whole sequence. One launc
 Pull units are claimed by running blocks before those turn worker, every item is claimed before any dQ
 push or gather unit, and an item's own waits are only on pull units, so no wait can deadlock whatever the
 grid. Sequence split as in ``a2a_attn_kernel``.
+
+MLA head dims (q / k ``d`` 192, v / O / dO ``d_v`` 128) run the gfx950 MLA dK / dV body instead: 192-row
+bands (the last one may run past ``S``; its rows there are neither pushed nor gathered), dK / dV pushed in
+64-row parts and dQ in 64-row units, the a16 dQ image possibly spread over several images (summed in the
+push), Q unscaled (the body folds the softmax scale into its K packs).
 """
 
 import functools
@@ -105,8 +110,12 @@ PROG_DONE = 0x7FFFFFFF
 # rows of one pull unit, of one push / gather tile
 BM = 128
 STAGE_SPLIT = 4
-# kv rows of one backward band
+# kv rows of one backward band (the MLA body's: MLA_BAND)
 BAND = 256
+MLA_BAND = 192
+MLA_BLOCK_Q = 32
+# rows of one dK / dV push part and of one MLA dQ push unit: they divide BM and every MLA band
+MLA_PART_ROWS = 64
 # a band's dK / dV push: BM-row tile x (dK, dV)
 KV_PARTS = 2 * (BAND // BM)
 # dQ push unit bytes (BAND rows of 8 heads): one CU's push, so the last unit bounds the tail
@@ -161,28 +170,41 @@ def _pull_rows(hq_r, pull_rows=None):
     return pull_rows
 
 
-def _dq_rows(hq_r, dq_rows=None):
-    """Sequence rows of one dQ push unit: a divisor of BAND near DQ_UNIT_HEAD_ROWS / hq_r."""
+def _dq_rows(hq_r, dq_rows=None, mla=False):
+    """Sequence rows of one dQ push unit: a divisor of BAND near DQ_UNIT_HEAD_ROWS / hq_r (MLA: of
+    MLA_PART_ROWS, so a unit stays inside one band and one gather tile)."""
     if dq_rows is None:
-        dq_rows = BAND
+        dq_rows = MLA_PART_ROWS if mla else BAND
         while dq_rows > 32 and dq_rows * hq_r > DQ_UNIT_HEAD_ROWS:
             dq_rows //= 2
     return dq_rows
 
 
-def a2a_attn_bwd_bank_bytes(M, num_ranks, hq_r, hkv_r, head_dim):
+def a2a_attn_bwd_bank_bytes(M, num_ranks, hq_r, hkv_r, head_dim, head_dim_v=None):
     """Bank bytes: the dO staging rows, then the dq / dk / dv recv rows."""
-    return M * num_ranks * (2 * hq_r + 2 * hkv_r) * head_dim * 2
+    d_v = head_dim if head_dim_v is None else head_dim_v
+    return M * num_ranks * ((hq_r + hkv_r) * (head_dim + d_v)) * 2
 
 
-def _plan(S, hq_r, hkv_r, d):
-    """The stock dense SBHD backward plan for one rank's heads: ``(q_split, dkdv launcher)``."""
-    p = _bwd._dense_plan(1, S, S, hq_r, hkv_r, d, 1.0 / math.sqrt(d), -1, True, False)
-    q_split, block_kv, a16, a16_nat, dkdv_l, bat_plan = p[1], p[2], p[4], p[5], p[11], p[13]
-    assert a16 and not a16_nat and block_kv == BAND and len(bat_plan) == 1, (
-        "the fused backward runs the a16 dQ-image body with 256-row bands"
-    )
-    return q_split, dkdv_l
+@functools.lru_cache(maxsize=16)
+def _plan(S, hq_r, hkv_r, d, d_v=None, softmax_scale=None):
+    """The dense SBHD backward plan for one rank's heads: ``(q_split, dkdv launcher, dQ image scale)``,
+    with the stock body (``d_v == d``, scale ``d ** -0.5``) or the gfx950 MLA one."""
+    if d_v is None or d_v == d:
+        p = _bwd._dense_plan(1, S, S, hq_r, hkv_r, d, 1.0 / math.sqrt(d), -1, True, False)
+        q_split, block_kv, a16, a16_nat, dkdv_l, bat_plan = p[1], p[2], p[4], p[5], p[11], p[13]
+        assert a16 and not a16_nat and block_kv == BAND and len(bat_plan) == 1, (
+            "the fused backward runs the a16 dQ-image body with 256-row bands"
+        )
+        return q_split, dkdv_l, dkdv_l.dq_scale
+    from primus_turbo.flydsl.attention.gfx950_mla import ops_bwd as _mla
+
+    scale = 1.0 / math.sqrt(d) if softmax_scale is None else float(softmax_scale)
+    n_img = _mla._a16_imgs_for(S, MLA_BAND, 1, hkv_r)
+    kw = _mla._dkdv_kwargs(1, hq_r, hkv_r, d, d_v, scale, MLA_BAND, MLA_BLOCK_Q, 1, sbhd=True, a16_imgs=n_img)
+    dkdv_l = _mla.fb.build_flash_attn_bwd_dkdv_module(**kw)
+    assert kw["k_pre"], "the MLA body takes Q unscaled only with the score fold on its K packs"
+    return 1, dkdv_l, 1.0 / _mla._LOG2E
 
 
 def _global_row(t, src, cs, n):
@@ -234,7 +256,7 @@ def _row_dot(o_vec, do_vec, lane, lanes):
 def _stage_piece(thread_index, m_sub, dst, in_res, stage_res, **c):
     """Rows ``[m_sub * rows, +rows)`` of ``dst``'s heads of this rank's dO into the same place of the
     staging bank (dst's column block), retired on return."""
-    h_vecs = c["hq_r"] * c["head_dim"] // VEC_BF16
+    h_vecs = c["hq_r"] * c["d_v"] // VEC_BF16
     row_vecs = c["num_ranks"] * h_vecs
     rows = BM // STAGE_SPLIT
     t0 = m_sub * fx.Int32(rows)
@@ -285,7 +307,7 @@ def _pull_unit(thread_index, src, m_tile, src_heap, bank_offset, do_res, o_res, 
     """``src``'s staged dO rows ``[m_tile * pull_rows, +pull_rows)`` of this rank's column block into dO, with their delta;
     ``prep`` = (lse, scaled LSE) resources: those rows of the latter, as the stock ``_prescale_lse``
     rounds them (the Q prescale stays a launch: HBM-bound, it would slow the pull the items wait on)."""
-    n, d, rank, cs, hq_r, S = c["num_ranks"], c["head_dim"], c["rank"], c["seq_chunk"], c["hq_r"], c["S"]
+    n, d, rank, cs, hq_r, S = c["num_ranks"], c["d_v"], c["rank"], c["seq_chunk"], c["hq_r"], c["S"]
     pr = c["pull_rows"]
     pieces = pr // (BM // STAGE_SPLIT)
     lanes = d // VEC_BF16
@@ -393,8 +415,8 @@ def _prog_tag(epoch):
 def _desc_walk(band, split, **c):
     """The body's unmasked q walk of item ``(band, split)``: its bottom row, top row, trips and rotation
     (``_desc_q``: trip ``i`` visits ``top - ((i + rot) % trips) * step``)."""
-    S, bq, step, rr = c["S"], c["block_q"], c["block_q"] * c["q_split"], c["qdesc_r"]
-    bottom = band * fx.Int32(BAND) + fx.Int32(BAND) + split * fx.Int32(bq)
+    S, bq, step, rr, bk = c["S"], c["block_q"], c["block_q"] * c["q_split"], c["qdesc_r"], c["band_rows"]
+    bottom = band * fx.Int32(bk) + fx.Int32(bk) + split * fx.Int32(bq)
     span = arith.select(fx.Int32(S) > bottom, fx.Int32(S) - bottom, fx.Int32(0))
     trips = (span + fx.Int32(step - 1)) // fx.Int32(step)
     trips = arith.select(trips > fx.Int32(0), trips, fx.Int32(1))
@@ -487,7 +509,7 @@ def _wait_progress(thread_index, band_base, j, part, epoch, **c):
     those rows (``_publish_progress``)."""
     rank, ipb, qs, bq, rows = c["rank"], c["items_per_band"], c["q_split"], c["block_q"], c["dq_rows"]
     step = bq * qs
-    r0 = j * fx.Int32(BAND) + part * fx.Int32(rows)
+    r0 = j * fx.Int32(c["band_rows"]) + part * fx.Int32(rows)
     tag = _prog_tag(epoch)
     idx = thread_index
     spin_start = read_clock()
@@ -517,43 +539,46 @@ def _wait_progress(thread_index, band_base, j, part, epoch, **c):
 
 @ASTRewriter.transform
 def _push_kv_part(thread_index, band, part, peers_base, recv_offset, wsk_res, wsv_res, epoch, **c):
-    """Fold part ``part`` (``BM`` rows ``part // 2`` of the band, dK or dV by ``part % 2``) of the band's
+    """Fold part ``part`` (``kv_rows`` rows ``part // 2`` of the band, dK or dV by ``part % 2``) of the band's
     ``q_split`` slots (ascending, fp32, as the stock slot reduce) and push the rows into their owner's recv
-    bank (this rank's column block), then the owner's flag."""
-    n, d, rank, cs, hkv_r, S, qs = c["num_ranks"], c["head_dim"], c["rank"], c["seq_chunk"], c["hkv_r"], c["S"], c["q_split"]
+    bank (this rank's column block), then the owner's flag. A part past ``S`` (the MLA tail band) is empty."""
+    n, rank, cs, hkv_r, S, qs = c["num_ranks"], c["rank"], c["seq_chunk"], c["hkv_r"], c["S"], c["q_split"]
+    kr = c["kv_rows"]
     h, x = part // 2, part % 2
+    d = (c["head_dim"], c["d_v"])[x]
     row_elems = hkv_r * d
     row_vecs = row_elems // VEC_BF16
     slot_elems = S * row_elems
     K_kv = n * row_elems
     per_iter = THREADS * 2
-    pos0 = band * fx.Int32(BAND) + fx.Int32(h * BM)
-    owner, t0 = _owner_row(pos0, cs, n)
-    owner_heap = ld(peers_base, owner, dtype=fx.T.i64)
-    ws_res = (wsk_res, wsv_res)[x]
-    recv_res = create_buffer_resource_from_addr(
-        owner_heap + recv_offset + fx.Int64(c["recv_kv_at"][x]), num_records_bytes=c["recv_kv_bytes"]
-    )
-    for it in range(BM * row_vecs // per_iter):
-        for j in range_constexpr(2):
-            v = fx.Int32(it * per_iter + j * THREADS) + thread_index
-            r = v // fx.Int32(row_vecs)
-            col = v % fx.Int32(row_vecs) * fx.Int32(VEC_BF16)
-            src = (pos0 + r) * fx.Int32(row_elems) + col
-            parts = [
-                buffer_load(ws_res, src + fx.Int32(s * slot_elems), vec_width=VEC_BF16, dtype=_BF16)
-                for s in range_constexpr(qs)
-            ]
-            acc = Vec(parts[0]).to(fx.Float32)
-            for s in range_constexpr(1, qs):
-                acc = acc + Vec(parts[s]).to(fx.Float32)
-            dst = (t0 + r) * fx.Int32(K_kv) + fx.Int32(rank * row_elems) + col
-            buffer_store(acc.to(_BF16).ir_value(), recv_res, dst, cache_modifier=SYS_NT)
-    fx.rocdl.s_waitcnt(0)
-    fx.gpu.barrier()
-    if thread_index == fx.Int32(0):
-        slot = (fx.Int32(c["dq_flags"] + x * c["g_tiles"]) + t0 // fx.Int32(BM)) * fx.Int32(n) + fx.Int32(rank)
-        st(owner_heap + fx.Int64(REGION_BWD_RECV * FLAG_REGION_BYTES), slot, epoch, scope="sys", order="relaxed")
+    pos0 = band * fx.Int32(c["band_rows"]) + fx.Int32(h * kr)
+    if pos0 < fx.Int32(S):
+        owner, t0 = _owner_row(pos0, cs, n)
+        owner_heap = ld(peers_base, owner, dtype=fx.T.i64)
+        ws_res = (wsk_res, wsv_res)[x]
+        recv_res = create_buffer_resource_from_addr(
+            owner_heap + recv_offset + fx.Int64(c["recv_kv_at"][x]), num_records_bytes=c["recv_kv_bytes"][x]
+        )
+        for it in range(kr * row_vecs // per_iter):
+            for j in range_constexpr(2):
+                v = fx.Int32(it * per_iter + j * THREADS) + thread_index
+                r = v // fx.Int32(row_vecs)
+                col = v % fx.Int32(row_vecs) * fx.Int32(VEC_BF16)
+                src = (pos0 + r) * fx.Int32(row_elems) + col
+                parts = [
+                    buffer_load(ws_res, src + fx.Int32(s * slot_elems), vec_width=VEC_BF16, dtype=_BF16)
+                    for s in range_constexpr(qs)
+                ]
+                acc = Vec(parts[0]).to(fx.Float32)
+                for s in range_constexpr(1, qs):
+                    acc = acc + Vec(parts[s]).to(fx.Float32)
+                dst = (t0 + r) * fx.Int32(K_kv) + fx.Int32(rank * row_elems) + col
+                buffer_store(acc.to(_BF16).ir_value(), recv_res, dst, cache_modifier=SYS_NT)
+        fx.rocdl.s_waitcnt(0)
+        fx.gpu.barrier()
+        if thread_index == fx.Int32(0):
+            slot = (fx.Int32(c["dq_flags"] + x * c["kv_tiles"]) + t0 // fx.Int32(kr)) * fx.Int32(n) + fx.Int32(rank)
+            st(owner_heap + fx.Int64(REGION_BWD_RECV * FLAG_REGION_BYTES), slot, epoch, scope="sys", order="relaxed")
 
 
 @ASTRewriter.transform
@@ -563,7 +588,7 @@ def _claim_kv_part(thread_index, band, part, want, claim_slot, count_base, epoch
     if thread_index == fx.Int32(0):
         st_lds(claim_slot, 2, fx.Int32(0))
         if want:
-            at = fx.Int32(c["kv_claim_at"]) + band * fx.Int32(KV_PARTS) + fx.Int32(part)
+            at = fx.Int32(c["kv_claim_at"]) + band * fx.Int32(c["kv_parts"]) + fx.Int32(part)
             old = atomic_max(count_base, at, epoch, scope="agent")
             st_lds(claim_slot, 2, arith.select(old < epoch, fx.Int32(1), fx.Int32(0)))
     fx.rocdl.s_waitcnt(0)
@@ -577,7 +602,7 @@ def _claim_kv_part(thread_index, band, part, want, claim_slot, count_base, epoch
 @ASTRewriter.transform
 def _kv_parts(thread_index, band, claim_slot, count_base, peers_base, recv_offset, wsk_res, wsv_res, epoch, part=None, **c):
     """Push the band's dK / dV parts this block claims (``part``: that one only, else every one)."""
-    for p in range_constexpr(KV_PARTS):
+    for p in range_constexpr(c["kv_parts"]):
         if const_expr(not c["kv_help"]):
             _push_kv_part(thread_index, band, p, peers_base, recv_offset, wsk_res, wsv_res, epoch, **c)
         else:
@@ -630,11 +655,11 @@ def _kv_help(thread_index, claim_slot, stash, **c):
     unless its last item (or another helper) took it first."""
     nb, rank = c["num_bands"], c["rank"]
     u = claim_unit(opaque_tid(thread_index), _stashed(stash, _S_STATE), claim_slot, counter=STATE_KVH)
-    while u < fx.Int32(nb * KV_PARTS):
+    while u < fx.Int32(nb * c["kv_parts"]):
         epoch = _stashed(stash, _S_EPOCH)
         count_base = _stashed(stash, _S_COUNT)
         if thread_index == fx.Int32(0):
-            at = fx.Int32(c["kv_queue_at"]) + u // fx.Int32(KV_PARTS)
+            at = fx.Int32(c["kv_queue_at"]) + u // fx.Int32(c["kv_parts"])
             tag = _prog_tag(epoch)
             spin_start = read_clock()
             entry = ld(count_base, at, scope="agent", dtype=fx.T.i64)
@@ -662,7 +687,7 @@ def _kv_help(thread_index, claim_slot, stash, **c):
             _ws_res(stash, _S_WSK, c),
             _ws_res(stash, _S_WSV, c),
             epoch,
-            part=u % fx.Int32(KV_PARTS),
+            part=u % fx.Int32(c["kv_parts"]),
             **c,
         )
         u = claim_unit(opaque_tid(thread_index), _stashed(stash, _S_STATE), claim_slot, counter=STATE_KVH)
@@ -670,9 +695,9 @@ def _kv_help(thread_index, claim_slot, stash, **c):
 
 @ASTRewriter.transform
 def _push_dq(thread_index, j, part, band_base, peers_base, recv_offset, img_res, epoch, **c):
-    """Un-permute and scale rows ``[j * BAND + part * dq_rows, +dq_rows)`` of the dQ image (the stock dqa16
-    map; bands ``0..j`` done) into their owners' recv banks (this rank's column block), then the owners'
-    flags."""
+    """Un-permute, sum (fp32, over the images ``img_res``) and scale rows ``[j * band + part * dq_rows,
+    +dq_rows)`` of the dQ image (the stock dqa16 map; bands ``0..j`` done) into their owners' recv banks
+    (this rank's column block), then the owners' flags."""
     n, d, rank, cs, hq_r, rows = c["num_ranks"], c["head_dim"], c["rank"], c["seq_chunk"], c["hq_r"], c["dq_rows"]
     gran = c["dq_flag_rows"]
     tiles = rows // 16
@@ -692,33 +717,39 @@ def _push_dq(thread_index, j, part, band_base, peers_base, recv_offset, img_res,
     sm_vec = Vec.filled(8, c["dq_scale"], fx.Float32)
     waves = THREADS // WARP
     n_it = tiles * hq_r // waves
-    # tiles per step: their image loads are all in flight before the first store
-    unroll = next(u for u in (_DQ_UNROLL, 2, 1) if n_it % u == 0)
+    # tiles per step: their image loads are all in flight before the first store (at most the GQA
+    # D128 step's 64 dwords a lane)
+    unroll = next(
+        u for u in (_DQ_UNROLL, 2, 1) if n_it % u == 0 and (u * len(img_res) * npair * 4 <= 96 or u == 1)
+    )
     for it in range(n_it // unroll):
         steps = []
         for u in range_constexpr(unroll):
             w = fx.Int32(it * (unroll * waves) + u * waves) + wave
-            qt = j * fx.Int32(BAND // 16) + part * fx.Int32(tiles) + w // fx.Int32(hq_r)
+            qt = j * fx.Int32(c["band_rows"] // 16) + part * fx.Int32(tiles) + w // fx.Int32(hq_r)
             qh = w % fx.Int32(hq_r)
             ibase = (
                 (qt * fx.Int32(hq_r) + qh) * fx.Int32(npair * 512) + w1 * fx.Int32(256) + kgh * fx.Int32(64) + lane16 * fx.Int32(2)
             )
             parts = [
                 [
-                    buffer_load(
-                        img_res,
-                        ibase + fx.Int32(p * 512 + w0 * 128 + kgl * 32),
-                        vec_width=2,
-                        dtype=_BF16,
-                        cache_modifier=SYS_NT,
-                    )
-                    for kgl in range_constexpr(2)
-                    for w0 in range_constexpr(2)
+                    [
+                        buffer_load(
+                            res,
+                            ibase + fx.Int32(p * 512 + w0 * 128 + kgl * 32),
+                            vec_width=2,
+                            dtype=_BF16,
+                            cache_modifier=SYS_NT,
+                        )
+                        for kgl in range_constexpr(2)
+                        for w0 in range_constexpr(2)
+                    ]
+                    for p in range_constexpr(npair)
                 ]
-                for p in range_constexpr(npair)
+                for res in img_res
             ]
             steps.append((qt, qh, parts))
-        for qt, qh, parts in steps:
+        for qt, qh, img_parts in steps:
             # the tile pair (qt, qt ^ 1) holds one 32-row group, inside one chunk (cs % BM == 0)
             pos = (qt >> fx.Int32(1)) * fx.Int32(32)
             owner, t = _owner_row(pos, cs, n)
@@ -727,11 +758,14 @@ def _push_dq(thread_index, j, part, band_base, peers_base, recv_offset, img_res,
             row = t + q_in + (qt & fx.Int32(1)) * fx.Int32(8)
             obase = row * fx.Int32(K_q) + fx.Int32(rank * hq_r * d) + qh * fx.Int32(d) + w1 * fx.Int32(16) + kgh * fx.Int32(8)
             for p in range_constexpr(npair):
-                lo = Vec(parts[p][0]).shuffle(Vec(parts[p][1]), [0, 1, 2, 3])
-                hi = Vec(parts[p][2]).shuffle(Vec(parts[p][3]), [0, 1, 2, 3])
-                v8 = lo.shuffle(hi, [0, 1, 2, 3, 4, 5, 6, 7])
+                acc = None
+                for parts in img_parts:
+                    lo = Vec(parts[p][0]).shuffle(Vec(parts[p][1]), [0, 1, 2, 3])
+                    hi = Vec(parts[p][2]).shuffle(Vec(parts[p][3]), [0, 1, 2, 3])
+                    v8 = lo.shuffle(hi, [0, 1, 2, 3, 4, 5, 6, 7]).to(fx.Float32)
+                    acc = v8 if acc is None else acc + v8
                 buffer_store(
-                    (v8.to(fx.Float32) * sm_vec).to(_BF16).ir_value(),
+                    (acc * sm_vec).to(_BF16).ir_value(),
                     recv_res,
                     obase + fx.Int32(p * 32),
                     cache_modifier=SYS_NT,
@@ -741,9 +775,10 @@ def _push_dq(thread_index, j, part, band_base, peers_base, recv_offset, img_res,
     # the unit's image rows are one contiguous span: zero it for the next call's atomics
     span = rows * hq_r * d
     zero = Vec.filled(VEC_BF16, 0.0, _BF16).ir_value()
-    row0 = j * fx.Int32(BAND) + part * fx.Int32(rows)
-    for it in range_constexpr(span // VEC_BF16 // THREADS):
-        buffer_store(zero, img_res, row0 * fx.Int32(hq_r * d) + (fx.Int32(it * THREADS) + thread_index) * fx.Int32(VEC_BF16))
+    row0 = j * fx.Int32(c["band_rows"]) + part * fx.Int32(rows)
+    for res in img_res:
+        for it in range_constexpr(span // VEC_BF16 // THREADS):
+            buffer_store(zero, res, row0 * fx.Int32(hq_r * d) + (fx.Int32(it * THREADS) + thread_index) * fx.Int32(VEC_BF16))
     if thread_index == fx.Int32(0):
         for h in range_constexpr(rows // gran):
             owner, t0 = _owner_row(row0 + fx.Int32(h * gran), cs, n)
@@ -755,11 +790,16 @@ def _push_dq(thread_index, j, part, band_base, peers_base, recv_offset, img_res,
 @ASTRewriter.transform
 def _gather_unit(thread_index, g, src, flag_base, recv_addr, out_res, epoch, **c):
     """``src``'s column blocks of recv tile ``g`` (dq, dk, dv) into the outputs once ``src`` pushed them."""
-    n, d = c["num_ranks"], c["head_dim"]
+    n = c["num_ranks"]
     if thread_index == fx.Int32(0):
         per_g = BM // c["dq_flag_rows"]
         flag_idxs = [(g * fx.Int32(per_g) + fx.Int32(i)) * fx.Int32(n) + src for i in range(per_g)]
-        flag_idxs += [(fx.Int32(c["dq_flags"] + x * c["g_tiles"]) + g) * fx.Int32(n) + src for x in range(2)]
+        per_kv = BM // c["kv_rows"]
+        flag_idxs += [
+            (fx.Int32(c["dq_flags"] + x * c["kv_tiles"]) + g * fx.Int32(per_kv) + fx.Int32(i)) * fx.Int32(n) + src
+            for x in range(2)
+            for i in range(per_kv)
+        ]
         spin_flags(flag_base, flag_idxs, epoch, c["rank"], src, "a2a_attn_bwd gather", sleep=c["spin_sleep"])
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
@@ -767,7 +807,7 @@ def _gather_unit(thread_index, g, src, flag_base, recv_addr, out_res, epoch, **c
     memory_fence(order="acquire", scope="sys")
     row0 = g * fx.Int32(BM)
     for x in range_constexpr(3):
-        blk_vecs = (c["hq_r"], c["hkv_r"], c["hkv_r"])[x] * d // VEC_BF16
+        blk_vecs = (c["hq_r"], c["hkv_r"], c["hkv_r"])[x] * (c["head_dim"], c["head_dim"], c["d_v"])[x] // VEC_BF16
         row_vecs = n * blk_vecs
         recv_res = create_buffer_resource_from_addr(
             recv_addr + fx.Int64(c["recv_at"][x]), num_records_bytes=c["recv_x_bytes"][x]
@@ -808,9 +848,19 @@ def _recv_offset(epoch, c):
 
 
 def _ws_res(stash, i, c):
+    d = c["head_dim"] if i == _S_WSK else c["d_v"]
     return create_buffer_resource_from_addr(
-        _stashed(stash, i), num_records_bytes=c["q_split"] * c["S"] * c["hkv_r"] * c["head_dim"] * 2
+        _stashed(stash, i), num_records_bytes=c["q_split"] * c["S"] * c["hkv_r"] * d * 2
     )
+
+
+def _img_res(stash, c):
+    """The dQ images, one descriptor each (the stack can outgrow a 32-bit buffer offset)."""
+    img_bytes = c["S"] * c["hq_r"] * c["head_dim"] * 2
+    return [
+        create_buffer_resource_from_addr(_stashed(stash, _S_IMG) + fx.Int64(i * img_bytes), num_records_bytes=img_bytes)
+        for i in range(c["n_img"])
+    ]
 
 
 def read_shader_clock():
@@ -852,8 +902,6 @@ def _work_loop(thread_index, block_index, claim_slot, stash, run_item, **c):
         c["num_ranks"],
     )
     attn, comm = c["mode"] != "comm_only", c["mode"] != "attn_only"
-    dq_per_band = BAND // c["dq_rows"]
-    nq = nb * dq_per_band
     num_claims = ni + c["g_tiles"] * n
     trace, trace_at = c["trace"], c["trace_item_at"]
     if const_expr(comm and c["num_comm"] > 0):
@@ -936,8 +984,8 @@ def _dq_units(thread_index, claim_slot, stash, **c):
     the top, the top band last (with a rotated walk, the odd bands visit their top row on their last
     trip)."""
     nb = c["num_bands"]
-    dq_per_band = BAND // c["dq_rows"]
-    nq = nb * dq_per_band
+    dq_per_band = c["band_rows"] // c["dq_rows"]
+    nq = c["S"] // c["dq_rows"]
     trace = c["trace"]
     jj = claim_unit(opaque_tid(thread_index), _stashed(stash, _S_STATE), claim_slot, counter=STATE_DQ)
     while jj < fx.Int32(nq):
@@ -965,7 +1013,7 @@ def _dq_units(thread_index, claim_slot, stash, **c):
             _region(stash, REGION_BWD_BAND),
             _stashed(stash, _S_PEERS),
             _recv_offset(epoch, c),
-            create_buffer_resource_from_addr(_stashed(stash, _S_IMG), num_records_bytes=c["S"] * c["hq_r"] * c["head_dim"] * 2),
+            _img_res(stash, c),
             epoch,
             **c,
         )
@@ -977,16 +1025,17 @@ def _dq_units(thread_index, claim_slot, stash, **c):
 TRACE_MAX_BLOCKS = 1024
 
 
-def trace_layout(M, num_ranks, hq_r, hkv_r, head_dim, dq_rows=None, pull_rows=None):
+def trace_layout(M, num_ranks, hq_r, hkv_r, head_dim, dq_rows=None, pull_rows=None, head_dim_v=None):
     """Offsets of the debug timeline (s_memrealtime, 100 MHz): pull unit ends ``[M / pull_rows * n]``, then
-    ``[claim, body end, end]`` per item, ``[start, end]`` per dQ push unit ``[num_bands * BAND / dq_rows]``
+    ``[claim, body end, end]`` per item, ``[start, end]`` per dQ push unit ``[S / dq_rows]``
     and per gather unit ``[g_tiles * n]``, stage piece ends ``[m_tiles * STAGE_SPLIT * n]``, block starts
     ``[TRACE_MAX_BLOCKS]``, the dQ push units' band-wait ends, the body's summed dO spin ticks ``[1]``,
     shader-clock cycles of each item's body ``[num_items]``; and the length."""
     S = M * num_ranks
-    q_split, _ = _plan(S, hq_r, hkv_r, head_dim)
-    nq = S // _dq_rows(hq_r, dq_rows)
-    ni = S // BAND * q_split * hkv_r
+    mla = head_dim_v is not None and head_dim_v != head_dim
+    q_split = _plan(S, hq_r, hkv_r, head_dim, head_dim_v)[0]
+    nq = S // _dq_rows(hq_r, dq_rows, mla)
+    ni = _ceildiv(S, MLA_BAND if mla else BAND) * q_split * hkv_r
     item_at = M // _pull_rows(hq_r, pull_rows) * num_ranks
     dq_at = item_at + 3 * ni
     gather_at = dq_at + 2 * nq
@@ -1004,6 +1053,8 @@ def _make_kernel(
     hq_r,
     hkv_r,
     head_dim,
+    head_dim_v,
+    softmax_scale,
     seq_chunk,
     num_pull,
     num_blocks,
@@ -1022,64 +1073,80 @@ def _make_kernel(
     trace,
     mode,
 ):
-    n, d = num_ranks, head_dim
+    n, d, d_v = num_ranks, head_dim, head_dim_v
+    mla = d_v != d
     S = M * n
     cs = seq_chunk if seq_chunk else M
-    assert M % cs == 0 and cs % BM == 0 and S % BAND == 0, f"need M % seq_chunk == 0, seq_chunk % {BM} == 0"
-    assert d in (64, 128)
-    q_split, dkdv_l = _plan(S, hq_r, hkv_r, d)
+    band = MLA_BAND if mla else BAND
+    kv_rows = MLA_PART_ROWS if mla else BM
+    assert M % cs == 0 and cs % BM == 0, f"need M % seq_chunk == 0, seq_chunk % {BM} == 0"
+    assert (d, d_v) in ((64, 64), (128, 128), (192, 128))
+    if mla:
+        assert S % kv_rows == 0 and cs % 256 == 0 and not (dq_prog or dq_desc or kv_help), (
+            "MLA: S a multiple of 64, seq_chunk of 256, the default dQ / dK / dV push"
+        )
+    else:
+        assert S % BAND == 0
+    q_split, dkdv_l, dq_scale = _plan(S, hq_r, hkv_r, d, d_v if mla else None, softmax_scale if mla else None)
     emb = dkdv_l.embed
-    assert emb["block_size"] == THREADS and emb["block_kv"] == BAND and emb["q_split"] == q_split
+    assert emb["block_size"] == THREADS and emb["block_kv"] == band and emb["q_split"] == q_split
+    n_img = emb.get("a16_imgs", 1)
     m_tiles = M // BM
     g_tiles = M // BM
-    nb = S // BAND
+    nb = _ceildiv(S, band)
     ipb = q_split * hkv_r
     num_items = nb * ipb
-    stage_bytes = M * n * hq_r * d * 2
-    recv_x_bytes = (M * n * hq_r * d * 2, M * n * hkv_r * d * 2, M * n * hkv_r * d * 2)
+    kv_parts = 2 * (band // kv_rows)
+    stage_bytes = M * n * hq_r * d_v * 2
+    recv_x_bytes = (M * n * hq_r * d * 2, M * n * hkv_r * d * 2, M * n * hkv_r * d_v * 2)
     recv_at = (0, recv_x_bytes[0], recv_x_bytes[0] + recv_x_bytes[1])
     assert stage_bytes + sum(recv_x_bytes) <= bank_bytes
     assert q_split * S * hkv_r * d * 2 < 2**31 and S * hq_r * d * 2 < 2**31, "i32 byte offsets overflow"
-    # dQ recv flags: one per (dq_flag_rows rows, source); the dK / dV ones follow
+    # dQ recv flags: one per (dq_flag_rows rows, source); the dK / dV ones (per kv_rows rows) follow
     dq_flag_rows = min(dq_rows, BM)
     dq_flags = M // dq_flag_rows
-    assert BAND % dq_rows == 0 and (dq_rows // 16 * hq_r) % (THREADS // WARP) == 0, "dq_rows: 16-row tiles per wave"
+    kv_tiles = M // kv_rows
+    assert band % dq_rows == 0 and (dq_rows // 16 * hq_r) % (THREADS // WARP) == 0, "dq_rows: 16-row tiles per wave"
+    assert not mla or BM % dq_rows == 0, "MLA dQ push units: inside one gather tile"
     assert (dq_rows * hq_r * d) % (VEC_BF16 * THREADS) == 0
-    assert m_tiles * STAGE_SPLIT * n <= FLAGS_PER_REGION and (dq_flags + 2 * g_tiles) * n <= FLAGS_PER_REGION
+    assert m_tiles * STAGE_SPLIT * n <= FLAGS_PER_REGION and (dq_flags + 2 * kv_tiles) * n <= FLAGS_PER_REGION
     assert 0 <= num_comm <= num_pull and num_comm < num_blocks, "comm blocks: some of the pull blocks"
     assert pull_rows in (BM // 4, BM // 2, BM) and BM // STAGE_SPLIT <= pull_rows
     assert cs % max(emb["block_q"], pull_rows) == 0, "a q block's pull units: one chunk of one source"
-    assert (pull_rows * hq_r * d // VEC_BF16) % (THREADS * _BATCH) == 0 and pull_rows * hq_r % THREADS == 0
+    assert (pull_rows * hq_r * d_v // VEC_BF16) % (THREADS * _BATCH) == 0 and pull_rows * hq_r % THREADS == 0
     assert nb <= BAND_DONE_AT and BM * hq_r % THREADS == 0
-    assert (BM * hq_r * d // VEC_BF16) % (THREADS * _BATCH) == 0 and (BM * hkv_r * d // VEC_BF16) % (THREADS * _BATCH) == 0
+    for h_r, dd in ((hq_r, d), (hkv_r, d), (hkv_r, d_v)):
+        assert (BM * h_r * dd // VEC_BF16) % (THREADS * _BATCH) == 0, "gather tiles: whole copy steps"
+    for dd in (d, d_v):
+        assert (kv_rows * hkv_r * dd // VEC_BF16) % (THREADS * 2) == 0, "dK / dV parts: whole push steps"
     grid = max(num_blocks, num_pull)
     trace_item_at, trace_dq_at, trace_gather_at, trace_stage_at, trace_start_at, trace_dqw_at, trace_len = trace_layout(
-        M, n, hq_r, hkv_r, d, dq_rows, pull_rows
+        M, n, hq_r, hkv_r, d, dq_rows, pull_rows, d_v
     )
     assert not trace or grid <= TRACE_MAX_BLOCKS
     body = emb["body"]
     assert emb["q_ready"], "the dO readiness hook needs the body's q-block prefetch"
     if dq_prog:
         assert emb["qdesc_r"] > 0 and num_items * WAVES <= BAND_DONE_AT - PROG_AT, "dQ progress: QDESC walk, flags"
-        assert BAND % (emb["block_q"] * q_split) == 0, "the band-relative split walk (_desc_walk)"
+        assert band % (emb["block_q"] * q_split) == 0, "the band-relative split walk (_desc_walk)"
     num_early = min(num_early, nb)
     if num_prefix < 0:
         # the first wave's bands below the top ones start on their diagonal q blocks
         num_prefix = _ceildiv(grid, ipb) - num_early
     # local first: the first wave runs this rank's own bands of [0, n * local_bands), whose diagonal rows
     # need no link, and the pull starts on the top rows they go on to; the other bands follow
-    bpc = cs // BAND if cs % BAND == 0 else 0
+    bpc = cs // band if cs % band == 0 else 0
     local_bands = _ceildiv(_ceildiv(grid, ipb) - num_early, bpc) * bpc if local_first and bpc else 0
     if local_bands <= 0 or n * local_bands > nb - num_early:
         local_bands = 0
     if local_bands:
         num_prefix = n * local_bands
-    prefix_rows = min(max(num_prefix, 0), nb - num_early) * BAND
+    prefix_rows = min(min(max(num_prefix, 0), nb - num_early) * band, S)
     prefix_tiles = prefix_rows // pull_rows
     # every source's local rows of the sequence rows [0, prefix_rows)
     prefix_m_tiles = min(_ceildiv(prefix_rows, cs * n) * cs // BM, m_tiles)
     # the top rows every first-wave item goes on to after its diagonal ones: whole chunks of every source
-    top_rows = _ceildiv(num_top * BAND, cs * n) * cs * n if num_top > 0 and not local_bands else 0
+    top_rows = _ceildiv(num_top * band, cs * n) * cs * n if num_top > 0 and not local_bands else 0
     if top_rows // n // BM + prefix_m_tiles > m_tiles:
         top_rows = 0
 
@@ -1094,6 +1161,12 @@ def _make_kernel(
         rank=rank,
         num_ranks=n,
         head_dim=d,
+        d_v=d_v,
+        band_rows=band,
+        kv_rows=kv_rows,
+        kv_parts=kv_parts,
+        kv_tiles=kv_tiles,
+        n_img=n_img,
         hq_r=hq_r,
         hkv_r=hkv_r,
         seq_chunk=cs,
@@ -1107,7 +1180,7 @@ def _make_kernel(
         recv_at=recv_at,
         recv_q_bytes=recv_x_bytes[0],
         recv_kv_at=recv_at[1:],
-        recv_kv_bytes=recv_x_bytes[1],
+        recv_kv_bytes=recv_x_bytes[1:],
         num_bands=nb,
         q_split=q_split,
         items_per_band=ipb,
@@ -1119,7 +1192,7 @@ def _make_kernel(
         top_m_tiles=top_rows // n // BM,
         local_bands=local_bands,
         bands_per_chunk=bpc,
-        dq_scale=dkdv_l.dq_scale,
+        dq_scale=dq_scale,
         dq_rows=dq_rows,
         dq_prog=dq_prog,
         dq_desc=bool(dq_desc),
@@ -1127,7 +1200,7 @@ def _make_kernel(
         kv_help=bool(kv_help),
         spin_sleep=spin_sleep,
         kv_claim_at=nb,
-        kv_queue_at=nb + nb * KV_PARTS,
+        kv_queue_at=nb + nb * kv_parts,
         qdesc_r=emb.get("qdesc_r", 0),
         num_comm=num_comm,
         dq_flag_rows=dq_flag_rows,
@@ -1212,8 +1285,8 @@ def _make_kernel(
                     peers_base,
                     my_base,
                     bank_offset,
-                    create_buffer_resource(DO, num_records_bytes=S * hq_r * d * 2),
-                    create_buffer_resource(O, num_records_bytes=S * hq_r * d * 2),
+                    create_buffer_resource(DO, num_records_bytes=S * hq_r * d_v * 2),
+                    create_buffer_resource(O, num_records_bytes=S * hq_r * d_v * 2),
                     create_buffer_resource(DELTA, num_records_bytes=S * hq_r * 4),
                     [
                         create_buffer_resource(LSE_IN, num_records_bytes=S * hq_r * 4),
@@ -1284,6 +1357,8 @@ def _launch(
     hq_r: fx.Constexpr[int],
     hkv_r: fx.Constexpr[int],
     head_dim: fx.Constexpr[int],
+    head_dim_v: fx.Constexpr[int],
+    softmax_scale: fx.Constexpr[float],
     seq_chunk: fx.Constexpr[int],
     num_pull: fx.Constexpr[int],
     num_blocks: fx.Constexpr[int],
@@ -1310,6 +1385,8 @@ def _launch(
         hq_r,
         hkv_r,
         head_dim,
+        head_dim_v,
+        softmax_scale or None,
         seq_chunk,
         num_pull,
         num_blocks,
@@ -1343,22 +1420,25 @@ _BUFS: dict = {}
 _IMG_DIRTY: set = set()
 
 
-def _buffers(S, hq_r, hkv_r, d, q_split, device):
-    """dO and delta of this rank's heads, the dK / dV slots, the dQ image (zero between calls: its dQ push
-    units zero it), the band item counts (zero between calls: a band's last item resets its count) and
-    the scaled LSE; reused across calls."""
-    key = (S, hq_r, hkv_r, d, q_split, device)
+def _buffers(S, hq_r, hkv_r, d, d_v, q_split, n_img, device):
+    """dO and delta of this rank's heads, the dK / dV slots, the dQ images (zero between calls: its dQ
+    push units zero them), the band item counts (zero between calls: a band's last item resets its count)
+    and the scaled LSE; reused across calls."""
+    key = (S, hq_r, hkv_r, d, d_v, q_split, n_img, device)
     bufs = _BUFS.get(key)
     if bufs is None:
         _BUFS.clear()
+        mla = d_v != d
+        nb = _ceildiv(S, MLA_BAND if mla else BAND)
+        kv_parts = 2 * MLA_BAND // MLA_PART_ROWS if mla else KV_PARTS
         bufs = (
-            torch.empty(S, hq_r, d, device=device, dtype=torch.bfloat16),
+            torch.empty(S, hq_r, d_v, device=device, dtype=torch.bfloat16),
             torch.empty(hq_r, S, device=device, dtype=torch.float32),
             torch.empty(q_split, S, hkv_r, d, device=device, dtype=torch.bfloat16),
-            torch.empty(q_split, S, hkv_r, d, device=device, dtype=torch.bfloat16),
-            torch.zeros(S * hq_r * d, device=device, dtype=torch.bfloat16),
+            torch.empty(q_split, S, hkv_r, d_v, device=device, dtype=torch.bfloat16),
+            torch.zeros(n_img * S * hq_r * d, device=device, dtype=torch.bfloat16),
             # item counts, then the dK / dV part claims and the finished-band queue (epoch-stamped)
-            torch.zeros(S // BAND * (2 + KV_PARTS), device=device, dtype=torch.int64),
+            torch.zeros(nb * (2 + kv_parts), device=device, dtype=torch.int64),
             torch.empty(hq_r * S, device=device, dtype=torch.float32),
         )
         _IMG_DIRTY.clear()
@@ -1394,11 +1474,15 @@ def ulysses_a2a_attn_bwd(
     spin_sleep=1,
     trace=None,
     mode="full",
+    softmax_scale=None,
 ):
-    """``dout`` ``[M, n * hq_r, d]``: dO for this rank's tokens with every head (batch 1); ``q`` / ``k`` /
-    ``v`` / ``o`` ``[S, h_r, d]`` and the natural-log ``lse`` ``[S, hq_r]`` fp32 of this rank's heads over
-    the sequence, as the fused forward leaves them. Writes ``dq`` ``[M, n * hq_r, d]`` and ``dk`` / ``dv``
-    ``[M, n * hkv_r, d]`` for this rank's tokens. The bank must hold ``a2a_attn_bwd_bank_bytes``.
+    """``dout`` ``[M, n * hq_r, d_v]``: dO for this rank's tokens with every head (batch 1); ``q`` / ``k``
+    ``[S, h_r, d]``, ``v`` / ``o`` ``[S, h_r, d_v]`` and the natural-log ``lse`` ``[S, hq_r]`` fp32 of this
+    rank's heads over the sequence, as the fused forward leaves them. Writes ``dq`` ``[M, n * hq_r, d]``,
+    ``dk`` ``[M, n * hkv_r, d]`` and ``dv`` ``[M, n * hkv_r, d_v]`` for this rank's tokens. ``d_v != d``:
+    the MLA shapes (``d`` 192, ``d_v`` 128) on the gfx950 MLA dK / dV body, with ``softmax_scale``
+    (default ``d ** -0.5``; the GQA path bakes the default). The bank must hold
+    ``a2a_attn_bwd_bank_bytes``.
     ``num_pull``: pull blocks (default: by ``n``, see ``_link_plan``). ``dq_rows``: sequence rows of one
     dQ push unit (default: by bytes, see ``_dq_rows``). ``num_comm``: of the pull blocks, how many push dQ
     units as their bands finish instead of joining the items first (default: by ``n``).
@@ -1416,25 +1500,30 @@ def ulysses_a2a_attn_bwd(
     call (no exchange, no waits, no folds, pushes or gathers; LSE prescaled and the dQ image zeroed by
     separate launches); ``"comm_only"`` runs every step but the items' attention body."""
     n = workspace.num_ranks
-    M, H, d = dout.shape[0], dout.shape[-2], dout.shape[-1]
-    S, hq_r, hkv_r = M * n, H // n, k.shape[-2]
-    assert dout.dtype == torch.bfloat16 and H % n == 0 and q.shape == (S, hq_r, d) and o.shape == q.shape
+    M, H, d_v = dout.shape[0], dout.shape[-2], dout.shape[-1]
+    S, hq_r, hkv_r, d = M * n, H // n, k.shape[-2], q.shape[-1]
+    mla = d_v != d
+    assert softmax_scale is None or mla, "the GQA backward bakes softmax_scale = d ** -0.5"
+    assert dout.dtype == torch.bfloat16 and H % n == 0 and q.shape == (S, hq_r, d) and o.shape == (S, hq_r, d_v)
+    assert k.shape == (S, hkv_r, d) and v.shape == (S, hkv_r, d_v)
     assert all(t.is_contiguous() for t in (dout, q, k, v, o, lse, dq, dk, dv))
-    assert dq.shape == dout.shape and dk.shape == (M, n * hkv_r, d) and dv.shape == dk.shape
-    q_split, _ = _plan(S, hq_r, hkv_r, d)
-    dq_rows = _dq_rows(hq_r, dq_rows)
+    assert dq.shape == (M, H, d) and dk.shape == (M, n * hkv_r, d) and dv.shape == (M, n * hkv_r, d_v)
+    plan = _plan(S, hq_r, hkv_r, d, d_v if mla else None, softmax_scale if mla else None)
+    q_split, n_img = plan[0], plan[1].embed.get("a16_imgs", 1)
+    dq_rows = _dq_rows(hq_r, dq_rows, mla)
     pull_rows = _pull_rows(hq_r, pull_rows)
     auto_pull, auto_comm, auto_local, auto_top = _link_plan(n, S)
     num_top = auto_top if num_top is None else num_top
     num_pull = auto_pull if num_pull is None else num_pull
     num_comm = auto_comm if num_comm is None else num_comm
-    local_first = auto_local if local_first is None else local_first
+    local_first = (auto_local and not mla) if local_first is None else local_first
     if num_blocks is None:
         num_blocks = torch.cuda.get_device_properties(dout.device).multi_processor_count
     stream = torch.cuda.current_stream()
-    key = (S, hq_r, hkv_r, d, q_split, dout.device)
+    key = (S, hq_r, hkv_r, d, d_v, q_split, n_img, dout.device)
     do_h, delta, ws_dk, ws_dv, img, counts, lsef = _buffers(*key)
-    qf = _bwd._prescale_q(q, 1.0 / math.sqrt(d))
+    # the MLA body scales Q itself
+    qf = q if mla else _bwd._prescale_q(q, 1.0 / math.sqrt(d))
     if mode == "attn_only":
         # no pull units to write it
         lsef = _bwd._prescale_lse(lse.view(1, S, hq_r).permute(0, 2, 1), stream).reshape(-1)
@@ -1444,7 +1533,7 @@ def ulysses_a2a_attn_bwd(
         _IMG_DIRTY.add(key)
     else:
         _IMG_DIRTY.discard(key)
-    with CompilationContext.compile_hints(_plan(S, hq_r, hkv_r, d)[1].embed["hints"]):
+    with CompilationContext.compile_hints(plan[1].embed["hints"]):
         run_launcher(
             _launch,
             dout,
@@ -1472,6 +1561,8 @@ def ulysses_a2a_attn_bwd(
             hq_r,
             hkv_r,
             d,
+            d_v,
+            0.0 if softmax_scale is None else float(softmax_scale),
             seq_chunk,
             num_pull,
             num_blocks,

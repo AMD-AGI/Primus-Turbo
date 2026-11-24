@@ -23,6 +23,7 @@ import flydsl.expr as fx
 import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import builtin, llvm
+from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
@@ -2044,26 +2045,29 @@ def build_flash_attn_bwd_dkdv_module(
     ld_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = ld_off + LD_ELEMS * 4
 
-    @flyc.kernel(
-        name="flash_attn_bwd_mla_dkdv_kernel" if MLA else "flash_attn_bwd_dkdv_kernel",
-        known_block_size=[BLOCK_SIZE, 1, 1],
-    )
-    def flash_attn_bwd_dkdv_kernel(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        DO: fx.Tensor,
-        LSE: fx.Tensor,
-        DELTA: fx.Tensor,
-        DK: fx.Tensor,
-        DV: fx.Tensor,
-        CuSeqQ: fx.Tensor,  # varlen: cu_seqlens_q [num_seg+1] i32; else unused placeholder slot
-        CuSeqKv: fx.Tensor,  # varlen: cu_seqlens_kv [num_seg+1] i32; else unused placeholder slot
-        WSQ: fx.Tensor,  # dQ partials [kv_band, B, Sq, Hq, D] bf16
-        seq_len_q: fx.Int32,
-        seq_len_k: fx.Int32,
-        total_kv: fx.Int32,  # whole kv axis: dk/dv slot stride when this launch owns a slice of it
+    @ASTRewriter.transform
+    def _dkdv_body(
+        Q,
+        K,
+        V,
+        DO,
+        LSE,
+        DELTA,
+        DK,
+        DV,
+        CuSeqQ,
+        CuSeqKv,
+        WSQ,
+        seq_len_q,
+        seq_len_k,
+        total_kv,
+        ids=None,
+        q_ready=None,
     ):
+        """One work-group's band. ``ids`` = ``(kv_tile, kv_head, split, batch)`` index values replace the
+        decode of the work-group id: a persistent caller runs one band per work item. ``q_ready(q_start)``
+        (PF_QB only) runs before each q-block's first Q / dO / delta fetch: a caller still producing dO
+        waits there for those rows."""
         elem_dtype = dtype_to_elem_type(dtype_str)
         elem_type = elem_dtype.ir_type
         q_ptr = _extract_aligned_pointer(Q)
@@ -2114,7 +2118,6 @@ def build_flash_attn_bwd_dkdv_module(
                 return buffer_ops.get_element_ptr(_lds_p0, fx.Int64(byte_off))
             return buffer_ops.create_llvm_ptr(fx.Int64(byte_off), address_space=3)
 
-        block_id = fx.Index(gpu.block_idx.x)
         tid = fx.Index(gpu.thread_idx.x)
         wave_id = tid // WARP_SIZE
         lane = tid % WARP_SIZE
@@ -2147,7 +2150,11 @@ def build_flash_attn_bwd_dkdv_module(
         # rows stay co-resident. Bijective when B*NUM_HEADS_KV % NUM_XCD == 0; WIN_XCD gets the
         # same locality via xcd_remap_pid when it doesn't, else falls back to the plain decode.
         num_kv_tiles = (seq_len_k_v + BLOCK_KV - 1) // BLOCK_KV
-        if const_expr(NUM_HEADS_KV % NUM_XCD != 0 and WIN_XCD):
+        if const_expr(ids is None):
+            block_id = fx.Index(gpu.block_idx.x)
+        if const_expr(ids is not None):
+            kv_tile_idx, kv_head_idx, split_idx, batch_idx = ids
+        elif const_expr(NUM_HEADS_KV % NUM_XCD != 0 and WIN_XCD):
             _lin = fx.Index(xcd_remap_pid(block_id, fx.Index(gpu.grid_dim.x), NUM_XCD))
             split_idx = fx.Index(QSP_LO)
             kv_tile_idx = _lin % num_kv_tiles
@@ -4638,6 +4645,10 @@ def build_flash_attn_bwd_dkdv_module(
             _g3_prev = inner[H_ACCS_V + H_ACCS] if const_expr(G3_QCARRY) else None
             # DS_PAR: (dS write base, deferred GEMM3 read base, slot step) -- see _carry.
             _dsb = list(inner[H_ACCS_V + H_ACCS + 1 : H_ACCS_V + H_ACCS + 4]) if const_expr(DS_PAR) else None
+            if const_expr(q_ready is not None):
+                # the next q-block's ring fill and (-delta, lse) fetch ride this one's head-steps;
+                # checked here, where the fewest registers are live
+                q_ready(q_start + fx.Index(_step) if nq is None else nq)
             if const_expr(PF_QB):
                 _pfb = H_ACCS_V + H_ACCS + (1 if G3_QCARRY else 0) + (3 if DS_PAR else 0)
                 _rng = list(inner[_pfb : _pfb + 2]) if const_expr(Q_RING) else None
@@ -4766,6 +4777,8 @@ def build_flash_attn_bwd_dkdv_module(
                 _pf0 = fx.Index(
                     ArithValue(_q_loop_start < _masked_upper).select(_q_loop_start, _desc_q(fx.Index(0)))
                 )
+            if const_expr(q_ready is not None):
+                q_ready(_pf0)
             if const_expr(Q_RING):
                 # The first trip's tile goes into slot 0; the first trip's drain waits for it.
                 _qdo_dma_mla(_pf0, 0, 0, ring=[fx.Int32(0), fx.Int32(0)])
@@ -4907,6 +4920,28 @@ def build_flash_attn_bwd_dkdv_module(
         _store(dv_accs, dv_rsrc, False)
         _store(dk_accs, dk_rsrc, True)
 
+    @flyc.kernel(
+        name="flash_attn_bwd_mla_dkdv_kernel" if MLA else "flash_attn_bwd_dkdv_kernel",
+        known_block_size=[BLOCK_SIZE, 1, 1],
+    )
+    def flash_attn_bwd_dkdv_kernel(
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        DO: fx.Tensor,
+        LSE: fx.Tensor,
+        DELTA: fx.Tensor,
+        DK: fx.Tensor,
+        DV: fx.Tensor,
+        CuSeqQ: fx.Tensor,  # varlen: cu_seqlens_q [num_seg+1] i32; else unused placeholder slot
+        CuSeqKv: fx.Tensor,  # varlen: cu_seqlens_kv [num_seg+1] i32; else unused placeholder slot
+        WSQ: fx.Tensor,  # dQ partials [kv_band, B, Sq, Hq, D] bf16
+        seq_len_q: fx.Int32,
+        seq_len_k: fx.Int32,
+        total_kv: fx.Int32,  # whole kv axis: dk/dv slot stride when this launch owns a slice of it
+    ):
+        _dkdv_body(Q, K, V, DO, LSE, DELTA, DK, DV, CuSeqQ, CuSeqKv, WSQ, seq_len_q, seq_len_k, total_kv)
+
     @flyc.jit
     def launch_flash_attn_bwd_dkdv(
         Q: fx.Tensor,
@@ -5002,6 +5037,35 @@ def build_flash_attn_bwd_dkdv_module(
             return flyc.compile(launch_flash_attn_bwd_dkdv, *args)
 
     _launch.compile = _compile
+    # what a persistent kernel running this body per work item needs: the body, its LDS allocator
+    # (finalized by that kernel's launcher), the work-group size and the compile settings
+    _passthrough = [
+        ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
+        ["no-nans-fp-math", "true"],
+        ["unsafe-fp-math", "true"],
+    ]
+    if agpr != 0:
+        _passthrough += [["amdgpu-agpr-alloc", f"{int(agpr)},{int(agpr)}"], ["amdgpu-mfma-vgpr-form", "false"]]
+    _launch.embed = dict(
+        body=_dkdv_body,
+        allocator=allocator,
+        block_size=BLOCK_SIZE,
+        hints=_hints,
+        value_attrs={
+            "rocdl.waves_per_eu": waves_per_eu,
+            "rocdl.flat_work_group_size": f"{int(flat_work_group_size)},{int(flat_work_group_size)}",
+            "llvm.passthrough": _passthrough,
+        },
+        block_kv=BLOCK_KV,
+        block_q=BLOCK_Q,
+        q_split=Q_SPLIT,
+        q_ready=PF_QB,
+        # the unmasked q walk: descending, rotated by band % qdesc_r (see _desc_q); with g3_qcarry a trip's
+        # last head emits its dQ in the next trip
+        qdesc_r=QDESC_R if QDESC else 0,
+        g3_qcarry=G3_QCARRY,
+        a16_imgs=A16_IMGS,
+    )
     return _launch
 
 

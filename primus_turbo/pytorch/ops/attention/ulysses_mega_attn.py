@@ -11,7 +11,7 @@ takes this rank's tokens with every head and returns the attention output for th
 head. The forward is one kernel (pull q / k / v, attention, push O), and so is the backward (pull dO,
 the FlyDSL SBHD backward on this rank's heads, push dq / dk / dv to the token owners). A shape the fused
 backward does not cover runs it as an in-kernel all-to-all, the FlyDSL backward and a second all-to-all.
-MLA head dims (q / k 192, v 128) run the gfx950 MLA forward tile and, unfused, its backward.
+MLA head dims (q / k 192, v 128) run the gfx950 MLA forward tile and dK / dV body.
 
 Sequence split: with ``seq_chunk`` cs, global chunk ``c`` (cs tokens) lives on rank ``c % n``;
 ``seq_chunk=0`` is the contiguous split (rank r holds the r-th chunk of ``S / n`` tokens). A striped
@@ -58,19 +58,25 @@ def _bank_bytes(M, n, hq_r, hkv_r, d, d_v):
     banks = [
         a2a_attn_fwd_bank_bytes(M, n, hq_r, hkv_r, d, d_v),
         a2a_bank_bytes(M, n, (hq_r, hkv_r, hkv_r), (d, d, d_v)),
+        a2a_attn_bwd_bank_bytes(M, n, hq_r, hkv_r, d, d_v),
     ]
-    if d == d_v:
-        banks.append(a2a_attn_bwd_bank_bytes(M, n, hq_r, hkv_r, d))
     return max(banks)
 
 
-def _fused_bwd_ok(S, hq_r, hkv_r, d, d_v, cs):
+def _fused_bwd_ok(S, hq_r, hkv_r, d, d_v, cs, softmax_scale):
     """Whether the one-kernel backward runs this shape: the stock plan must be the a16 dQ image with
-    256-row bands (dense causal, ``S`` a multiple of the q-split tile)."""
-    if d != d_v or cs % 128 or S % 256:
+    256-row bands (dense causal, ``S`` a multiple of the q-split tile); MLA takes 192-row bands and
+    64-row dK / dV parts inside one chunk."""
+    if is_mla(d, d_v):
+        if (d, d_v) != (192, 128) or cs % 256 or S % 64:
+            return False
+    elif cs % 128 or S % 256:
         return False
     try:
-        _bwd_plan(S, hq_r, hkv_r, d)
+        if is_mla(d, d_v):
+            _bwd_plan(S, hq_r, hkv_r, d, d_v, softmax_scale)
+        else:
+            _bwd_plan(S, hq_r, hkv_r, d)
     except AssertionError:
         return False
     return True
@@ -123,8 +129,10 @@ class UlyssesMegaAttnFunction(torch.autograd.Function):
         dk = q_h.new_empty(M, n * hkv_r, d)
         dv = q_h.new_empty(M, n * hkv_r, d_v)
         grads = (dq, dk, dv, None, None, None, None)
-        if _fused_bwd_ok(S, hq_r, hkv_r, d, d_v, cs or M):
-            ulysses_a2a_attn_bwd(dout.contiguous(), q_h, k_h, v_h, o_h, lse, dq, dk, dv, ws, seq_chunk=cs)
+        if _fused_bwd_ok(S, hq_r, hkv_r, d, d_v, cs or M, ctx.softmax_scale):
+            ulysses_a2a_attn_bwd(
+                dout.contiguous(), q_h, k_h, v_h, o_h, lse, dq, dk, dv, ws, seq_chunk=cs, softmax_scale=ctx.softmax_scale
+            )
             return grads
         do_h = torch.empty_like(o_h)
         ulysses_a2a_seq_to_heads([dout.contiguous()], [do_h], ws, seq_chunk=cs)
