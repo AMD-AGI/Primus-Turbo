@@ -135,6 +135,14 @@ JAX hipBLASLt grouped GEMM (csrc/jax/grouped_gemm/hipblaslt_grouped_gemm.cpp).
 |---|---|---|---|
 | `PRIMUS_OVERLAP` | `bool` | `False` | "1" lets the training framework run independent chains (deferred wgrads, shared expert, indexer, compressor) on side streams. Only for a framework that calls `primus_turbo.pytorch.core.overlap.join()` after each backward: an un-joined deferred wgrad is silently wrong. Always off when torch.distributed has more than one rank. |
 
+### fp8_block MegaMoE (gfx1250)
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `PRIMUS_TURBO_MOE_FP8BLK_GG` | `str` | `mxp` | Grouped fwd / dgrad GEMM of the fp8_block MegaMoE operator: "mxp" (persistent, fragment pipeline), "k256" (K % 256 = 0 TDM kernel) or "tile". Each falls back to the next when its shape test fails (mxp -&gt; k256 -&gt; tile). Read when the operator is built. |
+| `PRIMUS_TURBO_MOE_FP8BLK_WGRAD` | `str` | `vkq` | Variable-K wgrad GEMM of the fp8_block MegaMoE operator: "vkq" (persistent, scale planes through async VMEM) or "vk" (the simple kernel). Read when the operator is built. |
+| `PRIMUS_TURBO_MOE_FP8BLK_VERIFY` | `bool` | `False` | "1" checks every fp8_block MegaMoE GEMM against a reference and logs the result (slow; debugging). |
+
 ### Flux
 
 | Variable | Type | Default | Description |
