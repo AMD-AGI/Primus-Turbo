@@ -6156,6 +6156,24 @@ _MUSE_NN = {
 _MUSE_COSCHED = {"lds_cosched": 3, "issue_first": 1}
 _MUSE_NN_MC44 = dict(_MUSE_NN, mc_m=4, mc_n=4)
 
+# Kimi K3.1 Pro's wgrad with accumulate=1: the k-loop knobs of its overwrite sets -- the deep ring with the split
+# barrier and co-scheduled fragment reads, head_pipe, the branch-free TDM issue, and the cluster -- without their
+# persistent seam, which the accumulate path does not take.
+_KIMI_VK_ACCUM = {
+    "BLOCK_K": 64,
+    "head_pipe": 8,
+    "lds_cosched": 2,
+    "mc_early": 0,
+    "mc_tile_sync": 1,
+    "num_buffers": 4,
+    "num_xcd": 8,
+    "split_bar": 1,
+    "tdm_deal": 3,
+    "wmma_b2b": 1,
+}
+_KIMI_VK_ACCUM_FC1 = dict(_KIMI_VK_ACCUM, mc_m=4, mc_n=2, xcd_band=256)
+_KIMI_VK_ACCUM_FC2 = dict(_KIMI_VK_ACCUM, mc_m=2, mc_n=4, xcd_band=128)
+
 _KWARGS_KEYS = {
     "nt": {
         # Muse Spark (EP4 / EP8, MBS 1 / 2) fwd fc1 at 512 / 1024 / 2048 rows and fwd fc2 at 512 / 1024: the
@@ -6322,7 +6340,7 @@ _KWARGS_KEYS = {
         },
     },
     # The variable-K wgrad with accumulate=1 (an fp32 or bf16 main_grad). It runs the plain non-persistent
-    # epilogue, so only knobs that leave that path are keyed here. Bit-identical.
+    # epilogue, so only the k-loop knobs it takes are keyed here. Bit-identical.
     "vk_accum": {
         # Muse Spark wgrad fc1 (OUT 8192 x 4096) and fc2 (OUT 4096 x 4096) at 512 / 1024 / 2048 rows per expert
         # (EP4 / EP8, MBS 1 / 2): the fragment reads co-scheduled with the matrix ops (+4% to +15% on the op).
@@ -6336,6 +6354,14 @@ _KWARGS_KEYS = {
         (4096, 4096, 2048): {"lds_cosched": 2},
         (4096, 4096, 4096): {"lds_cosched": 2},
         (4096, 4096, 8192): {"lds_cosched": 2},
+        # Kimi K3.1 Pro wgrad fc1 (OUT 6144 x 3584) and fc2 (OUT 3584 x 3072), into its bf16 main_grad, at the row
+        # counts its overwrite sets were tuned at.
+        (6144, 3584, 293): _KIMI_VK_ACCUM_FC1,
+        (6144, 3584, 585): _KIMI_VK_ACCUM_FC1,
+        (6144, 3584, 1170): _KIMI_VK_ACCUM_FC1,
+        (3584, 3072, 293): _KIMI_VK_ACCUM_FC2,
+        (3584, 3072, 585): _KIMI_VK_ACCUM_FC2,
+        (3584, 3072, 1170): _KIMI_VK_ACCUM_FC2,
     },
 }
 _KWARGS_PASSTHROUGH = {

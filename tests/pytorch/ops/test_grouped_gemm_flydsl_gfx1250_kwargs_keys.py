@@ -339,6 +339,49 @@ def test_a_vec_dec_key_needs_at_most_32_experts(kind, name, n, k):
         assert bool(gg._keyed_kwargs(kind, key, G, 0, {})) == (G <= 32 or not has_vec_dec), G
 
 
+# Kimi K3.1 Pro's accumulating wgrads (its bf16 main_grad): fc1 OUT (6144, 3584), fc2 (3584, 3072), 224 experts a GPU.
+KIMI_VK_ACCUM = {(6144, 3584): (4, 2), (3584, 3072): (2, 4)}  # the cluster each one runs
+# What the accumulate path refuses (the launcher raises): the persistent seam and the epilogue forms.
+_NOT_ACCUM = {
+    "persist",
+    "vk_ovl",
+    "vk_seam",
+    "vk_stagger",
+    "epi_chunk",
+    "out_ldc",
+    "issue_first",
+    "k_tiles_const",
+}
+
+
+def test_kimi_accumulate_keys_name_only_knobs_the_accumulate_path_takes():
+    for (n, k), (mc_m, mc_n) in KIMI_VK_ACCUM.items():
+        rows = sorted(row[2] for row in gg._KWARGS_KEYS["vk_accum"] if row[:2] == (n, k))
+        assert rows == [293, 585, 1170]
+        for avg_m in rows:
+            keyed = gg._KWARGS_KEYS["vk_accum"][(n, k, avg_m)]
+            assert set(keyed) <= set(_tuning_args("vk")), (n, k, avg_m)
+            assert not set(keyed) & _NOT_ACCUM, (n, k, avg_m)
+            assert (keyed["mc_m"], keyed["mc_n"]) == (mc_m, mc_n)
+            # whole clusters per expert at any expert count, and the tile the cluster cuts is the keyed one
+            assert (n // 256) % mc_m == 0 and (k // 256) % mc_n == 0
+            assert (keyed["BLOCK_K"], keyed["num_buffers"]) == (64, 4)
+
+
+@pytest.mark.parametrize("n, k", list(KIMI_VK_ACCUM), ids=["wgrad_fc1", "wgrad_fc2"])
+def test_kimi_accumulate_keys_reach_accumulating_calls_only(n, k):
+    """An accumulating call at a Kimi row count takes the nearest key, at the experts of EP4 and EP8; the overwrite
+    keeps its own table, and a tuning argument switches the key off."""
+    for G in (112, 224):
+        for avg_m in (147, 293, 414, 585, 827, 1170, 2340):
+            want = gg._KWARGS_KEYS["vk_accum"][gg._kwargs_key("vk_accum", (n, k, avg_m))]
+            assert gg._keyed_kwargs("vk_accum", (n, k, avg_m), G, 0, {"out": None, "accumulate": 1}) == want
+            assert gg._keyed_kwargs("vk_accum", (n, k, avg_m), G, 0, {"accumulate": 1, "group_m": 16}) == {}
+            assert gg._keyed_kwargs("vk", (n, k, avg_m), G, 0, {}) != want
+    assert gg._kwargs_key("vk_accum", (n, k, 414))[2] == 293
+    assert gg._kwargs_key("vk_accum", (n, k, 415))[2] == 585
+
+
 def test_the_wrappers_keep_the_entry_point_signatures():
     """Callers and tests read defaults off the public names (``inspect.signature`` follows ``__wrapped__``)."""
     for kind, public in _PUBLIC.items():

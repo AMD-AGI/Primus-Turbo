@@ -462,12 +462,16 @@ KIMI_CLUSTER = {
 @pytest.mark.parametrize("out_m, out_n", list(KIMI_CLUSTER), ids=["kimi_fc1", "kimi_fc2"])
 def test_k_loop_knobs_keep_the_accumulate_bit_identical(out_m, out_n, out_dtype):
     """head_pipe, tdm_deal and the cluster move loads and matrix ops, never a k-step: the old C is loaded at the
-    last k-tile's head as without them, and the sum is the untuned one bit for bit."""
+    last k-tile's head as without them, and the sum is the untuned one bit for bit -- the Kimi K3.1 key's included,
+    which the call without a tuning argument takes."""
     a, b, lens, offs, _ = _problem(out_m, out_n, KIMI_ROWS)
     old = _old_out((lens.numel(), out_m, out_n)).to(out_dtype)
     want = old.clone()
-    _accumulate(a, b, offs, lens, want, "auto")
-    for kw in (KLOOP, dict(KLOOP, **KIMI_CLUSTER[(out_m, out_n)])):
+    _accumulate(a, b, offs, lens, want, "auto", group_m=16)  # a tuning argument: the key is off
+    assert _vk()._keyed_kwargs(
+        "vk_accum", (out_m, out_n, sum(KIMI_ROWS) // len(KIMI_ROWS)), 8, 0, {"out": old}
+    )
+    for kw in (KLOOP, dict(KLOOP, **KIMI_CLUSTER[(out_m, out_n)]), {}):
         got = old.clone()
         _accumulate(a, b, offs, lens, got, "auto", **kw)
         assert _same_bits(got, want), kw
