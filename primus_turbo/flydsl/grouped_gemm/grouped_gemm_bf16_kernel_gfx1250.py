@@ -2410,9 +2410,10 @@ def _vk_launch(args: tuple):
 # vary from step to step (dropless routing), so avg_m lands near, not on, a keyed value. Such an avg_m takes
 # the keyed avg_m of its shape nearest to it on a log scale, within a factor _AVG_M_REACH, so a set is never
 # used far from the row counts it was measured at: keys a factor 2 apart serve every avg_m between them, and a
-# lone key serves a factor sqrt(2) either side (512 serves 363-724, 2048 serves 1449-2896).
+# lone key serves a factor 2 either side (512 serves 256-1024, 2048 serves 1024-4096). At that distance the
+# keyed sets still measured faster than the untuned path on every operator tried.
 # PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS=1 keeps the exact match only, for A/B runs.
-_AVG_M_REACH = 2**0.5
+_AVG_M_REACH = 2
 
 
 def _nearest_avg_m(avg_m: int, keyed) -> int | None:
