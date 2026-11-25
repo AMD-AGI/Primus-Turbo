@@ -132,11 +132,10 @@ def test_delivery_shapes_hit_the_stack_keys(kind, name, a, b, tile):
 
 @pytest.mark.parametrize("kind, name, a, b, tile", DELIVERY, ids=_IDS)
 def test_only_avg_m_2048_is_keyed(kind, name, a, b, tile):
-    """The table holds avg_m = 2048 only. The row counts within a factor ``_AVG_M_REACH`` of it read it at 2048
-    (see the near-key tests below); 512 rows per expert are further away, resolve the whole group off and run
-    exactly what the untuned path runs. Measured separately, the same knobs are worth +5.8% to +34.8% there,
-    so the table is known to be leaving that on the floor -- but reaching it needs more than a new row here
-    (see the variable-K window test below).
+    """The table holds avg_m = 2048 only, and the row counts within a factor ``_AVG_M_REACH`` of it read it at
+    2048 (see the near-key tests below). At 512 rows the variable-K group still refuses itself: measured
+    separately, its knobs are worth +34.8% there, but its ``split_bar`` needs more k windows than 512 rows give
+    the deep ring, which no new row here can change (see the variable-K window test below).
     """
     for avg_m in (64, 128, 256, 512, 1024, 4096):
         assert (a, b, avg_m) not in gg._STACK_KEYS[kind], (
@@ -375,7 +374,8 @@ def test_a_variable_k_key_at_512_rows_would_be_a_dead_row():
                 f"{gg._VK_SPLIT_BAR_MIN_WINDOWS}"
             )
     # And no other row count is a key of its own: read at its own row count the picker hands out the shallow
-    # tile. 1024 and 4096 reach the deep ring only through the 2048 key (`_shape_avg_m`).
+    # tile. 512 to 8192 rows reach the deep ring only through the 2048 key (`_shape_avg_m`), and below 833 rows
+    # the group then refuses itself on the window count above.
     for name, (out_m, out_n) in VK_SHAPES.items():
         for avg_m in (512, 1024, 4096):
             assert (out_m, out_n, avg_m) not in gg._VK_DEEP_RING_KEYS
@@ -466,10 +466,10 @@ def test_the_nn_entry_point_cannot_read_a_stack_override():
 # ---------------------------------------------------------------------------
 
 # Under expert parallelism the rows a GPU receives vary per step, so avg_m lands near 2048, not on it. Every table
-# below is read at the avg_m `_shape_avg_m` resolves: 2048 within a factor _AVG_M_REACH of it (1024-4096 rows),
+# below is read at the avg_m `_shape_avg_m` resolves: 2048 within a factor _AVG_M_REACH of it (512-8192 rows),
 # the call's own avg_m, which no table holds, outside.
-NEAR = (1024, 1449, 2047, 2049, 2896, 4096)
-FAR = (512, 1023, 4097, 8192)
+NEAR = (512, 1024, 2047, 2049, 4096, 8192)
+FAR = (256, 511, 8193, 16384)
 # Every shape table the entry points read, written out so that a new table has to be added here and to the
 # module's index together.
 SHAPE_TABLES = {
@@ -610,8 +610,6 @@ def test_near_the_key_every_lookup_answers_as_at_the_key(kind, name, a, b, tile)
             got["tdm_nn"] = (gg._pick_tdm_nn(a, b, key_m), gg._pick_tdm_assign_nn(a, b, key_m))
         if kind in ("nn", "vk"):
             got["wmma_b2b"] = gg._pick_wmma_b2b(kind, a, b, key_m)
-        if kind == "vk":
-            got["split_bar"] = gg._vk_auto_split_bar(got["tile"], a, b, avg_m)
         return got
 
     for G in (8, 16, 32, 64):
@@ -622,8 +620,13 @@ def test_near_the_key_every_lookup_answers_as_at_the_key(kind, name, a, b, tile)
         for avg_m in FAR:
             off = answers(avg_m, G)
             assert off["stack"] is None and off["lds_cosched"] == off["lds_cosched_off"] == 0, (G, avg_m)
-            # the NN tile at 2048 is the untuned one: no table keys it
-            assert (off["tile"] == tile) == (kind == "nn"), (G, avg_m)
+            if kind != "nn":  # the NN tile at 2048 is the untuned one: no table keys it
+                assert off["tile"] != tile, (G, avg_m)
+    if kind == "vk":
+        # The variable-K group needs split_bar, which the real row count decides: 512 rows leave the deep ring 5
+        # k windows, below the threshold, so there the group refuses itself and the rest of the tables still apply.
+        got = [gg._vk_auto_split_bar(tile, a, b, avg_m) for avg_m in NEAR]
+        assert got == [0, 1, 1, 1, 1, 1], got
 
 
 def _launched(kind: str, a: int, b: int, avg_m: int, G: int, monkeypatch) -> tuple:
@@ -659,18 +662,21 @@ def _launched(kind: str, a: int, b: int, avg_m: int, G: int, monkeypatch) -> tup
 
 @pytest.mark.parametrize("kind, name, a, b, tile", DELIVERY, ids=_IDS)
 def test_near_the_key_the_entry_point_launches_the_keyed_kernel(kind, name, a, b, tile, monkeypatch):
-    """At both ends of what 2048 serves the entry point launches exactly the kernel the keyed row count launches; one
-    row past them it launches what PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS=1 launches at the ends themselves."""
+    """At both ends of what 2048 serves the entry point launches exactly the kernel the keyed row count launches --
+    except the variable-K group at 512 rows, which refuses itself there (see the lookup test above) -- and one row
+    past them what PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS=1 launches at the ends themselves."""
     G = NUMERIC_G
     keyed = _launched(kind, a, b, KEYED_AVG_M, G, monkeypatch)
-    below, above = _launched(kind, a, b, 1023, G, monkeypatch), _launched(kind, a, b, 4097, G, monkeypatch)
+    below, above = _launched(kind, a, b, 511, G, monkeypatch), _launched(kind, a, b, 8193, G, monkeypatch)
     assert keyed not in (below, above)
-    for avg_m in (1024, 4096):
+    low = _launched(kind, a, b, 512, G, monkeypatch)
+    assert (low == keyed) == (kind != "vk") and low != below
+    for avg_m in (1024, 8192):
         assert _launched(kind, a, b, avg_m, G, monkeypatch) == keyed, avg_m
     monkeypatch.setenv("PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS", "1")
     envs.reset_cache()
-    assert _launched(kind, a, b, 1024, G, monkeypatch) == below
-    assert _launched(kind, a, b, 4096, G, monkeypatch) == above
+    assert _launched(kind, a, b, 512, G, monkeypatch) == below
+    assert _launched(kind, a, b, 8192, G, monkeypatch) == above
     assert _launched(kind, a, b, KEYED_AVG_M, G, monkeypatch) == keyed
 
 
@@ -881,12 +887,13 @@ def test_ragged_rows_do_not_depend_on_the_stack():
 
 
 @needs_gfx1250
+@pytest.mark.parametrize("avg_m", [512, 1024])
 @pytest.mark.parametrize("kind, name, a, b, tile", DELIVERY, ids=_IDS)
-def test_near_the_key_numeric(kind, name, a, b, tile, monkeypatch):
-    """Uneven rows at M_total // G = 1024, the low end of what 2048 serves: right against the fp32 reference, and bit
+def test_near_the_key_numeric(kind, name, a, b, tile, avg_m, monkeypatch):
+    """Uneven rows at M_total // G = 512, the low end of what 2048 serves (where the variable-K group refuses itself
+    and the rest of its tables still apply), and at 1024 (where it fires): right against the fp32 reference, and bit
     for bit the untuned call (PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS=1), since every keyed value moves a schedule only.
     """
-    avg_m = 1024
     rows = [0, 1, 40, 255, avg_m + 7, 2 * avg_m, 3 * avg_m]
     rows += [NUMERIC_G * avg_m - sum(rows)]
     assert len(rows) == NUMERIC_G and min(rows) >= 0
