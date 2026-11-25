@@ -6835,41 +6835,71 @@ _KWARGS_PASSTHROUGH = {
 }
 
 
-def _kwargs_key(kind: str, key: tuple):
-    """The ``_KWARGS_KEYS[kind]`` row serving ``key`` = (N, K, avg_m): the row of the keyed avg_m of its (N, K)
-    that `_nearest_avg_m` picks, the rule the shape-keyed tables follow; None without one."""
+def _kwargs_rows(kind: str, key: tuple) -> list:
+    """The ``_KWARGS_KEYS[kind]`` rows that may serve ``key`` = (N, K, avg_m), in the order they are tried: the keyed
+    avg_m of its (N, K) that `_nearest_avg_m` picks, then each one it picks with those before it left out."""
     n, k, avg_m = key
-    key_m = _nearest_avg_m(avg_m, {row[2] for row in _KWARGS_KEYS[kind] if row[:2] == (n, k)})
-    return None if key_m is None else (n, k, key_m)
+    keyed = {row[2] for row in _KWARGS_KEYS[kind] if row[:2] == (n, k)}
+    rows = []
+    while True:
+        key_m = _nearest_avg_m(avg_m, keyed)
+        if key_m is None:
+            return rows
+        rows.append((n, k, key_m))
+        keyed.discard(key_m)
 
 
-def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:
-    """The kwargs of the key serving this call, or {} when the call tunes anything or no key serves it."""
-    # The positional extras the entry points take: out_dtype (NT / NN), masked_k and out_dtype (variable-K).
-    if n_pos > (2 if kind in ("vk", "vk_accum") else 1) or not set(kw) <= _KWARGS_PASSTHROUGH[kind]:
-        return {}
-    row = _kwargs_key(kind, key)
-    if row is None:
-        return {}
-    keyed = _KWARGS_KEYS[kind][row]
+def _kwargs_key(kind: str, key: tuple):
+    """The ``_KWARGS_KEYS[kind]`` row nearest to ``key`` (the first `_kwargs_rows` tries), the rule the shape-keyed
+    tables follow; None without one."""
+    rows = _kwargs_rows(kind, key)
+    return rows[0] if rows else None
+
+
+def _key_fits(kind: str, key: tuple, row: tuple, G: int, keyed: dict, kw: dict) -> bool:
+    """Whether the set ``keyed`` of ``row`` can serve a call at ``key`` on G experts with the pass-through ``kw``."""
     if kind == "vk" and keyed.get("persist", 0) > 0:
         # The variable-K launcher refuses a persistent grid that does not divide the call's tile count into
         # two or more tiles per workgroup, which another G at the same avg_m can give.
         tm, tn = keyed.get("BLOCK_M") or 256, keyed.get("BLOCK_N") or 256
         tiles = G * (-(-key[0] // tm)) * (-(-key[1] // tn))
-        if tiles % keyed["persist"] or tiles // keyed["persist"] < 2:
-            return {}
-    if kind in ("nt", "nn") and keyed.get("vec_dec") and G > 32:
+        return not (tiles % keyed["persist"] or tiles // keyed["persist"] < 2)
+    if kind not in ("nt", "nn"):
+        return True
+    if keyed.get("vec_dec") and G > 32:
         # The NT and NN launchers drop vec_dec above 32 experts, and nt_seam bit 2 then refuses the set.
+        return False
+    # A set is measured on the tile its row count gets at many experts. When the experts hold 8 or fewer
+    # 256-row tiles in all, `_pick_config_shape` hands out 128 x 128 instead, whose 4 x 4 warp tile has as
+    # many fragment reads per sub-step as matrix ops, and the launchers refuse lds_cosched >= 2 there.
+    pick = _pick_config if kind == "nt" else _pick_config_nn
+    base = pick(key[0], key[1], key[2], G)
+    if base != pick(*row):
+        return False
+    # A set that pins its own tile height is borrowed only where it pads each expert's rows to no more than the
+    # default tile does: ceil(avg_m / BLOCK_M) * BLOCK_M <= ceil(avg_m / base) * base. The rows past an expert's
+    # last row are matrix work on zero-filled A; at 250 rows the 293 key's 160-row tile pads to 320 where the
+    # default 256 pads to 256, and measured 9-17% slower than the default path on the forward and dgrad.
+    tile_m = keyed.get("BLOCK_M") or base[0]
+    if -(-key[2] // tile_m) * tile_m > -(-key[2] // base[0]) * base[0]:
+        return False
+    # A prebuilt m_tiles is checked against the tile height it was built for (`check_prebuilt`).
+    prov = getattr(kw.get("m_tiles"), _PROV, None)
+    return prov is None or prov[3] == tile_m
+
+
+def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:
+    """The kwargs of the key serving this call, or {} when the call tunes anything or no key serves it: the first
+    of `_kwargs_rows` whose set fits the call (`_key_fits`), so a key that cannot serve it gives way to the next
+    nearest one within reach."""
+    # The positional extras the entry points take: out_dtype (NT / NN), masked_k and out_dtype (variable-K).
+    if n_pos > (2 if kind in ("vk", "vk_accum") else 1) or not set(kw) <= _KWARGS_PASSTHROUGH[kind]:
         return {}
-    if kind in ("nt", "nn"):
-        # A set is measured on the tile its row count gets at many experts. When the experts hold 8 or fewer
-        # 256-row tiles in all, `_pick_config_shape` hands out 128 x 128 instead, whose 4 x 4 warp tile has as
-        # many fragment reads per sub-step as matrix ops, and the launchers refuse lds_cosched >= 2 there.
-        pick = _pick_config if kind == "nt" else _pick_config_nn
-        if pick(key[0], key[1], key[2], G) != pick(*row):
-            return {}
-    return dict(keyed)
+    for row in _kwargs_rows(kind, key):
+        keyed = _KWARGS_KEYS[kind][row]
+        if _key_fits(kind, key, row, G, keyed, kw):
+            return dict(keyed)
+    return {}
 
 
 @functools.wraps(_grouped_gemm_bf16_nt_flydsl_kernel_entry, assigned=("__doc__",), updated=())

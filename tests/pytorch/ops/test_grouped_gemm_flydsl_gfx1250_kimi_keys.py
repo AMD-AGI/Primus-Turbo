@@ -181,6 +181,50 @@ def test_variable_k_keys_need_whole_persistent_rounds(kind, name, n, k):
     assert bool(gg._keyed_kwargs(kind, (n, k, 585), 112, 0, {})) == (name == "wgrad_fc1")
 
 
+def _padded(avg_m, tile_m):
+    return -(-avg_m // tile_m) * tile_m
+
+
+@pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
+def test_a_pinned_tile_height_pads_no_more_than_the_default(kind, name, n, k):
+    """The 293 forward / dgrad sets run 160-row tiles; they serve a row count only where they pad each expert's rows
+    to no more than the default tile does, else the call takes the next-nearest key within reach, else none.
+    Below 257 rows the 160-row tile pads to 320 against the default 256; the variable-K sets are not affected."""
+    lo = math.ceil(KEYED_AVG_M[0] / gg._AVG_M_REACH)
+    for avg_m in range(lo, 830):
+        nearest = [row[2] for row in gg._kwargs_rows(kind, (n, k, avg_m))]
+        want = None
+        for key_m in nearest:
+            keyed = _key(kind, n, k, key_m)
+            if kind != "vk":
+                pick = gg._pick_config if kind == "nt" else gg._pick_config_nn
+                cfg = pick(n, k, avg_m, MEASURED_G)
+                if cfg != pick(n, k, key_m) or _padded(avg_m, keyed.get("BLOCK_M") or cfg[0]) > _padded(
+                    avg_m, cfg[0]
+                ):
+                    continue
+            want = key_m
+            break
+        got = gg._keyed_kwargs(kind, (n, k, avg_m), MEASURED_G, 0, {})
+        assert got == (dict(_key(kind, n, k, want)) if want else {}), avg_m
+        if kind != "vk" and 160 < avg_m <= 256 and nearest[0] == 293:
+            assert got != _key(kind, n, k, 293), avg_m
+    for avg_m in (257, 293, 320, 414):
+        assert gg._keyed_kwargs(kind, (n, k, avg_m), MEASURED_G, 0, {}) == _key(kind, n, k, 293), avg_m
+
+
+@pytest.mark.parametrize("kind, name, n, k", SHAPES[:4], ids=_IDS[:4])
+def test_a_prebuilt_m_tiles_of_another_height_skips_the_set(kind, name, n, k):
+    """A caller's prebuilt m_tiles is checked against the tile height it was built for, so a set of another
+    height (the 293 one, 160 rows) is left out rather than refused at launch; one built for 160 rows takes it."""
+    rows = [293] * MEASURED_G
+    offs = torch.tensor([0, *itertools.accumulate(rows)], dtype=torch.int64)
+    for block_m, served in ((256, False), (160, True)):
+        kw = {"m_tiles": gg.build_m_tile_map(offs, block_m)}
+        got = gg._keyed_kwargs(kind, (n, k, 293), MEASURED_G, 0, kw)
+        assert (got == _key(kind, n, k, 293)) == served, block_m
+
+
 @pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
 def test_the_picker_still_hands_out_the_measured_tile(kind, name, n, k):
     """The sets were measured on the picker's 256 x 256 x 128 tile (the 293 forward / dgrad ones and the wgrad
@@ -258,10 +302,11 @@ def _call_four_times(entry, *args, **kwargs):
 NUMERIC_G = {"nt": 8, "nn": 8, "vk": 32}
 
 
-def _check(kind, n, k, rows, reference=True):
+def _check(kind, n, k, rows, reference=True, keyed_call=True):
     args, kw = _operands(kind, n, k, rows)
     G = len(rows)
-    assert gg._keyed_kwargs(kind, (n, k, sum(rows) // G), G, 0, kw), "the call would not take a key"
+    if keyed_call:
+        assert gg._keyed_kwargs(kind, (n, k, sum(rows) // G), G, 0, kw), "the call would not take a key"
     keyed = _call_four_times(_PUBLIC[kind], *args, **kw)
     # persist=0 is a tuning argument: the key is off and the call runs the untuned path
     plain = _call_four_times(_PUBLIC[kind], *args, persist=0, **kw)
@@ -282,10 +327,11 @@ def test_keyed_shape_numeric(kind, name, n, k, avg_m):
 @pytest.mark.parametrize("avg_m", (250, 414, 827, 1600))
 @pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
 def test_nearest_key_numeric(kind, name, n, k, avg_m):
-    """Ragged routing at a row count between or past the keys: the nearest key, bit-identical to the untuned path
-    (an empty expert, a one-row expert and a run that does not fill a tile)."""
+    """Ragged routing at a row count between or past the keys: the key serving it (at 250 the 293 forward / dgrad
+    sets give way, see the tile-height test), bit-identical to the untuned path (an empty expert, a one-row expert
+    and a run that does not fill a tile)."""
     G = NUMERIC_G[kind]
     rows = [0, 1, 159, 256 + 7] + [avg_m] * (G - 5)
     rows.append(avg_m * G - sum(rows))
     assert min(rows) >= 0 and sum(rows) // G == avg_m
-    _check(kind, n, k, rows, reference=False)
+    _check(kind, n, k, rows, reference=False, keyed_call=False)
