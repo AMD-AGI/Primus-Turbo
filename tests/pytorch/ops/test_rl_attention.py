@@ -439,6 +439,27 @@ def test_visibility_backward(dtype, heads, with_sinks):
         torch.testing.assert_close(g.float(), w, atol=5e-2, rtol=5e-2, msg=name)
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("with_mask", [False, True])
+def test_dsink_fp32_accuracy(dtype, with_mask):
+    """dsink takes each row's do . o in fp32 from the backward's own P and dP, not from the rounded
+    forward output (which costs ~1e-3 relative error in bf16)."""
+    hq, hkv, d = 8, 2, 64
+    lens = [33, 200, 129]
+    q, k, v, cu = _varlen(lens, hq, hkv, d, dtype, seed=13)
+    sinks = _sinks(hq, 13)
+    dout = torch.randn(q.shape[0], hq, d, generator=torch.Generator().manual_seed(14)).to(DEVICE, dtype)
+    if with_mask:
+        lo, hi, mask = _mixed_mask(lens, seed=13)
+        got = _grads(q, k, v, cu, 200, d**-0.5, dout, sinks, block_mask=mask)[-1]
+        want = _ref_grads(q, k, v, cu, d**-0.5, dout, sinks, lo=lo, hi=hi)[-1]
+    else:
+        got = _grads(q, k, v, cu, 200, d**-0.5, dout, sinks)[-1]
+        want = _ref_grads(q, k, v, cu, d**-0.5, dout, sinks)[-1]
+    err = ((got.float() - want).norm() / want.norm()).item()
+    assert err < 1e-4, f"dsink relative error {err:.2e}"
+
+
 def test_visibility_backward_sparse_intervals():
     """Short intervals scattered over long sequences, so the pruned dK/dV and dQ walks skip most
     tiles."""

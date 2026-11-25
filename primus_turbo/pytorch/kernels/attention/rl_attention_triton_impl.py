@@ -322,6 +322,7 @@ def rl_attention_bwd_triton(
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
+    dsink = torch.empty(sinks.shape, dtype=torch.float32, device=q.device) if sinks is not None else None
     rl_attention_bwd.flash_attn_onekernel_backward(
         dout,
         q,
@@ -341,12 +342,9 @@ def rl_attention_bwd_triton(
         max_seqlen_q,
         max_seqlen_k,
         0.0,
+        sink=sinks,
+        dsink=dsink,
         sliding_window=window_left if window_left is not None and window_left >= 0 else 0,
         visibility=(vis_lo, vis_hi) if vis_lo is not None else None,
     )
-    dsink = None
-    if sinks is not None:
-        # A sink is a key with value 0: dsink_h = -sum_t exp(sink_h - lse_th) * rowsum(dO * O)_th.
-        delta = (dout.float() * out.float()).sum(-1)
-        dsink = -(torch.exp(sinks.float()[None, :] - lse) * delta).sum(0)
     return dq, dk, dv, dsink

@@ -1250,15 +1250,9 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 ENABLE_SINK=ENABLE_SINK,
             )
             if ENABLE_SINK:
-                sink = tl.load(Sink + hqid).to(tl.float32)
-                if USE_EXP2:
-                    RCP_LN2: tl.constexpr = 1.4426950408889634
-                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
-                else:
-                    psink = tl.math.exp(sink - m)
+                # Per-row fp32 do . o, in delta's layout; the launcher reduces it in a fixed order.
                 delta_recomp = delta_recomp_masked + delta_recomp_unmasked
-                dsink = tl.sum(-psink * delta_recomp[:, None])
-                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
+                tl.store(DSink + adj_delta + offs_m * stride_deltam, delta_recomp, mask=mask_m)
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
             offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
@@ -1796,14 +1790,8 @@ def bwd_kernel_noncausal(
                 VIS_BASE=k_start,
             )
             if ENABLE_SINK:
-                sink = tl.load(Sink + hqid).to(tl.float32)
-                if USE_EXP2:
-                    RCP_LN2: tl.constexpr = 1.4426950408889634
-                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
-                else:
-                    psink = tl.math.exp(sink - m)
-                dsink = tl.sum(-psink * delta_recomp[:, None])
-                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
+                # Per-row fp32 do . o, in delta's layout; the launcher reduces it in a fixed order.
+                tl.store(DSink + adj_delta + offs_m * stride_deltam, delta_recomp, mask=mask_m)
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
             offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
@@ -2045,6 +2033,9 @@ def flash_attn_onekernel_backward(
     else:
         # [batch, num_q_heads, seqlen_q]
         delta_strides = delta.stride()
+    # With a sink, the dq pass stores each row's do . o recomputed in fp32 (sum of p * dp) here;
+    # delta itself comes from the rounded forward output.
+    sink_delta = torch.zeros_like(softmax_lse) if sink is not None else None
 
     # preprocess
     # compute D(delta) = rowsum(dO*O). Note, multiplication is element-wise.
@@ -2142,7 +2133,7 @@ def flash_attn_onekernel_backward(
             dq,
             dk,
             dv,
-            dsink,
+            sink_delta,
             softmax_lse,
             delta,
             *q_strides,
@@ -2200,7 +2191,7 @@ def flash_attn_onekernel_backward(
             dq,
             dk,
             dv,
-            dsink,
+            sink_delta,
             softmax_lse,
             delta,
             *q_strides,
@@ -2248,5 +2239,16 @@ def flash_attn_onekernel_backward(
             **config_onekernel,
             enable_fp_fusion=True,
         )
+
+    if sink is not None:
+        # A sink is a key with value 0: dsink_h = -sum_t exp(sink_h - lse_th) * (do . o)_th, as one
+        # fixed-shape reduction (no atomics, so the result is deterministic).
+        sink_f = sink.float()
+        if IS_VARLEN:
+            p_sink = torch.exp(sink_f[None, :] - softmax_lse)
+            dsink.copy_(-(p_sink * sink_delta).sum(0))
+        else:
+            p_sink = torch.exp(sink_f[None, :, None] - softmax_lse)
+            dsink.copy_(-(p_sink * sink_delta).sum((0, 2)))
 
     return delta
