@@ -276,10 +276,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT": lambda: (
         os.getenv("PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT", "0") == "1"
     ),
-    # "1" makes the gfx1250 FlyDSL bf16 grouped GEMM apply a tuned key only at the exact avg_m
-    # (rows // experts) it was measured at, for A/B runs against the default: a call whose avg_m
-    # lies between keys takes the nearest one on a log scale. Read at every call that can take a
-    # key.
+    # "1" makes the gfx1250 FlyDSL bf16 grouped GEMM apply its tuned keys (the per-shape tables and
+    # the whole-argument sets) only at the exact avg_m (rows // experts) they were measured at, for
+    # A/B runs against the default, where a call whose avg_m is within a factor sqrt(2) of a key
+    # takes the nearest key on a log scale. Read at every call that can take a key.
     "PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS": lambda: (
         os.getenv("PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS", "0") == "1"
     ),

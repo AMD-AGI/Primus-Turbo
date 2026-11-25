@@ -2406,8 +2406,30 @@ def _vk_launch(args: tuple):
     return _cached_launch(_launch_grouped_bf16_variable_k, _VK_COMPILED, 7, args)
 
 
+# Keys serve every avg_m near them, not only the keyed one. Under expert parallelism the rows a GPU receives
+# vary from step to step (dropless routing), so avg_m lands near, not on, a keyed value. Such an avg_m takes
+# the keyed avg_m of its shape nearest to it on a log scale, within a factor _AVG_M_REACH, so a set is never
+# used far from the row counts it was measured at: keys a factor 2 apart serve every avg_m between them, and a
+# lone key serves a factor sqrt(2) either side (512 serves 363-724, 2048 serves 1449-2896).
+# PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS=1 keeps the exact match only, for A/B runs.
+_AVG_M_REACH = 2**0.5
+
+
+def _nearest_avg_m(avg_m: int, keyed) -> int | None:
+    """The keyed avg_m serving a call at ``avg_m`` (>= 1): ``avg_m`` itself if keyed, else the keyed one nearest
+    on a log scale if it is within a factor ``_AVG_M_REACH`` (a tie goes to the smaller), else None."""
+    if avg_m in keyed:
+        return avg_m
+    if not keyed or envs.PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS:
+        return None
+    ratio, near = min((max(m, avg_m) / min(m, avg_m), m) for m in keyed)
+    return near if ratio <= _AVG_M_REACH else None
+
+
 # Shape-keyed pipeline knobs. All are bit-identical to the default path: they move scheduling,
-# dealing or store granularity, never an address, an extent or an accumulation order.
+# dealing or store granularity, never an address, an extent or an accumulation order. The entry
+# points read every table below at the avg_m `_shape_avg_m` resolves, so an avg_m near a key gets
+# the whole group of that key.
 
 _VK_DEEP_RING_KEYS = frozenset({(4096, 7168, 2048), (7168, 2048, 2048)})
 
@@ -2743,14 +2765,15 @@ def _vk_stack_cluster_ok(s: dict, n_blocks_n: int, n_blocks_k: int, tiles: int, 
 
 
 @functools.lru_cache(maxsize=64)
-def _pick_variable_k_config(OUT_M: int, OUT_N: int, avg_m: int, stack: bool = False):
+def _pick_variable_k_config(OUT_M: int, OUT_N: int, avg_m: int, stack: bool = False, key_m: int = 0):
+    # `key_m`: the avg_m the shape keys are read at (`_shape_avg_m`); 0 reads them at avg_m itself.
     if OUT_M < 256 or OUT_N < 256:
         return (64, 64, 64, 2, 2, 2)
     # At avg_m <= 128 the shipped tile runs exactly one k-tile per expert, so the double buffer
     # never reaches steady state.
     if avg_m <= 128:
         return (256, 256, 64, 2, 2, 2)
-    if (OUT_M, OUT_N, avg_m) in _VK_DEEP_RING_KEYS:
+    if (OUT_M, OUT_N, key_m or avg_m) in _VK_DEEP_RING_KEYS:
         # The fourth slot exists for the `_STACK_KEYS` group: the C staging covers two pitches of
         # this arena and the persistent seam (`vk_ovl`) prefetches the next tile's k-tiles 0 and 1
         # into the two past it. Without the seam there is nothing to prefetch into it.
@@ -2911,6 +2934,8 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
         )
 
     _avg_m = max(1, M_total // max(G, 1))
+    # The shape keys are read at `_key_m`; the k-window count behind `split_bar` stays on the real row count.
+    _key_m = _shape_avg_m("vk", OUT_M, OUT_N, _avg_m)
     _keyed = not (BLOCK_M or BLOCK_N)
     # The group as the call left it; anything but -1 in here turns the whole lookup off.
     _passed = (
@@ -2936,18 +2961,18 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
     _want = (
         _keyed
         and all(v < 0 for v in _passed)
-        and (OUT_M, OUT_N, _avg_m) in _STACK_KEYS["vk"]
+        and (OUT_M, OUT_N, _key_m) in _STACK_KEYS["vk"]
         and lds_cosched in (-1, 2)
         and num_buffers in (0, 4)
         and split_bar in (-1, 1)
         and frag_pipeline == 1
         and not (issue_first or k_tiles_const)
     )
-    cfg = _pick_variable_k_config(OUT_M, OUT_N, _avg_m, _want)
+    cfg = _pick_variable_k_config(OUT_M, OUT_N, _avg_m, _want, _key_m)
     if epi_chunk < 0:
-        epi_chunk = _pick_epi_chunk("vk", OUT_M, OUT_N, _avg_m) if _keyed else 1
+        epi_chunk = _pick_epi_chunk("vk", OUT_M, OUT_N, _key_m) if _keyed else 1
     if wmma_b2b < 0:
-        wmma_b2b = _pick_wmma_b2b("vk", OUT_M, OUT_N, _avg_m) if _keyed else 0
+        wmma_b2b = _pick_wmma_b2b("vk", OUT_M, OUT_N, _key_m) if _keyed else 0
     _auto_cosched = lds_cosched < 0
     _auto_buffers = not num_buffers
     _auto_sbar = split_bar == -1
@@ -2959,7 +2984,7 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
     num_buffers = num_buffers or cfg[5]
     _tile = (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
     if _auto_cosched:
-        lds_cosched = _pick_vk_lds_cosched(OUT_M, OUT_N, _avg_m, _want, _tile, frag_pipeline) if _keyed else 0
+        lds_cosched = _pick_vk_lds_cosched(OUT_M, OUT_N, _key_m, _want, _tile, frag_pipeline) if _keyed else 0
     assert OUT_M >= tile_m, f"OUT_M={OUT_M} must be >= tile_m={tile_m} for the descriptor back-off"
     assert OUT_N >= tile_n, f"OUT_N={OUT_N} must be >= tile_n={tile_n} for the descriptor back-off"
     if accumulate:
@@ -2998,7 +3023,7 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
         "vk",
         OUT_M,
         OUT_N,
-        _avg_m,
+        _key_m,
         _STACK_VK,
         _passed,
         (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers),
@@ -3018,9 +3043,9 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
         # then refused. Put its two advanced knobs back on the ungrouped values: with no
         # `head_pipe` / `tdm_deal` / `vk_ovl` riding them they are cost and nothing else.
         if _auto_cosched:
-            lds_cosched = _pick_vk_lds_cosched(OUT_M, OUT_N, _avg_m, False, _tile, frag_pipeline)
+            lds_cosched = _pick_vk_lds_cosched(OUT_M, OUT_N, _key_m, False, _tile, frag_pipeline)
         if _auto_buffers:
-            num_buffers = _pick_variable_k_config(OUT_M, OUT_N, _avg_m)[5]
+            num_buffers = _pick_variable_k_config(OUT_M, OUT_N, _avg_m, False, _key_m)[5]
             if _auto_sbar:
                 split_bar = _vk_auto_split_bar(
                     (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers), OUT_M, OUT_N, _avg_m
@@ -5022,6 +5047,7 @@ def _pick_config(
     b_lds_transpose: int = 0,
     a_ld: int = 0,
     b_ld: int = 0,
+    key_m: int = 0,
 ):
     """(tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) for the NT/NN path.
 
@@ -5029,8 +5055,10 @@ def _pick_config(
     4x4 spills at 256x256 and a two-wave grid runs into the 1024-VGPR-per-lane cap --
     and ``tile_k = 128`` forces ``num_buffers = 2``, because three 128-deep stages of a
     256x256 tile do not fit in the LDS budget.
+
+    ``key_m`` is the avg_m the shape keys are read at (`_shape_avg_m`); 0 reads them at ``avg_m``.
     """
-    cfg = _pick_config_shape(N, K, avg_m, n_groups, b_lds_transpose)
+    cfg = _pick_config_shape(N, K, avg_m, n_groups, b_lds_transpose, key_m)
     if allow_ragged_k:
         wide = _wide_over_narrow_192(cfg, N, K, b_lds_transpose, a_ld, b_ld)
         if wide is not None:
@@ -5051,18 +5079,60 @@ def _wide_over_narrow_192(cfg, N: int, K: int, b_lds_transpose: int, a_ld: int =
     return _ragged_k_upgrade((256, 256, 64, 2, 2, 3), K, b_lds_transpose, a_ld, b_ld)
 
 
-_FWD_WIDE_N_KEYS = frozenset({(4096, 7168), (7168, 2048)})
+_FWD_WIDE_N_KEYS = frozenset({(4096, 7168, 2048), (7168, 2048, 2048)})
 
 _TILE_ORDER_NT = {(4096, 7168, 2048): (8, 8, 32), (7168, 2048, 2048): (8, 8, 32)}
 _TILE_ORDER_NN = {(7168, 4096, 2048): (8, 8, 32), (2048, 7168, 2048): (8, 8, 32)}
 
-_FWD_TDM_DEAL_KEYS = frozenset({(4096, 7168)})
+_FWD_TDM_DEAL_KEYS = frozenset({(4096, 7168, 2048)})
 
 
-def _pick_config_shape(N: int, K: int, avg_m: int, n_groups: int = 0, b_lds_transpose: int = 0):
-    # Exact key only. 448 divides this N, so both dispatch rounds are full and the ragged-N
-    # read-back path is never taken. On an N it does not divide, the NT read path would address
-    # past the allocation, and on NN `pad_interval = tile_n * 2` would be unencodable.
+def _avg_m_index(*tables) -> Mapping:
+    """(N, K) -> the avg_m values ``tables`` key it at; every table is keyed (N, K, avg_m)."""
+    index = {}
+    for table in tables:
+        for n, k, avg_m in table:
+            index.setdefault((n, k), set()).add(avg_m)
+    return MappingProxyType({nk: frozenset(ms) for nk, ms in index.items()})
+
+
+# Every shape-keyed table an entry point reads, by its kind.
+_SHAPE_TABLES = (
+    _ISSUE_FIRST_KEYS,
+    _EPI_CHUNK_KEYS,
+    _STACK_EPI_CHUNK,
+    _WMMA_B2B_KEYS,
+    _LDS_COSCHED_KEYS,
+    _STACK_LDS_COSCHED,
+    _STACK_KEYS,
+)
+_SHAPE_KEY_AVG_M = MappingProxyType(
+    {
+        kind: _avg_m_index(*(t[kind] for t in _SHAPE_TABLES if kind in t), *own)
+        for kind, own in (
+            ("nt", (_FWD_WIDE_N_KEYS, _TILE_ORDER_NT, _FWD_TDM_DEAL_KEYS)),
+            ("nn", (_TILE_ORDER_NN, _TDM_NN_KEYS, _TDM_ASSIGN_NN_KEYS)),
+            ("vk", (_VK_DEEP_RING_KEYS,)),
+        )
+    }
+)
+
+
+def _shape_avg_m(kind: str, N: int, K: int, avg_m: int) -> int:
+    """The avg_m an entry point of ``kind`` reads its shape-keyed tables at: the keyed avg_m of (N, K) that serves
+    ``avg_m`` (`_nearest_avg_m`), else ``avg_m`` itself, which no table then holds."""
+    key_m = _nearest_avg_m(avg_m, _SHAPE_KEY_AVG_M[kind].get((N, K), ()))
+    return avg_m if key_m is None else key_m
+
+
+def _pick_config_shape(
+    N: int, K: int, avg_m: int, n_groups: int = 0, b_lds_transpose: int = 0, key_m: int = 0
+):
+    # Exact key only, not a `_shape_avg_m` table: the 128-row tiles here and in `_pick_config_nn` serve their
+    # row count alone. Served from nearby they measured -13% to -20% at 160 rows, where every expert needs a
+    # second 128-row tile, and within +-2% at 100. 448 divides this N, so both dispatch rounds are full and the
+    # ragged-N read-back path is never taken. On an N it does not divide, the NT read path would address past
+    # the allocation, and on NN `pad_interval = tile_n * 2` would be unencodable.
     if not b_lds_transpose:
         if (N, K, avg_m) == (7168, 2048, 128):
             return (128, 448, 64, 2, 2, 3)
@@ -5083,7 +5153,7 @@ def _pick_config_shape(N: int, K: int, avg_m: int, n_groups: int = 0, b_lds_tran
         # clamped by B's dim-0 extent on the load and C's dim-1 extent on the store. NT ONLY --
         # the transposed B stage of NN needs a power-of-two `pad_interval` (`tile_n * 2`), which
         # 320 is not.
-        if not b_lds_transpose and avg_m == 2048 and (N, K) in _FWD_WIDE_N_KEYS:
+        if not b_lds_transpose and (N, K, key_m or avg_m) in _FWD_WIDE_N_KEYS:
             return (256, 320, 128, 2, 2, 2)
         return (256, 256, 128, 2, 2, 2)
     if avg_m >= 1536 and N % 192 == 0:
@@ -5098,7 +5168,7 @@ def _head_pipe_fits(head_pipe: int, wmma_m_rep: int, wmma_n_rep: int) -> bool:
 
 
 def _head_pipe_ok(head_pipe, cfg, lds_cosched, split_bar, split_bar_depth, k_tail, half_n_skip) -> bool:
-    # Performance-only knob: where the resolved schedule cannot carry it (e.g. off the exact keys,
+    # Performance-only knob: where the resolved schedule cannot carry it (e.g. off the keys,
     # where lds_cosched stays 0), it is dropped rather than raised, like the keyed knobs.
     tile_m, tile_n, _tile_k, m_warp, n_warp, num_buffers = cfg
     wm, wn = tile_m // m_warp // 16, tile_n // n_warp // 16
@@ -5116,7 +5186,8 @@ def _head_pipe_ok(head_pipe, cfg, lds_cosched, split_bar, split_bar_depth, k_tai
 
 def grouped_gemm_bf16_nt_supported(N: int, K: int, avg_m: int = 0, n_groups: int = 0) -> bool:
     """Whether ``grouped_gemm_bf16_nt_flydsl_kernel`` can serve this shape."""
-    cfg = _pick_config(N, K, max(1, avg_m), n_groups)
+    avg_m = max(1, avg_m)
+    cfg = _pick_config(N, K, avg_m, n_groups, key_m=_shape_avg_m("nt", N, K, avg_m))
     return _nt_unsupported_reason(K, cfg) is None
 
 
@@ -5215,14 +5286,15 @@ def _grouped_gemm_bf16_nt_flydsl_kernel_entry(
     _reject_cap_cu(cap_cu)
 
     avg_m = max(1, TOTAL_M // max(G, 1))
-    cfg = _pick_config(N, K, avg_m, G, allow_ragged_k=allow_ragged_k != 0, a_ld=a_ld, b_ld=b_ld)
+    key_m = _shape_avg_m("nt", N, K, avg_m)
+    cfg = _pick_config(N, K, avg_m, G, allow_ragged_k=allow_ragged_k != 0, a_ld=a_ld, b_ld=b_ld, key_m=key_m)
     _keyed = not (BLOCK_M or BLOCK_N)
     if (GROUP_M, num_xcd, xcd_band) == (16, 1, 32):
-        GROUP_M, num_xcd, xcd_band = _TILE_ORDER_NT.get((N, K, avg_m), (GROUP_M, num_xcd, xcd_band))
-    if _keyed and tdm_balance == 0 and tdm_assign == 0 and (N, K) in _FWD_TDM_DEAL_KEYS and avg_m == 2048:
+        GROUP_M, num_xcd, xcd_band = _TILE_ORDER_NT.get((N, K, key_m), (GROUP_M, num_xcd, xcd_band))
+    if _keyed and tdm_balance == 0 and tdm_assign == 0 and (N, K, key_m) in _FWD_TDM_DEAL_KEYS:
         tdm_balance, tdm_assign = 1, 1
     if issue_first < 0:
-        issue_first = _pick_issue_first("nt", N, K, avg_m) if _keyed else 0
+        issue_first = _pick_issue_first("nt", N, K, key_m) if _keyed else 0
     tile_m = BLOCK_M or cfg[0]
     tile_n = BLOCK_N or cfg[1]
     tile_k = BLOCK_K or cfg[2]
@@ -5232,7 +5304,7 @@ def _grouped_gemm_bf16_nt_flydsl_kernel_entry(
     _tile = (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
     if lds_cosched < 0:
         lds_cosched = (
-            _pick_nt_lds_cosched("nt", N, K, avg_m, _tile, frag_ring, sched_style, issue_first)
+            _pick_nt_lds_cosched("nt", N, K, key_m, _tile, frag_ring, sched_style, issue_first)
             if _keyed
             else 0
         )
@@ -5300,7 +5372,7 @@ def _grouped_gemm_bf16_nt_flydsl_kernel_entry(
         "nt",
         N,
         K,
-        avg_m,
+        key_m,
         _passed,
         _tile,
         _keyed and not (seg_split or inkernel_scan or dead_tile_exit or half_n_skip) and epi_fence >= 2,
@@ -5316,7 +5388,7 @@ def _grouped_gemm_bf16_nt_flydsl_kernel_entry(
     # Resolved only here: the store granularity is a member of the group above, and nothing
     # between the entry and this point reads it, so it can wait for the gates to have their say.
     if epi_chunk < 0:
-        epi_chunk = _pick_epi_chunk("nt", N, K, avg_m, _stack is not None) if _keyed else 1
+        epi_chunk = _pick_epi_chunk("nt", N, K, key_m, _stack is not None) if _keyed else 1
 
     if not _head_pipe_ok(
         head_pipe,
@@ -5450,6 +5522,7 @@ _NN_FALLBACK_WARNED: set = set()
 @functools.lru_cache(maxsize=64)
 def _pick_config_nn(N: int, K: int, avg_m: int, n_groups: int = 0, allow_ragged_k: bool = True):
     if allow_ragged_k:
+        # Exact keys only, like the 128-row NT tile in `_pick_config_shape`.
         if (N, K, avg_m) == (7168, 4096, 128):
             return _clamp_num_buffers((128, 512, 64, 2, 2, 3), K)
         if (N, K, avg_m) == (2048, 7168, 128):
@@ -5766,21 +5839,23 @@ def _grouped_gemm_bf16_nn_flydsl_kernel_entry(
         why = nn_native_unsupported_reason(N, Kb, cfg[1], cfg[2], cfg[5], allow_ragged_k=ragged_ok)
         if why is None:
             keyed = not (BLOCK_M or BLOCK_N)
+            # No NN tile is shape-keyed, so only the knobs below read the tables at key_m.
+            key_m = _shape_avg_m("nn", N, Kb, avg_m)
             if (GROUP_M or 16, num_xcd, xcd_band) == (16, 1, 32):
-                GROUP_M, num_xcd, xcd_band = _TILE_ORDER_NN.get((N, Kb, avg_m), (GROUP_M, num_xcd, xcd_band))
+                GROUP_M, num_xcd, xcd_band = _TILE_ORDER_NN.get((N, Kb, key_m), (GROUP_M, num_xcd, xcd_band))
             if issue_first < 0:
-                issue_first = _pick_issue_first("nn", N, Kb, avg_m) if keyed else 0
+                issue_first = _pick_issue_first("nn", N, Kb, key_m) if keyed else 0
             if epi_chunk < 0:
-                epi_chunk = _pick_epi_chunk("nn", N, Kb, avg_m) if keyed else 1
+                epi_chunk = _pick_epi_chunk("nn", N, Kb, key_m) if keyed else 1
             if tdm_nn < 0:
-                tdm_nn = _pick_tdm_nn(N, Kb, avg_m) if keyed else 0
+                tdm_nn = _pick_tdm_nn(N, Kb, key_m) if keyed else 0
             if tdm_assign < 0:
-                tdm_assign = _pick_tdm_assign_nn(N, Kb, avg_m) if (keyed and tdm_nn) else 0
+                tdm_assign = _pick_tdm_assign_nn(N, Kb, key_m) if (keyed and tdm_nn) else 0
             if wmma_b2b < 0:
-                wmma_b2b = _pick_wmma_b2b("nn", N, Kb, avg_m) if keyed else 0
+                wmma_b2b = _pick_wmma_b2b("nn", N, Kb, key_m) if keyed else 0
             if lds_cosched < 0:
                 lds_cosched = (
-                    _pick_nt_lds_cosched("nn", N, Kb, avg_m, cfg, frag_ring, sched_style, issue_first)
+                    _pick_nt_lds_cosched("nn", N, Kb, key_m, cfg, frag_ring, sched_style, issue_first)
                     if keyed
                     else 0
                 )
@@ -5820,7 +5895,7 @@ def _grouped_gemm_bf16_nn_flydsl_kernel_entry(
                 "nn",
                 N,
                 Kb,
-                avg_m,
+                key_m,
                 _passed,
                 cfg,
                 keyed and not inkernel_scan and epi_fence >= 2,
@@ -5975,11 +6050,11 @@ def _grouped_gemm_bf16_nn_flydsl_kernel_entry(
 # and refusal of the explicit path still applies; a call that passes any tuning argument gets none of it, and
 # every other shape reaches the entry points unchanged. A key also declines a call whose expert count the
 # launchers would refuse it for (see `_keyed_kwargs`). These shapes cannot go through `_STACK_KEYS`: its
-# group also needs `lds_cosched`, `issue_first`, the tile order and the TDM dealing from tables keyed for
-# DeepSeek-V3 at avg_m = 2048 only (the forward `tdm_balance` / `tdm_assign` pair is tied to avg_m == 2048
-# in code), and off those keys `head_pipe` is dropped and `nt_ovl` then refuses. Every value moves a
-# schedule, a dealing or a store granularity -- none moves an address, an extent or an accumulation order --
-# so a key changes the speed and never the result.
+# group also needs `lds_cosched`, `issue_first`, the tile order and the TDM dealing from tables that hold
+# only DeepSeek-V3's (N, K), and off those keys `head_pipe` is dropped and `nt_ovl` then refuses. Every value
+# moves a schedule, a dealing or a store granularity -- none moves an address, an extent or an accumulation
+# order -- so a key changes the speed and never the result. A key serves the avg_m near it by the same rule
+# as the shape-keyed tables (`_nearest_avg_m`).
 #
 # MiniMax-M3 MoE: hidden 6144, gated expert FFN 3072 (fc1 N = 6144), 128 experts, top-4. At EP4 and
 # sequence 4096 each GPU holds G = 32 experts and receives M = 16384 rows, avg_m = 512.
@@ -6219,32 +6294,12 @@ _KWARGS_PASSTHROUGH = {
 }
 
 
-# Keys serve every avg_m near them, not only the keyed one. Under expert parallelism the rows a GPU receives
-# vary from step to step (dropless routing), so avg_m lands near, not on, a keyed value. Such an avg_m takes
-# the keyed avg_m of its (N, K) nearest to it on a log scale, up to a factor _AVG_M_REACH past the smallest
-# and the largest key, so a set is never used far from the row counts it was measured at: with keys a factor
-# 2 apart each one serves a factor sqrt(2) either side (512 serves 363-724), and so does a lone key.
-# PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS=1 keeps the exact match only, for A/B runs.
-_AVG_M_REACH = 2**0.5
-
-
 def _kwargs_key(kind: str, key: tuple):
-    """The ``_KWARGS_KEYS[kind]`` row for ``key``: the exact one, else the keyed avg_m of its (N, K) nearest
-    to ``key``'s on a log scale, within ``_AVG_M_REACH`` of the keyed range; None without one."""
-    table = _KWARGS_KEYS[kind]
-    if key in table:
-        return key
-    if envs.PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS:
-        return None
+    """The ``_KWARGS_KEYS[kind]`` row serving ``key`` = (N, K, avg_m): the row of the keyed avg_m of its (N, K)
+    that `_nearest_avg_m` picks, the rule the shape-keyed tables follow; None without one."""
     n, k, avg_m = key
-    rows = [row for row in table if row[:2] == (n, k)]
-    if (
-        not rows
-        or not min(r[2] for r in rows) / _AVG_M_REACH <= avg_m <= max(r[2] for r in rows) * _AVG_M_REACH
-    ):
-        return None
-    # ratio distance; a tie (the geometric midpoint) goes to the smaller key
-    return min(rows, key=lambda row: (max(row[2], avg_m) / min(row[2], avg_m), row[2]))
+    key_m = _nearest_avg_m(avg_m, {row[2] for row in _KWARGS_KEYS[kind] if row[:2] == (n, k)})
+    return None if key_m is None else (n, k, key_m)
 
 
 def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:

@@ -17,9 +17,12 @@ Two groups:
   ``test_stack_off_resolves_to_the_pre_group_values``: three knobs of the group were once applied
   outside it, which cost a measured 0.86% / 0.57% / 0.44% on the three operators concerned when a
   caller switched the stack off, and nothing in the entry points stops that from coming back.
+  The row counts near the key (``_shape_avg_m``) are host-only too, down to what the entry points
+  launch, recorded with the launch itself replaced.
 * Numeric, on a gfx1250 card: the six delivery shapes of the DeepSeek-V3 MoE layer, at the
-  ``avg_m`` the key table is written for. These are the only shapes in the repository's test
-  suite that take the keyed path, so without them the whole table is untested on hardware.
+  ``avg_m`` the key table is written for and at a row count it serves from nearby. These are the
+  only shapes in the repository's test suite that take the keyed path, so without them the whole
+  table is untested on hardware.
 
 ``tests/conftest.py`` lists this file in ``_GFX1250_ENABLED_TESTS``; on gfx1250 every test outside
 that list is skipped, so an unlisted file never runs on the part it was written for.
@@ -27,9 +30,12 @@ that list is skipped, so an unlisted file never runs on the part it was written 
 
 import inspect
 import itertools
+from collections.abc import Mapping
 
 import pytest
 import torch
+
+import primus_turbo.common.envs as envs
 
 pytest.importorskip("flydsl", reason="the FlyDSL gfx1250 grouped GEMM lives behind flydsl")
 
@@ -83,13 +89,14 @@ _VK_GROUP_M = inspect.signature(grouped_gemm_bf16_variable_k_flydsl_kernel).para
 
 def _picked_tile(kind: str, a: int, b: int, avg_m: int, G: int):
     """The tile the entry point will build the key lookup against."""
+    key_m = gg._shape_avg_m(kind, a, b, avg_m)
     if kind == "nt":
-        return gg._pick_config(a, b, avg_m, G)
+        return gg._pick_config(a, b, avg_m, G, key_m=key_m)
     if kind == "nn":
         return gg._pick_config_nn(a, b, avg_m, G)
     # The variable-K picker answers a different ring depth inside the group than outside it, and
     # the lookup compares against the inside one -- see the ring-depth test below.
-    return gg._pick_variable_k_config(a, b, avg_m, True)
+    return gg._pick_variable_k_config(a, b, avg_m, True, key_m)
 
 
 def _keyed_group(kind: str, a: int, b: int, avg_m: int = KEYED_AVG_M) -> dict:
@@ -125,13 +132,11 @@ def test_delivery_shapes_hit_the_stack_keys(kind, name, a, b, tile):
 
 @pytest.mark.parametrize("kind, name, a, b, tile", DELIVERY, ids=_IDS)
 def test_only_avg_m_2048_is_keyed(kind, name, a, b, tile):
-    """The table is a point lookup on ``avg_m``; every other row count takes the fallback.
-
-    Stated as a test because it is the main limitation of this revision: 512, 1024 and 4096 rows
-    per expert resolve the whole group off and run exactly what the untuned path runs. Measured
-    separately, the same knobs are worth +5.8% to +34.8% at those row counts, so the table is
-    known to be leaving that on the floor -- but reaching it needs more than new rows here
-    (see the variable-K window test below).
+    """The table holds avg_m = 2048 only. The row counts near it read it at 2048 (see the near-key tests below);
+    512, 1024 and 4096 rows per expert are further than a factor ``_AVG_M_REACH`` away, resolve the whole group
+    off and run exactly what the untuned path runs. Measured separately, the same knobs are worth +5.8% to
+    +34.8% at those row counts, so the table is known to be leaving that on the floor -- but reaching it needs
+    more than new rows here (see the variable-K window test below).
     """
     for avg_m in (64, 128, 256, 512, 1024, 4096):
         assert (a, b, avg_m) not in gg._STACK_KEYS[kind], (
@@ -456,6 +461,219 @@ def test_the_nn_entry_point_cannot_read_a_stack_override():
 
 
 # ---------------------------------------------------------------------------
+# Host-only: row counts near the key.
+# ---------------------------------------------------------------------------
+
+# Under expert parallelism the rows a GPU receives vary per step, so avg_m lands near 2048, not on it. Every table
+# below is read at the avg_m `_shape_avg_m` resolves: 2048 within a factor _AVG_M_REACH of it (1449-2896 rows),
+# the call's own avg_m, which no table holds, outside.
+NEAR = (1449, 1700, 2047, 2049, 2400, 2896)
+FAR = (1024, 1448, 2897, 4096)
+# Every shape table the entry points read, written out so that a new table has to be added here and to the
+# module's index together.
+SHAPE_TABLES = {
+    "nt": (
+        "_ISSUE_FIRST_KEYS",
+        "_EPI_CHUNK_KEYS",
+        "_STACK_EPI_CHUNK",
+        "_LDS_COSCHED_KEYS",
+        "_STACK_LDS_COSCHED",
+        "_STACK_KEYS",
+        "_FWD_WIDE_N_KEYS",
+        "_TILE_ORDER_NT",
+        "_FWD_TDM_DEAL_KEYS",
+    ),
+    "nn": (
+        "_ISSUE_FIRST_KEYS",
+        "_EPI_CHUNK_KEYS",
+        "_STACK_EPI_CHUNK",
+        "_WMMA_B2B_KEYS",
+        "_LDS_COSCHED_KEYS",
+        "_STACK_LDS_COSCHED",
+        "_STACK_KEYS",
+        "_TILE_ORDER_NN",
+        "_TDM_NN_KEYS",
+        "_TDM_ASSIGN_NN_KEYS",
+    ),
+    "vk": (
+        "_EPI_CHUNK_KEYS",
+        "_STACK_EPI_CHUNK",
+        "_WMMA_B2B_KEYS",
+        "_LDS_COSCHED_KEYS",
+        "_STACK_LDS_COSCHED",
+        "_STACK_KEYS",
+        "_VK_DEEP_RING_KEYS",
+    ),
+}
+# The tables above that serve one kind only, keyed (N, K, avg_m) directly rather than per kind.
+_ONE_KIND = frozenset(
+    {
+        "_FWD_WIDE_N_KEYS",
+        "_TILE_ORDER_NT",
+        "_FWD_TDM_DEAL_KEYS",
+        "_TILE_ORDER_NN",
+        "_TDM_NN_KEYS",
+        "_TDM_ASSIGN_NN_KEYS",
+        "_VK_DEEP_RING_KEYS",
+    }
+)
+
+
+def _is_shape_key(row) -> bool:
+    return isinstance(row, tuple) and len(row) == 3 and all(isinstance(v, int) for v in row)
+
+
+def _rows(name: str, kind: str):
+    table = getattr(gg, name)
+    return set(table) if name in _ONE_KIND else set(table.get(kind, ()))
+
+
+def test_every_shape_table_is_indexed():
+    """`_shape_avg_m` reads one index of the (N, K, avg_m) rows of every shape table, and no table is missing from it.
+
+    A table left out would be read at the call's own avg_m and miss near the key -- what every one of them did
+    before -- and only the speed would show it. The module is scanned for tables of (N, K, avg_m) rows so that a
+    new one cannot be added without being listed here.
+    """
+    for kind, names in SHAPE_TABLES.items():
+        want = {}
+        for name in names:
+            for n, k, avg_m in _rows(name, kind):
+                want.setdefault((n, k), set()).add(avg_m)
+        assert {nk: set(ms) for nk, ms in gg._SHAPE_KEY_AVG_M[kind].items()} == want, kind
+    listed = {name for names in SHAPE_TABLES.values() for name in names}
+    for name, table in vars(gg).items():
+        if name == "_KWARGS_KEYS" or not isinstance(table, (Mapping, frozenset, set)):
+            continue
+        if table and all(kind in ("nt", "nn", "vk") for kind in table):
+            rows = [row for per_kind in table.values() for row in per_kind]
+        else:
+            rows = list(table)
+        if rows and all(_is_shape_key(row) for row in rows):
+            assert name in listed, f"{name} holds (N, K, avg_m) rows but is not read through _shape_avg_m"
+
+
+@pytest.mark.parametrize("kind, name, a, b, tile", DELIVERY, ids=_IDS)
+def test_row_counts_near_the_key_read_the_tables_at_it(kind, name, a, b, tile):
+    """Every avg_m within a factor _AVG_M_REACH of 2048 reads the tables at 2048, and nothing further away does."""
+    for avg_m in range(1, 8193):
+        got = gg._shape_avg_m(kind, a, b, avg_m)
+        near = max(avg_m, KEYED_AVG_M) / min(avg_m, KEYED_AVG_M) <= gg._AVG_M_REACH
+        assert got == (KEYED_AVG_M if near else avg_m), avg_m
+    assert [gg._shape_avg_m(kind, a, b, m) for m in NEAR] == [KEYED_AVG_M] * len(NEAR)
+    assert [gg._shape_avg_m(kind, a, b, m) for m in FAR] == list(FAR)
+
+
+def test_shapes_without_a_key_read_the_tables_at_their_own_avg_m():
+    """MiniMax-M3, Muse Spark and any other (N, K): no shape table holds them, so nothing changes for them here."""
+    for kind, n, k in (("nt", 6144, 6144), ("nn", 4096, 8192), ("vk", 8192, 4096), ("nt", 7168, 7168)):
+        assert [gg._shape_avg_m(kind, n, k, m) for m in (363, 512, 1449, 2048)] == [363, 512, 1449, 2048]
+
+
+def test_exact_keys_switch_reads_the_tables_at_the_call_s_own_avg_m(monkeypatch):
+    """PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS=1: only 2048 itself is keyed, and the cached pickers follow the switch."""
+    out_m, out_n = VK_SHAPES["wgrad_fc1"]
+    near = gg._pick_variable_k_config(out_m, out_n, 1700, True, gg._shape_avg_m("vk", out_m, out_n, 1700))
+    assert near == (256, 256, 64, 2, 2, 4)
+    monkeypatch.setenv("PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS", "1")
+    envs.reset_cache()
+    for kind, name, a, b, tile in DELIVERY:
+        assert [gg._shape_avg_m(kind, a, b, m) for m in NEAR] == list(NEAR), name
+        assert gg._shape_avg_m(kind, a, b, KEYED_AVG_M) == KEYED_AVG_M, name
+    exact = gg._pick_variable_k_config(out_m, out_n, 1700, True, gg._shape_avg_m("vk", out_m, out_n, 1700))
+    assert exact == (256, 256, 128, 2, 2, 2)
+
+
+@pytest.mark.parametrize("kind, name, a, b, tile", DELIVERY, ids=_IDS)
+def test_near_the_key_every_lookup_answers_as_at_the_key(kind, name, a, b, tile):
+    """Tile, ring depth, tile order, dealing, schedule, store chunk and the stack itself, knob by knob."""
+
+    def answers(avg_m, G):
+        key_m = gg._shape_avg_m(kind, a, b, avg_m)
+        got = {
+            "tile": _picked_tile(kind, a, b, avg_m, G),
+            "epi_chunk": gg._pick_epi_chunk(kind, a, b, key_m, True),
+        }
+        got["epi_chunk_off"] = gg._pick_epi_chunk(kind, a, b, key_m, False)
+        got["lds_cosched"] = gg._pick_lds_cosched(kind, a, b, key_m, True)
+        got["lds_cosched_off"] = gg._pick_lds_cosched(kind, a, b, key_m, False)
+        names = gg._STACK_VK if kind == "vk" else gg._STACK_NT
+        got["stack"] = gg._pick_stack(kind, a, b, key_m, names, tuple(-1 for _ in names), got["tile"], True)
+        if kind in ("nt", "nn"):
+            got["issue_first"] = gg._pick_issue_first(kind, a, b, key_m)
+            order = gg._TILE_ORDER_NT if kind == "nt" else gg._TILE_ORDER_NN
+            got["order"] = order.get((a, b, key_m))
+        if kind == "nt":
+            got["tdm_deal"] = (a, b, key_m) in gg._FWD_TDM_DEAL_KEYS
+        if kind == "nn":
+            got["tdm_nn"] = (gg._pick_tdm_nn(a, b, key_m), gg._pick_tdm_assign_nn(a, b, key_m))
+        if kind in ("nn", "vk"):
+            got["wmma_b2b"] = gg._pick_wmma_b2b(kind, a, b, key_m)
+        if kind == "vk":
+            got["split_bar"] = gg._vk_auto_split_bar(got["tile"], a, b, avg_m)
+        return got
+
+    for G in (8, 16, 32, 64):
+        keyed = answers(KEYED_AVG_M, G)
+        assert keyed["tile"] == tile and keyed["stack"] is not None
+        for avg_m in NEAR:
+            assert answers(avg_m, G) == keyed, (G, avg_m)
+        for avg_m in FAR:
+            off = answers(avg_m, G)
+            assert off["stack"] is None and off["lds_cosched"] == off["lds_cosched_off"] == 0, (G, avg_m)
+            # the NN tile at 2048 is the untuned one: no table keys it
+            assert (off["tile"] == tile) == (kind == "nn"), (G, avg_m)
+
+
+def _launched(kind: str, a: int, b: int, avg_m: int, G: int, monkeypatch) -> tuple:
+    """The compile-time arguments the public entry point launches with for balanced rows, on CPU tensors.
+
+    The launch itself is replaced by a recorder, so this runs everything the entry point resolves -- the picker, every
+    table, the group and its gates -- without a device. Dropped from the record: the runtime arguments (pointers,
+    stream, strides) and, on NT / NN, the M tile count, which follows the row count rather than the key.
+    """
+    seen = []
+    monkeypatch.setattr(gg, "_require_gfx1250", lambda device: None)
+    monkeypatch.setattr(gg, "_as_ptr", lambda t: 0)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(gg, "_nt_launch", lambda args: seen.append(args[11:]))
+    monkeypatch.setattr(gg, "_vk_launch", lambda args: seen.append(args[7:]))
+    M, bf16 = G * avg_m, torch.bfloat16
+    offs = _group_offs(G, avg_m, "cpu")
+    if kind == "nt":
+        grouped_gemm_bf16_nt_flydsl_kernel(
+            torch.empty(M, b, dtype=bf16), torch.empty(G, a, b, dtype=bf16), offs
+        )
+    elif kind == "nn":
+        grouped_gemm_bf16_nn_flydsl_kernel(
+            torch.empty(M, b, dtype=bf16), torch.empty(G, b, a, dtype=bf16), offs
+        )
+    else:
+        grouped_gemm_bf16_variable_k_flydsl_kernel(
+            torch.empty(M, a, dtype=bf16), torch.empty(M, b, dtype=bf16), offs
+        )
+    assert len(seen) == 1
+    return seen[0]
+
+
+@pytest.mark.parametrize("kind, name, a, b, tile", DELIVERY, ids=_IDS)
+def test_near_the_key_the_entry_point_launches_the_keyed_kernel(kind, name, a, b, tile, monkeypatch):
+    """At both ends of what 2048 serves the entry point launches exactly the kernel the keyed row count launches; past
+    them, and with PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS=1, the untuned one."""
+    G = NUMERIC_G
+    keyed = _launched(kind, a, b, KEYED_AVG_M, G, monkeypatch)
+    untuned = _launched(kind, a, b, 1448, G, monkeypatch)
+    assert keyed != untuned
+    for avg_m in (1449, 2896):
+        assert _launched(kind, a, b, avg_m, G, monkeypatch) == keyed, avg_m
+    assert _launched(kind, a, b, 2897, G, monkeypatch) == untuned
+    monkeypatch.setenv("PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS", "1")
+    envs.reset_cache()
+    assert _launched(kind, a, b, 1449, G, monkeypatch) == untuned
+    assert _launched(kind, a, b, KEYED_AVG_M, G, monkeypatch) == keyed
+
+
+# ---------------------------------------------------------------------------
 # Numeric: the six delivery shapes, on a gfx1250 card.
 # ---------------------------------------------------------------------------
 
@@ -659,3 +877,39 @@ def test_ragged_rows_do_not_depend_on_the_stack():
     ref = _ref_rows(a, b, offs, trans_b=True)
     _assert_matches(keyed.detach().cpu(), ref, a.dtype)
     torch.testing.assert_close(plain, keyed, rtol=0, atol=0)
+
+
+@needs_gfx1250
+@pytest.mark.parametrize("kind, name, a, b, tile", DELIVERY, ids=_IDS)
+def test_near_the_key_numeric(kind, name, a, b, tile, monkeypatch):
+    """Uneven rows at M_total // G = 1449, the low end of what 2048 serves: right against the fp32 reference, and bit
+    for bit the untuned call (PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS=1), since every keyed value moves a schedule only.
+    """
+    avg_m = 1449
+    rows = [0, 1, 40, 255, avg_m + 7, 2 * avg_m, 3 * avg_m]
+    rows += [NUMERIC_G * avg_m - sum(rows)]
+    assert len(rows) == NUMERIC_G and min(rows) >= 0
+    assert gg._shape_avg_m(kind, a, b, avg_m) == KEYED_AVG_M
+    _assert_keyed_path(kind, a, b, NUMERIC_G)
+    offs = torch.tensor([0, *itertools.accumulate(rows)], dtype=torch.int64, device="cuda")
+    M = sum(rows)
+    torch.manual_seed(0)
+    if kind == "nt":
+        x = torch.randn(M, b, dtype=torch.bfloat16, device="cuda")
+        w = torch.randn(NUMERIC_G, a, b, dtype=torch.bfloat16, device="cuda")
+        entry, ref = grouped_gemm_bf16_nt_flydsl_kernel, lambda: _ref_rows(x, w, offs, trans_b=True)
+    elif kind == "nn":
+        x = torch.randn(M, b, dtype=torch.bfloat16, device="cuda")
+        w = torch.randn(NUMERIC_G, b, a, dtype=torch.bfloat16, device="cuda")
+        entry, ref = grouped_gemm_bf16_nn_flydsl_kernel, lambda: _ref_rows(x, w, offs, trans_b=False)
+    else:
+        x = torch.randn(M, a, dtype=torch.bfloat16, device="cuda")
+        w = torch.randn(M, b, dtype=torch.bfloat16, device="cuda")
+        entry, ref = grouped_gemm_bf16_variable_k_flydsl_kernel, lambda: _ref_variable_k(x, w, offs)
+
+    keyed = _call_four_times(entry, x, w, offs)
+    monkeypatch.setenv("PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS", "1")
+    envs.reset_cache()
+    plain = _call_four_times(entry, x, w, offs)
+    _assert_matches(keyed.detach().cpu(), ref(), x.dtype)
+    torch.testing.assert_close(keyed, plain, rtol=0, atol=0)

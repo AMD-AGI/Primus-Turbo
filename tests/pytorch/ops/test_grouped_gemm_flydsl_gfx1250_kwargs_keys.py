@@ -222,13 +222,36 @@ def test_keys_serve_every_row_count_in_reach(kind, n, k):
 
 
 def test_the_geometric_midpoint_splits_two_keys(monkeypatch):
-    """512 and 1024 meet at 724.08 rows, 1024 and 2048 at 1448.2; an exact tie goes to the smaller key."""
+    """512 and 1024 meet at 724.08 rows, 1024 and 2048 at 1448.2; an exact tie goes to the smaller key. The reach
+    bounds every key, not only the outer ones, so keys a factor 4 apart leave the row counts between them unserved."""
     for kind, n, k in FAMILIES:
         if {512, 1024, 2048} <= set(_keyed_avg_m(kind, n, k)):
             got = [gg._kwargs_key(kind, (n, k, avg_m))[2] for avg_m in (724, 725, 1448, 1449)]
             assert got == [512, 1024, 1024, 2048], (kind, n, k)
+    monkeypatch.setitem(gg._KWARGS_KEYS, "nt", {(1, 1, 400): {}, (1, 1, 484): {}})
+    assert gg._kwargs_key("nt", (1, 1, 440)) == (1, 1, 400)
     monkeypatch.setitem(gg._KWARGS_KEYS, "nt", {(1, 1, 512): {}, (1, 1, 2048): {}})
-    assert gg._kwargs_key("nt", (1, 1, 1024)) == (1, 1, 512)
+    got = [gg._kwargs_key("nt", (1, 1, avg_m)) for avg_m in (724, 725, 1024, 1448, 1449)]
+    assert got == [(1, 1, 512), None, None, None, (1, 1, 2048)]
+
+
+def test_one_rule_serves_both_key_forms():
+    """`_nearest_avg_m` is the rule `_KWARGS_KEYS` and the shape-keyed tables both read: the keyed avg_m itself,
+    else the nearest on a log scale within a factor _AVG_M_REACH, a tie going to the smaller; else none."""
+    near = gg._nearest_avg_m
+    assert [near(avg_m, {512}) for avg_m in (362, 363, 724, 725)] == [None, 512, 512, None]
+    assert [near(avg_m, {512}) for avg_m in (511, 512, 513)] == [512] * 3
+    assert [near(avg_m, {512, 1024}) for avg_m in (724, 725)] == [512, 1024]
+    assert near(440, {400, 484}) == 400
+    assert near(1024, {512, 2048}) is None
+    assert near(512, ()) is None and near(512, frozenset()) is None
+    assert [near(avg_m, {2048}) for avg_m in (1448, 1449, 2896, 2897)] == [None, 2048, 2048, None]
+
+
+def test_one_rule_exact_keys_switch(monkeypatch):
+    monkeypatch.setenv("PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS", "1")
+    got = [gg._nearest_avg_m(avg_m, {512, 1024}) for avg_m in (511, 512, 724, 1024)]
+    assert got == [None, 512, None, 1024]
 
 
 @pytest.mark.parametrize("kind, n, k", FAMILIES, ids=[f"{kd}-{n}x{k}" for kd, n, k in FAMILIES])
