@@ -150,6 +150,30 @@ def _metadata(
     return starts, vis_lo, vis_hi, group
 
 
+def _row_stride(t: torch.Tensor, head_size: int) -> Optional[int]:
+    """The token stride the kernel can take for ``t`` [..., tokens, heads, D]: heads packed in a
+    row (head stride D, unit last stride), rows 16-byte aligned. None if a copy is needed."""
+    if t.stride(-1) != 1 or (t.shape[-2] > 1 and t.stride(-2) != head_size) or t.data_ptr() % 16:
+        return None
+    row = t.stride(-3)
+    if row % 8 or row < t.shape[-2] * head_size:
+        return None
+    if t.ndim == 4 and t.shape[0] > 1 and t.stride(0) != t.shape[1] * row:
+        return None  # pages must follow each other as whole rows of a [blocks * page, ...] cache
+    return row
+
+
+def _kv_with_stride(k: torch.Tensor, v: torch.Tensor, head_size: int):
+    """K, V and their shared token stride. Token-strided views (K / V slices of a fused QKV
+    projection, say) are read in place; K and V share one stride in the kernel, so a layout it
+    cannot address is copied to contiguous."""
+    sk, sv = _row_stride(k, head_size), _row_stride(v, head_size)
+    if sk is not None and sk == sv:
+        return k, v, sk
+    k, v = k.contiguous(), v.contiguous()
+    return k, v, k.shape[-2] * head_size
+
+
 def rl_attention_fwd_flydsl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -188,12 +212,16 @@ def rl_attention_fwd_flydsl(
     num_tokens, num_q_heads, head_size = q.shape
     num_kv_heads = k.shape[-2]
     assert v.shape[-1] == head_size, "the FlyDSL RL forward needs equal q / v head sizes"
-    assert k.is_contiguous() and v.is_contiguous(), "the FlyDSL RL forward needs contiguous K / V"
-    q = q.contiguous()
+    k, v, stride_kv = _kv_with_stride(k, v, head_size)
+    stride_q = _row_stride(q, head_size)
+    if stride_q is None:
+        q = q.contiguous()
+        stride_q = num_q_heads * head_size
     if out is None:
-        out = torch.empty_like(q)
-    elif not out.is_contiguous():
-        raise ValueError("the FlyDSL RL forward writes out with q's contiguous [num_tokens, Hq, D] layout")
+        out = torch.empty((num_tokens, num_q_heads, head_size), dtype=q.dtype, device=q.device)
+    elif _row_stride(out, head_size) is None:
+        raise ValueError("the FlyDSL RL forward writes out rows of [Hq, D] with unit last stride, 16-byte aligned")
+    stride_o = _row_stride(out, head_size)
     lse = torch.empty((num_tokens, num_q_heads) if return_lse else (0,), dtype=torch.float32, device=q.device)
     if num_tokens == 0:
         return out, lse
@@ -255,6 +283,9 @@ def rl_attention_fwd_flydsl(
     if return_lse:
         kw["debug_counts"] = lse
     kw.update(
+        stride_kv_n=stride_kv,
+        stride_q_n=stride_q,
+        stride_o_n=stride_o,
         seq_len_kv=int(max_seqlen_k),
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_kv=cu_seqlens_k,

@@ -174,6 +174,7 @@ def build_rl_flash_attn_module(
         seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
         stride_kv_n: fx.Int32,
+        stride_o_n: fx.Int32,
         head_dim_runtime: fx.Int32,
         block_table_stride: fx.Int32,
     ):
@@ -193,6 +194,7 @@ def build_rl_flash_attn_module(
             stride_kv_n,
             head_dim_runtime,
             block_table_stride,
+            stride_o_n=stride_o_n,
             SINK=SINK,
             # The D <= 64 Cauchy-Schwarz bound is computed over the whole packed K, and it floors
             # rows whose prologue tile is masked, so it is batch-dependent: off unless asked for.
@@ -1033,6 +1035,7 @@ def build_rl_flash_attn_module(
         seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
         stride_kv_n: fx.Int32,
+        stride_o_n: fx.Int32,
         head_dim_runtime: fx.Int32,
         block_table_stride: fx.Int32,
         split_programs: fx.Int32,
@@ -1082,6 +1085,7 @@ def build_rl_flash_attn_module(
             seq_len_kv,
             stride_q_n,
             stride_kv_n,
+            stride_o_n,
             head_dim_runtime,
             block_table_stride,
             value_attrs={
@@ -1119,6 +1123,7 @@ def build_rl_flash_attn_module(
         seq_len,
         stride_kv_n,
         stride_q_n,  # noqa: E741
+        stride_o_n,
         head_dim_runtime,
         debug_counts,
         seq_len_kv,
@@ -1157,6 +1162,8 @@ def build_rl_flash_attn_module(
             seq_len if seq_len_kv is None else seq_len_kv,
             traits.DEFAULT_STRIDE_Q_N if stride_q_n is None else stride_q_n,
             traits.DEFAULT_STRIDE_KV_N if stride_kv_n is None else stride_kv_n,
+            # O defaults to Q's token stride (the contiguous layout of both).
+            (traits.DEFAULT_STRIDE_Q_N if stride_q_n is None else stride_q_n) if stride_o_n is None else stride_o_n,
             traits.HEAD_DIM if head_dim_runtime is None else head_dim_runtime,
             0 if block_table_stride is None else block_table_stride,
             1 if split_programs is None else split_programs,
@@ -1174,6 +1181,7 @@ def build_rl_flash_attn_module(
         head_dim_runtime=None,
         debug_counts=None,
         *,
+        stride_o_n=None,
         seq_len_kv=None,
         cu_seqlens_q=None,
         cu_seqlens_kv=None,
@@ -1197,6 +1205,7 @@ def build_rl_flash_attn_module(
             seq_len,
             stride_kv_n,
             stride_q_n,
+            stride_o_n,
             head_dim_runtime,
             debug_counts,
             seq_len_kv,
@@ -1236,6 +1245,7 @@ def build_rl_flash_attn_module(
         head_dim_runtime=None,
         debug_counts=None,
         *,
+        stride_o_n=None,
         seq_len_kv=None,
         cu_seqlens_q=None,
         cu_seqlens_kv=None,
@@ -1259,6 +1269,7 @@ def build_rl_flash_attn_module(
             seq_len,
             stride_kv_n,
             stride_q_n,
+            stride_o_n,
             head_dim_runtime,
             debug_counts,
             seq_len_kv,

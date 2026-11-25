@@ -148,6 +148,7 @@ per-shape auto-tuning across backends.
 | Hardware | any ROCm GPU Triton supports | gfx950 (MI350 / MI355) |
 | dtypes, head size | bf16 / fp16, D <= 256 | bf16, D = 64 or 128, `softmax_scale` = 1/sqrt(D) |
 | Paged cache | any page size | pages that are multiples of 64 |
+| Strided Q / K / V | any strides | read in place when each token's heads are packed (head stride D, unit last stride; e.g. slices of a fused QKV projection) and K, V share a token stride; other layouts are copied |
 | Masks, window, sinks, varlen, GQA | yes | yes |
 | Split-KV for decode | yes (`SEGMENT_SIZE`) | yes (`SEGMENT_SIZE`, see [the segment cost](#known-issue-cost-of-segments-on-flydsl)) |
 | Backward | Triton, deterministic | the same Triton backward |

@@ -116,6 +116,53 @@ def test_paged_and_builtin_equal_contiguous(heads, page, masked):
     assert _bits_equal(paged, contiguous)
 
 
+@pytest.mark.parametrize("heads", HEADS[:2])
+@pytest.mark.parametrize("masked", [False, True])
+def test_fused_qkv_views(heads, masked):
+    """Q / K / V sliced from one fused QKV projection [T, (Hq + 2 Hkv) * D] are read in place and give
+    the bits of contiguous copies, forward and backward."""
+    from primus_turbo.pytorch.kernels.attention.rl_attention_flydsl_impl import _row_stride
+
+    hq, hkv, d = heads
+    total = sum(LENS)
+    cu = _cu(LENS)
+    gen = torch.Generator().manual_seed(23)
+    qkv = torch.randn(total, (hq + 2 * hkv) * d, generator=gen).to(DEVICE, BF16).requires_grad_()
+    q = qkv[:, : hq * d].unflatten(-1, (hq, d))
+    k = qkv[:, hq * d : (hq + hkv) * d].unflatten(-1, (hkv, d))
+    v = qkv[:, (hq + hkv) * d :].unflatten(-1, (hkv, d))
+    assert _row_stride(q, d) == _row_stride(k, d) == _row_stride(v, d) == (hq + 2 * hkv) * d
+    kw = {"block_mask": _mixed_mask(LENS, seed=23)[2]} if masked else {}
+    dout = torch.randn(total, hq, d, generator=gen).to(DEVICE, BF16)
+    strided = _train(q, k, v, cu, 1024, **kw)
+    strided.backward(dout)
+    leaves = [t.detach().contiguous().requires_grad_() for t in (q, k, v)]
+    contiguous = _train(*leaves, cu, 1024, **kw)
+    contiguous.backward(dout)
+    assert _bits_equal(strided, contiguous)
+    grads = torch.cat([t.grad.flatten(1) for t in leaves], dim=1)
+    assert _bits_equal(qkv.grad, grads)
+
+
+def test_strided_kv_layouts():
+    """A paged cache holding K and V per token ([blocks, page, 2 Hkv, D]) is read in place; a layout
+    the kernel cannot address (heads not packed) is copied. Both give the contiguous bits."""
+    from primus_turbo.pytorch.kernels.attention.rl_attention_flydsl_impl import _row_stride
+
+    hq, hkv, d = HEADS[0]
+    q, k, v, cu = _varlen(LENS, hq, hkv, d, BF16, seed=24)
+    want = _train(q, k, v, cu, 1024)
+    k_cache, v_cache, block_table, seq_lens = _paged(k, v, cu, 64)
+    kv_cache = torch.cat([k_cache, v_cache], dim=2)
+    k_view, v_view = kv_cache[:, :, :hkv], kv_cache[:, :, hkv:]
+    assert _row_stride(k_view, d) == _row_stride(v_view, d) == 2 * hkv * d
+    paged = rl_paged_attention_func(q, k_view, v_view, cu, seq_lens, block_table, 1024, 1024, kernel_options=FLY)
+    assert _bits_equal(paged, want)
+    k_t = k.transpose(1, 2).contiguous().transpose(1, 2)  # [T, Hkv, D] with head stride 1
+    assert _row_stride(k_t, d) is None
+    assert _bits_equal(_train(q, k_t, v, cu, 1024), want)
+
+
 @pytest.mark.parametrize("mode", ["auto", "split"])
 def test_decode_graph_replay(mode):
     """One FlyDSL decode graph captured at max_seqlen_k = 8192 (eight 1024-key segments) serves

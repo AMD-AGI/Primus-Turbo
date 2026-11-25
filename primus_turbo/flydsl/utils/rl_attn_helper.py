@@ -683,6 +683,7 @@ class DualwaveKernelContext:
         stride_kv_n=None,
         head_dim_runtime=None,
         block_table_stride=None,
+        stride_o_n=None,
         SINK=None,
         ScoreBound=None,
         VisLo=None,
@@ -722,6 +723,8 @@ class DualwaveKernelContext:
         self.seq_len_kv = seq_len_kv
         self.stride_q_n = stride_q_n
         self.stride_kv_n = stride_kv_n
+        # O's token stride; Q's when not given (both contiguous).
+        self.stride_o_n = stride_q_n if stride_o_n is None else stride_o_n
         self.head_dim_runtime = head_dim_runtime
         self.block_table_stride = block_table_stride
 
@@ -771,6 +774,7 @@ class DualwaveKernelContext:
         self.seq_len_kv_v = fx.Index(seq_len_kv)
         self.stride_q_n_v = fx.Index(stride_q_n)
         self.stride_kv_n_v = fx.Index(stride_kv_n)
+        self.stride_o_n_v = fx.Index(self.stride_o_n)
 
         lds = fx.SharedAllocator().allocate(shared_storage).peek()
         self.lds = lds
@@ -911,9 +915,12 @@ class DualwaveKernelContext:
                 off = tok_base * stride * fx.Index(traits.BF16_BYTES)
             return _view(ta, off, nrec_bytes, layout), _view(tb, off, nrec_bytes, layout)
 
-        self.q_div, self.o_div = _batch_views(
-            self.seqlen_q_v, self.stride_q_n_v, traits.NUM_HEADS_Q, self.q_tok_base, q_tensor, o_tensor
-        )
+        self.q_div = _batch_views(
+            self.seqlen_q_v, self.stride_q_n_v, traits.NUM_HEADS_Q, self.q_tok_base, q_tensor, q_tensor
+        )[0]
+        self.o_div = _batch_views(
+            self.seqlen_q_v, self.stride_o_n_v, traits.NUM_HEADS_Q, self.q_tok_base, o_tensor, o_tensor
+        )[0]
         self.k_div, self.v_div = _batch_views(
             self.seqlen_kv_v, self.stride_kv_n_v, traits.NUM_HEADS_KV, self.kv_tok_base, k_tensor, v_tensor
         )
@@ -2332,8 +2339,8 @@ class DualwaveKernelContext:
     def _final_o_base(self, q_row):
         head = self.q_head_lane if const_expr(self.traits.GQA_PACK) else self.q_head_idx
         if const_expr(self.traits.ROWS_PER_WAVE == 16):
-            return q_row * self.stride_q_n_v + head * self.traits.HEAD_DIM + self.lane_kgrp * 4
-        return q_row * self.stride_q_n_v + head * self.traits.HEAD_DIM + self.lane_div_32 * 8
+            return q_row * self.stride_o_n_v + head * self.traits.HEAD_DIM + self.lane_kgrp * 4
+        return q_row * self.stride_o_n_v + head * self.traits.HEAD_DIM + self.lane_div_32 * 8
 
     def _final_o_global(self, o_base, dc, g):
         return o_base + (dc * self.traits.D_CHUNK + 2 * g * 8)
