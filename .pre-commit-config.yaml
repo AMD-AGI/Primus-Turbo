@@ -20,6 +20,13 @@ repos:
         language: system
         files: ^primus_turbo/.*\.py$
         exclude: ^primus_turbo/common/envs\.py$
+      - id: check-conventions
+        name: Repository conventions (python tools/conventions --list-rules)
+        entry: python tools/conventions --tracked
+        language: system
+        # every commit, also one that only deletes files (0.1 s): a rule can break without a file it matches
+        always_run: true
+        pass_filenames: false
       - id: check-env-docs
         name: Keep docs/env.md in sync with primus_turbo/common/envs.py
         entry: python tools/gen_env_docs.py --check

@@ -1,0 +1,48 @@
+# Findings that predate a rule of tools/conventions: `<rule id> <path>`, sorted.
+# A file listed here passes that rule; any other file must follow it. A listed file that no
+# longer breaks the rule must be removed (`python tools/conventions --update-baseline`), so this
+# list only shrinks. Adding a line is accepting a new exception: say why in the pull request.
+NAME001 primus_turbo/flydsl/attention/flash_attn_bwd.py
+NAME001 primus_turbo/flydsl/attention/flash_attn_bwd_flux.py
+NAME001 primus_turbo/flydsl/attention/flash_attn_bwd_stock.py
+NAME001 primus_turbo/flydsl/attention/flash_attn_fwd.py
+NAME001 primus_turbo/flydsl/attention/flash_attn_fwd_flux.py
+NAME001 primus_turbo/flydsl/attention/flash_attn_fwd_stock.py
+NAME001 primus_turbo/flydsl/attention/sparse_mla_bwd.py
+NAME001 primus_turbo/flydsl/attention/sparse_mla_fwd.py
+NAME001 primus_turbo/flydsl/deep_ep/arch.py
+NAME001 primus_turbo/flydsl/deep_ep/common.py
+NAME001 primus_turbo/flydsl/deep_ep/launch_cache.py
+NAME001 primus_turbo/flydsl/flux/a6w4_fwd_pack.py
+NAME001 primus_turbo/flydsl/fused_collective_gemm/common.py
+NAME001 primus_turbo/flydsl/fused_collective_gemm/split_k_wgrad.py
+NAME001 primus_turbo/flydsl/fused_collective_gemm/workspace.py
+NAME001 primus_turbo/flydsl/gemm/gemm_a6w4_kernel_tuned.py
+NAME001 primus_turbo/flydsl/gemm/gemm_a6w4_kernel_v0.py
+NAME001 primus_turbo/flydsl/gemm/gemm_fp8_kernel_flux.py
+NAME001 primus_turbo/flydsl/gemm/gemm_fp8_kernel_stock.py
+NAME001 primus_turbo/flydsl/gemm/gemm_mxfp4_kernel_p3.py
+NAME001 primus_turbo/flydsl/gemm/gemm_mxfp4_kernel_stock.py
+NAME001 primus_turbo/flydsl/gemm/lora_fp4_frozen.py
+NAME001 primus_turbo/flydsl/grouped_gemm/grouped_gemm_bf16_dispatch.py
+NAME001 primus_turbo/flydsl/quantization/a6w4_quant.py
+NAME001 primus_turbo/flydsl/quantization/a6w4_quant_triton.py
+NAME001 primus_turbo/flydsl/quantization/mxfp4_grouped_quant.py
+NAME001 primus_turbo/flydsl/quantization/mxfp4_quant_kernel_flux.py
+NAME001 primus_turbo/flydsl/quantization/mxfp4_quant_kernel_pre_dual.py
+NAME001 primus_turbo/flydsl/quantization/mxfp4_quant_kernel_stock.py
+NAME001 primus_turbo/flydsl/quantization/mxfp8_quant_flydsl.py
+NAME001 primus_turbo/flydsl/quantization/rmsnorm_mxfp4_fusion.py
+NAME001 primus_turbo/pytorch/kernels/async_tp/common_ops.py
+NAME001 primus_turbo/pytorch/kernels/fused_mega_moe/mega_moe_fp8_weights.py
+NAME001 primus_turbo/pytorch/kernels/gemm/gemm_fp4_impl_p3.py
+NAME001 primus_turbo/pytorch/kernels/gemm/gemm_fp4_impl_stock.py
+NAME001 primus_turbo/triton/attention/score_bound.py
+NAME001 primus_turbo/triton/attention/sparse_mla.py
+NAME001 primus_turbo/triton/attention/sparse_mla_dkv_gather.py
+NAME001 primus_turbo/triton/attention/sparse_mla_dsink.py
+NAME001 primus_turbo/triton/cross_entropy.py
+NAME001 primus_turbo/triton/grouped_gemm/grouped_gemm_helper.py
+NAME001 primus_turbo/triton/moe/multihot_to_indices.py
+NAME001 primus_turbo/triton/moe/permutation.py
+NAME001 primus_turbo/triton/quantization/quant_blockwise.py
