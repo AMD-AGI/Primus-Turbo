@@ -256,6 +256,42 @@ def test_causal_rollout_matches_training(dtype, window, block_size, small_segmen
             assert _bits_equal(out[: hi - lo], training[lo:hi]), f"tokens [{lo}, {hi}) ({mode})"
 
 
+# Model attention shapes: (Hq, Hkv, D, window, sinks) of Llama-3 8B and of gpt-oss-120b's
+# sliding-window layers.
+MODEL_SHAPES = [(32, 8, 128, -1, False), (64, 8, 64, 128, True)]
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", MODEL_SHAPES, ids=["llama3", "gpt-oss"])
+@pytest.mark.parametrize("chunk", [None, 1000])
+def test_model_shape_rollout_matches_training(dtype, shape, chunk):
+    """Llama-3 8B and gpt-oss-120b head shapes at the default 1024-key segments: a 2990-token prompt prefilled whole
+    or in 1000-token chunks (crossing segment boundaries), then decoded alone and next to another
+    long sequence, in every mode. Every token must match one training forward bitwise."""
+    hq, hkv, d, window, has_sinks = shape
+    prompt, total = 2990, 3000
+    q, k, v, cu = _varlen([total], hq, hkv, d, dtype, seed=21)
+    sinks = _sinks(hq, 21) if has_sinks else None
+    training = rl_flash_attn_varlen_func(q, k, v, cu, cu, total, total, d**-0.5, window, sinks=sinks)
+    oq, ok, ov, _ = _varlen([4000], hq, hkv, d, dtype, seed=22)
+    k_cache, v_cache, block_table, _ = _paged(torch.cat([k, ok]), torch.cat([v, ov]), _cu([total, 4000]), 64)
+    steps = [(0, prompt)] if chunk is None else [(s, min(s + chunk, prompt)) for s in range(0, prompt, chunk)]
+    steps += [(t, t + 1) for t in range(prompt, total)]
+    for t0, t1 in steps:
+        for with_other in (False, True):
+            other = 3000 + t0 - prompt if t1 - t0 == 1 else 3500
+            step_q = torch.cat([q[t0:t1], oq[other : other + 1]]) if with_other else q[t0:t1]
+            lens = [t1, other + 1] if with_other else [t1]
+            q_lens = [t1 - t0, 1] if with_other else [t1 - t0]
+            for mode in ("auto", "fused", "split"):
+                out = rl_paged_attention_func(
+                    step_q, k_cache, v_cache, _cu(q_lens), torch.tensor(lens, dtype=torch.int32, device=DEVICE),
+                    block_table[: len(lens)], t1 - t0, max(lens), d**-0.5, window_left=window, sinks=sinks,
+                    kernel_options={"MODE": mode},
+                )  # fmt: skip
+                assert _bits_equal(out[: t1 - t0], training[t0:t1]), f"tokens [{t0}, {t1}) other={with_other} {mode}"
+
+
 # ----------------------------------------------------------------------------- visibility, sinks
 
 
