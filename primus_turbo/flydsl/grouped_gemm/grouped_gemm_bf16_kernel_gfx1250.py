@@ -571,6 +571,58 @@ def _decode_m_tile_span_vec(mt, blk_m_idx, n_groups: int, block_m: int, lane):
     )
 
 
+def _decode_m_tile_span_mvec_issue(mt, blk_m_idx, n_groups: int, lane):
+    """The per-lane loads of `_decode_m_tile_span_mvec_finish`, for any n_groups: entry e of the map's two
+    halves sits in slot e // 32 of lane e % 32. One round of independent loads: ceil(G / 32) end tiles and
+    ceil((G + 1) / 32) group offsets per lane, indices clamped to the map."""
+    G = n_groups
+    t = rocdl.readfirstlane(T.i32, blk_m_idx)
+    ends = []
+    for j in range((G + 31) // 32):
+        e = lane + fx.Int32(32 * j)
+        ends.append(mt[(e < fx.Int32(G - 1)).select(e, fx.Int32(G - 1))])
+    offs = []
+    for j in range((G + 32) // 32):
+        e = lane + fx.Int32(32 * j)
+        offs.append(mt[fx.Int32(G) + (e < fx.Int32(G)).select(e, fx.Int32(G))])
+    return t, ends, offs
+
+
+def _decode_m_tile_span_mvec_finish(issued, n_groups: int, block_m: int, lane):
+    """`_decode_m_tile_span` from `_decode_m_tile_span_mvec_issue`'s slots: one ballot per slot counts the
+    experts ending at or before the tile, and the expert's entries come back by a uniform slot select and a
+    readlane. Same results for every non-decreasing table."""
+    G = n_groups
+    t, ends, offs = issued
+    zero = t * fx.Int32(0)
+    cnt = zero
+    for j in range(len(ends)):
+        le = ends[j] <= t
+        if G < 32 * (j + 1):
+            le = (lane < fx.Int32(G - 32 * j)).select(le, lane < zero)
+        mask = fx.Int32(rocdl.ballot(T.i32, le))
+        cnt = cnt + fx.Int32(_llvm.intr_ctpop(_raw(mask)))
+    g_idx = rocdl.readfirstlane(T.i32, (cnt < fx.Int32(G)).select(cnt, fx.Int32(G - 1)))
+
+    def _entry(slots, i):
+        hi = i >> fx.Int32(5)
+        v = slots[0]
+        for j in range(1, len(slots)):
+            v = (hi == fx.Int32(j)).select(slots[j], v)
+        return fx.Int32(rocdl.readlane(T.i32, v, i & fx.Int32(31)))
+
+    end_g = _entry(ends, g_idx)
+    row_beg = _entry(offs, g_idx)
+    len_g = _entry(offs, g_idx + fx.Int32(1)) - row_beg
+    first_g = end_g - (len_g + fx.Int32(block_m - 1)) // fx.Int32(block_m)
+    return (
+        g_idx,
+        *_m_tile_rows(t, zero, row_beg, len_g, first_g, block_m),
+        rocdl.readfirstlane(T.i32, first_g),
+        rocdl.readfirstlane(T.i32, end_g),
+    )
+
+
 @flyc.jit
 def _launch_grouped_bf16_variable_k(
     arg_c: fx.Pointer,
@@ -723,6 +775,22 @@ def _launch_grouped_bf16_variable_k(
     # bit 12 (needs mc_tile_sync and a cluster): the per-tile cluster barrier is split: each workgroup signals
     #        it at its epilogue fence (all its waves are past the k-loop) when a next tile follows, and the next
     #        tile only waits for it, so a peer that is up to an epilogue behind no longer stalls the others.
+    # bit 20 (needs bit 4): every next-tile k-tile goes out at the first k-tile head at which its ring slot is free,
+    #        whatever K_TILES % 4. With bit 7 the ring runs on across the seam: the heads of the last three k-tiles
+    #        issue the next tile's k-tiles (K_TILES + j) % 4, j = 0, 1, 2, the epilogue the fourth, and the next
+    #        tile waits for all four at its prologue fence. Without bit 7 the next tile's k-tile 0 goes out at the
+    #        head of k-tile K_TILES - 4 + (-K_TILES) % 4 + 1 and its k-tile 1 one k-tile later (the epilogue when
+    #        that is past the last k-tile); K_TILES % 4 == 1, where k-tile 1's slot frees first, keeps both in the
+    #        epilogue so that k-tile 0 still retires first.
+    # bit 21 (needs bits 7 and 20, tdm_deal = 3): the next-tile k-tile that a drain head (and the epilogue) issues
+    #        is selected without a branch -- its index (K_TILES + j) % 4 and its ring slot are scalars -- and the
+    #        issue is dealt between the matrix ops of the k-tile's first run, like a steady k-tile's (tdm_deal
+    #        bit 1), so neither the issue nor the next tile's decode that feeds it runs ahead of the k-tile's
+    #        matrix work. Same loads, same slots, same descriptors as bit 20 alone.
+    # bits 22-23 (field f = (vk_seam >> 22) & 3; need bit 11): a fragment's staging write follows its conversion
+    #        by (2, 3, 4, 6)[f] epilogue slots instead of 2, so fewer staging writes wait for every VALU write in
+    #        flight (matrix ops included). Same staging writes, read-backs and stores.
+    # Bits 20 - 23 were built and measured without bits 8 - 10 and 14 - 18, and refuse them.
     vk_seam: Constexpr[int] = 0,
     # > 0 (needs persist): phase groups of tile walks (clusters, or workgroups without one) start their first
     # tile later, so that the groups reach their tile seams -- and their C write-back bursts -- out of phase.
@@ -869,10 +937,16 @@ def _launch_grouped_bf16_variable_k(
         )
     if (vk_ovl & 2) and (not head_pipe or num_buffers != 4 or C_PITCHES != 2 or MC > 1 and mc_sync):
         raise ValueError("vk_ovl bit 1 needs head_pipe, num_buffers=4, C_PITCHES=2 and mc_sync=0")
-    if vk_seam < 0 or vk_seam & ~(
-        31 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536 | 131072 | 262144 | 524288
-    ):
-        raise ValueError(f"vk_seam must be a bitfield of 1, 2, 4, 8, 16 and 128 .. 524288, got {vk_seam}")
+    if vk_seam < 0 or vk_seam & ~(31 | 0xFFFF80):
+        raise ValueError(f"vk_seam must be a bitfield of 1, 2, 4, 8, 16 and 128 .. 8388608, got {vk_seam}")
+    if (vk_seam & 0xF00000) and (vk_seam & 0x7C700):
+        raise ValueError("vk_seam bits 20 - 23 exclude bits 8, 9, 10 and 14 - 18")
+    if (vk_seam & 12582912) and not (vk_seam & 2048):
+        raise ValueError("vk_seam bits 22 / 23 need bit 11")
+    if (vk_seam & 1048576) and not (vk_seam & 16):
+        raise ValueError("vk_seam bit 20 needs bit 4")
+    if (vk_seam & 2097152) and ((vk_seam & (128 | 1048576)) != (128 | 1048576) or tdm_deal != 3):
+        raise ValueError("vk_seam bit 21 needs bits 7 and 20 and tdm_deal=3")
     if (vk_seam & 131072) and not (vk_seam & 2048):
         raise ValueError("vk_seam bit 17 needs bit 11")
     if (vk_seam & 262144) and not (vk_seam & 2048):
@@ -1476,8 +1550,10 @@ def _launch_grouped_bf16_variable_k(
             n_steady = (K_TILES - NB1) if const_expr(k_tiles_const) else (K_TILES - fx.Int32(NB1))
 
             if const_expr(vk_seam & 128):
-                # In flight: k-tiles 0..3 and nothing behind them; in-order retirement.
-                _fence(outstanding=TDM_PW * NB1)
+                # In flight: k-tiles 0..3 and nothing behind them; in-order retirement. With bit 20 they were
+                # issued in the order the previous tile's slots freed, so k-tile 0 may not be the first: wait for
+                # all four.
+                _fence(outstanding=0 if const_expr(vk_seam & 1048576) else TDM_PW * NB1)
             elif const_expr(vk_seam & 512):
                 # In flight on TENSORcnt: k-tiles 0 and 1 only (the stores count on ASYNCcnt).
                 if const_expr(vk_seam & 1024):
@@ -1542,7 +1618,7 @@ def _launch_grouped_bf16_variable_k(
                     _llvm.inline_asm(i32, [_raw(v)], "v_mov_b32 $0, $1", "=v,v", has_side_effects=True)
                 )
 
-            def _hp_run_issue(addrs, ring, prefetch_kt):
+            def _hp_run_issue(addrs, ring, prefetch_kt, issue_fn=None):
                 # Sub-step 0 with the TDM issue inside its run: sub-step 1's reads ride the first KS_DS
                 # matrix ops as usual, then the issue block's scalar ops are dealt DL_SALU per matrix op.
                 # The issue follows the reads in program order, so its LDS write cannot hold them back.
@@ -1554,7 +1630,10 @@ def _launch_grouped_bf16_variable_k(
                     rocdl.sched_dsrd(1)
                     rocdl.sched_mfma(1)
                 rocdl.sched_barrier(0)
-                issue(_slot(prefetch_kt), prefetch_kt)
+                if const_expr(issue_fn is not None):
+                    issue_fn()
+                else:
+                    issue(_slot(prefetch_kt), prefetch_kt)
                 _mma_ks_range(ring[0], KS_DS, n_acc)
                 for _j in range_constexpr(DL_ILV):
                     rocdl.sched_mfma(1)
@@ -1563,18 +1642,21 @@ def _launch_grouped_bf16_variable_k(
                 _hold_live(ring[0])
                 rocdl.sched_barrier(0)
 
-            def _hp_ktile(addrs, prefetch_kt, head, prev_tail=None, first=False):
+            def _hp_ktile(addrs, prefetch_kt, head, prev_tail=None, first=False, issue_fn=None):
                 # `head` holds this k-tile's sub-step 0, read in the previous barrier window.
                 # `prev_tail` (the previous k-tile's deferred sub-step, whose matrix ops may still be
                 # in flight) is held live across this run so the reads here cannot reuse its registers.
                 # `first`: the head was read just ahead of this run, so its matrix ops wait for their
                 # own fragments instead of the whole head.
+                # `issue_fn` (vk_seam bit 21, with prefetch_kt None): an issue dealt into the first run instead.
                 ring = [head, None]
                 for ks in range_constexpr(K_WS):
                     load_ks = ks + 1
                     if const_expr(not (first and ks == 0)):
                         rocdl.s_wait_dscnt(0)
-                    if const_expr(ks == 0 and prefetch_kt is not None and (tdm_deal & 2)):
+                    if const_expr(ks == 0 and issue_fn is not None):
+                        _hp_run_issue(addrs, ring, None, issue_fn)
+                    elif const_expr(ks == 0 and prefetch_kt is not None and (tdm_deal & 2)):
                         _hp_run_issue(addrs, ring, prefetch_kt)
                     else:
                         if const_expr(ks == 0 and prefetch_kt is not None):
@@ -1611,6 +1693,11 @@ def _launch_grouped_bf16_variable_k(
                         tdm_ops.tensor_wait(outstanding[1])
                     if outstanding[2]:
                         tdm_ops.tensor_wait(outstanding[3])
+                elif const_expr(isinstance(outstanding, list)):
+                    # [(cond, count), ...], the conditions uniform, exclusive and exhaustive.
+                    for q in range_constexpr(len(outstanding)):
+                        if outstanding[q][0]:
+                            tdm_ops.tensor_wait(outstanding[q][1])
                 else:
                     tdm_ops.tensor_wait(outstanding)
                 rocdl.sched_barrier(0)
@@ -1773,18 +1860,91 @@ def _launch_grouped_bf16_variable_k(
                     for pk in range_constexpr(PRE_KT):
                         issue(_slot(pk), pk, dec=dec2[:4])
 
+                if const_expr(vk_seam & 1048576):
+                    K4S = [k4 == fx.Int32(c) for c in range_constexpr(4)]
+
+                    def _issue_next(i):
+                        issue(_slot(i), i, dec=dec2[:4])
+
+                    def _issue_rot(r):
+                        # The next tile's k-tile (K_TILES + r) % 4, one uniform branch per residue so that its
+                        # slot and row offset stay constants.
+                        for c in range_constexpr(4):
+                            if K4S[c]:
+                                _issue_next((c + r) % 4)
+
+                    if const_expr(vk_seam & 2097152):
+                        col2 = rocdl.readfirstlane(T.i32, dec2[2] + dl_b * (dec2[3] - dec2[2]))
+
+                        def _issue_rt(r):
+                            # _issue_rot(r) without the branches: k-tile (K_TILES + r) % 4 into its slot.
+                            i_rt = (k4 + fx.Int32(r)) & fx.Int32(3)
+                            s_rt = (i_rt + fx.Int32(BUF_SHIFT)) & fx.Int32(num_buffers - 1)
+                            _issue_dealt(
+                                fx.add_offset(base_ptr, s_rt * fx.Int32(PITCH)),
+                                i_rt,
+                                dec2[0],
+                                dec2[1],
+                                dec2[2],
+                                dec2[3],
+                                col2,
+                            )
+
             for j in range_constexpr(NB1):
                 kt = n_steady + j
                 buf = _bidx(_buf_ptr(_slot(kt)))
                 if const_expr(head_pipe):
-                    if const_expr((vk_seam & 16) and j == NB1 - 2):
-                        if pre_a:
-                            _pre_issue()
-                    if const_expr((vk_seam & 16) and j == NB1 - 1):
-                        if pre_b:
-                            _pre_issue()
-                    tail = _hp_ktile(_addrs(kt), None, HEAD)
-                    if const_expr((vk_seam & 16) and j == NB1 - 2):
+                    if const_expr(vk_seam & 2097152):
+                        pass
+                    elif const_expr((vk_seam & 1048576) and NB1 == 3):
+                        # Drain head j: the slot of k-tile K_TILES - 4 + j is free (read before the previous fence).
+                        rocdl.sched_barrier(0)
+                        if const_expr(vk_seam & 128):
+                            _issue_rot(j)
+                        else:
+                            # Slot 2 (next k-tile 0) holds k-tile K_TILES - 4 + (-K_TILES) % 4, slot 3 (next
+                            # k-tile 1) the one after it.
+                            if const_expr(j == 0):
+                                if K4S[0]:
+                                    _issue_next(0)
+                            if const_expr(j == 1):
+                                if K4S[0]:
+                                    _issue_next(1)
+                                if K4S[3]:
+                                    _issue_next(0)
+                            if const_expr(j == 2):
+                                if K4S[3]:
+                                    _issue_next(1)
+                                if K4S[2]:
+                                    _issue_next(0)
+                        rocdl.sched_barrier(0)
+                    else:
+                        if const_expr((vk_seam & 16) and j == NB1 - 2):
+                            if pre_a:
+                                _pre_issue()
+                        if const_expr((vk_seam & 16) and j == NB1 - 1):
+                            if pre_b:
+                                _pre_issue()
+                    if const_expr(vk_seam & 2097152):
+                        tail = _hp_ktile(_addrs(kt), None, HEAD, issue_fn=lambda j=j: _issue_rt(j))
+                    else:
+                        tail = _hp_ktile(_addrs(kt), None, HEAD)
+                    if const_expr((vk_seam & 1048576) and NB1 == 3 and j < 2):
+                        # In flight: this tile's k-tiles behind this one, then the next tile's issued so far.
+                        if const_expr(vk_seam & 128):
+                            _hp_fence(tail, TDM_PW * 2, _addrs(kt + 1), HEAD)
+                        elif const_expr(j == 0):
+                            _hp_fence(
+                                tail, (K4S[0], TDM_PW * 2, k4 != fx.Int32(0), TDM_PW), _addrs(kt + 1), HEAD
+                            )
+                        else:
+                            _hp_fence(
+                                tail,
+                                [(K4S[0], TDM_PW * 2), (K4S[3], TDM_PW), (pre_epi, 0)],
+                                _addrs(kt + 1),
+                                HEAD,
+                            )
+                    elif const_expr((vk_seam & 16) and j == NB1 - 2):
                         _hp_fence(tail, (pre_a, TDM_PW * PRE_KT, pre_not_a, 0), _addrs(kt + 1), HEAD)
                     elif const_expr(j < num_buffers - 2):
                         _hp_fence(tail, TDM_PW * (num_buffers - 3 - j), _addrs(kt + 1), HEAD)
@@ -1813,7 +1973,14 @@ def _launch_grouped_bf16_variable_k(
             else:
                 accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
             # vk_seam bit 4: the next tile's k-tiles 0 and 1 may be in flight; they are not in the staging.
-            _fence(outstanding=(TDM_PW * PRE_KT) if const_expr(vk_seam & 16) else 0)
+            # Bit 20 with bit 7: the three issued at the drain heads.
+            _fence(
+                outstanding=(
+                    TDM_PW * (3 if const_expr((vk_seam & (128 | 1048576)) == (128 | 1048576)) else PRE_KT)
+                )
+                if const_expr(vk_seam & 16)
+                else 0
+            )
             if const_expr(MC > 1 and mc_epi_sync):
                 _cluster.cluster_barrier()
             if const_expr(vk_seam & 4096):
@@ -1824,14 +1991,21 @@ def _launch_grouped_bf16_variable_k(
                 # Every wave is past its last ring read, so all four slots may be refilled: the next tile's
                 # k-tiles 2 and 3 go out behind its k-tiles 0 and 1, riding the first two blocks' matrix ops.
                 rocdl.sched_barrier(0)
-                if pre_epi:
-                    _pre_issue()
+                if const_expr(not (vk_seam & 1048576)):
+                    if pre_epi:
+                        _pre_issue()
                 rocdl.sched_barrier(0)
                 VB_BLK = 1 if const_expr(vk_seam & 2048) else 2
                 VB_MMA = VB_BLK * wmma_n_rep
                 _mma_ks_range(last_tail, 0, VB_MMA)
-                for pk in range_constexpr(PRE_KT, num_buffers):
-                    issue(_slot(pk), pk, dec=dec2[:4])
+                if const_expr(vk_seam & 2097152):
+                    _issue_rt(3)
+                elif const_expr(vk_seam & 1048576):
+                    # The last k-tile's slot: the fourth of the next tile's k-tiles.
+                    _issue_rot(3)
+                else:
+                    for pk in range_constexpr(PRE_KT, num_buffers):
+                        issue(_slot(pk), pk, dec=dec2[:4])
                 if const_expr(carry is not None):
                     carry.store(
                         Vec.from_elements([dec2[4], dec2[5], dec2[6], dec2[0], dec2[1], 0, 0, 0], fx.Int32)
@@ -1901,6 +2075,8 @@ def _launch_grouped_bf16_variable_k(
                     NB_ = wmma_m_rep
                     FPB = wmma_n_rep
                     NAS = WS_NSUB if const_expr(vk_seam & 8192) else 0
+                    # vk_seam bits 22-23 (field f): the staging write follows its conversion by (2, 3, 4, 6)[f] slots.
+                    EPI_LAG_B = (2, 3, 4, 6)[(vk_seam >> 22) & 3]
                     cvt = {}
                     rdv = {}
                     if const_expr(vk_seam & 65536):
@@ -1952,7 +2128,7 @@ def _launch_grouped_bf16_variable_k(
                             if const_expr(s < NB_):
                                 wm, wn = MMA_ORDER[s * FPB + k]
                                 cvt[s * FPB + k] = c_frags[wm * wmma_n_rep + wn].load().to(elem_cls)
-                            fs = s * FPB + k - 2
+                            fs = s * FPB + k - EPI_LAG_B
                             if const_expr(0 <= fs < NF and not ((vk_seam & 262144) and k < 2)):
                                 wm, wn = MMA_ORDER[fs]
                                 _stage(cvt.pop(fs), wm, wn)
@@ -1990,7 +2166,7 @@ def _launch_grouped_bf16_variable_k(
                                     (FPB if 0 <= bl - 1 < NB_ - NAS else 0) + (FPB if bl + 1 < NB_ else 0)
                                 )
                             else:
-                                rocdl.s_wait_dscnt(max(0, min(FPB - 2, NF - (bl + 1) * FPB)))
+                                rocdl.s_wait_dscnt(max(0, min(FPB - EPI_LAG_B, NF - (bl + 1) * FPB)))
                             _llvm.fence(_llvm.AtomicOrdering.acq_rel, syncscope="wavefront")
                             for k in range_constexpr(FPB):
                                 j = bl * FPB + k
@@ -2053,7 +2229,13 @@ def _launch_grouped_bf16_variable_k(
                     dec2 = (rocdl.readfirstlane(T.i32, dec2[0]), rocdl.readfirstlane(T.i32, dec2[1])) + tuple(
                         dec2[2:]
                     )
-            if const_expr(vk_seam & 16):
+            if const_expr(vk_seam & 1048576):
+                # K_TILES % 4 == 2: k-tile 1's slot was the last k-tile's; == 1: both, k-tile 0 first.
+                if K4S[2]:
+                    _issue_next(1)
+                if K4S[1]:
+                    _pre_issue()
+            elif const_expr(vk_seam & 16):
                 if pre_epi:
                     _pre_issue()
             elif PREFETCH_OK:
@@ -3303,6 +3485,16 @@ def _launch_grouped_gemm_bf16_nt(
     # overwrites what its own store read, so it is issued as soon as that store has drained, with no barrier:
     # 1 = at the next tile's first fence, 2 + s = ahead of sub-step s of the next tile's k-tile 0. Bit-identical to 0.
     nt_c1: Constexpr[int] = 0,
+    # 1: the m-tile decode reads the map with ceil(G / 32) slots per lane in one round of independent loads and one
+    # ballot per slot (see `_decode_m_tile_span_mvec_finish`) -- `vec_dec` for any n_groups, no per-tile table.
+    # Needs inkernel_scan=0; tt_dec takes precedence. Bit-identical to 0.
+    mv_dec: Constexpr[int] = 0,
+    # 1 (needs persist, nt_ovl, head_pipe, epi_chunk=1 and an even wmma_m_rep): a live tile with m_rows <= tile_m / 2
+    # runs a half-height wave grid -- every wave takes half its rows of the tile's first tile_m / 2 rows, all of its
+    # columns -- so the matrix work of the rows past tile_m / 2 is skipped instead of run on zero-filled A rows.
+    # Loads, waits, barriers and the C store are those of the full tile; each output element still accumulates the
+    # same k sub-steps in the same order, so it is bit-identical to 0.
+    nt_half: Constexpr[int] = 0,
 ):
     WMMA_M = WMMA_N = 16
     WMMA_K = 32
@@ -3397,6 +3589,9 @@ def _launch_grouped_gemm_bf16_nt(
     EPI_OPS = (epi_chunk * m_warp) if epi_chunk > 1 else 1
     if tt_dec not in (0, 1) or (tt_dec and inkernel_scan):
         raise ValueError(f"tt_dec={tt_dec} must be 0 or 1 and needs inkernel_scan=0")
+    if mv_dec not in (0, 1) or (mv_dec and inkernel_scan):
+        raise ValueError(f"mv_dec={mv_dec} must be 0 or 1 and needs inkernel_scan=0")
+    MV = bool(mv_dec and not tt_dec)
     MC_SPAN_OK = mc_m * mc_n > 1 and mc_m >= 2 and not inkernel_scan
     MC = mc_m * mc_n
     if nt_seam < 0 or nt_seam > 15 or (nt_seam & 2):
@@ -3404,10 +3599,14 @@ def _launch_grouped_gemm_bf16_nt(
     if (nt_seam & 8) and not (nt_seam & 4):
         raise ValueError("nt_seam bit 3 needs bit 2")
     if (nt_seam & 4) and not (
-        (nt_seam & 1) and head_pipe and (tt_dec or vec_dec) and not inkernel_scan and (MC == 1 or MC_SPAN_OK)
+        (nt_seam & 1)
+        and head_pipe
+        and (tt_dec or vec_dec or mv_dec)
+        and not inkernel_scan
+        and (MC == 1 or MC_SPAN_OK)
     ):
         raise ValueError(
-            "nt_seam bit 2 needs bit 0, head_pipe, tt_dec or vec_dec, and the span decode under a cluster"
+            "nt_seam bit 2 needs bit 0, head_pipe, tt_dec, vec_dec or mv_dec, and the span decode under a cluster"
         )
     if nt_deal not in (0, 1):
         raise ValueError(f"nt_deal must be 0 or 1, got {nt_deal}")
@@ -3518,6 +3717,23 @@ def _launch_grouped_gemm_bf16_nt(
         raise ValueError(
             "nt_c1 needs persist, nt_ovl, head_pipe, epi_chunk=1, 4 waves, num_buffers=2, seg_split=0, equal A / B "
             "k-tile job regions that each hold one block of C rows, and one job per issuing wave"
+        )
+    if nt_half not in (0, 1) or (
+        nt_half
+        and not all(
+            [
+                persist > 0,
+                nt_ovl == 1,
+                head_pipe > 0,
+                epi_chunk == 1,
+                wmma_m_rep % 2 == 0,
+                2 * (wmma_m_rep // 2 + wmma_n_rep) < (wmma_m_rep // 2) * wmma_n_rep,
+            ]
+        )
+    ):
+        raise ValueError(
+            f"nt_half={nt_half} must be 0 or 1 and needs persist, nt_ovl, head_pipe, epi_chunk=1, an even "
+            f"wmma_m_rep and fewer fragment reads than matrix ops on the half-height wave grid"
         )
     XCD_SPAN = (
         xcd_band * num_xcd if (num_xcd > 1 and xcd_band > 0 and TOTAL_TILES >= xcd_band * num_xcd) else 0
@@ -3670,6 +3886,15 @@ def _launch_grouped_gemm_bf16_nt(
                     out = _decode_m_tile_tt(_i32_table(arg_mtiles), bm, N_GROUPS, M_TILES)
                     if const_expr(not MC_SPAN):
                         out = out[:3] + (None, None)
+                elif const_expr(MV):
+                    out = _decode_m_tile_span_mvec_finish(
+                        _decode_m_tile_span_mvec_issue(_i32_table(arg_mtiles), bm, N_GROUPS, lane),
+                        N_GROUPS,
+                        tile_m,
+                        lane,
+                    )
+                    if const_expr(not MC_SPAN):
+                        out = out[:3] + (None, None)
                 elif const_expr(vec_dec):
                     out = _decode_m_tile_span_vec(_i32_table(arg_mtiles), bm, N_GROUPS, tile_m, lane)
                     if const_expr(not MC_SPAN):
@@ -3756,11 +3981,15 @@ def _launch_grouped_gemm_bf16_nt(
             def _dec_span_issue(bm):
                 if const_expr(tt_dec):
                     return _decode_m_tile_tt_issue(_i32_table(arg_mtiles), bm, N_GROUPS, M_TILES)
+                if const_expr(MV):
+                    return _decode_m_tile_span_mvec_issue(_i32_table(arg_mtiles), bm, N_GROUPS, lane)
                 return _decode_m_tile_span_vec_issue(_i32_table(arg_mtiles), bm, N_GROUPS, lane)
 
             def _dec_span_finish(issued):
                 if const_expr(tt_dec):
                     out = _decode_m_tile_tt_finish(issued)
+                elif const_expr(MV):
+                    out = _decode_m_tile_span_mvec_finish(issued, N_GROUPS, tile_m, lane)
                 else:
                     out = _decode_m_tile_span_vec_finish(issued, N_GROUPS, tile_m, lane)
                 return out if const_expr(MC_SPAN) else out[:3] + (None, None)
@@ -4219,7 +4448,7 @@ def _launch_grouped_gemm_bf16_nt(
 
             def _mma_ks(state):
                 act, wt = state
-                for wm in range_constexpr(wmma_m_rep):
+                for wm in range_constexpr(len(act)):
                     for wn_raw in range_constexpr(wmma_n_rep):
                         wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
                         idx = wm * wmma_n_rep + wn
@@ -4349,6 +4578,27 @@ def _launch_grouped_gemm_bf16_nt(
                     for wm in range_constexpr(wmma_m_rep)
                     for wn_raw in range_constexpr(wmma_n_rep)
                 ]
+            HL = None
+            if const_expr(nt_half):
+                # nt_half: (m reps, reads per sub-step, matrix ops per sub-step, head_pipe, op order, A lane offset,
+                # first row) of the half-height wave grid; its accumulators are c_frags[: matrix ops].
+                H_MREP = wmma_m_rep // 2
+                H_KSDS = H_MREP * DS_A + wmma_n_rep * DS_B
+                H_NACC = H_MREP * wmma_n_rep
+                H_WMB = wave_m * (warp_tile_m // 2)
+                HL = (
+                    H_MREP,
+                    H_KSDS,
+                    H_NACC,
+                    min(head_pipe, H_NACC - H_KSDS),
+                    [
+                        (wm, (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw)
+                        for wm in range_constexpr(H_MREP)
+                        for wn_raw in range_constexpr(wmma_n_rep)
+                    ],
+                    (H_WMB + lane16) * fx.Int32(LDS_ROW) + kgrp * fx.Int32(16),
+                    H_WMB,
+                )
 
             def _opaque(v):
                 # An asm result cannot be rematerialized, so the allocator keeps the address live
@@ -4358,9 +4608,9 @@ def _launch_grouped_gemm_bf16_nt(
                     _llvm.inline_asm(i32, [_raw(v)], "v_mov_b32 $0, $1", "=v,v", has_side_effects=True)
                 )
 
-            def _hp_addrs(s, pin=True):
+            def _hp_addrs(s, pin=True, L=None):
                 buf = fx.Int32(_bidx(_buf_ptr(s)))
-                a_addr, b_addr = buf + hp_a_lane, buf + hp_b_lane
+                a_addr, b_addr = buf + (hp_a_lane if const_expr(L is None) else L[5]), buf + hp_b_lane
                 return (_opaque(a_addr), _opaque(b_addr)) if const_expr(pin) else (a_addr, b_addr)
 
             def _hp_a(a_addr, wm, ks):
@@ -4371,29 +4621,33 @@ def _launch_grouped_gemm_bf16_nt(
                     return load_b(b_addr, wn, ks)
                 return _frag(b_addr, wn * WMMA_N * LDS_ROW + ks * KSB)
 
-            def _hp_load(addrs, ks):
-                act = [_rmem(8, _hp_a(addrs[0], wm, ks)) for wm in range_constexpr(wmma_m_rep)]
+            def _hp_load(addrs, ks, L=None):
+                m_rep = wmma_m_rep if const_expr(L is None) else L[0]
+                act = [_rmem(8, _hp_a(addrs[0], wm, ks)) for wm in range_constexpr(m_rep)]
                 wt = [_rmem(8, _hp_b(addrs[1], wn, ks)) for wn in range_constexpr(wmma_n_rep)]
                 return act, wt
 
             def _hp_load_into(addrs, ks, dst):
                 act, wt = dst
-                for wm in range_constexpr(wmma_m_rep):
+                for wm in range_constexpr(len(act)):
                     act[wm].store(_hp_a(addrs[0], wm, ks))
                 for wn in range_constexpr(wmma_n_rep):
                     wt[wn].store(_hp_b(addrs[1], wn, ks))
 
-            def _mma_range(state, lo, hi):
+            def _mma_range(state, lo, hi, L=None):
                 act, wt = state
-                for wm, wn in MMA_ORDER[lo:hi]:
+                for wm, wn in (MMA_ORDER if const_expr(L is None) else L[4])[lo:hi]:
                     idx = wm * wmma_n_rep + wn
                     fx.gemm(wmma_atom, c_frags[idx], wt[wn], act[wm], c_frags[idx])
 
-            def _hp_ktile(addrs, head, prefetch_kt=None, prefetch_slot=0, ovl=False):
+            def _hp_ktile(addrs, head, prefetch_kt=None, prefetch_slot=0, ovl=False, L=None):
                 # `head` holds this k-tile's sub-step 0, read in the previous barrier window.
                 # `ovl` replaces the prefetch at the head with one before sub-step K_WS // 2, behind a
                 # wait-all (this wave's share of the previous tile's store) and a barrier (every wave's).
                 # With nt_c1 it comes before sub-step nt_c1 - 2, behind this wave's wait-all only.
+                # `L`: the half-height wave grid (nt_half), None for the full one.
+                ks_ds = KS_DS if const_expr(L is None) else L[1]
+                nacc = n_acc if const_expr(L is None) else L[2]
                 if const_expr(prefetch_kt is not None):
                     rocdl.sched_barrier(0)
                     issue(prefetch_slot, prefetch_kt)
@@ -4415,48 +4669,54 @@ def _launch_grouped_gemm_bf16_nt(
                         rocdl.sched_barrier(0)
                     rocdl.s_wait_dscnt(0)
                     if const_expr(load_ks < K_WS):
-                        ring[load_ks % 2] = _hp_load(addrs, load_ks)
+                        ring[load_ks % 2] = _hp_load(addrs, load_ks, L)
                     if const_expr(i < K_WS - 1):
                         _mma_ks(ring[i % 2])
                         if const_expr(load_ks < K_WS):
-                            for _j in range_constexpr(KS_DS):
+                            for _j in range_constexpr(ks_ds):
                                 rocdl.sched_dsrd(1)
                                 rocdl.sched_mfma(1)
-                            rocdl.sched_mfma(n_acc - KS_DS)
+                            rocdl.sched_mfma(nacc - ks_ds)
                             _hold_live(ring[i % 2])
                         else:
-                            rocdl.sched_mfma(n_acc)
+                            rocdl.sched_mfma(nacc)
                     elif const_expr(load_ks < K_WS):
-                        rocdl.sched_dsrd(KS_DS)
+                        rocdl.sched_dsrd(ks_ds)
                     rocdl.sched_barrier(0)
                 return ring[(K_WS - 1) % 2]
 
-            def _hp_fence(tail, nxt_addrs, head):
+            def _hp_fence(tail, nxt_addrs, head, L=None):
+                ks_ds = KS_DS if const_expr(L is None) else L[1]
+                nacc = n_acc if const_expr(L is None) else L[2]
+                hp = head_pipe if const_expr(L is None) else L[3]
                 tdm_ops.tensor_wait(TDM_PW * (num_buffers - 2))
                 rocdl.sched_barrier(0)
                 rocdl.s_barrier_signal(_WG_BARRIER)
                 rocdl.sched_barrier(0)
-                _mma_range(tail, 0, head_pipe)
-                rocdl.sched_mfma(head_pipe)
+                _mma_range(tail, 0, hp, L)
+                rocdl.sched_mfma(hp)
                 rocdl.sched_barrier(0)
                 rocdl.s_barrier_wait(_WG_BARRIER)
                 rocdl.sched_barrier(0)
                 _hp_load_into(nxt_addrs, 0, head)
-                _mma_range(tail, head_pipe, n_acc)
-                for _j in range_constexpr(KS_DS):
+                _mma_range(tail, hp, nacc, L)
+                for _j in range_constexpr(ks_ds):
                     rocdl.sched_dsrd(1)
                     rocdl.sched_mfma(1)
-                rocdl.sched_mfma(n_acc - head_pipe - KS_DS)
+                rocdl.sched_mfma(nacc - hp - ks_ds)
                 _hold_live(tail)
                 rocdl.sched_barrier(0)
 
-            def _hp_kloop(n_loop, n_steady, kt_even=None):
+            def _hp_kloop(n_loop, n_steady, kt_even=None, L=None):
                 # Runs after the tile's first fence: k-tile 0 is in buffer 0.
                 head = (
-                    [fx.make_rmem_tensor(8, fx.Int32) for _ in range_constexpr(wmma_m_rep)],
+                    [
+                        fx.make_rmem_tensor(8, fx.Int32)
+                        for _ in range_constexpr(wmma_m_rep if const_expr(L is None) else L[0])
+                    ],
                     [fx.make_rmem_tensor(8, fx.Int32) for _ in range_constexpr(wmma_n_rep)],
                 )
-                slots = [_hp_addrs(s) for s in range_constexpr(num_buffers)]
+                slots = [_hp_addrs(s, L=L) for s in range_constexpr(num_buffers)]
                 _hp_load_into(slots[0], 0, head)
                 if const_expr((nt_seam & 8) and nt_c1):
                     # nt_seam bit 3: past the tile's last barrier with a memory fence (whose wait would take these
@@ -4465,12 +4725,12 @@ def _launch_grouped_gemm_bf16_nt(
                 rocdl.sched_barrier(0)
                 if const_expr(nt_ovl):
                     # n_loop >= 1 (a dead tile runs one steady k-tile under nt_ovl). k-tile kt sits in slot kt % 2.
-                    tail0 = _hp_ktile(slots[0], head, ovl=True)
+                    tail0 = _hp_ktile(slots[0], head, ovl=True, L=L)
                     if const_expr((nt_seam & 8) and not nt_c1):
                         rocdl.sched_barrier(0)
                         _decode_next_issue()
                         rocdl.sched_barrier(0)
-                    _hp_fence(tail0, slots[1], head)
+                    _hp_fence(tail0, slots[1], head, L)
                     n_loop1 = n_loop - fx.Int32(1)
                     n_rot1 = n_loop1 // fx.Int32(2)
                     for it in range(n_rot1):
@@ -4479,13 +4739,13 @@ def _launch_grouped_gemm_bf16_nt(
                             pf_r = it * fx.Int32(2) + fx.Int32(r + 2)
                             if const_expr(hp_opaque):
                                 pf_r = rocdl.readfirstlane(T.i32, fx.Int32(pf_r))
-                            tail_r = _hp_ktile(slots[rr], head, pf_r, r)
-                            _hp_fence(tail_r, slots[r], head)
+                            tail_r = _hp_ktile(slots[rr], head, pf_r, r, L=L)
+                            _hp_fence(tail_r, slots[r], head, L)
                     # At most one steady k-tile is left, at an odd index: slot 1.
                     n_done1 = n_rot1 * fx.Int32(2)
                     for kr in range(n_loop1 - n_done1):
-                        tail_k = _hp_ktile(slots[1], head, n_done1 + kr + fx.Int32(2), 0)
-                        _hp_fence(tail_k, slots[0], head)
+                        tail_k = _hp_ktile(slots[1], head, n_done1 + kr + fx.Int32(2), 0, L=L)
+                        _hp_fence(tail_k, slots[0], head, L)
                 n_rot = n_loop // fx.Int32(num_buffers)
                 if const_expr(nt_ovl):
                     n_rot = n_rot * fx.Int32(0)
@@ -4511,7 +4771,7 @@ def _launch_grouped_gemm_bf16_nt(
                     if kt_even:
                         _issue_next(*(nxt_hold[0] if const_expr(nt_seam & 4) else nxt_dec))
                     rocdl.sched_barrier(0)
-                tail_d = _hp_ktile(_hp_addrs(n_steady % fx.Int32(num_buffers), pin=False), head)
+                tail_d = _hp_ktile(_hp_addrs(n_steady % fx.Int32(num_buffers), pin=False, L=L), head, L=L)
                 _mma_ks(tail_d)
 
             def _tile_tail():
@@ -4542,6 +4802,48 @@ def _launch_grouped_gemm_bf16_nt(
                     kt_par = (n_steady + fx.Int32(num_buffers - 1)) % fx.Int32(2)
                     kt_even = kt_par == fx.Int32(0)
                     kt_odd = kt_par != fx.Int32(0)
+
+                def _epi_front(L):
+                    # nt_half: the epilogue up to and including the C staging, for the wave grid L (None = full
+                    # height).
+                    m_rep = wmma_m_rep if const_expr(L is None) else L[0]
+                    wmb_ = wmb if const_expr(L is None) else L[6]
+                    accs_ = [c_frags[idx].load() for idx in range_constexpr(m_rep * wmma_n_rep)]
+                    if const_expr(nt_seam & 1):
+                        if kt_even:
+                            tdm_ops.tensor_wait(TDM_PW)
+                        if kt_odd:
+                            tdm_ops.tensor_wait(0)
+                        gpu.barrier()
+                        if kt_odd:
+                            _issue_next(*(nxt_hold[0] if const_expr(nt_seam & 4) else nxt_dec))
+                    else:
+                        _pipeline_fence(outstanding=0)
+                        _issue_next(*(nxt_dec if const_expr(ntp_flags & 1) else _decode_next()))
+                    el16 = _opaque(lane16) if const_expr(hp_epi) else lane16
+                    ekg = _opaque(kgrp) if const_expr(hp_epi) else kgrp
+                    for wmg in range_constexpr(m_rep):
+                        row_rel = wmb_ + wmg * WMMA_M + el16
+                        if const_expr(nt_c1):
+                            c1_off = (wmb_ + fx.Int32(wmg * WMMA_M)) // fx.Int32(C1_RB) * fx.Int32(C1_SLACK)
+                        for wn in range_constexpr(wmma_n_rep):
+                            col_rel = wnb + wn * WMMA_N + ekg * 8
+                            h = accs_[wmg * wmma_n_rep + wn].to(elem_cls)
+                            if const_expr(nt_c1):
+                                fx.ptr_store(
+                                    h.bitcast(fx.Int8),
+                                    base_ptr + ((row_rel * C_ROW_E + col_rel) * EB + c1_off + PITCH),
+                                )
+                            elif const_expr(C_OFF):
+                                fx.ptr_store(
+                                    h.bitcast(fx.Int8),
+                                    base_ptr + ((row_rel * C_ROW_E + col_rel) * EB + C_OFF),
+                                )
+                            else:
+                                fx.ptr_store(
+                                    h.bitcast(fx.Int8), base_ptr + (row_rel * C_ROW_E + col_rel) * EB
+                                )
+
                 if const_expr(head_pipe and nt_ovl):
                     # In flight: k-tile 0, then (past the first tile) this wave's EPI_OPS store ops of the previous
                     # tile. The first tile issued its k-tile 0 just above, with nothing behind it.
@@ -4555,7 +4857,18 @@ def _launch_grouped_gemm_bf16_nt(
                         _workgroup_barrier()
                     else:
                         _pipeline_fence(outstanding=EPI_OPS)
-                    _hp_kloop(n_loop, n_steady, kt_even)
+                    if const_expr(nt_half):
+                        # Workgroup-uniform (m_rows comes back readfirstlane'd); dead tiles keep the full grid.
+                        hv = (m_rows <= fx.Int32(tile_m // 2)).select(fx.Int32(1), fx.Int32(0))
+                        hv = (m_rows > fx.Int32(0)).select(hv, fx.Int32(0))
+                        if hv > fx.Int32(0):
+                            _hp_kloop(n_loop, n_steady, kt_even, HL)
+                            _epi_front(HL)
+                        else:
+                            _hp_kloop(n_loop, n_steady, kt_even)
+                            _epi_front(None)
+                    else:
+                        _hp_kloop(n_loop, n_steady, kt_even)
                 elif const_expr(head_pipe):
                     _pipeline_fence(outstanding=TDM_PW * (num_buffers - 2))
                     _hp_kloop(n_loop, n_steady)
@@ -4600,30 +4913,33 @@ def _launch_grouped_gemm_bf16_nt(
                         _pipeline_fence(outstanding=TDM_PW * (num_buffers - 2 - j))
                         compute_ktile(buf, None, ks_lo=KS_SKIP if const_expr(j == num_buffers - 2) else 0)
 
-                # epilogue: accumulators -> LDS -> TDM store, clamped twice
-                accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
-                if const_expr(nt_seam & 1):
-                    # The next tile's k-tile 0 (one TDM op per issuing wave) is the only load that may be in flight.
-                    if kt_even:
-                        tdm_ops.tensor_wait(TDM_PW)
-                    if kt_odd:
-                        tdm_ops.tensor_wait(0)
-                    gpu.barrier()
-                    if kt_odd:
-                        _issue_next(*(nxt_hold[0] if const_expr(nt_seam & 4) else nxt_dec))
-                elif const_expr(epi_fence >= 2):
-                    _pipeline_fence(outstanding=0)
-                elif const_expr(epi_fence == 1):
-                    _workgroup_barrier()
-                if const_expr(persist and not (nt_seam & 1)):
-                    # Every wave is past its last LDS read and every load has landed, so buffer 0
-                    # is free.
-                    _issue_next(*(nxt_dec if const_expr(ntp_flags & 1) else _decode_next()))
+                # epilogue: accumulators -> LDS -> TDM store, clamped twice (under nt_half `_epi_front` has
+                # staged C on the wave grid the tile ran)
+                if const_expr(not nt_half):
+                    accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
+                    if const_expr(nt_seam & 1):
+                        # The next tile's k-tile 0 (one TDM op per issuing wave) is the only load that may be in
+                        # flight.
+                        if kt_even:
+                            tdm_ops.tensor_wait(TDM_PW)
+                        if kt_odd:
+                            tdm_ops.tensor_wait(0)
+                        gpu.barrier()
+                        if kt_odd:
+                            _issue_next(*(nxt_hold[0] if const_expr(nt_seam & 4) else nxt_dec))
+                    elif const_expr(epi_fence >= 2):
+                        _pipeline_fence(outstanding=0)
+                    elif const_expr(epi_fence == 1):
+                        _workgroup_barrier()
+                    if const_expr(persist and not (nt_seam & 1)):
+                        # Every wave is past its last LDS read and every load has landed, so buffer 0
+                        # is free.
+                        _issue_next(*(nxt_dec if const_expr(ntp_flags & 1) else _decode_next()))
 
-                # hp_epi: per-tile opaque lane indices, so the staging addresses cannot be hoisted
-                # out of the persistent loop and held live across the k-loop.
-                e_lane16 = _opaque(lane16) if const_expr(hp_epi) else lane16
-                e_kgrp = _opaque(kgrp) if const_expr(hp_epi) else kgrp
+                    # hp_epi: per-tile opaque lane indices, so the staging addresses cannot be hoisted
+                    # out of the persistent loop and held live across the k-loop.
+                    e_lane16 = _opaque(lane16) if const_expr(hp_epi) else lane16
+                    e_kgrp = _opaque(kgrp) if const_expr(hp_epi) else kgrp
 
                 def _epi_stage(wm_lo, wm_hi):
                     for wm in range_constexpr(wm_hi - wm_lo):
@@ -4701,7 +5017,13 @@ def _launch_grouped_gemm_bf16_nt(
                             src = fx.recast_iter(elem_cls, fx.add_offset(base_ptr, PITCH + r * C1_REG))
                             fx.copy(atom, _lv(src, (C1_RB, C_ROW_E), (C_ROW_E, 1)), gts)
 
-                if const_expr(epi_chunk > 1):
+                if const_expr(nt_half):
+                    _workgroup_barrier()
+                    if const_expr(nt_c1):
+                        _epi_c1()
+                    else:
+                        _epi_store(0, tile_m)
+                elif const_expr(epi_chunk > 1):
                     EPI_REP = wmma_m_rep // epi_chunk
                     EPI_ROWS = EPI_REP * WMMA_M
                     for ch in range_constexpr(epi_chunk):
@@ -4738,6 +5060,13 @@ def _launch_grouped_gemm_bf16_nt(
             if const_expr(tt_dec):
                 d0 = _decode_m_tile_tt_finish(
                     _decode_m_tile_tt_issue(_i32_table(arg_mtiles), bm0, N_GROUPS, M_TILES)
+                )
+            elif const_expr(MV):
+                d0 = _decode_m_tile_span_mvec_finish(
+                    _decode_m_tile_span_mvec_issue(_i32_table(arg_mtiles), bm0, N_GROUPS, lane),
+                    N_GROUPS,
+                    tile_m,
+                    lane,
                 )
             else:
                 d0 = _decode_m_tile_span_vec_finish(
@@ -4842,6 +5171,48 @@ _NT_COMPILED: dict = {}
 
 def _nt_launch(args: tuple):
     return _cached_launch(_launch_grouped_gemm_bf16_nt, _NT_COMPILED, 10, args)
+
+
+def _nt_tail(
+    mc_m,
+    mc_n,
+    mc_early,
+    mc_tile_sync,
+    head_pipe,
+    hp_opaque,
+    hp_epi,
+    vec_dec,
+    nt_ovl,
+    tt_dec,
+    nt_seam,
+    nt_deal,
+    nt_c1,
+    mv_dec=0,
+    nt_half=0,
+):
+    """The NT launcher's trailing Constexprs, each group passed only when it or a later one is set, so that every
+    setting that leaves the later knobs at 0 keeps the argument tuple -- the compile key -- it had without them."""
+    later = nt_c1 or mv_dec or nt_half
+    return (
+        (
+            (mc_m, mc_n, mc_early, mc_tile_sync)
+            if (mc_m * mc_n > 1 or head_pipe or vec_dec or nt_ovl or tt_dec or nt_seam or nt_deal or later)
+            else ()
+        )
+        + (
+            (head_pipe, hp_opaque, hp_epi)
+            if (head_pipe or vec_dec or nt_ovl or tt_dec or nt_seam or nt_deal or later)
+            else ()
+        )
+        + ((vec_dec,) if (vec_dec or nt_ovl or tt_dec or nt_seam or nt_deal or later) else ())
+        + ((nt_ovl,) if (nt_ovl or tt_dec or nt_seam or nt_deal or later) else ())
+        + ((tt_dec,) if (tt_dec or nt_seam or nt_deal or later) else ())
+        + ((nt_seam,) if (nt_seam or nt_deal or later) else ())
+        + ((nt_deal,) if (nt_deal or later) else ())
+        + ((nt_c1,) if later else ())
+        + ((mv_dec,) if (mv_dec or nt_half) else ())
+        + ((nt_half,) if nt_half else ())
+    )
 
 
 # Tile-shape selection
@@ -5272,6 +5643,10 @@ def _grouped_gemm_bf16_nt_flydsl_kernel_entry(
     nt_deal: int = 0,
     # C staging in the k-tile 1 job regions; see the launcher's `nt_c1`. 0 = off.
     nt_c1: int = 0,
+    # Multi-slot ballot m-tile decode for any expert count; see the launcher's `mv_dec`. 0 = off.
+    mv_dec: int = 0,
+    # Half-height wave grid on tiles of at most tile_m / 2 rows; see the launcher's `nt_half`. 0 = off.
+    nt_half: int = 0,
 ) -> torch.Tensor:
     """Grouped NT forward: ``out[rows] = a[rows] @ b[g].T`` for the expert owning each run."""
     assert a.dim() == 2 and b.dim() == 3, f"a must be 2-D and b 3-D, got {a.dim()}/{b.dim()}"
@@ -5483,22 +5858,23 @@ def _grouped_gemm_bf16_nt_flydsl_kernel_entry(
             persist,
             ntp_flags,
         )
-        + (
-            (mc_m, mc_n, mc_early, mc_tile_sync)
-            if (mc_m * mc_n > 1 or head_pipe or vec_dec or nt_ovl or tt_dec or nt_seam or nt_deal or nt_c1)
-            else ()
+        + _nt_tail(
+            mc_m,
+            mc_n,
+            mc_early,
+            mc_tile_sync,
+            head_pipe,
+            hp_opaque,
+            hp_epi,
+            vec_dec,
+            nt_ovl,
+            tt_dec,
+            nt_seam,
+            nt_deal,
+            nt_c1,
+            mv_dec,
+            nt_half,
         )
-        + (
-            (head_pipe, hp_opaque, hp_epi)
-            if (head_pipe or vec_dec or nt_ovl or tt_dec or nt_seam or nt_deal or nt_c1)
-            else ()
-        )
-        + ((vec_dec,) if (vec_dec or nt_ovl or tt_dec or nt_seam or nt_deal or nt_c1) else ())
-        + ((nt_ovl,) if (nt_ovl or tt_dec or nt_seam or nt_deal or nt_c1) else ())
-        + ((tt_dec,) if (tt_dec or nt_seam or nt_deal or nt_c1) else ())
-        + ((nt_seam,) if (nt_seam or nt_deal or nt_c1) else ())
-        + ((nt_deal,) if (nt_deal or nt_c1) else ())
-        + ((nt_c1,) if nt_c1 else ())
     )
     return out[:, :N] if out_ldc else out
 
@@ -5633,6 +6009,8 @@ def _nn_native_launch(
     nt_seam=0,
     nt_deal=0,
     nt_c1=0,
+    mv_dec=0,
+    nt_half=0,
 ):
     tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers = cfg
     if wave_grid < 0:
@@ -5721,22 +6099,23 @@ def _nn_native_launch(
             persist,
             ntp_flags,
         )
-        + (
-            (mc_m, mc_n, mc_early, mc_tile_sync)
-            if (mc_m * mc_n > 1 or head_pipe or vec_dec or nt_ovl or tt_dec or nt_seam or nt_deal or nt_c1)
-            else ()
+        + _nt_tail(
+            mc_m,
+            mc_n,
+            mc_early,
+            mc_tile_sync,
+            head_pipe,
+            hp_opaque,
+            hp_epi,
+            vec_dec,
+            nt_ovl,
+            tt_dec,
+            nt_seam,
+            nt_deal,
+            nt_c1,
+            mv_dec,
+            nt_half,
         )
-        + (
-            (head_pipe, hp_opaque, hp_epi)
-            if (head_pipe or vec_dec or nt_ovl or tt_dec or nt_seam or nt_deal or nt_c1)
-            else ()
-        )
-        + ((vec_dec,) if (vec_dec or nt_ovl or tt_dec or nt_seam or nt_deal or nt_c1) else ())
-        + ((nt_ovl,) if (nt_ovl or tt_dec or nt_seam or nt_deal or nt_c1) else ())
-        + ((tt_dec,) if (tt_dec or nt_seam or nt_deal or nt_c1) else ())
-        + ((nt_seam,) if (nt_seam or nt_deal or nt_c1) else ())
-        + ((nt_deal,) if (nt_deal or nt_c1) else ())
-        + ((nt_c1,) if nt_c1 else ())
     )
     return out
 
@@ -5811,6 +6190,10 @@ def _grouped_gemm_bf16_nn_flydsl_kernel_entry(
     nt_deal: int = 0,
     # Native NN path only: C staging in the k-tile 1 job regions; see the launcher's `nt_c1`. 0 = off.
     nt_c1: int = 0,
+    # Native NN path only: multi-slot ballot m-tile decode; see the launcher's `mv_dec`. 0 = off.
+    mv_dec: int = 0,
+    # Native NN path only: half-height wave grid on short tiles; see the launcher's `nt_half`. 0 = off.
+    nt_half: int = 0,
     **kw,
 ) -> torch.Tensor:
     """Grouped NN: ``out[rows] = a[rows] @ b[g]`` for the expert g owning each row run."""
@@ -5960,6 +6343,8 @@ def _grouped_gemm_bf16_nn_flydsl_kernel_entry(
                 nt_seam=nt_seam,
                 nt_deal=nt_deal,
                 nt_c1=nt_c1,
+                mv_dec=mv_dec,
+                nt_half=nt_half,
             )
             return out[:, :N] if out_ldc else out
         if out_ldc:
