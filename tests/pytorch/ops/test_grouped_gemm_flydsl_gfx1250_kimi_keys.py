@@ -189,7 +189,8 @@ def _padded(avg_m, tile_m):
 def test_a_pinned_tile_height_pads_no_more_than_the_default(kind, name, n, k):
     """The 293 forward / dgrad sets run 160-row tiles; they serve a row count only where they pad each expert's rows
     to no more than the default tile does, else the call takes the next-nearest key within reach, else none.
-    Below 257 rows the 160-row tile pads to 320 against the default 256; the variable-K sets are not affected."""
+    From 161 to 256 rows the 160-row tile pads to 320 against the default 256; the variable-K sets are not
+    affected."""
     lo = math.ceil(KEYED_AVG_M[0] / gg._AVG_M_REACH)
     for avg_m in range(lo, 830):
         nearest = [row[2] for row in gg._kwargs_rows(kind, (n, k, avg_m))]
