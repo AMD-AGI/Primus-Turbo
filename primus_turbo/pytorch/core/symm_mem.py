@@ -5,8 +5,6 @@
 ###############################################################################
 
 import operator
-import os
-import socket
 import warnings
 from functools import reduce
 from typing import Optional, Sequence
@@ -17,64 +15,23 @@ import triton
 import triton.language as tl
 from torch._tensor import _dtype_to_typestr
 
-import primus_turbo.common.envs as envs
 from primus_turbo.pytorch.core.pyhip_runtime_wrapper import (
-    HIPRuntimeLibrary,
     get_hip_runtime_lib,
-    hipDeviceAttributeEnum,
-    hipMemAllocationGranularityEnum,
-    hipMemAllocationHandleTypeEnum,
-    hipMemAllocationProp,
-    hipMemAllocationTypeEnum,
     hipMemcpyKindEnum,
-    hipMemLocationTypeEnum,
 )
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
-
-# Realtime-clock cycles (100 MHz) a barrier spin may wait before trapping. A spin that never
-# ends wedges the queue, and on gfx1250 tearing down a spinning queue can leave the GPU's
-# scheduler firmware unrecoverable until reboot, so a dead peer must abort the kernel instead.
-_SPIN_TIMEOUT_CYCLES = 3_000_000_000
 
 
 @triton.jit
-def _read_realtime(GFX12: tl.constexpr):
-    if GFX12:
-        t = tl.inline_asm_elementwise(
-            "s_sendmsg_rtn_b64 $0, sendmsg(MSG_RTN_GET_REALTIME)\n\ts_wait_kmcnt 0",
-            "=s",
-            [],
-            dtype=tl.int64,
-            is_pure=False,
-            pack=1,
-        )
-    else:
-        t = tl.inline_asm_elementwise(
-            "s_memrealtime $0\n\ts_waitcnt lgkmcnt(0)", "=s", [], dtype=tl.int64, is_pure=False, pack=1
-        )
-    return t
-
-
-@triton.jit
-def _trap():
-    tl.inline_asm_elementwise("s_trap 2\n\ts_mov_b32 $0, 0", "=s", [], dtype=tl.int32, is_pure=False, pack=1)
-
-
-@triton.jit
-def _barrier_all_ipc_kernel(rank, num_ranks, comm_buf_base_ptrs, GFX12: tl.constexpr, TIMEOUT: tl.constexpr):
+def _barrier_all_ipc_kernel(rank, num_ranks, comm_buf_base_ptrs):
     for i in range(num_ranks):
         remote_base_ptr = tl.load(comm_buf_base_ptrs + i).to(tl.pointer_type(tl.int32))
-        start = _read_realtime(GFX12)
         while tl.atomic_cas(remote_base_ptr + rank, 0, 1, scope="sys", sem="release") != 0:
-            if _read_realtime(GFX12) - start > TIMEOUT:
-                _trap()
+            pass
 
     for i in range(num_ranks):
         local_base_ptr = tl.load(comm_buf_base_ptrs + rank).to(tl.pointer_type(tl.int32))
-        start = _read_realtime(GFX12)
         while tl.atomic_cas(local_base_ptr + i, 1, 0, scope="sys", sem="acquire") != 1:
-            if _read_realtime(GFX12) - start > TIMEOUT:
-                _trap()
+            pass
 
     tl.debug_barrier()
 
@@ -124,192 +81,9 @@ def _tensor_from_device_ptr(
 
 _DEFAULT_SIGNAL_PAD_SIZE = 1024
 
-_SYMM_MEM_BACKENDS = ("auto", "ipc", "fabric")
-
-
-def _os_instance_id() -> str:
-    """Identity of the kernel this process runs on: legacy HIP IPC handles only open on the same one
-    (containers on one host share it)."""
-    try:
-        with open("/proc/sys/kernel/random/boot_id") as f:
-            return f.read().strip()
-    except OSError:
-        return socket.gethostname()
-
-
-def resolve_symm_mem_backend(group: dist.ProcessGroup, backend: Optional[str] = None) -> str:
-    """Collective: the heap backend every rank of ``group`` uses.
-
-    ``backend`` (else ``$PRIMUS_TURBO_SYMM_MEM_BACKEND``, else ``"auto"``) is ``"ipc"``, ``"fabric"`` or
-    ``"auto"``. ``"auto"`` keeps legacy IPC when the group lives on one OS instance and takes fabric
-    handles when it spans several, e.g. the trays of an MI455X UALink pod, which only fabric-exported
-    memory can be mapped across."""
-    requested = (backend or envs.PRIMUS_TURBO_SYMM_MEM_BACKEND).lower()
-    if requested not in _SYMM_MEM_BACKENDS:
-        raise ValueError(f"symmetric memory backend must be one of {_SYMM_MEM_BACKENDS}, got {requested!r}")
-    infos = [None] * group.size()
-    dist.all_gather_object(infos, (_os_instance_id(), requested, _fabric_supported()), group=group)
-    if len({req for _, req, _ in infos}) != 1:
-        raise ValueError(f"ranks of one group requested different symmetric memory backends: {infos}")
-    num_os = len({os_id for os_id, _, _ in infos})
-    if requested == "auto":
-        requested = "ipc" if num_os == 1 else "fabric"
-    if requested == "ipc" and num_os > 1:
-        raise RuntimeError(
-            f"the group spans {num_os} OS instances, which legacy HIP IPC handles cannot cross; "
-            "use the 'fabric' symmetric memory backend"
-        )
-    if requested == "fabric" and not all(ok for _, _, ok in infos):
-        bad = [rank for rank, (_, _, ok) in enumerate(infos) if not ok]
-        raise RuntimeError(
-            f"the 'fabric' symmetric memory backend needs fabric handle support on every rank's device; "
-            f"group ranks {bad} lack it"
-            + (
-                f" (the group spans {num_os} OS instances, so legacy IPC is no alternative)"
-                if num_os > 1
-                else ""
-            )
-        )
-    return requested
-
-
-def _fabric_supported() -> bool:
-    try:
-        return bool(
-            get_hip_runtime_lib().hipDeviceGetAttribute(
-                hipDeviceAttributeEnum.hipDeviceAttributeHandleTypeFabricSupported,
-                torch.cuda.current_device(),
-            )
-        )
-    except Exception:
-        return False
-
-
-def _align(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
-
-
-class _IpcHeap:
-    """One ``hipMalloc`` allocation per rank; peers open it through legacy HIP IPC (same OS instance)."""
-
-    def __init__(self, lib: HIPRuntimeLibrary, group: dist.ProcessGroup, size: int, uncached: bool):
-        self.lib = lib
-        self.rank = group.rank()
-        self.ptrs: list[int] = []
-        world_size = group.size()
-        ptr = (lib.hipMallocUncached if uncached else lib.hipMalloc)(size)
-        ptrs = [0] * world_size
-        ptrs[self.rank] = SymmetricMemory._c_void_p_to_int(ptr)
-        try:
-            lib.hipMemset(ptr, 0, size)
-            handle = lib.mem_handle_to_bytes(lib.hipIpcGetMemHandle(ptr))
-            handles = [None] * world_size
-            dist.all_gather_object(handles, handle, group=group)
-            for rank in range(world_size):
-                if rank != self.rank:
-                    ptrs[rank] = SymmetricMemory._c_void_p_to_int(lib.hipIpcOpenMemHandle(handles[rank]))
-        except Exception:
-            self.ptrs = ptrs
-            self.close()
-            raise
-        self.ptrs = ptrs
-
-    def close(self) -> None:
-        for rank, ptr in enumerate(self.ptrs):
-            if ptr == 0:
-                continue
-            try:
-                if rank == self.rank:
-                    self.lib.hipFree(ptr)
-                else:
-                    self.lib.hipIpcCloseMemHandle(ptr)
-            except Exception as e:
-                warnings.warn(f"SymmetricMemory cleanup error for rank {rank}: {e}")
-        self.ptrs = []
-
-
-class _FabricHeap:
-    """A VMM allocation per rank exported as a fabric handle; every rank imports and maps the others'.
-
-    Fabric handles open on any OS instance of the scale-up domain (the UALink pod of MI455X trays), so
-    the group may span hosts. Each mapping is visible to this process's device only."""
-
-    def __init__(
-        self, lib: HIPRuntimeLibrary, group: dist.ProcessGroup, size: int, uncached: bool, device: int
-    ):
-        self.lib = lib
-        self.device = device
-        self.ptrs: list[int] = []
-        self._mappings: list[tuple[int, object]] = []
-        prop = hipMemAllocationProp()
-        prop.type = (
-            hipMemAllocationTypeEnum.hipMemAllocationTypeUncached
-            if uncached
-            else hipMemAllocationTypeEnum.hipMemAllocationTypePinned
-        )
-        prop.requestedHandleType = hipMemAllocationHandleTypeEnum.hipMemHandleTypeFabric
-        prop.location.type = hipMemLocationTypeEnum.hipMemLocationTypeDevice
-        prop.location.id = device
-        self.granularity = lib.hipMemGetAllocationGranularity(
-            prop, hipMemAllocationGranularityEnum.hipMemAllocationGranularityRecommended
-        )
-        self.size = _align(size, self.granularity)
-        rank, world_size = group.rank(), group.size()
-        ptrs = [0] * world_size
-        try:
-            ptrs[rank] = self._map(lib.hipMemCreate(self.size, prop))
-            lib.hipMemset(ptrs[rank], 0, self.size)
-            handle = lib.hipMemExportToFabricHandle(self._mappings[0][1])
-            handles = [None] * world_size
-            dist.all_gather_object(handles, handle, group=group)
-            for peer in range(world_size):
-                if peer != rank:
-                    ptrs[peer] = self._map(lib.hipMemImportFromFabricHandle(handles[peer]))
-        except Exception:
-            self.close()
-            raise
-        self.ptrs = ptrs
-
-    def _map(self, handle) -> int:
-        """Reserve a VA range, map ``handle`` (owned from here on) there and open it to this device."""
-        va, mapped = None, False
-        try:
-            va = self.lib.hipMemAddressReserve(self.size, self.granularity).value
-            self.lib.hipMemMap(va, self.size, 0, handle)
-            mapped = True
-            self.lib.hipMemSetAccess(va, self.size, [self.device])
-        except Exception:
-            self._release(va, mapped, handle)
-            raise
-        self._mappings.append((va, handle))
-        return va
-
-    def _release(self, va: Optional[int], mapped: bool, handle) -> None:
-        steps = []
-        if mapped:
-            steps.append(("hipMemUnmap", lambda: self.lib.hipMemUnmap(va, self.size)))
-        if va is not None:
-            steps.append(("hipMemAddressFree", lambda: self.lib.hipMemAddressFree(va, self.size)))
-        steps.append(("hipMemRelease", lambda: self.lib.hipMemRelease(handle)))
-        for name, step in steps:
-            try:
-                step()
-            except Exception as e:
-                warnings.warn(f"SymmetricMemory fabric cleanup: {name} failed: {e}")
-
-    def close(self) -> None:
-        for va, handle in reversed(self._mappings):
-            self._release(va, True, handle)
-        self._mappings = []
-        self.ptrs = []
-
 
 class SymmetricMemory:
-    """GPU symmetric memory: one heap per rank, every rank holding device pointers to all of them.
-
-    The heaps come from legacy HIP IPC (one OS instance) or fabric handles (a scale-up domain that
-    may span hosts); see ``resolve_symm_mem_backend``. The caller must set the correct CUDA device
-    (local rank) first."""
+    """GPU symmetric memory backed by HIP IPC; caller must set the correct CUDA device (local rank) first."""
 
     def __init__(
         self,
@@ -318,7 +92,6 @@ class SymmetricMemory:
         signal_pad_size: int = _DEFAULT_SIGNAL_PAD_SIZE,
         uncached_signal_pad: bool = False,
         uncached_buffer: bool = False,
-        backend: Optional[str] = None,
     ):
         if alloc_size <= 0:
             raise ValueError(f"requested alloc size must be greater than 0, got {alloc_size}")
@@ -334,20 +107,23 @@ class SymmetricMemory:
         self.buffer_size = alloc_size
         self.signal_pad_size = signal_pad_size
         self.device = torch.cuda.current_device()
-        self.backend = resolve_symm_mem_backend(group, backend)
 
         self.buffer_ptrs: list[int] = []
         self.signal_pad_ptrs: list[int] = []
         self.buffer_ptrs_dev: torch.Tensor = None
         self.signal_pad_ptrs_dev: torch.Tensor = None
         self.is_destroyed = False
-        self._heaps: list = []
 
+        buffer_ptr = None
+        signal_pad_ptr = None
         try:
             # ``uncached_buffer``: same trade-off as ``uncached_signal_pad`` below, for a caller whose
             # cross-rank protocol relies on every access to the heap bypassing L2 (DeepEP's channel
             # ring buffers, which drop the release/acquire fences around their head/tail updates).
-            self.buffer_ptrs = self._open_heap(alloc_size, uncached_buffer).ptrs
+            alloc_buffer = self.lib.hipMallocUncached if uncached_buffer else self.lib.hipMalloc
+            buffer_ptr = alloc_buffer(alloc_size)
+            self.lib.hipMemset(buffer_ptr, 0, alloc_size)
+            self.buffer_ptrs = self._rendezvous(buffer_ptr)
             # signal_pad allocated only when requested (bf16 mega passes 0 and skips it).
             #
             # ``uncached_signal_pad`` is for a caller that puts DATA in the pad, not just flags. The
@@ -360,8 +136,15 @@ class SymmetricMemory:
             # too, and a pad holding only spin-wait flags (async_tp's few bytes per split, or the
             # 1 KB default this class hands out) does not need it.
             if self.signal_pad_size > 0:
-                self.signal_pad_ptrs = self._open_heap(self.signal_pad_size, uncached_signal_pad).ptrs
+                alloc_pad = self.lib.hipMallocUncached if uncached_signal_pad else self.lib.hipMalloc
+                signal_pad_ptr = alloc_pad(self.signal_pad_size)
+                self.lib.hipMemset(signal_pad_ptr, 0, self.signal_pad_size)
+                self.signal_pad_ptrs = self._rendezvous(signal_pad_ptr)
         except Exception:
+            if not self.buffer_ptrs and buffer_ptr is not None:
+                self._try_free(buffer_ptr)
+            if not self.signal_pad_ptrs and signal_pad_ptr is not None:
+                self._try_free(signal_pad_ptr)
             self._cleanup_ptrs()
             self.is_destroyed = True
             raise
@@ -387,20 +170,51 @@ class SymmetricMemory:
             raise ValueError(f"NULL device pointer: {ptr!r}")
         return val
 
-    def _open_heap(self, size: int, uncached: bool):
-        """Collective: allocate this rank's zeroed heap and map every rank's; returns the heap."""
-        if self.backend == "fabric":
-            heap = _FabricHeap(self.lib, self.group, size, uncached, self.device)
-        else:
-            heap = _IpcHeap(self.lib, self.group, size, uncached)
-        self._heaps.append(heap)
-        return heap
+    def _rendezvous(self, ptr) -> list[int]:
+        """Exchange IPC handles across ranks and open remote memory; returns list[int] of device ptrs (one per rank)."""
+        mem_handle = self.lib.hipIpcGetMemHandle(ptr)
+        mem_handle_bytes = self.lib.mem_handle_to_bytes(mem_handle)
+        mem_handle_list = [None] * self.world_size
+        dist.all_gather_object(mem_handle_list, mem_handle_bytes, group=self.group)
+
+        ptr_list: list[int] = [0] * self.world_size
+        opened_ranks: list[int] = []
+        try:
+            for rank in range(self.world_size):
+                if rank == self.rank:
+                    ptr_list[rank] = self._c_void_p_to_int(ptr)
+                else:
+                    ipc_ptr = self.lib.hipIpcOpenMemHandle(mem_handle_list[rank])
+                    ptr_list[rank] = self._c_void_p_to_int(ipc_ptr)
+                    opened_ranks.append(rank)
+        except Exception:
+            for r in opened_ranks:
+                try:
+                    self.lib.hipIpcCloseMemHandle(ptr_list[r])
+                except Exception:
+                    pass
+            raise
+        return ptr_list
+
+    def _try_free(self, ptr):
+        try:
+            self.lib.hipFree(ptr)
+        except Exception as e:
+            warnings.warn(f"hipFree failed during cleanup: {e}")
 
     def _cleanup_ptrs(self):
-        """Release all allocated memory and peer mappings, tolerating individual failures."""
-        for heap in reversed(self._heaps):
-            heap.close()
-        self._heaps = []
+        """Release all allocated memory and IPC handles, tolerating individual failures."""
+        for ptrs in (self.buffer_ptrs, self.signal_pad_ptrs):
+            for rank in range(min(self.world_size, len(ptrs))):
+                if ptrs[rank] == 0:
+                    continue
+                try:
+                    if rank == self.rank:
+                        self.lib.hipFree(ptrs[rank])
+                    else:
+                        self.lib.hipIpcCloseMemHandle(ptrs[rank])
+                except Exception as e:
+                    warnings.warn(f"SymmetricMemory cleanup error for rank {rank}: {e}")
         self.buffer_ptrs = []
         self.signal_pad_ptrs = []
 
@@ -485,8 +299,6 @@ class SymmetricMemory:
                 self.rank,
                 self.world_size,
                 self.signal_pad_ptrs_dev,
-                GFX12=get_device_compute_capability()[0] >= 12,
-                TIMEOUT=_SPIN_TIMEOUT_CYCLES,
             )
 
     def destroy(self):
@@ -547,8 +359,10 @@ def get_symm_mem_workspace(
 
 
 if __name__ == "__main__":
+    import os
+
     rank = int(os.environ.get("RANK", 0))
-    torch.cuda.set_device(rank % torch.cuda.device_count())
+    torch.cuda.set_device(rank)
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     dist.init_process_group("nccl", world_size=world_size, rank=rank)
     group = dist.new_group(list(range(world_size)))
