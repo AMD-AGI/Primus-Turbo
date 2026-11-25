@@ -2435,10 +2435,11 @@ def _vk_launch(args: tuple):
 # vary from step to step (dropless routing), so avg_m lands near, not on, a keyed value. Such an avg_m takes
 # the keyed avg_m of its shape nearest to it on a log scale, within a factor _AVG_M_REACH, so a set is never
 # used far from the row counts it was measured at: keys a factor 2 apart serve every avg_m between them, and a
-# lone key serves a factor 2 either side (512 serves 256-1024, 2048 serves 1024-4096). At that distance the
-# keyed sets still measured faster than the untuned path on every operator tried.
+# lone key serves a factor 4 either side (512 serves 128-2048, 2048 serves 512-8192). A factor 2 from their key
+# the DeepSeek-V3 and MiniMax-M3 sets measured 7% to 43% faster than the untuned path, and a factor 4 away 3% to
+# 28%; Muse Spark's 512 set is about even at 256 rows, the furthest below its key it was measured.
 # PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS=1 keeps the exact match only, for A/B runs.
-_AVG_M_REACH = 2
+_AVG_M_REACH = 4
 
 
 def _nearest_avg_m(avg_m: int, keyed) -> int | None:
@@ -6375,9 +6376,10 @@ def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:
         # The NT and NN launchers drop vec_dec above 32 experts, and nt_seam bit 2 then refuses the set.
         return {}
     if kind in ("nt", "nn"):
-        # A set is measured on the tile its row count gets at many experts. When the experts hold 8 or fewer
-        # 256-row tiles in all, `_pick_config_shape` hands out 128 x 128 instead, whose 4 x 4 warp tile has as
-        # many fragment reads per sub-step as matrix ops, and the launchers refuse lds_cosched >= 2 there.
+        # A set is measured on the tile its row count gets at many experts, and declines any other. At 128 rows
+        # or fewer `_pick_config_shape` hands out a 128-row tile; when the experts hold 8 or fewer 256-row tiles
+        # in all, 128 x 128, whose 4 x 4 warp tile has as many fragment reads per sub-step as matrix ops, and the
+        # launchers refuse lds_cosched >= 2 there.
         pick = _pick_config if kind == "nt" else _pick_config_nn
         if pick(key[0], key[1], key[2], G) != pick(*row):
             return {}
