@@ -576,9 +576,9 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
     # gfx1250 the kernel has no expert-count limit of its own: the expert table is read
     # from memory per tile, and every offset that scales with the expert index is 64-bit.
     # There the cap is the largest count measured, G=224 -- Kimi K3.1 at EP4 (896 experts),
-    # against an fp32 reference under even, adversarial and lognormal routing (the overwrite
-    # epilogue; the accumulate one is measured at G=64) -- since a smaller one makes a pinned
-    # FlyDSL backend raise on that model's wgrad.
+    # the overwrite and the accumulate epilogue against an fp32 reference under even,
+    # adversarial and lognormal routing -- since a smaller one makes a pinned FlyDSL backend
+    # raise on that model's wgrad.
     MAX_G = 64
     MAX_G_GFX1250 = 224
 
