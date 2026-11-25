@@ -56,6 +56,8 @@ _GFX1250_ENABLED_TESTS = (
     # The kwargs-mode shape keys of the same kernel (the MiniMax-M3 shapes): which calls get a key's
     # whole argument set, and that the keyed result is bit-identical to the untuned one.
     "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_kwargs_keys.py",
+    # The Kimi K3.1 kwargs keys: three row counts per shape, the nearest-key rule, 224 / 112 experts.
+    "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_kimi_keys.py",
     # beta = 1 on the same kernel's variable-K wgrad, into an fp32 main_grad (Muse Spark expert shapes).
     "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_variable_k_accum.py",
     # FlyDSL attention at the DeepSeek-V3 MLA head dims (primus_turbo/flydsl/attention/gfx1250_mla).
