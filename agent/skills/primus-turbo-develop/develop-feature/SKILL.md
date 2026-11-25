@@ -67,6 +67,9 @@ Wrap the op for model code (hold `nn.Parameter`s, reshape, call the op). Referen
 ```
 - [ ] Correctness first  → ../verify-accuracy/SKILL.md   (add ref in tests/pytorch/ref/, test in tests/pytorch/ops/)
 - [ ] Then performance    → ../verify-performance/SKILL.md (add/extend benchmark/ops/training/bench_*.py)
+- [ ] Architecture-specific kernel → gfx ID as a name tag (`<op>_<dtype>_kernel_gfx1250.py`, `<op>/gfx1250_<variant>/`) and an entry in the operation's `primus_turbo/pytorch/kernels/<op>/<op>_registry.py` (kernel, impl, gates, tests, benchmarks)
+- [ ] `python tools/conventions` passes (a finding names its rule; `--explain <ID>` gives the reason and the fix)
+- [ ] Tests of the registered kernels the change touches (code, gate modules, tests): `python -m primus_turbo.registry --owning $(git diff --name-only main) --tests`
 - [ ] Focused test green, then `pytest tests/pytorch/ -n 8`
 - [ ] Rebuilt if a C++ schema changed
 - [ ] Push toward HW limit → ../optimize-handoff/SKILL.md
