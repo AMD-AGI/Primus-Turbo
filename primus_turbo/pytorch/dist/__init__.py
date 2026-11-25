@@ -5,3 +5,4 @@
 ###############################################################################
 
 from .fp8_alltoall import *
+from .sdma_comm import SdmaCommunicator
