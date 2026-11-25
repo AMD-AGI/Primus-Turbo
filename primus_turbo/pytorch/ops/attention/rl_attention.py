@@ -62,7 +62,7 @@ No keys (output 0, LSE +inf)            hi + 1                         any
 ======================================  =============================  ===========
 
 ``create_block_mask(lo, hi, cu_seqlens_q=..., cu_seqlens_k=... or seq_lens=...)`` takes the bounds
-as positions in each token's own sequence instead and converts them once per mask.
+as positions in each token's own sequence instead and converts them on the device.
 
 Keys outside [lo, hi] are exact no-ops, and tiles are walked in increasing key position whatever the
 mask, so a token's output depends only on its own interval. The backward prunes its walks to the
@@ -71,7 +71,7 @@ intervals.
 
 import functools
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
@@ -201,32 +201,17 @@ class RLBlockMask:
 
     lo: torch.Tensor  # [num_tokens] int32
     hi: torch.Tensor  # [num_tokens] int32
-    _cache: dict = field(default_factory=dict, init=False, repr=False, compare=False)
 
     @property
     def num_tokens(self) -> int:
         return self.lo.numel()
 
     def with_window(self, window_left: int) -> "RLBlockMask":
-        """Narrow each row to [max(lo, hi - window_left), hi]. Cached, so every layer of a step
-        reuses one narrowed mask."""
+        """Narrow each row to [max(lo, hi - window_left), hi]. Computed on every call, never
+        cached: a HIP graph must capture the narrowing so a replay reads the live bounds."""
         if window_left is None or window_left < 0:
             return self
-        key = ("window", window_left)
-        if key not in self._cache:
-            self._cache[key] = RLBlockMask(
-                torch.maximum(self.lo, self.hi - window_left).contiguous(), self.hi
-            )
-        return self._cache[key]
-
-    def key_starts(self, seq_lens: torch.Tensor) -> torch.Tensor:
-        """cu_seqlens_k of a paged cache: the exclusive cumulative sum of seq_lens. Cached per
-        seq_lens tensor and version, so every layer of a step reuses one."""
-        cached = self._cache.get("starts")
-        if cached is None or cached[0] is not seq_lens or cached[1] != seq_lens._version:
-            starts = torch.nn.functional.pad(torch.cumsum(seq_lens, 0, dtype=torch.int32), (1, 0))
-            cached = self._cache["starts"] = (seq_lens, seq_lens._version, starts)
-        return cached[2]
+        return RLBlockMask(torch.maximum(self.lo, self.hi - window_left).contiguous(), self.hi)
 
     def validate(self, cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor) -> None:
         """Check every non-empty interval lies inside its token's own keys. Syncs with the device."""
@@ -257,24 +242,22 @@ def create_block_mask(
     not a mask_mod function. ``window_left`` >= 0 narrows each row to [max(lo, hi - window_left), hi].
 
     By default lo / hi are global key indices. With ``cu_seqlens_q`` they are positions in each
-    token's own sequence (0 is its first key), and the mask converts them once, on the device and
-    without a host sync, using the key starts: ``cu_seqlens_k`` for contiguous K/V, or ``seq_lens``
-    for a paged cache (the mask then also holds the key starts its paged calls need).
+    token's own sequence (0 is its first key), and the mask converts them on the device without a
+    host sync, using the key starts: ``cu_seqlens_k`` for contiguous K/V, or ``seq_lens`` for a
+    paged cache.
     """
     if cu_seqlens_q is not None:
         mask = create_block_mask(bounds, hi)
         if (cu_seqlens_k is None) == (seq_lens is None):
             raise ValueError("sequence positions need exactly one of cu_seqlens_k and seq_lens")
         if seq_lens is not None:
-            starts = mask.key_starts(seq_lens)
+            starts = torch.nn.functional.pad(torch.cumsum(seq_lens, 0, dtype=torch.int32), (1, 0))
         else:
             starts = cu_seqlens_k
         tokens = torch.arange(mask.num_tokens, dtype=torch.int32, device=mask.lo.device)
         seq = torch.searchsorted(cu_seqlens_q[1:].to(torch.int32), tokens, right=True)
         base = starts.to(torch.int32)[seq]
-        out = RLBlockMask((mask.lo + base).contiguous(), (mask.hi + base).contiguous())
-        out._cache.update(mask._cache)
-        return out.with_window(window_left)
+        return RLBlockMask((mask.lo + base).contiguous(), (mask.hi + base).contiguous()).with_window(window_left)
     if cu_seqlens_k is not None or seq_lens is not None:
         raise ValueError("cu_seqlens_k / seq_lens convert sequence positions, which also need cu_seqlens_q")
     if hi is None:
@@ -343,7 +326,7 @@ def rl_paged_attention_func(
         k_cache,
         v_cache,
         cu_seqlens_q,
-        block_mask.key_starts(seq_lens) if block_mask is not None else None,
+        None,  # key starts: each backend derives them from seq_lens in the same call
         seq_lens,
         block_table,
         int(max_seqlen_q),

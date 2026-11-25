@@ -369,21 +369,30 @@ def test_paged_out_buffer(dtype, flat, heads, small_segments):
         rl_paged_attention_func(*args, out=torch.empty(q.shape[0] - 1, hq, d, dtype=dtype, device=DEVICE))
 
 
-def _graph_decode_check(hq, hkv, d, page, bound, steps, kernel_options, sinks=None, window_left=-1, seed=0):
+def _graph_decode_check(
+    hq, hkv, d, page, bound, steps, kernel_options, sinks=None, window_left=-1, seed=0, masked=False
+):
     """Capture one decode graph with max_seqlen_k = bound, as a serving engine does, then replay it
     for steps of other context lengths (q and seq_lens updated in place): every replay must give
-    the bits of an eager call at the real max_seqlen_k."""
+    the bits of an eager call at the real max_seqlen_k. With ``masked``, the call builds a mask from
+    per-sequence bounds (sequence positions, a nonzero lower bound) that are also updated in place,
+    narrowed by the window inside the call, so the graph must recompute it from the live values."""
     batch = len(steps[0])
     _, k, v, cu_k = _varlen([bound] * batch, hq, hkv, d, torch.bfloat16, seed=seed)
     k_cache, v_cache, block_table, _ = _paged(k, v, cu_k, page, seed=seed)
     q = torch.zeros(batch, hq, d, dtype=torch.bfloat16, device=DEVICE)
     seq_lens = torch.tensor(steps[0], dtype=torch.int32, device=DEVICE)
     cu_q = _cu([1] * batch)
+    rel_lo = torch.zeros(batch, dtype=torch.int32, device=DEVICE)
+    rel_hi = seq_lens - 1
 
     def call(max_k):
+        mask = None
+        if masked:
+            mask = create_block_mask(rel_lo, rel_hi, cu_seqlens_q=cu_q, seq_lens=seq_lens)
         return rl_paged_attention_func(
             q, k_cache, v_cache, cu_q, seq_lens, block_table, 1, max_k, d**-0.5, window_left=window_left,
-            sinks=sinks, kernel_options=kernel_options,
+            block_mask=mask, sinks=sinks, kernel_options=kernel_options,
         )  # fmt: skip
 
     call(bound)
@@ -395,6 +404,8 @@ def _graph_decode_check(hq, hkv, d, page, bound, steps, kernel_options, sinks=No
     for lens in steps:
         q.copy_(torch.randn(batch, hq, d, generator=gen))
         seq_lens.copy_(torch.tensor(lens, dtype=torch.int32))
+        rel_hi.copy_(seq_lens - 1)
+        rel_lo.copy_(torch.tensor([int(torch.randint(0, n, (1,), generator=gen)) for n in lens], dtype=torch.int32))
         graph.replay()
         assert _bits_equal(out, call(max(lens))), f"graph replay at lens {lens}"
 
@@ -412,6 +423,43 @@ def test_decode_graph_replay(mode, with_sinks, heads, small_segments):
     )
 
 
+@pytest.mark.parametrize("mode", ["auto", "split"])
+@pytest.mark.parametrize("heads", MODEL_HEADS, ids=MODEL_IDS)
+def test_masked_decode_graph_replay(mode, heads, small_segments):
+    """A captured graph whose mask (sequence positions, window narrowing) is built inside the call
+    from buffers the engine updates in place follows the live bounds on every replay."""
+    hq, hkv, d = heads
+    steps = [[100, 700, 129], [101, 1024, 300], [5, 6, 7]]
+    _graph_decode_check(hq, hkv, d, 16, 1024, steps, {"MODE": mode}, window_left=300, seed=25, masked=True)
+
+
+@pytest.mark.parametrize("heads", MODEL_HEADS, ids=MODEL_IDS)
+def test_masked_paged_under_inference_mode(heads, small_segments):
+    """vLLM runs the model under torch.inference_mode(), where tensors carry no version counter:
+    masked paged calls (global and sequence-position masks, a window) work there and give the bits
+    of the same calls outside it."""
+    hq, hkv, d = heads
+    lens = [300, 7, 129]
+    _, k, v, cu_k = _varlen(lens, hq, hkv, d, torch.bfloat16, seed=26)
+    k_cache, v_cache, block_table, seq_lens = _paged(k, v, cu_k, 16, seed=26)
+    q = _varlen([1] * len(lens), hq, hkv, d, torch.bfloat16, seed=27)[0]
+    rlo = torch.tensor([37, 0, 100], dtype=torch.int32, device=DEVICE)
+    rhi = torch.tensor(lens, dtype=torch.int32, device=DEVICE) - 1
+
+    def run(q, seq_lens, rlo, rhi):
+        cu_q = _cu([1] * len(lens))
+        rel = create_block_mask(rlo, rhi, cu_seqlens_q=cu_q, seq_lens=seq_lens)
+        glob = create_block_mask(rel.lo.clone(), rel.hi.clone())
+        args = (q, k_cache, v_cache, cu_q, seq_lens, block_table, 1, max(lens), d**-0.5)
+        return [rl_paged_attention_func(*args, block_mask=m, window_left=w) for m in (rel, glob) for w in (-1, 50)]
+
+    want = run(q, seq_lens, rlo, rhi)
+    with torch.inference_mode():
+        got = run(q.clone(), seq_lens.clone(), rlo.clone(), rhi.clone())
+    for i, (g, w) in enumerate(zip(got, want)):
+        assert _bits_equal(g, w), f"call {i} under inference_mode"
+
+
 def test_sequence_position_mask():
     """Bounds in each token's own sequence positions give the global mask, for contiguous K/V and
     for a paged cache whose sequences have more keys than queries."""
@@ -427,7 +475,6 @@ def test_sequence_position_mask():
     glo, ghi = _to_global(rlo, rhi, q_lens, starts)
     mask = create_block_mask(torch.stack([rlo, rhi]), cu_seqlens_q=_cu(q_lens), seq_lens=seq_lens)
     assert torch.equal(mask.lo, glo) and torch.equal(mask.hi, ghi)
-    assert torch.equal(mask.key_starts(seq_lens), torch.tensor(starts + [sum(k_lens)], device=DEVICE).int())
     with pytest.raises(ValueError, match="exactly one"):
         create_block_mask(rlo, rhi, cu_seqlens_q=_cu(q_lens))
 

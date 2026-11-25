@@ -164,6 +164,9 @@ def rl_attention_fwd_triton(
         _, num_kv_heads, head_size = k.shape
         block_size = 1
     has_vis = vis_lo is not None
+    if has_vis and paged and cu_seqlens_k is None:
+        # Global key indices of a paged cache start at the exclusive cumulative sum of seq_lens.
+        cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(seq_lens, 0, dtype=torch.int32), (1, 0))
     assert not has_vis or cu_seqlens_k is not None, "visibility needs cu_seqlens_k (key starts)"
     num_tokens, num_q_heads, q_head_size = q.shape
     assert q_head_size == head_size and num_q_heads % num_kv_heads == 0

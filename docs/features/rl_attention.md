@@ -57,7 +57,7 @@ the call without `out`.
 `[lo, hi]` of its own sequence. Unlike `torch.nn.attention.flex_attention.create_block_mask`, it
 takes the bounds directly, not a `mask_mod`. Bounds are **global key indices**: sequence `s` owns
 keys `cu_seqlens_k[s] .. cu_seqlens_k[s+1]-1`. For a paged cache, `cu_seqlens_k` is the exclusive
-cumulative sum of `seq_lens`; it is computed once per mask and reused by every layer. With `i` the
+cumulative sum of `seq_lens`, which each call derives on the device. With `i` the
 global index of a query token:
 
 | Mask | lo | hi |
@@ -69,8 +69,12 @@ global index of a query token:
 
 To give bounds as positions in each token's own sequence (0 = its first key), pass the layout:
 `create_block_mask(lo, hi, cu_seqlens_q=cu_q, seq_lens=seq_lens)` for a paged cache, or
-`cu_seqlens_k=cu_k` for contiguous K/V. The mask converts them once on the device (no host sync,
-CUDA-graph safe) and every layer of the step reuses the result.
+`cu_seqlens_k=cu_k` for contiguous K/V. The mask converts them on the device (no host sync).
+
+Masks hold no cached state: the window narrowing and the key starts of a paged cache are computed
+on every call, so a HIP graph captures them and a replay follows the engine's in-place updates of
+`seq_lens` and the bounds, and the calls work under `torch.inference_mode()` (whose tensors have no
+version counter).
 
 `create_block_mask(..., window_left=W)` narrows every row to `[max(lo, hi - W), hi]`. Keys
 outside a row's interval are exact no-ops. Tiles are always walked in increasing key position, so a

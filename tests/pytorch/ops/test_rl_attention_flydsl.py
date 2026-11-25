@@ -199,6 +199,42 @@ def test_decode_steps_do_not_recompile(mode, monkeypatch):
     assert len(compiles) == first, f"{len(compiles) - first} compiles after the first step"
 
 
+@pytest.mark.parametrize("mode", ["auto", "split"])
+def test_masked_decode_graph_replay(mode):
+    """FlyDSL: a captured graph whose sequence-position mask and window are built inside the call
+    from buffers updated in place follows the live bounds on every replay."""
+    steps = [[1500, 3000, 200, 64], [1501, 8192, 1024, 1025], [65, 66, 67, 68]]
+    _graph_decode_check(32, 8, 128, 64, 8192, steps, {**FLY, "MODE": mode}, window_left=1000, seed=25, masked=True)
+
+
+def test_masked_paged_under_inference_mode():
+    """FlyDSL masked paged calls work under torch.inference_mode() (no version counters) with the
+    bits of the same calls outside it."""
+    lens = [3000, 70, 1300]
+    _, k, v, cu_k = _varlen(lens, 32, 8, 128, BF16, seed=26)
+    k_cache, v_cache, block_table, seq_lens = _paged(k, v, cu_k, 64, seed=26)
+    q = _varlen([1] * len(lens), 32, 8, 128, BF16, seed=27)[0]
+    rlo = torch.tensor([370, 0, 1000], dtype=torch.int32, device=DEVICE)
+    rhi = torch.tensor(lens, dtype=torch.int32, device=DEVICE) - 1
+
+    def run(q, seq_lens, rlo, rhi):
+        cu_q = _cu([1] * len(lens))
+        rel = create_block_mask(rlo, rhi, cu_seqlens_q=cu_q, seq_lens=seq_lens)
+        glob = create_block_mask(rel.lo.clone(), rel.hi.clone())
+        args = (q, k_cache, v_cache, cu_q, seq_lens, block_table, 1, max(lens))
+        return [
+            rl_paged_attention_func(*args, block_mask=m, window_left=w, kernel_options=FLY)
+            for m in (rel, glob)
+            for w in (-1, 500)
+        ]
+
+    want = run(q, seq_lens, rlo, rhi)
+    with torch.inference_mode():
+        got = run(q.clone(), seq_lens.clone(), rlo.clone(), rhi.clone())
+    for i, (g, w) in enumerate(zip(got, want)):
+        assert _bits_equal(g, w), f"call {i} under inference_mode"
+
+
 def test_split_programs_bitwise():
     """Split programs per (sequence, KV head) only schedule work: one program walking every segment,
     uneven runs, one segment each and more programs than segments give the fused bits, for decode
