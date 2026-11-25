@@ -14,6 +14,11 @@ import importlib.util
 import unittest
 from pathlib import Path
 
+import pytest
+
+# Source-only: the same on every GPU, gfx1250 included.
+pytestmark = pytest.mark.gfx1250
+
 
 def _package_dir() -> Path:
     source = Path(__file__).resolve().parents[3] / "primus_turbo"

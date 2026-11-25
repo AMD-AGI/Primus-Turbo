@@ -37,6 +37,10 @@ from tests.pytorch.ref.gemm_ref import (
 )
 from tests.pytorch.test_utils import compute_snr, get_tolerances
 
+# On gfx1250 too: bf16 grouped GEMM through the backend registry is Triton plus the FlyDSL WMMA / TDM
+# kernels of grouped_gemm_bf16_kernel_gfx1250.py.
+pytestmark = pytest.mark.gfx1250
+
 # (backend, auto_tune, reduce_num_cu): auto_tune is ignored under a pinned backend, and
 # hipBLASLt (which the tuner may pick) rejects a reduced CU count.
 _FUNC_BACKEND_CONFIGS = [

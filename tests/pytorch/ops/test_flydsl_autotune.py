@@ -1025,6 +1025,7 @@ for line in sorted(
 """
 
 
+@pytest.mark.gfx1250  # host-only; the rest of this file stays skipped on gfx1250
 def test_no_module_level_launch_reads_a_mutable_global():
     import primus_turbo
 

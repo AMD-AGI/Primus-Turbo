@@ -12,6 +12,7 @@ import unittest
 from typing import Optional
 from unittest import mock
 
+import pytest
 import torch
 import torch.distributed as dist
 from torch.testing._internal.common_distributed import (
@@ -42,6 +43,9 @@ from tests.pytorch.ref.deep_ep_ref import (
     get_dispatch_layout_ref,
     tune_and_verify_intranode,
 )
+
+# FlyDSL intranode DeepEP (primus_turbo/flydsl/deep_ep) runs on gfx1250; the C++ DeepEP is not loaded there.
+pytestmark = pytest.mark.gfx1250
 
 # gfx1250 runs v2 and, for the tests, the FlyDSL port of v1 (the C++ DeepEP is not loaded there);
 # every other GPU runs the C++ v1

@@ -1487,6 +1487,7 @@ def _build_sparse_mla(cr, num_heads, seqlen, pool, topk_pool, seed=0):
     return q.contiguous(), kv.contiguous(), topk.to(torch.int32).contiguous(), sink, grad_out
 
 
+@pytest.mark.gfx1250  # every backend it can pick runs there (primus_turbo/flydsl/attention/gfx1250_sparse_mla)
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and (is_gfx950() or is_gfx1250())),
     reason="sparse-MLA (flydsl) is gfx950 / gfx1250 only",
