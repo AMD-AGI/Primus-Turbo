@@ -171,6 +171,34 @@ def test_decode_graph_replay(mode):
     _graph_decode_check(32, 8, 128, 64, 8192, steps, {**FLY, "MODE": mode}, seed=20)
 
 
+@pytest.mark.parametrize("mode", ["fused", "split"])
+def test_decode_steps_do_not_recompile(mode, monkeypatch):
+    """Eager decode with a growing context passes a new max_seqlen_k (and batch) every step; those
+    are runtime arguments, so after the first step no launch compiles again."""
+    import flydsl.compiler as flyc
+
+    compiles = []
+    real = flyc.compile
+    monkeypatch.setattr(flyc, "compile", lambda *a, **k: compiles.append(1) or real(*a, **k))
+    _, k, v, cu_k = _varlen([4096] * 4, 32, 8, 128, BF16, seed=23)
+    k_cache, v_cache, block_table, _ = _paged(k, v, cu_k, 64)
+    q = _varlen([1] * 4, 32, 8, 128, BF16, seed=24)[0]
+
+    def step(ctx, batch=4):
+        seq_lens = torch.full((batch,), ctx, dtype=torch.int32, device=DEVICE)
+        rl_paged_attention_func(
+            q[:batch], k_cache, v_cache, _cu([1] * batch), seq_lens, block_table[:batch], 1, ctx,
+            kernel_options={**FLY, "MODE": mode},
+        )  # fmt: skip
+
+    step(3000)
+    first = len(compiles)
+    for ctx in (3001, 3002, 4000, 4096):
+        step(ctx)
+    step(3500, batch=3)
+    assert len(compiles) == first, f"{len(compiles) - first} compiles after the first step"
+
+
 def test_split_programs_bitwise():
     """Split programs per (sequence, KV head) only schedule work: one program walking every segment,
     uneven runs, one segment each and more programs than segments give the fused bits, for decode

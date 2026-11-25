@@ -1221,9 +1221,11 @@ def build_rl_flash_attn_module(
             partial,
             split_programs,
         )
-        # The scalar shape/mode args (JIT cache key) follow the 14 tensors; has_sink / has_vis
-        # are baked into the module (separate builds), so their tensors stay out of the key.
-        key = args[14:] + (stream is None,)
+        # Everything compile-time is in the module's traits (one build per traits), and the scalar
+        # args (batch, max lengths, strides, split programs) are runtime Int32s, so one compiled
+        # launcher serves every value. Keying on their values called flyc.compile (~0.2 ms of host
+        # time) on every decode step whose max_seqlen_k was new.
+        key = (stream is None,)
         fn = _compiled.get(key)
         if fn is None:
             if len(_compiled) >= _COMPILED_MAX:
