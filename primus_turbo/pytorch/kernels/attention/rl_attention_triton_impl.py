@@ -93,17 +93,28 @@ def _launch(
 
 
 def _choose_mode(
-    mode: str, num_q_blocks: int, num_kv_heads: int, num_segments: int, max_seqlen_q: int, device
+    mode: str,
+    num_q_blocks: int,
+    num_kv_heads: int,
+    num_segments: int,
+    max_seqlen_q: int,
+    device,
+    queries_per_kv: int = 1,
+    head_size: int = 128,
 ) -> str:
+    """Decode (at most 16 query tokens per sequence) over several segments splits the keys when the
+    fused grid is too small for the GPU, and also when a KV head serves 8 or more query heads or the
+    head size is 64 or less: there one fused program per (sequence, KV head) walking the whole
+    context was 1.1-1.7x slower than split at batch 64-256 and context 4k-32k (MI355X; e.g.
+    gpt-oss-120b full attention, Qwen3-32B), while Llama-3 8B (4 query heads per KV head, D 128)
+    stays fused."""
     if mode != "auto":
         return mode
-    if (
-        max_seqlen_q <= 16
-        and num_segments > 1
-        and num_q_blocks * num_kv_heads < 2 * _num_cus(device.index or 0)
-    ):
+    if max_seqlen_q > 16 or num_segments <= 1:
+        return "fused"
+    if num_q_blocks * num_kv_heads < 2 * _num_cus(device.index or 0):
         return "split"
-    return "fused"
+    return "split" if queries_per_kv >= 8 or head_size <= 64 else "fused"
 
 
 def _sliding_window(window_left: int) -> int:
@@ -169,7 +180,9 @@ def rl_attention_fwd_triton(
         mode = "fused"  # the window reads at most two segments; split programs would find no keys
     probe = _launch(queries_per_kv, "fused", int(max_seqlen_q), block_m=block_m, head_size=head_size)
     probe_blocks = num_tokens // (probe.block_m // queries_per_kv) + num_seqs
-    mode = _choose_mode(mode, probe_blocks, num_kv_heads, num_segments, int(max_seqlen_q), q.device)
+    mode = _choose_mode(
+        mode, probe_blocks, num_kv_heads, num_segments, int(max_seqlen_q), q.device, queries_per_kv, head_size
+    )
     launch = _launch(
         queries_per_kv,
         mode,

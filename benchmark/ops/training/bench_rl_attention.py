@@ -53,9 +53,13 @@ MODELS = {
     "qwen3-32b": {"num_q_heads": 64, "num_kv_heads": 8, "head_dim": 128, "window": -1, "sinks": False},
     # https://huggingface.co/openai/gpt-oss-120b  (sliding-window layers: window 128, attention sinks)
     "gpt-oss-120b": {"num_q_heads": 64, "num_kv_heads": 8, "head_dim": 64, "window": 128, "sinks": True},
+    # gpt-oss-120b's full-attention layers (alternating with the window-128 ones): no window, sinks
+    "gpt-oss-120b-full": {"num_q_heads": 64, "num_kv_heads": 8, "head_dim": 64, "window": -1, "sinks": True},
 }
 
 DECODE_CASES = [(1, 4096), (8, 4096), (64, 4096), (256, 2048), (1, 32768), (8, 32768), (32, 32768)]
+# Real rollout decode shapes: batch 64-256 per GPU, context 4k-32k.
+DECODE_CASES += [(b, c) for c in (4096, 16384, 32768) for b in (64, 128, 256) if (b, c) not in DECODE_CASES]
 PREFILL_CASES = [(1, 4096, 512), (4, 4096, 512), (1, 16384, 2048), (8, 2048, 2048)]  # (batch, ctx, q_len)
 TRAIN_CASES = [(8, 4096), (4, 8192), (2, 16384)]  # (num_seqs, seqlen)
 BLOCK_SIZE = 64
