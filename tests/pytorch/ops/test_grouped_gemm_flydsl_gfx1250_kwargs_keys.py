@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""The kwargs-mode shape keys of the FlyDSL bf16 grouped GEMM on gfx1250: the six MiniMax-M3 shapes.
+"""The kwargs-mode shape keys of the FlyDSL bf16 grouped GEMM on gfx1250: the six MiniMax-M3 / M3.1 shapes.
 
 ``test_grouped_gemm_flydsl_gfx1250_keys.py`` covers ``_STACK_KEYS``, the persistent-cluster group the
 DeepSeek-V3 shapes resolve knob by knob. ``_KWARGS_KEYS`` is the other form: per (N, K, avg_m) the
@@ -18,10 +18,10 @@ Two groups:
   nearest key on a log scale, or the exact one under PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS=1), that any
   tuning argument switches the key off, that the key names only real arguments, the tile, whole-round
   and expert-count preconditions, and that the wrappers keep the entry points' signatures.
-* Numeric, on a gfx1250 card: the six MiniMax-M3 shapes at avg_m = 512 and at a row count the 512 key
-  serves from nearby, called the way the backend calls them, against an fp32 host reference and bit for
-  bit against the same call with the key switched off -- every keyed value moves a schedule, never an
-  address or an accumulation order -- and the forward at 64 experts, where the key declines.
+* Numeric, on a gfx1250 card: the six shapes at every keyed avg_m (512, 1024, 2048) and at a row count
+  each key serves from nearby, called the way the backend calls them, against an fp32 host reference and
+  bit for bit against the same call with the key switched off -- every keyed value moves a schedule, never
+  an address or an accumulation order -- and the forward at 64 experts, where the key declines.
 
 Listed in ``tests/conftest.py``'s ``_GFX1250_ENABLED_TESTS``, without which it never runs on gfx1250.
 """
@@ -57,7 +57,9 @@ needs_gfx1250 = pytest.mark.skipif(not _have_gfx1250(), reason="needs a gfx1250 
 
 # MiniMax-M3's MoE layer: hidden 6144, gated expert FFN 3072, so fc1 is (N, K) = (6144, 6144) and fc2
 # (6144, 3072). NT and variable-K keys take the forward (N, K); NN takes (output N, reduction K).
+# MiniMax-M3 is keyed at 512 rows per expert; MiniMax-M3.1 (the same shapes, top-16) adds 1024 and 2048.
 KEYED_AVG_M = 512
+KEYED_AVG_MS = (512, 1024, 2048)
 MEASURED_G = 32
 SHAPES = (
     ("nt", "fwd_fc1", 6144, 6144),
@@ -115,10 +117,11 @@ def _picked_tile(kind: str, n: int, k: int, avg_m: int, G: int):
 
 
 def test_only_the_minimax_m3_shapes_are_keyed():
-    """At the MiniMax-M3 (N, K) shapes, exactly the six keys at avg_m = 512; another row count needs its own
-    measurement. Other models' keys (other (N, K)) are covered by their own tests."""
+    """At the MiniMax-M3 (N, K) shapes, exactly the six keys at avg_m = 512, 1024 and 2048; another row count
+    needs its own measurement. Other models' keys (other (N, K)) are covered by their own tests."""
     want = {
-        kind: {(n, k, KEYED_AVG_M) for kd, _, n, k in SHAPES if kd == kind} for kind in ("nt", "nn", "vk")
+        kind: {(n, k, avg_m) for kd, _, n, k in SHAPES if kd == kind for avg_m in KEYED_AVG_MS}
+        for kind in ("nt", "nn", "vk")
     }
     minimax = {kind: {(n, k) for kd, _, n, k in SHAPES if kd == kind} for kind in ("nt", "nn", "vk")}
     got = {
@@ -146,23 +149,36 @@ def test_a_key_names_only_entry_point_arguments(kind, name, n, k):
     it is what marks the call as tuned.
     """
     tuning = set(_tuning_args(kind))
-    for knob, value in gg._KWARGS_KEYS[kind][(n, k, KEYED_AVG_M)].items():
-        assert knob in tuning, f"{name}: {knob} is not a tuning argument of the {kind} entry point"
-        assert isinstance(value, int) and not isinstance(value, bool), f"{name}: {knob}={value!r}"
+    for avg_m in KEYED_AVG_MS:
+        for knob, value in gg._KWARGS_KEYS[kind][(n, k, avg_m)].items():
+            assert knob in tuning, f"{name}: {knob} is not a tuning argument of the {kind} entry point"
+            assert isinstance(value, int) and not isinstance(value, bool), f"{name}: {knob}={value!r}"
+
+
+@pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
+def test_the_minimax_m31_keys_widen_the_512_set(kind, name, n, k):
+    """1024 and 2048 rows: the 512 set with the multicast cluster widened to 4 rows on forward and dgrad, and
+    GROUP_M 8 on the forward at 2048; wgrad keeps the 512 set. Nothing else differs."""
+    base = gg._KWARGS_KEYS[kind][(n, k, 512)]
+    widen = {} if kind == "vk" else {"mc_m": 4}
+    assert gg._KWARGS_KEYS[kind][(n, k, 1024)] == dict(base, **widen)
+    group_m = {"GROUP_M": 8} if kind == "nt" else {}
+    assert gg._KWARGS_KEYS[kind][(n, k, 2048)] == dict(base, **widen, **group_m)
 
 
 @pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
 def test_an_untuned_call_gets_the_whole_key(kind, name, n, k):
     """No tuning argument -- with or without the pass-through arguments -- gets the key's whole set."""
-    key = (n, k, KEYED_AVG_M)
-    want = dict(gg._KWARGS_KEYS[kind][key])
-    assert gg._keyed_kwargs(kind, key, MEASURED_G, 0, {}) == want
-    passthrough = dict.fromkeys(PASSTHROUGH[kind])
-    assert gg._keyed_kwargs(kind, key, MEASURED_G, 0, passthrough) == want
-    # the positional extras the entry points take: out_dtype, and masked_k first on variable-K
-    n_pos = 2 if kind == "vk" else 1
-    assert gg._keyed_kwargs(kind, key, MEASURED_G, n_pos, {}) == want
-    assert gg._keyed_kwargs(kind, key, MEASURED_G, n_pos + 1, {}) == {}
+    for avg_m in KEYED_AVG_MS:
+        key = (n, k, avg_m)
+        want = dict(gg._KWARGS_KEYS[kind][key])
+        assert gg._keyed_kwargs(kind, key, MEASURED_G, 0, {}) == want
+        passthrough = dict.fromkeys(PASSTHROUGH[kind])
+        assert gg._keyed_kwargs(kind, key, MEASURED_G, 0, passthrough) == want
+        # the positional extras the entry points take: out_dtype, and masked_k first on variable-K
+        n_pos = 2 if kind == "vk" else 1
+        assert gg._keyed_kwargs(kind, key, MEASURED_G, n_pos, {}) == want
+        assert gg._keyed_kwargs(kind, key, MEASURED_G, n_pos + 1, {}) == {}
 
 
 @pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
@@ -172,28 +188,54 @@ def test_any_tuning_argument_switches_the_key_off(kind, name, n, k):
     The members need each other (the launchers refuse several pairs outright), so a partial override
     of the set would launch a combination that was never measured, or none at all.
     """
-    key = (n, k, KEYED_AVG_M)
     params = inspect.signature(_ENTRY[kind]).parameters
-    for arg in _tuning_args(kind):
-        assert gg._keyed_kwargs(kind, key, MEASURED_G, 0, {arg: params[arg].default}) == {}, arg
+    for avg_m in KEYED_AVG_MS:
+        key = (n, k, avg_m)
+        for arg in _tuning_args(kind):
+            assert gg._keyed_kwargs(kind, key, MEASURED_G, 0, {arg: params[arg].default}) == {}, (avg_m, arg)
+
+
+def _served_range():
+    """The row counts the 512 / 1024 / 2048 keys serve: a factor _AVG_M_REACH beyond the outer ones."""
+    return math.ceil(KEYED_AVG_MS[0] / gg._AVG_M_REACH), math.floor(KEYED_AVG_MS[-1] * gg._AVG_M_REACH)
 
 
 @pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
 def test_row_counts_out_of_reach_are_not_keyed(kind, name, n, k):
-    """The lone 512 key serves 256-1024 rows (a factor _AVG_M_REACH either side) and nothing past that."""
-    for avg_m in (64, 128, 255, 1025, 2048, 4096):
+    """The keys serve a factor _AVG_M_REACH below 512 and above 2048 and nothing past that."""
+    lo, hi = _served_range()
+    for avg_m in (1, lo - 1, hi + 1, 2 * hi):
         assert gg._keyed_kwargs(kind, (n, k, avg_m), MEASURED_G, 0, {}) == {}, avg_m
 
 
+# Row count -> the key serving it. Between two keys the nearer on a log scale: 512 and 1024 meet at 724.08
+# rows, 1024 and 2048 at 1448.2.
+NEARBY = {
+    363: 512,
+    511: 512,
+    513: 512,
+    700: 512,
+    724: 512,
+    725: 1024,
+    1000: 1024,
+    1448: 1024,
+    1449: 2048,
+    2047: 2048,
+    2049: 2048,
+    2896: 2048,
+}
+
+
 @pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
-def test_nearby_row_counts_get_the_whole_key(kind, name, n, k):
-    """Every row count the 512 key serves gets its whole set, as the keyed row count does."""
-    want = dict(gg._KWARGS_KEYS[kind][(n, k, KEYED_AVG_M)])
-    for avg_m in (256, 363, 511, 513, 724, 1024):
+def test_nearby_row_counts_get_the_whole_nearest_key(kind, name, n, k):
+    """Every row count a key serves gets that key's whole set, as the keyed row count does."""
+    lo, hi = _served_range()
+    for avg_m, key_m in {**NEARBY, lo: 512, hi: 2048}.items():
+        want = dict(gg._KWARGS_KEYS[kind][(n, k, key_m)])
         assert gg._keyed_kwargs(kind, (n, k, avg_m), MEASURED_G, 0, {}) == want, avg_m
 
 
-# Every keyed (kind, N, K): the Muse Spark shapes keyed at 512 to 8192 rows, the MiniMax-M3 ones at 512.
+# Every keyed (kind, N, K): the Muse Spark shapes keyed at 512 to 8192 rows, the MiniMax ones at 512 to 2048.
 FAMILIES = sorted({(kind, n, k) for kind, rows in gg._KWARGS_KEYS.items() for n, k, _ in rows})
 
 
@@ -275,7 +317,7 @@ def test_a_key_declines_the_few_expert_tile(kind, n, k):
     call runs on the tile the keys were measured on."""
     pick = gg._pick_config if kind == "nt" else gg._pick_config_nn
     for G in (1, 2, 3, 4, 8, 16, 32):
-        for avg_m in (363, 512, 600, 724, 1024, 2048):
+        for avg_m in (363, 512, 600, 724, 1024, 1448, 2048, 2896, 4096):
             if gg._keyed_kwargs(kind, (n, k, avg_m), G, 0, {}):
                 assert pick(n, k, avg_m, G) == MEASURED_TILE, (G, avg_m)
             elif gg._kwargs_key(kind, (n, k, avg_m)) is not None:
@@ -291,7 +333,7 @@ def test_the_picker_still_hands_out_the_measured_tile(kind, name, n, k):
     symptom would be the speed -- or, for a cluster that no longer cuts the tile grid, a refusal.
     """
     for G in (8, 16, MEASURED_G, 64):
-        for avg_m in (363, KEYED_AVG_M, 724, 1024):
+        for avg_m in (363, 512, 724, 1024, 1448, 2048, 2896, 4096):
             assert _picked_tile(kind, n, k, avg_m, G) == MEASURED_TILE, (G, avg_m)
     # The low end of what the key serves; at 8 experts 256 rows get the narrow tile, where the key declines
     # (see the few-expert test above).
@@ -308,12 +350,13 @@ def test_variable_k_key_needs_whole_persistent_rounds(kind, name, n, k):
     256 workgroups over G x (n / 256) x (k / 256) tiles: whole rounds of two or more need G >= 4 on
     fc1 (576 tiles per expert) and G >= 8 on fc2 (288). Below that the call runs the untuned path.
     """
-    key = (n, k, KEYED_AVG_M)
-    persist = gg._KWARGS_KEYS[kind][key]["persist"]
-    for G in (1, 2, 4, 8, 16, 32, 64):
-        tiles = G * (n // 256) * (k // 256)
-        fits = tiles % persist == 0 and tiles // persist >= 2
-        assert bool(gg._keyed_kwargs(kind, key, G, 0, {})) == fits, G
+    for avg_m in KEYED_AVG_MS:
+        key = (n, k, avg_m)
+        persist = gg._KWARGS_KEYS[kind][key]["persist"]
+        for G in (1, 2, 4, 8, 16, 32, 64):
+            tiles = G * (n // 256) * (k // 256)
+            fits = tiles % persist == 0 and tiles // persist >= 2
+            assert bool(gg._keyed_kwargs(kind, key, G, 0, {})) == fits, (avg_m, G)
 
 
 @pytest.mark.parametrize(
@@ -326,11 +369,12 @@ def test_a_vec_dec_key_needs_at_most_32_experts(kind, name, n, k):
     MiniMax-M3 at EP2 with MBS 2 (64 experts, 512 rows each). The dgrad keys decode through tt_dec and
     fire at every expert count.
     """
-    key = (n, k, KEYED_AVG_M)
-    has_vec_dec = bool(gg._KWARGS_KEYS[kind][key].get("vec_dec"))
-    assert has_vec_dec == (kind == "nt")
-    for G in (8, 16, 32, 33, 64, 128):
-        assert bool(gg._keyed_kwargs(kind, key, G, 0, {})) == (G <= 32 or not has_vec_dec), G
+    for avg_m in KEYED_AVG_MS:
+        key = (n, k, avg_m)
+        has_vec_dec = bool(gg._KWARGS_KEYS[kind][key].get("vec_dec"))
+        assert has_vec_dec == (kind == "nt")
+        for G in (8, 16, 32, 33, 64, 128):
+            assert bool(gg._keyed_kwargs(kind, key, G, 0, {})) == (G <= 32 or not has_vec_dec), (avg_m, G)
 
 
 def test_the_wrappers_keep_the_entry_point_signatures():
@@ -341,7 +385,7 @@ def test_the_wrappers_keep_the_entry_point_signatures():
 
 
 # ---------------------------------------------------------------------------
-# Numeric: the six MiniMax-M3 shapes, on a gfx1250 card.
+# Numeric: the six MiniMax-M3 / M3.1 shapes, on a gfx1250 card.
 # ---------------------------------------------------------------------------
 
 # The smallest expert count at which both variable-K keys fire (see the whole-round test), which keeps
@@ -427,10 +471,11 @@ def _check(kind, n, k, rows):
 
 
 @needs_gfx1250
+@pytest.mark.parametrize("avg_m", KEYED_AVG_MS)
 @pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
-def test_keyed_shape_numeric(kind, name, n, k):
-    """Balanced routing at the key's row count: right, and bit-identical to the untuned path."""
-    _check(kind, n, k, [KEYED_AVG_M] * NUMERIC_G)
+def test_keyed_shape_numeric(kind, name, n, k, avg_m):
+    """Balanced routing at each key's row count: right, and bit-identical to the untuned path."""
+    _check(kind, n, k, [avg_m] * NUMERIC_G)
 
 
 @needs_gfx1250
@@ -448,10 +493,11 @@ def test_keyed_shape_ragged_numeric(kind, name, n, k):
 
 
 @needs_gfx1250
+@pytest.mark.parametrize("avg_m", (700, 1448, 2896))
 @pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
-def test_nearby_row_count_ragged_numeric(kind, name, n, k):
-    """The same uneven routing at M_total // G = 700, which takes the 512 key from nearby."""
-    avg_m = 700
+def test_nearby_row_count_ragged_numeric(kind, name, n, k, avg_m):
+    """The same uneven routing at an M_total // G each key serves from nearby: 700 takes the 512 key, 1448 the
+    1024 one and 2896 the 2048 one."""
     rows = [0, 1, 40, 255, avg_m + 7, 2 * avg_m, 3 * avg_m]
     rows.append(NUMERIC_G * avg_m - sum(rows))
     assert len(rows) == NUMERIC_G and min(rows) >= 0
