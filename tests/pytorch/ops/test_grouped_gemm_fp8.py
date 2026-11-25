@@ -26,6 +26,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
 )
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.ops import grouped_gemm_fp8
+from primus_turbo.triton.grouped_gemm import grouped_gemm_fp8_kernel
 from tests.pytorch.ops.determinism_helper import (  # noqa: F401  (_det_seed: fixture)
     ACCUM_GROUPED_SHAPE,
     DET_REPEATS,
@@ -1135,6 +1136,71 @@ def test_grouped_gemm_fp8_mx_fused_grad_accum(ori_dtype, backend, main_grad_fp32
         backend=backend,
         main_grad_dtype=main_grad_dtype,
     )
+
+
+# An OUT_N that is not a multiple of the tile width leaves a partial last N tile. With beta=1 every
+# output store is a read-modify-write, so columns of that tile must not be stored onto another tile's
+# columns: the wgrad would be added twice whenever the two tiles do not run at the same moment. The
+# persistent grid is sized from the CU count, so a one-CTA grid runs every tile in turn, which makes
+# that failure deterministic instead of a race.
+@pytest.mark.parametrize("OUT_M, OUT_N", [(512, 320), (320, 2880)])
+@pytest.mark.parametrize(
+    "granularity",
+    [ScalingGranularity.TENSORWISE, ScalingGranularity.ROWWISE, ScalingGranularity.BLOCKWISE],
+)
+def test_grouped_gemm_fp8_variable_k_triton_accumulate_partial_n_tile(OUT_M, OUT_N, granularity, monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    monkeypatch.setattr(grouped_gemm_fp8_kernel, "get_num_cus", lambda: 1)
+    torch.manual_seed(42)
+    device = "cuda"
+    B = 3
+
+    # Blockwise scales are per 128 rows of the reduction dim, so every group is padded to 128.
+    group_lens = torch.tensor([256, 128, 384], dtype=torch.int64, device=device)
+    group_offs = torch.zeros(B + 1, dtype=torch.int64, device=device)
+    group_offs[1:] = group_lens.cumsum(0)
+    total_m = int(group_offs[-1].item())
+
+    lhs = torch.randn((total_m, OUT_M), device=device).to(float8_e4m3)
+    rhs = torch.randn((total_m, OUT_N), device=device).to(float8_e4m3)
+    previous = torch.randn((B, OUT_M, OUT_N), dtype=torch.float32, device=device)
+
+    def segment(x, g):
+        return x[int(group_offs[g]) : int(group_offs[g + 1])].float()
+
+    if granularity == ScalingGranularity.TENSORWISE:
+        lhs_scale = torch.tensor([0.5], dtype=torch.float32, device=device)
+        rhs_scale = torch.tensor([0.25], dtype=torch.float32, device=device)
+        wgrad = torch.stack([segment(lhs, g).T @ segment(rhs, g) for g in range(B)]) * 0.125
+        kernel = grouped_gemm_fp8_kernel.grouped_gemm_fp8_tensorwise_variable_k_triton_kernel
+    elif granularity == ScalingGranularity.ROWWISE:
+        lhs_scale = 0.5 + torch.rand(OUT_M, dtype=torch.float32, device=device)
+        rhs_scale = 0.5 + torch.rand(OUT_N, dtype=torch.float32, device=device)
+        wgrad = torch.stack([segment(lhs, g).T @ segment(rhs, g) for g in range(B)])
+        wgrad = wgrad * lhs_scale[None, :, None] * rhs_scale[None, None, :]
+        kernel = grouped_gemm_fp8_kernel.grouped_gemm_fp8_rowwise_variable_k_triton_kernel
+    else:
+        blocks = total_m // 128
+        lhs_scale = 0.5 + torch.rand((blocks, OUT_M), dtype=torch.float32, device=device)
+        rhs_scale = 0.5 + torch.rand((blocks, OUT_N), dtype=torch.float32, device=device)
+        wgrad = torch.zeros((B, OUT_M, OUT_N), dtype=torch.float32, device=device)
+        for g in range(B):
+            for blk in range(int(group_offs[g]) // 128, int(group_offs[g + 1]) // 128):
+                rows = slice(blk * 128, (blk + 1) * 128)
+                wgrad[g] += (
+                    (lhs[rows].float().T @ rhs[rows].float())
+                    * lhs_scale[blk][:, None]
+                    * rhs_scale[blk][None, :]
+                )
+        kernel = grouped_gemm_fp8_kernel.grouped_gemm_fp8_blockwise_variable_k_triton_kernel
+
+    out = previous.clone()
+    kernel(lhs, rhs, lhs_scale, rhs_scale, group_offs, beta=1.0, out=out)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out, previous + wgrad, rtol=1e-3, atol=1e-2)
 
 
 # ---------------------------------------------------------------------------

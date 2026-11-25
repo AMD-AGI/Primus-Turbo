@@ -17,6 +17,9 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
     grouped_gemm_variable_k_impl,
 )
 from primus_turbo.pytorch.ops import grouped_gemm
+from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
+    grouped_gemm_variable_k_triton_kernel,
+)
 from tests.pytorch.ops.determinism_helper import (  # noqa: F401  (_det_seed: fixture)
     ACCUM_GROUPED_SHAPE,
     DET_DTYPES,
@@ -648,6 +651,46 @@ def test_grouped_gemm_variable_k_backend(B, M, N, K, dtype, trans_c, backend):
     snr = compute_snr(ref, out)
     assert snr > 45.0, f"snr {snr:.2f} dB too low"
     torch.testing.assert_close(out, ref, **get_tolerances(dtype))
+
+
+# An OUT_N that is not a multiple of the tile width leaves a partial last N tile. With beta=1 every
+# output store is a read-modify-write, so columns of that tile must not be stored onto another tile's
+# columns: the wgrad would be added twice whenever the two tiles do not run at the same moment. A
+# one-CTA grid runs every tile in turn, which makes that failure deterministic instead of a race.
+@pytest.mark.parametrize("OUT_M, OUT_N", [(512, 320), (320, 2880)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("work_steal", [False, True], ids=["static", "work_steal"])
+def test_grouped_gemm_variable_k_triton_accumulate_partial_n_tile(OUT_M, OUT_N, dtype, work_steal):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    torch.manual_seed(42)
+    device = "cuda"
+    B, M = 3, 512
+
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
+    group_offs = torch.zeros(B + 1, dtype=torch.int64, device=device)
+    group_offs[1:] = group_lens.cumsum(0)
+    total_m = int(group_offs[-1].item())
+
+    lhs = torch.randn((total_m, OUT_M), dtype=dtype, device=device)
+    rhs = torch.randn((total_m, OUT_N), dtype=dtype, device=device)
+    previous = torch.randn((B, OUT_M, OUT_N), dtype=torch.float32, device=device)
+    wgrad = torch.stack(
+        [
+            lhs[int(group_offs[g]) : int(group_offs[g + 1])].float().T
+            @ rhs[int(group_offs[g]) : int(group_offs[g + 1])].float()
+            for g in range(B)
+        ]
+    )
+
+    out = previous.clone()
+    grouped_gemm_variable_k_triton_kernel(
+        lhs, rhs, group_offs, num_cu=1, work_steal=work_steal, beta=1.0, out=out
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out, previous + wgrad, rtol=1e-4, atol=1e-3)
 
 
 # ---------------------------------------------------------------------------
