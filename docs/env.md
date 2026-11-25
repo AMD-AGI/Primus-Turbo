@@ -51,6 +51,7 @@ Variables owned by other projects (FlyDSL, Triton, NVSHMEM, the launcher's `RANK
 |---|---|---|---|
 | `PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32` | `bool` | `True` | Whether the attention V3 (CK) backward accumulates with FP32 atomics. Only "0" disables it; unset, "1" and any other value keep it on. Read at the first forward that does not pass `is_v3_atomic_fp32` explicitly. |
 | `PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT` | `bool` | `False` | "1" lets the FP4 variable-K grouped GEMM (wgrad) overwrite `out` with beta=0 instead of accumulating into it, when the caller allows it and no CUDA graph is being captured. |
+| `PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS` | `bool` | `False` | "1" makes the gfx1250 FlyDSL bf16 grouped GEMM apply a tuned key only at the exact avg_m (rows // experts) it was measured at, for A/B runs against the default: a call whose avg_m lies between keys takes the nearest one on a log scale. Read at every call that can take a key. |
 
 ### Expert parallel
 

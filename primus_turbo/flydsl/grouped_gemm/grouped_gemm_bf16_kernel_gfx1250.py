@@ -59,6 +59,8 @@ from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
+import primus_turbo.common.envs as envs
+
 try:  # optional: only used for a friendlier LDS-overflow message
     from flydsl.runtime.device import get_rocm_arch as _get_arch
     from flydsl.utils.smem_allocator import check_smem_capacity as _check_smem
@@ -6217,30 +6219,24 @@ _KWARGS_PASSTHROUGH = {
 }
 
 
-# (N, K) pairs whose keys serve every avg_m, not only the keyed one. Under expert parallelism the rows a GPU
-# receives vary from step to step (dropless routing), so avg_m lands near, not on, a keyed value. Such an
-# avg_m takes the keyed avg_m nearest to it on a log scale (512 serves about 362-724 next to a 1024 key), up to
-# a factor _AVG_M_REACH past the smallest and the largest key, so a set is never used far from the row counts
-# it was measured at. Muse Spark only: other models' keys stay exact.
+# Keys serve every avg_m near them, not only the keyed one. Under expert parallelism the rows a GPU receives
+# vary from step to step (dropless routing), so avg_m lands near, not on, a keyed value. Such an avg_m takes
+# the keyed avg_m of its (N, K) nearest to it on a log scale, up to a factor _AVG_M_REACH past the smallest
+# and the largest key, so a set is never used far from the row counts it was measured at: with keys a factor
+# 2 apart each one serves a factor sqrt(2) either side (512 serves 363-724), and so does a lone key.
+# PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS=1 keeps the exact match only, for A/B runs.
 _AVG_M_REACH = 2**0.5
-_AVG_M_TOLERANT = MappingProxyType(
-    {
-        "nt": frozenset({(8192, 4096), (4096, 4096)}),
-        "nn": frozenset({(4096, 8192), (4096, 4096)}),
-        "vk_accum": frozenset({(8192, 4096), (4096, 4096)}),
-    }
-)
 
 
 def _kwargs_key(kind: str, key: tuple):
-    """The ``_KWARGS_KEYS[kind]`` row for ``key``: the exact one, else for a tolerant (N, K) the keyed avg_m
-    nearest to ``key``'s on a log scale, within ``_AVG_M_REACH`` of the keyed range; None without one."""
+    """The ``_KWARGS_KEYS[kind]`` row for ``key``: the exact one, else the keyed avg_m of its (N, K) nearest
+    to ``key``'s on a log scale, within ``_AVG_M_REACH`` of the keyed range; None without one."""
     table = _KWARGS_KEYS[kind]
     if key in table:
         return key
-    n, k, avg_m = key
-    if (n, k) not in _AVG_M_TOLERANT.get(kind, ()):
+    if envs.PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS:
         return None
+    n, k, avg_m = key
     rows = [row for row in table if row[:2] == (n, k)]
     if (
         not rows
@@ -6252,7 +6248,7 @@ def _kwargs_key(kind: str, key: tuple):
 
 
 def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:
-    """The key's kwargs for this call, or {} when the call tunes anything or the shape is not a key."""
+    """The kwargs of the key serving this call, or {} when the call tunes anything or no key serves it."""
     # The positional extras the entry points take: out_dtype (NT / NN), masked_k and out_dtype (variable-K).
     if n_pos > (2 if kind in ("vk", "vk_accum") else 1) or not set(kw) <= _KWARGS_PASSTHROUGH[kind]:
         return {}
@@ -6270,6 +6266,13 @@ def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:
     if kind in ("nt", "nn") and keyed.get("vec_dec") and G > 32:
         # The NT and NN launchers drop vec_dec above 32 experts, and nt_seam bit 2 then refuses the set.
         return {}
+    if kind in ("nt", "nn"):
+        # A set is measured on the tile its row count gets at many experts. When the experts hold 8 or fewer
+        # 256-row tiles in all, `_pick_config_shape` hands out 128 x 128 instead, whose 4 x 4 warp tile has as
+        # many fragment reads per sub-step as matrix ops, and the launchers refuse lds_cosched >= 2 there.
+        pick = _pick_config if kind == "nt" else _pick_config_nn
+        if pick(key[0], key[1], key[2], G) != pick(*row):
+            return {}
     return dict(keyed)
 
 
