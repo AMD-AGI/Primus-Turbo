@@ -279,7 +279,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # "1" makes the gfx1250 FlyDSL bf16 grouped GEMM apply its tuned keys (the per-shape tables and
     # the whole-argument sets) only at the exact avg_m (rows // experts) they were measured at, for
-    # A/B runs against the default, where a call whose avg_m is within a factor 2 of a key takes
+    # A/B runs against the default, where a call whose avg_m is within a factor 4 of a key takes
     # the nearest key on a log scale. Read at every call that can take a key.
     "PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS": lambda: (
         os.getenv("PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS", "0") == "1"
