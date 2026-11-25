@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+from .flash_attn_agkv_interface import flash_attn_agkv_func
 from .flash_attn_interface import (
     flash_attn_fp8_func,
     flash_attn_func,
