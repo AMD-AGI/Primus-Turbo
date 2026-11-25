@@ -188,9 +188,9 @@ def _padded(avg_m, tile_m):
 @pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
 def test_a_pinned_tile_height_pads_no_more_than_the_default(kind, name, n, k):
     """The 293 forward / dgrad sets run 160-row tiles; they serve a row count only where they pad each expert's rows
-    to no more than the default tile does, else the call takes the next-nearest key within reach, else none.
-    From 161 to 256 rows the 160-row tile pads to 320 against the default 256; the variable-K sets are not
-    affected."""
+    to no more than the default tile does and by no smaller a margin than at 293 rows (320 against 512), else the
+    call takes the next-nearest key within reach, else none. From 161 to 256 rows the 160-row tile pads to 320
+    against the default 256, from 321 to 414 to 480 against 512; the variable-K sets are not affected."""
     lo = math.ceil(KEYED_AVG_M[0] / gg._AVG_M_REACH)
     for avg_m in range(lo, 830):
         nearest = [row[2] for row in gg._kwargs_rows(kind, (n, k, avg_m))]
@@ -200,18 +200,20 @@ def test_a_pinned_tile_height_pads_no_more_than_the_default(kind, name, n, k):
             if kind != "vk":
                 pick = gg._pick_config if kind == "nt" else gg._pick_config_nn
                 cfg = pick(n, k, avg_m, MEASURED_G)
-                if cfg != pick(n, k, key_m) or _padded(avg_m, keyed.get("BLOCK_M") or cfg[0]) > _padded(
-                    avg_m, cfg[0]
-                ):
+                tile_m = keyed.get("BLOCK_M") or cfg[0]
+                pad, pad_base = _padded(avg_m, tile_m), _padded(avg_m, cfg[0])
+                pad_key, pad_base_key = _padded(key_m, tile_m), _padded(key_m, cfg[0])
+                if cfg != pick(n, k, key_m) or pad > pad_base or pad * pad_base_key > pad_key * pad_base:
                     continue
             want = key_m
             break
         got = gg._keyed_kwargs(kind, (n, k, avg_m), MEASURED_G, 0, {})
         assert got == (dict(_key(kind, n, k, want)) if want else {}), avg_m
-        if kind != "vk" and 160 < avg_m <= 256 and nearest[0] == 293:
+        if kind != "vk" and (160 < avg_m <= 256 or 320 < avg_m) and nearest[0] == 293:
             assert got != _key(kind, n, k, 293), avg_m
     for avg_m in (257, 293, 320, 414):
-        assert gg._keyed_kwargs(kind, (n, k, avg_m), MEASURED_G, 0, {}) == _key(kind, n, k, 293), avg_m
+        want = 585 if kind != "vk" and avg_m > 320 else 293
+        assert gg._keyed_kwargs(kind, (n, k, avg_m), MEASURED_G, 0, {}) == _key(kind, n, k, want), avg_m
 
 
 @pytest.mark.parametrize("kind, name, n, k", SHAPES[:4], ids=_IDS[:4])
@@ -328,9 +330,9 @@ def test_keyed_shape_numeric(kind, name, n, k, avg_m):
 @pytest.mark.parametrize("avg_m", (250, 414, 827, 1600))
 @pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
 def test_nearest_key_numeric(kind, name, n, k, avg_m):
-    """Ragged routing at a row count between or past the keys: the key serving it (at 250 the 293 forward / dgrad
-    sets give way, see the tile-height test), bit-identical to the untuned path (an empty expert, a one-row expert
-    and a run that does not fill a tile)."""
+    """Ragged routing at a row count between or past the keys: the key serving it (at 250 and 414 the 293 forward /
+    dgrad sets give way, see the tile-height test), bit-identical to the untuned path (an empty expert, a one-row
+    expert and a run that does not fill a tile)."""
     G = NUMERIC_G[kind]
     rows = [0, 1, 159, 256 + 7] + [avg_m] * (G - 5)
     rows.append(avg_m * G - sum(rows))

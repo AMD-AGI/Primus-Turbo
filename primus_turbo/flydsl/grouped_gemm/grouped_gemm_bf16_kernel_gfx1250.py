@@ -6878,12 +6878,17 @@ def _key_fits(kind: str, key: tuple, row: tuple, G: int, keyed: dict, kw: dict) 
     base = pick(key[0], key[1], key[2], G)
     if base != pick(*row):
         return False
-    # A set that pins its own tile height is borrowed only where it pads each expert's rows to no more than the
-    # default tile does: ceil(avg_m / BLOCK_M) * BLOCK_M <= ceil(avg_m / base) * base. The rows past an expert's
-    # last row are matrix work on zero-filled A; at 250 rows the 293 key's 160-row tile pads to 320 where the
-    # default 256 pads to 256, and measured 9-17% slower than the default path on the forward and dgrad.
+    # A set that pins its own tile height is borrowed only where, at the call's row count, it pads each expert's
+    # rows to no more than the default tile does (ceil(avg_m / BLOCK_M) * BLOCK_M against ceil(avg_m / base) *
+    # base), and by no smaller a margin than at its key. The rows past an expert's last row are matrix work on
+    # zero-filled A. The 293 key's 160-row tile pads 293 rows to 320 where the default 256 pads them to 512; at 250
+    # rows it pads to 320 against 256 (measured 9-17% slower than the default path on the forward and dgrad), at 414
+    # to 480 against 512, where the 585 key's set measured +19% to +23% against the 160-row set's +1% to +13%.
     tile_m = keyed.get("BLOCK_M") or base[0]
-    if -(-key[2] // tile_m) * tile_m > -(-key[2] // base[0]) * base[0]:
+    (pad, pad_base), (pad_key, pad_base_key) = (
+        (-(-m // tile_m) * tile_m, -(-m // base[0]) * base[0]) for m in (key[2], row[2])
+    )
+    if pad > pad_base or pad * pad_base_key > pad_key * pad_base:
         return False
     # A prebuilt m_tiles is checked against the tile height it was built for (`check_prebuilt`).
     prov = getattr(kw.get("m_tiles"), _PROV, None)
