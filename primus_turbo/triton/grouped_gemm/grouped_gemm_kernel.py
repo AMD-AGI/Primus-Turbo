@@ -125,7 +125,22 @@ def _get_gg_bf16_vk_config(OUT_M, OUT_N, avg_k, dtype_lhs, dtype_rhs, G, num_sms
         # this kernel up to 5.4x slower than on Triton 3.7.1 (AIMA-250). BK=32
         # keeps the 256x256 output tile, drops spills to 0, and is 1.6-3.5x
         # faster in microbench / 1.44x faster end-to-end. Matches gfx950 above.
+        #
+        # A tile count just above a multiple of num_sms leaves the last persistent round mostly
+        # idle. Prefer 256x128 / 128x256 (BLOCK_K=64, no VGPR spills) when they cut
+        # rounds x tile area by >= 15%. The tile must divide OUT_N: the epilogue wraps a partial
+        # last N tile onto the first columns, which races under beta=1 accumulation.
         BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 32
+        best_cost = (
+            triton.cdiv(G * triton.cdiv(OUT_M, BLOCK_M) * triton.cdiv(OUT_N, BLOCK_N), num_sms)
+            * BLOCK_M
+            * BLOCK_N
+        )
+        for bm, bn in ((256, 128), (128, 256)):
+            cost = triton.cdiv(G * triton.cdiv(OUT_M, bm) * triton.cdiv(OUT_N, bn), num_sms) * bm * bn
+            if OUT_N % bn == 0 and cost < best_cost * 0.85:
+                BLOCK_M, BLOCK_N, BLOCK_K = bm, bn, 64
+                best_cost = cost
         group_m = 4
         num_stages_val = 2
         cache_a, cache_b = ".ca", ".ca"
