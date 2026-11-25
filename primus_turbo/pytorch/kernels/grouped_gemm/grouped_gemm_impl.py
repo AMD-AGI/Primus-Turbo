@@ -625,7 +625,9 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
                     grouped_gemm_bf16_variable_k_accum_supported,
                 )
 
-                supported &= grouped_gemm_bf16_variable_k_accum_supported(lhs.shape[1], rhs.shape[1], avg_m)
+                supported &= grouped_gemm_bf16_variable_k_accum_supported(
+                    lhs.shape[1], rhs.shape[1], avg_m, out.dtype
+                )
                 supported &= tuple(out.shape) == (group_lens.numel(), lhs.shape[1], rhs.shape[1])
         return supported
 

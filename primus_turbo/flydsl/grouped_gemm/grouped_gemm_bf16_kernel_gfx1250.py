@@ -2837,8 +2837,13 @@ def _vk_accum_tdm_fits(
     return m_warp == 2 and (tile_m // 2) * c_row <= pitch
 
 
-def grouped_gemm_bf16_variable_k_accum_supported(OUT_M: int, OUT_N: int, avg_m: int = 0) -> bool:
-    """Whether ``accumulate=1`` can serve this shape: whole output tiles of the tile it picks."""
+def grouped_gemm_bf16_variable_k_accum_supported(
+    OUT_M: int, OUT_N: int, avg_m: int = 0, out_dtype: torch.dtype = torch.float32
+) -> bool:
+    """Whether ``accumulate=1`` can serve this shape into an ``out`` of ``out_dtype``: whole output tiles of the
+    tile it picks, into fp32 or a 16-bit float (the operands' dtype)."""
+    if out_dtype not in (torch.float32, *_F16):
+        return False
     tile_m, tile_n = _pick_variable_k_config(OUT_M, OUT_N, avg_m)[:2]
     return OUT_M >= tile_m and OUT_N >= tile_n and OUT_M % tile_m == 0 and OUT_N % tile_n == 0
 

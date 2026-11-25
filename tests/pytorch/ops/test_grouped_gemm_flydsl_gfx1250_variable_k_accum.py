@@ -322,8 +322,14 @@ def test_muse_wgrad_key_is_bit_identical(out_m, out_n):
 def test_refuses_what_it_cannot_add_into():
     vk = _vk()
     run = vk.grouped_gemm_bf16_variable_k_flydsl_kernel
-    assert vk.grouped_gemm_bf16_variable_k_accum_supported(2 * FFN, LATENT, TOKENS * TOPK // NUM_EXPERTS)
-    assert not vk.grouped_gemm_bf16_variable_k_accum_supported(5760, 2880, 2048)  # GPT-OSS: ragged tiles
+    supported = vk.grouped_gemm_bf16_variable_k_accum_supported
+    assert supported(2 * FFN, LATENT, TOKENS * TOPK // NUM_EXPERTS)
+    assert not supported(5760, 2880, 2048)  # GPT-OSS: ragged tiles
+    # the out dtypes it adds into: fp32 (the default) and the 16-bit operand dtypes
+    for dtype in (torch.float32, torch.bfloat16, torch.float16):
+        assert supported(6144, 3584, 585, dtype)
+        assert not supported(5760, 2880, 2048, dtype)
+    assert not supported(6144, 3584, 585, torch.float64)
     a, b, lens, offs, _ = _problem(512, 512, [300])
 
     def f32(*shape):
