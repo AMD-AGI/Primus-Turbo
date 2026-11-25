@@ -47,6 +47,8 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_GROUPED_GEMM_BACKEND: str | None = None
     PRIMUS_TURBO_ATTN_BACKEND: str | None = None
     PRIMUS_TURBO_SPARSE_ATTN_BACKEND: str | None = None
+    PRIMUS_TURBO_ATTN_BATCH_INVARIANT: bool = False
+    PRIMUS_TURBO_RL_ATTN_KERNEL_OPTIONS: str | None = None
     PRIMUS_TURBO_MLA_BWD_IMPL: str = "flydsl"
     PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB: int = 5120
     PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND: str | None = None
@@ -233,6 +235,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PRIMUS_TURBO_ATTN_BACKEND": backend_spec("PRIMUS_TURBO_ATTN_BACKEND"),
     # Sparse-attention (DeepSeek-V4 sparse-MLA) backend, e.g. FLYDSL, TRITON, or "autotune".
     "PRIMUS_TURBO_SPARSE_ATTN_BACKEND": backend_spec("PRIMUS_TURBO_SPARSE_ATTN_BACKEND"),
+    # "1" routes every flash_attn_func / flash_attn_varlen_func call to the batch-invariant RL
+    # attention kernel (as if each passed batch_invariant=True), so a trainer gets the same forward
+    # bits as a rollout engine calling that kernel; unset or any other value keeps the backend
+    # selection above. Read at every flash-attention call (through the cache).
+    "PRIMUS_TURBO_ATTN_BATCH_INVARIANT": lambda: os.getenv("PRIMUS_TURBO_ATTN_BATCH_INVARIANT", "0") == "1",
+    # Default kernel_options of RL attention (primus_turbo.pytorch.ops.attention.rl_attention), as
+    # comma-separated KEY=VALUE pairs, e.g. "TILE_SIZE=64,SEGMENT_SIZE=1024,BACKEND=TRITON". Keys are
+    # those of its kernel_options argument, which overrides this per call. TILE_SIZE, SEGMENT_SIZE and
+    # BACKEND change the output bits, so rollout and training processes must set the same values.
+    # Read at the first RL attention call; an unknown key or bad value raises ValueError there.
+    "PRIMUS_TURBO_RL_ATTN_KERNEL_OPTIONS": lambda: (
+        (os.getenv("PRIMUS_TURBO_RL_ATTN_KERNEL_OPTIONS") or "").strip() or None
+    ),
     # Kernels of the gfx1250 DeepSeek-V3 MLA attention backward (qk 192 / v 128) under the FLYDSL
     # backend: "flydsl" (unset or blank) or "hk", the HipKittens kernels, which hand a call they
     # cannot take to FlyDSL (e.g. seqlen_q % 384 not 0 or 256, see their README). Read at the first

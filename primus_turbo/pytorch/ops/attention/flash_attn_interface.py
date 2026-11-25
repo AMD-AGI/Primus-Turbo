@@ -1,5 +1,5 @@
 ###############################################################################
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #
 # See LICENSE for license information.
 ###############################################################################
@@ -63,6 +63,7 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     dense_forward as triton_dense_forward,
 )
+from primus_turbo.pytorch.ops.attention import rl_attention
 from primus_turbo.pytorch.ops.attention.attention_utils import (
     _infer_qkv_format,
     _resolve_is_v3_atomic_fp32_from_env,
@@ -608,12 +609,26 @@ def flash_attn_func(
     return_lse=False,
     return_attn_probs=False,
     sink: Optional[torch.Tensor] = None,
+    *,
+    batch_invariant: bool = False,
+    block_mask: Optional[rl_attention.RLBlockMask] = None,
+    kernel_options: Optional[dict] = None,
 ):
     """q/k/v are ``[b, s, h, d]``-shaped; an sbhd caller passes a permuted view and permutes
     the result back. aiter reads the memory layout to allocate outputs and grads matching it.
     FlyDSL takes sbhd only on gfx950 and any layout on gfx1250, where its head-dim-128 kernels
     return contiguous [b, s, h, d] outputs and grads.
+
+    ``batch_invariant=True`` (or PRIMUS_TURBO_ATTN_BATCH_INVARIANT=1), a ``block_mask`` from
+    ``rl_attention.create_block_mask`` or ``kernel_options`` run the batch-invariant RL attention
+    kernel instead, whose forward matches the paged rollout path bitwise; see
+    ``primus_turbo.pytorch.ops.attention.rl_attention``.
     """
+    if rl_attention.use_rl_attention(batch_invariant, block_mask, kernel_options):
+        return rl_attention.flash_attn_rl_dense(
+            q, k, v, dropout_p, softmax_scale, causal, window_size, bias, alibi_slopes, return_lse,
+            return_attn_probs, sink, block_mask, kernel_options,
+        )  # fmt: skip
     qkv_format = _infer_qkv_format(q, k, v)
     is_grad_enabled = torch.is_grad_enabled()
     needs_backward = is_grad_enabled and _any_requires_grad(q, k, v)
@@ -923,6 +938,12 @@ def flash_attn_varlen_func(
     return_lse=False,
     return_attn_probs=False,
     sink: Optional[torch.Tensor] = None,
+    *,
+    batch_invariant: bool = False,
+    block_mask: Optional[rl_attention.RLBlockMask] = None,
+    kernel_options: Optional[dict] = None,
+    block_table: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
 ):
     """Variable-length flash attention (THD layout).
 
@@ -946,7 +967,24 @@ def flash_attn_varlen_func(
         deterministic: use the deterministic backward (slower, more memory).
         return_lse: also return softmax_lse of shape (nheads, total_q).
         return_attn_probs: testing-only; return the dropout-encoded softmax output.
+        sink: (nheads,) per-head sink logits.
+
+    Batch-invariant RL attention (``primus_turbo.pytorch.ops.attention.rl_attention``) runs
+    instead when any of these is given:
+        batch_invariant: True (or PRIMUS_TURBO_ATTN_BATCH_INVARIANT=1) to match the rollout
+            kernel bitwise.
+        block_mask: per-token visible key ranges from ``rl_attention.create_block_mask``.
+        kernel_options: dict of RL attention kernel options (TILE_SIZE, SEGMENT_SIZE, ...).
+        block_table: (batch, max_blocks) int32; k / v are then a paged cache
+            (num_blocks, block_size, nheads_k, headdim) and ``seqused_k`` (batch,) int32 gives
+            each sequence's key count (forward only; ``cu_seqlens_k`` is not used).
     """
+    if rl_attention.use_rl_attention(batch_invariant, block_mask, kernel_options, block_table):
+        return rl_attention.flash_attn_rl_varlen(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale,
+            causal, window_size, bias, alibi_slopes, return_lse, return_attn_probs, sink, block_mask,
+            kernel_options, block_table, seqused_k,
+        )  # fmt: skip
     backend = resolve_flash_attn_backend(
         varlen=True,
         user_backend=GlobalBackendManager.get_attn_backend(_ATTN_PRECISION),
