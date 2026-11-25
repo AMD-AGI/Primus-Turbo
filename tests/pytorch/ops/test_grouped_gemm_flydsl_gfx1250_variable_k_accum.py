@@ -266,6 +266,9 @@ def test_backend_takes_accumulating_calls(impl, out_dtype, monkeypatch):
     kw = dict(trans_a=True, trans_b=False, trans_c=True, num_cu=None, inplace_add_to_out=True, out=out)
     assert backend.can_handle(x, dy, lens, offs, **kw)
     assert not backend.can_handle(x, dy, lens, offs, **{**kw, "out": out.to(torch.float16)})
+    assert not backend.can_handle(
+        x, dy, lens, offs, **{**kw, "out": _misaligned(tuple(out.shape), out_dtype)}
+    )
     backend.execute(x, dy, lens, offs, **kw)
     tol = 1e-5 if out_dtype == torch.float32 else 2**-8
     assert _max_rel_err(out.float(), old.float() + ref) < tol
@@ -345,6 +348,10 @@ def test_refuses_what_it_cannot_add_into():
     for dtype in (torch.float32, torch.bfloat16):
         with pytest.raises(ValueError, match="contiguous"):
             run(a, b, offs, masked_k=lens, out=f32(1, 512, 512).to(dtype).transpose(1, 2), accumulate=1)
+    # a main_grad is a view into a gradient bucket: a view off the 16-byte grain is refused, not misread
+    for dtype in (torch.float32, torch.bfloat16):
+        with pytest.raises(ValueError, match="16-byte"):
+            run(a, b, offs, masked_k=lens, out=_misaligned((1, 512, 512), dtype), accumulate=1)
     # the persistent walk takes a 16-bit out only
     with pytest.raises(ValueError, match="persist"):
         run(a, b, offs, masked_k=lens, out=f32(1, 512, 512), accumulate=1, persist=2)
@@ -374,6 +381,12 @@ BF16_CASES = [
     pytest.param(512, 512, [100, 0, 50, 0], id="avg_m_le_128"),  # 64-deep k-tiles
     pytest.param(4096, 7168, [2048] * 2, id="three_buffer_ring"),  # 64-deep, three buffers
 ]
+
+
+def _misaligned(shape, dtype):
+    """A contiguous view one element past a 16-byte boundary, as a main_grad can sit in its gradient bucket."""
+    n = shape[0] * shape[1] * shape[2]
+    return torch.zeros(n + 16, dtype=dtype, device="cuda")[1 : 1 + n].view(shape)
 
 
 def _same_bits(x, y):

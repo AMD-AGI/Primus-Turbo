@@ -3142,6 +3142,9 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
                 f"accumulate needs a contiguous out of shape {(G, OUT_M, OUT_N)}, got {tuple(out.shape)} "
                 f"contiguous={out.is_contiguous()}"
             )
+        # The launch assumes 16-byte-aligned buffers (`_as_ptr`); a main_grad is a view into a gradient bucket.
+        if out.data_ptr() % 16:
+            raise ValueError(f"accumulate needs a 16-byte-aligned out, got data_ptr {out.data_ptr():#x}")
     lds_pad = lds_pad or _vk_lds_pad(tile_m, tile_n, 2)
     if accumulate:
         tdm_fits = _vk_accum_tdm_fits(tile_m, tile_n, tile_k, m_warp, lds_pad, 2 if accum_c16 else 4)

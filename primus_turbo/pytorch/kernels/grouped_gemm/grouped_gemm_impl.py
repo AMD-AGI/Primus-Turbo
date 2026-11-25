@@ -602,7 +602,9 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
         out = kwargs.get("out")
         if inplace_add_to_out:
             supported &= gfx1250 and out is not None and out.is_contiguous()
-            supported &= out is not None and out.dtype in (torch.float32, a.dtype)
+            supported &= (
+                out is not None and out.dtype in (torch.float32, a.dtype) and out.data_ptr() % 16 == 0
+            )
         supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
         supported &= a.dim() == 2 and b.dim() == 2 and a.shape[0] == b.shape[0]
         supported &= a.dtype in (torch.bfloat16, torch.float16) and b.dtype == a.dtype
