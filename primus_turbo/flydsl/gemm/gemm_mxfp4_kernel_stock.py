@@ -1958,6 +1958,12 @@ class MfmaScaleFp4:
                                     _mi += 1
             if _cq is not None:
                 L += _CST_HAZ + _cq.flush()
+        # Every exit can leave ds_reads in flight: a phase barrier waits only to lgkmcnt(_ELGK), and the
+        # last phase still prefetches the next k-block's operands into this block's temps. LLVM cannot see
+        # them, so it takes the temps for dead outputs and hands their VGPRs to the next value it computes
+        # -- which a late LDS return then overwrites (AIMA-354: the dglu epilogue's row index, under
+        # concurrent HBM traffic). Retire them before the registers are given back.
+        L.append("s_waitcnt lgkmcnt(0)")
         # ── register pinning (PIN + PINSC): scales LOW (PINBASE), then the traded
         # accumulator slice, then whatever frags did not move to AGPR ──
         # Bypasses the LLVM RA "Cannot decrease cascade number" crash and aligns
