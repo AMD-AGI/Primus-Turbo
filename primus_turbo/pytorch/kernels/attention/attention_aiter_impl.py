@@ -173,7 +173,7 @@ class AttnFwdAiterBackend(KernelBackend):
                 causal, window_size_left, window_size_right
             )
 
-            out, softmax_lse, S_dmask, philox_seed, philox_offset = _get_aiter_attn_kernels()[
+            out, softmax_lse, S_dmask, philox_seed, philox_offset, *aiter_extra = _get_aiter_attn_kernels()[
                 "triton_flash_attn_forward"
             ](
                 q,
@@ -191,6 +191,12 @@ class AttnFwdAiterBackend(KernelBackend):
                 max_seqlen_q,
                 max_seqlen_k,
                 sink=sink,
+            )
+            # Older aiter returns the five values above; aiter >= v0.1.30 appends rng_state, which is
+            # None for the default MHA implementation. Anything else is an unreviewed aiter change.
+            assert aiter_extra in ([], [None]), (
+                "Unexpected return from aiter's Triton flash-attention forward; "
+                "update this unpacking for the installed aiter version."
             )
             rng_state = torch.tensor([philox_seed, philox_offset], dtype=torch.int64, device="cpu")
 
