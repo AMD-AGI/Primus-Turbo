@@ -7,7 +7,7 @@
 """Offline schedule tuning for the batch-invariant RL attention (TRITON and FLYDSL backends).
 
 For each setting (phase, model heads, batch, context, query length) and backend, searches the
-schedule kernel options (MODE, BLOCK_M, num_warps, num_stages, waves_per_eu, SPLIT_SEGS, PACK) and
+schedule kernel options (MODE, BLOCK_M, num_warps, num_stages, waves_per_eu, SPLIT_PROGRAMS, PACK) and
 prints the fastest ``kernel_options`` whose output is bitwise equal to the default schedule's.
 Options that change bits (TILE_SIZE, SEGMENT_SIZE) stay at --tile-size / --segment-size, which
 must match the training process. Training settings tune the forward (the backward uses a fixed

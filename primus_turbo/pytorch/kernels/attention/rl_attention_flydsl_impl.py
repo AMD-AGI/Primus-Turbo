@@ -66,10 +66,22 @@ def _num_cus(device_index):
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+def num_split_programs(base_programs: int, num_segments: int, device, forced: int = 0) -> int:
+    """Split programs per (sequence, query block, KV head): about 8 programs per CU from the batch
+    alone, and at least num_segments / 8 so a sequence of max_seqlen_k keys walks runs of at most
+    8 segments. max_seqlen_k only bounds the count: a shorter sequence's runs shrink on the device
+    and its spare programs exit at once, so a HIP graph captured at a graph-safe max_seqlen_k
+    splits a short context as finely as one captured at its length."""
+    if forced:
+        return max(1, min(forced, num_segments))
+    by_batch = -(-8 * _num_cus(device.index or 0) // max(base_programs, 1))
+    return max(1, min(num_segments, max(by_batch, -(-num_segments // 8))))
+
+
 @functools.lru_cache(maxsize=64)
 def _module(
     num_q_heads, num_kv_heads, head_size, cross, vis, page_size, pack, sink, emit_lse, block_m, waves_per_eu,
-    segment_tiles, split_mode, split_segs=1, wave_rows=32, seq_major=False, kv_cache_aux=0,
+    segment_tiles, split_mode, wave_rows=32, seq_major=False, kv_cache_aux=0,
 ):  # fmt: skip
     from primus_turbo.flydsl.attention.rl_attention_fwd import build_rl_flash_attn_module
 
@@ -92,7 +104,6 @@ def _module(
         has_sink=sink,
         segment_tiles=segment_tiles,
         split_mode=split_mode,
-        split_segs=split_segs,
         rows_per_wave=wave_rows,
         seq_major=seq_major,
         kv_cache_aux=kv_cache_aux,
@@ -162,15 +173,16 @@ def rl_attention_fwd_flydsl(
     num_warps: int = 0,
     num_stages: int = 0,
     waves_per_eu: int = 0,
-    split_segs: int = 0,
+    split_programs: int = 0,
     pack: str = "auto",
     wave_rows: int = 0,
     out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Same contract as rl_attention_fwd_triton. Schedule options (none changes the bits):
     ``block_m`` (64 / 128), ``waves_per_eu`` (1 / 2), ``mode`` ("fused" never splits the keys across
-    programs, "split" splits packed decode whenever there are several segments), ``split_segs``
-    (segments per split program; 0 picks up to 8 while at least 4 programs per CU remain) and ``pack`` ("on" / "off" forces (token, head) rows); 0 / "auto"
+    programs, "split" splits packed decode whenever there are several segments), ``split_programs``
+    (split programs per (sequence, query block, KV head); 0 = ``num_split_programs``) and ``pack``
+    ("on" / "off" forces (token, head) rows); 0 / "auto"
     keeps the measured defaults. ``num_warps`` and ``num_stages`` belong to the Triton kernel."""
     paged = block_table is not None
     num_tokens, num_q_heads, head_size = q.shape
@@ -223,10 +235,10 @@ def rl_attention_fwd_flydsl(
     else:
         split = num_seqs * num_kv_heads * num_q_blocks < 2 * _num_cus(q.device.index or 0)
 
-    def build(split_mode, segs=1):
+    def build(split_mode):
         return _module(
             num_q_heads, num_kv_heads, head_size, not builtin, not builtin, k.shape[1] if paged else 0, pack,
-            sinks is not None, bool(return_lse), block_m, wpe, segment_tiles, split_mode, segs, rows,
+            sinks is not None, bool(return_lse), block_m, wpe, segment_tiles, split_mode, rows,
             SEQ_MAJOR and pack and split_mode != 2, KV_CACHE_AUX if pack else 0,
         )  # fmt: skip
 
@@ -252,15 +264,8 @@ def rl_attention_fwd_flydsl(
     )
     if split:
         num_segments = (int(max_seqlen_k) + segment - 1) // segment
-        if not split_segs:
-            # Walking several segments per program pays only with many programs: keep at least
-            # 4 per CU, up to 8 segments each.
-            programs = num_seqs * num_kv_heads * num_q_blocks * num_segments
-            split_segs = 1
-            while split_segs < 8 and programs // (2 * split_segs) >= 4 * _num_cus(q.device.index or 0):
-                split_segs *= 2
-        split_segs = min(split_segs, num_segments)
-        slots = -(-num_segments // split_segs) * split_segs + 1  # + the trash slot of multi-segment programs
+        programs = num_split_programs(num_seqs * num_kv_heads * num_q_blocks, num_segments, q.device, split_programs)
+        slots = num_segments + 1  # + the trash slot for stores outside a program's run
         per_thread = 2 + head_size * rows // 64
         threads = 64 * block_m // rows
         # One row per program; 2D so no dimension passes the launcher's int32.
@@ -269,7 +274,7 @@ def rl_attention_fwd_flydsl(
             dtype=torch.float32,
             device=q.device,
         )
-        build(1, split_segs)(q, k, v, out, num_seqs, int(max_seqlen_q), partial=workspace, **kw)
+        build(1)(q, k, v, out, num_seqs, int(max_seqlen_q), partial=workspace, split_programs=programs, **kw)
         build(2)(q, k, v, out, num_seqs, int(max_seqlen_q), partial=workspace, **kw)
     else:
         build(0)(q, k, v, out, num_seqs, int(max_seqlen_q), **kw)

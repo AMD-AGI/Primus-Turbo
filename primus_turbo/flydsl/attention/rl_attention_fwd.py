@@ -79,7 +79,6 @@ def build_rl_flash_attn_module(
     gqa_pack=False,
     segment_tiles=0,
     split_mode=0,
-    split_segs=1,
     rows_per_wave=32,
     seq_major=False,
     kv_cache_aux=0,
@@ -129,7 +128,6 @@ def build_rl_flash_attn_module(
         gqa_pack=gqa_pack,
         segment_tiles=segment_tiles,
         split_mode=split_mode,
-        split_segs=split_segs,
         rows_per_wave=rows_per_wave,
         seq_major=seq_major,
         kv_cache_aux=kv_cache_aux,
@@ -320,7 +318,7 @@ def build_rl_flash_attn_module(
             _s_barrier()
 
             q_all_bf16 = ctx.load_all()
-            if const_expr(traits.SPLIT_MODE == 1 and traits.SPLIT_SEGS > 1):
+            if const_expr(traits.SPLIT_MODE == 1):
                 # After load_all: the stores are masked to real rows, set up there.
                 ctx.store_empty_partials()
             q_all_scaled_bf16 = ctx.scale_all(q_all_bf16)
@@ -532,7 +530,7 @@ def build_rl_flash_attn_module(
             outer = (
                 ctx.empty_outer()
                 if const_expr(
-                    traits.SEGMENT_TILES > 0 and not (traits.SPLIT_MODE == 1 and traits.SPLIT_SEGS > 1)
+                    traits.SEGMENT_TILES > 0 and traits.SPLIT_MODE != 1
                 )
                 else []
             )
@@ -990,7 +988,7 @@ def build_rl_flash_attn_module(
             # finalize_o_scale folds the learned sink into the denominator when HAS_SINK
             # (else it is the plain 1/l path, byte-identical) and returns the (max, denom)
             # to record as LSE.
-            if const_expr(traits.SPLIT_MODE == 1 and traits.SPLIT_SEGS > 1):
+            if const_expr(traits.SPLIT_MODE == 1):
                 ctx.store_last_split_segment(split_t_end - fx.Index(1), m_row, l_row, v_o)
             else:
                 if const_expr(traits.SEGMENT_TILES > 0):
@@ -998,10 +996,7 @@ def build_rl_flash_attn_module(
                     m_row, l_row, v_o = merged[0], merged[1], list(merged[2:])
                 else:
                     l_row = ctx.finish_row_sum(l_row)
-                if const_expr(traits.SPLIT_MODE == 1):
-                    ctx.store_partial(m_row, l_row, v_o, ctx.group_id)
-                else:
-                    _finish(m_row, l_row, v_o)
+                _finish(m_row, l_row, v_o)
 
         if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN and not traits.HAS_VIS):
             ctx.zero_o_block_if_needed()
@@ -1040,6 +1035,7 @@ def build_rl_flash_attn_module(
         stride_kv_n: fx.Int32,
         head_dim_runtime: fx.Int32,
         block_table_stride: fx.Int32,
+        split_programs: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         # Make shape/mode traits visible to the JIT cache key.
@@ -1049,11 +1045,7 @@ def build_rl_flash_attn_module(
         rows = sl_idx * fx.Index(traits.GQA_GROUP_SIZE) if const_expr(traits.GQA_PACK) else sl_idx
         num_q_blocks = (rows + traits.BLOCK_M - 1) // traits.BLOCK_M
         if const_expr(traits.SPLIT_MODE == 1):
-            seg_keys = traits.SEGMENT_TILES * traits.BLOCK_N
-            group_keys = seg_keys * traits.SPLIT_SEGS
-            grid_x = fx.Index(traits.NUM_HEADS_KV) * (
-                (fx.Index(seq_len_kv) + fx.Index(group_keys - 1)) // fx.Index(group_keys)
-            )
+            grid_x = fx.Index(traits.NUM_HEADS_KV) * fx.Index(split_programs)
         elif const_expr(traits.SPLIT_MODE == 2):
             grid_x = traits.NUM_HEADS_KV * (traits.ACC_FLOATS // 8)
         elif const_expr(traits.GQA_PACK):
@@ -1140,6 +1132,7 @@ def build_rl_flash_attn_module(
         vis_hi,
         vis_group,
         partial,
+        split_programs,
     ):
         # cu_seqlens_*/block_table/sink are unused kernel-signature placeholders for dense
         # launches / has_sink=False; the kernel only reads them under const_expr(traits.VARLEN
@@ -1166,6 +1159,7 @@ def build_rl_flash_attn_module(
             traits.DEFAULT_STRIDE_KV_N if stride_kv_n is None else stride_kv_n,
             traits.HEAD_DIM if head_dim_runtime is None else head_dim_runtime,
             0 if block_table_stride is None else block_table_stride,
+            1 if split_programs is None else split_programs,
         )
 
     def _launch(
@@ -1191,6 +1185,7 @@ def build_rl_flash_attn_module(
         vis_hi=None,
         vis_group=None,
         partial=None,
+        split_programs=None,
         stream=None,
     ):
         args = _fill_defaults(
@@ -1215,6 +1210,7 @@ def build_rl_flash_attn_module(
             vis_hi,
             vis_group,
             partial,
+            split_programs,
         )
         # The scalar shape/mode args (JIT cache key) follow the 14 tensors; has_sink / has_vis
         # are baked into the module (separate builds), so their tensors stay out of the key.
@@ -1251,6 +1247,7 @@ def build_rl_flash_attn_module(
         vis_hi=None,
         vis_group=None,
         partial=None,
+        split_programs=None,
         stream=None,
     ):
         args = _fill_defaults(
@@ -1275,6 +1272,7 @@ def build_rl_flash_attn_module(
             vis_hi,
             vis_group,
             partial,
+            split_programs,
         )
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
             return flyc.compile(launch_flash_attn_dualwave_swp, *args, fx.Stream(stream))

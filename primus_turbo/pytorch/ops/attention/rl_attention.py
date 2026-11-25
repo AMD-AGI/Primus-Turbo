@@ -29,7 +29,7 @@ TILE_SIZE       yes          KV tile per inner step (default 64, 32 for head siz
 SEGMENT_SIZE    yes          KV segment length, the split-KV unit (default 1024)
 BACKEND         yes          "TRITON" or "FLYDSL" (gfx950)
 MODE            no           "auto", "fused" (one pass) or "split" (split-KV + reduce)
-SPLIT_SEGS      no           FLYDSL: segments per split-KV program (0 = auto)
+SPLIT_PROGRAMS  no           FLYDSL: split-KV programs per (sequence, query block, KV head)
 PACK            no           FLYDSL: "auto", "on" or "off" — (token, head) rows of one query group
 WAVE_ROWS       no (*)       FLYDSL: rows per wave, 16 (16x16x32 MFMAs) or 32 (32x32x16)
 BLOCK_M         no           query rows per program (a multiple of the GQA group)
@@ -95,7 +95,7 @@ _INT_OPTIONS = (
     "num_warps",
     "num_stages",
     "waves_per_eu",
-    "SPLIT_SEGS",
+    "SPLIT_PROGRAMS",
     "WAVE_ROWS",
 )
 KERNEL_OPTIONS = _INT_OPTIONS + ("MODE", "PACK", "BACKEND")
@@ -109,7 +109,7 @@ class _Options:
     num_warps: int = 0
     num_stages: int = 0
     waves_per_eu: int = 0
-    split_segs: int = 0
+    split_programs: int = 0
     wave_rows: int = 0
     mode: str = "auto"
     pack: str = "auto"
@@ -125,7 +125,7 @@ class _Options:
             self.num_warps,
             self.num_stages,
             self.waves_per_eu,
-            self.split_segs,
+            self.split_programs,
             self.pack,
             self.wave_rows,
             self.backend,
@@ -187,7 +187,7 @@ def _resolve_options(kernel_options: Optional[dict]) -> _Options:
         num_warps=merged.get("num_warps", 0),
         num_stages=merged.get("num_stages", 0),
         waves_per_eu=merged.get("waves_per_eu", 0),
-        split_segs=merged.get("SPLIT_SEGS", 0),
+        split_programs=merged.get("SPLIT_PROGRAMS", 0),
         wave_rows=merged.get("WAVE_ROWS", 0),
         mode=merged.get("MODE", "auto"),
         pack=merged.get("PACK", "auto"),

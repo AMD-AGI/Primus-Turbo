@@ -134,7 +134,7 @@ def rl_attention_fwd_triton(
     num_warps: int = 0,
     num_stages: int = 0,
     waves_per_eu: int = 0,
-    split_segs: int = 0,
+    split_programs: int = 0,
     pack: str = "auto",
     wave_rows: int = 0,
     out: Optional[torch.Tensor] = None,

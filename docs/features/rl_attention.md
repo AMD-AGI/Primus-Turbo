@@ -89,7 +89,7 @@ overrides them key by key. 0 or `auto` means the default.
 | `SEGMENT_SIZE` | yes | KV segment length, the split-KV unit (default 1024) |
 | `BACKEND` | yes | `TRITON` (default) or `FLYDSL` (gfx950), see [Backends](#backends) |
 | `MODE` | no | `auto`, `fused` (one pass) or `split` (split-KV + reduce) |
-| `SPLIT_SEGS` | no | `FLYDSL`: segments per split-KV program (0: up to 8 while at least 4 programs per CU remain) |
+| `SPLIT_PROGRAMS` | no | `FLYDSL`: split-KV programs per (sequence, query block, KV head). 0: about 8 programs per CU from the batch, and at least `max_seqlen_k / SEGMENT_SIZE / 8`. Each program walks a run of `ceil(segments / programs)` of its sequence's own segments, computed on the GPU, so a HIP graph captured at a graph-safe `max_seqlen_k` still splits a short context finely |
 | `PACK` | no | `FLYDSL`: `auto`, `on` or `off`, rows as (token, head) of one query group |
 | `WAVE_ROWS` | no (*) | `FLYDSL`: rows per wave, 16 (default, 16x16x32 MFMAs) or 32 (32x32x16, opt-in) |
 | `BLOCK_M`, `num_warps`, `num_stages`, `waves_per_eu` | no | Schedule only |
@@ -105,6 +105,18 @@ same environment variable in both is the simplest way. The others may differ per
 process. `num_warps` is clamped to `BLOCK_M / 16` when `BLOCK_M > 16`, because warps that also
 split the columns of the score tile change the bits. The backward uses its own fixed configuration.
 
+### Decode under HIP graphs
+
+A serving engine captures decode once and replays it at every context length, so it passes a
+graph-safe `max_seqlen_k` (the model's maximum length). The output bits never depend on it, and
+the time hardly does: FLYDSL split decode launches a fixed number of programs per (sequence, KV
+head) and computes each program's run of segments from the sequence's own length on the GPU, and
+the merge reads only the sequence's own segments; TRITON split programs past a sequence's keys exit
+at once, and the segment count is a runtime argument, so new lengths do not recompile. Measured on
+MI355X (Llama-3 8B heads, graph captured at `max_seqlen_k` = 128k vs at the real context, from
+`bench_rl_attention.py --phase decode-graph`): FLYDSL within 1 %, TRITON within 16 % (empty
+programs) at 4k context.
+
 ### Tuning the schedule
 
 The defaults are measured on MI355X for common model shapes. For other shapes, tune the schedule
@@ -116,7 +128,7 @@ python benchmark/ops/training/tune_rl_attention.py --phase decode prefill train 
 ```
 
 For each setting and backend it searches `MODE`, `BLOCK_M`, `num_warps`, `num_stages`,
-`waves_per_eu`, `SPLIT_SEGS` and `PACK` (coordinate descent; `--exhaustive` times the full grid),
+`waves_per_eu`, `SPLIT_PROGRAMS` and `PACK` (coordinate descent; `--exhaustive` times the full grid),
 keeps only candidates whose output is **bitwise equal to the default schedule's**, and prints the
 fastest as a `kernel_options` string. It needs a 3% gain (`--min-gain`) to leave a default.
 `TILE_SIZE` and `SEGMENT_SIZE` change bits, so they are not searched; pass the values your training
@@ -139,7 +151,7 @@ per-shape auto-tuning across backends.
 | Masks, window, sinks, varlen, GQA | yes | yes |
 | Split-KV for decode | yes (`SEGMENT_SIZE`) | yes (`SEGMENT_SIZE`, see [the segment cost](#known-issue-cost-of-segments-on-flydsl)) |
 | Backward | Triton, deterministic | the same Triton backward |
-| Options used | all but `SPLIT_SEGS` / `PACK` | `SEGMENT_SIZE` (a multiple of 64), `BLOCK_M` (64 / 128), `MODE`, `waves_per_eu`, `SPLIT_SEGS`, `PACK`; `TILE_SIZE` must be 0 or 64; `num_warps` / `num_stages` are ignored |
+| Options used | all but `SPLIT_PROGRAMS` / `PACK` | `SEGMENT_SIZE` (a multiple of 64), `BLOCK_M` (64 / 128), `MODE`, `waves_per_eu`, `SPLIT_PROGRAMS`, `PACK`; `TILE_SIZE` must be 0 or 64; `num_warps` / `num_stages` are ignored |
 
 **FLYDSL** (`primus_turbo/flydsl/attention/rl_attention_fwd.py`, helpers in
 `primus_turbo/flydsl/utils/rl_attn_helper.py`) is a fork of the dual-wave, software-pipelined gfx950
@@ -306,7 +318,7 @@ Each test changes one thing a token's result must not depend on, and requires id
 |---|---|---|
 | Layout | `test_paged_split_fused_contiguous_bitwise`, `test_visibility_paged_split_fused_bitwise` | Paged cache (each page size) vs contiguous K/V; split-KV vs fused |
 | Launch | `test_launch_invariance` | 16 (`BLOCK_M`, `num_warps`) launches given through `kernel_options`, with and without masks |
-| Schedule (FLYDSL) | `test_schedule_knobs_do_not_change_bits` | `BLOCK_M`, `waves_per_eu`, `MODE`, `SPLIT_SEGS`, `PACK` on training, decode and a 37-token chunk |
+| Schedule (FLYDSL) | `test_schedule_knobs_do_not_change_bits` | `BLOCK_M`, `waves_per_eu`, `MODE`, `SPLIT_PROGRAMS`, `PACK` on training, decode and a 37-token chunk |
 | Batch | `test_batch_invariance`, `test_visibility_batch_invariance` | A 200-token sequence alone vs packed among others (`[1, 5]`, `[333, 64, 17]`, six of 129), with masks and sinks |
 | Mask form | `test_causal_intervals_equal_builtin` | Causal / sliding window as `[lo, hi]` intervals vs the built-in masks |
 | Rollout vs training | `test_causal_rollout_matches_training`, `test_visibility_rollout_matches_training`, `test_flash_attn_varlen_func_paged_rollout_matches_training` | See below |

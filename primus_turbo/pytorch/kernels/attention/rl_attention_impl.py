@@ -97,7 +97,7 @@ def rl_attention_fwd_impl(
     num_warps: int,
     num_stages: int,
     waves_per_eu: int,
-    split_segs: int,
+    split_programs: int,
     pack: str,
     wave_rows: int,
     backend: str,
@@ -127,7 +127,7 @@ def rl_attention_fwd_impl(
         num_warps=num_warps,
         num_stages=num_stages,
         waves_per_eu=waves_per_eu,
-        split_segs=split_segs,
+        split_programs=split_programs,
         pack=pack,
         wave_rows=wave_rows,
     )
@@ -138,7 +138,7 @@ def rl_attention_fwd_impl(
 def _rl_attention_fwd_impl_meta(
     q, k, v, cu_seqlens_q, cu_seqlens_k, seq_lens, block_table, max_seqlen_q, max_seqlen_k,
     softmax_scale, window_left, vis_lo, vis_hi, sinks, return_lse, mode, tile_size, segment_size,
-    block_m, num_warps, num_stages, waves_per_eu, split_segs, pack, wave_rows, backend,
+    block_m, num_warps, num_stages, waves_per_eu, split_programs, pack, wave_rows, backend,
 ):  # fmt: skip
     num_tokens, num_q_heads, _ = q.shape
     lse_shape = (num_tokens, num_q_heads) if return_lse else (0,)
@@ -169,7 +169,7 @@ def rl_attention_fwd_out_impl(
     num_warps: int,
     num_stages: int,
     waves_per_eu: int,
-    split_segs: int,
+    split_programs: int,
     pack: str,
     wave_rows: int,
     backend: str,
@@ -198,7 +198,7 @@ def rl_attention_fwd_out_impl(
         num_warps=num_warps,
         num_stages=num_stages,
         waves_per_eu=waves_per_eu,
-        split_segs=split_segs,
+        split_programs=split_programs,
         pack=pack,
         wave_rows=wave_rows,
     )
@@ -209,7 +209,7 @@ def rl_attention_fwd_out_impl(
 def _rl_attention_fwd_out_impl_meta(
     out, q, k, v, cu_seqlens_q, cu_seqlens_k, seq_lens, block_table, max_seqlen_q, max_seqlen_k,
     softmax_scale, window_left, vis_lo, vis_hi, sinks, mode, tile_size, segment_size,
-    block_m, num_warps, num_stages, waves_per_eu, split_segs, pack, wave_rows, backend,
+    block_m, num_warps, num_stages, waves_per_eu, split_programs, pack, wave_rows, backend,
 ):  # fmt: skip
     return None
 

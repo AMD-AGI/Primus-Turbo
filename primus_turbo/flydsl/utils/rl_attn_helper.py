@@ -53,12 +53,13 @@ bits as one program walking every segment. Merging into an empty outer state is 
 whose keys lie in one segment is unchanged.
 
 SPLIT (with SEGMENT_TILES, HAS_VIS and GQA_PACK, for decode) runs the same walk with every row's
-interval clipped to SPLIT_SEGS consecutive segments (grid x = KV heads x segment groups) and stores
-the (reference, row sum, accumulator) of each of its segments to that segment's workspace slot
-instead of the output. With one segment per program it merges its walk into the outer state and
-stores that; with several it stores each finished segment and restarts the row state, every slot
-first written as an empty segment (the merge is not associative in floating point, so the partials
-must stay per segment). MERGE loads those partials, merges them in
+interval clipped to a run of consecutive segments and stores the (reference, row sum, accumulator)
+of each of its segments to that segment's workspace slot instead of the output: it stores each
+finished segment and restarts the row state, every slot first written as an empty segment (the
+merge is not associative in floating point, so the partials must stay per segment). The grid has
+a fixed number of programs per (sequence, KV head), independent of max_seqlen_k (grid x = KV heads
+x programs); each program's run, ceil(segments / programs) segments, follows the sequence's own
+length on the device, so one launch configuration fits every context length (a HIP graph). MERGE loads those partials, merges them in
 segment order with ``merge_segment``, and finishes through the same normalize / store code as a
 full walk. The merge uses exact IEEE arithmetic (no fast-math), so the two kernels cannot fuse or
 reorder it differently.
@@ -107,6 +108,16 @@ def _wave_any(cond):
     """Wave-uniform "some lane satisfies cond", as one ballot and one compare."""
     mask = rocdl.ballot(fx.Int64.ir_type, as_mlir_value(cond))
     return ArithValue(fx.Int64(mask) != fx.Int64(0))
+
+
+def _for_index(start, stop, body):
+    """Dynamic ``for i in range(start, stop): body(i)`` over index Values, carrying nothing."""
+    from flydsl._mlir.dialects import scf
+
+    op = scf.ForOp(as_mlir_value(fx.Index(start)), as_mlir_value(fx.Index(stop)), as_mlir_value(fx.Index(1)))
+    with ir.InsertionPoint(op.body):
+        body(fx.Index(op.induction_variable))
+        scf.YieldOp([])
 
 
 def _if_wave(cond, vals, then_fn):
@@ -479,7 +490,6 @@ class DualwaveSwpTraits:
             self.GQA_PACK,
             self.SEGMENT_TILES,
             self.SPLIT_MODE,
-            self.SPLIT_SEGS,
             self.ROWS_PER_WAVE,
             self.SEQ_MAJOR,
             self.KV_CACHE_AUX,
@@ -509,7 +519,6 @@ def _make_dualwave_swp_traits(
     gqa_pack=False,
     segment_tiles=0,
     split_mode=0,
-    split_segs=1,
     rows_per_wave=32,
     seq_major=False,
     kv_cache_aux=0,
@@ -608,7 +617,6 @@ def _make_dualwave_swp_traits(
         GQA_PACK=bool(gqa_pack),
         SEGMENT_TILES=int(segment_tiles),
         SPLIT_MODE=int(split_mode),
-        SPLIT_SEGS=int(split_segs),
         SEQ_MAJOR=bool(seq_major),
         # Cache-policy bits of paged K / V loads (gfx950: 1 = sc0, 2 = nt); 0 keeps the copy atom.
         KV_CACHE_AUX=int(kv_cache_aux),
@@ -858,6 +866,18 @@ class DualwaveKernelContext:
             self.seqlen_q_v = self.seq_len_v
             self.seqlen_kv_v = self.seq_len_kv_v
             self.seqlen_kv_i32 = self.seq_len_kv
+        if const_expr(traits.SPLIT_MODE == 1):
+            # This sequence's segments, spread over the grid's programs per (sequence, KV head)
+            # in runs of ceil(segments / programs); the grid never depends on max_seqlen_k.
+            seg_keys = fx.Index(traits.SEGMENT_TILES * traits.BLOCK_N)
+            self.seq_segments = (self.seqlen_kv_v + seg_keys - fx.Index(1)) // seg_keys
+            programs = fx.Index(gpu.grid_dim.z if traits.SEQ_MAJOR else gpu.grid_dim.x) // fx.Index(
+                traits.NUM_HEADS_KV
+            )
+            run = (self.seq_segments + programs - fx.Index(1)) // programs
+            self.split_run = fx.Index(ArithValue(run > fx.Index(1)).select(run, fx.Index(1)))
+            # Slot after the last segment max_seqlen_k allows: where out-of-run stores go.
+            self.trash_slot = (self.seq_len_kv_v + seg_keys - fx.Index(1)) // seg_keys
 
         q_tensor = self.Q
         k_tensor = self.K
@@ -1068,13 +1088,13 @@ class DualwaveKernelContext:
         )
 
     def _first_split_segment(self):
-        return fx.Index(self.group_id) * fx.Index(self.traits.SPLIT_SEGS)
+        return fx.Index(self.group_id) * self.split_run
 
     def _segment_keys(self):
         """[first, last] key of this SPLIT program's segments, sequence-relative."""
         seg_keys = self.traits.SEGMENT_TILES * self.traits.BLOCK_N
         first = fx.Int32(self._first_split_segment()) * fx.Int32(seg_keys)
-        return first, first + fx.Int32(seg_keys * self.traits.SPLIT_SEGS - 1)
+        return first, first + fx.Int32(self.split_run) * fx.Int32(seg_keys) - fx.Int32(1)
 
     def _clip_to_segment(self, lo, hi):
         if const_expr(self.traits.SPLIT_MODE != 1):
@@ -1792,27 +1812,27 @@ class DualwaveKernelContext:
     def _store_split_segment(self, seg, m_row, l_row, v_o):
         """SPLIT: store the state of segment ``seg`` (an index Value) if it is one of this program's.
         The workspace descriptor is unbounded, so a masked store would still land somewhere: an
-        out-of-range segment (walk tiles outside the program's range, always empty) goes to the
-        trash slot after the last real one instead."""
+        out-of-range segment (walk tiles outside the program's run or past the sequence's keys,
+        always empty) goes to the trash slot after the last one max_seqlen_k allows instead."""
         first = self._first_split_segment()
-        in_range = ArithValue(fx.Index(seg) >= first) & (
-            fx.Index(seg) < first + fx.Index(self.traits.SPLIT_SEGS)
+        in_range = (
+            ArithValue(fx.Index(seg) >= first)
+            & ArithValue(fx.Index(seg) < first + self.split_run)
+            & ArithValue(fx.Index(seg) < self.seq_segments)
         )
-        trash = (
-            fx.Index(gpu.grid_dim.z if self.traits.SEQ_MAJOR else gpu.grid_dim.x)
-            // fx.Index(self.traits.NUM_HEADS_KV)
-            * fx.Index(self.traits.SPLIT_SEGS)
-        )
-        target = fx.Index(in_range.select(fx.Index(seg), trash))
+        target = fx.Index(in_range.select(fx.Index(seg), self.trash_slot))
         self.store_partial(m_row, self.finish_row_sum(l_row), v_o, target)
 
     def store_empty_partials(self):
-        """SPLIT: write every segment slot of this program as an empty segment first."""
+        """SPLIT: write every segment slot of this program's run (within the sequence's segments)
+        as an empty segment first."""
         zeros = [self.c_zero_acc] * self.traits.ACC_TILES
-        for k in range_constexpr(self.traits.SPLIT_SEGS):
-            self.store_partial(
-                self.c_neg_floor, self.c_zero_f, zeros, self._first_split_segment() + fx.Index(k)
-            )
+        first = self._first_split_segment()
+        end = first + self.split_run
+        end = fx.Index(ArithValue(end < self.seq_segments).select(end, self.seq_segments))
+        _for_index(
+            first, end, lambda seg: self.store_partial(self.c_neg_floor, self.c_zero_f, zeros, seg)
+        )
 
     def store_last_split_segment(self, last_tile, m_row, l_row, v_o):
         self._store_split_segment(
@@ -1825,7 +1845,7 @@ class DualwaveKernelContext:
         if const_expr(self.traits.SEGMENT_TILES == 0):
             return m_row, l_row, v_o, outer
         nd = self.traits.ACC_TILES
-        if const_expr(self.traits.SPLIT_MODE == 1 and self.traits.SPLIT_SEGS > 1):
+        if const_expr(self.traits.SPLIT_MODE == 1):
 
             def _then_split():
                 finished = fx.Index(tile_idx) // fx.Index(self.traits.SEGMENT_TILES) - fx.Index(1)

@@ -7,7 +7,7 @@
 """Schedule tuning for the batch-invariant RL attention.
 
 ``tune`` searches the kernel options that only schedule work (MODE, BLOCK_M, num_warps,
-num_stages, waves_per_eu, SPLIT_SEGS, PACK) for one call and returns the fastest. A candidate is
+num_stages, waves_per_eu, SPLIT_PROGRAMS, PACK) for one call and returns the fastest. A candidate is
 kept only if its output is bitwise equal to the default schedule's, so a tuned schedule never
 breaks rollout == training. The options that change bits (TILE_SIZE, SEGMENT_SIZE, BACKEND) are
 held at the caller's values: they must match between the rollout and the training process.
@@ -24,7 +24,7 @@ import torch
 
 __all__ = ["SCHEDULE_OPTIONS", "TuneResult", "format_options", "search_space", "tune"]
 
-SCHEDULE_OPTIONS = ("MODE", "BLOCK_M", "num_warps", "num_stages", "waves_per_eu", "SPLIT_SEGS", "PACK", "WAVE_ROWS")
+SCHEDULE_OPTIONS = ("MODE", "BLOCK_M", "num_warps", "num_stages", "waves_per_eu", "SPLIT_PROGRAMS", "PACK", "WAVE_ROWS")
 _DEFAULTS = (0, "auto")
 
 
@@ -40,7 +40,7 @@ def search_space(backend: str, max_seqlen_q: int) -> Dict[str, list]:
             "waves_per_eu": [0, 1, 2],
         }
         if decode:
-            space.update(PACK=["auto", "off"], SPLIT_SEGS=[0, 1, 2, 4, 8, 16])
+            space.update(PACK=["auto", "off"], SPLIT_PROGRAMS=[0, 4, 16, 64])
         return space
     return {
         "MODE": ["auto", "fused", "split"] if decode else ["auto", "fused"],

@@ -124,6 +124,21 @@ def test_decode_graph_replay(mode):
     _graph_decode_check(32, 8, 128, 64, 8192, steps, {**FLY, "MODE": mode}, seed=20)
 
 
+def test_split_programs_bitwise():
+    """Split programs per (sequence, KV head) only schedule work: one program walking every segment,
+    uneven runs, one segment each and more programs than segments give the fused bits, for decode
+    next to longer and shorter sequences (runs follow each sequence's own length)."""
+    lens = [5000, 3, 1300, 129]
+    _, k, v, cu_k = _varlen(lens, 32, 8, 128, BF16, seed=21)
+    k_cache, v_cache, block_table, seq_lens = _paged(k, v, cu_k, 64)
+    q = _varlen([1] * len(lens), 32, 8, 128, BF16, seed=22)[0]
+    args = (q, k_cache, v_cache, _cu([1] * len(lens)), seq_lens, block_table, 1, max(lens))
+    fused = rl_paged_attention_func(*args, kernel_options={**FLY, "MODE": "fused"})
+    for programs in (1, 2, 3, 64):
+        opts = {**FLY, "MODE": "split", "SPLIT_PROGRAMS": programs}
+        assert _bits_equal(rl_paged_attention_func(*args, kernel_options=opts), fused), f"SPLIT_PROGRAMS={programs}"
+
+
 @pytest.mark.parametrize("split", [False, True])
 def test_paged_out_buffer(split):
     """out= on FlyDSL: a caller's padded buffer gets the returned bits; rows past the tokens are kept."""
@@ -307,8 +322,8 @@ def _knob_sets(decode):
     sets += [{"WAVE_ROWS": 32}, {"WAVE_ROWS": 32, "BLOCK_M": 128}, {"WAVE_ROWS": 16, "BLOCK_M": 32}]
     if decode:
         sets += [{"MODE": "fused"}, {"MODE": "fused", "PACK": "off"}]
-        sets += [{"MODE": "split", "SPLIT_SEGS": k, "BLOCK_M": bm} for k in (1, 2, 4) for bm in (64, 128)]
-        sets += [{"MODE": "split", "SPLIT_SEGS": 2, "waves_per_eu": 2}]
+        sets += [{"MODE": "split", "SPLIT_PROGRAMS": k, "BLOCK_M": bm} for k in (1, 2, 4) for bm in (64, 128)]
+        sets += [{"MODE": "split", "SPLIT_PROGRAMS": 2, "waves_per_eu": 2}]
     else:
         sets += [{"PACK": "on"}, {"PACK": "on", "BLOCK_M": 128}]
     return sets
