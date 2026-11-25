@@ -62,6 +62,7 @@ def quantize_fp8(
     pad_align_last: int = 0,
     pad_align_penultimate: int = 0,
     scale: Optional[torch.Tensor] = None,
+    amax_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     FP8 Quantize
@@ -82,6 +83,12 @@ def quantize_fp8(
         ``scale`` (TENSORWISE only, default None): a one-element float32 tensor on ``x``'s
         device to cast with, instead of measuring ``x``'s amax; the returned ``scale_inv`` is
         its reciprocal. For callers that keep scales across steps (delayed scaling).
+
+        ``amax_out`` (TENSORWISE with ``scale`` only, default None): a one-element float32 tensor
+        on ``x``'s device that the cast raises to the abs-max of ``x`` (before scaling), in the
+        same read, so a delayed-scaling caller gets its next amax without another pass. It is a
+        running max, never lowered, so several casts may share one buffer; whoever owns it resets
+        it. A NaN or Inf in ``x`` shows up in it. The FP8 output is bit-identical with or without it.
     """
     if scale is not None:
         if granularity != ScalingGranularity.TENSORWISE:
@@ -91,6 +98,14 @@ def quantize_fp8(
                 "scale must be a one-element float32 tensor on the input's device, got "
                 f"shape={tuple(scale.shape)}, dtype={scale.dtype}, device={scale.device}"
             )
+    if amax_out is not None:
+        if granularity != ScalingGranularity.TENSORWISE or scale is None:
+            raise ValueError("amax_out is only supported for TENSORWISE quantization with a given scale")
+        if amax_out.numel() != 1 or amax_out.dtype != torch.float32 or amax_out.device != x.device:
+            raise ValueError(
+                "amax_out must be a one-element float32 tensor on the input's device, got "
+                f"shape={tuple(amax_out.shape)}, dtype={amax_out.dtype}, device={amax_out.device}"
+            )
     if granularity == ScalingGranularity.TENSORWISE:
         # (k_align=1, pad_n=False) matches the legacy cast byte-for-byte; only padded callers widen K/N.
         return quantize_fp8_tensorwise_pad_impl(
@@ -99,6 +114,7 @@ def quantize_fp8(
             pad_n=(pad_align_penultimate > 0),
             k_align=(pad_align_last or 1),
             scale=scale,
+            amax_out=amax_out,
         )
 
     elif granularity == ScalingGranularity.ROWWISE:

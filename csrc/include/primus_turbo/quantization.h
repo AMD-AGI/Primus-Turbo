@@ -43,7 +43,8 @@ void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, cons
 template <typename FType, typename QType, typename ComputeType = float>
 void quantize_tensorwise_pad_impl(const FType *x, const float *scale, QType *y, const int64_t rows,
                                   const int64_t K, const int64_t Kp, hipStream_t stream,
-                                  const int64_t n_pen = 0, const int64_t np_pen = 0);
+                                  const int64_t n_pen = 0, const int64_t np_pen = 0,
+                                  float *amax_out = nullptr);
 
 // Segment-padded group offsets (each segment rounded up to block_size), on-device.
 template <typename IndexType>

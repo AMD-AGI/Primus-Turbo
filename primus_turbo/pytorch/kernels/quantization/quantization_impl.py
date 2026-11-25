@@ -45,6 +45,7 @@ def quantize_fp8_tensorwise_pad_impl(
     k_align: int = 128,
     amax_partials: Optional[torch.Tensor] = None,
     scale: Optional[torch.Tensor] = None,
+    amax_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-tensor fp8 cast + last-dim (K) pad to Kp=ceil(K, k_align), pad columns zeroed;
     ``k_align`` is the cpp op's ``padding_align_size`` (128 = K-aligned operand, 1 =
@@ -57,12 +58,20 @@ def quantize_fp8_tensorwise_pad_impl(
 
     ``scale`` skips the amax pass altogether: the cast multiplies by this one-element
     float32 tensor, and the returned ``scale_inv`` is its reciprocal. It and
-    ``amax_partials`` are alternatives."""
+    ``amax_partials`` are alternatives.
+
+    ``amax_out`` (needs ``scale``) is a one-element float32 buffer the cast raises to the
+    abs-max of ``x`` (before scaling) while it reads ``x`` anyway, so the next delayed scale
+    costs no extra pass. It is a running max: the buffer is never lowered, so one buffer shared
+    by several casts holds their maximum, and its owner resets it. A NaN or Inf in ``x`` lands
+    in it as NaN or Inf (it is not dropped). The cast's output is unchanged."""
     x = x.contiguous()
     pad_n_align = 128 if pad_n else 1
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(
-        x, out_dtype, scale, k_align, pad_n_align, amax_partials
-    )
+    args = (x, out_dtype, scale, k_align, pad_n_align, amax_partials)
+    if amax_out is not None:
+        # Passed only when given: every argument adds host time to this launch-bound call.
+        args += (amax_out,)
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(*args)
     return x_fp8, scale_inv
 
 

@@ -41,18 +41,31 @@ inline bool is_torch_fp8(const at::ScalarType dtype) {
            dtype == at::kFloat8_e5m2 || dtype == at::kFloat8_e5m2fnuz;
 }
 
-std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
-                                                const at::ScalarType      dest_dtype,
-                                                c10::optional<at::Tensor> scale_opt,
-                                                const int64_t             padding_align_size,
-                                                const int64_t pad_penultimate_align_size,
-                                                c10::optional<at::Tensor> amax_partials_opt) {
+std::tuple<at::Tensor, at::Tensor> quantize_fp8_tensorwise(
+    const at::Tensor input, const at::ScalarType dest_dtype, c10::optional<at::Tensor> scale_opt,
+    const int64_t padding_align_size, const int64_t pad_penultimate_align_size,
+    c10::optional<at::Tensor> amax_partials_opt, c10::optional<at::Tensor> amax_out_opt) {
     PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf ||
                        input.scalar_type() == at::kFloat);
     PRIMUS_TURBO_CHECK(is_torch_fp8(dest_dtype));
     PRIMUS_TURBO_CHECK(input.is_contiguous(), "input must be contiguous");
     PRIMUS_TURBO_CHECK(!(scale_opt.has_value() && amax_partials_opt.has_value()),
                        "scale_opt and amax_partials are alternatives, not a pair");
+    // amax_out: the cast also folds the abs-max of `input` (before scaling) into this buffer, so a
+    // delayed-scaling caller gets the next scale's amax without a second read. It only raises the
+    // value (one running max over every cast that is given the same buffer); the caller resets it.
+    float *amax_out = nullptr;
+    if (amax_out_opt.has_value()) {
+        const at::Tensor &amax = amax_out_opt.value();
+        PRIMUS_TURBO_CHECK(scale_opt.has_value(),
+                           "amax_out needs a given scale: a cast that measures its own amax "
+                           "already produces it");
+        PRIMUS_TURBO_CHECK(amax.scalar_type() == at::kFloat && amax.numel() == 1 &&
+                               amax.is_contiguous() && amax.device() == input.device(),
+                           "amax_out must be a one-element contiguous float32 tensor on the "
+                           "input's device");
+        amax_out = amax.data_ptr<float>();
+    }
     auto stream = at::cuda::getCurrentCUDAStream();
 
     const int64_t K    = input.size(-1);
@@ -116,7 +129,8 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
             quantize_tensorwise_pad_impl<FType, QType>(
                 reinterpret_cast<const FType *>(input.data_ptr()),
                 reinterpret_cast<const float *>(scale.data_ptr()),
-                reinterpret_cast<QType *>(output.data_ptr()), rows, K, Kp, stream, n_pen, np_pen);
+                reinterpret_cast<QType *>(output.data_ptr()), rows, K, Kp, stream, n_pen, np_pen,
+                amax_out);
         });
     });
 

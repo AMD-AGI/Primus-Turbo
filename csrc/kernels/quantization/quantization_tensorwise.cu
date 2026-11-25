@@ -233,10 +233,66 @@ template <int UNROLL, typename QType> PRIMUS_TURBO_DEVICE void store_zero_pack(Q
     store_words<UNROLL / 4>(reinterpret_cast<uint32_t *>(dst), w);
 }
 
+// Delayed-scaling amax of the data a cast reads. A cast with a given scale already loads every
+// element, so it can fold the abs-max of its input (before scaling) into `amax_out` at no extra
+// read. The max is taken on the float's bit pattern with the sign cleared: for non-negative
+// floats the unsigned order is the float order, and NaN (0x7fc00000 and up) sorts above Inf, so a
+// non-finite input shows up in the result instead of being dropped, as fmaxf would. The buffer
+// only ever grows: whoever reads it resets it (a running max over several casts per step).
+template <typename FType> PRIMUS_TURBO_DEVICE uint32_t quant_abs_bits(const FType v) {
+    return __float_as_uint(fabsf(static_cast<float>(v)));
+}
+
+// Block-wide max of one value per thread, then one atomic per block. Every thread of the block
+// must call it (it synchronises).
+template <int BLOCK>
+PRIMUS_TURBO_DEVICE void quant_block_atomic_amax(uint32_t bits, uint32_t *out) {
+    constexpr int NUM_WAVES = BLOCK / THREADS_PER_WARP;
+#pragma unroll
+    for (int offset = THREADS_PER_WARP >> 1; offset > 0; offset >>= 1) {
+        bits = max(bits, static_cast<uint32_t>(__shfl_xor_sync(FINAL_MASK, bits, offset)));
+    }
+    __shared__ uint32_t wave_max[NUM_WAVES];
+    const int           wave = threadIdx.x / THREADS_PER_WARP;
+    if (threadIdx.x % THREADS_PER_WARP == 0) {
+        wave_max[wave] = bits;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        uint32_t m = wave_max[0];
+#pragma unroll
+        for (int i = 1; i < NUM_WAVES; ++i) {
+            m = max(m, wave_max[i]);
+        }
+        // Once a few blocks have raised the value, most blocks have nothing to add: a plain load
+        // keeps them off the single hot address.
+        if (m > __hip_atomic_load(out, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) {
+            atomicMax(out, m);
+        }
+    }
+}
+
+// Amax-only pass for the cast layouts that have no folded variant (the generic pad kernel). It
+// costs the second read the folded variants avoid, so it is only a fallback.
+template <int BLOCK, typename FType>
+__launch_bounds__(BLOCK) __global__
+    void quantize_tensorwise_amax_only_kernel(const FType *__restrict__ x, const int64_t n,
+                                              uint32_t *__restrict__ amax_out) {
+    uint32_t      amax_bits = 0u;
+    const int64_t stride    = static_cast<int64_t>(gridDim.x) * BLOCK;
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * BLOCK + threadIdx.x; i < n; i += stride) {
+        amax_bits = max(amax_bits, quant_abs_bits(x[i]));
+    }
+    quant_block_atomic_amax<BLOCK>(amax_bits, amax_out);
+}
+
 // Tensorwise amax -> scale: one scalar suffices, so the input is streamed
 // nontemporally (re-read from DRAM by the quant kernel anyway) and reduction +
 // amax -> scale fold into a second launch -- byte-identical, order-independent.
 constexpr int32_t AMAX_BLOCK_SIZE = 1024;
+// A cast that also reports its input's amax ends each block with one atomic on a single address,
+// so it runs on a capped grid whose blocks loop over many rows instead of one block per row.
+constexpr int64_t QUANT_AMAX_GRID = 8192;
 constexpr int32_t AMAX_UNROLL     = 2; // 16-byte loads in flight per thread
 constexpr int32_t AMAX_MAX_BLOCKS = 2048;
 constexpr float   AMAX_SCALE_EPS  = 1e-12f;
@@ -363,12 +419,13 @@ constexpr int64_t PAD_MAX_BLOCKS     = 1 << 20;
 // pad variants: [G, N, K] -> [G, Np, Kp], padding N -> Np and K -> Kp. pad ROWS
 // MUST be exact zero (down-proj dgrad NN contracts HIDDEN=N). Group index rides
 // gridDim.y to avoid a 64-bit divide; a flat [rows, K] is the N==Np==rows case.
-template <int BLOCK, int UNROLL, typename FType, typename QType, typename ComputeType>
+template <int BLOCK, int UNROLL, bool AMAX, typename FType, typename QType, typename ComputeType>
 __launch_bounds__(BLOCK) __global__
     void quantize_tensorwise_pad_row_kernel(const FType *__restrict__ x, QType *__restrict__ y,
                                             const QuantTensorwiseScalePtrOp<ComputeType> op,
                                             const int32_t N, const int32_t Np, const int32_t K,
-                                            const int32_t Kp) {
+                                            const int32_t Kp, uint32_t *__restrict__ amax_out) {
+    uint32_t          amax_bits     = 0u;
     const ComputeType scale         = op.scale_ptr[0];
     const uint32_t    k_real        = static_cast<uint32_t>(K);
     const int32_t     packs_per_row = Kp / UNROLL;
@@ -392,6 +449,12 @@ __launch_bounds__(BLOCK) __global__
             if (c + UNROLL <= k_real) {
                 FType ld_regs[UNROLL];
                 load_data_nt<FType, UNROLL>(xr + c, ld_regs);
+                if constexpr (AMAX) {
+#pragma unroll
+                    for (int i = 0; i < UNROLL; ++i) {
+                        amax_bits = max(amax_bits, quant_abs_bits(ld_regs[i]));
+                    }
+                }
                 quant_store_pack<UNROLL>(yr + c, ld_regs, op, scale);
             } else if (c >= k_real) {
                 store_zero_pack<UNROLL, QType>(yr + c);
@@ -400,6 +463,11 @@ __launch_bounds__(BLOCK) __global__
 #pragma unroll
                 for (int i = 0; i < UNROLL; ++i) {
                     const uint32_t gcol = c + i;
+                    if constexpr (AMAX) {
+                        if (gcol < k_real) {
+                            amax_bits = max(amax_bits, quant_abs_bits(xr[gcol]));
+                        }
+                    }
                     st_regs[i] =
                         (gcol < k_real)
                             ? static_cast<QType>(op(static_cast<ComputeType>(xr[gcol]), scale))
@@ -408,6 +476,9 @@ __launch_bounds__(BLOCK) __global__
                 store_data<QType, UNROLL>(yr + c, st_regs);
             }
         }
+    }
+    if constexpr (AMAX) {
+        quant_block_atomic_amax<BLOCK>(amax_bits, amax_out);
     }
 }
 
@@ -463,25 +534,54 @@ constexpr int32_t FLAT_BLOCK_SIZE    = 512;
 constexpr int32_t FLAT_PACK          = 16;
 constexpr int64_t FLAT_MAX_ROW_BYTES = PAD_ROW_BLOCK_SIZE * 16;
 
-template <int BLOCK, typename FType, typename QType, typename ComputeType>
-__launch_bounds__(BLOCK) __global__
-    void quantize_tensorwise_flat_kernel(const FType *__restrict__ x, QType *__restrict__ y,
-                                         const QuantTensorwiseScalePtrOp<ComputeType> op,
-                                         const int64_t npack, const int64_t n) {
-    constexpr int32_t CHUNK = 16 / sizeof(FType);
-    const ComputeType scale = op.scale_ptr[0];
-    const int64_t     tid   = static_cast<int64_t>(blockIdx.x) * BLOCK + threadIdx.x;
+// One element pack (or one tail element) of the flat cast; returns the abs-max bits it read.
+template <typename FType, typename QType, typename ComputeType>
+PRIMUS_TURBO_DEVICE uint32_t
+quantize_tensorwise_flat_item(const FType *__restrict__ x, QType *__restrict__ y,
+                              const QuantTensorwiseScalePtrOp<ComputeType> &op,
+                              const ComputeType scale, const int64_t npack, const int64_t tid) {
+    constexpr int32_t CHUNK     = 16 / sizeof(FType);
+    uint32_t          amax_bits = 0u;
     if (tid < npack) {
         FType ld_regs[FLAT_PACK];
 #pragma unroll
         for (int32_t c = 0; c < FLAT_PACK; c += CHUNK) {
             load_data_nt<FType, CHUNK>(x + tid * FLAT_PACK + c, ld_regs + c);
         }
+#pragma unroll
+        for (int32_t i = 0; i < FLAT_PACK; ++i) {
+            amax_bits = max(amax_bits, quant_abs_bits(ld_regs[i]));
+        }
         quant_store_pack<FLAT_PACK>(y + tid * FLAT_PACK, ld_regs, op, scale);
     } else {
         const int64_t idx = npack * FLAT_PACK + (tid - npack);
-        if (idx < n) {
-            y[idx] = static_cast<QType>(op(static_cast<ComputeType>(x[idx]), scale));
+        amax_bits         = quant_abs_bits(x[idx]);
+        y[idx]            = static_cast<QType>(op(static_cast<ComputeType>(x[idx]), scale));
+    }
+    return amax_bits;
+}
+
+// The plain cast runs one item per thread on a grid that covers them all; the amax variant runs on
+// a capped grid (see QUANT_AMAX_GRID) and strides over the rest.
+template <int BLOCK, bool AMAX, typename FType, typename QType, typename ComputeType>
+__launch_bounds__(BLOCK) __global__
+    void quantize_tensorwise_flat_kernel(const FType *__restrict__ x, QType *__restrict__ y,
+                                         const QuantTensorwiseScalePtrOp<ComputeType> op,
+                                         const int64_t npack, const int64_t n,
+                                         uint32_t *__restrict__ amax_out) {
+    const ComputeType scale = op.scale_ptr[0];
+    const int64_t     total = npack + (n - npack * FLAT_PACK);
+    const int64_t     tid   = static_cast<int64_t>(blockIdx.x) * BLOCK + threadIdx.x;
+    if constexpr (AMAX) {
+        uint32_t      amax_bits = 0u;
+        const int64_t stride    = static_cast<int64_t>(gridDim.x) * BLOCK;
+        for (int64_t i = tid; i < total; i += stride) {
+            amax_bits = max(amax_bits, quantize_tensorwise_flat_item(x, y, op, scale, npack, i));
+        }
+        quant_block_atomic_amax<BLOCK>(amax_bits, amax_out);
+    } else {
+        if (tid < total) {
+            quantize_tensorwise_flat_item(x, y, op, scale, npack, tid);
         }
     }
 }
@@ -490,17 +590,24 @@ __launch_bounds__(BLOCK) __global__
 template <typename FType, typename QType, typename ComputeType>
 static bool launch_quantize_tensorwise_flat(const FType *x, QType *y,
                                             const QuantTensorwiseScalePtrOp<ComputeType> &op,
-                                            const int64_t n, hipStream_t stream) {
+                                            const int64_t n, uint32_t *amax_out,
+                                            hipStream_t stream) {
     if constexpr (sizeof(QType) != 1 || (FLAT_PACK * sizeof(FType)) % 16 != 0) {
         return false;
     } else {
         if (reinterpret_cast<uintptr_t>(x) % 16 != 0 || reinterpret_cast<uintptr_t>(y) % 16 != 0) {
             return false;
         }
-        const int64_t npack  = n / FLAT_PACK;
-        const int64_t nBlock = DIVUP<int64_t>(npack + n % FLAT_PACK, FLAT_BLOCK_SIZE);
-        quantize_tensorwise_flat_kernel<FLAT_BLOCK_SIZE, FType, QType, ComputeType>
-            <<<nBlock, FLAT_BLOCK_SIZE, 0, stream>>>(x, y, op, npack, n);
+        const int64_t npack      = n / FLAT_PACK;
+        const int64_t nBlock     = DIVUP<int64_t>(npack + n % FLAT_PACK, FLAT_BLOCK_SIZE);
+        const int64_t nBlockAmax = std::min<int64_t>(nBlock, QUANT_AMAX_GRID);
+        if (amax_out != nullptr) {
+            quantize_tensorwise_flat_kernel<FLAT_BLOCK_SIZE, true, FType, QType, ComputeType>
+                <<<nBlockAmax, FLAT_BLOCK_SIZE, 0, stream>>>(x, y, op, npack, n, amax_out);
+        } else {
+            quantize_tensorwise_flat_kernel<FLAT_BLOCK_SIZE, false, FType, QType, ComputeType>
+                <<<nBlock, FLAT_BLOCK_SIZE, 0, stream>>>(x, y, op, npack, n, nullptr);
+        }
         return true;
     }
 }
@@ -511,22 +618,40 @@ static void launch_quantize_tensorwise_pad(const FType *x, QType *y,
                                            const QuantTensorwiseScalePtrOp<ComputeType> &op,
                                            const int64_t out_rows, const int64_t N,
                                            const int64_t Np, const int64_t K, const int64_t Kp,
-                                           hipStream_t stream) {
+                                           uint32_t *amax_out, hipStream_t stream) {
     if constexpr (UNROLL >= 4 && UNROLL % 4 == 0 && sizeof(QType) == 1) {
         const bool row_path = (K % UNROLL == 0) && (Kp % UNROLL == 0) &&
                               (Kp <= std::numeric_limits<int32_t>::max()) &&
                               (Np <= std::numeric_limits<int32_t>::max());
         if (row_path) {
             // (Np, G) grid: x-major dispatch keeps the row order of the flat form.
-            const dim3 grid(static_cast<uint32_t>(std::min<int64_t>(Np, PAD_MAX_BLOCKS)),
-                            static_cast<uint32_t>(out_rows / Np));
-            quantize_tensorwise_pad_row_kernel<PAD_ROW_BLOCK_SIZE, UNROLL, FType, QType,
-                                               ComputeType>
-                <<<grid, PAD_ROW_BLOCK_SIZE, 0, stream>>>(
-                    x, y, op, static_cast<int32_t>(N), static_cast<int32_t>(Np),
-                    static_cast<int32_t>(K), static_cast<int32_t>(Kp));
+            const int64_t max_x = (amax_out != nullptr) ? QUANT_AMAX_GRID : PAD_MAX_BLOCKS;
+            const dim3    grid(static_cast<uint32_t>(std::min<int64_t>(Np, max_x)),
+                               static_cast<uint32_t>(out_rows / Np));
+            if (amax_out != nullptr) {
+                quantize_tensorwise_pad_row_kernel<PAD_ROW_BLOCK_SIZE, UNROLL, true, FType, QType,
+                                                   ComputeType>
+                    <<<grid, PAD_ROW_BLOCK_SIZE, 0, stream>>>(
+                        x, y, op, static_cast<int32_t>(N), static_cast<int32_t>(Np),
+                        static_cast<int32_t>(K), static_cast<int32_t>(Kp), amax_out);
+            } else {
+                quantize_tensorwise_pad_row_kernel<PAD_ROW_BLOCK_SIZE, UNROLL, false, FType, QType,
+                                                   ComputeType>
+                    <<<grid, PAD_ROW_BLOCK_SIZE, 0, stream>>>(
+                        x, y, op, static_cast<int32_t>(N), static_cast<int32_t>(Np),
+                        static_cast<int32_t>(K), static_cast<int32_t>(Kp), nullptr);
+            }
             return;
         }
+    }
+    if (amax_out != nullptr) {
+        // The generic pad kernel has no folded amax: measure it in its own pass first.
+        constexpr int32_t AMAX_ONLY_BLOCK = 256;
+        const int64_t     n               = N * K * (out_rows / Np);
+        const int64_t     nblock          = std::min<int64_t>(
+            QUANT_AMAX_GRID, std::max<int64_t>(1, DIVUP<int64_t>(n, AMAX_ONLY_BLOCK)));
+        quantize_tensorwise_amax_only_kernel<AMAX_ONLY_BLOCK, FType>
+            <<<nblock, AMAX_ONLY_BLOCK, 0, stream>>>(x, n, amax_out);
     }
     const int64_t nBlock = DIVUP<int64_t>(out_rows * (Kp / UNROLL), BLOCK);
     quantize_tensorwise_pad_kernel<BLOCK, UNROLL, FType, QType,
@@ -537,7 +662,7 @@ static void launch_quantize_tensorwise_pad(const FType *x, QType *y,
 template <typename FType, typename QType, typename ComputeType>
 void quantize_tensorwise_pad_impl(const FType *x, const float *scale, QType *y, const int64_t rows,
                                   const int64_t K, const int64_t Kp, hipStream_t stream,
-                                  const int64_t n_pen, const int64_t np_pen) {
+                                  const int64_t n_pen, const int64_t np_pen, float *amax_out) {
     if (rows <= 0 || Kp <= 0) {
         return;
     }
@@ -557,7 +682,8 @@ void quantize_tensorwise_pad_impl(const FType *x, const float *scale, QType *y, 
         static_cast<ComputeType>(std::numeric_limits<QType>::max())};
 
     if (!do_pad && K == Kp && K * static_cast<int64_t>(sizeof(FType)) < FLAT_MAX_ROW_BYTES &&
-        launch_quantize_tensorwise_flat<FType, QType, ComputeType>(x, y, op, rows * K, stream)) {
+        launch_quantize_tensorwise_flat<FType, QType, ComputeType>(
+            x, y, op, rows * K, reinterpret_cast<uint32_t *>(amax_out), stream)) {
         return;
     }
 
@@ -574,24 +700,24 @@ void quantize_tensorwise_pad_impl(const FType *x, const float *scale, QType *y, 
     case 8: {
         constexpr int UNROLL = valid_pack<FType, 8>();
         launch_quantize_tensorwise_pad<BLOCK_SIZE, UNROLL, FType, QType, ComputeType>(
-            x, y, op, out_rows, N, Np, K, Kp, stream);
+            x, y, op, out_rows, N, Np, K, Kp, reinterpret_cast<uint32_t *>(amax_out), stream);
         break;
     }
     case 4: {
         constexpr int UNROLL = valid_pack<FType, 4>();
         launch_quantize_tensorwise_pad<BLOCK_SIZE, UNROLL, FType, QType, ComputeType>(
-            x, y, op, out_rows, N, Np, K, Kp, stream);
+            x, y, op, out_rows, N, Np, K, Kp, reinterpret_cast<uint32_t *>(amax_out), stream);
         break;
     }
     case 2: {
         constexpr int UNROLL = valid_pack<FType, 2>();
         launch_quantize_tensorwise_pad<BLOCK_SIZE, UNROLL, FType, QType, ComputeType>(
-            x, y, op, out_rows, N, Np, K, Kp, stream);
+            x, y, op, out_rows, N, Np, K, Kp, reinterpret_cast<uint32_t *>(amax_out), stream);
         break;
     }
     case 1: {
         launch_quantize_tensorwise_pad<BLOCK_SIZE, 1, FType, QType, ComputeType>(
-            x, y, op, out_rows, N, Np, K, Kp, stream);
+            x, y, op, out_rows, N, Np, K, Kp, reinterpret_cast<uint32_t *>(amax_out), stream);
         break;
     }
     default:
@@ -667,7 +793,8 @@ DECL_QUANT_TENSORWISE_AMAX_INSTANCE(dtype::float32)
         const FType *x, const float *scale, QType *y, const int64_t n, hipStream_t stream);        \
     template void quantize_tensorwise_pad_impl<FType, QType>(                                      \
         const FType *x, const float *scale, QType *y, const int64_t rows, const int64_t K,         \
-        const int64_t Kp, hipStream_t stream, const int64_t n_pen, const int64_t np_pen);          \
+        const int64_t Kp, hipStream_t stream, const int64_t n_pen, const int64_t np_pen,           \
+        float *amax_out);                                                                          \
     template void dequantize_tensorwise_impl<FType, QType>(                                        \
         const QType *x, const float *scale_inv, FType *y, const int64_t n, hipStream_t stream);
 
