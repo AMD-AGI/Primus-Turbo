@@ -676,6 +676,28 @@ def expert_order_lpt_fused(poffs_i32: torch.Tensor) -> torch.Tensor:
 
 
 @triton.jit
+def _route_dw_kernel(GW, INV, DW, R, NC: tl.constexpr, BLOCK: tl.constexpr):
+    """d topk-weights: for each routing entry r, sum the NC partial gradient columns of GW[INV[r]].
+    grid (cdiv(R, BLOCK),); writes DW [R] in BF16.  Extracted from _combine_route_dw_kernel so the
+    combine path can use a 2D grid (_combine_kernel) without an expensive non-power-of-2 division."""
+    pid = tl.program_id(0)
+    r = pid * BLOCK + tl.arange(0, BLOCK)
+    m = r < R
+    p = tl.load(INV + r, mask=m, other=0).to(tl.int64)
+    if NC == 16:
+        acc = (_gw4(GW, p, m, NC, 0) + _gw4(GW, p, m, NC, 1)) + (
+            _gw4(GW, p, m, NC, 2) + _gw4(GW, p, m, NC, 3)
+        )
+    elif NC == 8:
+        acc = _gw4(GW, p, m, NC, 0) + _gw4(GW, p, m, NC, 1)
+    else:
+        acc = tl.zeros((BLOCK,), dtype=tl.float32)
+        for c in tl.static_range(NC):
+            acc += tl.load(GW + p * NC + c, mask=m, other=0.0)
+    tl.store(DW + r, acc.to(DW.dtype.element_ty), mask=m)
+
+
+@triton.jit
 def _combine_route_dw_kernel(
     Y,
     INV,
@@ -725,9 +747,13 @@ def combine_rows_route_dw(
     y: torch.Tensor, inv: torch.Tensor, T: int, K: int, gw: torch.Tensor, out_dtype, bh: int = 1024
 ):
     """The MegaMoE backward's combine (dx = sum_k y[inv[t, k]], as combine_rows) and d topk-weights
-    (dw[r] = sum_c gw[inv[r], c], the pairwise tree of ``gw.sum(1)`` for 16 / 8 partial columns) in ONE launch:
-    programs [0, ndw) are the d topk-weights programs, the rest the (token, h-block) combine programs. Returns
-    (dx [T, H], dw [T*K] in ``out_dtype``)."""
+    (dw[r] = sum_c gw[inv[r], c], the pairwise tree of ``gw.sum(1)`` for 16 / 8 partial columns).
+    Uses two separate kernel launches:
+      - _route_dw_kernel: 1D grid (cdiv(R,1024)=24 programs), computes dw.
+      - _combine_kernel: 2D grid (T, H//BH), computes dx without the expensive q//ND and q%ND
+        integer divisions that the original fused 1D-grid kernel required (ND=H//BH=7 for H=7168
+        is non-power-of-2, costing ~20-40 extra cycles per combine thread on AMD GPUs).
+    Returns (dx [T, H], dw [T*K] in ``out_dtype``)."""
     H = y.shape[1]
     bh = _column_block(H, bh)
     assert y.is_contiguous() and inv.is_contiguous() and gw.is_contiguous()
@@ -736,8 +762,9 @@ def combine_rows_route_dw(
     NC = gw.shape[1]
     dw = torch.empty(R, device=gw.device, dtype=out_dtype)
     ndw = triton.cdiv(R, 1024)
-    nd = H // bh
-    _combine_route_dw_kernel[(ndw + T * nd,)](
-        y, inv, out, H, gw, dw, R, ndw, nd, K=K, BH=bh, NC=NC, BLOCK=1024, num_warps=4
-    )
+    # Route-dw: tiny kernel (ndw=24 programs for T*K=24576, R=T*K).
+    _route_dw_kernel[(ndw,)](gw, inv, dw, R, NC=NC, BLOCK=1024, num_warps=4)
+    # Combine: 2D grid (T, H//BH) -- direct program_id indexing, no q//ND or q%ND.
+    # num_warps=16 improves latency hiding for the gather-heavy memory access pattern.
+    _combine_kernel[(T, H // bh)](y, inv, out, H, K=K, BH=bh, ADD=y, HAS_ADD=0, num_warps=16)
     return out, dw
