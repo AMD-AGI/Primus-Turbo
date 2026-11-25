@@ -955,6 +955,9 @@ def _launch_grouped_bf16_variable_k(
     C_HALF = tile_m // 2
     C_WHOLE = bool(accum_c16) and tile_m * C_LDS_ROW <= PITCH
     C_ROWS = tile_m if C_WHOLE else C_HALF  # rows of the old C per TDM load and store
+    # A 16-bit C in two halves with three buffers or more: past the fence ahead of the last k-tile two buffers are
+    # free, so both halves come in during that k-tile, and none is left to load after the k-loop.
+    C_BOTH_EARLY = bool(accum_c16) and accum == 1 and not C_WHOLE and num_buffers >= 3
     if accum == 1 and not C_WHOLE and (m_warp != 2 or C_HALF * C_LDS_ROW > PITCH):
         raise ValueError(
             f"accum=1 needs m_warp=2 and half the C tile ({C_HALF * C_LDS_ROW} B) within one ring buffer "
@@ -1197,8 +1200,8 @@ def _launch_grouped_bf16_variable_k(
                 def _c_load(dst, hh):
                     # Rows hh * C_HALF .. hh * C_HALF + C_ROWS of this tile's old C into LDS at `dst`, rows
                     # C_LDS_ROW apart. Whole tiles only (checked by the entry point), so the window lies inside
-                    # the allocation. The last wave issues it: it issues no operand loads, so its TENSORcnt
-                    # holds these alone.
+                    # the allocation. The last wave issues it past the last fence that counts operand loads, so
+                    # its TENSORcnt holds these alone.
                     if wave == num_waves - 1:
                         gt = _gv(gC8_base, _c_half_off(hh), (C_ROWS, tile_n * CEB), (ldc_b4, 1))
                         atom = _tdm(gt, fx.Int32(C_ROWS), fx.Int32(tile_n * CEB), ldc_b4, tile_n * CEB)
@@ -1206,9 +1209,12 @@ def _launch_grouped_bf16_variable_k(
 
                 def _c_early(kt):
                     # During the last k-tile `kt`, into the buffer it does not read: k-tile kt - 1 is consumed by
-                    # the fence ahead of it, and nothing is prefetched past the steady loop.
+                    # the fence ahead of it, and nothing is prefetched past the steady loop. With C_BOTH_EARLY the
+                    # second half too, into the buffer of k-tile kt - 2 (three buffers) or kt - 3 (four).
                     def _go():
                         _c_load(_buf_ptr(_slot(kt + 1)), 0)
+                        if const_expr(C_BOTH_EARLY):
+                            _c_load(_buf_ptr(_slot(kt + 2)), 1)
 
                     return _go
 
@@ -2236,6 +2242,13 @@ def _launch_grouped_bf16_variable_k(
                     # The whole old C landed during the last k-tile and the entry fence drained it.
                     p_h0 = _buf_ptr(_slot(K_TILES))
                     c_base = fx.Int32(_bidx(p_h0))
+                elif const_expr(C_BOTH_EARLY):
+                    # Both halves landed during the last k-tile and the entry fence drained them.
+                    p_h0 = _buf_ptr(_slot(K_TILES))
+                    p_h1 = _buf_ptr(_slot(K_TILES + 1))
+                    c_base = (wave_m == fx.Int32(0)).select(
+                        fx.Int32(_bidx(p_h0)), fx.Int32(_bidx(p_h1)) - fx.Int32(C_HALF * C_LDS_ROW)
+                    )
                 else:
                     # Half 0 landed during the last k-tile and the entry fence drained it. Half 1 goes into the
                     # last k-tile's buffer, free past that fence, while the waves of half 0 add theirs.
@@ -2289,6 +2302,11 @@ def _launch_grouped_bf16_variable_k(
                     _add_stage()
                     gpu.barrier()
                     _store_half(0, p_h0)
+                elif const_expr(C_BOTH_EARLY):
+                    _add_stage()
+                    gpu.barrier()
+                    _store_half(0, p_h0)
+                    _store_half(1, p_h1)
                 else:
                     if wave_m == fx.Int32(0):
                         _add_stage()
