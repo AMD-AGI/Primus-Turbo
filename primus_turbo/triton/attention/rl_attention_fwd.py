@@ -16,6 +16,10 @@ triton_unified_attention.py. Changes from upstream, all for batch invariance and
   uses a 0 stand-in only inside exp2. Upstream resets it to 0, so a fully masked leading tile changed
   a row's rounding depending on how rows were grouped into a block.
 - Key loads are always masked by seq_len (upstream skips the mask when TILE_SIZE == page size).
+- The kernels compile with enable_fp_fusion=False and spell every fused multiply-add as tl.fma:
+  with fusion on, which product of `a * b + c * d` (the segment merge) becomes an fma was the
+  compiler's choice, and it differed between launch shapes on Triton 3.7 / 3.8, so split, paged
+  and other BLOCK_M / num_warps launches lost bit equality with the training forward.
 - KV segments are fixed absolute key ranges [s * SEGMENT, (s + 1) * SEGMENT). The 2D kernel (fused
   mode) walks them in order with fresh per-segment state; the 3D kernel (split mode) computes one
   segment per program and the reduce kernel merges them in the same order. The tile loop, the merge
@@ -332,7 +336,7 @@ def _attn_tile(
     m_safe = tl.where(m_new > float("-inf"), m_new, 0.0)
     P = tl.math.exp2(S - m_safe[:, None])
     alpha = tl.math.exp2(M - m_safe)
-    L = L * alpha + tl.sum(P, axis=1)
+    L = tl.fma(L, alpha, tl.sum(P, axis=1))
     acc = acc * alpha[:, None]
     acc = tl.dot(P.to(V.dtype), V, acc=acc)
     return m_new, L, acc
@@ -346,8 +350,8 @@ def _merge(M, L, A, m, l, a):
     m_safe = tl.where(m_new > float("-inf"), m_new, 0.0)
     ca = tl.math.exp2(M - m_safe)
     cb = tl.math.exp2(m - m_safe)
-    L = L * ca + l * cb
-    A = A * ca[:, None] + a * cb[:, None]
+    L = tl.fma(L, ca, l * cb)
+    A = tl.fma(A, ca[:, None], a * cb[:, None])
     return m_new, L, A
 
 
@@ -358,7 +362,7 @@ def _fold_sink(M, L, A, sink2):
     m_new = tl.maximum(M, sink2)
     m_safe = tl.where(m_new > float("-inf"), m_new, 0.0)
     ca = tl.math.exp2(M - m_safe)
-    L = L * ca + tl.math.exp2(sink2 - m_safe)
+    L = tl.fma(L, ca, tl.math.exp2(sink2 - m_safe))
     A = A * ca[:, None]
     return m_new, L, A
 

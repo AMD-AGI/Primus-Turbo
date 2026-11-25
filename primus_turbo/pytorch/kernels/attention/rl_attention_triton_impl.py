@@ -239,6 +239,7 @@ def rl_attention_fwd_triton(
         num_stages=launch.num_stages,
         waves_per_eu=launch.waves_per_eu,
         matrix_instr_nonkdim=16,
+        enable_fp_fusion=False,
     )
     lse_arg = lse if return_lse else out
 
@@ -296,6 +297,7 @@ def rl_attention_fwd_triton(
             HAS_VIS=has_vis,
             HAS_SINK=sinks is not None,
             num_warps=1,
+            enable_fp_fusion=False,
         )
     else:
         raise ValueError(f"unknown RL attention mode {mode!r}")
