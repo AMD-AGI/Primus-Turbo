@@ -1,0 +1,1123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MI455X Helios 上的 Collective GEMM 设计</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --bg: #ffffff; --panel: #f6f8fa; --border: #d1d9e0;
+    --accent: #0969da; --good: #1a7f37; --warn: #9a6700; --bad: #cf222e;
+    --l0: #ddf4ff; --l1: #dafbe1; --l2: #fff8c5; --l3: #fbefff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; color: var(--fg); background: var(--bg);
+         font: 15px/1.65 -apple-system, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; }
+  .wrap { display: flex; max-width: 1280px; margin: 0 auto; }
+  nav { position: sticky; top: 0; align-self: flex-start; width: 250px; height: 100vh; overflow-y: auto;
+        padding: 28px 16px; border-right: 1px solid var(--border); font-size: 13.5px; }
+  nav a { display: block; color: var(--muted); text-decoration: none; padding: 3px 6px; border-radius: 4px; }
+  nav a:hover { background: var(--panel); color: var(--fg); }
+  nav .sub { padding-left: 18px; font-size: 13px; }
+  main { flex: 1; min-width: 0; padding: 28px 44px 80px; }
+  h1 { font-size: 28px; margin: 0 0 6px; }
+  h2 { font-size: 22px; margin: 44px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 17px; margin: 28px 0 8px; }
+  p, li { max-width: 900px; }
+  .meta { color: var(--muted); font-size: 13.5px; margin-bottom: 18px; }
+  code { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--panel);
+         padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px;
+        overflow-x: auto; max-width: 960px; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; margin: 10px 0 14px; font-size: 14px; max-width: 980px; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--panel); font-weight: 600; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .tldr { background: #f0f7ff; border: 1px solid #b6d7ff; border-radius: 8px; padding: 14px 20px; max-width: 960px; }
+  .tldr li { margin: 4px 0; }
+  .note { border-left: 4px solid var(--accent); background: var(--panel); padding: 8px 14px; margin: 12px 0; max-width: 940px; }
+  .warn { border-left-color: var(--warn); background: #fff8e6; }
+  .bad { border-left-color: var(--bad); background: #fff1f0; }
+  .good { color: var(--good); font-weight: 600; }
+  .badc { color: var(--bad); font-weight: 600; }
+  .warnc { color: var(--warn); font-weight: 600; }
+  .tag { display: inline-block; font-size: 12px; padding: 0 7px; border-radius: 10px; border: 1px solid; margin-left: 6px; vertical-align: 2px; }
+  .tag.done { color: var(--good); border-color: #8fd19e; background: #eefbf1; }
+  .tag.wip { color: var(--warn); border-color: #e6c66a; background: #fff8e6; }
+  .tag.todo { color: var(--muted); border-color: var(--border); background: var(--panel); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; max-width: 980px; }
+  .card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; }
+  .card h4 { margin: 2px 0 6px; font-size: 15px; }
+  .card ul { margin: 4px 0; padding-left: 20px; }
+  svg text { font-family: -apple-system, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif; }
+  figure { margin: 18px 0 24px; max-width: 960px; }
+  figure svg { display: block; width: 100%; height: auto; }
+  figcaption { color: var(--muted); font-size: 13px; margin-top: 6px; }
+  figcaption b { color: var(--fg); }
+  .bar { height: 12px; background: var(--accent); border-radius: 2px; display: inline-block; vertical-align: middle; }
+  .bar.cu { background: #d1242f; } .bar.sdma { background: #1a7f37; }
+  @media (max-width: 900px) { nav { display: none; } main { padding: 20px; } .grid2 { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#59636e"/></marker>
+    <marker id="arrG" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1a7f37"/></marker>
+    <marker id="arrR" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#cf222e"/></marker>
+    <marker id="arrB" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#0969da"/></marker>
+  </defs>
+</svg>
+<div class="wrap">
+<nav>
+  <a href="#tldr"><b>摘要</b></a>
+  <a href="#background">1. 背景与问题</a>
+  <a class="sub" href="#scope">1.1 适用范围</a>
+  <a href="#hw">2. 硬件与拓扑</a>
+  <a href="#data">3. 实测数据</a>
+  <a class="sub" href="#data-link">3.1 带宽与延迟</a>
+  <a class="sub" href="#data-cu">3.2 CU 搬运的扩展性</a>
+  <a class="sub" href="#data-sdma">3.3 SDMA</a>
+  <a class="sub" href="#data-8">3.4 8 卡并发</a>
+  <a class="sub" href="#data-gemm">3.5 对 GEMM 的干扰</a>
+  <a href="#findings">4. 关键结论</a>
+  <a href="#goals">5. 设计目标：通用性与性能</a>
+  <a href="#arch">6. 分层架构</a>
+  <a class="sub" href="#l0">L0 对称内存</a>
+  <a class="sub" href="#l1">L1 通信原语</a>
+  <a class="sub" href="#l2">L2 融合算子</a>
+  <a class="sub" href="#l3">L3 模型算子</a>
+  <a href="#engine">7. 搬运引擎的选择</a>
+  <a href="#sync">8. 同步协议</a>
+  <a href="#existing">9. 与现有代码的关系</a>
+  <a href="#plan">10. 分阶段计划</a>
+  <a href="#risks">11. 风险与待验证</a>
+  <a href="#appendix">附录：复现方法</a>
+</nav>
+<main>
+
+<h1>MI455X Helios 上的 Collective GEMM 设计</h1>
+<div class="meta">
+  适用平台：MI455X（gfx1250），Helios 机柜，UALink（UALoE）scale-up 域，跨 compute tray<br>
+  状态：设计稿；阶段 0（fabric 对称内存）已实现，跨 tray 复测待完成（见 <a href="#plan">分阶段计划</a>）<br>
+  测试机器：<code>ctheliosr-rck-g02-e15-01</code> / <code>-02</code>，2 个 tray × 4 张 GPU，2026-11-23
+</div>
+
+<div class="tldr" id="tldr">
+<b>摘要</b>
+<ul>
+  <li><b>两台 tray 的 8 张 GPU 在硬件上是同一个扁平的 scale-up 域。</b>tray 内和跨 tray 的带宽（单对约 1.3–1.4 TB/s）、延迟（远端 load 约 3.1–3.2 µs）几乎一样，不需要分层（hierarchical）算法。</li>
+  <li><b>现有实现跨不了 tray，原因在内存映射层。</b><code>SymmetricMemory</code> 用 legacy HIP IPC，只能在同一个 OS 实例内使用。改用 VMM + fabric handle 之后，跨 tray 的 load/store、原子操作、release/acquire flag 都已实测可用。这部分已经实现，所有使用对称内存的模块不改代码就能跨 tray。</li>
+  <li><b>在 MI455 上，数据搬运应以 SDMA 为主，CU 只做 flag、reduce 和小消息。</b>CU 每个只能向远端推 8–10 GB/s，打满链路需要 128–256 个 CU，和 GEMM 并发时 GEMM 慢 20–47%。SDMA 单个 engine 就有 1.55 TB/s，而且不占 CU，和 GEMM 并发时 GEMM 的变化在 ±2% 以内。</li>
+  <li><b>架构分四层，通用性优先：</b>L0 对称内存（IPC / fabric）→ L1 通信原语（<code>put + signal</code>，SDMA 或 CU 两种引擎）→ L2 融合算子（GEMM 只多一个"按 flag 放行 tile"的钩子）→ L3 模型算子（只描述数据布局，不再为每个模型手写融合 kernel）。</li>
+</ul>
+</div>
+
+<!-- ======================================================================= -->
+<h2 id="background">1. 背景与问题</h2>
+
+<p>Primus-Turbo 现有的融合通信 GEMM 在 <code>primus_turbo/flydsl/fused_collective_gemm/</code>，包括 GemmA2A、A2AGemm、AgGemm、GemmRS 四个 kernel，服务于 Ulysses 和 MLA latent 投影。它们的共同做法是：</p>
+<ul>
+  <li>通过 <code>SymmetricMemory</code> 拿到每个 rank 的 heap 指针（<code>peer_ptrs</code>），由 GEMM kernel 里的一部分 block 直接对远端 heap 做 load/store（push 或 pull），并用 system-scope 的 flag 和 tile 级的流水做同步。</li>
+  <li>对称内存用 <code>hipMalloc</code> + <code>hipIpcGetMemHandle</code> / <code>hipIpcOpenMemHandle</code> 做 rendezvous。</li>
+  <li>kernel 针对 MI355X（gfx950）调优：写死了 <code>WARP=64</code>、<code>NUM_XCDS=8</code>、缓存策略位 <code>SYS_NT=0x13</code>，测试也明确只在 gfx950 上运行。</li>
+</ul>
+
+<p>在 Helios 上，一个训练任务会跨多个 compute tray，每个 tray 是一个独立的 OS 实例，只能看到本 tray 的 4 张 GPU。由此带来三个问题：</p>
+<ol>
+  <li><b>能不能跨 tray？</b>legacy IPC handle 只在同一个内核实例内有效，打不开另一台机器上的 handle。</li>
+  <li><b>该用什么搬数据？</b>MI355X 上"CU 直接 load/store 远端内存"是合理选择，在 MI455 上是否仍然成立，需要实测。</li>
+  <li><b>怎么兼顾通用性？</b>现有四个 kernel 是按模型特化的。要支持新的架构、新的拓扑规模和更多算子，逐个移植的成本很高。</li>
+</ol>
+
+<h3 id="scope">1.1 适用范围</h3>
+<p>本设计只覆盖 <b>scale-up 域</b>，也就是同一个 UALink vpod 里的 GPU。它们之间可以直接 load/store 对方的显存。跨 vpod、跨机柜的 <b>scale-out</b>（经后端 RDMA 网卡）不在范围内：</p>
+<ul>
+  <li><b>原语不同</b>：fabric handle 只能在 vpod 内导入，出了 vpod 就没有 <code>peer_ptrs</code>。L1 和 L2 依赖的"直接写对端地址、spin 对端写来的 flag"都不成立；scale-out 要用 RDMA write、atomic 和 completion。</li>
+  <li><b>需求上也不需要</b>：collective GEMM 服务的 TP、SP/Ulysses、MLA 投影本来就应该放在 scale-up 域内。Helios 的 scale-up 域最大是整个机柜 72 卡。跨机柜的 DP、PP 和大部分 EP 由 RCCL 或 DeepEP 的 internode 路径负责，一般不需要和 GEMM 做 tile 级融合。</li>
+  <li><b>扩展路径</b>：L1 的 <code>put(dst_rank, dst_offset, src, nbytes, signal)</code> 语义上就是"RDMA write + 远端 flag"。以后需要时，可以加一个与 SDMA、CU 并列的 RDMA 引擎；L0 要相应地支持内存注册和 rkey 交换。L2、L3 基本不变。这不在当前计划内。</li>
+</ul>
+
+<!-- ======================================================================= -->
+<h2 id="hw">2. 硬件与拓扑</h2>
+
+<table>
+  <tr><th>项目</th><th>值</th><th>来源</th></tr>
+  <tr><td>GPU</td><td>MI455X（<code>AMD MI450X_GENERIC</code>），gfx1250，256 CU，8 XCC，wave32，LDS 320 KB，L2 4 MB，HBM 464 GB</td><td>hipDeviceProp、KFD topology</td></tr>
+  <tr><td>SDMA</td><td>每张 GPU 16 个 SDMA engine，每个 engine 6 个队列</td><td>KFD topology <code>num_sdma_engines</code></td></tr>
+  <tr><td>tray 内</td><td>4 张 GPU，同一个 XGMI hive，拓扑显示两两 1 跳</td><td><code>amd-smi topology</code></td></tr>
+  <tr><td>scale-up</td><td><code>link_type = UALoE</code>，<code>ppod_size = 72</code>（整个机柜），<code>vpod_size = 8</code>，<code>vpod_id = 17</code>，<code>addr_mode = source-aliasing</code></td><td><code>/sys/class/drm/card*/device/ualink/</code></td></tr>
+  <tr><td>vpod 成员</td><td>e15-01 的 4 张 GPU 是 accel 0–3，e15-02 的 4 张是 accel 4–7，<code>vpod_active_accels = 0..7</code></td><td>同上</td></tr>
+  <tr><td>scale-out 网卡</td><td>每张 GPU 2 张 Pensando 后端网卡，测试时全部 DOWN；只有前端 400G 网卡是 UP</td><td><code>/sys/class/infiniband</code></td></tr>
+  <tr><td>Fabric handle</td><td><code>hipDeviceAttributeHandleTypeFabricSupported = 1</code>；宿主机 ROCm 10.2 和容器 HIP 7.17 都支持导出、导入</td><td>实测</td></tr>
+</table>
+
+<figure>
+<svg viewBox="0 0 960 420" role="img" aria-label="两台 tray 的拓扑与对称内存的有效范围">
+  <text x="14" y="26" font-size="13" font-weight="600" fill="#1a7f37">fabric handle 的有效范围：同一个 vpod（当前为 accel 0–7；vpod 最大可覆盖整个机柜 72 卡）</text>
+  <rect x="8" y="38" width="944" height="318" rx="12" fill="none" stroke="#1a7f37" stroke-width="1.5" stroke-dasharray="8 5"/>
+  <!-- tray 1 -->
+  <rect x="20" y="54" width="340" height="290" rx="10" fill="#fff" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="36" y="84" font-size="15" font-weight="600">Tray e15-01</text>
+  <text x="36" y="106" font-size="12.5">一个 OS 实例（boot_id A）</text>
+  <text x="36" y="150" font-size="12.5">XGMI hive（4 卡）</text>
+  <text x="36" y="170" font-size="12" fill="#59636e">拓扑显示两两 1 跳</text>
+  <text x="36" y="210" font-size="12.5">前端 NIC：UP</text>
+  <text x="36" y="230" font-size="12.5" fill="#8c959f">后端 NIC ×8：DOWN</text>
+  <text x="36" y="330" font-size="12.5" font-weight="600" fill="#cf222e">legacy IPC 的有效范围</text>
+  <path d="M212,113 V293 M212,113 H220 M212,173 H220 M212,233 H220 M212,293 H220" stroke="#8c959f" stroke-width="1.5" fill="none"/>
+  <g font-size="13" text-anchor="middle">
+    <rect x="220" y="90" width="120" height="46" rx="6" fill="#ddf4ff" stroke="#54aeff"/><text x="280" y="111">GPU0</text><text x="280" y="128" font-size="11" fill="#59636e">accel 0</text>
+    <rect x="220" y="150" width="120" height="46" rx="6" fill="#ddf4ff" stroke="#54aeff"/><text x="280" y="171">GPU1</text><text x="280" y="188" font-size="11" fill="#59636e">accel 1</text>
+    <rect x="220" y="210" width="120" height="46" rx="6" fill="#ddf4ff" stroke="#54aeff"/><text x="280" y="231">GPU2</text><text x="280" y="248" font-size="11" fill="#59636e">accel 2</text>
+    <rect x="220" y="270" width="120" height="46" rx="6" fill="#ddf4ff" stroke="#54aeff"/><text x="280" y="291">GPU3</text><text x="280" y="308" font-size="11" fill="#59636e">accel 3</text>
+  </g>
+  <!-- tray 2 -->
+  <rect x="600" y="54" width="340" height="290" rx="10" fill="#fff" stroke="#cf222e" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="764" y="84" font-size="15" font-weight="600">Tray e15-02</text>
+  <text x="764" y="106" font-size="12.5">一个 OS 实例（boot_id B）</text>
+  <text x="764" y="150" font-size="12.5">XGMI hive（4 卡）</text>
+  <text x="764" y="170" font-size="12" fill="#59636e">拓扑显示两两 1 跳</text>
+  <text x="764" y="210" font-size="12.5">前端 NIC：UP</text>
+  <text x="764" y="230" font-size="12.5" fill="#8c959f">后端 NIC ×8：DOWN</text>
+  <text x="764" y="330" font-size="12.5" font-weight="600" fill="#cf222e">legacy IPC 的有效范围</text>
+  <path d="M748,113 V293 M740,113 H748 M740,173 H748 M740,233 H748 M740,293 H748" stroke="#8c959f" stroke-width="1.5" fill="none"/>
+  <g font-size="13" text-anchor="middle">
+    <rect x="620" y="90" width="120" height="46" rx="6" fill="#ddf4ff" stroke="#54aeff"/><text x="680" y="111">GPU0</text><text x="680" y="128" font-size="11" fill="#59636e">accel 4</text>
+    <rect x="620" y="150" width="120" height="46" rx="6" fill="#ddf4ff" stroke="#54aeff"/><text x="680" y="171">GPU1</text><text x="680" y="188" font-size="11" fill="#59636e">accel 5</text>
+    <rect x="620" y="210" width="120" height="46" rx="6" fill="#ddf4ff" stroke="#54aeff"/><text x="680" y="231">GPU2</text><text x="680" y="248" font-size="11" fill="#59636e">accel 6</text>
+    <rect x="620" y="270" width="120" height="46" rx="6" fill="#ddf4ff" stroke="#54aeff"/><text x="680" y="291">GPU3</text><text x="680" y="308" font-size="11" fill="#59636e">accel 7</text>
+  </g>
+  <!-- UALink switch -->
+  <g stroke="#0969da" stroke-width="2">
+    <line x1="340" y1="113" x2="420" y2="113"/><line x1="340" y1="173" x2="420" y2="173"/>
+    <line x1="340" y1="233" x2="420" y2="233"/><line x1="340" y1="293" x2="420" y2="293"/>
+    <line x1="540" y1="113" x2="620" y2="113"/><line x1="540" y1="173" x2="620" y2="173"/>
+    <line x1="540" y1="233" x2="620" y2="233"/><line x1="540" y1="293" x2="620" y2="293"/>
+  </g>
+  <rect x="420" y="80" width="120" height="240" rx="8" fill="#ddf4ff" stroke="#0969da" stroke-width="1.5"/>
+  <g text-anchor="middle" font-size="13">
+    <text x="480" y="150" font-weight="600">UALink</text>
+    <text x="480" y="170">交换机</text>
+    <text x="480" y="190" font-size="12" fill="#59636e">（UALoE）</text>
+    <text x="480" y="226" font-size="12">vpod 17</text>
+    <text x="480" y="246" font-size="12">ppod 72</text>
+    <text x="480" y="340" font-size="11.5" fill="#59636e">任意两卡 ≈1.37 TB/s，3.1–3.2 µs</text>
+  </g>
+  <!-- frontend -->
+  <line x1="190" y1="344" x2="190" y2="376" stroke="#8c959f" stroke-width="1.5"/>
+  <line x1="770" y1="344" x2="770" y2="376" stroke="#8c959f" stroke-width="1.5"/>
+  <rect x="20" y="376" width="920" height="30" rx="6" fill="#f6f8fa" stroke="#d1d9e0"/>
+  <text x="480" y="396" font-size="12.5" text-anchor="middle" fill="#59636e">前端以太网（enp4s0np0）：torchrun / gloo / NCCL 引导，交换 IPC 或 fabric handle；不承载数据面</text>
+</svg>
+<figcaption><b>图 1　拓扑与对称内存的有效范围。</b>数据面全部经过 UALink；红框是 legacy IPC 能工作的范围（一个 OS 实例），绿框是 fabric handle 能工作的范围（一个 vpod）。tray 内是否也经过交换机尚未确认，但实测带宽和延迟与跨 tray 一致。</figcaption>
+</figure>
+
+<div class="note">vpod 由管理员配置（<code>ualink/setup</code>、<code>ualink/config</code> 需要 root）。当前 vpod 只包含这 8 张卡；扩到更多 tray 需要重新配置 vpod，软件这一侧不需要改。</div>
+
+<!-- ======================================================================= -->
+<h2 id="data">3. 实测数据</h2>
+<p>除特别说明外，都是在两台 tray 之间用 fabric handle 互相映射显存后测得。测试程序见 <a href="#appendix">附录</a>。CU copy 用 512 线程的 block、16 B 向量、每线程 8 个 load 在途；SDMA 通过 <code>hsa_amd_memory_async_copy_on_engine</code> 指定 engine 发起。</p>
+
+<h3 id="data-link">3.1 带宽与延迟</h3>
+<table>
+  <tr><th>指标</th><th class="num">本地 HBM</th><th class="num">tray 内</th><th class="num">跨 tray</th></tr>
+  <tr><td>单对 CU copy 峰值，写 / 读（≥256 block）</td><td class="num">copy 4.4–4.7 TB/s</td><td class="num">1.33–1.38 / 1.35–1.40 TB/s</td><td class="num">1.29–1.37 / 1.32–1.38 TB/s</td></tr>
+  <tr><td>单个 SDMA engine</td><td class="num">1.07 TB/s</td><td class="num">1.55 TB/s</td><td class="num">1.53–1.57 TB/s</td></tr>
+  <tr><td>远端 load 延迟（单线程 pointer chase）</td><td class="num">0.33 µs</td><td class="num">3.08 µs</td><td class="num">3.21 µs</td></tr>
+  <tr><td>flag 往返（store-release + spin-acquire）</td><td class="num">—</td><td class="num">4.96 µs</td><td class="num">4.9–5.8 µs</td></tr>
+</table>
+<p>tray 内和跨 tray 的数字几乎相同。拓扑表虽然把 tray 内链路标成 XGMI，但从数据看，tray 内流量大概率也经过 UALink 交换机（这是推断，未经硬件团队确认）。</p>
+
+<h3 id="data-cu">3.2 CU 搬运的扩展性</h3>
+<p>CU copy 的带宽随参与的 CU 数近似线性增长，每个 CU 只能向远端推 8–10 GB/s。把 block 改成 1024 线程、unroll 改到 16、使用 non-temporal 指令，都没有提升，有的反而更慢。</p>
+<table>
+  <tr><th>block 数（约等于占用的 CU 数）</th><th class="num">8</th><th class="num">16</th><th class="num">32</th><th class="num">64</th><th class="num">128</th><th class="num">256</th></tr>
+  <tr><td>跨 tray 写，GB/s</td><td class="num">81</td><td class="num">144–147</td><td class="num">250–254</td><td class="num">403–410</td><td class="num">845–882</td><td class="num">1265–1373</td></tr>
+  <tr><td>跨 tray 读，GB/s</td><td class="num">115–116</td><td class="num">188–189</td><td class="num">302–306</td><td class="num">352–354</td><td class="num">965–1002</td><td class="num">1253–1341</td></tr>
+  <tr><td>本地 HBM copy，GB/s（对照）</td><td class="num">453</td><td class="num">825–830</td><td class="num">1352–1388</td><td class="num">1868–1878</td><td class="num">3155–3352</td><td class="num">3912–4545</td></tr>
+</table>
+<figure>
+<svg viewBox="0 0 960 340" role="img" aria-label="CU 数与远端带宽的关系">
+  <g stroke="#d1d9e0" stroke-dasharray="3 3">
+    <line x1="90" y1="227.5" x2="650" y2="227.5"/><line x1="90" y1="165" x2="650" y2="165"/>
+    <line x1="90" y1="102.5" x2="650" y2="102.5"/><line x1="90" y1="40" x2="650" y2="40"/>
+  </g>
+  <line x1="90" y1="290" x2="650" y2="290" stroke="#59636e"/>
+  <line x1="90" y1="30" x2="90" y2="290" stroke="#59636e"/>
+  <g font-size="12" fill="#59636e" text-anchor="end">
+    <text x="82" y="294">0</text><text x="82" y="231">400</text><text x="82" y="169">800</text>
+    <text x="82" y="106">1200</text><text x="82" y="44">1600</text>
+  </g>
+  <text x="20" y="22" font-size="12" fill="#59636e">GB/s</text>
+  <g font-size="12" fill="#59636e" text-anchor="middle">
+    <text x="90" y="308">8</text><text x="202" y="308">16</text><text x="314" y="308">32</text>
+    <text x="426" y="308">64</text><text x="538" y="308">128</text><text x="650" y="308">256</text>
+    <text x="370" y="330">block 数（约等于占用的 CU 数，对数刻度；整卡共 256 个 CU）</text>
+  </g>
+  <line x1="90" y1="47.8" x2="650" y2="47.8" stroke="#1a7f37" stroke-width="2" stroke-dasharray="7 4"/>
+  <text x="100" y="62" font-size="12.5" fill="#1a7f37" font-weight="600">单个 SDMA engine：1.55 TB/s，占用 0 个 CU</text>
+  <polyline points="90,277.3 202,267.2 314,250.6 426,226.6 538,155.2 650,83.9" fill="none" stroke="#d1242f" stroke-width="2.2"/>
+  <g fill="#d1242f"><circle cx="90" cy="277.3" r="3.5"/><circle cx="202" cy="267.2" r="3.5"/><circle cx="314" cy="250.6" r="3.5"/><circle cx="426" cy="226.6" r="3.5"/><circle cx="538" cy="155.2" r="3.5"/><circle cx="650" cy="83.9" r="3.5"/></g>
+  <polyline points="90,271.9 202,260.5 314,242.5 426,234.8 538,136.4 650,87.3" fill="none" stroke="#bc4c00" stroke-width="2" stroke-dasharray="5 3"/>
+  <g fill="#bc4c00"><circle cx="90" cy="271.9" r="3"/><circle cx="202" cy="260.5" r="3"/><circle cx="314" cy="242.5" r="3"/><circle cx="426" cy="234.8" r="3"/><circle cx="538" cy="136.4" r="3"/><circle cx="650" cy="87.3" r="3"/></g>
+  <text x="640" y="110" font-size="12" text-anchor="end" fill="#d1242f">≈1.3 TB/s</text>
+  <!-- legend -->
+  <g font-size="13">
+    <line x1="690" y1="76" x2="720" y2="76" stroke="#d1242f" stroke-width="2.2"/><text x="728" y="80">CU 跨 tray 写</text>
+    <line x1="690" y1="100" x2="720" y2="100" stroke="#bc4c00" stroke-width="2" stroke-dasharray="5 3"/><text x="728" y="104">CU 跨 tray 读</text>
+    <line x1="690" y1="124" x2="720" y2="124" stroke="#1a7f37" stroke-width="2" stroke-dasharray="7 4"/><text x="728" y="128">SDMA 单 engine</text>
+    <text x="690" y="176">每个 CU 只能推 8–10 GB/s</text>
+    <text x="690" y="198">打满链路要 128–256 个 CU</text>
+    <text x="690" y="220" fill="#59636e">TDM 实现同样约 9 GB/s/CU</text>
+    <text x="690" y="242" fill="#59636e">（DeepEP V2 数据）</text>
+  </g>
+</svg>
+<figcaption><b>图 2　CU 搬运带宽随 CU 数线性增长。</b>数值取两次运行的中值；CU 要用掉大半张卡才能接近单个 SDMA engine 的带宽。</figcaption>
+</figure>
+<div class="note">交叉印证：<a href="deep_ep_v2_mi455.md">DeepEP V2 on MI455X</a> 用 TDM（gfx1250 的 tensor data mover）经 LDS 写的 copy kernel，256 个 block 达到 1491 GB/s，160 个 block 达到 1462 GB/s，同样约合每个 CU 9 GB/s。也就是说换成 TDM 也绕不开单 CU 的远端吞吐上限。</div>
+
+<h3 id="data-sdma">3.3 SDMA</h3>
+<ul>
+  <li><b>正确性：</b>tray 内和跨 tray 各 256 MB，逐字比对 0 mismatch。3.5 节用到的 torch peer copy 在 rocprofv3 trace 里只有 memory copy 记录、没有 copy kernel，确认走的是 copy engine。</li>
+  <li><b>带宽：</b>16 个 engine 任选一个都在 1.52–1.56 TB/s，单个 engine 就能打满链路，多个 engine 并行不再增加单对带宽。DeepEP V2 文档测得的 copy engine 带宽为 1542 GB/s，与此一致。</li>
+  <li><b>每次操作的固定开销：</b>从 host 提交到完成信号，单次约 7 µs，即使连续提交也没有明显摊薄。</li>
+</ul>
+<table>
+  <tr><th>单次传输大小</th><th class="num">4 KB</th><th class="num">64 KB</th><th class="num">1 MB</th><th class="num">4 MB</th><th class="num">16 MB</th></tr>
+  <tr><td>单次耗时（跨 tray，连续提交）</td><td class="num">7.0 µs</td><td class="num">7.2 µs</td><td class="num">7.9 µs</td><td class="num">10.0 µs</td><td class="num">19.1 µs</td></tr>
+  <tr><td>有效带宽</td><td class="num">1 GB/s</td><td class="num">9 GB/s</td><td class="num">132 GB/s</td><td class="num">418 GB/s</td><td class="num">877 GB/s</td></tr>
+</table>
+<figure>
+<svg viewBox="0 0 960 340" role="img" aria-label="SDMA 单次传输大小与有效带宽">
+  <g stroke="#d1d9e0" stroke-dasharray="3 3">
+    <line x1="90" y1="227.5" x2="650" y2="227.5"/><line x1="90" y1="165" x2="650" y2="165"/>
+    <line x1="90" y1="102.5" x2="650" y2="102.5"/><line x1="90" y1="40" x2="650" y2="40"/>
+  </g>
+  <line x1="90" y1="290" x2="650" y2="290" stroke="#59636e"/>
+  <line x1="90" y1="30" x2="90" y2="290" stroke="#59636e"/>
+  <g font-size="12" fill="#59636e" text-anchor="end">
+    <text x="82" y="294">0</text><text x="82" y="231">400</text><text x="82" y="169">800</text>
+    <text x="82" y="106">1200</text><text x="82" y="44">1600</text>
+  </g>
+  <text x="20" y="22" font-size="12" fill="#59636e">GB/s</text>
+  <line x1="90" y1="47.8" x2="650" y2="47.8" stroke="#1a7f37" stroke-width="2" stroke-dasharray="7 4"/>
+  <text x="100" y="62" font-size="12.5" fill="#1a7f37" font-weight="600">链路上限（大块传输时单个 engine 可达）≈1.55 TB/s</text>
+  <g fill="#1a7f37">
+    <rect x="116" y="288.5" width="60" height="1.5"/>
+    <rect x="228" y="288" width="60" height="2"/>
+    <rect x="340" y="269.4" width="60" height="20.6"/>
+    <rect x="452" y="224.7" width="60" height="65.3"/>
+    <rect x="564" y="153" width="60" height="137"/>
+  </g>
+  <g font-size="12.5" text-anchor="middle">
+    <text x="146" y="282">1</text><text x="258" y="282">9</text><text x="370" y="263">132</text>
+    <text x="482" y="218">418</text><text x="594" y="147">877</text>
+  </g>
+  <g font-size="12" fill="#59636e" text-anchor="middle">
+    <text x="146" y="308">4 KB</text><text x="258" y="308">64 KB</text><text x="370" y="308">1 MB</text>
+    <text x="482" y="308">4 MB</text><text x="594" y="308">16 MB</text>
+    <text x="146" y="324">7.0 µs</text><text x="258" y="324">7.2 µs</text><text x="370" y="324">7.9 µs</text>
+    <text x="482" y="324">10.0 µs</text><text x="594" y="324">19.1 µs</text>
+  </g>
+  <g font-size="13">
+    <text x="680" y="100" font-weight="600">近似模型</text>
+    <text x="680" y="124">单次耗时 ≈ 7 µs + 大小 / 1.55 TB/s</text>
+    <text x="680" y="160">达到 50% 链路带宽：单次 ≈ 11 MB</text>
+    <text x="680" y="184">达到 80% 链路带宽：单次 ≈ 43 MB</text>
+    <text x="680" y="226" fill="#59636e">更小的 chunk 要靠多个 engine</text>
+    <text x="680" y="246" fill="#59636e">并行来重叠固定开销（待验证）</text>
+  </g>
+</svg>
+<figcaption><b>图 3　单个 SDMA engine 的有效带宽取决于单次传输大小。</b>横轴下方第二行是单次耗时（跨 tray，连续提交）。固定开销约 7 µs，所以 SDMA 只适合大块数据，小消息交给 CU。</figcaption>
+</figure>
+<div class="note warn"><b>ROCm 问题：</b>用 <code>hipMemcpyAsync</code> 写跨 tray 导入的 fabric 内存只有 <b>268 GB/s</b>，runtime 走了慢路径；同样的拷贝写到 tray 内对端是 1.56 TB/s。所以目前必须直接调用 HSA 接口，这个问题也应该报给 ROCm。<code>async_tp</code> 现在用的正是 <code>hipMemcpyAsync</code>。</div>
+
+<h3 id="data-8">3.4 8 卡并发</h3>
+<p>两台 tray 的 8 张 GPU 同时发送，统计每卡的出口带宽：</p>
+<table>
+  <tr><th>模式</th><th>引擎</th><th class="num">每卡出口带宽</th></tr>
+  <tr><td>8 卡 all-to-all（每卡发给 7 个 peer），双向</td><td>CU，252–1022 个 block</td><td class="num">1.29–1.35 TB/s</td></tr>
+  <tr><td>8 卡 all-to-all，双向</td><td>SDMA，每个 peer 1 个 engine</td><td class="num">1.32 TB/s</td></tr>
+  <tr><td>8 卡 all-to-all，双向</td><td>SDMA，每个 peer 2 个 engine</td><td class="num"><b>1.41 TB/s</b></td></tr>
+  <tr><td>只发给对面 tray 的 4 张卡，双向</td><td>CU</td><td class="num">1.06–1.25 TB/s</td></tr>
+  <tr><td>一对一（GPU g 只发给对面 tray 的 GPU g），双向</td><td>CU</td><td class="num"><span class="badc">0.80–0.87 TB/s</span></td></tr>
+  <tr><td>一台 tray 的 4 卡各自发给对面 4 卡，单向</td><td>CU</td><td class="num">1.09–1.27 TB/s</td></tr>
+</table>
+<figure>
+<svg viewBox="0 0 960 280" role="img" aria-label="三种通信模式与每卡出口带宽">
+  <g fill="#f6f8fa" stroke="#d1d9e0">
+    <rect x="8" y="8" width="304" height="264" rx="8"/><rect x="328" y="8" width="304" height="264" rx="8"/><rect x="648" y="8" width="304" height="264" rx="8"/>
+  </g>
+  <g font-size="13" font-weight="600" text-anchor="middle">
+    <text x="160" y="34">全互联（每卡发往 7 个 peer）</text>
+    <text x="480" y="34">只发往对面 tray（每卡 4 个 peer）</text>
+    <text x="800" y="34">一对一（GPU g → GPU g+4）</text>
+  </g>
+  <!-- panel A arrows -->
+  <g stroke="#1a7f37" stroke-width="1.6" fill="none" marker-end="url(#arrG)">
+    <path d="M68,76 C34,80 34,106 66,108"/><path d="M68,78 C22,84 22,144 66,148"/><path d="M68,80 C8,90 8,182 66,188"/>
+    <line x1="93" y1="70" x2="224" y2="70"/><line x1="92.5" y1="73.4" x2="225.5" y2="106.1"/>
+    <line x1="91.4" y1="76.2" x2="226.8" y2="142.8"/><line x1="90.1" y1="78.2" x2="228.4" y2="180.5"/>
+  </g>
+  <!-- panel B arrows -->
+  <g stroke="#9a6700" stroke-width="1.6" fill="none" marker-end="url(#arr)">
+    <line x1="413" y1="70" x2="544" y2="70"/><line x1="412.5" y1="73.4" x2="545.5" y2="106.1"/>
+    <line x1="411.4" y1="76.2" x2="546.8" y2="142.8"/><line x1="410.1" y1="78.2" x2="548.4" y2="180.5"/>
+  </g>
+  <!-- panel C arrows -->
+  <g stroke="#cf222e" stroke-width="1.6" fill="none" marker-end="url(#arrR)">
+    <line x1="733" y1="70" x2="864" y2="70"/><line x1="733" y1="110" x2="864" y2="110"/>
+    <line x1="733" y1="150" x2="864" y2="150"/><line x1="733" y1="190" x2="864" y2="190"/>
+  </g>
+  <!-- GPUs -->
+  <g font-size="12" text-anchor="middle">
+    <g fill="#ddf4ff" stroke="#54aeff">
+      <circle cx="80" cy="110" r="13"/><circle cx="80" cy="150" r="13"/><circle cx="80" cy="190" r="13"/>
+      <circle cx="240" cy="70" r="13"/><circle cx="240" cy="110" r="13"/><circle cx="240" cy="150" r="13"/><circle cx="240" cy="190" r="13"/>
+      <circle cx="400" cy="110" r="13"/><circle cx="400" cy="150" r="13"/><circle cx="400" cy="190" r="13"/>
+      <circle cx="560" cy="70" r="13"/><circle cx="560" cy="110" r="13"/><circle cx="560" cy="150" r="13"/><circle cx="560" cy="190" r="13"/>
+      <circle cx="720" cy="70" r="13"/><circle cx="720" cy="110" r="13"/><circle cx="720" cy="150" r="13"/><circle cx="720" cy="190" r="13"/>
+      <circle cx="880" cy="70" r="13"/><circle cx="880" cy="110" r="13"/><circle cx="880" cy="150" r="13"/><circle cx="880" cy="190" r="13"/>
+    </g>
+    <circle cx="80" cy="70" r="13" fill="#0969da"/><circle cx="400" cy="70" r="13" fill="#0969da"/>
+    <text x="80" y="74" fill="#fff">0</text><text x="80" y="114">1</text><text x="80" y="154">2</text><text x="80" y="194">3</text>
+    <text x="240" y="74">4</text><text x="240" y="114">5</text><text x="240" y="154">6</text><text x="240" y="194">7</text>
+    <text x="400" y="74" fill="#fff">0</text><text x="400" y="114">1</text><text x="400" y="154">2</text><text x="400" y="194">3</text>
+    <text x="560" y="74">4</text><text x="560" y="114">5</text><text x="560" y="154">6</text><text x="560" y="194">7</text>
+    <text x="720" y="74">0</text><text x="720" y="114">1</text><text x="720" y="154">2</text><text x="720" y="194">3</text>
+    <text x="880" y="74">4</text><text x="880" y="114">5</text><text x="880" y="154">6</text><text x="880" y="194">7</text>
+    <g font-size="11" fill="#59636e">
+      <text x="80" y="218">e15-01</text><text x="240" y="218">e15-02</text>
+      <text x="400" y="218">e15-01</text><text x="560" y="218">e15-02</text>
+      <text x="720" y="218">e15-01</text><text x="880" y="218">e15-02</text>
+    </g>
+  </g>
+  <g font-size="12" fill="#59636e" text-anchor="middle">
+    <text x="160" y="240">只画出 GPU0 的发送；8 卡同时双向</text>
+    <text x="480" y="240">只画出 GPU0 的发送；8 卡同时双向</text>
+    <text x="800" y="240">8 卡同时双向，每卡只有 1 个 peer</text>
+  </g>
+  <g font-size="14" font-weight="600" text-anchor="middle">
+    <text x="160" y="262" fill="#1a7f37">每卡 1.29–1.41 TB/s</text>
+    <text x="480" y="262" fill="#9a6700">每卡 1.06–1.25 TB/s</text>
+    <text x="800" y="262" fill="#cf222e">每卡 0.80–0.87 TB/s</text>
+  </g>
+</svg>
+<figcaption><b>图 4　同时发往的 peer 越多，出口带宽越接近链路上限。</b>一对一模式只有约 0.8 TB/s，因此 L1 的调度要同时直连所有 peer，而不是 ring 或固定配对。</figcaption>
+</figure>
+<p>只做一对一时带宽明显偏低，同时发给多个 peer 才能接近链路上限。所以 ring 或固定配对的调度不适合，应该同时直连所有 peer，并且各 rank 的发送顺序错开。</p>
+
+<h3 id="data-gemm">3.5 对 GEMM 的干扰</h3>
+<p>在 GPU0 上跑 bf16 GEMM（torch / hipBLASLt），同时在另一条 stream 上持续向 GPU1 搬 256 MB 的数据块：</p>
+<table>
+  <tr><th>GEMM（M×N×K）</th><th class="num">单独运行</th><th class="num">+ SDMA</th><th class="num">+ CU copy，16 CU</th><th class="num">+ CU copy，64 CU</th><th class="num">+ CU copy，128 CU</th></tr>
+  <tr><td>8192×8192×8192</td><td class="num">582 µs，1890 TFLOPS</td><td class="num good">+2.2%（1.35 TB/s）</td><td class="num badc">+19.5%（0.11 TB/s）</td><td class="num badc">+22.0%（0.40 TB/s）</td><td class="num badc">+22.6%（0.63 TB/s）</td></tr>
+  <tr><td>32768×4096×1536</td><td class="num">286 µs，1442 TFLOPS</td><td class="num good">−2.1%（1.40 TB/s）</td><td class="num badc">+36.3%</td><td class="num badc">+37.2%</td><td class="num badc">+31.5%</td></tr>
+  <tr><td>8192×7168×2048</td><td class="num">157 µs，1529 TFLOPS</td><td class="num good">−0.1%（1.40 TB/s）</td><td class="num badc">+43.0%</td><td class="num badc">+47.5%</td><td class="num badc">+47.1%</td></tr>
+</table>
+<figure>
+<svg viewBox="0 0 960 310" role="img" aria-label="并发搬运对 GEMM 耗时的影响">
+  <g stroke="#d1d9e0" stroke-dasharray="3 3">
+    <line x1="80" y1="204.5" x2="700" y2="204.5"/><line x1="80" y1="160.9" x2="700" y2="160.9"/>
+    <line x1="80" y1="117.3" x2="700" y2="117.3"/><line x1="80" y1="73.6" x2="700" y2="73.6"/><line x1="80" y1="30" x2="700" y2="30"/>
+  </g>
+  <line x1="80" y1="248.2" x2="700" y2="248.2" stroke="#59636e"/>
+  <line x1="80" y1="24" x2="80" y2="272" stroke="#59636e"/>
+  <g font-size="12" fill="#59636e" text-anchor="end">
+    <text x="72" y="252">0%</text><text x="72" y="208">+10%</text><text x="72" y="165">+20%</text>
+    <text x="72" y="121">+30%</text><text x="72" y="78">+40%</text><text x="72" y="34">+50%</text>
+  </g>
+  <text x="10" y="16" font-size="12" fill="#59636e">GEMM 耗时变化</text>
+  <g>
+    <rect x="110" y="238.6" width="36" height="9.6" fill="#1a7f37"/><rect x="152" y="163.1" width="36" height="85.1" fill="#ff8182"/>
+    <rect x="194" y="152.2" width="36" height="96" fill="#e5534b"/><rect x="236" y="149.6" width="36" height="98.6" fill="#a40e26"/>
+    <rect x="310" y="248.2" width="36" height="9.2" fill="#1a7f37"/><rect x="352" y="89.8" width="36" height="158.4" fill="#ff8182"/>
+    <rect x="394" y="85.9" width="36" height="162.3" fill="#e5534b"/><rect x="436" y="110.7" width="36" height="137.5" fill="#a40e26"/>
+    <rect x="510" y="248.2" width="36" height="1.5" fill="#1a7f37"/><rect x="552" y="60.5" width="36" height="187.7" fill="#ff8182"/>
+    <rect x="594" y="40.9" width="36" height="207.3" fill="#e5534b"/><rect x="636" y="42.7" width="36" height="205.5" fill="#a40e26"/>
+  </g>
+  <g font-size="11" text-anchor="middle">
+    <text x="128" y="233" fill="#1a7f37">+2.2</text><text x="170" y="158">+19.5</text><text x="212" y="147">+22.0</text><text x="254" y="144">+22.6</text>
+    <text x="328" y="270" fill="#1a7f37">−2.1</text><text x="370" y="85">+36.3</text><text x="412" y="81">+37.2</text><text x="454" y="106">+31.5</text>
+    <text x="528" y="262" fill="#1a7f37">−0.1</text><text x="570" y="56">+43.0</text><text x="612" y="36">+47.5</text><text x="654" y="38">+47.1</text>
+  </g>
+  <g font-size="12" fill="#59636e" text-anchor="middle">
+    <text x="191" y="292">8192×8192×8192</text><text x="391" y="292">32768×4096×1536</text><text x="591" y="292">8192×7168×2048</text>
+  </g>
+  <g font-size="13">
+    <rect x="730" y="50" width="14" height="14" fill="#1a7f37"/><text x="752" y="62">+ SDMA</text>
+    <rect x="730" y="74" width="14" height="14" fill="#ff8182"/><text x="752" y="86">+ CU copy，16 CU</text>
+    <rect x="730" y="98" width="14" height="14" fill="#e5534b"/><text x="752" y="110">+ CU copy，64 CU</text>
+    <rect x="730" y="122" width="14" height="14" fill="#a40e26"/><text x="752" y="134">+ CU copy，128 CU</text>
+    <text x="730" y="180">SDMA 搬 1.35–1.40 TB/s 时，</text>
+    <text x="730" y="200">GEMM 变化在 ±2% 以内</text>
+    <text x="730" y="234">CU copy 只用 16 个 CU、</text>
+    <text x="730" y="254">也会让 GEMM 慢 20–43%</text>
+  </g>
+</svg>
+<figcaption><b>图 5　在同一张卡上并发搬运时，GEMM 耗时的变化。</b>GEMM 为 torch / hipBLASLt 的 bf16 矩阵乘，搬运目标是 tray 内的另一张卡。</figcaption>
+</figure>
+<div class="note">CU 这一列测的是"两个独立 kernel 并发"的情况，persistent GEMM 被抢走 CU 后会出现 wave 量化和尾部效应，所以是偏悲观的上界。但即使在融合 kernel 里精确地只划出 N 个 CU，直接代价也至少是 N/256 的算力，再加上 L2 和 HBM 的争用；而按 3.2 节的数据，要搬 1 TB/s，N 得在 128 左右。</div>
+
+<!-- ======================================================================= -->
+<h2 id="findings">4. 关键结论</h2>
+<ol>
+  <li><b>拓扑是扁平的。</b>8 张卡之间的带宽和延迟几乎一致，算法只需要按"一个 scale-up 域里有 n 个 rank"来设计，不用区分 tray 内和跨 tray。</li>
+  <li><b>能不能跨 tray，只取决于内存映射方式。</b>fabric handle 映射之后，kernel 层的指针语义、原子操作、内存序都和 tray 内一样。</li>
+  <li><b>大块数据用 SDMA，CU 用于计算。</b>SDMA 在带宽（1.55 对 1.37 TB/s）、CU 占用（0 对 128–256 个）和对 GEMM 的干扰（±2% 对 +20–47%）三项上全面胜出。CU 只在需要计算（reduce）、消息很小（SDMA 每次 7 µs 的固定开销占主导）或者要求 tile 级细粒度同步时使用。</li>
+  <li><b>流量要分散。</b>同时直连所有 peer，避免一对一和 ring。</li>
+  <li><b>跨 rank 优先 push。</b>远端 load 要等约 3 µs 的往返，而写是 posted 的；跨 rank 的数据路径应尽量写到对端，读只发生在本地。</li>
+</ol>
+<figure>
+<svg viewBox="0 0 960 330" role="img" aria-label="现有方案与 MI455 方案的对比">
+  <defs>
+    <pattern id="cuB1" x="40" y="70" width="22" height="22" patternUnits="userSpaceOnUse"><rect width="18" height="18" rx="2" fill="#54aeff"/></pattern>
+    <pattern id="cuR1" x="40" y="70" width="22" height="22" patternUnits="userSpaceOnUse"><rect width="18" height="18" rx="2" fill="#d1242f"/></pattern>
+    <pattern id="cuB2" x="520" y="70" width="22" height="22" patternUnits="userSpaceOnUse"><rect width="18" height="18" rx="2" fill="#54aeff"/></pattern>
+    <pattern id="sdG" x="826" y="96" width="20" height="20" patternUnits="userSpaceOnUse"><rect width="14" height="14" rx="2" fill="#1a7f37"/></pattern>
+  </defs>
+  <!-- left: current -->
+  <text x="20" y="22" font-size="14" font-weight="600">现有方案（MI355X）：GEMM kernel 里的一部分 CU 负责搬运</text>
+  <rect x="20" y="36" width="440" height="210" rx="8" fill="#fff" stroke="#8c959f"/>
+  <text x="32" y="58" font-size="12" fill="#59636e">GPU r · 256 个 CU</text>
+  <rect x="40" y="70" width="198" height="110" fill="url(#cuB1)"/>
+  <rect x="238" y="70" width="66" height="110" fill="url(#cuR1)"/>
+  <line x1="271" y1="180" x2="271" y2="262" stroke="#cf222e" stroke-width="2" marker-end="url(#arrR)"/>
+  <text x="282" y="214" font-size="12" fill="#cf222e">CU 直接 load/store 远端</text>
+  <text x="282" y="230" font-size="12" fill="#cf222e">每个 CU 8–10 GB/s</text>
+  <rect x="40" y="198" width="12" height="12" rx="2" fill="#54aeff"/><text x="58" y="209" font-size="12">GEMM tile</text>
+  <rect x="40" y="220" width="12" height="12" rx="2" fill="#d1242f"/><text x="58" y="231" font-size="12">通信 block</text>
+  <rect x="20" y="266" width="440" height="26" rx="5" fill="#f6f8fa" stroke="#d1d9e0"/>
+  <text x="240" y="284" font-size="12.5" text-anchor="middle">peer 的对称 heap（legacy IPC 指针）</text>
+  <text x="240" y="318" font-size="13" text-anchor="middle" fill="#cf222e" font-weight="600">打满链路要 128–256 个 CU；并发时 GEMM 慢 20–47%</text>
+  <!-- right: MI455 -->
+  <text x="500" y="22" font-size="14" font-weight="600">MI455 方案：SDMA 负责搬运，GEMM 只等 flag</text>
+  <rect x="500" y="36" width="440" height="210" rx="8" fill="#fff" stroke="#8c959f"/>
+  <text x="512" y="58" font-size="12" fill="#59636e">GPU r · 256 个 CU</text>
+  <rect x="520" y="70" width="264" height="110" fill="url(#cuB2)"/>
+  <rect x="806" y="70" width="120" height="110" rx="6" fill="#dafbe1" stroke="#4ac26b"/>
+  <text x="866" y="88" font-size="12" font-weight="600" text-anchor="middle">SDMA ×16</text>
+  <rect x="826" y="96" width="80" height="80" fill="url(#sdG)"/>
+  <line x1="806" y1="128" x2="790" y2="128" stroke="#0969da" stroke-width="1.6" stroke-dasharray="3 2" marker-end="url(#arrB)"/>
+  <text x="797" y="62" font-size="11" fill="#0969da" text-anchor="middle">flag</text>
+  <line x1="797" y1="66" x2="797" y2="124" stroke="#0969da" stroke-width="0.8" stroke-dasharray="2 2"/>
+  <line x1="866" y1="180" x2="866" y2="262" stroke="#1a7f37" stroke-width="2" marker-end="url(#arrG)"/>
+  <text x="856" y="214" font-size="12" fill="#1a7f37" text-anchor="end">SDMA 写远端</text>
+  <text x="856" y="230" font-size="12" fill="#1a7f37" text-anchor="end">单 engine 1.55 TB/s</text>
+  <rect x="520" y="198" width="12" height="12" rx="2" fill="#54aeff"/><text x="538" y="209" font-size="12">GEMM tile（全部 CU）</text>
+  <rect x="520" y="220" width="12" height="12" rx="2" fill="#1a7f37"/><text x="538" y="231" font-size="12">SDMA engine</text>
+  <rect x="500" y="266" width="440" height="26" rx="5" fill="#f6f8fa" stroke="#d1d9e0"/>
+  <text x="720" y="284" font-size="12.5" text-anchor="middle">peer 的对称 heap（IPC 或 fabric 映射）</text>
+  <text x="720" y="318" font-size="13" text-anchor="middle" fill="#1a7f37" font-weight="600">不占 CU；并发时 GEMM 变化在 ±2% 以内</text>
+</svg>
+<figcaption><b>图 6　搬运从 CU 移到 SDMA。</b>GEMM 不再划出通信 block，只在计算每个 tile 前等待对应数据块的 flag。</figcaption>
+</figure>
+
+<!-- ======================================================================= -->
+<h2 id="goals">5. 设计目标：通用性与性能</h2>
+<p>性能不能是唯一目标。下表列出通用性的各个维度，以及设计如何满足：</p>
+<table>
+  <tr><th>维度</th><th>要求</th><th>设计如何满足</th></tr>
+  <tr><td>拓扑与规模</td><td>单 tray 4 卡、2 tray 8 卡、vpod 扩大后的 72 卡；也要能回退到 MI355X 单机 XGMI</td><td>L0 自动选择 IPC 或 fabric；L1 的调度只依赖 n，不依赖 tray 结构；需要时多个 peer 共享 SDMA engine</td></tr>
+  <tr><td>架构</td><td>gfx1250 为主，gfx950 可用</td><td>搬运引擎可选：MI455 默认 SDMA；MI355X 的 SDMA 单 engine 较弱，可以继续用 CU 引擎。L1 接口不变</td></tr>
+  <tr><td>算子</td><td>AG / RS / A2A 与 GEMM 的组合；bf16、fp8、fp4（scale 随数据一起搬）</td><td>L1 的三种集合通信都由同一个 <code>put + signal</code> 原语组合而成，dtype 无关</td></tr>
+  <tr><td>数据布局</td><td>sbhd / bshd、Megatron 的交错 QKV、rank-major 等</td><td>L3 用布局描述符表达"哪些行发给谁、落在哪里"，不进入 kernel 代码</td></tr>
+  <tr><td>GEMM 实现</td><td>不绑定某一个 GEMM</td><td>L2 与 GEMM 之间只有一个接口："按 flag 放行 tile"。没有 FlyDSL GEMM 时，退化为按 chunk 拆分的 hipBLASLt 加 stream 等待</td></tr>
+  <tr><td>工程约束</td><td>能进 CUDA graph；RS 结果 bitwise 确定；kernel 卡住时能退出</td><td>沿用 epoch + 双 bank 协议，无需 host 同步；RS 在本地按固定 rank 顺序归约；所有 spin 等待都有超时并 trap（见 <a href="#risks">风险</a>）</td></tr>
+  <tr><td>可维护性</td><td>新增一个模型算子不需要写新 kernel</td><td>模型相关的逻辑全部收敛在 L3</td></tr>
+</table>
+
+<!-- ======================================================================= -->
+<h2 id="arch">6. 分层架构</h2>
+
+<figure>
+<svg viewBox="0 0 960 400" role="img" aria-label="分层架构图">
+  <!-- L3 -->
+  <rect x="10" y="10" width="940" height="70" rx="8" fill="#fbefff" stroke="#c297e6"/>
+  <text x="24" y="34" font-size="15" font-weight="600">L3 模型算子（布局描述）</text>
+  <text x="24" y="58" font-size="13" fill="#59636e">Ulysses QKV / O 投影 · MLA latent 上投影 · TP 的 AG-GEMM / GEMM-RS（async_tp 接口）· MoE（未来）</text>
+  <!-- L2 -->
+  <rect x="10" y="100" width="940" height="80" rx="8" fill="#fff8c5" stroke="#d4a72c"/>
+  <text x="24" y="124" font-size="15" font-weight="600">L2 融合算子</text>
+  <rect x="24" y="134" width="210" height="34" rx="5" fill="#fff" stroke="#d4a72c"/><text x="40" y="156" font-size="13">AG-GEMM</text>
+  <rect x="246" y="134" width="210" height="34" rx="5" fill="#fff" stroke="#d4a72c"/><text x="262" y="156" font-size="13">GEMM-RS（A2A + 本地归约）</text>
+  <rect x="468" y="134" width="210" height="34" rx="5" fill="#fff" stroke="#d4a72c"/><text x="484" y="156" font-size="13">A2A-GEMM / GEMM-A2A</text>
+  <rect x="690" y="134" width="246" height="34" rx="5" fill="#fff" stroke="#d4a72c"/><text x="700" y="156" font-size="13">GEMM 钩子：按 flag 放行 tile</text>
+  <!-- L1 -->
+  <rect x="10" y="200" width="940" height="100" rx="8" fill="#dafbe1" stroke="#4ac26b"/>
+  <text x="24" y="224" font-size="15" font-weight="600">L1 通信原语</text>
+  <text x="24" y="246" font-size="13" fill="#59636e">核心原语 put(dst_rank, dst_off, src, bytes, signal)；集合通信：AG / A2A / RS = A2A + 本地归约；epoch + 双 bank 的 flag 协议</text>
+  <rect x="24" y="256" width="300" height="34" rx="5" fill="#fff" stroke="#4ac26b"/><text x="36" y="278" font-size="13">SDMA 引擎（默认，用于大块数据）</text>
+  <rect x="338" y="256" width="300" height="34" rx="5" fill="#fff" stroke="#4ac26b"/><text x="350" y="278" font-size="13">CU 引擎（小消息、flag、reduce、回退）</text>
+  <rect x="652" y="256" width="284" height="34" rx="5" fill="#fff" stroke="#4ac26b"/><text x="664" y="278" font-size="13">选择策略：按消息大小 + autotune</text>
+  <!-- L0 -->
+  <rect x="10" y="320" width="940" height="70" rx="8" fill="#ddf4ff" stroke="#54aeff"/>
+  <text x="24" y="344" font-size="15" font-weight="600">L0 对称内存 SymmetricMemory <tspan font-size="12" fill="#1a7f37">（已实现）</tspan></text>
+  <text x="24" y="364" font-size="12.5" fill="#59636e">IPC 后端（同一 OS 实例）· fabric 后端（VMM + fabric handle，可跨 tray）· auto 选择</text>
+  <text x="24" y="382" font-size="12.5" fill="#59636e">对外接口不变：buffer_ptrs / get_buffer / signal pad / barrier</text>
+  <line x1="480" y1="80" x2="480" y2="98" stroke="#59636e" marker-end="url(#arr)"/>
+  <line x1="480" y1="180" x2="480" y2="198" stroke="#59636e" marker-end="url(#arr)"/>
+  <line x1="480" y1="300" x2="480" y2="318" stroke="#59636e" marker-end="url(#arr)"/>
+</svg>
+<figcaption><b>图 7　四层架构。</b>每层只依赖下一层的接口：L0 屏蔽映射方式，L1 屏蔽搬运引擎，L2 只给 GEMM 加一个钩子，L3 只描述数据布局。</figcaption>
+</figure>
+
+<h3 id="l0">L0 对称内存 <span class="tag done">已实现</span></h3>
+<p>每个 rank 分配一块大小相同的 heap，每个 rank 都持有所有 heap 的设备指针。上层只依赖指针语义，不关心底层映射方式。</p>
+<figure>
+<svg viewBox="0 0 960 300" role="img" aria-label="对称 heap 的地址映射">
+  <g font-size="13" fill="#59636e">
+    <text x="10" y="56">rank 0 的</text><text x="10" y="74">虚拟地址</text>
+    <text x="10" y="218">各 GPU 的</text><text x="10" y="236">物理显存</text>
+  </g>
+  <g stroke-width="1.6">
+    <line x1="176" y1="80" x2="176" y2="196" stroke="#59636e" marker-end="url(#arr)"/>
+    <line x1="276" y1="80" x2="276" y2="196" stroke="#0969da" marker-end="url(#arrB)"/>
+    <line x1="376" y1="80" x2="376" y2="196" stroke="#0969da" marker-end="url(#arrB)"/>
+    <line x1="476" y1="80" x2="476" y2="196" stroke="#0969da" marker-end="url(#arrB)"/>
+    <line x1="576" y1="80" x2="576" y2="196" stroke="#1a7f37" marker-end="url(#arrG)"/>
+    <line x1="676" y1="80" x2="676" y2="196" stroke="#1a7f37" marker-end="url(#arrG)"/>
+    <line x1="776" y1="80" x2="776" y2="196" stroke="#1a7f37" marker-end="url(#arrG)"/>
+    <line x1="876" y1="80" x2="876" y2="196" stroke="#1a7f37" marker-end="url(#arrG)"/>
+  </g>
+  <g font-size="12.5" text-anchor="middle">
+    <rect x="150" y="126" width="52" height="20" fill="#fff"/><text x="176" y="140" fill="#59636e">本地</text>
+    <rect x="296" y="126" width="160" height="20" fill="#fff"/><text x="376" y="140" fill="#0969da">IPC（同一 OS）或 fabric</text>
+    <rect x="666" y="126" width="120" height="20" fill="#fff"/><text x="726" y="140" fill="#1a7f37" font-weight="600">只能用 fabric</text>
+  </g>
+  <g font-size="11.5" text-anchor="middle">
+    <rect x="130" y="40" width="92" height="40" rx="5" fill="#f6f8fa" stroke="#8c959f"/><text x="176" y="64">peer_ptrs[0]</text>
+    <rect x="230" y="40" width="92" height="40" rx="5" fill="#ddf4ff" stroke="#54aeff"/><text x="276" y="64">peer_ptrs[1]</text>
+    <rect x="330" y="40" width="92" height="40" rx="5" fill="#ddf4ff" stroke="#54aeff"/><text x="376" y="64">peer_ptrs[2]</text>
+    <rect x="430" y="40" width="92" height="40" rx="5" fill="#ddf4ff" stroke="#54aeff"/><text x="476" y="64">peer_ptrs[3]</text>
+    <rect x="530" y="40" width="92" height="40" rx="5" fill="#dafbe1" stroke="#4ac26b"/><text x="576" y="64">peer_ptrs[4]</text>
+    <rect x="630" y="40" width="92" height="40" rx="5" fill="#dafbe1" stroke="#4ac26b"/><text x="676" y="64">peer_ptrs[5]</text>
+    <rect x="730" y="40" width="92" height="40" rx="5" fill="#dafbe1" stroke="#4ac26b"/><text x="776" y="64">peer_ptrs[6]</text>
+    <rect x="830" y="40" width="92" height="40" rx="5" fill="#dafbe1" stroke="#4ac26b"/><text x="876" y="64">peer_ptrs[7]</text>
+  </g>
+  <g text-anchor="middle">
+    <g fill="#fff" stroke="#8c959f">
+      <rect x="130" y="198" width="92" height="50" rx="5"/><rect x="230" y="198" width="92" height="50" rx="5"/>
+      <rect x="330" y="198" width="92" height="50" rx="5"/><rect x="430" y="198" width="92" height="50" rx="5"/>
+      <rect x="530" y="198" width="92" height="50" rx="5"/><rect x="630" y="198" width="92" height="50" rx="5"/>
+      <rect x="730" y="198" width="92" height="50" rx="5"/><rect x="830" y="198" width="92" height="50" rx="5"/>
+    </g>
+    <g font-size="12.5" font-weight="600">
+      <text x="176" y="219">GPU 0</text><text x="276" y="219">GPU 1</text><text x="376" y="219">GPU 2</text><text x="476" y="219">GPU 3</text>
+      <text x="576" y="219">GPU 4</text><text x="676" y="219">GPU 5</text><text x="776" y="219">GPU 6</text><text x="876" y="219">GPU 7</text>
+    </g>
+    <g font-size="11" fill="#59636e">
+      <text x="176" y="237">heap</text><text x="276" y="237">heap</text><text x="376" y="237">heap</text><text x="476" y="237">heap</text>
+      <text x="576" y="237">heap</text><text x="676" y="237">heap</text><text x="776" y="237">heap</text><text x="876" y="237">heap</text>
+    </g>
+  </g>
+  <path d="M130,256 V264 H522 V256 M530,256 V264 H922 V256" stroke="#8c959f" fill="none"/>
+  <g font-size="12.5" text-anchor="middle" fill="#59636e">
+    <text x="326" y="284">e15-01（OS 实例 A）</text><text x="726" y="284">e15-02（OS 实例 B）</text>
+  </g>
+</svg>
+<figcaption><b>图 8　对称 heap。</b>每个 rank 都有一份同样结构的 <code>peer_ptrs</code>，指向同一组物理 heap，图中只画出 rank 0 的视角。kernel 拿到指针后直接读写，不区分对端在 tray 内还是跨 tray。</figcaption>
+</figure>
+<div class="grid2">
+  <div class="card"><h4>IPC 后端（<code>_IpcHeap</code>）</h4>
+    <ul><li><code>hipMalloc</code> 或 <code>hipExtMallocWithFlags(Uncached)</code></li>
+        <li><code>hipIpcGetMemHandle</code> → all-gather → <code>hipIpcOpenMemHandle</code></li>
+        <li>只在同一个 OS 实例内有效；行为与改动前完全一致</li></ul></div>
+  <div class="card"><h4>fabric 后端（<code>_FabricHeap</code>）</h4>
+    <ul><li><code>hipMemCreate</code>（Pinned 或 Uncached，<code>requestedHandleType = Fabric</code>），按推荐粒度对齐</li>
+        <li><code>hipMemExportToShareableHandle</code> → all-gather 64 字节 handle → <code>hipMemImportFromShareableHandle</code></li>
+        <li><code>hipMemAddressReserve</code> / <code>hipMemMap</code> / <code>hipMemSetAccess</code>，只对本进程的设备开放访问</li>
+        <li>可跨同一 scale-up 域内的任意 OS 实例</li></ul></div>
+</div>
+<p><b>后端选择</b>（<code>resolve_symm_mem_backend</code>，所有 rank 共同参与）：显式参数 <code>backend=</code> 优先，其次是 <code>PRIMUS_TURBO_SYMM_MEM_BACKEND</code>，默认 <code>auto</code>。<code>auto</code> 时，所有 rank 的内核 <code>boot_id</code> 相同就用 IPC，否则用 fabric。<code>boot_id</code> 正好对应 legacy IPC 的有效边界：容器共享宿主机内核，所以同一台机器上的多个容器算同一个 OS 实例。选择过程用一次 all-gather 汇总各 rank 的 OS 实例、请求的后端和 fabric 支持情况，任何不一致都会让所有 rank 一起报错，不会出现部分 rank 卡在后续集合通信里。</p>
+<figure>
+<svg viewBox="0 0 960 350" role="img" aria-label="后端选择与 fabric rendezvous 流程">
+  <text x="10" y="22" font-size="13" font-weight="600">后端选择（resolve_symm_mem_backend，所有 rank 共同执行）</text>
+  <rect x="10" y="36" width="190" height="92" rx="6" fill="#fff" stroke="#8c959f"/>
+  <text x="22" y="58" font-size="13" font-weight="600">请求的后端</text>
+  <g font-size="12"><text x="22" y="80">1. backend= 参数</text><text x="22" y="98">2. 环境变量</text><text x="22" y="116">3. 默认 auto</text></g>
+  <line x1="200" y1="82" x2="228" y2="82" stroke="#59636e" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="230" y="36" width="220" height="92" rx="6" fill="#f6f8fa" stroke="#8c959f"/>
+  <text x="242" y="58" font-size="13" font-weight="600">一次 all-gather，汇总</text>
+  <g font-size="12"><text x="242" y="80">· boot_id（属于哪个 OS 实例）</text><text x="242" y="98">· 请求的后端</text><text x="242" y="116">· 是否支持 fabric handle</text></g>
+  <line x1="450" y1="82" x2="478" y2="82" stroke="#59636e" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="480" y="36" width="150" height="92" rx="6" fill="#fff8c5" stroke="#d4a72c"/>
+  <text x="555" y="76" font-size="12.5" text-anchor="middle">各 rank 请求的</text>
+  <text x="555" y="96" font-size="12.5" text-anchor="middle" font-weight="600">后端一致？</text>
+  <line x1="630" y1="82" x2="658" y2="82" stroke="#59636e" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="644" y="74" font-size="11.5" text-anchor="middle" fill="#1a7f37">是</text>
+  <rect x="660" y="36" width="290" height="92" rx="6" fill="#ddf4ff" stroke="#54aeff"/>
+  <g font-size="12">
+    <text x="672" y="56">auto：boot_id 全部相同 → ipc，</text>
+    <text x="672" y="74">　　　否则 → fabric</text>
+    <text x="672" y="96">ipc：跨 OS 实例 → 报错</text>
+    <text x="672" y="116">fabric：有 rank 不支持 → 报错</text>
+  </g>
+  <line x1="555" y1="128" x2="555" y2="150" stroke="#cf222e" stroke-width="1.5" marker-end="url(#arrR)"/>
+  <text x="564" y="144" font-size="11.5" fill="#cf222e">否</text>
+  <path d="M700,128 V167 H632" fill="none" stroke="#cf222e" stroke-width="1.5" marker-end="url(#arrR)"/>
+  <rect x="480" y="152" width="150" height="30" rx="5" fill="#fff1f0" stroke="#cf222e"/>
+  <text x="555" y="172" font-size="12" text-anchor="middle" fill="#cf222e">所有 rank 一起报错</text>
+
+  <text x="10" y="222" font-size="13" font-weight="600">fabric 后端的 rendezvous（每个 rank 执行）</text>
+  <g stroke-width="1">
+    <rect x="10" y="236" width="160" height="64" rx="6" fill="#fff" stroke="#8c959f"/>
+    <rect x="200" y="236" width="160" height="64" rx="6" fill="#fff" stroke="#8c959f"/>
+    <rect x="390" y="236" width="160" height="64" rx="6" fill="#f6f8fa" stroke="#8c959f"/>
+    <rect x="580" y="236" width="160" height="64" rx="6" fill="#fff" stroke="#8c959f"/>
+    <rect x="770" y="236" width="160" height="64" rx="6" fill="#dafbe1" stroke="#4ac26b"/>
+  </g>
+  <g text-anchor="middle" font-size="12.5">
+    <text x="90" y="262">hipMemCreate</text><text x="90" y="282" font-size="11.5" fill="#59636e">handle 类型 = Fabric</text>
+    <text x="280" y="258">hipMemExportTo</text><text x="280" y="274">ShareableHandle</text><text x="280" y="292" font-size="11.5" fill="#59636e">→ 64 字节 handle</text>
+    <text x="470" y="262">all_gather</text><text x="470" y="282" font-size="11.5" fill="#59636e">经前端网络交换</text>
+    <text x="660" y="258">hipMemImportFrom</text><text x="660" y="274">ShareableHandle</text><text x="660" y="292" font-size="11.5" fill="#59636e">→ 对端的物理内存</text>
+    <text x="850" y="256">AddressReserve</text><text x="850" y="274">+ Map + SetAccess</text><text x="850" y="292" font-size="11.5" fill="#59636e">→ peer_ptrs[j]</text>
+  </g>
+  <g stroke="#59636e" stroke-width="1.5" marker-end="url(#arr)">
+    <line x1="170" y1="268" x2="198" y2="268"/><line x1="360" y1="268" x2="388" y2="268"/>
+    <line x1="550" y1="268" x2="578" y2="268"/><line x1="740" y1="268" x2="768" y2="268"/>
+  </g>
+  <text x="10" y="334" font-size="12" fill="#59636e">IPC 后端：hipMalloc → hipIpcGetMemHandle → all_gather → hipIpcOpenMemHandle → peer_ptrs[j]（与改动前一致）</text>
+</svg>
+<figcaption><b>图 9　后端选择与 rendezvous。</b>所有判断都基于一次 all-gather 的结果，各 rank 得出相同结论；两种后端产出的都是同样的 <code>peer_ptrs</code>。</figcaption>
+</figure>
+<p><b>附带收益：</b>VMM 可以先预留一大段虚拟地址，按需映射物理内存，以后能让 workspace 原地扩容，不用像现在这样"先分配新的、再释放旧的"。</p>
+
+<h3 id="l1">L1 通信原语 <span class="tag wip">阶段 1</span></h3>
+<p>只有一个核心原语：把一段本地数据写到某个 rank 的对称内存，写完后在对端置一个 flag。一次调用是 stream 上的一个会话，epoch 由 <code>begin</code> 分配，put 时不用再传：</p>
+<pre><code>epoch = comm.begin()                    # 不在 stream 上放任何东西
+comm.put(dst_rank, dst_offset, src_ptr, nbytes, flag, engine=None)   # 次数、目的地、切分都由调用方决定
+comm.release()                          # 可选：此前的 put 从 stream 的这个位置起开始搬（读到的是这里之前产生的数据）
+comm.wait_flag(src_rank, flag)          # 可选：stream 等某个 peer 的某个 flag（按块开始计算）
+comm.wait(num_flags)                    # stream 等待：本 rank 的 put 已落地，各 peer 的 flag 0..num_flags-1 已到
+comm.flags()                            # [world, max_chunks]，融合 kernel 可以自己轮询，代替 wait
+
+all_gather(inp, num_chunks)       # 每个 peer 的块切成 num_chunks 次 put，第 c 块用 flag c
+all_to_all(inp, num_chunks)       # 按目的地切片后 put
+reduce_scatter(inp, num_chunks)   # A2A：把属于别人的 partial 推到对方；拥有者本地按固定 rank 顺序归约</code></pre>
+<p>flag 按"源 rank"分块：接收方每个 bank 为每个源 rank 留 <code>max_chunks</code> 个 flag，只由该源写，所以只要同一次调用里每个 <code>(dst_rank, flag)</code> 只 put 一次，每个 flag 就只有一个写者。默认 engine 分配：发给第 k 个下游 peer 的第 i 次 put 用 <code>engines[(k − 1 + i·(n − 1)) mod E]</code>，peer 和 chunk 同时错开。</p>
+<ul>
+  <li><b>SDMA 引擎</b>：每个 peer 分配独立的 engine（16 个 engine 足够覆盖 7 个 peer，peer 更多时共享），各 rank 的 peer 顺序错开。按 chunk 发起。单个 engine 上，chunk 约 11 MB 才能达到 50% 的链路带宽（图 3）；更小的 chunk 要靠多个 engine 并行来重叠每次约 7 µs 的固定开销，这一点在阶段 1 验证。</li>
+  <li><b>CU 引擎</b>：用于小消息、flag，以及没有可用 SDMA 的环境。可以嵌进融合 kernel 里运行。</li>
+  <li><b>RS 改写为 A2A + 本地归约</b>：跨 rank 只有写；归约只读本地 HBM（单 CU 约 50 GB/s，远高于远端的 8–10 GB/s），结果确定。代价是多占 n 份 staging 显存。</li>
+</ul>
+<figure>
+<svg viewBox="0 0 960 320" role="img" aria-label="SDMA engine 分配与错开的发送顺序">
+  <text x="10" y="22" font-size="13" font-weight="600">rank 0 的 SDMA engine 分配（8 卡）</text>
+  <rect x="10" y="40" width="100" height="224" rx="8" fill="#ddf4ff" stroke="#54aeff"/>
+  <text x="60" y="148" font-size="14" font-weight="600" text-anchor="middle">rank 0</text>
+  <text x="60" y="168" font-size="11.5" text-anchor="middle" fill="#59636e">本地数据</text>
+  <g stroke="#59636e" stroke-width="1.2">
+    <line x1="110" y1="53" x2="140" y2="53"/><line x1="110" y1="86" x2="140" y2="86"/><line x1="110" y1="119" x2="140" y2="119"/>
+    <line x1="110" y1="152" x2="140" y2="152"/><line x1="110" y1="185" x2="140" y2="185"/><line x1="110" y1="218" x2="140" y2="218"/>
+    <line x1="110" y1="251" x2="140" y2="251"/>
+  </g>
+  <g stroke="#1a7f37" stroke-width="1.6" marker-end="url(#arrG)">
+    <line x1="260" y1="53" x2="298" y2="53"/><line x1="260" y1="86" x2="298" y2="86"/><line x1="260" y1="119" x2="298" y2="119"/>
+    <line x1="260" y1="152" x2="298" y2="152"/><line x1="260" y1="185" x2="298" y2="185"/><line x1="260" y1="218" x2="298" y2="218"/>
+    <line x1="260" y1="251" x2="298" y2="251"/>
+  </g>
+  <g font-size="12" text-anchor="middle">
+    <g fill="#dafbe1" stroke="#4ac26b">
+      <rect x="140" y="40" width="120" height="26" rx="4"/><rect x="140" y="73" width="120" height="26" rx="4"/><rect x="140" y="106" width="120" height="26" rx="4"/>
+      <rect x="140" y="139" width="120" height="26" rx="4"/><rect x="140" y="172" width="120" height="26" rx="4"/><rect x="140" y="205" width="120" height="26" rx="4"/>
+      <rect x="140" y="238" width="120" height="26" rx="4"/>
+    </g>
+    <text x="200" y="57">SDMA engine 0</text><text x="200" y="90">SDMA engine 1</text><text x="200" y="123">SDMA engine 2</text>
+    <text x="200" y="156">SDMA engine 3</text><text x="200" y="189">SDMA engine 4</text><text x="200" y="222">SDMA engine 5</text>
+    <text x="200" y="255">SDMA engine 6</text>
+    <g fill="#fff" stroke="#8c959f">
+      <rect x="300" y="40" width="110" height="26" rx="4"/><rect x="300" y="73" width="110" height="26" rx="4"/><rect x="300" y="106" width="110" height="26" rx="4"/>
+      <rect x="300" y="139" width="110" height="26" rx="4"/><rect x="300" y="172" width="110" height="26" rx="4"/><rect x="300" y="205" width="110" height="26" rx="4"/>
+      <rect x="300" y="238" width="110" height="26" rx="4"/>
+    </g>
+    <text x="355" y="57">rank 1 的 heap</text><text x="355" y="90">rank 2 的 heap</text><text x="355" y="123">rank 3 的 heap</text>
+    <text x="355" y="156">rank 4 的 heap</text><text x="355" y="189">rank 5 的 heap</text><text x="355" y="222">rank 6 的 heap</text>
+    <text x="355" y="255">rank 7 的 heap</text>
+  </g>
+  <text x="10" y="292" font-size="12" fill="#59636e">每个 peer 独占一个 engine，16 个 engine 还剩 9 个，可给每个 peer 加第二路</text>
+  <text x="10" y="310" font-size="12" fill="#59636e">（实测每个 peer 2 个 engine 时为 1.41 TB/s）；peer 超过 16 个时共享 engine</text>
+
+  <text x="480" y="22" font-size="13" font-weight="600">各 rank 的发送顺序错开：第 k 步发往 (r + k) mod 8</text>
+  <g font-size="12" text-anchor="middle">
+<text x="568" y="54">第 1 步</text><text x="624" y="54">第 2 步</text><text x="680" y="54">第 3 步</text><text x="736" y="54">第 4 步</text>
+<text x="792" y="54">第 5 步</text><text x="848" y="54">第 6 步</text><text x="904" y="54">第 7 步</text>
+<text x="530" y="79" text-anchor="end">rank 0</text>
+<rect x="540" y="62" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="568" y="79">1</text>
+<rect x="596" y="62" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="624" y="79">2</text>
+<rect x="652" y="62" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="680" y="79">3</text>
+<rect x="708" y="62" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="736" y="79">4</text>
+<rect x="764" y="62" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="792" y="79">5</text>
+<rect x="820" y="62" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="848" y="79">6</text>
+<rect x="876" y="62" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="904" y="79">7</text>
+<text x="530" y="105" text-anchor="end">rank 1</text>
+<rect x="540" y="88" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="568" y="105">2</text>
+<rect x="596" y="88" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="624" y="105">3</text>
+<rect x="652" y="88" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="680" y="105">4</text>
+<rect x="708" y="88" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="736" y="105">5</text>
+<rect x="764" y="88" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="792" y="105">6</text>
+<rect x="820" y="88" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="848" y="105">7</text>
+<rect x="876" y="88" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="904" y="105">0</text>
+<text x="530" y="131" text-anchor="end">rank 2</text>
+<rect x="540" y="114" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="568" y="131">3</text>
+<rect x="596" y="114" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="624" y="131">4</text>
+<rect x="652" y="114" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="680" y="131">5</text>
+<rect x="708" y="114" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="736" y="131">6</text>
+<rect x="764" y="114" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="792" y="131">7</text>
+<rect x="820" y="114" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="848" y="131">0</text>
+<rect x="876" y="114" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="904" y="131">1</text>
+<text x="530" y="157" text-anchor="end">rank 3</text>
+<rect x="540" y="140" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="568" y="157">4</text>
+<rect x="596" y="140" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="624" y="157">5</text>
+<rect x="652" y="140" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="680" y="157">6</text>
+<rect x="708" y="140" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="736" y="157">7</text>
+<rect x="764" y="140" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="792" y="157">0</text>
+<rect x="820" y="140" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="848" y="157">1</text>
+<rect x="876" y="140" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="904" y="157">2</text>
+<text x="530" y="183" text-anchor="end">rank 4</text>
+<rect x="540" y="166" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="568" y="183">5</text>
+<rect x="596" y="166" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="624" y="183">6</text>
+<rect x="652" y="166" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="680" y="183">7</text>
+<rect x="708" y="166" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="736" y="183">0</text>
+<rect x="764" y="166" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="792" y="183">1</text>
+<rect x="820" y="166" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="848" y="183">2</text>
+<rect x="876" y="166" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="904" y="183">3</text>
+<text x="530" y="209" text-anchor="end">rank 5</text>
+<rect x="540" y="192" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="568" y="209">6</text>
+<rect x="596" y="192" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="624" y="209">7</text>
+<rect x="652" y="192" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="680" y="209">0</text>
+<rect x="708" y="192" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="736" y="209">1</text>
+<rect x="764" y="192" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="792" y="209">2</text>
+<rect x="820" y="192" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="848" y="209">3</text>
+<rect x="876" y="192" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="904" y="209">4</text>
+<text x="530" y="235" text-anchor="end">rank 6</text>
+<rect x="540" y="218" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="568" y="235">7</text>
+<rect x="596" y="218" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="624" y="235">0</text>
+<rect x="652" y="218" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="680" y="235">1</text>
+<rect x="708" y="218" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="736" y="235">2</text>
+<rect x="764" y="218" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="792" y="235">3</text>
+<rect x="820" y="218" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="848" y="235">4</text>
+<rect x="876" y="218" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="904" y="235">5</text>
+<text x="530" y="261" text-anchor="end">rank 7</text>
+<rect x="540" y="244" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="568" y="261">0</text>
+<rect x="596" y="244" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="624" y="261">1</text>
+<rect x="652" y="244" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="680" y="261">2</text>
+<rect x="708" y="244" width="56" height="26" fill="#dafbe1" stroke="#fff" stroke-width="2"/><text x="736" y="261">3</text>
+<rect x="764" y="244" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="792" y="261">4</text>
+<rect x="820" y="244" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="848" y="261">5</text>
+<rect x="876" y="244" width="56" height="26" fill="#ddf4ff" stroke="#fff" stroke-width="2"/><text x="904" y="261">6</text>
+  </g>
+  <g font-size="12">
+    <rect x="540" y="284" width="12" height="12" fill="#ddf4ff" stroke="#54aeff"/><text x="558" y="295">tray 内</text>
+    <rect x="620" y="284" width="12" height="12" fill="#dafbe1" stroke="#4ac26b"/><text x="638" y="295">跨 tray</text>
+    <text x="700" y="295" fill="#59636e">每一列 8 个目的地互不相同</text>
+  </g>
+</svg>
+<figcaption><b>图 10　L1 的 SDMA 调度。</b>左：每个 peer 一个 engine，7 路并发。右：数据按 chunk 发送时，第 k 步 rank r 发往 (r + k) mod 8，每一步每个 rank 恰好只被一个 rank 写，入站流量均匀，不会有多个 rank 同时挤向同一个目的地。</figcaption>
+</figure>
+
+<h3 id="l2">L2 融合算子 <span class="tag wip">阶段 2</span></h3>
+<p>GEMM 是 persistent kernel，只增加一个能力：每个 m-tile 在计算前，等待它依赖的 chunk 的 flag；tile 的调度顺序按 chunk 的到达顺序排，本地 chunk 先算。</p>
+<table>
+  <tr><th>算子</th><th>数据流</th><th>谁在搬</th></tr>
+  <tr><td>AG-GEMM</td><td>每个 rank 把自己的 A 按 chunk 推给所有 peer 的 recv bank，每个 chunk 置一个 flag；GEMM 按 flag 放行 tile，直接从 bank 读 A</td><td>SDMA</td></tr>
+  <tr><td>GEMM-RS</td><td>GEMM 把 partial 写进本地 staging，每算完一个 chunk 置 flag；flag 触发 SDMA，把这块 partial 推到拥有者的 staging 槽位；拥有者等齐 n 份后在本地归约</td><td>SDMA 搬，CU 归约</td></tr>
+  <tr><td>A2A-GEMM</td><td>与 AG-GEMM 相同，只是按目的地切片，GEMM 按到达顺序遍历 K 段</td><td>SDMA</td></tr>
+  <tr><td>GEMM-A2A</td><td>与 GEMM-RS 相同，但不需要归约，按列块分发到各 rank</td><td>SDMA</td></tr>
+</table>
+<figure>
+<svg viewBox="0 0 960 290" role="img" aria-label="AG-GEMM 的时间线">
+  <g font-size="12.5" font-weight="600">
+    <text x="10" y="56">出站（SDMA）</text><text x="10" y="120">入站（recv bank）</text><text x="10" y="200">GEMM（persistent）</text>
+  </g>
+  <g font-size="11.5" fill="#59636e">
+    <text x="10" y="72">本地 A → 各 peer</text><text x="10" y="136">各 peer 推来的 A 分块</text><text x="10" y="216">按 flag 放行 m-tile</text>
+  </g>
+  <!-- outbound -->
+  <g fill="#dafbe1" stroke="#4ac26b">
+    <rect x="170" y="38" width="480" height="12" rx="2"/><rect x="170" y="53" width="480" height="12" rx="2"/><rect x="170" y="68" width="480" height="12" rx="2"/>
+  </g>
+  <g font-size="10.5"><text x="178" y="48">本地 A → peer 1</text><text x="178" y="63">本地 A → peer 2</text><text x="178" y="78">本地 A → peer 3</text></g>
+  <text x="670" y="58" font-size="11.5" fill="#59636e">每个 peer 一个 engine，同时进行</text>
+  <!-- inbound -->
+  <g font-size="11.5" text-anchor="middle">
+    <rect x="170" y="105" width="80" height="32" fill="#b6e3ff" stroke="#54aeff"/><text x="210" y="125">P1·0</text>
+    <rect x="250" y="105" width="80" height="32" fill="#aceebb" stroke="#4ac26b"/><text x="290" y="125">P2·0</text>
+    <rect x="330" y="105" width="80" height="32" fill="#f5e0a0" stroke="#d4a72c"/><text x="370" y="125">P3·0</text>
+    <rect x="410" y="105" width="80" height="32" fill="#b6e3ff" stroke="#54aeff"/><text x="450" y="125">P1·1</text>
+    <rect x="490" y="105" width="80" height="32" fill="#aceebb" stroke="#4ac26b"/><text x="530" y="125">P2·1</text>
+    <rect x="570" y="105" width="80" height="32" fill="#f5e0a0" stroke="#d4a72c"/><text x="610" y="125">P3·1</text>
+  </g>
+  <g fill="#cf222e">
+    <path d="M245,147 L250,139 L255,147 z"/><path d="M325,147 L330,139 L335,147 z"/><path d="M405,147 L410,139 L415,147 z"/>
+    <path d="M485,147 L490,139 L495,147 z"/><path d="M565,147 L570,139 L575,147 z"/><path d="M645,147 L650,139 L655,147 z"/>
+  </g>
+  <text x="670" y="118" font-size="11.5" fill="#59636e">入站链路由各 peer 共享，</text>
+  <text x="670" y="134" font-size="11.5" fill="#59636e">图中按完成顺序画</text>
+  <!-- flag -> tile -->
+  <g stroke="#cf222e" stroke-width="1" stroke-dasharray="3 3" fill="none" marker-end="url(#arrR)">
+    <line x1="250" y1="148" x2="328" y2="183"/><line x1="330" y1="148" x2="408" y2="183"/><line x1="410" y1="148" x2="488" y2="183"/>
+    <line x1="490" y1="148" x2="568" y2="183"/><line x1="570" y1="148" x2="648" y2="183"/><line x1="650" y1="148" x2="728" y2="183"/>
+  </g>
+  <!-- GEMM -->
+  <g font-size="11.5" text-anchor="middle">
+    <rect x="170" y="185" width="160" height="32" fill="#d0d7de" stroke="#8c959f"/><text x="250" y="205">本地 A（不用等）</text>
+    <rect x="330" y="185" width="80" height="32" fill="#b6e3ff" stroke="#54aeff"/><text x="370" y="205">P1·0</text>
+    <rect x="410" y="185" width="80" height="32" fill="#aceebb" stroke="#4ac26b"/><text x="450" y="205">P2·0</text>
+    <rect x="490" y="185" width="80" height="32" fill="#f5e0a0" stroke="#d4a72c"/><text x="530" y="205">P3·0</text>
+    <rect x="570" y="185" width="80" height="32" fill="#b6e3ff" stroke="#54aeff"/><text x="610" y="205">P1·1</text>
+    <rect x="650" y="185" width="80" height="32" fill="#aceebb" stroke="#4ac26b"/><text x="690" y="205">P2·1</text>
+    <rect x="730" y="185" width="80" height="32" fill="#f5e0a0" stroke="#d4a72c"/><text x="770" y="205">P3·1</text>
+  </g>
+  <g font-size="11.5" fill="#59636e">
+    <text x="822" y="190">只要每个 chunk 的</text><text x="822" y="206">计算时间 ≥ 传输时间，</text><text x="822" y="222">GEMM 就不会停顿</text>
+  </g>
+  <line x1="170" y1="242" x2="940" y2="242" stroke="#59636e" marker-end="url(#arr)"/>
+  <text x="936" y="258" font-size="12" text-anchor="end" fill="#59636e">时间</text>
+  <g font-size="12">
+    <rect x="170" y="268" width="14" height="12" fill="#d0d7de" stroke="#8c959f"/><text x="190" y="279">本地分块</text>
+    <rect x="260" y="268" width="14" height="12" fill="#b6e3ff" stroke="#54aeff"/><text x="280" y="279">来自 peer 1</text>
+    <rect x="365" y="268" width="14" height="12" fill="#aceebb" stroke="#4ac26b"/><text x="385" y="279">来自 peer 2</text>
+    <rect x="470" y="268" width="14" height="12" fill="#f5e0a0" stroke="#d4a72c"/><text x="490" y="279">来自 peer 3</text>
+    <path d="M580,280 L585,270 L590,280 z" fill="#cf222e"/><text x="596" y="279">该分块的 flag 到达（值 = epoch）</text>
+  </g>
+</svg>
+<figcaption><b>图 11　AG-GEMM 的时间线（4 rank 为例，每个 peer 的 A 切成 2 个 chunk）。</b>GEMM 先算本地分块，掩盖第一个 chunk 的传输；之后按 flag 到达的顺序放行对应的 m-tile。</figcaption>
+</figure>
+<figure>
+<svg viewBox="0 0 960 290" role="img" aria-label="GEMM-RS 的数据流">
+  <rect x="10" y="10" width="420" height="270" rx="10" fill="#fff" stroke="#8c959f"/>
+  <text x="24" y="34" font-size="14" font-weight="600">rank r</text>
+  <rect x="530" y="10" width="420" height="270" rx="10" fill="#fff" stroke="#8c959f"/>
+  <text x="544" y="34" font-size="14" font-weight="600">rank j（输出分片 C_j 的拥有者）</text>
+  <!-- rank r -->
+  <rect x="30" y="60" width="130" height="60" rx="6" fill="#ddf4ff" stroke="#54aeff"/>
+  <text x="95" y="86" font-size="13" text-anchor="middle" font-weight="600">GEMM</text>
+  <text x="95" y="104" font-size="11.5" text-anchor="middle" fill="#59636e">按目的 rank 分块算</text>
+  <line x1="160" y1="90" x2="196" y2="90" stroke="#59636e" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="198" y="56" font-size="12" fill="#59636e">本地 staging（每个目的 rank 一段）</text>
+  <g font-size="11.5" text-anchor="middle">
+    <rect x="200" y="66" width="52" height="48" fill="#f6f8fa" stroke="#8c959f"/><text x="226" y="94">→ 0</text>
+    <rect x="252" y="66" width="52" height="48" fill="#f6f8fa" stroke="#8c959f"/><text x="278" y="94">→ 1</text>
+    <rect x="304" y="66" width="52" height="48" fill="#fff8c5" stroke="#d4a72c"/><text x="330" y="94">→ j</text>
+    <rect x="356" y="66" width="52" height="48" fill="#f6f8fa" stroke="#8c959f"/><text x="382" y="94">…</text>
+  </g>
+  <path d="M95,120 V210 H198" fill="none" stroke="#0969da" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#arrB)"/>
+  <text x="104" y="160" font-size="11.5" fill="#0969da">分块算完，</text>
+  <text x="104" y="176" font-size="11.5" fill="#0969da">写本地 flag</text>
+  <line x1="330" y1="114" x2="330" y2="188" stroke="#59636e" stroke-width="1.4" marker-end="url(#arr)"/>
+  <text x="338" y="156" font-size="11.5" fill="#59636e">读本地</text>
+  <rect x="200" y="190" width="210" height="44" rx="6" fill="#dafbe1" stroke="#4ac26b"/>
+  <text x="305" y="210" font-size="12.5" text-anchor="middle" font-weight="600">SDMA engine（→ rank j）</text>
+  <text x="305" y="226" font-size="11" text-anchor="middle" fill="#59636e">等到 flag 后开始拷贝</text>
+  <!-- cross rank -->
+  <line x1="410" y1="212" x2="566" y2="212" stroke="#1a7f37" stroke-width="2.2" marker-end="url(#arrG)"/>
+  <text x="488" y="202" font-size="12" text-anchor="middle" fill="#1a7f37" font-weight="600">数据 + flag</text>
+  <text x="488" y="232" font-size="11.5" text-anchor="middle" fill="#1a7f37">跨 rank 只有写</text>
+  <!-- rank j -->
+  <text x="570" y="62" font-size="12" fill="#59636e">staging 槽位（每个来源 rank 一段）</text>
+  <g font-size="11.5">
+    <rect x="570" y="72" width="170" height="30" fill="#f6f8fa" stroke="#8c959f"/><text x="580" y="92">来自 rank 0 的 partial</text>
+    <rect x="570" y="102" width="170" height="30" fill="#f6f8fa" stroke="#8c959f"/><text x="580" y="122">来自 rank 1 的 partial</text>
+    <rect x="570" y="132" width="170" height="30" fill="#f6f8fa" stroke="#8c959f"/><text x="580" y="152">…</text>
+    <rect x="570" y="192" width="170" height="40" fill="#fff8c5" stroke="#d4a72c"/><text x="580" y="217">来自 rank r 的 partial</text>
+    <rect x="570" y="162" width="170" height="30" fill="#f6f8fa" stroke="#8c959f"/><text x="580" y="182">…</text>
+  </g>
+  <line x1="740" y1="152" x2="776" y2="152" stroke="#59636e" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="746" y="140" font-size="11" fill="#59636e">等齐 n 个</text>
+  <text x="746" y="172" font-size="11" fill="#59636e">flag</text>
+  <rect x="780" y="120" width="150" height="64" rx="6" fill="#ddf4ff" stroke="#54aeff"/>
+  <text x="855" y="146" font-size="12.5" text-anchor="middle" font-weight="600">本地归约（CU）</text>
+  <text x="855" y="166" font-size="11.5" text-anchor="middle" fill="#59636e">按固定 rank 顺序</text>
+  <line x1="855" y1="120" x2="855" y2="84" stroke="#59636e" stroke-width="1.5" marker-end="url(#arr)"/>
+  <rect x="790" y="46" width="130" height="36" rx="6" fill="#dafbe1" stroke="#4ac26b"/>
+  <text x="855" y="69" font-size="12.5" text-anchor="middle" font-weight="600">输出分片 C_j</text>
+  <text x="855" y="214" font-size="11.5" text-anchor="middle" fill="#59636e">只读本地 HBM，</text>
+  <text x="855" y="230" font-size="11.5" text-anchor="middle" fill="#59636e">结果 bitwise 确定</text>
+</svg>
+<figcaption><b>图 12　GEMM-RS 改写为"A2A + 本地归约"。</b>每个 rank 的 GEMM 把发给 rank j 的 partial 写进本地 staging，SDMA 推到 rank j 对应来源的槽位；rank j 等齐 n 份后按固定顺序归约。所有 rank 对称地执行同样的流程，图中只画出 r → j 一条路径。</figcaption>
+</figure>
+<p>"flag 触发 SDMA"用 HSA copy 的依赖信号实现：put 时 host 就把拷贝提交给 SDMA，拷贝依赖一个闸门信号；GPU kernel 在 stream 上把闸门清零，SDMA 随即开始，不经过 host 轮询。e15-01 上已验证（GEMM-RS 每算完一块就 <code>release</code> 一次）。</p>
+<p><b>当前实现（GEMM 无关的版本，<code>comm_method="sdma"</code>）</b>：<code>pytorch/kernels/async_tp/sdma_impl.py</code>，接在 <code>fused_all_gather_matmul</code> / <code>fused_all_gather_scaled_matmul</code> / <code>fused_matmul_reduce_scatter</code> 后面。GEMM 仍是 hipBLASLt，按块在调用方的 stream 上执行，stream 在每块之前 <code>wait_flag</code>：</p>
+<ul>
+  <li>AG-GEMM：先把本 rank 的 A（以及行 scale）按 <code>num_splits</code> 块 put 给所有 peer，<code>release</code> 后先算本地分块；之后按发送顺序（rank r 第 k 步收到 r − k 的数据）逐块 <code>wait_flag</code> 再算。GEMM 直接从 bank 读 A；bank 默认不走 cache，实测 GEMM 只慢 0–4.6%。</li>
+  <li>GEMM-RS：按目的 rank、按块计算 partial 写入本地 staging，每块算完立刻 put 并 <code>release</code>；本 rank 的行最后算；<code>wait</code> 后按 rank 顺序以 fp32 归约，结果确定。</li>
+  <li>tile 级的"按 flag 放行"仍是下一步：需要 gfx1250 的 persistent GEMM（FlyDSL）读 <code>flags()</code>。</li>
+</ul>
+
+<h3 id="l3">L3 模型算子 <span class="tag todo">阶段 3</span></h3>
+<p>Ulysses 的 QKV / O 投影、MLA latent 投影等，都改写成 L2 之上的布局描述：每个 rank 的哪些行（或列块）发给谁，在对端落在什么偏移。新增一个模型算子只需要写描述，不需要写 kernel。对外接口沿用 <code>async_tp.py</code> 里已有的 <code>fused_all_gather_matmul</code> / <code>fused_matmul_reduce_scatter</code>，名字与 PyTorch 一致；Ulysses 和 MLA 的现有接口保持不变。</p>
+
+<!-- ======================================================================= -->
+<h2 id="engine">7. 搬运引擎的选择</h2>
+<table>
+  <tr><th>场景</th><th>引擎</th><th>原因</th></tr>
+  <tr><td>每个 peer 的数据量 ≥ 约 4 MB（训练里的 AG / A2A / RS 大多如此）</td><td><b>SDMA</b></td><td>带宽最高、不占 CU、不干扰 GEMM</td></tr>
+  <tr><td>每个 peer 的数据量很小（推理 decode、小 batch）</td><td>CU</td><td>SDMA 每次约 7 µs 的固定开销占主导</td></tr>
+  <tr><td>需要边搬边算（归约、量化、加 residual）</td><td>SDMA 搬 + CU 在本地算</td><td>远端只写；计算只碰本地 HBM</td></tr>
+  <tr><td>flag、少量控制数据</td><td>CU（或 SDMA 在数据之后补写）</td><td>延迟最低</td></tr>
+  <tr><td>MI355X 等 SDMA 单 engine 较弱的平台</td><td>CU</td><td>由 autotune 根据实测决定阈值</td></tr>
+</table>
+
+<!-- ======================================================================= -->
+<h2 id="sync">8. 同步协议</h2>
+<figure>
+<svg viewBox="0 0 960 290" role="img" aria-label="epoch 双 bank 协议与 SDMA 的顺序要求">
+  <!-- left: epoch / bank -->
+  <text x="10" y="22" font-size="13" font-weight="600">epoch + 双 bank（沿用 fused_collective_gemm 的协议）</text>
+  <g font-size="12.5" fill="#59636e"><text x="20" y="75">bank 0</text><text x="20" y="125">bank 1</text></g>
+  <line x1="90" y1="70" x2="460" y2="70" stroke="#d1d9e0"/><line x1="90" y1="120" x2="460" y2="120" stroke="#d1d9e0"/>
+  <g text-anchor="middle">
+    <rect x="95" y="50" width="110" height="40" rx="5" fill="#ddf4ff" stroke="#54aeff"/>
+    <text x="150" y="67" font-size="12.5" font-weight="600">调用 e = 2</text><text x="150" y="83" font-size="11" fill="#59636e">flag 写入 2</text>
+    <rect x="210" y="100" width="110" height="40" rx="5" fill="#dafbe1" stroke="#4ac26b"/>
+    <text x="265" y="117" font-size="12.5" font-weight="600">调用 e = 3</text><text x="265" y="133" font-size="11" fill="#59636e">flag 写入 3</text>
+    <rect x="325" y="50" width="110" height="40" rx="5" fill="#ddf4ff" stroke="#54aeff"/>
+    <text x="380" y="67" font-size="12.5" font-weight="600">调用 e = 4</text><text x="380" y="83" font-size="11" fill="#59636e">flag 写入 4</text>
+  </g>
+  <path d="M205,46 C240,30 290,30 323,46" fill="none" stroke="#9a6700" stroke-width="1.3" marker-end="url(#arr)"/>
+  <text x="264" y="30" font-size="11" text-anchor="middle" fill="#9a6700">bank 0 复用</text>
+  <g font-size="12">
+    <text x="20" y="176">· epoch 存在 state[0]，从 1 开始；最后一个退出的 block 把它加 1</text>
+    <text x="20" y="198">· 使用 bank epoch &amp; 1，flag 写入值 = epoch，等待方 spin 到 flag ≥ epoch</text>
+    <text x="20" y="220">· flag 只增不减，不用清零；不需要 host 同步，可进 CUDA graph</text>
+    <text x="20" y="242">· 调用 e + 2 开始时，所有 peer 都已完成调用 e，</text>
+    <text x="20" y="260">　所以 bank e &amp; 1 可以直接复用，不需要确认或 barrier</text>
+  </g>
+  <line x1="478" y1="10" x2="478" y2="280" stroke="#d1d9e0"/>
+  <!-- right: SDMA ordering -->
+  <text x="494" y="22" font-size="13" font-weight="600" fill="#9a6700">SDMA 的顺序要求：先数据、后 flag</text>
+  <text x="500" y="46" font-size="12" fill="#59636e">rank r 的 SDMA 队列（发往 rank j）</text>
+  <g font-size="11.5" text-anchor="middle">
+    <rect x="500" y="54" width="110" height="34" fill="#dafbe1" stroke="#4ac26b"/><text x="555" y="75">chunk 0 数据</text>
+    <rect x="612" y="54" width="40" height="34" fill="#ffebe9" stroke="#cf222e"/><text x="632" y="75">flag</text>
+    <rect x="654" y="54" width="110" height="34" fill="#dafbe1" stroke="#4ac26b"/><text x="709" y="75">chunk 1 数据</text>
+    <rect x="766" y="54" width="40" height="34" fill="#ffebe9" stroke="#cf222e"/><text x="786" y="75">flag</text>
+    <text x="830" y="75" fill="#59636e">…</text>
+  </g>
+  <text x="500" y="160" font-size="12" fill="#59636e">rank j 的 GEMM（等待方）</text>
+  <g font-size="11.5" text-anchor="middle">
+    <rect x="500" y="168" width="130" height="34" fill="#f6f8fa" stroke="#8c959f"/><text x="565" y="189">等待 flag₀ ≥ epoch</text>
+    <rect x="630" y="168" width="130" height="34" fill="#ddf4ff" stroke="#54aeff"/><text x="695" y="189">算 chunk 0 的 tile</text>
+    <rect x="760" y="168" width="130" height="34" fill="#ddf4ff" stroke="#54aeff"/><text x="825" y="189">算 chunk 1 的 tile</text>
+  </g>
+  <g stroke="#cf222e" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#arrR)">
+    <line x1="632" y1="88" x2="630" y2="166"/><line x1="786" y1="88" x2="762" y2="166"/>
+  </g>
+  <text x="640" y="130" font-size="11" fill="#cf222e">跨 tray 约 2.5–3 µs</text>
+  <g font-size="12">
+    <text x="494" y="232">要求：flag 对 rank j 可见时，同一 chunk 的数据必须已经可见</text>
+    <text x="494" y="252" fill="#59636e">采用：同一 engine 上的 8 字节 flag 拷贝，</text>
+    <text x="494" y="272" fill="#59636e">依赖数据拷贝的完成信号（signal-after-copy 不可用）</text>
+  </g>
+</svg>
+<figcaption><b>图 13　同步协议。</b>左：现有的 epoch + 双 bank 协议，L1 直接沿用。右：flag 改由 SDMA 写之后需要额外保证的顺序；e15-01 上已用依赖信号实现并通过逐位校验。</figcaption>
+</figure>
+<ul>
+  <li><b>沿用现有的 epoch + 双 bank 协议</b>（<code>fused_collective_gemm/workspace.py</code>）：每次调用从 <code>state[0]</code> 读 epoch，使用 <code>epoch &amp; 1</code> 号 bank，flag 的值就是 epoch，等待方 spin 到 <code>flag ≥ epoch</code>。两个 bank 交替使用，不需要额外的确认或 barrier，也能进 CUDA graph。</li>
+  <li><b>SDMA 的顺序保证</b>：同一个 chunk 的数据和 flag 必须"先数据、后 flag"可见。原计划用 <code>hsa_amd_memory_async_batch_copy</code> 的 signal-after-copy（拷贝后由 SDMA 原子写任意地址），但在 e15-01（gfx1250）上实测不可用：容器的 ROCm 7 和宿主机的 ROCm 10.2 运行库都接受这个参数，拷贝也完成了，目标地址却始终没被写（host 内存、device 内存都试过）；宿主机运行库上，之后同一队列的 SDMA 工作也不再完成。现在的实现这样串起来：
+    <ol>
+      <li>数据拷贝用 <code>hsa_amd_memory_async_copy_on_engine</code> 发到指定 engine，依赖一个 HSA 信号（闸门）。</li>
+      <li>flag 是同一个 engine 上的第二个拷贝：8 字节，源是本 slot 的 epoch 字，目的地是对端的 flag，依赖数据拷贝的完成信号。HSA 只在拷贝的数据可见后才递减完成信号，所以 flag 一定在数据之后。</li>
+      <li>stream 上一个单 wave 的 kernel 先写 epoch 字，再以 system scope release 把闸门清零。release 会写回 L2，所以 SDMA 读到的是 stream 上游已经产生的数据。这一步就是"GPU 触发 SDMA"，不经过 host。<code>release()</code> 可以调用多次，每次打开一个新的闸门，对应 GEMM-RS 里"算完一块发一块"。</li>
+      <li><code>wait</code> / <code>wait_flag</code> 在同一个带超时的 kernel 里先开闸，再等：本 rank 发出的 flag 拷贝都已完成，以及对应 peer 的 flag 已到达。</li>
+    </ol>
+    e15-01 上 GPU 侧一次调用（开闸 → 数据 → flag → 等待）约 23–28 µs；host 侧提交约 48 µs（4 卡 all-gather：每个拷贝约 2.5 µs 的 HSA 调用，加一次约 12 µs 的 Triton launch），背靠背的小消息 microbenchmark 因此受 host 限制，训练中 host 通常领先 GPU。这条路径由 host 按次提交 SDMA 工作，所以 epoch 是 host 侧的计数器，不能进 CUDA graph。</li>
+  <li><b>延迟预算</b>：flag 单程约 2.5–3 µs，按 chunk 粒度同步完全可以接受；不建议按单个 tile 跨 rank 同步。</li>
+  <li><b>所有 spin 等待必须有超时</b>：DeepEP V2 的经验是，在 gfx1250 上驱动抢占或销毁一个仍在 spin 的队列时，MES 可能进入不可恢复的状态。本次测试中 e15-02 驱动卡死，很可能就是这类情况。spin 超时后应该 trap，而不是一直等待。</li>
+</ul>
+
+<!-- ======================================================================= -->
+<h2 id="existing">9. 与现有代码的关系</h2>
+<table>
+  <tr><th>现有部分</th><th>处理</th></tr>
+  <tr><td><code>SymmetricMemory</code>（<code>pytorch/core/symm_mem.py</code>）</td><td>保留接口，增加 fabric 后端（已完成）。mega、DeepEP intranode、<code>fused_collective_gemm</code>、<code>async_tp</code> 都通过它拿对称内存，因此在内存层面自动支持跨 tray。</td></tr>
+  <tr><td><code>fused_collective_gemm</code> 的四个 kernel</td><td>gfx950 上保持不变。不直接移植到 gfx1250，原因有三：写死 wave64 / 8 XCD；<code>SYS_NT=0x13</code> 在 gfx1250 上会被解释成 TH_LU + SCOPE_DEV，语义不对；通信完全依赖 CU，在 MI455 上代价过高。它们的协议设计（epoch / bank、按到达顺序调度 tile、确定性归约）会被 L1 和 L2 吸收。</td></tr>
+  <tr><td><code>async_tp</code>（AG-GEMM / GEMM-RS，按 chunk 切分）</td><td>接口保留，作为 L3 对外的 TP 入口。它内部用 <code>hipMemcpyAsync</code> 写 peer，在跨 tray 的 fabric 内存上只有 268 GB/s，需要换成 L1 的 SDMA 路径。</td></tr>
+  <tr><td>DeepEP V2（MI455X）</td><td>它的 <code>ArchTraits</code>（wave32、拆分的等待计数器、缓存策略位、watchdog）是 gfx1250 上 CU 引擎的现成参考，L1 的 CU 引擎应复用。</td></tr>
+</table>
+
+<!-- ======================================================================= -->
+<h2 id="plan">10. 分阶段计划</h2>
+<table>
+  <tr><th>阶段</th><th>内容</th><th>状态</th></tr>
+  <tr><td>0</td><td>
+    fabric 版 <code>SymmetricMemory</code>；新环境变量登记在 <code>envs.py</code>、<code>docs/env.md</code>；测试 <code>tests/pytorch/core/test_symm_mem.py</code><br>
+    · e15-01 单机 4 卡：IPC 和 fabric 两种后端全部通过（零初始化、跨 rank 读写、signal pad、GPU barrier、uncached、反复销毁重建）<br>
+    · <code>bench_xgmi_read_write.py</code>：两种后端的 push、pull 带宽差别 &lt; 1%<br>
+    · 跨 tray 8 卡：第一次运行的数据检查全部通过；随后 e15-02 驱动卡死。重启后复测时，RCCL 在建立通信器时报错（<code>p2p_tmp.cc:376 invalid argument</code>），与对称内存无关；测试已改用 gloo 进程组，<b>待复测</b><br>
+    · <code>SymmetricMemory.barrier()</code> 的两段 spin 已加实时时钟看门狗。e15-01 单卡实测：对端永远不到时，kernel 约 2 s（测试用的超时值）后 trap 退出，报错里写明 kernel 名，之后 GPU 仍可正常使用</td>
+    <td><span class="tag wip">基本完成</span></td></tr>
+  <tr><td>1</td><td>L1 通信原语：SDMA 的 put + signal（数据后 flag 的顺序、GPU 触发 SDMA）；独立的 AG / A2A / RS，在 8 卡上与 RCCL 对比正确性和性能；验证 CUDA graph<br>
+    · 代码：HSA 的 ctypes 封装 <code>pytorch/core/pyhsa_runtime_wrapper.py</code>；<code>SdmaCommunicator</code>（<code>pytorch/dist/sdma_comm.py</code>）：公开原语 <code>begin</code> / <code>put</code> / <code>release</code> / <code>wait_flag</code> / <code>wait</code> / <code>flags</code>，以及由它组合的 <code>all_gather</code> / <code>all_to_all</code> / <code>reduce_scatter</code>（带 <code>num_chunks</code>）<br>
+    · 测试 <code>tests/pytorch/dist/test_sdma_comm.py</code>：3 种 dtype × 4 种大小，每种连续 5 轮，chunk 数在 1–4 之间轮换，不做 host 同步，覆盖两个 bank 和全部信号槽的循环使用，逐位比对；另用 <code>put</code> 直接拼一个自定义布局的 all-gather（两个 release 点，第二批数据在第一次 release 之后才在 stream 上产生，逐 peer <code>wait_flag</code>，乱序 flag，含 0 字节 put）；只用 gloo 进程组。<b>e15-01 单机 2 / 3 / 4 卡全部通过</b>（含 1 字节拷贝；bank 走 cache 时 3 次也都通过）<br>
+    · 性能（e15-01，4 卡，每 peer 64 MiB）：SDMA all-gather / all-to-all 出口约 1.32 TB/s，RCCL 0.52 TB/s；reduce-scatter 0.89 TB/s，略低于 RCCL 的 0.93 TB/s（本地归约占时间）。16 MiB 以下 SDMA 每次调用约 62–80 µs 的固定耗时（之后 host 提交从约 58 µs 降到约 48 µs），受 host 提交限制（见第 8 节），而 RCCL all-gather 只要 17–28 µs；同样大小下 chunk 越多越慢<br>
+    · 尚未实现：CU 引擎和 <code>engine="auto"</code> 的选择（当前只有 SDMA）；跨 tray 8 卡复测<br>
+    · CUDA graph 暂不支持（见第 8 节）</td><td><span class="tag wip">单机验证通过</span></td></tr>
+  <tr><td>2</td><td>gfx1250 GEMM 加"按 flag 放行 tile"的钩子；通用 AG-GEMM、GEMM-RS，接入 <code>async_tp</code> 接口<br>
+    · 已完成 GEMM 无关的版本：<code>comm_method="sdma"</code>（<code>pytorch/kernels/async_tp/sdma_impl.py</code>，见 L2 一节），复用 <code>ag_gemm_impl</code> 里各种 scale 模式的 consumer<br>
+    · e15-01 4 卡：<code>test_fused_all_gather_matmul.py</code> 的小规模用例（bf16 / fp16，fp8 tensor-wise / row-wise-sharded / row-wise-replicated，gather_dim 0 / 1）全部通过，A 逐位相等；<code>test_fused_matmul_reduce_scatter.py</code> 的小规模用例和 Llama3-70B 形状通过<br>
+    · Llama3-70B 形状的 AG-GEMM 未得出结论：现有 <code>tile</code> 方法的 Triton kernel（<code>kernel_gemm_rs_producer_fuse_scatter</code>）在 gfx1250 上大量 page fault，随后两张卡（0003、0004）的 MES 失去响应，之后在这两张卡上的结果（包括一次不一致、<code>pipeline</code> 方法超时）都不可信；GPU reset 失败，需要重启后复测<br>
+    · 未做：tile 级的 flag 放行（需要 gfx1250 persistent GEMM）</td><td><span class="tag wip">进行中</span></td></tr>
+  <tr><td>3</td><td>Ulysses A2A、MLA latent 改写为 L3 布局描述；CU 小消息路径；按消息大小自动选择引擎</td><td><span class="tag todo">未开始</span></td></tr>
+  <tr><td>4</td><td>vpod 扩大后扩展到 16 卡及以上；peer 数超过 engine 数时的 engine 共享策略</td><td><span class="tag todo">未开始</span></td></tr>
+</table>
+
+<!-- ======================================================================= -->
+<h2 id="risks">11. 风险与待验证</h2>
+<table>
+  <tr><th>优先级</th><th>问题</th><th>影响</th><th>验证方法</th></tr>
+  <tr><td class="badc">高</td><td>SDMA "先数据、后 flag"的顺序保证；GPU kernel 能否通过依赖信号触发 SDMA</td><td>决定 GEMM-RS 能否完全不经过 host</td><td>单机已解决：signal-after-copy 在 gfx1250 上不可用，改为依赖数据拷贝完成信号的 flag 拷贝（第 8 节），<code>test_sdma_comm.py</code> 在 2–4 卡逐位通过，含 1 字节拷贝。跨 tray 待复测</td></tr>
+  <tr><td class="badc">高</td><td><code>async_tp</code> 的 <code>tile</code> 方法在 gfx1250 上 page fault</td><td>一次运行就让两张卡的 MES 失去响应、reset 失败，整机需要重启</td><td>gfx1250 上不要运行 <code>tile</code>（测试的 Llama3-70B GEMM-RS 用例仍包含它）；它属于未移植到 gfx1250 的 kernel</td></tr>
+  <tr><td class="badc">高</td><td>HSA 的 SDMA 调用能否进 CUDA graph；<code>hipMemcpyAsync</code> 写导入内存的慢路径</td><td>graph 模式下能否使用 SDMA</td><td>graph capture 实验；向 ROCm 报 bug</td></tr>
+  <tr><td class="badc">高</td><td>spin 中的队列被驱动销毁或抢占后，MES 可能进入不可恢复状态</td><td>整机 GPU 不可用，需要重启</td><td>所有 spin 加超时并 trap；进程退出前确保没有在 spin 的 kernel</td></tr>
+  <tr><td class="warnc">中</td><td>8 卡全双向通信，再叠加 GEMM 的 HBM 压力时，SDMA 是否仍然不影响 GEMM</td><td>3.5 节只测了单路 copy 加 GEMM</td><td>阶段 1、2 的端到端测试</td></tr>
+  <tr><td class="warnc">中</td><td>SDMA 每次约 7 µs 的固定开销能否降低（批量提交、直接写 SDMA 队列），多个 engine 并行时能否互相重叠</td><td>决定可用的最小 chunk 和 SDMA / CU 的分界点</td><td>阶段 1</td></tr>
+  <tr><td class="warnc">中</td><td>tray 内流量是否真的经过 UALink 交换机</td><td>影响对拓扑扁平性的解释，不影响设计</td><td>向硬件团队确认</td></tr>
+  <tr><td>低</td><td>Helios 交换机是否支持 multicast 或 in-network reduction</td><td>如果支持，会是 AG / RS 的更优路径</td><td>向硬件团队确认</td></tr>
+  <tr><td>低</td><td>TDM 直接从远端读进 LDS（GEMM 里的 pull 路径）</td><td>DeepEP V2 的数据显示单 CU 吞吐同样受限，收益有限</td><td>研究项</td></tr>
+</table>
+
+<!-- ======================================================================= -->
+<h2 id="appendix">附录：复现方法</h2>
+<h3>环境</h3>
+<ul>
+  <li>两边都在 <code>xiaompen_rccl</code> 容器里运行（torch 2.15、HIP 7.17、triton 3.8），<code>net=host</code>，<code>ipc=host</code>。</li>
+  <li>跨节点进程组：<code>GLOO_SOCKET_IFNAME=enp4s0np0 NCCL_SOCKET_IFNAME=enp4s0np0</code>，master 是 e15-01（10.190.224.68）。</li>
+</ul>
+<h3>对称内存测试</h3>
+<pre><code># 单机（pytest 入口会按本机 GPU 数启动 torchrun）
+pytest tests/pytorch/core/test_symm_mem.py
+
+# 跨 tray，两台机器分别执行，node-rank 为 0 / 1
+torchrun --nnodes 2 --nproc-per-node 4 --node-rank &lt;0|1&gt; \
+  --master-addr 10.190.224.68 --master-port 29500 tests/pytorch/core/test_symm_mem.py
+
+# 强制使用某个后端
+PRIMUS_TURBO_SYMM_MEM_BACKEND=fabric torchrun --nproc-per-node 4 \
+  benchmark/ops/training/bench_xgmi_read_write.py --mib-per-peer 24 --cus 222</code></pre>
+<h3>SDMA 集合通信（阶段 1）</h3>
+<pre><code># 正确性：单机由 pytest 启动 torchrun；跨 tray 用两台机器各自的 torchrun
+pytest tests/pytorch/dist/test_sdma_comm.py
+torchrun --nnodes 2 --nproc-per-node 4 --node-rank &lt;0|1&gt; \
+  --master-addr 10.190.224.68 --master-port 29500 tests/pytorch/dist/test_sdma_comm.py
+
+# 性能，与 RCCL 对比；RCCL 不可用时加 --no-rccl
+torchrun --nnodes 2 --nproc-per-node 4 --node-rank &lt;0|1&gt; \
+  --master-addr 10.190.224.68 --master-port 29500 \
+  benchmark/ops/training/bench_sdma_comm.py --mib 0.25 1 4 16 64</code></pre>
+<h3>通信与干扰测试（临时脚本，位于 <code>/tmp/fabtest/</code>）</h3>
+<ul>
+  <li><code>fb.cpp</code> + <code>run2.sh</code>：两节点通信 microbenchmark（3.1–3.4 节）。<code>run2.sh ./fb</code> 跑基础项，<code>run2.sh ./fb ext</code> 跑 CU 变体和 SDMA 项。</li>
+  <li><code>interf.py</code>：GEMM 与 SDMA / CU copy 的干扰测试（3.5 节）。</li>
+  <li><code>mn_run.sh</code>、<code>run_src.py</code>、<code>_bootstrap.py</code>：两节点 torchrun 启动，以及在没有编译 <code>_C</code> 的情况下直接从源码 import。</li>
+</ul>
+<div class="note warn"><code>/tmp</code> 是 tmpfs，机器重启后这些脚本会丢失。如果需要长期保留，应整理进 <code>benchmark/</code>。</div>
+
+</main>
+</div>
+</body>
+</html>

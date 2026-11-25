@@ -21,6 +21,7 @@ from torch.testing._internal.common_utils import (
 import primus_turbo.pytorch as pt
 from tests.pytorch.test_utils import get_tolerances
 
+COMM_METHODS = ["pipeline", "sdma"]
 _backend_streams: Dict[int, List[torch.cuda.Stream]] = {}
 
 
@@ -162,7 +163,9 @@ class FusedAllGatherMatmulTestBase(MultiProcessTestCase):
 
         torch.manual_seed(42 + rank)
 
-        for gather_dim, dtype in itertools.product([0, 1], [torch.bfloat16, torch.float16]):
+        for gather_dim, dtype, comm_method in itertools.product(
+            [0, 1], [torch.bfloat16, torch.float16], COMM_METHODS
+        ):
             A_shard = torch.rand(BATCH, M // self.world_size, K, dtype=dtype, device="cuda")
             Bs = [torch.rand(K, N, dtype=dtype, device="cuda") for _ in range(3)]
 
@@ -182,7 +185,7 @@ class FusedAllGatherMatmulTestBase(MultiProcessTestCase):
                 gemm_streams=self.gemm_streams,
                 comm_streams=self.comm_streams,
                 copy_streams=self.copy_streams,
-                comm_method="pipeline",
+                comm_method=comm_method,
             )
 
             torch.testing.assert_close(ag_output_0, ag_output_1, atol=0.0, rtol=0.0)
@@ -191,7 +194,7 @@ class FusedAllGatherMatmulTestBase(MultiProcessTestCase):
                 torch.testing.assert_close(mm_output_0, mm_output_1, **get_tolerances(dtype))
 
             if self.rank == 0:
-                print(f"test_fused_all_gather_matmul_{gather_dim}_{dtype} Pass")
+                print(f"test_fused_all_gather_matmul_{gather_dim}_{dtype}_{comm_method} Pass")
 
     @skip_if_lt_x_gpu(2)
     def test_llama3_70b_fused_all_gather_matmul(self) -> None:
@@ -201,7 +204,9 @@ class FusedAllGatherMatmulTestBase(MultiProcessTestCase):
 
         torch.manual_seed(42 + rank)
 
-        for M, N, K, batch_size, dtype in get_llama3_70b_cfg():
+        for (M, N, K, batch_size, dtype), comm_method in itertools.product(
+            get_llama3_70b_cfg(), COMM_METHODS
+        ):
             A_shard = torch.rand(batch_size * M // self.world_size, K, dtype=dtype, device="cuda")
             Bs = [torch.rand(K, N, dtype=dtype, device="cuda")]
 
@@ -221,7 +226,7 @@ class FusedAllGatherMatmulTestBase(MultiProcessTestCase):
                 gemm_streams=self.gemm_streams,
                 comm_streams=self.comm_streams,
                 copy_streams=self.copy_streams,
-                comm_method="pipeline",
+                comm_method=comm_method,
                 num_splits=4,
             )
 
@@ -230,7 +235,9 @@ class FusedAllGatherMatmulTestBase(MultiProcessTestCase):
                 torch.testing.assert_close(mm_output_0, mm_output_1, **get_tolerances(dtype))
 
             if self.rank == 0:
-                print(f"test_llama3_70b_fused_all_gather_matmul_{M}_{N}_{K}_{batch_size}_{dtype} Pass")
+                print(
+                    f"test_llama3_70b_fused_all_gather_matmul_{M}_{N}_{K}_{batch_size}_{dtype}_{comm_method} Pass"
+                )
 
     @skip_if_lt_x_gpu(2)
     def test_fused_all_gather_scaled_matmul(self) -> None:
@@ -244,12 +251,13 @@ class FusedAllGatherMatmulTestBase(MultiProcessTestCase):
 
         torch.manual_seed(42 + rank)
 
-        for gather_dim, dtype, scale_dtype, out_dtype, scale_mode in itertools.product(
+        for gather_dim, dtype, scale_dtype, out_dtype, scale_mode, comm_method in itertools.product(
             [0, 1],
             [torch.bfloat16],
             [pt.float8_e4m3],
             [torch.bfloat16],
             ["tensor-wise", "row-wise-sharded", "row-wise-replicated"],
+            COMM_METHODS,
         ):
             if gather_dim == 0:
                 leading_dims = (BATCH // self.world_size, M)
@@ -297,7 +305,7 @@ class FusedAllGatherMatmulTestBase(MultiProcessTestCase):
                 gemm_streams=self.gemm_streams,
                 comm_streams=self.comm_streams,
                 copy_streams=self.copy_streams,
-                comm_method="pipeline",
+                comm_method=comm_method,
             )
 
             torch.testing.assert_close(ag_output_0, ag_output_1, atol=0.0, rtol=0.0)
@@ -307,7 +315,8 @@ class FusedAllGatherMatmulTestBase(MultiProcessTestCase):
 
             if self.rank == 0:
                 print(
-                    f"test_fused_all_gather_scaled_matmul_{gather_dim}_{dtype}_{scale_dtype}_{out_dtype}_{scale_mode} Pass"
+                    f"test_fused_all_gather_scaled_matmul_{gather_dim}_{dtype}_{scale_dtype}_{out_dtype}_{scale_mode}"
+                    f"_{comm_method} Pass"
                 )
 
     @skip_if_lt_x_gpu(2)
@@ -320,7 +329,8 @@ class FusedAllGatherMatmulTestBase(MultiProcessTestCase):
 
         torch.manual_seed(42 + rank)
 
-        for M, N, K, batch_size, dtype, scale_dtype, out_dtype, scale_mode in get_llama3_70b_fp8_cfg():
+        for cfg, comm_method in itertools.product(get_llama3_70b_fp8_cfg(), COMM_METHODS):
+            M, N, K, batch_size, dtype, scale_dtype, out_dtype, scale_mode = cfg
             A_shard = torch.rand(batch_size * M // group.size(), K, dtype=dtype, device="cuda").to(
                 scale_dtype
             )
@@ -363,7 +373,7 @@ class FusedAllGatherMatmulTestBase(MultiProcessTestCase):
                 gemm_streams=self.gemm_streams,
                 comm_streams=self.comm_streams,
                 copy_streams=self.copy_streams,
-                comm_method="pipeline",
+                comm_method=comm_method,
             )
 
             torch.testing.assert_close(ag_output_0, ag_output_1, atol=0.0, rtol=0.0)

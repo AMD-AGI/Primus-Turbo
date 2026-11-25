@@ -31,7 +31,7 @@ def get_llama3_70b_cfg():
     Ks = [8192, 28672]
     Bs = [1, 4]
     dtypes = [torch.bfloat16]
-    comm_methods = ["tile", "pipeline"]
+    comm_methods = ["tile", "pipeline", "sdma"]
     for m, n, k, batch_size, dtype, comm_method in itertools.product(Ms, Ns, Ks, Bs, dtypes, comm_methods):
         yield m, n, k, batch_size, dtype, comm_method
 
@@ -160,7 +160,7 @@ class FusedMatmulReduceScatterTestBase(MultiProcessTestCase):
     def test_fused_matmul_reduce_scatter(self) -> None:
         self._init_process()
         for comm_method, dtype, reduce_op, scatter_dim in itertools.product(
-            ["pipeline"], [torch.bfloat16, torch.float16], ["sum", "avg"], [0, 1]
+            ["pipeline", "sdma"], [torch.bfloat16, torch.float16], ["sum", "avg"], [0, 1]
         ):
             self.init_streams(comm_method)
 

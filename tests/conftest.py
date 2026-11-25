@@ -34,6 +34,9 @@ if _worker_id is not None:
 # pytest_collection_modifyitems. Paths are matched as suffixes of the test file path; an
 # optional "::<prefix>" narrows an entry to the test ids starting with that prefix.
 _GFX1250_ENABLED_TESTS = (
+    # SymmetricMemory over IPC and fabric handles (UALink vpod), and the SDMA put + signal collectives on it.
+    "tests/pytorch/core/test_symm_mem.py",
+    "tests/pytorch/dist/test_sdma_comm.py",
     # FlyDSL intranode DeepEP (primus_turbo/flydsl/deep_ep); the C++ DeepEP is not loaded here.
     "tests/pytorch/deep_ep/test_intranode.py",
     # Source-only: the imports between the FlyDSL DeepEP modules, the same on every GPU.
