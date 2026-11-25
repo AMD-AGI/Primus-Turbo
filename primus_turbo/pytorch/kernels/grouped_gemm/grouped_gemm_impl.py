@@ -572,12 +572,15 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
 
     """
 
-    # A real measured boundary on gfx950 (clean through G=65, wrong at G=80 and G=96),
-    # but only a convention on gfx1250, which was measured correct up to G=160. The cap
-    # is kept at 64 on both anyway: raising it for one arch would make the supported
-    # expert count arch-dependent for no measured shape, and no MoE configuration in
-    # the benchmark table exceeds G=32.
+    # A real measured boundary on gfx950 (clean through G=65, wrong at G=80 and G=96). On
+    # gfx1250 the kernel has no expert-count limit of its own: the expert table is read
+    # from memory per tile, and every offset that scales with the expert index is 64-bit.
+    # There the cap is the largest count measured, G=224 -- Kimi K3.1 at EP4 (896 experts),
+    # against an fp32 reference under even, adversarial and lognormal routing (the overwrite
+    # epilogue; the accumulate one is measured at G=64) -- since a smaller one makes a pinned
+    # FlyDSL backend raise on that model's wgrad.
     MAX_G = 64
+    MAX_G_GFX1250 = 224
 
     @staticmethod
     def can_handle(
@@ -606,7 +609,11 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
         supported &= a.dim() == 2 and b.dim() == 2 and a.shape[0] == b.shape[0]
         supported &= a.dtype in (torch.bfloat16, torch.float16) and b.dtype == a.dtype
         supported &= trans_a and not trans_b
-        supported &= group_lens.numel() <= GroupedGEMMVariableKFlyDSLBackend.MAX_G
+        supported &= group_lens.numel() <= (
+            GroupedGEMMVariableKFlyDSLBackend.MAX_G_GFX1250
+            if gfx1250
+            else GroupedGEMMVariableKFlyDSLBackend.MAX_G
+        )
         if supported and gfx1250:
             from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
                 grouped_gemm_bf16_variable_k_supported,
