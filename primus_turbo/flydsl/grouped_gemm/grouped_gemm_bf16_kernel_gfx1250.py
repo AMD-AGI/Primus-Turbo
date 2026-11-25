@@ -939,20 +939,12 @@ def _launch_grouped_bf16_variable_k(
         EPI_OPS //= 2
     if accum not in (0, 1, 2):
         raise ValueError(f"accum must be 0, 1 or 2, got {accum}")
-    if accum and (
-        persist
-        or MC > 1
-        or vk_seam
-        or head_pipe
-        or out_ldc
-        or epi_chunk != 1
-        or tdm_deal
-        or vk_ovl
-        or issue_first
-    ):
+    # The k-loop knobs (head_pipe, tdm_deal, the cluster) leave the old C alone: its early load is issued at the
+    # last k-tile's head, past the last in-loop fence, by a plain TDM load. The persistent seam and the epilogue
+    # forms are not built for it.
+    if accum and (persist or vk_seam or out_ldc or epi_chunk != 1 or vk_ovl or issue_first):
         raise ValueError(
-            "accum needs persist=0, no cluster, vk_seam=0, head_pipe=0, out_ldc=0, epi_chunk=1, tdm_deal=0, "
-            "vk_ovl=0 and issue_first=0"
+            "accum needs persist=0, vk_seam=0, out_ldc=0, epi_chunk=1, vk_ovl=0 and issue_first=0"
         )
     if accum_c16 not in (0, 1, 2) or (accum_c16 and not accum):
         raise ValueError(f"accum_c16 must be 0, or 1 or 2 with accum, got {accum_c16}")
@@ -1580,12 +1572,13 @@ def _launch_grouped_bf16_variable_k(
                 _hold_live(ring[0])
                 rocdl.sched_barrier(0)
 
-            def _hp_ktile(addrs, prefetch_kt, head, prev_tail=None, first=False):
+            def _hp_ktile(addrs, prefetch_kt, head, prev_tail=None, first=False, c_load=None):
                 # `head` holds this k-tile's sub-step 0, read in the previous barrier window.
                 # `prev_tail` (the previous k-tile's deferred sub-step, whose matrix ops may still be
                 # in flight) is held live across this run so the reads here cannot reuse its registers.
                 # `first`: the head was read just ahead of this run, so its matrix ops wait for their
                 # own fragments instead of the whole head.
+                # `c_load` (`accum` 1, last k-tile): the early load of the old C, issued at sub-step 0.
                 ring = [head, None]
                 for ks in range_constexpr(K_WS):
                     load_ks = ks + 1
@@ -1597,6 +1590,10 @@ def _launch_grouped_bf16_variable_k(
                         if const_expr(ks == 0 and prefetch_kt is not None):
                             rocdl.sched_barrier(0)
                             issue(_slot(prefetch_kt), prefetch_kt)
+                            rocdl.sched_barrier(0)
+                        if const_expr(ks == 0 and c_load is not None):
+                            rocdl.sched_barrier(0)
+                            c_load()
                             rocdl.sched_barrier(0)
                         if const_expr(load_ks < K_WS):
                             ring[load_ks % 2] = _load_ks(addrs, load_ks)
@@ -1800,7 +1797,8 @@ def _launch_grouped_bf16_variable_k(
                     if const_expr((vk_seam & 16) and j == NB1 - 1):
                         if pre_b:
                             _pre_issue()
-                    tail = _hp_ktile(_addrs(kt), None, HEAD)
+                    c_load = _c_early(kt) if const_expr(accum == 1 and j == NB1 - 1) else None
+                    tail = _hp_ktile(_addrs(kt), None, HEAD, c_load=c_load)
                     if const_expr((vk_seam & 16) and j == NB1 - 2):
                         _hp_fence(tail, (pre_a, TDM_PW * PRE_KT, pre_not_a, 0), _addrs(kt + 1), HEAD)
                     elif const_expr(j < num_buffers - 2):

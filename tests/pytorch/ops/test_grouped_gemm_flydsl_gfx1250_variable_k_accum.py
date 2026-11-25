@@ -374,7 +374,8 @@ BF16_CASES = [
 
 
 def _same_bits(x, y):
-    return x.dtype == y.dtype and torch.equal(x.view(torch.int16), y.view(torch.int16))
+    bits = torch.int32 if x.element_size() == 4 else torch.int16
+    return x.dtype == y.dtype and torch.equal(x.view(bits), y.view(bits))
 
 
 def _old_bf16(shape):
@@ -446,6 +447,30 @@ def test_bf16_stagings_agree(out_m, out_n, counts):
             _accumulate(a, b, offs, lens, out, impl, **kw)
             outs.append(out)
     assert all(_same_bits(out, outs[0]) for out in outs[1:])
+
+
+# The k-loop knobs of the Kimi K3.1 wgrad sets, without their persistent seam: the deep ring with the split barrier
+# and co-scheduled fragment reads, head_pipe, the branch-free TDM issue, and a 4 x 2 / 2 x 4 cluster.
+KLOOP = dict(BLOCK_K=64, num_buffers=4, split_bar=1, lds_cosched=2, wmma_b2b=1, head_pipe=8, tdm_deal=3)
+KIMI_CLUSTER = {
+    (6144, 3584): dict(mc_m=4, mc_n=2, mc_early=0, mc_tile_sync=1, num_xcd=8, xcd_band=256),
+    (3584, 3072): dict(mc_m=2, mc_n=4, mc_early=0, mc_tile_sync=1, num_xcd=8, xcd_band=128),
+}
+
+
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("out_m, out_n", list(KIMI_CLUSTER), ids=["kimi_fc1", "kimi_fc2"])
+def test_k_loop_knobs_keep_the_accumulate_bit_identical(out_m, out_n, out_dtype):
+    """head_pipe, tdm_deal and the cluster move loads and matrix ops, never a k-step: the old C is loaded at the
+    last k-tile's head as without them, and the sum is the untuned one bit for bit."""
+    a, b, lens, offs, _ = _problem(out_m, out_n, KIMI_ROWS)
+    old = _old_out((lens.numel(), out_m, out_n)).to(out_dtype)
+    want = old.clone()
+    _accumulate(a, b, offs, lens, want, "auto")
+    for kw in (KLOOP, dict(KLOOP, **KIMI_CLUSTER[(out_m, out_n)])):
+        got = old.clone()
+        _accumulate(a, b, offs, lens, got, "auto", **kw)
+        assert _same_bits(got, want), kw
 
 
 def test_bf16_staging_fits_where_fp32_does_not():
