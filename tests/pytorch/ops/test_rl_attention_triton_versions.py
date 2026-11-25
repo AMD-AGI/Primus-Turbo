@@ -8,11 +8,10 @@
 
 Bit equality across schedules (BLOCK_M, num_warps, split / fused, paged / contiguous) is a property
 of the code a Triton release generates, not only of the kernel source: integrators ship their own
-Triton. Each release in PRIMUS_TURBO_RL_TRITON_VERSIONS (default "3.7,3.8") is installed once into
-a cache directory (pip, no dependencies; PRIMUS_TURBO_TRITON_CACHE, default
-~/.cache/primus_turbo/triton) and the bitwise tests of test_rl_attention.py run against it in a
-child process, since one process cannot load two Triton releases. A release that cannot be
-installed (no network) is skipped; the running release is skipped too (the suite itself covers it).
+Triton. Each release in VERSIONS is installed once into ~/.cache/primus_turbo/triton (pip, no
+dependencies) and the bitwise tests of test_rl_attention.py run against it in a child process,
+since one process cannot load two Triton releases. A release that cannot be installed (no network)
+is skipped; the running release is skipped too (the suite itself covers it).
 """
 
 import os
@@ -23,10 +22,10 @@ from pathlib import Path
 import pytest
 import triton
 
-VERSIONS = [v.strip() for v in os.environ.get("PRIMUS_TURBO_RL_TRITON_VERSIONS", "3.7,3.8").split(",") if v.strip()]
+VERSIONS = "3.7,3.8,3.9".split(",")
 REPO = Path(__file__).resolve().parents[3]
 SUITE = REPO / "tests" / "pytorch" / "ops" / "test_rl_attention.py"
-CACHE = Path(os.environ.get("PRIMUS_TURBO_TRITON_CACHE", Path.home() / ".cache" / "primus_turbo" / "triton"))
+CACHE = Path.home() / ".cache" / "primus_turbo" / "triton"
 # The tests that assert bit equality (modes, launch parameters, layouts, batches, rollout ==
 # training, graph replay), split in groups that each fit a CI per-test timeout.
 GROUPS = {

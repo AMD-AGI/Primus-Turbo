@@ -325,7 +325,7 @@ Each test changes one thing a token's result must not depend on, and requires id
 | Rollout vs training | `test_causal_rollout_matches_training`, `test_visibility_rollout_matches_training`, `test_flash_attn_varlen_func_paged_rollout_matches_training` | See below |
 | Options route | `test_env_options_and_per_call_override` | The same options through the environment vs per call (and a different `TILE_SIZE` must change the bits) |
 | Interface | `test_flash_attn_*_routes_to_rl_kernel`, `test_env_switch_routes_flash_attn` | `flash_attn_*` vs the `rl_*` entry points |
-| Triton release | `test_rl_attention_triton_versions.py` | The layout, launch, batch, graph-replay and rollout-vs-training tests above, under Triton 3.7 and 3.8 (`PRIMUS_TURBO_RL_TRITON_VERSIONS`), each installed into a cache directory and run in a child process; skipped without network |
+| Triton release | `test_rl_attention_triton_versions.py` | The layout, launch, batch, graph-replay and rollout-vs-training tests above, under Triton 3.7, 3.8 and 3.9 (the running release excepted), each installed into a cache directory and run in a child process; skipped without network |
 
 Bit equality across launches is a property of the generated code, so the TRITON kernels leave no
 choice to the compiler: they compile with `enable_fp_fusion=False` and write every fused
