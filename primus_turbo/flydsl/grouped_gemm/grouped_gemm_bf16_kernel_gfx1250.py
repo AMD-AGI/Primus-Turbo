@@ -941,11 +941,12 @@ def _launch_grouped_bf16_variable_k(
         raise ValueError(f"accum must be 0, 1 or 2, got {accum}")
     # The k-loop knobs (head_pipe, tdm_deal, the cluster) leave the old C alone: its early load is issued at the
     # last k-tile's head, past the last in-loop fence, by a plain TDM load. Under `persist` a 16-bit C through LDS
-    # sits in the C staging slots, clear of the next tile's prefetch (C_PERSIST below); the seam's other forms
-    # (vk_ovl bit 1, vk_seam bits 0, 3, 4 and 7 up) and the chunked epilogue are not built for it.
-    if accum and (out_ldc or epi_chunk != 1 or issue_first or (vk_ovl & 2) or (vk_seam & ~6)):
+    # sits in the C staging slots, clear of the next tile's prefetch (C_PERSIST below), and its TDM stores read them
+    # as the overwrite's do, so vk_ovl's seam carries over; vk_seam bits 0, 4 and 7 up and the chunked epilogue are
+    # not built for it.
+    if accum and (out_ldc or epi_chunk != 1 or issue_first or (vk_seam & ~14)):
         raise ValueError(
-            "accum needs out_ldc=0, epi_chunk=1, issue_first=0, vk_ovl bit 1 off and vk_seam within bits 1 and 2"
+            "accum needs out_ldc=0, epi_chunk=1, issue_first=0 and vk_seam within bits 1, 2 and 3"
         )
     if accum_c16 not in (0, 1, 2) or (accum_c16 and not accum):
         raise ValueError(f"accum_c16 must be 0, or 1 or 2 with accum, got {accum_c16}")
@@ -977,6 +978,8 @@ def _launch_grouped_bf16_variable_k(
             f"persist with accum needs the old C's {C_NS} ring slot(s) within the C staging ({C_PITCHES}) and a "
             f"slot past it for the next tile's prefetch ({num_buffers} buffers)"
         )
+    if C_PERSIST:
+        EPI_OPS = C_NS  # a TDM store per part of the old C, one op on every wave
 
     @flyc.kernel(name="kernel_grouped_bf16_variable_k_gfx1250", known_block_size=[block, 1, 1])
     def kernel_grouped_variable_k(
@@ -2995,7 +2998,7 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
     # operands' dtype. The old ``out`` is added to the fp32 accumulators: an fp32 ``out`` with no rounding to the
     # operand dtype, a 16-bit one rounded once. Whole output tiles only
     # (``grouped_gemm_bf16_variable_k_accum_supported``); runs the plain epilogue, a 16-bit out also under
-    # ``persist`` (with vk_ovl bits 0 and 2, vk_seam bits 1 and 2 and vk_stagger).
+    # ``persist`` (with vk_ovl, vk_seam bits 1 to 3 and vk_stagger).
     accumulate: int = 0,
     # How the old ``out`` reaches the accumulators: "tdm" through LDS (TDM loads and stores), "reg" straight
     # from global memory into registers, "auto" = "tdm" where the launcher's LDS staging of it fits.

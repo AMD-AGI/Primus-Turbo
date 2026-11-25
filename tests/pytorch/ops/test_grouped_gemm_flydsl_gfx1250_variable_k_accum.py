@@ -482,11 +482,14 @@ def test_k_loop_knobs_keep_the_accumulate_bit_identical(out_m, out_n, out_dtype)
 
 # The persistent tile walk at 8 experts: 64 workgroups (whole clusters, whole rounds on both outputs).
 PERSIST_SETS = [
-    dict(persist=64),  # 128-deep k-tiles, two buffers: the whole old C in slot 0
-    dict(KLOOP, persist=64),  # 64-deep, four buffers: the halves in slots 0 and 1
-    dict(
-        KLOOP, persist=64, vk_ovl=5, vk_stagger=127, vk_seam=6
-    ),  # + the next tile's k-tiles 0 and 1 in the epilogue
+    # 128-deep k-tiles, two buffers: the whole old C in slot 0
+    dict(persist=64),
+    # 64-deep, four buffers: the halves in slots 0 and 1
+    dict(KLOOP, persist=64),
+    # + the next tile's k-tiles 0 and 1 in the epilogue, the stagger and the decode carry
+    dict(KLOOP, persist=64, vk_ovl=5, vk_stagger=127, vk_seam=6),
+    # + no seam wait (the next tile waits for this tile's stores) and the first-use head order
+    dict(KLOOP, persist=64, vk_ovl=7, vk_stagger=127, vk_seam=14),
 ]
 
 
