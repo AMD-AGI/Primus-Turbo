@@ -34,7 +34,7 @@ from primus_turbo.pytorch.core.utils import is_gfx950
 HEAD_CONFIGS = {
     "qwen3_30b_a3b": (32, 4, 128),
     "llama3_8b": (32, 8, 128),
-    "d64": (16, 4, 64),
+    "gpt_oss_120b": (64, 8, 64),
 }
 MODES = ("naive", "serial", "overlap", "mega", "fused")
 # modes that run on the flux FlyDSL attention only

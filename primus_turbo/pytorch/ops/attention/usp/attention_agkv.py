@@ -75,8 +75,9 @@ Modes:
     halves as ``mega`` does, then every block claims attention work of q0 and q1 (their own keys first, then
     the remote chunks, each once its flag is up; the final output and lse stored) and the copies of the
     backward's [ remote | own ] K / V out of the bank. Shapes the kernel does not take (head dim other than
-    128, odd GQA groups, chunks not a multiple of 128 tokens) run ``mega``'s forward. The backward is one
-    persistent kernel too (``agkv_fused_bwd``; ``PRIMUS_TURBO_AGKV_FUSED_BWD=0`` runs ``mega``'s): the dK /
+    128, odd GQA groups, chunks not a multiple of 128 tokens) run ``mega``'s forward; head dim 64 goes
+    there too, being faster. The backward is one persistent kernel at head dim 64 and 128 alike
+    (``agkv_fused_bwd``; ``PRIMUS_TURBO_AGKV_FUSED_BWD=0`` runs ``mega``'s): the dK /
     dV work-groups of q0 and q1 store the remote-key gradients (q splits and q0's part summed) straight into
     the owners' slots and raise their flags, dQ is reduced head group by head group as each group's items
     finish, and the same kernel sums what this rank received.

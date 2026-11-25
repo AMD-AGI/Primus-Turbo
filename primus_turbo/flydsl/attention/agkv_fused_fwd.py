@@ -99,6 +99,8 @@ _BLOCK_N = 64
 
 def supported(num_heads, num_kv_heads, head_dim, c):
     """Whether the fused forward handles this shape (else the caller keeps the unfused path)."""
+    # head dim 64 builds too, but runs 0-7% slower than the unfused forward at BLOCK_M 64 and up to 1.7x
+    # slower at 128 (gpt-oss-120b, muse-spark-open at CP8, 16K-64K)
     if head_dim != 128 or num_heads % num_kv_heads or (num_heads // num_kv_heads) % 2:
         return False
     return c % 128 == 0 and c >= 256

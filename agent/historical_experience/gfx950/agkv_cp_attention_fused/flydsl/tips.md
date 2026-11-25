@@ -92,3 +92,30 @@ XGMI mesh, zigzag cp 8, mbs 1, `FLUX_ATTN_FLYDSL=1`.
 - Signal (qwen cp 2 64K hang): fused and serial hung in iteration 1 rather than failing. With every GPU full, rank 2's first data-parallel reduce-scatter failed in RCCL (`Failed to CUDA calloc 6291456 bytes`, NCCL unhandled cuda error); Primus logged it on that rank only (the runner shows local rank 0) and the other ranks waited for it in their collectives
 - Takeaway: the fusion factor holds or grows at lower cp (1.06-1.10); serial / TE follows the per-rank length, the same at equal per-rank tokens (8K per rank: cp 8 64K 0.951, cp 4 32K 0.973, cp 2 16K 0.994), so the flux kernels lose to TE's CK kernels as the per-rank sequence grows whatever the cp. Memory, not speed, ends the range: the flux dQ partial workspace (64 GiB at 32K query rows x 64K keys, the same at cp 8 128K) is uncapped for these non-square calls
 - Applicability: per-rank 32K query rows (cp 2 64K, cp 8 128K) is the limit on 288 GB; capping the non-square dQ workspace (bands in rounds under a budget, as the square path does) is what extends it. Debug a silent multi-rank hang with `LOCAL_RANKS="--local-ranks-filter 0,...,7"` and `PYTHONFAULTHANDLER=1`
+
+### 2026-11-25 06:20 UTC head dim 64, llama3.1-70B / qwen3-235b-a22b end to end
+- Context: head dim 64 at the op level (`bench_agkv_cp.py`, cp 8, fwd + bwd us, max over ranks): gpt-oss-120b (Hq 64 / Hkv 8) and muse-spark-open (Hq 128 / Hkv 16). Their models need sinks and sliding windows (gpt-oss all layers, muse 3 of 4), which the Primus agkv path does not take, so no end-to-end run. Large models end to end as 16-layer proxies at cp 8, GBS 8, 20 iterations: llama3.1-70B (Hq 64 / Hkv 8, hidden 8192) and qwen3-235b-a22b (Hq 64 / Hkv 4, 128 experts top 8, ep 8, DeepEP), `--num_layers 16`
+- Signal (head dim 64, fwd + bwd us): fused at head dim 64 runs `mega`'s forward and the fused backward (`agkv_fused_bwd` plans d 64 with bkv 256, q split 4)
+
+| model | seq | serial | mega | fused | serial / fused |
+|---|---|---|---|---|---|
+| gpt-oss-120b | 16K | 2130 | 1744 | 1438 | 1.48x |
+| gpt-oss-120b | 32K | 5791 | 4850 | 4555 | 1.27x |
+| gpt-oss-120b | 64K | 17486 | 16356 | 15986 | 1.09x |
+| muse-spark-open | 16K | 3183 | 2795 | 2786 | 1.14x |
+| muse-spark-open | 32K | 9745 | 9004 | 8803 | 1.11x |
+| muse-spark-open | 64K | 34034 | 32430 | 31356 | 1.09x |
+
+- Signal (the persistent forward at head dim 64, forward us vs `mega`'s): BLOCK_M 64 (the unfused forward's tile; GQA merge on) gpt-oss 461 / 1346 / 4662 vs 446 / 1336 / 4456, muse 839 / 2671 / 9111 vs 836 / 2476 / 8578 at 16K / 32K / 64K; BLOCK_M 128 (which forces 4 waves per EU at d 64) 1.3-1.7x slower. fused as kept (mega's forward, fused backward) is correct at gpt-oss, muse, qwen3-235b and llama3.1-70B heads, cp 8, 16K / 32K, batch 1 / 2, modes mega and fused
+- Signal (end to end, ms/iter, x = speedup over TE all_gather):
+
+| model | seq | TE all_gather | serial | fused | max alloc TE / fused |
+|---|---|---|---|---|---|
+| llama3.1-70B x16 | 32K | 3847 | 3837 (1.003x) | 3716 (1.035x) | 130.4 / 137.4 GB |
+| llama3.1-70B x16 | 64K | 8979 | 9152 (0.981x) | 8877 (1.011x) | 148.4 / 181.2 GB |
+| qwen3-235b x16 | 32K | 2416 | 2558 (0.944x) | 2341 (1.032x) | 72.3 / 80.2 GB |
+| qwen3-235b x16 | 64K | 6031 | 6608 (0.913x) | 6140 (0.982x) | 87.5 / 120.3 GB |
+
+  Loss equals TE at iteration 1; largest per-iteration relative difference 2.9e-3 (llama), 1.5e-5 (qwen)
+- Takeaway: the fusion holds on the large models (fused / serial 1.03 on llama, 1.08-1.09 on qwen), but their wider MLPs / experts shrink attention's share of the step, so the gain over TE is 3 % at 32K and about 0 at 64K, where qwen3-235b loses 2 % to the flux kernels' deficit against CK. At head dim 64 the fused backward carries the win; the persistent forward's extra work per block (claims, flag polls, partial merges) does not pay at d 64's half-size tiles, so `agkv_fused_fwd.supported` keeps head dim 128 only
+- Applicability: use fused at head dim 64 and 128; for gpt-oss / muse end to end the agkv path first needs sinks and left windows (the flux kernels have both). On the large models the next gain is the flux kernels at 8K+ per rank, as before
