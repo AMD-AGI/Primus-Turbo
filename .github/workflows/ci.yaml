@@ -45,6 +45,13 @@ jobs:
         uses: pre-commit/action@v3.0.1
         with:
           extra_args: --all-files --show-diff-on-failure
+      # The rules that the check-conventions hook runs have tests of their own (each rule fires on what it
+      # is for). They need neither torch nor a GPU, so they run here, on every pull request, rather than
+      # only in the GPU jobs. --noconftest: tests/conftest.py imports the framework frontends.
+      - name: Test the convention rules
+        run: |
+          python -m pip install -q pytest
+          python -m pytest --noconftest -q tests/pytorch/core/test_conventions.py
 
   install-dependencies:
     # GPU runner job: for PRs, only run when a maintainer adds the 'ci:gpu'
