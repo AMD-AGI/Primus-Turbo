@@ -60,6 +60,12 @@ Variables owned by other projects (FlyDSL, Triton, NVSHMEM, the launcher's `RANK
 | `PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM` | `bool` | `False` | A non-zero integer runs the EP dispatch/combine kernels on the caller's current stream instead of the Buffer's comm stream. Parsed as C++ does (`is_ep_force_current_stream` in deep_ep/configs.h, which caches it once per process): unset is off, and an empty or non-integer value is an error (ValueError here, std::stoi throws in C++). On gfx1250 the intranode runtime reads it when it is constructed. `DeepEPTokenDispatcher` writes "1" with `set_env()` when a dispatcher asks for `deepep_use_comm_stream=False`. |
 | `PRIMUS_TURBO_JAX_DEEPEP_MODE` | `str \| None` | unset | JAX DeepEP launch mode: "inproc" (the default when unset) or "per_process"; case and "-"/"_" are normalized by `LaunchMode.from_str`. `auto_detect_mode` and `setup(mode=...)` write it with `set_env()`, `reset_runtime()` clears it, and the mode locks at the first DeepEP call. |
 
+### Symmetric memory
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `PRIMUS_TURBO_SYMM_MEM_BACKEND` | `str` | `auto` | How `SymmetricMemory` maps the peers' heaps: "ipc" (legacy HIP IPC, one OS instance only), "fabric" (VMM allocations exported as fabric handles, which also map across the hosts of one scale-up domain, e.g. the trays of an MI455X UALink pod) or "auto" (the default: ipc when the group lives on one OS instance, fabric when it spans several). A `backend=` argument wins. Read when a `SymmetricMemory` is created; every rank of the group must agree. |
+
 ### Mega MoE (FlyDSL FP8 combine)
 
 | Variable | Type | Default | Description |

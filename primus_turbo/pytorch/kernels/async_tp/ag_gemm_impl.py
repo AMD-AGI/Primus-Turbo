@@ -23,6 +23,7 @@ from primus_turbo.pytorch.core.pyhip_runtime_wrapper import (
 from primus_turbo.pytorch.core.symm_mem import get_symm_mem_workspace
 
 from .common_ops import put_signal_rel_sys, wait_signal_acq_sys
+from .sdma_impl import _sdma_multi_all_gather_and_consume
 
 
 @lru_cache
@@ -336,8 +337,13 @@ def _fused_all_gather_matmul_impl(
     if comm_method == "pipeline":
         multi_all_gather_consume_fn = _pipelined_multi_all_gather_and_consume
         multi_all_gather_consume_kwargs = {"num_splits": num_splits, "enable_sdma": enable_sdma}
+    elif comm_method == "sdma":
+        multi_all_gather_consume_fn = _sdma_multi_all_gather_and_consume
+        multi_all_gather_consume_kwargs = {"num_splits": num_splits}
     elif comm_method == "ring_exchange":
         raise NotImplementedError("not support yet!")
+    else:
+        raise ValueError(f"unknown comm_method {comm_method!r}")
 
     # Move the gather_dim to the front and flatten the tensor into a 2D matrix.
     # The flattened tensor doesn't need to be contiguous (for computation

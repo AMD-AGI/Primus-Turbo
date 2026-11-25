@@ -11,7 +11,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed.distributed_c10d as c10d
 
-from primus_turbo.pytorch.kernels.async_tp import ag_gemm_impl, gemm_rs_impl
+from primus_turbo.pytorch.kernels.async_tp import ag_gemm_impl, gemm_rs_impl, sdma_impl
 
 __all__ = ["fused_all_gather_matmul", "fused_matmul_reduce_scatter", "fused_all_gather_scaled_matmul"]
 
@@ -58,7 +58,8 @@ def fused_all_gather_matmul(
         copy_streams (List[torch.cuda.Stream]): multi streams for copy
 
     Keyword Arguments:
-        comm_method (str, optional): specify internal algorithm of the implementation, 'ring_exchange' or 'pipeline' or 'auto'. Defaults to "pipeline".
+        comm_method (str, optional): specify internal algorithm of the implementation, 'pipeline' or 'sdma'
+            (SDMA put + signal on the current stream; the stream arguments are unused). Defaults to "pipeline".
         num_splits (int, optional): number of chunk splits by pipeline method. Defaults to 2.
         skip_copy_local_ag_out (bool, optional): skip copy A_shard to A_out, only used for transformer engine. Defaults to False.
         return_A (bool, optional): if return_A is True, return the result of all-gathered A_shard. Defaults to True.
@@ -234,7 +235,7 @@ def fused_matmul_reduce_scatter(
         out_dtype = A.dtype
 
     group = c10d._resolve_process_group(group_name)
-    if comm_method == "pipeline":
+    if comm_method in ("pipeline", "sdma"):
         B = B.T if layout[1] == "T" else B
         N = B.shape[1]
     else:
@@ -281,6 +282,18 @@ def fused_matmul_reduce_scatter(
                 rs_output=rs_out,
                 out_dtype=out_dtype,
                 stream=torch.cuda.current_stream(),
+            )
+        elif comm_method == "sdma":
+            rs_output = sdma_impl._sdma_matmul_reduce_scatter_impl(
+                torch.ops.aten.mm.out,
+                input=x,
+                weight=B,
+                group_name=group_name,
+                reduce_op=reduce_op,
+                num_splits=num_splits,
+                output=output,
+                rs_output=rs_out,
+                out_dtype=out_dtype,
             )
         else:
             rs_output = gemm_rs_impl._pipeline_matmul_scatter_out_impl(

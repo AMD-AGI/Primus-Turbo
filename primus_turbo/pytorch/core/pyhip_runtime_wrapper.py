@@ -43,6 +43,69 @@ class hipIpcMemHandle_t(ctypes.Structure):
     _fields_ = [("reserved", ctypes.c_byte * 64)]
 
 
+class hipDeviceAttributeEnum:
+    hipDeviceAttributeVirtualMemoryManagementSupported = 89
+    hipDeviceAttributeHandleTypeFabricSupported = 95
+
+
+class hipMemAllocationTypeEnum:
+    hipMemAllocationTypePinned = 0x1
+    hipMemAllocationTypeUncached = 0x40000000
+
+
+class hipMemAllocationHandleTypeEnum:
+    hipMemHandleTypeNone = 0x0
+    hipMemHandleTypePosixFileDescriptor = 0x1
+    hipMemHandleTypeFabric = 0x8
+
+
+class hipMemLocationTypeEnum:
+    hipMemLocationTypeDevice = 0x1
+
+
+class hipMemAccessFlagsEnum:
+    hipMemAccessFlagsProtReadWrite = 0x3
+
+
+class hipMemAllocationGranularityEnum:
+    hipMemAllocationGranularityMinimum = 0x0
+    hipMemAllocationGranularityRecommended = 0x1
+
+
+class hipMemLocation(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
+
+
+class hipMemAllocFlags(ctypes.Structure):
+    _fields_ = [
+        ("compressionType", ctypes.c_ubyte),
+        ("gpuDirectRDMACapable", ctypes.c_ubyte),
+        ("usage", ctypes.c_ushort),
+    ]
+
+
+class hipMemAllocationProp(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("requestedHandleType", ctypes.c_int),
+        ("location", hipMemLocation),
+        ("win32HandleMetaData", ctypes.c_void_p),
+        ("allocFlags", hipMemAllocFlags),
+    ]
+
+
+class hipMemAccessDesc(ctypes.Structure):
+    _fields_ = [("location", hipMemLocation), ("flags", ctypes.c_int)]
+
+
+class hipMemFabricHandle_t(ctypes.Structure):
+    _fields_ = [("data", ctypes.c_ubyte * 64)]
+
+
+# opaque ihipMemGenericAllocationHandle*
+hipMemGenericAllocationHandle_t = ctypes.c_void_p
+
+
 @dataclass
 class Function:
     name: str
@@ -101,6 +164,78 @@ class HIPRuntimeLibrary:
         Function("hipMemset", hipError_t, [buffer_type, ctypes.c_int, ctypes.c_size_t]),
         # hipError_t hipIpcCloseMemHandle(void* dev_ptr)
         Function("hipIpcCloseMemHandle", hipError_t, [buffer_type]),
+        # hipError_t hipDeviceGetAttribute(int* pi, hipDeviceAttribute_t attr, int deviceId)
+        Function(
+            "hipDeviceGetAttribute", hipError_t, [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
+        ),
+        # hipError_t hipMemGetAllocationGranularity(
+        #   size_t* granularity, const hipMemAllocationProp* prop, hipMemAllocationGranularity_flags option)
+        Function(
+            "hipMemGetAllocationGranularity",
+            hipError_t,
+            [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(hipMemAllocationProp), ctypes.c_int],
+        ),
+        # hipError_t hipMemCreate(
+        #   hipMemGenericAllocationHandle_t* handle, size_t size, const hipMemAllocationProp* prop,
+        #   unsigned long long flags)
+        Function(
+            "hipMemCreate",
+            hipError_t,
+            [
+                ctypes.POINTER(hipMemGenericAllocationHandle_t),
+                ctypes.c_size_t,
+                ctypes.POINTER(hipMemAllocationProp),
+                ctypes.c_ulonglong,
+            ],
+        ),
+        # hipError_t hipMemRelease(hipMemGenericAllocationHandle_t handle)
+        Function("hipMemRelease", hipError_t, [hipMemGenericAllocationHandle_t]),
+        # hipError_t hipMemExportToShareableHandle(
+        #   void* shareableHandle, hipMemGenericAllocationHandle_t handle,
+        #   hipMemAllocationHandleType handleType, unsigned long long flags)
+        Function(
+            "hipMemExportToShareableHandle",
+            hipError_t,
+            [ctypes.c_void_p, hipMemGenericAllocationHandle_t, ctypes.c_int, ctypes.c_ulonglong],
+        ),
+        # hipError_t hipMemImportFromShareableHandle(
+        #   hipMemGenericAllocationHandle_t* handle, void* osHandle, hipMemAllocationHandleType shHandleType)
+        Function(
+            "hipMemImportFromShareableHandle",
+            hipError_t,
+            [ctypes.POINTER(hipMemGenericAllocationHandle_t), ctypes.c_void_p, ctypes.c_int],
+        ),
+        # hipError_t hipMemAddressReserve(
+        #   void** ptr, size_t size, size_t alignment, void* addr, unsigned long long flags)
+        Function(
+            "hipMemAddressReserve",
+            hipError_t,
+            [ctypes.POINTER(buffer_type), ctypes.c_size_t, ctypes.c_size_t, buffer_type, ctypes.c_ulonglong],
+        ),
+        # hipError_t hipMemAddressFree(void* devPtr, size_t size)
+        Function("hipMemAddressFree", hipError_t, [buffer_type, ctypes.c_size_t]),
+        # hipError_t hipMemMap(
+        #   void* ptr, size_t size, size_t offset, hipMemGenericAllocationHandle_t handle,
+        #   unsigned long long flags)
+        Function(
+            "hipMemMap",
+            hipError_t,
+            [
+                buffer_type,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                hipMemGenericAllocationHandle_t,
+                ctypes.c_ulonglong,
+            ],
+        ),
+        # hipError_t hipMemUnmap(void* ptr, size_t size)
+        Function("hipMemUnmap", hipError_t, [buffer_type, ctypes.c_size_t]),
+        # hipError_t hipMemSetAccess(void* ptr, size_t size, const hipMemAccessDesc* desc, size_t count)
+        Function(
+            "hipMemSetAccess",
+            hipError_t,
+            [buffer_type, ctypes.c_size_t, ctypes.POINTER(hipMemAccessDesc), ctypes.c_size_t],
+        ),
     ]
 
     path_to_library_cache: dict[str, Any] = {}
@@ -200,6 +335,77 @@ class HIPRuntimeLibrary:
     def hipIpcCloseMemHandle(self, ptr: int | buffer_type) -> None:
         self.HIP_CHECK(self._funcs["hipIpcCloseMemHandle"](_as_void_p(ptr)))
 
+    def hipDeviceGetAttribute(self, attr: int, device: int) -> int:
+        value = ctypes.c_int()
+        self.HIP_CHECK(self._funcs["hipDeviceGetAttribute"](ctypes.byref(value), attr, device))
+        return value.value
+
+    def hipMemGetAllocationGranularity(self, prop: hipMemAllocationProp, option: int) -> int:
+        granularity = ctypes.c_size_t()
+        self.HIP_CHECK(
+            self._funcs["hipMemGetAllocationGranularity"](
+                ctypes.byref(granularity), ctypes.byref(prop), option
+            )
+        )
+        return granularity.value
+
+    def hipMemCreate(self, size_bytes: int, prop: hipMemAllocationProp) -> hipMemGenericAllocationHandle_t:
+        handle = hipMemGenericAllocationHandle_t()
+        self.HIP_CHECK(self._funcs["hipMemCreate"](ctypes.byref(handle), size_bytes, ctypes.byref(prop), 0))
+        return handle
+
+    def hipMemRelease(self, handle: hipMemGenericAllocationHandle_t) -> None:
+        self.HIP_CHECK(self._funcs["hipMemRelease"](handle))
+
+    def hipMemExportToFabricHandle(self, handle: hipMemGenericAllocationHandle_t) -> bytes:
+        fabric = hipMemFabricHandle_t()
+        self.HIP_CHECK(
+            self._funcs["hipMemExportToShareableHandle"](
+                ctypes.byref(fabric), handle, hipMemAllocationHandleTypeEnum.hipMemHandleTypeFabric, 0
+            )
+        )
+        return bytes(fabric.data)
+
+    def hipMemImportFromFabricHandle(self, data: bytes) -> hipMemGenericAllocationHandle_t:
+        if len(data) != ctypes.sizeof(hipMemFabricHandle_t):
+            raise ValueError(
+                f"Expected {ctypes.sizeof(hipMemFabricHandle_t)} bytes for a fabric handle, got {len(data)}"
+            )
+        fabric = hipMemFabricHandle_t.from_buffer_copy(data)
+        handle = hipMemGenericAllocationHandle_t()
+        self.HIP_CHECK(
+            self._funcs["hipMemImportFromShareableHandle"](
+                ctypes.byref(handle),
+                ctypes.byref(fabric),
+                hipMemAllocationHandleTypeEnum.hipMemHandleTypeFabric,
+            )
+        )
+        return handle
+
+    def hipMemAddressReserve(self, size_bytes: int, alignment: int = 0) -> buffer_type:
+        ptr = buffer_type()
+        self.HIP_CHECK(self._funcs["hipMemAddressReserve"](ctypes.byref(ptr), size_bytes, alignment, None, 0))
+        return ptr
+
+    def hipMemAddressFree(self, ptr: int | buffer_type, size_bytes: int) -> None:
+        self.HIP_CHECK(self._funcs["hipMemAddressFree"](_as_void_p(ptr), size_bytes))
+
+    def hipMemMap(
+        self, ptr: int | buffer_type, size_bytes: int, offset: int, handle: hipMemGenericAllocationHandle_t
+    ) -> None:
+        self.HIP_CHECK(self._funcs["hipMemMap"](_as_void_p(ptr), size_bytes, offset, handle, 0))
+
+    def hipMemUnmap(self, ptr: int | buffer_type, size_bytes: int) -> None:
+        self.HIP_CHECK(self._funcs["hipMemUnmap"](_as_void_p(ptr), size_bytes))
+
+    def hipMemSetAccess(self, ptr: int | buffer_type, size_bytes: int, devices: list[int]) -> None:
+        descs = (hipMemAccessDesc * len(devices))()
+        for i, device in enumerate(devices):
+            descs[i].location.type = hipMemLocationTypeEnum.hipMemLocationTypeDevice
+            descs[i].location.id = device
+            descs[i].flags = hipMemAccessFlagsEnum.hipMemAccessFlagsProtReadWrite
+        self.HIP_CHECK(self._funcs["hipMemSetAccess"](_as_void_p(ptr), size_bytes, descs, len(devices)))
+
     @staticmethod
     def mem_handle_to_bytes(handle: hipIpcMemHandle_t) -> bytes:
         return bytes(handle.reserved)
@@ -225,6 +431,14 @@ __all__ = [
     "hipMemcpyKindEnum",
     "hipIpcMemFlagsEnum",
     "hipIpcMemHandle_t",
+    "hipDeviceAttributeEnum",
+    "hipMemAllocationTypeEnum",
+    "hipMemAllocationHandleTypeEnum",
+    "hipMemLocationTypeEnum",
+    "hipMemAccessFlagsEnum",
+    "hipMemAllocationGranularityEnum",
+    "hipMemAllocationProp",
+    "hipMemGenericAllocationHandle_t",
     "hipStream_t",
     "buffer_type",
 ]
