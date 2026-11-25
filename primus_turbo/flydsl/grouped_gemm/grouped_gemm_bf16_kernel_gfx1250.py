@@ -6490,6 +6490,138 @@ _MUSE_NN = {
 _MUSE_COSCHED = {"lds_cosched": 3, "issue_first": 1}
 _MUSE_NN_MC44 = dict(_MUSE_NN, mc_m=4, mc_n=4)
 
+# Kimi K3.1 Pro MoE: the routed experts run in the latent dim 3584 (hidden 7168 / 2), gated expert FFN 3072,
+# so fc1 is (N, K) = (6144, 3584) and fc2 (3584, 3072); 896 experts, top-16. At EP4 each GPU holds G = 224
+# experts and receives 65536 rows per sequence of the micro-batch: avg_m = 292 / 585 / 1170 at MBS 1 / 2 / 4
+# (measured at 293 / 585 / 1170 with M = 224 x avg_m, even routing; at EP8, G = 112, MBS 1 / 2 land on the
+# 585 / 1170 keys). One fwd / dgrad set per operator at 585 and 1170, with the half-height grid at 585 only:
+# an expert's last m-tile holds 73 rows there and 146 at 1170. At 293 the 160-row tile puts an expert in two
+# m-tiles of 160 + 133 rows instead of 256 + 37, with the multi-slot decode (tt_dec is not built for a tile
+# with tile_m != tile_n). wgrad is the MiniMax-M3 seam plus vk_seam bits 20 and 21, and bits 22-23 with no
+# stagger at 293. Gain over the untuned path on the op (10 s, G = 224): fwd fc1 / fc2, dgrad fc1 / fc2, wgrad
+# fc1 / fc2 +43.6 / +29.8 / +28.0 / +28.9 / +55.1 / +56.2% at 293, +20.9 / +17.8 / +20.0 / +21.5 / +37.9 /
+# +39.3% at 585, +18.1 / +16.6 / +17.7 / +17.6 / +40.9 / +41.9% at 1170.
+_KIMI_NT_FC1 = {
+    "GROUP_M": 4,
+    "head_pipe": 32,
+    "hp_epi": 0,
+    "issue_first": 1,
+    "lds_cosched": 3,
+    "mc_m": 2,
+    "mc_n": 4,
+    "mc_tile_sync": 1,
+    "nt_c1": 4,
+    "nt_deal": 1,
+    "nt_ovl": 1,
+    "nt_seam": 13,
+    "ntp_flags": 3,
+    "num_xcd": 8,
+    "persist": 256,
+    "tdm_assign": 1,
+    "tdm_balance": 1,
+    "tt_dec": 1,
+    "xcd_band": 32,
+}
+_KIMI_NT_FC2 = {
+    "GROUP_M": 4,
+    "epi_chunk": 1,
+    "head_pipe": 32,
+    "issue_first": 1,
+    "lds_cosched": 3,
+    "mc_m": 2,
+    "mc_n": 2,
+    "nt_c1": 4,
+    "nt_deal": 1,
+    "nt_ovl": 1,
+    "nt_seam": 13,
+    "ntp_flags": 3,
+    "num_xcd": 8,
+    "persist": 256,
+    "tdm_balance": 1,
+    "tt_dec": 1,
+    "xcd_band": 32,
+}
+_KIMI_NN_FC1 = {
+    "GROUP_M": 8,
+    "head_pipe": 32,
+    "issue_first": 1,
+    "lds_cosched": 3,
+    "mc_m": 2,
+    "mc_n": 2,
+    "mc_tile_sync": 1,
+    "nt_c1": 3,
+    "nt_deal": 1,
+    "nt_ovl": 1,
+    "nt_seam": 13,
+    "ntp_flags": 3,
+    "num_xcd": 8,
+    "persist": 256,
+    "tdm_assign": 1,
+    "tdm_nn": 1,
+    "tt_dec": 1,
+    "xcd_band": 32,
+}
+_KIMI_NN_FC2 = {
+    "GROUP_M": 8,
+    "head_pipe": 32,
+    "issue_first": 1,
+    "lds_cosched": 3,
+    "mc_m": 2,
+    "mc_n": 4,
+    "mc_tile_sync": 1,
+    "nt_c1": 2,
+    "nt_deal": 1,
+    "nt_ovl": 1,
+    "nt_seam": 13,
+    "ntp_flags": 3,
+    "num_xcd": 8,
+    "persist": 256,
+    "tdm_nn": 1,
+    "tt_dec": 1,
+    "wmma_b2b": 1,
+    "xcd_band": 32,
+}
+# avg_m = 293: 160-row tiles, no cluster, the decode carried across the tile seam (nt_seam bit 2).
+_KIMI_T160 = {
+    "BLOCK_K": 128,
+    "BLOCK_M": 160,
+    "BLOCK_N": 256,
+    "issue_first": 1,
+    "lds_cosched": 3,
+    "mc_m": 1,
+    "mc_n": 1,
+    "mv_dec": 1,
+    "nt_ovl": 1,
+    "nt_seam": 5,
+    "ntp_flags": 3,
+    "num_xcd": 8,
+    "persist": 256,
+    "xcd_band": 32,
+}
+_KIMI_VK_FC1 = {
+    "BLOCK_K": 64,
+    "epi_chunk": 4,
+    "head_pipe": 8,
+    "lds_cosched": 2,
+    "mc_early": 0,
+    "mc_m": 4,
+    "mc_n": 2,
+    "mc_tile_sync": 1,
+    "num_buffers": 4,
+    "num_xcd": 8,
+    "persist": 256,
+    "split_bar": 1,
+    "tdm_deal": 3,
+    "vk_ovl": 7,
+    "vk_seam": 3684511,
+    "vk_stagger": 127,
+    "wmma_b2b": 1,
+    "xcd_band": 256,
+}
+_KIMI_VK_FC2 = dict(_KIMI_VK_FC1, mc_m=2, mc_n=4, xcd_band=128)
+# vk_seam bits 22-23 at f = 3 (staging-write lag 6) and no stagger.
+_KIMI_VK_293 = {"vk_seam": 16267423, "vk_stagger": 0}
+
 _KWARGS_KEYS = {
     "nt": {
         # Muse Spark (EP4 / EP8, MBS 1 / 2) fwd fc1 at 512 / 1024 / 2048 rows and fwd fc2 at 512 / 1024: the
@@ -6551,6 +6683,15 @@ _KWARGS_KEYS = {
             "vec_dec": 1,
             "xcd_band": 32,
         },
+        # Kimi K3.1 fwd fc1 and fc2 at 293 / 585 / 1170 rows per expert
+        (6144, 3584, 293): dict(
+            _KIMI_T160, BLOCK_N=384, GROUP_M=4, head_pipe=26, hp_epi=0, tdm_assign=1, tdm_balance=1
+        ),
+        (6144, 3584, 585): dict(_KIMI_NT_FC1, nt_half=1),
+        (6144, 3584, 1170): _KIMI_NT_FC1,
+        (3584, 3072, 293): dict(_KIMI_T160, GROUP_M=4, epi_chunk=1, head_pipe=14, tdm_balance=1),
+        (3584, 3072, 585): dict(_KIMI_NT_FC2, nt_half=1),
+        (3584, 3072, 1170): _KIMI_NT_FC2,
     },
     "nn": {
         # Muse Spark: the MiniMax-M3 dgrad fc1 set. dgrad fc1 and fc2 at 1024 / 2048 rows per expert (at 512 it
@@ -6610,6 +6751,13 @@ _KWARGS_KEYS = {
             "tt_dec": 1,
             "xcd_band": 32,
         },
+        # Kimi K3.1 dgrad fc1 (output 3584, reduction 6144) and fc2 (3072, 3584) at 293 / 585 / 1170 rows
+        (3584, 6144, 293): dict(_KIMI_T160, GROUP_M=8, head_pipe=14, tdm_assign=1, tdm_nn=1),
+        (3584, 6144, 585): dict(_KIMI_NN_FC1, nt_half=1),
+        (3584, 6144, 1170): _KIMI_NN_FC1,
+        (3072, 3584, 293): dict(_KIMI_T160, GROUP_M=8, head_pipe=14, tdm_nn=1, wmma_b2b=1),
+        (3072, 3584, 585): dict(_KIMI_NN_FC2, nt_half=1),
+        (3072, 3584, 1170): _KIMI_NN_FC2,
     },
     "vk": {
         # MiniMax-M3 wgrad fc2, avg_m = 512
@@ -6654,6 +6802,13 @@ _KWARGS_KEYS = {
             "wmma_b2b": 1,
             "xcd_band": 256,
         },
+        # Kimi K3.1 wgrad fc1 (OUT 6144 x 3584) and fc2 (OUT 3584 x 3072) at 293 / 585 / 1170 rows per expert
+        (6144, 3584, 293): dict(_KIMI_VK_FC1, **_KIMI_VK_293),
+        (6144, 3584, 585): _KIMI_VK_FC1,
+        (6144, 3584, 1170): _KIMI_VK_FC1,
+        (3584, 3072, 293): dict(_KIMI_VK_FC2, **_KIMI_VK_293),
+        (3584, 3072, 585): _KIMI_VK_FC2,
+        (3584, 3072, 1170): _KIMI_VK_FC2,
     },
     # The variable-K wgrad with accumulate=1 (fp32 main_grad). It runs the plain non-persistent epilogue,
     # so only knobs that leave that path are keyed here. Bit-identical.
