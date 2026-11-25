@@ -345,6 +345,9 @@ def test_refuses_what_it_cannot_add_into():
     for dtype in (torch.float32, torch.bfloat16):
         with pytest.raises(ValueError, match="contiguous"):
             run(a, b, offs, masked_k=lens, out=f32(1, 512, 512).to(dtype).transpose(1, 2), accumulate=1)
+    # the persistent walk takes a 16-bit out only
+    with pytest.raises(ValueError, match="persist"):
+        run(a, b, offs, masked_k=lens, out=f32(1, 512, 512), accumulate=1, persist=2)
     # the round-first hook exists for a 16-bit out only, and only when accumulating
     with pytest.raises(ValueError, match="_round_first"):
         run(a, b, offs, masked_k=lens, out=f32(1, 512, 512), accumulate=1, _round_first=True)
@@ -472,6 +475,31 @@ def test_k_loop_knobs_keep_the_accumulate_bit_identical(out_m, out_n, out_dtype)
         "vk_accum", (out_m, out_n, sum(KIMI_ROWS) // len(KIMI_ROWS)), 8, 0, {"out": old}
     )
     for kw in (KLOOP, dict(KLOOP, **KIMI_CLUSTER[(out_m, out_n)]), {}):
+        got = old.clone()
+        _accumulate(a, b, offs, lens, got, "auto", **kw)
+        assert _same_bits(got, want), kw
+
+
+# The persistent tile walk at 8 experts: 64 workgroups (whole clusters, whole rounds on both outputs).
+PERSIST_SETS = [
+    dict(persist=64),  # 128-deep k-tiles, two buffers: the whole old C in slot 0
+    dict(KLOOP, persist=64),  # 64-deep, four buffers: the halves in slots 0 and 1
+    dict(
+        KLOOP, persist=64, vk_ovl=5, vk_stagger=127, vk_seam=6
+    ),  # + the next tile's k-tiles 0 and 1 in the epilogue
+]
+
+
+@pytest.mark.parametrize("out_m, out_n", list(KIMI_CLUSTER), ids=["kimi_fc1", "kimi_fc2"])
+def test_bf16_persistent_accumulate_is_bit_identical(out_m, out_n):
+    """A bf16 out takes the persistent walk too: the old C sits in the C staging slots and comes in at the last
+    k-tile's head unless that k-tile reads its slot -- the routing reaches every case (no part, the first, the second
+    half late) -- and the sum is the untuned one bit for bit, with the cluster and the seam's prefetch as well."""
+    a, b, lens, offs, _ = _problem(out_m, out_n, KIMI_ROWS)
+    old = _old_bf16((lens.numel(), out_m, out_n))
+    want = old.clone()
+    _accumulate(a, b, offs, lens, want, "auto", group_m=16)
+    for kw in PERSIST_SETS + [dict(PERSIST_SETS[-1], **KIMI_CLUSTER[(out_m, out_n)])]:
         got = old.clone()
         _accumulate(a, b, offs, lens, got, "auto", **kw)
         assert _same_bits(got, want), kw

@@ -940,14 +940,17 @@ def _launch_grouped_bf16_variable_k(
     if accum not in (0, 1, 2):
         raise ValueError(f"accum must be 0, 1 or 2, got {accum}")
     # The k-loop knobs (head_pipe, tdm_deal, the cluster) leave the old C alone: its early load is issued at the
-    # last k-tile's head, past the last in-loop fence, by a plain TDM load. The persistent seam and the epilogue
-    # forms are not built for it.
-    if accum and (persist or vk_seam or out_ldc or epi_chunk != 1 or vk_ovl or issue_first):
+    # last k-tile's head, past the last in-loop fence, by a plain TDM load. Under `persist` a 16-bit C through LDS
+    # sits in the C staging slots, clear of the next tile's prefetch (C_PERSIST below); the seam's other forms
+    # (vk_ovl bit 1, vk_seam bits 0, 3, 4 and 7 up) and the chunked epilogue are not built for it.
+    if accum and (out_ldc or epi_chunk != 1 or issue_first or (vk_ovl & 2) or (vk_seam & ~6)):
         raise ValueError(
-            "accum needs persist=0, vk_seam=0, out_ldc=0, epi_chunk=1, vk_ovl=0 and issue_first=0"
+            "accum needs out_ldc=0, epi_chunk=1, issue_first=0, vk_ovl bit 1 off and vk_seam within bits 1 and 2"
         )
     if accum_c16 not in (0, 1, 2) or (accum_c16 and not accum):
         raise ValueError(f"accum_c16 must be 0, or 1 or 2 with accum, got {accum_c16}")
+    if accum and persist and not (accum == 1 and accum_c16):
+        raise ValueError("persist with accum needs a 16-bit C through LDS (accum 1, accum_c16)")
     CEB = EB if accum_c16 else 4  # bytes per element of C under `accum`
     # accum 1: a half is C_HALF rows of the old C, padded like the stage rows; each fits one ring buffer, and
     # the two warp rows split the tile along the same line, so a wave reads, adds and stages within one half.
@@ -957,11 +960,22 @@ def _launch_grouped_bf16_variable_k(
     C_ROWS = tile_m if C_WHOLE else C_HALF  # rows of the old C per TDM load and store
     # A 16-bit C in two halves with three buffers or more: past the fence ahead of the last k-tile two buffers are
     # free, so both halves come in during that k-tile, and none is left to load after the k-loop.
-    C_BOTH_EARLY = bool(accum_c16) and accum == 1 and not C_WHOLE and num_buffers >= 3
+    C_BOTH_EARLY = bool(accum_c16) and accum == 1 and not C_WHOLE and num_buffers >= 3 and not persist
     if accum == 1 and not C_WHOLE and (m_warp != 2 or C_HALF * C_LDS_ROW > PITCH):
         raise ValueError(
             f"accum=1 needs m_warp=2 and half the C tile ({C_HALF * C_LDS_ROW} B) within one ring buffer "
             f"({PITCH} B)"
+        )
+    # Under `persist` part p of the old C (the whole tile, or half p) sits in ring slot p, inside the C staging
+    # region that BUF_SHIFT keeps clear of the next tile's prefetch. A part comes in at the last k-tile's head
+    # unless that k-tile reads its slot (K_TILES % num_buffers decides, uniform per tile), else past the entry
+    # fence, ahead of the prefetch.
+    C_PERSIST = bool(accum == 1 and persist)
+    C_NS = 1 if C_WHOLE else 2
+    if C_PERSIST and (C_NS > C_PITCHES or not PREFETCH_OK):
+        raise ValueError(
+            f"persist with accum needs the old C's {C_NS} ring slot(s) within the C staging ({C_PITCHES}) and a "
+            f"slot past it for the next tile's prefetch ({num_buffers} buffers)"
         )
 
     @flyc.kernel(name="kernel_grouped_bf16_variable_k_gfx1250", known_block_size=[block, 1, 1])
@@ -1211,10 +1225,17 @@ def _launch_grouped_bf16_variable_k(
                     # During the last k-tile `kt`, into the buffer it does not read: k-tile kt - 1 is consumed by
                     # the fence ahead of it, and nothing is prefetched past the steady loop. With C_BOTH_EARLY the
                     # second half too, into the buffer of k-tile kt - 2 (three buffers) or kt - 3 (four).
+                    # C_PERSIST: every part whose slot k-tile kt does not read.
                     def _go():
-                        _c_load(_buf_ptr(_slot(kt + 1)), 0)
-                        if const_expr(C_BOTH_EARLY):
-                            _c_load(_buf_ptr(_slot(kt + 2)), 1)
+                        if const_expr(C_PERSIST):
+                            c_last = _slot(kt)
+                            for p in range_constexpr(C_NS):
+                                if c_last != fx.Int32(p):
+                                    _c_load(_buf_ptr(p), p)
+                        else:
+                            _c_load(_buf_ptr(_slot(kt + 1)), 0)
+                            if const_expr(C_BOTH_EARLY):
+                                _c_load(_buf_ptr(_slot(kt + 2)), 1)
 
                     return _go
 
@@ -1837,6 +1858,13 @@ def _launch_grouped_bf16_variable_k(
             _fence(outstanding=(TDM_PW * PRE_KT) if const_expr(vk_seam & 16) else 0)
             if const_expr(MC > 1 and mc_epi_sync):
                 _cluster.cluster_barrier()
+            if const_expr(C_PERSIST):
+                # The part of the old C in the slot the last k-tile read, ahead of the next tile's prefetch so that
+                # the last wave's TENSORcnt retires it first.
+                c_last = _slot(K_TILES - 1)
+                for p in range_constexpr(C_NS):
+                    if c_last == fx.Int32(p):
+                        _c_load(_buf_ptr(p), p)
             if const_expr(vk_seam & 4096):
                 # The fence's barrier put every wave past the k-loop; the next tile waits for this signal.
                 if tile_raw + fx.Int32(C_STEP) < fx.Int32(C_TOTAL):
@@ -2238,7 +2266,17 @@ def _launch_grouped_bf16_variable_k(
                 if const_expr(vk_seam & 512):
                     _async_chunk(epi_chunk - 1, 0)
             elif const_expr(accum == 1):
-                if const_expr(C_WHOLE):
+                if const_expr(C_PERSIST):
+                    # Part p in slot p; the one in the last k-tile's slot, if any, was issued past the entry fence.
+                    p_h0 = _buf_ptr(0)
+                    if const_expr(C_WHOLE):
+                        c_base = fx.Int32(_bidx(p_h0))
+                    else:
+                        p_h1 = _buf_ptr(1)
+                        c_base = (wave_m == fx.Int32(0)).select(
+                            fx.Int32(_bidx(p_h0)), fx.Int32(_bidx(p_h1)) - fx.Int32(C_HALF * C_LDS_ROW)
+                        )
+                elif const_expr(C_WHOLE):
                     # The whole old C landed during the last k-tile and the entry fence drained it.
                     p_h0 = _buf_ptr(_slot(K_TILES))
                     c_base = fx.Int32(_bidx(p_h0))
@@ -2298,7 +2336,36 @@ def _launch_grouped_bf16_variable_k(
                     )
                     fx.copy(atom_h, _lv(src, (C_ROWS, C_LDS_ROW), (C_LDS_ROW, 1)), gt_h)
 
-                if const_expr(C_WHOLE):
+                if const_expr(C_PERSIST):
+                    # In flight on the last wave behind a late part: its own share of the next tile's prefetch.
+                    PF_OPS = TDM_PW * PRE_KT if const_expr(tdm_deal or num_waves <= 2) else 0
+                    c_last = _slot(K_TILES - 1)
+                    if const_expr(C_WHOLE):
+                        if c_last == fx.Int32(0):
+                            tdm_ops.tensor_wait(PF_OPS)
+                            gpu.barrier()
+                        _add_stage()
+                        gpu.barrier()
+                        _store_half(0, p_h0)
+                    else:
+                        if c_last < fx.Int32(2):
+                            # One half is late: the waves of the other one add theirs while it lands.
+                            first = (c_last == fx.Int32(0)).select(fx.Int32(1), fx.Int32(0))
+                            if wave_m == first:
+                                _add_stage()
+                            tdm_ops.tensor_wait(PF_OPS)
+                            gpu.barrier()
+                            _store_half(first, _buf_ptr(first))
+                            if wave_m != first:
+                                _add_stage()
+                            gpu.barrier()
+                            _store_half(fx.Int32(1) - first, _buf_ptr(fx.Int32(1) - first))
+                        else:
+                            _add_stage()
+                            gpu.barrier()
+                            _store_half(0, p_h0)
+                            _store_half(1, p_h1)
+                elif const_expr(C_WHOLE):
                     _add_stage()
                     gpu.barrier()
                     _store_half(0, p_h0)
@@ -2927,7 +2994,8 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
     # 1 = accumulate: ``out[g] += a[rows_g].T @ b[rows_g]`` into ``out`` (e.g. a weight's main_grad), fp32 or the
     # operands' dtype. The old ``out`` is added to the fp32 accumulators: an fp32 ``out`` with no rounding to the
     # operand dtype, a 16-bit one rounded once. Whole output tiles only
-    # (``grouped_gemm_bf16_variable_k_accum_supported``); runs the plain, non-persistent epilogue.
+    # (``grouped_gemm_bf16_variable_k_accum_supported``); runs the plain epilogue, a 16-bit out also under
+    # ``persist`` (with vk_ovl bits 0 and 2, vk_seam bits 1 and 2 and vk_stagger).
     accumulate: int = 0,
     # How the old ``out`` reaches the accumulators: "tdm" through LDS (TDM loads and stores), "reg" straight
     # from global memory into registers, "auto" = "tdm" where the launcher's LDS staging of it fits.
@@ -2985,14 +3053,18 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
             raise ValueError(
                 f"accum_impl must be 'auto' or one of {sorted(_VK_ACCUM_IMPLS)}, got {accum_impl!r}"
             )
-        # The persistent stack and the chunked epilogue are not built for it; an explicit 0 turns the lookup off.
+        # The persistent stack is never looked up for it (an explicit 0 turns the lookup off), and the chunked
+        # epilogue is not built for it. A 16-bit out takes the persistent seam's tile walk when the call sets it.
         if persist < 0:
             persist = 0
         if epi_chunk < 0:
             epi_chunk = 1
-        if persist or out_ldc or vk_seam or vk_stagger or epi_chunk != 1 or issue_first:
+        if out_ldc or epi_chunk != 1 or issue_first:
+            raise ValueError("accumulate needs out_ldc=0, epi_chunk=1 and issue_first=0")
+        if (persist or vk_seam or vk_stagger) and not accum_c16:
             raise ValueError(
-                "accumulate needs persist=0, out_ldc=0, vk_seam=0, vk_stagger=0, epi_chunk=1 and issue_first=0"
+                "accumulate into an fp32 out needs persist=0, vk_seam=0 and vk_stagger=0; persist is for an out of "
+                "the operands' dtype"
             )
     elif _round_first:
         raise ValueError("_round_first needs accumulate=1")
