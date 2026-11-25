@@ -302,6 +302,48 @@ def test_visibility_paged_split_fused_bitwise(dtype, block_size, with_sinks, sma
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("flat", [False, True])
+def test_paged_out_buffer(dtype, flat, small_segments):
+    """out= writes the returned output's bits into a caller's padded buffer, rows past the tokens
+    untouched."""
+    q, k, v, cu = _varlen(LENS, 8, 2, 64, dtype, seed=15)
+    mask = _mixed_mask(LENS, seed=15)[2]
+    k_cache, v_cache, block_table, seq_lens = _paged(k, v, cu, 16)
+    rows = q.shape[0] + 5
+    for mode in ("fused", "split"):
+        args = (q, k_cache, v_cache, cu, seq_lens, block_table, 300, 300, 0.125)
+        kw = dict(block_mask=mask, kernel_options={"MODE": mode})
+        want = rl_paged_attention_func(*args, **kw)
+        buf = torch.full((rows, 8, 64), 7.0, dtype=dtype, device=DEVICE)
+        out = buf.view(rows, 8 * 64) if flat else buf
+        assert rl_paged_attention_func(*args, out=out, **kw) is out
+        assert _bits_equal(buf[: q.shape[0]], want), mode
+        assert bool((buf[q.shape[0] :] == 7.0).all()), f"padded rows written ({mode})"
+    with pytest.raises(ValueError, match="out must be"):
+        rl_paged_attention_func(*args, out=torch.empty(q.shape[0] - 1, 8, 64, dtype=dtype, device=DEVICE))
+
+
+def test_sequence_position_mask():
+    """Bounds in each token's own sequence positions give the global mask, for contiguous K/V and
+    for a paged cache whose sequences have more keys than queries."""
+    rlo, rhi = _mixed_rel(LENS, seed=16)
+    cu = _cu(LENS)
+    glo, ghi = _to_global(rlo, rhi, LENS, cu[:-1].tolist())
+    mask = create_block_mask(rlo, rhi, cu_seqlens_q=cu, cu_seqlens_k=cu)
+    assert torch.equal(mask.lo, glo) and torch.equal(mask.hi, ghi)
+    q_lens, k_lens = [1, 3, 1], [40, 7, 129]
+    rlo, rhi = _causal_rel(q_lens, k_lens, window_left=5)
+    seq_lens = torch.tensor(k_lens, dtype=torch.int32, device=DEVICE)
+    starts = [0] + torch.tensor(k_lens).cumsum(0)[:-1].tolist()
+    glo, ghi = _to_global(rlo, rhi, q_lens, starts)
+    mask = create_block_mask(torch.stack([rlo, rhi]), cu_seqlens_q=_cu(q_lens), seq_lens=seq_lens)
+    assert torch.equal(mask.lo, glo) and torch.equal(mask.hi, ghi)
+    assert torch.equal(mask.key_starts(seq_lens), torch.tensor(starts + [sum(k_lens)], device=DEVICE).int())
+    with pytest.raises(ValueError, match="exactly one"):
+        create_block_mask(rlo, rhi, cu_seqlens_q=_cu(q_lens))
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
 def test_visibility_batch_invariance(dtype, small_segments):
     q, k, v, cu = _varlen([200], 8, 2, 128, dtype, seed=4)
     rlo, rhi = _mixed_rel([200], seed=4)

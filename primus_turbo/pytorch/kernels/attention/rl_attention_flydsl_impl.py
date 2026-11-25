@@ -165,6 +165,7 @@ def rl_attention_fwd_flydsl(
     split_segs: int = 0,
     pack: str = "auto",
     wave_rows: int = 0,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Same contract as rl_attention_fwd_triton. Schedule options (none changes the bits):
     ``block_m`` (64 / 128), ``waves_per_eu`` (1 / 2), ``mode`` ("fused" never splits the keys across
@@ -177,7 +178,10 @@ def rl_attention_fwd_flydsl(
     assert v.shape[-1] == head_size, "the FlyDSL RL forward needs equal q / v head sizes"
     assert k.is_contiguous() and v.is_contiguous(), "the FlyDSL RL forward needs contiguous K / V"
     q = q.contiguous()
-    out = torch.empty_like(q)
+    if out is None:
+        out = torch.empty_like(q)
+    elif not out.is_contiguous():
+        raise ValueError("the FlyDSL RL forward writes out with q's contiguous [num_tokens, Hq, D] layout")
     lse = torch.empty((num_tokens, num_q_heads) if return_lse else (0,), dtype=torch.float32, device=q.device)
     if num_tokens == 0:
         return out, lse

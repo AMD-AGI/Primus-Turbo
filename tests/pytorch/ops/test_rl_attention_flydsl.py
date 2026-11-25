@@ -115,6 +115,23 @@ def test_paged_and_builtin_equal_contiguous(heads, page, masked):
     assert _bits_equal(paged, contiguous)
 
 
+@pytest.mark.parametrize("split", [False, True])
+def test_paged_out_buffer(split):
+    """out= on FlyDSL: a caller's padded buffer gets the returned bits; rows past the tokens are kept."""
+    lens = [1, 1, 1, 1] if split else [1, 77, 300]
+    kv_lens = [3000, 2100, 1500, 1025] if split else lens
+    q = _varlen(lens, 32, 8, 128, BF16, seed=17)[0]
+    _, k, v, cu_k = _varlen(kv_lens, 32, 8, 128, BF16, seed=18)
+    k_cache, v_cache, block_table, seq_lens = _paged(k, v, cu_k, 64)
+    args = (q, k_cache, v_cache, _cu(lens), seq_lens, block_table, max(lens), max(kv_lens))
+    opts = {**FLY, "MODE": "split"} if split else FLY
+    want = rl_paged_attention_func(*args, kernel_options=opts)
+    buf = torch.full((q.shape[0] + 3, 32 * 128), 7.0, dtype=BF16, device=DEVICE)
+    assert rl_paged_attention_func(*args, kernel_options=opts, out=buf) is buf
+    assert _bits_equal(buf[: q.shape[0]].view_as(want), want)
+    assert bool((buf[q.shape[0] :] == 7.0).all())
+
+
 @pytest.mark.parametrize("heads", HEADS[:2])
 def test_batch_and_launch_invariance(heads):
     hq, hkv, d = heads

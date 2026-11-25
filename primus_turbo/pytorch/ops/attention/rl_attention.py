@@ -61,12 +61,16 @@ Sliding window of W keys                max(seq start, i - W + 1)      i
 No keys (output 0, LSE +inf)            hi + 1                         any
 ======================================  =============================  ===========
 
+``create_block_mask(lo, hi, cu_seqlens_q=..., cu_seqlens_k=... or seq_lens=...)`` takes the bounds
+as positions in each token's own sequence instead and converts them once per mask.
+
 Keys outside [lo, hi] are exact no-ops, and tiles are walked in increasing key position whatever the
 mask, so a token's output depends only on its own interval. The backward prunes its walks to the
 intervals.
 """
 
 import functools
+import math
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Union
 
@@ -239,13 +243,40 @@ class RLBlockMask:
 
 
 def create_block_mask(
-    bounds: torch.Tensor, hi: Optional[torch.Tensor] = None, *, window_left: int = -1
+    bounds: torch.Tensor,
+    hi: Optional[torch.Tensor] = None,
+    *,
+    window_left: int = -1,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seq_lens: Optional[torch.Tensor] = None,
 ) -> RLBlockMask:
     """Build a visibility mask from a [2, num_tokens] tensor of (lo, hi), or from lo and hi.
 
     Unlike ``torch.nn.attention.flex_attention.create_block_mask`` this takes the bounds directly,
     not a mask_mod function. ``window_left`` >= 0 narrows each row to [max(lo, hi - window_left), hi].
+
+    By default lo / hi are global key indices. With ``cu_seqlens_q`` they are positions in each
+    token's own sequence (0 is its first key), and the mask converts them once, on the device and
+    without a host sync, using the key starts: ``cu_seqlens_k`` for contiguous K/V, or ``seq_lens``
+    for a paged cache (the mask then also holds the key starts its paged calls need).
     """
+    if cu_seqlens_q is not None:
+        mask = create_block_mask(bounds, hi)
+        if (cu_seqlens_k is None) == (seq_lens is None):
+            raise ValueError("sequence positions need exactly one of cu_seqlens_k and seq_lens")
+        if seq_lens is not None:
+            starts = mask.key_starts(seq_lens)
+        else:
+            starts = cu_seqlens_k
+        tokens = torch.arange(mask.num_tokens, dtype=torch.int32, device=mask.lo.device)
+        seq = torch.searchsorted(cu_seqlens_q[1:].to(torch.int32), tokens, right=True)
+        base = starts.to(torch.int32)[seq]
+        out = RLBlockMask((mask.lo + base).contiguous(), (mask.hi + base).contiguous())
+        out._cache.update(mask._cache)
+        return out.with_window(window_left)
+    if cu_seqlens_k is not None or seq_lens is not None:
+        raise ValueError("cu_seqlens_k / seq_lens convert sequence positions, which also need cu_seqlens_q")
     if hi is None:
         if bounds.ndim != 2 or bounds.shape[0] != 2:
             raise ValueError(
@@ -291,18 +322,23 @@ def rl_paged_attention_func(
     block_mask: Optional[RLBlockMask] = None,
     sinks: Optional[torch.Tensor] = None,
     kernel_options: Optional[dict] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Rollout forward over a paged KV cache.
 
     q [num_tokens, Hq, D]; k_cache, v_cache [num_blocks, block_size, Hkv, D]; block_table
     [num_seqs, max_blocks] int32; seq_lens [num_seqs] int32 (keys per sequence, including this
     step's queries); cu_seqlens_q [num_seqs + 1] int32. Returns out [num_tokens, Hq, Dv].
+
+    ``out``, a caller's buffer of q's dtype, [rows, Hq, Dv] or [rows, Hq * Dv] with rows >=
+    num_tokens (vLLM passes its padded buffer), is written in its first num_tokens rows, which must
+    be contiguous; the other rows are left untouched. It is returned as given.
     """
     opts = _resolve_options(kernel_options)
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
     window_left, block_mask, sinks = _prepare(q.shape[0], q.shape[1], window_left, block_mask, sinks)
-    out, _ = rl_attention_impl.rl_attention_fwd_impl(
+    args = (
         q,
         k_cache,
         v_cache,
@@ -317,10 +353,29 @@ def rl_paged_attention_func(
         block_mask.lo if block_mask is not None else None,
         block_mask.hi if block_mask is not None else None,
         sinks,
-        False,
-        *opts.fwd_args(),
     )
+    if out is None:
+        res, _ = rl_attention_impl.rl_attention_fwd_impl(*args, False, *opts.fwd_args())
+        return res
+    rl_attention_impl.rl_attention_fwd_out_impl(_out_rows(out, q, v_cache.shape[-1]), *args, *opts.fwd_args())
     return out
+
+
+def _out_rows(out: torch.Tensor, q: torch.Tensor, v_head_size: int) -> torch.Tensor:
+    """The [num_tokens, Hq, Dv] view of a caller's output buffer's first num_tokens rows."""
+    num_tokens, num_q_heads = q.shape[0], q.shape[1]
+    width = num_q_heads * v_head_size
+    if out.dtype != q.dtype or out.device != q.device:
+        raise ValueError(f"out must be {q.dtype} on {q.device}, got {out.dtype} on {out.device}")
+    if out.ndim not in (2, 3) or out.shape[0] < num_tokens or math.prod(out.shape[1:]) != width:
+        raise ValueError(
+            f"out must be [rows >= {num_tokens}, {num_q_heads}, {v_head_size}] or [rows, {width}], "
+            f"got {tuple(out.shape)}"
+        )
+    rows = out[:num_tokens]
+    if not rows.is_contiguous():
+        raise ValueError("out's first num_tokens rows must be contiguous")
+    return rows.view(num_tokens, num_q_heads, v_head_size)
 
 
 class RLFlashAttnVarlenFunc(torch.autograd.Function):

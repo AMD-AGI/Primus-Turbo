@@ -137,11 +137,13 @@ def rl_attention_fwd_triton(
     split_segs: int = 0,
     pack: str = "auto",
     wave_rows: int = 0,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward over a paged cache (``block_table`` and ``seq_lens``) or contiguous K/V
     (``cu_seqlens_k``). With visibility, ``cu_seqlens_k`` gives each sequence's first global key
-    index in both layouts. Returns out and the natural-log LSE (empty unless ``return_lse``).
-    Kernel options are described in the module docstring."""
+    index in both layouts. Returns out (``out`` if given, [num_tokens, Hq, Dv] with a unit last
+    stride) and the natural-log LSE (empty unless ``return_lse``). Kernel options are described
+    in the module docstring."""
     paged = block_table is not None
     if paged:
         assert seq_lens is not None and k.ndim == 4
@@ -182,7 +184,8 @@ def rl_attention_fwd_triton(
     block_q = launch.block_m // queries_per_kv
     num_q_blocks = num_tokens // block_q + num_seqs
 
-    out = torch.empty((num_tokens, num_q_heads, v_head_size), dtype=q.dtype, device=q.device)
+    if out is None:
+        out = torch.empty((num_tokens, num_q_heads, v_head_size), dtype=q.dtype, device=q.device)
     lse_shape = (num_tokens, num_q_heads) if return_lse else (0,)
     lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
     if num_tokens == 0:

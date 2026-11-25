@@ -145,6 +145,75 @@ def _rl_attention_fwd_impl_meta(
     return q.new_empty((num_tokens, num_q_heads, v.shape[-1])), q.new_empty(lse_shape, dtype=torch.float32)
 
 
+@torch.library.custom_op("primus_turbo::rl_attention_fwd_out_impl", mutates_args=("out",), device_types="cuda")
+def rl_attention_fwd_out_impl(
+    out: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: Optional[torch.Tensor],
+    seq_lens: Optional[torch.Tensor],
+    block_table: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    window_left: int,
+    vis_lo: Optional[torch.Tensor],
+    vis_hi: Optional[torch.Tensor],
+    sinks: Optional[torch.Tensor],
+    mode: str,
+    tile_size: int,
+    segment_size: int,
+    block_m: int,
+    num_warps: int,
+    num_stages: int,
+    waves_per_eu: int,
+    split_segs: int,
+    pack: str,
+    wave_rows: int,
+    backend: str,
+) -> None:
+    """The forward written into ``out`` [num_tokens, Hq, Dv], a caller's buffer (no LSE)."""
+    kwargs = dict(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seq_lens=seq_lens,
+        block_table=block_table,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        window_left=window_left,
+        vis_lo=vis_lo,
+        vis_hi=vis_hi,
+        sinks=sinks,
+        return_lse=False,
+        mode=mode,
+        tile_size=tile_size,
+        segment_size=segment_size,
+        block_m=block_m,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        waves_per_eu=waves_per_eu,
+        split_segs=split_segs,
+        pack=pack,
+        wave_rows=wave_rows,
+    )
+    _select(backend, **kwargs).fwd(out=out, **kwargs)
+
+
+@rl_attention_fwd_out_impl.register_fake
+def _rl_attention_fwd_out_impl_meta(
+    out, q, k, v, cu_seqlens_q, cu_seqlens_k, seq_lens, block_table, max_seqlen_q, max_seqlen_k,
+    softmax_scale, window_left, vis_lo, vis_hi, sinks, mode, tile_size, segment_size,
+    block_m, num_warps, num_stages, waves_per_eu, split_segs, pack, wave_rows, backend,
+):  # fmt: skip
+    return None
+
+
 @torch.library.custom_op("primus_turbo::rl_attention_bwd_impl", mutates_args=(), device_types="cuda")
 def rl_attention_bwd_impl(
     dout: torch.Tensor,

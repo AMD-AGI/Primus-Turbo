@@ -46,6 +46,11 @@ out = flash_attn_varlen_func(q, k_cache, v_cache, cu_seqlens_q, None, max_seqlen
 The same kernel has dedicated entry points: `rl_paged_attention_func` (rollout),
 `rl_flash_attn_varlen_func` (THD) and `rl_flash_attn_func` (BSHD).
 
+`rl_paged_attention_func(..., out=buf)` writes into a caller's buffer, as vLLM passes it:
+`[rows, Hq, Dv]` or `[rows, Hq * Dv]` with `rows >= num_tokens`. Only the first `num_tokens` rows
+are written (they must be contiguous); padded rows are left untouched, and the bits are those of
+the call without `out`.
+
 ## Visibility masks
 
 `create_block_mask(lo, hi)` gives each query token one contiguous, inclusive range of keys
@@ -61,6 +66,11 @@ global index of a query token:
 | Bidirectional span (e.g. an image) | span start | span end |
 | Sliding window of W keys | max(seq start, i - W + 1) | i |
 | No keys (output 0) | hi + 1 | any |
+
+To give bounds as positions in each token's own sequence (0 = its first key), pass the layout:
+`create_block_mask(lo, hi, cu_seqlens_q=cu_q, seq_lens=seq_lens)` for a paged cache, or
+`cu_seqlens_k=cu_k` for contiguous K/V. The mask converts them once on the device (no host sync,
+CUDA-graph safe) and every layer of the step reuses the result.
 
 `create_block_mask(..., window_left=W)` narrows every row to `[max(lo, hi - W), hi]`. Keys
 outside a row's interval are exact no-ops. Tiles are always walked in increasing key position, so a
