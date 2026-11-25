@@ -91,7 +91,8 @@ PASSTHROUGH = {
     "nt": {"out", "out_dtype", "m_tiles"},
     "nn": {"out", "out_dtype", "m_tiles"},
     "vk": {"out", "out_dtype", "masked_k", "expert_table"},
-    "vk_accum": {"out", "out_dtype", "masked_k", "expert_table", "accumulate", "accum_impl"},
+    # `_round_first` (the bf16 accumulate's test hook) too, so that the hook runs the production call's key.
+    "vk_accum": {"out", "out_dtype", "masked_k", "expert_table", "accumulate", "accum_impl", "_round_first"},
 }
 
 

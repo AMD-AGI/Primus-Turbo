@@ -598,10 +598,11 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
         # gfx950 (CDNA4) builds the body on mfma_f32_16x16x32_bf16; gfx1250 on
         # v_wmma_f32_16x16x32_bf16 with the transpose done by ds_load_tr16_b128 in LDS.
         supported &= gfx950 or gfx1250
-        # beta=1 exists on gfx1250 only, into an fp32 out (a weight's main_grad).
+        # beta=1 exists on gfx1250 only, into an fp32 or an operand-dtype out (a weight's main_grad).
         out = kwargs.get("out")
         if inplace_add_to_out:
-            supported &= gfx1250 and out is not None and out.dtype == torch.float32 and out.is_contiguous()
+            supported &= gfx1250 and out is not None and out.is_contiguous()
+            supported &= out is not None and out.dtype in (torch.float32, a.dtype)
         supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
         supported &= a.dim() == 2 and b.dim() == 2 and a.shape[0] == b.shape[0]
         supported &= a.dtype in (torch.bfloat16, torch.float16) and b.dtype == a.dtype
@@ -736,8 +737,9 @@ class GroupedGEMMVariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatc
         k = a.shape[0] if trans_a else a.shape[1]
         if trans_c:
             m, n = n, m
-        # CK cannot accumulate and FlyDSL only on gfx1250 into an fp32 out, while Triton and hipBLASLt
-        # can. A cache hit skips can_handle, so overwrite and beta=1 calls must never share a backend choice.
+        # CK cannot accumulate and FlyDSL only on gfx1250 into an fp32 or an operand-dtype out, while Triton
+        # and hipBLASLt can. A cache hit skips can_handle, so overwrite and beta=1 calls must never share a
+        # backend choice, nor beta=1 calls into outs of different dtypes.
         return (
             bs,
             m,
@@ -751,6 +753,7 @@ class GroupedGEMMVariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatc
             trans_c,
             maybe_pre_sync,
             inplace_add_to_out,
+            getattr(kwargs.get("out"), "dtype", None) if inplace_add_to_out else None,
         )
 
 
