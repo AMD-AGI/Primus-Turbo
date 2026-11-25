@@ -1004,6 +1004,11 @@ class DualwaveKernelContext:
         if const_expr(traits.VARLEN and traits.HAS_VIS):
             # Rows that see nothing still write zeros, so a block is active while it has rows.
             self.active = ArithValue(self.q_start // fx.Index(self._rows_per_token()) < self.seqlen_q_v)
+            if const_expr(traits.SPLIT_MODE == 1):
+                # The grid follows max_seqlen_k; a segment group past this sequence's keys holds no
+                # key, and MERGE reads only the sequence's own segments, so it writes nothing.
+                first_key = self._first_split_segment() * fx.Index(traits.SEGMENT_TILES * traits.BLOCK_N)
+                self.active = self.active & ArithValue(first_key < self.seqlen_kv_v)
         elif const_expr(traits.VARLEN):
             if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN):
                 self.active = ArithValue(self.q_start < self.seqlen_q_v) & (

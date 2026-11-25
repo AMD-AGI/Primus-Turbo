@@ -323,6 +323,47 @@ def test_paged_out_buffer(dtype, flat, small_segments):
         rl_paged_attention_func(*args, out=torch.empty(q.shape[0] - 1, 8, 64, dtype=dtype, device=DEVICE))
 
 
+def _graph_decode_check(hq, hkv, d, page, bound, steps, kernel_options, sinks=None, window_left=-1, seed=0):
+    """Capture one decode graph with max_seqlen_k = bound, as a serving engine does, then replay it
+    for steps of other context lengths (q and seq_lens updated in place): every replay must give
+    the bits of an eager call at the real max_seqlen_k."""
+    batch = len(steps[0])
+    _, k, v, cu_k = _varlen([bound] * batch, hq, hkv, d, torch.bfloat16, seed=seed)
+    k_cache, v_cache, block_table, _ = _paged(k, v, cu_k, page, seed=seed)
+    q = torch.zeros(batch, hq, d, dtype=torch.bfloat16, device=DEVICE)
+    seq_lens = torch.tensor(steps[0], dtype=torch.int32, device=DEVICE)
+    cu_q = _cu([1] * batch)
+
+    def call(max_k):
+        return rl_paged_attention_func(
+            q, k_cache, v_cache, cu_q, seq_lens, block_table, 1, max_k, d**-0.5, window_left=window_left,
+            sinks=sinks, kernel_options=kernel_options,
+        )  # fmt: skip
+
+    call(bound)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = call(bound)
+    gen = torch.Generator().manual_seed(seed + 1)
+    for lens in steps:
+        q.copy_(torch.randn(batch, hq, d, generator=gen))
+        seq_lens.copy_(torch.tensor(lens, dtype=torch.int32))
+        graph.replay()
+        assert _bits_equal(out, call(max(lens))), f"graph replay at lens {lens}"
+
+
+@pytest.mark.parametrize("mode", ["auto", "split"])
+@pytest.mark.parametrize("with_sinks", [False, True])
+def test_decode_graph_replay(mode, with_sinks, small_segments):
+    """One graph captured at max_seqlen_k = 1024 (eight 128-key segments) serves shorter and
+    full-length decode steps with the eager bits."""
+    steps = [[100, 700, 129], [101, 1024, 300], [5, 6, 7]]
+    _graph_decode_check(
+        8, 2, 64, 16, 1024, steps, {"MODE": mode}, sinks=_sinks(8, 19) if with_sinks else None, seed=19
+    )
+
+
 def test_sequence_position_mask():
     """Bounds in each token's own sequence positions give the global mask, for contiguous K/V and
     for a paged cache whose sequences have more keys than queries."""

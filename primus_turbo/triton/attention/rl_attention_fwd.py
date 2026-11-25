@@ -575,7 +575,7 @@ def attention_fwd_fused_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_segments"])
 def attention_fwd_split_kernel(
     segm_m_ptr,  # [num_tokens, num_q_heads, num_segments] fp32
     segm_l_ptr,  # [num_tokens, num_q_heads, num_segments] fp32
@@ -603,7 +603,7 @@ def attention_fwd_split_kernel(
     stride_v1,
     stride_v2,
     stride_v3: tl.constexpr,
-    NUM_SEGMENTS: tl.constexpr,
+    num_segments,
     NUM_Q_HEADS: tl.constexpr,
     QUERIES_PER_KV: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
@@ -703,14 +703,14 @@ def attention_fwd_split_kernel(
         HAS_VIS,
     )
 
-    row = ((q_start + query_pos).to(tl.int64) * NUM_Q_HEADS + head_idx) * NUM_SEGMENTS + seg
+    row = ((q_start + query_pos).to(tl.int64) * NUM_Q_HEADS + head_idx) * num_segments + seg
     tl.store(segm_m_ptr + row, m, mask=row_valid)
     tl.store(segm_l_ptr + row, l, mask=row_valid)
     offs_vd = tl.arange(0, V_HEAD_SIZE_PADDED)
     tl.store(segm_acc_ptr + row[:, None] * V_HEAD_SIZE_PADDED + offs_vd[None, :], a, mask=row_valid[:, None])
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_segments"])
 def attention_fwd_reduce_kernel(
     out_ptr,
     lse_ptr,
@@ -726,7 +726,7 @@ def attention_fwd_reduce_kernel(
     num_seqs,
     stride_o0,
     stride_o1,
-    NUM_SEGMENTS: tl.constexpr,
+    num_segments,
     NUM_Q_HEADS: tl.constexpr,
     QUERIES_PER_KV: tl.constexpr,
     GROUP_PADDED: tl.constexpr,
@@ -769,7 +769,7 @@ def attention_fwd_reduce_kernel(
     L = tl.zeros([GROUP_PADDED], dtype=tl.float32)
     A = tl.zeros([GROUP_PADDED, V_HEAD_SIZE_PADDED], dtype=tl.float32)
     for seg in range(key_lo // SEGMENT_SIZE, key_lo // SEGMENT_SIZE + num_token_segments):
-        row = (token.to(tl.int64) * NUM_Q_HEADS + head_idx) * NUM_SEGMENTS + seg
+        row = (token.to(tl.int64) * NUM_Q_HEADS + head_idx) * num_segments + seg
         m = tl.load(segm_m_ptr + row, mask=row_valid, other=float("-inf"))
         l = tl.load(segm_l_ptr + row, mask=row_valid, other=0.0)
         a = tl.load(

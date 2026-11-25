@@ -9,6 +9,9 @@
 Phases, all with bf16 / fp16 and real model head shapes (heads sharded by --tp-size):
   - decode  : paged KV cache, one query token per sequence, batch x context sweep. Reports time and
               KV bandwidth. Baseline: aiter unified_attention (the Triton kernel SGLang / vLLM use).
+  - decode-graph : decode replayed from one HIP graph captured with max_seqlen_k = --graph-max-ctx
+              (a serving engine's max model length), against a graph at max_seqlen_k = ctx; checks
+              the bits match. Not in the default phases.
   - prefill : paged KV cache, a chunk of query tokens on top of existing context. Same baseline.
   - train   : packed varlen sequences, forward and forward + backward. Reports time and TFLOPS.
               Baseline: Turbo's default flash_attn_varlen_func backend (not batch invariant).
@@ -25,6 +28,7 @@ prefill, that the rollout result equals a training forward of the same tokens bi
     python benchmark/ops/training/bench_rl_attention.py [--phase decode prefill train]
         [--model llama3-8b gpt-oss-120b] [--backend TRITON FLYDSL] [--tp-size N] [--check] [-o out.csv]
         [--decode-batch 1 8 32 --decode-ctx 131072 262144 524288]
+    python benchmark/ops/training/bench_rl_attention.py --phase decode-graph [--graph-max-ctx 131072]
 """
 
 import argparse
@@ -61,6 +65,24 @@ _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 def bench_ms(fn):
     return triton.testing.do_bench(fn, warmup=25, rep=100)
+
+
+def bench_graph_ms(fn, iters=200):
+    """Milliseconds per call of ``fn`` captured once in a HIP graph and replayed."""
+    fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+    for _ in range(10):
+        graph.replay()
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        graph.replay()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / iters
 
 
 def compute_snr(ref, actual):
@@ -188,6 +210,41 @@ def bench_rollout(phase, model, tp_size, dtype, check, backends, decode_cases=DE
     ]
 
 
+def _graph_case(model, batch, ctx, max_ctx, shape, dtype, backends):
+    """Decode as a serving engine captures it: one HIP graph with max_seqlen_k = max_ctx (the
+    model's max length) replayed at the real context, against a graph captured at max_seqlen_k =
+    ctx. The block table has max_ctx // BLOCK_SIZE columns, as an engine allocates it."""
+    hq, hkv, d, window, has_sinks = shape
+    scale = d**-0.5
+    sinks = torch.randn(hq, device="cuda") if has_sinks else None
+    q, k_cache, v_cache, block_table, seq_lens, cu_q = paged_inputs(batch, ctx, 1, hq, hkv, d, dtype)
+    wide = torch.zeros(batch, triton.cdiv(max_ctx, BLOCK_SIZE), dtype=torch.int32, device="cuda")
+    wide[:, : block_table.shape[1]] = block_table
+    row = {"phase": "decode-graph", "model": model, "batch": batch, "ctx": ctx, "max_ctx": max_ctx}
+    for backend in backends:
+        opts = {"BACKEND": backend}
+        name = backend.lower()
+
+        def rl(max_k, opts=opts):
+            return rl_paged_attention_func(
+                q, k_cache, v_cache, cu_q, seq_lens, wide, 1, max_k, scale, window_left=window, sinks=sinks,
+                kernel_options=opts,
+            )  # fmt: skip
+
+        t_ctx = bench_graph_ms(lambda: rl(ctx)) * 1e3
+        t_max = bench_graph_ms(lambda: rl(max_ctx)) * 1e3
+        row[f"{name}_graph_us"] = round(t_ctx, 1)
+        row[f"{name}_graph_max_us"] = round(t_max, 1)
+        row[f"{name}_max/ctx"] = round(t_max / t_ctx, 2)
+        row[f"{name}_bits_equal"] = bits_equal(rl(ctx), rl(max_ctx))
+    return row
+
+
+def bench_decode_graph(model, tp_size, dtype, backends, decode_cases, max_ctx):
+    shape = heads(model, tp_size)
+    return [_graph_case(model, b, c, max_ctx, shape, dtype, backends) for b, c in decode_cases if c <= max_ctx]
+
+
 def _time_fwd_and_fwdbwd(fn, dout):
     with torch.no_grad():
         fwd = bench_ms(fn)
@@ -254,7 +311,10 @@ def bench_train(model, tp_size, dtype, check, backends):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Benchmark batch-invariant RL attention")
     parser.add_argument(
-        "--phase", nargs="+", default=["decode", "prefill", "train"], choices=["decode", "prefill", "train"]
+        "--phase",
+        nargs="+",
+        default=["decode", "prefill", "train"],
+        choices=["decode", "decode-graph", "prefill", "train"],
     )
     parser.add_argument("--model", nargs="+", default=list(MODELS), choices=list(MODELS))
     parser.add_argument("--backend", nargs="+", default=["TRITON", "FLYDSL"], choices=["TRITON", "FLYDSL"])
@@ -263,6 +323,9 @@ def main(argv=None):
     parser.add_argument("--check", action="store_true", help="also check accuracy and rollout == train bits")
     parser.add_argument("--decode-batch", nargs="+", type=int, help="decode batches (with --decode-ctx)")
     parser.add_argument("--decode-ctx", nargs="+", type=int, help="decode contexts, e.g. 131072 262144 524288")
+    parser.add_argument(
+        "--graph-max-ctx", type=int, default=131072, help="decode-graph: max_seqlen_k a captured graph passes"
+    )
     parser.add_argument("-o", "--output", help="CSV path (default: rl_attention_<date>_<gpu>.csv)")
     args = parser.parse_args(argv)
 
@@ -281,6 +344,10 @@ def main(argv=None):
         for model in args.model:
             if phase == "train":
                 rows += bench_train(model, args.tp_size, dtype, args.check, args.backend)
+            elif phase == "decode-graph":
+                rows += bench_decode_graph(
+                    model, args.tp_size, dtype, args.backend, decode_cases, args.graph_max_ctx
+                )
             else:
                 rows += bench_rollout(phase, model, args.tp_size, dtype, args.check, args.backend, decode_cases)
         print(f"\n{phase}")

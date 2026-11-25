@@ -264,7 +264,7 @@ def rl_attention_fwd_triton(
             segm_m_ptr=segm_m,
             segm_l_ptr=segm_l,
             segm_acc_ptr=segm_acc,
-            NUM_SEGMENTS=num_segments,
+            num_segments=num_segments,
             **common,
             **opts,
         )
@@ -283,7 +283,7 @@ def rl_attention_fwd_triton(
             num_seqs=num_seqs,
             stride_o0=out.stride(0),
             stride_o1=out.stride(1),
-            NUM_SEGMENTS=num_segments,
+            num_segments=num_segments,
             NUM_Q_HEADS=num_q_heads,
             QUERIES_PER_KV=queries_per_kv,
             GROUP_PADDED=triton.next_power_of_2(queries_per_kv),

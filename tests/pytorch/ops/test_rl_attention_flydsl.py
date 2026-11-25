@@ -23,6 +23,7 @@ from tests.pytorch.ops.test_rl_attention import (
     DEVICE,
     _bits_equal,
     _cu,
+    _graph_decode_check,
     _mixed_mask,
     _paged,
     _sinks,
@@ -113,6 +114,14 @@ def test_paged_and_builtin_equal_contiguous(heads, page, masked):
         q, k_cache, v_cache, cu, seq_lens, block_table, 1024, 1024, block_mask=mask, kernel_options=FLY
     )
     assert _bits_equal(paged, contiguous)
+
+
+@pytest.mark.parametrize("mode", ["auto", "split"])
+def test_decode_graph_replay(mode):
+    """One FlyDSL decode graph captured at max_seqlen_k = 8192 (eight 1024-key segments) serves
+    steps of other lengths with the eager bits."""
+    steps = [[1500, 3000, 200, 64], [1501, 8192, 1024, 1025], [65, 66, 67, 68]]
+    _graph_decode_check(32, 8, 128, 64, 8192, steps, {**FLY, "MODE": mode}, seed=20)
 
 
 @pytest.mark.parametrize("split", [False, True])

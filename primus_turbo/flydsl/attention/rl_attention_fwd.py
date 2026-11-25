@@ -280,7 +280,9 @@ def build_rl_flash_attn_module(
             ctx.setup_rows()
             piece = ctx.group_id
             seg_keys = traits.SEGMENT_TILES * traits.BLOCK_N
-            num_segments = (ctx.seq_len_kv_v + fx.Index(seg_keys - 1)) // fx.Index(seg_keys)
+            # This sequence's own segments, not max_seqlen_k's: the rest hold no key (an empty
+            # segment merges as an exact no-op), so a graph-safe max_seqlen_k costs nothing here.
+            num_segments = (ctx.seqlen_kv_v + fx.Index(seg_keys - 1)) // fx.Index(seg_keys)
             num_groups = (num_segments + fx.Index(MERGE_DEPTH - 1)) // fx.Index(MERGE_DEPTH)
             last = num_segments - fx.Index(1)
             init = [ctx.c_neg_floor, ctx.c_zero_f, Vec.filled(8, 0.0, fx.Float32)]
