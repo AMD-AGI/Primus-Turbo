@@ -59,6 +59,8 @@ from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
+import primus_turbo.common.envs as envs
+
 try:  # optional: only used for a friendlier LDS-overflow message
     from flydsl.runtime.device import get_rocm_arch as _get_arch
     from flydsl.utils.smem_allocator import check_smem_capacity as _check_smem
@@ -5060,7 +5062,8 @@ _FWD_TDM_DEAL_KEYS = frozenset({(4096, 7168)})
 def _pick_config_shape(N: int, K: int, avg_m: int, n_groups: int = 0, b_lds_transpose: int = 0):
     # Exact key only. 448 divides this N, so both dispatch rounds are full and the ragged-N
     # read-back path is never taken. On an N it does not divide, the NT read path would address
-    # past the allocation, and on NN `pad_interval = tile_n * 2` would be unencodable.
+    # past the allocation, and on NN `pad_interval = tile_n * 2` would be unencodable. Served from
+    # nearby, the 128-row tiles here and in `_pick_config_nn` measured -13% to -20% at 160 rows.
     if not b_lds_transpose:
         if (N, K, avg_m) == (7168, 2048, 128):
             return (128, 448, 64, 2, 2, 3)
@@ -5448,6 +5451,7 @@ _NN_FALLBACK_WARNED: set = set()
 @functools.lru_cache(maxsize=64)
 def _pick_config_nn(N: int, K: int, avg_m: int, n_groups: int = 0, allow_ragged_k: bool = True):
     if allow_ragged_k:
+        # Exact keys only, like the 128-row NT tile in `_pick_config_shape`.
         if (N, K, avg_m) == (7168, 4096, 128):
             return _clamp_num_buffers((128, 512, 64, 2, 2, 3), K)
         if (N, K, avg_m) == (2048, 7168, 128):
@@ -5981,6 +5985,11 @@ def _grouped_gemm_bf16_nn_flydsl_kernel_entry(
 #
 # MiniMax-M3 MoE: hidden 6144, gated expert FFN 3072 (fc1 N = 6144), 128 experts, top-4. At EP4 and
 # sequence 4096 each GPU holds G = 32 experts and receives M = 16384 rows, avg_m = 512.
+# MiniMax-M3.1-Flash has the same expert shapes with top-16 routing: at EP4 (G = 32) and sequence 4096,
+# micro-batch 1 / 2 / 4 gives avg_m = 512 / 1024 / 2048. Its 512 sets are the MiniMax-M3 ones. At 1024 and
+# 2048 rows the forward and dgrad sets widen the multicast cluster to 4 rows (mc_m 4, +0.75% to +1.9% on the
+# op over the 512 set), the forward at 2048 also takes GROUP_M 8, and the wgrad sets stay as at 512. Against
+# the untuned path: +14% to +18% on forward and dgrad, +28% to +39% on wgrad.
 # Muse Spark key sets, shared by several (N, K, avg_m) rows below.
 _MUSE_NT = {
     "GROUP_M": 4,
@@ -6066,6 +6075,46 @@ _KWARGS_KEYS = {
             "vec_dec": 1,
             "xcd_band": 32,
         },
+        # MiniMax-M3.1 fwd fc2, avg_m = 1024: the 512 set with mc_m 4
+        (6144, 3072, 1024): {
+            "GROUP_M": 4,
+            "epi_chunk": 1,
+            "head_pipe": 32,
+            "issue_first": 1,
+            "lds_cosched": 3,
+            "mc_m": 4,
+            "mc_n": 4,
+            "nt_c1": 4,
+            "nt_deal": 1,
+            "nt_ovl": 1,
+            "nt_seam": 13,
+            "ntp_flags": 3,
+            "num_xcd": 8,
+            "persist": 256,
+            "tdm_balance": 1,
+            "vec_dec": 1,
+            "xcd_band": 32,
+        },
+        # MiniMax-M3.1 fwd fc2, avg_m = 2048: the 512 set with mc_m 4 and GROUP_M 8
+        (6144, 3072, 2048): {
+            "GROUP_M": 8,
+            "epi_chunk": 1,
+            "head_pipe": 32,
+            "issue_first": 1,
+            "lds_cosched": 3,
+            "mc_m": 4,
+            "mc_n": 4,
+            "nt_c1": 4,
+            "nt_deal": 1,
+            "nt_ovl": 1,
+            "nt_seam": 13,
+            "ntp_flags": 3,
+            "num_xcd": 8,
+            "persist": 256,
+            "tdm_balance": 1,
+            "vec_dec": 1,
+            "xcd_band": 32,
+        },
         # MiniMax-M3 fwd fc1, avg_m = 512
         (6144, 6144, 512): {
             "GROUP_M": 4,
@@ -6074,6 +6123,50 @@ _KWARGS_KEYS = {
             "issue_first": 1,
             "lds_cosched": 3,
             "mc_m": 2,
+            "mc_n": 4,
+            "mc_tile_sync": 1,
+            "nt_c1": 4,
+            "nt_deal": 1,
+            "nt_ovl": 1,
+            "nt_seam": 13,
+            "ntp_flags": 3,
+            "num_xcd": 8,
+            "persist": 256,
+            "tdm_assign": 1,
+            "tdm_balance": 1,
+            "vec_dec": 1,
+            "xcd_band": 32,
+        },
+        # MiniMax-M3.1 fwd fc1, avg_m = 1024: the 512 set with mc_m 4
+        (6144, 6144, 1024): {
+            "GROUP_M": 4,
+            "head_pipe": 32,
+            "hp_epi": 0,
+            "issue_first": 1,
+            "lds_cosched": 3,
+            "mc_m": 4,
+            "mc_n": 4,
+            "mc_tile_sync": 1,
+            "nt_c1": 4,
+            "nt_deal": 1,
+            "nt_ovl": 1,
+            "nt_seam": 13,
+            "ntp_flags": 3,
+            "num_xcd": 8,
+            "persist": 256,
+            "tdm_assign": 1,
+            "tdm_balance": 1,
+            "vec_dec": 1,
+            "xcd_band": 32,
+        },
+        # MiniMax-M3.1 fwd fc1, avg_m = 2048: the 512 set with mc_m 4 and GROUP_M 8
+        (6144, 6144, 2048): {
+            "GROUP_M": 8,
+            "head_pipe": 32,
+            "hp_epi": 0,
+            "issue_first": 1,
+            "lds_cosched": 3,
+            "mc_m": 4,
             "mc_n": 4,
             "mc_tile_sync": 1,
             "nt_c1": 4,
@@ -6126,6 +6219,47 @@ _KWARGS_KEYS = {
             "wmma_b2b": 1,
             "xcd_band": 32,
         },
+        # MiniMax-M3.1 dgrad fc2, avg_m = 1024 and 2048: the 512 set with mc_m 4
+        (3072, 6144, 1024): {
+            "GROUP_M": 8,
+            "head_pipe": 32,
+            "issue_first": 1,
+            "lds_cosched": 3,
+            "mc_m": 4,
+            "mc_n": 4,
+            "mc_tile_sync": 1,
+            "nt_c1": 2,
+            "nt_deal": 1,
+            "nt_ovl": 1,
+            "nt_seam": 13,
+            "ntp_flags": 3,
+            "num_xcd": 8,
+            "persist": 256,
+            "tdm_nn": 1,
+            "tt_dec": 1,
+            "wmma_b2b": 1,
+            "xcd_band": 32,
+        },
+        (3072, 6144, 2048): {
+            "GROUP_M": 8,
+            "head_pipe": 32,
+            "issue_first": 1,
+            "lds_cosched": 3,
+            "mc_m": 4,
+            "mc_n": 4,
+            "mc_tile_sync": 1,
+            "nt_c1": 2,
+            "nt_deal": 1,
+            "nt_ovl": 1,
+            "nt_seam": 13,
+            "ntp_flags": 3,
+            "num_xcd": 8,
+            "persist": 256,
+            "tdm_nn": 1,
+            "tt_dec": 1,
+            "wmma_b2b": 1,
+            "xcd_band": 32,
+        },
         # MiniMax-M3 dgrad fc1, avg_m = 512
         (6144, 6144, 512): {
             "GROUP_M": 8,
@@ -6133,6 +6267,47 @@ _KWARGS_KEYS = {
             "issue_first": 1,
             "lds_cosched": 3,
             "mc_m": 2,
+            "mc_n": 4,
+            "mc_tile_sync": 1,
+            "nt_c1": 3,
+            "nt_deal": 1,
+            "nt_ovl": 1,
+            "nt_seam": 13,
+            "ntp_flags": 3,
+            "num_xcd": 8,
+            "persist": 256,
+            "tdm_assign": 1,
+            "tdm_nn": 1,
+            "tt_dec": 1,
+            "xcd_band": 32,
+        },
+        # MiniMax-M3.1 dgrad fc1, avg_m = 1024 and 2048: the 512 set with mc_m 4
+        (6144, 6144, 1024): {
+            "GROUP_M": 8,
+            "head_pipe": 32,
+            "issue_first": 1,
+            "lds_cosched": 3,
+            "mc_m": 4,
+            "mc_n": 4,
+            "mc_tile_sync": 1,
+            "nt_c1": 3,
+            "nt_deal": 1,
+            "nt_ovl": 1,
+            "nt_seam": 13,
+            "ntp_flags": 3,
+            "num_xcd": 8,
+            "persist": 256,
+            "tdm_assign": 1,
+            "tdm_nn": 1,
+            "tt_dec": 1,
+            "xcd_band": 32,
+        },
+        (6144, 6144, 2048): {
+            "GROUP_M": 8,
+            "head_pipe": 32,
+            "issue_first": 1,
+            "lds_cosched": 3,
+            "mc_m": 4,
             "mc_n": 4,
             "mc_tile_sync": 1,
             "nt_c1": 3,
@@ -6170,8 +6345,90 @@ _KWARGS_KEYS = {
             "wmma_b2b": 1,
             "xcd_band": 128,
         },
+        # MiniMax-M3.1 wgrad fc2, avg_m = 1024 and 2048: the 512 set
+        (6144, 3072, 1024): {
+            "BLOCK_K": 64,
+            "epi_chunk": 4,
+            "head_pipe": 8,
+            "lds_cosched": 2,
+            "mc_early": 0,
+            "mc_m": 4,
+            "mc_n": 4,
+            "mc_tile_sync": 1,
+            "num_buffers": 4,
+            "num_xcd": 8,
+            "persist": 256,
+            "split_bar": 1,
+            "tdm_deal": 3,
+            "vk_ovl": 7,
+            "vk_seam": 538783,
+            "vk_stagger": 127,
+            "wmma_b2b": 1,
+            "xcd_band": 128,
+        },
+        (6144, 3072, 2048): {
+            "BLOCK_K": 64,
+            "epi_chunk": 4,
+            "head_pipe": 8,
+            "lds_cosched": 2,
+            "mc_early": 0,
+            "mc_m": 4,
+            "mc_n": 4,
+            "mc_tile_sync": 1,
+            "num_buffers": 4,
+            "num_xcd": 8,
+            "persist": 256,
+            "split_bar": 1,
+            "tdm_deal": 3,
+            "vk_ovl": 7,
+            "vk_seam": 538783,
+            "vk_stagger": 127,
+            "wmma_b2b": 1,
+            "xcd_band": 128,
+        },
         # MiniMax-M3 wgrad fc1, avg_m = 512
         (6144, 6144, 512): {
+            "BLOCK_K": 64,
+            "epi_chunk": 4,
+            "head_pipe": 8,
+            "lds_cosched": 2,
+            "mc_early": 0,
+            "mc_m": 4,
+            "mc_n": 4,
+            "mc_tile_sync": 1,
+            "num_buffers": 4,
+            "num_xcd": 8,
+            "persist": 256,
+            "split_bar": 1,
+            "tdm_deal": 3,
+            "vk_ovl": 7,
+            "vk_seam": 538783,
+            "vk_stagger": 127,
+            "wmma_b2b": 1,
+            "xcd_band": 256,
+        },
+        # MiniMax-M3.1 wgrad fc1, avg_m = 1024 and 2048: the 512 set
+        (6144, 6144, 1024): {
+            "BLOCK_K": 64,
+            "epi_chunk": 4,
+            "head_pipe": 8,
+            "lds_cosched": 2,
+            "mc_early": 0,
+            "mc_m": 4,
+            "mc_n": 4,
+            "mc_tile_sync": 1,
+            "num_buffers": 4,
+            "num_xcd": 8,
+            "persist": 256,
+            "split_bar": 1,
+            "tdm_deal": 3,
+            "vk_ovl": 7,
+            "vk_seam": 538783,
+            "vk_stagger": 127,
+            "wmma_b2b": 1,
+            "xcd_band": 256,
+        },
+        (6144, 6144, 2048): {
             "BLOCK_K": 64,
             "epi_chunk": 4,
             "head_pipe": 8,
@@ -6217,42 +6474,38 @@ _KWARGS_PASSTHROUGH = {
 }
 
 
-# (N, K) pairs whose keys serve every avg_m, not only the keyed one. Under expert parallelism the rows a GPU
-# receives vary from step to step (dropless routing), so avg_m lands near, not on, a keyed value. Such an
-# avg_m takes the keyed avg_m nearest to it on a log scale (512 serves about 362-724 next to a 1024 key), up to
-# a factor _AVG_M_REACH past the smallest and the largest key, so a set is never used far from the row counts
-# it was measured at. Muse Spark only: other models' keys stay exact.
-_AVG_M_REACH = 2**0.5
-_AVG_M_TOLERANT = MappingProxyType(
-    {
-        "nt": frozenset({(8192, 4096), (4096, 4096)}),
-        "nn": frozenset({(4096, 8192), (4096, 4096)}),
-        "vk_accum": frozenset({(8192, 4096), (4096, 4096)}),
-    }
-)
+# Keys serve every avg_m near them, not only the keyed one. Under expert parallelism the rows a GPU receives
+# vary from step to step (dropless routing), so avg_m lands near, not on, a keyed value. Such an avg_m takes
+# the keyed avg_m of its (N, K) nearest to it on a log scale, within a factor _AVG_M_REACH, so a set is never
+# used far from the row counts it was measured at: keys a factor 2 apart serve every avg_m between them, and a
+# lone key serves a factor 4 either side (512 serves 128-2048). The MiniMax-M3 sets measured 7% to 43% faster
+# than the untuned path a factor 2 from their key and 15% to 28% a factor 4 away; Muse Spark's outer sets
+# measured about even at 256 rows and 4% to 14% faster at 16384, a factor 2 past their keys.
+# PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS=1 keeps the exact match only, for A/B runs.
+_AVG_M_REACH = 4
+
+
+def _nearest_avg_m(avg_m: int, keyed) -> int | None:
+    """The keyed avg_m serving a call at ``avg_m`` (>= 1): ``avg_m`` itself if keyed, else the keyed one nearest
+    on a log scale if it is within a factor ``_AVG_M_REACH`` (a tie goes to the smaller), else None."""
+    if avg_m in keyed:
+        return avg_m
+    if not keyed or envs.PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS:
+        return None
+    ratio, near = min((max(m, avg_m) / min(m, avg_m), m) for m in keyed)
+    return near if ratio <= _AVG_M_REACH else None
 
 
 def _kwargs_key(kind: str, key: tuple):
-    """The ``_KWARGS_KEYS[kind]`` row for ``key``: the exact one, else for a tolerant (N, K) the keyed avg_m
-    nearest to ``key``'s on a log scale, within ``_AVG_M_REACH`` of the keyed range; None without one."""
-    table = _KWARGS_KEYS[kind]
-    if key in table:
-        return key
+    """The ``_KWARGS_KEYS[kind]`` row serving ``key`` = (N, K, avg_m): the row of the keyed avg_m of its (N, K)
+    that `_nearest_avg_m` picks; None without one."""
     n, k, avg_m = key
-    if (n, k) not in _AVG_M_TOLERANT.get(kind, ()):
-        return None
-    rows = [row for row in table if row[:2] == (n, k)]
-    if (
-        not rows
-        or not min(r[2] for r in rows) / _AVG_M_REACH <= avg_m <= max(r[2] for r in rows) * _AVG_M_REACH
-    ):
-        return None
-    # ratio distance; a tie (the geometric midpoint) goes to the smaller key
-    return min(rows, key=lambda row: (max(row[2], avg_m) / min(row[2], avg_m), row[2]))
+    key_m = _nearest_avg_m(avg_m, {row[2] for row in _KWARGS_KEYS[kind] if row[:2] == (n, k)})
+    return None if key_m is None else (n, k, key_m)
 
 
 def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:
-    """The key's kwargs for this call, or {} when the call tunes anything or the shape is not a key."""
+    """The kwargs of the key serving this call, or {} when the call tunes anything or no key serves it."""
     # The positional extras the entry points take: out_dtype (NT / NN), masked_k and out_dtype (variable-K).
     if n_pos > (2 if kind in ("vk", "vk_accum") else 1) or not set(kw) <= _KWARGS_PASSTHROUGH[kind]:
         return {}
@@ -6270,6 +6523,14 @@ def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:
     if kind in ("nt", "nn") and keyed.get("vec_dec") and G > 32:
         # The NT and NN launchers drop vec_dec above 32 experts, and nt_seam bit 2 then refuses the set.
         return {}
+    if kind in ("nt", "nn"):
+        # A set is measured on the tile its row count gets at many experts, and declines any other. At 128 rows
+        # or fewer `_pick_config_shape` hands out a 128-row tile; when the experts hold 8 or fewer 256-row tiles
+        # in all, 128 x 128, whose 4 x 4 warp tile has as many fragment reads per sub-step as matrix ops, and the
+        # launchers refuse lds_cosched >= 2 there.
+        pick = _pick_config if kind == "nt" else _pick_config_nn
+        if pick(key[0], key[1], key[2], G) != pick(*row):
+            return {}
     return dict(keyed)
 
 
