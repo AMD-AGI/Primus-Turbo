@@ -146,7 +146,7 @@ def _ceildiv(a, b):
     return (a + b - 1) // b
 
 
-def _link_plan(num_ranks, S, mla=False):
+def _link_plan(num_ranks, S, mla=False, contiguous=False):
     """``(num_pull, num_comm, local_first, num_top)``: on two ranks one link carries the whole exchange,
     and fewer pullers land the first dO rows sooner while dedicated pushers keep it busy as bands finish;
     with more links the exchange is short and every block is worth more on the items. Local first pays
@@ -156,7 +156,11 @@ def _link_plan(num_ranks, S, mla=False):
     MLA moves 5-10x the GQA bytes per row of attention and keeps pushers on four and eight ranks, 32
     pullers each (DeepSeek-V3 / Kimi-K2 heads): four ranks 8 pushers up to 32K (A/B 0.0..-2.6%), 4 and
     8 top bands at 64K (-2.3%); eight ranks 4 pushers (A/B -0.2..-6.7% against 8 pullers, the gain
-    shrinking as attention grows). Two ranks match GQA (within 1% of the best)."""
+    shrinking as attention grows). Two ranks match GQA (within 1% of the best). Those are striped
+    splits (``seq_chunk`` 256..1024); on the contiguous one (``seq_chunk`` 0) fewer pullers win, 16 on
+    four ranks (A/B -2.0..-5.5% against the GQA plan) and 8 on eight (-2.4..-4.7% against 32)."""
+    if mla and contiguous and num_ranks in (4, 8):
+        return (16 if num_ranks == 4 else 8), 4, False, 0
     if mla and num_ranks == 4:
         return 32, (8 if S <= 32768 else 4), False, (0 if S <= 32768 else 8)
     if mla and num_ranks == 8:
@@ -1567,7 +1571,7 @@ def ulysses_a2a_attn_bwd(
     q_split, n_img = plan[0], plan[1].embed.get("a16_imgs", 1)
     dq_rows = _dq_rows(hq_r, dq_rows, mla)
     pull_rows = _pull_rows(hq_r, pull_rows)
-    auto_pull, auto_comm, auto_local, auto_top = _link_plan(n, S, mla)
+    auto_pull, auto_comm, auto_local, auto_top = _link_plan(n, S, mla, seq_chunk in (0, M))
     num_top = auto_top if num_top is None else num_top
     num_pull = auto_pull if num_pull is None else num_pull
     num_comm = auto_comm if num_comm is None else num_comm
