@@ -260,10 +260,11 @@ def run_suite(quick, checks, models, large=False):
         # pull units, so both run unfused
         fallback.append((n, n, 128, 128, 128**-0.5, 1024, 256))
     if "mla" in models and large and n <= 4:
-        # 32 local heads over 64K tokens (DeepSeek-V3 at CP4): the forward's exchange passes i32 byte
-        # offsets, so it runs unfused with its q / k / v exchange over two calls; the backward is fused.
-        # Past four ranks the global reference backward (32 * n heads) passes them itself.
-        fallback.append((32 * n, 32 * n, 192, 128, MLA_SCALE, 65536 // n, 256))
+        # DeepSeek-V3's 128 heads over 64K tokens at CP2 / CP4: the forward's exchange passes i32 byte
+        # offsets, so it runs unfused with its q / k / v exchange split into calls; the backward is fused
+        # (at CP2 with dQ images of over 2^31 elements together). Past four ranks the global reference
+        # backward (more heads) passes them itself.
+        fallback.append((128, 128, 192, 128, MLA_SCALE, 65536 // n, 256))
     if "gqa" in models:
         configs.append((32 if n <= 4 else 64, 4 if n <= 4 else 8, 128, 128, 128**-0.5))
         if not quick:

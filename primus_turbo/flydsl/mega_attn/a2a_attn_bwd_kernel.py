@@ -1486,7 +1486,8 @@ def _buffers(S, hq_r, hkv_r, d, d_v, q_split, n_img, device):
             torch.empty(hq_r, S, device=device, dtype=torch.float32),
             torch.empty(q_split, S, hkv_r, d, device=device, dtype=torch.bfloat16),
             torch.empty(q_split, S, hkv_r, d_v, device=device, dtype=torch.bfloat16),
-            torch.zeros(n_img * S * hq_r * d, device=device, dtype=torch.bfloat16),
+            # one row per image: the launch passes tensor sizes as i32
+            torch.zeros(n_img, S * hq_r * d, device=device, dtype=torch.bfloat16),
             # item counts, then the dK / dV part claims and the finished-band queue (epoch-stamped)
             torch.zeros(nb * (2 + kv_parts), device=device, dtype=torch.int64),
             torch.empty(hq_r * S, device=device, dtype=torch.float32),
