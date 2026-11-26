@@ -46,6 +46,9 @@ FFN = 4096
 MICRO_BATCHES = 2
 
 IMPLS = ["tdm", "reg"]
+# One bf16 rounding of a sum: at most half an ulp, 2^-8 of the value (so of the expert's largest), plus the fp32
+# accumulation error of the sum and of its reference.
+ONE_ROUNDING = 2**-8 + 1e-4
 
 
 def _vk():
@@ -163,7 +166,7 @@ def test_muse_spark_expert_wgrads_into_bf16_main_grad(flydsl_grouped_gemm):
             w.grad = None
     for got, sep, ref in ((w1.main_grad, sep1.main_grad, ref1), (w2.main_grad, sep2.main_grad, ref2)):
         assert got.dtype == torch.bfloat16
-        assert _max_rel_err(got.float(), ref) < MICRO_BATCHES * 2**-8
+        assert _max_rel_err(got.float(), ref) < MICRO_BATCHES * ONE_ROUNDING
         assert (got.float() - ref).abs().sum() <= (sep.float() - ref).abs().sum() * 1.001
 
 
@@ -270,7 +273,7 @@ def test_backend_takes_accumulating_calls(impl, out_dtype, monkeypatch):
         x, dy, lens, offs, **{**kw, "out": _misaligned(tuple(out.shape), out_dtype)}
     )
     backend.execute(x, dy, lens, offs, **kw)
-    tol = 1e-5 if out_dtype == torch.float32 else 2**-8
+    tol = 1e-5 if out_dtype == torch.float32 else ONE_ROUNDING
     assert _max_rel_err(out.float(), old.float() + ref) < tol
 
 
@@ -439,13 +442,13 @@ def test_bf16_accumulates_close_to_fp32(out_m, out_n, counts):
     exact = old.float() + ref
     once = old.clone()
     _accumulate(a, b, offs, lens, once, "auto")
-    assert _max_rel_err(once.float(), exact) < 2**-8
+    assert _max_rel_err(once.float(), exact) < ONE_ROUNDING
     separate = old.clone()
     separate.add_(_vk().grouped_gemm_bf16_variable_k_flydsl_kernel(a, b, offs, masked_k=lens))
     assert (once.float() - exact).abs().sum() <= (separate.float() - exact).abs().sum() * 1.001
     for _ in range(2):
         _accumulate(a, b, offs, lens, once, "auto")
-    assert _max_rel_err(once.float(), old.float() + 3 * ref) < 3 * 2**-8
+    assert _max_rel_err(once.float(), old.float() + 3 * ref) < 3 * ONE_ROUNDING
     for e in (lens == 0).nonzero().flatten().tolist():
         assert _same_bits(once[e], old[e])
 
