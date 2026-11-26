@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_STRICT_DISPATCH: bool = False
     PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32: bool = True
     PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT: bool = False
+    PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS: bool = False
     PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM: bool = False
     PRIMUS_TURBO_JAX_DEEPEP_MODE: str | None = None
     PT_MEGA_FP8_COMBINE_AUTOTUNE: bool = True
@@ -274,6 +275,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # accumulating into it, when the caller allows it and no CUDA graph is being captured.
     "PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT": lambda: (
         os.getenv("PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT", "0") == "1"
+    ),
+    # "1" makes the gfx1250 FlyDSL bf16 grouped GEMM apply a whole-argument key (`_KWARGS_KEYS`) only
+    # at the exact avg_m (rows // experts) it was measured at, for A/B runs against the default,
+    # where a call whose avg_m is within a factor 4 of a key takes the nearest key on a log scale.
+    # The per-shape tables are always exact. Read at every call that can take a key.
+    "PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS": lambda: (
+        os.getenv("PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS", "0") == "1"
     ),
     # ================== Expert parallel ==================
     # A non-zero integer runs the EP dispatch/combine kernels on the caller's current stream
