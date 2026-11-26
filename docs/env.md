@@ -51,7 +51,7 @@ Variables owned by other projects (FlyDSL, Triton, NVSHMEM, the launcher's `RANK
 |---|---|---|---|
 | `PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32` | `bool` | `True` | Whether the attention V3 (CK) backward accumulates with FP32 atomics. Only "0" disables it; unset, "1" and any other value keep it on. Read at the first forward that does not pass `is_v3_atomic_fp32` explicitly. |
 | `PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT` | `bool` | `False` | "1" lets the FP4 variable-K grouped GEMM (wgrad) overwrite `out` with beta=0 instead of accumulating into it, when the caller allows it and no CUDA graph is being captured. |
-| `PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS` | `bool` | `False` | "1" makes the gfx1250 FlyDSL bf16 grouped GEMM apply its tuned keys (the per-shape tables and the whole-argument sets) only at the exact avg_m (rows // experts) they were measured at, for A/B runs against the default, where a call whose avg_m is within a factor 4 of a key takes the nearest key on a log scale. Read at every call that can take a key. |
+| `PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS` | `bool` | `False` | "1" makes the gfx1250 FlyDSL bf16 grouped GEMM apply a whole-argument key (`_KWARGS_KEYS`) only at the exact avg_m (rows // experts) it was measured at, for A/B runs against the default, where a call whose avg_m is within a factor 4 of a key takes the nearest key on a log scale. The per-shape tables are always exact. Read at every call that can take a key. |
 
 ### Expert parallel
 
@@ -59,12 +59,6 @@ Variables owned by other projects (FlyDSL, Triton, NVSHMEM, the launcher's `RANK
 |---|---|---|---|
 | `PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM` | `bool` | `False` | A non-zero integer runs the EP dispatch/combine kernels on the caller's current stream instead of the Buffer's comm stream. Parsed as C++ does (`is_ep_force_current_stream` in deep_ep/configs.h, which caches it once per process): unset is off, and an empty or non-integer value is an error (ValueError here, std::stoi throws in C++). On gfx1250 the intranode runtime reads it when it is constructed. `DeepEPTokenDispatcher` writes "1" with `set_env()` when a dispatcher asks for `deepep_use_comm_stream=False`. |
 | `PRIMUS_TURBO_JAX_DEEPEP_MODE` | `str \| None` | unset | JAX DeepEP launch mode: "inproc" (the default when unset) or "per_process"; case and "-"/"_" are normalized by `LaunchMode.from_str`. `auto_detect_mode` and `setup(mode=...)` write it with `set_env()`, `reset_runtime()` clears it, and the mode locks at the first DeepEP call. |
-
-### Symmetric memory
-
-| Variable | Type | Default | Description |
-|---|---|---|---|
-| `PRIMUS_TURBO_SYMM_MEM_BACKEND` | `str` | `auto` | How `SymmetricMemory` maps the peers' heaps: "ipc" (legacy HIP IPC, one OS instance only), "fabric" (VMM allocations exported as fabric handles, which also map across the hosts of one scale-up domain, e.g. the trays of an MI455X UALink pod) or "auto" (the default: ipc when the group lives on one OS instance, fabric when it spans several). A `backend=` argument wins. Read when a `SymmetricMemory` is created; every rank of the group must agree. |
 
 ### Mega MoE (FlyDSL FP8 combine)
 

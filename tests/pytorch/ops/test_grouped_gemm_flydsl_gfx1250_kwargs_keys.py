@@ -240,9 +240,9 @@ def test_the_geometric_midpoint_splits_two_keys(monkeypatch):
     assert got == [(1, 1, 128), None, None, (1, 1, 4096)]
 
 
-def test_one_rule_serves_both_key_forms():
-    """`_nearest_avg_m` is the rule `_KWARGS_KEYS` and the shape-keyed tables both read: the keyed avg_m itself,
-    else the nearest on a log scale within a factor _AVG_M_REACH, a tie going to the smaller; else none."""
+def test_the_nearest_key_rule():
+    """`_nearest_avg_m`, the rule `_kwargs_key` reads: the keyed avg_m itself, else the nearest on a log scale within a
+    factor _AVG_M_REACH, a tie going to the smaller; else none."""
     near = gg._nearest_avg_m
     assert [near(avg_m, {512}) for avg_m in (127, 128, 2048, 2049)] == [None, 512, 512, None]
     assert [near(avg_m, {512}) for avg_m in (511, 512, 513)] == [512] * 3
@@ -253,7 +253,7 @@ def test_one_rule_serves_both_key_forms():
     assert [near(avg_m, {2048}) for avg_m in (511, 512, 8192, 8193)] == [None, 2048, 2048, None]
 
 
-def test_one_rule_exact_keys_switch(monkeypatch):
+def test_the_nearest_key_rule_exact_keys_switch(monkeypatch):
     monkeypatch.setenv("PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS", "1")
     got = [gg._nearest_avg_m(avg_m, {512, 1024}) for avg_m in (511, 512, 724, 1024)]
     assert got == [None, 512, None, 1024]
