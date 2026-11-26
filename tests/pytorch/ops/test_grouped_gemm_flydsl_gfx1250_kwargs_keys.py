@@ -341,17 +341,15 @@ def test_a_vec_dec_key_needs_at_most_32_experts(kind, name, n, k):
 
 # Kimi K3.1 Pro's accumulating wgrads (its bf16 main_grad): fc1 OUT (6144, 3584), fc2 (3584, 3072), 224 experts a GPU.
 KIMI_VK_ACCUM = {(6144, 3584): (4, 2), (3584, 3072): (2, 4)}  # the cluster each one runs
-# What the accumulate path refuses (the launcher raises): the persistent seam and the epilogue forms.
-_NOT_ACCUM = {
-    "persist",
-    "vk_ovl",
-    "vk_seam",
-    "vk_stagger",
-    "epi_chunk",
-    "out_ldc",
-    "issue_first",
-    "k_tiles_const",
-}
+# What the accumulate path refuses (the launcher raises): the chunked epilogue and the experiment-only knobs.
+_NOT_ACCUM = {"epi_chunk", "out_ldc", "issue_first", "k_tiles_const"}
+# Stand-ins for the out an accumulating call passes: only its dtype is read.
+BF16_OUT = torch.empty(0, dtype=torch.bfloat16)
+FP32_OUT = torch.empty(0, dtype=torch.float32)
+
+
+def _k_loop_part(keyed):
+    return {k: v for k, v in keyed.items() if k not in gg._VK_ACCUM_WALK}
 
 
 def test_kimi_accumulate_keys_name_only_knobs_the_accumulate_path_takes():
@@ -362,6 +360,8 @@ def test_kimi_accumulate_keys_name_only_knobs_the_accumulate_path_takes():
             keyed = gg._KWARGS_KEYS["vk_accum"][(n, k, avg_m)]
             assert set(keyed) <= set(_tuning_args("vk")), (n, k, avg_m)
             assert not set(keyed) & _NOT_ACCUM, (n, k, avg_m)
+            # the persistent walk's knobs the accumulate path takes: vk_ovl, vk_seam bits 1 to 3, vk_stagger
+            assert keyed.get("vk_seam", 0) & ~14 == 0, (n, k, avg_m)
             assert (keyed["mc_m"], keyed["mc_n"]) == (mc_m, mc_n)
             # whole clusters per expert at any expert count, and the tile the cluster cuts is the keyed one
             assert (n // 256) % mc_m == 0 and (k // 256) % mc_n == 0
@@ -370,16 +370,41 @@ def test_kimi_accumulate_keys_name_only_knobs_the_accumulate_path_takes():
 
 @pytest.mark.parametrize("n, k", list(KIMI_VK_ACCUM), ids=["wgrad_fc1", "wgrad_fc2"])
 def test_kimi_accumulate_keys_reach_accumulating_calls_only(n, k):
-    """An accumulating call at a Kimi row count takes the nearest key, at the experts of EP4 and EP8; the overwrite
-    keeps its own table, and a tuning argument switches the key off."""
-    for G in (112, 224):
-        for avg_m in (147, 293, 414, 585, 827, 1170, 2340):
-            want = gg._KWARGS_KEYS["vk_accum"][gg._kwargs_key("vk_accum", (n, k, avg_m))]
-            assert gg._keyed_kwargs("vk_accum", (n, k, avg_m), G, 0, {"out": None, "accumulate": 1}) == want
-            assert gg._keyed_kwargs("vk_accum", (n, k, avg_m), G, 0, {"accumulate": 1, "group_m": 16}) == {}
-            assert gg._keyed_kwargs("vk", (n, k, avg_m), G, 0, {}) != want
+    """An accumulating call into a bf16 out at a Kimi row count takes the nearest key whole at EP4's 224 experts; the
+    overwrite keeps its own table, and a tuning argument switches the key off."""
+    for avg_m in (147, 293, 414, 585, 827, 1170, 2340):
+        want = gg._KWARGS_KEYS["vk_accum"][gg._kwargs_key("vk_accum", (n, k, avg_m))]
+        kw = {"out": BF16_OUT, "accumulate": 1}
+        assert gg._keyed_kwargs("vk_accum", (n, k, avg_m), 224, 0, kw) == want
+        assert gg._keyed_kwargs("vk_accum", (n, k, avg_m), 224, 0, {**kw, "group_m": 16}) == {}
+        assert gg._keyed_kwargs("vk", (n, k, avg_m), 224, 0, {}) != want
     assert gg._kwargs_key("vk_accum", (n, k, 414))[2] == 293
     assert gg._kwargs_key("vk_accum", (n, k, 415))[2] == 585
+
+
+@pytest.mark.parametrize("n, k", list(KIMI_VK_ACCUM), ids=["wgrad_fc1", "wgrad_fc2"])
+def test_kimi_accumulate_keys_keep_their_k_loop_part_off_the_walk(n, k):
+    """Where the persistent walk cannot run -- an fp32 out, or a grid that does not cut the call's tiles into whole
+    rounds (EP8's 112 experts on fc2: 18816 tiles over 256 workgroups) -- a key gives its k-loop knobs alone."""
+    tiles_per_expert = (n // 256) * (k // 256)
+    for G in (8, 16, 112, 224):
+        for avg_m in (293, 585, 1170):
+            keyed = gg._KWARGS_KEYS["vk_accum"][(n, k, avg_m)]
+            persist = keyed.get("persist", 0)
+            walk = (
+                bool(persist)
+                and (G * tiles_per_expert) % persist == 0
+                and G * tiles_per_expert >= 2 * persist
+            )
+            got = gg._keyed_kwargs("vk_accum", (n, k, avg_m), G, 0, {"out": BF16_OUT, "accumulate": 1})
+            assert got == (keyed if walk else _k_loop_part(keyed)), (G, avg_m)
+            got = gg._keyed_kwargs("vk_accum", (n, k, avg_m), G, 0, {"out": FP32_OUT, "accumulate": 1})
+            assert got == _k_loop_part(keyed), (G, avg_m)
+    assert gg._keyed_kwargs("vk_accum", (n, k, 585), 112, 0, {"out": BF16_OUT}) == (
+        gg._KWARGS_KEYS["vk_accum"][(n, k, 585)]
+        if n == 6144
+        else _k_loop_part(gg._KWARGS_KEYS["vk_accum"][(n, k, 585)])
+    )
 
 
 def test_the_wrappers_keep_the_entry_point_signatures():

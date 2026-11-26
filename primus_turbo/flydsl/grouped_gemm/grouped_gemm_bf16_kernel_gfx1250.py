@@ -6177,9 +6177,12 @@ _MUSE_NN = {
 _MUSE_COSCHED = {"lds_cosched": 3, "issue_first": 1}
 _MUSE_NN_MC44 = dict(_MUSE_NN, mc_m=4, mc_n=4)
 
-# Kimi K3.1 Pro's wgrad with accumulate=1: the k-loop knobs of its overwrite sets -- the deep ring with the split
-# barrier and co-scheduled fragment reads, head_pipe, the branch-free TDM issue, and the cluster -- without their
-# persistent seam, which the accumulate path does not take.
+# Kimi K3.1 Pro's wgrad with accumulate=1 into its bf16 main_grad: the k-loop knobs of its overwrite sets -- the deep
+# ring with the split barrier and co-scheduled fragment reads, head_pipe, the branch-free TDM issue, and the cluster --
+# and the persistent walk with the seam's prefetch (vk_ovl 7), not the rest of their seam. G 224 (EP4), per call,
+# against Triton's fused wgrad (Primus-Turbo's default) and against the tuned overwrite + main_grad.add_ (fusion off):
+# 293 rows fc1 / fc2 2.33 / 1.15 ms (Triton 6.25 / 3.11, overwrite + add 3.52 / 1.76), 585 rows 3.40 / 1.68 ms
+# (8.59 / 4.15, 4.60 / 2.29), 1170 rows with vk_seam 14 5.46 / 2.74 ms (13.24 / 6.29, 6.57 / 3.31).
 _KIMI_VK_ACCUM = {
     "BLOCK_K": 64,
     "head_pipe": 8,
@@ -6192,8 +6195,10 @@ _KIMI_VK_ACCUM = {
     "tdm_deal": 3,
     "wmma_b2b": 1,
 }
-_KIMI_VK_ACCUM_FC1 = dict(_KIMI_VK_ACCUM, mc_m=4, mc_n=2, xcd_band=256)
-_KIMI_VK_ACCUM_FC2 = dict(_KIMI_VK_ACCUM, mc_m=2, mc_n=4, xcd_band=128)
+_KIMI_VK_ACCUM_FC1 = dict(_KIMI_VK_ACCUM, mc_m=4, mc_n=2, persist=256, vk_ovl=7, xcd_band=256)
+_KIMI_VK_ACCUM_FC2 = dict(_KIMI_VK_ACCUM, mc_m=2, mc_n=4, persist=256, vk_ovl=7, xcd_band=128)
+# The persistent walk's members of a `vk_accum` set: dropped where the walk cannot run (`_keyed_kwargs`).
+_VK_ACCUM_WALK = frozenset({"persist", "vk_ovl", "vk_seam", "vk_stagger"})
 
 _KWARGS_KEYS = {
     "nt": {
@@ -6360,8 +6365,8 @@ _KWARGS_KEYS = {
             "xcd_band": 256,
         },
     },
-    # The variable-K wgrad with accumulate=1 (an fp32 or bf16 main_grad). It runs the plain non-persistent
-    # epilogue, so only the k-loop knobs it takes are keyed here. Bit-identical.
+    # The variable-K wgrad with accumulate=1 (an fp32 or bf16 main_grad): the k-loop knobs it takes, and for a
+    # 16-bit out the persistent walk, which `_keyed_kwargs` drops where it cannot run. Bit-identical.
     "vk_accum": {
         # Muse Spark wgrad fc1 (OUT 8192 x 4096) and fc2 (OUT 4096 x 4096) at 512 / 1024 / 2048 rows per expert
         # (EP4 / EP8, MBS 1 / 2): the fragment reads co-scheduled with the matrix ops (+4% to +15% on the op).
@@ -6379,10 +6384,10 @@ _KWARGS_KEYS = {
         # counts its overwrite sets were tuned at.
         (6144, 3584, 293): _KIMI_VK_ACCUM_FC1,
         (6144, 3584, 585): _KIMI_VK_ACCUM_FC1,
-        (6144, 3584, 1170): _KIMI_VK_ACCUM_FC1,
+        (6144, 3584, 1170): dict(_KIMI_VK_ACCUM_FC1, vk_seam=14),
         (3584, 3072, 293): _KIMI_VK_ACCUM_FC2,
         (3584, 3072, 585): _KIMI_VK_ACCUM_FC2,
-        (3584, 3072, 1170): _KIMI_VK_ACCUM_FC2,
+        (3584, 3072, 1170): dict(_KIMI_VK_ACCUM_FC2, vk_seam=14),
     },
 }
 _KWARGS_PASSTHROUGH = {
@@ -6434,13 +6439,18 @@ def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:
     if row is None:
         return {}
     keyed = _KWARGS_KEYS[kind][row]
-    if kind == "vk" and keyed.get("persist", 0) > 0:
+    if kind in ("vk", "vk_accum") and keyed.get("persist", 0) > 0:
         # The variable-K launcher refuses a persistent grid that does not divide the call's tile count into
         # two or more tiles per workgroup, which another G at the same avg_m can give.
         tm, tn = keyed.get("BLOCK_M") or 256, keyed.get("BLOCK_N") or 256
         tiles = G * (-(-key[0] // tm)) * (-(-key[1] // tn))
-        if tiles % keyed["persist"] or tiles // keyed["persist"] < 2:
+        walk_ok = not (tiles % keyed["persist"] or tiles // keyed["persist"] < 2)
+        if kind == "vk" and not walk_ok:
             return {}
+        out = kw.get("out")
+        if kind == "vk_accum" and not (walk_ok and out is not None and out.dtype in _F16):
+            # The accumulate's persistent walk also takes a 16-bit out only. Its k-loop knobs run without it.
+            return {k: v for k, v in keyed.items() if k not in _VK_ACCUM_WALK}
     if kind in ("nt", "nn") and keyed.get("vec_dec") and G > 32:
         # The NT and NN launchers drop vec_dec above 32 experts, and nt_seam bit 2 then refuses the set.
         return {}
