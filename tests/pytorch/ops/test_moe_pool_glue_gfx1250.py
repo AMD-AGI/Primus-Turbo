@@ -33,22 +33,15 @@ def _tables(t, seed=0):
 
 
 @pytest.mark.parametrize("nc", [16, 8])
-@pytest.mark.parametrize("t, h", [(64, 1024), (96, 1280), (128, 768)])
-def test_combine_route_dw_fused_equals_separate(t, h, nc):
-    from primus_turbo.triton.quantization.quantization_fp8blk_moe_kernel import (
-        combine_rows,
-        combine_rows_route_dw,
-    )
+@pytest.mark.parametrize("t", [64, 96, 128])
+def test_route_dw(t, nc):
+    from primus_turbo.triton.quantization.quantization_fp8blk_moe_kernel import route_dw
 
     p, inv = _tables(t)
     g = torch.Generator(device="cuda").manual_seed(1)
-    y = torch.randn(p, h, device="cuda", generator=g).to(torch.bfloat16)
     gw = torch.randn(p, nc, device="cuda", generator=g)
-    comb = combine_rows(y, inv, t, K)
     dw = gw.sum(1)[inv.long()]  # dw[r] = sum_c gw[inv[r], c]
-    comb2, dw2 = combine_rows_route_dw(y, inv, t, K, gw, torch.float32)
-    assert bits_equal(comb, comb2)
-    torch.testing.assert_close(dw2, dw, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(route_dw(inv, gw, torch.float32), dw, rtol=1e-6, atol=1e-6)
 
 
 @pytest.mark.parametrize("h", [256, 768, 1280, 1536])

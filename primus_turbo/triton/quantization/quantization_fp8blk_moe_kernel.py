@@ -439,7 +439,7 @@ def swiglu_bwd_dual_blk(
     q, s, qT, sT = _dual_alloc(P, 2 * I, dtype, sl, compact_t, dev)
     # rows past the real pool keep zero partials (their d w is never read)
     # raw_dw: return the per-(row, 128-col block) partials [P, I/128] unsummed and unzeroed (rows past the real pool
-    # hold garbage; combine_rows_route_dw reads only routed rows)
+    # hold garbage; route_dw reads only routed rows)
     gw = (torch.empty if raw_dw else torch.zeros)((P, I // 128), device=dev, dtype=torch.float32)
     if (
         gluon_ok()  # Gluon TDM-streamed SwiGLU backward + dual quants on the quant2 core (byte-identical outputs)
@@ -676,68 +676,32 @@ def expert_order_lpt_fused(poffs_i32: torch.Tensor) -> torch.Tensor:
 
 
 @triton.jit
-def _combine_route_dw_kernel(
-    Y,
-    INV,
-    OUT,
-    H,
-    GW,
-    DW,
-    R,
-    NDW,
-    ND,
-    K: tl.constexpr,
-    BH: tl.constexpr,
-    NC: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
+def _route_dw_kernel(GW, INV, DW, R, NC: tl.constexpr, BLOCK: tl.constexpr):
+    """d topk-weights: for each routing entry r, sum the NC partial gradient columns of GW[INV[r]].
+    grid (cdiv(R, BLOCK),); writes DW [R]."""
     pid = tl.program_id(0)
-    if pid < NDW:
-        # d topk-weights program pid
-        r = pid * BLOCK + tl.arange(0, BLOCK)
-        m = r < R
-        p = tl.load(INV + r, mask=m, other=0).to(tl.int64)
-        if NC == 16:
-            acc = (_gw4(GW, p, m, NC, 0) + _gw4(GW, p, m, NC, 1)) + (
-                _gw4(GW, p, m, NC, 2) + _gw4(GW, p, m, NC, 3)
-            )
-        elif NC == 8:
-            acc = _gw4(GW, p, m, NC, 0) + _gw4(GW, p, m, NC, 1)
-        else:
-            acc = tl.zeros((BLOCK,), dtype=tl.float32)
-            for c in tl.static_range(NC):
-                acc += tl.load(GW + p * NC + c, mask=m, other=0.0)
-        tl.store(DW + r, acc.to(DW.dtype.element_ty), mask=m)
+    r = pid * BLOCK + tl.arange(0, BLOCK)
+    m = r < R
+    p = tl.load(INV + r, mask=m, other=0).to(tl.int64)
+    if NC == 16:
+        acc = (_gw4(GW, p, m, NC, 0) + _gw4(GW, p, m, NC, 1)) + (
+            _gw4(GW, p, m, NC, 2) + _gw4(GW, p, m, NC, 3)
+        )
+    elif NC == 8:
+        acc = _gw4(GW, p, m, NC, 0) + _gw4(GW, p, m, NC, 1)
     else:
-        # combine program (t, h-block), as _combine_kernel without ADD
-        q = pid - NDW
-        t = q // ND
-        h = (q % ND) * BH + tl.arange(0, BH)
-        cacc = tl.zeros((BH,), dtype=tl.float32)
-        for k in tl.static_range(K):
-            rk = tl.load(INV + t * K + k).to(tl.int64)
-            cacc += tl.load(Y + rk * H + h).to(tl.float32)
-        o = cacc.to(OUT.dtype.element_ty)
-        tl.store(OUT + t.to(tl.int64) * H + h, o)
+        acc = tl.zeros((BLOCK,), dtype=tl.float32)
+        for c in tl.static_range(NC):
+            acc += tl.load(GW + p * NC + c, mask=m, other=0.0)
+    tl.store(DW + r, acc.to(DW.dtype.element_ty), mask=m)
 
 
-def combine_rows_route_dw(
-    y: torch.Tensor, inv: torch.Tensor, T: int, K: int, gw: torch.Tensor, out_dtype, bh: int = 1024
-):
-    """The MegaMoE backward's combine (dx = sum_k y[inv[t, k]], as combine_rows) and d topk-weights
-    (dw[r] = sum_c gw[inv[r], c], the pairwise tree of ``gw.sum(1)`` for 16 / 8 partial columns) in ONE launch:
-    programs [0, ndw) are the d topk-weights programs, the rest the (token, h-block) combine programs. Returns
-    (dx [T, H], dw [T*K] in ``out_dtype``)."""
-    H = y.shape[1]
-    bh = _column_block(H, bh)
-    assert y.is_contiguous() and inv.is_contiguous() and gw.is_contiguous()
-    out = torch.empty((T, H), device=y.device, dtype=y.dtype)
+def route_dw(inv: torch.Tensor, gw: torch.Tensor, out_dtype) -> torch.Tensor:
+    """d topk-weights of the MegaMoE backward: dw[r] = sum_c gw[inv[r], c] (the pairwise tree of ``gw.sum(1)`` for
+    16 / 8 partial columns), in ``out_dtype``. Only needs the SwiGLU backward's partials, so the backward issues it
+    before the side-stream expert wgrads, which would otherwise hold every CU while its few programs wait."""
+    assert inv.is_contiguous() and gw.is_contiguous()
     R = inv.numel()
-    NC = gw.shape[1]
     dw = torch.empty(R, device=gw.device, dtype=out_dtype)
-    ndw = triton.cdiv(R, 1024)
-    nd = H // bh
-    _combine_route_dw_kernel[(ndw + T * nd,)](
-        y, inv, out, H, gw, dw, R, ndw, nd, K=K, BH=bh, NC=NC, BLOCK=1024, num_warps=4
-    )
-    return out, dw
+    _route_dw_kernel[(triton.cdiv(R, 1024),)](gw, inv, dw, R, NC=gw.shape[1], BLOCK=1024, num_warps=4)
+    return dw
