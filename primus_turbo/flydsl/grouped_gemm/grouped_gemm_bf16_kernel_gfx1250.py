@@ -578,6 +578,14 @@ def _launch_grouped_bf16_variable_k(
     stream: fx.Stream,
     i32_n: fx.Int32,
     i32_k: fx.Int32,
+    # Output segments 1..3 (see `_segments`): first group, and the offset in C elements added to that
+    # group's span. Runtime so that a new segment address does not compile a new kernel.
+    seg_first1: fx.Int32,
+    seg_first2: fx.Int32,
+    seg_first3: fx.Int32,
+    seg_delta1: fx.Int64,
+    seg_delta2: fx.Int64,
+    seg_delta3: fx.Int64,
     G: Constexpr[int],
     N_BLOCKS_N: Constexpr[int],
     N_BLOCKS_K: Constexpr[int],
@@ -588,6 +596,8 @@ def _launch_grouped_bf16_variable_k(
     m_warp: Constexpr[int],
     n_warp: Constexpr[int],
     num_buffers: Constexpr[int],
+    # 1 = one output tensor; the segment arguments above are then never read.
+    n_segs: Constexpr[int],
     is_f16: Constexpr[int] = 0,
     group_m: Constexpr[int] = 16,
     num_xcd: Constexpr[int] = 1,
@@ -966,12 +976,32 @@ def _launch_grouped_bf16_variable_k(
         arg_etab: fx.Pointer,
         i32_n: fx.Int32,
         i32_k: fx.Int32,
+        seg_first1: fx.Int32,
+        seg_first2: fx.Int32,
+        seg_first3: fx.Int32,
+        seg_delta1: fx.Int64,
+        seg_delta2: fx.Int64,
+        seg_delta3: fx.Int64,
     ):
         if const_expr(wmma_b2b):
             rocdl.disable_xdl_arb_stall()
         ldn_b = fx.Int64(i32_n) * EB
         ldk_b = fx.Int64(i32_k) * EB
         ldc64 = fx.Int64(out_ldc) if const_expr(out_ldc) else fx.Int64(i32_k)
+
+        def _c_grp(g):
+            # Offset in C elements of expert g's output from `arg_c`. g is workgroup-uniform, so the
+            # segment pick stays scalar.
+            off = fx.Int64(g) * fx.Int64(C_GRP_ELEMS)
+            if const_expr(n_segs > 1):
+                gi = fx.Int32(g)
+                delta = (gi >= seg_first1).select(seg_delta1, fx.Int64(0))
+                if const_expr(n_segs > 2):
+                    delta = (gi >= seg_first2).select(seg_delta2, delta)
+                if const_expr(n_segs > 3):
+                    delta = (gi >= seg_first3).select(seg_delta3, delta)
+                off = off + delta
+            return off
 
         tid = fx.Int32(fx.thread_idx.x)
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
@@ -1178,9 +1208,7 @@ def _launch_grouped_bf16_variable_k(
 
                 def _c_half_off(hh):
                     return (
-                        fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS)
-                        + fx.Int64(blk_n + hh * C_HALF) * ldc64
-                        + fx.Int64(blk_k)
+                        _c_grp(g_idx) + fx.Int64(blk_n + hh * C_HALF) * ldc64 + fx.Int64(blk_k)
                     ) * fx.Int64(CEB)
 
                 def _c_load(dst, hh):
@@ -1852,11 +1880,7 @@ def _launch_grouped_bf16_variable_k(
                 ROW_B = C_GRP_ELEMS // (N_BLOCKS_N * tile_m) * EB
                 g_vb = (
                     fx.Int64(fx.ptrtoint(fx.recast_iter(fx.Int8, arg_c)))
-                    + (
-                        fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS)
-                        + fx.Int64(blk_n + wmb) * fx.Int64(ROW_B // EB)
-                        + fx.Int64(blk_k + wnb)
-                    )
+                    + (_c_grp(g_idx) + fx.Int64(blk_n + wmb) * fx.Int64(ROW_B // EB) + fx.Int64(blk_k + wnb))
                     * fx.Int64(EB)
                     + fx.Int64(kgrp * fx.Int32(ROW_B) + lane16 * fx.Int32(16))
                 )
@@ -2062,7 +2086,7 @@ def _launch_grouped_bf16_variable_k(
                 carry.store(
                     Vec.from_elements([dec2[4], dec2[5], dec2[6], dec2[0], dec2[1], 0, 0, 0], fx.Int32)
                 )
-            c_off = fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS) + fx.Int64(blk_n) * ldc64 + fx.Int64(blk_k)
+            c_off = _c_grp(g_idx) + fx.Int64(blk_n) * ldc64 + fx.Int64(blk_k)
             if const_expr(vk_seam & 1):
                 for _j in range_constexpr(EPI_CH_MMA):
                     rocdl.sched_mfma(1)
@@ -2160,7 +2184,7 @@ def _launch_grouped_bf16_variable_k(
                     a_glb = (
                         fx.Int64(fx.ptrtoint(fx.recast_iter(fx.Int8, arg_c)))
                         + (
-                            fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS)
+                            _c_grp(g_idx)
                             + fx.Int64(blk_n + wmb) * fx.Int64(ROW_B // EB)
                             + fx.Int64(blk_k + wnb)
                         )
@@ -2278,9 +2302,7 @@ def _launch_grouped_bf16_variable_k(
                 _PTR1 = ir.Type.parse("!llvm.ptr<1>")
                 vec8f = ir.VectorType.get([8], ir.F32Type.get())
                 c_lane = fx.Int64(fx.ptrtoint(fx.recast_iter(fx.Int8, arg_c))) + (
-                    fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS)
-                    + fx.Int64(blk_n + wmb + lane16) * ldc64
-                    + fx.Int64(blk_k + wnb + kgrp * 8)
+                    _c_grp(g_idx) + fx.Int64(blk_n + wmb + lane16) * ldc64 + fx.Int64(blk_k + wnb + kgrp * 8)
                 ) * fx.Int64(CEB)
                 row16_b = ldc64 * fx.Int64(WMMA_M * CEB)
 
@@ -2367,6 +2389,12 @@ def _launch_grouped_bf16_variable_k(
         arg_etab,
         i32_n,
         i32_k,
+        seg_first1,
+        seg_first2,
+        seg_first3,
+        seg_delta1,
+        seg_delta2,
+        seg_delta3,
         value_attrs=({"rocdl.cluster_dims": f"{MC},1,1"} if MC > 1 else None),
     ).launch(
         grid=(PERSIST, 1, 1),
@@ -2401,7 +2429,7 @@ def _cached_launch(jit_fn, cache: dict, n_runtime: int, args: tuple):
 
 
 def _vk_launch(args: tuple):
-    return _cached_launch(_launch_grouped_bf16_variable_k, _VK_COMPILED, 7, args)
+    return _cached_launch(_launch_grouped_bf16_variable_k, _VK_COMPILED, 13, args)
 
 
 # Shape-keyed pipeline knobs. All are bit-identical to the default path: they move scheduling,
@@ -2810,7 +2838,8 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
     # Provenance-checked -- a table from a different call raises rather than silently computing
     # the wrong thing.
     expert_table: torch.Tensor | None = None,
-    out: torch.Tensor | None = None,
+    # Or up to ``MAX_SEGMENTS`` output segments (see ``_segments``), e.g. each weight segment's main_grad.
+    out: torch.Tensor | Sequence[torch.Tensor] | None = None,
     trans_c: bool = False,
     cap_cu: int = 0,
     tdm_load_cache: int = 0,
@@ -2859,6 +2888,20 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
     M2, OUT_N = b.shape
     assert M2 == M_total, f"token counts differ: a M={M_total} vs b M={M2}"
     G = group_k_offsets.numel() - 1
+    out_segs = None if out is None or isinstance(out, torch.Tensor) else list(out)
+    out_seg_args, out_n_segs = (0, 0, 0, 0, 0, 0), 1
+    if out_segs is not None:
+        who = "grouped_gemm_bf16_variable_k_flydsl_kernel"
+        if out_ldc:
+            raise ValueError(f"{who}: out_ldc is not taken with output segments")
+        out, out_g, out_seg_args, out_n_segs = _segments(out_segs, who, "output", out_segs[0].element_size())
+        if out_g != G or tuple(out.shape[1:]) != (OUT_M, OUT_N) or not out.is_contiguous():
+            raise ValueError(
+                f"{who}: output segments must hold {G} groups of contiguous [{OUT_M}, {OUT_N}], got "
+                f"{[tuple(s.shape) for s in out_segs]}"
+            )
+    else:
+        out_g = None if out is None else out.shape[0]
     _require_gfx1250(a.device)
     if trans_c:
         raise NotImplementedError(
@@ -2966,9 +3009,9 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
                 f"accumulate needs whole output tiles: [{OUT_M}, {OUT_N}] is not a multiple of ({tile_m}, {tile_n}); "
                 f"see grouped_gemm_bf16_variable_k_accum_supported()"
             )
-        if tuple(out.shape) != (G, OUT_M, OUT_N) or not out.is_contiguous():
+        if (out_g, *out.shape[1:]) != (G, OUT_M, OUT_N) or not out.is_contiguous():
             raise ValueError(
-                f"accumulate needs a contiguous out of shape {(G, OUT_M, OUT_N)}, got {tuple(out.shape)} "
+                f"accumulate needs a contiguous out of shape {(G, OUT_M, OUT_N)}, got {(out_g, *out.shape[1:])} "
                 f"contiguous={out.is_contiguous()}"
             )
     lds_pad = lds_pad or _vk_lds_pad(tile_m, tile_n, 2)
@@ -3083,8 +3126,11 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
             _as_ptr(etab),
             torch.cuda.current_stream(),
             OUT_M,
-            OUT_N,
-            G,  # i32_n, i32_k, G
+            OUT_N,  # i32_n, i32_k
+        )
+        + out_seg_args
+        + (
+            G,
             (OUT_M + tile_m - 1) // tile_m,  # N_BLOCKS_N
             (OUT_N + tile_n - 1) // tile_n,  # N_BLOCKS_K
             OUT_M * c_ldc,  # C_GRP_ELEMS
@@ -3094,6 +3140,7 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
             m_warp,
             n_warp,
             num_buffers,
+            out_n_segs,
             1 if a.dtype == torch.float16 else 0,  # is_f16
             group_m,
             num_xcd,
@@ -3128,6 +3175,8 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
         + ((vk_stagger,) if (vk_stagger or accum) else ())
         + ((accum,) if accum else ())
     )
+    if out_segs is not None:
+        return out_segs
     return out[:, :, :OUT_N] if out_ldc else out
 
 
@@ -3146,7 +3195,7 @@ def _launch_grouped_gemm_bf16_nt(
     i32_lda: fx.Int32,
     i32_ldb: fx.Int32,
     i32_ldc: fx.Int32,
-    # Weight segments 1..3 (see `_weight_segments`): first group, and the byte offset added to that
+    # Weight segments 1..3 (see `_segments`): first group, and the byte offset added to that
     # group's slab. Runtime so that a new segment address does not compile a new kernel.
     seg_first1: fx.Int32,
     seg_first2: fx.Int32,
@@ -4949,44 +4998,46 @@ def _resolve_padded_operands(a, b, K: int, N: int, G: int, experiment: bool, who
     return a_ld, b_ld
 
 
-# The NT / NN weight may come in up to this many segments (the launcher's segment arguments): each
-# segment is a [G_s, ...] tensor holding groups [sum(G_0..G_{s-1}), sum(G_0..G_s)), e.g. an MoE
-# layer's own experts and its replica slots. Group g's slab is addressed from segment 0's pointer
-# plus a 64-bit offset written into the TDM descriptor, so the segments may sit anywhere.
+# The NT / NN weight, and the variable-K output, may come in up to this many segments (the launchers'
+# segment arguments): each segment is a [G_s, ...] tensor holding groups [sum(G_0..G_{s-1}),
+# sum(G_0..G_s)), e.g. an MoE layer's own experts and its replica slots (or their main_grads). Group g
+# is addressed from one segment's pointer plus a 64-bit offset written into the TDM descriptor or the
+# store address, so the segments may sit anywhere.
 MAX_SEGMENTS = 4
 
 
-def _weight_segments(b, who: str):
-    """``(ref, G, seg_args, n_segs)`` for a weight given as one 3D tensor or as a sequence of segments
-    that agree in every dim but the first, in dtype, device and (if they hold groups) strides. ``ref``
-    is the first segment that holds groups, whose address and strides the kernel takes: it reads
-    group g at ``ref.data_ptr() + g * group bytes + seg_delta(g)``. ``G`` is the total group count and
-    ``seg_args`` the launcher's ``seg_first1..3, seg_delta1..3``."""
-    if isinstance(b, torch.Tensor):
-        return b, b.shape[0], (0, 0, 0, 0, 0, 0), 1
-    segs = list(b)
+def _segments(x, who: str, what: str, unit: int = 1):
+    """``(ref, G, seg_args, n_segs)`` for a 3D tensor or a sequence of segments that agree in every dim
+    but the first, in dtype, device and (if they hold groups) strides. ``ref`` is the first segment that
+    holds groups, whose address and strides the kernel takes: it reaches group g at ``ref.data_ptr() +
+    (g * group size + seg_delta(g)) * unit`` bytes. ``G`` is the total group count and ``seg_args`` the
+    launchers' ``seg_first1..3, seg_delta1..3``, the offsets in ``unit`` bytes."""
+    if isinstance(x, torch.Tensor):
+        return x, x.shape[0], (0, 0, 0, 0, 0, 0), 1
+    segs = list(x)
     if not 1 <= len(segs) <= MAX_SEGMENTS:
-        raise ValueError(f"{who}: 1 to {MAX_SEGMENTS} weight segments, got {len(segs)}")
+        raise ValueError(f"{who}: 1 to {MAX_SEGMENTS} {what} segments, got {len(segs)}")
     # An empty segment is never read, and its strides are whatever the allocator left.
     ref = next((s for s in segs if s.dim() == 3 and s.shape[0] > 0), segs[0])
     for s in segs:
         if s.dim() != 3 or s.shape[1:] != ref.shape[1:] or (s.shape[0] and s.stride() != ref.stride()):
             raise ValueError(
-                f"{who}: weight segments must be 3D and agree in shape and strides but for the "
+                f"{who}: {what} segments must be 3D and agree in shape and strides but for the "
                 f"group count; got {tuple(s.shape)} / {tuple(s.stride())} against "
                 f"{tuple(ref.shape)} / {tuple(ref.stride())}"
             )
         if s.dtype != ref.dtype or s.device != ref.device:
-            raise ValueError(f"{who}: weight segments differ in dtype or device")
+            raise ValueError(f"{who}: {what} segments differ in dtype or device")
         if s.shape[0] and s.data_ptr() % 16:
-            raise ValueError(f"{who}: every weight segment must be 16-byte aligned")
+            raise ValueError(f"{who}: every {what} segment must be 16-byte aligned")
     grp_bytes = ref.stride(0) * ref.element_size()
     # The segments before `ref` are empty, so `ref` starts at group 0 and its own offset is 0.
     base = ref.data_ptr()
     firsts, deltas, G = [], [], segs[0].shape[0]
     for s in segs[1:]:
         firsts.append(G)
-        deltas.append(s.data_ptr() - base - G * grp_bytes)
+        # Exact: every address and the group size are multiples of 16 bytes and unit divides 16.
+        deltas.append((s.data_ptr() - base - G * grp_bytes) // unit)
         G += s.shape[0]
     # Unused slots are never read (`n_segs` gates them at compile time).
     pad = MAX_SEGMENTS - len(segs)
@@ -5281,8 +5332,8 @@ def _grouped_gemm_bf16_nt_flydsl_kernel_entry(
     nt_c1: int = 0,
 ) -> torch.Tensor:
     """Grouped NT forward: ``out[rows] = a[rows] @ b[g].T`` for the expert owning each run. ``b`` may
-    be a sequence of up to ``MAX_SEGMENTS`` weight segments (see ``_weight_segments``)."""
-    b, G, seg_args, n_segs = _weight_segments(b, "grouped_gemm_bf16_nt_flydsl_kernel")
+    be a sequence of up to ``MAX_SEGMENTS`` weight segments (see ``_segments``)."""
+    b, G, seg_args, n_segs = _segments(b, "grouped_gemm_bf16_nt_flydsl_kernel", "weight")
     assert a.dim() == 2 and b.dim() == 3, f"a must be 2-D and b 3-D, got {a.dim()}/{b.dim()}"
     assert a.dtype == b.dtype and a.dtype in _F16, f"16-bit float operands only, got {a.dtype}/{b.dtype}"
     TOTAL_M, K = a.shape
@@ -5833,10 +5884,10 @@ def _grouped_gemm_bf16_nn_flydsl_kernel_entry(
     **kw,
 ) -> torch.Tensor:
     """Grouped NN: ``out[rows] = a[rows] @ b[g]`` for the expert g owning each row run. ``b`` may be a
-    sequence of up to ``MAX_SEGMENTS`` weight segments (see ``_weight_segments``)."""
+    sequence of up to ``MAX_SEGMENTS`` weight segments (see ``_segments``)."""
     global _NN_TRANSPOSE_WARNED
     segs = None if isinstance(b, torch.Tensor) else list(b)
-    b, G, seg_args, n_segs = _weight_segments(b, "grouped_gemm_bf16_nn_flydsl_kernel")
+    b, G, seg_args, n_segs = _segments(b, "grouped_gemm_bf16_nn_flydsl_kernel", "weight")
     assert a.dim() == 2 and b.dim() == 3, f"a must be [M,K] and b [G,K,N], got {a.dim()}/{b.dim()}"
     _, Kb, N = b.shape
     assert Kb == a.shape[1], f"b K={Kb} != a K={a.shape[1]}"
