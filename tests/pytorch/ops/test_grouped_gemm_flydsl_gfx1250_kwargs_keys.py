@@ -182,6 +182,45 @@ def test_other_row_counts_are_not_keyed(kind, name, n, k):
         assert gg._keyed_kwargs(kind, (n, k, avg_m), MEASURED_G, 0, {}) == {}, avg_m
 
 
+MUSE_TOLERANT = [
+    ("nt", 8192, 4096),
+    ("nt", 4096, 4096),
+    ("nn", 4096, 8192),
+    ("nn", 4096, 4096),
+    ("vk_accum", 8192, 4096),
+    ("vk_accum", 4096, 4096),
+]
+
+
+def _ratio(key_avg_m, avg_m):
+    """Distance on a log scale, as a ratio >= 1."""
+    return max(key_avg_m, avg_m) / min(key_avg_m, avg_m)
+
+
+@pytest.mark.parametrize("kind, n, k", MUSE_TOLERANT, ids=[f"{kd}-{n}x{k}" for kd, n, k in MUSE_TOLERANT])
+def test_muse_keys_serve_every_row_count_in_range(kind, n, k):
+    """Under expert parallelism a GPU's rows vary per step: every avg_m from the smallest Muse Spark key /
+    _AVG_M_REACH to the largest x _AVG_M_REACH takes the key nearest to it on a log scale, and nothing outside."""
+    keyed = sorted(row[2] for row in gg._KWARGS_KEYS[kind] if row[:2] == (n, k))
+    assert keyed, "no Muse Spark key for this shape"
+    lo, hi = int(keyed[0] / gg._AVG_M_REACH) + 1, int(keyed[-1] * gg._AVG_M_REACH)
+    for avg_m in range(lo, hi + 1):
+        got = gg._kwargs_key(kind, (n, k, avg_m))
+        assert got is not None, avg_m
+        assert _ratio(got[2], avg_m) == min(_ratio(key, avg_m) for key in keyed), (avg_m, got)
+    assert gg._kwargs_key(kind, (n, k, lo - 2)) is None
+    assert gg._kwargs_key(kind, (n, k, hi + 2)) is None
+    for avg_m in keyed:  # the keyed row counts themselves are exact hits
+        assert gg._kwargs_key(kind, (n, k, avg_m)) == (n, k, avg_m)
+
+
+@pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
+def test_other_models_keys_stay_exact(kind, name, n, k):
+    """Only the Muse Spark shapes take a nearby avg_m; the MiniMax-M3 keys match their row count exactly."""
+    assert (n, k) not in gg._AVG_M_TOLERANT.get(kind, ())
+    assert gg._kwargs_key(kind, (n, k, KEYED_AVG_M + KEYED_AVG_M // 16)) is None
+
+
 @pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
 def test_the_picker_still_hands_out_the_measured_tile(kind, name, n, k):
     """The keys were measured on one tile; a picker change would apply them to another one.

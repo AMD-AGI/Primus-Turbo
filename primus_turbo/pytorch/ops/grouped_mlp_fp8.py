@@ -875,6 +875,11 @@ def grouped_mlp_fp8(
     """
     if config is None:
         config = Float8QuantConfig()
+    if config.default_backend is not None:
+        raise ValueError(
+            "Float8QuantConfig.default_backend is read by the dense FP8 GEMMs only; "
+            "grouped_mlp_fp8 picks its backends per stage."
+        )
 
     clamp_limit = _check_activation(activation, clamp_limit)
 

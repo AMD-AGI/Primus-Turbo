@@ -220,6 +220,46 @@ def test_quantize_fp8_tensorwise_amax_correctness(orig_dtype, dest_dtype, granul
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
+@pytest.mark.parametrize("torch_compile", [False, True])
+def test_quantize_fp8_tensorwise_given_scale(orig_dtype, dest_dtype, torch_compile):
+    """A given scale replaces the amax pass: the cast multiplies by exactly that value in fp32,
+    saturates at the FP8 range, and returns the scale's reciprocal."""
+    torch.manual_seed(42)
+    x = torch.randn(1031, 3072, device="cuda", dtype=orig_dtype) * 4
+    fp8_max = torch.finfo(dest_dtype).max
+    # Twice the dynamic scale, so the largest values saturate.
+    scale = 2 * fp8_max / x.abs().amax().float()
+
+    def quantize(t, s):
+        return quantize_fp8(t, dest_dtype, ScalingGranularity.TENSORWISE, scale=s)
+
+    if torch_compile:
+        torch._dynamo.reset()
+        quantize = torch.compile(quantize, fullgraph=True)
+    x_fp8, x_scale_inv = quantize(x, scale)
+
+    x_fp8_ref = (x.float() * scale).clamp(-fp8_max, fp8_max).to(dest_dtype)
+    assert torch.equal(x_fp8.view(torch.uint8), x_fp8_ref.view(torch.uint8))
+    torch.testing.assert_close(x_scale_inv, 1.0 / scale, rtol=0, atol=0)
+
+
+def test_quantize_fp8_given_scale_validation():
+    x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    for bad in (
+        torch.ones(2, device="cuda"),
+        torch.ones((), device="cuda", dtype=torch.bfloat16),
+        torch.ones(()),
+    ):
+        with pytest.raises(ValueError, match="scale must be a one-element float32 tensor"):
+            quantize_fp8(x, turbo.float8_e4m3, ScalingGranularity.TENSORWISE, scale=bad)
+    with pytest.raises(ValueError, match="only supported for TENSORWISE"):
+        quantize_fp8(
+            x, turbo.float8_e4m3, ScalingGranularity.ROWWISE, axis=1, scale=torch.ones((), device="cuda")
+        )
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
 @pytest.mark.parametrize(
     "shape",
     [

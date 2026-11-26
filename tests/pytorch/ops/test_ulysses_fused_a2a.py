@@ -114,6 +114,16 @@ def _fp32_leaf(t):
     return t.detach().float().requires_grad_()
 
 
+def _rewrite_in_place(w, seed):
+    """New values written through another tensor over ``w``'s storage, as an optimizer updating its
+    parameter buffer does: ``w._version`` does not move, so no cache may key on it."""
+    version = w._version
+    alias = torch.empty(0, dtype=w.dtype, device=w.device)
+    alias.set_(w.untyped_storage(), w.storage_offset(), w.shape, w.stride())
+    alias.copy_(_randn(*w.shape, seed=seed, scale=0.02))
+    assert w._version == version
+
+
 def check_qkv(group, hq, hkv, d, b, s_local, hidden, qkv_format, weight_layout, repeats, failures):
     from primus_turbo.pytorch.ops.attention.ulysses_fused_a2a import ulysses_qkv_gemm_a2a
 
@@ -123,6 +133,8 @@ def check_qkv(group, hq, hkv, d, b, s_local, hidden, qkv_format, weight_layout, 
     for it in range(repeats):
         shape = (s_local, b, hidden) if qkv_format == "sbhd" else (b, s_local, hidden)
         x = _randn(*shape, seed=100 * it + rank).requires_grad_()
+        if it:
+            _rewrite_in_place(w_qkv, seed=1234 + it)
         w_qkv.grad = None
         outs = ulysses_qkv_gemm_a2a(x, w_qkv, hq, hkv, d, group, qkv_format, weight_layout)
         x_ref, w_ref = _fp32_leaf(x), _fp32_leaf(w_qkv)
@@ -240,7 +252,10 @@ def check_scenarios(group, failures, hq=32, hkv=8, d=128, b=2, s_local=300, hidd
 def _poison_banks(group):
     """Fill both recv banks of every workspace with bf16 NaN: a kernel that reads a recv row before
     its producer wrote it this epoch (or a padding row into a live output) shows up as NaN."""
-    from primus_turbo.flydsl.ulysses.workspace import _WORKSPACES, FLAG_BYTES
+    from primus_turbo.flydsl.fused_collective_gemm.workspace import (
+        _WORKSPACES,
+        FLAG_BYTES,
+    )
 
     torch.cuda.synchronize()
     dist.barrier(group=group)
@@ -259,6 +274,12 @@ def check_poisoned(group, failures, hq=32, hkv=8, d=128, b=2, s_local=300, hidde
             for s in (s_local, 512):
                 _poison_banks(group)
                 check_qkv(group, hq, hkv, d, b, s, hidden, qkv_format, "interleaved", 1, failures)
+            # GLM-4.7 widths: the blocks copy the own rows before the dgrad tiles
+            _poison_banks(group)
+            check_qkv(group, 96, 8, 128, 1, 512, 5120, qkv_format, "interleaved", 1, failures)
+            # MiniMax-M2.5 widths: the same with few wgrad tiles, after 128-row dgrad tiles
+            _poison_banks(group)
+            check_qkv(group, 48, 8, 128, 1, 512, 3072, qkv_format, "interleaved", 1, failures)
             _poison_banks(group)
             check_o_gemm(group, hq, d, b, s_local, hidden, qkv_format, True, 1, failures)
 
@@ -292,6 +313,11 @@ def run_suite(quick):
     # GLM-4.7 widths: over two waves of dw tiles (1120 QKV, 960 o_proj) change both launch orders
     check_qkv(group, 96, 8, 128, 1, 512, 5120, "sbhd", "interleaved", 2, failures)
     check_o_gemm(group, 96, 128, 1, 512, 5120, "sbhd", True, 2, failures)
+    # Llama-70B widths: more GEMM tiles than CUs, GEMM-bound launch (256-row tiles, K walk in step)
+    check_qkv(group, 64, 8, 128, 1, 1024, 8192, "sbhd", "interleaved", 1, failures)
+    check_o_gemm(group, 64, 128, 1, 2048, 8192, "bshd", True, 1, failures)
+    # long sequence, narrow QKV (M > K): a wave of GEMM tiles after the longer wgrad tiles
+    check_qkv(group, 16, 8, 64, 1, 4096, 4096, "sbhd", "interleaved", 2, failures)
     check_scenarios(group, failures)
     check_poisoned(group, failures)
 

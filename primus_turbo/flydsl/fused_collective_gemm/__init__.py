@@ -10,3 +10,6 @@
 # This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
+
+"""Fused kernels of a dense GEMM and an evenly split collective (all-to-all / all-gather /
+reduce-scatter), and the symmetric-memory protocol they share."""

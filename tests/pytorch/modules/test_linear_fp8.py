@@ -4,6 +4,8 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import copy
+
 import pytest
 import torch
 import torch.nn as nn
@@ -100,3 +102,38 @@ def test_float8linear(config, dtype, format, M, N, K, bias, enable_torch_compile
 
     if bias:
         torch.testing.assert_close(bias_grad, bias_grad_ref, **get_tolerances(dtype))
+
+
+@pytest.mark.parametrize("format", [Format.E4M3, Format.HYBRID])
+def test_float8linear_tensorwise_fullgraph(format):
+    """Tensorwise Float8Linears compile into one graph, and their outputs and input and weight
+    gradients are bit-identical to eager. The bias gradient is a reduction Inductor may order
+    differently, so it is compared with a tolerance."""
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    config = Float8QuantConfig(granularity=ScalingGranularity.TENSORWISE, format=format)
+    eager = nn.Sequential(
+        Float8Linear(1024, 3072, config=config), Float8Linear(3072, 1024, config=config)
+    ).to("cuda", dtype=dtype)
+    compiled = copy.deepcopy(eager)
+    torch._dynamo.reset()
+    compiled_forward = torch.compile(compiled, fullgraph=True)
+
+    x = torch.randn(4096, 1024, dtype=dtype, device="cuda")
+    grad_out = torch.randn(4096, 1024, dtype=dtype, device="cuda")
+    results = []
+    for model, forward in ((eager, eager), (compiled, compiled_forward)):
+        x_ = x.clone().requires_grad_(True)
+        out = forward(x_)
+        out.backward(grad_out)
+        results.append((out.detach(), x_.grad, [p.grad for p in model.parameters()]))
+
+    (out_e, xg_e, grads_e), (out_c, xg_c, grads_c) = results
+    assert torch.equal(out_c, out_e)
+    assert torch.equal(xg_c, xg_e)
+    names = [name for name, _ in eager.named_parameters()]
+    for name, g_c, g_e in zip(names, grads_c, grads_e):
+        if name.endswith("bias"):
+            torch.testing.assert_close(g_c, g_e, **get_tolerances(dtype))
+        else:
+            assert torch.equal(g_c, g_e), f"{name} gradient differs"

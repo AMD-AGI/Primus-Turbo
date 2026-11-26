@@ -4,10 +4,19 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import importlib
+
 import pytest
 import torch
 
-from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
+import primus_turbo.common.envs as envs
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+    GlobalBackendManager,
+    PrecisionType,
+    dispatch_report,
+    reset_dispatch_report,
+)
 from primus_turbo.pytorch.core.low_precision import (
     MXFP8_BLOCK_SIZE,
     Float8QuantConfig,
@@ -23,7 +32,11 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
     QuantizedTensorPair,
 )
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
+from primus_turbo.pytorch.core.utils import (
+    build_ck,
+    get_device_compute_capability,
+    is_gfx950,
+)
 from primus_turbo.pytorch.ops import gemm_fp8
 from primus_turbo.pytorch.ops.gemm_fp8 import _deter_use_nt_layout_gemm_in_bwd
 from tests.pytorch.ops.determinism_helper import (  # noqa: F401  (_det_seed: fixture)
@@ -642,6 +655,184 @@ def test_gemm_fp8_mx_fused_grad_accum(dtype, format, backend):
         block_size=MXFP8_BLOCK_SIZE,
         scale_dtype=ScaleDtype.E8M0,
     )
+
+
+# ---------------------------------------------------------------------------
+# Float8QuantConfig.default_backend
+# ---------------------------------------------------------------------------
+def _gemm_fp8_fwd_bwd(fn, a0, b0, grad_c, trans_a, trans_b, config):
+    a = a0.clone().requires_grad_(True)
+    b = b0.clone().requires_grad_(True)
+    c = fn(a, b, trans_a, trans_b, a0.dtype, config)
+    c.backward(grad_c)
+    return c.detach(), a.grad, b.grad
+
+
+def _assert_bitwise_equal(got, expected, names=("out", "a.grad", "b.grad")):
+    for name, x, y in zip(names, got, expected):
+        assert torch.equal(x, y), f"{name} differs"
+
+
+@pytest.fixture
+def dispatch_state():
+    GlobalBackendManager.reset()
+    reset_dispatch_report()
+    yield
+    envs.reset_cache("PRIMUS_TURBO_STRICT_DISPATCH")
+    GlobalBackendManager.reset()
+    reset_dispatch_report()
+
+
+def _fp8_gemm_choices():
+    """``{(backend, source): calls}`` for the dense FP8 GEMMs since the last reset."""
+    return {
+        (r["backend"], r["source"]): r["calls"]
+        for r in dispatch_report()
+        if r["dispatcher"] == "GEMMFP8KernelDispatcher"
+    }
+
+
+def _run_nt_fwd_bwd(m, n, k, config):
+    a0 = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    b0 = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
+    grad_c = torch.randn(m, n, dtype=torch.bfloat16, device="cuda")
+    return _gemm_fp8_fwd_bwd(gemm_fp8, a0, b0, grad_c, False, True, config)
+
+
+@pytest.mark.parametrize("backend", [BackendType.FLYDSL, BackendType.TRITON, BackendType.HIPBLASLT])
+def test_gemm_fp8_config_default_backend(dispatch_state, backend):
+    """The config's backend runs all three GEMMs, as the same kernels a pinned backend runs;
+    where it cannot run at all (FlyDSL before gfx950) every GEMM falls back."""
+    torch.manual_seed(0)
+    config = Float8QuantConfig(default_backend=backend)
+    got = _run_nt_fwd_bwd(512, 1024, 1024, config)
+
+    if backend == BackendType.FLYDSL and not is_gfx950():
+        assert _fp8_gemm_choices() == {("HIPBLASLT", "fallback"): 3}
+        return
+    assert _fp8_gemm_choices() == {(backend.name, "default"): 3}
+
+    torch.manual_seed(0)
+    GlobalBackendManager.set_gemm_backend(backend, PrecisionType.FP8)
+    _assert_bitwise_equal(got, _run_nt_fwd_bwd(512, 1024, 1024, Float8QuantConfig()))
+
+
+def test_gemm_fp8_config_default_backend_falls_back(dispatch_state, monkeypatch):
+    """A shape the config's backend refuses falls back on its own, and is an error under
+    PRIMUS_TURBO_STRICT_DISPATCH. FlyDSL needs K > 128, so only the K = 64 forward falls back."""
+    require_gfx950("FlyDSL")
+    config = Float8QuantConfig(default_backend=BackendType.FLYDSL)
+    _run_nt_fwd_bwd(512, 1024, 64, config)
+    assert _fp8_gemm_choices() == {("FLYDSL", "default"): 2, ("HIPBLASLT", "fallback"): 1}
+
+    monkeypatch.setenv("PRIMUS_TURBO_STRICT_DISPATCH", "1")
+    envs.reset_cache("PRIMUS_TURBO_STRICT_DISPATCH")
+    with pytest.raises(RuntimeError, match="STRICT_DISPATCH"):
+        _run_nt_fwd_bwd(512, 1024, 64, config)
+
+
+def test_gemm_fp8_user_backend_overrides_config_default(dispatch_state):
+    GlobalBackendManager.set_gemm_backend(BackendType.HIPBLASLT, PrecisionType.FP8)
+    _run_nt_fwd_bwd(512, 1024, 1024, Float8QuantConfig(default_backend=BackendType.TRITON))
+    assert _fp8_gemm_choices() == {("HIPBLASLT", "user"): 3}
+
+
+@pytest.mark.parametrize(
+    "granularity, builtin",
+    [
+        (ScalingGranularity.ROWWISE, BackendType.TRITON),
+        (ScalingGranularity.BLOCKWISE, BackendType.TRITON),
+        (ScalingGranularity.MX_BLOCKWISE, BackendType.FLYDSL),
+    ],
+)
+def test_gemm_fp8_config_default_backend_other_granularities(dispatch_state, granularity, builtin):
+    """Every granularity reads the field; without it each keeps its built-in default."""
+    if granularity == ScalingGranularity.MX_BLOCKWISE:
+        require_mxfp8()
+        require_gfx950("FlyDSL")
+        kwargs = dict(block_size=MXFP8_BLOCK_SIZE, scale_dtype=ScaleDtype.E8M0)
+        preferred = BackendType.HIPBLASLT
+    else:
+        kwargs = dict(block_size=128) if granularity == ScalingGranularity.BLOCKWISE else {}
+        preferred = BackendType.CK
+        if not build_ck():
+            pytest.skip("the CK backend is not built")
+    m, n, k = 1024, 1024, 1024
+
+    _run_nt_fwd_bwd(m, n, k, Float8QuantConfig(granularity=granularity, **kwargs))
+    assert _fp8_gemm_choices() == {(builtin.name, "default"): 3}
+
+    reset_dispatch_report()
+    config = Float8QuantConfig(granularity=granularity, default_backend=preferred, **kwargs)
+    _run_nt_fwd_bwd(m, n, k, config)
+    assert _fp8_gemm_choices() == {(preferred.name, "default"): 3}
+
+
+def test_float8_quant_config_default_backend_validation_and_fx_repr():
+    with pytest.raises(AssertionError, match="default_backend must be a BackendType"):
+        Float8QuantConfig(default_backend="flydsl")
+    for config in (Float8QuantConfig(), Float8QuantConfig(default_backend=BackendType.FLYDSL)):
+        source, globals_ = config.__fx_repr__()
+        assert eval(source, globals_) == config
+
+
+# ---------------------------------------------------------------------------
+# torch.compile: the tensorwise path is traced into the caller's graph.
+# ---------------------------------------------------------------------------
+_gemm_fp8_module = importlib.import_module("primus_turbo.pytorch.ops.gemm_fp8")
+
+
+# (256, 512, 64): K = 64, which FlyDSL leaves to another backend. (16384, 3072, 4096): FLUX.1's
+# context_embedder, whose weight gradient FlyDSL's TN split once got wrong (#589).
+@pytest.mark.parametrize("m, n, k", [(256, 512, 64), (1032, 1536, 1024), (16384, 3072, 4096)])
+@pytest.mark.parametrize(
+    "layout, nt_bwd",
+    [("NT", True), ("NT", False), ("NN", False), ("TN", False)],
+    ids=["NT-nt_bwd", "NT", "NN", "TN"],
+)
+@pytest.mark.parametrize("format", [Format.E4M3, Format.HYBRID])
+@pytest.mark.parametrize("default_backend", [None, BackendType.FLYDSL], ids=["default", "FLYDSL"])
+def test_gemm_fp8_tensorwise_compile(monkeypatch, m, n, k, layout, nt_bwd, format, default_backend):
+    """fullgraph compile of forward and backward, bit-identical to eager.
+
+    ``nt_bwd`` picks the backward layout independently of the arch: transposed operands saved in
+    forward for NT GEMMs (gfx950's choice for an NT forward) or the operands themselves (gfx942's).
+    """
+    monkeypatch.setattr(_gemm_fp8_module, "_deter_use_nt_layout_gemm_in_bwd", lambda trans_a, trans_b: nt_bwd)
+    torch._dynamo.reset()
+    dtype = torch.bfloat16
+    trans_a, trans_b = layout[0] == "T", layout[1] == "T"
+    a0 = torch.randn((k, m) if trans_a else (m, k), dtype=dtype, device="cuda")
+    b0 = torch.randn((n, k) if trans_b else (k, n), dtype=dtype, device="cuda")
+    grad_c = torch.randn(m, n, dtype=dtype, device="cuda")
+    config = Float8QuantConfig(format=format, default_backend=default_backend)
+
+    eager = _gemm_fp8_fwd_bwd(gemm_fp8, a0, b0, grad_c, trans_a, trans_b, config)
+    compiled = _gemm_fp8_fwd_bwd(
+        torch.compile(gemm_fp8, fullgraph=True), a0, b0, grad_c, trans_a, trans_b, config
+    )
+    _assert_bitwise_equal(compiled, eager)
+
+    c_ref = (a0.T if trans_a else a0).float() @ (b0.T if trans_b else b0).float()
+    snr_threshold = 25 if format == Format.E4M3 else 20
+    assert compute_snr(c_ref, eager[0]) > snr_threshold
+
+
+@pytest.mark.parametrize("layout", ["NT", "NN"])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.HYBRID])
+def test_gemm_fp8_tensorwise_plain_matches_prequantized(layout, format):
+    """Plain operands and the same operands passed pre-quantized give bit-identical outputs."""
+    trans_b = layout[1] == "T"
+    m, n, k = 1032, 1536, 1024
+    a = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn((n, k) if trans_b else (k, n), dtype=torch.bfloat16, device="cuda")
+    config = Float8QuantConfig(format=format)
+    fwd_dtype = _get_fp8_dtype(format, True)
+
+    out = gemm_fp8(a, b, False, trans_b, torch.bfloat16, config)
+    a_q = QuantizedTensor.quantize(a, fwd_dtype, ScalingGranularity.TENSORWISE)
+    b_q = QuantizedTensor.quantize(b, fwd_dtype, ScalingGranularity.TENSORWISE)
+    assert torch.equal(out, gemm_fp8(a_q, b_q, False, trans_b, torch.bfloat16, config))
 
 
 # ---------------------------------------------------------------------------
