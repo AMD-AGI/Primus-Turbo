@@ -93,15 +93,17 @@ def opaque_base(tensor):
     )
 
 
-def copy_rows(thread_index, num_vecs, vec_coords, src_res, dst_res, src_cm, dst_cm, batch=_BATCH):
-    """Copy ``num_vecs`` 16 B vectors, ``batch`` loads in flight per thread; ``vec_coords(v)`` gives
-    ``(src_word, dst_word, valid)``."""
-    per_iter = BLOCK_THREADS * batch
+def copy_rows(
+    thread_index, num_vecs, vec_coords, src_res, dst_res, src_cm, dst_cm, batch=_BATCH, threads=BLOCK_THREADS
+):
+    """Copy ``num_vecs`` 16 B vectors, ``batch`` loads in flight per thread of ``threads``;
+    ``vec_coords(v)`` gives ``(src_word, dst_word, valid)``."""
+    per_iter = threads * batch
     for it in range_constexpr(ceildiv(num_vecs, per_iter)):
         coords = [
-            vec_coords(fx.Int32(it * per_iter + j * BLOCK_THREADS) + thread_index)
+            vec_coords(fx.Int32(it * per_iter + j * threads) + thread_index)
             for j in range_constexpr(batch)
-            if it * per_iter + j * BLOCK_THREADS < num_vecs
+            if it * per_iter + j * threads < num_vecs
         ]
         vals = [
             buffer_load(src_res, src, vec_width=VEC_I32, dtype=fx.T.i32, mask=valid, cache_modifier=src_cm)
@@ -146,15 +148,16 @@ def _all_reached(flag_base, flag_idxs, expected):
 
 
 @ASTRewriter.transform
-def spin_flags(flag_base, flag_idxs, expected, rank, src, tag, report=True):
+def spin_flags(flag_base, flag_idxs, expected, rank, src, tag, report=True, sleep=1):
     """``spin_flag`` over several flags, polled together (one round trip per poll). ``report=False``
     traps on timeout without the printf: inside a GEMM K loop its hostcall code needs the registers the
-    accumulators and prefetches hold, and what it evicts is reloaded after every wait."""
+    accumulators and prefetches hold, and what it evicts is reloaded after every wait. ``sleep``: the
+    s_sleep count between polls (64 clocks each)."""
     spin_start = read_clock()
     fx.rocdl.s_waitcnt(0)
     ready = _all_reached(flag_base, flag_idxs, expected)
     while not ready:
-        fx.rocdl.s_sleep(fx.Int32(1))
+        fx.rocdl.s_sleep(fx.Int32(sleep))
         if spin_timed_out(spin_start, SPIN_TIMEOUT):
             if const_expr(report):
                 fx.printf(
