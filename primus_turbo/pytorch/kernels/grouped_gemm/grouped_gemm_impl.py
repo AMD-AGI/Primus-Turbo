@@ -798,10 +798,11 @@ class GroupedGEMMSegmentsTritonBackend(GroupedGEMMTritonBackend):
         return supported
 
 
-class GroupedGEMMSegmentsFlyDSLBackend(KernelBackend):
+class GroupedGEMMSegmentsFlyDSLBackend(GroupedGEMMFlyDSLBackend):
     """``GroupedGEMMFlyDSLBackend`` with ``b`` given as a list of weight segments, gfx1250 only: the gfx1250
     kernel adds each segment's offset to the expert's slab address in its TDM descriptors, so the call runs
-    the same tiles as on the one tensor holding all the groups and gives the same result."""
+    the same tiles as on the one tensor holding all the groups and gives the same result. ``execute`` passes
+    ``b`` through as the parent's gfx1250 branch does."""
 
     @staticmethod
     def can_handle(
@@ -829,26 +830,6 @@ class GroupedGEMMSegmentsFlyDSLBackend(KernelBackend):
             supported &= _cap_cu(num_cu, a.device) == 0
             supported &= _gfx1250_grouped_gemm_shapes_ok(a, b, trans_b)
         return supported
-
-    @staticmethod
-    def execute(
-        a: torch.Tensor,
-        b: List[torch.Tensor],
-        group_lens: torch.Tensor,
-        group_offs: torch.Tensor,
-        trans_a: bool,
-        trans_b: bool,
-        num_cu: int | None,
-        schedule: str = "static",
-        **kwargs,
-    ) -> torch.Tensor:
-        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
-            grouped_gemm_bf16_nn_flydsl_kernel,
-            grouped_gemm_bf16_nt_flydsl_kernel,
-        )
-
-        kernel = grouped_gemm_bf16_nt_flydsl_kernel if trans_b else grouped_gemm_bf16_nn_flydsl_kernel
-        return kernel(a, b, group_offs, out_dtype=a.dtype)
 
 
 class GroupedGEMMSegmentsKernelDispatcher(AutoKernelDispatcher):

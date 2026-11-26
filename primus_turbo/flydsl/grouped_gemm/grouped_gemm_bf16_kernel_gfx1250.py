@@ -606,7 +606,7 @@ def _launch_grouped_bf16_variable_k(
     frag_pipeline: Constexpr[int] = 1,
     split_bar: Constexpr[int] = 0,
     k_tiles_const: Constexpr[int] = 0,
-    # `c_off` is `g_idx * C_GRP_ELEMS + blk_n * ldc + blk_k`, so the stride and the per-expert
+    # `c_off` is `_c_grp(g_idx) + blk_n * ldc + blk_k`, so the stride and the per-expert
     # span must move TOGETHER or the store walks off the allocation; the entry point derives
     # `C_GRP_ELEMS` from this value and checks `out` against it.
     out_ldc: Constexpr[int] = 0,
@@ -2894,8 +2894,13 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
         who = "grouped_gemm_bf16_variable_k_flydsl_kernel"
         if out_ldc:
             raise ValueError(f"{who}: out_ldc is not taken with output segments")
-        out, out_g, out_seg_args, out_n_segs = _segments(out_segs, who, "output", out_segs[0].element_size())
-        if out_g != G or tuple(out.shape[1:]) != (OUT_M, OUT_N) or not out.is_contiguous():
+        out, out_g, out_seg_args, out_n_segs = _segments(out_segs, who, "output", unit=0)
+        if (
+            out_g != G
+            or tuple(out.shape[1:]) != (OUT_M, OUT_N)
+            or not out.is_contiguous()
+            or out.stride(0) != OUT_M * OUT_N
+        ):
             raise ValueError(
                 f"{who}: output segments must hold {G} groups of contiguous [{OUT_M}, {OUT_N}], got "
                 f"{[tuple(s.shape) for s in out_segs]}"
@@ -5011,7 +5016,7 @@ def _segments(x, who: str, what: str, unit: int = 1):
     but the first, in dtype, device and (if they hold groups) strides. ``ref`` is the first segment that
     holds groups, whose address and strides the kernel takes: it reaches group g at ``ref.data_ptr() +
     (g * group size + seg_delta(g)) * unit`` bytes. ``G`` is the total group count and ``seg_args`` the
-    launchers' ``seg_first1..3, seg_delta1..3``, the offsets in ``unit`` bytes."""
+    launchers' ``seg_first1..3, seg_delta1..3``, the offsets in ``unit`` bytes (0: the element size)."""
     if isinstance(x, torch.Tensor):
         return x, x.shape[0], (0, 0, 0, 0, 0, 0), 1
     segs = list(x)
@@ -5031,6 +5036,7 @@ def _segments(x, who: str, what: str, unit: int = 1):
         if s.shape[0] and s.data_ptr() % 16:
             raise ValueError(f"{who}: every {what} segment must be 16-byte aligned")
     grp_bytes = ref.stride(0) * ref.element_size()
+    unit = unit or ref.element_size()
     # The segments before `ref` are empty, so `ref` starts at group 0 and its own offset is 0.
     base = ref.data_ptr()
     firsts, deltas, G = [], [], segs[0].shape[0]

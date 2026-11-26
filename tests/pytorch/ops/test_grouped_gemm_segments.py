@@ -69,8 +69,15 @@ def _split(b, segments):
 
 
 def _split_reversed(b, segments):
-    """``_split`` with the later segments allocated first, so they may sit below segment 0."""
-    return [s.clone().requires_grad_(True) for s in reversed(b.split(segments))][::-1]
+    """Separate leaf tensors laid out in one buffer in reverse order: every later segment sits below segment 0,
+    so the kernels address it at a negative offset from segment 0."""
+    buf, top, segs = torch.empty_like(b), b.shape[0], []
+    for n, src in zip(segments, b.split(segments)):
+        top -= n
+        view = buf[top : top + n]
+        view.copy_(src)
+        segs.append(view.detach().requires_grad_(True))
+    return segs
 
 
 def _wgrad_fp32(a, grad_out, group_lens, trans_b):
@@ -216,7 +223,7 @@ def test_grouped_gemm_segments_rejects():
 
 
 @needs_gfx1250
-@pytest.mark.parametrize("segments", SEGMENTS + [(0, 5, 1)])
+@pytest.mark.parametrize("segments", SEGMENTS + [(0, 5, 1), (3, 0, 3)])
 @pytest.mark.parametrize("shape", FLYDSL_SHAPES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("trans_b", [True, False])
@@ -244,6 +251,37 @@ def test_grouped_gemm_segments_flydsl(segments, shape, dtype, trans_b, num_zero)
     for s, g in zip(segs, b_ref.grad.split(segments)):
         torch.testing.assert_close(s.grad, g, rtol=0.0, atol=0.0)
     torch.testing.assert_close(out, grouped_gemm_ref(a0, b0, group_lens, trans_b), **get_tolerances(dtype))
+
+
+# DeepSeek-V3 expert GEMMs at their tuned keys (G = 32, avg_m 2048): the persistent-cluster stacks, whose TDM
+# dealing and next-tile prefetch address the weights too. (kind, N, K) as the keys write them.
+FLYDSL_KEYED = [("nt", 4096, 7168), ("nt", 7168, 2048), ("nn", 7168, 4096), ("nn", 2048, 7168)]
+
+
+@needs_gfx1250
+@pytest.mark.parametrize("kind, N, K", FLYDSL_KEYED)
+@pytest.mark.parametrize("segments", [(28, 4), (0, 30, 2)])
+def test_grouped_gemm_segments_flydsl_keyed(kind, N, K, segments):
+    """Segments below segment 0 give the one tensor's result bit for bit on the keyed shapes, and a new set of
+    segment addresses reuses the compiled kernel (the addresses are runtime arguments)."""
+    pytest.importorskip("flydsl")
+    from primus_turbo.flydsl.grouped_gemm import grouped_gemm_bf16_kernel_gfx1250 as gg
+
+    torch.manual_seed(42)
+    G, avg_m = 32, 2048
+    a = torch.randn(G * avg_m, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((G, N, K) if kind == "nt" else (G, K, N), device="cuda", dtype=torch.bfloat16)
+    offs = torch.arange(0, G * avg_m + 1, avg_m, device="cuda", dtype=torch.int64)
+    fn = gg.grouped_gemm_bf16_nt_flydsl_kernel if kind == "nt" else gg.grouped_gemm_bf16_nn_flydsl_kernel
+    ref = fn(a, b, offs)
+    segs = [s.detach() for s in _split_reversed(b, segments)]
+    seg_args = gg._segments(segs, "test", "weight")[2]
+    assert min(seg_args[3:]) < 0, "the layout must put a segment below the first one that holds groups"
+    torch.testing.assert_close(fn(a, segs, offs), ref, rtol=0.0, atol=0.0)
+    compiled = len(gg._NT_COMPILED)
+    moved = [s.clone() for s in segs]
+    torch.testing.assert_close(fn(a, moved, offs), ref, rtol=0.0, atol=0.0)
+    assert len(gg._NT_COMPILED) == compiled, "new segment addresses must not compile a new kernel"
 
 
 @needs_gfx1250
