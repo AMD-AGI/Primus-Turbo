@@ -1,0 +1,235 @@
+###############################################################################
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+"""Ulysses causal attention with the all-to-alls fused around it (FlyDSL, single node, batch 1).
+
+``ulysses_mega_attn`` replaces ``all-to-all -> flash_attn -> all-to-all`` between the projections: it
+takes this rank's tokens with every head and returns the attention output for those tokens with every
+head. The forward is one kernel (pull q / k / v, attention, push O), and so is the backward (pull dO,
+the FlyDSL SBHD backward on this rank's heads, push dq / dk / dv to the token owners). A shape a fused
+kernel does not cover (e.g. byte offsets past i32) runs that pass as in-kernel all-to-alls, the FlyDSL
+attention and all-to-alls back, the tensors of one exchange split over several calls where needed.
+MLA head dims (q / k 192, v 128) run the gfx950 MLA forward tile and dK / dV body.
+
+Sequence split: with ``seq_chunk`` cs, global chunk ``c`` (cs tokens) lives on rank ``c % n``;
+``seq_chunk=0`` is the contiguous split (rank r holds the r-th chunk of ``S / n`` tokens). A striped
+split balances causal attention across ranks and lets the attention start before the exchange ends.
+
+The kernels spin on flags the peer ranks' kernels set, so a peer must not be queued behind a kernel
+that waits on this rank: with ``GPU_MAX_HW_QUEUES=2`` RCCL collectives overlapped on a side stream
+(Megatron's grad reduce / param gather) deadlock against them until the spin watchdog traps. Run
+with ``GPU_MAX_HW_QUEUES`` unset (HIP's 4) or >= 4.
+"""
+
+from typing import Optional
+
+import torch
+import torch.distributed as dist
+
+from primus_turbo.flydsl.fused_collective_gemm.workspace import get_collective_gemm_workspace
+from primus_turbo.flydsl.mega_attn.a2a_attn_bwd_kernel import (
+    a2a_attn_bwd_bank_bytes,
+    a2a_attn_bwd_unsupported,
+    ulysses_a2a_attn_bwd,
+)
+from primus_turbo.flydsl.mega_attn.a2a_attn_kernel import (
+    a2a_attn_fwd_bank_bytes,
+    a2a_attn_fwd_unsupported,
+    is_mla,
+    ulysses_a2a_attn_fwd,
+)
+from primus_turbo.flydsl.mega_attn.a2a_kernel import (
+    a2a_bank_bytes,
+    a2a_fits,
+    ulysses_a2a_heads_to_seq,
+    ulysses_a2a_seq_to_heads,
+)
+from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx950_mla_impl import (
+    flash_attn_flydsl_gfx950_mla_backward_impl,
+    flash_attn_flydsl_gfx950_mla_forward_impl,
+)
+from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
+    flash_attn_sbhd_flydsl_backward_impl,
+    flash_attn_sbhd_flydsl_forward_impl,
+)
+
+__all__ = ["ulysses_mega_attn"]
+
+
+def _fused(M, n, hq_r, hkv_r, d, d_v, seq_chunk, softmax_scale):
+    """Whether the fused forward and the fused backward kernel run this shape."""
+    return (
+        a2a_attn_fwd_unsupported(M, n, hq_r, hkv_r, d, d_v, seq_chunk, softmax_scale) is None,
+        a2a_attn_bwd_unsupported(M, n, hq_r, hkv_r, d, d_v, seq_chunk, softmax_scale) is None,
+    )
+
+
+def _a2a_groups(M, n, widths):
+    """Consecutive tensor groups (indices) whose exchange fits one in-kernel all-to-all call."""
+    groups = [[]]
+    for i, w in enumerate(widths):
+        assert a2a_fits(M, n, (w,)), "one tensor's exchange overflows the all-to-all's i32 byte offsets"
+        if groups[-1] and not a2a_fits(M, n, [widths[j] for j in groups[-1]] + [w]):
+            groups.append([])
+        groups[-1].append(i)
+    return groups
+
+
+def _a2a_bank_bytes(M, n, heads, dims):
+    groups = _a2a_groups(M, n, [h * d for h, d in zip(heads, dims)])
+    return max(a2a_bank_bytes(M, n, [heads[i] for i in g], [dims[i] for i in g]) for g in groups)
+
+
+def _exchange(a2a, xs, ys, ws, seq_chunk):
+    """The in-kernel all-to-all ``a2a`` of ``xs`` into ``ys``, over as many calls as the offsets need."""
+    per_head = ys if a2a is ulysses_a2a_seq_to_heads else xs
+    n = ws.num_ranks
+    M = per_head[0].shape[0] // n
+    for g in _a2a_groups(M, n, [t.shape[-2] * t.shape[-1] for t in per_head]):
+        a2a([xs[i] for i in g], [ys[i] for i in g], ws, seq_chunk=seq_chunk)
+
+
+def _bank_bytes(M, n, hq_r, hkv_r, d, d_v, seq_chunk=0, softmax_scale=None):
+    """The bank of the passes this shape runs; one size for both, since regrowing the heap is collective."""
+    fused_fwd, fused_bwd = _fused(M, n, hq_r, hkv_r, d, d_v, seq_chunk, softmax_scale)
+    qkv = _a2a_bank_bytes(M, n, (hq_r, hkv_r, hkv_r), (d, d, d_v))
+    o = _a2a_bank_bytes(M, n, (hq_r,), (d_v,))
+    fwd = a2a_attn_fwd_bank_bytes(M, n, hq_r, hkv_r, d, d_v) if fused_fwd else max(qkv, o)
+    bwd = a2a_attn_bwd_bank_bytes(M, n, hq_r, hkv_r, d, d_v) if fused_bwd else max(qkv, o)
+    return max(fwd, bwd)
+
+
+class UlyssesMegaAttnFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, group, seq_chunk, num_pull, softmax_scale):
+        n = group.size()
+        M, hq, d = q.shape
+        hkv, d_v = k.shape[1], v.shape[-1]
+        hq_r, hkv_r = hq // n, hkv // n
+        S = M * n
+        bank = _bank_bytes(M, n, hq_r, hkv_r, d, d_v, seq_chunk, softmax_scale)
+        ws = get_collective_gemm_workspace(group, bank, name="mega_attn")
+        q_h = q.new_empty(S, hq_r, d)
+        k_h = q.new_empty(S, hkv_r, d)
+        v_h = q.new_empty(S, hkv_r, d_v)
+        out = q.new_empty(M, hq, d_v)
+        if _fused(M, n, hq_r, hkv_r, d, d_v, seq_chunk, softmax_scale)[0]:
+            o_h = q.new_empty(S, hq_r, d_v)
+            lse = q.new_empty(S, hq_r, dtype=torch.float32)
+            ulysses_a2a_attn_fwd(
+                q,
+                k,
+                v,
+                q_h,
+                k_h,
+                v_h,
+                o_h,
+                lse,
+                out,
+                ws,
+                seq_chunk=seq_chunk,
+                num_pull=num_pull,
+                softmax_scale=softmax_scale,
+            )
+        else:
+            _exchange(ulysses_a2a_seq_to_heads, [q, k, v], [q_h, k_h, v_h], ws, seq_chunk)
+            if is_mla(d, d_v):
+                o, lse = flash_attn_flydsl_gfx950_mla_forward_impl(
+                    q_h[:, None], k_h[:, None], v_h[:, None], softmax_scale
+                )
+            else:
+                o, lse = flash_attn_sbhd_flydsl_forward_impl(
+                    q_h[:, None], k_h[:, None], v_h[:, None], causal=True, return_lse=True
+                )
+            o_h = o.reshape(S, hq_r, d_v)
+            _exchange(ulysses_a2a_heads_to_seq, [o_h], [out], ws, seq_chunk)
+        ctx.save_for_backward(q_h, k_h, v_h, o_h, lse)
+        ctx.group, ctx.seq_chunk, ctx.softmax_scale = group, seq_chunk, softmax_scale
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        q_h, k_h, v_h, o_h, lse = ctx.saved_tensors
+        group, cs, scale = ctx.group, ctx.seq_chunk, ctx.softmax_scale
+        n = group.size()
+        S, hq_r, d = q_h.shape
+        hkv_r, d_v = k_h.shape[1], v_h.shape[-1]
+        M = S // n
+        ws = get_collective_gemm_workspace(
+            group, _bank_bytes(M, n, hq_r, hkv_r, d, d_v, cs, scale), name="mega_attn"
+        )
+        dout = dout.contiguous()
+        dq = q_h.new_empty(M, n * hq_r, d)
+        dk = q_h.new_empty(M, n * hkv_r, d)
+        dv = q_h.new_empty(M, n * hkv_r, d_v)
+        grads = (dq, dk, dv, None, None, None, None)
+        if _fused(M, n, hq_r, hkv_r, d, d_v, cs, scale)[1]:
+            ulysses_a2a_attn_bwd(
+                dout, q_h, k_h, v_h, o_h, lse, dq, dk, dv, ws, seq_chunk=cs, softmax_scale=scale
+            )
+            return grads
+        do_h = torch.empty_like(o_h)
+        _exchange(ulysses_a2a_seq_to_heads, [dout], [do_h], ws, cs)
+        if is_mla(d, d_v):
+            dq_h, dk_h, dv_h = flash_attn_flydsl_gfx950_mla_backward_impl(
+                do_h[:, None], q_h[:, None], k_h[:, None], v_h[:, None], o_h[:, None], lse, scale
+            )
+        else:
+            dq_h, dk_h, dv_h = flash_attn_sbhd_flydsl_backward_impl(
+                do_h[:, None],
+                q_h[:, None],
+                k_h[:, None],
+                v_h[:, None],
+                o_h[:, None],
+                lse.view(1, S, hq_r).permute(0, 2, 1),
+                causal=True,
+            )
+        _exchange(
+            ulysses_a2a_heads_to_seq,
+            [dq_h.reshape(S, hq_r, d), dk_h.reshape(S, hkv_r, d), dv_h.reshape(S, hkv_r, d_v)],
+            [dq, dk, dv],
+            ws,
+            cs,
+        )
+        return grads
+
+
+def ulysses_mega_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    group: dist.ProcessGroup,
+    seq_chunk: int = 0,
+    num_pull: int = 32,
+    softmax_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """Causal attention over the Ulysses group's sequence for this rank's tokens.
+
+    Args:
+        q: ``[M, Hq, D]`` or SBHD ``[M, 1, Hq, D]`` bf16, this rank's tokens with every head.
+        k, v: ``[M, Hkv, D]`` / ``[M, Hkv, D_v]`` (or SBHD), like ``q``. ``D_v != D`` only for MLA
+            (``D`` 192, ``D_v`` 128, ``Hq == Hkv``).
+        group: the Ulysses group (one node); ``Hq`` and ``Hkv`` must divide by its size. An odd
+            local ``Hq / Hkv`` group (e.g. MHA) runs the unfused forward.
+        seq_chunk: the striped split's chunk (a multiple of 128 dividing ``M``, of 256 for MLA);
+            0 is contiguous.
+        num_pull: forward blocks that stage and pull q / k / v before joining the attention.
+        softmax_scale: MLA only (e.g. YaRN's ``mscale ** 2 / sqrt(D)``); default ``D ** -0.5``.
+
+    Returns:
+        The attention output for this rank's tokens, ``[M, Hq, D_v]`` (or SBHD).
+    """
+    sbhd = q.dim() == 4
+    if sbhd:
+        assert q.shape[1] == 1, "batch 1 only"
+        q, k, v = q[:, 0], k[:, 0], v[:, 0]
+    if softmax_scale is not None and abs(softmax_scale * q.shape[-1] ** 0.5 - 1.0) <= 1e-12:
+        softmax_scale = None
+    assert softmax_scale is None or is_mla(q.shape[-1], v.shape[-1]), "softmax_scale: MLA only"
+    out = UlyssesMegaAttnFunction.apply(
+        q.contiguous(), k.contiguous(), v.contiguous(), group, seq_chunk, num_pull, softmax_scale
+    )
+    return out[:, None] if sbhd else out
