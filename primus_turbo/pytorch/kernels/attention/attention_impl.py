@@ -34,6 +34,12 @@ from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_forward_impl,
     attention_aiter_varlen_forward_impl,
 )
+from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx950_mla_impl import (
+    flash_attn_flydsl_gfx950_mla_forward_bshd_impl,
+    flash_attn_flydsl_gfx950_mla_forward_impl,
+    flydsl_gfx950_mla_unsupported_reason,
+    mla_bshd_native,
+)
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_impl import (
     flash_attn_flydsl_gfx1250_forward_impl,
     flydsl_gfx1250_unsupported_reason,
@@ -289,14 +295,28 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
                 sink,
                 return_softmax,
             )
-        # The gfx950 kernels are sbhd only: they are compiled to address that order and take the
-        # [s,b,h,d] view of these [b,s,h,d]-shaped tensors with no copy. Everything else goes to
-        # aiter.
-        if k is None or v is None or not _sbhd_layout(q, qkv_format):
-            return False
         # These kernels never materialise the dropout softmax matrix, so a caller that asked
         # for it has to go to aiter, which does.
-        if return_softmax:
+        if k is None or v is None or return_softmax:
+            return False
+        if is_mla_head_dims(q, k, v):
+            # The DeepSeek-V3 MLA head dims (qk 192 / v 128) have their own kernels, compiled for
+            # contiguous bshd and for contiguous sbhd; the op layer copies any other byte order.
+            return (
+                get_device_compute_capability() == _GFX950
+                and dropout_p == 0.0
+                and bias is None
+                and alibi_slopes is None
+                and sink is None
+                and flydsl_gfx950_mla_unsupported_reason(
+                    q, k, v, causal, window_size, softmax_scale, kwargs.get("deterministic", False)
+                )
+                is None
+            )
+        # The other gfx950 kernels are sbhd only: they are compiled to address that order and take
+        # the [s,b,h,d] view of these [b,s,h,d]-shaped tensors with no copy. Everything else goes
+        # to aiter.
+        if not _sbhd_layout(q, qkv_format):
             return False
         if not _gqa_group_ok(q.shape[2], k.shape[2], q.shape[3]) or not _sink_ok(sink, q.shape[2]):
             return False
@@ -310,8 +330,14 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
             else:
                 out, lse = flash_attn_flydsl_gfx1250_forward_impl(q, k, v, softmax_scale, causal)
             return (out, lse) if return_lse else out
+        if is_mla_head_dims(q, k, v) and mla_bshd_native(q, k, v):
+            out, lse = flash_attn_flydsl_gfx950_mla_forward_bshd_impl(q, k, v)
+            return (out, lse) if return_lse else out
         # Under autotune, off the op layer's path, so the sbhd view is taken here too.
         q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))
+        if is_mla_head_dims(q, k, v):
+            out, lse = flash_attn_flydsl_gfx950_mla_forward_impl(q, k, v)
+            return (out, lse) if return_lse else out
         return flash_attn_sbhd_flydsl_forward_impl(
             q,
             k,
