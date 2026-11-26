@@ -53,7 +53,9 @@ std::tuple<at::Tensor, at::Tensor> quantize_fp8_tensorwise(
                        "scale_opt and amax_partials are alternatives, not a pair");
     // amax_out: the cast also folds the abs-max of `input` (before scaling) into this buffer, so a
     // delayed-scaling caller gets the next scale's amax without a second read. It only raises the
-    // value (one running max over every cast that is given the same buffer); the caller resets it.
+    // value (one running max over every cast that is given the same buffer); the caller resets it
+    // to +0 (e.g. amax_out.zero_()). The max compares float bit patterns as unsigned, so a buffer
+    // that starts negative (such as -inf) is never raised and the amax silently stays negative.
     float *amax_out = nullptr;
     if (amax_out_opt.has_value()) {
         const at::Tensor &amax = amax_out_opt.value();

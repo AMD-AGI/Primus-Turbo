@@ -239,6 +239,9 @@ template <int UNROLL, typename QType> PRIMUS_TURBO_DEVICE void store_zero_pack(Q
 // floats the unsigned order is the float order, and NaN (0x7fc00000 and up) sorts above Inf, so a
 // non-finite input shows up in the result instead of being dropped, as fmaxf would. The buffer
 // only ever grows: whoever reads it resets it (a running max over several casts per step).
+// The reset must be to +0 (e.g. amax_out.zero_()), not -inf: a negative float has the sign bit
+// set (bits >= 0x80000000), which compares above every positive pattern, so atomicMax would
+// never raise it and the amax would silently stay negative.
 template <typename FType> PRIMUS_TURBO_DEVICE uint32_t quant_abs_bits(const FType v) {
     return __float_as_uint(fabsf(static_cast<float>(v)));
 }

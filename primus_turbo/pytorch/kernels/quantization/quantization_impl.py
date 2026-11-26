@@ -63,8 +63,11 @@ def quantize_fp8_tensorwise_pad_impl(
     ``amax_out`` (needs ``scale``) is a one-element float32 buffer the cast raises to the
     abs-max of ``x`` (before scaling) while it reads ``x`` anyway, so the next delayed scale
     costs no extra pass. It is a running max: the buffer is never lowered, so one buffer shared
-    by several casts holds their maximum, and its owner resets it. A NaN or Inf in ``x`` lands
-    in it as NaN or Inf (it is not dropped). The cast's output is unchanged."""
+    by several casts holds their maximum, and its owner resets it to +0 (e.g.
+    ``amax_out.zero_()``). Not to ``-inf`` or any other value with the sign bit set: the max
+    compares float bit patterns as unsigned, so such a buffer is never raised and the amax
+    silently stays negative. A NaN or Inf in ``x`` lands in it as NaN or Inf (it is not
+    dropped). The cast's output is unchanged."""
     x = x.contiguous()
     pad_n_align = 128 if pad_n else 1
     args = (x, out_dtype, scale, k_align, pad_n_align, amax_partials)

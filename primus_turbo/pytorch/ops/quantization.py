@@ -88,7 +88,10 @@ def quantize_fp8(
         on ``x``'s device that the cast raises to the abs-max of ``x`` (before scaling), in the
         same read, so a delayed-scaling caller gets its next amax without another pass. It is a
         running max, never lowered, so several casts may share one buffer; whoever owns it resets
-        it. A NaN or Inf in ``x`` shows up in it. The FP8 output is bit-identical with or without it.
+        it to +0 (e.g. ``amax_out.zero_()``). Do not initialise it to ``-inf`` or any other value
+        with the sign bit set: the max compares float bit patterns as unsigned, so such a buffer
+        is never raised and the amax silently stays negative. A NaN or Inf in ``x`` shows up in
+        it. The FP8 output is bit-identical with or without it.
     """
     if scale is not None:
         if granularity != ScalingGranularity.TENSORWISE:
