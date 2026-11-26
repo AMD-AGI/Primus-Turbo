@@ -153,10 +153,14 @@ def _link_plan(num_ranks, S, mla=False):
     only while the start is a large share of the call (two ranks, up to 16K: A/B -1.0 / -1.5%, +0.8..+2.8%
     above). Four ranks keep pushers up to 32K (64K: A/B -1.5% without them) and pull 8 top bands right
     after the prefix (A/B 0.0..-2.0% up to 32K); eight ranks pull with 48 blocks (A/B -0.2..-1.3%).
-    MLA moves 5-10x the GQA bytes per row of attention: on eight ranks 8 pullers, 4 of them pushers
-    (DeepSeek-V3 / Kimi-K2 heads, 32K / 64K: A/B -2.6..-7.4% against 48 / 0)."""
+    MLA moves 5-10x the GQA bytes per row of attention and keeps pushers on four and eight ranks, 32
+    pullers each (DeepSeek-V3 / Kimi-K2 heads): four ranks 8 pushers up to 32K (A/B 0.0..-2.6%), 4 and
+    8 top bands at 64K (-2.3%); eight ranks 4 pushers (A/B -0.2..-6.7% against 8 pullers, the gain
+    shrinking as attention grows). Two ranks match GQA (within 1% of the best)."""
+    if mla and num_ranks == 4:
+        return 32, (8 if S <= 32768 else 4), False, (0 if S <= 32768 else 8)
     if mla and num_ranks == 8:
-        return 8, 4, False, 0
+        return 32, 4, False, 0
     if num_ranks == 2:
         return 24, 8, S <= 16384, 0
     if num_ranks == 4:
