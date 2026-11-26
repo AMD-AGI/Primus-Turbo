@@ -63,7 +63,7 @@ skip_unless_gfx950 = unittest.skipUnless(
 def _clamp(v, lo, hi):
     """``v.clamp(lo, hi)`` whose gradient passes on the bounds too, as the kernels' does.
 
-    torch>=2.14 zeroes the ``torch.clamp`` gradient at a scalar bound (pytorch/pytorch#185831), and
+    torch>=2.14 zeroes the ``torch.clamp`` gradient at a scalar bound (pytorch/pytorch#191142), and
     bf16 lands many values exactly on a bound like 7.
     """
     inside = torch.ones_like(v, dtype=torch.bool)
