@@ -50,6 +50,9 @@ def ep1_group():
         (333, 7168, 2048, 32, 8, 5),  # ragged token count, five experts receive nothing
         (2048, 2048, 1408, 16, 4, 0),  # N = 2816 = 11 tiles, a different hidden
         (1, 7168, 2048, 32, 8, 0),  # one token: every live tile is mostly padding
+        # GPT-OSS: 5760-byte rows end mid 256-byte line (64-wide k-tiles), so a row's edge shares a line
+        # with its neighbour's; a stale read of that line shows from the 2nd call on
+        (1024, 2880, 2880, 32, 4, 0),
     ],
 )
 def test_dispatch_gemm_nt_ep1(ep1_group, num_tokens, hidden, inter, num_experts, num_topk, num_empty):
@@ -78,6 +81,95 @@ def test_dispatch_gemm_nt_ep1(ep1_group, num_tokens, hidden, inter, num_experts,
             rows = slice(prefix[e], prefix[e] + counts[e])
             ref = x.float()[token[rows]] @ w1[e].float().T
             torch.testing.assert_close(out[rows].float(), ref, rtol=1.6e-2, atol=1e-2, msg=f"expert {e}")
+
+
+def test_combine_buffer_capacity_is_checked():
+    """The combine buffer's 32-bit offsets bound the tokens per rank (host-only: the check where the heap is sized,
+    for the bf16 and the MXFP8 Mega): DeepSeek-V3's top-8 and hidden 7168 take 37,376 tokens, not one more."""
+    from primus_turbo.flydsl.mega.gfx1250.symm_buffer import check_combine_capacity
+
+    check_combine_capacity(37376, 8, 7168)
+    check_combine_capacity(65536, 8, 2048)
+    for tokens in (37377, 65536):
+        with pytest.raises(ValueError, match="at most 37376 tokens per rank at top-8, hidden 7168"):
+            check_combine_capacity(tokens, 8, 7168)
+
+
+def test_dispatch_only_ep1(ep1_group):
+    """The dispatch-only launch (the comm role without the GEMM role) lands every token at its receive row."""
+    from primus_turbo.flydsl.mega.gfx1250.bf16.dispatch_gemm_kernel import (
+        dispatch_only_gfx1250,
+    )
+    from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
+        run_dispatch_prologue,
+    )
+
+    num_tokens, hidden, num_experts, num_topk = 333, 2048, 16, 4
+    torch.manual_seed(num_tokens)
+    w1 = torch.empty(num_experts, 512, hidden, device="cuda", dtype=torch.bfloat16)  # only its shape is read
+    for _ in range(2):
+        x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+        topk_w, topk_idx = (
+            torch.randn(num_tokens, num_experts, device="cuda").softmax(-1).topk(num_topk, dim=-1)
+        )
+        handle, _ = run_dispatch_prologue(x, w1, ep1_group, topk_idx, topk_w)
+        received = dispatch_only_gfx1250(x, handle)  # at EP1 token t's receive row is t
+        assert torch.equal(received[:num_tokens].view(torch.int16), x.view(torch.int16))
+
+
+@pytest.mark.parametrize(
+    "num_tokens, num_experts, num_topk, num_empty",
+    [(333, 8, 4, 2), (8192, 32, 8, 0)],
+)
+def test_dispatch_prologue_pool_order_ep1(ep1_group, num_tokens, num_experts, num_topk, num_empty):
+    """Each part of an expert's pool segment (the rows the combine folds a token's routes into, then the others)
+    lists its tokens in increasing order, and so does each send list: the tables depend on the routing alone, not
+    on the grid the prologue was tuned to or on the order its workgroups ran in, so the wgrads, which contract over
+    the pool rows, are the same in every run."""
+    from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
+        run_dispatch_prologue,
+    )
+
+    torch.manual_seed(num_tokens + num_empty)
+    x = torch.randn(num_tokens, 1024, device="cuda", dtype=torch.bfloat16)
+    w1 = torch.empty(num_experts, 512, 1024, device="cuda", dtype=torch.bfloat16)  # only its shape is read
+    scores = torch.randn(num_tokens, num_experts, device="cuda")
+    scores[:, num_experts - num_empty :] = float("-inf")
+    topk_w, topk_idx = scores.softmax(-1).topk(num_topk, dim=-1)
+    tables = []
+    for _ in range(2):
+        handle, weights = run_dispatch_prologue(x, w1, ep1_group, topk_idx, topk_w)
+        start = handle.combine_recv_start_row.tolist()
+        fold = handle.combine_recv_fold_count.tolist()
+        counts = handle.num_tokens_per_expert.tolist()
+        token = handle.pool_row_to_recv_token.tolist()
+        for e in range(num_experts):
+            for lo, hi in ((start[e], start[e] + fold[e]), (start[e] + fold[e], start[e] + counts[e])):
+                assert token[lo:hi] == sorted(set(token[lo:hi])), (
+                    f"expert {e}: pool rows {lo}..{hi} out of order"
+                )
+        send_offset = handle.expert_send_offset.tolist()
+        send_count = handle.expert_send_count.tolist()
+        sent = handle.dispatched_token_idx.tolist()
+        for e in range(num_experts):
+            part = sent[send_offset[e] : send_offset[e] + send_count[e]]
+            assert part == sorted(set(part)), f"expert {e}: send list out of order"
+        num_sent = sum(send_count)
+        tables.append(
+            [handle.pool_row_to_recv_token, handle.pool_row_to_route, handle.recv_token_to_pool_rows, weights]
+            + [handle.dispatched_token_idx[:num_sent]]
+        )
+    for a, b, what in zip(
+        *tables,
+        (
+            "pool_row_to_recv_token",
+            "pool_row_to_route",
+            "recv_token_to_pool_rows",
+            "dispatch weights",
+            "dispatched_token_idx",
+        ),
+    ):
+        assert torch.equal(a, b), f"{what} differs between two calls"
 
 
 # the plain schedule first, then issue_first alone, then every option on (lds_cosched needs issue_first)
