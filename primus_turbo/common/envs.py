@@ -57,7 +57,6 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT: bool = False
     PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM: bool = False
     PRIMUS_TURBO_JAX_DEEPEP_MODE: str | None = None
-    PRIMUS_TURBO_SYMM_MEM_BACKEND: str = "auto"
     PT_MEGA_FP8_COMBINE_AUTOTUNE: bool = True
     PT_MEGA_FP8_COMBINE_AUTOTUNE_VERBOSE: bool = True
     PT_MEGA_FP8_COMBINE_CU_CANDIDATES: tuple[int, ...] = (16, 32, 48, 64, 80, 96, 128)
@@ -292,15 +291,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # it with ``set_env()``, ``reset_runtime()`` clears it, and the mode locks at the first DeepEP
     # call.
     "PRIMUS_TURBO_JAX_DEEPEP_MODE": lambda: os.getenv("PRIMUS_TURBO_JAX_DEEPEP_MODE"),
-    # ================== Symmetric memory ==================
-    # How ``SymmetricMemory`` maps the peers' heaps: "ipc" (legacy HIP IPC, one OS instance only),
-    # "fabric" (VMM allocations exported as fabric handles, which also map across the hosts of one
-    # scale-up domain, e.g. the trays of an MI455X UALink pod) or "auto" (the default: ipc when the
-    # group lives on one OS instance, fabric when it spans several). A ``backend=`` argument wins.
-    # Read when a ``SymmetricMemory`` is created; every rank of the group must agree.
-    "PRIMUS_TURBO_SYMM_MEM_BACKEND": env_choice(
-        "PRIMUS_TURBO_SYMM_MEM_BACKEND", "auto", ("auto", "ipc", "fabric")
-    ),
     # ================== Mega MoE (FlyDSL FP8 combine) ==================
     # Online tuning of the FP8 combine's CU split. On unless set to "0", "false" or "False".
     # Read once, when ``primus_turbo.flydsl.mega.fp8.combine_autotune`` is imported.
