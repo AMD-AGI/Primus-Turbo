@@ -39,8 +39,9 @@ VEC_I32 = 4
 VEC_BF16 = 8
 # sc0|sc1|nt: system-coherent, streaming; staging is read by peers, recv reuses a bank every 2 epochs
 SYS_NT = 19
-# s_memrealtime ticks at 100 MHz: 5 s
-SPIN_TIMEOUT = 500_000_000
+# s_memrealtime ticks at 100 MHz: 300 s. Kernels start without a barrier, so this is how late a peer may
+# start: a first compilation, a data loader or host stall on one rank must not trap the others.
+SPIN_TIMEOUT = 30_000_000_000
 
 # state: [epoch, exit counter, unit claim counter, tile claim counter]
 STATE_EPOCH = 0
