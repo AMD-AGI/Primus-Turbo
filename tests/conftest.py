@@ -41,6 +41,9 @@ _GFX1250_ENABLED_TESTS = (
     # bf16 grouped GEMM through the backend registry: Triton, plus the FlyDSL
     # WMMA/TDM kernels in grouped_gemm_bf16_kernel_gfx1250.py.
     "tests/pytorch/ops/test_grouped_gemm.py",
+    # The same with the weights in segments (an MoE layer's experts and its replica slots): Triton in
+    # every direction, FlyDSL in the forward and dgrad.
+    "tests/pytorch/ops/test_grouped_gemm_segments.py",
     # Shape rules and ragged-K coverage for the same FlyDSL bf16 grouped GEMM. Separate
     # from the suite above because most of it is host-only: it checks that the published
     # shape gates and the entry points cannot disagree, which needs no GPU.

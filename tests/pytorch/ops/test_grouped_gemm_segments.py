@@ -6,10 +6,13 @@
 
 """Grouped GEMM with the weights given as segments: ``grouped_gemm(a, [b0, b1, ...], group_lens)``."""
 
+import warnings
+
 import pytest
 import torch
 
 from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
+from primus_turbo.pytorch.core.utils import is_gfx1250
 from primus_turbo.pytorch.ops import grouped_gemm
 from tests.pytorch.ops.test_grouped_gemm import (
     _poison_alloc_pool,
@@ -32,6 +35,13 @@ SCHEDULE_SHAPES = [
     ("static", (256, 320, 2880)),
     ("work_steal", (512, 2048, 1536)),
 ]
+# (rows per group, N, K) that the gfx1250 FlyDSL forward and native dgrad both run: a small shape and the
+# DeepSeek-V3 gate/up projection.
+FLYDSL_SHAPES = [(512, 2048, 1536), (1024, 4096, 7168)]
+
+needs_gfx1250 = pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx1250()), reason="the FlyDSL segments backend is gfx1250 only"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -56,6 +66,11 @@ def _make_inputs(segments, M, N, K, dtype, trans_b, num_zero=0):
 def _split(b, segments):
     """Separate allocations, as the segments of a real layer are."""
     return [s.clone().requires_grad_(True) for s in b.split(segments)]
+
+
+def _split_reversed(b, segments):
+    """``_split`` with the later segments allocated first, so they may sit below segment 0."""
+    return [s.clone().requires_grad_(True) for s in reversed(b.split(segments))][::-1]
 
 
 def _wgrad_fp32(a, grad_out, group_lens, trans_b):
@@ -193,7 +208,91 @@ def test_grouped_gemm_segments_rejects():
     with pytest.raises(AssertionError, match="one dtype"):
         grouped_gemm(a, segs, group_lens, trans_b=True, fuse_bgrad_accum_pattern="megatron")
 
-    # Segments run on Triton only: pinning another backend is an error, not a silent fallback.
+    # Segments run on Triton and (gfx1250) FlyDSL only: pinning another backend is an error, not a silent
+    # fallback.
     GlobalBackendManager.set_grouped_gemm_backend(BackendType.CK)
     with pytest.raises(ValueError, match="not registered"):
         grouped_gemm(a, list(b.split(5)), group_lens, trans_b=True)
+
+
+@needs_gfx1250
+@pytest.mark.parametrize("segments", SEGMENTS + [(0, 5, 1)])
+@pytest.mark.parametrize("shape", FLYDSL_SHAPES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("trans_b", [True, False])
+@pytest.mark.parametrize("num_zero", [0, 2])
+def test_grouped_gemm_segments_flydsl(segments, shape, dtype, trans_b, num_zero):
+    """FlyDSL pinned: forward and dgrad on segments, and the unfused wgrad split into them, equal those of the
+    same weights in one tensor bit for bit (same tile config, tiles and accumulation order)."""
+    GlobalBackendManager.set_grouped_gemm_backend(BackendType.FLYDSL)
+    torch.manual_seed(42)
+    a0, b0, group_lens = _make_inputs(segments, *shape, dtype, trans_b, num_zero)
+
+    a_ref = a0.clone().requires_grad_(True)
+    b_ref = b0.clone().requires_grad_(True)
+    out_ref = grouped_gemm(a_ref, b_ref, group_lens, trans_b=trans_b)
+    grad_out = torch.randn_like(out_ref)
+    out_ref.backward(grad_out)
+
+    a = a0.clone().requires_grad_(True)
+    segs = _split_reversed(b0, segments)
+    out = grouped_gemm(a, segs, group_lens, trans_b=trans_b)
+    out.backward(grad_out)
+
+    torch.testing.assert_close(out, out_ref, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(a.grad, a_ref.grad, rtol=0.0, atol=0.0)
+    for s, g in zip(segs, b_ref.grad.split(segments)):
+        torch.testing.assert_close(s.grad, g, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(out, grouped_gemm_ref(a0, b0, group_lens, trans_b), **get_tolerances(dtype))
+
+
+@needs_gfx1250
+@pytest.mark.parametrize("segments", SEGMENTS)
+def test_grouped_gemm_segments_flydsl_nn_transposed_copy(segments):
+    """The NN entry's fallback through a transposed weight copy takes segments too (one copy per segment)."""
+    pytest.importorskip("flydsl")
+    from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+        grouped_gemm_bf16_nn_flydsl_kernel,
+    )
+
+    torch.manual_seed(42)
+    a, b, group_lens = _make_inputs(segments, 512, 2048, 1536, torch.bfloat16, trans_b=False)
+    group_offs = torch.cat([group_lens.new_zeros(1), group_lens.cumsum(0)])
+    segs = [s.detach() for s in _split_reversed(b, segments)]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        ref = grouped_gemm_bf16_nn_flydsl_kernel(a, b, group_offs, native=0)
+        out = grouped_gemm_bf16_nn_flydsl_kernel(a, segs, group_offs, native=0)
+    torch.testing.assert_close(out, ref, rtol=0.0, atol=0.0)
+
+
+def test_grouped_gemm_segments_flydsl_rejects():
+    pytest.importorskip("flydsl")
+    from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+        _weight_segments,
+    )
+
+    b = torch.empty((6, 64, 32), dtype=torch.bfloat16)
+    who = "test"
+    with pytest.raises(ValueError, match="1 to 4"):
+        _weight_segments(list(b.split(1)), who)
+    with pytest.raises(ValueError, match="agree in shape and strides"):
+        _weight_segments([b[:3], b[3:, :32]], who)
+    with pytest.raises(ValueError, match="agree in shape and strides"):
+        _weight_segments([b[:3], b[3:].transpose(1, 2).contiguous().transpose(1, 2)], who)
+    with pytest.raises(ValueError, match="dtype or device"):
+        _weight_segments([b[:3], b[3:].half()], who)
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        _weight_segments([b[:3], torch.empty(3 * 64 * 32 + 1, dtype=b.dtype)[1:].view(3, 64, 32)], who)
+
+    # Group g of segment s sits seg_delta_s bytes past where it would in one tensor with segment 0's strides.
+    segs = [b[:2].clone(), b[2:2].clone(), b[2:].clone()]
+    ref, G, seg_args, n_segs = _weight_segments(segs, who)
+    grp_bytes = 64 * 32 * 2
+    assert (ref is segs[0], G, n_segs) == (True, 6, 3)
+    assert seg_args[:3] == (2, 2, 0)
+    assert seg_args[4] == segs[2].data_ptr() - segs[0].data_ptr() - 2 * grp_bytes
+    # A leading empty segment: the kernel takes the first segment with groups as its base.
+    segs = [b[:0].clone(), b.clone()]
+    ref, G, seg_args, n_segs = _weight_segments(segs, who)
+    assert (ref is segs[1], G, n_segs, seg_args[0], seg_args[3]) == (True, 6, 2, 0, 0)
