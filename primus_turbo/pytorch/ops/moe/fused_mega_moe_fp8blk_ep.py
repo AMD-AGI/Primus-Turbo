@@ -41,18 +41,24 @@ Communication goes through an ``EPComm``: ``DistEPComm(group)`` (torch.distribut
   emulation used by the tests.
 """
 
+import os
 from typing import List, Optional, Sequence
 
 import torch
 
+from primus_turbo.pytorch.core import overlap as _overlap
 from primus_turbo.pytorch.ops.moe import fused_mega_moe_fp8blk as _blk
 from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8blk import FP8BlockWeightCache
 from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad, main_grad_first_write
 from primus_turbo.triton.quantization.quantization_fp8blk_ep_kernel import (
     build_routing_blk_masked,
+    build_routing_blk_meta,
+    combine_ranks,
     gather_dual_fp8,
     pack_pool_rows,
+    presum_routes,
     quant_rows_send,
+    scatter_pool_ext,
     src_layout_ep,
 )
 from primus_turbo.triton.quantization.quantization_fp8blk_moe_kernel import (
@@ -176,7 +182,13 @@ class _EPState:
         self.N = R * self.cap  # received token rows per rank
         align = _blk._ALIGN
         self.P = -(-(self.N * self.kl + E_l * align) // 256) * 256
-        self.wk = _blk._wgrad_kernel(self.N)  # longest possible expert window = N tokens
+        # Longest expert window the wgrad is built for. The true bound is N tokens, which is past what the persistent
+        # vkq / vkw wgrad holds in LDS; PRIMUS_TURBO_EP_WGRAD_WINDOW (default 5120, 0 = N) caps it so they run, and
+        # every wgrad asserts on the device that the real windows fit (no host sync; aborts instead of a wrong result,
+        # as the vk path does past its own cap).
+        cap_win = int(os.environ.get("PRIMUS_TURBO_EP_WGRAD_WINDOW", "5120"))
+        self.wwin = min(self.N, cap_win) if cap_win > 0 else self.N
+        self.wk = _blk._wgrad_kernel(self.wwin)
         self.ct = self.wk == "vkq"  # compact col scales + LPT order + sumsq fold: the persistent wgrad
         self.ranks = [_Rank() for _ in comm.local_ranks]
         self.activation = None
@@ -189,25 +201,55 @@ def _src_layout(st: _EPState, rk: _Rank, idx: torch.Tensor, tw: torch.Tensor):
     return meta, cnt.view(st.R, 1)
 
 
-def _recv_tables(st: _EPState, rk: _Rank, meta: torch.Tensor, cnt: torch.Tensor):
-    """Expert rank: pool routing tables over the local experts from the received route metadata [R, cap, 3K] and
-    per-source counts [R, 1], with the pool row -> combine slot map (p2s)."""
-    K, cap, N = st.K, st.cap, st.N
-    live = (
-        torch.arange(cap, device=meta.device)[None, :] < cnt
-    )  # [R, cap]: slots a count-based transport filled
-    li = torch.where(live[:, :, None], meta[:, :, :K], -1).reshape(N, K)
-    m2 = meta.view(N, 3 * K)
-    rk.rowmap, rk.rw, rk.inv, rk.poffs, rk.preal, rk.p2s = build_routing_blk_masked(
-        li,
-        m2[:, K : 2 * K].view(torch.float32),
-        st.E_l,
-        st.P,
-        align=_blk._ALIGN,
-        cslot=m2[:, 2 * K :],
-        cap=cap,
-        ccap=st.ccap,
+def _recv_tables(st: _EPState, rk: _Rank, meta, cnt):
+    """Expert rank: pool routing tables over the local experts from the received route metadata and per-source
+    counts, with the pool row -> combine slot map (p2s). ``meta`` / ``cnt``: (flat int32 buffer, element offset,
+    per-source stride) of the [cap, 3K] metadata blocks / the counts (slots past a source's count are dead; the
+    kernels mask them, no materialized columns)."""
+    (mb, moff, mstride), (cb, coff, cstride) = meta, cnt
+    rk.rowmap, rk.rw, rk.inv, rk.poffs, rk.preal, rk.p2s = build_routing_blk_meta(
+        mb, moff, mstride, cb, coff, cstride, st.N, st.K, st.E_l, st.P, st.cap, st.ccap, align=_blk._ALIGN
     )
+
+
+def _flat_src(t: torch.Tensor):
+    """(flat int32 view, offset 0, per-source stride) of a contiguous [R, ...] int32 tensor."""
+    t = t.contiguous()
+    return t.view(-1), 0, t[0].numel()
+
+
+def _merge_small() -> bool:
+    return os.environ.get("PRIMUS_TURBO_EP_MERGE_SMALL", "1") != "0"
+
+
+def _a2a_small(comm: EPComm, ps, pm, pc):
+    """The dispatch's three small exchanges (E8M0 scales [R, cap, H/128] u8, route metadata [R, cap, 3K] i32, counts
+    [R, 1] i32) as ONE all-to-all of their per-peer bytes: one launch instead of three, and it avoids a slow message
+    size (the metadata alone, 1152 KiB per rank at the DSv4 shapes, takes ~3x a 2 MiB message on MI455X RCCL)."""
+    sends, parts = [], None
+    for s, m, c in zip(ps, pm, pc):
+        R = s.shape[0]
+        parts = [t.reshape(R, -1).view(torch.uint8) for t in (s, m, c)]
+        widths = [p.shape[1] for p in parts]
+        blk = -(-sum(widths) // 16) * 16
+        buf = torch.empty((R, blk), dtype=torch.uint8, device=s.device)
+        off = 0
+        for p, w in zip(parts, widths):
+            buf[:, off : off + w].copy_(p)
+            off += w
+        sends.append(buf)
+    recvs = comm.all_to_all(sends)
+    rs, rm, rc = [], [], []
+    for r, s, m, c in zip(recvs, ps, pm, pc):
+        ws = s[0].numel() * s.element_size()
+        wm = m[0].numel() * m.element_size()
+        rs.append(r[:, :ws].contiguous().view(s.dtype).view(s.shape))
+        # metadata / counts are read in place by the routing kernels: (int32 buffer, offset, per-source stride)
+        b32 = r.view(torch.int32).view(-1)
+        stride = r.shape[1] // 4
+        rm.append((b32, ws // 4, stride))
+        rc.append((b32, (ws + wm) // 4, stride))
+    return rs, rm, rc
 
 
 def _dispatch_fwd(st: _EPState, xs, idxs, tws):
@@ -221,9 +263,12 @@ def _dispatch_fwd(st: _EPState, xs, idxs, tws):
         pq.append(q), ps.append(s), pm.append(meta), pc.append(cnt)
     comm = st.comm
     rq = comm.all_to_all(pq)
-    rs = comm.all_to_all(ps) if fp8 else [None] * len(rq)
-    rm = comm.all_to_all(pm)
-    rc = comm.all_to_all(pc)
+    if fp8 and _merge_small():
+        rs, rm, rc = _a2a_small(comm, ps, pm, pc)
+    else:
+        rs = comm.all_to_all(ps) if fp8 else [None] * len(rq)
+        rm = [_flat_src(m) for m in comm.all_to_all(pm)]
+        rc = [_flat_src(c) for c in comm.all_to_all(pc)]
     del pq, ps, pm, pc
     out = []
     for rk, q, s, meta, cnt in zip(st.ranks, rq, rs, rm, rc):
@@ -264,9 +309,42 @@ def _dispatch_dy(st: _EPState, dys):
     return out
 
 
+def _presum() -> bool:
+    return os.environ.get("PRIMUS_TURBO_EP_PRESUM", "1") != "0"
+
+
+def _combine_presum(st: _EPState, pool_rows, extra=None):
+    """Combine with the routes of a token summed on the expert rank first: one bf16 row per (token, expert rank)
+    ([R, cap, H], the dispatch slots) instead of one per route ([R, ccap, H], ccap = T * min(K, E_l)), then the
+    per-rank partials summed on the token's rank in rank order. Not bit-identical to EP=1 (sum order and one more
+    bf16 rounding). ``extra`` (d route_w) still travels per route ([R, ccap] fp32)."""
+    R, H, ccap, K, cap, N = st.R, st.H, st.ccap, st.K, st.cap, st.N
+    sends, exts = [], []
+    for i, (rk, rows) in enumerate(zip(st.ranks, pool_rows)):
+        if extra is None:
+            sends.append(presum_routes(rows, rk.inv, N, K).view(R, cap, H))
+        else:  # d route_w scattered to its combine slot inside the same launch
+            o, eo = presum_routes(rows, rk.inv, N, K, ext=extra[i], p2s=rk.p2s, nslots=R * ccap)
+            sends.append(o.view(R, cap, H))
+            exts.append(eo.view(R, ccap))
+    recvs = st.comm.all_to_all(sends)
+    del sends
+    if extra is not None:
+        rws = st.comm.all_to_all(exts)
+    outs = []
+    for i, (rk, rv) in enumerate(zip(st.ranks, recvs)):
+        if extra is None:
+            outs.append(combine_ranks(rv.view(R * cap, H), rk.slot, rk.T, R, cap))
+        else:  # d topk_w gathered by combine slot inside the same launch
+            outs.append(combine_ranks(rv.view(R * cap, H), rk.slot, rk.T, R, cap, rws=rws[i].view(-1), cinv=rk.cinv, K=K))
+    return outs
+
+
 def _combine(st: _EPState, pool_rows, extra=None):
     """Each live route's pool row (bf16 [P, H]) back to its token's rank, summed there in k order (combine_rows).
     ``extra``: per-rank fp32 [P] (d route_w) sent along per route -> [T, K]."""
+    if _presum():
+        return _combine_presum(st, pool_rows, extra)
     R, H, ccap, K = st.R, st.H, st.ccap, st.K
     sends, exts = [], []
     for i, (rk, rows) in enumerate(zip(st.ranks, pool_rows)):
@@ -290,12 +368,20 @@ def _wgrad(st: _EPState, rk: _Rank, w, lhs, lhs_s, rhs, rhs_s, n, k, accumulate)
     """fused_mega_moe_fp8blk's wgrad step (main_grad accumulation, sumsq fold, dummy grad) for one weight."""
 
     def run(out, beta, sq=None):
-        _blk._run_wgrad(st.wk, lhs, rhs, lhs_s, rhs_s, rk.poffs, n, k, out, beta, rk.perm, st.N, sq)
+        if st.wwin < st.N:
+            torch._assert_async((rk.poffs[1:] - rk.poffs[:-1]).max() <= _blk._vkp_kwin(st.wwin))
+        _blk._run_wgrad(st.wk, lhs, rhs, lhs_s, rhs_s, rk.poffs, n, k, out, beta, rk.perm, st.wwin, sq)
 
     mg = _blk._setup_accum(w, accumulate)
     if mg is not None:
         sq = _blk._wgrad_sumsq_buf(w, mg) if st.wk == "vkq" else None
-        run(mg, 0.0 if main_grad_first_write(w) else 1.0, sq)
+        beta = 0.0 if main_grad_first_write(w) else 1.0
+        if _overlap.enabled("MOE_WGRAD"):
+            # the expert wgrad only feeds the optimizer: run it on the side stream next to the dgrad chain and the
+            # EP all-to-alls (same kernel and inputs -> same main_grad bits; joined after the micro-batch backward)
+            _overlap.defer(lambda: run(mg, beta, sq), lhs, lhs_s, rhs, rhs_s, rk.poffs, rk.perm, mg, sq)
+        else:
+            run(mg, beta, sq)
         w._primus_main_grad_sumsq_fresh = sq is not None
         w.grad_added_to_main_grad = True
         return _get_dummy_wgrad(w.shape, w.dtype)

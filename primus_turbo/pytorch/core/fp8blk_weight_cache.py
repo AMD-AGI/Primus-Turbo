@@ -21,6 +21,7 @@ while the cache is enabled. PRIMUS_TURBO_FP8_WCACHE_VERIFY=1 re-quantizes every 
 raises on any byte difference (debugging; syncs).
 """
 
+import weakref
 from typing import Optional
 
 import torch
@@ -28,6 +29,12 @@ import torch
 import primus_turbo.common.envs as envs
 
 BLOCK = 128
+_WANTED = {}  # id -> weakref of each weight a block-FP8 GEMM has asked for (refresh_unmanaged); no tensor ==
+
+
+def _want(p: torch.Tensor) -> None:
+    if id(p) not in _WANTED:
+        _WANTED[id(p)] = weakref.ref(p)
 
 
 def enabled() -> bool:
@@ -142,6 +149,7 @@ def attach_joint(params, dtype: torch.dtype = torch.float8_e4m3fn) -> Optional[J
     jc = JointFp8BlockWeightCache(params, dtype)
     for p in params:
         p._primus_fp8blk_wanted = True
+        _want(p)
         p._primus_fp8blk_joint = jc
     return jc
 
@@ -191,6 +199,7 @@ def lookup(b: torch.Tensor, dtype: torch.dtype) -> Optional[Fp8BlockWeightCache]
         return None
     try:
         b._primus_fp8blk_wanted = True
+        _want(b)
     except (AttributeError, RuntimeError):
         return None
     cache = getattr(b, "_primus_fp8blk_cache", None)
@@ -200,3 +209,38 @@ def lookup(b: torch.Tensor, dtype: torch.dtype) -> Optional[Fp8BlockWeightCache]
     if _verify():
         _check(b, cache)
     return cache
+
+
+def refresh_unmanaged() -> int:
+    """Quantize every wanted weight whose cache no optimizer fills (``optimizer_managed`` unset), e.g. a weight split
+    across a ZeRO data-parallel group, from its current BF16 value: the bytes a cache miss would compute, once per
+    step instead of once per GEMM call. Call after the step's parameter update / all-gather, outside graphs. Returns
+    the number of weights refreshed."""
+    if not enabled():
+        return 0
+    from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+        quant_fp8_blockwise_for_weight_impl,
+    )
+
+    n = 0
+    for key, ref in list(_WANTED.items()):
+        p = ref()
+        if p is None:
+            del _WANTED[key]
+            continue
+        cache = getattr(p, "_primus_fp8blk_cache", None)
+        if cache is not None and getattr(cache, "optimizer_managed", False):
+            continue
+        if cache is None or cache.shape != tuple(p.shape) or cache.data_ptr != p.data_ptr():
+            cache = attach(p)
+        materialize(p)
+        q, s = quant_fp8_blockwise_for_weight_impl(p.detach().contiguous(), cache.dtype, block_size=BLOCK)
+        e = ((s.contiguous().view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
+        cache.w.copy_(q)
+        cache.scale_inv.copy_(s)
+        cache.e8m0.copy_(e)
+        cache.wt.copy_(q.transpose(-1, -2))
+        cache.e8m0_t.copy_(e.transpose(-1, -2))
+        cache.ready = True
+        n += 1
+    return n

@@ -312,8 +312,8 @@ def build_routing_blk_masked(
     if cslot is not None:
         assert cslot.dtype == torch.int32 and cslot.stride() == local_w.stride() and cap > 0 and ccap > 0
     dev = local_idx.device
-    if block is None:  # at most ~1024 chunks: the offsets kernel scans all chunks in one program
-        block = max(128, triton.next_power_of_2(triton.cdiv(R, 1024)))
+    if block is None:  # at most ~128 chunks: the offsets kernel scans all chunks (x E experts) in one program
+        block = max(128, min(512, triton.next_power_of_2(triton.cdiv(R, 128))))
     nw = 4 if block <= 128 else 8
     nch = triton.cdiv(R, block)
     pb = triton.next_power_of_2(triton.cdiv(P, nch))
@@ -347,6 +347,153 @@ def build_routing_blk_masked(
         BLOCK=block,
         HAS_CS=int(cslot is not None),
         num_warps=nw,
+    )
+    return rowmap, rw, inv, poffs, poffs[E:], p2s
+
+
+@triton.jit
+def _meta_route(META, META_OFF, SRC_STRIDE, CNTS, CNT_OFF, CNT_STRIDE, CAP, r, m, K: tl.constexpr):
+    """Route r = (n, k) of received slot n = (source, slot): its metadata row offset and whether the slot is live
+    (slot < the source's count; rows past the count are unwritten)."""
+    n = r // K
+    src = n // CAP
+    slot = n % CAP
+    c = tl.load(CNTS + CNT_OFF + src * CNT_STRIDE, mask=m, other=0)
+    live = m & (slot < c)
+    row = META_OFF + src.to(tl.int64) * SRC_STRIDE + slot.to(tl.int64) * (3 * K)
+    return n, row, live
+
+
+@triton.jit
+def _route_count_meta_kernel(
+    META,
+    META_OFF,
+    SRC_STRIDE,
+    CNTS,
+    CNT_OFF,
+    CNT_STRIDE,
+    CAP,
+    CNT,
+    ROWMAP,
+    RW,
+    P2S,
+    R,
+    P,
+    K: tl.constexpr,
+    E: tl.constexpr,
+    BLOCK: tl.constexpr,
+    PB: tl.constexpr,
+    HAS_CS: tl.constexpr,
+):
+    """_route_count_kernel over the received route metadata (local expert ids in columns [0, K) of each live slot's
+    row, -1 for dead slots); also resets ROWMAP -1, RW 0 (and P2S -1) over this program's share of P."""
+    ch = tl.program_id(0)
+    e_ar = tl.arange(0, E)
+    r = ch * BLOCK + tl.arange(0, BLOCK)
+    m = r < R
+    n, row, live = _meta_route(META, META_OFF, SRC_STRIDE, CNTS, CNT_OFF, CNT_STRIDE, CAP, r, m, K)
+    idx = tl.load(META + row + r % K, mask=live, other=-1)
+    tl.store(CNT + ch * E + e_ar, tl.sum((idx[:, None] == e_ar[None, :]).to(tl.int32), axis=0))
+    pr = ch * PB + tl.arange(0, PB)
+    tl.store(ROWMAP + pr, tl.full((PB,), -1, tl.int32), mask=pr < P)
+    tl.store(RW + pr, tl.zeros((PB,), tl.float32), mask=pr < P)
+    if HAS_CS:
+        tl.store(P2S + pr, tl.full((PB,), -1, tl.int32), mask=pr < P)
+
+
+@triton.jit
+def _route_scatter_meta_kernel(
+    META,
+    META_OFF,
+    SRC_STRIDE,
+    CNTS,
+    CNT_OFF,
+    CNT_STRIDE,
+    CAP,
+    BASE,
+    ROWMAP,
+    RW,
+    INV,
+    P2S,
+    R,
+    CCAP,
+    E: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    HAS_CS: tl.constexpr,
+):
+    """_route_scatter_masked_kernel over the received route metadata: ids in columns [0, K), route weights (fp32
+    bits) in [K, 2K), combine slots in [2K, 3K) of each live slot's row."""
+    ch = tl.program_id(0)
+    e_ar = tl.arange(0, E)
+    r = ch * BLOCK + tl.arange(0, BLOCK)
+    m = r < R
+    n, row, live0 = _meta_route(META, META_OFF, SRC_STRIDE, CNTS, CNT_OFF, CNT_STRIDE, CAP, r, m, K)
+    kk = r % K
+    idx = tl.load(META + row + kk, mask=live0, other=-1)
+    oh = (idx[:, None] == e_ar[None, :]).to(tl.int32)
+    base = tl.load(BASE + ch * E + e_ar)
+    pos = tl.sum(oh * (base[None, :] + tl.cumsum(oh, 0) - 1), axis=1)
+    live = live0 & (idx >= 0)
+    tl.store(ROWMAP + pos, n, mask=live)
+    tw = tl.load(META + row + K + kk, mask=live, other=0).to(tl.float32, bitcast=True)
+    tl.store(RW + pos, tw, mask=live)
+    tl.store(INV + r, tl.where(live, pos, -1), mask=m)
+    if HAS_CS:
+        cs = tl.load(META + row + 2 * K + kk, mask=live, other=0)
+        tl.store(P2S + pos, (n // CAP) * CCAP + cs, mask=live)
+
+
+def build_routing_blk_meta(
+    meta: torch.Tensor,
+    meta_off: int,
+    src_stride: int,
+    cnts: torch.Tensor,
+    cnt_off: int,
+    cnt_stride: int,
+    N: int,
+    K: int,
+    num_experts: int,
+    P: int,
+    cap: int,
+    ccap: int = 0,
+    align: int = 256,
+    block: int = None,
+):
+    """build_routing_blk_masked straight from the received route metadata, without materializing the masked id /
+    weight / slot columns: ``meta`` int32 (flat), the [cap, 3K] metadata block of source s at element
+    ``meta_off + s * src_stride`` (columns: local expert id or -1, route weight as fp32 bits, combine slot);
+    ``cnts`` int32 (flat), source s's live slot count at ``cnt_off + s * cnt_stride``. N = sources * cap received
+    slots. ``ccap`` > 0: also p2s. Same outputs, bit for bit, as build_routing_blk_masked of the masked columns."""
+    R = N * K
+    E = num_experts
+    assert E & (E - 1) == 0, "local expert count must be a power of two (tl.arange)"
+    assert meta.dtype == torch.int32 and cnts.dtype == torch.int32 and meta.is_contiguous() and cnts.is_contiguous()
+    dev = meta.device
+    if block is None:  # same chunking rule as build_routing_blk_masked (layout is chunking-independent)
+        block = max(128, min(512, triton.next_power_of_2(triton.cdiv(R, 128))))
+    nw = 4 if block <= 128 else 8
+    nch = triton.cdiv(R, block)
+    pb = triton.next_power_of_2(triton.cdiv(P, nch))
+    has_cs = int(ccap > 0)
+    poffs = torch.empty(E + 1, dtype=torch.int32, device=dev)
+    rowmap = torch.empty(P, dtype=torch.int32, device=dev)
+    rw = torch.empty(P, dtype=torch.float32, device=dev)
+    inv = torch.empty(R, dtype=torch.int32, device=dev)
+    cnt = torch.empty((nch, E), dtype=torch.int32, device=dev)
+    base = torch.empty((nch, E), dtype=torch.int32, device=dev)
+    p2s = torch.empty(P, dtype=torch.int32, device=dev) if has_cs else None
+    src = (meta, meta_off, src_stride, cnts, cnt_off, cnt_stride, cap)
+    _route_count_meta_kernel[(nch,)](
+        *src, cnt, rowmap, rw, p2s if has_cs else rowmap, R, P, K=K, E=E, BLOCK=block, PB=pb, HAS_CS=has_cs,
+        num_warps=nw,
+    )
+    _route_offs_kernel[(1,)](
+        cnt, base, poffs, nch, E=E, NCP=triton.next_power_of_2(nch), ALIGN=align, num_warps=4
+    )
+    _route_scatter_meta_kernel[(nch,)](
+        *src, base, rowmap, rw, inv, p2s if has_cs else rowmap, R, max(ccap, 1), E=E, K=K, BLOCK=block,
+        HAS_CS=has_cs, num_warps=nw,
     )
     return rowmap, rw, inv, poffs, poffs[E:], p2s
 
@@ -498,3 +645,134 @@ def pack_pool_rows(
         num_warps=4,
     )
     return out, ext_out
+
+
+@triton.jit
+def _presum_routes_kernel(
+    ROWS, INV, OUT, H, EXT, P2S, EXT_OUT, K: tl.constexpr, BH: tl.constexpr, HAS_EXT: tl.constexpr = 0
+):
+    """grid (N, H // BH). OUT[n] = sum over the live routes k of received token row n of ROWS[INV[n*K+k]] (fp32, k
+    order, one bf16 rounding); rows without a live route are left unwritten (no source reads them).
+    HAS_EXT: the first column block also writes EXT_OUT[P2S[p]] = EXT[p] for each live route's pool row p."""
+    n = tl.program_id(0)
+    h = tl.program_id(1) * BH + tl.arange(0, BH)
+    acc = tl.zeros((BH,), dtype=tl.float32)
+    live = 0
+    for k in tl.static_range(K):
+        p = tl.load(INV + n * K + k)
+        if p >= 0:
+            acc += tl.load(ROWS + p.to(tl.int64) * H + h).to(tl.float32)
+            live += 1
+            if HAS_EXT:
+                if tl.program_id(1) == 0:
+                    tl.store(EXT_OUT + tl.load(P2S + p), tl.load(EXT + p))
+    if live > 0:
+        tl.store(OUT + n.to(tl.int64) * H + h, acc.to(OUT.dtype.element_ty))
+
+
+def presum_routes(
+    rows: torch.Tensor,
+    inv: torch.Tensor,
+    N: int,
+    K: int,
+    bh: int = 1024,
+    ext: torch.Tensor = None,
+    p2s: torch.Tensor = None,
+    nslots: int = 0,
+):
+    """Expert rank of the EP combine: rows [P, H] pool rows (routing weight applied), inv int32 [N*K] pool row of
+    received route (n, k) or -1 -> out [N, H]: per received token, the sum of its routes on this rank.
+    ``ext`` fp32 [P] (with ``p2s``, ``nslots``): also -> ext_out [nslots] by combine slot (scatter_pool_ext of the
+    live routes; other slots unwritten). Returns out, or (out, ext_out)."""
+    P, H = rows.shape
+    assert rows.is_contiguous() and inv.dtype == torch.int32 and inv.numel() == N * K and H % 128 == 0
+    bh = min(bh, H & -H)
+    out = torch.empty((N, H), device=rows.device, dtype=rows.dtype)
+    ext_out = None
+    if ext is not None:
+        assert ext.dtype == torch.float32 and ext.numel() == P and p2s is not None and p2s.numel() == P
+        ext_out = torch.empty(nslots, device=rows.device, dtype=torch.float32)
+    _presum_routes_kernel[(N, H // bh)](
+        rows,
+        inv,
+        out,
+        H,
+        ext if ext is not None else rows,
+        p2s if ext is not None else inv,
+        ext_out if ext is not None else out,
+        K=K,
+        BH=bh,
+        HAS_EXT=int(ext is not None),
+        num_warps=4,
+    )
+    return out if ext is None else (out, ext_out)
+
+
+@triton.jit
+def _combine_ranks_kernel(
+    RECV, SLOT, OUT, H, CAP, RWS, CINV, DTW, R: tl.constexpr, BH: tl.constexpr, K: tl.constexpr = 1,
+    HAS_EXT: tl.constexpr = 0,
+):
+    """grid (T, H // BH). OUT[t] = sum over destination ranks r that token t was sent to (SLOT[t, r] >= 0) of
+    RECV[r, SLOT[t, r]] (fp32, rank order, one bf16 rounding). HAS_EXT: the first column block also gathers
+    DTW[t, k] = RWS[CINV[t*K+k]] (the per-route values received by combine slot)."""
+    t = tl.program_id(0)
+    h = tl.program_id(1) * BH + tl.arange(0, BH)
+    acc = tl.zeros((BH,), dtype=tl.float32)
+    for r in tl.static_range(R):
+        s = tl.load(SLOT + t * R + r)
+        if s >= 0:
+            acc += tl.load(RECV + (r * CAP + s).to(tl.int64) * H + h).to(tl.float32)
+    tl.store(OUT + t.to(tl.int64) * H + h, acc.to(OUT.dtype.element_ty))
+    if HAS_EXT:
+        if tl.program_id(1) == 0:
+            for k in tl.static_range(K):
+                tl.store(DTW + t * K + k, tl.load(RWS + tl.load(CINV + t * K + k)))
+
+
+def combine_ranks(
+    recv: torch.Tensor,
+    slot: torch.Tensor,
+    T: int,
+    R: int,
+    cap: int,
+    bh: int = 1024,
+    rws: torch.Tensor = None,
+    cinv: torch.Tensor = None,
+    K: int = 1,
+):
+    """Source rank of the EP combine: recv [R*cap, H] (block r: the per-token partial sums from expert rank r),
+    slot int32 [T, R] -> y [T, H]. ``rws`` fp32 [R*ccap] (per-route values by combine slot) with ``cinv`` int32
+    [T*K]: also -> [T, K] = rws[cinv]. Returns y, or (y, [T, K])."""
+    H = recv.shape[1]
+    assert recv.is_contiguous() and slot.dtype == torch.int32 and slot.shape == (T, R) and H % 128 == 0
+    bh = min(bh, H & -H)
+    out = torch.empty((T, H), device=recv.device, dtype=recv.dtype)
+    dtw = None
+    if rws is not None:
+        assert rws.dtype == torch.float32 and rws.is_contiguous() and cinv.dtype == torch.int32 and cinv.numel() == T * K
+        dtw = torch.empty((T, K), device=recv.device, dtype=torch.float32)
+    _combine_ranks_kernel[(T, H // bh)](
+        recv,
+        slot.contiguous(),
+        out,
+        H,
+        cap,
+        rws if rws is not None else recv,
+        cinv if rws is not None else slot,
+        dtw if rws is not None else out,
+        R=R,
+        BH=bh,
+        K=K,
+        HAS_EXT=int(rws is not None),
+        num_warps=4,
+    )
+    return out if rws is None else (out, dtw)
+
+
+def scatter_pool_ext(ext: torch.Tensor, p2s: torch.Tensor, nslots: int) -> torch.Tensor:
+    """ext [P] fp32 per pool row -> [nslots] by combine slot (p2s, -1 = padding row); other slots unwritten/zero."""
+    out = torch.zeros(nslots + 1, device=ext.device, dtype=torch.float32)
+    idx = torch.where(p2s >= 0, p2s, nslots).long()
+    out.index_put_((idx,), ext)
+    return out[:nslots]

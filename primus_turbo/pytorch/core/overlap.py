@@ -50,9 +50,15 @@ _keep = []  # tensors read/written by un-joined deferred work
 
 def _single_process() -> bool:
     """Only measured on one GPU: with any process group (DP / TP / EP / PP > 1) the step stays serial, so no grad
-    reduction launched from a backward hook can race a side-stream wgrad."""
+    reduction launched from a backward hook can race a side-stream wgrad. PRIMUS_OVERLAP_MULTI=1 lifts this for
+    multi-process runs whose framework launches no reduction before the join (e.g. Megatron DDP without
+    overlap_grad_reduce: the buckets are reduced in finalize_model_grads, after the backward's join)."""
+    import os
+
     import torch.distributed as dist
 
+    if os.environ.get("PRIMUS_OVERLAP_MULTI", "0") == "1":
+        return True
     return not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1)
 
 
