@@ -211,6 +211,66 @@ def _plan(S, hq_r, hkv_r, d, d_v=None, softmax_scale=None):
     return 1, dkdv_l, 1.0 / _mla._LOG2E
 
 
+def _layout_reason(hq_r, hkv_r, d, d_v, pull_rows, dq_rows):
+    """Why the copy loops' whole steps do not tile these heads with these pull / dQ push units (``None``:
+    they do)."""
+    mla = d_v != d
+    band = MLA_BAND if mla else BAND
+    kv_rows = MLA_PART_ROWS if mla else BM
+    if band % dq_rows or (dq_rows // 16 * hq_r) % (THREADS // WARP):
+        return "dq_rows: 16-row tiles per wave"
+    if mla and BM % dq_rows:
+        return "MLA dQ push units: inside one gather tile"
+    if (dq_rows * hq_r * d) % (VEC_BF16 * THREADS):
+        return "dQ push units: whole zeroing steps"
+    if pull_rows not in (BM // 4, BM // 2, BM) or BM // STAGE_SPLIT > pull_rows:
+        return f"pull_rows {pull_rows}"
+    if (pull_rows * hq_r * d_v // VEC_BF16) % (THREADS * _BATCH) or pull_rows * hq_r % THREADS:
+        return "pull units: whole copy steps"
+    if BM * hq_r % THREADS:
+        return "stage pieces: whole rows per thread"
+    for h_r, dd in ((hq_r, d), (hkv_r, d), (hkv_r, d_v)):
+        if (BM * h_r * dd // VEC_BF16) % (THREADS * _BATCH):
+            return "gather tiles: whole copy steps"
+    for dd in (d, d_v):
+        if (kv_rows * hkv_r * dd // VEC_BF16) % (THREADS * 2):
+            return "dK / dV parts: whole push steps"
+    return None
+
+
+@functools.lru_cache(maxsize=64)
+def a2a_attn_bwd_unsupported(M, num_ranks, hq_r, hkv_r, head_dim, head_dim_v=None, seq_chunk=0, softmax_scale=None):
+    """Why the fused backward cannot run this shape (``None``: it can): the stock plan must be the a16 dQ
+    image with 256-row bands (dense causal, ``S`` a multiple of the band); MLA takes 192-row bands and
+    64-row dK / dV parts inside one chunk. Byte offsets stay in i32 and the flags in their regions."""
+    n, d = num_ranks, head_dim
+    d_v = d if head_dim_v is None else head_dim_v
+    mla = d_v != d
+    S = M * n
+    cs = seq_chunk if seq_chunk else M
+    if (d, d_v) not in ((64, 64), (128, 128), (192, 128)):
+        return f"head dims {d} / {d_v}"
+    if M % cs or cs % BM:
+        return f"need M % seq_chunk == 0, seq_chunk % {BM} == 0"
+    if mla and (cs % 256 or S % MLA_PART_ROWS):
+        return f"MLA: S a multiple of {MLA_PART_ROWS}, seq_chunk of 256"
+    if not mla and S % BAND:
+        return f"S a multiple of {BAND}"
+    try:
+        q_split = _plan(S, hq_r, hkv_r, d, d_v if mla else None, softmax_scale if mla else None)[0]
+    except AssertionError as e:
+        return str(e) or "no fused backward plan"
+    if q_split * S * hkv_r * d * 2 >= 2**31 or S * hq_r * d * 2 >= 2**31:
+        return "i32 byte offsets overflow"
+    kv_rows = MLA_PART_ROWS if mla else BM
+    dq_flag_rows = min(_dq_rows(hq_r, None, mla), BM)
+    if M // BM * STAGE_SPLIT * n > FLAGS_PER_REGION or (M // dq_flag_rows + 2 * (M // kv_rows)) * n > FLAGS_PER_REGION:
+        return "flag regions too small"
+    if _ceildiv(S, MLA_BAND if mla else BAND) > BAND_DONE_AT:
+        return "too many bands for the band flags"
+    return _layout_reason(hq_r, hkv_r, d, d_v, _pull_rows(hq_r), _dq_rows(hq_r, None, mla))
+
+
 def _global_row(t, src, cs, n):
     """Sequence position of local token ``t`` of rank ``src``."""
     return (t // fx.Int32(cs) * fx.Int32(n) + src) * fx.Int32(cs) + t % fx.Int32(cs)
@@ -1083,14 +1143,9 @@ def _make_kernel(
     cs = seq_chunk if seq_chunk else M
     band = MLA_BAND if mla else BAND
     kv_rows = MLA_PART_ROWS if mla else BM
-    assert M % cs == 0 and cs % BM == 0, f"need M % seq_chunk == 0, seq_chunk % {BM} == 0"
-    assert (d, d_v) in ((64, 64), (128, 128), (192, 128))
-    if mla:
-        assert S % kv_rows == 0 and cs % 256 == 0 and not (dq_prog or dq_desc or kv_help), (
-            "MLA: S a multiple of 64, seq_chunk of 256, the default dQ / dK / dV push"
-        )
-    else:
-        assert S % BAND == 0
+    reason = a2a_attn_bwd_unsupported(M, n, hq_r, hkv_r, d, d_v, seq_chunk, softmax_scale)
+    assert reason is None, reason
+    assert not (mla and (dq_prog or dq_desc or kv_help)), "MLA: the default dQ / dK / dV push"
     q_split, dkdv_l, dq_scale = _plan(S, hq_r, hkv_r, d, d_v if mla else None, softmax_scale if mla else None)
     emb = dkdv_l.embed
     assert emb["block_size"] == THREADS and emb["block_kv"] == band and emb["q_split"] == q_split
@@ -1105,24 +1160,15 @@ def _make_kernel(
     recv_x_bytes = (M * n * hq_r * d * 2, M * n * hkv_r * d * 2, M * n * hkv_r * d_v * 2)
     recv_at = (0, recv_x_bytes[0], recv_x_bytes[0] + recv_x_bytes[1])
     assert stage_bytes + sum(recv_x_bytes) <= bank_bytes
-    assert q_split * S * hkv_r * d * 2 < 2**31 and S * hq_r * d * 2 < 2**31, "i32 byte offsets overflow"
     # dQ recv flags: one per (dq_flag_rows rows, source); the dK / dV ones (per kv_rows rows) follow
     dq_flag_rows = min(dq_rows, BM)
     dq_flags = M // dq_flag_rows
     kv_tiles = M // kv_rows
-    assert band % dq_rows == 0 and (dq_rows // 16 * hq_r) % (THREADS // WARP) == 0, "dq_rows: 16-row tiles per wave"
-    assert not mla or BM % dq_rows == 0, "MLA dQ push units: inside one gather tile"
-    assert (dq_rows * hq_r * d) % (VEC_BF16 * THREADS) == 0
+    reason = _layout_reason(hq_r, hkv_r, d, d_v, pull_rows, dq_rows)
+    assert reason is None, reason
     assert m_tiles * STAGE_SPLIT * n <= FLAGS_PER_REGION and (dq_flags + 2 * kv_tiles) * n <= FLAGS_PER_REGION
     assert 0 <= num_comm <= num_pull and num_comm < num_blocks, "comm blocks: some of the pull blocks"
-    assert pull_rows in (BM // 4, BM // 2, BM) and BM // STAGE_SPLIT <= pull_rows
     assert cs % max(emb["block_q"], pull_rows) == 0, "a q block's pull units: one chunk of one source"
-    assert (pull_rows * hq_r * d_v // VEC_BF16) % (THREADS * _BATCH) == 0 and pull_rows * hq_r % THREADS == 0
-    assert nb <= BAND_DONE_AT and BM * hq_r % THREADS == 0
-    for h_r, dd in ((hq_r, d), (hkv_r, d), (hkv_r, d_v)):
-        assert (BM * h_r * dd // VEC_BF16) % (THREADS * _BATCH) == 0, "gather tiles: whole copy steps"
-    for dd in (d, d_v):
-        assert (kv_rows * hkv_r * dd // VEC_BF16) % (THREADS * 2) == 0, "dK / dV parts: whole push steps"
     grid = max(num_blocks, num_pull)
     trace_item_at, trace_dq_at, trace_gather_at, trace_stage_at, trace_start_at, trace_dqw_at, trace_len = trace_layout(
         M, n, hq_r, hkv_r, d, dq_rows, pull_rows, d_v

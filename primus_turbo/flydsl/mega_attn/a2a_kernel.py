@@ -68,6 +68,12 @@ def a2a_bank_bytes(M, num_ranks, heads, head_dim):
     return M * num_ranks * sum(h * d for h, d in zip(heads, dims)) * 2
 
 
+def a2a_fits(M, num_ranks, widths):
+    """Whether one exchange of tensors of per-rank ``widths`` (heads * head dim each) keeps the kernel's
+    byte offsets in i32."""
+    return M * num_ranks * sum(widths) * 2 < 2**31
+
+
 @ASTRewriter.transform
 def _push_unit(thread_index, unit, peers_base, bank_offset, in_res, epoch, **c):
     """Rows ``[unit * BM, +BM)`` of the sequence into the owner's recv bank (this rank's column block),
@@ -168,9 +174,7 @@ def _make_kernel(direction, M, rank, num_ranks, w0, w1, w2, seq_chunk, num_block
     m_tiles = M // BM
     N_r = sum(widths)
     bank_used = M * n * N_r * 2
-    assert bank_used <= bank_bytes and bank_used < 2**31 and S * max(widths) * 2 < 2**31, (
-        "i32 byte offsets overflow"
-    )
+    assert bank_used <= bank_bytes and a2a_fits(M, n, widths), "i32 byte offsets overflow"
     assert m_tiles * STAGE_SPLIT * n <= FLAGS_PER_REGION
     c = dict(
         M=M,

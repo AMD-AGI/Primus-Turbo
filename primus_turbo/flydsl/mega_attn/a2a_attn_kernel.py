@@ -155,6 +155,41 @@ def a2a_attn_fwd_bank_bytes(M, num_ranks, hq_r, hkv_r, head_dim, head_dim_v=None
     return stage + M * num_ranks * hq_r * d_v * 2
 
 
+@functools.lru_cache(maxsize=64)
+def a2a_attn_fwd_unsupported(M, num_ranks, hq_r, hkv_r, head_dim, head_dim_v=None, seq_chunk=0, sm_scale=None):
+    """Why the fused forward cannot run this shape (``None``: it can)."""
+    n, d = num_ranks, head_dim
+    d_v = d if head_dim_v is None else head_dim_v
+    mla = is_mla(d, d_v)
+    if not (d_v == d or (mla and hq_r == hkv_r)):
+        return f"head dims {d} / {d_v}"
+    if sm_scale is not None and not mla:
+        return "the GQA forward bakes softmax_scale = d ** -0.5"
+    traits = make_traits(hq_r, hkv_r, d, d_v, sm_scale)
+    threads = traits.BLOCK_SIZE
+    if threads != (256 if mla else BLOCK_THREADS):
+        return (
+            f"the fused kernel runs {BLOCK_THREADS}-thread blocks; this head config builds {threads} "
+            "(an even q-per-kv group is needed for the two-head CTA)"
+        )
+    bm = traits.BLOCK_M
+    cs = seq_chunk if seq_chunk else M
+    # a q block lies inside one sequence chunk, so its O rows have one owner
+    if M % cs or cs % max(BM, bm):
+        return f"need M % seq_chunk == 0 and seq_chunk % {max(BM, bm)} == 0"
+    S = M * n
+    stage_bytes = S * (hq_r * d + hkv_r * d + hkv_r * d_v) * 2
+    recv_bytes = S * hq_r * d_v * 2
+    if stage_bytes >= 2**31 or recv_bytes >= 2**31 or S * hq_r * d * 2 >= 2**31:
+        return "i32 byte offsets overflow"
+    hg = hq_r // traits.Q_HEADS_PER_WG
+    if M // BM * STAGE_SPLIT * n > FLAGS_PER_REGION or M // bm * n * hg > FLAGS_PER_REGION:
+        return "flag regions too small"
+    if (bm * hq_r * d_v // VEC_BF16) % (threads * _GATHER_BATCH):
+        return "gather unit must be whole copy steps"
+    return None
+
+
 def _global_row(t, src, cs, n):
     """Sequence position of local token ``t`` of rank ``src``."""
     return (t // fx.Int32(cs) * fx.Int32(n) + src) * fx.Int32(cs) + t % fx.Int32(cs)
@@ -490,20 +525,14 @@ def _make_kernel(
 ):
     n, d, d_v = num_ranks, head_dim, head_dim_v
     mla = is_mla(d, d_v)
+    reason = a2a_attn_fwd_unsupported(M, n, hq_r, hkv_r, d, d_v, seq_chunk, sm_scale)
+    assert reason is None, reason
     traits = make_traits(hq_r, hkv_r, d, d_v, sm_scale)
     # the MLA tile is one 4-wave head per CTA (a block_m 256 q block)
     threads = traits.BLOCK_SIZE
-    assert threads == (256 if mla else BLOCK_THREADS), (
-        f"the fused kernel runs {BLOCK_THREADS}-thread blocks; this head config builds {threads} "
-        "(an even q-per-kv group is needed for the two-head CTA)"
-    )
     attn_tile = make_mla_tile(traits) if mla else make_dualwave_swp_tile(traits)
     bm = traits.BLOCK_M
     cs = seq_chunk if seq_chunk else M
-    # a q block lies inside one sequence chunk, so its O rows have one owner
-    assert M % cs == 0 and cs % max(BM, bm) == 0, (
-        f"need M % seq_chunk == 0 and seq_chunk % {max(BM, bm)} == 0"
-    )
     S = M * n
     m_tiles = M // BM
     widths = (hq_r * d, hkv_r * d, hkv_r * d_v)
@@ -512,16 +541,9 @@ def _make_kernel(
     K_o = n * hq_r * d_v
     recv_bytes = M * K_o * 2
     assert stage_bytes + recv_bytes <= bank_bytes
-    assert stage_bytes < 2**31 and recv_bytes < 2**31 and S * hq_r * d * 2 < 2**31, (
-        "i32 byte offsets overflow"
-    )
     hg = hq_r // traits.Q_HEADS_PER_WG
     nqb = S // bm
     m_tiles_o = M // bm
-    assert m_tiles * STAGE_SPLIT * n <= FLAGS_PER_REGION and m_tiles_o * n * hg <= FLAGS_PER_REGION
-    assert (bm * hq_r * d_v // VEC_BF16) % (threads * _GATHER_BATCH) == 0, (
-        "gather unit must be whole copy steps"
-    )
     num_ascending = min(num_ascending, nqb)
     grid = max(num_blocks, num_pull)
     trace_attn_at, trace_gather_at, trace_stage_at, trace_start_at, _ = trace_layout(

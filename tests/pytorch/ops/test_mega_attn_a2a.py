@@ -248,11 +248,22 @@ def check_op(group, hq, hkv, d, d_v, scale, s_local, seq_chunk, failures):
             )
 
 
-def run_suite(quick, checks, models):
+def run_suite(quick, checks, models, large=False):
     group = dist.group.WORLD
     n = group.size()
     failures = []
     configs = []
+    # shapes the fused forward does not run: ulysses_mega_attn falls back to the unfused passes
+    fallback = []
+    if "gqa" in models:
+        # MHA at one head a rank: no two-head CTA for the forward, no whole copy steps for the backward's
+        # pull units, so both run unfused
+        fallback.append((n, n, 128, 128, 128**-0.5, 1024, 256))
+    if "mla" in models and large and n <= 4:
+        # 32 local heads over 64K tokens (DeepSeek-V3 at CP4): the forward's exchange passes i32 byte
+        # offsets, so it runs unfused with its q / k / v exchange over two calls; the backward is fused.
+        # Past four ranks the global reference backward (32 * n heads) passes them itself.
+        fallback.append((32 * n, 32 * n, 192, 128, MLA_SCALE, 65536 // n, 256))
     if "gqa" in models:
         configs.append((32 if n <= 4 else 64, 4 if n <= 4 else 8, 128, 128, 128**-0.5))
         if not quick:
@@ -276,6 +287,9 @@ def run_suite(quick, checks, models):
                 check_a2a(group, hq, hkv, d, d_v, s_local, cs, failures)
             if "op" in checks:
                 check_op(group, hq, hkv, d, d_v, scale, s_local, cs, failures)
+    if "op" in checks:
+        for hq, hkv, d, d_v, scale, s_local, cs in fallback:
+            check_op(group, hq, hkv, d, d_v, scale, s_local, cs, failures)
     return failures
 
 
@@ -284,10 +298,11 @@ def main():
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--checks", default="fwd,a2a,op")
     parser.add_argument("--models", default="gqa,mla")
+    parser.add_argument("--large", action="store_true", help="also a 64K-token MLA shape past the fused forward")
     args = parser.parse_args()
     dist.init_process_group("nccl", timeout=timedelta(minutes=5))
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    failures = run_suite(args.quick, args.checks.split(","), args.models.split(","))
+    failures = run_suite(args.quick, args.checks.split(","), args.models.split(","), args.large)
     gathered = [None] * dist.get_world_size()
     dist.all_gather_object(gathered, failures)
     if dist.get_rank() == 0:
