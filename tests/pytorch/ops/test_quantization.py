@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import math
 from unittest.mock import Mock
 
 import pytest
@@ -256,6 +257,151 @@ def test_quantize_fp8_given_scale_validation():
         quantize_fp8(
             x, turbo.float8_e4m3, ScalingGranularity.ROWWISE, axis=1, scale=torch.ones((), device="cuda")
         )
+
+
+def _amax_out_input(shape, dtype, seed):
+    """Random input whose largest magnitude is a negative value in its last element, placed at the
+    start of a larger buffer whose tail holds an even larger value: a kernel that reads past the
+    end of the input (or into padding) would pick that value up."""
+    torch.manual_seed(seed)
+    numel = math.prod(shape)
+    buf = torch.full((numel + 4096,), 1.0e4, device="cuda", dtype=dtype)
+    x = buf[:numel].view(shape)
+    x.copy_(torch.randn(*shape, device="cuda", dtype=dtype) * 4)
+    x.view(-1)[-1] = -2 * x.float().abs().amax()
+    return x
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1031, 3072),  # row-per-block kernel
+        (512, 64),  # flat kernel, short rows
+        (1000, 777),  # flat kernel, K not a multiple of the vector width
+        (3, 5),  # smaller than one vector
+        (64, 4097),  # no folded variant: amax-only pass, then the generic cast
+    ],
+)
+@pytest.mark.parametrize("pad_align_last", [0, 128])
+@pytest.mark.parametrize("torch_compile", [False, True])
+def test_quantize_fp8_tensorwise_amax_out(orig_dtype, dest_dtype, shape, pad_align_last, torch_compile):
+    """The cast folds the abs-max of its input (before scaling) into amax_out: the FP8 bytes are
+    those of the cast without it, and the amax is exactly torch's, whichever kernel runs."""
+    if torch_compile and (shape != (1031, 3072) or orig_dtype != torch.bfloat16):
+        pytest.skip("compile is checked on one shape and dtype")
+    x = _amax_out_input(shape, orig_dtype, seed=7)
+    scale = torch.tensor(3.25, device="cuda", dtype=torch.float32)
+    amax = torch.zeros((), device="cuda", dtype=torch.float32)
+
+    def quantize(t, s, a):
+        return quantize_fp8(
+            t, dest_dtype, ScalingGranularity.TENSORWISE, pad_align_last=pad_align_last, scale=s, amax_out=a
+        )
+
+    if torch_compile:
+        torch._dynamo.reset()
+        quantize = torch.compile(quantize, fullgraph=True)
+    x_fp8, x_scale_inv = quantize(x, scale, amax)
+    x_fp8_ref, x_scale_inv_ref = quantize_fp8(
+        x, dest_dtype, ScalingGranularity.TENSORWISE, pad_align_last=pad_align_last, scale=scale
+    )
+
+    assert torch.equal(x_fp8.view(torch.uint8), x_fp8_ref.view(torch.uint8))
+    assert torch.equal(x_scale_inv, x_scale_inv_ref)
+    assert amax.item() == x.float().abs().amax().item()
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (4, 100, 256),  # grouped weight, rows padded 100 -> 128: row-per-block kernel
+        (3, 100, 4097),  # no folded variant: amax-only pass, then the generic cast
+        (2, 130, 7168),  # wide K
+        (100, 256),  # 2-D input: the rows themselves are padded
+    ],
+)
+def test_quantize_fp8_tensorwise_amax_out_padded_rows(shape):
+    """With penultimate padding the cast writes zero rows that have no input behind them; the amax
+    covers the real rows only."""
+    x = _amax_out_input(shape, torch.bfloat16, seed=11)
+    scale = torch.tensor(0.5, device="cuda", dtype=torch.float32)
+    amax = torch.zeros((), device="cuda", dtype=torch.float32)
+    kwargs = dict(pad_align_last=128, pad_align_penultimate=128, scale=scale)
+    x_fp8, _ = quantize_fp8(x, turbo.float8_e4m3, ScalingGranularity.TENSORWISE, amax_out=amax, **kwargs)
+    x_fp8_ref, _ = quantize_fp8(x, turbo.float8_e4m3, ScalingGranularity.TENSORWISE, **kwargs)
+
+    assert x_fp8.shape[-2] % 128 == 0 and x_fp8.shape[-2] > shape[-2]
+    assert torch.equal(x_fp8.view(torch.uint8), x_fp8_ref.view(torch.uint8))
+    assert amax.item() == x.float().abs().amax().item()
+
+
+def test_quantize_fp8_tensorwise_amax_out_running_max():
+    """amax_out is only ever raised: casts that share a buffer leave their maximum in it, a buffer
+    that starts higher is untouched, and the owner's reset starts a new window."""
+    torch.manual_seed(3)
+    x = torch.randn(1031, 3072, device="cuda", dtype=torch.bfloat16)
+    scale = torch.ones((), device="cuda")
+    amax = torch.zeros((), device="cuda")
+
+    def cast(t):
+        quantize_fp8(t, turbo.float8_e4m3, ScalingGranularity.TENSORWISE, scale=scale, amax_out=amax)
+
+    cast(x * 10)
+    big = (x * 10).float().abs().amax().item()
+    assert amax.item() == big
+    cast(x)  # a smaller tensor does not lower it
+    assert amax.item() == big
+    cast(x * 20)  # a larger one raises it
+    assert amax.item() == (x * 20).float().abs().amax().item()
+    amax.zero_()
+    cast(x)
+    assert amax.item() == x.float().abs().amax().item()
+
+    amax.fill_(1e30)  # a buffer that starts above every value stays there
+    start = amax.item()
+    cast(x)
+    assert amax.item() == start
+
+
+@pytest.mark.parametrize("shape", [(1031, 3072), (512, 64), (64, 4097)])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_quantize_fp8_tensorwise_amax_out_non_finite(shape, bad):
+    """A NaN or Inf in the input shows up in amax_out (it is not dropped as fmax would), so the
+    caller can refuse to turn it into a scale."""
+    x = torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
+    x[shape[0] // 2, shape[1] // 2] = bad
+    amax = torch.zeros((), device="cuda")
+    quantize_fp8(
+        x,
+        turbo.float8_e4m3,
+        ScalingGranularity.TENSORWISE,
+        scale=torch.ones((), device="cuda"),
+        amax_out=amax,
+    )
+    assert not torch.isfinite(amax).item()
+    if bad != bad:
+        assert torch.isnan(amax).item()
+    else:
+        assert amax.item() == float("inf")
+
+
+def test_quantize_fp8_amax_out_validation():
+    x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    scale = torch.ones((), device="cuda")
+    for bad in (
+        torch.zeros(2, device="cuda"),
+        torch.zeros((), device="cuda", dtype=torch.bfloat16),
+        torch.zeros(()),
+    ):
+        with pytest.raises(ValueError, match="amax_out must be a one-element float32 tensor"):
+            quantize_fp8(x, turbo.float8_e4m3, ScalingGranularity.TENSORWISE, scale=scale, amax_out=bad)
+    amax = torch.zeros((), device="cuda")
+    with pytest.raises(ValueError, match="with a given scale"):  # a cast that measures its own amax
+        quantize_fp8(x, turbo.float8_e4m3, ScalingGranularity.TENSORWISE, amax_out=amax)
+    with pytest.raises(ValueError, match="TENSORWISE"):
+        quantize_fp8(x, turbo.float8_e4m3, ScalingGranularity.ROWWISE, axis=1, scale=scale, amax_out=amax)
 
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
