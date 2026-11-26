@@ -605,7 +605,11 @@ class DualwaveKernelContext:
         self.head_dim_runtime = head_dim_runtime
         self.block_table_stride = block_table_stride
 
-    def _setup(self, shared_storage):
+    def _setup(self, shared_storage, block_ids=None, lds=None, tid=None):
+        """``block_ids`` (head group, q block), ``lds`` and ``tid`` default to the launch grid position, a
+        fresh ``shared_storage`` allocation and ``thread_idx.x``; persistent callers pass the claimed work
+        item, the LDS view they already hold, and a thread index LICM cannot hoist out of their claim loop
+        (else the body's lane offsets stay live across every item)."""
         head_dim_runtime = self.head_dim_runtime
         traits = self.traits
         self.NUM_DMA_K = traits.SMEM_D_RPT
@@ -651,22 +655,25 @@ class DualwaveKernelContext:
         self.stride_q_n_v = fx.Index(stride_q_n)
         self.stride_kv_n_v = fx.Index(stride_kv_n)
 
-        lds = fx.SharedAllocator().allocate(shared_storage).peek()
+        if lds is None:
+            lds = fx.SharedAllocator().allocate(shared_storage).peek()
         self.lds = lds
         self.lds_kv_base_idx = fx.Index(fx.ptrtoint(lds.kv.ptr))
         self.lds_kv_base_ptr = buffer_ops.create_llvm_ptr(self.lds_kv_base_idx, address_space=3)
 
-        self.h_idx = fx.Index(gpu.block_idx.x)
+        if block_ids is None:
+            block_ids = (gpu.block_idx.x, gpu.block_idx.y)
+        self.h_idx = fx.Index(block_ids[0])
         if const_expr(traits.CAUSAL):
             # Dispatch order is the list-schedule order and causal work grows with q_block
             # (a window flattens but never inverts that), so walk q_block descending
             # (longest-processing-time-first). From seq_len, not grid_dim.y, to stay uniform.
             _nq = (self.seq_len_v + fx.Index(traits.BLOCK_M - 1)) // fx.Index(traits.BLOCK_M)
-            self.q_block_idx = _nq - fx.Index(1) - fx.Index(gpu.block_idx.y)
+            self.q_block_idx = _nq - fx.Index(1) - fx.Index(block_ids[1])
         else:
-            self.q_block_idx = fx.Index(gpu.block_idx.y)
-        self.batch_idx = fx.Index(gpu.block_idx.z)
-        self.tid = fx.Index(gpu.thread_idx.x)
+            self.q_block_idx = fx.Index(block_ids[1])
+        self.batch_idx = self._grid_batch_index()
+        self.tid = fx.Index(gpu.thread_idx.x if tid is None else tid)
 
         self.wave_id = self.tid // traits.WARP_SIZE
         self.lane = self.tid % traits.WARP_SIZE
@@ -719,13 +726,7 @@ class DualwaveKernelContext:
             self.seqlen_kv_v = self.kv_tok_end - self.kv_tok_base
             self.seqlen_kv_i32 = fx.Int32(self.seqlen_kv_v)
         else:
-            self.q_tok_base = self.batch_idx * self.seq_len_v
-            self.kv_tok_base = self.batch_idx * self.seq_len_kv_v
-            self.q_tok_end = (self.batch_idx + fx.Index(1)) * self.seq_len_v
-            self.kv_tok_end = (self.batch_idx + fx.Index(1)) * self.seq_len_kv_v
-            self.seqlen_q_v = self.seq_len_v
-            self.seqlen_kv_v = self.seq_len_kv_v
-            self.seqlen_kv_i32 = self.seq_len_kv
+            self._dense_geometry()
 
         q_tensor = self.Q
         k_tensor = self.K
@@ -877,6 +878,19 @@ class DualwaveKernelContext:
         self.v_dma_m0 = self.dma_m0_table(
             lambda b, w, d: self._dma_base(b, w, d, _v_buf_base, traits.SMEM_V_LINE_STRIDE), self.NUM_DMA_V
         )
+
+    def _grid_batch_index(self):
+        return fx.Index(gpu.block_idx.z)
+
+    def _dense_geometry(self):
+        """Token bases and lengths of this work group's (q, kv) pair in a dense launch."""
+        self.q_tok_base = self.batch_idx * self.seq_len_v
+        self.kv_tok_base = self.batch_idx * self.seq_len_kv_v
+        self.q_tok_end = (self.batch_idx + fx.Index(1)) * self.seq_len_v
+        self.kv_tok_end = (self.batch_idx + fx.Index(1)) * self.seq_len_kv_v
+        self.seqlen_q_v = self.seq_len_v
+        self.seqlen_kv_v = self.seq_len_kv_v
+        self.seqlen_kv_i32 = self.seq_len_kv
 
     def _dma_base(self, buf_id, w_rep, d, buf_base_fn, line_stride):
         traits = self.traits
@@ -1385,8 +1399,7 @@ class DualwaveKernelContext:
             q_row_i32 = self.q_row_i32
         traits = self.traits
         s_lo, s_hi = v_s
-        kv_tile_start = tile_idx * traits.BLOCK_N
-        kv_start_i32 = fx.Int32(kv_tile_start)
+        kv_start_i32 = fx.Int32(self.tile_start(tile_idx))
         # lane>=32 has a larger n offset in the K-permuted P layout.
         lane_off_i32 = fx.Int32(self.lane_div_32) * fx.Int32(4)
         rel_lo_i32 = fx.Int32(q_row_i32 + self.delta_i32 - kv_start_i32 - lane_off_i32)

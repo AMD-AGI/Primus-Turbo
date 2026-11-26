@@ -249,6 +249,7 @@ def create_buffer_resource_from_addr(
     addr_i64: ir.Value,
     *,
     num_records_bytes: Optional[Union[int, ir.Value]] = None,
+    base_byte_offset: Optional[Union[int, ir.Value]] = None,
 ) -> ir.Value:
     """Create AMD buffer resource descriptor from a raw i64 device address.
 
@@ -260,6 +261,7 @@ def create_buffer_resource_from_addr(
     Args:
         addr_i64: Raw 64-bit device address (i64 MLIR value).
         num_records_bytes: Optional buffer size in bytes for hardware OOB checking.
+        base_byte_offset: Optional byte offset added to the descriptor base pointer.
 
     Returns:
         ROCDL buffer resource descriptor (!llvm.ptr<8>).
@@ -270,7 +272,7 @@ def create_buffer_resource_from_addr(
     """
     ptr_ty = fx.PointerType.get(elem_ty=fx.Int8.ir_type, address_space=fx.AddressSpace.Global)
     base_ptr = fx.inttoptr(ptr_ty, fx.Int64(_ir(addr_i64)))
-    return _buffer_rsrc(base_ptr, num_records_bytes)
+    return _buffer_rsrc(base_ptr, num_records_bytes, base_byte_offset)
 
 
 @dsl_loc_tracing
