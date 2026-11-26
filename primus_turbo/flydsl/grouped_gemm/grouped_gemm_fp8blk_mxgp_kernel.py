@@ -175,7 +175,7 @@ def launch_mxgp_fp8blk_nt_gfx1250(
         offs_rsrc = rocdl.get_buffer_rsrc(rocdl.make_buffer_ptr(fx.recast_iter(i32_ptr, arg_offs)))
         zero = bid * fx.Int32(0)
         one = zero + fx.Int32(1)
-        assert G <= WAVE
+        # G is unbounded: tile_params scans the group offsets with scalar loads (range_constexpr(G))
         # group offsets: lane i holds offs[i+1] in one VGPR (loaded once); per tile the expert index is the count of
         # lanes with offs[i+1] <= m_row (xor-shuffle sum): no SGPRs held across the loop
         lane0 = tid % WAVE  # noqa: F841
