@@ -400,6 +400,12 @@ def test_kimi_accumulate_keys_keep_their_k_loop_part_off_the_walk(n, k):
             assert got == (keyed if walk else _k_loop_part(keyed)), (G, avg_m)
             got = gg._keyed_kwargs("vk_accum", (n, k, avg_m), G, 0, {"out": FP32_OUT, "accumulate": 1})
             assert got == _k_loop_part(keyed), (G, avg_m)
+            # the walk keeps the old C in LDS: the register path takes the k-loop part, "tdm" the whole key
+            kw = {"out": BF16_OUT, "accumulate": 1}
+            got = gg._keyed_kwargs("vk_accum", (n, k, avg_m), G, 0, {**kw, "accum_impl": "reg"})
+            assert got == _k_loop_part(keyed), (G, avg_m)
+            got = gg._keyed_kwargs("vk_accum", (n, k, avg_m), G, 0, {**kw, "accum_impl": "tdm"})
+            assert got == (keyed if walk else _k_loop_part(keyed)), (G, avg_m)
     assert gg._keyed_kwargs("vk_accum", (n, k, 585), 112, 0, {"out": BF16_OUT}) == (
         gg._KWARGS_KEYS["vk_accum"][(n, k, 585)]
         if n == 6144

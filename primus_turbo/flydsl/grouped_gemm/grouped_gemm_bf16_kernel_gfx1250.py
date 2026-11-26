@@ -6448,8 +6448,10 @@ def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:
         if kind == "vk" and not walk_ok:
             return {}
         out = kw.get("out")
-        if kind == "vk_accum" and not (walk_ok and out is not None and out.dtype in _F16):
-            # The accumulate's persistent walk also takes a 16-bit out only. Its k-loop knobs run without it.
+        tdm = kw.get("accum_impl", "auto") in ("auto", "tdm")
+        if kind == "vk_accum" and not (walk_ok and tdm and out is not None and out.dtype in _F16):
+            # The accumulate's persistent walk also takes a 16-bit out only, through LDS. Its k-loop knobs run
+            # without it.
             return {k: v for k, v in keyed.items() if k not in _VK_ACCUM_WALK}
     if kind in ("nt", "nn") and keyed.get("vec_dec") and G > 32:
         # The NT and NN launchers drop vec_dec above 32 experts, and nt_seam bit 2 then refuses the set.
