@@ -387,7 +387,9 @@ def _cap_cu(num_cu: int | None, device: torch.device) -> int:
     return int(num_cu)
 
 
-def _gfx1250_grouped_gemm_shapes_ok(a: torch.Tensor, b: torch.Tensor, trans_b: bool) -> bool:
+def _gfx1250_grouped_gemm_shapes_ok(
+    a: torch.Tensor, b: torch.Tensor | List[torch.Tensor], trans_b: bool
+) -> bool:
     """Whether the gfx1250 NT/NN entries can run this shape *natively*.
 
     The gate has to live at selection time, because neither thing it checks fails
@@ -405,18 +407,22 @@ def _gfx1250_grouped_gemm_shapes_ok(a: torch.Tensor, b: torch.Tensor, trans_b: b
     comes out of ``_pick_config``, whose thresholds that docstring marks as fitted,
     so a second copy of the rule would turn a Triton fallback into an
     ``AssertionError`` the moment the two drift.
+
+    ``b`` may be a list of weight segments, judged as the one tensor holding all their groups.
     """
     from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
         grouped_gemm_bf16_nn_supported,
         grouped_gemm_bf16_nt_supported,
     )
 
+    segs = [b] if isinstance(b, torch.Tensor) else b
     # TDM reads whole tiles straight out of the operands, so a non-contiguous view
     # would be read as if it were packed.
-    if not (a.is_contiguous() and b.is_contiguous()):
+    if not (a.is_contiguous() and all(s.is_contiguous() for s in segs)):
         return False
 
-    G = b.shape[0]
+    G = sum(s.shape[0] for s in segs)
+    b = segs[0]
     avg_m = max(1, a.shape[0] // max(G, 1))
     if trans_b:  # NT, b is [G, N, K]
         return grouped_gemm_bf16_nt_supported(b.shape[1], a.shape[1], avg_m, G)
@@ -759,10 +765,12 @@ class GroupedGEMMVariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatc
 
 
 # -- Segmented weights: b (forward / dgrad) or out (wgrad) is a list of [G_s, ...] tensors whose groups follow
-# one another (see grouped_gemm_kernel.MAX_SEGMENTS). Only the Triton kernels take segments, so the dispatchers
-# below register Triton alone: a pinned backend without segment support raises as for any unregistered backend,
-# and a default other than Triton falls back to it (an error under PRIMUS_TURBO_STRICT_DISPATCH). With a single
-# candidate there is nothing to tune, hence autotune=False.
+# one another (see grouped_gemm_kernel.MAX_SEGMENTS). The Triton kernels take segments in every direction, the
+# gfx1250 FlyDSL kernels in the forward, the dgrad and the accumulating wgrad (the unfused wgrad is one output
+# tensor, split afterwards), so the dispatchers below register those alone: a pinned
+# backend without segment support raises as for any unregistered backend, and a default other than these falls
+# back (an error under PRIMUS_TURBO_STRICT_DISPATCH). The segments call exists to save a copy of the weights,
+# so its backends are not tuned against one another, hence autotune=False.
 
 
 class GroupedGEMMSegmentsTritonBackend(GroupedGEMMTritonBackend):
@@ -790,8 +798,45 @@ class GroupedGEMMSegmentsTritonBackend(GroupedGEMMTritonBackend):
         return supported
 
 
+class GroupedGEMMSegmentsFlyDSLBackend(GroupedGEMMFlyDSLBackend):
+    """``GroupedGEMMFlyDSLBackend`` with ``b`` given as a list of weight segments, gfx1250 only: the gfx1250
+    kernel adds each segment's offset to the expert's slab address in its TDM descriptors, so the call runs
+    the same tiles as on the one tensor holding all the groups and gives the same result. ``execute`` passes
+    ``b`` through as the parent's gfx1250 branch does."""
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: List[torch.Tensor],
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        num_cu: int | None,
+        schedule: str = "static",
+        **kwargs,
+    ) -> bool:
+        supported = is_gfx1250()
+        supported &= 1 <= len(b) <= MAX_SEGMENTS
+        supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
+        supported &= a.dim() == 2 and all(s.dim() == 3 for s in b)
+        supported &= a.dtype in (torch.bfloat16, torch.float16) and all(s.dtype == a.dtype for s in b)
+        supported &= not trans_a
+        if supported:
+            # An empty segment is never read, and its strides are whatever the allocator left.
+            full = [s for s in b if s.shape[0]] or b[:1]
+            supported &= all(s.shape[1:] == b[0].shape[1:] for s in b)
+            supported &= all(s.stride() == full[0].stride() and s.data_ptr() % 16 == 0 for s in full)
+            supported &= _cap_cu(num_cu, a.device) == 0
+            supported &= _gfx1250_grouped_gemm_shapes_ok(a, b, trans_b)
+        return supported
+
+
 class GroupedGEMMSegmentsKernelDispatcher(AutoKernelDispatcher):
-    _backends = {BackendType.TRITON: BackendEntry(GroupedGEMMSegmentsTritonBackend, autotune=False)}
+    _backends = {
+        BackendType.TRITON: BackendEntry(GroupedGEMMSegmentsTritonBackend, autotune=False),
+        BackendType.FLYDSL: BackendEntry(GroupedGEMMSegmentsFlyDSLBackend, autotune=False),
+    }
     _cache = TuneCache(1024)
 
     @classmethod
@@ -803,9 +848,58 @@ class GroupedGEMMSegmentsKernelDispatcher(AutoKernelDispatcher):
         return (segment_groups, m, n, k, a.dtype, b[0].dtype, a.dtype, trans_a, trans_b, False)
 
 
+class GroupedGEMMVariableKSegmentsFlyDSLBackend(GroupedGEMMVariableKFlyDSLBackend):
+    """``GroupedGEMMVariableKFlyDSLBackend`` accumulating into output segments (each weight segment's fp32
+    ``main_grad``), gfx1250 only: the kernel adds each segment's offset to the expert's output address. ``execute``
+    passes ``out`` through as the parent's does."""
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        num_cu: int | None,
+        schedule: str = "static",
+        inplace_add_to_out: bool = False,
+        out: List[torch.Tensor] | None = None,
+        **kwargs,
+    ) -> bool:
+        if not (is_gfx1250() and inplace_add_to_out and out is not None and 1 <= len(out) <= MAX_SEGMENTS):
+            return False
+        # The overwriting single-output gate covers the operands, the group cap and the shape.
+        if not GroupedGEMMVariableKFlyDSLBackend.can_handle(
+            a, b, group_lens, group_offs, trans_a, trans_b, trans_c, num_cu, schedule, **kwargs
+        ):
+            return False
+        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+            grouped_gemm_bf16_variable_k_accum_supported,
+        )
+
+        lhs, rhs = (b, a) if trans_c else (a, b)
+        out_shape = (lhs.shape[1], rhs.shape[1])
+        avg_m = max(1, a.shape[0] // max(group_lens.numel(), 1))
+        # An empty segment is never written, and its strides are whatever the allocator left.
+        full = [o for o in out if o.shape[0]]
+        return (
+            grouped_gemm_bf16_variable_k_accum_supported(*out_shape, avg_m)
+            and sum(o.shape[0] for o in out) == group_lens.numel()
+            and all(
+                o.dim() == 3 and tuple(o.shape[1:]) == out_shape and o.dtype == torch.float32 for o in out
+            )
+            and all(o.is_contiguous() and o.data_ptr() % 16 == 0 for o in full)
+        )
+
+
 class GroupedGEMMVariableKSegmentsKernelDispatcher(AutoKernelDispatcher):
-    # The Triton variable-K backend passes ``out`` through to the kernel, which takes segments as they are.
-    _backends = {BackendType.TRITON: BackendEntry(GroupedGEMMVariableKTritonBackend, autotune=False)}
+    # Both backends pass ``out`` through to their kernels, which take segments as they are.
+    _backends = {
+        BackendType.TRITON: BackendEntry(GroupedGEMMVariableKTritonBackend, autotune=False),
+        BackendType.FLYDSL: BackendEntry(GroupedGEMMVariableKSegmentsFlyDSLBackend, autotune=False),
+    }
     _cache = TuneCache(1024)
 
     @classmethod

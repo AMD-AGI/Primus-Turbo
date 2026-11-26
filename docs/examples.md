@@ -144,7 +144,9 @@ print(c.shape) # [128, 256]
 The weights can also come as a list of up to 4 tensors (segments) whose groups follow one another, e.g. an MoE
 layer's own experts and the replicas it holds of other experts. They run in one launch per pass without being
 copied together; with `fuse_bgrad_accum_pattern="megatron"` each segment needs its own `main_grad`, all in one
-dtype. Segments run on the TRITON backend only.
+dtype. Segments run on the TRITON backend, and on gfx1250 also on FLYDSL (forward, dgrad and the wgrad, fused
+into an fp32 `main_grad` or not); the FLYDSL wgrad takes at most 64 groups, and a pinned backend does not fall
+back.
 
 ```python
 experts = torch.randn(3, K, N, device=device, dtype=dtype, requires_grad=True)  # groups 0..2

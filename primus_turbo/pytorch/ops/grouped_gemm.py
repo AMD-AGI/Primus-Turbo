@@ -284,7 +284,7 @@ def grouped_gemm(
             sum(G_s) == G, all in one dtype: group g of segment s uses ``b[s][g - sum(G_0..G_{s-1})]``, so
             weights held in separate tensors (e.g. an MoE layer's experts and its replicas of other experts)
             run in a single launch per pass without being copied together. Segments are supported by the
-            Triton backend only.
+            Triton backend, and on gfx1250 by the FlyDSL backend (its wgrad takes at most 64 groups).
         group_lens (torch.Tensor): Rows per expert of shape [G], int64. sum(group_lens) == a.size(0).
         group_offs (torch.Tensor | None): Exclusive prefix-sum of group_lens, shape [G+1].
                                           If None, it will be computed internally.
