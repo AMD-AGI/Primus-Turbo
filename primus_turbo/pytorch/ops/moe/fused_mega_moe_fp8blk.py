@@ -39,10 +39,10 @@ from primus_turbo.triton.quantization.quantization_fp8blk_moe_kernel import (
     MX,
     build_routing_blk,
     combine_rows,
-    combine_rows_route_dw,
     expert_order_lpt_fused,
     quant_dual_blk,
     quant_w_128x128,
+    route_dw,
     swiglu_bwd_dual_blk,
     swiglu_fwd_dual_blk,
 )
@@ -321,6 +321,7 @@ class _FP8BlockMoE(torch.autograd.Function):
         gq, gs, gT, gTs, dwr = swiglu_bwd_dual_blk(
             dact, l1, route_w, ctx.activation, preal=preal, compact_t=vkq, raw_dw=True
         )
+        dtw = route_dw(inv, dwr, ctx.topk_dtype).view(T, K)
         jobs = ((w2, dT, dTs, aT, aTs, H, I), (w1, gT, gTs, xT, xTs, 2 * I, H))
         mgs = [_setup_accum(w, ctx.accumulate) for w, *_ in jobs]
         deferred = _overlap.enabled("MOE_WGRAD") and all(mg is not None for mg in mgs)
@@ -363,9 +364,7 @@ class _FP8BlockMoE(torch.autograd.Function):
                 grads.append(g.to(w.dtype))
         dW2, dW1 = grads if not deferred else (_get_dummy_wgrad(w.shape, w.dtype) for w in (w2, w1))
         dxp = _gg(gq, gs, c1, True, poffs)
-        # combine + d topk-weights (independent kernels) as one launch
-        dx, dtw = combine_rows_route_dw(dxp, inv, T, K, dwr, ctx.topk_dtype)
-        dtw = dtw.view(T, K)
+        dx = combine_rows(dxp, inv, T, K)
         return dx, None, dtw, dW1, dW2, None, None, None, None, (dy if ctx.has_add else None), None
 
 
