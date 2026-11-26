@@ -8,8 +8,8 @@
 
 The keys follow ``test_grouped_gemm_flydsl_gfx1250_kwargs_keys.py`` (the MiniMax-M3 ones) and add what is Kimi's
 own: three row counts per shape served by the nearest-key rule, sets that use the knobs this kernel took from the
-Kimi tuning (``mv_dec``, ``nt_half``, ``vk_seam`` bits 20-23), and an expert count (224 at EP4, 112 at EP8) above
-the 32 the forward vec_dec keys are limited to.
+Kimi tuning (``nt_half`` on fwd / dgrad, ``vk_seam`` bits 20-23 on wgrad), and an expert count (224 at EP4, 112 at
+EP8) above the 32 the forward vec_dec keys are limited to.
 
 * Host-only (needs flydsl, no GPU): which shapes are keyed, the row counts each key serves, the tile and the
   expert-count preconditions, the knobs the sets carry.
@@ -114,11 +114,11 @@ def test_a_key_names_only_entry_point_arguments(kind, name, n, k):
 
 @pytest.mark.parametrize("kind, name, n, k", SHAPES[:4], ids=_IDS[:4])
 def test_forward_and_dgrad_sets(kind, name, n, k):
-    """293: 160-row tiles, no cluster, the multi-slot decode; 585: the 1170 set plus the half-height grid."""
+    """293 shares the 585 set (the picker's 256-row tile with the half-height grid), not a 160-row tile of its
+    own; 585 is the 1170 set plus that half-height grid."""
     k293, k585, k1170 = (_key(kind, n, k, m) for m in KEYED_AVG_M)
-    assert k293["BLOCK_M"] == 160 and k293["mv_dec"] == 1 and (k293["mc_m"], k293["mc_n"]) == (1, 1)
-    assert "tt_dec" not in k293 and not k293["nt_seam"] & 8
-    assert k585 == dict(k1170, nt_half=1)
+    assert k293 == k585 == dict(k1170, nt_half=1)
+    assert "BLOCK_M" not in k293 and "mv_dec" not in k293
     assert "vec_dec" not in k1170 and k1170["tt_dec"] == 1
 
 
@@ -181,48 +181,41 @@ def test_variable_k_keys_need_whole_persistent_rounds(kind, name, n, k):
     assert bool(gg._keyed_kwargs(kind, (n, k, 585), 112, 0, {})) == (name == "wgrad_fc1")
 
 
-def _padded(avg_m, tile_m):
-    return -(-avg_m // tile_m) * tile_m
-
-
 @pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
-def test_a_pinned_tile_height_pads_no_more_than_the_default(kind, name, n, k):
-    """The 293 forward / dgrad sets run 160-row tiles; they serve a row count only where they pad each expert's rows
-    to no more than the default tile does and by no smaller a margin than at 293 rows (320 against 512), else the
-    call takes the next-nearest key within reach, else none. From 161 to 256 rows the 160-row tile pads to 320
-    against the default 256, from 321 to 414 to 480 against 512; the variable-K sets are not affected."""
+def test_forward_and_dgrad_keys_have_no_pinned_tile(kind, name, n, k):
+    """No forward / dgrad key pins its own tile height any more (the 293 sets took the 585 set's 256-row tile), so
+    the nearest key within reach serves a call wherever the default tile at the call matches the default tile at
+    the key -- i.e. whenever both row counts are above the 128-row boundary the picker switches tiles at. At 128
+    rows or fewer the picker hands out a 128-row tile and the key gives way to the untuned path. 129-414 take the
+    293 = 585 set, 415-827 the 585 set, 828+ the 1170 set; the variable-K sets keep their own persist rule."""
     lo = math.ceil(KEYED_AVG_M[0] / gg._AVG_M_REACH)
     for avg_m in range(lo, 830):
-        nearest = [row[2] for row in gg._kwargs_rows(kind, (n, k, avg_m))]
         want = None
-        for key_m in nearest:
-            keyed = _key(kind, n, k, key_m)
+        for key_m in (row[2] for row in gg._kwargs_rows(kind, (n, k, avg_m))):
             if kind != "vk":
                 pick = gg._pick_config if kind == "nt" else gg._pick_config_nn
-                cfg = pick(n, k, avg_m, MEASURED_G)
-                tile_m = keyed.get("BLOCK_M") or cfg[0]
-                pad, pad_base = _padded(avg_m, tile_m), _padded(avg_m, cfg[0])
-                pad_key, pad_base_key = _padded(key_m, tile_m), _padded(key_m, cfg[0])
-                if cfg != pick(n, k, key_m) or pad > pad_base or pad * pad_base_key > pad_key * pad_base:
+                if pick(n, k, avg_m, MEASURED_G) != pick(n, k, key_m):
                     continue
             want = key_m
             break
         got = gg._keyed_kwargs(kind, (n, k, avg_m), MEASURED_G, 0, {})
         assert got == (dict(_key(kind, n, k, want)) if want else {}), avg_m
-        if kind != "vk" and (160 < avg_m <= 256 or 320 < avg_m) and nearest[0] == 293:
-            assert got != _key(kind, n, k, 293), avg_m
-    for avg_m in (257, 293, 320, 414):
-        want = 585 if kind != "vk" and avg_m > 320 else 293
-        assert gg._keyed_kwargs(kind, (n, k, avg_m), MEASURED_G, 0, {}) == _key(kind, n, k, want), avg_m
+    if kind != "vk":
+        # 293 now equals the 585 set, so 129-414 (the band the 160-row tile used to own) all take it; 128 rows,
+        # one below the picker's tile switch, gets the untuned path.
+        for avg_m in (129, 160, 257, 293, 320, 414):
+            assert gg._keyed_kwargs(kind, (n, k, avg_m), MEASURED_G, 0, {}) == _key(kind, n, k, 585), avg_m
+        assert gg._keyed_kwargs(kind, (n, k, 128), MEASURED_G, 0, {}) == {}, "128 rows -> untuned"
 
 
 @pytest.mark.parametrize("kind, name, n, k", SHAPES[:4], ids=_IDS[:4])
 def test_a_prebuilt_m_tiles_of_another_height_skips_the_set(kind, name, n, k):
-    """A caller's prebuilt m_tiles is checked against the tile height it was built for, so a set of another
-    height (the 293 one, 160 rows) is left out rather than refused at launch; one built for 160 rows takes it."""
+    """A caller's prebuilt m_tiles is checked against the default tile height the set runs on -- 256 now that the
+    293 forward / dgrad sets dropped their 160-row tile -- so a map built for another height (160 rows) is left
+    out rather than refused at launch; one built for 256 rows takes it."""
     rows = [293] * MEASURED_G
     offs = torch.tensor([0, *itertools.accumulate(rows)], dtype=torch.int64)
-    for block_m, served in ((256, False), (160, True)):
+    for block_m, served in ((256, True), (160, False)):
         kw = {"m_tiles": gg.build_m_tile_map(offs, block_m)}
         got = gg._keyed_kwargs(kind, (n, k, 293), MEASURED_G, 0, kw)
         assert (got == _key(kind, n, k, 293)) == served, block_m
@@ -230,8 +223,8 @@ def test_a_prebuilt_m_tiles_of_another_height_skips_the_set(kind, name, n, k):
 
 @pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
 def test_the_picker_still_hands_out_the_measured_tile(kind, name, n, k):
-    """The sets were measured on the picker's 256 x 256 x 128 tile (the 293 forward / dgrad ones and the wgrad
-    ones then set their own tile fields)."""
+    """The sets were measured on the picker's 256 x 256 x 128 tile (the forward / dgrad sets run it as-is; the
+    wgrad ones then set their own tile fields)."""
     for avg_m in KEYED_AVG_M:
         for G in (112, MEASURED_G):
             if kind == "nt":
@@ -330,9 +323,9 @@ def test_keyed_shape_numeric(kind, name, n, k, avg_m):
 @pytest.mark.parametrize("avg_m", (250, 414, 827, 1600))
 @pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
 def test_nearest_key_numeric(kind, name, n, k, avg_m):
-    """Ragged routing at a row count between or past the keys: the key serving it (at 250 and 414 the 293 forward /
-    dgrad sets give way, see the tile-height test), bit-identical to the untuned path (an empty expert, a one-row
-    expert and a run that does not fill a tile)."""
+    """Ragged routing at a row count between or past the keys: the key serving it (250 and 414 take the 293 = 585
+    forward / dgrad set, see the no-pinned-tile test), bit-identical to the untuned path (an empty expert, a
+    one-row expert and a run that does not fill a tile)."""
     G = NUMERIC_G[kind]
     rows = [0, 1, 159, 256 + 7] + [avg_m] * (G - 5)
     rows.append(avg_m * G - sum(rows))

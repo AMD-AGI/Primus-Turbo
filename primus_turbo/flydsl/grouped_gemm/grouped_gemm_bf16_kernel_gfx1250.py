@@ -6420,13 +6420,16 @@ _MUSE_NN_MC44 = dict(_MUSE_NN, mc_m=4, mc_n=4)
 # so fc1 is (N, K) = (6144, 3584) and fc2 (3584, 3072); 896 experts, top-16. At EP4 each GPU holds G = 224
 # experts and receives 65536 rows per sequence of the micro-batch: avg_m = 292 / 585 / 1170 at MBS 1 / 2 / 4
 # (measured at 293 / 585 / 1170 with M = 224 x avg_m, even routing; at EP8, G = 112, MBS 1 / 2 land on the
-# 585 / 1170 keys). One fwd / dgrad set per operator at 585 and 1170, with the half-height grid at 585 only:
-# an expert's last m-tile holds 73 rows there and 146 at 1170. At 293 the 160-row tile puts an expert in two
-# m-tiles of 160 + 133 rows instead of 256 + 37, with the multi-slot decode (tt_dec is not built for a tile
-# with tile_m != tile_n). wgrad is the MiniMax-M3 seam plus vk_seam bits 20 and 21, and bits 22-23 with no
-# stagger at 293. Gain over the untuned path on the op (10 s, G = 224): fwd fc1 / fc2, dgrad fc1 / fc2, wgrad
-# fc1 / fc2 +43.6 / +29.8 / +28.0 / +28.9 / +55.1 / +56.2% at 293, +20.9 / +17.8 / +20.0 / +21.5 / +37.9 /
-# +39.3% at 585, +18.1 / +16.6 / +17.7 / +17.6 / +40.9 / +41.9% at 1170.
+# 585 / 1170 keys). One fwd / dgrad set per operator, shared by 293 and 585 with the half-height grid (nt_half)
+# and the full grid at 1170: an expert's last m-tile holds 37 rows at 293, 73 at 585 and 146 at 1170. At 293 the
+# fwd / dgrad take the 585 set's 256-row tile rather than a 160-row tile of their own: the 160-row tile is faster
+# under even routing (293 = 256 + 37 is the worst even-routing boundary for a 256 tile) but pays padding as soon
+# as routing is uneven, where the 256 tile stays ahead, so at the row counts a GPU actually receives the 256 tile
+# is the routing-stable choice. wgrad keeps its own 293 set (it tiles the weight N x K, so routing does not pad
+# it): the MiniMax-M3 seam plus vk_seam bits 20 and 21, and bits 22-23 with no stagger. Gain over the untuned
+# path on the op (10 s, G = 224): fwd fc1 / fc2, dgrad fc1 / fc2, wgrad fc1 / fc2 +20.9 / +17.8 / +20.0 / +21.5 /
+# +37.9 / +39.3% at 585 and +18.1 / +16.6 / +17.7 / +17.6 / +40.9 / +41.9% at 1170; the 293 fwd / dgrad run the
+# 585 set and wgrad its own 293 set (the PR tables carry the 293 screening, even and lognorm routing).
 _KIMI_NT_FC1 = {
     "GROUP_M": 4,
     "head_pipe": 32,
@@ -6505,23 +6508,6 @@ _KIMI_NN_FC2 = {
     "tdm_nn": 1,
     "tt_dec": 1,
     "wmma_b2b": 1,
-    "xcd_band": 32,
-}
-# avg_m = 293: 160-row tiles, no cluster, the decode carried across the tile seam (nt_seam bit 2).
-_KIMI_T160 = {
-    "BLOCK_K": 128,
-    "BLOCK_M": 160,
-    "BLOCK_N": 256,
-    "issue_first": 1,
-    "lds_cosched": 3,
-    "mc_m": 1,
-    "mc_n": 1,
-    "mv_dec": 1,
-    "nt_ovl": 1,
-    "nt_seam": 5,
-    "ntp_flags": 3,
-    "num_xcd": 8,
-    "persist": 256,
     "xcd_band": 32,
 }
 _KIMI_VK_FC1 = {
@@ -6609,13 +6595,12 @@ _KWARGS_KEYS = {
             "vec_dec": 1,
             "xcd_band": 32,
         },
-        # Kimi K3.1 fwd fc1 and fc2 at 293 / 585 / 1170 rows per expert
-        (6144, 3584, 293): dict(
-            _KIMI_T160, BLOCK_N=384, GROUP_M=4, head_pipe=26, hp_epi=0, tdm_assign=1, tdm_balance=1
-        ),
+        # Kimi K3.1 fwd fc1 and fc2 at 293 / 585 / 1170 rows per expert. 293 shares the 585 set (the routing-stable
+        # 256-row tile with the half-height grid) rather than a 160-row tile of its own; see the header comment.
+        (6144, 3584, 293): dict(_KIMI_NT_FC1, nt_half=1),
         (6144, 3584, 585): dict(_KIMI_NT_FC1, nt_half=1),
         (6144, 3584, 1170): _KIMI_NT_FC1,
-        (3584, 3072, 293): dict(_KIMI_T160, GROUP_M=4, epi_chunk=1, head_pipe=14, tdm_balance=1),
+        (3584, 3072, 293): dict(_KIMI_NT_FC2, nt_half=1),
         (3584, 3072, 585): dict(_KIMI_NT_FC2, nt_half=1),
         (3584, 3072, 1170): _KIMI_NT_FC2,
     },
@@ -6677,11 +6662,12 @@ _KWARGS_KEYS = {
             "tt_dec": 1,
             "xcd_band": 32,
         },
-        # Kimi K3.1 dgrad fc1 (output 3584, reduction 6144) and fc2 (3072, 3584) at 293 / 585 / 1170 rows
-        (3584, 6144, 293): dict(_KIMI_T160, GROUP_M=8, head_pipe=14, tdm_assign=1, tdm_nn=1),
+        # Kimi K3.1 dgrad fc1 (output 3584, reduction 6144) and fc2 (3072, 3584) at 293 / 585 / 1170 rows. 293
+        # shares the 585 set (see the fwd keys above and the header comment).
+        (3584, 6144, 293): dict(_KIMI_NN_FC1, nt_half=1),
         (3584, 6144, 585): dict(_KIMI_NN_FC1, nt_half=1),
         (3584, 6144, 1170): _KIMI_NN_FC1,
-        (3072, 3584, 293): dict(_KIMI_T160, GROUP_M=8, head_pipe=14, tdm_nn=1, wmma_b2b=1),
+        (3072, 3584, 293): dict(_KIMI_NN_FC2, nt_half=1),
         (3072, 3584, 585): dict(_KIMI_NN_FC2, nt_half=1),
         (3072, 3584, 1170): _KIMI_NN_FC2,
     },
@@ -6824,21 +6810,13 @@ def _key_fits(kind: str, key: tuple, row: tuple, G: int, keyed: dict, kw: dict) 
     base = pick(key[0], key[1], key[2], G)
     if base != pick(*row):
         return False
-    # A set that pins its own tile height is borrowed only where, at the call's row count, it pads each expert's
-    # rows to no more than the default tile does (ceil(avg_m / BLOCK_M) * BLOCK_M against ceil(avg_m / base) *
-    # base), and by no smaller a margin than at its key. The rows past an expert's last row are matrix work on
-    # zero-filled A. The 293 key's 160-row tile pads 293 rows to 320 where the default 256 pads them to 512; at 250
-    # rows it pads to 320 against 256 (measured 9-17% slower than the default path on the forward and dgrad), at 414
-    # to 480 against 512, where the 585 key's set measured +19% to +23% against the 160-row set's +1% to +13%.
-    tile_m = keyed.get("BLOCK_M") or base[0]
-    (pad, pad_base), (pad_key, pad_base_key) = (
-        (-(-m // tile_m) * tile_m, -(-m // base[0]) * base[0]) for m in (key[2], row[2])
-    )
-    if pad > pad_base or pad * pad_base_key > pad_key * pad_base:
-        return False
-    # A prebuilt m_tiles is checked against the tile height it was built for (`check_prebuilt`).
+    # No nt / nn key pins its own tile height any more: the Kimi 293 fwd / dgrad keys dropped their 160-row tile
+    # for the 585 set's default 256 tile (an uneven-routing win -- see the Kimi header comment), so a borrowed set
+    # always runs on the call's own default tile, and the `base != pick(*row)` guard above is the only tile check
+    # left (a key is used only where the default tile at the call matches the default tile at its key). A prebuilt
+    # m_tiles is still checked against that tile height (`check_prebuilt`).
     prov = getattr(kw.get("m_tiles"), _PROV, None)
-    return prov is None or prov[3] == tile_m
+    return prov is None or prov[3] == base[0]
 
 
 def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:
