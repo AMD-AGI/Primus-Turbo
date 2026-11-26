@@ -360,6 +360,227 @@ def _m_tile_tt_for(m_tiles, group_offs, block_m: int, upper: int) -> torch.Tenso
     return tt
 
 
+# Device-side index tables: what the builders above return, written by one kernel launch. A launcher that is passed
+# no table builds it here; the PyTorch builders stay the reference, the CPU path and the `m_tiles=` /
+# `expert_table=` contract.
+
+_TBL_BLOCK = 256
+# The kernel unrolls its loops over the experts, (2 G + 1) / 256 iterations at the most.
+_TBL_MAX_G = 8192
+
+
+@flyc.jit
+def _launch_m_tile_tables(
+    arg_out: fx.Pointer,
+    arg_offs: fx.Pointer,
+    stream: fx.Stream,
+    i32_upper: fx.Int32,
+    i32_grid: fx.Int32,
+    n_groups: Constexpr[int],
+    block_m: Constexpr[int],
+    offs_words: Constexpr[int],
+    tt: Constexpr[int],
+):
+    """``build_m_tile_map`` and, with ``tt``, ``build_m_tile_tt`` of it for ``i32_upper`` m-tiles. Every workgroup
+    stages the offsets and the inclusive scan of the per-expert tile counts in LDS; workgroup 0 writes the map (and
+    the zero pad up to ``_tt_off``), and thread t of the grid the record of m-tile t. ``offs_words`` is 2 for int64
+    offsets, of which the kernel reads the low word."""
+    G = n_groups
+    BLK = _TBL_BLOCK
+    CH = -(-G // BLK)
+    ROUNDS = (-(-G // CH) - 1).bit_length()
+    HEAD = _tt_off(G) if tt else 2 * G + 1
+    # LDS words: offs[G + 1] | incl[G] | two buffers of per-thread partial sums | a sink for the idle threads
+    S_INCL, S_PART = G + 1, 2 * G + 1
+    S_SINK = S_PART + 2 * BLK
+
+    @flyc.kernel(name="kernel_grouped_bf16_m_tile_tables_gfx1250", known_block_size=[BLK, 1, 1])
+    def kernel_m_tile_tables(arg_out: fx.Pointer, arg_offs: fx.Pointer, i32_upper: fx.Int32):
+        tid = fx.Int32(fx.thread_idx.x)
+        pid = fx.Int32(fx.block_idx.x)
+        zero = tid * fx.Int32(0)
+        out = _i32_table(arg_out)
+        offs = _i32_table(arg_offs)
+        arena = fx.SharedAllocator(static=False)
+        arena.allocate(4 * (S_SINK + 1))
+        lds = fx.recast_iter(fx.Int32, arena.base_ptr)
+
+        for r in range_constexpr(-(-(G + 1) // BLK)):
+            i = tid + fx.Int32(r * BLK)
+            i = (i < fx.Int32(G)).select(i, fx.Int32(G))
+            lds[i] = offs[i * fx.Int32(offs_words)]
+        gpu.barrier()
+
+        # Thread i owns experts [i * CH, i * CH + CH): their tile counts, scanned in registers, then the per-thread
+        # totals scanned across the workgroup (Hillis-Steele, one LDS buffer read and the other written per round).
+        run = []
+        acc = zero
+        for j in range_constexpr(CH):
+            e = tid * fx.Int32(CH) + fx.Int32(j)
+            live = e < fx.Int32(G)
+            e = live.select(e, fx.Int32(G - 1))
+            n = lds[e + fx.Int32(1)] - lds[e]
+            acc = acc + live.select((n + fx.Int32(block_m - 1)) // fx.Int32(block_m), zero)
+            run.append(acc)
+        lds[fx.Int32(S_PART) + tid] = acc
+        gpu.barrier()
+        incl = acc
+        for r in range_constexpr(ROUNDS):
+            far = tid >= fx.Int32(1 << r)
+            prev = lds[fx.Int32(S_PART + (r % 2) * BLK) + far.select(tid - fx.Int32(1 << r), zero)]
+            incl = far.select(incl + prev, incl)
+            lds[fx.Int32(S_PART + (r + 1) % 2 * BLK) + tid] = incl
+            gpu.barrier()
+        for j in range_constexpr(CH):
+            e = tid * fx.Int32(CH) + fx.Int32(j)
+            lds[(e < fx.Int32(G)).select(fx.Int32(S_INCL) + e, fx.Int32(S_SINK))] = incl - acc + run[j]
+        gpu.barrier()
+
+        for r in range_constexpr(-(-HEAD // BLK)):
+            w = tid + fx.Int32(r * BLK)
+            in_map = w < fx.Int32(2 * G + 1)
+            slot = (w < fx.Int32(G)).select(fx.Int32(S_INCL) + w, in_map.select(w - fx.Int32(G), zero))
+            v = in_map.select(lds[slot], zero)
+            if (pid == zero) & (w < fx.Int32(HEAD)):
+                out[w] = v
+
+        if const_expr(tt):
+            # torch.searchsorted(incl, t, right=True), clamped to G - 1, then `build_m_tile_tt`'s record.
+            t = pid * fx.Int32(BLK) + tid
+            lo, hi = zero, zero + fx.Int32(G)
+            for _ in range_constexpr(G.bit_length()):
+                mid = (lo + hi) // fx.Int32(2)
+                v = lds[fx.Int32(S_INCL) + (mid < fx.Int32(G - 1)).select(mid, fx.Int32(G - 1))]
+                open_ = lo < hi
+                lo, hi = (open_ & (v <= t)).select(mid + fx.Int32(1), lo), (open_ & (v > t)).select(mid, hi)
+            g = (lo < fx.Int32(G - 1)).select(lo, fx.Int32(G - 1))
+            end = lds[fx.Int32(S_INCL) + g]
+            row_beg = lds[g]
+            n = lds[g + fx.Int32(1)] - row_beg
+            first = end - (n + fx.Int32(block_m - 1)) // fx.Int32(block_m)
+            local = t - first
+            raw = n - local * fx.Int32(block_m)
+            rows = (raw < fx.Int32(block_m)).select(raw, fx.Int32(block_m))
+            rows = (rows > zero).select(rows, zero)
+            m_row = (rows > zero).select(row_beg + local * fx.Int32(block_m), zero)
+            rec = (g, m_row, rows, first, end, zero, zero, zero)
+            b = fx.Int32(HEAD) + t * fx.Int32(8)
+            if t < i32_upper:
+                for j in range_constexpr(8):
+                    out[b + fx.Int32(j)] = rec[j]
+
+    kernel_m_tile_tables(arg_out, arg_offs, i32_upper).launch(
+        grid=(i32_grid, 1, 1), block=(BLK, 1, 1), stream=stream
+    )
+
+
+@flyc.jit
+def _launch_expert_table(
+    arg_out: fx.Pointer,
+    arg_offs: fx.Pointer,
+    arg_len: fx.Pointer,
+    stream: fx.Stream,
+    i32_grid: fx.Int32,
+    n_groups: Constexpr[int],
+    offs_words: Constexpr[int],
+    len_words: Constexpr[int],
+):
+    """``build_expert_table``: (offs[g], masked_k[g]) per expert, offs[g + 1] - offs[g] for ``len_words`` = 0; one
+    thread per expert. A word count of 2 reads the low word of an int64."""
+    G = n_groups
+    BLK = _TBL_BLOCK
+
+    @flyc.kernel(name="kernel_grouped_bf16_expert_table_gfx1250", known_block_size=[BLK, 1, 1])
+    def kernel_expert_table(arg_out: fx.Pointer, arg_offs: fx.Pointer, arg_len: fx.Pointer):
+        e = fx.Int32(fx.block_idx.x) * fx.Int32(BLK) + fx.Int32(fx.thread_idx.x)
+        live = e < fx.Int32(G)
+        e = live.select(e, fx.Int32(G - 1))
+        out = _i32_table(arg_out)
+        offs = _i32_table(arg_offs)
+        start = offs[e * fx.Int32(offs_words)]
+        if const_expr(len_words):
+            length = _i32_table(arg_len)[e * fx.Int32(len_words)]
+        else:
+            length = offs[(e + fx.Int32(1)) * fx.Int32(offs_words)] - start
+        if live:
+            out[e * fx.Int32(2)] = start
+            out[e * fx.Int32(2) + fx.Int32(1)] = length
+
+    kernel_expert_table(arg_out, arg_offs, arg_len).launch(
+        grid=(i32_grid, 1, 1), block=(BLK, 1, 1), stream=stream
+    )
+
+
+_TBL_COMPILED: dict = {}
+_ETAB_COMPILED: dict = {}
+
+
+def _tbl_ok(t: torch.Tensor, G: int) -> bool:
+    return 1 <= G <= _TBL_MAX_G and t.dtype in (torch.int32, torch.int64) and t.is_contiguous() and t.is_cuda
+
+
+def _tbl_ptr(t: torch.Tensor):
+    # Index tensors are only element-aligned (a view can start anywhere).
+    return flyc.from_c_void_p(fx.Int8, t.data_ptr(), assumed_align=t.element_size())
+
+
+def _m_tile_tables(group_offs, block_m: int, upper: int) -> torch.Tensor:
+    """``build_m_tile_map(group_offs, block_m)`` for ``upper == 0``, else ``build_m_tile_tt`` of it for ``upper``
+    m-tiles: the same int32 words, from one launch on the current stream."""
+    G = group_offs.numel() - 1
+    if not _tbl_ok(group_offs, G):
+        m_map = build_m_tile_map(group_offs, block_m)
+        return build_m_tile_tt(m_map, group_offs, block_m, upper) if upper else m_map
+    out = torch.empty(
+        _tt_off(G) + 8 * upper if upper else 2 * G + 1, dtype=torch.int32, device=group_offs.device
+    )
+    _cached_launch(
+        _launch_m_tile_tables,
+        _TBL_COMPILED,
+        5,
+        (
+            _as_ptr(out),
+            _tbl_ptr(group_offs),
+            torch.cuda.current_stream(),
+            upper,
+            max(1, -(-upper // _TBL_BLOCK)),  # i32_upper, i32_grid
+            G,
+            block_m,
+            group_offs.element_size() // 4,
+            1 if upper else 0,
+        ),
+    )
+    return out
+
+
+def _expert_table(group_offs, masked_k=None) -> torch.Tensor:
+    """``build_expert_table(group_offs, masked_k).reshape(-1)``: the same int32 words, from one launch."""
+    G = group_offs.numel() - 1
+    if not (
+        _tbl_ok(group_offs, G)
+        and (masked_k is None or (_tbl_ok(masked_k, G) and masked_k.device == group_offs.device))
+    ):
+        return build_expert_table(group_offs, masked_k).reshape(-1)
+    out = torch.empty(2 * G, dtype=torch.int32, device=group_offs.device)
+    lens = group_offs if masked_k is None else masked_k
+    _cached_launch(
+        _launch_expert_table,
+        _ETAB_COMPILED,
+        5,
+        (
+            _as_ptr(out),
+            _tbl_ptr(group_offs),
+            _tbl_ptr(lens),
+            torch.cuda.current_stream(),
+            -(-G // _TBL_BLOCK),  # i32_grid
+            G,
+            group_offs.element_size() // 4,
+            0 if masked_k is None else masked_k.element_size() // 4,
+        ),
+    )
+    return out
+
+
 def _decode_m_tile_tt(mt, blk_m_idx, n_groups: int, m_tiles: int):
     """`_decode_m_tile_span` read from the per-tile records (`build_m_tile_tt`): one round of independent loads
     instead of a chain of dependent ones. The tile index is clamped to the table."""
@@ -3071,7 +3292,7 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
         check_prebuilt(expert_table, group_k_offsets, 0, G, 2 * G, "expert_table", masked_k=masked_k)
         etab = expert_table.reshape(-1)
     else:
-        etab = build_expert_table(group_k_offsets, masked_k).reshape(-1)
+        etab = _expert_table(group_k_offsets, masked_k)
 
     # Positional, in `_launch_grouped_bf16_variable_k` order; a trailing comment names the
     # parameter wherever the expression does not.
@@ -5338,18 +5559,16 @@ def _grouped_gemm_bf16_nt_flydsl_kernel_entry(
     m_upper += -m_upper % mc_m
     if wave_grid < 0:
         wave_grid = 0
-    if m_tiles is not None:
-        check_prebuilt(m_tiles, group_offs, tile_m, G, G + 1 if inkernel_scan else 2 * G + 1, "m_tiles")
-    else:
-        m_tiles = (
-            build_m_tile_map_offs_only(group_offs, tile_m)
-            if inkernel_scan
-            else build_m_tile_map(group_offs, tile_m)
-        )
     if inkernel_scan:
         tt_dec = 0
-    if tt_dec:
-        m_tiles = _m_tile_tt_for(m_tiles, group_offs, tile_m, m_upper)
+    if m_tiles is not None:
+        check_prebuilt(m_tiles, group_offs, tile_m, G, G + 1 if inkernel_scan else 2 * G + 1, "m_tiles")
+        if tt_dec:
+            m_tiles = _m_tile_tt_for(m_tiles, group_offs, tile_m, m_upper)
+    elif inkernel_scan:
+        m_tiles = build_m_tile_map_offs_only(group_offs, tile_m)
+    else:
+        m_tiles = _m_tile_tables(group_offs, tile_m, m_upper if tt_dec else 0)
 
     # Positional, in `_launch_grouped_gemm_bf16_nt` order; a trailing comment names the parameter
     # wherever the expression does not.
@@ -5576,18 +5795,18 @@ def _nn_native_launch(
         vec_dec = 0
     m_upper = m_tile_upper_bound(TOTAL_M, tile_m, G)
     m_upper += -m_upper % mc_m
+    if inkernel_scan:
+        tt_dec = 0
     if m_tiles is None:
         m_tiles = (
             build_m_tile_map_offs_only(group_offs, tile_m)
             if inkernel_scan
-            else build_m_tile_map(group_offs, tile_m)
+            else _m_tile_tables(group_offs, tile_m, m_upper if tt_dec else 0)
         )
     else:
         check_prebuilt(m_tiles, group_offs, tile_m, G, G + 1 if inkernel_scan else 2 * G + 1, "m_tiles")
-    if inkernel_scan:
-        tt_dec = 0
-    if tt_dec:
-        m_tiles = _m_tile_tt_for(m_tiles, group_offs, tile_m, m_upper)
+        if tt_dec:
+            m_tiles = _m_tile_tt_for(m_tiles, group_offs, tile_m, m_upper)
     # Positional, in `_launch_grouped_gemm_bf16_nt` order; a trailing comment names the parameter
     # wherever the expression does not. The native NN path pins the knobs it does not support.
     _nt_launch(

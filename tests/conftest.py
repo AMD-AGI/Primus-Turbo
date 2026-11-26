@@ -45,6 +45,8 @@ _GFX1250_ENABLED_TESTS = (
     # from the suite above because most of it is host-only: it checks that the published
     # shape gates and the entry points cannot disagree, which needs no GPU.
     "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_shapes.py",
+    # The one-launch m-tile and expert tables of the same kernel, word for word against the PyTorch builders.
+    "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_tile_tables.py",
     # The shape key table of the same kernel: which shapes get the tuned persistent-cluster
     # stack, what the cluster and head_pipe gates refuse, and what a caller who switches the
     # stack off is left with. Mostly host-only as well; its numeric cases are the DeepSeek-V3
