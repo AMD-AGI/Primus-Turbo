@@ -1041,7 +1041,11 @@ def _compile_dense_tn(
         rocdl.s_barrier()
         b0_frag = b_s2r.load(b_next0)
         a_g2s.load(a_next1, A1_gl_offset + arith.index((k + 1) * BLOCK_K) * cm_i)
-        rocdl.s_barrier()
+        # wave_m 0 runs one barrier ahead and reads a_next0 (the last K-tile) for Epilog 2 right after the
+        # next barrier, which pairs with this one in wave_m 1: land that refill here. sched_barrier(0) keeps
+        # a_next1's issue ahead of the wait, so only a_next1 may stay in flight.
+        rocdl.sched_barrier(0)
+        wait_barrier(N_LDS_STEPS_A)
         rocdl.s_setprio(1)
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
         rocdl.s_setprio(0)
