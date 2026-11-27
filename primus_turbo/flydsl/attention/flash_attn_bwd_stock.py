@@ -1965,8 +1965,8 @@ def build_flash_attn_bwd_dkdv_module(
     # directions, so a slot is only rewritten after the next trip's leading barrier, and the
     # two bases stay the same two registers HOIST_PIN already keeps live over the loop.
     # An odd group size above one would need the step per head-step; no caller has one.
-    DS_PAR = G3_QCARRY and GQA_GROUP_SIZE == 1 and MLA
-    assert not (G3_QCARRY and GQA_GROUP_SIZE % 2 == 1 and not DS_PAR and MLA)
+    DS_PAR = G3_QCARRY and GQA_GROUP_SIZE == 1
+    assert not (G3_QCARRY and GQA_GROUP_SIZE % 2 == 1 and not DS_PAR)
     assert not (DS_PAR and G3_SPLIT)
     # The step is added to XOR-addressed bases, which commutes only while the slot stride's
     # lowest set bit lies above every XOR mask applied to them afterwards.
