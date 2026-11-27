@@ -10,7 +10,7 @@ FlyDSL kernel so the cross-rank traffic is hidden behind compute.
 
 The design target is intra-node expert parallelism, where every rank owns a slice of the experts and
 tokens are routed directly into a peer rank's memory. It runs on MI355X (`gfx950`) in BF16 and
-MXFP8, and on MI455X (`gfx1250`) in BF16 with its own kernels (see
+MXFP8, and on MI455X (`gfx1250`) in BF16 and MXFP8 with its own kernels (see
 [gfx1250 (MI455X)](#gfx1250-mi455x)). Usage, support and limitations: [MegaMoE](../features/mega_moe.md).
 
 ### Key points
@@ -242,6 +242,7 @@ python benchmark/ops/training/bench_mega_moe_gfx1250.py --num-processes 4
 | Autograd ops, MXFP8 | `primus_turbo/pytorch/ops/moe/fused_mega_moe_fp8.py` |
 | Forward / backward custom ops and stage compositions | `primus_turbo/pytorch/kernels/fused_mega_moe/` |
 | gfx1250 stage compositions, shape check | `primus_turbo/pytorch/kernels/fused_mega_moe/fused_mega_moe_gfx1250_impl.py` |
+| gfx1250 MXFP8 stage compositions, contract check | `primus_turbo/pytorch/kernels/fused_mega_moe/fused_mega_moe_gfx1250_fp8_impl.py` |
 | MXFP8 weight prep and its per-step cache | `primus_turbo/pytorch/kernels/fused_mega_moe/mega_moe_fp8_weights.py` |
 | Expert-bias gradients | `primus_turbo/pytorch/kernels/fused_mega_moe/mega_moe_bias_impl.py` |
 | Symmetric memory (HIP IPC) | `primus_turbo/pytorch/core/symm_mem.py` |

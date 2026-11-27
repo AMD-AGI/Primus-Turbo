@@ -65,6 +65,19 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_attention_hipkittens_gfx1250_mla.py",
     # Dense FlyDSL attention (primus_turbo/flydsl/attention/gfx1250), bf16 head_dim 128.
     "tests/pytorch/ops/test_attention_flydsl_gfx1250.py",
+    # MXFP8 quantization (primus_turbo/flydsl/quantization/mxfp8_quant_gfx1250.py), bitwise vs the reference.
+    "tests/pytorch/ops/test_quant_mxfp8_gfx1250.py",
+    # The MXFP8 GEMM kernel (primus_turbo/flydsl/gemm/gemm_mxfp8_kernel_gfx1250.py).
+    "tests/pytorch/ops/test_gemm_mxfp8_gfx1250.py",
+    # MXFP8 through the op layer on those kernels: gemm_fp8, grouped_gemm_fp8, grouped_mlp_fp8.
+    "tests/pytorch/ops/test_mxfp8_ops_gfx1250.py",
+    # The MoE gather handoffs' host-side contract (primus_turbo/pytorch/ops/moe_gather.py).
+    "tests/pytorch/ops/test_moe_gather_handoff.py",
+    # The MXFP8 quantization ops with their raw recipes, which HIP's quantizer runs on gfx1250 as on main: a
+    # regression guard for the edited quantize_mxfp8_impl / dequantize_mxfp8_impl. Not
+    # test_quantize_mxfp8_shuffle: on gfx1250 the shuffle flags mean the gfx1250 GEMM layouts, not HIP's.
+    "tests/pytorch/ops/test_quantization.py::test_quantize_mxfp8[",
+    "tests/pytorch/ops/test_quantization.py::test_quantize_mxfp8_with_trans",
     # Sparse MLA (primus_turbo/flydsl/attention/gfx1250_sparse_mla); every backend it can pick
     # runs here.
     "tests/pytorch/ops/test_attention.py::test_sparse_mla_op",
@@ -83,9 +96,15 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe.py",
     # The same op across every visible GPU (EP2+).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe_ep.py",
+    # MegaMoE in MXFP8 (fused_mega_moe_gfx1250_fp8_impl), single GPU (EP1).
+    "tests/pytorch/ops/test_mega_mxfp8_gfx1250.py",
+    # The same across every visible GPU (EP2+).
+    "tests/pytorch/ops/test_mega_mxfp8_gfx1250_ep.py",
     # Host-only: a subprocess imports every primus_turbo.flydsl module and holds each launch
     # declared at module level to the no-mutable-global rule. The rest of that file stays skipped here.
     "tests/pytorch/ops/test_flydsl_autotune.py::test_no_module_level_launch_reads_a_mutable_global",
+    # bf16 MegaMoE with the post-norm stage2 (fused_mega_moe_gfx1250_post_norm_impl), EP2+.
+    "tests/pytorch/ops/test_mega_bf16_gfx1250_post_norm_ep.py",
 )
 
 

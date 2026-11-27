@@ -33,6 +33,11 @@ BLOCK_M = 256  # pool-block granularity + pool alignment
 
 # default dispatched-token dtype; override via ``token_dtype`` to target fp8, etc.
 TOKEN_DTYPE = torch.bfloat16
+# A launch's epoch (flag-bank parity + that bank's expected values), copied by its bump kernel into one 128-byte
+# slot per workgroup (block index modulo EPOCH_SLOTS). Every wave reads it at device scope, and device-scope reads
+# of one shared word are served one at a time: ~0.25 ms for the ~2048 waves of a comm launch.
+EPOCH_SLOTS = 1024
+EPOCH_SLOT_WORDS = 16  # i64 words: 128 bytes, two slots per 256-byte line (``GATHER_LINE_BYTES``)
 TOKEN_ALIGNMENT = 128  # get_token_alignment_for_mega_moe
 
 
@@ -393,7 +398,20 @@ class SymmBuffer:
         self._combine_parity = torch.zeros(1, dtype=torch.int64, device="cuda")
         self._combine_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
         self._reduce_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
+        # per-workgroup copies of the current epoch (EPOCH_SLOTS): dispatch (parity, expected), combine (parity,
+        # combine expected, reduce expected)
+        self._dispatch_epoch = torch.zeros(EPOCH_SLOTS * EPOCH_SLOT_WORDS, dtype=torch.int64, device="cuda")
+        self._combine_epoch = torch.zeros(EPOCH_SLOTS * EPOCH_SLOT_WORDS, dtype=torch.int64, device="cuda")
         self._sym_buffer = None  # cached so its peer-delta table stays alive with this heap
+
+    def dispatch_fp8_views(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The dispatch token buffer as MXFP8 tokens (``ep_intranode.dispatch_bf16_tile`` with scales):
+        E4M3 rows ``[R, hidden]``, then their raw E8M0 scale rows ``[R, hidden / 32]`` (uint8), R the
+        receive rows; both fit the bf16-sized region, so the heap layout is the bf16 one."""
+        rows, hidden = self.dispatch_token_buffer.shape
+        raw = self.dispatch_token_buffer.view(torch.uint8).view(-1)
+        q = raw[: rows * hidden].view(torch.float8_e4m3fn).view(rows, hidden)
+        return q, raw[rows * hidden : rows * hidden + rows * (hidden // 32)].view(rows, hidden // 32)
 
     def get_sym_buffer(self) -> SymBuffer:
         """Build (once) the SymBuffer handle; cached so its peer-delta table outlives async launches."""
@@ -428,6 +446,20 @@ class SymmBuffer:
 _CURRENT_SYMM_BUFFER = None
 
 
+def check_combine_capacity(num_tokens: int, num_topk: int, hidden: int) -> None:
+    """Raise ValueError when the combine token buffer of ``num_tokens`` tokens per rank (``align(num_tokens, 128)
+    x num_topk`` rows of ``hidden``) is out of reach of the 32-bit element offsets the combine and the reduce address
+    it with (its out-of-range sentinel included): past that they would read and write other tokens' rows."""
+    num_max_routes = align(int(num_tokens), TOKEN_ALIGNMENT) * int(num_topk)
+    if (num_max_routes + 1) * int(hidden) > 2**31:
+        max_tokens = (2**31 // int(hidden) - 1) // int(num_topk) // TOKEN_ALIGNMENT * TOKEN_ALIGNMENT
+        raise ValueError(
+            f"mega MoE on gfx1250 addresses the combine buffer with 32-bit offsets: align(tokens, {TOKEN_ALIGNMENT}) "
+            f"x topk x hidden must stay below 2**31, i.e. at most {max_tokens} tokens per rank at top-{num_topk}, "
+            f"hidden {hidden}; got {num_tokens} tokens"
+        )
+
+
 def get_symm_buffer_for_mega_moe(
     group: Optional["torch.distributed.ProcessGroup"] = None,
     *,
@@ -447,6 +479,7 @@ def get_symm_buffer_for_mega_moe(
             )
         return _CURRENT_SYMM_BUFFER
 
+    check_combine_capacity(num_max_tokens_per_rank, num_topk, hidden)
     num_max_tokens_per_rank = align(int(num_max_tokens_per_rank), TOKEN_ALIGNMENT)
     key = (
         group.size(),

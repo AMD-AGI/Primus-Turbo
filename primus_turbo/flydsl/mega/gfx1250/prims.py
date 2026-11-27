@@ -31,6 +31,7 @@ from primus_turbo.flydsl.utils.buffer_ops import (
     create_llvm_ptr,
     get_element_ptr,
 )
+from primus_turbo.flydsl.utils.prims import _readlane_i32
 
 WAVE = 32  # lanes of one hardware wave
 _WARP = 64  # lanes of a copy_warp by default: two waves
@@ -47,6 +48,10 @@ SPIN_TIMEOUT_CYCLES = 3_000_000_000
 _TH_NT = 1
 _SCOPE_DEV = 2 << 3
 _SCOPE_SYS = 3 << 3
+# coherent across the device (no stale line of this CU's caches), regular temporal hint
+CPOL_DEVICE = _SCOPE_DEV
+# the same at system scope: the line may hold a store of a peer GPU
+CPOL_SYSTEM = _SCOPE_SYS
 # non-temporal, coherent across the device: data another CU of this GPU produced
 CPOL_DEVICE_STREAM = _SCOPE_DEV | _TH_NT
 # non-temporal, coherent at system scope: a store a peer GPU reads, or a peer's store read here
@@ -294,6 +299,21 @@ def copy_warp(
     ]
     for o, v in zip(offs, vals):
         buffer_store(v, dst, dst_off + o, cache_modifier=store_cache_modifier)
+
+
+def wave_match_rank(key: ArithValue):
+    """``(rank, is_last)`` of this lane's i32 ``key`` within its hardware wave: how many lower lanes hold the same
+    key, and whether no higher lane does. A negative key is no key (``is_last`` false). It goes by lane number, so
+    unlike the values an atomic add returns it is the same in every run. Call it with every lane of the wave
+    active: it reads the other lanes' keys."""
+    lane = fx.Int32(fx.thread_idx.x) % fx.Int32(WAVE)
+    rank = fx.Int32(0)
+    num_after = fx.Int32(0)
+    for other_lane in range(WAVE):
+        same = _readlane_i32(key, fx.Int32(other_lane)) == key
+        rank = rank + arith.select(same & (lane > fx.Int32(other_lane)), fx.Int32(1), fx.Int32(0))
+        num_after = num_after + arith.select(same & (lane < fx.Int32(other_lane)), fx.Int32(1), fx.Int32(0))
+    return rank, (key >= fx.Int32(0)) & (num_after == fx.Int32(0))
 
 
 def ceildiv(a: int, b: int) -> int:
