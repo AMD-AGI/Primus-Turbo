@@ -45,6 +45,7 @@ from primus_turbo.flydsl.mega.fp8.gemm_helper import (
     scale_opsel,
     wait_barrier,
 )
+from primus_turbo.flydsl.utils.prims import _lds_barrier
 
 BLOCK_K = 128  # fp8 mxfp8 contraction tile (16x16x128 MMA spans K=128 = 4 E8M0 micro-blocks)
 # Match grouped ``mxfp8_grouped_kernel`` (_GG_SCALE_PACK): 4 K-scales/dword + per-iter opsel.
@@ -193,7 +194,9 @@ def emit_gemm_mxfp8_nt_tile(
         b0f = b_s2r.load(b_cur0)
         a0f = a_s2r.load(a_cur0)
         a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
-        rocdl.s_barrier()
+        # wave_m 0 runs one barrier ahead and refills b_cur0 right after this barrier; s_barrier
+        # waits on no counter, so wave_m 1's b0 reads must retire (lgkmcnt(0)) before it.
+        _lds_barrier()
         rocdl.s_setprio(1)
         c00 = mfma.call(a0f, b0f, c00, sa0, sb0)
         rocdl.s_setprio(0)
