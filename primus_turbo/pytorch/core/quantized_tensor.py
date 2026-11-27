@@ -25,6 +25,7 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
+from primus_turbo.pytorch.core.utils import is_gfx1250
 
 _SUPPORTED_QUANTIZED_DTYPES = [float8_e4m3, float8_e5m2, float4_e2m1fn_x2]
 _SUPPORTED_QUANTIZED_GRANS = [
@@ -771,6 +772,13 @@ class QuantizedTensor(torch.Tensor):
             return tensor._data, tensor._scale_inv, out_shape
 
         assert not tensor._k_blocked, "a K-blocked QuantizedTensor cannot be viewed or reshaped"
+        recipe = tensor._scaling_recipe
+        assert not (
+            recipe is not None
+            and (recipe.shuffle_scale or recipe.shuffle_out)
+            and tensor._dest_dtype in (float8_e4m3, float8_e5m2)
+            and is_gfx1250()
+        ), "an MXFP8 QuantizedTensor in gfx1250's MX GEMM layout cannot be viewed or reshaped"
         align = _get_padding_align_size(tensor)
         padded_target_shape = _pad_inner_dim(target_shape, align)
 
@@ -989,6 +997,42 @@ def _mxfp8_expert_weight_k_blocked(weight, dest_dtype, quant_config, need_weight
     return user is None or user.backend in (None, BackendType.FLYDSL)
 
 
+def _create_mxfp8_weight_gfx1250(weight, dest_dtype, quant_config, need_weight_transpose_cache):
+    """``create_quantized_weight`` for an MXFP8 weight on gfx1250: both copies in gfx1250's MX GEMM layout, the one
+    its MXFP8 ops read, written from one read of the weight (32x32 blocks: W and Wᵀ share their scales). None for
+    a grouped (3-D) weight the FlyDSL MX GEMMs do not take: ``grouped_gemm_fp8`` reads the generic copies then."""
+    from primus_turbo.pytorch.ops.quantization import quantize_fp8_with_trans
+    from primus_turbo.pytorch.ops.utils import mx1250_recipes
+
+    who, dense = "create_quantized_weight", weight.dim() == 2
+    recipes = mx1250_recipes(who, quant_config, torch.bfloat16, None, None, weight, strict=dense)
+    if recipes is None:
+        return None
+    recipe = recipes[2]
+    with torch.no_grad():
+        row, row_scale, col, col_scale = quantize_fp8_with_trans(
+            weight.detach(),
+            dest_dtype,
+            quant_config.granularity,
+            block_size=quant_config.block_size,
+            scaling_recipe=recipe,
+            scaling_recipe_for_trans=recipe,
+        )
+    meta = dict(
+        shape=weight.size(),
+        orig_dtype=weight.dtype,
+        dest_dtype=dest_dtype,
+        granularity=quant_config.granularity,
+        block_size=quant_config.block_size,
+        scaling_recipe=recipe,
+        requires_grad=weight.requires_grad,
+    )
+    quantized_weight = QuantizedTensor(row, row_scale, quantized_axis=-1, **meta)
+    if not need_weight_transpose_cache:
+        return quantized_weight, None
+    return quantized_weight, QuantizedTensor(col, col_scale, quantized_axis=-2, **meta)
+
+
 def create_quantized_weight(
     weight,
     dest_dtype: torch.dtype,
@@ -1034,6 +1078,16 @@ def create_quantized_weight(
             QuantizedTensor(row, row_scale, quantized_axis=-1, **meta),
             QuantizedTensor(col, col_scale, quantized_axis=-2, **meta),
         )
+
+    if (
+        isinstance(quant_config, Float8QuantConfig)
+        and quant_config.granularity == ScalingGranularity.MX_BLOCKWISE
+        and weight.dim() in (2, 3)
+        and is_gfx1250()
+    ):
+        pair = _create_mxfp8_weight_gfx1250(weight, dest_dtype, quant_config, need_weight_transpose_cache)
+        if pair is not None:
+            return pair
 
     scale_rounding_mode = (
         quant_config.scale_rounding_mode if isinstance(quant_config, Float4QuantConfig) else 0

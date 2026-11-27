@@ -49,7 +49,7 @@ notes; the kernel backend behind each cell is in
 | `gemm_fp8` | FP8 tensorwise | ✅ | ✅ | ✅ | E4M3 / E5M2 |
 | | FP8 rowwise | ✅ | ✅ | ✅ | |
 | | FP8 blockwise | ✅ | ✅ | ✅ | |
-| | MXFP8 | — | ✅ | — | |
+| | MXFP8 | — | ✅ | ✅ | gfx1250: E4M3, BF16 inputs and output, weight dims multiples of 16 |
 | `gemm_fp4` | MXFP4 | — | ✅ | — | See [MXFP4 training](./features/mxfp4.md) |
 | `mlp_fp4` | MXFP4 | — | ✅ | — | Dense GLU MLP with fused activation. See [MXFP4 training](./features/mxfp4.md) |
 
@@ -63,9 +63,9 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | `grouped_gemm_fp8` | FP8 tensorwise | ✅ | ✅ | ✅ | |
 | | FP8 rowwise | ✅ | ✅ | ✅ | |
 | | FP8 blockwise | ✅ | ✅ | ✅ | |
-| | MXFP8 | — | ✅ | ✅ | |
+| | MXFP8 | — | ✅ | ✅ | gfx1250: FlyDSL for E4M3, BF16 inputs and output and weight dims multiples of 32; any other call on Triton |
 | `grouped_gemm_fp4` | MXFP4 | — | ✅ | ✅ | See [MXFP4 training](./features/mxfp4.md) |
-| `grouped_mlp_fp8` | FP8 tensorwise / MXFP8 | — | ✅ | — | Expert MLP with SwiGLU / GeGLU fused into the grouped GEMM |
+| `grouped_mlp_fp8` | FP8 tensorwise / MXFP8 | — | ✅ | ✅ | Expert MLP with SwiGLU / GeGLU fused into the grouped GEMM; gfx1250: MXFP8 only (E4M3, BF16 inputs and output, weight dims multiples of 32, intermediate width of 128) |
 | `grouped_mlp_fp4` | MXFP4 | — | ✅ | — | Same, MXFP4. See [MXFP4 training](./features/mxfp4.md) |
 
 ### 2.3 Attention
@@ -87,7 +87,7 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | `moe_permute`, `moe_unpermute` | BF16 / FP8 tensorwise | ✅ | ✅ | ✅ | |
 | `moe_dispatch`, `moe_combine` | – | ✅ | ✅ | ✅ | Expert-parallel token dispatch / combine (intra- and inter-node; gfx1250 within one host) |
 | **MegaMoE**<br>`fused_mega_moe` (+ `_stage1` / `_stage2`) | BF16 | — | ✅ | ✅ | Dispatch + FC1 and FC2 + combine fused, intra-node EP. See [MegaMoE](./features/mega_moe.md) |
-| **MegaMoE**<br>`fused_mega_moe_fp8_stage1` / `_stage2` | MXFP8 | — | ✅ | — | Staged API only. See [MegaMoE](./features/mega_moe.md) |
+| **MegaMoE**<br>`fused_mega_moe_fp8_stage1` / `_stage2` | MXFP8 | — | ✅ | ✅ | Staged API only; gfx1250: hidden % 512, intermediate % 128, SiLU-SwiGLU, no expert biases. See [MegaMoE](./features/mega_moe.md) |
 
 ### 2.5 Normalization, activation, position embedding, loss
 
@@ -115,7 +115,7 @@ These are fwd-only utilities; the `_with_trans` variants also emit the transpose
 | | MXFP8 | — | ✅ | ✅ | |
 | `quantize_fp8_with_trans` | FP8 blockwise | ✅ | ✅ | ✅ | |
 | | MXFP8 | — | ✅ | ✅ | |
-| `grouped_quantize_fp8` / `_with_trans`, `grouped_dequantize_fp8` | MXFP8 | — | ✅ | ✅ | Per-expert |
+| `grouped_quantize_fp8` / `_with_trans`, `grouped_dequantize_fp8` | MXFP8 | — | ✅ | ✅ | Per-expert; on gfx1250 `_with_trans` fuses the MoE gather. See [MoE gather quantization](./moe_gather_quantization.md) |
 | `quantize_fp4`, `quantize_fp4_with_trans`, `dequantize_fp4` | MXFP4 | — | ✅ | ✅ | |
 | `grouped_quantize_fp4` / `_with_trans`, `grouped_dequantize_fp4` | MXFP4 | — | ✅ | ✅ | Fuses MoE gather. See [MoE gather quantization](./moe_gather_quantization.md) |
 | `weight_deosc_update`, `weight_deosc_close` | MXFP4 | ✅ | ✅ | — | Suppresses low-precision weight oscillation during training. See [MXFP4 training](./features/mxfp4.md#weight-de-oscillation) |
@@ -165,13 +165,13 @@ registration order, with the arch / format limits from each backend's `can_handl
 | Op | Backends |
 |---|---|
 | `gemm` | HIPBLASLT, TRITON |
-| `gemm_fp8` | TURBO (MXFP8, gfx950), HIPBLASLT (tensorwise; MXFP8 not on gfx942), CK (tensorwise / rowwise / blockwise; not gfx1250), TRITON (tensorwise / rowwise / blockwise), FLYDSL (tensorwise / MXFP8; gfx950) |
+| `gemm_fp8` | TURBO (MXFP8, gfx950), HIPBLASLT (tensorwise; MXFP8 on gfx950 only), CK (tensorwise / rowwise / blockwise; not gfx1250), TRITON (tensorwise / rowwise / blockwise), FLYDSL (tensorwise / MXFP8 on gfx950; MXFP8 on gfx1250) |
 | `gemm_fp4` | AITER (gfx950, NT layout), HIPBLASLT (not gfx942), FLYDSL (gfx950) |
 | `mlp_fp4` | FLYDSL (fused GLU + MXFP4 quantization, forward and backward; required, gfx950), HIPBLASLT (remaining GEMMs, default) |
 | `grouped_gemm` | CK (not gfx1250), HIPBLASLT, TRITON, FLYDSL (gfx950, gfx1250) |
-| `grouped_gemm_fp8` | CK (tensorwise / rowwise; not gfx1250), HIPBLASLT (tensorwise), TRITON (all formats; MXFP8 not on gfx942), FLYDSL (tensorwise / MXFP8; gfx950) |
+| `grouped_gemm_fp8` | CK (tensorwise / rowwise; not gfx1250), HIPBLASLT (tensorwise), TRITON (all formats; MXFP8 not on gfx942), FLYDSL (tensorwise / MXFP8 on gfx950; MXFP8 on gfx1250) |
 | `grouped_gemm_fp4` | FLYDSL (gfx950), TRITON (not gfx942) |
-| `grouped_mlp_fp8` | FLYDSL (gfx950), TRITON |
+| `grouped_mlp_fp8` | FLYDSL (gfx950; MXFP8 on gfx1250), TRITON |
 | `grouped_mlp_fp4` | FLYDSL (gfx950) |
 | `flash_attn_func` | FLYDSL (gfx950: causal, head dim 64/128, sbhd; gfx1250: head dim 128 GQA and DeepSeek-V3 MLA 192/128, the MLA backward keeping its dS scratch within `PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB` MiB (default 5120) unless one head's needs more, or on HipKittens kernels with `PRIMUS_TURBO_MLA_BWD_IMPL=hk` where seqlen_q % 384 is 0 or 256), AITER (general fallback; default on gfx942), HIPKITTENS (gfx950, causal, sbhd), GLUON (gfx950, fwd only), TRITON (gfx1250) |
 | `flash_attn_varlen_func` | FLYDSL (gfx950), AITER |

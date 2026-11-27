@@ -22,10 +22,11 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
     check_quantized_tensor,
 )
-from primus_turbo.pytorch.core.utils import is_gfx942
+from primus_turbo.pytorch.core.utils import is_gfx942, is_gfx1250
 from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
     gemm_fp8_accum_impl,
     gemm_fp8_impl,
+    mx1250_gemm_direct,
 )
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import quantize_mxfp8_impl
 from primus_turbo.pytorch.ops.quantization import (
@@ -33,9 +34,11 @@ from primus_turbo.pytorch.ops.quantization import (
     quantize_fp8_with_trans,
 )
 from primus_turbo.pytorch.ops.utils import (
+    MX_A,
     _get_dummy_wgrad,
     _get_fp8_dtype,
     _setup_fused_grad_accum,
+    mx1250_recipes,
 )
 
 __all__ = ["gemm_fp8"]
@@ -535,6 +538,21 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         )
 
 
+def _mx1250_gemm(a, a_scale_inv, trans_a, b, b_scale_inv, trans_b, out_dtype, trans_c, **kwargs):
+    """``_bgrad_gemm_fp8_impl_wrapper`` for the MXFP8 linear's GEMMs on gfx1250: the kernel is called directly where
+    the dispatcher would pick it (no torch.library dispatch per call), else through the custom op. The default
+    backend is FlyDSL whatever the caller's: hipBLASLt has no correct MX GEMM here."""
+    accum = kwargs.get("inplace_add_to_out", False)
+    out = kwargs.get("out") if accum else None
+    assert not trans_a and trans_b and not trans_c and (out is not None or not accum)
+    res = mx1250_gemm_direct(a, a_scale_inv, b, b_scale_inv, out_dtype, out)
+    if res is None:
+        kwargs["default_backend"] = BackendType.FLYDSL.value
+        args = (a, a_scale_inv, trans_a, b, b_scale_inv, trans_b, out_dtype, trans_c)
+        return _bgrad_gemm_fp8_impl_wrapper(*args, **kwargs)
+    return res if out is None else _get_dummy_wgrad(out.shape, out_dtype)
+
+
 class FP8GemmMXFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -554,6 +572,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
         assert trans_a == False and trans_b == True, "trans_a has to be False and trans_b has to be True"
 
+        # gfx1250's MX GEMM reads one operand layout: its recipes, or NotImplementedError before b is marked
+        who, fuse = "gemm_fp8 (MX_BLOCKWISE)", fuse_bgrad_accum_pattern
+        mx1250 = is_gfx1250() and mx1250_recipes(who, config, out_dtype, a, a_t, b, b_t, fuse=fuse)
         fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
 
         # Scale preshuffle is NOT done here: the quant emits raw E8M0 [dim, K//32]
@@ -564,6 +585,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
         block_size = config.block_size
 
         a_scaling_recipe = ScalingRecipe()
+        a_t_scaling_recipe, b_scaling_recipe = a_scaling_recipe, ScalingRecipe(use_2d_block=True)
+        if mx1250:
+            a_scaling_recipe, a_t_scaling_recipe, b_scaling_recipe = mx1250
         if isinstance(a, QuantizedTensor):
             check_quantized_tensor(a, config, axis=-1, scaling_recipe=a_scaling_recipe)
             a_row, a_row_scale = a.qdata, a.scale_inv
@@ -574,7 +598,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
                     granularity,
                     axis=-2,
                     block_size=block_size,
-                    scaling_recipe=a_scaling_recipe,
+                    scaling_recipe=a_t_scaling_recipe,
                 )
             a_col, a_col_scale = a_t.qdata, a_t.scale_inv
         else:
@@ -585,10 +609,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
                 block_size,
                 with_trans=True,
                 scaling_recipe=a_scaling_recipe,
-                scaling_recipe_for_trans=a_scaling_recipe,
+                scaling_recipe_for_trans=a_t_scaling_recipe,
             )
 
-        b_scaling_recipe = ScalingRecipe(use_2d_block=True)
         if isinstance(b, QuantizedTensor):
             check_quantized_tensor(b, config, axis=-1, scaling_recipe=b_scaling_recipe)
             b_row, b_row_scale = b.qdata, b.scale_inv
@@ -614,7 +637,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             )
 
         # NT layout
-        out = gemm_fp8_impl(
+        out = (_mx1250_gemm if mx1250 else gemm_fp8_impl)(
             a_row,
             a_row_scale,
             False,
@@ -644,6 +667,10 @@ class FP8GemmMXFunction(torch.autograd.Function):
         # a strided grad_out (e.g. a transpose/slice upstream) would trip it.
         grad_out = grad_out.reshape(grad_out.shape[0], -1).contiguous()
 
+        # gfx1250: grad_out's two copies are A operands of its MX GEMMs
+        mx1250 = is_gfx1250()
+        g_scaling_recipe = MX_A if mx1250 else ScalingRecipe()
+
         # Dual-cast grad_out: one kernel emits both the row-wise (grad_a, NN->NT) and
         # col-wise (grad_b, TN->NT) directions -- no second single-direction pass.
         g_row, g_row_scale, g_col, g_col_scale = quantize_mxfp8_impl(
@@ -652,11 +679,11 @@ class FP8GemmMXFunction(torch.autograd.Function):
             None,
             ctx.config.block_size,
             with_trans=True,
-            scaling_recipe=ScalingRecipe(),
-            scaling_recipe_for_trans=ScalingRecipe(),
+            scaling_recipe=g_scaling_recipe,
+            scaling_recipe_for_trans=g_scaling_recipe,
         )
 
-        grad_a = gemm_fp8_impl(
+        grad_a = (_mx1250_gemm if mx1250 else gemm_fp8_impl)(
             g_row,
             g_row_scale,
             False,
@@ -669,7 +696,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             default_backend=_stage_backend(ctx.config, BackendType.FLYDSL),
         )
 
-        grad_b = _bgrad_gemm_fp8_impl_wrapper(
+        grad_b = (_mx1250_gemm if mx1250 else _bgrad_gemm_fp8_impl_wrapper)(
             g_col,
             g_col_scale,
             False,
