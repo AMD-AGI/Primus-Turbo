@@ -15,7 +15,7 @@
 
 import torch
 
-from . import flash_attn_bwd_mla as fb
+from .. import flash_attn_bwd_stock as fb
 
 _LOG2E = fb._LOG2E
 # The sm*log2e score fold rides on the kernel's K packs (see K_PRE) instead of a host pass over Q.
