@@ -59,6 +59,8 @@ from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
+import primus_turbo.common.envs as envs
+
 try:  # optional: only used for a friendlier LDS-overflow message
     from flydsl.runtime.device import get_rocm_arch as _get_arch
     from flydsl.utils.smem_allocator import check_smem_capacity as _check_smem
@@ -734,6 +736,11 @@ def _launch_grouped_bf16_variable_k(
     # does not read), the sum staged in place over them and TDM-stored. 2 = every lane reads its fragments of
     # the old C from global memory into registers and writes the sums back, no LDS.
     accum: Constexpr[int] = 0,
+    # `arg_c` under `accum`. 0 = fp32, as above. 1 = the operand dtype (e.g. a bf16 main_grad): the old C is added
+    # to the fp32 accumulators and the sum rounded once; with `accum` 1 a tile that fits one ring buffer comes in
+    # whole during the last k-tile. 2 = the operand dtype, the accumulators rounded to it before the add, which
+    # reproduces a separate dW and `out.add_(dW)` bit for bit (the entry's `_round_first` test hook).
+    accum_c16: Constexpr[int] = 0,
 ):
     WMMA_M = WMMA_N = 16
     WMMA_K = 32
@@ -932,31 +939,47 @@ def _launch_grouped_bf16_variable_k(
         EPI_OPS //= 2
     if accum not in (0, 1, 2):
         raise ValueError(f"accum must be 0, 1 or 2, got {accum}")
-    if accum and (
-        persist
-        or MC > 1
-        or vk_seam
-        or head_pipe
-        or out_ldc
-        or epi_chunk != 1
-        or tdm_deal
-        or vk_ovl
-        or issue_first
-    ):
+    # The k-loop knobs (head_pipe, tdm_deal, the cluster) leave the old C alone: its early load is issued at the
+    # last k-tile's head, past the last in-loop fence, by a plain TDM load. Under `persist` a 16-bit C through LDS
+    # sits in the C staging slots, clear of the next tile's prefetch (C_PERSIST below), and its TDM stores read them
+    # as the overwrite's do, so vk_ovl's seam carries over; vk_seam bits 0, 4 and 7 up and the chunked epilogue are
+    # not built for it.
+    if accum and (out_ldc or epi_chunk != 1 or issue_first or (vk_seam & ~14)):
         raise ValueError(
-            "accum needs persist=0, no cluster, vk_seam=0, head_pipe=0, out_ldc=0, epi_chunk=1, tdm_deal=0, "
-            "vk_ovl=0 and issue_first=0"
+            "accum needs out_ldc=0, epi_chunk=1, issue_first=0 and vk_seam within bits 1, 2 and 3"
         )
-    CEB = 4  # fp32 C under `accum`
+    if accum_c16 not in (0, 1, 2) or (accum_c16 and not accum):
+        raise ValueError(f"accum_c16 must be 0, or 1 or 2 with accum, got {accum_c16}")
+    if accum and persist and not (accum == 1 and accum_c16):
+        raise ValueError("persist with accum needs a 16-bit C through LDS (accum 1, accum_c16)")
+    CEB = EB if accum_c16 else 4  # bytes per element of C under `accum`
     # accum 1: a half is C_HALF rows of the old C, padded like the stage rows; each fits one ring buffer, and
     # the two warp rows split the tile along the same line, so a wave reads, adds and stages within one half.
     C_LDS_ROW = tile_n * CEB + LDS_PAD
     C_HALF = tile_m // 2
-    if accum == 1 and (m_warp != 2 or C_HALF * C_LDS_ROW > PITCH):
+    C_WHOLE = bool(accum_c16) and tile_m * C_LDS_ROW <= PITCH
+    C_ROWS = tile_m if C_WHOLE else C_HALF  # rows of the old C per TDM load and store
+    # A 16-bit C in two halves with three buffers or more: past the fence ahead of the last k-tile two buffers are
+    # free, so both halves come in during that k-tile, and none is left to load after the k-loop.
+    C_BOTH_EARLY = bool(accum_c16) and accum == 1 and not C_WHOLE and num_buffers >= 3 and not persist
+    if accum == 1 and not C_WHOLE and (m_warp != 2 or C_HALF * C_LDS_ROW > PITCH):
         raise ValueError(
-            f"accum=1 needs m_warp=2 and half the fp32 C tile ({C_HALF * C_LDS_ROW} B) within one ring buffer "
+            f"accum=1 needs m_warp=2 and half the C tile ({C_HALF * C_LDS_ROW} B) within one ring buffer "
             f"({PITCH} B)"
         )
+    # Under `persist` part p of the old C (the whole tile, or half p) sits in ring slot p, inside the C staging
+    # region that BUF_SHIFT keeps clear of the next tile's prefetch. A part comes in at the last k-tile's head
+    # unless that k-tile reads its slot (K_TILES % num_buffers decides, uniform per tile), else past the entry
+    # fence, ahead of the prefetch.
+    C_PERSIST = bool(accum == 1 and persist)
+    C_NS = 1 if C_WHOLE else 2
+    if C_PERSIST and (C_NS > C_PITCHES or not PREFETCH_OK):
+        raise ValueError(
+            f"persist with accum needs the old C's {C_NS} ring slot(s) within the C staging ({C_PITCHES}) and a "
+            f"slot past it for the next tile's prefetch ({num_buffers} buffers)"
+        )
+    if C_PERSIST:
+        EPI_OPS = C_NS  # a TDM store per part of the old C, one op on every wave
 
     @flyc.kernel(name="kernel_grouped_bf16_variable_k_gfx1250", known_block_size=[block, 1, 1])
     def kernel_grouped_variable_k(
@@ -1172,6 +1195,14 @@ def _launch_grouped_bf16_variable_k(
             gB_base = fx.recast_iter(fx.Int8, arg_b)
             gC_base = fx.recast_iter(fx.PointerType.get(elem_cls.ir_type, arg_c.address_space), arg_c)
 
+            def _c_sum(acc, old):
+                # What `accum` stores for a fragment: the fp32 sum, or (`accum_c16`) the sum rounded once.
+                if const_expr(not accum_c16):
+                    return acc + old
+                if const_expr(accum_c16 == 2):
+                    acc = acc.to(elem_cls).to(fx.Float32)
+                return (acc + old.to(fx.Float32)).to(elem_cls)
+
             if const_expr(accum == 1):
                 gC8_base = fx.recast_iter(fx.Int8, arg_c)
                 ldc_b4 = ldc64 * CEB
@@ -1184,20 +1215,30 @@ def _launch_grouped_bf16_variable_k(
                     ) * fx.Int64(CEB)
 
                 def _c_load(dst, hh):
-                    # Rows hh * C_HALF .. (hh + 1) * C_HALF of this tile's old C into LDS at `dst`, rows
+                    # Rows hh * C_HALF .. hh * C_HALF + C_ROWS of this tile's old C into LDS at `dst`, rows
                     # C_LDS_ROW apart. Whole tiles only (checked by the entry point), so the window lies inside
-                    # the allocation. The last wave issues it: it issues no operand loads, so its TENSORcnt
-                    # holds these alone.
+                    # the allocation. The last wave issues it past the last fence that counts operand loads, so
+                    # its TENSORcnt holds these alone.
                     if wave == num_waves - 1:
-                        gt = _gv(gC8_base, _c_half_off(hh), (C_HALF, tile_n * CEB), (ldc_b4, 1))
-                        atom = _tdm(gt, fx.Int32(C_HALF), fx.Int32(tile_n * CEB), ldc_b4, tile_n * CEB)
-                        fx.copy(atom, gt, _lv(dst, (C_HALF, tile_n * CEB), (C_LDS_ROW, 1)))
+                        gt = _gv(gC8_base, _c_half_off(hh), (C_ROWS, tile_n * CEB), (ldc_b4, 1))
+                        atom = _tdm(gt, fx.Int32(C_ROWS), fx.Int32(tile_n * CEB), ldc_b4, tile_n * CEB)
+                        fx.copy(atom, gt, _lv(dst, (C_ROWS, tile_n * CEB), (C_LDS_ROW, 1)))
 
                 def _c_early(kt):
                     # During the last k-tile `kt`, into the buffer it does not read: k-tile kt - 1 is consumed by
-                    # the fence ahead of it, and nothing is prefetched past the steady loop.
+                    # the fence ahead of it, and nothing is prefetched past the steady loop. With C_BOTH_EARLY the
+                    # second half too, into the buffer of k-tile kt - 2 (three buffers) or kt - 3 (four).
+                    # C_PERSIST: every part whose slot k-tile kt does not read.
                     def _go():
-                        _c_load(_buf_ptr(_slot(kt + 1)), 0)
+                        if const_expr(C_PERSIST):
+                            c_last = _slot(kt)
+                            for p in range_constexpr(C_NS):
+                                if c_last != fx.Int32(p):
+                                    _c_load(_buf_ptr(p), p)
+                        else:
+                            _c_load(_buf_ptr(_slot(kt + 1)), 0)
+                            if const_expr(C_BOTH_EARLY):
+                                _c_load(_buf_ptr(_slot(kt + 2)), 1)
 
                     return _go
 
@@ -1561,12 +1602,13 @@ def _launch_grouped_bf16_variable_k(
                 _hold_live(ring[0])
                 rocdl.sched_barrier(0)
 
-            def _hp_ktile(addrs, prefetch_kt, head, prev_tail=None, first=False):
+            def _hp_ktile(addrs, prefetch_kt, head, prev_tail=None, first=False, c_load=None):
                 # `head` holds this k-tile's sub-step 0, read in the previous barrier window.
                 # `prev_tail` (the previous k-tile's deferred sub-step, whose matrix ops may still be
                 # in flight) is held live across this run so the reads here cannot reuse its registers.
                 # `first`: the head was read just ahead of this run, so its matrix ops wait for their
                 # own fragments instead of the whole head.
+                # `c_load` (`accum` 1, last k-tile): the early load of the old C, issued at sub-step 0.
                 ring = [head, None]
                 for ks in range_constexpr(K_WS):
                     load_ks = ks + 1
@@ -1578,6 +1620,10 @@ def _launch_grouped_bf16_variable_k(
                         if const_expr(ks == 0 and prefetch_kt is not None):
                             rocdl.sched_barrier(0)
                             issue(_slot(prefetch_kt), prefetch_kt)
+                            rocdl.sched_barrier(0)
+                        if const_expr(ks == 0 and c_load is not None):
+                            rocdl.sched_barrier(0)
+                            c_load()
                             rocdl.sched_barrier(0)
                         if const_expr(load_ks < K_WS):
                             ring[load_ks % 2] = _load_ks(addrs, load_ks)
@@ -1781,7 +1827,8 @@ def _launch_grouped_bf16_variable_k(
                     if const_expr((vk_seam & 16) and j == NB1 - 1):
                         if pre_b:
                             _pre_issue()
-                    tail = _hp_ktile(_addrs(kt), None, HEAD)
+                    c_load = _c_early(kt) if const_expr(accum == 1 and j == NB1 - 1) else None
+                    tail = _hp_ktile(_addrs(kt), None, HEAD, c_load=c_load)
                     if const_expr((vk_seam & 16) and j == NB1 - 2):
                         _hp_fence(tail, (pre_a, TDM_PW * PRE_KT, pre_not_a, 0), _addrs(kt + 1), HEAD)
                     elif const_expr(j < num_buffers - 2):
@@ -1814,6 +1861,13 @@ def _launch_grouped_bf16_variable_k(
             _fence(outstanding=(TDM_PW * PRE_KT) if const_expr(vk_seam & 16) else 0)
             if const_expr(MC > 1 and mc_epi_sync):
                 _cluster.cluster_barrier()
+            if const_expr(C_PERSIST):
+                # The part of the old C in the slot the last k-tile read, ahead of the next tile's prefetch so that
+                # the last wave's TENSORcnt retires it first.
+                c_last = _slot(K_TILES - 1)
+                for p in range_constexpr(C_NS):
+                    if c_last == fx.Int32(p):
+                        _c_load(_buf_ptr(p), p)
             if const_expr(vk_seam & 4096):
                 # The fence's barrier put every wave past the k-loop; the next tile waits for this signal.
                 if tile_raw + fx.Int32(C_STEP) < fx.Int32(C_TOTAL):
@@ -2215,17 +2269,39 @@ def _launch_grouped_bf16_variable_k(
                 if const_expr(vk_seam & 512):
                     _async_chunk(epi_chunk - 1, 0)
             elif const_expr(accum == 1):
-                # Half 0 landed during the last k-tile and the entry fence drained it. Half 1 goes into the last
-                # k-tile's buffer, free past that fence, while the waves of half 0 add theirs. Each lane overwrites
-                # the 32 B it read, so the sums are staged in place.
-                p_h0 = _buf_ptr(_slot(K_TILES))
-                p_h1 = _buf_ptr(_slot(K_TILES - 1))
-                _c_load(p_h1, 1)
-                # Half 1's base is backed off by its first row, so a wave's row offsets stay the tile's.
-                c_base = (wave_m == fx.Int32(0)).select(
-                    fx.Int32(_bidx(p_h0)), fx.Int32(_bidx(p_h1)) - fx.Int32(C_HALF * C_LDS_ROW)
-                )
-                vec8f = ir.VectorType.get([8], ir.F32Type.get())
+                if const_expr(C_PERSIST):
+                    # Part p in slot p; the one in the last k-tile's slot, if any, was issued past the entry fence.
+                    p_h0 = _buf_ptr(0)
+                    if const_expr(C_WHOLE):
+                        c_base = fx.Int32(_bidx(p_h0))
+                    else:
+                        p_h1 = _buf_ptr(1)
+                        c_base = (wave_m == fx.Int32(0)).select(
+                            fx.Int32(_bidx(p_h0)), fx.Int32(_bidx(p_h1)) - fx.Int32(C_HALF * C_LDS_ROW)
+                        )
+                elif const_expr(C_WHOLE):
+                    # The whole old C landed during the last k-tile and the entry fence drained it.
+                    p_h0 = _buf_ptr(_slot(K_TILES))
+                    c_base = fx.Int32(_bidx(p_h0))
+                elif const_expr(C_BOTH_EARLY):
+                    # Both halves landed during the last k-tile and the entry fence drained them.
+                    p_h0 = _buf_ptr(_slot(K_TILES))
+                    p_h1 = _buf_ptr(_slot(K_TILES + 1))
+                    c_base = (wave_m == fx.Int32(0)).select(
+                        fx.Int32(_bidx(p_h0)), fx.Int32(_bidx(p_h1)) - fx.Int32(C_HALF * C_LDS_ROW)
+                    )
+                else:
+                    # Half 0 landed during the last k-tile and the entry fence drained it. Half 1 goes into the
+                    # last k-tile's buffer, free past that fence, while the waves of half 0 add theirs.
+                    p_h0 = _buf_ptr(_slot(K_TILES))
+                    p_h1 = _buf_ptr(_slot(K_TILES - 1))
+                    _c_load(p_h1, 1)
+                    # Half 1's base is backed off by its first row, so a wave's row offsets stay the tile's.
+                    c_base = (wave_m == fx.Int32(0)).select(
+                        fx.Int32(_bidx(p_h0)), fx.Int32(_bidx(p_h1)) - fx.Int32(C_HALF * C_LDS_ROW)
+                    )
+                # Each lane overwrites the bytes it read, so the sums are staged in place.
+                vec_c = vec8 if const_expr(accum_c16) else ir.VectorType.get([8], ir.F32Type.get())
 
                 def _c_lds(wm, wn):
                     row_rel = wmb + wm * WMMA_M + lane16
@@ -2234,7 +2310,7 @@ def _launch_grouped_bf16_variable_k(
 
                 def _old_c(wm):
                     return [
-                        Vec(_llvm.load(vec8f, _c_lds(wm, wn), alignment=16))
+                        Vec(_llvm.load(vec_c, _c_lds(wm, wn), alignment=16))
                         for wn in range_constexpr(wmma_n_rep)
                     ]
 
@@ -2244,7 +2320,7 @@ def _launch_grouped_bf16_variable_k(
                     for wm in range_constexpr(wmma_m_rep):
                         nxt = _old_c(wm + 1) if const_expr(wm + 1 < wmma_m_rep) else None
                         for wn in range_constexpr(wmma_n_rep):
-                            s = accs[wm * wmma_n_rep + wn] + olds[wn]
+                            s = _c_sum(accs[wm * wmma_n_rep + wn], olds[wn])
                             _llvm.store(s.ir_value(), _c_lds(wm, wn), alignment=16)
                         olds = nxt
                         rocdl.sched_barrier(0)
@@ -2252,7 +2328,7 @@ def _launch_grouped_bf16_variable_k(
                 def _store_half(hh, src):
                     # A TDM store does not de-pad, so the padded rows go out as global rows of C_LDS_ROW bytes
                     # whose dim-1 extent stops at tile_n * CEB: the pad bytes fall outside it and are dropped.
-                    gt_h = _gv(gC8_base, _c_half_off(hh), (C_HALF, C_LDS_ROW), (ldc_b4, 1))
+                    gt_h = _gv(gC8_base, _c_half_off(hh), (C_ROWS, C_LDS_ROW), (ldc_b4, 1))
                     atom_h = fx.rocdl.make_tdm_atom(
                         gt_h,
                         [n_valid - fx.Int32(hh * C_HALF), fx.Int32(tile_n * CEB)],
@@ -2261,22 +2337,61 @@ def _launch_grouped_bf16_variable_k(
                         cache_modifier=tdm_store_cache,
                         early_timeout=False,
                     )
-                    fx.copy(atom_h, _lv(src, (C_HALF, C_LDS_ROW), (C_LDS_ROW, 1)), gt_h)
+                    fx.copy(atom_h, _lv(src, (C_ROWS, C_LDS_ROW), (C_LDS_ROW, 1)), gt_h)
 
-                if wave_m == fx.Int32(0):
+                if const_expr(C_PERSIST):
+                    # In flight on the last wave behind a late part: its own share of the next tile's prefetch.
+                    PF_OPS = TDM_PW * PRE_KT if const_expr(tdm_deal or num_waves <= 2) else 0
+                    c_last = _slot(K_TILES - 1)
+                    if const_expr(C_WHOLE):
+                        if c_last == fx.Int32(0):
+                            tdm_ops.tensor_wait(PF_OPS)
+                            gpu.barrier()
+                        _add_stage()
+                        gpu.barrier()
+                        _store_half(0, p_h0)
+                    else:
+                        if c_last < fx.Int32(2):
+                            # One half is late: the waves of the other one add theirs while it lands.
+                            first = (c_last == fx.Int32(0)).select(fx.Int32(1), fx.Int32(0))
+                            if wave_m == first:
+                                _add_stage()
+                            tdm_ops.tensor_wait(PF_OPS)
+                            gpu.barrier()
+                            _store_half(first, _buf_ptr(first))
+                            if wave_m != first:
+                                _add_stage()
+                            gpu.barrier()
+                            _store_half(fx.Int32(1) - first, _buf_ptr(fx.Int32(1) - first))
+                        else:
+                            _add_stage()
+                            gpu.barrier()
+                            _store_half(0, p_h0)
+                            _store_half(1, p_h1)
+                elif const_expr(C_WHOLE):
                     _add_stage()
-                tdm_ops.tensor_wait(0)
-                gpu.barrier()
-                # Half 0 leaves while the waves of half 1 add theirs.
-                _store_half(0, p_h0)
-                if wave_m != fx.Int32(0):
+                    gpu.barrier()
+                    _store_half(0, p_h0)
+                elif const_expr(C_BOTH_EARLY):
                     _add_stage()
-                gpu.barrier()
-                _store_half(1, p_h1)
+                    gpu.barrier()
+                    _store_half(0, p_h0)
+                    _store_half(1, p_h1)
+                else:
+                    if wave_m == fx.Int32(0):
+                        _add_stage()
+                    tdm_ops.tensor_wait(0)
+                    gpu.barrier()
+                    # Half 0 leaves while the waves of half 1 add theirs.
+                    _store_half(0, p_h0)
+                    if wave_m != fx.Int32(0):
+                        _add_stage()
+                    gpu.barrier()
+                    _store_half(1, p_h1)
             elif const_expr(accum == 2):
-                # Each lane's fragment row is 8 contiguous fp32 of one C row: read, add, write back in place.
+                # Each lane's fragment row is 8 contiguous elements of one C row: read, add, write back in place.
                 _PTR1 = ir.Type.parse("!llvm.ptr<1>")
-                vec8f = ir.VectorType.get([8], ir.F32Type.get())
+                vec_c = vec8 if const_expr(accum_c16) else ir.VectorType.get([8], ir.F32Type.get())
                 c_lane = fx.Int64(fx.ptrtoint(fx.recast_iter(fx.Int8, arg_c))) + (
                     fx.Int64(g_idx) * fx.Int64(C_GRP_ELEMS)
                     + fx.Int64(blk_n + wmb + lane16) * ldc64
@@ -2291,7 +2406,7 @@ def _launch_grouped_bf16_variable_k(
 
                 def _old_c_glb(wm):
                     return [
-                        Vec(_llvm.load(vec8f, _c_glb(wm, wn), alignment=16))
+                        Vec(_llvm.load(vec_c, _c_glb(wm, wn), alignment=16))
                         for wn in range_constexpr(wmma_n_rep)
                     ]
 
@@ -2300,7 +2415,7 @@ def _launch_grouped_bf16_variable_k(
                 for wm in range_constexpr(wmma_m_rep):
                     nxt = _old_c_glb(wm + 1) if const_expr(wm + 1 < wmma_m_rep) else None
                     for wn in range_constexpr(wmma_n_rep):
-                        s = accs[wm * wmma_n_rep + wn] + olds[wn]
+                        s = _c_sum(accs[wm * wmma_n_rep + wn], olds[wn])
                         _llvm.store(s.ir_value(), _c_glb(wm, wn), alignment=16)
                     olds = nxt
                     rocdl.sched_barrier(0)
@@ -2768,18 +2883,29 @@ wgrad_tn_ok = grouped_gemm_bf16_variable_k_supported
 _VK_ACCUM_IMPLS = {"tdm": 1, "reg": 2}
 
 
-def _vk_accum_tdm_fits(tile_m: int, tile_n: int, tile_k: int, m_warp: int, lds_pad: int) -> bool:
-    """The launcher's `accum` 1 precondition: two warp rows, half the padded fp32 tile within one PITCH."""
+def _vk_accum_tdm_fits(
+    tile_m: int, tile_n: int, tile_k: int, m_warp: int, lds_pad: int, c_eb: int = 4
+) -> bool:
+    """The launcher's `accum` 1 precondition for a C of `c_eb`-byte elements: two warp rows and half the padded
+    tile within one PITCH, or (16-bit C) the whole padded tile within one PITCH."""
 
     def stage(cols):
         return (tile_k * (cols * 2 + lds_pad) + 15) // 16 * 16
 
     pitch = (stage(tile_m) + stage(tile_n) + 1023) // 1024 * 1024
-    return m_warp == 2 and (tile_m // 2) * (tile_n * 4 + lds_pad) <= pitch
+    c_row = tile_n * c_eb + lds_pad
+    if c_eb < 4 and tile_m * c_row <= pitch:
+        return True
+    return m_warp == 2 and (tile_m // 2) * c_row <= pitch
 
 
-def grouped_gemm_bf16_variable_k_accum_supported(OUT_M: int, OUT_N: int, avg_m: int = 0) -> bool:
-    """Whether ``accumulate=1`` can serve this shape: whole output tiles of the tile it picks."""
+def grouped_gemm_bf16_variable_k_accum_supported(
+    OUT_M: int, OUT_N: int, avg_m: int = 0, out_dtype: torch.dtype = torch.float32
+) -> bool:
+    """Whether ``accumulate=1`` can serve this shape into an ``out`` of ``out_dtype``: whole output tiles of the
+    tile it picks, into fp32 or a 16-bit float (the operands' dtype)."""
+    if out_dtype not in (torch.float32, *_F16):
+        return False
     tile_m, tile_n = _pick_variable_k_config(OUT_M, OUT_N, avg_m)[:2]
     return OUT_M >= tile_m and OUT_N >= tile_n and OUT_M % tile_m == 0 and OUT_N % tile_n == 0
 
@@ -2843,13 +2969,18 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
     # Epilogue / tile-decode seam; see the launcher's `vk_seam`. Not a `_STACK_KEYS` member: 0 = off.
     vk_seam: int = 0,
     vk_stagger: int = 0,
-    # 1 = accumulate: ``out[g] += a[rows_g].T @ b[rows_g]`` into an fp32 ``out`` (e.g. a weight's main_grad),
-    # the old ``out`` added to the fp32 accumulators with no rounding to the operand dtype. Whole output tiles
-    # only (``grouped_gemm_bf16_variable_k_accum_supported``); runs the plain, non-persistent epilogue.
+    # 1 = accumulate: ``out[g] += a[rows_g].T @ b[rows_g]`` into ``out`` (e.g. a weight's main_grad), fp32 or the
+    # operands' dtype. The old ``out`` is added to the fp32 accumulators: an fp32 ``out`` with no rounding to the
+    # operand dtype, a 16-bit one rounded once. Whole output tiles only
+    # (``grouped_gemm_bf16_variable_k_accum_supported``); runs the plain epilogue, a 16-bit out also under
+    # ``persist`` (with vk_ovl, vk_seam bits 1 to 3 and vk_stagger).
     accumulate: int = 0,
     # How the old ``out`` reaches the accumulators: "tdm" through LDS (TDM loads and stores), "reg" straight
-    # from global memory into registers, "auto" = "tdm" where half the fp32 tile fits one ring buffer.
+    # from global memory into registers, "auto" = "tdm" where the launcher's LDS staging of it fits.
     accum_impl: str = "auto",
+    # Test hook for ``accumulate`` into an ``out`` of the operands' dtype: round the accumulators to it before
+    # adding the old ``out``, which matches a separate ``out.add_(dW)`` bit for bit.
+    _round_first: bool = False,
 ) -> torch.Tensor:
     """Variable-K grouped wgrad: ``out[g] = a[rows_g].T @ b[rows_g]`` (``+=`` with ``accumulate``)."""
     assert a.dim() == 2 and b.dim() == 2, f"a must be [M,OUT_M] and b [M,OUT_N], got {a.dim()}/{b.dim()}"
@@ -2883,25 +3014,38 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
             f"ones, on any input whose per-expert row counts disagree with it. Pass "
             f"i_am_running_an_experiment=True if that is genuinely what you want."
         )
-    accum = 0
+    accum = accum_c16 = 0
     if accumulate:
         if accumulate != 1:
             raise ValueError(f"accumulate must be 0 or 1, got {accumulate}")
-        if out is None or out.dtype != torch.float32:
-            raise ValueError("accumulate adds into out=, an fp32 tensor (e.g. a weight's main_grad)")
+        if out is None or out.dtype not in (torch.float32, a.dtype):
+            raise ValueError(
+                f"accumulate adds into out=, an fp32 or {a.dtype} tensor (e.g. a weight's main_grad), "
+                f"got {None if out is None else out.dtype}"
+            )
+        if out.dtype == a.dtype:
+            accum_c16 = 2 if _round_first else 1
+        elif _round_first:
+            raise ValueError(f"_round_first needs an out of the operands' dtype {a.dtype}, got {out.dtype}")
         if accum_impl != "auto" and accum_impl not in _VK_ACCUM_IMPLS:
             raise ValueError(
                 f"accum_impl must be 'auto' or one of {sorted(_VK_ACCUM_IMPLS)}, got {accum_impl!r}"
             )
-        # The persistent stack and the chunked epilogue are not built for it; an explicit 0 turns the lookup off.
+        # The persistent stack is never looked up for it (an explicit 0 turns the lookup off), and the chunked
+        # epilogue is not built for it. A 16-bit out takes the persistent seam's tile walk when the call sets it.
         if persist < 0:
             persist = 0
         if epi_chunk < 0:
             epi_chunk = 1
-        if persist or out_ldc or vk_seam or vk_stagger or epi_chunk != 1 or issue_first:
+        if out_ldc or epi_chunk != 1 or issue_first:
+            raise ValueError("accumulate needs out_ldc=0, epi_chunk=1 and issue_first=0")
+        if (persist or vk_seam or vk_stagger) and not accum_c16:
             raise ValueError(
-                "accumulate needs persist=0, out_ldc=0, vk_seam=0, vk_stagger=0, epi_chunk=1 and issue_first=0"
+                "accumulate into an fp32 out needs persist=0, vk_seam=0 and vk_stagger=0; persist is for an out of "
+                "the operands' dtype"
             )
+    elif _round_first:
+        raise ValueError("_round_first needs accumulate=1")
     elif out is not None and out.dtype != a.dtype:
         # The overwrite epilogue stores the operand dtype; anything else would be reinterpreted bits.
         raise ValueError(
@@ -2971,14 +3115,17 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
                 f"accumulate needs a contiguous out of shape {(G, OUT_M, OUT_N)}, got {tuple(out.shape)} "
                 f"contiguous={out.is_contiguous()}"
             )
+        # The launch assumes 16-byte-aligned buffers (`_as_ptr`); a main_grad is a view into a gradient bucket.
+        if out.data_ptr() % 16:
+            raise ValueError(f"accumulate needs a 16-byte-aligned out, got data_ptr {out.data_ptr():#x}")
     lds_pad = lds_pad or _vk_lds_pad(tile_m, tile_n, 2)
     if accumulate:
-        tdm_fits = _vk_accum_tdm_fits(tile_m, tile_n, tile_k, m_warp, lds_pad)
+        tdm_fits = _vk_accum_tdm_fits(tile_m, tile_n, tile_k, m_warp, lds_pad, 2 if accum_c16 else 4)
         if accum_impl == "auto":
             accum_impl = "tdm" if tdm_fits else "reg"
         elif accum_impl == "tdm" and not tdm_fits:
             raise ValueError(
-                f"accum_impl='tdm' needs half the fp32 tile within one ring buffer, which the tile "
+                f"accum_impl='tdm' needs the {out.dtype} old C staged within one ring buffer, which the tile "
                 f"({tile_m}, {tile_n}, {tile_k}) does not give; use 'reg' or 'auto'"
             )
         accum = _VK_ACCUM_IMPLS[accum_impl]
@@ -3127,6 +3274,7 @@ def _grouped_gemm_bf16_variable_k_flydsl_kernel_entry(
         + ((vk_seam,) if (vk_seam or vk_stagger or accum) else ())
         + ((vk_stagger,) if (vk_stagger or accum) else ())
         + ((accum,) if accum else ())
+        + ((accum_c16,) if accum_c16 else ())
     )
     return out[:, :, :OUT_N] if out_ldc else out
 
@@ -5060,7 +5208,8 @@ _FWD_TDM_DEAL_KEYS = frozenset({(4096, 7168)})
 def _pick_config_shape(N: int, K: int, avg_m: int, n_groups: int = 0, b_lds_transpose: int = 0):
     # Exact key only. 448 divides this N, so both dispatch rounds are full and the ragged-N
     # read-back path is never taken. On an N it does not divide, the NT read path would address
-    # past the allocation, and on NN `pad_interval = tile_n * 2` would be unencodable.
+    # past the allocation, and on NN `pad_interval = tile_n * 2` would be unencodable. Served from
+    # nearby, the 128-row tiles here and in `_pick_config_nn` measured -13% to -20% at 160 rows.
     if not b_lds_transpose:
         if (N, K, avg_m) == (7168, 2048, 128):
             return (128, 448, 64, 2, 2, 3)
@@ -5448,6 +5597,7 @@ _NN_FALLBACK_WARNED: set = set()
 @functools.lru_cache(maxsize=64)
 def _pick_config_nn(N: int, K: int, avg_m: int, n_groups: int = 0, allow_ragged_k: bool = True):
     if allow_ragged_k:
+        # Exact keys only, like the 128-row NT tile in `_pick_config_shape`.
         if (N, K, avg_m) == (7168, 4096, 128):
             return _clamp_num_buffers((128, 512, 64, 2, 2, 3), K)
         if (N, K, avg_m) == (2048, 7168, 128):
@@ -6027,6 +6177,29 @@ _MUSE_NN = {
 _MUSE_COSCHED = {"lds_cosched": 3, "issue_first": 1}
 _MUSE_NN_MC44 = dict(_MUSE_NN, mc_m=4, mc_n=4)
 
+# Kimi K3.1 Pro's wgrad with accumulate=1 into its bf16 main_grad: the k-loop knobs of its overwrite sets -- the deep
+# ring with the split barrier and co-scheduled fragment reads, head_pipe, the branch-free TDM issue, and the cluster --
+# and the persistent walk with the seam's prefetch (vk_ovl 7), not the rest of their seam. G 224 (EP4), per call,
+# against Triton's fused wgrad (Primus-Turbo's default) and against the tuned overwrite + main_grad.add_ (fusion off):
+# 293 rows fc1 / fc2 2.33 / 1.15 ms (Triton 6.25 / 3.11, overwrite + add 3.52 / 1.76), 585 rows 3.40 / 1.68 ms
+# (8.59 / 4.15, 4.60 / 2.29), 1170 rows with vk_seam 14 5.46 / 2.74 ms (13.24 / 6.29, 6.57 / 3.31).
+_KIMI_VK_ACCUM = {
+    "BLOCK_K": 64,
+    "head_pipe": 8,
+    "lds_cosched": 2,
+    "mc_early": 0,
+    "mc_tile_sync": 1,
+    "num_buffers": 4,
+    "num_xcd": 8,
+    "split_bar": 1,
+    "tdm_deal": 3,
+    "wmma_b2b": 1,
+}
+_KIMI_VK_ACCUM_FC1 = dict(_KIMI_VK_ACCUM, mc_m=4, mc_n=2, persist=256, vk_ovl=7, xcd_band=256)
+_KIMI_VK_ACCUM_FC2 = dict(_KIMI_VK_ACCUM, mc_m=2, mc_n=4, persist=256, vk_ovl=7, xcd_band=128)
+# The persistent walk's members of a `vk_accum` set: dropped where the walk cannot run (`_keyed_kwargs`).
+_VK_ACCUM_WALK = frozenset({"persist", "vk_ovl", "vk_seam", "vk_stagger"})
+
 _KWARGS_KEYS = {
     "nt": {
         # Muse Spark (EP4 / EP8, MBS 1 / 2) fwd fc1 at 512 / 1024 / 2048 rows and fwd fc2 at 512 / 1024: the
@@ -6192,8 +6365,8 @@ _KWARGS_KEYS = {
             "xcd_band": 256,
         },
     },
-    # The variable-K wgrad with accumulate=1 (fp32 main_grad). It runs the plain non-persistent epilogue,
-    # so only knobs that leave that path are keyed here. Bit-identical.
+    # The variable-K wgrad with accumulate=1 (an fp32 or bf16 main_grad): the k-loop knobs it takes, and for a
+    # 16-bit out the persistent walk, which `_keyed_kwargs` drops where it cannot run. Bit-identical.
     "vk_accum": {
         # Muse Spark wgrad fc1 (OUT 8192 x 4096) and fc2 (OUT 4096 x 4096) at 512 / 1024 / 2048 rows per expert
         # (EP4 / EP8, MBS 1 / 2): the fragment reads co-scheduled with the matrix ops (+4% to +15% on the op).
@@ -6207,52 +6380,58 @@ _KWARGS_KEYS = {
         (4096, 4096, 2048): {"lds_cosched": 2},
         (4096, 4096, 4096): {"lds_cosched": 2},
         (4096, 4096, 8192): {"lds_cosched": 2},
+        # Kimi K3.1 Pro wgrad fc1 (OUT 6144 x 3584) and fc2 (OUT 3584 x 3072), into its bf16 main_grad, at the row
+        # counts its overwrite sets were tuned at.
+        (6144, 3584, 293): _KIMI_VK_ACCUM_FC1,
+        (6144, 3584, 585): _KIMI_VK_ACCUM_FC1,
+        (6144, 3584, 1170): dict(_KIMI_VK_ACCUM_FC1, vk_seam=14),
+        (3584, 3072, 293): _KIMI_VK_ACCUM_FC2,
+        (3584, 3072, 585): _KIMI_VK_ACCUM_FC2,
+        (3584, 3072, 1170): dict(_KIMI_VK_ACCUM_FC2, vk_seam=14),
     },
 }
 _KWARGS_PASSTHROUGH = {
     "nt": frozenset({"out", "out_dtype", "m_tiles"}),
     "nn": frozenset({"out", "out_dtype", "m_tiles"}),
     "vk": frozenset({"out", "out_dtype", "masked_k", "expert_table"}),
-    "vk_accum": frozenset({"out", "out_dtype", "masked_k", "expert_table", "accumulate", "accum_impl"}),
+    "vk_accum": frozenset(
+        {"out", "out_dtype", "masked_k", "expert_table", "accumulate", "accum_impl", "_round_first"}
+    ),
 }
 
 
-# (N, K) pairs whose keys serve every avg_m, not only the keyed one. Under expert parallelism the rows a GPU
-# receives vary from step to step (dropless routing), so avg_m lands near, not on, a keyed value. Such an
-# avg_m takes the keyed avg_m nearest to it on a log scale (512 serves about 362-724 next to a 1024 key), up to
-# a factor _AVG_M_REACH past the smallest and the largest key, so a set is never used far from the row counts
-# it was measured at. Muse Spark only: other models' keys stay exact.
-_AVG_M_REACH = 2**0.5
-_AVG_M_TOLERANT = MappingProxyType(
-    {
-        "nt": frozenset({(8192, 4096), (4096, 4096)}),
-        "nn": frozenset({(4096, 8192), (4096, 4096)}),
-        "vk_accum": frozenset({(8192, 4096), (4096, 4096)}),
-    }
-)
+# Keys serve every avg_m near them, not only the keyed one. Under expert parallelism the rows a GPU receives
+# vary from step to step (dropless routing), so avg_m lands near, not on, a keyed value. Such an avg_m takes
+# the keyed avg_m of its (N, K) nearest to it on a log scale, within a factor _AVG_M_REACH, so a set is never
+# used far from the row counts it was measured at: keys a factor 2 apart serve every avg_m between them, and a
+# lone key serves a factor 4 either side (512 serves 128-2048). The MiniMax-M3 sets measured 7% to 43% faster
+# than the untuned path a factor 2 from their key and 15% to 28% a factor 4 away; Muse Spark's outer sets
+# measured about even at 256 rows and 4% to 14% faster at 16384, a factor 2 past their keys.
+# PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS=1 keeps the exact match only, for A/B runs.
+_AVG_M_REACH = 4
+
+
+def _nearest_avg_m(avg_m: int, keyed) -> int | None:
+    """The keyed avg_m serving a call at ``avg_m`` (>= 1): ``avg_m`` itself if keyed, else the keyed one nearest
+    on a log scale if it is within a factor ``_AVG_M_REACH`` (a tie goes to the smaller), else None."""
+    if avg_m in keyed:
+        return avg_m
+    if not keyed or envs.PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS:
+        return None
+    ratio, near = min((max(m, avg_m) / min(m, avg_m), m) for m in keyed)
+    return near if ratio <= _AVG_M_REACH else None
 
 
 def _kwargs_key(kind: str, key: tuple):
-    """The ``_KWARGS_KEYS[kind]`` row for ``key``: the exact one, else for a tolerant (N, K) the keyed avg_m
-    nearest to ``key``'s on a log scale, within ``_AVG_M_REACH`` of the keyed range; None without one."""
-    table = _KWARGS_KEYS[kind]
-    if key in table:
-        return key
+    """The ``_KWARGS_KEYS[kind]`` row serving ``key`` = (N, K, avg_m): the row of the keyed avg_m of its (N, K)
+    that `_nearest_avg_m` picks; None without one."""
     n, k, avg_m = key
-    if (n, k) not in _AVG_M_TOLERANT.get(kind, ()):
-        return None
-    rows = [row for row in table if row[:2] == (n, k)]
-    if (
-        not rows
-        or not min(r[2] for r in rows) / _AVG_M_REACH <= avg_m <= max(r[2] for r in rows) * _AVG_M_REACH
-    ):
-        return None
-    # ratio distance; a tie (the geometric midpoint) goes to the smaller key
-    return min(rows, key=lambda row: (max(row[2], avg_m) / min(row[2], avg_m), row[2]))
+    key_m = _nearest_avg_m(avg_m, {row[2] for row in _KWARGS_KEYS[kind] if row[:2] == (n, k)})
+    return None if key_m is None else (n, k, key_m)
 
 
 def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:
-    """The key's kwargs for this call, or {} when the call tunes anything or the shape is not a key."""
+    """The kwargs of the key serving this call, or {} when the call tunes anything or no key serves it."""
     # The positional extras the entry points take: out_dtype (NT / NN), masked_k and out_dtype (variable-K).
     if n_pos > (2 if kind in ("vk", "vk_accum") else 1) or not set(kw) <= _KWARGS_PASSTHROUGH[kind]:
         return {}
@@ -6260,16 +6439,31 @@ def _keyed_kwargs(kind: str, key: tuple, G: int, n_pos: int, kw: dict) -> dict:
     if row is None:
         return {}
     keyed = _KWARGS_KEYS[kind][row]
-    if kind == "vk" and keyed.get("persist", 0) > 0:
+    if kind in ("vk", "vk_accum") and keyed.get("persist", 0) > 0:
         # The variable-K launcher refuses a persistent grid that does not divide the call's tile count into
         # two or more tiles per workgroup, which another G at the same avg_m can give.
         tm, tn = keyed.get("BLOCK_M") or 256, keyed.get("BLOCK_N") or 256
         tiles = G * (-(-key[0] // tm)) * (-(-key[1] // tn))
-        if tiles % keyed["persist"] or tiles // keyed["persist"] < 2:
+        walk_ok = not (tiles % keyed["persist"] or tiles // keyed["persist"] < 2)
+        if kind == "vk" and not walk_ok:
             return {}
+        out = kw.get("out")
+        tdm = kw.get("accum_impl", "auto") in ("auto", "tdm")
+        if kind == "vk_accum" and not (walk_ok and tdm and out is not None and out.dtype in _F16):
+            # The accumulate's persistent walk also takes a 16-bit out only, through LDS. Its k-loop knobs run
+            # without it.
+            return {k: v for k, v in keyed.items() if k not in _VK_ACCUM_WALK}
     if kind in ("nt", "nn") and keyed.get("vec_dec") and G > 32:
         # The NT and NN launchers drop vec_dec above 32 experts, and nt_seam bit 2 then refuses the set.
         return {}
+    if kind in ("nt", "nn"):
+        # A set is measured on the tile its row count gets at many experts, and declines any other. At 128 rows
+        # or fewer `_pick_config_shape` hands out a 128-row tile; when the experts hold 8 or fewer 256-row tiles
+        # in all, 128 x 128, whose 4 x 4 warp tile has as many fragment reads per sub-step as matrix ops, and the
+        # launchers refuse lds_cosched >= 2 there.
+        pick = _pick_config if kind == "nt" else _pick_config_nn
+        if pick(key[0], key[1], key[2], G) != pick(*row):
+            return {}
     return dict(keyed)
 
 
