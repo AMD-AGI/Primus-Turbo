@@ -82,6 +82,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     xcd_remap_pid_u,
 )
 from primus_turbo.flydsl.utils.prims import (
+    _lds_barrier,
     _readfirstlane_i32,
     _readlane_i32,
     _sload_i32,
@@ -1387,7 +1388,9 @@ def _compile_grouped_nt(
                     else:
                         if wave_m == 1:
                             rocdl.s_barrier()
-                    wait_barrier(_nd)
+                    # wave_m 0 runs one barrier ahead and reads a_c0 after its next wait_barrier, which
+                    # pairs with this one in wave_m 1: land the first stage; only a_c1 may stay in flight.
+                    wait_barrier(N_LDS_STEPS_A)
                     _bg2s.load(b_n0, B0_gl_offset + 1 * BLOCK_K)
                     a_g2s.load(a_n0, A0_gl_offset + 1 * BLOCK_K)
                     if const_expr(_full):
@@ -1400,7 +1403,9 @@ def _compile_grouped_nt(
                         a0_frag = a_s2r.load(a_c0)
                         if const_expr(_full):
                             b1_frag = _bs2r.load(b_c1)
-                        rocdl.s_barrier()
+                        # wave_m 0 runs one barrier ahead and refills b_c0 right after this barrier; s_barrier
+                        # waits on no counter, so wave_m 1's b0 reads must retire (lgkmcnt(0)) before it.
+                        _lds_barrier()
                         rocdl.s_setprio(1)
                         c00 = _mm.call(a0_frag, b0_frag, c00)
                         rocdl.s_setprio(0)
@@ -1415,7 +1420,9 @@ def _compile_grouped_nt(
                         if const_expr(_mfull):
                             a1_frag = a_s2r.load(a_c1)
                         a_g2s.load(a_c0, A0_gl_offset + (k + 2) * BLOCK_K)
-                        rocdl.s_barrier()
+                        # Likewise for a_c1, which wave_m 0 refills right after this barrier: wave_m 1's a1
+                        # reads must retire first.
+                        _lds_barrier()
                         rocdl.s_setprio(1)
                         if const_expr(_mfull):
                             c10 = _mm.call(a1_frag, b0_frag, c10)
@@ -1458,13 +1465,18 @@ def _compile_grouped_nt(
                     if const_expr(_mfull):
                         c10 = _mm.call(a1_frag, b0_frag, c10)
                     rocdl.s_setprio(0)
-                    rocdl.s_barrier()
+                    # wave_m 0 runs one barrier ahead: its read of the last stage after the wait_barrier(0)
+                    # below pairs with wave_m 1's last barrier here, so wave_m 1 drains its refills before it.
+                    if const_expr(_full):
+                        rocdl.s_barrier()
+                    else:
+                        wait_barrier(0)
                     if const_expr(_full):
                         rocdl.s_setprio(1)
                         if const_expr(_mfull):
                             c11 = _mm.call(a1_frag, b1_frag, c11)
                         rocdl.s_setprio(0)
-                        rocdl.s_barrier()
+                        wait_barrier(0)  # wave_m 1's last barrier on the full-N path
                     a_c0, a_n0 = a_n0, a_c0
                     a_c1, a_n1 = a_n1, a_c1
                     b_c0, b_n0 = b_n0, b_c0
