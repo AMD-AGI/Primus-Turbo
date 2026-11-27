@@ -34,6 +34,7 @@ in sequence order, then the rest longest first.
 """
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -225,6 +226,13 @@ def _stage_unit(thread_index, m_sub, dst, in_res, stage_res, **c):
     fx.gpu.barrier()
 
 
+# Race diagnosis switches (comma-separated, read when a kernel is built; use a fresh FlyDSL cache per value):
+# wait_all, sys, pull_nt, item_fence.
+_DBG = frozenset(x for x in os.environ.get("MEGA_ATTN_FWD_DBG", "").split(",") if x)
+_WAIT_SCOPE = "sys" if "sys" in _DBG else "agent"
+_PULL_STORE = SYS_NT if "pull_nt" in _DBG else 0
+
+
 @ASTRewriter.transform
 def _pull_unit(thread_index, src, m_tile, src_heap, bank_offset, out_res, epoch, **c):
     """``src``'s staged rows ``[m_tile * BM, +BM)`` of this rank's column block into q / k / v."""
@@ -255,7 +263,7 @@ def _pull_unit(thread_index, src, m_tile, src_heap, bank_offset, out_res, epoch,
             dst_word = ((g0 + r) * fx.Int32(h_vecs) + col) * fx.Int32(VEC_I32)
             return src_word, dst_word, (r < fx.Int32(BM)) & (t0 + r < fx.Int32(M))
 
-        _copy_rows(thread_index, BM * h_vecs, coords, stage_res, out_res[x], SYS_NT, 0, threads=threads)
+        _copy_rows(thread_index, BM * h_vecs, coords, stage_res, out_res[x], SYS_NT, _PULL_STORE, threads=threads)
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
 
@@ -313,7 +321,7 @@ def _pull_role(
             src_heap = ld(peers_base, src, dtype=fx.T.i64)
             _pull_unit(thread_index, src, m_tile, src_heap, bank_offset, out_res, epoch, **c)
             if thread_index == fx.Int32(0):
-                st(ready_base, m_tile * fx.Int32(n) + src, epoch, scope="agent", order="release")
+                st(ready_base, m_tile * fx.Int32(n) + src, epoch, scope=_WAIT_SCOPE, order="release")
                 if const_expr(trace_base is not None):
                     st(trace_base, m_tile * fx.Int32(n) + src, read_clock())
         more_pull = arith.select(unit < fx.Int32(num_units), fx.Int32(1), fx.Int32(0))
@@ -330,17 +338,17 @@ def _wait_prefix(thread_index, ready_base, kv_end, epoch, **c):
     while idx < fx.Int32(total):
         g0 = _global_row(idx // fx.Int32(n) * fx.Int32(BM), idx % fx.Int32(n), cs, n)
         need = g0 < kv_end
-        flag = ld(ready_base, idx, scope="agent", dtype=fx.T.i64)
+        flag = ld(ready_base, idx, scope=_WAIT_SCOPE, dtype=fx.T.i64)
         while need & (flag < epoch):
             fx.rocdl.s_sleep(fx.Int32(1))
             if spin_timed_out(spin_start, SPIN_TIMEOUT):
                 fx.printf(f"[a2a_attn rank={rank}] ready flag timeout: idx={{}} flag={{}}\n", idx, flag)
                 _asm("s_trap 2")
-            flag = ld(ready_base, idx, scope="agent", dtype=fx.T.i64)
+            flag = ld(ready_base, idx, scope=_WAIT_SCOPE, dtype=fx.T.i64)
         idx = idx + fx.Int32(c["threads"])
     fx.rocdl.s_waitcnt(0)
     fx.gpu.barrier()
-    memory_fence(order="acquire", scope="agent")
+    memory_fence(order="acquire", scope=_WAIT_SCOPE)
 
 
 @ASTRewriter.transform
@@ -463,6 +471,12 @@ def _attn_loop(
                 ((qb + fx.Int32(1)) * fx.Int32(bm) + fx.Int32(2 * bn - 1)) // fx.Int32(2 * bn) * fx.Int32(2)
             )
             kv_tiles = arith.select(kv_tiles < fx.Int32(4), fx.Int32(4), kv_tiles)
+            if const_expr("wait_all" in _DBG):
+                kv_tiles = fx.Int32(nqb * bm // bn + 1)
+            if const_expr("item_fence" in _DBG):
+                fx.rocdl.s_waitcnt(0)
+                fx.gpu.barrier()
+                memory_fence(order="acquire", scope="agent")
             if const_expr(comm):
                 _wait_prefix(thread_index, ready_base, kv_tiles * fx.Int32(bn), epoch, **c)
             if const_expr(trace_base is not None):
