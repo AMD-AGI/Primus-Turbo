@@ -1420,7 +1420,14 @@ def _compile_grouped_nt(
                         if const_expr(_mfull):
                             c10 = _mm.call(a1_frag, b0_frag, c10)
                         rocdl.s_setprio(0)
-                        rocdl.s_barrier()
+                        if const_expr(_full):
+                            rocdl.s_barrier()
+                        else:
+                            # No c01/c11 phases: wave_m 0, one barrier ahead, reads the next stage's a_c0
+                            # after the wait_barrier below, which pairs with this barrier in wave_m 1. Land
+                            # that a_c0 here; only that stage's a_c1 and this iteration's b_c0 and a_c0 may
+                            # stay in flight.
+                            wait_barrier(_nd + (_bnd_ntb if _bnd else N_LDS_STEPS_B))
                         if const_expr(_full):
                             _bg2s.load(b_c1, B1_gl_offset + (k + 2) * BLOCK_K)
                         a_g2s.load(a_c1, _a1_off + (k + 2) * BLOCK_K)
