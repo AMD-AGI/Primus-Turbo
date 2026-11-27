@@ -1999,6 +1999,15 @@ def _inverted_topk_chunks(topk_indices, num_kv, chunk):
     return keys, inv_ptr, inv_data
 
 
+def _cast_into(acc, dtype, buf):
+    """``acc.to(dtype)``, written into ``buf`` when given (``copy_`` rounds exactly like ``.to``)."""
+    if buf is None:
+        return acc.to(dtype)
+    if acc is not None:
+        buf.copy_(acc)
+    return buf
+
+
 def _dsink(attn_sink, lse, delta, target=None):
     """dsink fp32 [H], or None after writing it into ``target = (main_grad, accumulate)`` (``dsink_main_grad``)."""
     from primus_turbo.triton.attention import sparse_mla_dsink as _sd
@@ -2029,8 +2038,17 @@ def sparse_mla_bwd_gfx1250(
     dkv_keep=None,
     dsink_main_grad=None,
     dpool_out=None,
+    dq_out=None,
+    dkv_out=None,
+    delta_out=None,
 ):
     """``(dq, dkv, dsink)``; dkv is shaped like ``kv`` and dsink is ``None`` without a sink.
+
+    ``dq_out`` / ``dkv_out`` / ``delta_out`` (optional; contiguous, shaped like ``q`` / ``kv`` and ``[T, H]`` fp32):
+    the backward writes dq / dkv / delta = rowsum(O * dO) there instead of into fresh buffers (per-sample band calls
+    that write the rows of one sample inside batch-wide buffers; the caller can then take dsink of the whole batch
+    from ``delta_out`` with one ``sparse_mla_dsink``). Same kernels and the same bytes; dkv on the index-driven path
+    is the same fp32 -> bf16 cast, written into ``dkv_out``.
 
     ``dsink_main_grad = (mg, accumulate)`` (``mg``: bf16 ``[H]``): the sink gradient is written into ``mg``
     (overwrite, or bf16 add when ``accumulate``) in two launches instead of being returned, and ``dsink`` is
@@ -2077,8 +2095,20 @@ def sparse_mla_bwd_gfx1250(
         # The band gather does not slow down on a large intermediate (no CSR scan of it), and
         # one launch beats two chunks (one fewer w1 prologue / tail, gather not competing).
         interm_bytes = _BAND_INTERM_BYTES
-    dq = torch.empty_like(q)
-    delta = torch.empty(T_, H, dtype=torch.float32, device=q.device)
+    if dq_out is not None:
+        assert dq_out.shape == q.shape and dq_out.dtype == q.dtype and dq_out.is_contiguous()
+        dq = dq_out
+    else:
+        dq = torch.empty_like(q)
+    if delta_out is not None:
+        assert delta_out.shape == (T_, H) and delta_out.dtype == torch.float32 and delta_out.is_contiguous()
+        delta = delta_out
+    else:
+        delta = torch.empty(T_, H, dtype=torch.float32, device=q.device)
+    dkv_buf = None  # caller's dkv buffer, [num_kv, DQK] view
+    if dkv_out is not None:
+        assert dkv_out.numel() == kv.numel() and dkv_out.dtype == kv.dtype and dkv_out.is_contiguous()
+        dkv_buf = dkv_out.view(kv.shape[0], DQK)
     dsink = None
     # Closed-form bands (same tests as the forward): cr0 = SWA window only; cr128 = window + causal
     # pool of P = num_kv - T rows (kv row T + p visible iff t >= cr * (p + 1) - 1, cr = T / P).
@@ -2117,7 +2147,7 @@ def sparse_mla_bwd_gfx1250(
             # Runtime S / dP and dQ loops (bit-identical to the unrolled kernel, code-placement independent).
             **(dict(sdp_u=1, psdp_u=4, dq_u=1) if pool_p > 0 else dict(sdp_u=2, dq_u=1)),
         )(q, kv2, o, do, lse, dq, delta, part, kvt, ppart, stream=stream)
-        dkv = torch.empty(num_kv, DQK, dtype=kv.dtype, device=q.device)
+        dkv = dkv_buf if dkv_buf is not None else torch.empty(num_kv, DQK, dtype=kv.dtype, device=q.device)
         build_swa_dkv_reduce(H, block_t=_SWA_BT, pool_p=max(pool_p, 0))(part, dkv, ppart, stream=stream)
         if attn_sink is not None:
             dsink = _dsink(attn_sink, lse, delta, dsink_main_grad)
@@ -2150,7 +2180,10 @@ def sparse_mla_bwd_gfx1250(
         and DQK > DV
     )
     dkv_acc = None if lg else torch.zeros(num_kv, DQK, dtype=torch.float32, device=q.device)
-    dkv_out = torch.empty(num_kv, DQK, dtype=kv.dtype, device=q.device) if lg else None
+    if lg:  # (rebinds the dkv_out kwarg: from here on the bf16 dKV the band gather writes)
+        dkv_out = dkv_buf if dkv_buf is not None else torch.empty(num_kv, DQK, dtype=kv.dtype, device=q.device)
+    else:
+        dkv_out = None
     lg_pos = lg_pre = lg_dp = None
     if T_ > 0:
         if w1:
@@ -2258,7 +2291,7 @@ def sparse_mla_bwd_gfx1250(
             if attn_sink is not None:
                 dsink = _dsink(attn_sink, lse, delta, dsink_main_grad)
             with torch.cuda.stream(side):
-                dkv = dkv_out if lg else dkv_acc.to(kv.dtype)
+                dkv = dkv_out if lg else _cast_into(dkv_acc, kv.dtype, dkv_buf)
             dkv_keep.extend(
                 t
                 for t in (topk_indices, dkv_acc, dkv_out, pos, lg_pos, *(lg_pre or ()), lg_dp, *interms)
@@ -2270,4 +2303,4 @@ def sparse_mla_bwd_gfx1250(
         dsink = _dsink(attn_sink, lse, delta, dsink_main_grad)
     if lg:
         return dq, dkv_out.view(kv_shape), dsink
-    return dq, dkv_acc.to(kv.dtype).view(kv_shape), dsink
+    return dq, _cast_into(dkv_acc, kv.dtype, dkv_buf).view(kv_shape), dsink

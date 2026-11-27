@@ -214,3 +214,44 @@ def test_backward_dsink_into_main_grad(cr, accumulate):
     assert bits_equal(dq, base[0]) and bits_equal(dkv, base[1])
     want = (mg0.float() + base[2].float()) if accumulate else base[2].float()
     assert rel_l2(mg.float(), want) < 2e-2
+
+
+@pytest.mark.parametrize("cr", [0, 4, 128], ids=["cr0", "cr4", "cr128"])
+def test_out_kwargs_bits_equal(cr):
+    """``out`` / ``lse_out`` (forward) and ``dq_out`` / ``dkv_out`` / ``delta_out`` (backward) write the bytes of the
+    default call into row slices of larger buffers (the per-sample band calls of a flattened batch)."""
+    from primus_turbo.flydsl.attention.gfx1250_sparse_mla.bwd_kernel import _dsink
+    from primus_turbo.flydsl.attention.gfx1250_sparse_mla.fwd_kernel import sparse_mla_fwd_gfx1250
+
+    q, kv, topk, sink, g, pool = _build(cr, 64, SEQLEN, seed=5)
+    o, lse = sparse_mla_fwd_gfx1250(q, kv, topk, attn_sink=sink, kv_lora_rank=D, scale=SCALE)
+    T, H = q.shape[:2]
+    big_o = torch.full((3 * T, H, D), float("nan"), device=q.device, dtype=q.dtype)
+    big_l = torch.full((3 * T, H), float("nan"), device=q.device, dtype=torch.float32)
+    o2, l2 = sparse_mla_fwd_gfx1250(
+        q, kv, topk, attn_sink=sink, kv_lora_rank=D, scale=SCALE, out=big_o[T : 2 * T], lse_out=big_l[T : 2 * T]
+    )
+    assert o2.data_ptr() == big_o[T].data_ptr() and bits_equal(o, o2) and bits_equal(lse, l2)
+    assert torch.isnan(big_o[:T].float()).all() and torch.isnan(big_l[2 * T :]).all()
+
+    base = _bwd(q, kv, o, g, topk, lse, sink, cr, pool)
+    big_dq = torch.full((3 * T,) + tuple(q.shape[1:]), float("nan"), device=q.device, dtype=q.dtype)
+    big_dkv = torch.full((2 * kv.shape[0],) + tuple(kv.shape[1:]), float("nan"), device=q.device, dtype=kv.dtype)
+    big_d = torch.full((3 * T, H), float("nan"), device=q.device, dtype=torch.float32)
+    dq, dkv, ds = _bwd(
+        q,
+        kv,
+        o,
+        g,
+        topk,
+        lse,
+        None,
+        cr,
+        pool,
+        dq_out=big_dq[T : 2 * T],
+        dkv_out=big_dkv[kv.shape[0] :],
+        delta_out=big_d[T : 2 * T],
+    )
+    assert ds is None and dq.data_ptr() == big_dq[T].data_ptr()
+    assert bits_equal(dq, base[0]) and bits_equal(dkv, base[1])
+    assert bits_equal(_dsink(sink, lse, big_d[T : 2 * T]), base[2])

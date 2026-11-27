@@ -1220,9 +1220,21 @@ def _swa_block_t(n_tok, num_heads, device):
 
 
 def sparse_mla_fwd_gfx1250(
-    q, kv, topk_indices, attn_sink=None, kv_lora_rank=512, scale=None, stream=None, use_swa=True
+    q,
+    kv,
+    topk_indices,
+    attn_sink=None,
+    kv_lora_rank=512,
+    scale=None,
+    stream=None,
+    use_swa=True,
+    out=None,
+    lse_out=None,
 ):
-    """o ``[T, H, 512]`` (q.dtype) and lse ``[T, H]`` fp32; see the module docstring."""
+    """o ``[T, H, 512]`` (q.dtype) and lse ``[T, H]`` fp32; see the module docstring.
+
+    ``out`` / ``lse_out`` (optional, contiguous ``[T, H, 512]`` / ``[T, H]``): written instead of fresh buffers, e.g.
+    the rows of one sample inside a batch-wide output (per-sample band calls); same kernels, same bytes."""
     assert kv_lora_rank == DV and q.shape[-1] == DQK, "gfx1250 sparse-MLA is the 512 + 64 latent layout"
     assert q.dtype == torch.bfloat16 and q.is_contiguous() and topk_indices.is_contiguous()
     T_, H, _ = q.shape
@@ -1234,8 +1246,16 @@ def sparse_mla_fwd_gfx1250(
     if attn_sink is not None:
         assert attn_sink.dtype == torch.float32 and attn_sink.shape == (H,)
         attn_sink = attn_sink.contiguous()
-    o = torch.empty(T_, H, DV, dtype=q.dtype, device=q.device)
-    lse = torch.empty(T_, H, dtype=torch.float32, device=q.device)
+    if out is not None:
+        assert out.shape == (T_, H, DV) and out.dtype == q.dtype and out.is_contiguous()
+        o = out
+    else:
+        o = torch.empty(T_, H, DV, dtype=q.dtype, device=q.device)
+    if lse_out is not None:
+        assert lse_out.shape == (T_, H) and lse_out.dtype == torch.float32 and lse_out.is_contiguous()
+        lse = lse_out
+    else:
+        lse = torch.empty(T_, H, dtype=torch.float32, device=q.device)
     if T_ == 0:
         return o, lse
     # Closed-form bands (same tests as the backward): cr0 = SWA window only; cr128 = window + causal
