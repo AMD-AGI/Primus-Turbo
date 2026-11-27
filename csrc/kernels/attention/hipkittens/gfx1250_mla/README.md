@@ -31,8 +31,9 @@ the FlyDSL backward. Every output element is written by exactly one workgroup, s
 
 **dS scratch.** One block per backward call from the torch caching allocator, on the current stream: the layout of
 `include/dslayout.h`, about batch * heads * seqlen_q * seqlen_kv bytes under the causal mask: 4.33 GB at b2 s4096
-h128, 33 GB at b1 s16128 h128 (FlyDSL needs none). When it or the gradients cannot be allocated, the call runs the
-FlyDSL backward, and no scratch at least as large is tried again on that device.
+h128, 33 GB at b1 s16128 h128 (the FlyDSL backward holds a scratch of the same layout, bounded by
+`PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB`). When it or the gradients cannot be allocated, the call runs the FlyDSL
+backward, and no scratch at least as large is tried again on that device.
 
 ## Build
 
@@ -72,6 +73,11 @@ never fails the install.
    ```
 
 ## Performance
+
+The numbers below are from when these kernels were added: "FlyDSL" is the FlyDSL backward of that time, which
+recomputed S and dP for dQ. The current FlyDSL backward computes dS once as well, on generated dK / dV schedules, and
+is the faster of the two at the DeepSeek-V3 shape (about 1.6 ms against 1.9 ms per backward on a node at its normal
+GPU clock).
 
 MI455X (GPU clock held at 1.3 GHz on the test node), DeepSeek-V3 MBS 2 (b2 s4096 h128), SBHD, causal, bf16, through
 the impl layer training uses; medians of 3 processes x 10 interleaved rounds of 20 back-to-back calls each:

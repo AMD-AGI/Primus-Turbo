@@ -20,18 +20,20 @@ std::unique_ptr<CKGroupedGemmRunnerInterFace> get_ck_grouped_gemm_instance_gfx94
 
     if constexpr (std::is_same_v<ADataType, ck_tile::half_t> ||
                   std::is_same_v<ADataType, ck_tile::bfloat16_t>)  {
-        if (n % 256 == 0) {
-            using TileConfig = CKGroupedGemmTileCfg_256x256x64_32x32x16_2x2x1;
+        constexpr bool kForwardLayout = std::is_same_v<ALayout, ck_tile::tensor_layout::gemm::RowMajor> &&
+                                        std::is_same_v<BLayout, ck_tile::tensor_layout::gemm::RowMajor>;
+        if (kForwardLayout && n % 256 == 0) {
+            using TileConfig = CKGroupedGemmTileCfg_128x256x32_32x32x16_2x2x1;
             using Runner = CKGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
                                                CLayout, TileConfig, AccDataType>;
             runner       = std::make_unique<Runner>();
         } else if (n % 128 == 0) {
-            using TileConfig = CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1;
+            using TileConfig = CKGroupedGemmTileCfg_128x128x64_16x16x16_2x2x1;
             using Runner = CKGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
                                                CLayout, TileConfig, AccDataType>;
             runner       = std::make_unique<Runner>();
         } else {
-            using TileConfig = CKGroupedGemmTileCfg_256x128x64_32x32x16_2x2x1_padding;
+            using TileConfig = CKGroupedGemmTileCfg_128x128x64_16x16x16_2x2x1_padding;
             using Runner = CKGroupedGemmRunner<ADataType, BDataType, CDataType, ALayout, BLayout,
                                                CLayout, TileConfig, AccDataType>;
             runner       = std::make_unique<Runner>();

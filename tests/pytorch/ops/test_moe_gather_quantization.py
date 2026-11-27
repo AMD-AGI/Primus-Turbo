@@ -13,7 +13,12 @@ if not torch.cuda.is_available():
     pytest.skip("Requires a gfx950 GPU and built Turbo extensions", allow_module_level=True)
 
 from primus_turbo.flydsl.quantization import mxfp4_quant_kernel
-from primus_turbo.pytorch.core.low_precision import ScalingGranularity, ScalingRecipe, float4_e2m1fn_x2
+from primus_turbo.pytorch.core.low_precision import (
+    MXFP4_BLOCK_SIZE,
+    ScalingGranularity,
+    ScalingRecipe,
+    float4_e2m1fn_x2,
+)
 from primus_turbo.pytorch.ops.quantization import grouped_quantize_fp4_with_trans
 
 
@@ -52,6 +57,7 @@ def test_gather_matches_materialized_quantization(use_sr, zero_probs, dtype):
                     ScalingGranularity.MX_BLOCKWISE,
                     lens,
                     offsets,
+                    block_size=MXFP4_BLOCK_SIZE,
                     scaling_recipe=ScalingRecipe(use_sr=use_sr),
                     scaling_recipe_for_trans=ScalingRecipe(use_sr=use_sr, use_rht=True),
                     scale_rounding_mode=2,

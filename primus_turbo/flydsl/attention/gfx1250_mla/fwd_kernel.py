@@ -11,113 +11,287 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-# Adapted from the gfx1250 FMHA forward prefill of aiter (https://github.com/ROCm/aiter, commit 6963ae9d),
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc., under the MIT license.
+"""gfx1250 MLA attention forward with scheduled tile regions (DeepSeek-V3 head dims qk 192 / v 128).
 
-"""gfx1250 FlyDSL flash-attention forward kernel at the DeepSeek-V3 MLA head dims.
+A workgroup is 4 waves (one per SIMD, one workgroup per CU: LDS_B bytes of LDS) running q blocks of 256 rows of one
+(batch, head); wave w owns four 16-row q tiles, q tile i = block rows 64 i + 16 w .. + 15. A block's kv range is n
+tiles of 64 rows: tiles [0, ncc) need no mask; the rest (seqlen_q == seqlen_kv: at most 4) are the diagonal tiles
+ncc + k, in which q tiles i < k are fully masked (skipped), q tile k takes the causal mask and q tiles i > k none.
 
-A workgroup of 8 wave32 waves owns 256 query rows of one (batch, head) and streams 64-row K/V
-tiles through two LDS slots. Both GEMMs run on ``v_wmma_f32_16x16x32_bf16``; the online softmax
-works in fp32 with ``p = exp2(s * scale * log2(e) - m)`` and lets the running max lag by up to
-one natural-log unit before it rescales O.
+The per-tile math is generated code (fwd_sched): straight-line WMMA / LDS / softmax schedules on a static register
+plan of 1024 VGPRs, as inline asm statements (regions INIT, INIT_C0, TILE_CL, TILE_D0..2, TILE_D3F, FINAL_A) whose
+state lives in v[fwd_sched.BASE:1024]. This file is the rest: the schedule of q blocks, the TDM ring, the barriers,
+the loop control and the output stores. Its own code must stay below BASE VGPRs between the regions of a block: a
+region clobbers v[BASE:256), so LLVM keeps nothing there across one, and between two regions it takes the lowest
+free VGPRs. This code needs v0..v38 in the build that was validated, so after any change here the final ISA must be
+checked: outside the regions only the warm-up block and the never-taken reserve block may name a VGPR >= BASE (the
+numeric tests fail if another instruction does).
+
+LDS: a 4-stage ring of kv tiles (a stage holds K 64 x 400 B and V 64 x 272 B), the Q block (256 x 400 B) and the
+epilogue staging. Ring slot t of a block is its tile t, in stage (sb + t) % 4; the ring runs on across the blocks of
+a workgroup. A slot takes 3 TDM ops (K columns 0..127 and 128..191, V), one each from waves 0..2; wave 3 issues a
+NULL descriptor in their place, so every wave runs the same code and waits on static counts. Per block:
+  prologue  the first block only: Q (waves 1, 2) and slots 0..2; B_0: every wave s_wait_tensorcnt 0, then the
+            barrier
+  tile t    issue slot t + 3 into the stage of tile t - 1; read the K / V fragments (the Q fragments stay in VGPRs
+            from INIT on), then s_wait_dscnt 0, s_wait_tensorcnt 2 (slot t + 1 landed) and s_barrier_signal, the
+            tile's math around them; s_barrier_wait. This barrier, B_{t+1}, makes tile t + 1 visible to every wave
+            and frees the stage of tile t. Slots n..n + 2 past the last tile n - 1 load the next block's tiles 0..2
+            (its ring slots 0..2: the same stages) when there is one, else 1-row copies of tile n - 1, so a wave
+            issues one op in every tile.
+  epilogue  after B_n: the next block's Q, then the output (staged at TAIL and in tile n - 1's stage)
+No LDS read follows a tile's s_barrier_signal: right after B_n the next block's Q overwrites the Q area.
+
+Grid: one q block per workgroup (npw == 0), or npw persistent workgroups on a static schedule: workgroup w runs
+(q block, head-batch) pairs, x = w % 8, w / 8 = r nqb + i, R = npw / 8 / nqb: its step s is head-batch
+hb = 8 (R s + r) + x, q block i on even steps and nqb - 1 - i on odd ones; the list ends at the first hb >= H B.
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
-# UNSTABLE(gfx1250): the rocdl / tdm_ops calls (WMMA, permlanex16, ballot, mbcnt_lo, wave_id,
-# sched_barrier, the split workgroup barrier, s_wait_dscnt, tensor_wait) have no stable API in
-# FlyDSL 0.3.4.1; arith is stable.
-from flydsl.expr import arith, rocdl
+# UNSTABLE(gfx1250): the raw TDM load, the split barrier, MMRA fences, inline asm and disable_xdl_arb_stall have no
+# stable API in FlyDSL 0.3.4.1.
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
+from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.rocdl import tdm_ops
 
-from primus_turbo.flydsl.utils.buffer_ops import buffer_store, create_buffer_resource
+from primus_turbo.flydsl.utils.buffer_ops import buffer_store, create_buffer_resource_from_addr
 from primus_turbo.flydsl.utils.prims import LOG2E
 
-from . import SOURCE_DIGEST
-from .fwd_staging import (
-    BLOCK_M,
-    D_QK,
-    D_V,
-    K_LDS_BYTES,
-    K_ROW_ELEMS,
-    N_BLOCK,
-    NUM_WAVES,
-    O_LDS_BYTES,
-    Q_LDS_BYTES,
-    Q_TILES,
-    ROWS_PER_WAVE,
-    V_LDS_BYTES,
-    V_ROW_ELEMS,
-    WAVE_SIZE,
-    WMMA_K,
-    WMMA_M,
-    OutputWriter,
-    issue_q_copy,
-    k_read_base,
-    kv_copies,
-    load_k,
-    load_v,
-    read_q_fragments,
-    v_read_base,
-)
+from . import SOURCE_DIGEST, fwd_sched
+from .common import inline_region, lds_ptr, reserve_vgprs
 
-BLOCK_SIZE = WAVE_SIZE * NUM_WAVES
-WMMA_N = 16
-D_TILES = D_V // WMMA_M  # 16-column O accumulators per q tile
-# LDS: two K/V slots, K and V each at the start of a 64 KB segment. Q is staged in slot 1 before
-# the loop, O in the slot the last tile does not use.
-KV_BLOCK_BYTES = 64 * 1024
-SLOT_BYTES = 2 * KV_BLOCK_BYTES
-LDS_BYTES = 320 * 1024  # a gfx1250 workgroup's whole LDS, as the source kernel takes it; the slots use 256 KB
-assert max(K_LDS_BYTES, V_LDS_BYTES) <= KV_BLOCK_BYTES and max(Q_LDS_BYTES, O_LDS_BYTES) <= SLOT_BYTES
-# Head-grouped dispatch: KV_GROUP q blocks of KV_HEAD_CHUNK heads run together (powers of two).
+KERNEL_NAME = "mla_fwd_kernel"  # also the function's symbol (_warm_code)
+D_QK, D_V = 192, 128
+BM = 256  # q rows per block
+QT = 4  # 16-row q tiles per wave
+NB = 64  # kv rows per tile (ring stage)
+NWAVES = 4
+# The prologue fills ring slots 0..2 with the first block's own tiles, without looking at a next block: a workgroup
+# that runs more than one block (the persistent grid: seqlen_q == seqlen_kv in whole q blocks, fwd.launch_grid)
+# needs 3 tiles in every block, and has BM / NB of them at least.
+assert BM // NB >= 3
+XK, XV = fwd_sched.XK, fwd_sched.XV  # LDS row strides of K / Q and V (bytes)
+K_B = NB * XK
+V_B = NB * XV
+STG_B = K_B + V_B  # a ring stage, K then V
+NSTG = 4
+Q_OFF = NSTG * STG_B  # the Q block
+TAIL = Q_OFF + BM * XK  # the epilogue staging of q tiles 2, 3
+# epilogue staging: SQT bytes per wave and q tile, O row r at XO r (16 rows), the lse of lane l at LSE_SLOT + 4 l;
+# q tiles 0, 1 of the 4 waves in the ring stage of the block's last tile, q tiles 2, 3 at TAIL
+XO = 272
+LSE_SLOT = 16 * XO
+SQT = LSE_SLOT + 32 * 4
+LDS_B = TAIL + 2 * 4 * SQT
+assert STG_B == fwd_sched.STG_B and SQT == fwd_sched.SQT_B
+assert 2 * 4 * SQT <= STG_B and LDS_B <= 327680 and 2 * LDS_B > 327680
+OOB = 0x80000000  # > every num_records (< 2^31) and + soffset < 2^32: dropped, no wrap
+W0_A = 0x47510000  # TDM group 1 word 0: 128 columns, pad 72 elements -> 400-B rows
+W0_B = 0x87110000  # 64 columns, pad 136 elements -> 400-B rows
+W0_V = 0x07510000  # 128 columns, pad 8 elements -> 272-B rows
+# One block per workgroup: KV_GROUP q blocks of KV_HEAD_CHUNK heads are dispatched together (powers of two)
 KV_GROUP = 16
 KV_HEAD_CHUNK = 16
-# The running max may lag the row max by this many natural-log units before O is rescaled.
-RESCALE_THRESHOLD = 1.0
-# Finite running-max seed: a fully masked row keeps a finite m, so no -inf - -inf.
-BIG_NEG = -1.0e30
-
-_FAST = arith.FastMathFlags.fast
-# Fast math without reassoc, so LLVM keeps the sum trees instead of re-linearizing them.
-_NO_REASSOC = (
-    arith.FastMathFlags.nnan
-    | arith.FastMathFlags.ninf
-    | arith.FastMathFlags.nsz
-    | arith.FastMathFlags.arcp
-    | arith.FastMathFlags.contract
-    | arith.FastMathFlags.afn
-)
+RESERVE_V4 = 254  # common.reserve_vgprs: 16-byte values kept live (1016 VGPRs, plus the address)
+# Code warm-up (_warm_code): the regions a block runs, 2 KB of code per load (32 lanes x one 64-byte line each), and
+# this many 2 KB pieces of the kernel's own code before INIT_C0
+WARM_REGIONS = ("INIT_C0", "TILE_CL", "TILE_D0", "TILE_D1", "TILE_D2", "TILE_D3F")
+WARM_PIECE = 2048
+WARM_OWN_PIECES = 2
 
 
-def _drain_and_arrive():
-    """Retire this wave's LDS reads and TDM copies, then arrive at the workgroup barrier."""
+def _w(x):
+    """A 32-bit word as an i32 constant."""
+    return fx.Int32(x - (1 << 32) if x >= 1 << 31 else x)
+
+
+def _ir(v):
+    return fx.as_ir_value(v)
+
+
+def _sel(c, a, b):
+    return c.select(a, b)
+
+
+def _min(a, b):
+    return _sel(a < b, a, b)
+
+
+def _lds_fence(release):
+    """Workgroup fence on LDS only (MMRA amdgpu-synchronize-as = local): the release waits for this wave's DS ops,
+    not for its in-flight global stores."""
+    op = llvm.FenceOp(
+        llvm.AtomicOrdering.release if release else llvm.AtomicOrdering.acquire, syncscope="workgroup"
+    )
+    op.operation.attributes["llvm.mmra"] = ir.Attribute.parse(
+        '#llvm.mmra_tag<"amdgpu-synchronize-as":"local">'
+    )
+
+
+def _bar_signal():
+    """Retire this wave's LDS reads, release (workgroup, LDS), arrive at the barrier (no wait)."""
     rocdl.sched_barrier(0)
     rocdl.s_wait_dscnt(0)
-    tdm_ops.tensor_wait(0)
-    # The raw split barrier has no memory semantics: fence it the way gpu.barrier() does.
-    fx.llvm.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Release)
+    _lds_fence(True)
     rocdl.s_barrier_signal(-1)
     rocdl.sched_barrier(0)
 
 
-def _barrier_wait():
+def _bar_wait():
+    """Wait at the workgroup barrier, acquire (workgroup, LDS)."""
     rocdl.sched_barrier(0)
     rocdl.s_barrier_wait(-1)
-    fx.llvm.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Acquire)
+    _lds_fence(False)
     rocdl.sched_barrier(0)
 
 
-def _block_id(axis):
-    """Block id along ``axis`` after the longest-first remap of the dispatch order.
+def _wave_lds_order():
+    """Cross-lane LDS data within one wave: its LDS ops execute in order; keep the compiler from moving loads above
+    stores."""
+    rocdl.sched_barrier(0)
+    llvm.FenceOp(llvm.AtomicOrdering.seq_cst, syncscope="wavefront")
+    rocdl.sched_barrier(0)
 
-    Causal work grows with the q block index, so the hardware's linear order is remapped to start
-    the last q block of every (head, batch) first. When the grid divides evenly, windows of
-    KV_GROUP ranks go out KV_HEAD_CHUNK heads at a time so a head's K/V is shared in L2.
+
+def _region(name, *operands):
+    inline_region(fwd_sched, name, *operands)
+
+
+def _tdm_g1(w0, tdim1, tile0, tile1, stride_el):
+    """TDM group 1 of a 2-D tile load: w0 (element size and LDS row padding), dim 0 unbounded, tdim1 rows in bounds,
+    a tile of tile0 columns (an int, or an Int32 already shifted to bits 16..31) x tile1 rows, the row stride
+    stride_el (elements, Int64)."""
+    tdim1 = fx.Int32(tdim1)
+    return fx.Vector.from_elements(
+        [
+            _w(w0) if isinstance(w0, int) else w0,
+            _w(0xFFFF0000),
+            ((tdim1 & fx.Int32(0xFFFF)) << fx.Int32(16)) | fx.Int32(0x7FFF),
+            (tdim1.shrui(fx.Int32(16)) & fx.Int32(0xFFFF))
+            | (fx.Int32(tile0 << 16) if isinstance(tile0, int) else tile0),
+            fx.Int32(tile1),
+            fx.Int32(stride_el),
+            fx.Int32(stride_el >> fx.Int64(32)) & fx.Int32(0xFFFF),
+            fx.Int32(0),
+        ],
+        fx.Int32,
+    )
+
+
+def _tdm_g0(lds, ga, count):
+    """TDM group 0: the LDS and global addresses; count 0 = the NULL descriptor (moves nothing)."""
+    return fx.Vector.from_elements(
+        [count, fx.Int32(lds), fx.Int32(ga), fx.Int32(ga >> fx.Int64(32)) | _w(0x80000000)], fx.Int32
+    )
+
+
+def _tdm_load(g0, g1):
+    z4 = _ir(fx.Vector.filled(4, 0, fx.Int32))
+    z8 = _ir(fx.Vector.filled(8, 0, fx.Int32))
+    rocdl.tensor_load_to_lds(_ir(g0), _ir(g1), z4, z4, z8, cache_policy=0)
+
+
+class _Problem:
+    """The kernel arguments and the per-block helpers. ``z`` is an opaque 0 (derived from the block counter): every
+    value is recomputed per block from ``arg + z``, so LLVM hoists nothing argument-derived out of the block loop and
+    the kernel's own state fits in the SGPRs the regions leave it."""
+
+    def __init__(self, a, z):
+        self.a = {k: (v + z if isinstance(v, fx.Int32) else v) for k, v in a.items()}
+        z64 = fx.Int64(z)
+        a = self.a
+        self.z = z
+        self.cshift = a["Skv"] - a["Sq"]
+        self.krow = fx.Int64(a["H"]) * fx.Int64(D_QK)  # row strides in elements
+        self.vrow = fx.Int64(a["H"]) * fx.Int64(D_V)
+        self.qaddr = fx.Int64(fx.ptrtoint(fx.get_iter(a["Q"]))) + z64
+        self.kaddr = fx.Int64(fx.ptrtoint(fx.get_iter(a["K"]))) + z64
+        self.vaddr = fx.Int64(fx.ptrtoint(fx.get_iter(a["V"]))) + z64
+        self.oaddr = fx.Int64(fx.ptrtoint(fx.get_iter(a["O"]))) + z64
+        self.laddr = fx.Int64(fx.ptrtoint(fx.get_iter(a["LSE"]))) + z64
+
+    def lane(self):
+        """The lane id, from v_mbcnt with the opaque addend: neither hoisted nor CSEd across blocks."""
+        return fx.Int32(rocdl.mbcnt_lo(fx.Int32.ir_type, _ir(fx.Int32(-1)), _ir(self.z)))
+
+    def ntiles(self, qb):
+        Sq = self.a["Sq"]
+        return (_min(qb * fx.Int32(BM) + fx.Int32(BM), Sq) + self.cshift + fx.Int32(NB - 1)).shrui(
+            fx.Int32(6)
+        )
+
+    def kv_base(self, hh, bb):
+        a = self.a
+        row0 = fx.Int64(bb) * fx.Int64(a["Skv"]) * fx.Int64(a["H"]) + fx.Int64(hh)
+        return self.kaddr + row0 * fx.Int64(2 * D_QK), self.vaddr + row0 * fx.Int64(2 * D_V)
+
+    def slot_ops(self, wv, gk, gv):
+        """This wave's TDM op of every ring slot (a slot's 3 ops split over waves 0..2: K columns 0..127, K columns
+        128..191, V; wave 3 a NULL op): (count, LDS offset in a stage, global base of the block's tile 0, bytes per kv
+        row, group-1 word 0, tile columns)."""
+        is0, is1 = wv == fx.Int32(0), wv == fx.Int32(1)
+        isv = wv == fx.Int32(2)
+        cnt = _sel(wv < fx.Int32(3), fx.Int32(1), fx.Int32(0))
+        lds_off = _sel(is0, fx.Int32(0), _sel(is1, fx.Int32(256), fx.Int32(K_B)))
+        base = _sel(isv, gv, gk + _sel(is1, fx.Int64(256), fx.Int64(0)))
+        stride = _sel(isv, self.vrow, self.krow)
+        w0 = _sel(is0, _w(W0_A), _sel(is1, _w(W0_B), _w(W0_V)))
+        tile0 = _sel(is1, fx.Int32(64 << 16), fx.Int32(128 << 16))
+        return cnt, lds_off, base, stride, w0, tile0
+
+    def issue_slot(self, lds0, op, t, n, sb, nx=None, nn=None, opn=None):
+        """This wave's TDM op of ring slot t of a block (stage (sb + t) % 4; op = slot_ops of the block): its tile t,
+        or past its last tile a 1-row copy of tile n - 1 into that (free) stage; with a next block (nx: nn tiles, its
+        slot_ops opn) slot t >= n loads its tile t - n (1-row copies of its tile nn - 1 past it)."""
+        cnt, lds_off, base, stride, w0, tile0 = op
+        if nx is None:
+            tt = _min(t, n - fx.Int32(1))
+            real = t < n
+        else:
+            # t < n as the sign of t - n: next to the subtraction, a compare of t and n becomes a VALU
+            # subtract-with-borrow and a v_readfirstlane in every tile's shell (~34 cycles)
+            past = t - n
+            before = past.shrui(fx.Int32(31)) != fx.Int32(0)
+            own = before | (nx == fx.Int32(0))
+            tt = _sel(own, _min(t, n - fx.Int32(1)), _min(past, nn - fx.Int32(1)))
+            real = _sel(own, before, past < nn)
+            base = _sel(own, base, opn[2])
+        ga = base + fx.Int64(tt * fx.Int32(2 * NB)) * stride
+        th = _sel(real, fx.Int32(NB), fx.Int32(1))
+        st = lds0 + ((sb + t) & fx.Int32(NSTG - 1)) * fx.Int32(STG_B) + lds_off
+        _tdm_load(_tdm_g0(st, ga, cnt), _tdm_g1(w0, NB, tile0, th, stride))
+
+    def issue_q(self, lds0, wv, qb, hh, bb, on=None):
+        """The block's Q: columns 0..127 by wave 1, 128..191 by wave 2 (NULL ops on the other waves, and on every
+        wave unless on: two TDM ops per wave either way)."""
+        a = self.a
+        q0 = qb * fx.Int32(BM)
+        row = (fx.Int64(bb) * fx.Int64(a["Sq"]) + fx.Int64(q0)) * fx.Int64(a["H"]) + fx.Int64(hh)
+        gq = self.qaddr + row * fx.Int64(2 * D_QK)
+        rows = a["Sq"] - q0
+        w1, w2 = wv == fx.Int32(1), wv == fx.Int32(2)
+        if on is not None:
+            w1, w2 = w1 & on, w2 & on
+        _tdm_load(
+            _tdm_g0(lds0 + fx.Int32(Q_OFF), gq, _sel(w1, fx.Int32(1), fx.Int32(0))),
+            _tdm_g1(W0_A, rows, 128, BM, self.krow),
+        )
+        _tdm_load(
+            _tdm_g0(lds0 + fx.Int32(Q_OFF + 256), gq + fx.Int64(256), _sel(w2, fx.Int32(1), fx.Int32(0))),
+            _tdm_g1(W0_B, rows, 64, BM, self.krow),
+        )
+
+
+def _remap(lin, gx, gy, gz):
+    """(q block, head, batch) of dispatch rank ``lin`` after the longest-first remap.
+
+    Causal work grows with the q block index, so the linear order is remapped to start the last q
+    block of every (head, batch) first. When the grid divides evenly, windows of KV_GROUP ranks go
+    out KV_HEAD_CHUNK heads at a time so a head's K/V is shared in L2.
     """
-    gx, gy, gz = fx.grid_dim.x, fx.grid_dim.y, fx.grid_dim.z
-    lin = fx.block_idx.x + gx * (fx.block_idx.y + gy * fx.block_idx.z)
     gyz = gy * gz
     rank = lin // gyz
     rem = lin - rank * gyz
@@ -133,571 +307,399 @@ def _block_id(axis):
     )
     rank = lin // gyz
     rem = lin - rank * gyz
-    if axis == "x":
-        return gx - fx.Int32(1) - rank
-    if axis == "y":
-        return rem % gy
-    return rem // gy
+    return gx - fx.Int32(1) - rank, rem % gy, rem // gy
 
 
-def _wmma(a, b, c):
-    """C[16x16 f32] += A[16x32 bf16] @ B[32x16 bf16]."""
-    v8f32 = fx.Vector.make_type(8, fx.Float32)
-    return rocdl.wmma_f32_16x16x32_bf16(
-        v8f32, fx.as_ir_value(a), fx.as_ir_value(b), fx.as_ir_value(c), reuseA=False, reuseB=False
-    ).result
+class _Sched:
+    """The workgroup's blocks (q block, head, batch). Persistent (npw > 0): workgroup w runs step s as head-batch
+    hb = 8 (R s + r) + w % 8 with r = (w / 8) / nqb, R = npw / 8 / nqb, q block i = (w / 8) % nqb on even steps and
+    nqb - 1 - i on odd ones, while hb < H B; the divisions run once per workgroup, a step advances (head, batch) by
+    8 R heads without one. Else one block per workgroup in the hardware dispatch order (_remap)."""
 
-
-def _qk_gemm(k_vals, q_frags):
-    """S^T = K Q^T of one tile: [q tile][kv tile] v8 f32 (kv on the rows, q on the columns).
-
-    Runs k-step major in the order ``load_k`` issued the K reads, fenced so every LDS wait
-    releases at most one k-step; each accumulator still sums its k-steps in order.
-    """
-    nkv, nks = N_BLOCK // WMMA_N, D_QK // WMMA_K
-    zero = fx.Vector.filled(8, 0.0, fx.Float32)
-    acc = [[zero] * nkv for _ in range(Q_TILES)]
-    for ks in range(nks):
-        if ks > 0:
-            rocdl.sched_barrier(0)
-        for kv in range(nkv):
-            if kv > 0:
-                rocdl.sched_barrier(0)
-            j = (kv * nks + ks) * 2
-            k_frag = k_vals[j].shuffle(k_vals[j + 1], list(range(16)))
-            for qt in range(Q_TILES):
-                acc[qt][kv] = _wmma(k_frag, q_frags[qt][ks], acc[qt][kv])
-    return acc
-
-
-def _pv_gemm(v_vals, p, o_acc):
-    """O^T += V^T P^T of one tile for both q tiles: [q tile][d tile] v8 f32."""
-    nkt = N_BLOCK // WMMA_K
-    rocdl.s_wait_dscnt(0)
-    out = [[None] * D_TILES for _ in range(Q_TILES)]
-    for dt in range(D_TILES):
-        accs = [o_acc[qt][dt] for qt in range(Q_TILES)]
-        j = dt * nkt * 2
-        for kt in range(nkt):
-            v_frag = v_vals[j].shuffle(v_vals[j + 1], list(range(16)))
-            j += 2
-            for qt in range(Q_TILES):
-                p_frag = p[qt][2 * kt].shuffle(p[qt][2 * kt + 1], list(range(16)))
-                accs[qt] = _wmma(v_frag, p_frag, accs[qt])
-        for qt in range(Q_TILES):
-            out[qt][dt] = accs[qt]
-    return out
-
-
-def _tree_reduce(lists, op3, op2):
-    """Balanced 3-ary reduction of each list, emitted position-major across the lists so the
-    independent rows interleave."""
-    curs = [list(v) for v in lists]
-    while max(len(c) for c in curs) > 1:
-        nxts = [[] for _ in curs]
-        idxs = [0] * len(curs)
-        while any(idxs[k] < len(curs[k]) for k in range(len(curs))):
-            for k in range(len(curs)):
-                cur, i, n = curs[k], idxs[k], len(curs[k])
-                if i >= n:
-                    continue
-                if n - i >= 3:
-                    nxts[k].append(op3(cur[i], cur[i + 1], cur[i + 2]))
-                    idxs[k] += 3
-                elif n - i == 2:
-                    nxts[k].append(op2(cur[i], cur[i + 1]))
-                    idxs[k] += 2
-                else:
-                    nxts[k].append(cur[i])
-                    idxs[k] += 1
-        curs = nxts
-    return [c[0] for c in curs]
-
-
-def _fmax(a, b):
-    return arith.maxnumf(a, b, fastmath=_FAST)
-
-
-def _fsub(a, b):
-    with arith.fastmath(_FAST):
-        return a - b
-
-
-def _fmul(a, b):
-    with arith.fastmath(_FAST):
-        return a * b
-
-
-def _fadd(a, b):
-    with arith.fastmath(_NO_REASSOC):
-        return a + b
-
-
-def _exp2(x):
-    return fx.math.exp2(x, fastmath=arith.FastMathFlags.afn)
-
-
-def _softmax(*, s, m_prev, d_prev, lane_idx, c_exp2, kv_pos_base, kv_last):
-    """Online-softmax update of both q tiles for one kv tile.
-
-    ``s`` is the unscaled S^T: lane l holds query l % 16 and kv rows (l // 16) * 8 + [0, 8) of each
-    16-row kv tile, lane l ^ 16 the other eight. ``kv_last`` is the last key each q tile's row may
-    see (None on unmasked tiles). m is carried in log2 units of the scaled score. Returns the bf16
-    probabilities, the new m and d, the O correction and the wave-uniform rescale flag.
-    """
-    nkv = N_BLOCK // WMMA_N
-    neg_inf = fx.Float32(float("-inf"))
-    zero = fx.Float32(0.0)
-    sel_lo, sel_hi = fx.as_ir_value(fx.Int32(0x76543210)), fx.as_ir_value(fx.Int32(0xFEDCBA98))
-
-    def peer(x):  # the value held by lane l ^ 16; fx.gpu.shuffle_xor changes the generated code
-        x = fx.as_ir_value(x)
-        return fx.Float32(
-            rocdl.permlanex16(fx.Float32.ir_type, x, x, sel_lo, sel_hi, fi=False, bound_control=False)
+    def __init__(self, a):
+        npw, nqb, H, B = a["npw"], a["nqb"], a["H"], a["B"]
+        wg = fx.Int32(fx.block_idx.x)
+        self.persist = npw > fx.Int32(0)
+        nq = _sel(nqb > fx.Int32(0), nqb, fx.Int32(1))
+        w8 = wg.shrui(fx.Int32(3))
+        pr = w8 // nq
+        self.pq = w8 - pr * nq
+        p_r = npw.shrui(fx.Int32(3)) // nq
+        self.p_r, self.pr = p_r, pr
+        step = fx.Int32(8) * p_r
+        self.st_b = step // H
+        self.st_h = step - self.st_b * H
+        self.n_hx = (H * B).shrui(fx.Int32(3))
+        self.nqb, self.H = nqb, H
+        hb = fx.Int32(8) * pr + (wg & fx.Int32(7))
+        hb = _sel(pr < p_r, hb, fx.Int32(0))
+        bb_p = hb // H
+        hh_p = hb - bb_p * H
+        lin = wg + nqb * (fx.Int32(fx.block_idx.y) + H * fx.Int32(fx.block_idx.z))
+        qb_n, hh_n, bb_n = _remap(lin, nqb, H, B)
+        p = self.persist
+        self.first = (
+            _sel(p, (pr < p_r) & (pr < self.n_hx), fx.Int32(1) == fx.Int32(1)),
+            _sel(p, self.pq, qb_n),
+            _sel(p, hh_p, hh_n),
+            _sel(p, bb_p, bb_n),
         )
 
-    khalf = lane_idx // fx.Int32(WMMA_M)
-    s_masked = []
-    for qt in range(Q_TILES):
-        row = []
-        for kvt in range(nkv):
-            svec = fx.Vector(s[qt][kvt])
-            for i in range(8):
-                sval = fx.Float32(svec[i])
-                if kv_last is not None:
-                    kv_pos = kv_pos_base + khalf * fx.Int32(8) + fx.Int32(kvt * WMMA_N + i)
-                    sval = (kv_pos > kv_last[qt]).select(neg_inf, sval)
-                row.append(sval)
-        s_masked.append(row)
-
-    local_max = _tree_reduce(s_masked, lambda a, b, c: _fmax(_fmax(a, b), c), _fmax)
-    m_new, corr, neg_m, rescale = [], [], [], []
-    for qt in range(Q_TILES):
-        row_max = _fmul(_fmax(local_max[qt], peer(local_max[qt])), c_exp2)
-        m_full = _fmax(m_prev[qt], row_max)
-        # Wave-uniform: rescale O once any row's max grew by more than the threshold.
-        need = _fsub(row_max, m_prev[qt]) > fx.Float32(RESCALE_THRESHOLD * LOG2E)
-        do_rescale = fx.Int32(rocdl.ballot(fx.Int32.ir_type, need)) != fx.Int32(0)
-        m = do_rescale.select(m_full, m_prev[qt])
-        corr.append(_exp2(_fsub(m_prev[qt], m)))
-        neg_m.append(_fsub(zero, m))
-        m_new.append(m)
-        rescale.append(do_rescale)
-
-    # p = exp2(s * c - m), two elements per packed FMA.
-    p, p_flat = [], []
-    c2 = fx.Vector.from_elements([c_exp2], fx.Float32).broadcast_to(2)
-    for qt in range(Q_TILES):
-        tiles, flat, idx = [], [], 0
-        n2 = fx.Vector.from_elements([neg_m[qt]], fx.Float32).broadcast_to(2)
-        for _ in range(nkv):
-            pe = []
-            for _ in range(4):
-                sv = fx.Vector.from_elements([s_masked[qt][idx], s_masked[qt][idx + 1]], fx.Float32)
-                av = fx.math.fma(sv, c2, n2)
-                for e in range(2):
-                    pj = _exp2(fx.Float32(av[e]))
-                    pe.append(pj)
-                    flat.append(pj)
-                idx += 2
-            tiles.append(fx.Vector.from_elements(pe, fx.Float32).to(fx.BFloat16))
-        p.append(tiles)
-        p_flat.append(flat)
-
-    # Both rows' sum trees run as one tree of (row 0, row 1) pairs.
-    leaves = [fx.Vector.from_elements([a, b], fx.Float32) for a, b in zip(p_flat[0], p_flat[1])]
-    (tot,) = _tree_reduce([leaves], lambda a, b, c: _fadd(_fadd(a, b), c), _fadd)
-    local_sum = [fx.Float32(tot[0]), fx.Float32(tot[1])]
-    d_new = [
-        _fadd(_fmul(corr[qt], d_prev[qt]), _fadd(local_sum[qt], peer(local_sum[qt]))) for qt in range(Q_TILES)
-    ]
-    return p, m_new, d_new, corr, rescale
+    def next(self, s, hh, bb):
+        """(ok, q block, head, batch) of step s + 1 after step s at (head hh, batch bb)."""
+        s1 = s + fx.Int32(1)
+        ok = self.persist & (self.p_r * s1 + self.pr < self.n_hx)
+        h2 = hh + self.st_h
+        wrap = h2 >= self.H
+        hh2 = _sel(wrap, h2 - self.H, h2)
+        bb2 = bb + self.st_b + _sel(wrap, fx.Int32(1), fx.Int32(0))
+        qb2 = _sel((s1 & fx.Int32(1)) == fx.Int32(1), self.nqb - fx.Int32(1) - self.pq, self.pq)
+        return ok, qb2, hh2, bb2
 
 
-@flyc.jit
-def _copy_if(cond, copies):
-    if cond:
-        for c in copies:
-            fx.copy_atom_call(*c)
+def _warm_code(wv):
+    """The kernel's code into L2 through the data path, at the kernel start, by wave 0 of every workgroup.
+
+    When another kernel ran since this one's last launch (every call in training), its code is neither in the CUs'
+    instruction caches nor in L2, and each line's first fetch comes from HBM behind the kernel's own K / V stream
+    (thread trace: ~770 cycles per 256 bytes of INIT_C0; s_prefetch_inst and global_prefetch_b8 change nothing
+    there). Loaded as data it is in L2 before the first block starts (the workgroup waits for its first TDM loads
+    meanwhile), and the fetches hit L2. One global_load_b128 per WARM_PIECE bytes, its 32 lanes 64 bytes apart,
+    counted back from each region's end label over the region's size bound (so never past the kernel's code: before
+    a region is the kernel's own code), plus WARM_OWN_PIECES before INIT_C0. A piece that would begin before the
+    function's start begins there instead: every load reads the function's own bytes, however the compiler lays
+    the kernel out. The loads' data goes to v[BASE:], which no code uses before the first region (each load's
+    address offset is first written to its own destination); _warm_code_landed() ends them."""
+    pieces = []  # (label, bytes before it)
+    for name in WARM_REGIONS:
+        end = f"{fwd_sched.region_label(name)}_end"
+        pieces += [
+            (end, WARM_PIECE * k) for k in range(1, -(-fwd_sched.region_bytes(name) // WARM_PIECE) + 1)
+        ]
+    first = fwd_sched.region_label(WARM_REGIONS[0])
+    pieces += [(first, WARM_PIECE * k) for k in range(1, WARM_OWN_PIECES + 1)]
+    assert fwd_sched.BASE + 4 * len(pieces) <= 256
+    regs = [fwd_sched.BASE + 4 * i for i in range(len(pieces))]
+    # s[92:93]: the function's start, as a signed 64-bit add to the pc. Per piece, its first byte from there (not
+    # before it) + the lane's line, then one wait for these offsets (expert scheduling mode) and the loads
+    lines = ["s_getpc_b64 s[90:91]", "fwd_warm_pc:"]
+    lines += [f"s_mov_b32 s94, {KERNEL_NAME}-fwd_warm_pc", "s_ashr_i32 s95, s94, 31"]
+    lines.append("s_add_nc_u64 s[92:93], s[90:91], s[94:95]")
+    for r, (label, back) in zip(regs, pieces):
+        lines += [f"s_mov_b32 s94, {label}-{KERNEL_NAME}-{back}", "s_max_i32 s94, s94, 0"]
+        lines.append(f"v_add_nc_u32 v{r}, s94, $0")
+    lines.append("s_wait_alu depctr_va_vdst(0)")
+    lines += [f"global_load_b128 v[{r}:{r + 3}], v{r}, s[92:93]" for r in regs]
+    lines.append("s_wait_xcnt 0x0")
+    clobbers = [f"~{{v{r}}}" for r in range(fwd_sched.BASE, fwd_sched.BASE + 4 * len(pieces))]
+    clobbers += [f"~{{s{r}}}" for r in range(90, 96)] + ["~{scc}"]
+    lane64 = (fx.Int32(fx.thread_idx.x) & fx.Int32(31)) * fx.Int32(64)
+
+    @flyc.jit
+    def warm(cond):
+        if cond:
+            llvm.inline_asm(
+                res=None,
+                operands_=[_ir(lane64)],
+                asm_string="\n".join(lines),
+                constraints=",".join(["v"] + clobbers),
+                has_side_effects=True,
+            )
+
+    warm(wv == fx.Int32(0))
 
 
-@flyc.jit
-def _rescale_if(o_vecs, corr_vec, do_rescale):
-    result = o_vecs
-    if do_rescale:
-        result = [ov * corr_vec for ov in o_vecs]
-    return result
-
-
-def _attention(
-    *,
-    o,
-    q,
-    k,
-    v,
-    lse,
-    softmax_scale,
-    stride_q_seq,
-    stride_k_seq,
-    stride_v_seq,
-    stride_o_seq,
-    stride_q_head,
-    stride_k_head,
-    stride_v_head,
-    stride_o_head,
-    stride_lse_seq,
-    stride_lse_head,
-    lse_base,
-    lse_bytes,
-    q_start,
-    q_len,
-    kv_start,
-    kv_len,
-    window_right,
-    warp_idx,
-    hi_wave,
-    lds_base,
-):
-    """One wave's share of the workgroup: 32 query rows of one (batch, head)."""
-    # Lane id within the wave32: mbcnt of all lanes below this one (fx.gpu.lane_id changes the code).
-    lane_idx = fx.Int32(rocdl.mbcnt_lo(fx.Int32.ir_type, fx.Int32(-1).ir_value(), fx.Int32(0).ir_value()))
-    head = _block_id("y")
-    row0 = _block_id("x") * BLOCK_M + warp_idx * ROWS_PER_WAVE
-    seq_idx = [row0 + qt * WMMA_M + lane_idx % WMMA_M for qt in range(Q_TILES)]
-
-    def k_slot(pp):
-        return lds_base + fx.Int32(pp) * fx.Int32(SLOT_BYTES)
-
-    def v_slot(pp):
-        return k_slot(pp) + fx.Int32(KV_BLOCK_BYTES)
-
-    q_lds = lds_base + fx.Int32(SLOT_BYTES)
-    q_region = issue_q_copy(
-        q=q,
-        stride_q_seq=stride_q_seq,
-        stride_q_head=stride_q_head,
-        q_start=q_start,
-        q_len=q_len,
-        head=head,
-        block_x=_block_id("x"),
-        warp_idx=warp_idx,
-        lds_base=q_lds,
+def _warm_code_landed():
+    """_warm_code's loads have written their VGPRs: before the first region, and before the wave ends."""
+    llvm.inline_asm(
+        res=None, operands_=[], asm_string="s_wait_loadcnt 0x0", constraints="", has_side_effects=True
     )
 
-    # Tiles [0, n_tiles) hold every key the workgroup's last query attends.
-    block_x = _block_id("x")
-    causal_off = kv_len - q_len
-    wg_max_seq = fx.min(block_x * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M - 1), q_len - fx.Int32(1))
-    kv_len_wg = fx.max(fx.min(wg_max_seq + causal_off + window_right + fx.Int32(1), kv_len), fx.Int32(1))
-    n_tiles = fx.ceildiv(kv_len_wg, fx.Int32(N_BLOCK))
 
-    def kv_valid(row):
-        return fx.min(fx.max(kv_len_wg - row, fx.Int32(0)), fx.Int32(N_BLOCK))
+def _attention(a):
+    pb = _Problem(a, fx.Int32(0))
+    lds0 = fx.Int32(fx.ptrtoint(fx.SharedAllocator().allocate(LDS_B).peek().ptr))
+    rocdl.disable_xdl_arb_stall()
+    wv = fx.Int32(rocdl.wave_id())
+    _warm_code(wv)
+    c2 = a["scale"] * fx.Float32(LOG2E)
 
-    def tile_copies(pp, row, valid):
-        """K then V copies of the tile at kv row ``row`` into slot ``pp``."""
-        kc = kv_copies(
-            lds_base=k_slot(pp),
-            src=k,
-            stride_seq=stride_k_seq,
-            stride_head=stride_k_head,
-            head=head,
-            row0=kv_start + row,
-            valid=valid,
-            width=D_QK,
-            row_elems=K_ROW_ELEMS,
-        )
-        vc = kv_copies(
-            lds_base=v_slot(pp),
-            src=v,
-            stride_seq=stride_v_seq,
-            stride_head=stride_v_head,
-            head=head,
-            row0=kv_start + row,
-            valid=valid,
-            width=D_V,
-            row_elems=V_ROW_ELEMS,
-        )
-        return kc + vc
+    sc = _Sched(a)
 
-    first = tile_copies(0, fx.Int32(0), kv_valid(fx.Int32(0)))
-    q_frags = read_q_fragments(q_region, lane_idx)
-    for c in first:
-        fx.copy_atom_call(*c)
-    # Split workgroup barrier, one arrive and one wait per tile: a wave arrives once its reads of
-    # the current slot and its share of the next tile's copy are done and waits before the next
-    # tile, so it may run one PV GEMM ahead of the slowest wave.
-    _drain_and_arrive()
+    @flyc.jit
+    def run():
+        ok0, qb0, hh0, bb0 = sc.first
+        if ok0:
+            # the first block's prologue loads: Q (waves 1, 2), then its tiles 0..2 = ring slots 0..2 (waves 0..2;
+            # past its last tile copies of that one, never a next block's tiles: the assertion on BM / NB above)
+            pb.issue_q(lds0, wv, qb0, hh0, bb0)
+            n0 = pb.ntiles(qb0)
+            op0 = pb.slot_ops(wv, *pb.kv_base(hh0, bb0))
+            for t in range_constexpr(3):
+                pb.issue_slot(lds0, op0, fx.Int32(t), n0, fx.Int32(0))
+            s = fx.Int32(0)
+            sb = fx.Int32(0)
+            more = fx.Int32(1)
+            qb, hh, bb = qb0, hh0, bb0
+            _warm_code_landed()
+            while more != fx.Int32(0):
+                # an opaque 0 from the block counter: the block's values are not hoisted out of the block loop
+                z = s.shrui(fx.Int32(30))
+                wvz = wv + z
+                more, n, qb, hh, bb = _block(_Problem(a, z), sc, lds0 + z, wvz, c2, s, sb, qb, hh, bb)
+                s = s + fx.Int32(1)
+                sb = (sb + n) & fx.Int32(NSTG - 1)
+            # past the last block: no TDM write (the 1-row copies) may land after the workgroup retires
+            tdm_ops.tensor_wait(0)
 
-    c_exp2 = softmax_scale * fx.Float32(LOG2E)
-    init = []
-    for _ in range(Q_TILES):
-        init += [fx.Float32(BIG_NEG), fx.Float32(0.0)]
-        init += [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range(D_TILES)]
-    nst = 2 + D_TILES  # (m, d, O accumulators) per q tile
-    ptr_base = len(init)
-    k0, v0 = k_read_base(k_slot(0), lane_idx), v_read_base(v_slot(0), lane_idx)
-    k1, v1 = k_read_base(k_slot(1), lane_idx), v_read_base(v_slot(1), lane_idx)
-    init += [k0, k1, v0, v1]
+    run()
+    _warm_code_landed()  # (a workgroup without a block)
+    reserve_vgprs(a["never"] != fx.Int32(0), lds0, RESERVE_V4)
 
-    def tile(t, state, *, masked, sync_only=False):
-        """One kv tile: wait for its K/V, prefetch the next one, then QK, softmax, rescale, PV.
 
-        ``masked`` tiles apply the causal edge and the kv tail. ``sync_only`` tiles are fully masked
-        for every row of this wave and keep only the barrier and the prefetch.
-        """
-        pb = 0 if sync_only else ptr_base
-        nxt_pp = (t + fx.Int32(1)) % fx.Int32(2)
-        kv_tile_start = t * fx.Int32(N_BLOCK)
-        if not sync_only:
-            m_prev = [fx.Float32(state[qt * nst]) for qt in range(Q_TILES)]
-            d_prev = [fx.Float32(state[qt * nst + 1]) for qt in range(Q_TILES)]
-            o_acc = [[fx.Vector(state[qt * nst + 2 + dt]) for dt in range(D_TILES)] for qt in range(Q_TILES)]
-        k_cur, k_nxt, v_cur, v_nxt = state[pb : pb + 4]
-        nxt = t + fx.Int32(1)
-        nxt_row = nxt * fx.Int32(N_BLOCK)
-        nxt_copies = tile_copies(nxt_pp, nxt_row, kv_valid(nxt_row))
-        swapped = [k_nxt, k_cur, v_nxt, v_cur]
-        if sync_only:
-            _barrier_wait()
-            _copy_if(nxt < n_tiles, nxt_copies)
-            _drain_and_arrive()
-            return swapped
-        _barrier_wait()
-        # Waves i and i + 4 share a SIMD; the high half prefetches before reading K so the pair
-        # does not run the same phase in lockstep.
-        if hi_wave:
-            _copy_if(nxt < n_tiles, nxt_copies)
-            k_vals = load_k(k_cur)
+def _block(pb, sc, lds0, wv, c2, s, sb, qb, hh, bb):
+    """Block s (q block qb, head hh, batch bb) of the workgroup, its tile 0 in ring stage sb. Returns (1 if a next block
+    follows else 0, this block's number of kv tiles, the next block's q block, head, batch)."""
+    q0 = qb * fx.Int32(BM)
+    n = pb.ntiles(qb)
+    ncc = _min((q0 + pb.cshift + fx.Int32(1)).shrui(fx.Int32(6)), n)  # tiles [0, ncc) need no mask
+    op = pb.slot_ops(wv, *pb.kv_base(hh, bb))
+    lane = pb.lane()
+    # B_0: Q and tiles 0..2 landed and visible; every wave's reads of the previous block's staging retired
+    tdm_ops.tensor_wait(0)
+    _bar_signal()
+    _bar_wait()
+    # per-lane LDS bases: Q B operands (q tiles 0, 1 from qa, 2, 3 from qb2, + 64 rows for q tiles 1, 3), K A
+    # operands, V^T A operands (ds_load_tr16_b128)
+    l15 = lane & fx.Int32(15)
+    l4 = lane.shrui(fx.Int32(4))
+    qa = lds0 + fx.Int32(Q_OFF) + (fx.Int32(16) * wv + l15) * fx.Int32(XK) + l4 * fx.Int32(16)
+    qb2 = qa + fx.Int32(2 * 64 * XK)
+    k_lane = l15 * fx.Int32(XK) + l4 * fx.Int32(16)
+    v_lane = (l4 * fx.Int32(8) + (lane & fx.Int32(7))) * fx.Int32(XV) + (
+        lane.shrui(fx.Int32(3)) & fx.Int32(1)
+    ) * fx.Int32(16)
+    # causal: element e of kv16 tile j of tile t (kv = 64 t + 16 j + 8 (lane / 16) + e) is masked for q tile i iff
+    # 16 j + e > dl0 - 64 t + 64 i
+    dl0 = q0 + fx.Int32(16) * wv + l15 + pb.cshift - l4 * fx.Int32(8)
+
+    # Tiles [0, ncc). Tile t issues this wave's op of ring slot t + 3 into the stage of tile t - 1 (freed by barrier
+    # B_t): the block's tile min(t + 3, n - 1) with all its 64 rows (past tile n - 1 a copy of it into the free stage,
+    # never read), so group 1 is the same for every slot. Tile 0 runs with INIT in one region (INIT_C0: no previous
+    # tile, so no prefix), tiles [1, ncc) as one generated loop (TILE_CL).
+    cnt, lds_off, base, stride, w0, tile0 = op
+    step = fx.Int64(2 * NB) * stride
+    g1 = _tdm_g1(w0, NB, tile0, NB, stride)
+
+    def slot_quad(t):
+        """Group 0 of this wave's op of ring slot t + 3 (tile t's) for the tiles [0, ncc)."""
+        lds = lds0 + ((sb + t + fx.Int32(3)) & fx.Int32(NSTG - 1)) * fx.Int32(STG_B) + lds_off
+        return lds, (base + fx.Int64(_min(t + fx.Int32(3), n - fx.Int32(1))) * step) | fx.Int64(-(1 << 63))
+
+    @flyc.jit
+    def tiles_c(cond):
+        if cond:
+            st0 = lds0 + (sb & fx.Int32(NSTG - 1)) * fx.Int32(STG_B)
+            lds3, addr3 = slot_quad(fx.Int32(0))
+            q3 = fx.Vector.from_elements(
+                [cnt, lds3, fx.Int32(addr3), fx.Int32(addr3 >> fx.Int64(32))], fx.Int32
+            )
+            _region("INIT_C0", qa, qb2, st0 + k_lane, st0 + fx.Int32(K_B) + v_lane, c2, q3, g1)
+            _bar_wait()  # B_1
+
+            @flyc.jit
+            def loop(cond2):
+                if cond2:
+                    # the loop counts from 0: tile 1 + t, slot advance while 1 + t < n - 4
+                    stage1 = lds0 + ((sb + fx.Int32(1)) & fx.Int32(NSTG - 1)) * fx.Int32(STG_B)
+                    lds4, addr4 = slot_quad(fx.Int32(1))
+                    _region(
+                        "TILE_CL",
+                        k_lane,
+                        v_lane + fx.Int32(K_B),
+                        c2,
+                        stage1,
+                        cnt,
+                        lds4,
+                        lds_off,
+                        lds0 + fx.Int32(NSTG * STG_B),
+                        ncc - fx.Int32(1),
+                        n - fx.Int32(5),
+                        addr4,
+                        step,
+                        g1,
+                    )
+
+            loop(ncc > fx.Int32(1))
         else:
-            k_vals = load_k(k_cur)
-            _copy_if(nxt < n_tiles, nxt_copies)
-        rocdl.sched_barrier(0)
-        s = _qk_gemm(k_vals, q_frags)
-        rocdl.sched_barrier(0)
-        v_vals = load_v(v_cur)
-        rocdl.sched_barrier(0)
-        kv_last = None
-        if masked:
-            kv_last = [
-                fx.min(seq_idx[qt] + causal_off + window_right, kv_len - fx.Int32(1)) for qt in range(Q_TILES)
-            ]
-        p, m_new, d_new, corr, rescale = _softmax(
-            s=s,
-            m_prev=m_prev,
-            d_prev=d_prev,
-            lane_idx=lane_idx,
-            c_exp2=c_exp2,
-            kv_pos_base=kv_tile_start,
-            kv_last=kv_last,
-        )
-        _drain_and_arrive()
-        o_scaled = []
-        for qt in range(Q_TILES):
-            corr_vec = fx.Vector.from_elements([corr[qt]], fx.Float32).broadcast_to(8)
-            o_scaled.append(list(_rescale_if(o_acc[qt], corr_vec, rescale[qt])))
-        o_new = _pv_gemm(v_vals, p, o_scaled)
-        out = []
-        for qt in range(Q_TILES):
-            out += [m_new[qt], d_new[qt]] + o_new[qt]
-        return out + swapped
+            _region("INIT", qa, qb2, c2)
 
+    tiles_c(ncc > fx.Int32(0))
+
+    # the diagonal tiles ncc + k, k < 4 (seqlen_q == seqlen_kv); their slots n..n + 2 load the next block's tiles
+    # 0..2 (the next block is known here on the static schedule)
+    nx, qbx, hhx, bbx = sc.next(s, hh, bb)
+    nnx = pb.ntiles(qbx)
+    opx = pb.slot_ops(wv, *pb.kv_base(hhx, bbx))
+    nxi = _sel(nx, fx.Int32(1), fx.Int32(0))
+    for k in range_constexpr(3):
+
+        @flyc.jit
+        def diag(cond):
+            if cond:
+                t2 = ncc + fx.Int32(k)  # noqa: B023 (diag runs within its iteration)
+                pb.issue_slot(lds0, op, t2 + fx.Int32(3), n, sb, nxi, nnx, opx)
+                st = lds0 + ((sb + t2) & fx.Int32(NSTG - 1)) * fx.Int32(STG_B)
+                _region(f"TILE_D{k}", st + k_lane, st + fx.Int32(K_B) + v_lane, dl0 - fx.Int32(NB) * t2, c2)  # noqa: B023
+                _bar_wait()  # B_{t2+1}
+
+        diag(ncc + fx.Int32(k) < n)
+
+    stg = _staging(pb, lds0, wv, sb, n)
+
+    # the last diagonal tile with FINAL (TILE_D3F), else FINAL alone after the block's last tile. The next block's Q
+    # goes out before them (every wave's reads of the Q area retired at B_1; two TDM ops per wave, NULL ops past the
+    # workgroup's last block, which TILE_D3F's tensorcnt wait leaves in flight)
     @flyc.jit
-    def run_tiles(state, lo, hi, *, masked):
-        final_state = state
-        for t, carried in range(fx.Index(lo), fx.Index(hi), 1, init=state):
-            next_state = tile(fx.Int32(t), list(carried), masked=masked)
-            final_state = yield next_state
-        return final_state
+    def last(cond):
+        if cond:
+            t2 = ncc + fx.Int32(3)
+            pb.issue_slot(lds0, op, t2 + fx.Int32(3), n, sb, nxi, nnx, opx)
+            pb.issue_q(lds0, wv, qbx, hhx, bbx, on=nx)
+            st = lds0 + ((sb + t2) & fx.Int32(NSTG - 1)) * fx.Int32(STG_B)
+            _region(
+                "TILE_D3F", st + k_lane, st + fx.Int32(K_B) + v_lane, dl0 - fx.Int32(NB) * t2, c2, *stg[2:]
+            )
+        else:
+            pb.issue_q(lds0, wv, qbx, hhx, bbx, on=nx)
+            _region("FINAL_A", *stg[2:])
 
-    @flyc.jit
-    def run_sync_tiles(ptrs, lo, hi):
-        final_ptrs = ptrs
-        for t, carried in range(fx.Index(lo), fx.Index(hi), 1, init=ptrs):
-            next_ptrs = tile(fx.Int32(t), list(carried), masked=False, sync_only=True)
-            final_ptrs = yield next_ptrs
-        return final_ptrs
+    last(ncc + fx.Int32(3) < n)
+    rocdl.sched_barrier(0)
+    _store_out(pb, stg, wv, q0, hh, bb)
+    return nxi, n, qbx, hhx, bbx
 
-    # Tiles [0, clean_hi) need no mask for any row of the workgroup, [clean_hi, wave_end) are
-    # masked, and [wave_end, n_tiles) are fully masked for every row of this wave.
-    n_last = n_tiles - fx.Int32(1)
-    qmax_min = fx.max(block_x * fx.Int32(BLOCK_M) + causal_off + window_right, fx.Int32(0))
-    clean_hi = fx.max(fx.min((qmax_min + fx.Int32(1)) // fx.Int32(N_BLOCK), n_last), fx.Int32(0))
-    state = run_tiles(init, fx.Int32(0), clean_hi, masked=False)
-    wave_max_seq = fx.min(
-        block_x * fx.Int32(BLOCK_M) + warp_idx * fx.Int32(ROWS_PER_WAVE) + fx.Int32(ROWS_PER_WAVE - 1),
-        q_len - fx.Int32(1),
+
+def _staging(pb, lds0, wv, sb, n):
+    """This wave's staging slots of out / lse (q tiles 0, 1 in the stage of tile n - 1, q tiles 2, 3 at TAIL; O row r
+    at XO r, the lse of lane l at LSE_SLOT + 4 l): (slot base a, slot base b, FINAL's operands wa, wb, la, lb)."""
+    lane = pb.lane()
+    sga = lds0 + ((sb + n - fx.Int32(1)) & fx.Int32(NSTG - 1)) * fx.Int32(STG_B) + wv * fx.Int32(SQT)
+    sgb = lds0 + fx.Int32(TAIL) + wv * fx.Int32(SQT)
+    wl = (lane & fx.Int32(15)) * fx.Int32(XO) + lane.shrui(fx.Int32(4)) * fx.Int32(16)
+    wls = fx.Int32(LSE_SLOT) + fx.Int32(4) * lane
+    return sga, sgb, sga + wl, sgb + wl, sga + wls, sgb + wls
+
+
+def _store_out(pb, stg, wv, q0, hh, bb):
+    """Copies this wave's staged out / lse (stg: _staging) to global memory: 8 row-pair buffer stores per q tile and
+    one lse store."""
+    _wave_lds_order()
+    a = pb.a
+    Sq, H = a["Sq"], a["H"]
+    sga, sgb = stg[0], stg[1]
+    # O, q tile i: a buffer resource based at its first row q0 + 64 i (num_records 0 past Sq: the 64 rows are all in
+    # or all past Sq), soffset 2 j * row bytes (store j: rows 2 j, 2 j + 1), voffset the lane's row 16 wv + l / 16 and
+    # 16-B column l % 16; lse: one 8-byte store of two rows per lane for the wave's 64 rows
+    rsb = H * fx.Int32(D_V * 2)  # bytes per q row
+    o_bytes = fx.Int64(a["B"]) * fx.Int64(Sq) * fx.Int64(H) * fx.Int64(D_V * 2)
+    off0 = ((fx.Int64(bb) * fx.Int64(Sq) + fx.Int64(q0)) * fx.Int64(H) + fx.Int64(hh)) * fx.Int64(D_V * 2)
+    ln = pb.lane()
+    hl = ln.shrui(fx.Int32(4))
+    rl = ln & fx.Int32(15)
+    vo_l = (fx.Int32(16) * wv + hl) * rsb + rl * fx.Int32(16)
+    rda = sga + hl * fx.Int32(XO) + rl * fx.Int32(16)
+    rdb = sgb + hl * fx.Int32(XO) + rl * fx.Int32(16)
+    v4 = fx.Vector.make_type(4, fx.Int32)
+    v2 = fx.Vector.make_type(2, fx.Int32)
+    lt = ln.shrui(fx.Int32(3))
+    lk = ln & fx.Int32(7)
+    lsrc = (
+        _sel(lt < fx.Int32(2), sga, sgb)
+        + (lt & fx.Int32(1)) * fx.Int32(4 * SQT)
+        + fx.Int32(LSE_SLOT)
+        + fx.Int32(8) * lk
     )
-    wave_q_max = fx.max(wave_max_seq + causal_off + window_right, fx.Int32(-1))
-    wave_end = fx.max(fx.min((wave_q_max + fx.Int32(N_BLOCK)) // fx.Int32(N_BLOCK), n_tiles), clean_hi)
-    state = run_tiles(state, clean_hi, wave_end, masked=True)
-    run_sync_tiles(list(state[ptr_base:]), wave_end, n_tiles)
-    _barrier_wait()
-
-    # O / d goes out through the LDS slot the last tile did not use.
-    writer = OutputWriter(
-        o=o,
-        stride_o_seq=stride_o_seq,
-        stride_o_head=stride_o_head,
-        q_start=q_start,
-        q_len=q_len,
-        head=head,
-        block_x=block_x,
-        warp_idx=warp_idx,
-        lane_idx=lane_idx,
+    lsev = llvm.load(v2, lds_ptr(lsrc))
+    lq = q0 + fx.Int32(16) * wv + fx.Int32(64) * lt + fx.Int32(2) * lk
+    la = ((bb * H + hh) * Sq + lq) * fx.Int32(4)
+    lo = _sel(q0 + fx.Int32(64) * lt < Sq, la, _w(OOB))
+    rocdl.sched_barrier(0)
+    for i in range(QT):  # the q tile's 8 reads into registers of their own, then its stores
+        ok = (q0 + fx.Int32(64 * i)) < Sq
+        offi = off0 + fx.Int64(64 * i) * fx.Int64(rsb)
+        base = pb.oaddr + _sel(ok, offi, fx.Int64(0))
+        nrec = _sel(ok, fx.Int32(o_bytes - offi), fx.Int32(0))
+        r_o = create_buffer_resource_from_addr(_ir(base), num_records_bytes=_ir(nrec))
+        src = rda if i < 2 else rdb
+        ws = [llvm.load(v4, lds_ptr(src + fx.Int32((i & 1) * 4 * SQT + 2 * j * XO))) for j in range(8)]
+        for j, w in enumerate(ws):
+            buffer_store(w, r_o, vo_l, soffset_bytes=fx.Int32(2 * j) * rsb, offset_is_bytes=True)
+        rocdl.sched_barrier(0)
+    # B H Sq 4 < 2^31 (the host's check)
+    r_l = create_buffer_resource_from_addr(
+        _ir(pb.laddr), num_records_bytes=_ir(a["B"] * H * Sq * fx.Int32(4))
     )
-    o_lds = k_slot(n_tiles % fx.Int32(2))
-    for qt in range(Q_TILES):
-        d_final = fx.Float32(state[qt * nst + 1])
-        inv = (d_final > fx.Float32(0.0)).select(fx.Float32(1.0) / d_final, fx.Float32(0.0))
-        inv_vec = fx.Vector.from_elements([inv], fx.Float32).broadcast_to(8)
-        o_norm = [fx.Vector(state[qt * nst + 2 + dt]) * inv_vec for dt in range(D_TILES)]
-        if qt > 0:
-            rocdl.s_wait_dscnt(0)  # nothing is pending; the wait only pins the epilogue schedule
-        writer.stage(o_lds, o_norm, qt)
-    writer.flush()
-
-    # lse = (m + log2(d)) * ln(2), stored by the lanes holding kv half 0. Masked lanes store at
-    # byte offset 0x7FFFFFFF, past the descriptor bound, so the store is dropped.
-    khalf0 = (lane_idx // fx.Int32(WMMA_M)) == fx.Int32(0)
-    lse_rsrc = create_buffer_resource(lse, num_records_bytes=lse_bytes)
-    for qt in range(Q_TILES):
-        m_final = fx.Float32(state[qt * nst])
-        d_final = fx.Float32(state[qt * nst + 1])
-        lse_val = (m_final + fx.log2(d_final)) * fx.Float32(1.0 / LOG2E)
-        mask = khalf0 & (seq_idx[qt] < q_len)
-        off = lse_base + seq_idx[qt] * stride_lse_seq + head * stride_lse_head
-        off = mask.select(off * fx.Int32(4), fx.Int32(0x7FFFFFFF))
-        buffer_store(lse_val, lse_rsrc, off, mask=None, offset_is_bytes=True)
+    buffer_store(lsev, r_l, lo, offset_is_bytes=True)
+    rocdl.sched_barrier(0)
 
 
-@flyc.kernel(name="mla_fwd_kernel", known_block_size=[BLOCK_SIZE, 1, 1])
+@flyc.kernel(name=KERNEL_NAME, known_block_size=[NWAVES * 32, 1, 1])
 def mla_fwd_kernel(
-    o: fx.Tensor,
-    q: fx.Tensor,
-    k: fx.Tensor,
-    v: fx.Tensor,
-    lse: fx.Tensor,
-    unused_tensor: fx.Tensor,
-    softmax_scale: fx.Float32,
-    stride_q_seq: fx.Int32,
-    stride_k_seq: fx.Int32,
-    stride_v_seq: fx.Int32,
-    stride_o_seq: fx.Int32,
-    stride_q_head: fx.Int32,
-    stride_k_head: fx.Int32,
-    stride_v_head: fx.Int32,
-    stride_o_head: fx.Int32,
-    stride_lse_seq: fx.Int32,
-    stride_lse_head: fx.Int32,
-    stride_lse_batch: fx.Int32,
-    unused_i32: fx.Int32,
-    window_right: fx.Int32,
-    seq_len_q: fx.Int32,
-    seq_len_k: fx.Int32,
+    O: fx.Tensor,
+    Q: fx.Tensor,
+    K: fx.Tensor,
+    V: fx.Tensor,
+    LSE: fx.Tensor,
+    scale: fx.Float32,
+    Sq: fx.Int32,
+    Skv: fx.Int32,
+    H: fx.Int32,
+    B: fx.Int32,
+    nqb: fx.Int32,
+    npw: fx.Int32,
+    never: fx.Int32,
 ):
-    """Grid (q blocks, heads, batch). Query i sees keys j <= i + seq_len_k - seq_len_q + window_right.
-
-    The two unused arguments keep the argument layout the kernel was tuned with.
-    """
-    batch = _block_id("z")
-    lse_base = batch * stride_lse_batch
-    lse_bytes = fx.Int64(lse_base + stride_lse_batch) * fx.Int64(4)
-    q_start = batch * seq_len_q
-    kv_start = batch * seq_len_k
-    lds_base = fx.Int32(fx.ptrtoint(fx.SharedAllocator().allocate(LDS_BYTES).peek().ptr))
-    warp_idx = fx.Int32(rocdl.wave_id())
-    args = dict(
-        o=o,
-        q=q,
-        k=k,
-        v=v,
-        lse=lse,
-        softmax_scale=softmax_scale,
-        stride_q_seq=stride_q_seq,
-        stride_k_seq=stride_k_seq,
-        stride_v_seq=stride_v_seq,
-        stride_o_seq=stride_o_seq,
-        stride_q_head=stride_q_head,
-        stride_k_head=stride_k_head,
-        stride_v_head=stride_v_head,
-        stride_o_head=stride_o_head,
-        stride_lse_seq=stride_lse_seq,
-        stride_lse_head=stride_lse_head,
-        lse_base=lse_base,
-        lse_bytes=lse_bytes,
-        q_start=q_start,
-        q_len=seq_len_q,
-        kv_start=kv_start,
-        kv_len=seq_len_k,
-        window_right=window_right,
-        warp_idx=warp_idx,
-        lds_base=lds_base,
+    """Grid (nqb, H, B), or (npw, 1, 1) persistent (npw > 0). ``never`` is 0 (common.reserve_vgprs)."""
+    _attention(
+        dict(
+            O=O, Q=Q, K=K, V=V, LSE=LSE, scale=scale, Sq=Sq, Skv=Skv, H=H, B=B, nqb=nqb, npw=npw, never=never
+        )
     )
-    if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
-        _attention(hi_wave=False, **args)
-    else:
-        _attention(hi_wave=True, **args)
 
 
 @flyc.jit
 def launch_mla_fwd(
-    o: fx.Tensor,
-    q: fx.Tensor,
-    k: fx.Tensor,
-    v: fx.Tensor,
-    lse: fx.Tensor,
-    unused_tensor: fx.Tensor,
-    softmax_scale: fx.Float32,
-    stride_q_seq: fx.Int32,
-    stride_k_seq: fx.Int32,
-    stride_v_seq: fx.Int32,
-    stride_o_seq: fx.Int32,
-    stride_q_head: fx.Int32,
-    stride_k_head: fx.Int32,
-    stride_v_head: fx.Int32,
-    stride_o_head: fx.Int32,
-    stride_lse_seq: fx.Int32,
-    stride_lse_head: fx.Int32,
-    stride_lse_batch: fx.Int32,
-    unused_i32: fx.Int32,
-    window_right: fx.Int32,
-    seq_len_q: fx.Int32,
-    seq_len_k: fx.Int32,
-    num_heads: fx.Int32,
-    batch: fx.Int32,
+    O: fx.Tensor,
+    Q: fx.Tensor,
+    K: fx.Tensor,
+    V: fx.Tensor,
+    LSE: fx.Tensor,
+    scale: fx.Float32,
+    Sq: fx.Int32,
+    Skv: fx.Int32,
+    H: fx.Int32,
+    B: fx.Int32,
+    nqb: fx.Int32,
+    npw: fx.Int32,
     stream: fx.Stream,
 ):
     _ = SOURCE_DIGEST  # FlyDSL disk-cache key
-    grid_x = fx.Index(fx.ceildiv(fx.Uint32(seq_len_q), fx.Uint32(BLOCK_M)))
-    mla_fwd_kernel(
-        o,
-        q,
-        k,
-        v,
-        lse,
-        unused_tensor,
-        softmax_scale,
-        stride_q_seq,
-        stride_k_seq,
-        stride_v_seq,
-        stride_o_seq,
-        stride_q_head,
-        stride_k_head,
-        stride_v_head,
-        stride_o_head,
-        stride_lse_seq,
-        stride_lse_head,
-        stride_lse_batch,
-        unused_i32,
-        window_right,
-        seq_len_q,
-        seq_len_k,
-    ).launch(grid=(grid_x, fx.Index(num_heads), fx.Index(batch)), block=(BLOCK_SIZE, 1, 1), stream=stream)
+    persist = npw > fx.Int32(0)
+    gx = fx.Index(_sel(persist, npw, nqb))
+    gy = fx.Index(_sel(persist, fx.Int32(1), H))
+    gz = fx.Index(_sel(persist, fx.Int32(1), B))
+    mla_fwd_kernel(O, Q, K, V, LSE, scale, Sq, Skv, H, B, nqb, npw, fx.Int32(0)).launch(
+        grid=(gx, gy, gz), block=(NWAVES * 32, 1, 1), stream=stream
+    )
 
 
-# Expert scheduling mode turns the hardware dependency interlocks off and has LLVM insert the
-# dependency-counter waits, so memory ops must stay plain intrinsics (no inline asm) it can see.
-# waves_per_eu = 2: the 8 waves of a workgroup run two per SIMD, so each may use 512 VGPRs.
-launch_mla_fwd.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": True}
-launch_mla_fwd.compile_hints["waves_per_eu"] = 2
+# Expert scheduling mode: the generated regions carry their own dependency waits (fwd_sched / asm) and LLVM
+# inserts those of the kernel's own code. One wave per SIMD (1024 VGPRs). amdgpu-prealloc-sgpr-spill-vgprs: the
+# VGPR lanes LLVM spills SGPRs to are allocated with the kernel's own VGPRs (below fwd_sched.BASE), not among the
+# generated code's.
+launch_mla_fwd.compile_hints["llvm_options"] = {
+    "amdgpu-expert-scheduling-mode": True,
+    "amdgpu-prealloc-sgpr-spill-vgprs": True,
+}
+launch_mla_fwd.compile_hints["waves_per_eu"] = 1

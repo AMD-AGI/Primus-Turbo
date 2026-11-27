@@ -11,7 +11,7 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""Ulysses GemmA2A: a dense GEMM whose output columns are head-sharded over the group, scattered
+"""GemmA2A: a dense GEMM whose output columns are head-sharded over the group, scattered
 straight into the post-all-to-all layout (pull mode).
 
 GEMM blocks compute ``C = A @ B`` (``A`` = this rank's tokens) into this rank's symmetric staging
@@ -33,14 +33,7 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr
 
 from primus_turbo.flydsl.deep_ep.launch_cache import run_launcher
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
-    grouped_gemm_bf16_variable_k_tile,
-)
-from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
-    _make_shared_storage,
-    gemm_bf16_tile,
-)
-from primus_turbo.flydsl.ulysses.common import (
+from primus_turbo.flydsl.fused_collective_gemm.common import (
     BLOCK_THREADS,
     NUM_WARPS,
     SYS_NT,
@@ -52,10 +45,17 @@ from primus_turbo.flydsl.ulysses.common import (
     i64_base,
     spin_flag,
 )
-from primus_turbo.flydsl.ulysses.workspace import (
+from primus_turbo.flydsl.fused_collective_gemm.workspace import (
     FLAG_BYTES,
     FLAG_REGION_BYTES,
     FLAGS_PER_REGION,
+)
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
+    grouped_gemm_bf16_variable_k_tile,
+)
+from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
+    _make_shared_storage,
+    gemm_bf16_tile,
 )
 from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_load,
@@ -130,7 +130,13 @@ def _pull_unit(
     if thread_index == fx.Int32(0):
         for tile_n in range_constexpr(first_n, last_n + 1):
             spin_flag(
-                flag_base, m_tile * fx.Int32(n_tiles) + fx.Int32(tile_n), epoch, rank, src, "gemm_a2a pull"
+                flag_base,
+                m_tile * fx.Int32(n_tiles) + fx.Int32(tile_n),
+                epoch,
+                rank,
+                src,
+                "gemm_a2a pull",
+                report=False,
             )
         if const_expr(trace_base is not None):
             st(trace_base, trace_idx, read_clock())
@@ -285,7 +291,7 @@ def _make_kernel(
         else _make_shared_storage(BM, BN, num_lds_row_idx_entries=1)
     )
 
-    @flyc.kernel(name="ulysses_gemm_a2a_kernel", known_block_size=[BLOCK_THREADS, 1, 1])
+    @flyc.kernel(name="gemm_a2a_kernel", known_block_size=[BLOCK_THREADS, 1, 1])
     def kernel(
         A: fx.Tensor,
         B: fx.Tensor,
@@ -423,11 +429,13 @@ def _make_kernel(
             fx.gpu.barrier()
             if thread_index == fx.Int32(0):
                 flag_base = my_base + fx.Int64(flag_region * FLAG_REGION_BYTES)
-                st(flag_base, tile_m * fx.Int32(n_tiles) + tile_n, epoch, scope="sys", order="release")
+                # no release (an L2 writeback per tile): the staging stores are system scope (SYS_NT),
+                # and the waits above retired them before the flag goes out
+                st(flag_base, tile_m * fx.Int32(n_tiles) + tile_n, epoch, scope="sys", order="relaxed")
                 if const_expr(trace):
                     st(trace_base, (tile_m * fx.Int32(n_tiles) + tile_n) * fx.Int32(2) + 1, read_clock())
 
-        exit_and_bump_epoch(thread_index, state_base, epoch, grid)
+        exit_and_bump_epoch(thread_index, state_base, epoch, grid, order="relaxed")
 
     return kernel, grid
 
@@ -519,7 +527,7 @@ def gemm_a2a_bank_bytes(M, N, BM):
     return ceildiv(M, BM) * BM * N * 2
 
 
-def ulysses_gemm_a2a(
+def gemm_a2a(
     a,
     b,
     outs,
@@ -548,6 +556,10 @@ def ulysses_gemm_a2a(
 
     ``outs`` = (q, k, v) ordinary tensors ``[rows, heads, head_dim]`` with ``rows = n * M`` laid out as
     ``qkv_format`` (``sbhd``: [s, b], ``bshd``: [b, s]); a q-only output repeats one tensor.
+
+    ``workspace`` is the group's ``CollectiveGemmWorkspace`` with banks of at least
+    ``gemm_a2a_bank_bytes(M, N, BM)``; ``flag_region`` is this call site's flag region (see
+    ``workspace.py``).
 
     ``wgrad=(a, wb, dw)`` also computes ``dw = a^T @ wb`` (``wb`` [M, N_w], ``dw`` [K, N_w]) in the
     same launch, on ``wgrad_bm x 256`` tiles dispatched after GEMM tile ``wgrad_at`` (needs

@@ -4,9 +4,21 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import contextlib
+
 import torch
 
 from primus_turbo.pytorch.core.backend import AutoKernelDispatcher
+
+
+def _rewritten_call():
+    """Marks the profile runs below, whose group layout is not the caller's, so a FlyDSL kernel
+    tune on the call's own arguments waits for a real call (see ``runtime.rewritten_call``)."""
+    try:
+        from primus_turbo.flydsl.autotune.runtime import rewritten_call
+    except ImportError:
+        return contextlib.nullcontext()
+    return rewritten_call()
 
 
 def _lb_group_lens(group_lens: torch.Tensor, total: int) -> torch.Tensor:
@@ -73,7 +85,8 @@ class BaseGroupedGEMMKernelDispatcher(AutoKernelDispatcher):
             if entry.impl.can_handle(**kwargs):
                 torch.cuda.synchronize()
                 try:
-                    cur_time = cls.profile(entry.impl, **prof_kwargs)
+                    with _rewritten_call():
+                        cur_time = cls.profile(entry.impl, **prof_kwargs)
                 except Exception:
                     cur_time = float("inf")
                 finally:
@@ -137,7 +150,8 @@ class BaseGroupedGEMMVariableKKernelDispatcher(AutoKernelDispatcher):
             if entry.impl.can_handle(**kwargs):
                 torch.cuda.synchronize()
                 try:
-                    cur_time = cls.profile(entry.impl, **prof_kwargs)
+                    with _rewritten_call():
+                        cur_time = cls.profile(entry.impl, **prof_kwargs)
                 except Exception:
                     cur_time = float("inf")
                 finally:

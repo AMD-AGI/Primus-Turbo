@@ -8,11 +8,18 @@ import torch
 from einops import repeat
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-ATTN_BACKENDS = [
-    SDPBackend.FLASH_ATTENTION,
-    SDPBackend.EFFICIENT_ATTENTION,
-    SDPBackend.MATH,
-]
+from primus_turbo.pytorch.core.utils import is_gfx950
+
+# On gfx950 torch's flash attention intermittently loses accuracy on some inputs, enough to fail the
+# SNR checks it is the reference for, and its CK flavour rejects head_dim_v != head_dim_qk.
+if torch.cuda.is_available() and is_gfx950():
+    ATTN_BACKENDS = [SDPBackend.MATH]
+else:
+    ATTN_BACKENDS = [
+        SDPBackend.FLASH_ATTENTION,
+        SDPBackend.EFFICIENT_ATTENTION,
+        SDPBackend.MATH,
+    ]
 
 
 class AttnConfig:

@@ -60,21 +60,34 @@ skip_unless_gfx950 = unittest.skipUnless(
 )
 
 
+def _clamp(v, lo, hi):
+    """``v.clamp(lo, hi)`` whose gradient passes on the bounds too, as the kernels' does.
+
+    torch>=2.14 zeroes the ``torch.clamp`` gradient at a scalar bound (pytorch/pytorch#185831), and
+    bf16 lands many values exactly on a bound like 7.
+    """
+    inside = torch.ones_like(v, dtype=torch.bool)
+    if lo is not None:
+        inside &= v >= lo
+    if hi is not None:
+        inside &= v <= hi
+    return torch.where(inside, v, v.detach().clamp(lo, hi))
+
+
 def _weighted_glu(fc1_out, weights, activation=None):
     """The gated activation with a per-token routing weight.
 
     ``None`` is SiLU-SwiGLU (matches Megatron weighted_bias_swiglu). A ``GLUActivation`` is evaluated
-    in fp32 with ``torch.clamp``, whose autograd -- gradient passes where the input is inside the
-    range -- is the reference backward, as in Megatron's ``weighted_bias_quick_geglu_impl``."""
+    in fp32 as in Megatron's ``weighted_bias_quick_geglu_impl``, with ``_clamp`` for its clamps."""
     if activation is None:
         gate, up = fc1_out.chunk(2, dim=-1)
         return F.silu(gate) * up * weights
     a = activation
     gate, up = fc1_out.float().chunk(2, dim=-1)
     if a.gate_clamp_lo is not None or a.gate_clamp_hi is not None:
-        gate = gate.clamp(min=a.gate_clamp_lo, max=a.gate_clamp_hi)
+        gate = _clamp(gate, a.gate_clamp_lo, a.gate_clamp_hi)
     if a.up_clamp is not None:
-        up = up.clamp(-a.up_clamp, a.up_clamp)
+        up = _clamp(up, -a.up_clamp, a.up_clamp)
     return gate * torch.sigmoid(a.alpha * gate) * (up + a.glu_offset) * weights
 
 

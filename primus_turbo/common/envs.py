@@ -31,6 +31,10 @@ other projects (FlyDSL, Triton, NVSHMEM, the launcher's ``RANK`` / ``WORLD_SIZE`
 writes those through ``os.environ`` directly. The C++ extension reads its variables with
 ``getenv``; they are declared below so Python can discover and inspect them, but C++ reads and
 caches them itself, so ``set_env()`` reaches C++ only before C++ first reads the variable.
+
+``docs/env.md`` is generated from the declarations and the comments above each entry below: after
+changing either, run ``python tools/gen_env_docs.py`` (the ``check-env-docs`` pre-commit hook fails
+until the two agree).
 """
 
 import os
@@ -44,8 +48,11 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_ATTN_BACKEND: str | None = None
     PRIMUS_TURBO_SPARSE_ATTN_BACKEND: str | None = None
     PRIMUS_TURBO_MLA_BWD_IMPL: str = "flydsl"
+    PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB: int = 5120
     PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND: str | None = None
     PRIMUS_TURBO_AUTO_TUNE: bool = False
+    PRIMUS_TURBO_DISPATCH_REPORT: str | None = None
+    PRIMUS_TURBO_STRICT_DISPATCH: bool = False
     PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32: bool = True
     PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT: bool = False
     PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM: bool = False
@@ -58,9 +65,29 @@ if TYPE_CHECKING:
     PT_MEGA_FP8_L2_COMBINE_CU: int | None = None
     PRIMUS_TURBO_DEEPEP_CPU_TIMEOUT: int = 300
     PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE: bool = False
+    PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD: str = "off"
     PRIMUS_TURBO_ODC_GDA_BLOCK: int = 256
     PRIMUS_TURBO_ODC_GDA_PIPE: int = 1
     PRIMUS_TURBO_ODC_GDA_NUM_QP: int = 1
+    PRIMUS_TURBO_CACHE: str = "~/.cache/primus_turbo"
+    PRIMUS_TURBO_HB_GG_TUNE: str = "subprocess"
+    PRIMUS_TURBO_HB_GG_TUNE_CANDIDATES: int = 256
+    PRIMUS_TURBO_HB_GG_TUNE_CACHE: str = "~/.cache/primus_turbo/hipblaslt_grouped_gemm_tune.json"
+    PRIMUS_TURBO_HB_GG_DEBUG: bool = False
+    PRIMUS_FLYDSL_ROWS_CAP_DIV: int = 0
+    PRIMUS_FLYDSL_ZERO_PAD: bool = True
+    PRIMUS_FLYDSL_ALLOW_NOZERO: bool = False
+    PRIMUS_FLYDSL_WG_MAX_G: int = 64
+    PRIMUS_FLYDSL_NN: str = ""
+    PRIMUS_FLYDSL_NT: str = ""
+    PRIMUS_FLYDSL_WG: str = ""
+    PRIMUS_FP8_BWD: str = "all"
+    PRIMUS_TURBO_HB_GG_TUNE_MAX_ROWS: int = 131072
+    PRIMUS_TURBO_HB_GG_HOST_ROWS: str | None = None
+    PRIMUS_TURBO_HB_GG_PICK_NN: int = 0
+    PRIMUS_TURBO_HB_GG_PICK_NT: int = 0
+    PRIMUS_TURBO_HB_GG_PICK_TN: int = 0
+    PRIMUS_TURBO_HB_GG_VERBOSE: bool = False
     PRIMUS_TURBO_DGATE_ACC_ATOMIC: bool = True
 
 
@@ -77,14 +104,30 @@ def backend_spec(name: str) -> Callable[[], str | None]:
     return _get
 
 
-def _positive_int(name: str, raw: str, what: str) -> int:
+def _int_at_least(name: str, raw: str, what: str, minimum: int) -> int:
     try:
         value = int(raw)
     except ValueError:
-        value = 0
-    if value <= 0:
+        value = minimum - 1
+    if value < minimum:
         raise ValueError(f"{name}={raw!r}: {what}")
     return value
+
+
+def _positive_int(name: str, raw: str, what: str) -> int:
+    return _int_at_least(name, raw, what, 1)
+
+
+def env_choice(name: str, default: str, choices: tuple[str, ...]) -> Callable[[], str]:
+    """A getter for one of ``choices``; unset or empty reads as ``default``."""
+
+    def _get() -> str:
+        value = (os.getenv(name) or default).strip().lower()
+        if value not in choices:
+            raise ValueError(f"{name}={value!r}: must be one of {', '.join(choices)}")
+        return value
+
+    return _get
 
 
 def env_positive_int(
@@ -96,6 +139,19 @@ def env_positive_int(
     def _get() -> int | None:
         raw = os.getenv(name)
         return _positive_int(name, raw, what) if raw else default
+
+    return _get
+
+
+def env_non_negative_int(
+    name: str, default: int, what: str = "must be a non-negative integer"
+) -> Callable[[], int]:
+    """A getter for a non-negative integer; unset or empty reads as ``default``, anything else that is
+    not a non-negative integer raises ``ValueError`` naming the variable."""
+
+    def _get() -> int:
+        raw = os.getenv(name)
+        return _int_at_least(name, raw, what, 0) if raw else default
 
     return _get
 
@@ -181,6 +237,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # cannot take to FlyDSL (e.g. seqlen_q % 384 not 0 or 256, see their README). Read at the first
     # MLA backward (attention_flydsl_gfx1250_mla_impl.mla_bwd_impl); another value raises ValueError.
     "PRIMUS_TURBO_MLA_BWD_IMPL": _mla_bwd_impl,
+    # Most dS scratch, in MiB, the FlyDSL gfx1250 MLA backward holds at once (5120 when unset). The backward stores dS
+    # between its dK / dV and dQ kernels, about batch * heads * seqlen_q * seqlen_kv bytes in all (4.33 GB at b2 s4096
+    # h128): all heads on one scratch when that is within this, else the heads in chunks, two in flight, that are
+    # (gfx1250_mla.bwd.ds_chunkings; a few percent slower); below two heads' scratch (0 included) it runs one head at
+    # a time, on that one head's scratch even when it is over this (about batch * seqlen_q * seqlen_kv bytes: 16 GiB
+    # at seqlen 131072; a device without that much free memory raises torch.OutOfMemoryError). Read at every MLA
+    # backward (through the cache); a value that is not a non-negative integer raises ValueError.
+    "PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB": env_non_negative_int(
+        "PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB", 5120, "expected a non-negative integer (MiB)"
+    ),
     # MoE dispatch/combine EP backend: TURBO (the default when unset), DEEP_EP, or a custom EP name
     # such as UCCL_EP. "autotune" is rejected with an AssertionError.
     "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend_spec("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"),
@@ -189,6 +255,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel-level tuners with it. An explicit per-op backend still wins over it, and so does
     # ``GlobalBackendManager.set_auto_tune``. Read at the first dispatch or FlyDSL launch.
     "PRIMUS_TURBO_AUTO_TUNE": lambda: os.getenv("PRIMUS_TURBO_AUTO_TUNE", "0") == "1",
+    # ================== Dispatch diagnostics ==================
+    # A file path: record which backend every dispatcher picked for every input shape, and why
+    # (user, autotune, default or fallback), log each new choice at INFO, and write the report
+    # there as JSON when the process exits. "{rank}" in the path is replaced by $RANK (0 when
+    # unset) and "{pid}" by the process id. Unset keeps only the per-dispatcher totals of
+    # ``dispatch_report()``.
+    "PRIMUS_TURBO_DISPATCH_REPORT": lambda: os.getenv("PRIMUS_TURBO_DISPATCH_REPORT") or None,
+    # "1" makes a fallback an error: when the default backend cannot handle the inputs, dispatch
+    # raises RuntimeError instead of warning and running another registered backend.
+    "PRIMUS_TURBO_STRICT_DISPATCH": lambda: os.getenv("PRIMUS_TURBO_STRICT_DISPATCH", "0") == "1",
     # ================== Kernel behavior ==================
     # Whether the attention V3 (CK) backward accumulates with FP32 atomics. Only "0" disables it;
     # unset, "1" and any other value keep it on. Read at the first forward that does not pass
@@ -203,8 +279,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A non-zero integer runs the EP dispatch/combine kernels on the caller's current stream
     # instead of the Buffer's comm stream. Parsed as C++ does (``is_ep_force_current_stream`` in
     # deep_ep/configs.h, which caches it once per process): unset is off, and an empty
-    # or non-integer value is an error (ValueError here, std::stoi throws in C++). The FlyDSL
-    # intranode backend (``FlyDSLIntranodeRuntime``) reads it when it is constructed.
+    # or non-integer value is an error (ValueError here, std::stoi throws in C++). On gfx1250
+    # the intranode runtime reads it when it is constructed.
     # ``DeepEPTokenDispatcher`` writes "1" with ``set_env()`` when a dispatcher asks for
     # ``deepep_use_comm_stream=False``.
     "PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM": lambda: (
@@ -247,6 +323,47 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PT_MEGA_FP8_L2_COMBINE_CU": env_positive_int(
         "PT_MEGA_FP8_L2_COMBINE_CU", None, "the combine CU split must be a positive block count"
     ),
+    # ================== JAX grouped GEMM (hipBLASLt / FlyDSL) ==================
+    # Directory for the FlyDSL FFI trampoline library (libflydsl_launch.so), built with hipcc on
+    # first use. Read when the trampoline is first built.
+    "PRIMUS_TURBO_CACHE": lambda: os.getenv(
+        "PRIMUS_TURBO_CACHE", os.path.expanduser("~/.cache/primus_turbo")
+    ),
+    # How the hipBLASLt grouped GEMM picks its kernel at trace time: "subprocess" (the default;
+    # time the candidates in a child process on the same GPU), "inproc", or "0" to keep
+    # hipBLASLt's heuristic choice.
+    "PRIMUS_TURBO_HB_GG_TUNE": lambda: os.getenv("PRIMUS_TURBO_HB_GG_TUNE", "subprocess"),
+    # Maximum number of hipBLASLt grouped GEMM candidates the tuner times.
+    "PRIMUS_TURBO_HB_GG_TUNE_CANDIDATES": lambda: int(os.getenv("PRIMUS_TURBO_HB_GG_TUNE_CANDIDATES", "256")),
+    # On-disk cache of tuned hipBLASLt grouped GEMM algorithms (JSON).
+    "PRIMUS_TURBO_HB_GG_TUNE_CACHE": lambda: os.getenv(
+        "PRIMUS_TURBO_HB_GG_TUNE_CACHE",
+        os.path.join(os.path.expanduser("~"), ".cache", "primus_turbo", "hipblaslt_grouped_gemm_tune.json"),
+    ),
+    # Any non-empty value prints the tuner's results and its subprocess's stderr.
+    "PRIMUS_TURBO_HB_GG_DEBUG": lambda: bool(os.getenv("PRIMUS_TURBO_HB_GG_DEBUG")),
+    # d > 1: with ring-of-experts EP, launch the FlyDSL grouped GEMM with a tile grid for M/d rows
+    # when sum(group_lens) <= M/d, and the full grid otherwise. 0 (the default) always uses the
+    # full grid. Read once, at import of grouped_gemm_flydsl.
+    "PRIMUS_FLYDSL_ROWS_CAP_DIV": lambda: int(os.getenv("PRIMUS_FLYDSL_ROWS_CAP_DIV", "0")),
+    # Whether the FlyDSL grouped GEMM zeroes output rows past sum(group_lens) when the caller does
+    # not say. Only "0" turns it off.
+    "PRIMUS_FLYDSL_ZERO_PAD": lambda: os.getenv("PRIMUS_FLYDSL_ZERO_PAD", "1") != "0",
+    # "1" honours zero_pad=False in grouped_gemm_flydsl (valid only when sum(group_lens) == M);
+    # otherwise the output is always zero-padded.
+    "PRIMUS_FLYDSL_ALLOW_NOZERO": lambda: os.getenv("PRIMUS_FLYDSL_ALLOW_NOZERO") == "1",
+    # Largest group count the FlyDSL variable-K (wgrad) kernel is used for. It ranks groups with
+    # one 64-lane wave, so 64 is the correct value; larger values are for sensitivity tests only.
+    # Read once, at import of grouped_gemm_flydsl.
+    "PRIMUS_FLYDSL_WG_MAX_G": lambda: int(os.getenv("PRIMUS_FLYDSL_WG_MAX_G", "64")),
+    # FlyDSL grouped GEMM tile overrides for the forward (NN), input-gradient (NT) and
+    # weight-gradient (WG) kernels, e.g. "BM=128,GROUP_M=2"; they apply to every shape.
+    "PRIMUS_FLYDSL_NN": lambda: os.getenv("PRIMUS_FLYDSL_NN", ""),
+    "PRIMUS_FLYDSL_NT": lambda: os.getenv("PRIMUS_FLYDSL_NT", ""),
+    "PRIMUS_FLYDSL_WG": lambda: os.getenv("PRIMUS_FLYDSL_WG", ""),
+    # Backward of the FlyDSL FP8 grouped GEMM: "all" (FP8 dA and dW, the default), "dgrad" (FP8 dA,
+    # bf16 dW) or "bf16" (bf16 for both). Read once, at import of grouped_gemm_flydsl_fp8.
+    "PRIMUS_FP8_BWD": lambda: os.getenv("PRIMUS_FP8_BWD", "all"),
     # ================== Read by the C++ extension ==================
     # These getters mirror the C++ parsing so Python can report the effective value; C++ reads
     # the variable itself and caches it once per process.
@@ -260,6 +377,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE": lambda: (
         int(os.getenv("PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE") or "0") != 0
     ),
+    # The guards of DeepEP V2 (MI455X) for TDM operations lost while KFD evicts a queue.
+    # "off" (default): neither guard; "redo": move a row again when one pass takes more than
+    # 0.5 ms; "all": also compare 32 words of every TDM load with its source and reload stale data.
+    "PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD": env_choice(
+        "PRIMUS_TURBO_DEEPEP_V2_TDM_GUARD", "off", ("off", "redo", "all")
+    ),
     # ODC (on-demand-comm) rocSHMEM GDA device-kernel knobs, consumed by
     # csrc/kernels/odc_rocshmem/odc_rocshmem_gda.cu for the multi-node reduce-scatter /
     # all-gather device kernels.
@@ -271,6 +394,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rocSHMEM QPs/contexts for multi-QP NIC concurrency, clamped to [1, 256]; above 1 selects
     # the multi-QP path.
     "PRIMUS_TURBO_ODC_GDA_NUM_QP": env_clamped_int("PRIMUS_TURBO_ODC_GDA_NUM_QP", 1, 1, 256),
+    # JAX hipBLASLt grouped GEMM (csrc/jax/grouped_gemm/hipblaslt_grouped_gemm.cpp).
+    #
+    # Rows of the tuning problem; larger M share one tuned entry. Python's tuner reads it too.
+    "PRIMUS_TURBO_HB_GG_TUNE_MAX_ROWS": lambda: int(os.getenv("PRIMUS_TURBO_HB_GG_TUNE_MAX_ROWS", "131072")),
+    # "max" sizes the launch for M rows per group instead of ceil(M/G) plus one macro tile.
+    "PRIMUS_TURBO_HB_GG_HOST_ROWS": lambda: os.getenv("PRIMUS_TURBO_HB_GG_HOST_ROWS"),
+    # k: use the k-th supported heuristic candidate for the forward (NN), input-gradient (NT) or
+    # weight-gradient (TN) product instead of the first (kernel sweeps). C++ reads it at every call.
+    "PRIMUS_TURBO_HB_GG_PICK_NN": env_clamped_int("PRIMUS_TURBO_HB_GG_PICK_NN", 0, -(2**31), 2**31 - 1),
+    "PRIMUS_TURBO_HB_GG_PICK_NT": env_clamped_int("PRIMUS_TURBO_HB_GG_PICK_NT", 0, -(2**31), 2**31 - 1),
+    "PRIMUS_TURBO_HB_GG_PICK_TN": env_clamped_int("PRIMUS_TURBO_HB_GG_PICK_TN", 0, -(2**31), 2**31 - 1),
+    # Set (to any value): log the plans and tuning of the hipBLASLt grouped GEMM.
+    "PRIMUS_TURBO_HB_GG_VERBOSE": lambda: os.getenv("PRIMUS_TURBO_HB_GG_VERBOSE") is not None,
     # ================== Flux ==================
     # "0" makes the Flux dgate epilogue accumulate without atomics. Unset and any other value
     # keep the atomic path. Read once, when the MXFP4 quant kernel module is imported.

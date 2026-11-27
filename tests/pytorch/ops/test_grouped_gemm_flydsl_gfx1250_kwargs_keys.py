@@ -89,6 +89,7 @@ PASSTHROUGH = {
     "nt": {"out", "out_dtype", "m_tiles"},
     "nn": {"out", "out_dtype", "m_tiles"},
     "vk": {"out", "out_dtype", "masked_k", "expert_table"},
+    "vk_accum": {"out", "out_dtype", "masked_k", "expert_table", "accumulate", "accum_impl"},
 }
 
 
@@ -112,11 +113,16 @@ def _picked_tile(kind: str, n: int, k: int, avg_m: int, G: int):
 
 
 def test_only_the_minimax_m3_shapes_are_keyed():
-    """Exactly the six shapes at avg_m = 512; another row count needs its own measurement."""
+    """At the MiniMax-M3 (N, K) shapes, exactly the six keys at avg_m = 512; another row count needs its own
+    measurement. Other models' keys (other (N, K)) are covered by their own tests."""
     want = {
         kind: {(n, k, KEYED_AVG_M) for kd, _, n, k in SHAPES if kd == kind} for kind in ("nt", "nn", "vk")
     }
-    got = {kind: set(rows) for kind, rows in gg._KWARGS_KEYS.items()}
+    minimax = {kind: {(n, k) for kd, _, n, k in SHAPES if kd == kind} for kind in ("nt", "nn", "vk")}
+    got = {
+        kind: {row for row in gg._KWARGS_KEYS.get(kind, {}) if row[:2] in minimax[kind]}
+        for kind in ("nt", "nn", "vk")
+    }
     assert got == want
 
 
@@ -174,6 +180,45 @@ def test_any_tuning_argument_switches_the_key_off(kind, name, n, k):
 def test_other_row_counts_are_not_keyed(kind, name, n, k):
     for avg_m in (64, 128, 256, 511, 513, 1024, 2048, 4096):
         assert gg._keyed_kwargs(kind, (n, k, avg_m), MEASURED_G, 0, {}) == {}, avg_m
+
+
+MUSE_TOLERANT = [
+    ("nt", 8192, 4096),
+    ("nt", 4096, 4096),
+    ("nn", 4096, 8192),
+    ("nn", 4096, 4096),
+    ("vk_accum", 8192, 4096),
+    ("vk_accum", 4096, 4096),
+]
+
+
+def _ratio(key_avg_m, avg_m):
+    """Distance on a log scale, as a ratio >= 1."""
+    return max(key_avg_m, avg_m) / min(key_avg_m, avg_m)
+
+
+@pytest.mark.parametrize("kind, n, k", MUSE_TOLERANT, ids=[f"{kd}-{n}x{k}" for kd, n, k in MUSE_TOLERANT])
+def test_muse_keys_serve_every_row_count_in_range(kind, n, k):
+    """Under expert parallelism a GPU's rows vary per step: every avg_m from the smallest Muse Spark key /
+    _AVG_M_REACH to the largest x _AVG_M_REACH takes the key nearest to it on a log scale, and nothing outside."""
+    keyed = sorted(row[2] for row in gg._KWARGS_KEYS[kind] if row[:2] == (n, k))
+    assert keyed, "no Muse Spark key for this shape"
+    lo, hi = int(keyed[0] / gg._AVG_M_REACH) + 1, int(keyed[-1] * gg._AVG_M_REACH)
+    for avg_m in range(lo, hi + 1):
+        got = gg._kwargs_key(kind, (n, k, avg_m))
+        assert got is not None, avg_m
+        assert _ratio(got[2], avg_m) == min(_ratio(key, avg_m) for key in keyed), (avg_m, got)
+    assert gg._kwargs_key(kind, (n, k, lo - 2)) is None
+    assert gg._kwargs_key(kind, (n, k, hi + 2)) is None
+    for avg_m in keyed:  # the keyed row counts themselves are exact hits
+        assert gg._kwargs_key(kind, (n, k, avg_m)) == (n, k, avg_m)
+
+
+@pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)
+def test_other_models_keys_stay_exact(kind, name, n, k):
+    """Only the Muse Spark shapes take a nearby avg_m; the MiniMax-M3 keys match their row count exactly."""
+    assert (n, k) not in gg._AVG_M_TOLERANT.get(kind, ())
+    assert gg._kwargs_key(kind, (n, k, KEYED_AVG_M + KEYED_AVG_M // 16)) is None
 
 
 @pytest.mark.parametrize("kind, name, n, k", SHAPES, ids=_IDS)

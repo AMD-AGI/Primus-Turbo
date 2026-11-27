@@ -175,6 +175,7 @@ class QuantizedTensor(torch.Tensor):
         scale_rounding_mode: int = 0,
         quantized_axis: Optional[int] = None,
         requires_grad: bool = False,
+        k_blocked: bool = False,
     ):
         assert dest_dtype in _SUPPORTED_QUANTIZED_DTYPES, "Unsupported quantized dtype"
         assert data.is_contiguous(), "data must be contiguous"
@@ -202,6 +203,7 @@ class QuantizedTensor(torch.Tensor):
         self._orig_group_offs = orig_group_offs
         self._is_grouped_tensor = is_grouped_tensor
         self._quantized_axis = quantized_axis
+        self._k_blocked = k_blocked
 
         self._data, self._scale_inv = data, scale_inv
 
@@ -544,6 +546,18 @@ class QuantizedTensor(torch.Tensor):
     def quantized_axis(self) -> int:
         return _normalize_axis(self._quantized_axis, self._data.ndim)
 
+    @property
+    def k_blocked(self) -> bool:
+        """``qdata`` keeps its [..., rows, cols] shape, but each [rows, cols] slab is stored
+        [cols / 128, rows, 128]. Only the FlyDSL MXFP8 grouped GEMM reads it this way."""
+        return self._k_blocked
+
+    def _row_major_data(self) -> torch.Tensor:
+        if not self._k_blocked:
+            return self._data
+        *lead, rows, cols = self._data.shape
+        return self._data.view(*lead, cols // 128, rows, 128).transpose(-3, -2).reshape(*lead, rows, cols)
+
     @torch.no_grad()
     def _grouped_dequantize(self) -> torch.Tensor:
         from primus_turbo.pytorch.ops.quantization import (
@@ -603,7 +617,7 @@ class QuantizedTensor(torch.Tensor):
 
         if self._dest_dtype in [float8_e4m3, float8_e5m2]:
             out = dequantize_fp8(
-                self._data,
+                self._row_major_data(),
                 self._orig_dtype,
                 self._granularity,
                 block_size=self._block_size,
@@ -677,6 +691,7 @@ class QuantizedTensor(torch.Tensor):
             "_scale_rounding_mode": self._scale_rounding_mode,
             "_is_grouped_tensor": self._is_grouped_tensor,
             "_quantized_axis": self._quantized_axis,
+            "_k_blocked": self._k_blocked,
         }
         return list(tensors.keys()), metadata
 
@@ -701,6 +716,7 @@ class QuantizedTensor(torch.Tensor):
             group_offs=inner_tensors.get("_group_offs"),
             is_grouped_tensor=metadata["_is_grouped_tensor"],
             quantized_axis=metadata.get("_quantized_axis"),
+            k_blocked=metadata.get("_k_blocked", False),
         )
 
     # ------------------------------------------------------------------
@@ -740,6 +756,7 @@ class QuantizedTensor(torch.Tensor):
             is_grouped_tensor=tensor._is_grouped_tensor,
             quantized_axis=tensor._quantized_axis,
             requires_grad=data.requires_grad,
+            k_blocked=tensor._k_blocked,
         )
 
     @staticmethod
@@ -753,6 +770,7 @@ class QuantizedTensor(torch.Tensor):
         if out_shape == wrapper_shape:
             return tensor._data, tensor._scale_inv, out_shape
 
+        assert not tensor._k_blocked, "a K-blocked QuantizedTensor cannot be viewed or reshaped"
         align = _get_padding_align_size(tensor)
         padded_target_shape = _pad_inner_dim(target_shape, align)
 
@@ -855,7 +873,7 @@ class QuantizedTensor(torch.Tensor):
         if func == torch.ops.aten.select.int:
             tensor = args[0]
             if isinstance(tensor, QuantizedTensor):
-                return func(tensor._data, *args[1:], **(kwargs or {}))
+                return func(tensor._row_major_data(), *args[1:], **(kwargs or {}))
 
         if func in (torch.ops.aten.detach.default, torch.ops.aten.alias.default):
             tensor = args[0]
@@ -941,6 +959,36 @@ class QuantizedTensorPair(NamedTuple):
     data_t: Optional[QuantizedTensor] = None
 
 
+def _mxfp8_expert_weight_k_blocked(weight, dest_dtype, quant_config, need_weight_transpose_cache) -> bool:
+    """Whether ``create_quantized_weight`` emits this expert weight K-blocked. Both of its
+    operands are then B of the FlyDSL MXFP8 grouped NT GEMM (gfx950), which contracts over
+    256 and up; the one-launch dual quant that writes the layout takes a 16-bit input. A
+    user-forced grouped GEMM backend other than FlyDSL cannot read the layout."""
+    from primus_turbo.pytorch.core.backend import (
+        BackendType,
+        GlobalBackendManager,
+        PrecisionType,
+    )
+    from primus_turbo.pytorch.core.utils import is_gfx950
+
+    if not (
+        need_weight_transpose_cache
+        and isinstance(quant_config, Float8QuantConfig)
+        and quant_config.granularity == ScalingGranularity.MX_BLOCKWISE
+        and dest_dtype in (float8_e4m3, float8_e5m2)
+        and weight.ndim == 3
+        and weight.is_cuda
+        and weight.dtype in (torch.bfloat16, torch.float16)
+        and min(weight.shape[-2:]) > 128
+        and weight.shape[-2] % MXFP8_BLOCK_SIZE == 0
+        and weight.shape[-1] % MXFP8_BLOCK_SIZE == 0
+        and is_gfx950()
+    ):
+        return False
+    user = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
+    return user is None or user.backend in (None, BackendType.FLYDSL)
+
+
 def create_quantized_weight(
     weight,
     dest_dtype: torch.dtype,
@@ -962,6 +1010,30 @@ def create_quantized_weight(
                 weight_scaling_recipe = ScalingRecipe()
 
         return weight_scaling_recipe
+
+    if _mxfp8_expert_weight_k_blocked(weight, dest_dtype, quant_config, need_weight_transpose_cache):
+        from primus_turbo.flydsl.quantization.mxfp8_quant_flydsl import (
+            quant_mxfp8_raw_batched,
+        )
+
+        with torch.no_grad():
+            row, row_scale, col, col_scale = quant_mxfp8_raw_batched(
+                weight.detach().contiguous(), dest_dtype, row_2d=True, col_2d=True, kblk=True
+            )
+        meta = dict(
+            shape=weight.size(),
+            orig_dtype=weight.dtype,
+            dest_dtype=dest_dtype,
+            granularity=quant_config.granularity,
+            block_size=quant_config.block_size,
+            scaling_recipe=_weight_scaling_recipe(quant_config),
+            requires_grad=weight.requires_grad,
+            k_blocked=True,
+        )
+        return (
+            QuantizedTensor(row, row_scale, quantized_axis=-1, **meta),
+            QuantizedTensor(col, col_scale, quantized_axis=-2, **meta),
+        )
 
     scale_rounding_mode = (
         quant_config.scale_rounding_mode if isinstance(quant_config, Float4QuantConfig) else 0

@@ -50,8 +50,8 @@ notes; the kernel backend behind each cell is in
 | | FP8 rowwise | ✅ | ✅ | ✅ | |
 | | FP8 blockwise | ✅ | ✅ | ✅ | |
 | | MXFP8 | — | ✅ | — | |
-| `gemm_fp4` | MXFP4 | — | ✅ | — | |
-| `mlp_fp4` | MXFP4 | — | ✅ | — | Dense GLU MLP with fused activation |
+| `gemm_fp4` | MXFP4 | — | ✅ | — | See [MXFP4 training](./features/mxfp4.md) |
+| `mlp_fp4` | MXFP4 | — | ✅ | — | Dense GLU MLP with fused activation. See [MXFP4 training](./features/mxfp4.md) |
 
 ### 2.2 Grouped GEMM (MoE experts)
 
@@ -64,9 +64,9 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | | FP8 rowwise | ✅ | ✅ | ✅ | |
 | | FP8 blockwise | ✅ | ✅ | ✅ | |
 | | MXFP8 | — | ✅ | ✅ | |
-| `grouped_gemm_fp4` | MXFP4 | — | ✅ | ✅ | |
+| `grouped_gemm_fp4` | MXFP4 | — | ✅ | ✅ | See [MXFP4 training](./features/mxfp4.md) |
 | `grouped_mlp_fp8` | FP8 tensorwise / MXFP8 | — | ✅ | — | Expert MLP with SwiGLU / GeGLU fused into the grouped GEMM |
-| `grouped_mlp_fp4` | MXFP4 | — | ✅ | — | Same, MXFP4 |
+| `grouped_mlp_fp4` | MXFP4 | — | ✅ | — | Same, MXFP4. See [MXFP4 training](./features/mxfp4.md) |
 
 ### 2.3 Attention
 
@@ -85,9 +85,9 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | `fused_group_topk_routing_with_aux_score` | – | ✅ | ✅ | ✅ | Group top-k router with aux-loss scores |
 | `tokens_per_expert_to_mask` | – | ✅ | ✅ | ✅ | Index helper, fwd only |
 | `moe_permute`, `moe_unpermute` | BF16 / FP8 tensorwise | ✅ | ✅ | ✅ | |
-| `moe_dispatch`, `moe_combine` | – | ✅ | ✅ | — | Expert-parallel token dispatch / combine (intra- and inter-node) |
-| **MegaMoE**<br>`fused_mega_moe` (+ `_stage1` / `_stage2`) | BF16 | — | ✅ | ✅ | Dispatch + FC1 and FC2 + combine fused, intra-node EP. See [MegaMoE](./mega_moe.md) |
-| **MegaMoE**<br>`fused_mega_moe_fp8_stage1` / `_stage2` | MXFP8 | — | ✅ | — | Staged API only |
+| `moe_dispatch`, `moe_combine` | – | ✅ | ✅ | ✅ | Expert-parallel token dispatch / combine (intra- and inter-node; gfx1250 within one host) |
+| **MegaMoE**<br>`fused_mega_moe` (+ `_stage1` / `_stage2`) | BF16 | — | ✅ | ✅ | Dispatch + FC1 and FC2 + combine fused, intra-node EP. See [MegaMoE](./features/mega_moe.md) |
+| **MegaMoE**<br>`fused_mega_moe_fp8_stage1` / `_stage2` | MXFP8 | — | ✅ | — | Staged API only. See [MegaMoE](./features/mega_moe.md) |
 
 ### 2.5 Normalization, activation, position embedding, loss
 
@@ -96,9 +96,14 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | `rmsnorm` | BF16 / FP16 / FP32 | ✅ | ✅ | ✅ | Optional zero-centered gamma |
 | `rmsnorm_residual` | BF16 / FP16 / FP32 | ✅ | ✅ | ✅ | Fused residual add |
 | `rmsnorm_residual_fp4` | BF16 → MXFP4 | — | ✅ | — | Fused residual add + MXFP4 quantization |
+| `adaln_modulate` | BF16 | — | ✅ | — | DiT adaLN: cat of two token segments + LayerNorm + `(1 + scale)` / `shift` modulation; C % 512, sequence lengths % 128. Eager PyTorch off gfx950 |
+| `gated_residual_adaln` | BF16 | — | ✅ | — | DiT gated residual `x + g * a` + adaLN, both streams of an MMDiT block in one call; C % 1536, sequence lengths % 32. Eager PyTorch off gfx950 |
 | `swiglu_with_probs`, `geglu_with_probs` | BF16 / FP16 | ✅ | ✅ | ✅ | GLU scaled by routing probability, optional row mask and clamp |
+| `linear_gelu` | BF16 | — | ✅ | — | Linear + bias + tanh GELU, optionally written after a prefix; bias gradient fused into the GELU backward. Unfused GELU off gfx950 and for untiled shapes |
 | `fused_qkv_rope` | BF16 | ✅ | ✅ | — | RoPE on packed QKV |
 | `fused_qkv_rmsnorm_rope` | BF16 | ✅ | ✅ | — | QK RMSNorm + RoPE on packed QKV |
+| `fused_qkv_rmsnorm_rope` | BF16 | — | ✅ | — | QK RMSNorm + RoPE on packed QKV |
+| `dit_qk_norm_rope` | BF16 / FP16 / FP32 | — | ✅ | — | DiT q / k RMSNorm + RoPE from the QKV GEMM output (`sbhd` / `bshd`, one or two streams, interleaved or half-split RoPE, the QKV bias added in the op and its gradient fused; `v_out="none"` returns v as a strided view of the QKV output instead of a copy, over both streams when they come in one buffer with `txt_seq_len`) |
 | `cross_entropy` | BF16 / FP32 | ✅ | ✅ | ✅ | Label smoothing, ignore index, in-place logits. See [Cross Entropy](./cross_entropy.md) |
 
 ### 2.6 Quantization and low-precision training support
@@ -114,7 +119,7 @@ These are fwd-only utilities; the `_with_trans` variants also emit the transpose
 | `grouped_quantize_fp8` / `_with_trans`, `grouped_dequantize_fp8` | MXFP8 | — | ✅ | ✅ | Per-expert |
 | `quantize_fp4`, `quantize_fp4_with_trans`, `dequantize_fp4` | MXFP4 | — | ✅ | ✅ | |
 | `grouped_quantize_fp4` / `_with_trans`, `grouped_dequantize_fp4` | MXFP4 | — | ✅ | ✅ | Fuses MoE gather. See [MoE gather quantization](./moe_gather_quantization.md) |
-| `weight_deosc_update`, `weight_deosc_close` | MXFP4 | ✅ | ✅ | — | Suppresses low-precision weight oscillation during training |
+| `weight_deosc_update`, `weight_deosc_close` | MXFP4 | ✅ | ✅ | — | Suppresses low-precision weight oscillation during training. See [MXFP4 training](./features/mxfp4.md#weight-de-oscillation) |
 | `weight_deosc_qdq` | MXFP4 | — | ✅ | — | Fused MXFP4 QDQ + tracking |
 
 ### 2.7 Communication and overlap
@@ -122,8 +127,9 @@ These are fwd-only utilities; the `_with_trans` variants also emit the transpose
 | API | gfx942 | gfx950 | gfx1250 | Notes |
 |---|:-:|:-:|:-:|---|
 | `turbo.ops.fused_all_gather_matmul`, `turbo.ops.fused_all_gather_scaled_matmul`, `turbo.ops.fused_matmul_reduce_scatter` | ✅ | ✅ | — | Async tensor parallelism; fwd only, the training integration supplies the backward |
+| Fused collective GEMM kernels (`primus_turbo.flydsl.fused_collective_gemm`: GemmA2A, A2AGemm, AgGemm, GemmRS) | — | ✅ | — | BF16 GEMM + all-to-all / all-gather / reduce-scatter in one launch, one node; kernel-level entry points. See [Fused collective GEMM](./features/fused_collective_gemm.md) |
 | `primus_turbo.pytorch.dist.FP8AllToAll` | ✅ | ✅ | — | All-to-all on FP8 payloads, with backward |
-| `primus_turbo.pytorch.deep_ep.Buffer` | ✅ | ✅ | — | Intra-node and inter-node EP buffers (needs rocSHMEM). See [DeepEP guide](../primus_turbo/pytorch/deep_ep/README.md) |
+| `primus_turbo.pytorch.deep_ep.Buffer` | ✅ | ✅ | ✅ | Intra-node EP buffers, and inter-node on gfx942 / gfx950 (needs rocSHMEM); gfx1250 covers one host. See [DeepEP](./features/deep_ep.md) |
 
 ## 3. Supported modules (PyTorch)
 
@@ -168,7 +174,7 @@ registration order, with the arch / format limits from each backend's `can_handl
 | `grouped_gemm_fp4` | FLYDSL (gfx950), TRITON (not gfx942) |
 | `grouped_mlp_fp8` | FLYDSL (gfx950), TRITON |
 | `grouped_mlp_fp4` | FLYDSL (gfx950) |
-| `flash_attn_func` | FLYDSL (gfx950: causal, head dim 64/128, sbhd; gfx1250: head dim 128 GQA and DeepSeek-V3 MLA 192/128, the MLA backward on HipKittens kernels with `PRIMUS_TURBO_MLA_BWD_IMPL=hk` where seqlen_q % 384 is 0 or 256), AITER (general fallback; default on gfx942), HIPKITTENS (gfx950, causal, sbhd), GLUON (gfx950, fwd only), TRITON (gfx1250) |
+| `flash_attn_func` | FLYDSL (gfx950: causal, head dim 64/128, sbhd; gfx1250: head dim 128 GQA and DeepSeek-V3 MLA 192/128, the MLA backward keeping its dS scratch within `PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB` MiB (default 5120) unless one head's needs more, or on HipKittens kernels with `PRIMUS_TURBO_MLA_BWD_IMPL=hk` where seqlen_q % 384 is 0 or 256), AITER (general fallback; default on gfx942), HIPKITTENS (gfx950, causal, sbhd), GLUON (gfx950, fwd only), TRITON (gfx1250) |
 | `flash_attn_varlen_func` | FLYDSL (gfx950), AITER |
 | `flash_attn_fp8_func` | TRITON |
 | `sparse_mla_func` | FLYDSL (gfx950, gfx1250), TRITON |
@@ -177,4 +183,7 @@ registration order, with the arch / format limits from each backend's `can_handl
 | MegaMoE (`fused_mega_moe*`) | FLYDSL |
 | `rmsnorm*`, `swiglu_with_probs`, `geglu_with_probs`, `cross_entropy`, router | TRITON (`rmsnorm_residual_fp4`: FLYDSL) |
 | `fused_qkv_rope`, `fused_qkv_rmsnorm_rope` | FLYDSL |
+| `dit_qk_norm_rope` | TRITON (forward; backward off gfx950 and outside the FlyDSL envelope), FLYDSL (backward, gfx950: BF16, D 128, interleaved RoPE) |
+| `linear_gelu` | FLYDSL GELU (gfx950, tiled shapes; unfused otherwise), TRITON GELU backward |
+| `adaln_modulate`, `gated_residual_adaln` | FLYDSL (gfx950), eager PyTorch otherwise |
 | Quantization | TURBO (HIP), TRITON (blockwise), FLYDSL (MXFP8 / MXFP4) |

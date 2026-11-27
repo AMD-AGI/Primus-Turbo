@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -41,6 +41,7 @@ from primus_turbo.pytorch.ops.utils import (
 __all__ = ["gemm_fp8"]
 
 
+@torch.compiler.assume_constant_result  # traced by the tensorwise path; the answer is fixed per device
 def _deter_use_nt_layout_gemm_in_bwd(trans_a: bool, trans_b: bool):
     if is_gfx942():
         return False
@@ -93,7 +94,34 @@ def _bgrad_gemm_fp8_impl_wrapper(
     return _get_dummy_wgrad(out.shape, out_dtype)
 
 
+def _stage_backend(config: Float8QuantConfig, builtin: BackendType) -> int:
+    """The default backend for one GEMM stage: the config's, else the stage's own."""
+    return (config.default_backend or builtin).value
+
+
+def _quantize_tensorwise_operand(
+    x: Union[torch.Tensor, QuantizedTensor], fp8_dtype: torch.dtype, config: Float8QuantConfig
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``(qdata, scale_inv)`` of a tensorwise GEMM operand, quantizing ``x`` unless it already is."""
+    if isinstance(x, QuantizedTensor):
+        check_quantized_tensor(x, config)
+        return x.qdata, x.scale_inv
+    return quantize_fp8(x, fp8_dtype, ScalingGranularity.TENSORWISE)
+
+
+def _transpose_tensorwise(qdata: torch.Tensor) -> torch.Tensor:
+    # One scale for the whole tensor, so transposing the FP8 data is exact.
+    return torch.ops.primus_turbo_cpp_extension.transpose_2d(qdata.contiguous(), 0, 1)
+
+
 class FP8GemmTensorFunction(torch.autograd.Function):
+    """Tensorwise FP8 GEMM.
+
+    Operands travel as plain ``(qdata, scale_inv)`` tensors, and only operands that
+    arrive pre-quantized are ``QuantizedTensor``s, so Dynamo can trace this function
+    when ``a`` and ``b`` are plain tensors (``gemm_fp8`` then leaves it in the graph).
+    """
+
     @staticmethod
     def forward(
         ctx,
@@ -109,74 +137,41 @@ class FP8GemmTensorFunction(torch.autograd.Function):
     ):
         use_nt_layout_gemm_in_bwd = _deter_use_nt_layout_gemm_in_bwd(trans_a, trans_b)
         fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+        fwd_dtype = _get_fp8_dtype(config.format, True)
+        default_backend = _stage_backend(config, BackendType.HIPBLASLT)
 
-        if isinstance(a, QuantizedTensor):
-            quantized_a = a
-            check_quantized_tensor(quantized_a, config)
-        else:
-            a_dtype = _get_fp8_dtype(config.format, True)
-            quantized_a = QuantizedTensor.quantize(
-                a,
-                a_dtype,
-                config.granularity,
-                axis=-1,
-                block_size=config.block_size,
-            )
-
-        if use_nt_layout_gemm_in_bwd:
-            if a_t is not None and isinstance(a_t, QuantizedTensor):
-                quantized_a_t = a_t
-            else:
-                quantized_a_t = quantized_a.t().contiguous()
-
-        if isinstance(b, QuantizedTensor):
-            quantized_b = b
-            check_quantized_tensor(quantized_b, config)
-        else:
-            b_dtype = _get_fp8_dtype(config.format, True)
-            quantized_b = QuantizedTensor.quantize(
-                b,
-                b_dtype,
-                config.granularity,
-                axis=-1,
-                block_size=config.block_size,
-            )
-
-        if use_nt_layout_gemm_in_bwd:
-            if b_t is not None and isinstance(b_t, QuantizedTensor):
-                quantized_b_t = b_t
-            else:
-                quantized_b_t = quantized_b.t().contiguous()
+        a_fp8, a_scale_inv = _quantize_tensorwise_operand(a, fwd_dtype, config)
+        b_fp8, b_scale_inv = _quantize_tensorwise_operand(b, fwd_dtype, config)
 
         out = gemm_fp8_impl(
-            quantized_a.qdata,
-            quantized_a.scale_inv,
+            a_fp8,
+            a_scale_inv,
             trans_a,
-            quantized_b.qdata,
-            quantized_b.scale_inv,
+            b_fp8,
+            b_scale_inv,
             trans_b,
             out_dtype,
             False,
-            granularity=config.granularity.value,
-            default_backend=BackendType.HIPBLASLT.value,
+            granularity=ScalingGranularity.TENSORWISE.value,
+            default_backend=default_backend,
         )
 
         if use_nt_layout_gemm_in_bwd:
-            ctx.save_for_backward(
-                quantized_a_t.qdata,
-                quantized_a_t.scale_inv,
-                quantized_b_t.qdata,
-                quantized_b_t.scale_inv,
-            )
-        else:
-            ctx.save_for_backward(
-                quantized_a.qdata, quantized_a.scale_inv, quantized_b.qdata, quantized_b.scale_inv
-            )
+            if isinstance(a_t, QuantizedTensor):
+                a_fp8, a_scale_inv = a_t.qdata, a_t.scale_inv
+            else:
+                a_fp8 = _transpose_tensorwise(a_fp8)
+            if isinstance(b_t, QuantizedTensor):
+                b_fp8, b_scale_inv = b_t.qdata, b_t.scale_inv
+            else:
+                b_fp8 = _transpose_tensorwise(b_fp8)
+        ctx.save_for_backward(a_fp8, a_scale_inv, b_fp8, b_scale_inv)
 
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
         ctx.out_dtype = out_dtype
-        ctx.config = config
+        ctx.grad_out_dtype = _get_fp8_dtype(config.format, False)
+        ctx.default_backend = default_backend
         ctx.use_nt_layout_gemm_in_bwd = use_nt_layout_gemm_in_bwd
         ctx.fuse_bgrad_accum = fuse_bgrad_accum
         ctx.main_grad = main_grad
@@ -188,76 +183,63 @@ class FP8GemmTensorFunction(torch.autograd.Function):
         if not grad_out.is_contiguous():
             grad_out = grad_out.contiguous()
 
-        if ctx.use_nt_layout_gemm_in_bwd:
-            a_fp8_t, a_t_scale_inv, b_fp8_t, b_t_scale_inv = ctx.saved_tensors
-        else:
-            a_fp8, a_scale_inv, b_fp8, b_scale_inv = ctx.saved_tensors
+        # The transposed operands under the NT layout, the operands themselves otherwise.
+        a_fp8, a_scale_inv, b_fp8, b_scale_inv = ctx.saved_tensors
+        granularity = ScalingGranularity.TENSORWISE.value
 
-        grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
-
-        quantized_grad_out = QuantizedTensor.quantize(
-            grad_out,
-            grad_out_dtype,
-            ctx.config.granularity,
-            axis=-1,
-        )
+        g_fp8, g_scale_inv = quantize_fp8(grad_out, ctx.grad_out_dtype, ScalingGranularity.TENSORWISE)
 
         if ctx.use_nt_layout_gemm_in_bwd:
             a_grad = gemm_fp8_impl(
-                quantized_grad_out.qdata,
-                quantized_grad_out.scale_inv,
+                g_fp8,
+                g_scale_inv,
                 False,
-                b_fp8_t,
-                b_t_scale_inv,
+                b_fp8,
+                b_scale_inv,
                 True,
                 ctx.out_dtype,
                 False,
-                granularity=ctx.config.granularity.value,
-                default_backend=BackendType.HIPBLASLT.value,
+                granularity=granularity,
+                default_backend=ctx.default_backend,
+            )
+            b_grad = _bgrad_gemm_fp8_impl_wrapper(
+                a_fp8,
+                a_scale_inv,
+                False,
+                _transpose_tensorwise(g_fp8),
+                g_scale_inv,
+                True,
+                ctx.out_dtype,
+                ctx.trans_b,
+                granularity=granularity,
+                default_backend=ctx.default_backend,
+                inplace_add_to_out=ctx.fuse_bgrad_accum,
+                out=ctx.main_grad,
             )
         else:
             a_grad = gemm_fp8_impl(
-                quantized_grad_out.qdata,
-                quantized_grad_out.scale_inv,
+                g_fp8,
+                g_scale_inv,
                 False,
                 b_fp8,
                 b_scale_inv,
                 not ctx.trans_b,
                 ctx.out_dtype,
                 ctx.trans_a,
-                granularity=ctx.config.granularity.value,
-                default_backend=BackendType.HIPBLASLT.value,
+                granularity=granularity,
+                default_backend=ctx.default_backend,
             )
-
-        if ctx.use_nt_layout_gemm_in_bwd:
-            quantized_grad_out_t = quantized_grad_out.t().contiguous()
-
-            b_grad = _bgrad_gemm_fp8_impl_wrapper(
-                a_fp8_t,
-                a_t_scale_inv,
-                False,
-                quantized_grad_out_t.qdata,
-                quantized_grad_out_t.scale_inv,
-                True,
-                ctx.out_dtype,
-                ctx.trans_b,
-                granularity=ctx.config.granularity.value,
-                default_backend=BackendType.HIPBLASLT.value,
-                inplace_add_to_out=ctx.fuse_bgrad_accum,
-                out=ctx.main_grad,
-            )
-        else:
             b_grad = _bgrad_gemm_fp8_impl_wrapper(
                 a_fp8,
                 a_scale_inv,
                 not ctx.trans_a,
-                quantized_grad_out.qdata,
-                quantized_grad_out.scale_inv,
+                g_fp8,
+                g_scale_inv,
                 False,
                 ctx.out_dtype,
                 ctx.trans_b,
-                granularity=ctx.config.granularity.value,
-                default_backend=BackendType.HIPBLASLT.value,
+                granularity=granularity,
+                default_backend=ctx.default_backend,
                 inplace_add_to_out=ctx.fuse_bgrad_accum,
                 out=ctx.main_grad,
             )
@@ -350,7 +332,7 @@ class FP8GemmRowFunction(torch.autograd.Function):
             out_dtype,
             False,
             granularity=config.granularity.value,
-            default_backend=BackendType.TRITON.value,
+            default_backend=_stage_backend(config, BackendType.TRITON),
         )
 
         ctx.save_for_backward(
@@ -393,7 +375,7 @@ class FP8GemmRowFunction(torch.autograd.Function):
             ctx.out_dtype,
             ctx.trans_a,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.TRITON.value,
+            default_backend=_stage_backend(ctx.config, BackendType.TRITON),
         )
 
         quantized_grad_out_t = QuantizedTensor.quantize(
@@ -411,7 +393,7 @@ class FP8GemmRowFunction(torch.autograd.Function):
             ctx.out_dtype,
             ctx.trans_b,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.TRITON.value,
+            default_backend=_stage_backend(ctx.config, BackendType.TRITON),
         )
 
         return (
@@ -485,7 +467,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             out_dtype,
             False,
             granularity=config.granularity.value,
-            default_backend=BackendType.TRITON.value,
+            default_backend=_stage_backend(config, BackendType.TRITON),
         )
         ctx.save_for_backward(a_col, a_col_scale, b_col, b_col_scale)
 
@@ -525,7 +507,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             ctx.out_dtype,
             False,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.TRITON.value,
+            default_backend=_stage_backend(ctx.config, BackendType.TRITON),
         )
 
         grad_b = gemm_fp8_impl(
@@ -538,7 +520,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             ctx.out_dtype,
             ctx.trans_b,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.TRITON.value,
+            default_backend=_stage_backend(ctx.config, BackendType.TRITON),
         )
 
         return (
@@ -642,7 +624,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             out_dtype,
             False,
             granularity=granularity.value,
-            default_backend=BackendType.FLYDSL.value,
+            default_backend=_stage_backend(config, BackendType.FLYDSL),
         )
 
         ctx.save_for_backward(a_col, a_col_scale, b_col, b_col_scale)
@@ -684,7 +666,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             ctx.out_dtype,
             False,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.FLYDSL.value,
+            default_backend=_stage_backend(ctx.config, BackendType.FLYDSL),
         )
 
         grad_b = _bgrad_gemm_fp8_impl_wrapper(
@@ -697,8 +679,8 @@ class FP8GemmMXFunction(torch.autograd.Function):
             ctx.out_dtype,
             False,
             granularity=ctx.config.granularity.value,
-            default_backend=(
-                BackendType.HIPBLASLT.value if ctx.fuse_bgrad_accum else BackendType.FLYDSL.value
+            default_backend=_stage_backend(
+                ctx.config, BackendType.HIPBLASLT if ctx.fuse_bgrad_accum else BackendType.FLYDSL
             ),
             inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,
@@ -717,14 +699,6 @@ class FP8GemmMXFunction(torch.autograd.Function):
         )
 
 
-@torch._dynamo.disable(
-    recursive=True,
-    reason=(
-        "FP8 GEMM constructs QuantizedTensor wrapper subclasses inside its "
-        "autograd.Function.forward and reads their inner tensors (data / scale_inv). "
-        "Dynamo cannot recover Python sources for those graph-internal inner tensors, "
-    ),
-)
 def gemm_fp8(
     a: Union[torch.Tensor, QuantizedTensor, QuantizedTensorPair],
     b: Union[torch.Tensor, QuantizedTensor, QuantizedTensorPair],
@@ -766,6 +740,11 @@ def gemm_fp8(
         - E4M3
         - E5M2
 
+    torch.compile: a TENSORWISE call on plain tensors, without
+    ``fuse_bgrad_accum_pattern``, is traced into the caller's graph. Every other call
+    (other granularities, ``QuantizedTensor`` / ``QuantizedTensorPair`` inputs, fused
+    gradient accumulation) runs outside it, as a graph break.
+
     Example::
 
         >>> # Basic usage
@@ -784,6 +763,38 @@ def gemm_fp8(
     if config is None:
         config = Float8QuantConfig()
 
+    if (
+        config.granularity == ScalingGranularity.TENSORWISE
+        and fuse_bgrad_accum_pattern is None
+        and not isinstance(a, (QuantizedTensor, QuantizedTensorPair))
+        and not isinstance(b, (QuantizedTensor, QuantizedTensorPair))
+    ):
+        assert a.ndim == 2, "Only 2D tensors are supported"
+        assert b.ndim == 2, "Only 2D tensors are supported"
+        if out_dtype is None:
+            out_dtype = torch.promote_types(a.dtype, b.dtype)
+        return FP8GemmTensorFunction.apply(a, b, None, None, trans_a, trans_b, out_dtype, config, None)
+
+    return _gemm_fp8_untraced(a, b, trans_a, trans_b, out_dtype, config, fuse_bgrad_accum_pattern)
+
+
+@torch._dynamo.disable(
+    recursive=True,
+    reason=(
+        "FP8 GEMM constructs QuantizedTensor wrapper subclasses inside its "
+        "autograd.Function.forward and reads their inner tensors (data / scale_inv). "
+        "Dynamo cannot recover Python sources for those graph-internal inner tensors."
+    ),
+)
+def _gemm_fp8_untraced(
+    a: Union[torch.Tensor, QuantizedTensor, QuantizedTensorPair],
+    b: Union[torch.Tensor, QuantizedTensor, QuantizedTensorPair],
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: Union[torch.dtype, None],
+    config: Float8QuantConfig,
+    fuse_bgrad_accum_pattern: Union[None, str],
+) -> torch.Tensor:
     if isinstance(a, QuantizedTensorPair):
         a_data, a_data_t = a.data, a.data_t
     else:

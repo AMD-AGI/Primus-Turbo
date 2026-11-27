@@ -21,6 +21,7 @@ from .flydsl_version import require_flydsl
 require_flydsl()
 
 import inspect
+from types import MappingProxyType
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -37,8 +38,10 @@ LOG2E = 1.4426950408889634
 WAVE_SIZE = 32
 
 # LLVM address-space numbers (1 global, 3 LDS) as fx address spaces; fx.to_llvm_ptr maps fx's
-# Shared space back to !llvm.ptr<3>.
-_FX_ADDRESS_SPACE = {1: fx.AddressSpace.Global, 3: fx.AddressSpace.Shared}
+# Shared space back to !llvm.ptr<3>. A read-only view rather than a dict: the launches read it
+# through create_llvm_ptr, and a launch must not read a mutable global (flydsl folds what a
+# launch reads into its disk-cache key).
+_FX_ADDRESS_SPACE = MappingProxyType({1: fx.AddressSpace.Global, 3: fx.AddressSpace.Shared})
 
 
 def create_llvm_ptr(value, address_space=1):

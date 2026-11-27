@@ -11,7 +11,7 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""Symmetric workspace shared by the Ulysses GemmA2A / A2AGemm kernels of one group.
+"""Symmetric workspace shared by the fused collective + GEMM kernels of one group.
 
 Heap layout (identical on every rank):
 
@@ -23,6 +23,9 @@ exit bumps ``state[0]``. A rank's call ``e`` cannot finish before every peer has
 data, so when a rank starts call ``e + 2`` every peer has finished call ``e`` and bank ``e & 1`` is
 free again: two banks need no acknowledgement or barrier. This holds as long as, on every rank, all
 calls on one group are stream-ordered.
+
+Flags only grow, so two call sites whose launches can be in flight together (e.g. a forward and a
+backward op) must not share a flag region: the caller gives each call site its own ``flag_region``.
 """
 
 from typing import Optional
@@ -30,26 +33,21 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
+from primus_turbo.flydsl.fused_collective_gemm.common import NUM_STATE
 from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
 
 FLAGS_PER_REGION = 1 << 15
-NUM_FLAG_REGIONS = 4
+NUM_FLAG_REGIONS = 6
 FLAG_REGION_BYTES = FLAGS_PER_REGION * 8
 FLAG_BYTES = NUM_FLAG_REGIONS * FLAG_REGION_BYTES
 BANK_ALIGN = 1 << 16
-
-# flag region of each fused op; ops never share flag slots
-REGION_QKV_GEMM_A2A = 0
-REGION_O_GEMM_A2A = 1
-REGION_O_A2A_GEMM = 2
-REGION_QKV_A2A_GEMM = 3
 
 
 def _align(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
-class UlyssesWorkspace:
+class CollectiveGemmWorkspace:
     def __init__(self, group: dist.ProcessGroup, bank_bytes: int):
         self.group = group
         self.rank = group.rank()
@@ -58,8 +56,9 @@ class UlyssesWorkspace:
         self.num_bytes = FLAG_BYTES + 2 * self.bank_bytes
         self.symm_mem = SymmetricMemory(group, self.num_bytes, signal_pad_size=0)
         self.peer_ptrs = torch.tensor(self.symm_mem.buffer_ptrs, dtype=torch.int64, device="cuda")
-        # [0] epoch, [1] exit counter, [2] / [3] push-unit / tile claim counters of the running fused kernel
-        self.state = torch.tensor([1, 0, 0, 0], dtype=torch.int64, device="cuda")
+        # see common.STATE_*: [0] epoch, [1] exit counter, [2] / [3] unit / tile claim counters,
+        # [4] / [5] own-row pieces claimed / done, [6, 14) AgGemm per-XCD tile claim counters
+        self.state = torch.tensor([1] + [0] * (NUM_STATE - 1), dtype=torch.int64, device="cuda")
         torch.cuda.synchronize()
         dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
 
@@ -81,20 +80,20 @@ class UlyssesWorkspace:
 _WORKSPACES: dict = {}
 
 
-def get_ulysses_workspace(group: dist.ProcessGroup, bank_bytes: int) -> UlyssesWorkspace:
+def get_collective_gemm_workspace(group: dist.ProcessGroup, bank_bytes: int) -> CollectiveGemmWorkspace:
     """The group's workspace, regrown (collectively, outside graph capture) when a bank is too small."""
-    ws: Optional[UlyssesWorkspace] = _WORKSPACES.get(group.group_name)
+    ws: Optional[CollectiveGemmWorkspace] = _WORKSPACES.get(group.group_name)
     if ws is not None and ws.bank_bytes >= bank_bytes:
         return ws
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
-            f"the Ulysses fused-a2a workspace needs {bank_bytes} bytes per bank but has "
+            f"the fused collective GEMM workspace needs {bank_bytes} bytes per bank but has "
             f"{0 if ws is None else ws.bank_bytes}; run one eager step before CUDA graph capture"
         )
     old = ws
     # grow geometrically; allocate before freeing, since a heap that reuses just-freed memory
     # cannot be exported over IPC
-    ws = UlyssesWorkspace(group, max(bank_bytes, 0 if old is None else 2 * old.bank_bytes))
+    ws = CollectiveGemmWorkspace(group, max(bank_bytes, 0 if old is None else 2 * old.bank_bytes))
     if old is not None:
         old.destroy()
     _WORKSPACES[group.group_name] = ws

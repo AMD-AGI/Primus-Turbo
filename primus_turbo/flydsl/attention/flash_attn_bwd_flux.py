@@ -24,6 +24,7 @@ import flydsl.expr as fx
 import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
+from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
@@ -192,6 +193,19 @@ def _llvm_value(value):
     if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
         return value.ir_value()
     return value
+
+
+def _body_rsrc(bases, name, tensor, num_records_bytes, base_byte_offset):
+    """``tensor``'s buffer resource, or one at ``bases[name]()``: a persistent caller hands every address
+    over as a read at the use, which keeps the kernel arguments of its work items out of registers
+    across its claim loop."""
+    if bases is not None and name in bases:
+        return buffer_ops.create_buffer_resource_from_addr(
+            bases[name](), num_records_bytes=num_records_bytes, base_byte_offset=base_byte_offset
+        )
+    return buffer_ops.create_buffer_resource(
+        tensor, max_size=False, num_records_bytes=num_records_bytes, base_byte_offset=base_byte_offset
+    )
 
 
 def _extract_aligned_pointer(tensor, address_space=None) -> ir.Value:
@@ -1936,23 +1950,31 @@ def build_flash_attn_bwd_dkdv_module(
     ld_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = ld_off + LD_ELEMS * 4
 
-    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
-    def flash_attn_bwd_dkdv_kernel(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        DO: fx.Tensor,
-        LSE: fx.Tensor,
-        DELTA: fx.Tensor,
-        DK: fx.Tensor,
-        DV: fx.Tensor,
-        CuSeqQ: fx.Tensor,  # varlen: cu_seqlens_q [num_seg+1] i32; else unused placeholder slot
-        CuSeqKv: fx.Tensor,  # varlen: cu_seqlens_kv [num_seg+1] i32; else unused placeholder slot
-        WSQ: fx.Tensor,  # dQ partials [kv_band, B, Sq, Hq, D] bf16
-        seq_len_q: fx.Int32,
-        seq_len_k: fx.Int32,
-        total_kv: fx.Int32,  # whole kv axis: dk/dv slot stride when this launch owns a slice of it
+    @ASTRewriter.transform
+    def _dkdv_body(
+        Q,
+        K,
+        V,
+        DO,
+        LSE,
+        DELTA,
+        DK,
+        DV,
+        CuSeqQ,
+        CuSeqKv,
+        WSQ,
+        seq_len_q,
+        seq_len_k,
+        total_kv,
+        ids=None,
+        tid=None,
+        bases=None,
     ):
+        """One work-group's (kv tile, kv head, q split, batch). ``ids`` = those four index values replace
+        the decode of the work-group id, and ``tid`` the thread index: a persistent caller runs one per
+        claimed work item, its thread index through a move the compiler cannot hoist out of its loop.
+        ``bases`` maps tensor names (Q K V DO LSE DELTA DK DV WSQ) to callables giving that tensor's
+        address, called where its buffer resource is built (see ``_body_rsrc``)."""
         elem_dtype = dtype_to_elem_type(dtype_str)
         elem_type = elem_dtype.ir_type
         q_ptr = _extract_aligned_pointer(Q)
@@ -1997,8 +2019,11 @@ def build_flash_attn_bwd_dkdv_module(
         base_ptr = allocator.get_base()
         lds = SmemPtr(base_ptr, lds_off, elem_type, shape=(LDS_VIEW_ELEMS,)).get()
 
-        block_id = fx.Index(gpu.block_idx.x)
-        tid = fx.Index(gpu.thread_idx.x)
+        if const_expr(ids is None):
+            block_id = fx.Index(gpu.block_idx.x)
+        if const_expr(tid is None):
+            tid = gpu.thread_idx.x
+        tid = fx.Index(tid)
         wave_id = tid // WARP_SIZE
         lane = tid % WARP_SIZE
         lane16 = lane % 16  # M/N index within a 16-tile
@@ -2019,7 +2044,9 @@ def build_flash_attn_bwd_dkdv_module(
         # rows stay co-resident. Bijective when B*NUM_HEADS_KV % NUM_XCD == 0; WIN_XCD gets the
         # same locality via xcd_remap_pid when it doesn't, else falls back to the plain decode.
         num_kv_tiles = (seq_len_k_v + BLOCK_KV - 1) // BLOCK_KV
-        if const_expr(NUM_HEADS_KV % NUM_XCD != 0 and WIN_XCD):
+        if const_expr(ids is not None):
+            kv_tile_idx, kv_head_idx, split_idx, batch_idx = ids
+        elif const_expr(NUM_HEADS_KV % NUM_XCD != 0 and WIN_XCD):
             _lin = fx.Index(xcd_remap_pid(block_id, fx.Index(gpu.grid_dim.x), NUM_XCD))
             split_idx = fx.Index(QSP_LO)
             kv_tile_idx = _lin % num_kv_tiles
@@ -2055,7 +2082,7 @@ def build_flash_attn_bwd_dkdv_module(
                 split_idx = fx.Index(QSP_LO)
             kv_tile_idx = _rest % num_kv_tiles
             batch_idx = _rest // num_kv_tiles
-        if const_expr(BAT_LO):
+        if const_expr(BAT_LO and ids is None):
             batch_idx = batch_idx + fx.Index(BAT_LO)
         # SHADOW seq_len_q_v/k_v to the per-segment length so downstream base/SRD/loop-bounds follow the segment (byte-identical when uniform; grid tiles were fixed from max above).
         if const_expr(varlen):
@@ -2306,12 +2333,8 @@ def build_flash_attn_bwd_dkdv_module(
                     )
                 )
             )
-        k_rsrc = buffer_ops.create_buffer_resource(
-            K, max_size=False, num_records_bytes=_kv_rd_nrec, base_byte_offset=_kv_batch_byte_off
-        )
-        v_rsrc = buffer_ops.create_buffer_resource(
-            V, max_size=False, num_records_bytes=_kv_rd_nrec, base_byte_offset=_kv_batch_byte_off
-        )
+        k_rsrc = _body_rsrc(bases, "K", K, _kv_rd_nrec, _kv_batch_byte_off)
+        v_rsrc = _body_rsrc(bases, "V", V, _kv_rd_nrec, _kv_batch_byte_off)
         # DK/DV point at this split's slot of the [B, q_split, S, Hkv, D] workspace
         # (slot index = batch*q_split + split_idx); one WG writes it exactly once.
         if const_expr(sbhd and BAND_LIFT):
@@ -2339,12 +2362,8 @@ def build_flash_attn_bwd_dkdv_module(
         else:
             _ws_slot = batch_idx * fx.Index(Q_SPLIT) + split_idx
             _dkv_ws_byte_off = _raw(_ws_slot * seq_len_k_v * fx.Index(STRIDE_TOKEN_KV * 2))
-        dk_rsrc = buffer_ops.create_buffer_resource(
-            DK, max_size=False, num_records_bytes=_kv_nrec_bytes, base_byte_offset=_dkv_ws_byte_off
-        )
-        dv_rsrc = buffer_ops.create_buffer_resource(
-            DV, max_size=False, num_records_bytes=_kv_nrec_bytes, base_byte_offset=_dkv_ws_byte_off
-        )
+        dk_rsrc = _body_rsrc(bases, "DK", DK, _kv_nrec_bytes, _dkv_ws_byte_off)
+        dv_rsrc = _body_rsrc(bases, "DV", DV, _kv_nrec_bytes, _dkv_ws_byte_off)
         # This band's slot for THIS q slice, whose num_records also clips the store of
         # the tail q-block when the slice is not a whole number of BLOCK_Q.
         # Dense: a band holds one slab per batch. Ragged: rows are packed by q token, so
@@ -2368,12 +2387,7 @@ def build_flash_attn_bwd_dkdv_module(
             _wsq_base = _wsq_grp * _wsq_band + _wsq_off - _wsq_shift
         else:
             _wsq_base = _wsq_grp * _wsq_band + _wsq_off
-        wsq_rsrc = buffer_ops.create_buffer_resource(
-            WSQ,
-            max_size=False,
-            num_records_bytes=_raw(_wsq_slice),
-            base_byte_offset=_raw(_wsq_base),
-        )
+        wsq_rsrc = _body_rsrc(bases, "WSQ", WSQ, _raw(_wsq_slice), _raw(_wsq_base))
         if const_expr(WSQ_A16):
             _wsq16_slice = seq_len_q_v * fx.Index(NUM_HEADS_Q * HEAD_DIM * 2)
             if const_expr(A16_NATIVE):
@@ -2392,24 +2406,16 @@ def build_flash_attn_bwd_dkdv_module(
             _lse_batch_byte_off = _raw(q_tok_base * fx.Index(NUM_HEADS_Q) * fx.Index(4))
         else:
             _lse_batch_byte_off = _raw(batch_idx * _lse_per_batch * fx.Index(4))
-        lse_rsrc = buffer_ops.create_buffer_resource(
-            LSE, max_size=False, num_records_bytes=_lse_nrec_bytes, base_byte_offset=_lse_batch_byte_off
-        )
-        delta_rsrc = buffer_ops.create_buffer_resource(
-            DELTA, max_size=False, num_records_bytes=_lse_nrec_bytes, base_byte_offset=_lse_batch_byte_off
-        )
+        lse_rsrc = _body_rsrc(bases, "LSE", LSE, _lse_nrec_bytes, _lse_batch_byte_off)
+        delta_rsrc = _body_rsrc(bases, "DELTA", DELTA, _lse_nrec_bytes, _lse_batch_byte_off)
 
         # ---- DMA-to-LDS for the Q/dO tiles (buffer_load_dwordx4 ... lds). ----
         # Q_STRIDE == head_dim, so the swizzled LDS layout matches the forward's K
         # DMA path verbatim (LDS[row][c] = Global[row][c ^ ((row&3)<<4)]); both the
         # normal read (_a_idx) and the transpose read (_read_tr) expect that layout.
         if const_expr(ENABLE_DMA):
-            q_rsrc = buffer_ops.create_buffer_resource(
-                Q, max_size=False, num_records_bytes=_q_nrec_bytes, base_byte_offset=_q_batch_byte_off
-            )
-            do_rsrc = buffer_ops.create_buffer_resource(
-                DO, max_size=False, num_records_bytes=_q_nrec_bytes, base_byte_offset=_q_batch_byte_off
-            )
+            q_rsrc = _body_rsrc(bases, "Q", Q, _q_nrec_bytes, _q_batch_byte_off)
+            do_rsrc = _body_rsrc(bases, "DO", DO, _q_nrec_bytes, _q_batch_byte_off)
             lds_base_idx = buffer_ops.extract_base_index(lds, address_space=3)
             DMA_BYTES = 16
             DMA_BATCH_BYTES = BLOCK_SIZE * DMA_BYTES
@@ -4401,6 +4407,25 @@ def build_flash_attn_bwd_dkdv_module(
         _store(dv_accs, dv_rsrc, False)
         _store(dk_accs, dk_rsrc, True)
 
+    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+    def flash_attn_bwd_dkdv_kernel(
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        DO: fx.Tensor,
+        LSE: fx.Tensor,
+        DELTA: fx.Tensor,
+        DK: fx.Tensor,
+        DV: fx.Tensor,
+        CuSeqQ: fx.Tensor,  # varlen: cu_seqlens_q [num_seg+1] i32; else unused placeholder slot
+        CuSeqKv: fx.Tensor,  # varlen: cu_seqlens_kv [num_seg+1] i32; else unused placeholder slot
+        WSQ: fx.Tensor,  # dQ partials [kv_band, B, Sq, Hq, D] bf16
+        seq_len_q: fx.Int32,
+        seq_len_k: fx.Int32,
+        total_kv: fx.Int32,  # whole kv axis: dk/dv slot stride when this launch owns a slice of it
+    ):
+        _dkdv_body(Q, K, V, DO, LSE, DELTA, DK, DV, CuSeqQ, CuSeqKv, WSQ, seq_len_q, seq_len_k, total_kv)
+
     @flyc.jit
     def launch_flash_attn_bwd_dkdv(
         Q: fx.Tensor,
@@ -4496,6 +4521,35 @@ def build_flash_attn_bwd_dkdv_module(
             return flyc.compile(launch_flash_attn_bwd_dkdv, *args)
 
     _launch.compile = _compile
+    # what a persistent kernel running this body per work item needs: the body, its LDS allocator
+    # (finalized by that kernel's launcher), the work-group shape and the compile settings
+    _passthrough = [
+        ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
+        ["no-nans-fp-math", "true"],
+        ["unsafe-fp-math", "true"],
+    ]
+    if agpr != 0:
+        _passthrough += [
+            ["amdgpu-agpr-alloc", f"{int(agpr)},{int(agpr)}"],
+            ["amdgpu-mfma-vgpr-form", "false"],
+        ]
+    _launch.embed = dict(
+        body=_dkdv_body,
+        allocator=allocator,
+        block_size=BLOCK_SIZE,
+        lds_bytes=allocator.ptr,
+        waves_per_eu=waves_per_eu,
+        hints=_hints,
+        value_attrs={
+            "rocdl.waves_per_eu": waves_per_eu,
+            "rocdl.flat_work_group_size": f"{int(flat_work_group_size)},{int(flat_work_group_size)}",
+            "llvm.passthrough": _passthrough,
+        },
+        block_kv=BLOCK_KV,
+        q_split=Q_SPLIT,
+        n_qsp=N_QSP,
+        qsp_lo=QSP_LO,
+    )
     return _launch
 
 

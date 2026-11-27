@@ -418,23 +418,46 @@ def test_flydsl_version_requirement(monkeypatch, version, ok, packaging):
             ver.require_flydsl()
 
 
-def test_setup_py_pins_a_flydsl_the_kernels_accept():
-    """The flydsl that setup.py pins must satisfy FLYDSL_REQUIREMENT. Under any other release the
-    gate declines every call and the tests that need the kernels skip, so a version bump that
-    the kernels have not been checked against would otherwise go unnoticed."""
+def test_setup_py_flydsl_requirement_agrees_with_the_gate():
+    """setup.py's flydsl requirement and FLYDSL_REQUIREMENT must stay reconciled.
+
+    setup.py deliberately admits releases these kernels decline -- it is a range, not a pin,
+    so that installing Primus-Turbo cannot downgrade a co-installed consumer's flydsl (see the
+    comment there); the gate then simply falls back for gfx1250 attention. What must stay true
+    is that the two windows still meet:
+
+      1. setup.py's FLOOR is a release the kernels accept, so raising it past the validated
+         0.3.4.x line cannot go unnoticed, and
+      2. the gate's own floor is installable under setup.py's requirement, so the gate cannot
+         come to demand a release the package refuses to install.
+    """
+    specifiers = pytest.importorskip("packaging.specifiers")
+    from packaging.version import Version
+
     from primus_turbo.flydsl.attention.gfx1250 import flydsl_version as ver
 
     setup_py = os.path.join(os.path.dirname(__file__), "..", "..", "..", "setup.py")
     if not os.path.isfile(setup_py):
         pytest.skip("no setup.py next to the tests")
     with open(setup_py) as f:
-        pins = re.findall(r"""["']flydsl==([^"']+)["']""", f.read())
-    assert pins, "setup.py pins no flydsl"
-    for pin in pins:
-        assert ver._satisfies(pin), (
-            f"setup.py pins flydsl=={pin}, outside the gfx1250 attention kernels' "
-            f"FLYDSL_REQUIREMENT {ver.FLYDSL_REQUIREMENT}: check the kernels on that release, then "
-            "update flydsl_version.py"
+        # an operator right after the name, so a bare "flydsl" elsewhere is not a match
+        reqs = re.findall(r"""["']flydsl([<>=!~][^"']*)["']""", f.read())
+    assert reqs, "setup.py declares no flydsl requirement"
+
+    gate_floor = ".".join(str(part) for part in ver._MIN)
+    for req in reqs:
+        spec = specifiers.SpecifierSet(req)
+        floors = [s.version for s in spec if s.operator in (">=", "==", "~=")]
+        assert floors, f"flydsl{req} in setup.py has no lower bound"
+        floor = min(floors, key=Version)
+        assert ver._satisfies(floor), (
+            f"setup.py admits flydsl{req}, whose floor {floor} is outside the gfx1250 attention "
+            f"kernels' FLYDSL_REQUIREMENT {ver.FLYDSL_REQUIREMENT}: check the kernels on that "
+            "release, then update flydsl_version.py"
+        )
+        assert spec.contains(Version(gate_floor), prereleases=True), (
+            f"the gfx1250 kernels accept flydsl {gate_floor}, but setup.py's flydsl{req} would "
+            "not install it: reconcile FLYDSL_REQUIREMENT with setup.py"
         )
 
 

@@ -44,6 +44,8 @@ def quantize_fp8_tensorwise_pad_impl(
     pad_n: bool = False,
     k_align: int = 128,
     amax_partials: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+    amax_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-tensor fp8 cast + last-dim (K) pad to Kp=ceil(K, k_align), pad columns zeroed;
     ``k_align`` is the cpp op's ``padding_align_size`` (128 = K-aligned operand, 1 =
@@ -52,12 +54,27 @@ def quantize_fp8_tensorwise_pad_impl(
     ``amax_partials`` skips the pass that re-reads ``x`` for its abs-amax: whoever wrote
     ``x`` reduced it on the way out and left the result here, as non-negative float32
     partials (the cpp op bounds how many). A max is exact and order-independent, so the
-    scale -- and the fp8 output -- are unchanged."""
+    scale -- and the fp8 output -- are unchanged.
+
+    ``scale`` skips the amax pass altogether: the cast multiplies by this one-element
+    float32 tensor, and the returned ``scale_inv`` is its reciprocal. It and
+    ``amax_partials`` are alternatives.
+
+    ``amax_out`` (needs ``scale``) is a one-element float32 buffer the cast raises to the
+    abs-max of ``x`` (before scaling) while it reads ``x`` anyway, so the next delayed scale
+    costs no extra pass. It is a running max: the buffer is never lowered, so one buffer shared
+    by several casts holds their maximum, and its owner resets it to +0 (e.g.
+    ``amax_out.zero_()``). Not to ``-inf`` or any other value with the sign bit set: the max
+    compares float bit patterns as unsigned, so such a buffer is never raised and the amax
+    silently stays negative. A NaN or Inf in ``x`` lands in it as NaN or Inf (it is not
+    dropped). The cast's output is unchanged."""
     x = x.contiguous()
     pad_n_align = 128 if pad_n else 1
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(
-        x, out_dtype, None, k_align, pad_n_align, amax_partials
-    )
+    args = (x, out_dtype, scale, k_align, pad_n_align, amax_partials)
+    if amax_out is not None:
+        # Passed only when given: every argument adds host time to this launch-bound call.
+        args += (amax_out,)
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(*args)
     return x_fp8, scale_inv
 
 
@@ -1068,7 +1085,8 @@ def dequantize_mxfp4_impl(
     block_size: int,
     scale_inv: torch.Tensor,
 ) -> torch.Tensor:
-    assert x.is_contiguous(), "The x tensor must be contiguous."
+    # The kernel takes no row pitch; the FlyDSL MXFP4 quant's row-wise data has one.
+    x = x.contiguous()
     assert x.dim() in (2, 3), "The x must be a 2D or 3D tensor."
     assert scale_inv.dim() == x.dim(), "The scale_inv rank must match x."
     assert scale_inv.is_contiguous(), "The scale_inv tensor must be contiguous."

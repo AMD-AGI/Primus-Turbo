@@ -4,12 +4,16 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Triton-backed RMSNorm ops (standard + fused residual variant).
+"""Normalization ops: Triton-backed RMSNorm (standard + fused residual variant) and the DiT adaLN
+modulation (FlyDSL on gfx950, eager PyTorch elsewhere).
 
 Public API:
     - ``rmsnorm(x, gamma, eps=1e-6, zero_centered=False) -> y``
     - ``rmsnorm_residual(x, residual, gamma, eps=1e-6) -> (y, x_plus_r)``
     - ``rmsnorm_residual_fp4(...) -> (y, x_plus_r, QuantizedTensorPair)``
+    - ``adaln_modulate(x_txt, x_img, scale, shift, eps) -> (r_txt, r_img, y)``
+    - ``gated_residual_adaln(x_img, a_img, g_img, s_img, h_img, x_txt, a_txt, g_txt, s_txt, h_txt, eps)
+      -> (x1_img, y_img, x1_txt, y_txt)``
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from __future__ import annotations
 from typing import Tuple, Union
 
 import torch
+import torch.nn.functional as F
 
 from primus_turbo.pytorch.core.low_precision import (
     Float4QuantConfig,
@@ -29,6 +34,17 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
     QuantizedTensorPair,
 )
+from primus_turbo.pytorch.core.utils import is_gfx950
+from primus_turbo.pytorch.kernels.normalization.adaln_modulate_impl import (
+    adaln_modulate_bwd_impl,
+    adaln_modulate_fwd_impl,
+    adaln_modulate_shape_error,
+)
+from primus_turbo.pytorch.kernels.normalization.gated_residual_adaln_impl import (
+    gated_residual_adaln_bwd_impl,
+    gated_residual_adaln_fwd_impl,
+    gated_residual_adaln_shape_error,
+)
 from primus_turbo.pytorch.kernels.normalization.rmsnorm_impl import (
     rmsnorm_bwd_impl,
     rmsnorm_bwd_residual_impl,
@@ -36,7 +52,13 @@ from primus_turbo.pytorch.kernels.normalization.rmsnorm_impl import (
     rmsnorm_fwd_residual_impl,
 )
 
-__all__ = ["rmsnorm", "rmsnorm_residual", "rmsnorm_residual_fp4"]
+__all__ = [
+    "rmsnorm",
+    "rmsnorm_residual",
+    "rmsnorm_residual_fp4",
+    "adaln_modulate",
+    "gated_residual_adaln",
+]
 
 
 class _RMSNormFunction(torch.autograd.Function):
@@ -315,3 +337,130 @@ def rmsnorm_residual_fp4(
         y, xpr2, rstd, gamma, config, row_recipe, col_recipe, flydsl_rmsnorm_dual_quant
     )
     return y, x_plus_r, QuantizedTensorPair(row_qt, col_qt)
+
+
+class _AdaLNModulateFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x_txt, x_img, scale, shift, eps):
+        r_txt, r_img, y, stats = adaln_modulate_fwd_impl(x_txt, x_img, scale, shift, eps)
+        ctx.save_for_backward(x_txt, x_img, scale, stats)
+        return r_txt, r_img, y
+
+    @staticmethod
+    def backward(ctx, g_r_txt, g_r_img, g_y):
+        x_txt, x_img, scale, stats = ctx.saved_tensors
+        dx_txt, dx_img, dss = adaln_modulate_bwd_impl(g_y, g_r_txt, g_r_img, x_txt, x_img, scale, stats)
+        return dx_txt, dx_img, dss[:, 1], dss[:, 0], None
+
+
+def _adaln_modulate_eager(x_txt, x_img, scale, shift, eps):
+    x = torch.cat([x_txt, x_img], dim=1)
+    one_plus = (1 + scale.float()).to(x.dtype).float()
+    y = F.layer_norm(x.float(), (x.shape[-1],), eps=eps) * one_plus[:, None] + shift.float()[:, None]
+    return x_txt.clone(), x_img.clone(), y.to(x.dtype)
+
+
+def adaln_modulate(
+    x_txt: torch.Tensor, x_img: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """DiT adaLN modulation of two concatenated token segments: ``(x_txt, x_img, LN(cat([x_txt, x_img],
+    1)) * (1 + scale[:, None]) + shift[:, None])`` for BF16 ``[B, S_*, C]`` segments and ``[B, C]``
+    modulation chunks, LayerNorm without affine parameters. The first two outputs are copies of the
+    inputs for the block's residual, so the caller's ``torch.cat`` of the two segments needs no pass of
+    its own. FLUX's single-stream block computes this on its text and image tokens.
+
+    Inductor's arithmetic (``1 + scale`` rounded to BF16, FP32 inside, one rounding per output);
+    only the order of the row and column sums differs. FlyDSL kernels on gfx950, eager PyTorch
+    elsewhere.
+
+    Takes BF16 CUDA tensors with C a multiple of 512, both sequence lengths multiples of 128, and scale
+    and shift with unit column stride and one row stride, on every arch; anything else raises
+    ``ValueError``. ``adaln_modulate_shape_error`` in
+    ``primus_turbo.pytorch.kernels.normalization.adaln_modulate_impl`` lets a caller check first.
+    """
+    why = adaln_modulate_shape_error(x_txt, x_img, scale, shift)
+    if why is not None:
+        raise ValueError(f"adaln_modulate: unsupported input ({why})")
+    if not is_gfx950():
+        return _adaln_modulate_eager(x_txt, x_img, scale, shift, float(eps))
+    return _AdaLNModulateFunction.apply(x_txt, x_img, scale, shift, float(eps))
+
+
+class _GatedResidualAdaLNFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x_img, a_img, g_img, s_img, h_img, x_txt, a_txt, g_txt, s_txt, h_txt, eps):
+        x1_img, y_img, x1_txt, y_txt, stats = gated_residual_adaln_fwd_impl(
+            x_img, a_img, g_img, s_img, h_img, x_txt, a_txt, g_txt, s_txt, h_txt, eps
+        )
+        ctx.save_for_backward(x_img, a_img, g_img, s_img, x_txt, a_txt, g_txt, s_txt, stats)
+        return x1_img, y_img, x1_txt, y_txt
+
+    @staticmethod
+    def backward(ctx, gx_img, gy_img, gx_txt, gy_txt):
+        x_img, a_img, g_img, s_img, x_txt, a_txt, g_txt, s_txt, stats = ctx.saved_tensors
+        dx_img, da_img, dx_txt, da_txt, vec = gated_residual_adaln_bwd_impl(
+            gy_img, gx_img, x_img, a_img, g_img, s_img, gy_txt, gx_txt, x_txt, a_txt, g_txt, s_txt, stats
+        )
+        batch = x_img.shape[0]
+        vi, vt = vec[:batch], vec[batch:]
+        return (
+            dx_img,
+            da_img,
+            vi[:, 2],
+            vi[:, 1],
+            vi[:, 0],
+            dx_txt,
+            da_txt,
+            vt[:, 2],
+            vt[:, 1],
+            vt[:, 0],
+            None,
+        )
+
+
+def _gated_residual_adaln_eager(x, a, g, s, h, eps):
+    x1 = x.float() + g.float()[:, None] * a.float()
+    y = F.layer_norm(x1, (x1.shape[-1],), eps=eps) * (1 + s.float()[:, None]) + h.float()[:, None]
+    return x1.to(x.dtype), y.to(x.dtype)
+
+
+def gated_residual_adaln(
+    x_img: torch.Tensor,
+    a_img: torch.Tensor,
+    g_img: torch.Tensor,
+    s_img: torch.Tensor,
+    h_img: torch.Tensor,
+    x_txt: torch.Tensor,
+    a_txt: torch.Tensor,
+    g_txt: torch.Tensor,
+    s_txt: torch.Tensor,
+    h_txt: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """DiT gated residual followed by adaLN modulation, for the two streams of an MMDiT block in one
+    call: ``x1 = x + g[:, None] * a`` and ``y = LN(x1) * (1 + s[:, None]) + h[:, None]``, as
+    ``(x1_img, y_img, x1_txt, y_txt)``, for BF16 ``[B, S_*, C]`` streams, the attention outputs ``a``
+    and ``[B, C]`` gate, scale and shift chunks; LayerNorm without affine parameters. FLUX's dual-stream
+    block computes this between its attention and its MLPs.
+
+    Inductor's arithmetic (``x1`` and ``1 + s`` in FP32, one rounding per output), with the row
+    statistics combined exactly instead of by Welford's update; ``x1`` is returned in BF16. FlyDSL
+    kernels on gfx950, eager PyTorch elsewhere.
+
+    Takes BF16 CUDA tensors with both sequence lengths multiples of 32 (they may differ), C a multiple
+    of 1536, and modulation vectors with unit column stride and one row stride, on every arch; anything
+    else raises ``ValueError``. ``gated_residual_adaln_shape_error`` in
+    ``primus_turbo.pytorch.kernels.normalization.gated_residual_adaln_impl`` lets a caller check first.
+    """
+    why = gated_residual_adaln_shape_error(
+        x_img, a_img, g_img, s_img, h_img, x_txt, a_txt, g_txt, s_txt, h_txt
+    )
+    if why is not None:
+        raise ValueError(f"gated_residual_adaln: unsupported input ({why})")
+    if not is_gfx950():
+        return _gated_residual_adaln_eager(
+            x_img, a_img, g_img, s_img, h_img, float(eps)
+        ) + _gated_residual_adaln_eager(x_txt, a_txt, g_txt, s_txt, h_txt, float(eps))
+    return _GatedResidualAdaLNFunction.apply(
+        x_img, a_img, g_img, s_img, h_img, x_txt, a_txt, g_txt, s_txt, h_txt, float(eps)
+    )

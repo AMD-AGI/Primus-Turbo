@@ -12,12 +12,17 @@ from primus_turbo.pytorch.kernels.activation.geglu_impl import (
     geglu_bwd_with_probs,
     geglu_fwd_with_probs,
 )
+from primus_turbo.pytorch.kernels.activation.linear_gelu_impl import (
+    linear_gelu_bwd_impl,
+    linear_gelu_fwd_impl,
+    linear_gelu_shape_error,
+)
 from primus_turbo.pytorch.kernels.activation.swiglu_impl import (
     swiglu_bwd_with_probs,
     swiglu_fwd_with_probs,
 )
 
-__all__ = ["swiglu_with_probs", "geglu_with_probs"]
+__all__ = ["swiglu_with_probs", "geglu_with_probs", "linear_gelu"]
 
 
 class GLUWithProbs(torch.autograd.Function):
@@ -113,3 +118,40 @@ def geglu_with_probs(
             straight-through, matching ``torch.clamp``. None for no clamp.
     """
     return GLUWithProbs.apply(x, probs, row_mask, "gelu", clamp_limit)
+
+
+class _LinearGeluFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, bias, prefix):
+        out, aux = linear_gelu_fwd_impl(x, weight, bias, prefix)
+        ctx.save_for_backward(x, weight, aux)
+        ctx.width = 0 if prefix is None else prefix.shape[1]
+        ctx.has_prefix = prefix is not None
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, weight, aux = ctx.saved_tensors
+        grad_h, grad_bias = linear_gelu_bwd_impl(grad_out[:, ctx.width :], aux)
+        grad_prefix = grad_out[:, : ctx.width] if ctx.has_prefix else None
+        return grad_h @ weight, grad_h.t() @ x, grad_bias, grad_prefix
+
+
+def linear_gelu(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, prefix: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """``cat([prefix, gelu_tanh(x @ weight.T + bias)], dim=1)`` for BF16 ``x [M, K]``, ``weight [N, K]``,
+    ``bias [N]`` and an optional ``prefix [M, P]``: an MLP up-projection and tanh GELU, optionally written
+    after a prefix, as a parallel DiT block (FLUX's single-stream block) concatenates the attention
+    output in front of it for one output projection.
+
+    The GELU is evaluated as Inductor's ``gelu(approximate="tanh")``, operation for operation; the
+    backward computes Inductor's ``gelu_backward`` and the bias gradient in one pass. The fused FlyDSL
+    GELU runs on gfx950 when M is a multiple of 2048 and N and P are multiples of 3072; other shapes and
+    archs take the unfused GELU. Inputs that are not 2-D BF16 CUDA tensors of matching shapes raise
+    ``ValueError``.
+    """
+    why = linear_gelu_shape_error(x, weight, bias, prefix)
+    if why is not None:
+        raise ValueError(f"linear_gelu: unsupported input ({why})")
+    return _LinearGeluFunction.apply(x, weight, bias, prefix)

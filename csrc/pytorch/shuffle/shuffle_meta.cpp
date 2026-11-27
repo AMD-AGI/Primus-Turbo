@@ -35,7 +35,6 @@ at::Tensor shuffle_weight_impl_meta(const at::Tensor weight, at::IntArrayRef lay
     PRIMUS_TURBO_CHECK(weight.scalar_type() == at::kFloat4_e2m1fn_x2,
                        "Weight must be Float4_e2m1fn_x2.");
     PRIMUS_TURBO_CHECK(weight.dim() == 2, "Weight must be 2D");
-    PRIMUS_TURBO_CHECK(weight.is_contiguous(), "Weight must be contiguous");
 
     const int64_t M = weight.size(0);
     const int64_t N = weight.size(1);
