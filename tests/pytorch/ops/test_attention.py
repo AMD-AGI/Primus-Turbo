@@ -1490,10 +1490,11 @@ def test_flydsl_gfx950_mla_refuses_what_the_kernels_lack(kwargs):
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and is_gfx950()), reason="FlyDSL MLA attention is gfx950-only"
 )
-def test_flydsl_gfx950_mla_deterministic_misses_the_tune_cache():
+def test_flydsl_gfx950_mla_deterministic_misses_the_tune_cache(monkeypatch):
     """A FlyDSL winner tuned without ``deterministic`` is not replayed for a deterministic call."""
     torch.manual_seed(42)
     q, k, v, dout = _mla_case("bshd", 1, 1024, 2)
+    flydsl = attention_impl.DenseAttnFwdFlydslBackend
     cache = attention_impl.FlashAttnDenseDispatcher._cache
     GlobalBackendManager.reset()
     GlobalBackendManager.set_auto_tune(True)
@@ -1502,9 +1503,12 @@ def test_flydsl_gfx950_mla_deterministic_misses_the_tune_cache():
         assert len(cache) == 1, "forward was not auto-tuned"
         # Whichever backend won, make the warm entry the one deterministic runs cannot take.
         for key in list(cache._cache):
-            cache.put(key, attention_impl.DenseAttnFwdFlydslBackend)
+            cache.put(key, flydsl)
+        flydsl_calls = []
+        execute = flydsl.execute
+        monkeypatch.setattr(flydsl, "execute", staticmethod(lambda **kw: flydsl_calls.append(1) or execute(**kw)))
         flash_attn_func(q, k, v, causal=True, deterministic=True).backward(dout)
-        assert len(cache) == 2, "the deterministic call reused the non-deterministic entry"
+        assert not flydsl_calls, "the deterministic call reused the non-deterministic FlyDSL entry"
     finally:
         GlobalBackendManager.reset()
 
