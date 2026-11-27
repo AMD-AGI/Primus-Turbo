@@ -515,10 +515,16 @@ def _combine(st: _EPState, pool_rows, extra=None):
 def _wgrad(st: _EPState, rk: _Rank, w, lhs, lhs_s, rhs, rhs_s, n, k, accumulate):
     """fused_mega_moe_fp8blk's wgrad step (main_grad accumulation, sumsq fold, dummy grad) for one weight."""
 
+    # Bound now: the (possibly deferred) launch must use exactly these tensors, never a later rk attribute.
+    poffs, perm = rk.poffs, rk.perm
+    if st.wwin < st.N:
+        # Device-side window check, issued on the current (main) stream before any fork: its temporaries are
+        # allocated and freed in the main stream's pool, so the deferred launch below allocates nothing on the side
+        # stream (same check, same abort; it only reads poffs, complete on the main stream here).
+        torch._assert_async((poffs[1:] - poffs[:-1]).max() <= _blk._vkp_kwin(st.wwin))
+
     def run(out, beta, sq=None):
-        if st.wwin < st.N:
-            torch._assert_async((rk.poffs[1:] - rk.poffs[:-1]).max() <= _blk._vkp_kwin(st.wwin))
-        _blk._run_wgrad(st.wk, lhs, rhs, lhs_s, rhs_s, rk.poffs, n, k, out, beta, rk.perm, st.wwin, sq)
+        _blk._run_wgrad(st.wk, lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta, perm, st.wwin, sq)
 
     mg = _blk._setup_accum(w, accumulate)
     if mg is not None:
@@ -526,8 +532,9 @@ def _wgrad(st: _EPState, rk: _Rank, w, lhs, lhs_s, rhs, rhs_s, n, k, accumulate)
         beta = 0.0 if main_grad_first_write(w) else 1.0
         if _overlap.enabled("MOE_WGRAD"):
             # the expert wgrad only feeds the optimizer: run it on the side stream next to the dgrad chain and the
-            # EP all-to-alls (same kernel and inputs -> same main_grad bits; joined after the micro-batch backward)
-            _overlap.defer(lambda: run(mg, beta, sq), lhs, lhs_s, rhs, rhs_s, rk.poffs, rk.perm, mg, sq)
+            # EP all-to-alls (same kernel and inputs -> same main_grad bits; joined after the micro-batch backward).
+            # Every tensor the launch touches is listed: defer() keeps it and record_streams it on the side stream.
+            _overlap.defer(lambda: run(mg, beta, sq), lhs, lhs_s, rhs, rhs_s, poffs, perm, mg, sq)
         else:
             run(mg, beta, sq)
         w._primus_main_grad_sumsq_fresh = sq is not None

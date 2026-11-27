@@ -84,16 +84,61 @@ def side_stream(name: str = "wgrad", device=None) -> torch.cuda.Stream:
     return s
 
 
+# Debug only (PRIMUS_TURBO_OVERLAP_DBG_SYNC=fork / after / fork,after; eager steps only): device-wide synchronize
+# right before the fork ("fork": every operand is complete and the main stream idle when the side starts) and/or
+# right after the deferred launch ("after": the side kernel never runs next to main-stream work). Both together keep
+# the side stream but remove all concurrency: separates "side stream reads incomplete / stale operands" from
+# "concurrent execution corrupts the result".
+_DBG_SYNC = set(__import__("os").environ.get("PRIMUS_TURBO_OVERLAP_DBG_SYNC", "").split(",")) - {""}
+
+
+def _tensors(x):
+    if isinstance(x, torch.Tensor):
+        return [x]
+    if isinstance(x, (list, tuple)):
+        return [t for y in x for t in _tensors(y)]
+    return []
+
+
+def _record(ts, stream):
+    """Mark the caching-allocator blocks of ``ts`` as used by ``stream`` (eager only)."""
+    for t in ts:
+        if t.is_cuda:
+            try:
+                t.record_stream(stream)
+            except RuntimeError:  # not caching-allocator memory (e.g. a from_blob comm buffer): nothing to protect
+                pass
+
+
 def defer(fn, *keep, device=None):
-    """Run ``fn()`` on the "wgrad" side stream after everything issued so far on the current stream."""
+    """Run ``fn()`` on the "wgrad" side stream after everything issued so far on the current stream.
+
+    Memory ownership: every tensor in ``keep`` (all ``fn`` reads or writes) is also ``record_stream``-ed on the side
+    stream in eager mode, so the caching allocator itself refuses to hand its block to anyone until the side work
+    queued so far is done -- independent of where ``join()`` runs, which stream / thread drops the last reference,
+    and of blocks freed between the fork and the join (``_keep`` alone only holds Python references; eager mode
+    reuses a freed block at once). Under CUDA-graph capture record_stream is skipped (the allocator would keep such
+    blocks out of the private pool until the capture ends, GBs here): there the captured join edge orders every
+    reuse. ``fn`` should not allocate (its allocations would belong to the side stream's pool); a returned tensor is
+    recorded on the current stream as well."""
     s = side_stream("wgrad", device)
     cur = torch.cuda.current_stream(s.device)
+    eager = not torch.cuda.is_current_stream_capturing()
+    if eager and "fork" in _DBG_SYNC:
+        torch.cuda.synchronize(s.device)
     s.wait_stream(cur)
+    kept = [t for t in keep if t is not None]
+    if eager:
+        _record(_tensors(kept), s)
     with torch.cuda.stream(s):
         out = fn()
+    if eager and "after" in _DBG_SYNC:
+        torch.cuda.synchronize(s.device)
     _used[(s.device.index, "wgrad")] = s
-    _keep.extend(t for t in keep if t is not None)
+    _keep.extend(kept)
     if out is not None:
+        if eager:
+            _record(_tensors(out), cur)
         _keep.append(out)
     return out
 

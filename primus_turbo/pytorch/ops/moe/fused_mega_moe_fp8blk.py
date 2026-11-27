@@ -80,6 +80,8 @@ _VK = dict(num_buffers=2)
 # kernel itself is bit-exact standalone): keep it unset (one per CU) until that race is fixed.
 _VKQ_NWG = int(__import__("os").environ.get("PRIMUS_TURBO_VKQ_NWG", "0") or 0) or None
 assert _VKQ_NWG is None or _VKQ_NWG >= 1, f"PRIMUS_TURBO_VKQ_NWG={_VKQ_NWG}: needs >= 1 (0 / unset = one per CU)"
+# Debug A/B: PRIMUS_TURBO_VKQ_FORCE_VKP=1 runs the vkq wgrads with the bit-identical vkp kernel (see _run_wgrad).
+_FORCE_VKP = __import__("os").environ.get("PRIMUS_TURBO_VKQ_FORCE_VKP", "0") == "1"
 _CACHES = weakref.WeakSet()
 # wgrad kernel (PRIMUS_TURBO_MOE_FP8BLK_WGRAD): "vkq" (persistent, experts longest-first, old-C prefetch for beta = 1,
 # scale planes on VMEM; needs the compact 1-byte-per-128-token col scales from the quant kernels) or "vk" (one tile
@@ -236,7 +238,16 @@ def early_routing_tables(topk_idx: torch.Tensor, topk_w: torch.Tensor, E: int):
 def _run_wgrad(wk, lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta, perm, window, sq=None):
     """One expert wgrad launch: out [E, n, k] bf16 (+)= per-expert lhs[:, seg] @ rhs[:, seg]^T. ``window``: upper
     bound (tokens) of any expert window; ``perm``: LPT expert order (vkq only); ``sq``: sumsq partials (vkq only)."""
-    if wk == "vkq":
+    if wk == "vkq" and _FORCE_VKP:
+        # Debug A/B (same bits): vkp instead of vkq / vkw -- TDM in-order scale planes, no async-LDS tile-ahead plane
+        # prefetch; isolates a vkq-internal hazard that would only open under concurrent main-stream load
+        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8blk_vkp_kernel import flyvkpblk_fp8
+
+        flyvkpblk_fp8(
+            lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta=beta, perm=perm, kwin_max=_vkp_kwin(window),
+            sumsq_out=sq, nwg=_VKQ_NWG,
+        )
+    elif wk == "vkq":
         flyvkqblk_fp8(
             lhs,
             rhs,
@@ -340,14 +351,15 @@ class _FP8BlockMoE(torch.autograd.Function):
             betas = [0.0 if main_grad_first_write(w) else 1.0 for w, *_ in jobs]
             sqs = [_wgrad_sumsq_buf(w, mg) if vkq else None for (w, *_), mg in zip(jobs, mgs)]
 
+            # experts longest-first (one tiny order kernel shared by both wgrads), built on the main stream so the
+            # deferred launches allocate nothing on the side stream (see overlap.defer)
+            perm_s = expert_order_lpt_fused(poffs) if vkq else None
+
             def side_wgrads():
-                # experts longest-first (one tiny order kernel shared by both wgrads)
-                perm_s = expert_order_lpt_fused(poffs) if vkq else None
                 for (w, lhs, lhs_s, rhs, rhs_s, n, k), mg, beta, sq in zip(jobs, mgs, betas, sqs):
                     _run_wgrad(ctx.wk, lhs, rhs, lhs_s, rhs_s, poffs, n, k, mg, beta, perm_s, T, sq)
-                return perm_s
 
-            _overlap.defer(side_wgrads, dT, dTs, aT, aTs, gT, gTs, xT, xTs, poffs, *mgs, *sqs)
+            _overlap.defer(side_wgrads, dT, dTs, aT, aTs, gT, gTs, xT, xTs, poffs, perm_s, *mgs, *sqs)
             for (w, *_), sq in zip(jobs, sqs):
                 w._primus_main_grad_sumsq_fresh = sq is not None
                 w.grad_added_to_main_grad = True
