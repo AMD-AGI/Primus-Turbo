@@ -85,19 +85,19 @@ class FusedMegaMoEFunction(torch.autograd.Function):
     ) -> torch.Tensor:
         with torch.profiler.record_function("fused_mega_moe_forward"):
             # Validate at the op boundary so failures point here, not deep in FlyDSL.
-            assert x.dim() == 2 and x.is_cuda and x.dtype == torch.bfloat16, (
-                f"x must be 2D bf16 CUDA, got {x.shape}/{x.dtype}"
-            )
+            assert (
+                x.dim() == 2 and x.is_cuda and x.dtype == torch.bfloat16
+            ), f"x must be 2D bf16 CUDA, got {x.shape}/{x.dtype}"
             assert w1.is_cuda and w2.is_cuda, "w1/w2 must be CUDA tensors"
-            assert x.device == w1.device == w2.device == topk_idx.device == topk_weights.device, (
-                "all inputs must share one device"
-            )
-            assert topk_idx.shape[0] == topk_weights.shape[0] == x.shape[0], (
-                f"token count mismatch: x={x.shape[0]} idx={topk_idx.shape[0]} w={topk_weights.shape[0]}"
-            )
-            assert topk_idx.shape[-1] == topk_weights.shape[-1], (
-                f"num_topk mismatch: idx={topk_idx.shape[-1]} w={topk_weights.shape[-1]}"
-            )
+            assert (
+                x.device == w1.device == w2.device == topk_idx.device == topk_weights.device
+            ), "all inputs must share one device"
+            assert (
+                topk_idx.shape[0] == topk_weights.shape[0] == x.shape[0]
+            ), f"token count mismatch: x={x.shape[0]} idx={topk_idx.shape[0]} w={topk_weights.shape[0]}"
+            assert (
+                topk_idx.shape[-1] == topk_weights.shape[-1]
+            ), f"num_topk mismatch: idx={topk_idx.shape[-1]} w={topk_weights.shape[-1]}"
 
             num_tokens = x.shape[0]
             num_topk = topk_idx.shape[-1]
@@ -193,10 +193,11 @@ def fused_mega_moe(
 
 
 def _wgrad_accum_target(
-    w: torch.Tensor, pattern: Optional[str], needs_grad: bool, supported=None
+    w: torch.Tensor, pattern: Optional[str], needs_grad: bool, supported=None, allow_fp32: bool = False
 ) -> Optional[torch.Tensor]:
     """``w.main_grad`` when this op's wgrad can accumulate into it, else None (ordinary gradient).
     ``supported(w)``: whether the wgrad kernel can (default: the bf16 gfx1250 variable-K's check).
+    ``allow_fp32``: an fp32 ``main_grad`` qualifies too (the generic gfx1250 variable-K accumulates into it).
 
     Checked BEFORE ``_setup_fused_grad_accum``, which marks the weight as already accumulated as a
     side effect: marking a weight whose gradient then takes the ordinary path would drop it.
@@ -206,11 +207,22 @@ def _wgrad_accum_target(
     main_grad = getattr(w, "main_grad", None)
     if not (
         isinstance(main_grad, torch.Tensor)
-        and main_grad.dtype == w.dtype == torch.bfloat16
+        and w.dtype == torch.bfloat16
         and main_grad.shape == w.shape
         and main_grad.device == w.device
         and main_grad.is_contiguous()
     ):
+        return None
+    if main_grad.dtype == torch.float32 and allow_fp32:
+        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+            grouped_gemm_bf16_variable_k_supported,
+        )
+
+        if not grouped_gemm_bf16_variable_k_supported(w.shape[1], w.shape[2]):
+            return None
+        _, main_grad = _setup_fused_grad_accum(w, pattern)
+        return main_grad
+    if main_grad.dtype != torch.bfloat16:
         return None
     if supported is None:
         from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_gfx1250_impl import (
@@ -243,11 +255,12 @@ class FusedMegaMoEStage1Function(torch.autograd.Function):
         w1: torch.Tensor,
         group: ProcessGroup,
         fuse_wgrad_accum_pattern: Optional[str],
+        wgrad_accum_fp32: bool = False,
     ):
         with torch.profiler.record_function("fused_mega_moe_stage1_forward"):
-            assert x.dim() == 2 and x.is_cuda and x.dtype == torch.bfloat16, (
-                f"x must be 2D bf16 CUDA, got {tuple(x.shape)}/{x.dtype}"
-            )
+            assert (
+                x.dim() == 2 and x.is_cuda and x.dtype == torch.bfloat16
+            ), f"x must be 2D bf16 CUDA, got {tuple(x.shape)}/{x.dtype}"
             assert w1.is_cuda and w1.dim() == 3, "w1 must be a 3D CUDA tensor"
             topk_idx = topk_idx.to(torch.int64)
 
@@ -262,7 +275,9 @@ class FusedMegaMoEStage1Function(torch.autograd.Function):
                 ctx.num_tokens = x.shape[0]
                 ctx.num_topk = topk_idx.shape[-1]
                 ctx.topk_idx = topk_idx
-                ctx.w1_main_grad = _wgrad_accum_target(w1, fuse_wgrad_accum_pattern, ctx.needs_input_grad[3])
+                ctx.w1_main_grad = _wgrad_accum_target(
+                    w1, fuse_wgrad_accum_pattern, ctx.needs_input_grad[3], allow_fp32=wgrad_accum_fp32
+                )
                 ctx.save_for_backward(x, w1)
             # handle tensors are non-differentiable index/table tensors
             ctx.mark_non_differentiable(*handle)
@@ -278,20 +293,30 @@ class FusedMegaMoEStage1Function(torch.autograd.Function):
             if grad_l1 is None:
                 return (None,) * len(ctx.needs_input_grad)
             x, w1 = ctx.saved_tensors
-            dx, grad_topk_weights, dW1 = fused_mega_moe_stage1_backward_impl(
-                grad_l1,
-                x,
-                w1,
-                ctx.handle,
-                ctx.group,
-                ctx.topk_idx,
-                grad_dispatch_weights,  # courier: grad w.r.t. dispatch_weights slot == grad_gate
-                ctx.num_tokens,
-                ctx.num_topk,
-                dw1_out=ctx.w1_main_grad,
-            )
-            # grads for (x, topk_idx, topk_weights, w1, group, fuse_wgrad_accum_pattern)
-            return dx, None, grad_topk_weights, _fused_wgrad(dW1, ctx.w1_main_grad, w1), None, None
+            if ctx.w1_main_grad is not None and ctx.w1_main_grad.dtype == torch.float32:
+                from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_gfx1250_post_norm_impl import (
+                    stage1_backward_fp32_accum,
+                )
+
+                dx, grad_topk_weights = stage1_backward_fp32_accum(
+                    grad_l1, x, w1, ctx.handle, ctx.topk_idx, grad_dispatch_weights, ctx.w1_main_grad
+                )
+                dW1 = None
+            else:
+                dx, grad_topk_weights, dW1 = fused_mega_moe_stage1_backward_impl(
+                    grad_l1,
+                    x,
+                    w1,
+                    ctx.handle,
+                    ctx.group,
+                    ctx.topk_idx,
+                    grad_dispatch_weights,  # courier: grad w.r.t. dispatch_weights slot == grad_gate
+                    ctx.num_tokens,
+                    ctx.num_topk,
+                    dw1_out=ctx.w1_main_grad,
+                )
+            # grads for (x, topk_idx, topk_weights, w1, group, fuse_wgrad_accum_pattern, wgrad_accum_fp32)
+            return dx, None, grad_topk_weights, _fused_wgrad(dW1, ctx.w1_main_grad, w1), None, None, None
 
 
 class FusedMegaMoEStage2Function(torch.autograd.Function):
@@ -374,6 +399,93 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
             )
 
 
+class FusedMegaMoEStage2PostNormFunction(torch.autograd.Function):
+    """Stage2 with a per-expert post norm (gfx1250 bf16): activation + grouped GEMM2 + norm with the routing
+    weight + combine (owns w2 and the norm weight). Output is the MoE result y."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        l1_out: torch.Tensor,
+        dispatch_weights: torch.Tensor,
+        topk_idx: torch.Tensor,
+        w2: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        group: ProcessGroup,
+        activation: Optional[GLUActivation],
+        fuse_wgrad_accum_pattern: Optional[str],
+        wgrad_accum_fp32: bool,
+        *handle,
+    ) -> torch.Tensor:
+        from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_gfx1250_post_norm_impl import (
+            stage2_post_norm_forward,
+        )
+
+        with torch.profiler.record_function("fused_mega_moe_stage2_post_norm_forward"):
+            assert is_gfx1250(), "the post-norm Mega MoE stage2 runs on gfx1250 only"
+            assert (
+                w2.is_cuda and w2.dim() == 3 and w2.dtype == torch.bfloat16
+            ), "w2 must be a 3D bf16 CUDA tensor"
+            assert norm_weight.shape == (w2.shape[1],), f"norm_weight must be [{w2.shape[1]}]"
+            handle = DispatchHandle(*handle)
+            y, act, l2, rstd = stage2_post_norm_forward(
+                l1_out, w2, handle, topk_idx.to(torch.int64), dispatch_weights, norm_weight, eps, activation
+            )
+            ctx.set_materialize_grads(False)
+            if any(ctx.needs_input_grad):
+                ctx.activation = activation
+                ctx.handle = handle
+                ctx.w2_main_grad = _wgrad_accum_target(
+                    w2, fuse_wgrad_accum_pattern, ctx.needs_input_grad[3], allow_fp32=wgrad_accum_fp32
+                )
+                ctx.save_for_backward(l1_out, act, l2, rstd, dispatch_weights, norm_weight, w2)
+            return y
+
+    @staticmethod
+    @torch.no_grad()
+    def backward(ctx, grad_y: Optional[torch.Tensor]):
+        """grad l1_out + dW2 + d norm_weight; grad_gate (the norm's routing-weight gradient) rides the
+        dispatch_weights slot to stage1.backward."""
+        from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_gfx1250_post_norm_impl import (
+            stage2_post_norm_backward,
+        )
+
+        with torch.profiler.record_function("fused_mega_moe_stage2_post_norm_backward"):
+            if grad_y is None:
+                return (None,) * len(ctx.needs_input_grad)
+            l1_out, act, l2, rstd, dispatch_weights, norm_weight, w2 = ctx.saved_tensors
+            grad_l1, grad_gate, dW2, d_norm_weight = stage2_post_norm_backward(
+                grad_y,
+                l1_out,
+                act,
+                l2,
+                rstd,
+                dispatch_weights,
+                norm_weight,
+                w2,
+                ctx.handle,
+                ctx.activation,
+                need_norm_weight_grad=ctx.needs_input_grad[4],
+                dw2_out=ctx.w2_main_grad,
+            )
+            # grads for (l1_out, dispatch_weights, topk_idx, w2, norm_weight, eps, group, activation,
+            # fuse_wgrad_accum_pattern, wgrad_accum_fp32, *handle)
+            return (
+                grad_l1,
+                grad_gate,
+                None,
+                _fused_wgrad(dW2, ctx.w2_main_grad, w2),
+                d_norm_weight,
+                None,
+                None,
+                None,
+                None,
+                None,
+                *((None,) * len(ctx.handle)),
+            )
+
+
 def fused_mega_moe_stage1(
     x: torch.Tensor,
     topk_idx: torch.Tensor,
@@ -381,15 +493,17 @@ def fused_mega_moe_stage1(
     w1: torch.Tensor,
     group: ProcessGroup,
     fuse_wgrad_accum_pattern: Optional[str] = None,
+    wgrad_accum_fp32: bool = False,
 ):
     """Stage1 gate-up. Returns ``(l1_out, dispatch_weights, handle)`` to feed stage2.
 
     ``dispatch_weights`` and ``handle`` are opaque forward state; pass them straight into
     :func:`fused_mega_moe_stage2`. ``fuse_wgrad_accum_pattern="megatron"`` accumulates dW1 into
-    ``w1.main_grad`` (see the module docstring).
+    ``w1.main_grad`` (see the module docstring): a bf16 one, or with ``wgrad_accum_fp32`` also an fp32 one
+    (gfx1250, through the generic variable-K grouped GEMM).
     """
     l1_out, dispatch_weights, *handle = FusedMegaMoEStage1Function.apply(
-        x, topk_idx, topk_weights, w1, group, fuse_wgrad_accum_pattern
+        x, topk_idx, topk_weights, w1, group, fuse_wgrad_accum_pattern, wgrad_accum_fp32
     )
     return l1_out, dispatch_weights, DispatchHandle(*handle)
 
@@ -428,5 +542,39 @@ def fused_mega_moe_stage2(
         group,
         activation,
         fuse_wgrad_accum_pattern,
+        *handle,
+    )
+
+
+def fused_mega_moe_stage2_post_norm(
+    l1_out: torch.Tensor,
+    dispatch_weights: torch.Tensor,
+    handle: DispatchHandle,
+    topk_idx: torch.Tensor,
+    w2: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    group: ProcessGroup,
+    activation: Optional[GLUActivation] = None,
+    fuse_wgrad_accum_pattern: Optional[str] = None,
+    wgrad_accum_fp32: bool = False,
+) -> torch.Tensor:
+    """Stage2 gate-down with a per-expert post norm (gfx1250, bf16). Consumes stage1's
+    ``(l1_out, dispatch_weights, handle)``; returns ``y = sum_k round(n_k * p_k)`` where, per routed row,
+    ``n = round(RMSNorm(round((act @ w2^T) * (1 + norm_weight)), eps))`` (``act`` unweighted). The routing weight
+    is applied after the norm, which a weight inside the activation (:func:`fused_mega_moe_stage2`) cannot express.
+    ``fuse_wgrad_accum_pattern`` / ``wgrad_accum_fp32``: as for :func:`fused_mega_moe_stage1`, for dW2.
+    """
+    return FusedMegaMoEStage2PostNormFunction.apply(
+        l1_out,
+        dispatch_weights,
+        topk_idx,
+        w2,
+        norm_weight,
+        eps,
+        group,
+        activation,
+        fuse_wgrad_accum_pattern,
+        wgrad_accum_fp32,
         *handle,
     )

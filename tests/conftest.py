@@ -103,6 +103,8 @@ _GFX1250_ENABLED_TESTS = (
     # Host-only: a subprocess imports every primus_turbo.flydsl module and holds each launch
     # declared at module level to the no-mutable-global rule. The rest of that file stays skipped here.
     "tests/pytorch/ops/test_flydsl_autotune.py::test_no_module_level_launch_reads_a_mutable_global",
+    # bf16 MegaMoE with the post-norm stage2 (fused_mega_moe_gfx1250_post_norm_impl), EP2+.
+    "tests/pytorch/ops/test_mega_bf16_gfx1250_post_norm_ep.py",
 )
 
 
