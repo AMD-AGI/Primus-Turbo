@@ -19,14 +19,20 @@ bounds and a kv pad mask. On the dense causal path, odd KV-tile spans are even-r
 the left-windowed path keeps an odd span and pairs it with a two-tile epilogue drain.
 """
 
+import heapq
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr.utils.arith import ArithValue
+from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
+from primus_turbo.flydsl.utils import buffer_ops
 from primus_turbo.flydsl.utils.attn_helper_stock import (
+    NUM_XCD,
     DualwaveKernelContext,
     _anchor_v_o,
     _dualwave_sync_barrier,
@@ -42,6 +48,7 @@ from primus_turbo.flydsl.utils.attn_helper_stock import (
     _sched_barrier_pairs,
     _waitcnt_vm_n,
     dtype_to_elem_type,
+    host_job_order,
 )
 
 # Persistent schedule entry: head | q block << 9 | batch << 24.
@@ -1021,6 +1028,88 @@ def emit_dualwave_swp_body(ctx, traits, next_job=None, q_raw=None):
     return _main_body(next_job=next_job, q_raw=q_raw)
 
 
+@ASTRewriter.transform
+def _dualwave_swp_kernel_body(
+    traits,
+    shared_storage,
+    Q,
+    K,
+    V,
+    O,  # noqa: E741
+    DebugCounts,
+    CuSeqQ,
+    CuSeqKv,
+    BlockTable,
+    SINK,
+    ScoreBound,
+    seq_len,
+    seq_len_kv,
+    stride_q_n,
+    stride_kv_n,
+    head_dim_runtime,
+    block_table_stride,
+    Sched=None,
+    sched_stride=None,
+):
+    ctx = DualwaveKernelContext(
+        traits,
+        Q,
+        K,
+        V,
+        O,
+        DebugCounts,
+        CuSeqQ,
+        CuSeqKv,
+        BlockTable,
+        seq_len,
+        seq_len_kv,
+        stride_q_n,
+        stride_kv_n,
+        head_dim_runtime,
+        block_table_stride,
+        SINK=SINK,
+        ScoreBound=ScoreBound,
+    )
+    ctx._setup(shared_storage, bind_block=not traits.PERSISTENT)
+
+    active = None if traits.PERSISTENT else ctx.active
+
+    if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN):
+        ctx.zero_o_block_if_needed()
+
+    if const_expr(traits.PERSISTENT):
+        # Row block_idx.x of the schedule: job count, then the packed jobs; each next job is
+        # read one job ahead (the read past the row's last job is never used).
+        sched_base = as_mlir_value(fx.Int64(fx.ptrtoint(fx.get_iter(Sched))) + fx.Int64(fx.Int64(0)))
+        sched_rsrc = buffer_ops.create_buffer_resource_from_addr(sched_base)
+        sched_row = fx.Int32(gpu.block_idx.x) * sched_stride
+
+        def _sched_load(idx):
+            return fx.Int32(buffer_ops.buffer_load(sched_rsrc, idx, vec_width=1, is_scalar=True))
+
+        n_jobs = _sched_load(sched_row)
+        job_first = _sched_load(sched_row + 1)
+        prefetch_k(ctx, job_first)
+        q_first = prefetch_q(ctx, job_first)
+        # No O stores follow the first job's prefetch for the job-top wait to count past.
+        _s_waitcnt(0)
+        n_q = len(q_first)
+        for k, job_args in range(fx.Index(0), fx.Index(n_jobs), fx.Index(1), init=[job_first] + q_first):
+            job = fx.Int32(job_args[0])
+            q_cur = [job_args[1 + i] for i in range_constexpr(n_q)]
+            job_next = _sched_load(sched_row + fx.Int32(k) + 2)
+            # The last job's drain re-fetches its own tiles rather than whatever follows the row.
+            job_prefetch = fx.Int32(ArithValue(fx.Int32(k) + 1 < n_jobs).select(job_next, job))
+            ctx.bind_item(*job_coords(job))
+            q_next = emit_dualwave_swp_body(ctx, traits, next_job=job_prefetch, q_raw=q_cur)
+            _ = yield [job_next] + q_next
+        _s_waitcnt(0)
+    elif const_expr(active is None):
+        emit_dualwave_swp_body(ctx, traits)
+    elif active:
+        emit_dualwave_swp_body(ctx, traits)
+
+
 def build_flash_attn_dualwave_swp_module(
     num_heads,
     head_dim,
@@ -1079,6 +1168,13 @@ def build_flash_attn_dualwave_swp_module(
         sbhd=sbhd,
         has_sink=has_sink,
     )
+    return build_dualwave_swp_launcher(traits)
+
+
+def build_dualwave_swp_launcher(traits):
+    """The DUALWAVE_SWP launcher of ``traits``. One job per CTA; with ``traits.PERSISTENT`` at
+    most that many CTAs, each running the jobs of its row of the host schedule
+    (``launcher.schedule``, passed back as ``sched=``)."""
     _dualwave_swp_cache_tag = traits.cache_tag
 
     _lds_elem_dtype = dtype_to_elem_type(traits.DTYPE_STR)
@@ -1086,61 +1182,96 @@ def build_flash_attn_dualwave_swp_module(
     @fx.struct
     class SharedStorage:
         kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
+        if traits.O_LDS_STAGE:
+            o: fx.Array[_lds_elem_dtype, traits.LDS_O_STAGE_SIZE, 16]
 
-    @flyc.kernel(name="flash_attn_dualwave_swp_gfx950_kernel", known_block_size=[traits.BLOCK_SIZE, 1, 1])
-    def flash_attn_dualwave_swp_gfx950_kernel(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        O: fx.Tensor,  # noqa: E741
-        DebugCounts: fx.Tensor,
-        CuSeqQ: fx.Tensor,
-        CuSeqKv: fx.Tensor,
-        BlockTable: fx.Tensor,
-        SINK: fx.Tensor,
-        ScoreBound: fx.Tensor,
-        seq_len: fx.Int32,
-        seq_len_kv: fx.Int32,
-        stride_q_n: fx.Int32,
-        stride_kv_n: fx.Int32,
-        head_dim_runtime: fx.Int32,
-        block_table_stride: fx.Int32,
-    ):
-        ctx = DualwaveKernelContext(
-            traits,
-            Q,
-            K,
-            V,
-            O,
-            DebugCounts,
-            CuSeqQ,
-            CuSeqKv,
-            BlockTable,
-            seq_len,
-            seq_len_kv,
-            stride_q_n,
-            stride_kv_n,
-            head_dim_runtime,
-            block_table_stride,
-            SINK=SINK,
-            ScoreBound=ScoreBound,
-        )
-        ctx._setup(SharedStorage)
+    if traits.PERSISTENT:
 
-        active = ctx.active
-        if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN):
-            ctx.zero_o_block_if_needed()
+        @flyc.kernel(name="flash_attn_dualwave_swp_gfx950_kernel", known_block_size=[traits.BLOCK_SIZE, 1, 1])
+        def flash_attn_dualwave_swp_gfx950_kernel(
+            Q: fx.Tensor,
+            K: fx.Tensor,
+            V: fx.Tensor,
+            O: fx.Tensor,  # noqa: E741
+            DebugCounts: fx.Tensor,
+            CuSeqQ: fx.Tensor,
+            CuSeqKv: fx.Tensor,
+            BlockTable: fx.Tensor,
+            SINK: fx.Tensor,
+            ScoreBound: fx.Tensor,
+            Sched: fx.Tensor,
+            seq_len: fx.Int32,
+            seq_len_kv: fx.Int32,
+            stride_q_n: fx.Int32,
+            stride_kv_n: fx.Int32,
+            head_dim_runtime: fx.Int32,
+            block_table_stride: fx.Int32,
+            sched_stride: fx.Int32,
+        ):
+            _dualwave_swp_kernel_body(
+                traits,
+                SharedStorage,
+                Q,
+                K,
+                V,
+                O,
+                DebugCounts,
+                CuSeqQ,
+                CuSeqKv,
+                BlockTable,
+                SINK,
+                ScoreBound,
+                seq_len,
+                seq_len_kv,
+                stride_q_n,
+                stride_kv_n,
+                head_dim_runtime,
+                block_table_stride,
+                Sched,
+                sched_stride,
+            )
 
-        if active is None:
-            emit_dualwave_swp_body(ctx, traits)
-        else:
+    else:
 
-            @flyc.jit
-            def _run_body_if_active():
-                if active:
-                    emit_dualwave_swp_body(ctx, traits)
-
-            _run_body_if_active()
+        @flyc.kernel(name="flash_attn_dualwave_swp_gfx950_kernel", known_block_size=[traits.BLOCK_SIZE, 1, 1])
+        def flash_attn_dualwave_swp_gfx950_kernel(
+            Q: fx.Tensor,
+            K: fx.Tensor,
+            V: fx.Tensor,
+            O: fx.Tensor,  # noqa: E741
+            DebugCounts: fx.Tensor,
+            CuSeqQ: fx.Tensor,
+            CuSeqKv: fx.Tensor,
+            BlockTable: fx.Tensor,
+            SINK: fx.Tensor,
+            ScoreBound: fx.Tensor,
+            seq_len: fx.Int32,
+            seq_len_kv: fx.Int32,
+            stride_q_n: fx.Int32,
+            stride_kv_n: fx.Int32,
+            head_dim_runtime: fx.Int32,
+            block_table_stride: fx.Int32,
+        ):
+            _dualwave_swp_kernel_body(
+                traits,
+                SharedStorage,
+                Q,
+                K,
+                V,
+                O,
+                DebugCounts,
+                CuSeqQ,
+                CuSeqKv,
+                BlockTable,
+                SINK,
+                ScoreBound,
+                seq_len,
+                seq_len_kv,
+                stride_q_n,
+                stride_kv_n,
+                head_dim_runtime,
+                block_table_stride,
+            )
 
     @flyc.jit
     def launch_flash_attn_dualwave_swp(
@@ -1154,6 +1285,7 @@ def build_flash_attn_dualwave_swp_module(
         BlockTable: fx.Tensor,
         SINK: fx.Tensor,
         ScoreBound: fx.Tensor,
+        Sched: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
@@ -1161,6 +1293,8 @@ def build_flash_attn_dualwave_swp_module(
         stride_kv_n: fx.Int32,
         head_dim_runtime: fx.Int32,
         block_table_stride: fx.Int32,
+        sched_ctas: fx.Int32,
+        sched_stride: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         # Make shape/mode traits visible to the JIT cache key.
@@ -1168,7 +1302,14 @@ def build_flash_attn_dualwave_swp_module(
         bs_idx = fx.Index(batch_size)
         sl_idx = fx.Index(seq_len)
         num_q_blocks = (sl_idx + traits.BLOCK_M - 1) // traits.BLOCK_M
-        grid_z = bs_idx
+        tensors = [Q, K, V, O, DebugCounts, CuSeqQ, CuSeqKv, BlockTable, SINK, ScoreBound]
+        scalars = [seq_len, seq_len_kv, stride_q_n, stride_kv_n, head_dim_runtime, block_table_stride]
+        if const_expr(traits.PERSISTENT):
+            grid = (fx.Index(sched_ctas), 1, 1)
+            tensors.append(Sched)
+            scalars.append(sched_stride)
+        else:
+            grid = (traits.NUM_HEADS_Q // traits.Q_HEADS_PER_WG, num_q_blocks, bs_idx)
 
         passthrough_entries = (
             [
@@ -1180,29 +1321,15 @@ def build_flash_attn_dualwave_swp_module(
             else None
         )
         flash_attn_dualwave_swp_gfx950_kernel(
-            Q,
-            K,
-            V,
-            O,
-            DebugCounts,
-            CuSeqQ,
-            CuSeqKv,
-            BlockTable,
-            SINK,
-            ScoreBound,
-            seq_len,
-            seq_len_kv,
-            stride_q_n,
-            stride_kv_n,
-            head_dim_runtime,
-            block_table_stride,
+            *tensors,
+            *scalars,
             value_attrs={
                 "rocdl.waves_per_eu": traits.WAVES_PER_EU,
                 "rocdl.flat_work_group_size": f"{traits.BLOCK_SIZE},{traits.BLOCK_SIZE}",
                 "llvm.passthrough": passthrough_entries,
             },
         ).launch(
-            grid=(traits.NUM_HEADS_Q // traits.Q_HEADS_PER_WG, num_q_blocks, grid_z),
+            grid=grid,
             block=(traits.BLOCK_SIZE, 1, 1),
             stream=stream,
         )
@@ -1240,10 +1367,14 @@ def build_flash_attn_dualwave_swp_module(
         block_table_stride,
         sink,
         score_bound,
+        sched,
     ):
-        # cu_seqlens_*/block_table/sink are unused kernel-signature placeholders for dense
-        # launches / has_sink=False; the kernel only reads them under const_expr(traits.VARLEN
-        # / HAS_SINK). O fills those slots. Returns the ordered 16-tuple the JIT entry expects.
+        # cu_seqlens_*/block_table/sink/sched are unused kernel-signature placeholders for dense
+        # launches / has_sink=False / one job per CTA; the kernel only reads them under
+        # const_expr(traits.VARLEN / HAS_SINK / PERSISTENT). O fills those slots. Returns the
+        # ordered 20-tuple the JIT entry expects.
+        assert (sched is not None) == bool(traits.PERSISTENT), "persistent launches need `schedule`"
+        sched_table, sched_ctas, sched_stride = (O, 0, 0) if sched is None else sched
         return (
             Q,
             K,
@@ -1255,6 +1386,7 @@ def build_flash_attn_dualwave_swp_module(
             O if block_table is None else block_table,
             O if sink is None else sink,
             O if score_bound is None else score_bound,
+            sched_table,
             batch_size,
             seq_len,
             seq_len if seq_len_kv is None else seq_len_kv,
@@ -1262,7 +1394,48 @@ def build_flash_attn_dualwave_swp_module(
             traits.DEFAULT_STRIDE_KV_N if stride_kv_n is None else stride_kv_n,
             traits.HEAD_DIM if head_dim_runtime is None else head_dim_runtime,
             0 if block_table_stride is None else block_table_stride,
+            sched_ctas,
+            sched_stride,
         )
+
+    def _schedule(batch_size, seq_len, seq_len_kv=None):
+        """Persistent schedule: (flat int32 rows, number of CTAs, row stride).
+
+        Replays the one-job-per-CTA dispatch: each XCD's share of the job order (same L2
+        grouping, longest first) goes job by job to whichever of its CTAs the cost model frees
+        first. Row c holds CTA c's job count, then its packed jobs in run order."""
+        assert traits.PERSISTENT
+        seq_len_kv = seq_len if seq_len_kv is None else seq_len_kv
+        nh = traits.NUM_HEADS_Q // traits.Q_HEADS_PER_WG
+        nq = -(-seq_len // traits.BLOCK_M)
+        assert nh <= JOB_HEAD_MASK + 1 and nq <= JOB_QBLOCK_MASK + 1 and batch_size <= JOB_BATCH_LIMIT
+        num_kv_tiles = -(-seq_len_kv // traits.BLOCK_N)
+
+        def _tiles(q_block):
+            n = num_kv_tiles
+            if traits.CAUSAL:
+                causal_end = max(0, (q_block + 1) * traits.BLOCK_M + seq_len_kv - seq_len)
+                n = min(-(-causal_end // traits.BLOCK_N), n)
+            return max(4, (n + 1) // 2 * 2)
+
+        order = host_job_order(nh, nq, traits.CAUSAL)
+        jobs = [(b, h, q) for b in range(batch_size) for h, q in order]
+        ctas = min(traits.PERSISTENT, len(jobs))
+        queues = NUM_XCD if ctas % NUM_XCD == 0 else 1
+        rows = [[] for _ in range(ctas)]
+        for x in range(queues):
+            free = [(0, c) for c in range(x, ctas, queues)]
+            for b, h, q in jobs[x::queues]:
+                t, c = heapq.heappop(free)
+                rows[c].append(h | q << JOB_QBLOCK_SHIFT | b << JOB_BATCH_SHIFT)
+                heapq.heappush(free, (t + JOB_FIXED_TILES + _tiles(q), c))
+        stride = 1 + max(len(r) for r in rows)
+        flat = []
+        for r in rows:
+            flat += [len(r)] + r + [0] * (stride - 1 - len(r))
+        # The kernel reads one job past each row's last; a longest last row would read past the table.
+        flat.append(0)
+        return flat, ctas, stride
 
     def _launch(
         Q,
@@ -1283,6 +1456,7 @@ def build_flash_attn_dualwave_swp_module(
         block_table_stride=None,
         sink=None,
         score_bound=None,
+        sched=None,
         stream=None,
     ):
         args = _fill_defaults(
@@ -1303,11 +1477,11 @@ def build_flash_attn_dualwave_swp_module(
             block_table_stride,
             sink,
             score_bound,
+            sched,
         )
-        # SINK now sits at index 8; the scalar shape/mode args (JIT cache key) start at 9.
-        # has_sink is baked into the module (separate build), so the SINK tensor stays out
-        # of the key.
-        key = args[10:] + (stream is None,)
+        # The scalar shape/mode args (JIT cache key) follow the 11 tensors. has_sink is baked
+        # into the module (separate build), so the SINK tensor stays out of the key.
+        key = args[11:] + (stream is None,)
         fn = _compiled.get(key)
         if fn is None:
             if len(_compiled) >= _COMPILED_MAX:
@@ -1336,6 +1510,7 @@ def build_flash_attn_dualwave_swp_module(
         block_table_stride=None,
         sink=None,
         score_bound=None,
+        sched=None,
         stream=None,
     ):
         args = _fill_defaults(
@@ -1356,10 +1531,12 @@ def build_flash_attn_dualwave_swp_module(
             block_table_stride,
             sink,
             score_bound,
+            sched,
         )
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
             return flyc.compile(launch_flash_attn_dualwave_swp, *args, fx.Stream(stream))
 
     _launch.compile = _compile
+    _launch.schedule = _schedule
 
     return _launch
