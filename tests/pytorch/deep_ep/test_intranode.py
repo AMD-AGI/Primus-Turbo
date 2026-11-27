@@ -259,18 +259,26 @@ class DeepEPIntranodeTestCase(MultiProcessTestCase):
 
     @unittest.skipUnless(IS_GFX1250, "v2 runs on gfx1250 only")
     @skip_if_lt_x_gpu(2)
-    def test_v2_refuses_graph_capture(self):
-        """A replay would rerun a call's host-side epochs: v2 dispatch and combine raise under
-        capture before touching any state, and the buffer keeps working."""
+    def test_v2_graph_capture(self):
+        """v2 keeps its epochs on the device: a captured cached dispatch + combine replays with fresh
+        epochs, matches the eager calls bit for bit on every replay, and the buffer keeps working."""
         buffer = self._init_process("v2")
         torch.manual_seed(42 + self.rank)
         x, recv_x, recv_topk_weights, handle = self._check_round_trip(buffer)
+        ref_recv, *_ = buffer.dispatch(x, handle=handle)
+        ref_x, ref_w, _ = buffer.combine(recv_x, handle, topk_weights=recv_topk_weights)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            with self.assertRaisesRegex(RuntimeError, "CUDA graph"):
-                buffer.dispatch(x, handle=handle)
-            with self.assertRaisesRegex(RuntimeError, "CUDA graph"):
-                buffer.combine(recv_x, handle, topk_weights=recv_topk_weights)
+        with torch.cuda.graph(graph, stream=stream):
+            g_recv, *_ = buffer.dispatch(x, handle=handle)
+            g_x, g_w, _ = buffer.combine(recv_x, handle, topk_weights=recv_topk_weights)
+        for _ in range(3):
+            g_recv.zero_()
+            g_x.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(g_recv, ref_recv) and torch.equal(g_x, ref_x) and torch.equal(g_w, ref_w)
         self._check_round_trip(buffer)
         dist.barrier()
 

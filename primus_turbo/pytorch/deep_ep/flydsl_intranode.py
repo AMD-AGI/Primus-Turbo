@@ -840,28 +840,15 @@ class FlyDSLIntranodeV2Runtime(FlyDSLIntranodeRuntime):
         self.symm.get_buffer(
             self.rank, ((DATA_OFFSET - META_BYTES) // 4,), torch.int32, META_BYTES // 4
         ).zero_()
-        self.dispatch_epoch = 0
-        self.combine_epoch = 0
-        # the combine's reduce queue; it only ever grows, each combine claims from where the
-        # previous one left it
+        # the dispatch / combine epochs live on the device (advanced on the launch stream before each launch)
+        # and the reduce queue restarts at 0 for every combine: no host state a CUDA-graph replay would rerun
+        self.epochs = torch.zeros(2, dtype=torch.int32, device="cuda")
         self.reduce_counter = torch.zeros(1, dtype=torch.int32, device="cuda")
-        self.reduce_grabs = 0
         # a combine may push into a peer's combine region only once that peer is done reducing
         # the previous combine: the notify of a dispatch in between is a barrier that ensures it
         self.combine_needs_barrier = False
 
-    @staticmethod
-    def _check_not_capturing() -> None:
-        # a V2 launch takes host state that every call advances (the epoch its flags carry, the base of
-        # the reduce queue): a graph replay would rerun the old values and take stale flags as fresh
-        _check(
-            not torch.cuda.is_current_stream_capturing(),
-            "DeepEP v2 cannot be captured in a CUDA graph: each call advances host-side epochs; "
-            "to capture the MoE token exchange on MI455X, use the all-to-all (RCCL) token dispatcher",
-        )
-
     def _num_channels(self, config) -> int:
-        self._check_not_capturing()
         return config.num_sms
 
     def _notify_memset_ints(self, num_channels: int) -> int:
@@ -880,7 +867,9 @@ class FlyDSLIntranodeV2Runtime(FlyDSLIntranodeRuntime):
             (args.num_tokens + args.num_channels - 1) // args.num_channels < TAIL_DONE_BIT,
             f"V2 dispatch takes fewer than {TAIL_DONE_BIT} tokens per channel",
         )
-        self.dispatch_epoch = self.dispatch_epoch % MAX_EPOCH + 1
+        with torch.cuda.stream(launch_stream):
+            e = self.epochs[0:1]
+            e.remainder_(MAX_EPOCH).add_(1)
         self.combine_needs_barrier = False
         dummy_i32 = args.rank_prefix_matrix
         dummy_f32 = dummy_i32.view(torch.float32)
@@ -901,12 +890,12 @@ class FlyDSLIntranodeV2Runtime(FlyDSLIntranodeRuntime):
             args.channel_prefix_matrix,
             args.rank_prefix_matrix,
             self.buffer_ptrs,
+            self.epochs,
             args.num_tokens,
             args.num_worst_tokens,
             args.scale_token_stride,
             args.scale_hidden_stride,
             self.rank,
-            self.dispatch_epoch,
             self.num_ranks,
             args.num_channels,
             args.hidden_bytes,
@@ -931,9 +920,10 @@ class FlyDSLIntranodeV2Runtime(FlyDSLIntranodeRuntime):
             num_recv_tokens * num_ranks * 4 <= COMBINE_FLAGS_BYTES,
             f"V2 combine of {num_recv_tokens} tokens needs more than {COMBINE_FLAGS_BYTES} flag bytes",
         )
-        self.combine_epoch = self.combine_epoch % (2**31 - 1) + 1
-        grab_base = self.reduce_grabs
-        self.reduce_grabs += combine_v2_grabs(num_recv_tokens, num_channels)
+        with torch.cuda.stream(launch_stream):
+            e = self.epochs[1:2]
+            e.remainder_(2**31 - 2).add_(1)
+            self.reduce_counter.zero_()
         if self.combine_needs_barrier:
             run_launcher(launch_barrier, self.barrier_ptrs, self.rank, num_ranks, launch_stream)
         self.combine_needs_barrier = True
@@ -950,11 +940,11 @@ class FlyDSLIntranodeV2Runtime(FlyDSLIntranodeRuntime):
             args.send_head,
             self.buffer_ptrs,
             self.reduce_counter,
+            self.epochs,
             args.num_tokens,
             num_recv_tokens,
             self.rank,
-            self.combine_epoch,
-            _as_i32(grab_base),
+            0,
             num_ranks,
             num_channels,
             args.hidden,

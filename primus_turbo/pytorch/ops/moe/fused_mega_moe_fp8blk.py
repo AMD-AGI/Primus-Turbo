@@ -73,6 +73,8 @@ assert _ALIGN % 256 == 0
 _K256 = dict(tile=(256, 256, 256), num_buffers=2)
 _TILE = dict(tile=(256, 256, 128), num_buffers=3)
 _VK = dict(num_buffers=2)
+# vkq workgroups (default: one per CU). Fewer leaves CUs to the main stream while a deferred expert wgrad runs.
+_VKQ_NWG = int(__import__("os").environ.get("PRIMUS_TURBO_VKQ_NWG", "0")) or None
 _CACHES = weakref.WeakSet()
 # wgrad kernel (PRIMUS_TURBO_MOE_FP8BLK_WGRAD): "vkq" (persistent, experts longest-first, old-C prefetch for beta = 1,
 # scale planes on VMEM; needs the compact 1-byte-per-128-token col scales from the quant kernels) or "vk" (one tile
@@ -244,6 +246,7 @@ def _run_wgrad(wk, lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta, perm, window,
             kwin_max=_vkp_kwin(window),
             sumsq_out=sq,
             vkw=_VKW,
+            nwg=_VKQ_NWG,
         )
     else:
         bound = _vkp_kwin(window)  # an expert window holds each token at most once, padded to 256 rows

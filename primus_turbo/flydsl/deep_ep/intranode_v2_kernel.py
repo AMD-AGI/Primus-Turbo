@@ -804,13 +804,16 @@ def _make_dispatch_v2(
         CHANNEL_PREFIX_MATRIX: fx.Tensor,
         RANK_PREFIX_MATRIX: fx.Tensor,
         BUFFER_PTRS: fx.Tensor,
+        EPOCH: fx.Tensor,
         num_tokens: fx.Int32,
         num_worst_tokens: fx.Int32,
         scale_token_stride: fx.Int32,
         scale_hidden_stride: fx.Int32,
         rank: fx.Int32,
-        epoch: fx.Int32,
     ):
+        # the epoch lives on the device (int32 [2]: dispatch, combine), advanced by a stream op before each
+        # launch, so a CUDA-graph replay runs with fresh epochs
+        epoch = _uniform_load_i32(create_buffer_resource(EPOCH, max_size=True), fx.Int32(0))
         thread_id = fx.thread_idx.x
         channel = fx.block_idx.x
         lane_id = thread_id % fx.Int32(WARP_SIZE)
@@ -1169,12 +1172,12 @@ def launch_dispatch_v2(
     channel_prefix_matrix,
     rank_prefix_matrix,
     buffer_ptrs,
+    epoch_t,
     num_tokens: fx.Int32,
     num_worst_tokens: fx.Int32,
     scale_token_stride: fx.Int32,
     scale_hidden_stride: fx.Int32,
     rank: fx.Int32,
-    epoch: fx.Int32,
     num_ranks: fx.Constexpr[int],
     num_channels: fx.Constexpr[int],
     hidden_bytes: fx.Constexpr[int],
@@ -1211,12 +1214,12 @@ def launch_dispatch_v2(
         channel_prefix_matrix,
         rank_prefix_matrix,
         buffer_ptrs,
+        epoch_t,
         num_tokens,
         num_worst_tokens,
         scale_token_stride,
         scale_hidden_stride,
         rank,
-        epoch,
     ).launch(grid=(num_channels, 1, 1), block=(NUM_THREADS, 1, 1), stream=stream, smem=lds_words * 4)
 
 
@@ -1444,12 +1447,13 @@ def _make_combine_v2(
         SEND_HEAD: fx.Tensor,
         BUFFER_PTRS: fx.Tensor,
         REDUCE_COUNTER: fx.Tensor,
+        EPOCH: fx.Tensor,
         num_rows: fx.Int32,
         num_recv_tokens: fx.Int32,
         rank: fx.Int32,
-        epoch: fx.Int32,
         grab_base: fx.Int32,
     ):
+        epoch = _uniform_load_i32(create_buffer_resource(EPOCH, max_size=True), fx.Int32(1))
         thread_id = fx.thread_idx.x
         block_id = fx.block_idx.x
         lane_id = thread_id % fx.Int32(WARP_SIZE)
@@ -1761,10 +1765,10 @@ def launch_combine_v2(
     send_head,
     buffer_ptrs,
     reduce_counter,
+    epoch_t,
     num_rows: fx.Int32,
     num_recv_tokens: fx.Int32,
     rank: fx.Int32,
-    epoch: fx.Int32,
     grab_base: fx.Int32,
     num_ranks: fx.Constexpr[int],
     num_channels: fx.Constexpr[int],
@@ -1790,9 +1794,9 @@ def launch_combine_v2(
         send_head,
         buffer_ptrs,
         reduce_counter,
+        epoch_t,
         num_rows,
         num_recv_tokens,
         rank,
-        epoch,
         grab_base,
     ).launch(grid=(num_channels, 1, 1), block=(NUM_THREADS, 1, 1), stream=stream, smem=smem_bytes)

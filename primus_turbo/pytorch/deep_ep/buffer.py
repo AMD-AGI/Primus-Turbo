@@ -126,8 +126,8 @@ class Buffer:
                 writes); unset, the one of this GPU's architecture (`get_rocm_arch()`): `"v1"` on gfx942 /
                 gfx950, `"v2"` on gfx1250; other architectures are not supported and raise. `"v1"` runs the
                 C++ kernels on gfx942 / gfx950 and their FlyDSL port on gfx1250, with interchangeable handles;
-                `"v2"` (not on gfx942 / gfx950) returns the same outputs with handles of its own, is not
-                capturable in a CUDA graph, and needs `num_nvl_bytes` that hold the whole batch of the rank
+                `"v2"` (not on gfx942 / gfx950) returns the same outputs with handles of its own, is
+                capturable in a CUDA graph (its epochs live on the device), and needs `num_nvl_bytes` that hold the whole batch of the rank
                 with the most tokens (`get_token_buffer_size_hint` with the same `num_max_tokens_per_rank` on
                 every rank; `moe_dispatch` sizes it itself). The internode and low-latency paths always use
                 the C++ `"v1"`. `buffer.intranode_backend` is the version a buffer runs.

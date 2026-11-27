@@ -72,6 +72,7 @@ from primus_turbo.triton.quantization.quantization_fp8blk_moe_kernel import (
 __all__ = [
     "EPComm",
     "DistEPComm",
+    "DeepEPComm",
     "EmulatedEPComm",
     "FP8BlockWeightCache",
     "fused_mega_moe_fp8blk_ep",
@@ -122,6 +123,65 @@ class DistEPComm(EPComm):
         return [out.view(s.dtype)]
 
 
+class DeepEPComm(DistEPComm):
+    """DistEPComm plus a DeepEP intranode buffer (FlyDSL kernels: V2 direct peer writes into fixed slots by default,
+    V1 channel rings with PRIMUS_TURBO_EP_DEEPEP_BACKEND=v1; ``num_sms`` CUs, no host sync with ``num_worst_tokens``,
+    CUDA-graph capturable with device-side epochs) instead of all_to_all_single: the FP8 rows of the x / dy dispatch
+    go once per (token, rank) and only for the real tokens, with their E8M0 scales (and on the forward the token's
+    global expert ids + route weights) as payload words; the presummed BF16 combine rows come back through DeepEP's
+    combine (fp32 sum in rank order, one bf16 rounding: the combine_ranks numerics), d route_w as its top-k weights.
+    Bit-identical to DistEPComm. Needs fp8 dispatch, presum combine and one driven rank. Opt-in: PRIMUS_TURBO_EP_COMM=deepep (PRIMUS_TURBO_EP_DEEPEP_SMS CUs per kernel, default 64)."""
+
+    _cache = {}
+
+    @classmethod
+    def get(cls, group):
+        key = id(group)
+        if key not in cls._cache:
+            cls._cache[key] = cls(group)
+        return cls._cache[key]
+
+    def __init__(self, group):
+        super().__init__(group)
+        from primus_turbo.pytorch.deep_ep import Config
+
+        self.backend = os.environ.get("PRIMUS_TURBO_EP_DEEPEP_BACKEND", "v2")
+        sms = int(os.environ.get("PRIMUS_TURBO_EP_DEEPEP_SMS", "64"))
+        self.dcfg = Config(sms, 6, 256, 6, 128)
+        self.ccfg = Config(sms, 24 if self.backend == "v1" else 9, 256, 6, 128)
+        self.rank = group.rank()
+        self.buf = None
+        self.shape = None
+
+    def buffer(self, T, H, K):
+        """The DeepEP buffer, built on first use (collective, eager: before any graph capture)."""
+        if self.buf is None:
+            from primus_turbo.pytorch.deep_ep import Buffer
+
+            hb = H * 2
+            if self.backend == "v1":
+                nbytes = max(
+                    self.dcfg.get_nvl_buffer_size_hint(hb, self.size),
+                    self.ccfg.get_nvl_buffer_size_hint(hb, self.size),
+                )
+            else:
+                nbytes = Buffer.get_token_buffer_size_hint(T, hb, self.size, K, "v2")
+            self.buf = Buffer(self.group, nbytes, intranode_backend=self.backend)
+            self.shape = (T, H, K)
+        assert self.shape == (T, H, K), f"DeepEPComm built for (T, H, K)={self.shape}, got {(T, H, K)}"
+        return self.buf
+
+
+def _make_comm(group):
+    if os.environ.get("PRIMUS_TURBO_EP_COMM", "") == "deepep":
+        return DeepEPComm.get(group)
+    return DistEPComm(group)
+
+
+def _dp(st) -> bool:
+    return isinstance(st.comm, DeepEPComm)
+
+
 class EmulatedEPComm(EPComm):
     """Single-process emulation of an EP group: this process drives all ``size`` ranks; the exchange copies block d of
     rank s into block s of rank d (the all-to-all's data movement, as device copies)."""
@@ -164,6 +224,7 @@ class _Rank:
         "g",
         "perm",
         "topk_dtype",
+        "handle",
     )
 
     def __init__(self):
@@ -257,6 +318,8 @@ def _dispatch_fwd(st: _EPState, xs, idxs, tws):
     H, cap, N, P = st.H, st.cap, st.N, st.P
     fp8 = st.dispatch == "fp8"
     pq, ps, pm, pc = [], [], [], []
+    if _dp(st):
+        return _dispatch_fwd_dp(st, xs, idxs, tws)
     for rk, x, idx, tw in zip(st.ranks, xs, idxs, tws):
         meta, cnt = _src_layout(st, rk, idx, tw)
         q, s = quant_rows_send(x, rk.slot, cap, quant=fp8)
@@ -285,10 +348,82 @@ def _dispatch_fwd(st: _EPState, xs, idxs, tws):
     return out
 
 
+def _src_rows(x, quant):
+    """Source-side 1x128 quant of every token once ([T, H] fp8 + [T, H/128] E8M0 bytes, the bytes quant_rows_send
+    writes into each destination's slot)."""
+    T = x.shape[0]
+    slot = torch.arange(T, device=x.device, dtype=torch.int32).view(T, 1)
+    q, s = quant_rows_send(x, slot, T, quant=quant)
+    return q.view(T, -1), (None if s is None else s.view(T, -1))
+
+
+def _dp_send(st, payload, q, rk, itr=None):
+    """DeepEP dispatch of the FP8 rows q [T, H] with ``payload`` int32 [T, w] (E8M0 scales, + the routes on the
+    forward) to the ranks in ``itr`` (bool [T, R]); the backward reuses the forward's handle (cached notify).
+    Received rows are in DeepEP order (source rank, token order), [N, ...] with only the first
+    rank_prefix_matrix[R-1, me] live. DeepEP's own top-k path is not used: one dummy route per token and one
+    "expert" per rank, so its notify sends R counts instead of E."""
+    comm = st.comm
+    T, H = q.shape
+    buf = comm.buffer(T, H, st.K)
+    if itr is None:
+        (rq, rp), *_ = buf.dispatch((q, payload), handle=rk.handle, num_worst_tokens=st.N, config=comm.dcfg)
+        return rq, rp
+    ntr = itr.sum(0, dtype=torch.int32)
+    didx = torch.zeros((T, 1), dtype=torch.int64, device=q.device)
+    dw = torch.zeros((T, 1), dtype=torch.float32, device=q.device)
+    (rq, rp), _, _, _, rk.handle, _ = buf.dispatch(
+        (q, payload), num_tokens_per_rank=ntr, is_token_in_rank=itr, num_tokens_per_expert=ntr, topk_idx=didx,
+        topk_weights=dw, num_worst_tokens=st.N, config=comm.dcfg,
+    )
+    return rq, rp
+
+
+def _dispatch_fwd_dp(st: _EPState, xs, idxs, tws):
+    """_dispatch_fwd through DeepEP, no all_to_all: each token's FP8 row goes once to each rank it has routes on, with
+    its E8M0 scales, global expert ids and fp32 route weights as payload words. The expert rank builds its pool
+    tables straight in DeepEP row order (one source block of N rows, live count from the rank prefix matrix): the
+    order of the routes inside each expert (source rank, then token) is the slot order of the all_to_all path, so
+    the pools, GEMMs and wgrads are the same bit for bit."""
+    assert st.dispatch == "fp8" and len(st.ranks) == 1 and _presum(), "DeepEP EP comm: fp8 dispatch + presum combine"
+    H, N, P, R, K, E_l = st.H, st.N, st.P, st.R, st.K, st.E_l
+    rk, x, idx, tw = st.ranks[0], xs[0], idxs[0], tws[0]
+    T = x.shape[0]
+    me = st.comm.rank
+    itr = torch.zeros((T, R), dtype=torch.bool, device=x.device)
+    itr.scatter_(1, idx // E_l, True)
+    q, s = _src_rows(x, True)
+    nsw = H // 128 // 4
+    payload = torch.empty((T, nsw + 2 * K), dtype=torch.int32, device=x.device)
+    payload[:, :nsw].copy_(s.view(torch.int32))
+    payload[:, nsw : nsw + K].copy_(idx)
+    payload[:, nsw + K :].copy_(tw.to(torch.float32).view(torch.int32))
+    rq, rp = _dp_send(st, payload, q, rk, itr=itr)
+    del payload
+    rs = rp[:, :nsw].contiguous().view(torch.uint8)
+    loc = rp[:, nsw : nsw + K] - me * E_l
+    live = (loc >= 0) & (loc < E_l)
+    meta = torch.empty((N, 3 * K), dtype=torch.int32, device=x.device)
+    meta[:, :K] = torch.where(live, loc, -1)
+    meta[:, K : 2 * K] = torch.where(live, rp[:, nsw + K :], 0)
+    meta[:, 2 * K :] = -1
+    cnt = rk.handle[0][R - 1, me].reshape(1).contiguous()
+    rk.rowmap, rk.rw, rk.inv, rk.poffs, rk.preal, rk.p2s = build_routing_blk_meta(
+        meta.view(-1), 0, N * 3 * K, cnt, 0, 1, N, K, E_l, P, N, 0, align=_blk._ALIGN
+    )
+    xq, xs_, rk.xT, rk.xTs = gather_dual_fp8(rq.view(N, H), rs, P, rk.rowmap, preal=rk.preal, compact_t=st.ct)
+    return [(xq, xs_)]
+
+
 def _dispatch_dy(st: _EPState, dys):
     """dy -> pool operands (1x128 for the fc2 dgrad, 128x1 for dW2) through the forward's dispatch slots."""
     H, N, P, cap = st.H, st.N, st.P, st.cap
     fp8 = st.dispatch == "fp8"
+    if _dp(st):
+        rk = st.ranks[0]
+        q, s = _src_rows(dys[0].contiguous().to(torch.bfloat16), True)
+        rq, rp = _dp_send(st, s.view(torch.int32), q, rk)
+        return [gather_dual_fp8(rq.view(N, H), rp.view(torch.uint8), P, rk.rowmap, preal=rk.preal, compact_t=st.ct)]
     pq, ps = [], []
     for rk, dy in zip(st.ranks, dys):
         q, s = quant_rows_send(dy.contiguous().to(torch.bfloat16), rk.slot, cap, quant=fp8)
@@ -319,6 +454,19 @@ def _combine_presum(st: _EPState, pool_rows, extra=None):
     per-rank partials summed on the token's rank in rank order. Not bit-identical to EP=1 (sum order and one more
     bf16 rounding). ``extra`` (d route_w) still travels per route ([R, ccap] fp32)."""
     R, H, ccap, K, cap, N = st.R, st.H, st.ccap, st.K, st.cap, st.N
+    if _dp(st):
+        # DeepEP combine of the presummed rows (fp32 sum over ranks in rank order, one bf16 rounding: the
+        # combine_ranks numerics); d route_w rides its top-k weights: route k of token t is live on exactly one
+        # rank, the others add 0
+        rk, rows = st.ranks[0], pool_rows[0]
+        o = presum_routes(rows, rk.inv, N, K)
+        ew = None
+        if extra is not None:
+            inv = rk.inv.view(N, K)
+            ew = torch.where(inv >= 0, extra[0][inv.clamp(min=0).long()], 0.0).contiguous()
+        y, dtw, _ = st.comm.buf.combine(o, rk.handle, topk_weights=ew, config=st.comm.ccfg)
+        del o
+        return [y] if extra is None else [(y, dtw)]
     sends, exts = [], []
     for i, (rk, rows) in enumerate(zip(st.ranks, pool_rows)):
         if extra is None:
@@ -581,7 +729,7 @@ def fused_mega_moe_fp8blk_ep(
     """One rank of an EP group (torch.distributed group, or an EPComm driving one rank): y [T, H] for this rank's
     tokens. x [T, H] bf16, topk_idx [T, K] global expert ids, w1 [E_l, 2I, H] / w2 [E_l, H, I] this rank's experts,
     caches as for fused_mega_moe_fp8blk. Same contract as fused_mega_moe_fp8blk otherwise."""
-    comm = group_or_comm if isinstance(group_or_comm, EPComm) else DistEPComm(group_or_comm)
+    comm = group_or_comm if isinstance(group_or_comm, EPComm) else _make_comm(group_or_comm)
     assert len(comm.local_ranks) == 1
     (y,) = fused_mega_moe_fp8blk_ep_multi(
         [x],
