@@ -31,6 +31,8 @@ import itertools
 import pytest
 import torch
 
+import primus_turbo.common.envs as envs
+
 pytest.importorskip("flydsl", reason="the FlyDSL gfx1250 grouped GEMM lives behind flydsl")
 
 from primus_turbo.flydsl.grouped_gemm import grouped_gemm_bf16_kernel_gfx1250 as gg  # noqa: E402
@@ -453,6 +455,56 @@ def test_the_nn_entry_point_cannot_read_a_stack_override():
                 assert base[kind].get(key, 0 if table is gg._STACK_LDS_COSCHED else 1) != rows[key], (
                     f"{kind} {key}: the override equals the ungrouped value, so it does nothing"
                 )
+
+
+def _launched(kind: str, a: int, b: int, avg_m: int, G: int, monkeypatch) -> tuple:
+    """The compile-time arguments the public entry point launches with for balanced rows, on CPU tensors.
+
+    The launch itself is replaced by a recorder, so this runs everything the entry point resolves -- the picker, every
+    table, the group and its gates -- without a device. Dropped from the record: the runtime arguments (pointers,
+    stream, strides) and, on NT / NN, the M tile count, which follows the row count rather than the key.
+    """
+    seen = []
+    monkeypatch.setattr(gg, "_require_gfx1250", lambda device: None)
+    monkeypatch.setattr(gg, "_as_ptr", lambda t: 0)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(gg, "_nt_launch", lambda args: seen.append(args[11:]))
+    monkeypatch.setattr(gg, "_vk_launch", lambda args: seen.append(args[7:]))
+    M, bf16 = G * avg_m, torch.bfloat16
+    offs = _group_offs(G, avg_m, "cpu")
+    if kind == "nt":
+        grouped_gemm_bf16_nt_flydsl_kernel(
+            torch.empty(M, b, dtype=bf16), torch.empty(G, a, b, dtype=bf16), offs
+        )
+    elif kind == "nn":
+        grouped_gemm_bf16_nn_flydsl_kernel(
+            torch.empty(M, b, dtype=bf16), torch.empty(G, b, a, dtype=bf16), offs
+        )
+    else:
+        grouped_gemm_bf16_variable_k_flydsl_kernel(
+            torch.empty(M, a, dtype=bf16), torch.empty(M, b, dtype=bf16), offs
+        )
+    assert len(seen) == 1
+    return seen[0]
+
+
+@pytest.mark.parametrize("kind, name, a, b, tile", DELIVERY, ids=_IDS)
+def test_off_the_key_the_tables_stay_exact(kind, name, a, b, tile, monkeypatch):
+    """No other row count reads these tables, near the key or not.
+
+    The whole-argument keys serve the avg_m near them (see test_grouped_gemm_flydsl_gfx1250_kwargs_keys.py); these
+    tables wait until other DeepSeek-V3 row counts are tuned, and Kimi-K2 shares their shapes. So the exact-keys
+    switch must change nothing here: recorded with the launch replaced, every call from 512 to 8192 rows but 2048
+    launches the same kernel with and without it, and none of them the keyed one.
+    """
+    G = NUMERIC_G
+    off = {
+        m: _launched(kind, a, b, m, G, monkeypatch) for m in (512, 1024, 1449, 2047, 2049, 2896, 4096, 8192)
+    }
+    assert _launched(kind, a, b, KEYED_AVG_M, G, monkeypatch) not in off.values()
+    monkeypatch.setenv("PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS", "1")
+    envs.reset_cache()
+    assert {m: _launched(kind, a, b, m, G, monkeypatch) for m in off} == off
 
 
 # ---------------------------------------------------------------------------
