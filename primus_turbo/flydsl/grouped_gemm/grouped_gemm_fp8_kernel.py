@@ -194,7 +194,7 @@ def _compile_grouped_nn(
     BLOCK_M: int = 256,
     BLOCK_N: int = 256,
     waves_per_eu: int = 2,
-    nt_vmcnt: int = 3,
+    nt_vmcnt: int = 3,  # end-of-iter vmcnt budget: -2 derives it from the streams (below), -1 disables
     num_xcd: int = 8,
     agpr_inplace: bool = True,
     acc_mode: str = "agpr",  # "agpr" = AGPR in-place (mma mode 2); "vgpr" = VGPR in-place (mode 3)
@@ -607,7 +607,12 @@ def _compile_grouped_nn(
                 else:
                     rocdl.s_barrier()
 
-            _nt_vmcnt = nt_vmcnt
+            # wave_m 0 runs one barrier ahead and reads iteration k's A.0 fill at the top of k + 2, after the
+            # barrier that pairs with wave_m 1's c11 barrier of k + 1, which the graded drains do not cover.
+            # -2 lands the fill at the end of k, where at most b_cur1's N_LDS_STEPS_B loads follow it. As in
+            # stock, a literal would be read against the A stream's width, which BLOCK_M halves.
+            _derive_drain = nt_vmcnt == -2
+            _nt_vmcnt = N_LDS_STEPS_B if _derive_drain else nt_vmcnt
 
             wave_n_offset = wave_n * (N_TILES_B * 16)
             wave_m_offset = wave_m * (N_TILES_A * 16)
@@ -631,7 +636,10 @@ def _compile_grouped_nn(
                 # Half-M body: a1 is re-aimed, not dropped, so load counts and graded drains stay full.
                 _a1_off = A1_gl_offset if _mfull else A0_gl_offset
                 # Lower in-flight count only over-drains; gfx950 retires vmcnt out of order, so leave slack.
-                _wi = _w2 = _w1 = (0) if nq == 0 else (N_LDS_STEPS_A + N_LDS_STEPS_B)
+                _wi = _w1 = (0) if nq == 0 else (N_LDS_STEPS_A + N_LDS_STEPS_B)
+                # With the derived drain, a_next0 (K-tile 1) lands here too: it is read after the barrier that
+                # pairs with wave_m 1's first c11 barrier. Only b_next1 may stay in flight.
+                _w2 = (0) if nq == 0 else (N_LDS_STEPS_B if _derive_drain else N_LDS_STEPS_A + N_LDS_STEPS_B)
                 # Graded drain: vmcnt rides the phase-trailing barriers that separate a fill from its
                 # reader; nq==0 keeps the fully-drained rendezvous.
                 _nd = 2 * (N_LDS_STEPS_A + N_LDS_STEPS_B)
@@ -2492,7 +2500,7 @@ def _np_launch(trans_b, N, K, G, out_fp16, cbsz, blgp, beta_is_one, n_stride, bm
             store_cshuffle=False,
             sched_schedbar=False,
             beta_is_one=beta_is_one,
-            # Keep the loop-tail vmcnt on NT: dropping it measured net-negative (it is redundant on NN).
+            # Keep the loop-tail vmcnt on NT: dropping it measured net-negative (NN: see below).
             nt_vmcnt=3,
             N=N,
             n_stride=n_stride,
@@ -2513,7 +2521,9 @@ def _np_launch(trans_b, N, K, G, out_fp16, cbsz, blgp, beta_is_one, n_stride, bm
         agpr_inplace=True,
         store_cshuffle=False,
         sched_schedbar=False,
-        nt_vmcnt=-1,
+        # BLOCK_M 256 reads A.0 rows the other wave group loaded, so it needs the derived drain; at 128
+        # each group reads only its own rows.
+        nt_vmcnt=-2 if bm == 256 else -1,
         # NN B[K,N] traversal: re-base B SRD per load in i64 when the per-group span K*N reaches 2^32 fp8.
         i64_traverse=K * max(N, n_stride) >= 2**32,
         N=N,
