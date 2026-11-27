@@ -390,9 +390,9 @@ class _AgkvFwdContext(DualwaveKernelContext):
         idx = fx.Index(ArithValue(k < fx.Index(n1)).select(second, idx))
         _wait_flag(need, self.flag_base, fx.Int32(idx), self.epoch)
 
-    def load_k_tile(self, tile_idx, buf_id):
+    def load_k_tile(self, tile_idx, buf_id, pieces=None):
         self._wait_chunk(tile_idx)
-        super().load_k_tile(tile_idx, buf_id)
+        super().load_k_tile(tile_idx, buf_id, pieces=pieces)
 
     def combine(self, thread_index, ws, wsl, out, lse):
         """``out`` / ``lse`` of this block's rows and heads from its segment's slots, weighted by their lse."""

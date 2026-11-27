@@ -764,6 +764,17 @@ def _make_dualwave_swp_traits(
         # The CTA's lane state comes first and the job is bound after it (`bind_item`), so a
         # persistent or embedding kernel can bind its own jobs.
         BIND_JOB_LAST=False,
+        # QK k-steps whose K packs are read before the first MFMA group; the rest follow it.
+        K_HEAD=max(1, head_dim // k_step_qk - 2),
+        # Whether the memory-cluster rendezvous folds into the compute-cluster barriers (see
+        # `emit_dualwave_swp_body`): it protects nothing and costs at 8 waves.
+        FOLD_BARRIERS=q_heads_per_wg > 1,
+        # The persistent job loop's work-group count (0: one job per work-group) and whether it
+        # stages the next job's Q through the O stage tiles.
+        PERSISTENT=0,
+        Q_LDS_STAGE=False,
+        # Softmax scale baked into the kernel (None: 1 / sqrt(head_dim) from the launch).
+        SM_SCALE=None,
         DEFAULT_STRIDE_Q_N=num_heads * head_dim,
         DEFAULT_STRIDE_KV_N=num_kv_heads * head_dim,
         DEFAULT_STRIDE_V_N=num_kv_heads * head_dim_v,
