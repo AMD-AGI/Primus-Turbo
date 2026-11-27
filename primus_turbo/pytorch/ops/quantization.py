@@ -82,7 +82,8 @@ def quantize_fp8(
 
         ``scale`` (TENSORWISE only, default None): a one-element float32 tensor on ``x``'s
         device to cast with, instead of measuring ``x``'s amax; the returned ``scale_inv`` is
-        its reciprocal. For callers that keep scales across steps (delayed scaling).
+        its reciprocal, 0-d whatever the shape of ``scale``. For callers that keep scales across
+        steps (delayed scaling).
 
         ``amax_out`` (TENSORWISE with ``scale`` only, default None): a one-element float32 tensor
         on ``x``'s device that the cast raises to the abs-max of ``x`` (before scaling), in the

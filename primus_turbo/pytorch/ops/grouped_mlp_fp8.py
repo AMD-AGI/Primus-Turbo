@@ -14,6 +14,7 @@ from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     ScalingGranularity,
     ScalingRecipe,
+    ScalingStrategy,
     check_mxfp8_support,
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
@@ -833,6 +834,8 @@ def grouped_mlp_fp8(
             "Float8QuantConfig.default_backend is read by the dense FP8 GEMMs only; "
             "grouped_mlp_fp8 picks its backends per stage."
         )
+    if config.strategy != ScalingStrategy.DYNAMIC:
+        raise ValueError(f"grouped_mlp_fp8 supports ScalingStrategy.DYNAMIC only, got {config.strategy}")
 
     clamp_limit = _check_activation(activation, clamp_limit)
 

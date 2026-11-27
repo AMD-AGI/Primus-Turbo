@@ -266,6 +266,9 @@ FP8 (including **MXFP8**) quantization is configured through `Float8QuantConfig`
   - The backend `gemm_fp8` tries first for its forward and backward GEMMs, e.g. `BackendType.FLYDSL` from `primus_turbo.pytorch.core.backend`. `None` keeps each GEMM's own default.
   - A backend set with `set_gemm_backend()` / `PRIMUS_TURBO_GEMM_BACKEND`, or chosen by auto-tune, still takes precedence, and a shape the backend cannot run falls back to another backend.
   - Dense GEMMs only: `grouped_gemm_fp8` and `grouped_mlp_fp8` reject a config that sets it.
+- **strategy**
+  - `ScalingStrategy.DYNAMIC` (default): each cast measures its input's amax first.
+  - `ScalingStrategy.DELAYED`: casts with scales kept from earlier steps, updated once per optimizer step by a `DelayedScaling` recipe (see [3.2](#32-fp8-gemm)). `TENSORWISE` with FP32 scales, dense GEMMs only.
 
 FP4 (i.e. **MXFP4**) quantization is configured through `Float4QuantConfig`:
 
@@ -316,6 +319,34 @@ print(c.shape) # [128, 256]
 ```
 
 Under `torch.compile`, a `TENSORWISE` `gemm_fp8` on plain tensors is traced into the graph, forward and backward. The other granularities, pre-quantized `QuantizedTensor` inputs and `fuse_bgrad_accum_pattern` run outside it, as a graph break.
+
+With delayed scaling, a tensorwise cast reads its input once instead of twice: it uses a scale kept from earlier steps and records the input's amax in the same pass. A `DelayedScaling` recipe makes one `DelayedScalingState` per GEMM and turns the recorded amaxes into scales once per optimizer step:
+
+```python
+from primus_turbo.pytorch.core import DelayedScaling
+from primus_turbo.pytorch.core.low_precision import ScalingStrategy
+from primus_turbo.pytorch.modules import Float8Linear
+
+recipe = DelayedScaling()
+config = Float8QuantConfig(strategy=ScalingStrategy.DELAYED)
+linear = Float8Linear(K, N, config=config, delayed_scaling=recipe, device=device)
+# A framework with its own linear class keeps a state per layer instead:
+#   state = recipe.make_state(config, device)
+#   out = turbo.ops.gemm_fp8(x, w, trans_b=True, config=config, scaling_state=state)
+
+for step in range(num_steps):
+    loss = model(batch).sum()
+    loss.backward()
+    optimizer.step()
+    recipe.step()  # once per optimizer step, after the last backward
+```
+
+- Until a state's first `recipe.step()`, its GEMM casts dynamically and only records the amaxes.
+- The amax is a running max since the last step, so gradient accumulation and activation-checkpoint recomputation fold into it. Scales change only in `recipe.step()`.
+- `recipe.step()` uses the dynamic cast's formula, `fp8_max / max(amax, 1e-12)`. An amax that is zero or not finite keeps the previous scale.
+- `DelayedScaling(refresh_interval=n)` records amaxes only in optimizer steps 0, n, 2n, ... The steps in between cast with the stored scales and skip the amax update; under `torch.compile` they are a second graph. The default `n=1` records every step.
+- Each rank keeps its own scales unless `DelayedScaling(amax_reduction_group=group)` is given.
+- `Float8Linear` casts dynamically in eval mode. The state is not saved in `state_dict`: a resumed run warms up again.
 
 The same `gemm_fp8` entry point also supports `BLOCKWISE` granularity. Just swap the
 `Float8QuantConfig` and keep the rest of the call site unchanged:

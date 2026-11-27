@@ -148,7 +148,8 @@ class ScalingStrategy(Enum):
     """
 
     DYNAMIC = auto()
-    # DELAYED_SCALING = auto() # TODO: undetermined
+    # Scales kept from earlier steps; see primus_turbo.pytorch.core.delayed_scaling.
+    DELAYED = auto()
 
 
 class _ScalingRecipeFields(NamedTuple):
@@ -213,6 +214,12 @@ class Float8QuantConfig(metaclass=_OpaqueMeta):
     takes precedence, and a shape the backend cannot run falls back to another one as any
     default does (an error under ``PRIMUS_TURBO_STRICT_DISPATCH=1``). Only the dense FP8
     GEMMs read it; ``grouped_gemm_fp8`` and ``grouped_mlp_fp8`` reject a config that sets it.
+
+    ``strategy=ScalingStrategy.DELAYED`` (TENSORWISE with FP32 scales only): casts with scales
+    kept from earlier steps instead of measuring each operand first. The scales live in a
+    ``DelayedScalingState`` passed to ``gemm_fp8`` (or held by ``Float8Linear``), and a
+    ``DelayedScaling`` recipe updates them once per optimizer step. Dense GEMMs only, like
+    ``default_backend``.
     """
 
     format: Format = Format.E4M3
@@ -229,6 +236,11 @@ class Float8QuantConfig(metaclass=_OpaqueMeta):
         assert self.default_backend is None or isinstance(self.default_backend, BackendType), (
             f"default_backend must be a BackendType or None, got {self.default_backend!r}"
         )
+
+        if self.strategy == ScalingStrategy.DELAYED:
+            assert (
+                self.granularity == ScalingGranularity.TENSORWISE and self.scale_dtype == ScaleDtype.FP32
+            ), "ScalingStrategy.DELAYED needs TENSORWISE granularity with FP32 scales"
 
         if self.granularity == ScalingGranularity.BLOCKWISE:
             assert self.block_size is not None, "block_size must be set when granularity is BLOCKWISE"
