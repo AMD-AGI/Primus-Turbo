@@ -5102,7 +5102,7 @@ def _nearest_avg_m(avg_m: int, tuned, reach: float):
 def _grouped_gemm_exact_keys() -> bool:
     """``PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS=1`` restores exact shape keys (no nearest-avg_m
     matching), for A/B against the tuned points."""
-    return os.getenv("PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS", "0") == "1"
+    return os.getenv("PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS", "0") == "1"  # envs: allow
 
 
 def _dsv3_key_avg_m(a: int, b: int, avg_m: int) -> int:
@@ -5332,7 +5332,13 @@ def _grouped_gemm_bf16_nt_flydsl_kernel_entry(
     _keyed = not (BLOCK_M or BLOCK_N)
     if (GROUP_M, num_xcd, xcd_band) == (16, 1, 32):
         GROUP_M, num_xcd, xcd_band = _TILE_ORDER_NT.get((N, K, avg_m), (GROUP_M, num_xcd, xcd_band))
-    if _keyed and tdm_balance == 0 and tdm_assign == 0 and (N, K) in _FWD_TDM_DEAL_KEYS and avg_m in (1024, 2048, 4096):
+    if (
+        _keyed
+        and tdm_balance == 0
+        and tdm_assign == 0
+        and (N, K) in _FWD_TDM_DEAL_KEYS
+        and avg_m in (1024, 2048, 4096)
+    ):
         tdm_balance, tdm_assign = 1, 1
     if issue_first < 0:
         issue_first = _pick_issue_first("nt", N, K, avg_m) if _keyed else 0

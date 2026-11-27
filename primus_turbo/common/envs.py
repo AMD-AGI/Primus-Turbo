@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_LOG_LEVEL: str = "WARNING"
     PRIMUS_TURBO_GEMM_BACKEND: str | None = None
     PRIMUS_TURBO_GROUPED_GEMM_BACKEND: str | None = None
+    PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS: bool = False
     PRIMUS_TURBO_ATTN_BACKEND: str | None = None
     PRIMUS_TURBO_SPARSE_ATTN_BACKEND: str | None = None
     PRIMUS_TURBO_MLA_BWD_IMPL: str = "flydsl"
@@ -226,7 +227,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PRIMUS_TURBO_GROUPED_GEMM_BACKEND": backend_spec("PRIMUS_TURBO_GROUPED_GEMM_BACKEND"),
     # "1" turns off nearest-avg_m key matching in the FlyDSL gfx1250 bf16 grouped GEMM (exact shape
     # keys only), for A/B against the tuned points. Default off: a key serves nearby avg_m as designed.
-    "PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS": lambda: os.getenv("PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS", "0") == "1",
+    "PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS": lambda: (
+        os.getenv("PRIMUS_TURBO_GROUPED_GEMM_EXACT_KEYS", "0") == "1"
+    ),
     # Flash-attention backend (dense and varlen share it). Same per-precision format as
     # PRIMUS_TURBO_GEMM_BACKEND. Unset auto-selects: FLYDSL when eligible, else the op's fallback.
     # GLUON is explicit and forward-only, never auto-selected; it is dense-only, so selecting it
