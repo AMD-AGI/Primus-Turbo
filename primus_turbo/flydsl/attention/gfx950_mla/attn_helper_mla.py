@@ -16,6 +16,7 @@ dual-wave, software-pipelined flash-attention kernels.
 """
 
 import math as host_math
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -137,8 +138,14 @@ _LDS_ALIAS_DOMAIN = '#llvm.alias_scope_domain<id = "flydsl.dualwave_swp.lds">'
 # Wait and low-level ROCDL wrappers
 
 
+# Race diagnosis (MEGA_ATTN_FWD_DBG, read when a kernel is built): vm0_all turns every counted vmcnt wait into a full drain.
+_VM0_ALL = "vm0_all" in frozenset(os.environ.get("MEGA_ATTN_FWD_DBG", "").split(","))
+
+
 def _waitcnt_vm_n(n):
     """Emit s_waitcnt vmcnt(n) only (lgkmcnt=63, expcnt=7)."""
+    if _VM0_ALL:
+        n = 0
     val = (n & _VMCNT_LO_MASK) | _LGKMCNT_EXPCNT_BASE | (((n >> 4) & _VMCNT_HI_MASK) << _VMCNT_HI_SHIFT)
     rocdl.s_waitcnt(val)
 

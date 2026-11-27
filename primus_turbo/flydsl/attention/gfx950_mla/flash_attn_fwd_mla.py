@@ -66,10 +66,12 @@ JOB_BATCH_LIMIT = 1 << 7
 # Per-job cost outside the KV tiles (prologue, drain, store), in KV tiles, for the host's
 # list-schedule replay.
 JOB_FIXED_TILES = 8
-# Race diagnosis (MegaAttn, comma-separated MEGA_ATTN_FWD_DBG, read when a tile is built): prologue_vm0, sched_kv.
+# Race diagnosis (comma-separated MEGA_ATTN_FWD_DBG, read when a tile is built): prologue_vm0, sched_kv
+# (MegaAttn's next_job=None prologue), vm0_jobtop (the persistent job-top wait drains the previous job's O stores too).
 _DBG = frozenset(x for x in os.environ.get("MEGA_ATTN_FWD_DBG", "").split(",") if x)
 _PROLOGUE_VM0 = "prologue_vm0" in _DBG
 _SCHED_KV = "sched_kv" in _DBG
+_VM0_JOBTOP = "vm0_jobtop" in _DBG
 
 
 def prefetch_k(ctx, job):
@@ -185,7 +187,7 @@ def make_mla_tile(traits):
                 # The previous job issued its O stores after this job's K and Q prefetch, and vmcnt
                 # retires in order: wait for the prefetch only, so the stores drain under the prologue.
                 _s_waitcnt(traits.LGKMCNT_0_ONLY)
-                _waitcnt_vm_n(ctx.o_stores_per_lane)
+                _waitcnt_vm_n(0 if _VM0_JOBTOP else ctx.o_stores_per_lane)
             _sched_barrier(0)
             _s_barrier()
 
