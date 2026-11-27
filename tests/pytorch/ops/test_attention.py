@@ -1506,7 +1506,9 @@ def test_flydsl_gfx950_mla_deterministic_misses_the_tune_cache(monkeypatch):
             cache.put(key, flydsl)
         flydsl_calls = []
         execute = flydsl.execute
-        monkeypatch.setattr(flydsl, "execute", staticmethod(lambda **kw: flydsl_calls.append(1) or execute(**kw)))
+        monkeypatch.setattr(
+            flydsl, "execute", staticmethod(lambda **kw: flydsl_calls.append(1) or execute(**kw))
+        )
         flash_attn_func(q, k, v, causal=True, deterministic=True).backward(dout)
         assert not flydsl_calls, "the deterministic call reused the non-deterministic FlyDSL entry"
     finally:
