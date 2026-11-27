@@ -22,9 +22,9 @@ the 288-shape Primus-Turbo MoE bench:
         tpc < 16  -> hierarchical adaptive split
         tpc >= 16  -> global
 
-    variable-K kernel (wgrad):
-        tpc < 64  -> per-xcd
-        tpc >= 64  -> global
+    variable-K kernel (wgrad), from a sweep with even and uneven group sizes:
+        tpc < 1   -> per-xcd
+        tpc >= 1  -> global
 
 (``tpc`` = total_tiles / num_sms.)
 """
@@ -72,9 +72,10 @@ def resolve_triton_ws_local_per_xcd(
 
     if ws_mode == "auto":
         if kernel_kind == _KERNEL_VARIABLE_K:
-            # wgrad: per-xcd wins on ~56% of shapes; global only takes over on
-            # very dense shapes.
-            if tpc < 64:
+            # wgrad: per-xcd cuts the tiles into num_xcds contiguous ranges, so with uneven
+            # group sizes (the usual MoE case) the XCDs holding the large groups finish last.
+            # Only with fewer tiles than CUs is per-xcd still ahead of global.
+            if tpc < 1:
                 return per_xcd_full
             return 0
         # standard kernel (fwd / dgrad):

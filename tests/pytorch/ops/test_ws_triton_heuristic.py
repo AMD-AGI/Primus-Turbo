@@ -112,19 +112,19 @@ def test_auto_standard_floor_at_half():
 
 
 def test_auto_variable_k_sparse_picks_per_xcd():
-    """tpc < 64 on the variable-K kernel -> per-xcd."""
-    # tpc = 1024 / 256 = 4 (< 64) -> per-xcd
-    assert resolve_triton_ws_local_per_xcd("auto", 1024, 256, kernel_kind="variable_k") == 128
-    # tpc = 63 (just under threshold)
-    assert resolve_triton_ws_local_per_xcd("auto", 16128, 256, kernel_kind="variable_k") == 2016
+    """tpc < 1 on the variable-K kernel (fewer tiles than CUs) -> per-xcd."""
+    # tpc = 128 / 256 = 0.5 -> ceil(128 / 8) = 16
+    assert resolve_triton_ws_local_per_xcd("auto", 128, 256, kernel_kind="variable_k") == 16
+    # tpc = 255 / 256 (just under 1) -> ceil(255 / 8) = 32
+    assert resolve_triton_ws_local_per_xcd("auto", 255, 256, kernel_kind="variable_k") == 32
 
 
-def test_auto_variable_k_dense_picks_global():
-    """tpc >= 64 on the variable-K kernel -> global (returns 0)."""
-    # tpc = 64 exactly -> global
-    assert resolve_triton_ws_local_per_xcd("auto", 16384, 256, kernel_kind="variable_k") == 0
-    # tpc = 128
-    assert resolve_triton_ws_local_per_xcd("auto", 32768, 256, kernel_kind="variable_k") == 0
+def test_auto_variable_k_picks_global():
+    """tpc >= 1 on the variable-K kernel -> global (returns 0): per-xcd's contiguous tile
+    ranges leave the XCDs with the large groups last when the group sizes are uneven."""
+    # tpc = 1, 4, 63, 64, 128
+    for total_tiles in (256, 1024, 16128, 16384, 32768):
+        assert resolve_triton_ws_local_per_xcd("auto", total_tiles, 256, kernel_kind="variable_k") == 0
 
 
 # ---------------------------------------------------------------------------
