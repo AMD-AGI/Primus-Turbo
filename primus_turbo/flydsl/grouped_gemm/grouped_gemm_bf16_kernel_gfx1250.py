@@ -5057,6 +5057,78 @@ _TILE_ORDER_NN = {(7168, 4096, 2048): (8, 8, 32), (2048, 7168, 2048): (8, 8, 32)
 _FWD_TDM_DEAL_KEYS = frozenset({(4096, 7168)})
 
 
+# ---------------------------------------------------------------------------------------------
+# DeepSeek-V3 (G = 32) routed-expert GEMM: serve avg_m 1024 and 4096 as well as the original 2048.
+# ---------------------------------------------------------------------------------------------
+# fc1 = gate+up (N, K) = (4096, 7168); fc2 = down (7168, 2048); dgrad is NN on (7168, 4096) /
+# (2048, 7168); wgrad is variable-K over (OUT_M, OUT_N) = (4096, 7168) / (7168, 2048).  The
+# avg_m = 2048 sets above reach 85-92 % WMMA busy per operator on gfx1250
+# (results/b0_dsv3_2048_20261030/ATT_S18.md).  Every knob in those sets -- the persistent-cluster
+# stack, the tile, the k-loop schedule, the TDM dealing and the cluster geometry -- is a function
+# of the TILE and the per-call (N, mc) geometry, never of avg_m: at G = 32 the per-expert row
+# count only sets how many whole 256-row tiles the persistent grid walks, and every gate the stack
+# must pass (`_head_pipe_ok`, `_nt_stack_cluster_ok`, `_vk_stack_cluster_ok`) is computed from the
+# tile and mc alone, so it gives the same answer at every avg_m here.  The one exception is the
+# super-block size GROUP_M in `_TILE_ORDER_NT/NN`: one super-block is one expert =
+# rows-per-expert / 256 m-tiles, i.e. 4 at 1024 and 16 at 4096 (8 at 2048, unchanged).  So each
+# avg_m = 2048 DeepSeek-V3 key is mirrored value-for-value at 1024 and 4096, GROUP_M alone
+# following avg_m.  The mirror ADDS keys only (2048 is left byte-for-byte unchanged) and is guarded
+# to the DeepSeek-V3 (N, K) pairs, so MiniMax / Kimi / Muse and every other shape are untouched;
+# the output stays bit-identical to the default path.
+_DSV3_NK = frozenset({(4096, 7168), (7168, 2048), (7168, 4096), (2048, 7168)})
+_DSV3_MORE_AVG_M = (1024, 4096)
+
+
+def _dsv3_is_seed(n: int, k: int, m: int) -> bool:
+    """Whether ``(n, k, m)`` is a DeepSeek-V3 avg_m = 2048 key to mirror onto 1024 and 4096."""
+    return m == 2048 and (n, k) in _DSV3_NK
+
+
+def _dsv3_mirror_set(keys: frozenset) -> frozenset:
+    return keys | frozenset(
+        (n, k, am) for (n, k, m) in keys if _dsv3_is_seed(n, k, m) for am in _DSV3_MORE_AVG_M
+    )
+
+
+def _dsv3_mirror_map(table: dict) -> None:
+    for (n, k, m), v in list(table.items()):
+        if _dsv3_is_seed(n, k, m):
+            for am in _DSV3_MORE_AVG_M:
+                table.setdefault((n, k, am), v)
+
+
+_VK_DEEP_RING_KEYS = _dsv3_mirror_set(_VK_DEEP_RING_KEYS)
+_TDM_NN_KEYS = _dsv3_mirror_set(_TDM_NN_KEYS)
+_TDM_ASSIGN_NN_KEYS = _dsv3_mirror_set(_TDM_ASSIGN_NN_KEYS)
+for _kind in _ISSUE_FIRST_KEYS:
+    _ISSUE_FIRST_KEYS[_kind] = _dsv3_mirror_set(_ISSUE_FIRST_KEYS[_kind])
+for _kind in _WMMA_B2B_KEYS:
+    _WMMA_B2B_KEYS[_kind] = _dsv3_mirror_set(_WMMA_B2B_KEYS[_kind])
+for _kind in _EPI_CHUNK_KEYS:
+    _dsv3_mirror_map(_EPI_CHUNK_KEYS[_kind])
+for _kind in _STACK_EPI_CHUNK:
+    _dsv3_mirror_map(_STACK_EPI_CHUNK[_kind])
+for _kind in _LDS_COSCHED_KEYS:
+    _dsv3_mirror_map(_LDS_COSCHED_KEYS[_kind])
+for _kind in _STACK_LDS_COSCHED:
+    _dsv3_mirror_map(_STACK_LDS_COSCHED[_kind])
+for _kind in _STACK_KEYS:
+    for (_n, _k, _m), _set in list(_STACK_KEYS[_kind].items()):
+        if _dsv3_is_seed(_n, _k, _m):
+            for _am in _DSV3_MORE_AVG_M:
+                _STACK_KEYS[_kind].setdefault((_n, _k, _am), dict(_set))
+# GROUP_M is the super-block (consecutive m-tiles sharing an XCD band) and is tuned together with
+# xcd_band = 32 at GROUP_M = 8. At and above avg_m 2048 one super-block is one expert (avg_m // 256
+# m-tiles): 8 at 2048, 16 at 4096. Below 2048, keeping GROUP_M = 8 rather than the one-expert
+# avg_m // 256 = 4 preserves that band pairing and measured ~+0.6 pp (fwd_fc2 / dgrad_fc1) to
+# +3.1 pp (dgrad_fc2) WMMA busy at avg_m 1024 (ATT, 2 SIMD). So GROUP_M = max(avg_m, 2048) // 256.
+for _order in (_TILE_ORDER_NT, _TILE_ORDER_NN):
+    for (_n, _k, _m), (_gm, _xcd, _band) in list(_order.items()):
+        if _dsv3_is_seed(_n, _k, _m):
+            for _am in _DSV3_MORE_AVG_M:
+                _order.setdefault((_n, _k, _am), (max(_am, 2048) // 256, _xcd, _band))
+
+
 def _pick_config_shape(N: int, K: int, avg_m: int, n_groups: int = 0, b_lds_transpose: int = 0):
     # Exact key only. 448 divides this N, so both dispatch rounds are full and the ragged-N
     # read-back path is never taken. On an N it does not divide, the NT read path would address
@@ -5081,7 +5153,7 @@ def _pick_config_shape(N: int, K: int, avg_m: int, n_groups: int = 0, b_lds_tran
         # clamped by B's dim-0 extent on the load and C's dim-1 extent on the store. NT ONLY --
         # the transposed B stage of NN needs a power-of-two `pad_interval` (`tile_n * 2`), which
         # 320 is not.
-        if not b_lds_transpose and avg_m == 2048 and (N, K) in _FWD_WIDE_N_KEYS:
+        if not b_lds_transpose and avg_m in (1024, 2048, 4096) and (N, K) in _FWD_WIDE_N_KEYS:
             return (256, 320, 128, 2, 2, 2)
         return (256, 256, 128, 2, 2, 2)
     if avg_m >= 1536 and N % 192 == 0:
@@ -5217,7 +5289,7 @@ def _grouped_gemm_bf16_nt_flydsl_kernel_entry(
     _keyed = not (BLOCK_M or BLOCK_N)
     if (GROUP_M, num_xcd, xcd_band) == (16, 1, 32):
         GROUP_M, num_xcd, xcd_band = _TILE_ORDER_NT.get((N, K, avg_m), (GROUP_M, num_xcd, xcd_band))
-    if _keyed and tdm_balance == 0 and tdm_assign == 0 and (N, K) in _FWD_TDM_DEAL_KEYS and avg_m == 2048:
+    if _keyed and tdm_balance == 0 and tdm_assign == 0 and (N, K) in _FWD_TDM_DEAL_KEYS and avg_m in (1024, 2048, 4096):
         tdm_balance, tdm_assign = 1, 1
     if issue_first < 0:
         issue_first = _pick_issue_first("nt", N, K, avg_m) if _keyed else 0
