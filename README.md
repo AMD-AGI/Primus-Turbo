@@ -25,7 +25,7 @@ Note: JAX support is under active development. Optim support is planned but not 
 | MoE | `fused_group_topk_routing_with_aux_score`, `moe_permute` / `moe_unpermute`, `moe_dispatch` / `moe_combine`, MegaMoE (BF16 / MXFP8) |
 | Norm / Act / RoPE / Loss | `rmsnorm`, `rmsnorm_residual`, `rmsnorm_residual_fp4`, `swiglu_with_probs`, `geglu_with_probs`, `fused_qkv_rope`, `fused_qkv_rmsnorm_rope`, `cross_entropy` |
 | Quantization | `quantize_fp8` / `quantize_fp4` (+ `_with_trans`, grouped, dequantize), `weight_deosc_*` |
-| Communication | `fused_all_gather_matmul`, `fused_matmul_reduce_scatter`, `FP8AllToAll`, DeepEP `Buffer` |
+| Communication | `fused_all_gather_matmul`, `fused_matmul_reduce_scatter`, DeepEP `Buffer` |
 
 > **Part of the Primus Ecosystem**: Primus-Turbo is the high-performance operator layer of the [Primus ecosystem](#-primus-ecosystem), working together with [Primus-LM](https://github.com/AMD-AGI/Primus) (training framework) and [Primus-SaFE](https://github.com/AMD-AGI/Primus-SaFE) (stability & platform).
 
