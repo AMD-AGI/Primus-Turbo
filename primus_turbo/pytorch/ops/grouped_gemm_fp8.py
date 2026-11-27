@@ -15,6 +15,7 @@ from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     ScalingGranularity,
     ScalingRecipe,
+    ScalingStrategy,
     check_mxfp8_support,
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
@@ -914,6 +915,8 @@ def grouped_gemm_fp8(
             "grouped_gemm_fp8 picks its backends per stage. Use a config without it, or "
             "set_grouped_gemm_backend() / PRIMUS_TURBO_GROUPED_GEMM_BACKEND."
         )
+    if config.strategy != ScalingStrategy.DYNAMIC:
+        raise ValueError(f"grouped_gemm_fp8 supports ScalingStrategy.DYNAMIC only, got {config.strategy}")
 
     if group_offs is None:
         group_offs = group_offs_from_lens(group_lens)

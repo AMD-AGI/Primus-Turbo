@@ -11,10 +11,12 @@ import torch
 from primus_turbo.pytorch.core.backend import (
     BackendType,
 )
+from primus_turbo.pytorch.core.delayed_scaling import DelayedScalingState
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     ScalingGranularity,
     ScalingRecipe,
+    ScalingStrategy,
     check_mxfp8_support,
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
@@ -100,13 +102,37 @@ def _stage_backend(config: Float8QuantConfig, builtin: BackendType) -> int:
 
 
 def _quantize_tensorwise_operand(
-    x: Union[torch.Tensor, QuantizedTensor], fp8_dtype: torch.dtype, config: Float8QuantConfig
+    x: Union[torch.Tensor, QuantizedTensor],
+    fp8_dtype: torch.dtype,
+    config: Float8QuantConfig,
+    scale: Optional[torch.Tensor] = None,
+    amax: Optional[torch.Tensor] = None,
+    delayed_ready: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``(qdata, scale_inv)`` of a tensorwise GEMM operand, quantizing ``x`` unless it already is."""
+    """``(qdata, scale_inv)`` of a tensorwise GEMM operand, quantizing ``x`` unless it already is.
+
+    With a ``scale`` (delayed scaling) and an ``amax`` buffer the cast also raises the buffer to
+    ``x``'s abs-max: in the same pass when the state is ready, beside a dynamic cast before its
+    first recipe step. A ready state that does not record this step passes no ``amax``.
+    """
     if isinstance(x, QuantizedTensor):
         check_quantized_tensor(x, config)
         return x.qdata, x.scale_inv
+    if scale is None:
+        return quantize_fp8(x, fp8_dtype, ScalingGranularity.TENSORWISE)
+    if delayed_ready:
+        return quantize_fp8(x, fp8_dtype, ScalingGranularity.TENSORWISE, scale=scale, amax_out=amax)
+    if x.numel() > 0:
+        amax.copy_(torch.maximum(amax, x.detach().abs().amax().float()))
     return quantize_fp8(x, fp8_dtype, ScalingGranularity.TENSORWISE)
+
+
+def _delayed_scaling_args(state: Optional[DelayedScalingState]) -> tuple:
+    """``FP8GemmTensorFunction``'s trailing delayed-scaling arguments: flat, so Dynamo traces them."""
+    if state is None:
+        return ()
+    amax = state.amax if state.recording else (None, None, None)
+    return (*state.scale, *amax, state.ready)
 
 
 def _transpose_tensorwise(qdata: torch.Tensor) -> torch.Tensor:
@@ -120,6 +146,12 @@ class FP8GemmTensorFunction(torch.autograd.Function):
     Operands travel as plain ``(qdata, scale_inv)`` tensors, and only operands that
     arrive pre-quantized are ``QuantizedTensor``s, so Dynamo can trace this function
     when ``a`` and ``b`` are plain tensors (``gemm_fp8`` then leaves it in the graph).
+
+    Delayed scaling passes a ``DelayedScalingState``'s tensors as the trailing arguments
+    (``_delayed_scaling_args``). The output-gradient amax is a ``ctx`` attribute rather than a
+    saved tensor: the backward writes it, and a GEMM called twice before its backwards would
+    otherwise fail autograd's version check. The output-gradient scale is saved, so a recipe
+    step between a forward and its backward is reported instead of silently changing the scale.
     """
 
     @staticmethod
@@ -134,14 +166,25 @@ class FP8GemmTensorFunction(torch.autograd.Function):
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
         fuse_bgrad_accum_pattern: Union[None, str] = None,
+        scale_a: Optional[torch.Tensor] = None,
+        scale_b: Optional[torch.Tensor] = None,
+        scale_grad: Optional[torch.Tensor] = None,
+        amax_a: Optional[torch.Tensor] = None,
+        amax_b: Optional[torch.Tensor] = None,
+        amax_grad: Optional[torch.Tensor] = None,
+        delayed_ready: bool = False,
     ):
         use_nt_layout_gemm_in_bwd = _deter_use_nt_layout_gemm_in_bwd(trans_a, trans_b)
         fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
         fwd_dtype = _get_fp8_dtype(config.format, True)
         default_backend = _stage_backend(config, BackendType.HIPBLASLT)
 
-        a_fp8, a_scale_inv = _quantize_tensorwise_operand(a, fwd_dtype, config)
-        b_fp8, b_scale_inv = _quantize_tensorwise_operand(b, fwd_dtype, config)
+        a_fp8, a_scale_inv = _quantize_tensorwise_operand(
+            a, fwd_dtype, config, scale_a, amax_a, delayed_ready
+        )
+        b_fp8, b_scale_inv = _quantize_tensorwise_operand(
+            b, fwd_dtype, config, scale_b, amax_b, delayed_ready
+        )
 
         out = gemm_fp8_impl(
             a_fp8,
@@ -165,7 +208,9 @@ class FP8GemmTensorFunction(torch.autograd.Function):
                 b_fp8, b_scale_inv = b_t.qdata, b_t.scale_inv
             else:
                 b_fp8 = _transpose_tensorwise(b_fp8)
-        ctx.save_for_backward(a_fp8, a_scale_inv, b_fp8, b_scale_inv)
+        ctx.save_for_backward(a_fp8, a_scale_inv, b_fp8, b_scale_inv, scale_grad)
+        ctx.amax_grad = amax_grad
+        ctx.delayed_ready = delayed_ready
 
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
@@ -184,10 +229,12 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             grad_out = grad_out.contiguous()
 
         # The transposed operands under the NT layout, the operands themselves otherwise.
-        a_fp8, a_scale_inv, b_fp8, b_scale_inv = ctx.saved_tensors
+        a_fp8, a_scale_inv, b_fp8, b_scale_inv, scale_grad = ctx.saved_tensors
         granularity = ScalingGranularity.TENSORWISE.value
 
-        g_fp8, g_scale_inv = quantize_fp8(grad_out, ctx.grad_out_dtype, ScalingGranularity.TENSORWISE)
+        g_fp8, g_scale_inv = _quantize_tensorwise_operand(
+            grad_out, ctx.grad_out_dtype, None, scale_grad, ctx.amax_grad, ctx.delayed_ready
+        )
 
         if ctx.use_nt_layout_gemm_in_bwd:
             a_grad = gemm_fp8_impl(
@@ -254,6 +301,13 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             None,  # out_dtype
             None,  # config
             None,  # fuse_bgrad_accum_pattern
+            None,  # scale_a
+            None,  # scale_b
+            None,  # scale_grad
+            None,  # amax_a
+            None,  # amax_b
+            None,  # amax_grad
+            None,  # delayed_ready
         )
 
 
@@ -707,6 +761,7 @@ def gemm_fp8(
     out_dtype: Union[torch.dtype, None] = None,
     config: Union[Float8QuantConfig, None] = None,
     fuse_bgrad_accum_pattern: Union[None, str] = None,
+    scaling_state: Optional[DelayedScalingState] = None,
 ) -> torch.Tensor:
     """General matrix multiplication (GEMM) with FP8 quantization, supporting autograd.
 
@@ -726,6 +781,10 @@ def gemm_fp8(
             ``"megatron"`` is the only supported pattern; ``b`` must carry
             ``main_grad`` / ``grad_added_to_main_grad``. TENSORWISE and
             MX_BLOCKWISE only. Defaults to None (no fusion).
+        scaling_state: The ``DelayedScalingState`` of this GEMM, required with a
+            ``ScalingStrategy.DELAYED`` config and rejected otherwise. Its scales cast ``a``,
+            ``b`` and the output gradient, and the casts record their amaxes in it for the
+            recipe's next ``step()``. ``a`` and ``b`` must be plain tensors.
 
     Returns:
         torch.Tensor: Output matrix with shape (M, N)
@@ -743,7 +802,9 @@ def gemm_fp8(
     torch.compile: a TENSORWISE call on plain tensors, without
     ``fuse_bgrad_accum_pattern``, is traced into the caller's graph. Every other call
     (other granularities, ``QuantizedTensor`` / ``QuantizedTensorPair`` inputs, fused
-    gradient accumulation) runs outside it, as a graph break.
+    gradient accumulation) runs outside it, as a graph break. A DELAYED call is traced with
+    its state's tensors as graph inputs; the state turning ready at its first recipe step is
+    one recompile.
 
     Example::
 
@@ -762,20 +823,33 @@ def gemm_fp8(
     """
     if config is None:
         config = Float8QuantConfig()
+    plain_operands = not isinstance(a, (QuantizedTensor, QuantizedTensorPair)) and not isinstance(
+        b, (QuantizedTensor, QuantizedTensorPair)
+    )
+    if (config.strategy == ScalingStrategy.DELAYED) != (scaling_state is not None):
+        raise ValueError(
+            "gemm_fp8 takes a scaling_state with a ScalingStrategy.DELAYED config and only then, "
+            f"got strategy={config.strategy} and scaling_state={scaling_state!r}"
+        )
+    if scaling_state is not None and not plain_operands:
+        raise ValueError("delayed scaling takes plain tensors: pre-quantized operands carry their own scales")
 
     if (
         config.granularity == ScalingGranularity.TENSORWISE
         and fuse_bgrad_accum_pattern is None
-        and not isinstance(a, (QuantizedTensor, QuantizedTensorPair))
-        and not isinstance(b, (QuantizedTensor, QuantizedTensorPair))
+        and plain_operands
     ):
         assert a.ndim == 2, "Only 2D tensors are supported"
         assert b.ndim == 2, "Only 2D tensors are supported"
         if out_dtype is None:
             out_dtype = torch.promote_types(a.dtype, b.dtype)
-        return FP8GemmTensorFunction.apply(a, b, None, None, trans_a, trans_b, out_dtype, config, None)
+        return FP8GemmTensorFunction.apply(
+            a, b, None, None, trans_a, trans_b, out_dtype, config, None, *_delayed_scaling_args(scaling_state)
+        )
 
-    return _gemm_fp8_untraced(a, b, trans_a, trans_b, out_dtype, config, fuse_bgrad_accum_pattern)
+    return _gemm_fp8_untraced(
+        a, b, trans_a, trans_b, out_dtype, config, fuse_bgrad_accum_pattern, scaling_state
+    )
 
 
 @torch._dynamo.disable(
@@ -794,6 +868,7 @@ def _gemm_fp8_untraced(
     out_dtype: Union[torch.dtype, None],
     config: Float8QuantConfig,
     fuse_bgrad_accum_pattern: Union[None, str],
+    scaling_state: Optional[DelayedScalingState] = None,
 ) -> torch.Tensor:
     if isinstance(a, QuantizedTensorPair):
         a_data, a_data_t = a.data, a.data_t
@@ -813,7 +888,16 @@ def _gemm_fp8_untraced(
 
     if config.granularity == ScalingGranularity.TENSORWISE:
         return FP8GemmTensorFunction.apply(
-            a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config, fuse_bgrad_accum_pattern
+            a_data,
+            b_data,
+            a_data_t,
+            b_data_t,
+            trans_a,
+            trans_b,
+            out_dtype,
+            config,
+            fuse_bgrad_accum_pattern,
+            *_delayed_scaling_args(scaling_state),
         )
     elif config.granularity == ScalingGranularity.MX_BLOCKWISE:
         return FP8GemmMXFunction.apply(

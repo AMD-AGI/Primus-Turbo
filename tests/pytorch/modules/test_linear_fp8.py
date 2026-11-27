@@ -10,10 +10,12 @@ import pytest
 import torch
 import torch.nn as nn
 
+from primus_turbo.pytorch.core.delayed_scaling import DelayedScaling
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
     ScalingGranularity,
+    ScalingStrategy,
 )
 from primus_turbo.pytorch.modules import Float8Linear
 from tests.pytorch.test_utils import compute_snr, get_tolerances
@@ -137,3 +139,115 @@ def test_float8linear_tensorwise_fullgraph(format):
             torch.testing.assert_close(g_c, g_e, **get_tolerances(dtype))
         else:
             assert torch.equal(g_c, g_e), f"{name} gradient differs"
+
+
+def _delayed_mlp(recipe, format=Format.E4M3, bias=False, device="cuda"):
+    config = Float8QuantConfig(format=format, strategy=ScalingStrategy.DELAYED)
+    return nn.Sequential(
+        Float8Linear(1024, 3072, bias=bias, config=config, delayed_scaling=recipe, device=device),
+        Float8Linear(3072, 1024, bias=bias, config=config, delayed_scaling=recipe, device=device),
+    )
+
+
+@pytest.mark.parametrize("format", [Format.E4M3, Format.HYBRID])
+def test_float8linear_delayed_training_fullgraph(format):
+    """Four optimizer steps with recipe.step() after each: the compiled model's outputs, weights
+    and scales are bit-identical to eager's. Bias-free, so no gradient is a reduction Inductor
+    may order differently."""
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    batches = [
+        (
+            torch.randn(2048, 1024, dtype=dtype, device="cuda") * (i + 1),
+            torch.randn(2048, 1024, dtype=dtype, device="cuda"),
+        )
+        for i in range(4)
+    ]
+    init = _delayed_mlp(DelayedScaling(), format).to(dtype=dtype).state_dict()
+    runs = []
+    for compiled in (False, True):
+        torch._dynamo.reset()
+        recipe = DelayedScaling()
+        model = _delayed_mlp(recipe, format).to(dtype=dtype)
+        model.load_state_dict(init)
+        forward = torch.compile(model, fullgraph=True) if compiled else model
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        outputs = []
+        for x, grad_out in batches:
+            out = forward(x)
+            out.backward(grad_out)
+            optimizer.step()
+            optimizer.zero_grad()
+            recipe.step()
+            outputs.append(out.detach())
+        scales = [torch.stack(m.scaling_state.scale) for m in model]
+        runs.append((outputs, [p.detach().clone() for p in model.parameters()], scales))
+    for got, expected in zip(runs[1], runs[0]):
+        for x, y in zip(got, expected):
+            assert torch.equal(x, y)
+
+
+def test_float8linear_delayed_matches_dynamic_with_fresh_amax():
+    """With bias, step 0 (warm-up) and step 1 on the same input match a dynamic Float8Linear."""
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    recipe = DelayedScaling()
+    delayed = Float8Linear(
+        1024, 2048, config=Float8QuantConfig(strategy=ScalingStrategy.DELAYED), delayed_scaling=recipe
+    ).to("cuda", dtype=dtype)
+    dynamic = Float8Linear(1024, 2048).to("cuda", dtype=dtype)
+    dynamic.load_state_dict(delayed.state_dict())
+    x = torch.randn(4096, 1024, dtype=dtype, device="cuda")
+    grad_out = torch.randn(4096, 2048, dtype=dtype, device="cuda")
+
+    def run(model):
+        x_ = x.clone().requires_grad_(True)
+        out = model(x_)
+        out.backward(grad_out)
+        result = (out.detach(), x_.grad, model.weight.grad, model.bias.grad)
+        model.zero_grad()
+        return result
+
+    expected = run(dynamic)
+    for _ in range(2):
+        for got, ref in zip(run(delayed), expected):
+            assert torch.equal(got, ref)
+        recipe.step()
+
+
+def test_float8linear_delayed_eval_is_dynamic():
+    """Eval-mode forwards cast dynamically and leave the state alone."""
+    torch.manual_seed(0)
+    recipe = DelayedScaling()
+    model = _delayed_mlp(recipe).to(dtype=torch.bfloat16)
+    reference = copy.deepcopy(model)
+    for m in reference:
+        if isinstance(m, Float8Linear):
+            m.config, m.scaling_state = m._eval_config, None
+    x = torch.randn(512, 1024, dtype=torch.bfloat16, device="cuda")
+    model.eval()
+    with torch.no_grad():
+        assert torch.equal(model(x), reference(x))
+    for state in recipe.states():
+        assert not state.ready and not torch.stack(state.amax).any()
+
+
+def test_float8linear_delayed_from_float_and_meta_init():
+    recipe = DelayedScaling()
+    config = Float8QuantConfig(strategy=ScalingStrategy.DELAYED)
+    linear = nn.Linear(256, 512, device="cuda")
+    converted = Float8Linear.from_float(linear, config, delayed_scaling=recipe)
+    assert converted is linear and converted.scaling_state.device == linear.weight.device
+    copied = Float8Linear.from_float(
+        nn.Linear(256, 512, device="cuda"), config, inplace=False, delayed_scaling=recipe
+    )
+    assert len(recipe.states()) == 2 and copied.scaling_state is not converted.scaling_state
+
+    meta = _delayed_mlp(recipe, device="meta")
+    meta.to_empty(device="cuda")
+    assert all(s.device.type == "cuda" for s in recipe.states())
+
+    with pytest.raises(ValueError, match="delayed_scaling"):
+        Float8Linear(256, 512, config=config)
+    with pytest.raises(ValueError, match="delayed_scaling"):
+        Float8Linear(256, 512, delayed_scaling=recipe)

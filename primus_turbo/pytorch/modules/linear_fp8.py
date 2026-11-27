@@ -4,13 +4,16 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import dataclasses
 from typing import Optional
 
 import torch
 
+from primus_turbo.pytorch.core.delayed_scaling import DelayedScaling
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     ScalingGranularity,
+    ScalingStrategy,
 )
 from primus_turbo.pytorch.ops.gemm_fp8 import gemm_fp8
 
@@ -28,6 +31,10 @@ class Float8Linear(torch.nn.Linear):
         out_features: Output feature dimension
         bias: Whether to include bias term (default: True)
         config: Float8QuantConfig for quantization settings (default: TENSORWISE)
+        delayed_scaling: The ``DelayedScaling`` recipe that updates this layer's scales, required
+            with a ``ScalingStrategy.DELAYED`` config and rejected otherwise. The layer's
+            ``scaling_state`` lives on its weight's device and moves with it. Eval-mode forwards
+            cast dynamically and leave the state alone.
         **kwargs: Additional args passed to torch.nn.Linear (device, dtype, etc.)
 
     Examples:
@@ -37,6 +44,11 @@ class Float8Linear(torch.nn.Linear):
         >>> # Custom config
         >>> config = Float8QuantConfig(granularity=ScalingGranularity.BLOCKWISE, block_size=128)
         >>> linear = Float8Linear(512, 256, config=config)
+        >>>
+        >>> # Delayed tensorwise scaling: call recipe.step() once per optimizer step
+        >>> recipe = DelayedScaling()
+        >>> config = Float8QuantConfig(strategy=ScalingStrategy.DELAYED)
+        >>> linear = Float8Linear(512, 256, config=config, delayed_scaling=recipe)
         >>>
         >>> # Convert from existing Linear (in-place)
         >>> fp8_linear = Float8Linear.from_float(torch_linear, config)
@@ -51,20 +63,51 @@ class Float8Linear(torch.nn.Linear):
         out_features: int,
         bias: bool = True,
         config: Optional[Float8QuantConfig] = None,
+        delayed_scaling: Optional[DelayedScaling] = None,
         **kwargs,
     ):
         super().__init__(in_features, out_features, bias, **kwargs)
         if config is None:
             config = Float8QuantConfig(granularity=ScalingGranularity.TENSORWISE)
+        self._set_config(config, delayed_scaling)
+
+    def _set_config(self, config: Float8QuantConfig, delayed_scaling: Optional[DelayedScaling]) -> None:
+        delayed = config.strategy == ScalingStrategy.DELAYED
+        if delayed != (delayed_scaling is not None):
+            raise ValueError(
+                "Float8Linear takes a delayed_scaling recipe with a ScalingStrategy.DELAYED config "
+                f"and only then, got strategy={config.strategy}"
+            )
         self.config = config
+        self.scaling_state = delayed_scaling.make_state(config, self.weight.device) if delayed else None
+        self._eval_config = (
+            dataclasses.replace(config, strategy=ScalingStrategy.DYNAMIC) if delayed else config
+        )
+
+    def _apply(self, fn, recurse=True):
+        module = super()._apply(fn, recurse)
+        if getattr(self, "scaling_state", None) is not None:
+            self.scaling_state.to(self.weight.device)
+        return module
 
     def forward(self, x):
         flatten_shapes = x.shape[:-1]
         x_2d = x.reshape(-1, self.in_features)
 
-        out_2d = gemm_fp8(
-            x_2d, self.weight, trans_a=False, trans_b=True, out_dtype=x.dtype, config=self.config
-        )
+        if self.scaling_state is not None and self.training:
+            out_2d = gemm_fp8(
+                x_2d,
+                self.weight,
+                trans_a=False,
+                trans_b=True,
+                out_dtype=x.dtype,
+                config=self.config,
+                scaling_state=self.scaling_state,
+            )
+        else:
+            out_2d = gemm_fp8(
+                x_2d, self.weight, trans_a=False, trans_b=True, out_dtype=x.dtype, config=self._eval_config
+            )
 
         if self.bias is not None:
             out_2d = out_2d + self.bias
@@ -78,6 +121,7 @@ class Float8Linear(torch.nn.Linear):
         mod: torch.nn.Linear,
         config: Optional[Float8QuantConfig] = None,
         inplace: bool = True,
+        delayed_scaling: Optional[DelayedScaling] = None,
     ):
         """
         Convert a torch.nn.Linear module to Float8Linear.
@@ -86,6 +130,7 @@ class Float8Linear(torch.nn.Linear):
             mod: The Linear module to convert
             config: FP8 quantization config (default: TENSORWISE)
             inplace: If True, modify mod in-place; if False, create new module (default: True)
+            delayed_scaling: The recipe for a ``ScalingStrategy.DELAYED`` config (default: None)
 
         Returns:
             Float8Linear: The converted module
@@ -98,7 +143,7 @@ class Float8Linear(torch.nn.Linear):
         if inplace:
             # In-place conversion
             mod.__class__ = Float8Linear
-            mod.config = config
+            mod._set_config(config, delayed_scaling)
             return mod
         else:
             # Create new module
@@ -107,6 +152,7 @@ class Float8Linear(torch.nn.Linear):
                 mod.out_features,
                 bias=mod.bias is not None,
                 config=config,
+                delayed_scaling=delayed_scaling,
                 device=mod.weight.device,
                 dtype=mod.weight.dtype,
             )
