@@ -26,7 +26,7 @@ CLAMP_LIMIT = 1.0
 def _clamp_ref(x: torch.Tensor, min=None, max=None):
     """``torch.clamp`` that keeps the gradient at ``x == bound``, as the Turbo and TE clamped GLU kernels do.
 
-    torch>=2.14 zeroes the ``torch.clamp`` gradient at a scalar bound (pytorch/pytorch#185831).
+    torch>=2.14 zeroes the ``torch.clamp`` gradient at a scalar bound (pytorch/pytorch#191142).
     """
     if max is not None:
         x = torch.where(x > max, max, x)
