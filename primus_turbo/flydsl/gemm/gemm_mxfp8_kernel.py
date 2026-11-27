@@ -54,7 +54,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     wait_barrier,
     xcd_remap_pid,
 )
-from primus_turbo.flydsl.utils.prims import ceildiv
+from primus_turbo.flydsl.utils.prims import _lds_barrier, ceildiv
 from primus_turbo.flydsl.utils import buffer_ops
 from primus_turbo.flydsl.autotune import Compile, NoWorkingConfig, Op, Race, Refine
 from primus_turbo.flydsl.autotune.engine import Entry
@@ -435,7 +435,9 @@ def _build_mxfp8_nt_kernel(
             b0_frag = b_s2r.load(b_cur0)
             a0_frag = a_s2r.load(a_cur0)
             a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
-            rocdl.s_barrier()
+            # wave_m 0 runs one barrier ahead and refills b_cur0 right after this barrier; s_barrier
+            # waits on no counter, so wave_m 1's b0 reads must retire (lgkmcnt(0)) before it.
+            _lds_barrier()
 
             rocdl.s_setprio(1)
             c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, sa0, sb0)
