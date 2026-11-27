@@ -244,6 +244,37 @@ def test_quantize_fp8_tensorwise_given_scale(orig_dtype, dest_dtype, torch_compi
     torch.testing.assert_close(x_scale_inv, 1.0 / scale, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    "shape, pad_kwargs",
+    [
+        ((1031, 3072), {}),  # one block per row
+        ((33, 768), {}),  # short rows: flat kernel
+        ((7, 100), {"pad_align_last": 128}),  # generic pad kernel
+        ((3, 40, 256), {"pad_align_last": 128, "pad_align_penultimate": 128}),
+        ((0, 128), {}),
+    ],
+)
+@pytest.mark.parametrize("scale_shape", [(), (1,)])
+@pytest.mark.parametrize("torch_compile", [False, True])
+def test_quantize_fp8_tensorwise_given_scale_inv(shape, pad_kwargs, scale_shape, torch_compile):
+    """With a given scale, scale_inv is 0-d (as with a measured scale and in the fake impl) and is
+    exactly 1 / scale, on every cast kernel and for an empty input."""
+    torch.manual_seed(0)
+    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    scale = torch.full(scale_shape, 3.7, device="cuda")
+
+    def quantize(t, s):
+        return quantize_fp8(t, turbo.float8_e4m3, ScalingGranularity.TENSORWISE, scale=s, **pad_kwargs)
+
+    if torch_compile:
+        torch._dynamo.reset()
+        quantize = torch.compile(quantize, fullgraph=True)
+    _, x_scale_inv = quantize(x, scale)
+
+    assert x_scale_inv.shape == torch.Size([])
+    assert torch.equal(x_scale_inv, (1.0 / scale).reshape(()))
+
+
 def test_quantize_fp8_given_scale_validation():
     x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
     for bad in (

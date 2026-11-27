@@ -39,12 +39,14 @@ void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, cons
 
 // Tensorwise FP8 quant that K-pads the innermost dim K -> Kp=ceil128(K), columns
 // [K, Kp) zeroed; real columns [0, K) byte-identical to quantize_tensorwise_impl.
-// Optionally also pads the penultimate dim N -> np_pen (n_pen real rows).
+// Optionally also pads the penultimate dim N -> np_pen (n_pen real rows), and writes
+// 1 / scale[0] to scale_inv_out. Nothing is launched, and scale_inv_out is not written, when
+// rows or Kp is zero.
 template <typename FType, typename QType, typename ComputeType = float>
 void quantize_tensorwise_pad_impl(const FType *x, const float *scale, QType *y, const int64_t rows,
                                   const int64_t K, const int64_t Kp, hipStream_t stream,
                                   const int64_t n_pen = 0, const int64_t np_pen = 0,
-                                  float *amax_out = nullptr);
+                                  float *amax_out = nullptr, float *scale_inv_out = nullptr);
 
 // Segment-padded group offsets (each segment rounded up to block_size), on-device.
 template <typename IndexType>

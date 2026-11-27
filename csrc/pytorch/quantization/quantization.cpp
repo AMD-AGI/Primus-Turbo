@@ -75,10 +75,18 @@ std::tuple<at::Tensor, at::Tensor> quantize_fp8_tensorwise(
     const int64_t rows = input.numel() / std::max<int64_t>(K, 1);
 
     at::Tensor scale, scale_inv;
+    float     *scale_inv_out = nullptr;
     if (scale_opt.has_value()) {
         scale = scale_opt.value();
         PRIMUS_TURBO_CHECK(scale.numel() == 1, "tensorwise scale must be scalar tensor");
-        scale_inv = 1.0f / scale;
+        // 0-d like the dynamic path and the meta function, whatever shape the given scale has.
+        // The cast kernel writes it; an empty input launches no kernel.
+        if (input.numel() > 0) {
+            scale_inv     = torch::empty({}, input.options().dtype(at::kFloat));
+            scale_inv_out = scale_inv.data_ptr<float>();
+        } else {
+            scale_inv = at::reciprocal(scale).reshape({});
+        }
     } else {
         // Whole-tensor abs-amax over the real (unpadded) data -> scalar scale. scale and
         // scale_inv get their own allocations (not a packed workspace view) so the returned
@@ -132,7 +140,7 @@ std::tuple<at::Tensor, at::Tensor> quantize_fp8_tensorwise(
                 reinterpret_cast<const FType *>(input.data_ptr()),
                 reinterpret_cast<const float *>(scale.data_ptr()),
                 reinterpret_cast<QType *>(output.data_ptr()), rows, K, Kp, stream, n_pen, np_pen,
-                amax_out);
+                amax_out, scale_inv_out);
         });
     });
 

@@ -57,7 +57,8 @@ def quantize_fp8_tensorwise_pad_impl(
     scale -- and the fp8 output -- are unchanged.
 
     ``scale`` skips the amax pass altogether: the cast multiplies by this one-element
-    float32 tensor, and the returned ``scale_inv`` is its reciprocal. It and
+    float32 tensor, and the returned ``scale_inv`` is its reciprocal (0-d, whatever the shape
+    of ``scale``). It and
     ``amax_partials`` are alternatives.
 
     ``amax_out`` (needs ``scale``) is a one-element float32 buffer the cast raises to the
