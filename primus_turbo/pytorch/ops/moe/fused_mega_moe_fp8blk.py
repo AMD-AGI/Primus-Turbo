@@ -73,8 +73,13 @@ assert _ALIGN % 256 == 0
 _K256 = dict(tile=(256, 256, 256), num_buffers=2)
 _TILE = dict(tile=(256, 256, 128), num_buffers=3)
 _VK = dict(num_buffers=2)
-# vkq workgroups (default: one per CU). Fewer leaves CUs to the main stream while a deferred expert wgrad runs.
-_VKQ_NWG = int(__import__("os").environ.get("PRIMUS_TURBO_VKQ_NWG", "0")) or None
+# vkq / vkw expert-wgrad workgroups (PRIMUS_TURBO_VKQ_NWG; unset or 0 = one per CU). The kernels are correct for any
+# nwg >= 1 (tiles t = bid, bid + nwg, ...; bit-identical out to the default, eager and CUDA graph); values above the
+# CU count are clamped. Fewer workgroups leave CUs to the main stream while a deferred (MOE_WGRAD) wgrad runs, which
+# exposes an unresolved race in the MOE_WGRAD side-stream overlap (expert main_grad NaN / inf at nwg=224, the
+# kernel itself is bit-exact standalone): keep it unset (one per CU) until that race is fixed.
+_VKQ_NWG = int(__import__("os").environ.get("PRIMUS_TURBO_VKQ_NWG", "0") or 0) or None
+assert _VKQ_NWG is None or _VKQ_NWG >= 1, f"PRIMUS_TURBO_VKQ_NWG={_VKQ_NWG}: needs >= 1 (0 / unset = one per CU)"
 _CACHES = weakref.WeakSet()
 # wgrad kernel (PRIMUS_TURBO_MOE_FP8BLK_WGRAD): "vkq" (persistent, experts longest-first, old-C prefetch for beta = 1,
 # scale planes on VMEM; needs the compact 1-byte-per-128-token col scales from the quant kernels) or "vk" (one tile

@@ -568,6 +568,11 @@ class _Stage1(torch.autograd.Function):
         if all(g is None for g in d_rw) or st.ranks[0].g is None:
             return (None, None) + (None,) * (3 * n)
         dW1s, dxps = [], []
+        if _overlap.enabled("MOE_WGRAD") and os.environ.get("PRIMUS_TURBO_EP_WGRAD_W2_JOIN", "0") == "1":
+            # EXPERIMENTAL (opt-in): wait for the fc2 expert wgrad deferred at the end of _Stage2.backward before this
+            # stage's dgrad / combine. It cleared the PRIMUS_TURBO_VKQ_NWG=224 NaN in a 3-iteration run but not in a
+            # 20-iteration one, so it does NOT fix the MOE_WGRAD overlap race; it costs nothing at the default nwg.
+            torch.cuda.current_stream().wait_stream(_overlap.side_stream("wgrad"))
         for rk, w1, c1 in zip(st.ranks, ctx.w1s, ctx.caches1):
             gq, gs, gT, gTs = rk.g
             dW1s.append(_wgrad(st, rk, w1, gT, gTs, rk.xT, rk.xTs, 2 * st.I, st.H, st.acc1))

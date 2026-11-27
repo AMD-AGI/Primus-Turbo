@@ -885,9 +885,12 @@ def flyvkqblk_fp8(
     tm, tn, tk = tile
     assert OUT_M % tm == 0 and OUT_N % tn == 0
     total = (OUT_M // tm) * (OUT_N // tn) * G
-    if nwg is None:
-        nwg = torch.cuda.get_device_properties(out.device).multi_processor_count
-    nwg = min(nwg, total)
+    cus = torch.cuda.get_device_properties(out.device).multi_processor_count
+    nwg = cus if nwg is None else int(nwg)
+    assert nwg >= 1, nwg
+    # any nwg >= 1 is correct (persistent tiles t = bid, bid + nwg, ...); more than one per CU only queues extra
+    # workgroups and outgrows the vkpblk_sumsq_numel partial buffer, so clamp
+    nwg = min(nwg, cus, total)
     a_id = 0 if lhsP.dtype == torch.float8_e4m3fn else 1
     b_id = 0 if rhsP.dtype == torch.float8_e4m3fn else 1
     assert beta in (0.0, 1.0)
