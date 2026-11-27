@@ -130,7 +130,7 @@ def make_traits(hq, hkv, d, d_v=None, sm_scale=None):
             dualwave_swp_enable_stagger=False,
             k_head=1,
             rows_per_wave=64,
-            fold_barriers=True,
+            fold_barriers="no_fold" not in _DBG,
             persistent=1,
             sm_scale=sm_scale,
         )
@@ -227,7 +227,7 @@ def _stage_unit(thread_index, m_sub, dst, in_res, stage_res, **c):
 
 
 # Race diagnosis switches (comma-separated, read when a kernel is built; use a fresh FlyDSL cache per value):
-# wait_all, sys, pull_nt, item_fence.
+# wait_all, sys, pull_nt, item_fence, no_fold (and prologue_vm0, sched_kv in gfx950_mla/flash_attn_fwd_mla.py).
 _DBG = frozenset(x for x in os.environ.get("MEGA_ATTN_FWD_DBG", "").split(",") if x)
 _WAIT_SCOPE = "sys" if "sys" in _DBG else "agent"
 _PULL_STORE = SYS_NT if "pull_nt" in _DBG else 0

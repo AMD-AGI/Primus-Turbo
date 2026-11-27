@@ -24,6 +24,7 @@ the left-windowed path keeps an odd span and pairs it with a two-tile epilogue d
 """
 
 import heapq
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -65,6 +66,10 @@ JOB_BATCH_LIMIT = 1 << 7
 # Per-job cost outside the KV tiles (prologue, drain, store), in KV tiles, for the host's
 # list-schedule replay.
 JOB_FIXED_TILES = 8
+# Race diagnosis (MegaAttn, comma-separated MEGA_ATTN_FWD_DBG, read when a tile is built): prologue_vm0, sched_kv.
+_DBG = frozenset(x for x in os.environ.get("MEGA_ATTN_FWD_DBG", "").split(",") if x)
+_PROLOGUE_VM0 = "prologue_vm0" in _DBG
+_SCHED_KV = "sched_kv" in _DBG
 
 
 def prefetch_k(ctx, job):
@@ -325,6 +330,8 @@ def make_mla_tile(traits):
 
             if const_expr(next_job is None):
                 ctx.load_k_split(1, 1)
+                if const_expr(_SCHED_KV):
+                    _sched_barrier(0)
             ctx.load_v_split(0, 0)
             v_k = _load_k_head(0)
             _sched_barrier(0)
@@ -332,7 +339,7 @@ def make_mla_tile(traits):
             # This drain is for K1. A prefetched K1 is already resident, and V0 is first read after
             # the next cluster's drain, so it stays in flight under QK0.
             if const_expr(next_job is None):
-                _waitcnt_vm_n(ctx.VM_DRAIN_V)
+                _waitcnt_vm_n(0 if _PROLOGUE_VM0 else ctx.VM_DRAIN_V)
 
             _sched_barrier(0)
             _dualwave_sync_barrier()
