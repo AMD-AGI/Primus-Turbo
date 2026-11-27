@@ -1470,6 +1470,8 @@ def build_flash_attn_dualwave_swp_module(
         flat = []
         for r in rows:
             flat += [len(r)] + r + [0] * (stride - 1 - len(r))
+        # The kernel reads one job past each row's last; a longest last row would read past the table.
+        flat.append(0)
         return flat, ctas, stride
 
     def _launch(

@@ -1470,18 +1470,43 @@ def _check_mla_attention(batch, seqlen, num_head, qkv_format, backend, scale):
         {"deterministic": True},
         {"window_size": (128, 0)},
         {"dtype": torch.float16},
+        # Past the forward's persistent job packing.
+        {"batch": 129, "seqlen": 256},
     ],
 )
 def test_flydsl_gfx950_mla_refuses_what_the_kernels_lack(kwargs):
     kwargs = dict(kwargs)
     seqlen = kwargs.pop("seqlen", 1024)
-    q, k, v, _ = _mla_case("sbhd", 1, seqlen, 2, dtype=kwargs.pop("dtype", torch.bfloat16))
+    batch = kwargs.pop("batch", 1)
+    q, k, v, _ = _mla_case("sbhd", batch, seqlen, 2, dtype=kwargs.pop("dtype", torch.bfloat16))
     call = {"causal": True, **kwargs}
     assert not attention_impl.DenseAttnFwdFlydslBackend.can_handle(q=q, k=k, v=v, qkv_format="sbhd", **call)
     with pytest.raises(ValueError, match="cannot handle the given inputs"):
         resolve_flash_attn_backend(
             varlen=False, user_backend=BackendType.FLYDSL, q=q, k=k, v=v, qkv_format="sbhd", **call
         )
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()), reason="FlyDSL MLA attention is gfx950-only"
+)
+def test_flydsl_gfx950_mla_deterministic_misses_the_tune_cache():
+    """A FlyDSL winner tuned without ``deterministic`` is not replayed for a deterministic call."""
+    torch.manual_seed(42)
+    q, k, v, dout = _mla_case("bshd", 1, 1024, 2)
+    cache = attention_impl.FlashAttnDenseDispatcher._cache
+    GlobalBackendManager.reset()
+    GlobalBackendManager.set_auto_tune(True)
+    try:
+        flash_attn_func(q, k, v, causal=True).backward(dout)
+        assert len(cache) == 1, "forward was not auto-tuned"
+        # Whichever backend won, make the warm entry the one deterministic runs cannot take.
+        for key in list(cache._cache):
+            cache.put(key, attention_impl.DenseAttnFwdFlydslBackend)
+        flash_attn_func(q, k, v, causal=True, deterministic=True).backward(dout)
+        assert len(cache) == 2, "the deterministic call reused the non-deterministic entry"
+    finally:
+        GlobalBackendManager.reset()
 
 
 @pytest.mark.skipif(

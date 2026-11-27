@@ -591,6 +591,8 @@ class FlashAttnDenseDispatcher(AutoKernelDispatcher):
             dropout_p != 0.0,
             bias is not None,
             alibi_slopes is not None,
+            # The gfx950 MLA kernels have no deterministic path.
+            bool(kwargs.get("deterministic", False)),
         )
 
 

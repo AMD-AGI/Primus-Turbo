@@ -26,6 +26,11 @@ D_V = 128
 # The forward runs 256-row q blocks; the backward tiles q by 32.
 _SEQ_MULTIPLE = 256
 _I32_MAX = 2**31 - 1
+# The forward's persistent job packing (gfx950_mla.flash_attn_fwd_mla JOB_*): head | q block << 9 |
+# batch << 24, kept here so the check does not load the kernels.
+_MAX_HEADS = 1 << 9
+_MAX_Q_BLOCKS = 1 << 15
+_MAX_BATCH = 1 << 7
 
 
 def _kernels():
@@ -83,6 +88,8 @@ def flydsl_gfx950_mla_unsupported_reason(
         return "Hq == Hkv only"
     if Sq % _SEQ_MULTIPLE != 0:
         return f"sequence length must be a multiple of {_SEQ_MULTIPLE}"
+    if B > _MAX_BATCH or Hq > _MAX_HEADS or Sq // _SEQ_MULTIPLE > _MAX_Q_BLOCKS:
+        return f"the persistent schedule packs at most batch {_MAX_BATCH}, {_MAX_HEADS} heads, {_MAX_Q_BLOCKS} q blocks"
     if B * Sq * Hq * D_QK > _I32_MAX:
         return "q is too large for the int32 buffer offsets"
     return None
