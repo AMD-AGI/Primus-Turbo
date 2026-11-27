@@ -35,8 +35,7 @@ from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
 from primus_turbo.flydsl.utils import buffer_ops
-
-from .attn_helper_mla import (
+from primus_turbo.flydsl.utils.attn_helper_stock import (
     NUM_XCD,
     DualwaveKernelContext,
     _anchor_v_o,
@@ -1102,7 +1101,9 @@ def make_mla_traits(
         qk_mfma16=qk_mfma16,
         pv_mfma16=pv_mfma16,
         rows_per_wave=rows_per_wave,
+        xcd_q_order=True,
     )
+    traits.BIND_JOB_LAST = True
     traits.FOLD_BARRIERS = traits.NUM_WAVES > 4 if fold_barriers is None else bool(fold_barriers)
     traits.K_HEAD = max(1, traits.K_STEPS_QK - 2) if k_head is None else int(k_head)
     assert 1 <= traits.K_HEAD <= traits.K_STEPS_QK
