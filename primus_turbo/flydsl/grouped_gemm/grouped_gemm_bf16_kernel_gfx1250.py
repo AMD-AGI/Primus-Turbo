@@ -6205,17 +6205,18 @@ _KWARGS_KEYS = {
     # so only knobs that leave that path are keyed here. Bit-identical.
     "vk_accum": {
         # Muse Spark wgrad fc1 (OUT 8192 x 4096) and fc2 (OUT 4096 x 4096) at 512 / 1024 / 2048 rows per expert
-        # (EP4 / EP8, MBS 1 / 2): the fragment reads co-scheduled with the matrix ops (+4% to +15% on the op).
-        (8192, 4096, 512): {"lds_cosched": 2},
-        (8192, 4096, 1024): {"lds_cosched": 2},
-        (8192, 4096, 2048): {"lds_cosched": 2},
-        (8192, 4096, 4096): {"lds_cosched": 2},
-        (8192, 4096, 8192): {"lds_cosched": 2},
-        (4096, 4096, 512): {"lds_cosched": 2},
-        (4096, 4096, 1024): {"lds_cosched": 2},
-        (4096, 4096, 2048): {"lds_cosched": 2},
-        (4096, 4096, 4096): {"lds_cosched": 2},
-        (4096, 4096, 8192): {"lds_cosched": 2},
+        # (EP4 / EP8, MBS 1 / 2): the fragment reads co-scheduled with the matrix ops (+4% to +15% on the op), and
+        # the tile walk grouped by 4 M tiles (8 for fc1 from 4096 rows per expert): +2% to +12% on the op.
+        (8192, 4096, 512): {"lds_cosched": 2, "group_m": 4},
+        (8192, 4096, 1024): {"lds_cosched": 2, "group_m": 4},
+        (8192, 4096, 2048): {"lds_cosched": 2, "group_m": 4},
+        (8192, 4096, 4096): {"lds_cosched": 2, "group_m": 8},
+        (8192, 4096, 8192): {"lds_cosched": 2, "group_m": 8},
+        (4096, 4096, 512): {"lds_cosched": 2, "group_m": 4},
+        (4096, 4096, 1024): {"lds_cosched": 2, "group_m": 4},
+        (4096, 4096, 2048): {"lds_cosched": 2, "group_m": 4},
+        (4096, 4096, 4096): {"lds_cosched": 2, "group_m": 4},
+        (4096, 4096, 8192): {"lds_cosched": 2, "group_m": 4},
     },
 }
 _KWARGS_PASSTHROUGH = {
