@@ -80,9 +80,13 @@ class CollectiveGemmWorkspace:
 _WORKSPACES: dict = {}
 
 
-def get_collective_gemm_workspace(group: dist.ProcessGroup, bank_bytes: int) -> CollectiveGemmWorkspace:
-    """The group's workspace, regrown (collectively, outside graph capture) when a bank is too small."""
-    ws: Optional[CollectiveGemmWorkspace] = _WORKSPACES.get(group.group_name)
+def get_collective_gemm_workspace(
+    group: dist.ProcessGroup, bank_bytes: int, name: str = ""
+) -> CollectiveGemmWorkspace:
+    """The group's workspace, regrown (collectively, outside graph capture) when a bank is too small.
+    A ``name`` gives a separate heap with its own epoch, flag regions and banks."""
+    key = (group.group_name, name)
+    ws: Optional[CollectiveGemmWorkspace] = _WORKSPACES.get(key)
     if ws is not None and ws.bank_bytes >= bank_bytes:
         return ws
     if torch.cuda.is_current_stream_capturing():
@@ -96,5 +100,5 @@ def get_collective_gemm_workspace(group: dist.ProcessGroup, bank_bytes: int) -> 
     ws = CollectiveGemmWorkspace(group, max(bank_bytes, 0 if old is None else 2 * old.bank_bytes))
     if old is not None:
         old.destroy()
-    _WORKSPACES[group.group_name] = ws
+    _WORKSPACES[key] = ws
     return ws

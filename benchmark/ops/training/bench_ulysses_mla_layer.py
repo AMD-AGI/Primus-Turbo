@@ -23,6 +23,10 @@ with the unfused exit):
     laga        LAGA (MLSys 2026): RCCL all-gather of [c_kv | k_pe] + local-head kv up-projection,
                 q up-projected for every head and all-to-all'd
 
+and ``attn`` fuses the all-to-alls into the attention: entry is the up-projection of every head on
+the local tokens, attn is ``ulysses_mega_attn`` (exchange + attention + exchange back, the backward
+unfused) and exit is the local o_proj + residual.
+
 The exit forward and the entry backward follow attention, so without ``--sync-stages`` they also
 absorb the time a rank waits for the slowest rank's attention (milliseconds at 128K).
 
@@ -47,6 +51,7 @@ from torch.distributed.nn.functional import all_gather, all_to_all_single
 
 from primus_turbo.pytorch.ops import flash_attn_func
 from primus_turbo.pytorch.ops.attention.ulysses_fused_a2a import ulysses_a2a_o_gemm
+from primus_turbo.pytorch.ops.attention.ulysses_mega_attn import ulysses_mega_attn
 from primus_turbo.pytorch.ops.attention.ulysses_mla_latent import ulysses_mla_latent_up_proj
 from primus_turbo.pytorch.ops.attention.usp.attention_a2a_helper import (
     get_attention_cp_a2a_helper,
@@ -54,7 +59,8 @@ from primus_turbo.pytorch.ops.attention.usp.attention_a2a_helper import (
 
 HIDDEN = 7168
 STAGES = ("entry", "attn", "exit")
-VARIANTS = ("explicit", "laga", "unfused", "fused")
+VARIANTS = ("explicit", "laga", "unfused", "fused", "attn")
+ATTN_SEQ_CHUNK = 256
 
 
 def seq_to_heads(tensors, group):
@@ -119,11 +125,11 @@ class MLABlock:
         t = q_lat.shape[0]
         q = F.linear(q_lat, self.w_q).view(t, 1, h, dn + dr)
         c_kv, k_pe = kv_lat.split([ckv, dr], dim=-1)
-        if self.variant == "explicit":
+        if self.variant in ("explicit", "attn"):
             kv = F.linear(c_kv, self.w_kv).view(t, 1, h, dn + dv)
             k_nope, v = kv.split([dn, dv], dim=-1)
             k = torch.cat((k_nope, k_pe.unsqueeze(2).expand(t, 1, h, dr)), dim=-1)
-            return seq_to_heads([q, k, v], self.group)
+            return (q, k, v) if self.variant == "attn" else seq_to_heads([q, k, v], self.group)
         (q,) = seq_to_heads([q], self.group)
         kv_full = torch.cat(all_gather(kv_lat.contiguous(), group=self.group), dim=0)
         c_kv, k_pe = kv_full.split([ckv, dr], dim=-1)
@@ -137,7 +143,7 @@ class MLABlock:
     def __call__(self, q_lat, kv_lat, x):
         cfg = self.cfg
         q_lat, kv_lat = mark("start", "entry", q_lat, kv_lat)
-        if self.variant in ("explicit", "laga"):
+        if self.variant in ("explicit", "laga", "attn"):
             q, k, v = self.entry_per_head(q_lat, kv_lat)
         else:
             q, k, v = ulysses_mla_latent_up_proj(
@@ -147,11 +153,16 @@ class MLABlock:
         if self.sync_stages:
             q, k, v = _SyncBackward.apply(self.group, q, k, v)
         q, k, v = mark("entry", "attn", q, k, v)
-        o = flash_attn_func(*(t.permute(1, 0, 2, 3) for t in (q, k, v)), causal=True).permute(1, 0, 2, 3)
+        if self.variant == "attn":
+            o = ulysses_mega_attn(q, k, v, self.group, seq_chunk=ATTN_SEQ_CHUNK)
+        else:
+            o = flash_attn_func(*(t.permute(1, 0, 2, 3) for t in (q, k, v)), causal=True).permute(1, 0, 2, 3)
         o = mark("attn", "exit", o)
         if self.sync_stages:
             _sync_ranks(self.group, "fwd")
-        if self.fused:
+        if self.variant == "attn":
+            y = F.linear(o.reshape(x.shape[0], 1, -1), self.w_o) + x
+        elif self.fused:
             y = ulysses_a2a_o_gemm(o, self.w_o, x, self.group, "sbhd")
         else:
             y = self.exit_unfused(o, x)

@@ -154,6 +154,21 @@ def elem_ptr(
     return get_element_ptr(ptr, byte_offset=byte_off, elem_type=fx.T.i8)
 
 
+def _atomic_rmw(op, base, offset, val, scope, space, order) -> ArithValue:
+    val = _as_value(val)
+    elem_bytes = val.type.width // 8
+    ptr = elem_ptr(base, offset, space, elem_bytes)
+    res = llvm.atomicrmw(
+        op,
+        ptr,
+        val,
+        _unwrap_order(order),
+        syncscope=_unwrap_scope(scope),
+        alignment=elem_bytes,
+    )
+    return fx.arith.ArithValue(res, signed=True)
+
+
 def atomic_add(
     base: Union[int, ArithValue],
     offset: Union[int, ArithValue],
@@ -162,18 +177,19 @@ def atomic_add(
     space: Union[int, str] = "global",
     order: str = "relaxed",
 ) -> ArithValue:
-    val = _as_value(val)
-    elem_bytes = val.type.width // 8
-    ptr = elem_ptr(base, offset, space, elem_bytes)
-    res = llvm.atomicrmw(
-        llvm.AtomicBinOp.add,
-        ptr,
-        val,
-        _unwrap_order(order),
-        syncscope=_unwrap_scope(scope),
-        alignment=elem_bytes,
-    )
-    return fx.arith.ArithValue(res, signed=True)
+    return _atomic_rmw(llvm.AtomicBinOp.add, base, offset, val, scope, space, order)
+
+
+def atomic_max(
+    base: Union[int, ArithValue],
+    offset: Union[int, ArithValue],
+    val: Union[int, ArithValue],
+    scope: str = "agent",
+    space: Union[int, str] = "global",
+    order: str = "relaxed",
+) -> ArithValue:
+    """Signed max; returns the old value."""
+    return _atomic_rmw(llvm.AtomicBinOp.max, base, offset, val, scope, space, order)
 
 
 def ld(

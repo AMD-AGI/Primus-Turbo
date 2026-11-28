@@ -51,6 +51,18 @@ from primus_turbo.flydsl.utils.attn_helper_stock import (
     host_job_order,
 )
 
+# K/V LDS reads are spread across compute clusters, so the module compiles with a memory-clause
+# pre-RA schedule plus the post-RA waitcnt cleanup.
+DUALWAVE_SWP_COMPILE_HINTS = {
+    "fast_fp_math": True,
+    "unsafe_fp_math": True,
+    "llvm_options": {
+        "amdgpu-sched-strategy": "max-memory-clause",
+        "enable-post-misched": True,
+        "lsr-drop-solution": True,
+    },
+}
+
 # Persistent schedule entry: head | q block << 9 | batch << 24.
 JOB_HEAD_MASK = (1 << 9) - 1
 JOB_QBLOCK_SHIFT = 9
@@ -1334,17 +1346,7 @@ def build_dualwave_swp_launcher(traits):
             stream=stream,
         )
 
-    # K/V LDS reads are spread across compute clusters, so this module compiles with a
-    # memory-clause pre-RA schedule plus the post-RA waitcnt cleanup.
-    _dualwave_swp_compile_hints = {
-        "fast_fp_math": True,
-        "unsafe_fp_math": True,
-        "llvm_options": {
-            "amdgpu-sched-strategy": "max-memory-clause",
-            "enable-post-misched": True,
-            "lsr-drop-solution": True,
-        },
-    }
+    _dualwave_swp_compile_hints = DUALWAVE_SWP_COMPILE_HINTS
 
     _compiled: dict = {}
     _COMPILED_MAX = 64
