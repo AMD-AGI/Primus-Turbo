@@ -127,8 +127,11 @@ def test_backward_matches_triton_and_is_repeatable(cr, heads):
         {"PRIMUS_SMLA_BWD_V2": "1", "PRIMUS_CSABWD_PP": "1"},
         {"PRIMUS_SWAHCA_LOOP": "1"},
         {"PRIMUS_SMLA_BWD_V2": "1", "PRIMUS_CSABWD_PP": "1", "PRIMUS_SWAHCA_LOOP": "1"},
+        {"PRIMUS_TURBO_MLA_PP_POS": "0"},
+        {"PRIMUS_TURBO_MLA_PP_PERSIST": "1"},
+        {"PRIMUS_TURBO_MLA_PP_POS": "0", "PRIMUS_TURBO_MLA_PP_PERSIST": "1"},
     ],
-    ids=["v2", "v2_pp", "swahca_loop", "all"],
+    ids=["v2", "v2_pp", "swahca_loop", "all", "pp_pos_off", "pp_persist", "pp_persist_pos_off"],
 )
 @pytest.mark.parametrize(
     "cr, heads",
@@ -139,7 +142,13 @@ def test_backward_variants_bits_equal_default(monkeypatch, env, cr, heads):
     """Backward tiling variants write the bits of the default backward (dq, dKV and dsink)."""
     from primus_turbo.flydsl.attention.gfx1250_sparse_mla.fwd_kernel import sparse_mla_fwd_gfx1250
 
-    for name in ("PRIMUS_SMLA_BWD_V2", "PRIMUS_CSABWD_PP", "PRIMUS_SWAHCA_LOOP"):
+    for name in (
+        "PRIMUS_SMLA_BWD_V2",
+        "PRIMUS_CSABWD_PP",
+        "PRIMUS_SWAHCA_LOOP",
+        "PRIMUS_TURBO_MLA_PP_POS",
+        "PRIMUS_TURBO_MLA_PP_PERSIST",
+    ):
         monkeypatch.delenv(name, raising=False)
     q, kv, topk, sink, g, pool = _build(cr, heads, SEQLEN, seed=3)
     o, lse = sparse_mla_fwd_gfx1250(q, kv, topk, attn_sink=sink, kv_lora_rank=D, scale=SCALE)

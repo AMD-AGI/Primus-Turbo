@@ -2073,6 +2073,7 @@ def sparse_mla_bwd_gfx1250(
     dkv_out=None,
     delta_out=None,
     batch=1,
+    dkv_defer=None,
 ):
     """``(dq, dkv, dsink)``; dkv is shaped like ``kv`` and dsink is ``None`` without a sink.
 
@@ -2244,6 +2245,7 @@ def sparse_mla_bwd_gfx1250(
     else:
         dkv_out = None
     lg_pos = lg_pre = lg_dp = None
+    pp_pos = False
     if T_ > 0:
         if w1:
             if v2:
@@ -2251,7 +2253,15 @@ def sparse_mla_bwd_gfx1250(
                 # next CU-round token's inputs into L2 during their idle first step): same results bit for bit.
                 from .bwd_pp_kernel import build_sparse_mla_bwd_gfx1250_pp
 
-                run = build_sparse_mla_bwd_gfx1250_pp(H, topk, float(scale), l2pf=cus)
+                # PRIMUS_TURBO_MLA_PP_POS (default 1): on the single-chunk band path the pp kernel fills the
+                # pool-position table itself (its C^T waves are idle in their first step), so no ``_pool_pos_kernel``
+                # runs next to it; same table, same bits.
+                pp_pos = lg and os.environ.get("PRIMUS_TURBO_MLA_PP_POS", "1") == "1" and (topk - band_pool[0]) % 128 == 0
+                # PRIMUS_TURBO_MLA_PP_PERSIST: one persistent workgroup per CU walking tokens bid, bid + #CUs, ...
+                pp_kw = {"pos_w": band_pool[0]} if pp_pos else {}
+                if os.environ.get("PRIMUS_TURBO_MLA_PP_PERSIST", "0") == "1":
+                    pp_kw["persist"] = True
+                run = build_sparse_mla_bwd_gfx1250_pp(H, topk, float(scale), l2pf=cus, **pp_kw)
             else:
                 run = build_sparse_mla_bwd_gfx1250_w1(H, topk, float(scale), ahead=cus)
             # Tiles up to each token's last valid slot (slots past it are all -1).
@@ -2285,7 +2295,7 @@ def sparse_mla_bwd_gfx1250(
             side.wait_stream(main)
             with torch.cuda.stream(side):
                 keys, inv_ptr_all, inv_data = _inverted_topk_chunks(topk_indices, num_kv, chunk)
-        if lg:
+        if lg and not pp_pos:
             # Pool positions and the per-row entry lists depend only on the map: built next to w1, off the dKV chain.
             side.wait_stream(main)
             with torch.cuda.stream(side):
@@ -2310,9 +2320,32 @@ def sparse_mla_bwd_gfx1250(
             idx = topk_indices[t0:t1]
             im = interms[b][: t1 - t0]
             args = (q[t0:t1], kv2, o[t0:t1], do[t0:t1], idx, lse[t0:t1], dq[t0:t1], delta[t0:t1], im)
-            run(*args, *((ntile[t0:t1],) if w1 else ()), stream=main)
+            if pp_pos:
+                run(*args, ntile[t0:t1], stream=main, pos=lg_pos, n_raw=band_pool[1])
+            else:
+                run(*args, *((ntile[t0:t1],) if w1 else ()), stream=main)
+            if pp_pos and defer_dkv and dkv_defer is not None:
+                # The caller issues the entry lists + dKV gather later (on ``dkv_stream``, after making it wait
+                # for the current stream), e.g. after every sample's pp kernel. Same kernels, same inputs.
+                def _late(im=im, pos=lg_pos, out=dkv_out):
+                    from primus_turbo.triton.attention.sparse_mla_dkv_band_gather_kernel import (
+                        dkv_band_gather_all,
+                        pool_fill_cnt,
+                    )
+
+                    pre = pool_fill_cnt(pos, T_, topk)
+                    dkv_band_gather_all(im, *pre, out, *band_pool, d=DV)
+                    return pre
+
+                dkv_defer.append(_late)
+                continue
             side.wait_stream(main)
             with torch.cuda.stream(side):
+                if pp_pos:
+                    from primus_turbo.triton.attention.sparse_mla_dkv_band_gather_kernel import pool_fill_cnt
+
+                    pos = lg_pos
+                    lg_pre = pool_fill_cnt(pos, T_, topk)
                 if lg:
                     from primus_turbo.triton.attention.sparse_mla_dkv_band_gather_kernel import (
                         dkv_band_gather_all,
