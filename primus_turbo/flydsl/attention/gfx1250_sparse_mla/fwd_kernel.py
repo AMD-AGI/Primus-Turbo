@@ -909,7 +909,16 @@ def build_sparse_mla_fwd_gfx1250_swa(
         l16 = lane % 16
         hi = lane // 16
         l8 = lane % 8
-        t0 = fx.Int32(fx.block_idx.x) * BT
+        # Batched samples (grid x = blocks per sample x samples): sample b owns q / o / lse rows
+        # [b * N_TOK, (b + 1) * N_TOK) and kv rows [b * NKV, (b + 1) * NKV); each runs exactly the
+        # single-sample kernel on its rows (b = 0 for one sample).
+        nbps = (N_TOK + fx.Int32(BT - 1)) // fx.Int32(BT)
+        bx = fx.Int32(fx.block_idx.x)
+        smp = bx // nbps
+        t0 = (bx - smp * nbps) * BT
+        q_addr = tensor_addr(Q) + fx.Int64(smp * N_TOK) * (H * DQK * 2)
+        o_addr = tensor_addr(O) + fx.Int64(smp * N_TOK) * (H * DV * 2)
+        lse_addr = tensor_addr(LSE) + fx.Int64(smp * N_TOK) * (H * 4)
         tl = wave // NHG  # this wave's token lane
         h_lane = [
             fx.Int32(fx.block_idx.y) * HB + (wave % NHG) * hpw + g * 16 + l16 for g in range_constexpr(G)
@@ -925,7 +934,7 @@ def build_sparse_mla_fwd_gfx1250_swa(
 
         # LDS row p < NPP = kv row N_TOK + p (pool; rows past it land as zeros); LDS row NPP + i =
         # kv row t0 - 127 + i (window; rows < 0 land as zeros).
-        kv_addr = tensor_addr(KV)
+        kv_addr = tensor_addr(KV) + fx.Int64(smp * NKV) * (DQK * 2)
         row0 = t0 - fx.Int32(_SWA_W - 1)
         for m in range_constexpr(OPS):
             r = (wave * OPS + m) * 8
@@ -936,7 +945,7 @@ def build_sparse_mla_fwd_gfx1250_swa(
 
         def load_q(j):
             n_rec = fx.Int32((j < n_loc).select(fx.Int32(H * DQK * 2), fx.Int32(0)))
-            rsrc_q = make_rsrc(tensor_addr(Q) + fx.Int64(tok_of(j)) * (H * DQK * 2), n_rec)
+            rsrc_q = make_rsrc(q_addr + fx.Int64(tok_of(j)) * (H * DQK * 2), n_rec)
             out = []
             for g in range_constexpr(G):
                 q_off = h_lane[g] * (DQK * 2) + hi * 16
@@ -1078,8 +1087,8 @@ def build_sparse_mla_fwd_gfx1250_swa(
 
         def finish_g(tok, g, m, l, o):  # noqa: E741
             # o / lse of head group g of one token (sink folded in), staged through LDS when it fits.
-            rsrc_o = make_rsrc(tensor_addr(O) + fx.Int64(tok) * (H * DV * 2), H * DV * 2)
-            rsrc_lse = make_rsrc(tensor_addr(LSE) + fx.Int64(tok) * (H * 4), H * 4)
+            rsrc_o = make_rsrc(o_addr + fx.Int64(tok) * (H * DV * 2), H * DV * 2)
+            rsrc_lse = make_rsrc(lse_addr + fx.Int64(tok) * (H * 4), H * 4)
             l_tot = fadd(l[g], swap_halves(l[g]))
             if const_expr(has_sink):
                 rsrc_sink = make_rsrc(tensor_addr(SINK), H * 4)
@@ -1193,9 +1202,10 @@ def build_sparse_mla_fwd_gfx1250_swa(
 
     compiled = {}
 
-    def run(q, kv, sink, o, lse, stream=None):
-        n_tok = int(q.shape[0])
-        args = (q, kv, o if sink is None else sink, o, lse, int(kv.shape[0]), n_tok, -(-n_tok // BT))
+    def run(q, kv, sink, o, lse, stream=None, batch=1):
+        # batch samples: q / o / lse rows and kv rows split evenly (see the kernel)
+        n_tok = int(q.shape[0]) // batch
+        args = (q, kv, o if sink is None else sink, o, lse, int(kv.shape[0]) // batch, n_tok, -(-n_tok // BT) * batch)
         fn = compiled.get("fn")
         if fn is None:
             fn = flyc.compile[COMPILE_HINTS](launch_sparse_mla_fwd_gfx1250_swa, *args, fx.Stream(stream))
@@ -1219,6 +1229,44 @@ def _swa_block_t(n_tok, num_heads, device):
     return None
 
 
+def _fwd_band(q, kv, topk_indices, attn_sink, scale, stream, o, lse, batch, use_swa):
+    """Run the closed-form band kernel when the shapes are a band (True), else False (nothing launched).
+
+    Closed-form bands (same tests as the backward): cr0 = SWA window only; cr128 = window + causal
+    pool of P = NKV - T rows (kv row T + p visible iff t >= cr * (p + 1) - 1, cr = T / P), per sample.
+    Shapes only, the indices are not read: other indices with these shapes (e.g. packed
+    sequences) get wrong results; see ``sparse_mla_func``."""
+    if not use_swa:
+        return False
+    T_, H, _ = q.shape
+    S_ = T_ // batch
+    topk = topk_indices.shape[1]
+    pool_p = kv.shape[0] // batch - S_
+    if pool_p > 0 and not (S_ % pool_p == 0 and S_ // pool_p >= 64 and topk >= _SWA_W + pool_p):
+        pool_p = -1
+    if pool_p == 0 and topk != _SWA_W:
+        pool_p = -1
+    # Token block from the whole launch (all samples): the largest that still fills the GPU.
+    bt = _swa_block_t(T_, H, q.device)
+    # With 128 heads the pool forces 32-row tiles, which lose to the generic 64-row kernel
+    # once the pool is long (T = 16K: +4%).
+    pool_max = _SWA_POOL_MAX if H < 128 else _SWA_POOL_MAX // 2
+    if not (0 <= pool_p <= pool_max and bt is not None):
+        return False
+    if batch > 1 and _swa_block_t(S_, H, q.device) is None:
+        return False  # same kernel choice as a lone sample (whose call would take the index-driven kernel)
+    # (blocks never straddle samples: each sample has ceil(S / bt) of them)
+    build_sparse_mla_fwd_gfx1250_swa(
+        H,
+        float(scale),
+        attn_sink is not None,
+        block_t=bt,
+        pool_p=pool_p,
+        pool_cr=S_ // pool_p if pool_p > 0 else 0,
+    )(q, kv, attn_sink, o, lse, stream=stream, batch=batch)
+    return True
+
+
 def sparse_mla_fwd_gfx1250(
     q,
     kv,
@@ -1230,11 +1278,17 @@ def sparse_mla_fwd_gfx1250(
     use_swa=True,
     out=None,
     lse_out=None,
+    batch=1,
 ):
     """o ``[T, H, 512]`` (q.dtype) and lse ``[T, H]`` fp32; see the module docstring.
 
     ``out`` / ``lse_out`` (optional, contiguous ``[T, H, 512]`` / ``[T, H]``): written instead of fresh buffers, e.g.
-    the rows of one sample inside a batch-wide output (per-sample band calls); same kernels, same bytes."""
+    the rows of one sample inside a batch-wide output (per-sample band calls); same kernels, same bytes.
+
+    ``batch`` > 1 (band maps only, ``use_swa``): ``batch`` independent samples, q rows ``[b * T / batch, ...)`` and kv
+    rows ``[b * NKV / batch, ...)`` for sample b, each with the B == 1 band map; ``topk_indices`` is one sample's
+    ``[T / batch, topk]`` map (read only on the index-driven fallback). Same bytes as one call per sample, in one
+    launch (also allows the larger token blocks that a single sample cannot fill the GPU with)."""
     assert kv_lora_rank == DV and q.shape[-1] == DQK, "gfx1250 sparse-MLA is the 512 + 64 latent layout"
     assert q.dtype == torch.bfloat16 and q.is_contiguous() and topk_indices.is_contiguous()
     T_, H, _ = q.shape
@@ -1258,32 +1312,22 @@ def sparse_mla_fwd_gfx1250(
         lse = torch.empty(T_, H, dtype=torch.float32, device=q.device)
     if T_ == 0:
         return o, lse
-    # Closed-form bands (same tests as the backward): cr0 = SWA window only; cr128 = window + causal
-    # pool of P = NKV - T rows (kv row T + p visible iff t >= cr * (p + 1) - 1, cr = T / P).
-    # Shapes only, the indices are not read: other indices with these shapes (e.g. packed
-    # sequences) get wrong results; see ``sparse_mla_func``.
-    pool_p = kv.shape[0] - T_
-    if pool_p > 0 and not (T_ % pool_p == 0 and T_ // pool_p >= 64 and topk >= _SWA_W + pool_p):
-        pool_p = -1
-    if pool_p == 0 and topk != _SWA_W:
-        pool_p = -1
-    bt = _swa_block_t(T_, H, q.device)
-    # With 128 heads the pool forces 32-row tiles, which lose to the generic 64-row kernel
-    # once the pool is long (T = 16K: +4%).
-    pool_max = _SWA_POOL_MAX if H < 128 else _SWA_POOL_MAX // 2
+    if batch > 1:
+        S_, nkv_s = T_ // batch, kv.shape[0] // batch
+        assert S_ * batch == T_ and nkv_s * batch == kv.shape[0] and topk_indices.shape[0] == S_
+        if not _fwd_band(q, kv, topk_indices, attn_sink, scale, stream, o, lse, batch, use_swa):
+            for b in range(batch):
+                r = slice(b * S_, (b + 1) * S_)
+                sparse_mla_fwd_gfx1250(
+                    q[r], kv[b * nkv_s : (b + 1) * nkv_s], topk_indices, attn_sink, kv_lora_rank, scale, stream,
+                    use_swa, out=o[r], lse_out=lse[r],
+                )
+        return o, lse
+    if _fwd_band(q, kv, topk_indices, attn_sink, scale, stream, o, lse, 1, use_swa):
+        return o, lse
     # 64 heads: the top-k kernel runs the softmax of tile t inside the QK WMMAs of tile t+1
     # (sm_next); byte-identical outputs. The band kernels are unchanged.
     pipe = H == 64
-    if use_swa and 0 <= pool_p <= pool_max and bt is not None:
-        build_sparse_mla_fwd_gfx1250_swa(
-            H,
-            float(scale),
-            attn_sink is not None,
-            block_t=bt,
-            pool_p=pool_p,
-            pool_cr=T_ // pool_p if pool_p > 0 else 0,
-        )(q, kv, attn_sink, o, lse, stream=stream)
-        return o, lse
     hpw, waves, _ = _default_config(H, topk)
     # 16-bit indices halve the TDM op count; worth it where each wave issues several ops per tile.
     idx16 = kv.shape[0] <= 65536 and waves < 4

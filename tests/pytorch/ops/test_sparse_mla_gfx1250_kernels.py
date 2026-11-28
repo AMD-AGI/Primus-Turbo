@@ -255,3 +255,46 @@ def test_out_kwargs_bits_equal(cr):
     assert ds is None and dq.data_ptr() == big_dq[T].data_ptr()
     assert bits_equal(dq, base[0]) and bits_equal(dkv, base[1])
     assert bits_equal(_dsink(sink, lse, big_d[T : 2 * T]), base[2])
+
+
+@pytest.mark.parametrize("cr", [0, 4, 128], ids=["cr0", "cr4", "cr128"])
+def test_batched_bits_equal_per_sample(cr):
+    """``batch=B``: B samples (each its own kv block, the B == 1 map) in one call give the bytes of B single-sample
+    calls; the cr0 / cr128 bands run as one launch (also with the larger token block a lone sample cannot fill the
+    GPU with), the cr4 window + pool backward falls back to one call per sample. dsink once over the batch."""
+    from primus_turbo.flydsl.attention.gfx1250_sparse_mla.bwd_kernel import _dsink, sparse_mla_bwd_gfx1250
+    from primus_turbo.flydsl.attention.gfx1250_sparse_mla.fwd_kernel import sparse_mla_fwd_gfx1250
+
+    # 2048 tokens: on 256 CUs one sample just fills the GPU with the band kernels (block of 8 tokens), the batch
+    # takes 16-token blocks; with SEQLEN both would fall back to the index-driven kernels.
+    B, T = 2, 2048
+    smp = [_build(cr, 64, T, seed=20 + b) for b in range(B)]
+    topk, sink, pool = smp[0][2], smp[0][3], smp[0][5]
+    if cr == 4:  # sample-local maps differ per sample: pass them stacked
+        topk = torch.cat([x[2] for x in smp]).contiguous()
+    q = torch.cat([x[0] for x in smp]).contiguous()
+    kv = torch.cat([x[1] for x in smp]).contiguous()
+    g = torch.cat([x[4] for x in smp]).contiguous()
+    nk = smp[0][1].shape[0]
+    band = (WINDOW, T, pool) if cr == 4 else None
+    ref = []
+    for b, x in enumerate(smp):
+        o, lse = sparse_mla_fwd_gfx1250(x[0], x[1], x[2], attn_sink=sink, kv_lora_rank=D, scale=SCALE)
+        dq, dkv, _ = sparse_mla_bwd_gfx1250(
+            x[0], x[1], o, x[4], x[2], lse, attn_sink=None, kv_lora_rank=D, scale=SCALE, band_pool=band
+        )
+        ref.append((o, lse, dq, dkv))
+    if cr == 4:  # the CSA forward is index-driven over the flattened batch: per-sample reference outputs
+        o = torch.cat([r[0] for r in ref])
+        lse = torch.cat([r[1] for r in ref])
+    else:
+        o, lse = sparse_mla_fwd_gfx1250(q, kv, topk, attn_sink=sink, kv_lora_rank=D, scale=SCALE, batch=B)
+        assert bits_equal(o, torch.cat([r[0] for r in ref])) and bits_equal(lse, torch.cat([r[1] for r in ref]))
+    delta = torch.empty(B * T, 64, device=q.device, dtype=torch.float32)
+    dq, dkv, ds = sparse_mla_bwd_gfx1250(
+        q, kv, o, g, topk, lse, attn_sink=sink, kv_lora_rank=D, scale=SCALE, band_pool=band, delta_out=delta, batch=B
+    )
+    torch.cuda.synchronize()
+    assert bits_equal(dq, torch.cat([r[2] for r in ref])) and bits_equal(dkv, torch.cat([r[3] for r in ref]))
+    assert bits_equal(ds, _dsink(sink, lse, delta))
+    assert nk * B == kv.shape[0]
