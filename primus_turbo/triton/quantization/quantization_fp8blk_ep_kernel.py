@@ -961,19 +961,24 @@ def _presum_routes_kernel(
     HAS_EXT: the first column block also writes EXT_OUT[P2S[p]] = EXT[p] for each live route's pool row p."""
     n = tl.program_id(0)
     h = tl.program_id(1) * BH + tl.arange(0, BH)
+    # Branch-free: each route's row load is masked (no route -> +0.0), so the K row loads are in flight together
+    # instead of each waiting on its index test. Same bits: acc starts at +0.0 and an fp32 sum never turns into -0.0
+    # by adding +0.0 (round to nearest), so the masked adds leave it unchanged; the live routes add in k order.
     acc = tl.zeros((BH,), dtype=tl.float32)
     live = 0
     for k in tl.static_range(K):
         p = tl.load(INV + n * K + k)
-        if p >= 0:
-            acc += tl.load(ROWS + p.to(tl.int64) * H + h).to(tl.float32)
-            live += 1
-            if HAS_EXT == 1:
-                if tl.program_id(1) == 0:
-                    tl.store(EXT_OUT + tl.load(P2S + p), tl.load(EXT + p))
-        if HAS_EXT == 2:  # per received route: EXT_OUT[n, k] = EXT[p] (0 for no route on this rank)
-            if tl.program_id(1) == 0:
-                tl.store(EXT_OUT + n * K + k, tl.load(EXT + tl.maximum(p, 0), mask=p >= 0, other=0.0))
+        acc += tl.load(ROWS + tl.maximum(p, 0).to(tl.int64) * H + h, mask=p >= 0, other=0.0).to(tl.float32)
+        live += (p >= 0).to(tl.int32)
+    if HAS_EXT != 0:
+        if tl.program_id(1) == 0:
+            for k in tl.static_range(K):
+                p = tl.load(INV + n * K + k)
+                q = tl.maximum(p, 0)
+                if HAS_EXT == 1:
+                    tl.store(EXT_OUT + tl.load(P2S + q), tl.load(EXT + q), mask=p >= 0)
+                if HAS_EXT == 2:  # per received route: EXT_OUT[n, k] = EXT[p] (0 for no route on this rank)
+                    tl.store(EXT_OUT + n * K + k, tl.load(EXT + q, mask=p >= 0, other=0.0))
     if live > 0:
         tl.store(OUT + n.to(tl.int64) * H + h, acc.to(OUT.dtype.element_ty))
 
@@ -1019,7 +1024,7 @@ def presum_routes(
         K=K,
         BH=bh,
         HAS_EXT=mode,
-        num_warps=4,
+        num_warps=int(os.environ.get("PRIMUS_TURBO_EP_PRESUM_NW", "2")),  # 2: 134 -> 112 us at the MBS4 EP4 shape
     )
     return out if ext is None else (out, ext_out)
 
