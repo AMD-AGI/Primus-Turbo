@@ -4,7 +4,8 @@ Every What's New entry, grouped by the release it first shipped in, newest first
 
 ## Unreleased (main)
 
-Nothing since v0.7.0 yet.
+- **[2026/11/28]** 🔥 **Ulysses all-to-all fused into attention on MI355X (gfx950)** — `ulysses_mega_attn` runs the q / k / v all-to-all, causal attention and the output all-to-all of Ulysses context parallelism as one kernel, forward and backward, for GQA (head dim 128) and MLA (q / k 192, v 128): attention tiles start as soon as the rows they read have landed, and each output tile goes straight to the rank that owns its tokens. On 4× MI355X at 32K–64K tokens (Qwen3-30B-A3B, Qwen3-235B-A22B, Llama3.1-8B head shapes) it is 1.15–1.36× faster forward and 1.10–1.21× forward + backward than RCCL all-to-alls around the same attention kernels ([#708](https://github.com/AMD-AGI/Primus-Turbo/pull/708)).
+- **[2026/11/28]** 🔥 **MLA attention on MI355X (gfx950)** — `flash_attn_func` runs the DeepSeek-V3 / Kimi-K2 MLA head dims (q / k 192, v 128) on FlyDSL kernels on gfx950, forward and backward, causal BF16 with an optional `softmax_scale` (YaRN); the stock and MLA kernels share one forward job body, launcher and backward ([#707](https://github.com/AMD-AGI/Primus-Turbo/pull/707)).
 
 ## v0.7.0
 

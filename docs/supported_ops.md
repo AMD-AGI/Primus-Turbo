@@ -72,7 +72,7 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 
 | Op | Precision | gfx942 | gfx950 | gfx1250 | Notes |
 |---|---|:-:|:-:|:-:|---|
-| `flash_attn_func` | BF16 / FP16 | ✅ | ✅ | ✅ | GQA / MQA, causal, sliding window, attention sink |
+| `flash_attn_func` | BF16 / FP16 | ✅ | ✅ | ✅ | GQA / MQA, causal, sliding window, attention sink; MLA head dims (q / k 192, v 128) on gfx950 and gfx1250 |
 | `flash_attn_varlen_func` | BF16 / FP16 | ✅ | ✅ | — | Packed variable-length sequences |
 | `flash_attn_fp8_func` | FP8 | ✅ | ✅ | — | |
 | `flash_attn_usp_func`, `flash_attn_varlen_usp_func`, `flash_attn_fp8_usp_func` | BF16 / FP8 | ✅ | ✅ | — | Context parallelism: ring + all-to-all (USP) |
@@ -128,6 +128,7 @@ These are fwd-only utilities; the `_with_trans` variants also emit the transpose
 |---|:-:|:-:|:-:|---|
 | `turbo.ops.fused_all_gather_matmul`, `turbo.ops.fused_all_gather_scaled_matmul`, `turbo.ops.fused_matmul_reduce_scatter` | ✅ | ✅ | — | Async tensor parallelism; fwd only, the training integration supplies the backward |
 | Fused collective GEMM kernels (`primus_turbo.flydsl.fused_collective_gemm`: GemmA2A, A2AGemm, AgGemm, GemmRS) | — | ✅ | — | BF16 GEMM + all-to-all / all-gather / reduce-scatter in one launch, one node; kernel-level entry points. See [Fused collective GEMM](./features/fused_collective_gemm.md) |
+| `primus_turbo.pytorch.ops.attention.ulysses_mega_attn.ulysses_mega_attn` | — | ✅ | — | Ulysses context parallelism: q / k / v all-to-all + causal attention + output all-to-all in one kernel, forward and backward; BF16, batch 1, one node; GQA (head dim 128) and MLA (q / k 192, v 128) |
 | `primus_turbo.pytorch.dist.FP8AllToAll` | ✅ | ✅ | — | All-to-all on FP8 payloads, with backward |
 | `primus_turbo.pytorch.deep_ep.Buffer` | ✅ | ✅ | ✅ | Intra-node EP buffers, and inter-node on gfx942 / gfx950 (needs rocSHMEM); gfx1250 covers one host. See [DeepEP](./features/deep_ep.md) |
 
@@ -174,7 +175,7 @@ registration order, with the arch / format limits from each backend's `can_handl
 | `grouped_gemm_fp4` | FLYDSL (gfx950), TRITON (not gfx942) |
 | `grouped_mlp_fp8` | FLYDSL (gfx950), TRITON |
 | `grouped_mlp_fp4` | FLYDSL (gfx950) |
-| `flash_attn_func` | FLYDSL (gfx950: causal, head dim 64/128, sbhd; gfx1250: head dim 128 GQA and DeepSeek-V3 MLA 192/128, the MLA backward keeping its dS scratch within `PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB` MiB (default 5120) unless one head's needs more, or on HipKittens kernels with `PRIMUS_TURBO_MLA_BWD_IMPL=hk` where seqlen_q % 384 is 0 or 256), AITER (general fallback; default on gfx942), HIPKITTENS (gfx950, causal, sbhd), GLUON (gfx950, fwd only), TRITON (gfx1250) |
+| `flash_attn_func` | FLYDSL (gfx950: causal, head dim 64/128, sbhd, and DeepSeek-V3 MLA 192/128 (causal BF16, seqlen a multiple of 256, no window or deterministic mode); gfx1250: head dim 128 GQA and DeepSeek-V3 MLA 192/128, the MLA backward keeping its dS scratch within `PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB` MiB (default 5120) unless one head's needs more, or on HipKittens kernels with `PRIMUS_TURBO_MLA_BWD_IMPL=hk` where seqlen_q % 384 is 0 or 256), AITER (general fallback; default on gfx942), HIPKITTENS (gfx950, causal, sbhd), GLUON (gfx950, fwd only), TRITON (gfx1250) |
 | `flash_attn_varlen_func` | FLYDSL (gfx950), AITER |
 | `flash_attn_fp8_func` | TRITON |
 | `sparse_mla_func` | FLYDSL (gfx950, gfx1250), TRITON |

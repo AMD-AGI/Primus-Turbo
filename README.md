@@ -22,7 +22,7 @@ Note: JAX support is under active development. Optim support is planned but not 
 |---|---|
 | GEMM | `gemm` (BF16/FP16), `gemm_fp8` (tensorwise / rowwise / blockwise / MXFP8), `gemm_fp4` (MXFP4), `mlp_fp4` |
 | Grouped GEMM | `grouped_gemm`, `grouped_gemm_fp8`, `grouped_gemm_fp4`, `grouped_mlp_fp8`, `grouped_mlp_fp4` |
-| Attention | `flash_attn_func`, `flash_attn_varlen_func`, `flash_attn_fp8_func`, `flash_attn_*_usp_func` (context parallel), `sparse_mla_func` |
+| Attention | `flash_attn_func`, `flash_attn_varlen_func`, `flash_attn_fp8_func`, `flash_attn_*_usp_func` (context parallel), `ulysses_mega_attn` (Ulysses all-to-all + attention in one kernel), `sparse_mla_func` |
 | MoE | `fused_group_topk_routing_with_aux_score`, `moe_permute` / `moe_unpermute`, `moe_dispatch` / `moe_combine`, MegaMoE (BF16 / MXFP8) |
 | Norm / Act / RoPE / Loss | `rmsnorm`, `rmsnorm_residual`, `rmsnorm_residual_fp4`, `swiglu_with_probs`, `geglu_with_probs`, `fused_qkv_rope`, `fused_qkv_rmsnorm_rope`, `cross_entropy` |
 | Quantization | `quantize_fp8` / `quantize_fp4` (+ `_with_trans`, grouped, dequantize), `weight_deosc_*` |
@@ -32,14 +32,14 @@ Note: JAX support is under active development. Optim support is planned but not 
 
 ## 🚀 What's New
 
+- **[2026/11/28]** 🔥 **Ulysses all-to-all fused into attention on MI355X (gfx950)** — `ulysses_mega_attn` runs the q / k / v all-to-all, causal attention and the output all-to-all of Ulysses context parallelism as one kernel, forward and backward, for GQA (head dim 128) and MLA (q / k 192, v 128): attention tiles start as soon as the rows they read have landed, and each output tile goes straight to the rank that owns its tokens. On 4× MI355X at 32K–64K tokens (Qwen3-30B-A3B, Qwen3-235B-A22B, Llama3.1-8B head shapes) it is 1.15–1.36× faster forward and 1.10–1.21× forward + backward than RCCL all-to-alls around the same attention kernels ([#708](https://github.com/AMD-AGI/Primus-Turbo/pull/708)).
+- **[2026/11/28]** 🔥 **MLA attention on MI355X (gfx950)** — `flash_attn_func` runs the DeepSeek-V3 / Kimi-K2 MLA head dims (q / k 192, v 128) on FlyDSL kernels on gfx950, forward and backward, causal BF16 with an optional `softmax_scale` (YaRN); the stock and MLA kernels share one forward job body, launcher and backward ([#707](https://github.com/AMD-AGI/Primus-Turbo/pull/707)).
 - **[2026/11/18]** 🔥 **Release [v0.7.0](https://github.com/AMD-AGI/Primus-Turbo/releases/tag/v0.7.0)** — MoE training on MI455X (gfx1250): BF16 MegaMoE, DeepEP V1 / V2, MLA / flash / sparse-MLA attention and gradient accumulation into `main_grad`; GPT-OSS in MegaMoE; Ulysses GEMM + all-to-all fusion on MI355X; backend choice report and strict dispatch ([CHANGELOG](./CHANGELOG.md#v070--20261118), [changes since v0.6.0](https://github.com/AMD-AGI/Primus-Turbo/compare/v0.6.0...v0.7.0)).
 - **[2026/11/17]** 🔥 **Backend choice report and strict dispatch** — every operator dispatch records which backend it picked and why (user, autotune, default or fallback); `PRIMUS_TURBO_DISPATCH_REPORT=<path>` writes the per-shape report as JSON at exit, and `PRIMUS_TURBO_STRICT_DISPATCH=1` turns a fallback into an error ([#646](https://github.com/AMD-AGI/Primus-Turbo/pull/646), [env](./docs/env.md#dispatch-diagnostics)).
 - **[2026/11/10–11/17]** 🔥 **Gradient-accumulation fusion on MI455X (gfx1250)** — expert wgrads added straight into Megatron's `main_grad`, with no separate dW buffer or add: MegaMoE's BF16 staged ops into a bf16 `main_grad` ([#632](https://github.com/AMD-AGI/Primus-Turbo/pull/632), [MegaMoE](./docs/features/mega_moe.md)), and the BF16 grouped GEMM into an fp32 `main_grad` ([#647](https://github.com/AMD-AGI/Primus-Turbo/pull/647)).
 - **[2026/11/09]** 🔥 **Ulysses GEMM + all-to-all fusion on MI355X (gfx950)** — `ulysses_qkv_gemm_a2a` and `ulysses_a2a_o_gemm` fuse the QKV projection with the Ulysses all-to-all and the all-to-all with the output projection, forward and backward: GEMM tiles go straight to their peers in the post-all-to-all layout, with no pack, collective or unpack ([#624](https://github.com/AMD-AGI/Primus-Turbo/pull/624)).
 - **[2026/11/02]** 🔥 **DeepEP on MI455X (gfx1250)** — intranode dispatch / combine on MI455X: the V1 kernels ported to gfx1250, and a new V2 that writes every token straight into a fixed slot on its destination, the version MI455X runs. EP4 training on 4× MI455X is 1.08–1.10× faster than Megatron's alltoall dispatcher on a DeepSeek-V3 proxy and 1.04–1.07× on GPT-OSS 20B, with 12–16 GB less memory per GPU ([#583](https://github.com/AMD-AGI/Primus-Turbo/pull/583), [DeepEP](./docs/features/deep_ep.md), [design](./docs/design/deep_ep_v2_mi455.md)).
 - **[2026/10/28]** 🔥 **MegaMoE on MI455X (gfx1250)** — BF16 fused MegaMoE forward and backward on gfx1250, including the staged op with per-expert biases for GPT-OSS shapes; validated on 4× MI455X (EP4) ([#582](https://github.com/AMD-AGI/Primus-Turbo/pull/582), [MegaMoE](./docs/features/mega_moe.md)).
-- **[2026/10/19–10/27]** 🔥 **Attention on MI455X (gfx1250)** — FlyDSL MLA attention for DeepSeek-V3 (qk 192 / v 128) ([#567](https://github.com/AMD-AGI/Primus-Turbo/pull/567)); FlyDSL flash attention for head dim 128 (Llama-3.1-8B) and sparse-MLA for DeepSeek-V4 ([#580](https://github.com/AMD-AGI/Primus-Turbo/pull/580)).
-- **[2026/10/20–10/21]** 🔥 **GPT-OSS in MegaMoE** — hidden / intermediate 2880 and per-expert fc1 / fc2 biases in the BF16 and MXFP8 MegaMoE ops ([#571](https://github.com/AMD-AGI/Primus-Turbo/pull/571)), with the per-layer memory sized to the rows dispatched to each rank ([#566](https://github.com/AMD-AGI/Primus-Turbo/pull/566), [#568](https://github.com/AMD-AGI/Primus-Turbo/pull/568), [MegaMoE](./docs/features/mega_moe.md)).
 
 👉 **[Full history](./docs/history.md)** — every update, grouped by the release it shipped in; **[CHANGELOG](./CHANGELOG.md)** — every change in each release.
 
@@ -230,7 +230,7 @@ See [Examples](./docs/examples.md) for usage examples.
 See [Benchmarks](./benchmark/README.md) for detailed performance results and comparisons.
 
 ## 📍 Roadmap
-[Roadmap: Primus-Turbo Roadmap H1 2026](https://github.com/AMD-AGI/Primus-Turbo/issues/211)
+[Roadmap: Primus-Turbo Roadmap H1 2027](https://github.com/AMD-AGI/Primus-Turbo/issues/682) · past: [H1 2026](https://github.com/AMD-AGI/Primus-Turbo/issues/211), [H2 2025](https://github.com/AMD-AGI/Primus-Turbo/issues/101)
 
 ---
 
