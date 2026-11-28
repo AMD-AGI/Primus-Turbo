@@ -1,7 +1,57 @@
 # Changelog
 
-Changes in each Primus-Turbo release, newest first. The headline features of every release are in
+Changes in each Primus-Turbo release, newest first; what has merged since the last release is under
+"Unreleased". The headline features of every release are in
 [docs/history.md](./docs/history.md); each release's GitHub page lists every merged pull request.
+
+## Unreleased (main)
+
+[changes since v0.7.0](https://github.com/AMD-AGI/Primus-Turbo/compare/v0.7.0...main)
+
+### Highlights
+
+- **Collectives fused into GEMMs and attention on MI355X (gfx950).**
+  - `fused_collective_gemm`: GemmA2A, A2AGemm, AgGemm and GemmRS run their all-to-all, all-gather or
+    reduce-scatter in the GEMM launch ([#669](https://github.com/AMD-AGI/Primus-Turbo/pull/669), [#671](https://github.com/AMD-AGI/Primus-Turbo/pull/671), [#673](https://github.com/AMD-AGI/Primus-Turbo/pull/673), [#674](https://github.com/AMD-AGI/Primus-Turbo/pull/674); guide [#676](https://github.com/AMD-AGI/Primus-Turbo/pull/676)).
+  - The Ulysses ops run on that package: QKV / o_proj for GQA ([#677](https://github.com/AMD-AGI/Primus-Turbo/pull/677)) and MLA through the latents,
+    `ulysses_mla_latent_up_proj` ([#678](https://github.com/AMD-AGI/Primus-Turbo/pull/678)).
+  - `ulysses_mega_attn`: the Ulysses all-to-alls and causal attention in one kernel, forward and
+    backward, GQA and MLA ([#708](https://github.com/AMD-AGI/Primus-Turbo/pull/708)).
+  - `flash_attn_agkv_func`: all-gather-KV context parallelism with the exchange inside the attention
+    kernels ([#696](https://github.com/AMD-AGI/Primus-Turbo/pull/696)).
+- **MLA attention on MI355X (gfx950)**: `flash_attn_func` runs the DeepSeek-V3 / Kimi-K2 head dims
+  (q / k 192, v 128) on FlyDSL kernels, forward and backward, with `softmax_scale` ([#707](https://github.com/AMD-AGI/Primus-Turbo/pull/707)).
+- **Fused DiT block ops for FLUX (gfx950)**: `adaln_modulate`, `gated_residual_adaln`, `linear_gelu`
+  ([#649](https://github.com/AMD-AGI/Primus-Turbo/pull/649)) and `dit_qk_norm_rope` ([#652](https://github.com/AMD-AGI/Primus-Turbo/pull/652)).
+- **JAX grouped GEMM backends for MoE**: hipBLASLt and FlyDSL, under `jit` / `shard_map` ([#638](https://github.com/AMD-AGI/Primus-Turbo/pull/638)).
+
+### New features
+
+- Tensorwise `gemm_fp8` is traced by `torch.compile` ([#662](https://github.com/AMD-AGI/Primus-Turbo/pull/662)).
+- `Float8QuantConfig(default_backend=...)`: an opt-in backend for the dense FP8 GEMMs of one config
+  ([#663](https://github.com/AMD-AGI/Primus-Turbo/pull/663)).
+- `quantize_fp8(..., scale=, amax_out=)`: the tensorwise FP8 cast with a given scale also reports its
+  input's amax ([#698](https://github.com/AMD-AGI/Primus-Turbo/pull/698)).
+- `fused_qkv_rmsnorm_rope` runs on gfx942 ([#642](https://github.com/AMD-AGI/Primus-Turbo/pull/642)).
+- Docs: the [MXFP4 training guide](./docs/features/mxfp4.md) ([#666](https://github.com/AMD-AGI/Primus-Turbo/pull/666)) and the
+  [fused collective GEMM guide](./docs/features/fused_collective_gemm.md) ([#676](https://github.com/AMD-AGI/Primus-Turbo/pull/676)).
+
+### Performance
+
+- BF16 grouped GEMM on MI455X: retuned Muse Spark keys with nearest-key matching, and keys for
+  EP16 / EP32 ([#685](https://github.com/AMD-AGI/Primus-Turbo/pull/685)).
+
+### Bug fixes
+
+- Works with FlyDSL 0.5.0, which newer AITER requires ([#653](https://github.com/AMD-AGI/Primus-Turbo/pull/653)).
+- The Ulysses ops rebuild their rearranged projection weights on every call: an optimizer
+  can update a weight in place without changing the version the cache was keyed on ([#679](https://github.com/AMD-AGI/Primus-Turbo/pull/679)).
+- The CK grouped GEMM tile no longer spills registers on gfx942, and the JAX FP8 grouped GEMM works
+  under `jit` ([#638](https://github.com/AMD-AGI/Primus-Turbo/pull/638)).
+- The PyTorch unit tests pass on gfx950, including MXFP4 `shuffle_weight` / `dequantize_mxfp4` on
+  inputs with a padded row pitch ([#659](https://github.com/AMD-AGI/Primus-Turbo/pull/659)).
+- Lookup tables read by gfx1250 FlyDSL launches are read-only, so they no longer change the launch
+  cache key ([#650](https://github.com/AMD-AGI/Primus-Turbo/pull/650)).
 
 ## v0.7.0 — 2026/11/18
 
