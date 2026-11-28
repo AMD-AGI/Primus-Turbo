@@ -44,7 +44,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     wait_barrier,
     xcd_remap_pid,
 )
-from primus_turbo.flydsl.utils.prims import ceildiv
+from primus_turbo.flydsl.utils.prims import _lds_barrier, ceildiv
 
 # isort: on
 
@@ -274,7 +274,12 @@ def dense_mma_pipeline_bf16(
         b0_frag = b_s2r.load(b_cur0)
         a0_frag = a_s2r.load(a_cur0)
         a_load(1, a_next1, (k + 1))
-        rocdl.s_barrier()
+        # When the prologue barrier is wave_hi 1's alone (non-persistent and "staggered"), wave_hi 0 runs one
+        # barrier ahead and refills b_cur0 right after its next barrier, which pairs with this one; s_barrier
+        # waits on no counter, so wave_hi 1's b0 reads must retire (lgkmcnt(0)) before it. With
+        # persistent=True every wave runs that barrier and the wait is not needed; it is kept unconditional
+        # there, as in #706 and #713.
+        _lds_barrier()
 
         rocdl.sched_barrier(0)
         c00_frag = _mma(0, c00_frag, a0_frag, b0_frag)
