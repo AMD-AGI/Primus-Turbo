@@ -169,7 +169,10 @@ def flash_attn_fwd(q, k, v, softmax_scale=None, causal=True, window_left=-1):
     # An under-filled grid is bound by its heaviest workgroup's latency; the small-grid
     # tiling uses 64-row workgroups (BLOCK_M 64 instead of 256) to spread the work.
     grid = -(-sq * (hq // hkv) // _fwd.DEFAULT.block_m) * hkv * b
-    tiling = _fwd.SMALL_GRID if grid < _num_cu(q.device) else _fwd.DEFAULT
+    if grid < _num_cu(q.device):
+        tiling = _fwd.SMALL_GRID
+    else:
+        tiling = _fwd.HD64 if d == 64 else _fwd.DEFAULT
     return _fwd.flash_attn_fwd(
         q, k, v, tiling, softmax_scale=float(softmax_scale), causal=bool(causal), window_left=wl
     )

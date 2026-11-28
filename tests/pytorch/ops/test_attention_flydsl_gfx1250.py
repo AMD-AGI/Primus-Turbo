@@ -1037,6 +1037,28 @@ _NUMERIC_SHAPES = {
 
 
 @needs_flydsl
+@pytest.mark.parametrize(
+    ("shape", "d", "tiling"),
+    [
+        ((1, 4096, 4096, 128, 16), 64, "HD64"),  # Muse Spark, batch 1: the grid fills the machine
+        ((2, 4096, 4096, 128, 16), 64, "HD64"),
+        ((1, 256, 256, 8, 2), 64, "SMALL_GRID"),  # an under-filled grid keeps the small-grid tiling
+        ((1, 4096, 4096, 128, 16), 128, "DEFAULT"),  # head dim 128 keeps DEFAULT
+    ],
+)
+def test_forward_tiling_choice(monkeypatch, shape, d, tiling):
+    """Head dim 64 takes HD64 (two 4-wave workgroups per CU) once the grid fills the machine."""
+    from primus_turbo.flydsl.attention.gfx1250 import interface
+
+    seen = []
+    monkeypatch.setattr(interface, "_num_cu", lambda device: 256)
+    monkeypatch.setattr(interface._fwd, "flash_attn_fwd", lambda q, k, v, t, **kwargs: seen.append(t))
+    q, k, v = _meta(*shape, d=d)
+    interface.flash_attn_fwd(q, k, v, causal=True)
+    assert seen == [getattr(interface._fwd, tiling)]
+
+
+@needs_flydsl
 def test_numeric_shapes_reach_every_kernel_variant(monkeypatch):
     """The shapes of test_matches_reference reach both forward tilings at every GQA ratio (the
     tiling picked for a device of 256 CUs), split and unsplit dK/dV, split and grouped dQ, and

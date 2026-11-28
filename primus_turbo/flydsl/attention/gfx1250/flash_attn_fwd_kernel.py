@@ -167,6 +167,17 @@ DEFAULT = Tiling(
     min_kv_blk_bytes=64 * 1024,
     warp_specialized=True,
 )
+# Head dim 64: 4 waves of 32 rows each (BLOCK_M = 128), 160 KB of LDS, so two workgroups share a CU.
+# At d 64 the softmax is a larger share of each kv tile than at 128, and a second resident workgroup
+# hides it better than DEFAULT's warp specialization.
+HD64 = Tiling(
+    kernel_name="k_flash_attn_fwd_hd64",
+    num_waves=4,
+    num_row_waves=4,
+    lds_bytes=160 * 1024,
+    min_kv_blk_bytes=0,
+    warp_specialized=False,
+)
 SMALL_GRID = Tiling(
     kernel_name="k_flash_attn_fwd_small_grid",
     num_waves=4,
