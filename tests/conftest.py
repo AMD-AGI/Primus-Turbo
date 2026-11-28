@@ -63,7 +63,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla_codegen.py",
     # HipKittens kernels of its backward (csrc/kernels/attention/hipkittens/gfx1250_mla).
     "tests/pytorch/ops/test_attention_hipkittens_gfx1250_mla.py",
-    # Dense FlyDSL attention (primus_turbo/flydsl/attention/gfx1250), bf16 head_dim 128.
+    # Dense FlyDSL attention (primus_turbo/flydsl/attention/gfx1250), bf16 head_dim 64 / 128, with the
+    # causal sliding window.
     "tests/pytorch/ops/test_attention_flydsl_gfx1250.py",
     # fused_qkv_rmsnorm_rope on its Triton backend (primus_turbo/triton/rope/qk_rmsnorm_rope_kernel.py).
     "tests/pytorch/ops/test_qk_rmsnorm_rope.py",

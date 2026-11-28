@@ -14,7 +14,7 @@
 # Adapted from aiter (https://github.com/ROCm/aiter, commit 6963ae9d), where it is
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc., under the MIT license.
 
-"""Flash-attention forward kernel for gfx1250 (MI455X): bf16, head_dim 128, BSHD, GQA.
+"""Flash-attention forward kernel for gfx1250 (MI455X): bf16, head_dim 64 or 128, BSHD, GQA.
 
 Vendored from aiter's gfx1250 FlyDSL prefill forward (github.com/ROCm/aiter, commit
 6963ae9d) and tuned for Primus-Turbo (Llama-3.1-8B GQA training shapes). Written in the
@@ -24,7 +24,10 @@ A workgroup computes ``BLOCK_M`` packed query rows of one kv head: the ``G = Hq 
 query heads that share the kv head are packed into the rows (head fastest), so every K/V
 tile staged in LDS serves all of them. Each wave owns 32 packed rows (two 16-row WMMA
 tiles) and streams the kv axis in 64-row tiles through a double-buffered LDS ring:
-S^T = K Q^T, online softmax, O^T += V^T P^T. Masking is bottom-right causal, or none.
+S^T = K Q^T, online softmax, O^T += V^T P^T. Masking is bottom-right causal, optionally with a
+sliding window on the left (query i attends keys [i + Skv - Sq - window_left, i + Skv - Sq]),
+or none. Under the window a workgroup starts streaming at the first tile its earliest query
+reaches, so the work is that of the band, not of the full causal triangle.
 
 Two tilings share this code (``Tiling``); the interface picks one per call:
   - ``DEFAULT``: 8 waves (256 threads), BLOCK_M = 256, all 320 KB of LDS. Waves 0..3 and
@@ -83,7 +86,7 @@ WMMA_M = 16  # query rows per WMMA tile
 WMMA_N = 16  # kv rows per WMMA tile (the S^T = K Q^T output's kv axis)
 WMMA_K = 32  # WMMA contraction depth (bf16 v_wmma_f32_16x16x32); d-tile width
 WMMA_ROW_PER_WAVE = 2  # 16-row q tiles per row wave: wave i owns rows [32 i, 32 i + 32)
-HEAD_DIM = 128  # qk and v head dim
+HEAD_DIMS = (64, 128)  # qk == v head dims the kernel is built for (compile-time per launcher)
 N_BLOCK = 64  # kv rows per tile (columns of one QK^T tile)
 N_KV_PP = 2  # K/V LDS ping-pong slots the main loop rotates through
 LDS_BYTES = 320 * 1024  # LDS per workgroup on gfx1250, the only target of these kernels
@@ -142,7 +145,7 @@ class Tiling(NamedTuple):
 
     @property
     def d_split(self):
-        """Waves sharing one set of q rows; each accumulates HEAD_DIM // d_split of O."""
+        """Waves sharing one set of q rows; each accumulates head_dim // d_split of O."""
         return self.num_waves // self.num_row_waves
 
     @property
@@ -268,7 +271,7 @@ def _qk_gemm(*, k_values, q_frags_list):
     is shuffled once and fed into R independent WMMA chains.
 
     WMMA convention (gfx1250): S^T[kv,q] = K @ Q^T with **K = A-operand** (src_a)
-    and **Q = B-operand** (src_b). Contract d in ``NDT = HEAD_DIM//WMMA_K`` tiles;
+    and **Q = B-operand** (src_b). Contract d in ``NDT = head_dim//WMMA_K`` tiles;
     produce ``NKV = N_BLOCK//WMMA_N`` kv-tiles. Accumulator layout: lane ``l``
     element ``si`` holds S^T[kv = kv_tile*WMMA_N + (l//16)*8 + si, q = l%16] (kv on
     the C-row / M axis, q on the C-col / N axis).
@@ -287,7 +290,7 @@ def _qk_gemm(*, k_values, q_frags_list):
     """
     R = len(q_frags_list)
     NKV = N_BLOCK // WMMA_N  # output kv tiles (WMMA_N kv rows each)
-    NDT = len(q_frags_list[0])  # contraction d-tiles (== HEAD_DIM // WMMA_K)
+    NDT = len(q_frags_list[0])  # contraction d-tiles (== head_dim // WMMA_K)
 
     # Consume in (kv, dt, half) order: a (half=0, half=1) pair shuffles into a v16
     # K fragment (shared by all q-tiles); NDT d-tiles accumulate into one kv-tile's
@@ -335,7 +338,7 @@ def _tree_reduce_multi(lists, op3, op2):
     return [c[0] for c in curs]
 
 
-def _softmax(*, s_list, m_prev_list, d_prev_list, lane_idx, kv_pos_base, q_max_list, kv_len):
+def _softmax(*, s_list, m_prev_list, d_prev_list, lane_idx, kv_pos_base, q_max_list, kv_len, q_min_list):
     """Online-softmax update for one KV tile, for ALL R q-WMMA-tiles this wave owns.
 
     The R rows are independent (each owns its S, running m/d, and mask bound) but share
@@ -355,8 +358,9 @@ def _softmax(*, s_list, m_prev_list, d_prev_list, lane_idx, kv_pos_base, q_max_l
     kvt*16 + i``; all bounds fx.Int32): ``q_max_list[r]`` masks ``kv_pos > q_max`` (the
     causal edge ``q_seq + (kv_len - q_len)``; clamped to ``kv_len-1`` on the last tile to
     fold the tail); kv_len (only when q_max is None) masks ``kv_pos >= kv_len`` (the tail of
-    the non-causal case). ``q_max_list`` None and kv_len None (an interior tile) mask
-    nothing.
+    the non-causal case); ``q_min_list[r]`` (sliding window only) masks ``kv_pos < q_min`` (the
+    band's left edge ``q_seq + (kv_len - q_len) - window_left``). ``q_max_list`` None,
+    ``q_min_list`` None and kv_len None (an interior tile) mask nothing.
 
     Args: ``s_list``/``m_prev_list``/``d_prev_list``/``q_max_list`` are length-R lists
     (R = WMMA_ROW_PER_WAVE). m_prev/d_prev are fx.Float32 shared by the l<->l^16 pair.
@@ -426,18 +430,21 @@ def _softmax(*, s_list, m_prev_list, d_prev_list, lane_idx, kv_pos_base, q_max_l
     for r in range(R):
         s = s_list[r]
         q_max = q_max_list[r]
+        q_min = q_min_list[r]
         s_masked = []
         for kvt in range(NKV):
             svec = fx.Vector(s[kvt])
             for i in range(8):
                 sval = svec[i]
-                if q_max is not None or kv_len is not None:
+                if q_max is not None or kv_len is not None or q_min is not None:
                     kv_pos = kv_pos_base + khalf * fx.Int32(8) + fx.Int32(kvt * WMMA_N + i)
                     if q_max is not None:
                         ubound = q_max if kv_len is None else fx.min(q_max, kv_len - fx.Int32(1))
                         sval = (kv_pos > ubound).select(neg_inf, sval)
                     if kv_len is not None and q_max is None:
                         sval = (kv_pos >= kv_len).select(neg_inf, sval)
+                    if q_min is not None:
+                        sval = (kv_pos < q_min).select(neg_inf, sval)
                 s_masked.append(sval)
         s_masked_list.append(s_masked)
 
@@ -608,7 +615,9 @@ def _core_attention(
     *,
     tiling,  # compile-time Tiling
     causal,  # compile-time: mask keys past each query's (bottom-right) diagonal
+    windowed,  # compile-time: also mask keys left of each query's sliding window (needs causal)
     gqa_ratio,  # compile-time GQA group size = nheads_q // nheads_kv
+    head_dim,  # compile-time qk == v head dim (HEAD_DIMS)
     ptr_O,
     ptr_Q,
     ptr_K,
@@ -635,6 +644,8 @@ def _core_attention(
     kv_len,  # valid K/V tokens in this batch
     # Runtime fx.Int32 offset of the causal edge (the host passes 0); read only when causal.
     window_right,
+    # Runtime fx.Int32 left extent of the sliding window (>= 0); read only when windowed.
+    window_left,
     warp_idx,  # runtime fx.Int32 wave index
     warp_type,  # compile-time WarpType (LO_WARP / HI_WARP)
     lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
@@ -667,13 +678,13 @@ def _core_attention(
     # waves TDM-write the same bytes). slot_bytes is compile-time (no allocation; lds_base is
     # passed in).
     q_mgr = QManager16bV2(
-        qk_hdim=HEAD_DIM,
+        qk_hdim=head_dim,
         gqa_ratio=gqa_ratio,
         num_waves=tiling.num_row_waves,
         q_tiles_per_wave=WMMA_ROW_PER_WAVE,
     )
-    k_mgr = KManager16bV2(qk_hdim=HEAD_DIM, n_block=N_BLOCK, num_waves=tiling.num_waves)
-    v_mgr = VManager16bV2(v_hdim=HEAD_DIM, n_block=N_BLOCK, num_waves=tiling.num_waves)
+    k_mgr = KManager16bV2(qk_hdim=head_dim, n_block=N_BLOCK, num_waves=tiling.num_waves)
+    v_mgr = VManager16bV2(v_hdim=head_dim, n_block=N_BLOCK, num_waves=tiling.num_waves)
     k_blk_bytes = max(k_mgr.get_lds_size_in_byte(), tiling.min_kv_blk_bytes)
     v_blk_bytes = max(v_mgr.get_lds_size_in_byte(), tiling.min_kv_blk_bytes)
     slot_bytes = max(k_blk_bytes + v_blk_bytes, d_split * q_mgr.get_lds_size_in_byte())
@@ -727,9 +738,18 @@ def _core_attention(
     else:
         kv_len_wg = kv_len
 
-    # Tile range [start_tile, n_tiles): every WG starts at tile 0 (no left window edge).
+    # Tile range [start_tile, n_tiles). Without a window every WG starts at tile 0; under the
+    # sliding window it starts at the tile holding the band start of the WG's earliest query
+    # (each query attends [s + causal_off - window_left, s + causal_off]), so whole tiles left
+    # of every query's band are never loaded. That key is below kv_len_wg (the earliest query's
+    # own diagonal is), so start_tile < n_tiles.
     n_tiles = fx.ceildiv(kv_len_wg, fx.Int32(N_BLOCK))
-    start_tile = fx.Int32(0)
+    if windowed:
+        wg_min_seq_l = (block_x * fx.Int32(block_m)) // fx.Int32(gqa_ratio)
+        kv_lo = fx.max(wg_min_seq_l + causal_off - window_left, fx.Int32(0))
+        start_tile = kv_lo // fx.Int32(N_BLOCK)
+    else:
+        start_tile = fx.Int32(0)
 
     def _kv_valid(blk_row0):
         # How many rows of [blk_row0, blk_row0+N_BLOCK) are in-bounds, clamped to
@@ -781,8 +801,8 @@ def _core_attention(
     # corr=exp2(m_prev-m_new) underflows to 0 and zeroes the (already-zero) O before its PV
     # adds in -- the standard flash seed. Fully-masked leading tiles keep m finite, so
     # no NaN.
-    d_tiles = HEAD_DIM // WMMA_M // d_split  # O tiles of the d part this wave owns
-    v_hdim_w = HEAD_DIM // d_split  # head-dim columns of O this wave owns
+    d_tiles = head_dim // WMMA_M // d_split  # O tiles of the d part this wave owns
+    v_hdim_w = head_dim // d_split  # head-dim columns of O this wave owns
     R = WMMA_ROW_PER_WAVE
     _QS = 2 + d_tiles  # per-q-tile carried state: [m, d, O_0 .. O_{d_tiles-1}]
     m_init = [fx.Float32(BIG_NEG) for _ in range(R)]
@@ -822,10 +842,11 @@ def _core_attention(
     # tile t+1 prefetch UP FRONT into the other buffer, then computes QK->softmax->PV on
     # its own buffer while that async copy runs, drained at the next call's top.
     # ========================================================================
-    def main_loop(t, state, *, mask, kv_len):
-        # mask (apply the causal mask) and kv_len (mask the kv tail) are compile-time per
-        # sub-loop: the caller splits the tile stream into a mask-free clean region and a
-        # boundary loop, and passes False / None where a sub-loop provably needs neither.
+    def main_loop(t, state, *, mask, kv_len, mask_left=False):
+        # mask (apply the causal mask), mask_left (apply the sliding window's left edge) and
+        # kv_len (mask the kv tail) are compile-time per sub-loop: the caller splits the tile
+        # stream into a mask-free clean region and boundary loops, and passes False / None
+        # where a sub-loop provably needs neither.
         #
         # Runtime ping-pong: this tile reads its curr buffer (carried curr pointers); the
         # tile t+1 prefetch writes the next buffer, and curr<->next are swapped in the yield.
@@ -931,6 +952,7 @@ def _core_attention(
         # shared, but each q-tile has its own S and running m/d. All R q-tiles go through
         # ONE call so the rows' max/sum tree reductions emit INTERLEAVED (ILP). ----
         q_max_list = [seq_idx[qt] + causal_off + window_right if mask else None for qt in range(R)]
+        q_min_list = [seq_idx[qt] + causal_off - window_left if mask_left else None for qt in range(R)]
         p_list, m_new_list, d_new_list, corr_list, do_rescale_list = _softmax(
             s_list=s_list,
             m_prev_list=m_prev,
@@ -939,6 +961,7 @@ def _core_attention(
             kv_pos_base=kv_tile_start,
             q_max_list=q_max_list,
             kv_len=kv_len,
+            q_min_list=q_min_list,
         )
 
         # ---- Rescale each q-tile's running O by its corr, then GEMM2 accumulates this
@@ -975,14 +998,17 @@ def _core_attention(
         out += k_next + k_curr + v_next + v_curr
         return out
 
-    # ---- Stream tiles [start_tile, n_tiles) through 2 sub-loops split at the causal
-    # diagonal, so interior tiles fully inside it skip masking. clean_lo/clean_hi are
-    # runtime split points, but the mask on/off per sub-loop is COMPILE-TIME (each loop
-    # traces main_loop once with fixed None-ness). Ping-pong swap state threads
-    # continuously through both; buffer parity is by LOCAL iteration index, so the
-    # split leaves it intact.
-    #   [clean_lo, clean_hi) clean, no mask
-    #   [clean_hi, n_tiles)  causal boundary + kv_len tail (last tile)
+    # ---- Stream tiles [start_tile, n_tiles) through sub-loops split at the band edges, so
+    # interior tiles fully inside the band skip masking. clean_lo/clean_hi are runtime split
+    # points, but the mask on/off per sub-loop is COMPILE-TIME (each loop traces main_loop
+    # once with fixed None-ness). Ping-pong swap state threads continuously through all of
+    # them; buffer parity is by LOCAL iteration index, so the split leaves it intact.
+    #   [start_tile, clean_lo) left window edge (only when windowed)
+    #   [clean_lo, clean_hi)   clean, no mask
+    #   [clean_hi, n_tiles)    causal boundary + kv_len tail (last tile)
+    # The left loop ends at or before clean_hi and n_last, so its tiles are below every query's
+    # diagonal and hold no kv_len tail: it applies the left edge alone. The last loop applies
+    # both edges under the window: a narrow window can put them in one tile.
     n_iter = n_tiles - start_tile
     n_last = n_tiles - fx.Int32(1)  # last tile always carries the kv_len tail
 
@@ -996,19 +1022,35 @@ def _core_attention(
     else:
         clean_hi = n_tiles
     clean_hi = fx.max(fx.min(clean_hi, n_last), start_tile)
-    # The clean region starts at the first tile, clamped into [start_tile, clean_hi].
-    clean_lo = fx.min(start_tile, clean_hi)
+    # The clean region starts at the first tile fully at or right of the WG's LATEST query's
+    # band start (ceildiv(max q_min, N_BLOCK)) under the window, else at the first tile;
+    # clamped into [start_tile, clean_hi].
+    if windowed:
+        wg_max_seq_l = fx.min(
+            (block_x * fx.Int32(block_m) + fx.Int32(block_m - 1)) // fx.Int32(gqa_ratio),
+            q_len - fx.Int32(1),
+        )
+        qmin_max = fx.max(wg_max_seq_l + causal_off - window_left, fx.Int32(0))
+        clean_lo = (qmin_max + fx.Int32(N_BLOCK - 1)) // fx.Int32(N_BLOCK)
+        clean_lo = fx.min(fx.max(clean_lo, start_tile), clean_hi)
+    else:
+        clean_lo = fx.min(start_tile, clean_hi)
 
     @flyc.jit
-    def _run_tiles(state, lo_i32, hi_i32, *, mask, kv_len):
+    def _run_tiles(state, lo_i32, hi_i32, *, mask, kv_len, mask_left=False):
         final_state = state
         for tile, carried in range(fx.Index(lo_i32), fx.Index(hi_i32), 1, init=state):
-            next_state = main_loop(fx.Int32(tile), list(carried), mask=mask, kv_len=kv_len)
+            next_state = main_loop(
+                fx.Int32(tile), list(carried), mask=mask, kv_len=kv_len, mask_left=mask_left
+            )
             final_state = yield next_state
         return final_state
 
-    state = _run_tiles(_init, clean_lo, clean_hi, mask=False, kv_len=None)
-    final = _run_tiles(state, clean_hi, n_tiles, mask=causal, kv_len=kv_len)
+    state = _init
+    if windowed:
+        state = _run_tiles(state, start_tile, clean_lo, mask=False, kv_len=None, mask_left=True)
+    state = _run_tiles(state, clean_lo, clean_hi, mask=False, kv_len=None)
+    final = _run_tiles(state, clean_hi, n_tiles, mask=causal, kv_len=kv_len, mask_left=windowed)
 
     # ========================================================================
     # Epilogue: normalize O by the running denom d, then reshape+store to VRAM.
@@ -1103,19 +1145,22 @@ def _core_attention(
 
 
 @functools.cache
-def _launcher(tiling: Tiling, causal: bool, gqa_ratio: int):
-    """The ``flyc.jit`` launcher of the forward kernel for one tiling, mask and GQA ratio.
+def _launcher(tiling: Tiling, causal: bool, gqa_ratio: int, head_dim: int, windowed: bool):
+    """The ``flyc.jit`` launcher of the forward kernel for one tiling, mask, GQA ratio, head
+    dim and window mode.
 
-    All three are compile-time: the kernel and the launcher capture them in their closures,
+    All of them are compile-time: the kernel and the launcher capture them in their closures,
     which puts them in flydsl's JIT cache key, and ``gqa_ratio`` lets the per-lane ``% / //``
     fold to shift/and for powers of two. Every shape argument is a runtime Int32, so one
-    launcher serves every (B, Sq, Skv, Hkv).
+    launcher serves every (B, Sq, Skv, Hkv), and the window's extent is runtime too.
     """
     assert gqa_ratio >= 1, f"gqa_ratio must be >= 1, got {gqa_ratio}"
+    assert head_dim in HEAD_DIMS, f"head_dim must be one of {HEAD_DIMS}, got {head_dim}"
+    assert causal or not windowed, "the sliding window is defined against the causal mask"
 
-    # ptr_sink and window_left are unused, and window_right is always 0 (the causal edge
-    # is the diagonal): the tuned kernel's signature is kept, since dropping or folding a
-    # kernel argument changes the generated code.
+    # ptr_sink is unused, window_left is read only when windowed, and window_right is always
+    # 0 (the causal edge is the diagonal): the tuned kernel's signature is kept, since
+    # dropping or folding a kernel argument changes the generated code.
     @flyc.kernel(name=tiling.kernel_name, known_block_size=[tiling.block_size, 1, 1])
     def k_flash_attn_fwd(
         ptr_O: fx.Tensor,
@@ -1153,7 +1198,9 @@ def _launcher(tiling: Tiling, causal: bool, gqa_ratio: int):
         core_kw = {
             "tiling": tiling,
             "causal": causal,
+            "windowed": windowed,
             "gqa_ratio": gqa_ratio,
+            "head_dim": head_dim,
             "ptr_O": ptr_O,
             "ptr_Q": ptr_Q,
             "ptr_K": ptr_K,
@@ -1177,6 +1224,7 @@ def _launcher(tiling: Tiling, causal: bool, gqa_ratio: int):
             "kv_start": batch * seq_len_k,
             "kv_len": seq_len_k,
             "window_right": window_right,
+            "window_left": window_left,
         }
         lds_base = _alloc_lds(tiling.lds_bytes)
         warp_idx = _warp_id()
@@ -1254,19 +1302,21 @@ def _launcher(tiling: Tiling, causal: bool, gqa_ratio: int):
     return _launch
 
 
-def flash_attn_fwd(q, k, v, tiling=DEFAULT, *, softmax_scale, causal):
+def flash_attn_fwd(q, k, v, tiling=DEFAULT, *, softmax_scale, causal, window_left=-1):
     """Returns (o [B, Sq, Hq, D] bf16, lse [B, Hq, Sq] fp32, natural log).
 
     q [B, Sq, Hq, D] and k/v [B, Skv, Hkv, D]: contiguous bf16 tensors of a problem that
-    ``interface.unsupported_reason`` accepts (the caller checks). ``causal`` is bottom-right.
-    ``tiling`` is DEFAULT or SMALL_GRID.
+    ``interface.unsupported_reason`` accepts (the caller checks). ``causal`` is bottom-right;
+    ``window_left >= 0`` (causal only) adds the sliding window's left edge: query i attends
+    keys [i + Skv - Sq - window_left, i + Skv - Sq]. ``tiling`` is DEFAULT or SMALL_GRID.
     """
-    batch, seq_len_q, nheads_q, _ = q.shape
+    batch, seq_len_q, nheads_q, head_dim = q.shape
     seq_len_k, nheads_k = k.shape[1], k.shape[2]
-    out = torch.empty((batch, seq_len_q, nheads_q, HEAD_DIM), dtype=q.dtype, device=q.device)
+    windowed = int(window_left) >= 0
+    out = torch.empty((batch, seq_len_q, nheads_q, head_dim), dtype=q.dtype, device=q.device)
     lse = torch.empty((batch, nheads_q, seq_len_q), dtype=torch.float32, device=q.device)
     _run_compiled(
-        _launcher(tiling, bool(causal), nheads_q // nheads_k),
+        _launcher(tiling, bool(causal), nheads_q // nheads_k, head_dim, windowed),
         out,
         q,
         k,
@@ -1285,7 +1335,7 @@ def flash_attn_fwd(q, k, v, tiling=DEFAULT, *, softmax_scale, causal):
         lse.stride(2),
         lse.stride(1),
         lse.stride(0),
-        0,  # window_left: unused
+        int(window_left) if windowed else 0,  # window_left: read only when windowed
         0,  # window_right
         seq_len_q,
         seq_len_k,

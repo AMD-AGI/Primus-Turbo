@@ -16,12 +16,14 @@
 Both take BSHD tensors on one device: q/o/do [B, Sq, Hq, D], k/v [B, Skv, Hkv, D], bf16 and
 contiguous, with Hq a multiple of Hkv (GQA). The forward returns lse as [B, Hq, Sq] fp32 in
 natural log, which is exactly what the backward consumes. causal is bottom-right: query i
-attends keys j <= i + (Skv - Sq).
+attends keys j <= i + (Skv - Sq). ``window_left >= 0`` (causal only) adds a sliding window:
+query i attends keys [i + (Skv - Sq) - window_left, i + (Skv - Sq)], flash-attn's
+``window_size=(window_left, 0)``.
 
-The supported range is ``unsupported_reason``'s: head_dim 128, Hq / Hkv in ``GQA_RATIOS``,
-Sq a multiple of 64 and Skv of 32, no empty dimension, q and k each at most 1 GiB
-(``MAX_TENSOR_BYTES``), and Sq <= Skv when causal. Both entry points raise ValueError
-outside it.
+The supported range is ``unsupported_reason``'s: head_dim in ``HEAD_DIMS``, Hq / Hkv in
+``GQA_RATIOS``, Sq a multiple of 64 and Skv of 32, no empty dimension, q and k each at most
+1 GiB (``MAX_TENSOR_BYTES``) and within the launch grid (``MAX_GRID_YZ``), Sq <= Skv when
+causal, and a window only with causal. Both entry points raise ValueError outside it.
 
 Importing this module raises ImportError unless flydsl satisfies
 ``flydsl_version.FLYDSL_REQUIREMENT`` (``>=0.3.4.1,<0.3.5``).
@@ -41,9 +43,9 @@ from . import flash_attn_bwd_kernel as _bwd
 from . import flash_attn_fwd_kernel as _fwd
 from .flash_attn_utils import _run_compiled
 
-HEAD_DIM = _bwd.D
-if _fwd.HEAD_DIM != HEAD_DIM:
-    raise ImportError(f"forward head_dim {_fwd.HEAD_DIM} != backward head_dim {HEAD_DIM}")
+HEAD_DIMS = _bwd.HEAD_DIMS
+if _fwd.HEAD_DIMS != HEAD_DIMS:
+    raise ImportError(f"forward head_dims {_fwd.HEAD_DIMS} != backward head_dims {HEAD_DIMS}")
 # The dQ kernels consume query tiles of BLOCK_Q (k_dq_sp) / DQ_BQW (k_dqg) and launch
 # sq // tile of them, so a remainder would leave a tile uncomputed and write past the end;
 # k_dkdv streams query pairs of 32 rows. k_dkdv owns kv tiles of BLOCK_KV and the dQ
@@ -58,12 +60,16 @@ GQA_RATIOS = (1, 2, 4, 8, 16)
 # carry a flat 1 GiB extent: past it, loads would read zeros and stores would be dropped.
 # k_dq_sp's fp32 dq workspace has its true extent.
 MAX_TENSOR_BYTES = 1 << 30
+# The launches put B, Hkv, Sq / SEQLEN_Q_MULTIPLE and Skv / SEQLEN_KV_MULTIPLE on grid.y or grid.z,
+# which are 16-bit on gfx1250: 65536 of either launches no workgroup, silently.
+MAX_GRID_YZ = (1 << 16) - 1
 
 
-def unsupported_reason(q_shape, k_shape, v_shape, dtype, causal) -> Optional[str]:
+def unsupported_reason(q_shape, k_shape, v_shape, dtype, causal, window_left=-1) -> Optional[str]:
     """Why the gfx1250 kernels cannot run a BSHD problem, or None when they can.
 
-    Covers forward AND backward: the autograd path always needs both.
+    Covers forward AND backward: the autograd path always needs both. ``window_left >= 0`` is
+    a sliding window (flash-attn ``window_size=(window_left, 0)``), which needs ``causal``.
     """
     if dtype != torch.bfloat16:
         return f"dtype must be bfloat16, got {dtype}"
@@ -76,8 +82,8 @@ def unsupported_reason(q_shape, k_shape, v_shape, dtype, causal) -> Optional[str
     bk, skv, hkv, dk = k_shape
     if tuple(v_shape) != tuple(k_shape) or bk != b:
         return f"k {tuple(k_shape)} and v {tuple(v_shape)} must match, with q's batch {b}"
-    if d != HEAD_DIM or dk != HEAD_DIM:
-        return f"head_dim must be {HEAD_DIM}, got q {d} / k {dk}"
+    if d not in HEAD_DIMS or dk != d:
+        return f"head_dim must be one of {HEAD_DIMS} (q and k alike), got q {d} / k {dk}"
     if hq % hkv or hq // hkv not in GQA_RATIOS:
         return f"heads_q / heads_kv must be one of {GQA_RATIOS}, got {hq} / {hkv}"
     if sq % SEQLEN_Q_MULTIPLE:
@@ -90,10 +96,28 @@ def unsupported_reason(q_shape, k_shape, v_shape, dtype, causal) -> Optional[str
     if causal and sq > skv:
         # Bottom-right causal leaves the first sq - skv queries with no key at all.
         return f"causal needs seqlen_q <= seqlen_kv, got {sq} > {skv}"
+    if max(b, hkv, sq // SEQLEN_Q_MULTIPLE, skv // SEQLEN_KV_MULTIPLE) > MAX_GRID_YZ:
+        return (
+            f"batch, heads_kv, seqlen_q / {SEQLEN_Q_MULTIPLE} and seqlen_kv / {SEQLEN_KV_MULTIPLE} must each "
+            f"be under 65536 (16-bit launch grid), got {b}, {hkv}, {sq} and {skv}"
+        )
+    if int(window_left) >= 0 and not causal:
+        return f"a sliding window (window_left {int(window_left)}) needs causal"
     return None
 
 
-def _check(q, k, v, causal, do=None, o=None, lse=None):
+def _window(window_left, skv):
+    """The effective left window: -1 (none) for a negative one or one that covers every key.
+
+    Under bottom-right causal query i sees keys [i + Skv - Sq - wl, i + Skv - Sq]; the last
+    query's band starts at Skv - 1 - wl, so wl >= Skv - 1 cuts nothing for any query and the
+    unwindowed kernels compute exactly the same thing.
+    """
+    wl = int(window_left)
+    return -1 if wl < 0 or wl >= skv - 1 else wl
+
+
+def _check(q, k, v, causal, do=None, o=None, lse=None, window_left=-1):
     """Raise ValueError unless the kernels can take these tensors.
 
     The backward passes do, o and lse too. The kernels address every tensor from its base
@@ -110,7 +134,7 @@ def _check(q, k, v, causal, do=None, o=None, lse=None):
     for name, t in bf16.items():
         if t.dtype != torch.bfloat16 or not t.is_contiguous():
             raise ValueError(f"{name} must be a contiguous bfloat16 tensor")
-    reason = unsupported_reason(q.shape, k.shape, v.shape, q.dtype, causal)
+    reason = unsupported_reason(q.shape, k.shape, v.shape, q.dtype, causal, window_left)
     if reason is not None:
         raise ValueError(reason)
     for name, t in (("do", do), ("o", o)):
@@ -134,18 +158,21 @@ def _num_cu(device) -> int:
     return _NUM_CU[idx]
 
 
-def flash_attn_fwd(q, k, v, softmax_scale=None, causal=True):
+def flash_attn_fwd(q, k, v, softmax_scale=None, causal=True, window_left=-1):
     """Returns (o [B, Sq, Hq, D] bf16, lse [B, Hq, Sq] fp32 natural log)."""
-    _check(q, k, v, causal)
+    _check(q, k, v, causal, window_left=window_left)
     b, sq, hq, d = q.shape
     hkv = k.shape[2]
+    wl = _window(window_left, k.shape[1])
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(d)
     # An under-filled grid is bound by its heaviest workgroup's latency; the small-grid
     # tiling uses 64-row workgroups (BLOCK_M 64 instead of 256) to spread the work.
     grid = -(-sq * (hq // hkv) // _fwd.DEFAULT.block_m) * hkv * b
     tiling = _fwd.SMALL_GRID if grid < _num_cu(q.device) else _fwd.DEFAULT
-    return _fwd.flash_attn_fwd(q, k, v, tiling, softmax_scale=float(softmax_scale), causal=bool(causal))
+    return _fwd.flash_attn_fwd(
+        q, k, v, tiling, softmax_scale=float(softmax_scale), causal=bool(causal), window_left=wl
+    )
 
 
 def _launch(name, launcher, args):
@@ -163,7 +190,9 @@ def _launch(name, launcher, args):
 _NSP_Q_CAP = 8
 _NSP_KV_CAP = 16
 # Enough workgroups for two dispatch waves: one wave ends when its longest (most causal
-# work) workgroup ends; two let the dispatcher balance the causal skew.
+# work) workgroup ends; two let the dispatcher balance the causal skew. (Two waves at head dim
+# 128; at head dim 64 a CU holds 8 of these workgroups and this is one wave: higher targets
+# measured 2-10% slower there.)
 _TARGET_WGS = 2048
 
 
@@ -191,15 +220,26 @@ def _side_stream(device):
 
 
 # The fused backward (flash_attn_bwd_fused_kernel: dQ inside the dK/dV kernel, 5 GEMMs per unit
-# instead of 7) covers causal problems with Sq a multiple of 64 and Skv of 128. It adds dQ with
-# fp32 atomics, so dQ is not bitwise reproducible; deterministic=True keeps the two-kernel path.
+# instead of 7) covers causal problems of head dim 128 with Sq a multiple of 64 and Skv of 128,
+# without a sliding window. It adds dQ with fp32 atomics, so dQ is not bitwise reproducible;
+# deterministic=True keeps the two-kernel path. Head dim 64 takes the two-kernel path as well:
+# its single-wave kernels run two waves per SIMD there (flash_attn_bwd_kernel._at), which the
+# fused kernel's 4-wave workgroups (one K/V image of 128 kv rows in LDS each) do not reach, and
+# that outweighs the two GEMMs saved (MI455X, b1 s4096 hq128 hkv16 full causal: 0.58 ms against
+# 1.05 for a fused kernel built for head dim 64, which is why there is none).
 # Its split-K over the q loop aims at two dispatch waves of the 4-wave workgroups (one per CU).
 _FUSED_TARGET_WGS = 512
 _FUSED_NSP_CAP = 16
 
 
-def _fused_ok(sq, skv, causal):
-    return bool(causal) and sq % _fused.SEQLEN_Q_MULTIPLE == 0 and skv % _fused.SEQLEN_KV_MULTIPLE == 0
+def _fused_ok(sq, skv, d, causal, wl):
+    return (
+        bool(causal)
+        and wl < 0
+        and d == _fused.HEAD_DIM
+        and sq % _fused.SEQLEN_Q_MULTIPLE == 0
+        and skv % _fused.SEQLEN_KV_MULTIPLE == 0
+    )
 
 
 def _flash_attn_bwd_fused(do, q, k, v, o, lse, scale, stream):
@@ -208,7 +248,7 @@ def _flash_attn_bwd_fused(do, q, k, v, o, lse, scale, stream):
     g = hq // hkv
     n_rows = b * sq * hq
     delta = torch.empty((b, hq, sq), device=q.device, dtype=torch.float32)
-    _launch("delta", _bwd.launch_delta, (do, o, delta, sq, hq, n_rows, n_rows // _bwd.ROWS_DELTA, stream))
+    _launch("delta", _bwd.launch_delta, (do, o, delta, sq, hq, n_rows, n_rows // _bwd.ROWS_DELTA, d, stream))
     # fp32 dQ accumulator in the kernel's WMMA C-fragment order (k_dq_cvt de-swizzles it)
     dqa = torch.zeros((b, hq, sq, d), device=q.device, dtype=torch.float32)
     nblk = skv // _fused.W4_BKV
@@ -288,14 +328,15 @@ def _flash_attn_bwd_fused(do, q, k, v, o, lse, scale, stream):
     return dq, dk, dv
 
 
-def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, deterministic=False):
+def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, deterministic=False, window_left=-1):
     """Returns (dq, dk, dv) in q/k/v's dtype and layout; dk/dv have Hkv heads.
 
-    Unless ``deterministic``, a causal call with Sq a multiple of 64 and Skv of 128 takes the
-    fused backward (_flash_attn_bwd_fused), whose dQ is summed with fp32 atomics: dK/dV are
-    bitwise reproducible, dQ only to rounding. Otherwise, and for every other call: the GQA
-    reduction happens inside k_dkdv (one workgroup streams every q head of its kv head), so
-    every output element is written exactly once: deterministic, no atomics.
+    Unless ``deterministic``, a causal call of head dim 128 without a window, with Sq a
+    multiple of 64 and Skv of 128, takes the fused backward (_flash_attn_bwd_fused), whose dQ
+    is summed with fp32 atomics: dK/dV are bitwise reproducible, dQ only to rounding.
+    Otherwise, and for every other call (head dim 64 and the sliding window among them): the
+    GQA reduction happens inside k_dkdv (one workgroup streams every q head of its kv head),
+    so every output element is written exactly once: deterministic, no atomics.
 
     Streams: the dQ chain runs on a side stream (see _SIDE_STREAMS) that first waits for the
     caller's current stream, and the current stream waits for the side stream before this
@@ -308,9 +349,11 @@ def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, determi
     1.1 GiB per call at b4 s8192 hq32) until the side stream's work is seen complete, which
     raises peak memory while the host runs ahead.
     """
-    _check(q, k, v, causal, do=do, o=o, lse=lse)
+    _check(q, k, v, causal, do=do, o=o, lse=lse, window_left=window_left)
     b, sq, hq, d = q.shape
     skv, hkv = k.shape[1], k.shape[2]
+    wl = _window(window_left, skv)
+    win = int(wl >= 0)
     lse = lse.contiguous()
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(d)
@@ -318,12 +361,13 @@ def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, determi
     g = hq // hkv
     cz = int(bool(causal))
     stream = torch.cuda.current_stream()
-    if not deterministic and _fused_ok(sq, skv, causal):
+    if not deterministic and _fused_ok(sq, skv, d, causal, wl):
         return _flash_attn_bwd_fused(do, q, k, v, o, lse, scale, stream)
+    wl = max(wl, 0)  # read by the kernels only when win
     n_rows = b * sq * hq
 
     delta = torch.empty((b, hq, sq), device=q.device, dtype=torch.float32)
-    _launch("delta", _bwd.launch_delta, (do, o, delta, sq, hq, n_rows, n_rows // _bwd.ROWS_DELTA, stream))
+    _launch("delta", _bwd.launch_delta, (do, o, delta, sq, hq, n_rows, n_rows // _bwd.ROWS_DELTA, d, stream))
 
     # Split-K over the dQ kv loop when the dQ grid ((Sq/BLOCK_Q)*Hq*B workgroups, one wave32
     # each) is too small to fill the machine twice; k_redsp_q folds the partials in a fixed
@@ -369,6 +413,9 @@ def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, determi
                 skv // _bwd.BLOCK_KV,
                 hkv,
                 b,
+                wl,
+                d,
+                win,
                 stream,
             ),
         )
@@ -401,6 +448,9 @@ def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, determi
                 b,
                 nsp,
                 hkv * nsp,
+                wl,
+                d,
+                win,
                 stream,
             ),
         )
@@ -437,6 +487,9 @@ def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, determi
                 sq // _bwd.DQ_BQW,
                 hq,
                 b,
+                wl,
+                d,
+                win,
                 side,
             ),
         )
@@ -466,6 +519,9 @@ def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, determi
                 b,
                 nsp_q,
                 hq * nsp_q,
+                wl,
+                d,
+                win,
                 side,
             ),
         )

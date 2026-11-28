@@ -11,7 +11,8 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""FlyDSL flash attention for gfx1250 (MI455X): forward and backward, bf16, head_dim 128.
+"""FlyDSL flash attention for gfx1250 (MI455X): forward and backward, bf16, head_dim 64 or 128,
+causal with an optional sliding window, or full.
 
 Import only on gfx1250; the kernels are wave32 WMMA code. The entry points live in
 ``interface``. The kernels need a flydsl that satisfies ``flydsl_version.FLYDSL_REQUIREMENT``

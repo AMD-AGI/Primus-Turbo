@@ -225,12 +225,13 @@ def _flydsl_gfx1250_ok(
 ) -> bool:
     """Eligibility for FlyDSL's gfx1250 kernels, two families told apart by head dims: the
     DeepSeek-V3 MLA kernels (primus_turbo/flydsl/attention/gfx1250_mla, qk 192 / v 128) and the
-    head-dim-128 GQA kernels (primus_turbo/flydsl/attention/gfx1250).
+    head-dim-64/128 GQA kernels (primus_turbo/flydsl/attention/gfx1250).
 
     Both take bf16 in any byte order (the tensors are [b, s, h, d]-shaped) and no dropout, bias,
-    ALiBi, sink, sliding window or returned softmax; the shape rules (sequence multiples, sizes,
-    sq <= skv when causal) and the flydsl release are each family's own, asked rather than
-    restated.
+    ALiBi, sink or returned softmax; the GQA kernels also take a causal sliding window
+    (window_size (left, 0), or (left, -1) with causal, whose right bound causal makes 0), the
+    MLA kernels none. The shape rules (sequence multiples, sizes, sq <= skv when causal) and the
+    flydsl release are each family's own, asked rather than restated.
     """
     if k is None or v is None or any(t.ndim != 4 for t in (q, k, v)):
         return False
@@ -238,26 +239,27 @@ def _flydsl_gfx1250_ok(
         return False
     if sink is not None:
         return False
-    # No sliding window: full attention, or plain causal (which may arrive as (-1, 0)).
+    # No window on the right: full attention, plain causal (which may arrive as (-1, 0)), or a
+    # causal sliding window (left, 0).
     wl, wr = int(window_size[0]), int(window_size[1])
-    if wl >= 0 or wr > 0:
+    if wr > 0:
         return False
     if softmax_scale is not None and (not isinstance(softmax_scale, Real) or isinstance(softmax_scale, bool)):
         return False
     if is_mla_head_dims(q, k, v):
-        return flydsl_gfx1250_mla_unsupported_reason(q, k, v, bool(causal)) is None
+        return wl < 0 and flydsl_gfx1250_mla_unsupported_reason(q, k, v, bool(causal)) is None
     # A right bound of 0 is a causal mask, so it needs causal=True.
     if wr == 0 and not causal:
         return False
     if not all(t.device == q.device and t.dtype == q.dtype for t in (k, v)):
         return False
-    return flydsl_gfx1250_unsupported_reason(q, k, v, bool(causal)) is None
+    return flydsl_gfx1250_unsupported_reason(q, k, v, bool(causal), wl) is None
 
 
 class DenseAttnFwdFlydslBackend(KernelBackend):
     """FlyDSL dense attention: the gfx950 kernels (sbhd storage, head dim 64/128) on MI355X; on
-    MI455X (gfx1250) the DeepSeek-V3 MLA kernels (qk 192 / v 128) and the head-dim-128 GQA kernels,
-    both in any byte order."""
+    MI455X (gfx1250) the DeepSeek-V3 MLA kernels (qk 192 / v 128) and the head-dim-64/128 GQA
+    kernels (with the causal sliding window), both in any byte order."""
 
     @staticmethod
     def can_handle(
@@ -308,7 +310,9 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
             if is_mla_head_dims(q, k, v):
                 out, lse, _ = flash_attn_flydsl_gfx1250_mla_forward_impl(q, k, v, softmax_scale, causal)
             else:
-                out, lse = flash_attn_flydsl_gfx1250_forward_impl(q, k, v, softmax_scale, causal)
+                out, lse = flash_attn_flydsl_gfx1250_forward_impl(
+                    q, k, v, softmax_scale, causal, int(window_size[0])
+                )
             return (out, lse) if return_lse else out
         # Under autotune, off the op layer's path, so the sbhd view is taken here too.
         q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))
@@ -397,7 +401,7 @@ class DenseAttnFwdTritonBackend(KernelBackend):
     """Portable Triton attention: no CK, no aiter, no arch-specific extension.
 
     The general dense backend on gfx1250 -- FlyDSL there covers only the DeepSeek-V3 MLA head
-    dims and bf16 head_dim 128 without sink or window (q and k each at most 1 GiB), HipKittens
+    dims and bf16 head_dim 64/128 without sink (q and k each at most 1 GiB), HipKittens
     targets another arch, and the aiter path reaches CK, whose fmha backward rejects the call at
     runtime after the forward has succeeded. Its gate is narrow by construction, matching what
     the kernel asserts.
