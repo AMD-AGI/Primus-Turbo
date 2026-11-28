@@ -23,6 +23,10 @@ Two entry points share the same kernel sequence (all FlyDSL composition lives in
 The gated activation defaults to SiLU-SwiGLU; pass a :class:`GLUActivation` (e.g.
 ``GLUActivation.swigluoai()``) to the op that owns it -- ``fused_mega_moe`` or stage2.
 
+Stage2 also takes a per-expert post norm (``post_norm_weight``, gfx1250 bf16): each routed row becomes
+``p * RMSNorm(round((act @ w2^T) * (1 + w)))`` with the routing weight ``p`` applied after the norm (Muse Spark's latent
+MoE), instead of inside the activation.
+
 Each forward reads the rows dispatched to this rank back once (a D2H) and sizes every per-layer
 tensor to them, so neither entry point is CUDA-graph capturable.
 
@@ -294,7 +298,7 @@ class FusedMegaMoEStage1Function(torch.autograd.Function):
                 return (None,) * len(ctx.needs_input_grad)
             x, w1 = ctx.saved_tensors
             if ctx.w1_main_grad is not None and ctx.w1_main_grad.dtype == torch.float32:
-                from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_gfx1250_post_norm_impl import (
+                from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_gfx1250_impl import (
                     stage1_backward_fp32_accum,
                 )
 
@@ -399,7 +403,7 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
             )
 
 
-class FusedMegaMoEStage2PostNormFunction(torch.autograd.Function):
+class _FusedMegaMoEStage2PostNormFunction(torch.autograd.Function):
     """Stage2 with a per-expert post norm (gfx1250 bf16): activation + grouped GEMM2 + norm with the routing
     weight + combine (owns w2 and the norm weight). Output is the MoE result y."""
 
@@ -418,7 +422,7 @@ class FusedMegaMoEStage2PostNormFunction(torch.autograd.Function):
         wgrad_accum_fp32: bool,
         *handle,
     ) -> torch.Tensor:
-        from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_gfx1250_post_norm_impl import (
+        from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_gfx1250_impl import (
             stage2_post_norm_forward,
         )
 
@@ -447,7 +451,7 @@ class FusedMegaMoEStage2PostNormFunction(torch.autograd.Function):
     def backward(ctx, grad_y: Optional[torch.Tensor]):
         """grad l1_out + dW2 + d norm_weight; grad_gate (the norm's routing-weight gradient) rides the
         dispatch_weights slot to stage1.backward."""
-        from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_gfx1250_post_norm_impl import (
+        from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_gfx1250_impl import (
             stage2_post_norm_backward,
         )
 
@@ -520,6 +524,9 @@ def fused_mega_moe_stage2(
     fc1_bias: Optional[torch.Tensor] = None,
     fc2_bias: Optional[torch.Tensor] = None,
     fuse_wgrad_accum_pattern: Optional[str] = None,
+    post_norm_weight: Optional[torch.Tensor] = None,
+    post_norm_eps: float = 1e-5,
+    wgrad_accum_fp32: bool = False,
 ) -> torch.Tensor:
     """Stage2 gate-down. Consumes stage1's ``(l1_out, dispatch_weights, handle)``; returns y.
 
@@ -529,7 +536,30 @@ def fused_mega_moe_stage2(
     fc2 output scaled by the routing weight, i.e. ``y = sum_k p_k (act_k @ w2^T + fc2_bias)``.
     ``fuse_wgrad_accum_pattern="megatron"`` accumulates dW2 into ``w2.main_grad`` (see the module
     docstring).
+
+    ``post_norm_weight`` [H] (gfx1250, bf16, no biases): a per-expert post norm with the routing weight applied after
+    it, ``y = sum_k round(n_k * p_k)`` with ``n = round(RMSNorm(round((act @ w2^T) * (1 + post_norm_weight)),
+    post_norm_eps))`` and ``act`` unweighted; the norm weight gets its gradient. ``wgrad_accum_fp32`` (post norm
+    only, as for :func:`fused_mega_moe_stage1`) lets dW2 accumulate into an fp32 ``main_grad`` too.
     """
+    if post_norm_weight is not None:
+        if fc1_bias is not None or fc2_bias is not None:
+            raise ValueError("fused_mega_moe_stage2: post_norm_weight takes no expert biases")
+        return _FusedMegaMoEStage2PostNormFunction.apply(
+            l1_out,
+            dispatch_weights,
+            topk_idx,
+            w2,
+            post_norm_weight,
+            post_norm_eps,
+            group,
+            activation,
+            fuse_wgrad_accum_pattern,
+            wgrad_accum_fp32,
+            *handle,
+        )
+    if wgrad_accum_fp32:
+        raise ValueError("fused_mega_moe_stage2: wgrad_accum_fp32 needs post_norm_weight")
     # topk_weights stays for API compatibility; stage2 gets the routing weights through dispatch_weights
     return FusedMegaMoEStage2Function.apply(
         l1_out,
@@ -542,39 +572,5 @@ def fused_mega_moe_stage2(
         group,
         activation,
         fuse_wgrad_accum_pattern,
-        *handle,
-    )
-
-
-def fused_mega_moe_stage2_post_norm(
-    l1_out: torch.Tensor,
-    dispatch_weights: torch.Tensor,
-    handle: DispatchHandle,
-    topk_idx: torch.Tensor,
-    w2: torch.Tensor,
-    norm_weight: torch.Tensor,
-    eps: float,
-    group: ProcessGroup,
-    activation: Optional[GLUActivation] = None,
-    fuse_wgrad_accum_pattern: Optional[str] = None,
-    wgrad_accum_fp32: bool = False,
-) -> torch.Tensor:
-    """Stage2 gate-down with a per-expert post norm (gfx1250, bf16). Consumes stage1's
-    ``(l1_out, dispatch_weights, handle)``; returns ``y = sum_k round(n_k * p_k)`` where, per routed row,
-    ``n = round(RMSNorm(round((act @ w2^T) * (1 + norm_weight)), eps))`` (``act`` unweighted). The routing weight
-    is applied after the norm, which a weight inside the activation (:func:`fused_mega_moe_stage2`) cannot express.
-    ``fuse_wgrad_accum_pattern`` / ``wgrad_accum_fp32``: as for :func:`fused_mega_moe_stage1`, for dW2.
-    """
-    return FusedMegaMoEStage2PostNormFunction.apply(
-        l1_out,
-        dispatch_weights,
-        topk_idx,
-        w2,
-        norm_weight,
-        eps,
-        group,
-        activation,
-        fuse_wgrad_accum_pattern,
-        wgrad_accum_fp32,
         *handle,
     )

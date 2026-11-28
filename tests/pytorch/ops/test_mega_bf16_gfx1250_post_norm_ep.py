@@ -38,7 +38,7 @@ if not is_gfx1250():
 
 from primus_turbo.pytorch.ops.moe.fused_mega_moe import (  # noqa: E402
     fused_mega_moe_stage1,
-    fused_mega_moe_stage2_post_norm,
+    fused_mega_moe_stage2,
 )
 from tests.pytorch.ops.mega_gfx1250_ep_utils import (  # noqa: E402
     assert_snr_all_ranks,
@@ -127,8 +127,18 @@ class MegaMoEPostNormGfx1250EPTest(MultiProcContinuousTest):
                     w.grad_added_to_main_grad = False
                 accum = {"fuse_wgrad_accum_pattern": "megatron", "wgrad_accum_fp32": True}
             l1_out, dispatch_weights, handle = fused_mega_moe_stage1(lx, topk_idx, ltw, lw1, group, **accum)
-            y = fused_mega_moe_stage2_post_norm(
-                l1_out, dispatch_weights, handle, topk_idx, lw2, lnw, EPS, group, activation, **accum
+            y = fused_mega_moe_stage2(
+                l1_out,
+                dispatch_weights,
+                handle,
+                topk_idx,
+                ltw,
+                lw2,
+                group,
+                activation,
+                post_norm_weight=lnw,
+                post_norm_eps=EPS,
+                **accum,
             )
             y.backward(dy)
             if fp32_accum:
