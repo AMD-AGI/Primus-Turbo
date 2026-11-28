@@ -113,6 +113,7 @@ def launch_mxgp_fp8blk_nt_gfx1250(
     k_max: Constexpr[int] = 4096,
     early: Constexpr[int] = 4,
     tbl: Constexpr[int] = 0,
+    mc: Constexpr[int] = 1,
 ):
     """Persistent: grid = #CUs; workgroup bid computes live tiles t = bid, bid + nwg, ... (live = offs[G] / 256 m-tiles
     x N / 256, read on the device: no dead workgroups, usable for EP>1 worst-case pools). Across tiles: k-tile K-2's
@@ -160,7 +161,7 @@ def launch_mxgp_fp8blk_nt_gfx1250(
     NA = 2
     kernel_name = f"moe_mxgp_fp8blk_nt_gfx1250_t256x256x256_a{a_id}{b_id}_g{G}_k{k_max}_e{early}" + (
         f"_tb{tbl}" if tbl else ""
-    )
+    ) + (f"_mc{mc}" if mc > 1 else "")
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
     def kernel_mxgp(
@@ -244,6 +245,9 @@ def launch_mxgp_fp8blk_nt_gfx1250(
 
         gA = _gview(_cast(a_cls, arg_a), fx.Int64(0), (tile_m, tile_k), (i32_k, 1))
         gB = _gview(_cast(b_cls, arg_b), fx.Int64(0), (tile_n, tile_k), (i32_k, 1))
+        # mc > 1: workgroup cluster of mc consecutive ids = mc consecutive n-tiles of one m-tile (the walk
+        # t = bid + it * nwg with nwg % mc == 0 and n_tiles_n % mc == 0 keeps the peers on one m-tile for every
+        # tile): their A k-tiles are the same -> one TDM multicast load (same bytes in LDS, same C bits)
         atomA = fx.rocdl.make_tdm_atom(
             gA,
             [None, None],
@@ -251,7 +255,10 @@ def launch_mxgp_fp8blk_nt_gfx1250(
             num_warps=num_waves,
             pad_interval=tile_k,
             pad_amount=LDS_PAD,
+            early_timeout=mc > 1,
         )
+        if const_expr(mc > 1):
+            atomA = fx.atom_set_value(atomA, "workgroup_mask", fx.Int32((1 << mc) - 1))
         atomB = fx.rocdl.make_tdm_atom(
             gB,
             [None, None],
@@ -542,8 +549,23 @@ def launch_mxgp_fp8blk_nt_gfx1250(
                 bar()
                 load_scales(0, SETS[0])
 
-    kernel_mxgp(arg_c, arg_a, arg_b, arg_offs, arg_sa, arg_sb, i32_nwg, i32_n, i32_k).launch(
-        grid=(i32_nwg, 1, 1), block=(block, 1, 1), stream=stream
+    # the cluster geometry must reach both the kernel and the launch
+    kernel_mxgp(
+        arg_c,
+        arg_a,
+        arg_b,
+        arg_offs,
+        arg_sa,
+        arg_sb,
+        i32_nwg,
+        i32_n,
+        i32_k,
+        value_attrs=({"rocdl.cluster_dims": f"{mc},1,1"} if mc > 1 else None),
+    ).launch(
+        grid=(i32_nwg, 1, 1),
+        block=(block, 1, 1),
+        stream=stream,
+        cluster=((mc, 1, 1) if mc > 1 else None),
     )
 
 
@@ -551,9 +573,12 @@ launch_mxgp_fp8blk_nt_gfx1250.compile_hints["llvm_options"] = {"amdgpu-expert-sc
 _COMPILED_P: dict = {}
 # PRIMUS_TURBO_MXGP_TBL (default 1): expert lookup through the LDS m-tile table (same bits; 0 = per-tile scan)
 _MXGP_TBL = os.environ.get("PRIMUS_TURBO_MXGP_TBL", "1") != "0"
+# PRIMUS_TURBO_MXGP_MC (default 2): the A k-tiles are TDM-multicast to a cluster of this many workgroups (consecutive
+# n-tiles of one m-tile); 1 = off. Same C bits.
+_MXGP_MC = int(os.environ.get("PRIMUS_TURBO_MXGP_MC", "2"))
 
 
-def mxgp_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, early=4, nwg=None, tbl=None):
+def mxgp_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, early=4, nwg=None, tbl=None, mc=None):
     """out [M, N] bf16, bit-identical to flygg_fp8blk_nt(..., tile=(256, 256, 256), num_buffers=2): a [M, K] fp8,
     b [G, N, K] fp8, sa [M, K/32] / sb [G, N, K/32] uint8 E8M0. Needs K % 512 == 0, power-of-two K, N % 256 == 0,
     group offsets multiples of 256 (live tiles are bounded on the device by offs[G])."""
@@ -570,6 +595,12 @@ def mxgp_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, early=4, nwg=None, tbl=None
     if nwg is None:
         nwg = torch.cuda.get_device_properties(a.device).multi_processor_count
     nwg = max(1, min(nwg, (M // 256) * (N // 256)))
+    if mc is None:
+        mc = _MXGP_MC
+    if mc > 1 and ((N // 256) % mc or nwg < mc):
+        mc = 1
+    if mc > 1:
+        nwg = nwg // mc * mc  # whole clusters
     if tbl is None:
         tbl = _MXGP_TBL
     if tbl:
@@ -598,8 +629,9 @@ def mxgp_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, early=4, nwg=None, tbl=None
         K,
         early,
         tbl,
+        mc,
     )
-    key = (G, a_id, b_id, K, early, nwg, tbl)
+    key = (G, a_id, b_id, K, early, nwg, tbl, mc)
     c = _COMPILED_P.get(key)
     if c is None:
         _COMPILED_P[key] = flyc.compile(launch_mxgp_fp8blk_nt_gfx1250, *args)
