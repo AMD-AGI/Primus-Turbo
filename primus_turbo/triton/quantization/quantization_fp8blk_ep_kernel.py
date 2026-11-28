@@ -26,6 +26,8 @@ every table is built on the device, so nothing here syncs with the host.
   pack_pool_rows      receiving rank: live pool rows -> their combine slots (grid over the live pool rows only).
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -241,6 +243,220 @@ def quant_rows_send(
         num_warps=4,
     )
     return q, s
+
+
+@triton.jit
+def _dp_src_kernel(
+    X,
+    IDX,
+    TW,
+    Q,
+    PAY,
+    ITR,
+    NTR,
+    T,
+    H,
+    stride_x,
+    W,
+    K: tl.constexpr,
+    KP: tl.constexpr,
+    R: tl.constexpr,
+    EL: tl.constexpr,
+    BT: tl.constexpr,
+    ROUTES: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    """grid (cdiv(T, BT), H // 128). The DeepEP source side in one launch: Q [T, H] fp8 = the 1x128 row quant of
+    quant_rows_send (same expressions, same bytes), its E8M0 bytes into PAY int32 [T, W] (byte pc of each row: the
+    s.view(int32) words); ROUTES (column block 0): PAY[t, H/512 + k] = global expert id, PAY[t, H/512 + K + k] =
+    fp32 route weight bits, ITR u8 [T, R] (token has a route on rank d) and NTR [R] += tokens per rank (int atomics,
+    exact; NTR zeroed by the caller)."""
+    pt = tl.program_id(0)
+    pc = tl.program_id(1)
+    t = pt * BT + tl.arange(0, BT)
+    c = pc * 128 + tl.arange(0, 128)
+    tm = t < T
+    v = tl.load(X + t[:, None].to(tl.int64) * stride_x + c[None, :], mask=tm[:, None], other=0.0)
+    v = v.to(tl.float32)
+    av = tl.abs(v)
+    er = _ue8m0_exp(tl.max(av, axis=1), FP8_MAX)
+    q = (v * pow2_neg_fly(er)[:, None]).to(Q.dtype.element_ty)
+    b = ((er + 127) & 0xFF).to(tl.uint8)
+    tl.store(Q + t[:, None].to(tl.int64) * H + c[None, :], q, mask=tm[:, None])
+    tl.store(PAY.to(tl.pointer_type(tl.uint8)) + t.to(tl.int64) * (W * 4) + pc, b, mask=tm)
+    if ROUTES:
+        if pc == 0:
+            k = tl.arange(0, KP)
+            m = tm[:, None] & (k[None, :] < K)
+            off = t[:, None].to(tl.int64) * K + k[None, :]
+            idx = tl.load(IDX + off, mask=m, other=0)
+            w = tl.load(TW + off, mask=m, other=0.0).to(tl.float32)
+            prow = PAY + t[:, None].to(tl.int64) * W + H // 512 + k[None, :]
+            tl.store(prow, idx.to(tl.int32), mask=m)
+            tl.store(prow + K, w.to(tl.int32, bitcast=True), mask=m)
+            dst = tl.where(m, idx // EL, -1).to(tl.int32)
+            d = tl.arange(0, R)
+            has = tl.max((dst[:, :, None] == d[None, None, :]).to(tl.int32), axis=1)  # [BT, R]
+            tl.store(ITR + t[:, None].to(tl.int64) * R + d[None, :], has.to(tl.uint8), mask=tm[:, None])
+            tl.atomic_add(NTR + d, tl.sum(has, axis=0))
+
+
+def dp_src_pack(x: torch.Tensor, idx: torch.Tensor = None, tw: torch.Tensor = None, R: int = 1, E_l: int = 1,
+                dtype=torch.float8_e4m3fn, bt: int = 64):
+    """DeepEP source side: x [T, H] bf16 -> q [T, H] fp8 (quant_rows_send's row quant) and the payload int32 [T, W]
+    (E8M0 bytes in the first H/512 words; with ``idx`` int [T, K] global expert ids / ``tw`` [T, K] weights also the
+    ids and the fp32 weight bits, W = H/512 + 2K). With idx: also itr bool [T, R], ntr int32 [R] (tokens per rank).
+    Returns (q, payload) or (q, payload, itr, ntr)."""
+    T, H = x.shape
+    assert H % 512 == 0 and x.stride(1) == 1
+    dev = x.device
+    nsw = H // 512
+    routes = idx is not None
+    K = idx.shape[1] if routes else 0
+    W = nsw + 2 * K
+    q = torch.empty((T, H), device=dev, dtype=dtype)
+    pay = torch.empty((T, W), device=dev, dtype=torch.int32)
+    if routes:
+        idx = idx.contiguous()
+        tw = tw.contiguous()
+        assert R & (R - 1) == 0 and idx.shape == tw.shape
+        itr = torch.empty((T, R), device=dev, dtype=torch.bool)
+        ntr = torch.zeros(R, device=dev, dtype=torch.int32)
+    else:
+        itr = ntr = None
+    if T > 0:
+        _dp_src_kernel[(triton.cdiv(T, bt), H // 128)](
+            x, idx if routes else pay, tw if routes else pay, q, pay,
+            itr.view(torch.uint8) if routes else pay, ntr if routes else pay,
+            T, H, x.stride(0), W,
+            K=max(K, 1), KP=triton.next_power_of_2(max(K, 1)), R=R, EL=E_l, BT=bt, ROUTES=int(routes),
+            FP8_MAX=torch.finfo(dtype).max, num_warps=4,
+        )
+    return (q, pay, itr, ntr) if routes else (q, pay)
+
+
+@triton.jit
+def _dp_route_load(RP, W, IOFF, CNTP, ME_EL, r, m, K: tl.constexpr, EL: tl.constexpr):
+    """Route r = (n, k) of DeepEP received row n: (n, local expert id or -1, live). Rows past the live count
+    CNTP[0] are unwritten DeepEP slots (masked)."""
+    n = r // K
+    cnt = tl.load(CNTP)
+    live0 = m & (n < cnt)
+    g = tl.load(RP + n.to(tl.int64) * W + IOFF + r % K, mask=live0, other=-1)
+    loc = g - ME_EL
+    ok = live0 & (loc >= 0) & (loc < EL)
+    return n, tl.where(ok, loc, -1), ok
+
+
+@triton.jit
+def _dp_route_count_kernel(
+    RP, W, IOFF, CNTP, ME_EL, CNT, ROWMAP, RW, R, P, NCH,
+    K: tl.constexpr, E: tl.constexpr, BLOCK: tl.constexpr, PB: tl.constexpr,
+):
+    """_route_count_meta_kernel over the DeepEP payload; CNT [E, NCH] (expert-major: the offsets kernel reads a
+    contiguous column per expert); resets ROWMAP -1 / RW 0 over this program's share of P."""
+    ch = tl.program_id(0)
+    e_ar = tl.arange(0, E)
+    r = ch * BLOCK + tl.arange(0, BLOCK)
+    m = r < R
+    n, idx, ok = _dp_route_load(RP, W, IOFF, CNTP, ME_EL, r, m, K, E)
+    tl.store(CNT + e_ar * NCH + ch, tl.sum((idx[:, None] == e_ar[None, :]).to(tl.int32), axis=0))
+    pr = ch * PB + tl.arange(0, PB)
+    tl.store(ROWMAP + pr, tl.full((PB,), -1, tl.int32), mask=pr < P)
+    tl.store(RW + pr, tl.zeros((PB,), tl.float32), mask=pr < P)
+
+
+@triton.jit
+def _dp_route_offs_kernel(CNT, BASE, TOT, NCH, NCP: tl.constexpr):
+    """grid (E,): expert e's exclusive prefix over the chunks BASE[e, :] and its route total TOT[e] (one program per
+    expert instead of _route_offs_kernel's single program over all [nchunk, E])."""
+    e = tl.program_id(0)
+    c_ar = tl.arange(0, NCP)
+    m = c_ar < NCH
+    c = tl.load(CNT + e * NCH + c_ar, mask=m, other=0)
+    tl.store(BASE + e * NCH + c_ar, tl.cumsum(c, 0) - c, mask=m)
+    tl.store(TOT + e, tl.sum(c, 0))
+
+
+@triton.jit
+def _dp_route_scatter_kernel(
+    RP, W, IOFF, WOFF, CNTP, ME_EL, BASE, TOT, POFFS, ROWMAP, RW, INV, R, NCH, WOK, WCAP,
+    E: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr, ALIGN: tl.constexpr, HAS_WOK: tl.constexpr,
+):
+    """_route_scatter_meta_kernel over the DeepEP payload, with the padded expert starts (the _route_offs_kernel
+    formula) recomputed from TOT in every program; program 0 writes POFFS."""
+    ch = tl.program_id(0)
+    e_ar = tl.arange(0, E)
+    tot = tl.load(TOT + e_ar)
+    plen = tl.maximum((tot + ALIGN - 1) // ALIGN, 1) * ALIGN
+    pend = tl.cumsum(plen, 0)
+    pstart = pend - plen
+    if ch == 0:
+        tl.store(POFFS + 1 + e_ar, pend)
+        tl.store(POFFS + e_ar, pstart, mask=e_ar == 0)
+        if HAS_WOK:  # the wgrad window check (max expert window <= WCAP) as one flag
+            tl.store(WOK, (tl.max(plen, 0) <= WCAP).to(tl.uint8))
+    r = ch * BLOCK + tl.arange(0, BLOCK)
+    m = r < R
+    n, idx, live = _dp_route_load(RP, W, IOFF, CNTP, ME_EL, r, m, K, E)
+    oh = (idx[:, None] == e_ar[None, :]).to(tl.int32)
+    base = pstart + tl.load(BASE + e_ar * NCH + ch)
+    pos = tl.sum(oh * (base[None, :] + tl.cumsum(oh, 0) - 1), axis=1)
+    tl.store(ROWMAP + pos, n, mask=live)
+    tw = tl.load(RP + n.to(tl.int64) * W + WOFF + r % K, mask=live, other=0).to(tl.float32, bitcast=True)
+    tl.store(RW + pos, tw, mask=live)
+    tl.store(INV + r, tl.where(live, pos, -1), mask=m)
+
+
+def build_routing_dp(
+    rp: torch.Tensor,
+    ioff: int,
+    woff: int,
+    cntp: torch.Tensor,
+    me: int,
+    N: int,
+    K: int,
+    num_experts: int,
+    P: int,
+    align: int = 256,
+    block: int = None,
+    wcap: int = 0,
+):
+    """build_routing_blk_meta straight from DeepEP's received payload rp int32 [N, W] (global expert ids at column
+    ``ioff``, fp32 weight bits at ``woff``; rank ``me`` owns experts [me*E, (me+1)*E)), live rows n < cntp[0] (a
+    one-element view of the rank prefix matrix): no materialized metadata, and the chunk prefix in E parallel
+    programs. Same outputs, bit for bit, as build_routing_blk_meta over the equivalent metadata (p2s None).
+    ``wcap`` > 0: also a bool [1] flag, max(poffs[1:] - poffs[:-1]) <= wcap (7th output; else None)."""
+    E = num_experts
+    assert E & (E - 1) == 0, "local expert count must be a power of two (tl.arange)"
+    assert rp.dtype == torch.int32 and rp.is_contiguous() and rp.shape[0] == N and cntp.dtype == torch.int32
+    W = rp.shape[1]
+    R = N * K
+    dev = rp.device
+    if block is None:  # same chunking rule as build_routing_blk_masked (layout is chunking-independent)
+        block = max(128, min(512, triton.next_power_of_2(triton.cdiv(R, 128))))
+    nw = 4 if block <= 128 else 8
+    nch = triton.cdiv(R, block)
+    pb = triton.next_power_of_2(triton.cdiv(P, nch))
+    poffs = torch.empty(E + 1, dtype=torch.int32, device=dev)
+    rowmap = torch.empty(P, dtype=torch.int32, device=dev)
+    rw = torch.empty(P, dtype=torch.float32, device=dev)
+    inv = torch.empty(R, dtype=torch.int32, device=dev)
+    cnt = torch.empty((E, nch), dtype=torch.int32, device=dev)
+    base = torch.empty((E, nch), dtype=torch.int32, device=dev)
+    tot = torch.empty(E, dtype=torch.int32, device=dev)
+    me_el = me * E
+    wok = torch.empty(1, dtype=torch.bool, device=dev) if wcap > 0 else None
+    _dp_route_count_kernel[(nch,)](
+        rp, W, ioff, cntp, me_el, cnt, rowmap, rw, R, P, nch, K=K, E=E, BLOCK=block, PB=pb, num_warps=nw
+    )
+    _dp_route_offs_kernel[(E,)](cnt, base, tot, nch, NCP=triton.next_power_of_2(nch), num_warps=4)
+    _dp_route_scatter_kernel[(nch,)](
+        rp, W, ioff, woff, cntp, me_el, base, tot, poffs, rowmap, rw, inv, R, nch,
+        wok.view(torch.uint8) if wok is not None else tot, max(wcap, 0), E=E, K=K, BLOCK=block,
+        ALIGN=align, HAS_WOK=int(wok is not None), num_warps=nw,
+    )
+    return rowmap, rw, inv, poffs, poffs[E:], None, wok
 
 
 @triton.jit
@@ -510,6 +726,7 @@ def _gather_dual_fp8_kernel(
     P,
     C,
     PREAL,
+    XS_STRIDE,
     FP8_MAX: tl.constexpr,
     HAS_PREAL: tl.constexpr,
     CT: tl.constexpr = 0,
@@ -530,7 +747,7 @@ def _gather_dual_fp8_kernel(
     valid = src >= 0
     src = tl.where(valid, src, 0).to(tl.int64)
     qb = tl.load(XQ + src[:, None] * C + c[None, :], mask=valid[:, None], other=0)  # uint8 bytes
-    er = tl.load(XS + src * (C // 128) + pc, mask=valid, other=127).to(tl.int32) - 127
+    er = tl.load(XS + src * XS_STRIDE + pc, mask=valid, other=127).to(tl.int32) - 127
     tl.store(Q + p[:, None].to(tl.int64) * C + c[None, :], qb)
     store_scale(S, p, pc, er, P, C // 128, SL)
     v = qb.to(tl.float8e4nv, bitcast=True).to(tl.float32) * pow2_pos(er)[:, None]
@@ -548,6 +765,68 @@ def _gather_dual_fp8_kernel(
         store_scale(ST, c, pt, ec, C, P // 128, SL)
 
 
+@triton.jit
+def _gather_dual_fp8_tile_kernel(
+    XQ,
+    XS,
+    ROWMAP,
+    Q,
+    S,
+    QT,
+    ST,
+    P,
+    C,
+    PREAL,
+    XS_STRIDE,
+    FP8_MAX: tl.constexpr,
+    HAS_PREAL: tl.constexpr,
+    CT: tl.constexpr,
+    SL: tl.constexpr,
+    RB: tl.constexpr,
+    CB: tl.constexpr,
+):
+    """_gather_dual_fp8_kernel on a (RB*128) x (CB*128) tile: grid (P // (RB*128), C // (CB*128)). Per element the
+    same math (row scale of its 128-column block, column scale over its 128-row block), so bit-identical; the wider
+    tile gives longer contiguous runs for the gathered row loads / Q stores (CB) and the QT stores (RB)."""
+    BR: tl.constexpr = RB * 128
+    BC: tl.constexpr = CB * 128
+    pt = tl.program_id(0)
+    pc = tl.program_id(1)
+    if HAS_PREAL:
+        if pt * BR >= tl.load(PREAL):
+            return
+    p = pt * BR + tl.arange(0, BR)
+    c = pc * BC + tl.arange(0, BC)
+    kb = pc * CB + tl.arange(0, CB)
+    src = tl.load(ROWMAP + p)
+    valid = src >= 0
+    src = tl.where(valid, src, 0).to(tl.int64)
+    qb = tl.load(XQ + src[:, None] * C + c[None, :], mask=valid[:, None], other=0)  # uint8 bytes
+    er = tl.load(XS + src[:, None] * XS_STRIDE + kb[None, :], mask=valid[:, None], other=127).to(tl.int32) - 127
+    tl.store(Q + p[:, None].to(tl.int64) * C + c[None, :], qb)
+    store_scale(S, p[:, None], kb[None, :], er, P, C // 128, SL)
+    v = tl.reshape(qb.to(tl.float8e4nv, bitcast=True).to(tl.float32), (BR, CB, 128)) * pow2_pos(er)[:, :, None]
+    v = tl.reshape(v, (RB, 128, BC))
+    ec = _ue8m0_exp(tl.max(tl.abs(v), axis=1), FP8_MAX)  # [RB, BC]
+    qc = tl.reshape(v * pow2_neg_fly(ec)[:, None, :], (BR, BC)).to(QT.dtype.element_ty)
+    u = tl.reshape(qc.to(tl.uint8, bitcast=True).to(tl.int32), (BR // 4, 4, BC))
+    w = tl.sum(u << (tl.arange(0, 4) * 8)[None, :, None], axis=1)  # [BR/4, BC]: 4 pool rows of a column per int32
+    pw = pt * (BR // 4) + tl.arange(0, BR // 4)
+    tl.store(QT.to(tl.pointer_type(tl.int32)) + c[:, None].to(tl.int64) * (P // 4) + pw[None, :], tl.trans(w))
+    rb = pt * RB + tl.arange(0, RB)
+    if CT:
+        tl.store(ST + c[:, None].to(tl.int64) * (P // 128) + rb[None, :], tl.trans((ec + 127) & 0xFF).to(tl.uint8))
+    else:
+        store_scale(ST, c[:, None], rb[None, :], tl.trans(ec), C, P // 128, SL)
+
+
+def _gather_tile():
+    """PRIMUS_TURBO_GATHER_TILE="RB,CB[,num_warps]" of gather_dual_fp8 (default "2,1,8": 256 x 128 tiles, 256-B QT
+    runs; MBS4 EP4 shape 262 -> 236 us/call, bit-identical; "1,1" = the 128 x 128 _gather_dual_fp8_kernel)."""
+    v = os.environ.get("PRIMUS_TURBO_GATHER_TILE", "2,1,8").split(",")
+    return int(v[0]), int(v[1]), int(v[2]) if len(v) > 2 else 8
+
+
 def gather_dual_fp8(
     xq: torch.Tensor,
     xs: torch.Tensor,
@@ -562,10 +841,35 @@ def gather_dual_fp8(
     qT [C, P], sT [C, P/32] or [C, P/128] when ``compact_t``): quant_dual_blk's outputs and layouts, with the row
     quant taken over unchanged and the 128x1 quant re-derived from the FP8 values."""
     N, C = xq.shape
-    assert P % 128 == 0 and C % 128 == 0 and xq.is_contiguous() and xs.is_contiguous()
-    assert xs.dtype == torch.uint8 and xs.shape == (N, C // 128) and rowmap.dtype == torch.int32
+    assert P % 128 == 0 and C % 128 == 0 and xq.is_contiguous()
+    # xs: [N, C/128] with unit column stride and any row stride (e.g. the scale bytes inside a DeepEP payload row)
+    assert xs.dtype == torch.uint8 and xs.shape == (N, C // 128) and xs.stride(1) == 1 and rowmap.dtype == torch.int32
     sl = scale_layout_id(scale_layout)
     q, s, qT, sT = _dual_alloc(P, C, xq.dtype, sl, compact_t, xq.device)
+    rb, cb, tnw = _gather_tile()
+    # wide tiles for the x4 / byte scale layouts (validated); the packed layout keeps the 128 x 128 kernel
+    if (rb, cb) != (1, 1) and sl in (0, 1) and P % (rb * 128) == 0 and C % (cb * 128) == 0:
+        _gather_dual_fp8_tile_kernel[(P // (rb * 128), C // (cb * 128))](
+            xq.view(torch.uint8),
+            xs,
+            rowmap,
+            q.view(torch.uint8),
+            s,
+            qT,
+            sT,
+            P,
+            C,
+            preal if preal is not None else rowmap,
+            xs.stride(0),
+            FP8_MAX=torch.finfo(xq.dtype).max,
+            HAS_PREAL=int(preal is not None),
+            CT=int(compact_t),
+            SL=sl,
+            RB=rb,
+            CB=cb,
+            num_warps=tnw,
+        )
+        return q, s, qT, sT
     _gather_dual_fp8_kernel[(P // 128, C // 128)](
         xq.view(torch.uint8),
         xs,
@@ -577,6 +881,7 @@ def gather_dual_fp8(
         P,
         C,
         preal if preal is not None else rowmap,
+        xs.stride(0),
         FP8_MAX=torch.finfo(xq.dtype).max,
         HAS_PREAL=int(preal is not None),
         CT=int(compact_t),
@@ -663,9 +968,12 @@ def _presum_routes_kernel(
         if p >= 0:
             acc += tl.load(ROWS + p.to(tl.int64) * H + h).to(tl.float32)
             live += 1
-            if HAS_EXT:
+            if HAS_EXT == 1:
                 if tl.program_id(1) == 0:
                     tl.store(EXT_OUT + tl.load(P2S + p), tl.load(EXT + p))
+        if HAS_EXT == 2:  # per received route: EXT_OUT[n, k] = EXT[p] (0 for no route on this rank)
+            if tl.program_id(1) == 0:
+                tl.store(EXT_OUT + n * K + k, tl.load(EXT + tl.maximum(p, 0), mask=p >= 0, other=0.0))
     if live > 0:
         tl.store(OUT + n.to(tl.int64) * H + h, acc.to(OUT.dtype.element_ty))
 
@@ -683,26 +991,34 @@ def presum_routes(
     """Expert rank of the EP combine: rows [P, H] pool rows (routing weight applied), inv int32 [N*K] pool row of
     received route (n, k) or -1 -> out [N, H]: per received token, the sum of its routes on this rank.
     ``ext`` fp32 [P] (with ``p2s``, ``nslots``): also -> ext_out [nslots] by combine slot (scatter_pool_ext of the
-    live routes; other slots unwritten). Returns out, or (out, ext_out)."""
+    live routes; other slots unwritten); ``ext`` without ``p2s``: ext_out fp32 [N, K] = ext[inv] (0 where inv < 0).
+    Returns out, or (out, ext_out)."""
     P, H = rows.shape
     assert rows.is_contiguous() and inv.dtype == torch.int32 and inv.numel() == N * K and H % 128 == 0
     bh = min(bh, H & -H)
     out = torch.empty((N, H), device=rows.device, dtype=rows.dtype)
     ext_out = None
+    mode = 0
     if ext is not None:
-        assert ext.dtype == torch.float32 and ext.numel() == P and p2s is not None and p2s.numel() == P
-        ext_out = torch.empty(nslots, device=rows.device, dtype=torch.float32)
+        assert ext.dtype == torch.float32 and ext.numel() == P and ext.is_contiguous()
+        if p2s is None:
+            mode = 2
+            ext_out = torch.empty((N, K), device=rows.device, dtype=torch.float32)
+        else:
+            assert p2s.numel() == P
+            mode = 1
+            ext_out = torch.empty(nslots, device=rows.device, dtype=torch.float32)
     _presum_routes_kernel[(N, H // bh)](
         rows,
         inv,
         out,
         H,
         ext if ext is not None else rows,
-        p2s if ext is not None else inv,
+        p2s if p2s is not None and ext is not None else inv,
         ext_out if ext is not None else out,
         K=K,
         BH=bh,
-        HAS_EXT=int(ext is not None),
+        HAS_EXT=mode,
         num_warps=4,
     )
     return out if ext is None else (out, ext_out)

@@ -53,7 +53,9 @@ from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad, main_grad_first_wri
 from primus_turbo.triton.quantization.quantization_fp8blk_ep_kernel import (
     build_routing_blk_masked,
     build_routing_blk_meta,
+    build_routing_dp,
     combine_ranks,
+    dp_src_pack,
     gather_dual_fp8,
     pack_pool_rows,
     presum_routes,
@@ -225,6 +227,7 @@ class _Rank:
         "perm",
         "topk_dtype",
         "handle",
+        "wok",
     )
 
     def __init__(self):
@@ -357,7 +360,15 @@ def _src_rows(x, quant):
     return q.view(T, -1), (None if s is None else s.view(T, -1))
 
 
-def _dp_send(st, payload, q, rk, itr=None):
+def _dp_fused() -> bool:
+    """PRIMUS_TURBO_EP_DP_FUSED (default 1): the DeepEP path's source packing (quant + payload + per-rank counts),
+    expert-side tables (straight from the received payload, parallel chunk prefix) and combine d route_w in fused
+    launches. Bit-identical to 0 (the per-op torch path): DSv4-Flash 4L EP4 MBS4, same loss and grad norm at every
+    iteration, -3.7 ms/step."""
+    return os.environ.get("PRIMUS_TURBO_EP_DP_FUSED", "1") != "0"
+
+
+def _dp_send(st, payload, q, rk, itr=None, ntr=None):
     """DeepEP dispatch of the FP8 rows q [T, H] with ``payload`` int32 [T, w] (E8M0 scales, + the routes on the
     forward) to the ranks in ``itr`` (bool [T, R]); the backward reuses the forward's handle (cached notify).
     Received rows are in DeepEP order (source rank, token order), [N, ...] with only the first
@@ -369,9 +380,20 @@ def _dp_send(st, payload, q, rk, itr=None):
     if itr is None:
         (rq, rp), *_ = buf.dispatch((q, payload), handle=rk.handle, num_worst_tokens=st.N, config=comm.dcfg)
         return rq, rp
-    ntr = itr.sum(0, dtype=torch.int32)
-    didx = torch.zeros((T, 1), dtype=torch.int64, device=q.device)
-    dw = torch.zeros((T, 1), dtype=torch.float32, device=q.device)
+    if ntr is None:
+        ntr = itr.sum(0, dtype=torch.int32)
+    if _dp_fused():
+        # the dummy route (never read: one "expert" per rank) is a constant: built once, on the first (eager) call
+        z = getattr(comm, "_dummy_route", None)
+        if z is None or z[0].shape[0] != T or z[0].device != q.device:
+            z = comm._dummy_route = (
+                torch.zeros((T, 1), dtype=torch.int64, device=q.device),
+                torch.zeros((T, 1), dtype=torch.float32, device=q.device),
+            )
+        didx, dw = z
+    else:
+        didx = torch.zeros((T, 1), dtype=torch.int64, device=q.device)
+        dw = torch.zeros((T, 1), dtype=torch.float32, device=q.device)
     (rq, rp), _, _, _, rk.handle, _ = buf.dispatch(
         (q, payload), num_tokens_per_rank=ntr, is_token_in_rank=itr, num_tokens_per_expert=ntr, topk_idx=didx,
         topk_weights=dw, num_worst_tokens=st.N, config=comm.dcfg,
@@ -390,10 +412,24 @@ def _dispatch_fwd_dp(st: _EPState, xs, idxs, tws):
     rk, x, idx, tw = st.ranks[0], xs[0], idxs[0], tws[0]
     T = x.shape[0]
     me = st.comm.rank
+    nsw = H // 128 // 4
+    if _dp_fused():
+        # one launch: quant + payload (scales, ids, weight bits) + is_token_in_rank + tokens per rank
+        q, payload, itr, ntr = dp_src_pack(x, idx, tw, R, E_l)
+        rq, rp = _dp_send(st, payload, q, rk, itr=itr, ntr=ntr)
+        del payload
+        # tables straight from the received payload; the live count is read in place from the rank prefix matrix
+        cntp = rk.handle[0].view(-1)[(R - 1) * R + me :]
+        wcap = _blk._vkp_kwin(st.wwin) if st.wwin < st.N else 0
+        rk.rowmap, rk.rw, rk.inv, rk.poffs, rk.preal, rk.p2s, rk.wok = build_routing_dp(
+            rp, nsw, nsw + K, cntp, me, N, K, E_l, P, align=_blk._ALIGN, wcap=wcap
+        )
+        rs = rp.view(torch.uint8)[:, : H // 128]  # the E8M0 bytes in place (row stride = payload row)
+        xq, xs_, rk.xT, rk.xTs = gather_dual_fp8(rq.view(N, H), rs, P, rk.rowmap, preal=rk.preal, compact_t=st.ct)
+        return [(xq, xs_)]
     itr = torch.zeros((T, R), dtype=torch.bool, device=x.device)
     itr.scatter_(1, idx // E_l, True)
     q, s = _src_rows(x, True)
-    nsw = H // 128 // 4
     payload = torch.empty((T, nsw + 2 * K), dtype=torch.int32, device=x.device)
     payload[:, :nsw].copy_(s.view(torch.int32))
     payload[:, nsw : nsw + K].copy_(idx)
@@ -421,8 +457,12 @@ def _dispatch_dy(st: _EPState, dys):
     fp8 = st.dispatch == "fp8"
     if _dp(st):
         rk = st.ranks[0]
-        q, s = _src_rows(dys[0].contiguous().to(torch.bfloat16), True)
-        rq, rp = _dp_send(st, s.view(torch.int32), q, rk)
+        if _dp_fused():
+            q, pay = dp_src_pack(dys[0].contiguous().to(torch.bfloat16))
+        else:
+            q, s = _src_rows(dys[0].contiguous().to(torch.bfloat16), True)
+            pay = s.view(torch.int32)
+        rq, rp = _dp_send(st, pay, q, rk)
         return [gather_dual_fp8(rq.view(N, H), rp.view(torch.uint8), P, rk.rowmap, preal=rk.preal, compact_t=st.ct)]
     pq, ps = [], []
     for rk, dy in zip(st.ranks, dys):
@@ -459,9 +499,12 @@ def _combine_presum(st: _EPState, pool_rows, extra=None):
         # combine_ranks numerics); d route_w rides its top-k weights: route k of token t is live on exactly one
         # rank, the others add 0
         rk, rows = st.ranks[0], pool_rows[0]
-        o = presum_routes(rows, rk.inv, N, K)
         ew = None
-        if extra is not None:
+        if extra is not None and _dp_fused():  # d route_w per received route inside the presum launch
+            o, ew = presum_routes(rows, rk.inv, N, K, ext=extra[0].contiguous())
+        else:
+            o = presum_routes(rows, rk.inv, N, K)
+        if extra is not None and ew is None:
             inv = rk.inv.view(N, K)
             ew = torch.where(inv >= 0, extra[0][inv.clamp(min=0).long()], 0.0).contiguous()
         y, dtw, _ = st.comm.buf.combine(o, rk.handle, topk_weights=ew, config=st.comm.ccfg)
@@ -521,7 +564,10 @@ def _wgrad(st: _EPState, rk: _Rank, w, lhs, lhs_s, rhs, rhs_s, n, k, accumulate)
         # Device-side window check, issued on the current (main) stream before any fork: its temporaries are
         # allocated and freed in the main stream's pool, so the deferred launch below allocates nothing on the side
         # stream (same check, same abort; it only reads poffs, complete on the main stream here).
-        torch._assert_async((poffs[1:] - poffs[:-1]).max() <= _blk._vkp_kwin(st.wwin))
+        if rk.wok is not None:  # the same check, folded into the table build (one flag)
+            torch._assert_async(rk.wok)
+        else:
+            torch._assert_async((poffs[1:] - poffs[:-1]).max() <= _blk._vkp_kwin(st.wwin))
 
     def run(out, beta, sq=None):
         _blk._run_wgrad(st.wk, lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta, perm, st.wwin, sq)
