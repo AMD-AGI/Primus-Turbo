@@ -82,6 +82,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     xcd_remap_pid_u,
 )
 from primus_turbo.flydsl.utils.prims import (
+    _lds_barrier,
     _readfirstlane_i32,
     _readlane_i32,
     _sload_i32,
@@ -695,13 +696,19 @@ def _compile_grouped_nn(
                 wait_barrier(0 if K_ITERS == 2 else _w2)
 
                 for k in range_constexpr(K_ITERS - 2):
-                    # b0's reads stay in flight: a0 is read after them and lgkm retires in order,
-                    # so the wait the backend must emit for a0 (it feeds the first mfma) already
-                    # covers the asm prefix; draining here only exposes b0's latency ahead of a0.
+                    # b0's reads are not drained here: a0 is read after them and lgkm retires in
+                    # order, so the wait the backend emits for a0 also covers b0 for this wave's
+                    # mfma. That wait lands after the barrier below, and lgkmcnt counts only this
+                    # wave's reads. Non-persistent, wave_m 0 runs one barrier ahead (the wave_m == 1
+                    # prologue barrier) and refills b_cur0 right after its next barrier, which pairs
+                    # with this one, so wave_m 1's b0 reads must retire before this barrier.
                     b0_frag = _bs2r.load(b_cur0, vmcnt=nn_loop_tr_vmcnt, drain=not _elgk)
                     a0_frag = _ld_a(a_cur0, a_prev0)
                     a_g2s.load(a_next1, _a1_off + (k + 1) * BLOCK_K)
-                    _ibar()
+                    if const_expr(persistent):
+                        _ibar()  # every wave ran the prologue barrier: no group runs ahead
+                    else:
+                        _lds_barrier()  # lgkmcnt(0) + s_barrier
                     rocdl.s_setprio(1)
                     c00 = _mm.call(a0_frag, b0_frag, c00)
                     rocdl.s_setprio(0)
