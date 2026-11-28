@@ -170,6 +170,64 @@ def quant_fp8_blockwise_for_weight_kernel(
     tl.store(w_scales_ptr + scale_offs, w_scales_inv)
 
 
+# Same math as quant_fp8_blockwise_for_weight_kernel (byte-identical w / scales), plus, in the same pass, the
+# outputs the Turbo fp8blk_weight_cache keeps next to them:
+#   wt_ptr     [B, N, M] FP8   (w transposed)
+#   e8m0_ptr   [B, tM, tN] u8  (exponent byte of the fp32 scale_inv)
+#   e8m0t_ptr  [B, tN, tM] u8  (its transpose)
+@triton.jit
+def quant_fp8_blockwise_for_weight_cache_kernel(
+    w_ptr,
+    w_fp8_ptr,
+    w_scales_ptr,
+    wt_ptr,
+    e8m0_ptr,
+    e8m0t_ptr,
+    M,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    POW2_SCALE: tl.constexpr = False,
+):
+    bid = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
+    pid_n = tl.program_id(axis=2)
+
+    batch_offset_w = bid * M * N
+    tm = tl.cdiv(M, BLOCK_SIZE)
+    tn = tl.cdiv(N, BLOCK_SIZE)
+    batch_offset_scales = bid * tm * tn
+
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    w_ptrs = w_ptr + batch_offset_w + offs_m[:, None] * N + offs_n[None, :]
+    w_tile = tl.load(w_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    w_tile_abs = tl.abs(w_tile)
+    w_tile_max = tl.max(w_tile_abs)  # [1]
+    w_tile_max = tl.maximum(w_tile_max, 1e-4)
+    w_scales = FP8_MAX / w_tile_max
+    if POW2_SCALE:
+        w_scales = pow2_floor(w_scales)
+    w_fp8_tile = w_tile * w_scales
+    w_fp8_tile = tl.clamp(w_fp8_tile, min=-FP8_MAX, max=FP8_MAX)
+    q = w_fp8_tile.to(w_fp8_ptr.dtype.element_ty)
+
+    w_fp8_ptrs = w_fp8_ptr + batch_offset_w + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(w_fp8_ptrs, q, mask=mask)
+    # W^T [N, M]: element (n, m) = w[m, n]
+    wt_ptrs = wt_ptr + batch_offset_w + offs_n[:, None] * M + offs_m[None, :]
+    tl.store(wt_ptrs, tl.trans(q), mask=tl.trans(mask))
+
+    w_scales_inv = 1.0 / w_scales
+    tl.store(w_scales_ptr + batch_offset_scales + pid_m * tn + pid_n, w_scales_inv)
+    e = ((w_scales_inv.to(tl.int32, bitcast=True) >> 23) & 0xFF).to(tl.uint8)
+    tl.store(e8m0_ptr + batch_offset_scales + pid_m * tn + pid_n, e)
+    tl.store(e8m0t_ptr + batch_offset_scales + pid_n * tm + pid_m, e)
+
+
 # ---------------------------------------------------------------------------
 # Blockwise dequantize kernels (inverse of the quantize kernels above).
 # ---------------------------------------------------------------------------

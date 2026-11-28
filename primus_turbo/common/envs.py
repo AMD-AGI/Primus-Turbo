@@ -97,6 +97,7 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_FP8_BLOCK_KERNEL: str = "dsv4up"
     PRIMUS_TURBO_FP8_WCACHE: bool = True
     PRIMUS_TURBO_FP8_WCACHE_VERIFY: bool = False
+    PRIMUS_TURBO_FP8_WCACHE_FUSED_REFRESH: bool = True
     PRIMUS_TURBO_DSV4UP_CLUSTER: str = "2"
     PRIMUS_TURBO_DSV4UP_CLUSTER_MIN_CTAS: int = 256
     PRIMUS_TURBO_DSV4UP_SMALLTILE: str = "4096x1024x32768:256x128s3,4096x1536x4096:256x128s3,1536x4096x4096:256x128s3,1536x4096x4096a:256x128s3,1536x4096x16384:256x128s3,1536x4096x16384a:256x128s3"
@@ -444,6 +445,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PRIMUS_TURBO_FP8_WCACHE": lambda: os.getenv("PRIMUS_TURBO_FP8_WCACHE", "1") != "0",
     # "1" re-quantizes every weight-cache hit and raises on any byte difference (debugging; syncs).
     "PRIMUS_TURBO_FP8_WCACHE_VERIFY": lambda: os.getenv("PRIMUS_TURBO_FP8_WCACHE_VERIFY", "0") == "1",
+    # "0": refresh_unmanaged() takes the unfused quant + copies path instead of one fused kernel per weight
+    # (same bytes).
+    "PRIMUS_TURBO_FP8_WCACHE_FUSED_REFRESH": lambda: os.getenv("PRIMUS_TURBO_FP8_WCACHE_FUSED_REFRESH", "1")
+    != "0",
     # dsv4up CTA cluster edge (gemm_fp8blk_kernel.cluster_of): 2 (default) or 4 = c x c CTAs per 256c x 256c output tile with
     # TDM multicast of A / B (bit-identical to 1); 1 = one CTA per 256x256 tile. Shapes whose M / N are not multiples
     # of 256c or with fewer than PRIMUS_TURBO_DSV4UP_CLUSTER_MIN_CTAS 256x256 tiles use a smaller edge.

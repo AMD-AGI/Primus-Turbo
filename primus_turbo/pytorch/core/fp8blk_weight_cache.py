@@ -211,6 +211,41 @@ def lookup(b: torch.Tensor, dtype: torch.dtype) -> Optional[Fp8BlockWeightCache]
     return cache
 
 
+def _refresh_fused(p: torch.Tensor, cache: Fp8BlockWeightCache) -> bool:
+    """One kernel per weight: the bytes of quant_fp8_blockwise_for_weight_impl (UE8M0) written straight into
+    cache.w / scale_inv plus W^T and both E8M0 planes (the unfused path is a quant + 8 ATen copies, the strided
+    fp8 W^T copy alone ~60 us per weight). False -> caller takes the unfused path."""
+    if p.dtype != torch.bfloat16 or not p.is_cuda or not p.is_contiguous():
+        return False
+    bufs = (cache.w, cache.wt, cache.scale_inv, cache.e8m0, cache.e8m0_t)
+    if not all(b.is_contiguous() for b in bufs):
+        return False
+    from primus_turbo.pytorch.kernels.quantization.quantization_impl import blockwise_ue8m0
+    from primus_turbo.triton.quantization.quant_blockwise import (
+        quant_fp8_blockwise_for_weight_cache_kernel,
+    )
+
+    if p.dim() == 2:
+        B, M, N = 1, *p.shape
+    else:
+        B, M, N = p.shape
+    grid = (B, _cdiv(M, BLOCK), _cdiv(N, BLOCK))
+    quant_fp8_blockwise_for_weight_cache_kernel[grid](
+        p,
+        cache.w,
+        cache.scale_inv,
+        cache.wt,
+        cache.e8m0,
+        cache.e8m0_t,
+        M,
+        N,
+        BLOCK,
+        torch.finfo(cache.dtype).max,
+        POW2_SCALE=blockwise_ue8m0(),
+    )
+    return True
+
+
 def refresh_unmanaged() -> int:
     """Quantize every wanted weight whose cache no optimizer fills (``optimizer_managed`` unset), e.g. a weight split
     across a ZeRO data-parallel group, from its current BF16 value: the bytes a cache miss would compute, once per
@@ -223,6 +258,7 @@ def refresh_unmanaged() -> int:
     )
 
     n = 0
+    fused = envs.PRIMUS_TURBO_FP8_WCACHE_FUSED_REFRESH
     for key, ref in list(_WANTED.items()):
         p = ref()
         if p is None:
@@ -234,6 +270,10 @@ def refresh_unmanaged() -> int:
         if cache is None or cache.shape != tuple(p.shape) or cache.data_ptr != p.data_ptr():
             cache = attach(p)
         materialize(p)
+        if fused and _refresh_fused(p.detach(), cache):
+            cache.ready = True
+            n += 1
+            continue
         q, s = quant_fp8_blockwise_for_weight_impl(p.detach().contiguous(), cache.dtype, block_size=BLOCK)
         e = ((s.contiguous().view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
         cache.w.copy_(q)
