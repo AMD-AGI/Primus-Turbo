@@ -101,7 +101,7 @@ Each grouped GEMM has a forward kernel and a variable-K kernel for the weight gr
 | `swiglu_with_probs`, `geglu_with_probs` | BF16 / FP16 | ✅ | ✅ | ✅ | GLU scaled by routing probability, optional row mask and clamp |
 | `linear_gelu` | BF16 | — | ✅ | — | Linear + bias + tanh GELU, optionally written after a prefix; bias gradient fused into the GELU backward. Unfused GELU off gfx950 and for untiled shapes |
 | `fused_qkv_rope` | BF16 | ✅ | ✅ | — | RoPE on packed QKV |
-| `fused_qkv_rmsnorm_rope` | BF16 | — | ✅ | — | QK RMSNorm + RoPE on packed QKV |
+| `fused_qkv_rmsnorm_rope` | BF16 | ✅ | ✅ | ✅ | QK RMSNorm + RoPE on packed QKV; optional weights (weightless norm), optional RoPE (NoPE layers) and an optional gate block (`attention_output_gate`) on the Triton backend |
 | `dit_qk_norm_rope` | BF16 / FP16 / FP32 | — | ✅ | — | DiT q / k RMSNorm + RoPE from the QKV GEMM output (`sbhd` / `bshd`, one or two streams, interleaved or half-split RoPE, the QKV bias added in the op and its gradient fused; `v_out="none"` returns v as a strided view of the QKV output instead of a copy, over both streams when they come in one buffer with `txt_seq_len`) |
 | `cross_entropy` | BF16 / FP32 | ✅ | ✅ | ✅ | Label smoothing, ignore index, in-place logits. See [Cross Entropy](./cross_entropy.md) |
 
@@ -181,7 +181,8 @@ registration order, with the arch / format limits from each backend's `can_handl
 | `moe_dispatch`, `moe_combine` | TURBO, DEEP_EP |
 | MegaMoE (`fused_mega_moe*`) | FLYDSL |
 | `rmsnorm*`, `swiglu_with_probs`, `geglu_with_probs`, `cross_entropy`, router | TRITON (`rmsnorm_residual_fp4`: FLYDSL) |
-| `fused_qkv_rope`, `fused_qkv_rmsnorm_rope` | FLYDSL |
+| `fused_qkv_rope` | FLYDSL |
+| `fused_qkv_rmsnorm_rope` | FLYDSL (gfx942 / gfx950: weighted norms with RoPE, no gate, head dim 64 / 128, its row tiling), TRITON (every other input) |
 | `dit_qk_norm_rope` | TRITON (forward; backward off gfx950 and outside the FlyDSL envelope), FLYDSL (backward, gfx950: BF16, D 128, interleaved RoPE) |
 | `linear_gelu` | FLYDSL GELU (gfx950, tiled shapes; unfused otherwise), TRITON GELU backward |
 | `adaln_modulate`, `gated_residual_adaln` | FLYDSL (gfx950), eager PyTorch otherwise |
