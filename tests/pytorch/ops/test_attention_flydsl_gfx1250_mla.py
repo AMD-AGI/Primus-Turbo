@@ -371,9 +371,10 @@ def test_kernel_entries_raise_value_error(entry, change, match):
 
 
 @pytest.mark.parametrize("layout", ["bshd", "sbhd"])
-def test_mla_head_dims_route_as_before_on_gfx950(monkeypatch, layout):
-    """On gfx950 the MLA gate and kernels are never consulted: MLA head dims go to aiter, and head
-    dim 128 in SBHD storage still goes to the gfx950 FlyDSL kernels."""
+def test_gfx1250_mla_code_is_not_consulted_on_gfx950(monkeypatch, layout):
+    """On gfx950 the gfx1250 MLA gate and kernels are never consulted: MLA head dims go to the
+    gfx950 MLA FlyDSL kernels in either byte order, and head dim 128 still goes to the gfx950
+    FlyDSL kernels in SBHD storage only."""
 
     def forbidden(*args, **kwargs):
         raise AssertionError("gfx1250 MLA code consulted on gfx950")
@@ -383,7 +384,7 @@ def test_mla_head_dims_route_as_before_on_gfx950(monkeypatch, layout):
     monkeypatch.setattr(attention_impl, "flydsl_gfx1250_mla_unsupported_reason", forbidden)
     monkeypatch.setattr(mla_impl, "_bwd", forbidden)
     q, k, v = _meta(2, 4096, 4096, 128, layout=layout)
-    assert resolve_flash_attn_backend(False, None, **_resolve_kwargs(q, k, v, layout)) == BackendType.AITER
+    assert resolve_flash_attn_backend(False, None, **_resolve_kwargs(q, k, v, layout)) == BackendType.FLYDSL
     q, k, v = _meta(2, 4096, 4096, 128, d_qk=128, d_v=128, layout=layout)
     got = resolve_flash_attn_backend(False, None, **_resolve_kwargs(q, k, v, layout))
     assert got == (BackendType.FLYDSL if layout == "sbhd" else BackendType.AITER)

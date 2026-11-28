@@ -1387,6 +1387,164 @@ def test_flydsl_attention_backward_odd_rows(batch, seqlen_q, seqlen_kv, head_dim
     assert row_err.max() < 6e-2, f"dq row err {row_err.max():.4g} at (b, h, q) {worst}"
 
 
+def _mla_case(qkv_format, batch, seqlen, num_head, dtype=torch.bfloat16):
+    """q/k [b, s, h, 192] and v [b, s, h, 128] views over storage in ``qkv_format`` order."""
+    perm = {"sbhd": (1, 0, 2, 3), "bshd": (0, 1, 2, 3), "bhsd": (0, 2, 1, 3)}[qkv_format]
+    dims = {"b": batch, "s": seqlen, "h": num_head}
+
+    def make(d, requires_grad=True):
+        storage = torch.randn([dims[c] for c in qkv_format[:3]] + [d], device="cuda", dtype=dtype)
+        return storage.permute(*perm).requires_grad_(requires_grad)
+
+    return make(192), make(192), make(128), make(128, requires_grad=False)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()), reason="FlyDSL MLA attention is gfx950-only"
+)
+# DeepSeek-V3 / Kimi-K2 MLA head dims: long enough that the persistent forward and the banded dQ
+# images of the backward each run several tiles per head.
+@pytest.mark.parametrize("batch,seqlen,num_head", [(1, 4096, 16), (2, 2048, 8), (1, 8192, 4)])
+@pytest.mark.parametrize("qkv_format", ["sbhd", "bshd", "bhsd"])
+@pytest.mark.parametrize("backend", [None, BackendType.FLYDSL])
+def test_flydsl_gfx950_mla_attention(batch, seqlen, num_head, qkv_format, backend):
+    _check_mla_attention(batch, seqlen, num_head, qkv_format, backend, 192 ** (-0.5))
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()), reason="FlyDSL MLA attention is gfx950-only"
+)
+# DeepSeek-V3's YaRN scale (rotary factor 40, mscale_all_dim 1): baked into the forward.
+@pytest.mark.parametrize("qkv_format", ["sbhd", "bshd"])
+def test_flydsl_gfx950_mla_attention_softmax_scale(qkv_format):
+    mscale = 0.1 * math.log(40.0) + 1.0
+    _check_mla_attention(1, 4096, 16, qkv_format, BackendType.FLYDSL, mscale * mscale * 192 ** (-0.5))
+
+
+def _check_mla_attention(batch, seqlen, num_head, qkv_format, backend, scale):
+    torch.manual_seed(42)
+    q, k, v, dout = _mla_case(qkv_format, batch, seqlen, num_head)
+    # Unpinned, these shapes resolve to FlyDSL, not to aiter.
+    assert (
+        resolve_flash_attn_backend(
+            varlen=False, user_backend=None, q=q, k=k, v=v, causal=True, qkv_format=_infer_qkv_format(q, k, v)
+        )
+        == BackendType.FLYDSL
+    )
+
+    GlobalBackendManager.set_attn_backend(backend, PrecisionType.BF16_FP16_FP32)
+    try:
+        out, lse = flash_attn_func(q, k, v, softmax_scale=scale, causal=True, return_lse=True)
+    finally:
+        GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
+    out.backward(dout)
+
+    q_ref, k_ref, v_ref = (t.detach().clone().requires_grad_() for t in (q, k, v))
+    o_ref = attention_vanilla_forward_pytorch_ref_impl(q_ref, k_ref, v_ref, scale, True, "bshd")
+    o_ref.backward(dout)
+    # [B, H, S] natural-log LSE, as the aiter path returns it.
+    s = torch.einsum("bqhd,bkhd->bhqk", q.detach().float(), k.detach().float()) * scale
+    s = s.masked_fill(torch.ones(seqlen, seqlen, device="cuda", dtype=torch.bool).triu(1), float("-inf"))
+    lse_ref = torch.logsumexp(s, dim=-1)
+
+    snrs = {
+        "out": compute_snr(o_ref, out),
+        "lse": compute_snr(lse_ref, lse),
+        "dq": compute_snr(q_ref.grad, q.grad),
+        "dk": compute_snr(k_ref.grad, k.grad),
+        "dv": compute_snr(v_ref.grad, v.grad),
+    }
+    print(", ".join(f"{n}={x:.2f}" for n, x in snrs.items()))
+    for name, snr in snrs.items():
+        assert snr > 40, f"{name} snr too low: {snr:.2f}"
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()), reason="FlyDSL MLA attention is gfx950-only"
+)
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"causal": False},
+        {"seqlen": 1000},
+        {"deterministic": True},
+        {"window_size": (128, 0)},
+        {"dtype": torch.float16},
+        # Past the forward's persistent job packing.
+        {"batch": 129, "seqlen": 256},
+    ],
+)
+def test_flydsl_gfx950_mla_refuses_what_the_kernels_lack(kwargs):
+    kwargs = dict(kwargs)
+    seqlen = kwargs.pop("seqlen", 1024)
+    batch = kwargs.pop("batch", 1)
+    q, k, v, _ = _mla_case("sbhd", batch, seqlen, 2, dtype=kwargs.pop("dtype", torch.bfloat16))
+    call = {"causal": True, **kwargs}
+    assert not attention_impl.DenseAttnFwdFlydslBackend.can_handle(q=q, k=k, v=v, qkv_format="sbhd", **call)
+    with pytest.raises(ValueError, match="cannot handle the given inputs"):
+        resolve_flash_attn_backend(
+            varlen=False, user_backend=BackendType.FLYDSL, q=q, k=k, v=v, qkv_format="sbhd", **call
+        )
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()), reason="FlyDSL MLA attention is gfx950-only"
+)
+def test_flydsl_gfx950_mla_deterministic_misses_the_tune_cache(monkeypatch):
+    """A FlyDSL winner tuned without ``deterministic`` is not replayed for a deterministic call."""
+    torch.manual_seed(42)
+    q, k, v, dout = _mla_case("bshd", 1, 1024, 2)
+    flydsl = attention_impl.DenseAttnFwdFlydslBackend
+    cache = attention_impl.FlashAttnDenseDispatcher._cache
+    GlobalBackendManager.reset()
+    GlobalBackendManager.set_auto_tune(True)
+    try:
+        flash_attn_func(q, k, v, causal=True).backward(dout)
+        assert len(cache) == 1, "forward was not auto-tuned"
+        # Whichever backend won, make the warm entry the one deterministic runs cannot take.
+        for key in list(cache._cache):
+            cache.put(key, flydsl)
+        flydsl_calls = []
+        execute = flydsl.execute
+        monkeypatch.setattr(
+            flydsl, "execute", staticmethod(lambda **kw: flydsl_calls.append(1) or execute(**kw))
+        )
+        flash_attn_func(q, k, v, causal=True, deterministic=True).backward(dout)
+        assert not flydsl_calls, "the deterministic call reused the non-deterministic FlyDSL entry"
+    finally:
+        GlobalBackendManager.reset()
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()), reason="FlyDSL MLA attention is gfx950-only"
+)
+@pytest.mark.parametrize("qkv_format", ["sbhd", "bshd"])
+def test_flydsl_gfx950_mla_attention_compile_fullgraph(qkv_format):
+    torch.manual_seed(42)
+    q, k, v, dout = _mla_case(qkv_format, 2, 1024, 4)
+
+    out_eager = flash_attn_func(q, k, v, causal=True)
+    grads_eager = torch.autograd.grad(out_eager, (q, k, v), dout)
+
+    torch._dynamo.reset()
+
+    @torch.compile(fullgraph=True)
+    def fn(q, k, v):
+        return flash_attn_func(q, k, v, causal=True)
+
+    out = fn(q, k, v)
+    grads = torch.autograd.grad(out, (q, k, v), dout)
+
+    assert out.shape == out_eager.shape and out.stride() == out_eager.stride()
+    torch.testing.assert_close(out, out_eager, rtol=0, atol=0)
+    for name, g, g_eager in zip(("dq", "dk", "dv"), grads, grads_eager):
+        assert g.shape == g_eager.shape, name
+        # dQ sums bf16 atomics, whose order varies run to run: two eager runs already differ by
+        # 59-62 dB (dQ vs an fp32 reference is ~46 dB), so dQ gets the looser bound.
+        bound = 50 if name == "dq" else 60
+        assert compute_snr(g_eager, g) > bound, f"{name} compiled vs eager snr {compute_snr(g_eager, g):.2f}"
+
+
 @pytest.mark.parametrize("qkv_format", ["bshd", "sbhd", "bhsd"])
 def test_attention_fake_kernel_strides(qkv_format):
     """Verify that torch.compile sees correct output strides for every qkv_format.
