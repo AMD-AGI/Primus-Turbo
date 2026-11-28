@@ -23,11 +23,15 @@ TDM ops in the in-order TDM queue between the k-tiles. Calls whose scale planes 
 another tiling, run vkp.
 vkw (launch_vkw_fp8_gfx1250, beta 0, every window a multiple of 256 tokens): the same contract on 4 waves of
 128x128 with 256-token k-tiles and C stored through the freed ring stage as whole 256-B row segments; C and the
-sumsq partials bit-identical to vkq. flyvkqblk_fp8(vkw=True) selects it for beta 0; beta 1 runs vkq.
+sumsq partials bit-identical to vkq. flyvkqblk_fp8(vkw=True) selects it for beta 0 and (PRIMUS_TURBO_VKW_BETA1,
+default on) beta 1: each wave TDM-loads its 128x128 old C into the ring stage freed at the last k-tile (hidden behind
+that k-tile), adds it in the epilogue in place and the next tile's k-tile 0 goes to the last k-tile's stage.
 Requires OUT_M % 256 == 0, OUT_N % 256 == 0, every window a multiple of 128 and >= 1 k-tile, <= kwin_max.
 """
 
 from __future__ import annotations
+
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -475,8 +479,9 @@ def launch_vkw_fp8_gfx1250(
     kwin_max: Constexpr[int] = 4096,
     lpt: Constexpr[int] = 0,
     sumsq: Constexpr[int] = 0,
+    beta_one: Constexpr[int] = 0,
 ):
-    """ "vkw" (beta 0): the vkq wgrad contract with a 4-wave main loop.
+    """ "vkw": the vkq wgrad contract with a 4-wave main loop (beta 0, and beta 1 with ``beta_one``).
     * 4 waves (2x2) of 128x128 per 256x256 tile, 256-token k-tiles (two WMMA k-steps each, in k order), 2-stage TDM
       ring (2 x 139 KB, 272-B rows), persistent LPT tile -> workgroup map as vkq, scale planes per tile loaded with
       VMEM as in vkq (2 sets); each k-step's 16 scale operands are loaded from the planes and byte-replicated
@@ -516,6 +521,7 @@ def launch_vkw_fp8_gfx1250(
         f"moe_vkwblk_fp8_gfx1250_t256x256x256_w2x2_a{a_id}{b_id}_w{kwin_max}"
         + ("_lpt" if lpt else "")
         + ("_sq" if sumsq else "")
+        + ("_b1" if beta_one else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -756,6 +762,51 @@ def launch_vkw_fp8_gfx1250(
                 v = fx.Vector(lds_b128(lds_base, scr + r * ROW + lc * 16))
                 fx.ptr_store(v.bitcast(fx.Int8), gC8 + (cb + fx.Int64(r) * c_ld + fx.Int64(lc * 8)) * 2)
 
+        gC_bf = _cast(out_cls, arg_c)
+
+        def issue_oldc(s, g, blk_m, blk_n):
+            """beta 1: this wave's 128 x 128 old C -> its region of stage s (one TDM op per wave, rows of ROW bytes:
+            the layout the epilogue writes C in)"""
+            gtC = _gview(
+                gC_bf,
+                fx.Int64(g) * fx.Int64(i32_m) * c_ld + fx.Int64(blk_m + wmb) * c_ld + fx.Int64(blk_n + wnb),
+                (warp_m, ROW // 2),
+                (c_ld, 1),
+            )
+            atomC = fx.rocdl.make_tdm_atom(gtC, [None, warp_n], strides=[c_ld, None], num_warps=1)
+            dstC = _view(
+                fx.add_offset(base_ptr, s * PITCH + wave * (warp_m * ROW)), out_cls, (warp_m, ROW // 2), (ROW // 2, 1)
+            )
+            fx.copy(atomC, gtC, dstC)
+
+        def epilogue_b1(g, blk_m, blk_n, s_old, newer):
+            """beta 1: old C is in this wave's region of stage s_old (its TDM op, waited here with ``newer`` TDM ops
+            of this wave left in flight); C = bf16(acc + old) written back in place (+ sumsq, vkq order) and stored
+            as whole 256-B row segments; accumulators zeroed"""
+            tdm_ops.tensor_wait(newer)
+            scr = s_old * PITCH + wave * (warp_m * ROW)
+            for mi in range_constexpr(m_reps):
+                rocdl.sched_barrier(0)
+                for nj in range_constexpr(n_reps):
+                    ad = scr + (mi * WMMA_M + lane16) * ROW + (nj * WMMA_N + kgrp * 8) * 2
+                    old = fx.Vector(lds_b128(lds_base, ad)).bitcast(out_cls).to(fx.Float32)
+                    h = (c_frags[mi * n_reps + nj].load() + old).to(out_cls)
+                    if const_expr(sumsq):
+                        hf = h.to(fx.Float32)
+                        q = sq_regs[nj // (n_reps // VW)]
+                        q.store(q.load() + hf * hf)
+                    fx.ptr_store(h.bitcast(fx.Int8), base_ptr + ad)
+                    c_frags[mi * n_reps + nj].fill(0.0)
+            cb = fx.Int64(g) * fx.Int64(i32_m) * c_ld + fx.Int64(blk_m + wmb) * c_ld + fx.Int64(blk_n + wnb)
+            lr = lane // 16
+            lc = lane % 16
+            for q2 in range_constexpr(warp_m // 2):
+                if const_expr(q2 % 8 == 0):
+                    rocdl.sched_barrier(0)
+                r = q2 * 2 + lr
+                v = fx.Vector(lds_b128(lds_base, scr + r * ROW + lc * 16))
+                fx.ptr_store(v.bitcast(fx.Int8), gC8 + (cb + fx.Int64(r) * c_ld + fx.Int64(lc * 8)) * 2)
+
         # prologue: the first tile's planes (set 0) and k-tile 0 (stage 0)
         g0, bm0, bn0, kb0, ktn0 = tile_params(bid)
         issue_planes(0, bm0, bn0, kb0, ktn0)
@@ -783,11 +834,33 @@ def launch_vkw_fp8_gfx1250(
                     oa0, ob0 = offs_of(blk_m, blk_n, kb, f)
                     issue((gk + f) % 2, oa0, ob0)
                 else:
-                    oa1, ob1 = offs_of(nbm, nbn, nkb, 0)
-                    issue((gk + f) % 2, oa1, ob1)
+                    if const_expr(beta_one):
+                        if n2 >= 2:
+                            # the previous k-tile's stage is free: this tile's old C goes there (hidden behind the
+                            # last k-step); the next tile's k-tile 0 is issued in the epilogue instead
+                            issue_oldc((gk + j - 1) % 2, g, blk_m, blk_n)
+                        else:
+                            oa2, ob2 = offs_of(nbm, nbn, nkb, 0)
+                            issue((gk + f) % 2, oa2, ob2)
+                    else:
+                        oa1, ob1 = offs_of(nbm, nbn, nkb, 0)
+                        issue((gk + f) % 2, oa1, ob1)
                 compute((gk + j) % 2, j * KS + ksh, pset)
-            gk_reg.store(gk_reg.load() + n2)
-            epilogue(g, blk_m, blk_n, (gk + n2 - 1) % 2)
+            if const_expr(beta_one):
+                s_last = (gk + n2 + 1) % 2  # (gk + n2 - 1) % 2 without a negative operand for an empty window
+                fx.barrier()  # every wave is done reading the last k-tile's stage
+                if n2 >= 2:
+                    oa3, ob3 = offs_of(nbm, nbn, nkb, 0)
+                    issue(s_last, oa3, ob3)  # next tile's k-tile 0 -> the last stage
+                    gk_reg.store(gk_reg.load() + n2 - 1)
+                    epilogue_b1(g, blk_m, blk_n, (gk + n2 - 2) % 2, 2)
+                else:
+                    issue_oldc(s_last, g, blk_m, blk_n)  # single k-tile window: old C exposed
+                    gk_reg.store(gk_reg.load() + n2)
+                    epilogue_b1(g, blk_m, blk_n, s_last, 0)
+            else:
+                gk_reg.store(gk_reg.load() + n2)
+                epilogue(g, blk_m, blk_n, (gk + n2 - 1) % 2)
         tdm_ops.tensor_wait(0)
         rocdl.s_wait_asynccnt(0)
         if const_expr(sumsq):
@@ -821,6 +894,9 @@ launch_vkw_fp8_gfx1250.compile_hints["llvm_options"] = {"amdgpu-expert-schedulin
 
 
 _COMPILED: dict = {}
+# PRIMUS_TURBO_VKW_BETA1 (default 1): beta-1 (accumulating) calls with vkw=True run vkw too (old C TDM-loaded into the
+# stage freed at the last k-tile, same bits as vkq); 0 keeps vkq for them.
+_VKW_BETA1 = os.environ.get("PRIMUS_TURBO_VKW_BETA1", "1") != "0"
 
 
 def flyvkqblk_fp8(
@@ -847,7 +923,8 @@ def flyvkqblk_fp8(
     out [G, OUT_M, OUT_N] bf16 (+)= per-expert lhsP[:, seg] @ rhsP[:, seg]^T; lhs_s/rhs_s compact E8M0
     [rows, P/128] uint8 (row stride P/128 a multiple of 4). beta 1 accumulates into out, 0 overwrites it.
     vkw: the caller guarantees every expert window is a multiple of 256 tokens (the MegaMoE pool alignment; not
-    checked here, that would need a host sync); beta-0 calls then run the vkw kernel (same bits, faster)."""
+    checked here, that would need a host sync); beta-0 and beta-1 calls then run the vkw kernel (same bits, faster;
+    PRIMUS_TURBO_VKW_BETA1=0 keeps vkq for beta 1)."""
     assert out.dtype == torch.bfloat16 and out.is_contiguous()
     assert lhs_s.dtype == torch.uint8 and lhs_s.shape[1] * 128 == lhsP.shape[1]
     if not (
@@ -903,7 +980,7 @@ def flyvkqblk_fp8(
         assert sumsq_out.dtype == torch.float32 and sumsq_out.is_contiguous()
         assert sumsq_out.numel() >= nwg * m_warp * n_warp * 32, (sumsq_out.numel(), nwg)
         sq = 1
-    if vkw and not bo:
+    if vkw and (not bo or _VKW_BETA1):
         args = (
             _ptr(out),
             _ptr(lhsP),
@@ -926,8 +1003,9 @@ def flyvkqblk_fp8(
             kwin_max,
             lpt,
             sq,
+            bo,
         )
-        key = ("vkw", a_id, b_id, group_m, kwin_max, lpt, sq)
+        key = ("vkw", a_id, b_id, group_m, kwin_max, lpt, sq, bo)
         c = _COMPILED.get(key)
         if c is None:
             _COMPILED[key] = flyc.compile(launch_vkw_fp8_gfx1250, *args)

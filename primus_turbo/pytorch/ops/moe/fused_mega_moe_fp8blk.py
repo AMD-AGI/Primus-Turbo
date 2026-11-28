@@ -64,7 +64,9 @@ _ALIGN = 256
 #   mxp:  mxgp -- persistent (grid = #CUs, live tiles bounded on the device from the group offsets: no dead
 #         workgroups, EP>1 worst-case pools OK), 256x256x256 k-tiles in a 2-stage ring, fragments pipelined across
 #         k-tiles, next tile's k-tiles / scale planes issued during the current tile's last k-tiles; C via
-#         line-scratch VMEM stores. Needs K % 512 == 0 and K a power of two;
+#         line-scratch VMEM stores; each tile's expert from an m-tile table built in LDS once per workgroup
+#         (PRIMUS_TURBO_MXGP_TBL, default 1; 0 = per-tile scan of the offsets, same bits). Needs K % 512 == 0 and K a
+#         power of two;
 #   k256: flygg 256x256x256 k-tiles in a 2-stage ring + B scale plane of one row per 16-row fragment (128x128-block
 #         weight scales) so it fits LDS; needs K % 256 == 0;
 #   tile: flygg 256x256x128, 3-stage ring, one tile per workgroup, grid bound M/256 (pool offsets are 256-aligned).
@@ -87,9 +89,9 @@ _CACHES = weakref.WeakSet()
 # scale planes on VMEM; needs the compact 1-byte-per-128-token col scales from the quant kernels) or "vk" (one tile
 # per workgroup).
 _VKP_LDS_KWIN = 5120  # longest expert window the vkq LDS arena holds (scale planes grow with it)
-# Every expert window of the pool is a multiple of _ALIGN = 256 tokens, so the beta-0 vkq wgrads run as vkw
-# (4 waves of 128x128, 256-token k-tiles; main_grad and the sumsq partials bit-identical to vkq, 7-10% faster);
-# beta-1 (accumulating) calls keep vkq.
+# Every expert window of the pool is a multiple of _ALIGN = 256 tokens, so the vkq wgrads run as vkw (4 waves of
+# 128x128, 256-token k-tiles; main_grad and the sumsq partials bit-identical to vkq): beta 0, and beta 1
+# (accumulating; old C TDM-loaded into the ring, ~1.2x faster than vkq at MBS4; PRIMUS_TURBO_VKW_BETA1=0 keeps vkq).
 _VKW = _ALIGN % 256 == 0
 # longest expert window the vk LDS arena holds (a power of two: the scale-plane TDM pad interval)
 _VK_LDS_KWIN = 8192

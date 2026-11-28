@@ -27,6 +27,8 @@ Requires: aligned group offsets (multiples of 256: the caller's pool alignment),
 
 from __future__ import annotations
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -110,6 +112,7 @@ def launch_mxgp_fp8blk_nt_gfx1250(
     b_id: Constexpr[int],
     k_max: Constexpr[int] = 4096,
     early: Constexpr[int] = 4,
+    tbl: Constexpr[int] = 0,
 ):
     """Persistent: grid = #CUs; workgroup bid computes live tiles t = bid, bid + nwg, ... (live = offs[G] / 256 m-tiles
     x N / 256, read on the device: no dead workgroups, usable for EP>1 worst-case pools). Across tiles: k-tile K-2's
@@ -141,7 +144,11 @@ def launch_mxgp_fp8blk_nt_gfx1250(
     SC_OFF = 2 * PITCH
     OFF_LDS = SC_OFF + PLANE_SA + PLANE_SB  # 32 x i32: slot l = offs[min(l + 1, G)]
     PRM_LDS = OFF_LDS + 4 * WAVE  # 8 x i32 tile parameters
-    ARENA = PRM_LDS + 32
+    # tbl > 0: m-tile -> expert table (one int32 per m-tile of the pool, built once per workgroup from the group
+    # offsets) in LDS; each tile then reads its expert index with one LDS load instead of scanning the G offsets
+    # with scalar loads (the scan cost ~8-12% of the kernel at MBS4 EP4). Same expert index, same C bits.
+    TBL_OFF = PRM_LDS + 32
+    ARENA = TBL_OFF + 4 * tbl
     assert ARENA <= 320 * 1024, f"LDS arena {ARENA} B exceeds 320 KiB"
     G = n_groups
     m_reps = n_reps = 8
@@ -151,7 +158,9 @@ def launch_mxgp_fp8blk_nt_gfx1250(
     assert 2 <= early <= 6 and n_reps % (m_reps - early) == 0
     BPG = n_reps // (m_reps - early)
     NA = 2
-    kernel_name = f"moe_mxgp_fp8blk_nt_gfx1250_t256x256x256_a{a_id}{b_id}_g{G}_k{k_max}_e{early}"
+    kernel_name = f"moe_mxgp_fp8blk_nt_gfx1250_t256x256x256_a{a_id}{b_id}_g{G}_k{k_max}_e{early}" + (
+        f"_tb{tbl}" if tbl else ""
+    )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
     def kernel_mxgp(
@@ -190,8 +199,15 @@ def launch_mxgp_fp8blk_nt_gfx1250(
         sk64 = fx.Int64(sk)
 
         def tile_params(t):
-            # scalar loads + SALU scan at the tile start only (results go to the LDS parameter block)
+            # scalar loads + SALU scan (or the LDS table) at the tile start only (results go to the LDS parameter
+            # block)
             m_row = (t // n_tiles_n) * tile_m
+            if const_expr(tbl):
+                return (
+                    rocdl.readfirstlane(_T.i32, lds_b32(lds_base, TBL_OFF + (t // n_tiles_n) * 4)[0]),
+                    rocdl.readfirstlane(_T.i32, m_row),
+                    rocdl.readfirstlane(_T.i32, (t % n_tiles_n) * tile_n),
+                )
             g = zero
             for i_ in range_constexpr(G):
                 e = fx.Int32(
@@ -463,6 +479,23 @@ def launch_mxgp_fp8blk_nt_gfx1250(
             fx.ptr_store(v.bitcast(fx.Int8), base_ptr + PRM_LDS)
 
         gC8 = _cast(fx.Int8, _cast(out_cls, arg_c))
+        if const_expr(tbl):
+            # expert e fills table[offs[e] / 256 : offs[e+1] / 256] = e (the m-tiles of each expert spread over the
+            # threads); the m-tiles of the live tiles (< offs[G] / 256) are all covered
+            for e_ in range_constexpr(G):
+                lo = fx.Int32(_bops.buffer_load(offs_rsrc, zero + fx.Int32(e_), vec_width=1, is_scalar=True)) // tile_m
+                hi = (
+                    fx.Int32(_bops.buffer_load(offs_rsrc, zero + fx.Int32(e_ + 1), vec_width=1, is_scalar=True))
+                    // tile_m
+                )
+                for c0 in range(lo, hi, block):
+                    r = c0 + tid
+                    if r < hi:
+                        fx.ptr_store(
+                            fx.Vector.from_elements([zero + fx.Int32(e_)], fx.Int32).bitcast(fx.Int8),
+                            base_ptr + (TBL_OFF + r * 4),
+                        )
+            fx.barrier()
         # first tile: planes + k-tile 0, wait, its fragments + scale words, k-tile 1 in flight
         t0 = (my_cnt > zero).select(bid, zero)
         tp0 = tile_params(t0)
@@ -516,9 +549,11 @@ def launch_mxgp_fp8blk_nt_gfx1250(
 
 launch_mxgp_fp8blk_nt_gfx1250.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": True}
 _COMPILED_P: dict = {}
+# PRIMUS_TURBO_MXGP_TBL (default 1): expert lookup through the LDS m-tile table (same bits; 0 = per-tile scan)
+_MXGP_TBL = os.environ.get("PRIMUS_TURBO_MXGP_TBL", "1") != "0"
 
 
-def mxgp_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, early=4, nwg=None):
+def mxgp_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, early=4, nwg=None, tbl=None):
     """out [M, N] bf16, bit-identical to flygg_fp8blk_nt(..., tile=(256, 256, 256), num_buffers=2): a [M, K] fp8,
     b [G, N, K] fp8, sa [M, K/32] / sb [G, N, K/32] uint8 E8M0. Needs K % 512 == 0, power-of-two K, N % 256 == 0,
     group offsets multiples of 256 (live tiles are bounded on the device by offs[G])."""
@@ -535,6 +570,15 @@ def mxgp_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, early=4, nwg=None):
     if nwg is None:
         nwg = torch.cuda.get_device_properties(a.device).multi_processor_count
     nwg = max(1, min(nwg, (M // 256) * (N // 256)))
+    if tbl is None:
+        tbl = _MXGP_TBL
+    if tbl:
+        # one table entry per m-tile of the pool (offs[G] <= M), if it fits in LDS next to the ring and the planes
+        tbl = M // 256
+        sp = K // 32 + 4
+        used = 2 * (2 * 256 * 272) + 256 * sp + (16 * sp + 15) // 16 * 16 + 4 * 32 + 32
+        if used + 4 * tbl > 320 * 1024:
+            tbl = 0
     a_id = 0 if a.dtype == torch.float8_e4m3fn else 1
     b_id = 0 if b.dtype == torch.float8_e4m3fn else 1
     args = (
@@ -553,8 +597,9 @@ def mxgp_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, early=4, nwg=None):
         b_id,
         K,
         early,
+        tbl,
     )
-    key = (G, a_id, b_id, K, early, nwg)
+    key = (G, a_id, b_id, K, early, nwg, tbl)
     c = _COMPILED_P.get(key)
     if c is None:
         _COMPILED_P[key] = flyc.compile(launch_mxgp_fp8blk_nt_gfx1250, *args)
