@@ -731,6 +731,7 @@ def _gather_dual_fp8_kernel(
     HAS_PREAL: tl.constexpr,
     CT: tl.constexpr = 0,
     SL: tl.constexpr = 0,
+    SQ: tl.constexpr = 7,
 ):
     """grid (P // 128, C // 128). Pool row p <- received row ROWMAP[p] (negative: padding row, zeros):
     Q  [P, C] fp8 = the received bytes, S [P, C/32] = the received E8M0 byte (x4 word / layout SL),
@@ -748,21 +749,24 @@ def _gather_dual_fp8_kernel(
     src = tl.where(valid, src, 0).to(tl.int64)
     qb = tl.load(XQ + src[:, None] * C + c[None, :], mask=valid[:, None], other=0)  # uint8 bytes
     er = tl.load(XS + src * XS_STRIDE + pc, mask=valid, other=127).to(tl.int32) - 127
-    tl.store(Q + p[:, None].to(tl.int64) * C + c[None, :], qb)
-    store_scale(S, p, pc, er, P, C // 128, SL)
-    v = qb.to(tl.float8e4nv, bitcast=True).to(tl.float32) * pow2_pos(er)[:, None]
-    ec = _ue8m0_exp(tl.max(tl.abs(v), axis=0), FP8_MAX)
-    qc = (v * pow2_neg_fly(ec)[None, :]).to(QT.dtype.element_ty)
-    u = tl.reshape(qc.to(tl.uint8, bitcast=True).to(tl.int32), (32, 4, 128))
-    w = tl.sum(
-        u << (tl.arange(0, 4) * 8)[None, :, None], axis=1
-    )  # [32, 128]: 4 pool rows of a column per int32
-    pw = pt * 32 + tl.arange(0, 32)
-    tl.store(QT.to(tl.pointer_type(tl.int32)) + c[:, None].to(tl.int64) * (P // 4) + pw[None, :], tl.trans(w))
-    if CT:
-        tl.store(ST + c.to(tl.int64) * (P // 128) + pt, ((ec + 127) & 0xFF).to(tl.uint8))
-    else:
-        store_scale(ST, c, pt, ec, C, P // 128, SL)
+    if SQ & 1:
+        tl.store(Q + p[:, None].to(tl.int64) * C + c[None, :], qb)
+    if SQ & 2:
+        store_scale(S, p, pc, er, P, C // 128, SL)
+    if SQ & 4:
+        v = qb.to(tl.float8e4nv, bitcast=True).to(tl.float32) * pow2_pos(er)[:, None]
+        ec = _ue8m0_exp(tl.max(tl.abs(v), axis=0), FP8_MAX)
+        qc = (v * pow2_neg_fly(ec)[None, :]).to(QT.dtype.element_ty)
+        u = tl.reshape(qc.to(tl.uint8, bitcast=True).to(tl.int32), (32, 4, 128))
+        w = tl.sum(
+            u << (tl.arange(0, 4) * 8)[None, :, None], axis=1
+        )  # [32, 128]: 4 pool rows of a column per int32
+        pw = pt * 32 + tl.arange(0, 32)
+        tl.store(QT.to(tl.pointer_type(tl.int32)) + c[:, None].to(tl.int64) * (P // 4) + pw[None, :], tl.trans(w))
+        if CT:
+            tl.store(ST + c.to(tl.int64) * (P // 128) + pt, ((ec + 127) & 0xFF).to(tl.uint8))
+        else:
+            store_scale(ST, c, pt, ec, C, P // 128, SL)
 
 
 @triton.jit
@@ -784,6 +788,7 @@ def _gather_dual_fp8_tile_kernel(
     SL: tl.constexpr,
     RB: tl.constexpr,
     CB: tl.constexpr,
+    SQ: tl.constexpr = 7,
 ):
     """_gather_dual_fp8_kernel on a (RB*128) x (CB*128) tile: grid (P // (RB*128), C // (CB*128)). Per element the
     same math (row scale of its 128-column block, column scale over its 128-row block), so bit-identical; the wider
@@ -803,21 +808,24 @@ def _gather_dual_fp8_tile_kernel(
     src = tl.where(valid, src, 0).to(tl.int64)
     qb = tl.load(XQ + src[:, None] * C + c[None, :], mask=valid[:, None], other=0)  # uint8 bytes
     er = tl.load(XS + src[:, None] * XS_STRIDE + kb[None, :], mask=valid[:, None], other=127).to(tl.int32) - 127
-    tl.store(Q + p[:, None].to(tl.int64) * C + c[None, :], qb)
-    store_scale(S, p[:, None], kb[None, :], er, P, C // 128, SL)
-    v = tl.reshape(qb.to(tl.float8e4nv, bitcast=True).to(tl.float32), (BR, CB, 128)) * pow2_pos(er)[:, :, None]
-    v = tl.reshape(v, (RB, 128, BC))
-    ec = _ue8m0_exp(tl.max(tl.abs(v), axis=1), FP8_MAX)  # [RB, BC]
-    qc = tl.reshape(v * pow2_neg_fly(ec)[:, None, :], (BR, BC)).to(QT.dtype.element_ty)
-    u = tl.reshape(qc.to(tl.uint8, bitcast=True).to(tl.int32), (BR // 4, 4, BC))
-    w = tl.sum(u << (tl.arange(0, 4) * 8)[None, :, None], axis=1)  # [BR/4, BC]: 4 pool rows of a column per int32
-    pw = pt * (BR // 4) + tl.arange(0, BR // 4)
-    tl.store(QT.to(tl.pointer_type(tl.int32)) + c[:, None].to(tl.int64) * (P // 4) + pw[None, :], tl.trans(w))
-    rb = pt * RB + tl.arange(0, RB)
-    if CT:
-        tl.store(ST + c[:, None].to(tl.int64) * (P // 128) + rb[None, :], tl.trans((ec + 127) & 0xFF).to(tl.uint8))
-    else:
-        store_scale(ST, c[:, None], rb[None, :], tl.trans(ec), C, P // 128, SL)
+    if SQ & 1:
+        tl.store(Q + p[:, None].to(tl.int64) * C + c[None, :], qb)
+    if SQ & 2:
+        store_scale(S, p[:, None], kb[None, :], er, P, C // 128, SL)
+    if SQ & 4:
+        v = tl.reshape(qb.to(tl.float8e4nv, bitcast=True).to(tl.float32), (BR, CB, 128)) * pow2_pos(er)[:, :, None]
+        v = tl.reshape(v, (RB, 128, BC))
+        ec = _ue8m0_exp(tl.max(tl.abs(v), axis=1), FP8_MAX)  # [RB, BC]
+        qc = tl.reshape(v * pow2_neg_fly(ec)[:, None, :], (BR, BC)).to(QT.dtype.element_ty)
+        u = tl.reshape(qc.to(tl.uint8, bitcast=True).to(tl.int32), (BR // 4, 4, BC))
+        w = tl.sum(u << (tl.arange(0, 4) * 8)[None, :, None], axis=1)  # [BR/4, BC]: 4 pool rows of a column per int32
+        pw = pt * (BR // 4) + tl.arange(0, BR // 4)
+        tl.store(QT.to(tl.pointer_type(tl.int32)) + c[:, None].to(tl.int64) * (P // 4) + pw[None, :], tl.trans(w))
+        rb = pt * RB + tl.arange(0, RB)
+        if CT:
+            tl.store(ST + c[:, None].to(tl.int64) * (P // 128) + rb[None, :], tl.trans((ec + 127) & 0xFF).to(tl.uint8))
+        else:
+            store_scale(ST, c[:, None], rb[None, :], tl.trans(ec), C, P // 128, SL)
 
 
 def _gather_tile():
@@ -836,16 +844,37 @@ def gather_dual_fp8(
     compact_t: bool = False,
     scale_layout="x4",
     nw: int = 8,
+    store_q: bool = True,
+    parts: str = "qst",
+    out=None,
 ):
     """xq [N, C] fp8 received rows, xs [N, C/128] uint8 their E8M0 bytes -> pool-ordered (q [P, C], s [P, C/32],
     qT [C, P], sT [C, P/32] or [C, P/128] when ``compact_t``): quant_dual_blk's outputs and layouts, with the row
-    quant taken over unchanged and the 128x1 quant re-derived from the FP8 values."""
+    quant taken over unchanged and the 128x1 quant re-derived from the FP8 values. ``store_q=False``: q is not
+    written (returned as None) -- for a consumer that gathers the rows itself (mxgp_fp8blk_nt(rowmap=...)).
+    ``parts``: which outputs are written ("q" rows, "s" row scales, "t" the 128x1 copy + its scales; the others are
+    not allocated and returned as None unless ``out`` = (s, qT, sT) gives the buffers, e.g. the 128x1 copy computed
+    later on a side stream into buffers allocated now). Every written byte is the same as in the full call."""
     N, C = xq.shape
     assert P % 128 == 0 and C % 128 == 0 and xq.is_contiguous()
     # xs: [N, C/128] with unit column stride and any row stride (e.g. the scale bytes inside a DeepEP payload row)
     assert xs.dtype == torch.uint8 and xs.shape == (N, C // 128) and xs.stride(1) == 1 and rowmap.dtype == torch.int32
     sl = scale_layout_id(scale_layout)
-    q, s, qT, sT = _dual_alloc(P, C, xq.dtype, sl, compact_t, xq.device)
+    if not store_q:
+        parts = parts.replace("q", "")
+    m = ("q" in parts) * 1 + ("s" in parts) * 2 + ("t" in parts) * 4
+    if out is not None:
+        q = None
+        s, qT, sT = out
+    else:
+        q, s, qT, sT = _dual_alloc(P, C, xq.dtype, sl, compact_t, xq.device, alloc_q=bool(m & 1))
+        if not m & 2:
+            s = None
+        if not m & 4:
+            qT = sT = None
+    dummy = next(t for t in (q, s, qT, sT) if t is not None)
+    qa = q if q is not None else dummy
+    s_, qT_, sT_ = (t if t is not None else dummy for t in (s, qT, sT))
     rb, cb, tnw = _gather_tile()
     # wide tiles for the x4 / byte scale layouts (validated); the packed layout keeps the 128 x 128 kernel
     if (rb, cb) != (1, 1) and sl in (0, 1) and P % (rb * 128) == 0 and C % (cb * 128) == 0:
@@ -853,10 +882,10 @@ def gather_dual_fp8(
             xq.view(torch.uint8),
             xs,
             rowmap,
-            q.view(torch.uint8),
-            s,
-            qT,
-            sT,
+            qa.view(torch.uint8),
+            s_,
+            qT_,
+            sT_,
             P,
             C,
             preal if preal is not None else rowmap,
@@ -867,6 +896,7 @@ def gather_dual_fp8(
             SL=sl,
             RB=rb,
             CB=cb,
+            SQ=m,
             num_warps=tnw,
         )
         return q, s, qT, sT
@@ -874,10 +904,10 @@ def gather_dual_fp8(
         xq.view(torch.uint8),
         xs,
         rowmap,
-        q.view(torch.uint8),
-        s,
-        qT,
-        sT,
+        qa.view(torch.uint8),
+        s_,
+        qT_,
+        sT_,
         P,
         C,
         preal if preal is not None else rowmap,
@@ -886,6 +916,7 @@ def gather_dual_fp8(
         HAS_PREAL=int(preal is not None),
         CT=int(compact_t),
         SL=sl,
+        SQ=m,
         num_warps=nw,
     )
     return q, s, qT, sT

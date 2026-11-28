@@ -152,8 +152,8 @@ def _dual_1x128_128x1_kernel(
     _quant_tile_dual(x, p, c, pc, c, pt, P, C, Q, S, QT, ST, FP8_MAX, CT, SL)
 
 
-def _dual_alloc(P: int, C: int, dtype, sl: int, compact_t: bool, dev):
-    q = torch.empty((P, C), device=dev, dtype=dtype)
+def _dual_alloc(P: int, C: int, dtype, sl: int, compact_t: bool, dev, alloc_q: bool = True):
+    q = torch.empty((P, C), device=dev, dtype=dtype) if alloc_q else None
     s = _scale_alloc(P, C, sl, dev)
     qT = torch.empty((C, P), device=dev, dtype=dtype)
     sT = (

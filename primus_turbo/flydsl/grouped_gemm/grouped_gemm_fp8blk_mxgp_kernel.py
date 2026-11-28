@@ -32,7 +32,12 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import arith as std_arith
+from flydsl._mlir.dialects import llvm as _llvm
+from flydsl._mlir.dialects import rocdl as _rocdl
 from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import Constexpr
 from flydsl.expr.typing import T as _T
@@ -107,6 +112,8 @@ def launch_mxgp_fp8blk_nt_gfx1250(
     stream: fx.Stream,
     i32_n: fx.Int32,
     i32_k: fx.Int32,
+    arg_rowmap: fx.Pointer,
+    i32_arows: fx.Int32,
     n_groups: Constexpr[int],
     a_id: Constexpr[int],
     b_id: Constexpr[int],
@@ -114,6 +121,8 @@ def launch_mxgp_fp8blk_nt_gfx1250(
     early: Constexpr[int] = 4,
     tbl: Constexpr[int] = 0,
     mc: Constexpr[int] = 1,
+    gat: Constexpr[int] = 0,
+    gsp: Constexpr[int] = 0,
 ):
     """Persistent: grid = #CUs; workgroup bid computes live tiles t = bid, bid + nwg, ... (live = offs[G] / 256 m-tiles
     x N / 256, read on the device: no dead workgroups, usable for EP>1 worst-case pools). Across tiles: k-tile K-2's
@@ -149,7 +158,12 @@ def launch_mxgp_fp8blk_nt_gfx1250(
     # offsets) in LDS; each tile then reads its expert index with one LDS load instead of scanning the G offsets
     # with scalar loads (the scan cost ~8-12% of the kernel at MBS4 EP4). Same expert index, same C bits.
     TBL_OFF = PRM_LDS + 32
-    ARENA = TBL_OFF + 4 * tbl
+    # gat: A rows gathered straight from the received rows (A[p] = arg_a[rowmap[p]]) with per-lane async
+    # global -> LDS copies (global_load_async_to_lds_b128; no TDM gather, see mega/gfx1250/bf16/gemm_nt_tile.py)
+    # into the same padded LDS layout the TDM tile load writes: the same bytes in LDS, so the same C bits. Two
+    # tables of the tile's 256 row byte offsets (current / next tile) in LDS, lane-transposed for b128 reads.
+    RT_OFF = TBL_OFF + 4 * tbl
+    ARENA = RT_OFF + (2 * 4 * tile_m if gat else 0)
     assert ARENA <= 320 * 1024, f"LDS arena {ARENA} B exceeds 320 KiB"
     G = n_groups
     m_reps = n_reps = 8
@@ -161,7 +175,7 @@ def launch_mxgp_fp8blk_nt_gfx1250(
     NA = 2
     kernel_name = f"moe_mxgp_fp8blk_nt_gfx1250_t256x256x256_a{a_id}{b_id}_g{G}_k{k_max}_e{early}" + (
         f"_tb{tbl}" if tbl else ""
-    ) + (f"_mc{mc}" if mc > 1 else "")
+    ) + (f"_mc{mc}" if mc > 1 else "") + (f"_ga{gsp}" if gat else "")
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
     def kernel_mxgp(
@@ -174,6 +188,8 @@ def launch_mxgp_fp8blk_nt_gfx1250(
         i32_nwg: fx.Int32,
         i32_n: fx.Int32,
         i32_k: fx.Int32,
+        arg_rowmap: fx.Pointer,
+        i32_arows: fx.Int32,
     ):
         tid = fx.Int32(fx.thread_idx.x)
         bid_x, _, _ = fx.block_idx
@@ -270,15 +286,80 @@ def launch_mxgp_fp8blk_nt_gfx1250(
         gSA_base = _cast(fx.Uint8, arg_sa, 1)
         gSB_base = _cast(fx.Uint8, arg_sb, 1)
 
-        def issue(s, tp, kt):
+        # gat: lane tid copies 16-byte chunk tid % GCH of rows tid // GCH + GRPI * i (i < GNL); the immediate LDS
+        # offset of a load also moves its global address, so it is taken back out of the 32-bit global offset
+        # (G_BIAS keeps that unsigned) and the GNL loads go in two halves (immediates stay below 64 KiB)
+        GCH = tile_k // 16
+        GRPI = block // GCH
+        GNL = tile_m // GRPI
+        GHALF = GNL // 2
+        G_BIAS = (GHALF - 1) * GRPI * A_ROW
+        GSP = bool(gat) and gsp > 0 and GNL % (4 * (m_reps - early)) == 0
+        if const_expr(gat):
+            assert block % GCH == 0 and GNL % 8 == 0 and G_BIAS < (1 << 16)
+            rm_rsrc = rocdl.get_buffer_rsrc(rocdl.make_buffer_ptr(fx.recast_iter(i32_ptr, arg_rowmap)))
+            g_c16 = tid % fx.Int32(GCH)
+            g_rsub = tid // fx.Int32(GCH)
+            g_lane_lds = g_rsub * fx.Int32(A_ROW) + g_c16 * fx.Int32(16)
+            g_lane_glb = g_c16 * fx.Int32(16) + fx.Int32(G_BIAS)
+            g_abase = _raw(fx.Int64(fx.ptrtoint(arg_a)) - fx.Int64(G_BIAS))
+
+        def build_rt(tp, rb):
+            """Row byte offsets of tile tp's 256 pool rows into table rb: entry (j % GRPI) * GNL + j // GRPI = A row
+            rowmap[m_row + j] * K. A padding row (rowmap < 0) reads the tile's first row instead (always a live
+            row: expert segments are 256-aligned with their padding at the end); its output row is padding, which
+            the SwiGLU multiplies by its zero routing weight."""
+            m_row = tp[1]
+            first = fx.Int32(_bops.buffer_load(rm_rsrc, m_row, vec_width=1, is_scalar=True))
+            fb = ((first >= zero) & (first < i32_arows)).select(first, zero)
+            for h_ in range_constexpr(tile_m // block):
+                j = tid + fx.Int32(h_ * block)
+                idx = fx.Int32(_bops.buffer_load(rm_rsrc, m_row + j, vec_width=1, dtype=fx.Int32))
+                row = ((idx >= zero) & (idx < i32_arows)).select(idx, fb)
+                pos = (j % fx.Int32(GRPI)) * fx.Int32(GNL) + j // fx.Int32(GRPI)
+                fx.ptr_store(
+                    fx.Vector.from_elements([row * i32_k], fx.Int32).bitcast(fx.Int8),
+                    base_ptr + (RT_OFF + rb * (4 * tile_m) + pos * 4),
+                )
+
+        def read_rt(rb, lo=0, hi=GNL):
+            tb = lds_base + RT_OFF + rb * (4 * tile_m) + g_rsub * (4 * GNL)
+            offs = {}
+            for q_ in range_constexpr(lo // 4, hi // 4):
+                v = fx.Vector(lds_b128(tb, 16 * q_))
+                for e_ in range_constexpr(4):
+                    offs[4 * q_ + e_] = v[e_]
+            return offs
+
+        def issue_a_gather(s, rb, kt, part=0, nparts=1):
+            """Loads [part * GNL / nparts, (part + 1) * GNL / nparts) of k-tile kt into stage s (table rb)."""
+            i64 = ir.IntegerType.get_signless(64)
+            npl = GNL // nparts
+            koff = fx.Int32(kt) * fx.Int32(tile_k) + g_lane_glb
+            offs = read_rt(rb, part * npl, (part + 1) * npl)
+            st = fx.Int32(fx.ptrtoint(_stage(s))) + g_lane_lds
+            for i in range_constexpr(part * npl, (part + 1) * npl):
+                h_ = i // GHALF
+                il = i % GHALF
+                lds = _llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), _raw(st + fx.Int32(h_ * GHALF * GRPI * A_ROW)))
+                o = fx.Int32(offs[i]) + koff - fx.Int32(il * GRPI * A_ROW)
+                ga = std_arith.AddIOp(g_abase, std_arith.ExtUIOp(i64, _raw(o)).result).result
+                gp = _llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), ga)
+                _rocdl.global_load_async_to_lds_b128(gp, lds, il * GRPI * A_ROW)
+
+        def issue(s, tp, kt, rb=None, a_now=True):
             g, m_row, blk_n = tp
             k = fx.Int64(kt) * tile_k
-            fx.copy(
-                atomA,
-                gA,
-                _view(_stage(s), a_cls, (tile_m, tile_k), (A_ROW, 1)),
-                imm_offset=fx.Int64(m_row) * lda64 + k,
-            )
+            if const_expr(gat):
+                if const_expr(a_now):
+                    issue_a_gather(s, rb, kt)
+            else:
+                fx.copy(
+                    atomA,
+                    gA,
+                    _view(_stage(s), a_cls, (tile_m, tile_k), (A_ROW, 1)),
+                    imm_offset=fx.Int64(m_row) * lda64 + k,
+                )
             fx.copy(
                 atomB,
                 gB,
@@ -437,16 +518,26 @@ def launch_mxgp_fp8blk_nt_gfx1250(
                 if const_expr(mi == early):
                     rocdl.s_wait_dscnt(0)
                     tdm_ops.tensor_wait(0)
+                    if const_expr(gat):
+                        _rocdl.s_wait_asynccnt(0)
                     bar()
                     # stage kt % 2 and (at the last k-tile) the scale planes are no longer read by any wave
                     if kt + 2 < K_TILES:
-                        issue(kt % 2, tp_cur(), kt + 2)
+                        issue(kt % 2, tp_cur(), kt + 2, rb_cur(), a_now=not GSP)
                     else:
                         if prm(6) > zero:
                             if last:
                                 issue_planes(tp_nxt())
                             else:
-                                issue(kt % 2, tp_nxt(), 0)
+                                issue(kt % 2, tp_nxt(), 0, one - rb_cur(), a_now=not GSP)
+                if const_expr(GSP and mi >= early):
+                    # gat spread: the A k-tile's async loads go out over the row groups after the barrier
+                    if kt + 2 < K_TILES:
+                        issue_a_gather(kt % 2, rb_cur(), kt + 2, mi - early, m_reps - early)
+                    else:
+                        if prm(6) > zero:
+                            if kt + 1 < K_TILES:
+                                issue_a_gather(kt % 2, one - rb_cur(), 0, mi - early, m_reps - early)
                 _wmmas(b1, a1[mi], s1[mi], sb1, mi, 0, h)
                 rocdl.sched_barrier(0)
                 if const_expr(mi < early - 1):
@@ -481,8 +572,12 @@ def launch_mxgp_fp8blk_nt_gfx1250(
         def tp_nxt():
             return (prm(3), prm(4), prm(5))
 
-        def set_prm(tp, ntp, hn):
-            v = fx.Vector.from_elements([tp[0], tp[1], tp[2], ntp[0], ntp[1], ntp[2], hn, zero], fx.Int32)
+        def rb_cur():
+            # gat: row-offset table of the current tile (the next tile's is the other one)
+            return prm(7)
+
+        def set_prm(tp, ntp, hn, rb):
+            v = fx.Vector.from_elements([tp[0], tp[1], tp[2], ntp[0], ntp[1], ntp[2], hn, rb], fx.Int32)
             fx.ptr_store(v.bitcast(fx.Int8), base_ptr + PRM_LDS)
 
         gC8 = _cast(fx.Int8, _cast(out_cls, arg_c))
@@ -507,17 +602,26 @@ def launch_mxgp_fp8blk_nt_gfx1250(
         t0 = (my_cnt > zero).select(bid, zero)
         tp0 = tile_params(t0)
         if my_cnt > zero:
+            if const_expr(gat):
+                build_rt(tp0, 0)
+                fx.barrier()
             issue_planes(tp0)
-            issue(0, tp0, 0)
+            issue(0, tp0, 0, 0)
             tdm_ops.tensor_wait(0)
+            if const_expr(gat):
+                _rocdl.s_wait_asynccnt(0)
             fx.barrier()
             load_frags(0, SETS[0])
             load_scales(0, SETS[0])
-            issue(1, tp0, 1)
+            issue(1, tp0, 1, 0)
         for it in range(my_cnt):
             t = bid + it * i32_nwg
             hn = (it + 1 < my_cnt).select(one, zero)
-            set_prm(tile_params(t), tile_params((hn > zero).select(t + i32_nwg, t)), hn)
+            ntp = tile_params((hn > zero).select(t + i32_nwg, t))
+            set_prm(tile_params(t), ntp, hn, it % 2)
+            if const_expr(gat):
+                if hn > zero:
+                    build_rt(ntp, (it + 1) % 2)
             for cf in c_frags:
                 cf.fill(0.0)
             for kp in range(K_TILES // 2):
@@ -544,8 +648,9 @@ def launch_mxgp_fp8blk_nt_gfx1250(
             )
             if prm(6) > zero:
                 bar()  # every wave is done with its stage-1 scratch
-                issue(1, tp_nxt(), 1)
-                tdm_ops.tensor_wait(2)  # the next tile's planes (issued before k-tile 1)
+                issue(1, tp_nxt(), 1, one - rb_cur())
+                # the next tile's planes (issued before k-tile 1; with gat k-tile 1 has one TDM op, B)
+                tdm_ops.tensor_wait(1 if gat else 2)
                 bar()
                 load_scales(0, SETS[0])
 
@@ -560,6 +665,8 @@ def launch_mxgp_fp8blk_nt_gfx1250(
         i32_nwg,
         i32_n,
         i32_k,
+        arg_rowmap,
+        i32_arows,
         value_attrs=({"rocdl.cluster_dims": f"{mc},1,1"} if mc > 1 else None),
     ).launch(
         grid=(i32_nwg, 1, 1),
@@ -576,14 +683,26 @@ _MXGP_TBL = os.environ.get("PRIMUS_TURBO_MXGP_TBL", "1") != "0"
 # PRIMUS_TURBO_MXGP_MC (default 2): the A k-tiles are TDM-multicast to a cluster of this many workgroups (consecutive
 # n-tiles of one m-tile); 1 = off. Same C bits.
 _MXGP_MC = int(os.environ.get("PRIMUS_TURBO_MXGP_MC", "2"))
+# PRIMUS_TURBO_MXGP_GSP (default 0): gathered A (rowmap=...): spread the k-tile's async row loads over the row groups
+# after the early barrier (0 = all at the barrier). Same bits.
+_MXGP_GSP = int(os.environ.get("PRIMUS_TURBO_MXGP_GSP", "0"))
 
 
-def mxgp_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, early=4, nwg=None, tbl=None, mc=None):
+def mxgp_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, early=4, nwg=None, tbl=None, mc=None, rowmap=None):
     """out [M, N] bf16, bit-identical to flygg_fp8blk_nt(..., tile=(256, 256, 256), num_buffers=2): a [M, K] fp8,
     b [G, N, K] fp8, sa [M, K/32] / sb [G, N, K/32] uint8 E8M0. Needs K % 512 == 0, power-of-two K, N % 256 == 0,
-    group offsets multiples of 256 (live tiles are bounded on the device by offs[G])."""
+    group offsets multiples of 256 (live tiles are bounded on the device by offs[G]).
+    ``rowmap`` (int32 [M]): A is gathered, row p = a[rowmap[p]] (a [Na, K] the source rows; rowmap < 0 = a padding
+    row, whose output row is computed from the tile's first row instead and must not be consumed). Same C bits on
+    every non-padding row as the dense call on the gathered A; the A k-tiles go through per-lane async copies
+    (no multicast)."""
     assert sa.dtype == torch.uint8 and sb.dtype == torch.uint8 and sa.is_contiguous() and sb.is_contiguous()
-    M, K = a.shape
+    Na, K = a.shape
+    M = Na
+    if rowmap is not None:
+        assert rowmap.dtype == torch.int32 and rowmap.is_contiguous() and rowmap.dim() == 1
+        M = rowmap.shape[0]
+        assert Na * K + 65536 < 2**32, "gathered A too big for 32-bit row offsets"
     G, N, Kb = b.shape
     assert K == Kb and a.is_contiguous() and b.is_contiguous()
     assert K % 512 == 0 and (K & (K - 1)) == 0 and N % 256 == 0 and M % 256 == 0
@@ -597,6 +716,8 @@ def mxgp_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, early=4, nwg=None, tbl=None
     nwg = max(1, min(nwg, (M // 256) * (N // 256)))
     if mc is None:
         mc = _MXGP_MC
+    if rowmap is not None:
+        mc = 1
     if mc > 1 and ((N // 256) % mc or nwg < mc):
         mc = 1
     if mc > 1:
@@ -608,6 +729,7 @@ def mxgp_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, early=4, nwg=None, tbl=None
         tbl = M // 256
         sp = K // 32 + 4
         used = 2 * (2 * 256 * 272) + 256 * sp + (16 * sp + 15) // 16 * 16 + 4 * 32 + 32
+        used += 2 * 4 * 256 if rowmap is not None else 0
         if used + 4 * tbl > 320 * 1024:
             tbl = 0
     a_id = 0 if a.dtype == torch.float8_e4m3fn else 1
@@ -623,6 +745,8 @@ def mxgp_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, early=4, nwg=None, tbl=None
         fx.Stream(torch.cuda.current_stream(device=a.device)),
         N,
         K,
+        _ptr(rowmap if rowmap is not None else offs_i32),
+        Na,
         G,
         a_id,
         b_id,
@@ -630,8 +754,10 @@ def mxgp_fp8blk_nt(a, b, sa, sb, offs_i32, out=None, early=4, nwg=None, tbl=None
         early,
         tbl,
         mc,
+        int(rowmap is not None),
+        _MXGP_GSP,
     )
-    key = (G, a_id, b_id, K, early, nwg, tbl, mc)
+    key = (G, a_id, b_id, K, early, nwg, tbl, mc, rowmap is not None, _MXGP_GSP)
     c = _COMPILED_P.get(key)
     if c is None:
         _COMPILED_P[key] = flyc.compile(launch_mxgp_fp8blk_nt_gfx1250, *args)

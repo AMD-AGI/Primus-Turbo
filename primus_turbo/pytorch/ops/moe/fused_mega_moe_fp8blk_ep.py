@@ -401,6 +401,70 @@ def _dp_send(st, payload, q, rk, itr=None, ntr=None):
     return rq, rp
 
 
+def _gg_gather(st: _EPState) -> int:
+    """PRIMUS_TURBO_EP_GG_GATHER (DeepEP path; unset = 1 for pools of >= 32768 received rows, else 0):
+    0 = gather_dual_fp8 writes the pool-ordered FP8 rows, the fc1 forward / fc2 dgrad grouped GEMMs read them;
+    1 = the GEMMs read their 1x128 A rows straight from the received rows through the pool row map
+    (mxgp_fp8blk_nt(rowmap=...)) and gather_dual_fp8 writes only the scales and the 128x1 wgrad copy (DSv4-Flash 4L
+    EP4: MBS4 (N = 65536) -0.8 ms/step, MBS1 (N = 16384) +1.5 ms/step; same loss and grad norm at every iteration);
+    2 = as 1, and the 128x1 wgrad copy (x^T for dW1, dy^T for dW2) is built right before its wgrad, inside the same
+    deferred side-stream launch (MOE_WGRAD overlap), from the kept received rows, so the critical path only gathers
+    the scale bytes (MoE backward chain -0.6 ms/layer, but the copy then contends with the side-stream wgrads and
+    the next layer's kernels: +1.3 ms/step). Same bytes in the GEMM's LDS / the same 128x1 bytes -> same C,
+    main_grad bits on every live pool row; padding rows (zero routing weight) are computed from a live row of
+    their tile instead of zeros."""
+    v = os.environ.get("PRIMUS_TURBO_EP_GG_GATHER", "")
+    return int(v) if v else int(st.N >= 32768)
+
+
+def _pool_a(st: _EPState, rk: _Rank, rq, rs):
+    """gather_dual_fp8 of received rows rq [N, H] / E8M0 bytes rs -> (A, A scales, 128x1 copy, its scales); A is the
+    (rows, rowmap) pair of a gathered GEMM operand under _gg_gather(). Mode 2: the 128x1 copy is returned as a
+    _LazyT (built by _wgrad)."""
+    N, H, P = st.N, st.H, st.P
+    gat = _gg_gather(st)
+    rq = rq.view(N, H)
+    if gat == 2:
+        _, s, _, _ = gather_dual_fp8(rq, rs, P, rk.rowmap, preal=rk.preal, compact_t=st.ct, parts="s")
+        lazy = _LazyT(rq, rs, P, rk.rowmap, rk.preal, st.ct)
+        return (rq, rk.rowmap), s, lazy, None
+    q, s, qT, sT = gather_dual_fp8(rq, rs, P, rk.rowmap, preal=rk.preal, compact_t=st.ct, store_q=not gat)
+    return ((rq, rk.rowmap) if gat else q), s, qT, sT
+
+
+class _LazyT:
+    """The 128x1 (token-direction) copy of gathered rows, not built yet: alloc() allocates its buffers (call on the
+    stream that owns them), build(out) runs the gather_dual_fp8 "t" part into them (same bytes as the full call)."""
+
+    def __init__(self, rq, rs, P, rowmap, preal, ct):
+        self.rq, self.rs, self.P, self.rowmap, self.preal, self.ct = rq, rs, P, rowmap, preal, ct
+
+    def alloc(self):
+        C, P = self.rq.shape[1], self.P
+        qT = torch.empty((C, P), device=self.rq.device, dtype=self.rq.dtype)
+        sT = (
+            torch.empty((C, P // 128), device=self.rq.device, dtype=torch.uint8)
+            if self.ct
+            else _blk_scale_alloc(C, P, self.rq.device)
+        )
+        return qT, sT
+
+    def build(self, qT, sT):
+        gather_dual_fp8(
+            self.rq, self.rs, self.P, self.rowmap, preal=self.preal, compact_t=self.ct, parts="t", out=(None, qT, sT)
+        )
+
+    def keep(self):
+        return (self.rq, self.rs, self.rowmap, self.preal)
+
+
+def _blk_scale_alloc(C, P, dev):
+    from primus_turbo.triton.quantization.quantization_fp8blk_moe_kernel import _scale_alloc
+    from primus_turbo.triton.quantization.quantization_fp8blk_utils import scale_layout_id
+
+    return _scale_alloc(C, P, scale_layout_id("x4"), dev)
+
+
 def _dispatch_fwd_dp(st: _EPState, xs, idxs, tws):
     """_dispatch_fwd through DeepEP, no all_to_all: each token's FP8 row goes once to each rank it has routes on, with
     its E8M0 scales, global expert ids and fp32 route weights as payload words. The expert rank builds its pool
@@ -425,7 +489,7 @@ def _dispatch_fwd_dp(st: _EPState, xs, idxs, tws):
             rp, nsw, nsw + K, cntp, me, N, K, E_l, P, align=_blk._ALIGN, wcap=wcap
         )
         rs = rp.view(torch.uint8)[:, : H // 128]  # the E8M0 bytes in place (row stride = payload row)
-        xq, xs_, rk.xT, rk.xTs = gather_dual_fp8(rq.view(N, H), rs, P, rk.rowmap, preal=rk.preal, compact_t=st.ct)
+        xq, xs_, rk.xT, rk.xTs = _pool_a(st, rk, rq, rs)
         return [(xq, xs_)]
     itr = torch.zeros((T, R), dtype=torch.bool, device=x.device)
     itr.scatter_(1, idx // E_l, True)
@@ -463,7 +527,7 @@ def _dispatch_dy(st: _EPState, dys):
             q, s = _src_rows(dys[0].contiguous().to(torch.bfloat16), True)
             pay = s.view(torch.int32)
         rq, rp = _dp_send(st, pay, q, rk)
-        return [gather_dual_fp8(rq.view(N, H), rp.view(torch.uint8), P, rk.rowmap, preal=rk.preal, compact_t=st.ct)]
+        return [_pool_a(st, rk, rq, rp.view(torch.uint8))]
     pq, ps = [], []
     for rk, dy in zip(st.ranks, dys):
         q, s = quant_rows_send(dy.contiguous().to(torch.bfloat16), rk.slot, cap, quant=fp8)
@@ -560,6 +624,19 @@ def _wgrad(st: _EPState, rk: _Rank, w, lhs, lhs_s, rhs, rhs_s, n, k, accumulate)
 
     # Bound now: the (possibly deferred) launch must use exactly these tensors, never a later rk attribute.
     poffs, perm = rk.poffs, rk.perm
+    # a _LazyT operand (PRIMUS_TURBO_EP_GG_GATHER=2): buffers allocated here (current stream), filled by the same
+    # (possibly deferred) launch sequence right before the wgrad
+    builds, lkeep = [], []
+    if isinstance(lhs, _LazyT):
+        lz = lhs
+        lhs, lhs_s = lz.alloc()
+        builds.append((lz, lhs, lhs_s))
+        lkeep += lz.keep()
+    if isinstance(rhs, _LazyT):
+        lz = rhs
+        rhs, rhs_s = lz.alloc()
+        builds.append((lz, rhs, rhs_s))
+        lkeep += lz.keep()
     if st.wwin < st.N:
         # Device-side window check, issued on the current (main) stream before any fork: its temporaries are
         # allocated and freed in the main stream's pool, so the deferred launch below allocates nothing on the side
@@ -570,6 +647,8 @@ def _wgrad(st: _EPState, rk: _Rank, w, lhs, lhs_s, rhs, rhs_s, n, k, accumulate)
             torch._assert_async((poffs[1:] - poffs[:-1]).max() <= _blk._vkp_kwin(st.wwin))
 
     def run(out, beta, sq=None):
+        for lz, qT, sT in builds:
+            lz.build(qT, sT)
         _blk._run_wgrad(st.wk, lhs, rhs, lhs_s, rhs_s, poffs, n, k, out, beta, perm, st.wwin, sq)
 
     mg = _blk._setup_accum(w, accumulate)
@@ -580,7 +659,7 @@ def _wgrad(st: _EPState, rk: _Rank, w, lhs, lhs_s, rhs, rhs_s, n, k, accumulate)
             # the expert wgrad only feeds the optimizer: run it on the side stream next to the dgrad chain and the
             # EP all-to-alls (same kernel and inputs -> same main_grad bits; joined after the micro-batch backward).
             # Every tensor the launch touches is listed: defer() keeps it and record_streams it on the side stream.
-            _overlap.defer(lambda: run(mg, beta, sq), lhs, lhs_s, rhs, rhs_s, poffs, perm, mg, sq)
+            _overlap.defer(lambda: run(mg, beta, sq), lhs, lhs_s, rhs, rhs_s, poffs, perm, mg, sq, *lkeep)
         else:
             run(mg, beta, sq)
         w._primus_main_grad_sumsq_fresh = sq is not None

@@ -192,11 +192,19 @@ def refresh_fp8blk_weights():
 
 
 def _gg(a, a_s, c, transposed, poffs):
-    """Grouped NT GEMM over the expert pool: a [P, K] fp8 x expert weights (c.q, or c.qT for the dgrads)."""
+    """Grouped NT GEMM over the expert pool: a [P, K] fp8 x expert weights (c.q, or c.qT for the dgrads).
+    ``a`` may be a (rows [Na, K], rowmap int32 [P]) pair: pool row p = rows[rowmap[p]] (rowmap < 0: padding row,
+    not consumed), gathered inside mxgp; materialized here for the other schedules (zeros on padding rows)."""
     w, ws = (c.qT, c.sT) if transposed else (c.q, c.s)
-    P, K = a.shape
+    rowmap = None
+    if isinstance(a, tuple):
+        a, rowmap = a
+    P, K = (a.shape[0] if rowmap is None else rowmap.shape[0]), a.shape[1]
     if _GG_MODE == "mxp" and K % 512 == 0 and (K & (K - 1)) == 0 and w.shape[1] % 256 == 0 and P % 256 == 0:
-        return mxgp_fp8blk_nt(a, w, a_s, ws, poffs)
+        return mxgp_fp8blk_nt(a, w, a_s, ws, poffs, rowmap=rowmap)
+    if rowmap is not None:
+        ok = (rowmap >= 0).view(P, 1)
+        a = torch.where(ok, a[rowmap.clamp(min=0).long()].view(torch.uint8), 0).view(a.dtype)
     return flygg_fp8blk_nt(a, w, a_s, ws, poffs, **(_K256 if _GG_MODE != "tile" and K % 256 == 0 else _TILE))
 
 
