@@ -6,10 +6,12 @@
 
 """FlyDSL flash-attention forward/backward for gfx1250 (MI455X), dense [b, s, h, d] tensors.
 
-bf16, head_dim 128, GQA (Hq / Hkv of 1, 2, 4, 8 or 16), Sq a multiple of 64 and Skv of 32,
-q and k each at most 1 GiB, bottom-right causal or full attention, no dropout / bias / alibi /
-sink / sliding window; ``interface.unsupported_reason`` of the kernel package has the exact
-rules. The kernels address BSHD; any other byte order is made contiguous first. Mirrors the
+bf16, head_dim 64 or 128, GQA (Hq / Hkv of 1, 2, 4, 8 or 16), Sq a multiple of 64 and Skv of
+32, q and k each at most 1 GiB, bottom-right causal (optionally with a sliding window on the
+left: flash-attn ``window_size=(window_left, 0)``, query i attends keys
+[i + Skv - Sq - window_left, i + Skv - Sq]) or full attention, no dropout / bias / alibi /
+sink; ``interface.unsupported_reason`` of the kernel package has the exact rules. The kernels
+address BSHD; any other byte order is made contiguous first. Mirrors the
 ``attention_triton_impl`` layer -- dispatch and autograd wiring belong to the caller.
 
 The kernels need a flydsl that satisfies ``FLYDSL_REQUIREMENT`` (``>=0.3.4.1,<0.3.5``, in
@@ -82,29 +84,30 @@ def _interface():
 
 
 def flydsl_gfx1250_unsupported_reason(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool, window_left: int = -1
 ) -> Optional[str]:
     """Why the gfx1250 kernels cannot take these [b, s, h, d]-shaped tensors, or None.
 
-    A missing flydsl, one outside ``flydsl_version.FLYDSL_REQUIREMENT`` (found before any
-    kernel module is imported) or a kernel package that fails to import is a reason too:
-    the gate declines, it never raises.
+    ``window_left >= 0`` asks for the sliding window (causal only). A missing flydsl, one
+    outside ``flydsl_version.FLYDSL_REQUIREMENT`` (found before any kernel module is imported)
+    or a kernel package that fails to import is a reason too: the gate declines, it never
+    raises.
     """
     reason = _unavailable_reason()
     if reason is not None:
         return reason
-    return _INTERFACE.unsupported_reason(q.shape, k.shape, v.shape, q.dtype, causal)
+    return _INTERFACE.unsupported_reason(q.shape, k.shape, v.shape, q.dtype, causal, window_left)
 
 
 @_eager_custom_op("primus_turbo::flash_attn_flydsl_gfx1250_forward")
 def _forward(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: float, causal: bool
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: float, causal: bool, window_left: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _interface().flash_attn_fwd(q, k, v, softmax_scale, causal)
+    return _interface().flash_attn_fwd(q, k, v, softmax_scale, causal, window_left)
 
 
 @_forward.register_fake
-def _(q, k, v, softmax_scale, causal):
+def _(q, k, v, softmax_scale, causal, window_left):
     b, sq, hq, _ = q.shape
     return q.new_empty((b, sq, hq, v.shape[-1])), q.new_empty((b, hq, sq), dtype=torch.float32)
 
@@ -120,12 +123,15 @@ def _backward(
     softmax_scale: float,
     causal: bool,
     deterministic: bool,
+    window_left: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _interface().flash_attn_bwd(dout, q, k, v, out, lse, softmax_scale, causal, deterministic)
+    return _interface().flash_attn_bwd(
+        dout, q, k, v, out, lse, softmax_scale, causal, deterministic, window_left
+    )
 
 
 @_backward.register_fake
-def _(dout, q, k, v, out, lse, softmax_scale, causal, deterministic):
+def _(dout, q, k, v, out, lse, softmax_scale, causal, deterministic, window_left):
     return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
 
@@ -133,19 +139,23 @@ def _scale(softmax_scale: Optional[float], head_dim: int) -> float:
     return float(head_dim**-0.5 if softmax_scale is None else softmax_scale)
 
 
-def flash_attn_flydsl_gfx1250_forward_impl(q, k, v, softmax_scale=None, causal=True):
-    """Returns (out [b, sq, hq, d] contiguous, lse [b, hq, sq] fp32 natural log)."""
+def flash_attn_flydsl_gfx1250_forward_impl(q, k, v, softmax_scale=None, causal=True, window_left=-1):
+    """Returns (out [b, sq, hq, d] contiguous, lse [b, hq, sq] fp32 natural log).
+
+    ``window_left >= 0`` (causal only) is the sliding window of flash-attn's
+    ``window_size=(window_left, 0)``."""
     q, k, v = (t.contiguous() for t in (q, k, v))
-    return _forward(q, k, v, _scale(softmax_scale, q.shape[-1]), bool(causal))
+    return _forward(q, k, v, _scale(softmax_scale, q.shape[-1]), bool(causal), int(window_left))
 
 
 def flash_attn_flydsl_gfx1250_backward_impl(
-    dout, q, k, v, out, lse, softmax_scale=None, causal=True, deterministic=False
+    dout, q, k, v, out, lse, softmax_scale=None, causal=True, deterministic=False, window_left=-1
 ):
     """Returns (dq, dk, dv), contiguous [b, s, h, d]; dk/dv have k's head count.
 
-    q/k/v/out/lse are what the forward saw and returned; only dout may arrive strided. Unless
-    ``deterministic``, dq may be summed with fp32 atomics (not bitwise reproducible).
+    q/k/v/out/lse are what the forward saw and returned, and ``window_left`` the window it
+    used; only dout may arrive strided. Unless ``deterministic``, dq may be summed with fp32
+    atomics (not bitwise reproducible).
     """
     return _backward(
         dout.contiguous(),
@@ -157,4 +167,5 @@ def flash_attn_flydsl_gfx1250_backward_impl(
         _scale(softmax_scale, q.shape[-1]),
         bool(causal),
         bool(deterministic),
+        int(window_left),
     )
