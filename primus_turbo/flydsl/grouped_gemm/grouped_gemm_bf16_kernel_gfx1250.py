@@ -221,6 +221,15 @@ def m_tile_upper_bound(total_m: int, block_m: int, groups: int) -> int:
     return (total_m + block_m - 1) // block_m + groups
 
 
+# M_TILES is a compile-time constant of the NT / NN kernels: rounded up to a multiple of this, M totals within one
+# bucket share a compiled kernel (MoE token counts change every step); the extra tiles decode as dead (m_rows = 0).
+_M_TILES_BUCKET = 16
+
+
+def _bucket_m_tiles(m_tiles: int) -> int:
+    return -(-m_tiles // _M_TILES_BUCKET) * _M_TILES_BUCKET
+
+
 _PROV = "_flydsl_prov"
 
 
@@ -5333,7 +5342,7 @@ def _grouped_gemm_bf16_nt_flydsl_kernel_entry(
     )
     if out is None:
         out = torch.empty(TOTAL_M, N, device=a.device, dtype=out_dtype)
-    m_upper = m_tile_upper_bound(TOTAL_M, tile_m, G)
+    m_upper = _bucket_m_tiles(m_tile_upper_bound(TOTAL_M, tile_m, G))
     # A cluster spans whole M tiles; the padding tiles decode as dead (m_rows = 0).
     m_upper += -m_upper % mc_m
     if wave_grid < 0:
@@ -5574,7 +5583,7 @@ def _nn_native_launch(
         head_pipe = hp_opaque = hp_epi = 0
     if G > 32 or inkernel_scan:
         vec_dec = 0
-    m_upper = m_tile_upper_bound(TOTAL_M, tile_m, G)
+    m_upper = _bucket_m_tiles(m_tile_upper_bound(TOTAL_M, tile_m, G))
     m_upper += -m_upper % mc_m
     if m_tiles is None:
         m_tiles = (
