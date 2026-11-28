@@ -667,14 +667,13 @@ def attn_fwd(
             # The tensor allocated for L is based on MAX_SEQLENS_Q as that is
             # statically known.
             l_offset = LSE + off_z * stride_lse_z + off_h_q * stride_lse_h + cu_seqlens_q_start * stride_lse_m
-            l_ptrs = l_offset + offs_m * stride_lse_m
+            # Same blocked layout as the LSE write-back below: block start_m's LSE lives at
+            # start_m * 2 * BLOCK_M, followed by BLOCK_M slots the backward fills with delta.
+            l_ptrs = l_offset + (start_m * BLOCK_M * 2 + tl.arange(0, BLOCK_M)) * stride_lse_m
 
             l = tl.full([BLOCK_M], value=0.0, dtype=tl.float32)
 
-            # mask_m_offsets = start_m + tl.arange(0, BLOCK_M)
-            # lse_mask = mask_m_offsets < causal_start_idx
-            # softmax_lse = tl.where(lse_mask, 0.0, softmax_lse)
-            l_ptrs_mask = offs_m < MAX_SEQLENS_Q
+            l_ptrs_mask = offs_m < seqlen_q
             tl.store(l_ptrs, l, mask=l_ptrs_mask)
             # TODO: Should dropout and return encoded softmax be handled here too?
             return
