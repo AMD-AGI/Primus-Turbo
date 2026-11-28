@@ -97,6 +97,14 @@ def emit_gemm_mxfp8_nt_tile(
     N_LDS_STEPS_B = LDS_BLOCK_N // 64
     N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
 
+    # End-of-iteration G2S drain budget: -2 derives it from the streams, as the dense FP8 kernel does
+    # since #570. The tail reads the last K-tile's a_cur0 with no wait of its own, and in the last loop
+    # iteration only the b_cur1 refill (N_LDS_STEPS_B loads) is issued after a_cur0's last LDS-DMA, so
+    # vmcnt(N_LDS_STEPS_B) covers that DMA. A literal also counts whatever scale loads the scheduler
+    # puts behind it, which depends on scale_pack.
+    if nt_vmcnt == -2:
+        nt_vmcnt = N_LDS_STEPS_B
+
     a_cur0 = lds.A_lds_cur_0
     a_cur1 = lds.A_lds_cur_1
     a_next0 = lds.A_lds_next_0
@@ -221,9 +229,9 @@ def emit_gemm_mxfp8_nt_tile(
         rocdl.s_setprio(0)
         rocdl.s_barrier()
         if nt_vmcnt >= 0:
-            # Hand-placed drain for the gfx950 G2S/LDS hazard: at vmcnt >= 4 the next tile's global
-            # loads can overtake the LDS writes this MMA still reads, nondeterministically. 3 is the
-            # deepest value that stays deterministic, so this is a correctness bound, not a knob.
+            # Hand-placed drain for the gfx950 G2S/LDS hazard: a budget above the loads issued after
+            # a_cur0's last DMA lets the tail read it before it lands (see the derivation above), so
+            # this is a correctness bound, not a knob.
             _llvm.inline_asm(
                 res=None,
                 operands_=[],

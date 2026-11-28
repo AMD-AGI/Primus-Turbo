@@ -97,8 +97,9 @@ from primus_turbo.flydsl.utils.buffer_ops import (
 from primus_turbo.flydsl.utils.prims import _readfirstlane_i32, cast, read_clock, spin_timed_out
 
 # s_waitcnt vmcnt bound for the GEMM main loop; changes the emitted kernel, so it is in the flyc
-# compile cache key below.
-_COMBINE_NT_VMCNT = 3
+# compile cache key below. -2 derives it from the tile's streams (emit_gemm_mxfp8_nt_tile): with the
+# pack-4 scales a literal 3 leaves the last K-tile's A.0 LDS-DMA in flight when the tail reads it.
+_COMBINE_NT_VMCNT = -2
 # The GEMM role is one workgroup per tile, tiles mapped row-major, and the grid carries one block
 # per REAL tile (plus the tail-reduce reservation) rather than the pool's worst case. Three
 # alternatives were plumbed through here and none earned its keep: a persistent grid (a fixed CU
