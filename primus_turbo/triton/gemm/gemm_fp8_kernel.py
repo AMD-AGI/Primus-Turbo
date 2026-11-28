@@ -28,8 +28,8 @@ Contains:
       so each (key tuple) compiles to an independent binary.
     - _blockwise_fp8_{nt,nn,tn}_kernel: Layout-specialised `triton.autotune`
       wrappers around the unified jit body. Each owns its own config search
-      space and best-config cache (NT: 96 configs, NN: 144 with
-      matrix_instr_nonkdim=16 stack on BM=256, TN: 64 without num_stages=3).
+      space and best-config cache (gfx950: NT 48 configs, NN 72 with
+      matrix_instr_nonkdim=16 stack on BM=256, TN 32 without num_stages=3).
     - gemm_fp8_blockwise_triton_kernel: Unified public API (NT/NN/TN).
 
 Environment variable: PRIMUS_TURBO_GEMM_BACKEND=TRITON activates these kernels.
@@ -742,7 +742,9 @@ def gemm_fp8_rowwise_triton_kernel(
 # ═══════════════════════════════════════════════════════════════════════════════
 # Blockwise autotune configs
 # Fixed: BLOCK_N=128, BLOCK_K=128, wpe=2, mfma=16
-# Variable: BLOCK_M, kpack, GROUP_M, CHUNK, num_stages
+# Variable: BLOCK_M, BLOCK_N (gfx950), GROUP_M, CHUNK, num_stages
+# kpack is not a variable: the kernel always runs with the default kpack=1
+# (Triton overrides kpack to 1 on gfx950 anyway), so it is not iterated.
 #
 # ``allow_num_stages_3`` is a per-autotune-wrapper switch. The TN/wgrad
 # specialisation of the unified kernel uses dual strided-K loads
@@ -780,10 +782,9 @@ def _get_blockwise_autotune_configs(
     else:
         num_stage_values = [1, 2]
         block_n_values = [128]
-    for block_m, block_n, kp, gm, chunk, ns in itertools.product(
+    for block_m, block_n, gm, chunk, ns in itertools.product(
         [128, 256],
         block_n_values,
-        [1, 2],
         [4, 8],
         [32, 64],
         num_stage_values,
@@ -859,12 +860,12 @@ def _get_blockwise_autotune_configs(
 #
 # Three `triton.autotune` wrappers below specialise the kernel along the
 # dimensions that historically required separate search spaces:
-#   * NT  : 96 configs, key=("M","N","K","EVEN_K"), keeps `num_stages=3`.
-#   * NN  : 144 configs (96 + matrix_instr_nonkdim=16 stack on BM=256),
+#   * NT  : 48 configs, key=("M","N","K","EVEN_K"), keeps `num_stages=3`.
+#   * NN  : 72 configs (48 + matrix_instr_nonkdim=16 stack on BM=256),
 #           key=("M","N","K","EVEN_K"), keeps `num_stages=3` (the nonkdim=16
 #           candidate is what avoids the 16-AGPR overflow on
 #           BM=256/nw=8/ns=3 documented in §3.3).
-#   * TN  : 64 configs (no `num_stages=3` — dual strided-K + ns=3 hits the
+#   * TN  : 32 configs (no `num_stages=3` — dual strided-K + ns=3 hits the
 #           Triton 3.7 AMD-backend assertion mentioned above),
 #           key=("M","N","K").
 # ═══════════════════════════════════════════════════════════════════════════════
