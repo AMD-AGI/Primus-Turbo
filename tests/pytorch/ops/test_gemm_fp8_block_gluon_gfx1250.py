@@ -190,6 +190,41 @@ def test_split_output_epilogue_matches_plain(axis, split, accumulate):
     assert bits_equal(out, ref)
 
 
+@requires_gluon
+@pytest.mark.parametrize("cluster", [2, 4])
+@pytest.mark.parametrize("mode", ["bf16", "acc_fp32", "acc2", "split_n", "split_m_acc"])
+def test_cluster_bits_equal_one_cta(monkeypatch, cluster, mode):
+    """c x c CTA clusters (TDM multicast) give the bits of one CTA per 256x256 tile in every epilogue."""
+    import primus_turbo.common.envs as envs
+    from primus_turbo.gluon.gemm.gemm_fp8blk_kernel import cluster_of, dsv4up_gemm, dsv4up_gemm_split
+
+    monkeypatch.setenv("PRIMUS_TURBO_DSV4UP_CLUSTER_MIN_CTAS", "0")
+    envs.reset_cache("PRIMUS_TURBO_DSV4UP_CLUSTER_MIN_CTAS")
+    m, n, k = 2048, 3072, 1536
+    assert cluster_of(m, n, k, cluster=cluster) == cluster
+    a, b, ea, eb = _operands(m, n, k, seed=5)
+    pa, pb = _packed(ea, eb, m, n, k)
+    dt = torch.float32 if mode == "acc_fp32" else torch.bfloat16
+    c0 = torch.randn(m, n, device="cuda").to(dt)
+    outs = []
+    for cl in (1, cluster):
+        if mode.startswith("split"):
+            acc = mode.endswith("acc")
+            if mode == "split_n":
+                o0, o1 = c0[:, :1024].contiguous(), c0[:, 1024:].contiguous()
+            else:
+                o0, o1 = c0[:1024].clone(), c0[1024:].clone()  # row slices: .contiguous() would alias c0
+            dsv4up_gemm_split(a, b, pa, pb, o0, o1, "n" if mode == "split_n" else "m", accumulate=acc, cluster=cl)
+            outs.append(torch.cat([o0, o1], dim=1 if mode == "split_n" else 0))
+        else:
+            out = c0.clone()
+            acc = {"bf16": False, "acc_fp32": True, "acc2": 2}[mode]
+            dsv4up_gemm(a, b, pa, pb, out=out, accumulate=acc, cluster=cl)
+            outs.append(out)
+    envs.reset_cache("PRIMUS_TURBO_DSV4UP_CLUSTER_MIN_CTAS")
+    assert bits_equal(outs[1], outs[0])
+
+
 # ----------------------------------------------------------------------------- Linear / concat-N ops
 
 

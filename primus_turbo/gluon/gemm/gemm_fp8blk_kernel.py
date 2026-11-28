@@ -9,12 +9,15 @@ C[M,N] = (A[M,K] e4m3 * sA) @ (B[N,K] e4m3 * sB)^T     NT: both operands K-conti
 
 Kernel = upstream Triton third_party/amd/python/examples/gluon/gemm_warp_pipeline_cdna5.py (main 83c92283)
 MXFP8 256x256x256 BK256 path (8 waves, TDM async loads, 5-stage warp pipeline, fused TDM scale loads,
-wmma_scaled), single CTA (cluster = 1, no multicast), M/N/K/strides constexpr (one compile per shape: the
-runtime-shape 1-CTA build spills VGPRs, the static build does not).
+wmma_scaled), M/N/K/strides constexpr (one compile per shape: the runtime-shape 1-CTA build spills VGPRs, the
+static build does not). CTA cluster c x c (c = 1, 2, 4; see cluster_of, default 2 when the shape allows it): the c x c
+256x256 CTAs of a cluster share A rows / B columns through TDM multicast (upstream's cluster layouts), which cuts the
+L2 -> LDS traffic (MI455X, 16384-token DSv4 shapes: 5.3-6.0 -> 6.7-7.7 PF on the long-K / large grids). Every CTA
+still computes its 256x256 tile with the same WMMA sequence in the same K order, so the bits do not depend on c.
 The DSv4 recipe (1x128 activation / 128x128 weight UE8M0 scales) is fed as MX block-32 E8M0 scales replicated
 from the 128-wide blocks (exact for power-of-two scales), packed by gemm_fp8blk_utils.pack_scales.
 
-Changes vs upstream: cluster barriers dropped (1 CTA); a double-buffered epilogue (two LDS staging tiles, one TDM
+Changes vs upstream: cluster arrive/wait only when c > 1; a double-buffered epilogue (two LDS staging tiles, one TDM
 store per N half); an optional beta = 1 epilogue (ACCUM): the old C tile is read in the accumulator layout and added in
 fp32 before the TDM store, so wgrad can accumulate straight into an fp32 (or 16-bit) main_grad; and a split-output
 epilogue that stores each tile into one of two outputs. Requires Triton >= 3.9 (gluon cdna5 / tdm, see
@@ -252,8 +255,9 @@ def _consume_and_refill(
     CTA_N: gl.constexpr,
     REFILL_SCALE: gl.constexpr,
     DATA_SCALE_WAITCNT: gl.constexpr,
+    CLUSTERED: gl.constexpr = False,
 ):
-    # upstream _mxfp8_bk256_b2_consume_and_refill with the cluster arrive/wait removed (1 CTA)
+    # upstream _mxfp8_bk256_b2_consume_and_refill; cluster arrive/wait only for a CTA cluster (CLUSTERED)
     tdm.async_wait(DATA_SCALE_WAITCNT)
     next_a_desc = a_desc
     next_b_desc = b_desc
@@ -296,6 +300,8 @@ def _consume_and_refill(
         )
         b1_lo = _mxfp8_load_b2_parent(b_buf, data_slot, 0, 128, B2_LOAD_LAYOUT, DOT_B)
         b1_hi = _mxfp8_load_b2_parent(b_buf, data_slot, 128, 128, B2_LOAD_LAYOUT, DOT_B)
+        if CLUSTERED:
+            gl.amd.cdna5.cluster.arrive()
         next_a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, 256])
         next_b_desc = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, 0, 256])
         if REFILL_SCALE:
@@ -305,6 +311,8 @@ def _consume_and_refill(
         acc0 = gl.amd.cdna5.wmma_scaled(a1, as1, "e4m3", b1_lo, bs1_lo, "e4m3", acc0)
         acc1 = gl.amd.cdna5.wmma_scaled(a1, as1, "e4m3", b1_hi, bs1_hi, "e4m3", acc1)
     with gl.amd.warp_pipeline_stage("mxfp8_stage4_wait_refill"):
+        if CLUSTERED:
+            gl.amd.cdna5.cluster.wait()
         _mxfp8_issue_b2_parent_data_without_update(a_desc, b_desc, a_buf, b_buf, data_slot)
         if REFILL_SCALE:
             tdm.async_load_fused(
@@ -333,10 +341,13 @@ def _store_half(
     acc,
     WMMA_LAYOUT: gl.constexpr,
     ACCUM: gl.constexpr,
+    CTA_M: gl.constexpr = 1,
+    CTA_N: gl.constexpr = 1,
 ):
+    # (pid_m, pid_n): coordinates of the cluster's first 256x256 tile (in 256-tile units)
     cta_m: gl.constexpr = 256
     half_n: gl.constexpr = 128
-    out = acc.reshape((1, cta_m, 1, half_n)).permute((0, 2, 1, 3))
+    out = acc.reshape((CTA_M, cta_m, CTA_N, half_n)).permute((0, 2, 1, 3))
     if ACCUM:  # beta = 1: C = old C + acc (fp32 add, one rounding into C's dtype)
         # old C half-tile: TDM global -> LDS (same buffer / descriptor as the store), LDS -> registers in the
         # accumulator's layout (mirror of the store path), add, then the normal store.
@@ -398,9 +409,9 @@ def _store_split(
             block_shape=(CTA_M, CTA_N, cta_m, half_n),
             layout=shared_layout,
         )
-        _store_half(c_ptr, desc0, shared, pid_m, pid_n, 0, stride_cm, 1, acc0, WMMA_LAYOUT, ACCUM)
+        _store_half(c_ptr, desc0, shared, pid_m, pid_n, 0, stride_cm, 1, acc0, WMMA_LAYOUT, ACCUM, CTA_M, CTA_N)
         tdm.async_wait(0)
-        _store_half(c_ptr, desc0, shared, pid_m, pid_n, 1, stride_cm, 1, acc1, WMMA_LAYOUT, ACCUM)
+        _store_half(c_ptr, desc0, shared, pid_m, pid_n, 1, stride_cm, 1, acc1, WMMA_LAYOUT, ACCUM, CTA_M, CTA_N)
         tdm.async_wait(0)
     else:
         if SPLIT_AXIS == 1:
@@ -416,9 +427,9 @@ def _store_split(
             block_shape=(CTA_M, CTA_N, cta_m, half_n),
             layout=shared_layout,
         )
-        _store_half(c1_ptr, desc1, shared, pm1, pn1, 0, stride_c1m, 1, acc0, WMMA_LAYOUT, ACCUM)
+        _store_half(c1_ptr, desc1, shared, pm1, pn1, 0, stride_c1m, 1, acc0, WMMA_LAYOUT, ACCUM, CTA_M, CTA_N)
         tdm.async_wait(0)
-        _store_half(c1_ptr, desc1, shared, pm1, pn1, 1, stride_c1m, 1, acc1, WMMA_LAYOUT, ACCUM)
+        _store_half(c1_ptr, desc1, shared, pm1, pn1, 1, stride_c1m, 1, acc1, WMMA_LAYOUT, ACCUM, CTA_M, CTA_N)
         tdm.async_wait(0)
 
 
@@ -463,6 +474,7 @@ def _gemm_tile(
     stride_ak: gl.constexpr = 1
     stride_bk: gl.constexpr = 1
     stride_cn: gl.constexpr = 1
+    CLUSTERED: gl.constexpr = CTA_M * CTA_N > 1
     dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, 16)
     dot_b: gl.constexpr = gl.DotOperandLayout(1, WMMA_LAYOUT, 16)
     dot_b_load: gl.constexpr = gl.DotOperandLayout(1, LOAD_WMMA_LAYOUT, 16)
@@ -544,6 +556,7 @@ def _gemm_tile(
                 CTA_N,
                 True,
                 data_scale_waitcnt,
+                CLUSTERED,
             )
     for cleanup_pair in range(0, (iter_max - 4) % 6 // 2):
         cleanup_tile = cleanup_pair * 2
@@ -575,6 +588,7 @@ def _gemm_tile(
             CTA_N,
             True,
             data_scale_waitcnt,
+            CLUSTERED,
         )
         a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = _consume_and_refill(
             a_buf,
@@ -602,6 +616,7 @@ def _gemm_tile(
             CTA_N,
             True,
             data_scale_waitcnt,
+            CLUSTERED,
         )
     residual = iter_max - 4
     s0 = residual % 3
@@ -632,6 +647,7 @@ def _gemm_tile(
         CTA_N,
         True,
         data_scale_waitcnt,
+        CLUSTERED,
     )
     a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = _consume_and_refill(
         a_buf,
@@ -659,6 +675,7 @@ def _gemm_tile(
         CTA_N,
         False,
         data_scale_waitcnt,
+        CLUSTERED,
     )
     tdm.async_wait(3)
     acc0, acc1 = _consume_tail(
@@ -702,10 +719,15 @@ def _gemm_tile(
         BLOCK_N,
         CTA_N,
     )
+    if CLUSTERED:
+        gl.amd.cdna5.cluster.arrive()
+        gl.amd.cdna5.cluster.wait()
     a_buf._keep_alive()
     b_buf._keep_alive()
     as_buf._keep_alive()
     bs_buf._keep_alive()
+    tm = pid_m * CTA_M  # first 256x256 tile of this (cluster) tile, in 256-tile units
+    tn = pid_n * CTA_N
     # epilogue: upstream _tdm_store_split_n2 (one LDS buffer, two N halves), optional beta = 1 read-add
     cta_m: gl.constexpr = 256
     cta_n: gl.constexpr = 256
@@ -724,8 +746,8 @@ def _gemm_tile(
             c1_ptr,
             shared,
             shared_layout,
-            pid_m,
-            pid_n,
+            tm,
+            tn,
             M,
             N,
             stride_cm,
@@ -752,8 +774,8 @@ def _gemm_tile(
         shared1 = gl.allocate_shared_memory(
             c_ptr.type.element_ty, [CTA_M, CTA_N, cta_m, half_n], shared_layout
         )
-        _store_half(c_ptr, desc, shared, pid_m, pid_n, 0, stride_cm, stride_cn, acc0, WMMA_LAYOUT, ACCUM)
-        _store_half(c_ptr, desc, shared1, pid_m, pid_n, 1, stride_cm, stride_cn, acc1, WMMA_LAYOUT, ACCUM)
+        _store_half(c_ptr, desc, shared, tm, tn, 0, stride_cm, stride_cn, acc0, WMMA_LAYOUT, ACCUM, CTA_M, CTA_N)
+        _store_half(c_ptr, desc, shared1, tm, tn, 1, stride_cm, stride_cn, acc1, WMMA_LAYOUT, ACCUM, CTA_M, CTA_N)
         tdm.async_wait(0)
         shared1._keep_alive()
 
@@ -787,8 +809,9 @@ def dsv4up_gemm_kernel(
     CTA_M: gl.constexpr,
     CTA_N: gl.constexpr,
     ACCUM: gl.constexpr,
+    GROUP_M: gl.constexpr = 4,
 ):
-    pid_m, pid_n = _get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, 4)
+    pid_m, pid_n = _get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, GROUP_M)
     _gemm_tile(
         pid_m,
         pid_n,
@@ -854,9 +877,10 @@ def dsv4up_split_kernel(
     ACCUM: gl.constexpr,
     SPLIT_AXIS: gl.constexpr,
     SPLIT0: gl.constexpr,
+    GROUP_M: gl.constexpr = 4,
 ):
     # dsv4up_gemm_kernel (same tile order and main loop) whose C is split into two outputs, see _store_split.
-    pid_m, pid_n = _get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, 4)
+    pid_m, pid_n = _get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, GROUP_M)
     _gemm_tile(
         pid_m,
         pid_n,
@@ -898,15 +922,50 @@ def shape_supported(M, N, K):
     return M > 0 and N > 0 and M % TILE == 0 and N % TILE == 0 and K >= 1024 and K % 512 == 0
 
 
-_LAYOUTS = None
+_LAYOUTS = {}
 
 
-def build_layouts():
-    """Upstream make_mxfp8_case layout construction for the 256x256x256 tile, cluster = 1."""
-    tile, block_k, cluster = TILE, BLOCK_K, 1
-    block_m = block_n = tile
-    cga = []
-    output_cga = tuple()
+def _layouts(cluster):
+    lay = _LAYOUTS.get(cluster)
+    if lay is None:
+        lay = _LAYOUTS[cluster] = build_layouts(cluster)
+    return lay
+
+
+def cluster_of(M, N, K, split_axis=0, s0=0, cluster=None):
+    """CTA cluster edge c (1, 2 or 4) for a dsv4up launch: c x c CTAs of 256x256 share one (256c)x(256c) output tile
+    and TDM-multicast A across a cluster row / B across a cluster column (less L2 traffic). Needs M, N (and a split
+    point) % 256c and at least PRIMUS_TURBO_DSV4UP_CLUSTER_MIN_CTAS (256) 256x256 tiles, otherwise the next smaller edge
+    (small grids lose more to the coarser tile than they gain from the multicast). Same per-output K order and WMMA
+    sequence for every c, so the bits are identical. ``cluster`` / PRIMUS_TURBO_DSV4UP_CLUSTER (default 2): preferred
+    edge, 1 = one CTA per tile (the old kernel)."""
+    import primus_turbo.common.envs as envs
+
+    c = int(envs.PRIMUS_TURBO_DSV4UP_CLUSTER) if cluster is None else cluster
+    c = c if c in (1, 2, 4) else 1
+    min_ctas = envs.PRIMUS_TURBO_DSV4UP_CLUSTER_MIN_CTAS
+    while c > 1:
+        e = TILE * c
+        if M % e == 0 and N % e == 0 and (M // TILE) * (N // TILE) >= min_ctas and (not split_axis or s0 % e == 0):
+            break
+        c //= 2
+    return c
+
+
+def build_layouts(cluster=1):
+    """Upstream make_mxfp8_case layout construction for the 256x256x256 CTA tile, cluster x cluster CTAs (1 or 2;
+    a 2x2 cluster multicasts A across a cluster row and B across a cluster column through TDM)."""
+    assert cluster in (1, 2, 4), cluster
+    tile, block_k = TILE, BLOCK_K
+    block_m = block_n = tile * cluster
+    if cluster == 1:
+        cga = []
+        output_cga = tuple()
+    else:
+        from triton._C.libtriton.gluon_ir import make_cga_layout
+
+        cga = make_cga_layout([cluster, cluster], [cluster, cluster], [0, 1])
+        output_cga = tuple(tuple(basis) + (0, 0) for basis in cga)
     slice_n = tile // 2
     local_a = gl.PaddedSharedLayout.with_identity_for([[block_k, 16]], [block_m, block_k], [1, 0])
     local_b = gl.PaddedSharedLayout.with_identity_for([[block_k, 16]], [block_n, block_k], [1, 0])
@@ -979,7 +1038,7 @@ def build_layouts():
         ],
         lane_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [16, 0, 0]],
         warp_bases=[[0, 0, 64], [0, 0, 0], [0, 0, 0]],
-        block_bases=[],
+        block_bases=[[0, 0, 0]] * (cluster.bit_length() - 1) + [[0, 1 << i, 0] for i in range(cluster.bit_length() - 1)],
         shape=[128, cluster, 128],
     )
     return dict(
@@ -1002,14 +1061,12 @@ def build_layouts():
 _PLANS = {}
 
 
-def _plan(M, N, K, sam, sbn, scm, cdt, accum):
-    key = (M, N, K, sam, sbn, scm, cdt, accum)
+def _plan(M, N, K, sam, sbn, scm, cdt, accum, cluster=1, group_m=4):
+    key = (M, N, K, sam, sbn, scm, cdt, accum, cluster, group_m)
     p = _PLANS.get(key)
     if p is None:
-        global _LAYOUTS
-        if _LAYOUTS is None:
-            _LAYOUTS = build_layouts()
-        grid_mn = (M // TILE) * (N // TILE)
+        lay = _layouts(cluster)
+        grid_mn = (M // (TILE * cluster)) * (N // (TILE * cluster))
         p = (
             (grid_mn,),
             dict(
@@ -1023,17 +1080,18 @@ def _plan(M, N, K, sam, sbn, scm, cdt, accum):
                 stride_scale_b=K // 32 * 128,
                 GRID_MN=grid_mn,
                 ACCUM=accum,
+                GROUP_M=group_m,
                 num_warps=8,
                 waves_per_eu=2,
-                num_ctas=1,
-                **_LAYOUTS,
+                num_ctas=cluster * cluster,
+                **lay,
             ),
         )
         _PLANS[key] = p
     return p
 
 
-def dsv4up_gemm(a, b, a_packed, b_packed, out=None, out_dtype=torch.bfloat16, accumulate=False):
+def dsv4up_gemm(a, b, a_packed, b_packed, out=None, out_dtype=torch.bfloat16, accumulate=False, cluster=None, group_m=4):
     """C[M,N] = A[M,K] . B[N,K]^T; a/b fp8 e4m3 K-contiguous; *_packed from gemm_fp8blk_utils (contiguous
     [rows/128, K*4] uint8). accumulate=True: out += A.B^T (fp32 add, one rounding into out's dtype)."""
     M, K = a.shape
@@ -1048,7 +1106,8 @@ def dsv4up_gemm(a, b, a_packed, b_packed, out=None, out_dtype=torch.bfloat16, ac
         assert not accumulate
         out = torch.empty((M, N), dtype=out_dtype, device=a.device)
     assert tuple(out.shape) == (M, N) and out.stride(1) == 1
-    grid, kw = _plan(M, N, K, a.stride(0), b.stride(0), out.stride(0), out.dtype, acc_mode)
+    cl = cluster_of(M, N, K, cluster=cluster)
+    grid, kw = _plan(M, N, K, a.stride(0), b.stride(0), out.stride(0), out.dtype, acc_mode, cl, group_m)
     dsv4up_gemm_kernel[grid](a, b, out, a_packed, b_packed, **kw)
     return out
 
@@ -1056,7 +1115,7 @@ def dsv4up_gemm(a, b, a_packed, b_packed, out=None, out_dtype=torch.bfloat16, ac
 _SPLIT_PLANS = {}
 
 
-def dsv4up_gemm_split(a, b, a_packed, b_packed, out0, out1, axis, accumulate=False):
+def dsv4up_gemm_split(a, b, a_packed, b_packed, out0, out1, axis, accumulate=False, cluster=None):
     """One dsv4up GEMM C[M,N] = A[M,K] . B[N,K]^T whose C is two separate row-major outputs (split-output
     epilogue): axis "n" -> out0 [M, N0], out1 [M, N - N0] (columns); axis "m" -> out0 [M0, N], out1 [M - M0, N]
     (rows). The split point (N0 / M0) is a multiple of 256, so every 256x256 tile is stored whole into one output; the
@@ -1090,6 +1149,7 @@ def dsv4up_gemm_split(a, b, a_packed, b_packed, out0, out1, axis, accumulate=Fal
     assert 0 < s0 and s0 % TILE == 0, s0
     for t in (a, b, a_packed, b_packed, out0, out1):  # never hand the kernel a null / foreign address
         assert t.is_cuda and t.data_ptr() != 0 and t.device == a.device, "dsv4up split: bad operand"
+    cl = cluster_of(M, N, K, ax, s0, cluster=cluster)
     key = (
         M,
         N,
@@ -1102,13 +1162,12 @@ def dsv4up_gemm_split(a, b, a_packed, b_packed, out0, out1, axis, accumulate=Fal
         bool(accumulate),
         ax,
         s0,
+        cl,
     )
     p = _SPLIT_PLANS.get(key)
     if p is None:
-        global _LAYOUTS
-        if _LAYOUTS is None:
-            _LAYOUTS = build_layouts()
-        grid_mn = (M // TILE) * (N // TILE)
+        lay = _layouts(cl)
+        grid_mn = (M // (TILE * cl)) * (N // (TILE * cl))
         p = (
             (grid_mn,),
             dict(
@@ -1127,8 +1186,8 @@ def dsv4up_gemm_split(a, b, a_packed, b_packed, out0, out1, axis, accumulate=Fal
                 SPLIT0=s0,
                 num_warps=8,
                 waves_per_eu=2,
-                num_ctas=1,
-                **_LAYOUTS,
+                num_ctas=cl * cl,
+                **lay,
             ),
         )
         _SPLIT_PLANS[key] = p

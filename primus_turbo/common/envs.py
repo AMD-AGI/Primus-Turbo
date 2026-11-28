@@ -97,7 +97,9 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_FP8_BLOCK_KERNEL: str = "dsv4up"
     PRIMUS_TURBO_FP8_WCACHE: bool = True
     PRIMUS_TURBO_FP8_WCACHE_VERIFY: bool = False
-    PRIMUS_TURBO_DSV4UP_SMALLTILE: str = "4096x1024x32768:256x128s3,4096x1536x4096:256x128s3,1536x4096x4096:256x128s3,1536x4096x4096a:256x128s3"
+    PRIMUS_TURBO_DSV4UP_CLUSTER: str = "2"
+    PRIMUS_TURBO_DSV4UP_CLUSTER_MIN_CTAS: int = 256
+    PRIMUS_TURBO_DSV4UP_SMALLTILE: str = "4096x1024x32768:256x128s3,4096x1536x4096:256x128s3,1536x4096x4096:256x128s3,1536x4096x4096a:256x128s3,1536x4096x16384:256x128s3,1536x4096x16384a:256x128s3"
     PRIMUS_MB_QDUAL: str = "f1024:t2w8,f2048:t2w8,f4096:t2w8,f8192:t2w8,c4096:t2w8"
     PRIMUS_OVERLAP: bool = False
 
@@ -442,13 +444,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PRIMUS_TURBO_FP8_WCACHE": lambda: os.getenv("PRIMUS_TURBO_FP8_WCACHE", "1") != "0",
     # "1" re-quantizes every weight-cache hit and raises on any byte difference (debugging; syncs).
     "PRIMUS_TURBO_FP8_WCACHE_VERIFY": lambda: os.getenv("PRIMUS_TURBO_FP8_WCACHE_VERIFY", "0") == "1",
+    # dsv4up CTA cluster edge (gemm_fp8blk_kernel.cluster_of): 2 (default) or 4 = c x c CTAs per 256c x 256c output tile with
+    # TDM multicast of A / B (bit-identical to 1); 1 = one CTA per 256x256 tile. Shapes whose M / N are not multiples
+    # of 256c or with fewer than PRIMUS_TURBO_DSV4UP_CLUSTER_MIN_CTAS 256x256 tiles use a smaller edge.
+    "PRIMUS_TURBO_DSV4UP_CLUSTER": env_choice("PRIMUS_TURBO_DSV4UP_CLUSTER", "2", ("1", "2", "4")),
+    "PRIMUS_TURBO_DSV4UP_CLUSTER_MIN_CTAS": env_non_negative_int("PRIMUS_TURBO_DSV4UP_CLUSTER_MIN_CTAS", 256),
     # dsv4up GEMMs that run on the dsv4s smaller-output-tile kernel (bit-identical, more CUs busy):
     # comma-separated "MxNxK[a]:tile", the GEMM dims of the call, "a" for the beta-1 accumulate
     # call, tile from ``gemm_fp8blk_smalltile_kernel.TILES``. The default is the DSv4-Flash table; set it to the
     # empty string to turn the table off.
     "PRIMUS_TURBO_DSV4UP_SMALLTILE": lambda: os.getenv(
         "PRIMUS_TURBO_DSV4UP_SMALLTILE",
-        "4096x1024x32768:256x128s3,4096x1536x4096:256x128s3,1536x4096x4096:256x128s3,1536x4096x4096a:256x128s3",
+        "4096x1024x32768:256x128s3,4096x1536x4096:256x128s3,1536x4096x4096:256x128s3,1536x4096x4096a:256x128s3,1536x4096x16384:256x128s3,1536x4096x16384a:256x128s3",
     ),
     # Per-site kernel variant of the Triton dual quantization (non-Gluon fallback), comma-separated
     # "<f|c><K>:t2w<warps>". The default is the DSv4-Flash table; the empty string turns it off.
