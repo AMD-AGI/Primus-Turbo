@@ -48,6 +48,11 @@ F8_FWD_MAX: tl.constexpr = torch.finfo(get_f8_fwd_dtype()).max
 F8_BWD_MAX: tl.constexpr = torch.finfo(get_f8_bwd_dtype()).max
 
 
+def _lse_delta_len(seqlen_q: int) -> int:
+    """Length of the per-head LSE/delta scratch: 2 * BLOCK_M slots per block of rows."""
+    return triton.cdiv(seqlen_q, FIXED_BLOCK_M) * FIXED_BLOCK_M * 2
+
+
 @_torch_custom_op_wrapper("primus_turbo::attention_triton_forward_impl", mutates_args=(), device_types="cuda")
 def attention_triton_forward_impl(
     q: torch.Tensor,
@@ -143,7 +148,12 @@ def attention_triton_forward_impl(
         stride_lse_m, stride_lse_h = softmax_lse.stride()
         stride_lse_z = 0
     else:
-        softmax_lse = torch.empty((batch, nheads_q, max_seqlens_q * 2), device=q.device, dtype=torch.float32)
+        # Each BLOCK_M block of rows owns 2 * BLOCK_M slots (its LSE, then its delta), so a
+        # ragged last block still needs a whole 2 * BLOCK_M: otherwise its deltas land in the
+        # next head's LSE slots.
+        softmax_lse = torch.empty(
+            (batch, nheads_q, _lse_delta_len(max_seqlens_q)), device=q.device, dtype=torch.float32
+        )
         stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride()
 
     if bias is not None:
@@ -290,7 +300,9 @@ def _attention_triton_forward_impl_fake(
     else:
         exp_scores = torch.empty([], device=q.device, dtype=torch.float32)
 
-    softmax_lse = torch.empty((batch_q, nheads_q, max_seqlen_q * 2), device=q.device, dtype=torch.float32)
+    softmax_lse = torch.empty(
+        (batch_q, nheads_q, _lse_delta_len(max_seqlen_q)), device=q.device, dtype=torch.float32
+    )
 
     return o, softmax_lse, exp_scores
 
@@ -711,7 +723,7 @@ def dense_forward(
 
 
 def _lse_delta_views(lse_delta: torch.Tensor, seqlen_q: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Split the [B, Hq, seqlen_q * 2] scratch into per-row (lse, delta).
+    """Split the [B, Hq, 2 * BLOCK_M * cdiv(seqlen_q, BLOCK_M)] scratch into per-row (lse, delta).
 
     The forward writes LSE at block offset ``m * BLOCK_M * 2`` and the backward preprocess
     writes delta at ``+ BLOCK_M`` of the same block, so the two interleave per BLOCK_M rather
@@ -719,8 +731,6 @@ def _lse_delta_views(lse_delta: torch.Tensor, seqlen_q: int) -> Tuple[torch.Tens
     layout is knowable here. Both views are trimmed back to seqlen_q.
     """
     row = torch.arange(seqlen_q, device=lse_delta.device)
-    # Index rather than reshape: the scratch is allocated as seqlen_q * 2, which need not be
-    # a whole number of 2 * BLOCK_M blocks, so a view would be wrong on a ragged tail.
     lse_idx = (row // FIXED_BLOCK_M) * (2 * FIXED_BLOCK_M) + (row % FIXED_BLOCK_M)
     return lse_delta[:, :, lse_idx], lse_delta[:, :, lse_idx + FIXED_BLOCK_M]
 

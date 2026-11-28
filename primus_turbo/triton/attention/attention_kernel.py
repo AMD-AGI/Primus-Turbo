@@ -1434,7 +1434,8 @@ def _attn_bwd_dkdv(
                 qk = tl.where(win_col <= win_row + WINDOW_RIGHT, qk, float("-inf"))
 
         l_ptrs = ld_offset + (2 * start_m + tl.arange(0, 2 * BLOCK_M)) * stride_ldm
-        mask_ldm = tl.ravel(tl.join(mask_m, mask_m))
+        # The block holds BLOCK_M LSEs then BLOCK_M deltas; slot s belongs to row s % BLOCK_M.
+        mask_ldm = (start_m + tl.arange(0, 2 * BLOCK_M) % BLOCK_M) < N_CTX_Q
         lds = tl.load(l_ptrs, mask=mask_ldm, other=0.0)
         l_i = tl.gather(lds, index=tl.arange(0, BLOCK_M), axis=0)
 
@@ -1678,7 +1679,8 @@ def _bwd_kernel_dq(
         blk_do_descale = 1.0
 
     l_ptrs = ld_offset + (2 * start_m * BLOCK_M + tl.arange(0, 2 * BLOCK_M)) * stride_ldm
-    mask_ldm = tl.ravel(tl.join(mask_m, mask_m))
+    # The block holds BLOCK_M LSEs then BLOCK_M deltas; slot s belongs to row s % BLOCK_M.
+    mask_ldm = (start_m * BLOCK_M + tl.arange(0, 2 * BLOCK_M) % BLOCK_M) < N_CTX_Q
     lds = tl.load(l_ptrs, mask=mask_ldm, other=0.0)
 
     dq = _attn_bwd_dq(
