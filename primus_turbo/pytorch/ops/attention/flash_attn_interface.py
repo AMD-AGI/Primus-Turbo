@@ -593,6 +593,7 @@ class TritonFlashAttnFunc(torch.autograd.Function):
             ctx.sm_scale = softmax_scale
             ctx.p_scale = p_scale
             ctx.causal = causal
+            ctx.window_size = window_size
             ctx.use_fp8 = use_fp8
             ctx.cu_seqlens_q = None
             ctx.cu_seqlens_k = None
@@ -632,8 +633,8 @@ class TritonFlashAttnFunc(torch.autograd.Function):
             ctx.max_seqlens_k,
             ctx.sm_scale,
             ctx.causal,
-            -1,
-            -1,
+            int(ctx.window_size[0]),
+            int(ctx.window_size[1]),
             alibi_slopes,
             ctx.use_fp8,
         )
